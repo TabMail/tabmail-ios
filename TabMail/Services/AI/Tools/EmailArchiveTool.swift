@@ -88,8 +88,22 @@ struct EmailArchiveTool: AgentTool, Sendable {
         // `resolved` snapshot — which may have gone stale during the
         // unbounded confirmation wait above. `resolved` is still used for the
         // confirmation card display and the response payload below.
+        //
+        // 🚨 THE RE-RESOLVE NEEDS A WITNESS, OR IT ONLY ANSWERS "WHAT IS AT THIS
+        // ADDRESS NOW". The confirmation wait is unbounded, and on IMAP the
+        // address is a per-folder UID a UIDVALIDITY turnover reassigns — so
+        // re-resolving `resolved.map(\.id)` alone can hand the archive a
+        // DIFFERENT physical message, which every downstream address and epoch
+        // check then correctly authenticates because it IS the row that was
+        // resolved. `ExpectedMessageIdentity.map` captures the content witness
+        // from the very headers already rendered on the confirmation card, so it
+        // costs zero extra I/O, and the helper refuses any id whose row is
+        // provably no longer that message. PORT of
+        // `v2final:EmailArchiveTool.execute`, which passes the whole captured
+        // `headers` to `recordRoleMove` for exactly this reason.
         let admission = await AccountManager.shared.performCoordinatedRoleMove(
-            ids: resolved.map(\.id), role: .archive)
+            ids: resolved.map(\.id), role: .archive,
+            expectedIdentities: ExpectedMessageIdentity.map(resolved))
         // T4.V8 (PORT of `v2final:EmailArchiveTool.execute`, commit `b1c89ad4a`):
         // report only DURABLY ADMITTED work as archived. This call previously
         // reported `"success": true` with `archived_count == resolved.count`
@@ -127,6 +141,20 @@ struct EmailArchiveTool: AgentTool, Sendable {
         if !failedIds.isEmpty {
             result["failed_ids"] = failedIds
             result["warning"] = "\(failedIds.count) email(s) could not be archived"
+        }
+        // A refusal by CONTENT IDENTITY needs its own line, not just a slot in
+        // `failed_ids`: retrying the same unique_id fails identically forever
+        // (the id names an address a different message now occupies), so an agent
+        // told only "failed" will retry and get the same answer. Told this, it
+        // re-reads and re-addresses. Refusing silently is not an option — the
+        // user confirmed this archive and must learn it did not happen.
+        let identityChangedIds = zip(resolvedNumericIds, resolved)
+            .filter { admission.identityRefusedIds.contains($0.1.id) }
+            .map(\.0)
+        if !identityChangedIds.isEmpty {
+            result["identity_changed_ids"] = identityChangedIds
+            result["identity_changed_message"] =
+                "\(identityChangedIds.count) email(s) were NOT archived: the message at that id is no longer the one shown on the confirmation card, so acting on it would have hit the wrong email. Use inbox_read to re-read the mailbox and confirm again with the new ids."
         }
 
         if DebugModeManager.isLoggingEnabled() {

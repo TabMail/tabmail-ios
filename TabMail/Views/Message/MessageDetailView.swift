@@ -73,8 +73,18 @@ struct MessageDetailView: View {
             || labelMenuMessage != nil
     }
 
-    init(messageId: String, opensWithSkeletonDwell: Bool = false) {
-        self._viewModel = State(initialValue: MessageDetailViewModel(messageId: messageId))
+    /// `expectedRfc822MessageId` — the content witness of the message the OPENER
+    /// proved it was opening, forwarded to the view model so its own re-resolve
+    /// cannot durably mark a different message read. See
+    /// `MessageDetailViewModel.openIdentity`. Defaulted `nil` (fail open) so every
+    /// opener that has no witness keeps today's behaviour unchanged.
+    init(
+        messageId: String,
+        opensWithSkeletonDwell: Bool = false,
+        expectedRfc822MessageId: String? = nil
+    ) {
+        self._viewModel = State(initialValue: MessageDetailViewModel(
+            messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId))
         self.opensWithSkeletonDwell = opensWithSkeletonDwell
         self._skeletonOverlayVisible = State(initialValue: opensWithSkeletonDwell)
         if DebugModeManager.isLoggingEnabled() {

@@ -68,6 +68,19 @@ enum RoleMoveDisposition: String, Sendable, Equatable, CaseIterable {
 struct RoleMoveAdmission: Sendable, Equatable {
     private(set) var perID: [String: RoleMoveDisposition] = [:]
 
+    /// Ids refused because the row at their address is provably a DIFFERENT
+    /// physical message than the one the caller captured
+    /// (`ExpectedMessageIdentity`). An ANNOTATION on top of the disposition,
+    /// never a fourth disposition: these ids are also `.terminalStale`, and the
+    /// monotone rank lattice above is deliberately untouched.
+    ///
+    /// It exists because "could not be archived" and "the message at that id is
+    /// no longer the one you were shown" call for DIFFERENT recoveries. Retrying
+    /// the same id after an identity refusal fails identically forever; the only
+    /// recovery is to re-read and re-address. An agent told merely "failed" will
+    /// retry; told "identity changed", it re-reads.
+    private(set) var identityRefusedIds: Set<String> = []
+
     static let empty = RoleMoveAdmission()
 
     private static func rank(_ disposition: RoleMoveDisposition) -> Int {
@@ -93,6 +106,16 @@ struct RoleMoveAdmission: Sendable, Equatable {
 
     mutating func merge(_ other: RoleMoveAdmission) {
         for (id, disposition) in other.perID { set(disposition, id: id) }
+        identityRefusedIds.formUnion(other.identityRefusedIds)
+    }
+
+    /// Record a refusal by content identity. Sets the disposition AND the
+    /// annotation together so the two can never disagree.
+    mutating func setIdentityRefused(ids: some Sequence<String>) {
+        for id in ids {
+            set(.terminalStale, id: id)
+            identityRefusedIds.insert(id)
+        }
     }
 
     func disposition(for id: String) -> RoleMoveDisposition? { perID[id] }
@@ -108,6 +131,106 @@ struct RoleMoveAdmission: Sendable, Equatable {
     var pendingIds: Set<String> { ids(with: .retainedForRetry) }
     /// Provably not applicable. Safe to surface as a failure.
     var failedIds: Set<String> { ids(with: .terminalStale) }
+}
+
+// MARK: - Expected message identity — the producer's content witness
+//
+// PORT of `v2final:ExpectedMessageIdentity`
+// (`v2final:TabMail/Services/Account/AccountManagerIntentions.swift`), with the
+// intention-journal plumbing SUBTRACTED (v3 has no journal — ADR-IOS-070).
+//
+// THE PROBLEM IT EXISTS FOR, in the reference's own words: the composite
+// `MessageHeader.id` (`accountId:folderPath:messageId`) "is not proof of WHICH
+// physical message a producer looked at: for IMAP, a UIDVALIDITY reset +
+// force-resync can DELETE the row a gesture saw and INSERT a different physical
+// message under the exact same composite key" while the producer's request is
+// still in flight. Any consumer that re-resolves the bare address afterwards then
+// acts on the impostor, and every downstream address/epoch check correctly
+// authenticates THAT row — because it IS the row the consumer resolved. An epoch
+// guard proves the row is addressable in the CURRENT epoch; it cannot prove the
+// row is the message the producer pointed at, because after a turnover the
+// impostor's epoch is fresh too.
+//
+// ⚑ NOT AN ADR-IOS-068 / D4 VIOLATION — the direction is the opposite one. D4
+// forbids an RFC 822 Message-ID SELECTING or AUTHORIZING a mutation target. Here
+// the target is still selected by the durable composite address exactly as
+// before; the witness can only REFUSE that target, never widen it or nominate a
+// different one. Same content-witness use `AIWriteTarget.resolveCurrentHeader`
+// arm 6, `SearchView.resolveLocalResultHeaderId` arm 3, `MessageAICache`, the
+// FTS/body stores and RFC 5322 threading already make.
+
+/// One producer's snapshot of the message it captured, for comparison against
+/// whatever row later occupies that address.
+///
+/// ⚑ FAILABLE ON PURPOSE — this is how "no witness ⇒ no refusal" stays
+/// STRUCTURAL rather than being a boolean default someone can invert by accident.
+/// Mail with no `Message-ID` header genuinely exists (RFC 5322 makes it a SHOULD,
+/// not a MUST), and older rows and some provider quirks leave the column nil or
+/// unusable. Refusing every action on that population would be a large behaviour
+/// regression, so such a producer simply constructs NO identity and the consumer
+/// keeps today's behaviour — exactly the reference's contract, whose `map` "SKIPS
+/// an id whose header/snapshot has no normalizable one". The reference authored a
+/// `(date)` substitute for that population and REMOVED it as unsound in both
+/// directions (ADR-IOS-061 item E); a `(fromAddress, subject, date)` substitute
+/// was likewise authored (`94fac3e79`) and reverted (`3bd9f0bac`). Do not
+/// reintroduce one. The residual is registered as `IOS-IDENTITY-001`.
+struct ExpectedMessageIdentity: Sendable, Equatable {
+    /// Always a normalized, non-empty RFC 822 Message-ID — normalized ONCE, here,
+    /// through the tree's single identity-COMPARISON normalizer.
+    let rfc822MessageId: String
+
+    init?(capturedRfc822MessageId: String?) {
+        guard let normalized = MessageIdentity.comparableRfc822Identity(capturedRfc822MessageId) else {
+            return nil
+        }
+        self.rfc822MessageId = normalized
+    }
+
+    init?(header: MessageHeader) {
+        self.init(capturedRfc822MessageId: header.rfc822MessageId)
+    }
+
+    /// True when `header` is the same physical message this identity was captured
+    /// from. A replacement is a different email and therefore carries a different
+    /// Message-ID, so this witness cannot admit one. A row's `rfc822MessageId` is
+    /// never nulled once set, so a captured-present/current-absent pair is a
+    /// genuine disagreement rather than an ordinary absence.
+    func matches(_ header: MessageHeader) -> Bool {
+        rfc822MessageId == MessageIdentity.comparableRfc822Identity(header.rfc822MessageId)
+    }
+
+    /// Zero-DB construction from headers a producer ALREADY holds. Ids with no
+    /// usable witness are EXCLUDED from the map entirely (see the type doc).
+    /// Duplicate ids keep the last entry — a caller passing one id twice is a
+    /// caller bug, not a reason to trap.
+    static func map(_ headers: [MessageHeader]) -> [String: ExpectedMessageIdentity] {
+        Dictionary(
+            headers.compactMap { header -> (String, ExpectedMessageIdentity)? in
+                guard let identity = ExpectedMessageIdentity(header: header) else { return nil }
+                return (header.id, identity)
+            },
+            uniquingKeysWith: { _, latest in latest }
+        )
+    }
+
+    /// Split `headers` into the ones still matching their captured identity and
+    /// the ids that provably do not. Fail-open per id: a header with no entry in
+    /// `expectedIdentities` is kept, so the default empty map compiles to today's
+    /// exact behaviour for every caller that passes none.
+    static func partition(
+        _ headers: [MessageHeader],
+        against expectedIdentities: [String: ExpectedMessageIdentity]
+    ) -> (matched: [MessageHeader], refusedIds: Set<String>) {
+        guard !expectedIdentities.isEmpty else { return (headers, []) }
+        var refusedIds: Set<String> = []
+        let matched = headers.filter { header in
+            guard let expected = expectedIdentities[header.id] else { return true }
+            if expected.matches(header) { return true }
+            refusedIds.insert(header.id)
+            return false
+        }
+        return (matched, refusedIds)
+    }
 }
 
 extension AccountManager {
@@ -176,6 +299,27 @@ extension AccountManager {
     /// Singular convenience over `resolveHeadersForAction(ids:)` for single-message actions.
     func resolveHeaderForAction(id: String) async -> MessageHeader? {
         await resolveHeadersForAction(ids: [id]).first
+    }
+
+    /// PORT of `v2final:AccountManager.announceIdentityRefusedIds` (F9): post
+    /// `.inboxDataDidChange` with the refused ids so a row this call already hid
+    /// behind an optimistic overlay repaints at its real position instead of
+    /// staying hidden until some unrelated reload.
+    ///
+    /// This is the SURFACING half of a fail-closed identity refusal, and it is not
+    /// optional: refusing silently would convert a wrong-message mutation into a
+    /// user-invisible no-op, which the never-drop rule forbids just as strongly.
+    /// The other half is the caller's own report (the agent tools' `failed_ids` /
+    /// `identity_changed_ids`; `UndoService.undo`'s own empty-restore post).
+    ///
+    /// Fire-and-forget off the calling context, matching every other
+    /// `NotificationCenter.default.post` bridge in this file.
+    nonisolated static func announceIdentityRefusedIds(_ ids: some Collection<String>) {
+        guard !ids.isEmpty else { return }
+        let payload = Array(ids)
+        Task { @MainActor in
+            NotificationCenter.default.post(name: .inboxDataDidChange, object: payload)
+        }
     }
 
     // MARK: - T1.3 — an unknown folder epoch fails CLOSED for new gestures
@@ -998,10 +1142,32 @@ extension AccountManager {
     /// provider, and collapsing it into `failed` tells an agent to retry an action
     /// that is still outstanding — which makes it act twice.
     ///
+    /// **`expectedIdentities` — the CONTENT witness the re-resolve needs.** The
+    /// re-resolve above is what makes this helper act on execution-time truth, but
+    /// on its own it answers only "what is at this ADDRESS now", and on IMAP the
+    /// address is a per-folder UID a UIDVALIDITY turnover reassigns. A caller that
+    /// captured headers before an unbounded wait therefore hands them in here
+    /// (`ExpectedMessageIdentity.map`, zero extra I/O — the headers are already in
+    /// hand for the confirmation card), and BOTH resolve points refuse any id whose
+    /// row is provably a different message now. Default empty ⇒ today's exact
+    /// behaviour for callers with nothing to check against.
+    ///
+    /// APPLIED TWICE ON PURPOSE, exactly as the reference does
+    /// (`v2final:recordRoleMove` + `filterMembersAgainstExpectedIdentity`): the
+    /// pre-resolve verify runs against an EARLIER resolve than the queued closure's,
+    /// and the FIFO write queue can put an unbounded amount of other work between
+    /// them — wide enough for a UIDVALIDITY reset to purge and re-seat an impostor
+    /// under the same composite id in between. Checking only the first would prove
+    /// identity and then discard the proof, which is the defect itself.
+    ///
     /// `@discardableResult` for the test call sites that drive the coordination
     /// lifecycle rather than the receipt; every production caller consumes it.
     @discardableResult
-    func performCoordinatedRoleMove(ids: [String], role: FolderRole) async -> RoleMoveAdmission {
+    func performCoordinatedRoleMove(
+        ids: [String],
+        role: FolderRole,
+        expectedIdentities: [String: ExpectedMessageIdentity] = [:]
+    ) async -> RoleMoveAdmission {
         guard !ids.isEmpty else { return .empty }
         var outcome = RoleMoveAdmission()
         guard role == .archive || role == .trash else {
@@ -1052,12 +1218,25 @@ extension AccountManager {
             }
         }
 
-        let movable = await messagesNotInRole(preResolved, role: role)
+        // C3 — CONTENT PROOF, pass 1. A row that no longer carries the captured
+        // Message-ID is a DIFFERENT physical message at the same address, so this
+        // id is provably not the work the caller confirmed. TERMINAL: retrying the
+        // same id can never behave differently, because the id names an address the
+        // impostor now owns. The caller re-reads and re-addresses instead.
+        let (identityMatched, preRefusedIds) = ExpectedMessageIdentity.partition(
+            preResolved, against: expectedIdentities)
+        if !preRefusedIds.isEmpty {
+            outcome.setIdentityRefused(ids: preRefusedIds)
+            Self.announceIdentityRefusedIds(preRefusedIds)
+            print("[Queue] performCoordinatedRoleMove(\(role.rawValue)) refused \(preRefusedIds.count) id(s) at pre-resolve: the row at that address is not the message the caller captured (C3)")
+        }
+
+        let movable = await messagesNotInRole(identityMatched, role: role)
         // PROVEN already in the target role folder — `messagesNotInRole` fails
         // OPEN on a read error (it returns every message when its read throws),
         // so an id it DROPS is always a positive in-role match, never an unknown.
         let movableIds = Set(movable.map(\.id))
-        outcome.set(.terminalStale, ids: preResolved.map(\.id).filter { !movableIds.contains($0) })
+        outcome.set(.terminalStale, ids: identityMatched.map(\.id).filter { !movableIds.contains($0) })
         guard !movable.isEmpty else {
             // Observability (audit round 5): callers (agent tools, notification
             // router) used to report success unconditionally after this await — a
@@ -1125,7 +1304,17 @@ extension AccountManager {
                 // EXECUTION time, not the confirmation-time snapshot above —
                 // the staleness bug this helper exists to close.
                 let fresh = await self.resolveHeadersForAction(ids: Array(actionableIds))
-                let freshMovable = await self.messagesNotInRole(fresh, role: role)
+                // C3 — CONTENT PROOF, pass 2. See the `expectedIdentities` note on
+                // this function: pass 1 ran before this closure took its FIFO turn,
+                // so its proof is stale by exactly the window this pass closes.
+                let (freshMatched, freshRefusedIds) = ExpectedMessageIdentity.partition(
+                    fresh, against: expectedIdentities)
+                if !freshRefusedIds.isEmpty {
+                    queuedOutcome.setIdentityRefused(ids: freshRefusedIds)
+                    Self.announceIdentityRefusedIds(freshRefusedIds)
+                    print("[Queue] performCoordinatedRoleMove(\(role.rawValue)) refused \(freshRefusedIds.count) id(s) at execution: the row at that address is not the message the caller captured (C3)")
+                }
+                let freshMovable = await self.messagesNotInRole(freshMatched, role: role)
                 let freshIds = Set(freshMovable.map(\.id))
 
                 // Ids dropped by the fresh resolve (vanished row, or already
@@ -1139,8 +1328,17 @@ extension AccountManager {
                 // already recorded a proven `terminalStale` for the ids it could
                 // prove, and `set` is monotone, so a proof taken there is never
                 // downgraded by this coarser pass.
+                //
+                // ⚑ THE IDENTITY-REFUSED IDS ARE EXCLUDED FROM THE `retainedForRetry`
+                // CLASSIFICATION, NOT FROM THE RELEASE. `set` is monotone by RANK,
+                // and `retainedForRetry` OUTRANKS `terminalStale` — so folding them
+                // in would silently promote a PROVEN wrong-message refusal into
+                // "still outstanding", telling the agent to keep waiting for work
+                // that will never happen. Their overlay retain must still be
+                // released here, on the same pass, or the impostor row stays hidden
+                // behind a stranded optimistic entry.
                 let droppedByFreshResolve = actionableIds.subtracting(freshIds)
-                queuedOutcome.set(.retainedForRetry, ids: droppedByFreshResolve)
+                queuedOutcome.set(.retainedForRetry, ids: droppedByFreshResolve.subtracting(freshRefusedIds))
                 for id in droppedByFreshResolve {
                     self.releaseOverlayEntry(id: id)
                 }
@@ -1282,6 +1480,23 @@ extension AccountManager {
                 // Authenticate every exact local member before touching any
                 // row or operation. A vanished/re-keyed row is a whole-command
                 // refusal; there is no upsert/resurrection fallback.
+                //
+                // 🚨 THE LAST GUARD IS THE ONLY ONE THAT NAMES THE MESSAGE. The
+                // five above all describe the ADDRESS, and on IMAP the address is
+                // a per-folder UID the server reassigns at a UIDVALIDITY
+                // turnover: the reset reaction purges this folder and step 6
+                // resyncs it, so a DIFFERENT physical message can occupy this
+                // exact composite id while the in-memory undo stack — which the
+                // reaction does not touch — still names it. All five then pass,
+                // and so does the epoch check inside
+                // `admittedOrdinaryActionTargets`, because the impostor's epoch
+                // is the FRESH one. Undo would move a message the user never
+                // touched, and nothing recovers a misattributed move (C3).
+                //
+                // Refuse-only, never a lookup key (ADR-IOS-068/D4): the member is
+                // still selected by its recorded address. A member whose captured
+                // witness is unusable keeps today's behaviour — see
+                // `ExpectedMessageIdentity`.
                 var currentRows: [MessageHeader] = []
                 for member in members {
                     guard let row = try MessageHeader.fetchOne(db, key: member.originalHeaderId),
@@ -1291,6 +1506,12 @@ extension AccountManager {
                           row.folderId == MessageIdentity.folderId(
                               accountId: accountId, folderPath: forwardDestinationPath)
                     else { return UndoMoveWriteResult() }
+                    if let expected = ExpectedMessageIdentity(
+                        capturedRfc822MessageId: member.sourceRfc822MessageId),
+                       !expected.matches(row) {
+                        print("[UndoStack] undoMove refused \(member.originalHeaderId): the row at that address is not the message the gesture moved (C3 content witness)")
+                        return UndoMoveWriteResult()
+                    }
                     currentRows.append(row)
                 }
 

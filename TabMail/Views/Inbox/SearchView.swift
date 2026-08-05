@@ -88,8 +88,10 @@ struct SearchView: View {
                     .popoverTip(SearchScopeTip())
                 }
             }
-            .navigationDestination(for: String.self) { messageId in
-                MessageDetailView(messageId: messageId)
+            .navigationDestination(for: OpenTarget.self) { target in
+                MessageDetailView(
+                    messageId: target.headerId,
+                    expectedRfc822MessageId: target.provenRfc822MessageId)
             }
         }
         .background(Palette.previewPaneBg)
@@ -220,6 +222,30 @@ struct SearchView: View {
     }
 
     // MARK: - Navigation
+
+    /// What a tap pushes onto the navigation path.
+    ///
+    /// 🚨 IT IS A PAIR, NOT A STRING, BECAUSE THE PROOF MUST TRAVEL WITH THE
+    /// ADDRESS. `resolveLocalResultHeaderId` proves the row at `headerId` is still
+    /// the message the tapped row rendered — and a bare
+    /// `navigationPath.append(headerId)` then throws that proof away. What arrives
+    /// at the other end is only an address, which `MessageDetailViewModel`
+    /// re-resolves by primary key before `markReadOnOpenIfNeeded` durably marks it
+    /// read. A UIDVALIDITY reset (purge-and-resync) or a sync merge landing in that
+    /// window re-seats the address, and the read mutation lands on a message the
+    /// user was never shown — the same C3 misattribution `IOS-SEARCH-001` names,
+    /// one step further down the same path. Carrying the witness makes the detail
+    /// view re-check the identity this view already proved, instead of trusting an
+    /// address that had already been proved stale-able.
+    ///
+    /// `provenRfc822MessageId` is nil for a REMOTE result: that branch resolves a
+    /// provider hit into a durable row and has no captured content witness to
+    /// carry, so it keeps today's behaviour (fail open — see
+    /// `ExpectedMessageIdentity`).
+    struct OpenTarget: Hashable {
+        let headerId: String
+        let provenRfc822MessageId: String?
+    }
 
     /// Resolve a REMOTE search result to a current durable headerId, folder-
     /// scoped so a colliding UID in another folder — or another account — can
@@ -361,7 +387,12 @@ struct SearchView: View {
                 )
             }
             if let opened = resolved {
-                navigationPath.append(opened)
+                // Carry the witness this resolve just validated against — see
+                // `OpenTarget`. The proof is worth nothing to the consumer that
+                // actually mutates unless it travels with the address.
+                navigationPath.append(OpenTarget(
+                    headerId: opened,
+                    provenRfc822MessageId: result.capturedRfc822MessageId))
             } else {
                 showStaleResultAlert = true
             }
@@ -378,7 +409,7 @@ struct SearchView: View {
             )
         }
         if let headerId = resolved {
-            navigationPath.append(headerId)
+            navigationPath.append(OpenTarget(headerId: headerId, provenRfc822MessageId: nil))
         }
     }
 

@@ -591,4 +591,302 @@ struct CoordinatedToolActionTests {
         #expect(!output.contains("failed_ids"),
                 "a pending id must NEVER be reported as failed; got: \(output)")
     }
+
+    // MARK: - (8) C3 — the captured identity must survive the confirmation wait
+    //
+    // **The invariant these tests pin, as a system property:** *no archive/delete
+    // ever moves a message whose identity differs from the one the user was shown
+    // on the confirmation card, and the caller is told so.*
+    //
+    // WHY THE EXISTING FRESH RE-RESOLVE IS NOT THAT PROPERTY. Re-resolving inside
+    // the queued closure answers "what is at this ADDRESS now" — and on IMAP the
+    // address is a per-folder UID a UIDVALIDITY turnover reassigns. So the very
+    // mechanism that fixes the Trace-A staleness bug (test 2 in this suite) hands
+    // the write a DIFFERENT physical message when the folder turned over during
+    // the unbounded confirmation wait, and every downstream address and epoch check
+    // then correctly authenticates it — because it IS the row that was resolved.
+    // The impostor's `observedUidValidity` is the FRESH epoch, so the epoch guard
+    // passes too. Each fixture below sets it to the folder's live epoch precisely
+    // so the archive WOULD be admitted without the content witness; a test that
+    // let the impostor fail the epoch check instead would prove nothing.
+
+    /// An IMAP header at a bare numeric UID carrying a content witness.
+    private func makeWitnessedIMAPHeader(
+        folder: Folder, uid: String, rfc: String?, observedEpoch: Int?
+    ) -> MessageHeader {
+        var h = makeIMAPHeader(folder: folder, uid: uid, observedEpoch: observedEpoch)
+        h.rfc822MessageId = rfc
+        return h
+    }
+
+    @Test("""
+    C3 pass 1 (pre-resolve): a UIDVALIDITY turnover re-seats the captured address onto a \
+    DIFFERENT message while the confirmation card is up — the coordinated archive moves \
+    nothing, queues no PendingOperation, and reports the id as FAILED and identity-refused, \
+    never as admitted and never as pending
+    """)
+    func reseatedAddressIsRefusedAtPreResolve() async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let (imapInbox, imapArchive) = try seedIMAPAccount(
+            pool: pool, accountId: "acc-c3-prereso", inboxEpoch: 31)
+        let captured = makeWitnessedIMAPHeader(
+            folder: imapInbox, uid: "7001", rfc: "<captured@example.com>", observedEpoch: 31)
+        try await pool.writeWithoutTransaction { db in try captured.insert(db) }
+        let id = captured.id
+
+        // What the tool holds after rendering the confirmation card.
+        let expected = ExpectedMessageIdentity.map([captured])
+        #expect(expected[id] != nil, "fixture must actually carry a witness, or the test is vacuous")
+
+        // The turnover: the folder is purged and resynced, and UID 7001 now belongs
+        // to a different email. Same composite address, same primary key, and a
+        // FRESH epoch — so every address and epoch guard downstream still passes.
+        let impostor = makeWitnessedIMAPHeader(
+            folder: imapInbox, uid: "7001", rfc: "<impostor@example.com>", observedEpoch: 31)
+        #expect(impostor.id == id, "fixture must re-seat the SAME address")
+        try await pool.writeWithoutTransaction { db in
+            try captured.delete(db)
+            try impostor.insert(db)
+        }
+
+        let admission = await AccountManager.shared.performCoordinatedRoleMove(
+            ids: [id], role: .archive, expectedIdentities: expected)
+
+        #expect(admission.failedIds == [id], "a proven identity change is terminal — retrying the same id can never differ")
+        #expect(admission.identityRefusedIds == [id], "the refusal must be distinguishable from an ordinary failure")
+        #expect(admission.admittedIds.isEmpty, "nothing may be reported as admitted")
+        #expect(admission.pendingIds.isEmpty, "a PROVEN identity change is not an unknown — it must not sit pending forever")
+
+        // The system end state, which is what actually matters.
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderPath == imapInbox.path, "the message the user never confirmed was moved out of its folder")
+        #expect(final?.rfc822MessageId == "<impostor@example.com>", "non-vacuity: the impostor really is the row at that address")
+        #expect(final?.folderId != imapArchive.id)
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "a refused archive must queue no durable operation at all")
+
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil, "refcount stranded")
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded")
+    }
+
+    @Test("""
+    C3 pass 2 (execution): the re-seat lands AFTER the pre-resolve and BEFORE the queued \
+    closure's own resolve — the archive still moves nothing and still reports the id as \
+    identity-refused, because the identity is re-checked at the moment of the write
+    """)
+    func reseatedAddressIsRefusedInsideTheQueuedClosure() async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let (imapInbox, _) = try seedIMAPAccount(
+            pool: pool, accountId: "acc-c3-inflight", inboxEpoch: 33)
+        let captured = makeWitnessedIMAPHeader(
+            folder: imapInbox, uid: "7002", rfc: "<captured-inflight@example.com>", observedEpoch: 33)
+        try await pool.writeWithoutTransaction { db in try captured.insert(db) }
+        let id = captured.id
+        let expected = ExpectedMessageIdentity.map([captured])
+
+        // Hold the FIFO write queue so the coordinated closure cannot run until
+        // this test says so — that is the window pass 2 exists for. Safe to block
+        // a process-wide queue here because `.processGlobalState` excludes every
+        // other suite that touches `AccountManager.shared`.
+        let gate = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            for await _ in gate.stream { break }
+        }
+
+        let call = Task {
+            await AccountManager.shared.performCoordinatedRoleMove(
+                ids: [id], role: .archive, expectedIdentities: expected)
+        }
+
+        // Wait for the PRE-RESOLVE to have finished and passed: `registerMutation`
+        // runs after it and before `enqueueWrite`, so the overlay entry appearing
+        // is the observable "pass 1 admitted this id" edge.
+        var admittedByPassOne = false
+        for _ in 0..<400 {
+            if AccountManager.shared.snapshotOverlay()[id] != nil { admittedByPassOne = true; break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(admittedByPassOne, """
+            pass 1 never admitted the id, so this test would pass for the wrong reason — \
+            it must exercise the window AFTER a successful pre-resolve.
+            """)
+
+        // NOW the turnover, strictly between the two resolves.
+        let impostor = makeWitnessedIMAPHeader(
+            folder: imapInbox, uid: "7002", rfc: "<impostor-inflight@example.com>", observedEpoch: 33)
+        try await pool.writeWithoutTransaction { db in
+            try captured.delete(db)
+            try impostor.insert(db)
+        }
+
+        gate.continuation.finish()
+        let admission = await call.value
+        await drainWriteQueue()
+
+        #expect(admission.identityRefusedIds == [id], "the execution-time re-check must refuse the impostor")
+        #expect(admission.failedIds == [id], "an identity refusal is terminal")
+        #expect(admission.admittedIds.isEmpty, "nothing may be reported as admitted")
+        #expect(admission.pendingIds.isEmpty, """
+            the id was reported as still-outstanding. `set` is monotone by rank and \
+            `retainedForRetry` OUTRANKS `terminalStale`, so folding an identity refusal into \
+            the generic dropped-by-fresh-resolve bucket silently promotes a proven \
+            wrong-message refusal into "keep waiting".
+            """)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderPath == imapInbox.path, "the impostor was moved by an archive that never named it")
+        #expect(final?.rfc822MessageId == "<impostor-inflight@example.com>")
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "a refused archive must queue no durable operation at all")
+
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil, "refcount stranded by the refusal path")
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded by the refusal path")
+    }
+
+    @Test("""
+    NON-VACUITY: an UNCHANGED witnessed message still archives normally through the same \
+    call — one .move PendingOperation, reported ADMITTED, nothing identity-refused
+    """)
+    func witnessedMessageThatDidNotChangeStillArchives() async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let (imapInbox, imapArchive) = try seedIMAPAccount(
+            pool: pool, accountId: "acc-c3-control", inboxEpoch: 35)
+        let captured = makeWitnessedIMAPHeader(
+            folder: imapInbox, uid: "7003", rfc: "<unchanged@example.com>", observedEpoch: 35)
+        try await pool.writeWithoutTransaction { db in try captured.insert(db) }
+        let id = captured.id
+
+        let admission = await AccountManager.shared.performCoordinatedRoleMove(
+            ids: [id], role: .archive, expectedIdentities: ExpectedMessageIdentity.map([captured]))
+
+        #expect(admission.admittedIds == [id], "a witness that still agrees must never cost the user the action")
+        #expect(admission.identityRefusedIds.isEmpty)
+        #expect(admission.failedIds.isEmpty)
+        #expect(admission.pendingIds.isEmpty)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderId == imapArchive.id, "the archive must actually land")
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.count == 1)
+        guard ops.count == 1 else { return }
+        #expect(ops[0].type == .move)
+        #expect(ops[0].destinationPath == imapArchive.path)
+    }
+
+    /// A confirmation sink that models the real hazard: the user leaves the card on
+    /// screen while the mailbox turns over underneath it. The re-seat happens
+    /// strictly between the tool's own header capture and its coordinated call.
+    @MainActor
+    private final class ReseatingConfirmSink: AgentUISink {
+        let pool: DatabasePool
+        let remove: MessageHeader
+        let insert: MessageHeader
+        nonisolated init(pool: DatabasePool, remove: MessageHeader, insert: MessageHeader) {
+            self.pool = pool
+            self.remove = remove
+            self.insert = insert
+        }
+        func deliverConfirmation(_ confirmation: AgentToolRouter.ActionConfirmation) {
+            try? pool.writeWithoutTransaction { db in
+                try remove.delete(db)
+                try insert.insert(db)
+            }
+            confirmation.onRespond(true)
+        }
+    }
+
+    @Test("""
+    C3 end to end: EmailArchiveTool whose message is re-seated DURING the confirmation wait \
+    archives nothing, and tells the agent the identity changed rather than reporting a bare \
+    failure it would retry under the same id
+    """)
+    func archiveToolRefusesAndReportsAnIdentityChange() async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let (imapInbox, _) = try seedIMAPAccount(
+            pool: pool, accountId: "acc-c3-tool", inboxEpoch: 37)
+        let captured = makeWitnessedIMAPHeader(
+            folder: imapInbox, uid: "7004", rfc: "<card@example.com>", observedEpoch: 37)
+        try await pool.writeWithoutTransaction { db in try captured.insert(db) }
+        let impostor = makeWitnessedIMAPHeader(
+            folder: imapInbox, uid: "7004", rfc: "<not-the-card@example.com>", observedEpoch: 37)
+
+        let translator = MockChatIdTranslator()
+        await translator.seed(21, realId: captured.id)
+        let tool = EmailArchiveTool(context: ToolContext(db: pool, translator: translator))
+        let sink = ReseatingConfirmSink(pool: pool, remove: captured, insert: impostor)
+        let output = try await tool.execute(
+            arguments: ["unique_ids": .array([.int(21)])],
+            invocation: ToolInvocation(uiSink: sink, sessionKey: "c3-archive-reseat"))
+
+        #expect(output.contains("\"success\":false") || output.contains("\"success\": false"),
+                "the tool must not claim success for an archive that never happened — got: \(output)")
+        #expect(output.contains("\"archived_count\":0") || output.contains("\"archived_count\": 0"),
+                "got: \(output)")
+        #expect(output.contains("identity_changed_ids"), """
+            the refusal was not surfaced as an identity change, so the agent will retry the \
+            same unique_id — which fails identically forever. got: \(output)
+            """)
+        #expect(output.contains("21"), "the refused agent-facing id must be named — got: \(output)")
+
+        // The end state is the assertion that cannot be faked by a message string.
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: captured.id) }
+        #expect(final?.folderPath == imapInbox.path, "the impostor was archived")
+        #expect(final?.rfc822MessageId == "<not-the-card@example.com>", "non-vacuity: the sink really did re-seat the address")
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "no durable operation may exist for a refused archive")
+    }
+
+    @Test("""
+    C3 end to end: EmailDeleteTool whose message is re-seated DURING the confirmation wait \
+    moves nothing to Trash and reports the identity change — a misattributed delete is still \
+    a wrong-message mutation even though TabMail's delete is only a move to Trash
+    """)
+    func deleteToolRefusesAndReportsAnIdentityChange() async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let (imapInbox, _) = try seedIMAPAccount(
+            pool: pool, accountId: "acc-c3-tool-del", inboxEpoch: 39)
+        try await pool.writeWithoutTransaction { db in
+            var trash = Folder(name: "Trash", path: "Trash", role: .trash, accountId: "acc-c3-tool-del")
+            trash.lastKnownUidValidity = 39
+            try trash.insert(db)
+        }
+        let captured = makeWitnessedIMAPHeader(
+            folder: imapInbox, uid: "7005", rfc: "<card-del@example.com>", observedEpoch: 39)
+        try await pool.writeWithoutTransaction { db in try captured.insert(db) }
+        let impostor = makeWitnessedIMAPHeader(
+            folder: imapInbox, uid: "7005", rfc: "<not-the-card-del@example.com>", observedEpoch: 39)
+
+        let translator = MockChatIdTranslator()
+        await translator.seed(22, realId: captured.id)
+        let tool = EmailDeleteTool(context: ToolContext(db: pool, translator: translator))
+        let sink = ReseatingConfirmSink(pool: pool, remove: captured, insert: impostor)
+        let output = try await tool.execute(
+            arguments: ["unique_ids": .array([.int(22)])],
+            invocation: ToolInvocation(uiSink: sink, sessionKey: "c3-delete-reseat"))
+
+        #expect(output.contains("\"success\":false") || output.contains("\"success\": false"), "got: \(output)")
+        #expect(output.contains("\"deleted_count\":0") || output.contains("\"deleted_count\": 0"), "got: \(output)")
+        #expect(output.contains("identity_changed_ids"), "got: \(output)")
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: captured.id) }
+        #expect(final?.folderPath == imapInbox.path, "the impostor was moved to Trash")
+        #expect(final?.rfc822MessageId == "<not-the-card-del@example.com>")
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "no durable operation may exist for a refused delete")
+    }
 }

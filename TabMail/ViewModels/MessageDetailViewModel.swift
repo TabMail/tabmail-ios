@@ -237,8 +237,52 @@ final class MessageDetailViewModel {
         return notificationTapIdPrefix + sentinelPayload
     }
 
-    init(messageId: String) {
+    /// 🚨 THE OPENING GESTURE'S CONTENT WITNESS — what the caller PROVED it was
+    /// opening, carried across the navigation push so this VM's own re-resolve
+    /// cannot silently target a different message.
+    ///
+    /// THE GAP IT CLOSES. `SearchView.openResult` proves a tapped local result
+    /// still names the message its row rendered
+    /// (`resolveLocalResultHeaderId`, `IOS-SEARCH-001`) — and then appends only
+    /// the composite ADDRESS to the navigation path. This VM re-resolves that
+    /// address by primary key, and `markReadOnOpenIfNeeded` durably marks
+    /// whatever it finds read (its own single-shot latch exists so mark-read
+    /// "must succeed even when body load is cancelled mid-DB-read", i.e. it is
+    /// deliberately independent of the body path's timing). Between the tap-time
+    /// proof and that resolve the address can be re-seated — the UIDVALIDITY
+    /// reset reaction purges and resyncs the folder, and the sync merge can seat
+    /// a different message at a canonical address too — so the proof is taken and
+    /// then thrown away. That is a durable mutation on a message the user was
+    /// never shown: C3 misattribution, and nothing recovers a mark-read the user
+    /// never asked for, because by construction they were shown a different
+    /// message's row text and have no reason to notice.
+    ///
+    /// Gates ONLY the mark-read, which is the sole durable mutation this view
+    /// performs WITHOUT a user gesture. Rendering is not gated: an opened message
+    /// is on screen for the user to see, and refusing to render would be a
+    /// regression with no C3 payoff. Every other action in this view (archive,
+    /// flag, move, reply) is a fresh gesture on the row the user is looking at,
+    /// not a re-resolution of a discarded proof.
+    ///
+    /// `nil` — no witness, or an opener that has none to give — keeps today's
+    /// behaviour exactly; see `ExpectedMessageIdentity` for why that population
+    /// must fail open.
+    private let openIdentity: ExpectedMessageIdentity?
+
+    /// Whether `header` may receive this open's durable mark-read. True whenever
+    /// no witness was carried (fail open, by design) or the witness still agrees.
+    private func markReadPermitted(for header: MessageHeader) -> Bool {
+        guard let openIdentity else { return true }
+        if openIdentity.matches(header) { return true }
+        if DebugModeManager.isLoggingEnabled() {
+            print("[DetailRender] mark-read REFUSED for \(header.id.prefix(40)): the row at this address is not the message the opening gesture proved (C3)")
+        }
+        return false
+    }
+
+    init(messageId: String, expectedRfc822MessageId: String? = nil) {
         self.messageId = messageId
+        self.openIdentity = ExpectedMessageIdentity(capturedRfc822MessageId: expectedRfc822MessageId)
         // ZERO-I/O init (2026-07-03): seed only from the in-memory staged
         // snapshot. This init runs ON THE MAIN ACTOR at tap → view
         // construction, and the previous sync `dbPool.read` here is unbounded
@@ -277,11 +321,13 @@ final class MessageDetailViewModel {
         messageId: String,
         dbPool: DatabasePool,
         fetchBodyOverride: @escaping (MessageHeader) async throws -> Void,
-        observeNotifications: Bool = false
+        observeNotifications: Bool = false,
+        expectedRfc822MessageId: String? = nil
     ) {
         self._dbPoolOverride = PrioritizedDatabase(pool: dbPool)
         self._fetchBodyOverride = fetchBodyOverride
         self.messageId = messageId
+        self.openIdentity = ExpectedMessageIdentity(capturedRfc822MessageId: expectedRfc822MessageId)
         seedAtInit()
         if observeNotifications {
             startAIUpdateListener()
@@ -1705,6 +1751,11 @@ final class MessageDetailViewModel {
         // still unread" beat.
         if let msg = self.message {
             guard !msg.isRead else { return }
+            // C3 — the seeded row is the ADDRESS's current occupant (an NSE staged
+            // row matched by composite id, or an earlier resolve), so it needs the
+            // same witness check as the resolved one below. Refusing leaves the
+            // message unread; one more open fixes it.
+            guard markReadPermitted(for: msg) else { return }
             self.message?.isRead = true
             // Guarded `!msg.isRead` above, so baseline `false` is exact — the
             // visualized state (ADR-IOS-057 coalescing).
@@ -1720,6 +1771,12 @@ final class MessageDetailViewModel {
         guard await resolveTapIfNeeded() else { return }
         guard let msg = await resolveMessageAsync(compositeId: messageId) else { return }
         guard !msg.isRead else { return }
+        // C3 — this resolve is the one the opening gesture's proof was discarded
+        // before. `resolveMessageAsync` walks PK → cross-folder → rfc822, all of
+        // which answer "what is at (or near) this address now", never "is this the
+        // message that was proved". Refuse rather than mutate; the message stays
+        // unread and reopening it heals.
+        guard markReadPermitted(for: msg) else { return }
         // Layer any concurrent pending mutations (e.g. user just flagged this
         // message in another view before init's resolve raced through nil) on
         // top of the fresh DB header, then force isRead=true. Without this,

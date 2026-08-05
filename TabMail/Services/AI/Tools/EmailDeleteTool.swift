@@ -88,8 +88,17 @@ struct EmailDeleteTool: AgentTool, Sendable {
         // `resolved` snapshot — which may have gone stale during the
         // unbounded confirmation wait above. `resolved` is still used for the
         // confirmation card display and the response payload below.
+        //
+        // 🚨 THE RE-RESOLVE NEEDS A WITNESS — see the identical note in
+        // `EmailArchiveTool.execute`. TabMail never permanently deletes (`.trash`
+        // is a move to the Trash folder), so the failure mode here is not lost
+        // mail; it is the user's confirmed delete landing on a message they were
+        // never shown, which is the same C3 misattribution and is exactly as
+        // forbidden. `ExpectedMessageIdentity.map` reads the witness off the
+        // headers already rendered on the confirmation card — zero extra I/O.
         let admission = await AccountManager.shared.performCoordinatedRoleMove(
-            ids: resolved.map(\.id), role: .trash)
+            ids: resolved.map(\.id), role: .trash,
+            expectedIdentities: ExpectedMessageIdentity.map(resolved))
         // T4.V8 (PORT of `v2final:EmailDeleteTool.execute`, commit `b1c89ad4a`):
         // report only DURABLY ADMITTED work as deleted. This call previously
         // reported `"success": true` with `deleted_count == resolved.count`
@@ -127,6 +136,17 @@ struct EmailDeleteTool: AgentTool, Sendable {
         if !failedIds.isEmpty {
             result["failed_ids"] = failedIds
             result["warning"] = "\(failedIds.count) email(s) could not be deleted"
+        }
+        // See `EmailArchiveTool.execute`'s identical block: a content-identity
+        // refusal is not retryable under the same id, so it gets its own line
+        // instead of being folded into the generic failure count.
+        let identityChangedIds = zip(resolvedNumericIds, resolved)
+            .filter { admission.identityRefusedIds.contains($0.1.id) }
+            .map(\.0)
+        if !identityChangedIds.isEmpty {
+            result["identity_changed_ids"] = identityChangedIds
+            result["identity_changed_message"] =
+                "\(identityChangedIds.count) email(s) were NOT deleted: the message at that id is no longer the one shown on the confirmation card, so acting on it would have hit the wrong email. Use inbox_read to re-read the mailbox and confirm again with the new ids."
         }
 
         if DebugModeManager.isLoggingEnabled() {

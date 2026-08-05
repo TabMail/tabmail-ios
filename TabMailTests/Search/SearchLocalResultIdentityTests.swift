@@ -143,8 +143,16 @@ struct SearchLocalResultIdentityTests {
     ///     code that registers the durable `.isRead` gesture intent.
     ///
     /// Returns the id actually navigated to, or `nil` when nothing opened.
+    ///
+    /// `reseatBeforeOpening` runs BETWEEN the tap-time proof and the detail view's
+    /// own resolve — the window `SearchView.OpenTarget` exists to survive. Default
+    /// no-op, so every existing caller is unchanged.
     @MainActor
-    private func tap(_ result: SearchResult, pool: DatabasePool) async throws -> String? {
+    private func tap(
+        _ result: SearchResult,
+        pool: DatabasePool,
+        reseatBeforeOpening: () async throws -> Void = {}
+    ) async throws -> String? {
         let headerId = try #require(result.headerId, "fixture must mint a LOCAL result")
         let resolved = try? await pool.read { db in
             try SearchView.resolveLocalResultHeaderId(
@@ -154,7 +162,15 @@ struct SearchLocalResultIdentityTests {
             )
         }
         guard let opened = resolved else { return nil }
-        let vm = MessageDetailViewModel(messageId: opened, dbPool: pool, fetchBodyOverride: { _ in })
+        try await reseatBeforeOpening()
+        // Production step 2: `.navigationDestination(for: SearchView.OpenTarget.self)`
+        // → `MessageDetailView(messageId:expectedRfc822MessageId:)` → this VM. The
+        // witness travels WITH the address, exactly as `openResult` appends it.
+        let target = SearchView.OpenTarget(
+            headerId: opened, provenRfc822MessageId: result.capturedRfc822MessageId)
+        let vm = MessageDetailViewModel(
+            messageId: target.headerId, dbPool: pool, fetchBodyOverride: { _ in },
+            expectedRfc822MessageId: target.provenRfc822MessageId)
         await vm.markReadOnOpenIfNeeded()
         return opened
     }
@@ -279,14 +295,50 @@ struct SearchLocalResultIdentityTests {
         #expect(after?.isRead == true, "opening an unread message must still durably mark it read")
     }
 
-    // MARK: - (iii) The RFC-less residual — today's behaviour, deliberately unchanged
+    // MARK: - (iii) The witness-less population — a POSITIVE control, and a named residual
 
+    /// 🚨 ADJUDICATION (2026-08-04). The predecessor of this test was called
+    /// `rfcLessResultKeepsTodaysBehaviour` and it asserted, on the resolver's
+    /// RETURN VALUE alone, that `resolveLocalResultHeaderId` hands back the
+    /// headerId for a row with no usable RFC witness. A reviewer graded it a
+    /// BLESSING TEST. **It is REWRITTEN, not deleted, and the distinction is the
+    /// whole point:**
+    ///
+    ///  - A blessing test asserts that the DEFECTIVE OUTCOME is correct. The one
+    ///    this repo had to DELETE outright (`7c26989b9`) asserted that a
+    ///    nil-accountId notification tap SHOULD durably mark a globally-matched
+    ///    row read — the wrong-message mutation WAS the assertion's subject, so
+    ///    no rewrite could preserve it.
+    ///  - This test's subject is different: *an ordinary, un-re-seated,
+    ///    witness-less row still opens and still gets marked read*. That property
+    ///    is TRUE and REQUIRED — it is the never-drop half, and a guard that
+    ///    refused this population would silently kill search navigation for every
+    ///    message that carries no `Message-ID` header (RFC 5322 makes it a SHOULD,
+    ///    not a MUST) and for every older row whose column was never populated.
+    ///
+    /// What was genuinely wrong with the predecessor, and is fixed here: (a) it
+    /// pinned the fix's MECHANISM (a return value) rather than the system
+    /// property, which global Testing rule 12 forbids — a resolver that returned
+    /// the right id and a consumer that then opened the wrong row would have left
+    /// it green; (b) it framed an UNCLOSED residual as desired behaviour, with no
+    /// register row and nothing marking the limit of what it proves.
+    ///
+    /// **What this population does NOT get, stated plainly:** with no witness
+    /// there is nothing to compare, so a re-seated address IS still opened and
+    /// marked read for these rows. That is the accepted residual, registered as
+    /// `IOS-IDENTITY-001`, and it is the reference's own decision — `v2final`'s
+    /// `ExpectedMessageIdentity.map` excludes rfc-nil rows from the identity map
+    /// entirely so no refusal is possible (ADR-IOS-061 item E). Both substitutes
+    /// anyone reached for are BANNED: a `date` witness (authored and removed in
+    /// the reference as unsound in both directions) and a
+    /// `(fromAddress, subject, date)` witness (`94fac3e79`, reverted `3bd9f0bac`).
     @Test("""
-    a result captured from an RFC-less row (no content witness) still opens — the guard \
-    never becomes a refusal for mail that carries no Message-ID at all
+    NON-VACUITY / residual control: a witness-less row (no Message-ID at all, or an \
+    empty one) still opens through the real consumer chain AND still gets durably marked \
+    read — the guard never becomes a blanket refusal for mail that carries no Message-ID
     """)
     @MainActor
-    func rfcLessResultKeepsTodaysBehaviour() async throws {
+    func witnessLessRowStillOpensAndStillMarksRead() async throws {
         let env = try makeEnv()
         defer { finish(env); clearOverlay(); resetStagedGlobal() }
         clearOverlay(); resetStagedGlobal()
@@ -296,17 +348,34 @@ struct SearchLocalResultIdentityTests {
         let empty = header(uid: "12", rfc: "", subject: "Empty message id", inbox: env.inbox)
         try await env.pool.write { db in try none.insert(db); try empty.insert(db) }
 
-        let resolvedNone = try await env.pool.read { db in
-            try SearchView.resolveLocalResultHeaderId(
-                headerId: none.id, capturedRfc822MessageId: nil, db: db)
-        }
-        let resolvedEmpty = try await env.pool.read { db in
-            try SearchView.resolveLocalResultHeaderId(
-                headerId: empty.id, capturedRfc822MessageId: "", db: db)
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            var it = gateStream.makeAsyncIterator()
+            _ = await it.next()
         }
 
-        #expect(resolvedNone == none.id, "an RFC-less row must keep today's behaviour, not be refused")
-        #expect(resolvedEmpty == empty.id, "an empty Message-ID is no witness either — same residual")
+        // The REAL chain, not the resolver in isolation: tap → resolve → detail
+        // VM → markReadOnOpenIfNeeded.
+        let openedNone = try await tap(mintLocalResult(from: none), pool: env.pool)
+        let openedEmpty = try await tap(mintLocalResult(from: empty), pool: env.pool)
+
+        #expect(openedNone == none.id, "a witness-less row must keep today's behaviour, not be refused")
+        #expect(openedEmpty == empty.id, "an empty Message-ID is no witness either — same residual")
+
+        // The SYSTEM property, which the predecessor never reached: the open is
+        // real all the way to the durable mutation.
+        let cycles = AccountManager.shared.pendingIntentCyclesForTesting()
+        #expect(cycles[none.id]?.isReadTarget == true, "a witness-less open must still register its read intent")
+        #expect(cycles[empty.id]?.isReadTarget == true, "an empty-witness open must still register its read intent")
+        #expect(fixtureIntentCycleIds() == [none.id, empty.id].sorted())
+
+        gate.finish()
+        await drainWriteQueue()
+
+        let afterNone = try await env.pool.read { db in try MessageHeader.fetchOne(db, key: none.id) }
+        let afterEmpty = try await env.pool.read { db in try MessageHeader.fetchOne(db, key: empty.id) }
+        #expect(afterNone?.isRead == true, "opening a witness-less message must still durably mark it read")
+        #expect(afterEmpty?.isRead == true, "opening an empty-witness message must still durably mark it read")
     }
 
     // MARK: - (iv) The witness is COMPARED through the tree's normalizer
@@ -362,5 +431,132 @@ struct SearchLocalResultIdentityTests {
 
         #expect(opened == nil, "no row at the captured address ⇒ nothing to prove identity against ⇒ open nothing")
         #expect(fixtureIntentCycleIds().isEmpty, "a refused tap registers no read intent")
+    }
+
+    // MARK: - (vi) THE GAP AFTER THE PROOF — a re-seat BETWEEN the tap and the open
+
+    /// **The invariant, as a system property:** *no durable mark-read lands on a
+    /// message whose identity differs from the one the user's tap was proved
+    /// against — including when the address is re-seated AFTER that proof and
+    /// BEFORE the detail view resolves it.*
+    ///
+    /// WHY THIS IS A SEPARATE DEFECT FROM `staleAddressOpensNothingAndMarksNothingRead`.
+    /// That test re-seats the address BEFORE the tap, so `resolveLocalResultHeaderId`
+    /// sees the impostor and refuses; the proof does its job. This one re-seats it
+    /// AFTER — the proof PASSES, is correct at the instant it is taken, and is then
+    /// discarded by `navigationPath.append`, which used to carry only the composite
+    /// ADDRESS. `MessageDetailViewModel` re-resolves that address by primary key and
+    /// `markReadOnOpenIfNeeded` durably marks whatever it finds. The window is real:
+    /// the mark-read is deliberately independent of the body-load path's timing, and
+    /// a UIDVALIDITY purge-and-resync (or a sync merge seating a canonical address)
+    /// runs on its own schedule. A fix that only hardened the resolver leaves this
+    /// green-looking and broken; only carrying the witness closes it.
+    @Test("""
+    a UIDVALIDITY re-seat landing AFTER the tap's identity proof and BEFORE the detail \
+    view resolves the address registers NO read mutation — the proof travels with the \
+    address, so the impostor is still unread afterwards
+    """)
+    @MainActor
+    func reseatAfterTheProofMarksNothingRead() async throws {
+        let env = try makeEnv()
+        defer { finish(env); clearOverlay(); resetStagedGlobal() }
+        clearOverlay(); resetStagedGlobal()
+
+        let rendered = header(uid: "41", rfc: "<rendered-41@example.com>", subject: "Invoice", inbox: env.inbox)
+        try await env.pool.write { db in try rendered.insert(db) }
+        let result = mintLocalResult(from: rendered)
+
+        let impostor = header(uid: "41", rfc: "<impostor-41@example.com>", subject: "Salary review", inbox: env.inbox)
+        #expect(impostor.id == rendered.id, "fixture must re-seat the SAME address, or the test proves nothing")
+
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            var it = gateStream.makeAsyncIterator()
+            _ = await it.next()
+        }
+
+        // The proof PASSES (the rendered row is still there when the tap resolves),
+        // and only then does the folder turn over.
+        let opened = try await tap(result, pool: env.pool) {
+            try await env.pool.write { db in
+                try rendered.delete(db)
+                try impostor.insert(db)
+            }
+        }
+
+        // The navigation itself is legitimate — the proof was true when taken. What
+        // must NOT happen is the durable mutation on the row that replaced it.
+        #expect(opened == rendered.id, "the tap's own proof was valid at the time it was taken")
+
+        // NON-VACUITY: the impostor really is seated, really is a different message,
+        // and really is unread — so "no intent" is a discrimination, not an empty table.
+        let seated = try await env.pool.read { db in try MessageHeader.fetchOne(db, key: impostor.id) }
+        #expect(seated?.rfc822MessageId == "<impostor-41@example.com>")
+        #expect(seated?.isRead == false)
+
+        #expect(fixtureIntentCycleIds().isEmpty, """
+            a `.isRead` gesture intent was registered for a message the user never selected — \
+            the tap's identity proof was discarded at the navigation boundary and \
+            markReadOnOpenIfNeeded ran against the row that re-seated the address (C3).
+            """)
+
+        gate.finish()
+        await drainWriteQueue()
+
+        let after = try await env.pool.read { db in try MessageHeader.fetchOne(db, key: impostor.id) }
+        #expect(after?.isRead == false, "the re-seated row was durably marked read by an open that never named it")
+        let ops = try await env.pool.read { db in try PendingOperation.fetchCount(db) }
+        #expect(ops == 0, "a refused mark-read must queue no durable operation at all")
+    }
+
+    /// NON-VACUITY PARTNER for the test above, through the IDENTICAL harness
+    /// including the mid-flight hook: the hook fires but changes nothing about the
+    /// message's identity, and the read still lands. Without this, a
+    /// `markReadPermitted` that returned `false` unconditionally — or a harness
+    /// whose `reseatBeforeOpening` broke the VM outright — would look like a pass.
+    @Test("""
+    NON-VACUITY: a mid-flight write that does NOT change the message's identity still \
+    lets the open mark it read — the witness discriminates on identity, not on "something \
+    happened between the tap and the open"
+    """)
+    @MainActor
+    func identityPreservingMidFlightWriteStillMarksRead() async throws {
+        let env = try makeEnv()
+        defer { finish(env); clearOverlay(); resetStagedGlobal() }
+        clearOverlay(); resetStagedGlobal()
+
+        let row = header(uid: "42", rfc: "<stable-42@example.com>", subject: "Ordinary", inbox: env.inbox)
+        try await env.pool.write { db in try row.insert(db) }
+        let result = mintLocalResult(from: row)
+
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            var it = gateStream.makeAsyncIterator()
+            _ = await it.next()
+        }
+
+        let opened = try await tap(result, pool: env.pool) {
+            // Same address, SAME Message-ID — a perfectly ordinary re-write (a
+            // flag toggle arriving from sync, say). Identity is unchanged.
+            try await env.pool.write { db in
+                _ = try MessageHeader
+                    .filter(Column("id") == row.id)
+                    .updateAll(db, Column("isFlagged").set(to: true))
+            }
+        }
+
+        #expect(opened == row.id, "an identity-preserving change must never cost the user the open")
+        let cycles = AccountManager.shared.pendingIntentCyclesForTesting()
+        #expect(cycles[row.id]?.isReadTarget == true, """
+            the witness refused an open whose message never changed — that is a blanket \
+            refusal, and it would silently stop search opens from marking mail read.
+            """)
+
+        gate.finish()
+        await drainWriteQueue()
+
+        let after = try await env.pool.read { db in try MessageHeader.fetchOne(db, key: row.id) }
+        #expect(after?.isRead == true, "opening an unread message must still durably mark it read")
+        #expect(after?.isFlagged == true, "non-vacuity: the mid-flight write really did land")
     }
 }

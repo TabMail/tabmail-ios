@@ -29,6 +29,31 @@ struct UndoMember: Sendable, Equatable {
     /// it is never used as provider identity and is never resurrected. It is
     /// the row's PRIMARY KEY, which the drain's re-key changes — hence `rekey`.
     private(set) var originalHeaderId: String
+    /// 🚨 THE CONTENT WITNESS — the only field here that names the MESSAGE
+    /// rather than an address, and the only thing that can tell an undo target
+    /// apart from an impostor that inherited its address.
+    ///
+    /// Every other predicate `AccountManager.undoMove` authenticates a member
+    /// with — the primary key, `accountId`, `messageId`, `folderPath`,
+    /// `folderId` — describes the ADDRESS, and on IMAP the address is a
+    /// per-folder UID a UIDVALIDITY turnover reassigns. The reset reaction
+    /// purges the folder and step 6 resyncs it, so a DIFFERENT physical message
+    /// can legitimately occupy the exact composite id this member names while
+    /// the undo stack (in-memory, unaffected by the reaction) still holds it.
+    /// All five address predicates then PASS, and the epoch guard passes too
+    /// because the impostor's epoch is the FRESH one. Undo would move a message
+    /// the user never touched (C3).
+    ///
+    /// ⚑ REFUSE-ONLY, never a lookup key — this is not the banned mechanism.
+    /// ADR-IOS-068/D4 forbids resolving an undo target BY Message-ID (`v2final`'s
+    /// `UndoMember.memberIdentity` did exactly that, and `IOS-IMAP-002` records
+    /// what a Message-ID `SEARCH` does: it returns every copy and mutates all of
+    /// them). The target here is still selected by the recorded address; the
+    /// witness can only refuse it.
+    ///
+    /// `nil` for mail with no usable `Message-ID` — see
+    /// `ExpectedMessageIdentity`'s doc for why that population fails OPEN.
+    let sourceRfc822MessageId: String?
 
     init(header: MessageHeader) {
         providerMessageId = header.messageId
@@ -39,6 +64,7 @@ struct UndoMember: Sendable, Equatable {
         sourceActionTag = header.actionTag
         sourceTagSortOrder = header.tagSortOrder
         originalHeaderId = header.id
+        sourceRfc822MessageId = header.rfc822MessageId
     }
 
     /// Follow the row this member names to the destination address the drain
@@ -46,6 +72,12 @@ struct UndoMember: Sendable, Equatable {
     /// this member describes where the message came FROM — the folder, epoch,
     /// inbox flag and tag to restore — and undoing the move must still restore
     /// exactly those, so re-keying must not touch them.
+    ///
+    /// `sourceRfc822MessageId` is deliberately NOT re-keyed either, and for a
+    /// stronger reason than the rest: a move changes a message's address, never
+    /// its identity. The whole point of the witness is that it is invariant
+    /// across exactly the re-addressing this method performs — re-keying it would
+    /// make it agree with whatever now sits at the new address, i.e. destroy it.
     mutating func rekey(newHeaderId: String, newProviderMessageId: String) {
         originalHeaderId = newHeaderId
         providerMessageId = newProviderMessageId

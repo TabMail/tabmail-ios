@@ -539,6 +539,89 @@ struct UndoDestructiveActionTests {
         #expect(a.folderPath == "Archive", "the admissible member is not moved back alone")
         #expect(b.folderPath == "Archive")
     }
+
+    // MARK: - C3 — the undo stack must name the MESSAGE, not just the address
+
+    /// NEW PIN (no prior test). Every predicate `undoMove` authenticated a member
+    /// with described the ADDRESS — primary key, `messageId`, `folderPath`,
+    /// `folderId`, and the folder epoch consulted inside
+    /// `admittedOrdinaryActionTargets`. On IMAP the address is a per-folder UID
+    /// the server reassigns at a UIDVALIDITY turnover, and the reset reaction
+    /// purges the folder and resyncs it — so a DIFFERENT physical message can
+    /// come to occupy this exact composite id while the in-memory undo stack,
+    /// which the reaction does not touch, still names it. The impostor's epoch is
+    /// the FRESH one, so the epoch guard passes on it too.
+    ///
+    /// The fixture is deliberately minimal: the row's `rfc822MessageId` is the
+    /// ONLY field that differs from what the gesture captured. Every address
+    /// predicate and the epoch check therefore still pass, which is exactly the
+    /// state a turnover produces and the reason a sixth, content-based predicate
+    /// is needed.
+    ///
+    /// INVARIANT: undo never moves a message the user never touched. Refusing is
+    /// recoverable — the message is simply still in Archive and one ordinary
+    /// gesture moves it back — while a misattributed move is not (C3).
+    ///
+    /// NON-VACUITY, both sides, without duplicating a fixture: the identical
+    /// witness-carrying member with an UNCHANGED row IS admitted, and that is
+    /// already pinned by
+    /// `theImapInverseNamesTheDestinationUidAndNeverTheRfc822MessageId` (same
+    /// `seedDrainedMove(rfc822:)` seam, asserts the queued inverse).
+    @Test("Undo refuses when the row at the recorded address is a DIFFERENT message than the one the gesture moved")
+    @MainActor
+    func undoRefusesWhenTheRowAtTheAddressIsADifferentMessage() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        let member = try seedDrainedMove(
+            fixture, destinationUid: "205", rfc822: "moved-by-the-user@example.com")
+
+        // The turnover: same folder, same UID, same epoch, different email.
+        try await fixture.pool.write { db in
+            guard var impostor = try MessageHeader.fetchOne(db, key: member.id) else { return }
+            impostor.rfc822MessageId = "someone-elses-mail@example.com"
+            try impostor.update(db)
+        }
+
+        await undo(fixture, [member])
+
+        let ops = try await operations(fixture)
+        #expect(ops.isEmpty, "no inverse may be queued against a message the gesture never named")
+        let row = try #require(try await self.row(fixture, id: member.id))
+        #expect(row.folderPath == "Archive", "the impostor must not be moved to INBOX")
+        #expect(
+            row.rfc822MessageId == "someone-elses-mail@example.com",
+            "non-vacuity: the impostor really is the row at that address")
+    }
+
+    /// The companion half of the adjudication recorded on
+    /// `ExpectedMessageIdentity`: a member whose captured witness is UNUSABLE
+    /// (nil, empty, or a bare `<>`) keeps today's behaviour and is still
+    /// reversed. Rows with no usable RFC 822 Message-ID genuinely exist, and
+    /// refusing every undo on them would drop user intention wholesale to close a
+    /// rare edge — the opposite of the trade the mantra asks for.
+    ///
+    /// This is a REGISTERED GAP, not a claim of safety: such a member is still
+    /// authenticated by address alone and a turnover could still misattribute it
+    /// (`KNOWN_ISSUES.md` `IOS-IDENTITY-001`). It is pinned so that closing the
+    /// gap later is a deliberate, visible change rather than an accident, and so
+    /// that a fix which "closes" it by refusing everything fails here loudly.
+    @Test("A member with NO usable content witness keeps today's behaviour and is still reversed (registered gap IOS-IDENTITY-001)")
+    @MainActor
+    func undoWithoutAWitnessKeepsTodaysBehaviour() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        let member = try seedDrainedMove(fixture, destinationUid: "209", rfc822: nil)
+
+        await undo(fixture, [member])
+
+        let ops = try await operations(fixture)
+        #expect(ops.count == 1, "a witness-less member must not be refused — that would drop the intention")
+        guard ops.count == 1 else { return }
+        #expect(ops[0].type == .move)
+        #expect(ops[0].messageIds == ["209"], "and the inverse still names the destination ADDRESS")
+        let restored = try #require(try await row(fixture, id: member.id))
+        #expect(restored.folderPath == "INBOX")
+    }
 }
 
 // MARK: - MessageHeader.stableId legacy characterization (non-queue)
