@@ -520,7 +520,15 @@ final class NotificationService: UNNotificationServiceExtension {
             NSELog.step("NSE step4: FAIL — message fetch failed")
             deliverPassive(c: c, deliver: deliver); return
         }
-        NSELog.step("NSE step4 OK: from=\(String(msg.senderName.prefix(60))) subj=\(String(msg.subject.prefix(40)))")
+        // SHAPE, NOT CONTENT — do not "helpfully" put the strings back.
+        // `NSELog.step` is deliberately always-on and fires an
+        // `os_log(.error, privacy: .public)` line, which iOS PERSISTS in the
+        // unified log and hands to a sysdiagnose. The sender name and the
+        // subject are the user's mail; they must never reach that channel.
+        // The diagnostic question here is "did step 4 return a usable
+        // message, and did its fields actually arrive?" — the lengths answer
+        // it completely. Same rule, same shape as the step5 line below.
+        NSELog.step("NSE step4 OK: from=\(msg.senderName.count) chars subj=\(msg.subject.count) chars")
 
         // Zombie guard — same rationale as the step6a/6b/pre-step-7 checks: a
         // step-4 fetch that outlived the watchdog resumes here AFTER the exit
@@ -838,7 +846,15 @@ final class NotificationService: UNNotificationServiceExtension {
                 summaryBlurb = parsed.blurb; summaryTodos = parsed.todos
                 reminderDate = parsed.reminderDate; reminderTime = parsed.reminderTime
                 reminderContent = parsed.reminderContent
-                NSELog.step("NSE step6a OK: blurb=\(String((summaryBlurb ?? "nil").prefix(60)))")
+                // SHAPE, NOT CONTENT — see the step4 OK line above. The blurb
+                // is an AI summary OF THE USER'S EMAIL, and `NSELog.step`'s
+                // `privacy: .public` unified-log channel is persisted on
+                // device. Length + the nil/non-nil distinction is what the
+                // step is diagnosed by (the parity gate below branches on
+                // `summaryBlurb?.isEmpty == false`), so keep both and drop
+                // the text.
+                let blurbShape = summaryBlurb.map { "\($0.count) chars" } ?? "nil"
+                NSELog.step("NSE step6a OK: blurb=\(blurbShape)")
                 // ── GRADUAL STAGING stage 3a: summary ──
                 // Surface the summary before the action vote returns, so a merge
                 // landing mid-vote shows it. aiCompleted stays 0 until step 7.
