@@ -92,14 +92,62 @@ enum NSEStagingDB {
 
     /// Check if a message was already AI-processed (by a previous NSE run).
     /// Returns the cached result if aiCompleted, nil otherwise.
+    ///
+    /// ⚑ ADDRESSED BY `id`, ADMITTED BY IDENTITY (`IOS-NSE-006`) — the READ half
+    /// of the same class as `stageBody` / `stageSummary` / `persistProcessedMessage`.
+    /// `id` is `"<accountId>:<messageId>"` and on IMAP `messageId` is the UID, an
+    /// ADDRESS in a numbering space. `WHERE id = ? AND aiCompleted = 1` alone is
+    /// an address plus a completion flag with NO identity term, so after a
+    /// UIDVALIDITY turnover reissued the UID it serves the PREDECESSOR's summary,
+    /// todos, reminder and action tag as the SUCCESSOR's notification —
+    /// `NotificationService.process` hands the hit straight to
+    /// `EmailNotificationBuilder.fill` beside the successor's own sender, subject
+    /// and body. A notification that has been delivered and seen cannot be
+    /// un-shown by any later sync, which is what puts this in the
+    /// non-recoverable C3-misattribution set.
+    ///
+    /// ⚠️ **THE CALL ORDERING IS NOT THE GUARD, and the claim that it was is
+    /// RETRACTED here.** `Companion/Memory/Current/107-…` left this function alone
+    /// on the reasoning *"`stageHeader` runs strictly before it in
+    /// `NotificationService.process`, so the row's identity is already this run's;
+    /// the ordering IS the guard"*. `stageHeader` returns `Void` and wraps its
+    /// whole write in `do { … } catch { NSELog.error(…) }`, so a THROWN write is
+    /// logged and swallowed and **no caller can observe that the row was never
+    /// re-headed**. The staging DB is a non-WAL cross-process App Group file, so
+    /// `SQLITE_BUSY` under contention is a live outcome, not a hypothetical. The
+    /// ordering establishes only that `stageHeader` was CALLED — never that it
+    /// LANDED (`MIS-024`: reading a mechanism proves it is correct, never that it
+    /// ran before the damage).
+    ///
+    /// FAIL DIRECTION — the same as `stageHeader`'s and the OPPOSITE of
+    /// `stageBody`'s, because the question here is *may I REUSE payload already on
+    /// the row*, not *may I ADD payload to it*. Only POSITIVE evidence of a
+    /// different message turns a hit into a miss: an unanswerable identity (no RFC
+    /// on either side, no epoch on either side) still SERVES, exactly as
+    /// `unanswerableIdentityRetainsRatherThanClears` and
+    /// `unanswerableIdentityWritesRatherThanRefuses` pin it. Refusing on absence of
+    /// evidence would be the mirror image (`MIS-005`) and would make every rfc-less,
+    /// epoch-less message recompute its AI on every duplicate push. A miss costs
+    /// only that: the run computes its own summary through the path that already
+    /// works.
     static func getCachedResult(
         db: DatabaseQueue,
         accountId: String,
-        messageId: String
+        message: NSEMessageMetadata
     ) -> (summaryBlurb: String?, summaryTodos: String?, actionTag: String?,
           reminderDate: String?, reminderTime: String?, reminderContent: String?)? {
-        let id = "\(accountId):\(messageId)"
+        let id = "\(accountId):\(message.messageId)"
         return try? db.read { db in
+            // Same two doors, same precedence, as every writer in this file — so
+            // the read side and the write side cannot drift on what "a different
+            // message" means.
+            guard try !stagedIdentityPositivelyDiffers(db: db, id: id, message: message) else {
+                NSELog.error(
+                    "getCachedResult REFUSED at \(id): the staged row names a different message "
+                    + "(IOS-NSE-006) — this run computes its own AI rather than serving the "
+                    + "predecessor's as its notification")
+                return nil
+            }
             guard let row = try Row.fetchOne(db, sql: """
                 SELECT summaryBlurb, summaryTodos, actionTag, reminderDate, reminderTime, reminderContent, aiCompleted
                 FROM nse_processed_message WHERE id = ? AND aiCompleted = 1
@@ -138,6 +186,14 @@ enum NSEStagingDB {
     /// only POSITIVE evidence of a different message suppresses it. On the
     /// natural path the row was created by THIS run's `stageHeader`, so the
     /// identity agrees and the guard is transparent.
+    ///
+    /// Returns `true` only when the row was actually written. `false` means the
+    /// identity guard REFUSED it or the write THREW — both already logged here
+    /// with their reason. Deliberately NOT `@discardableResult`: the caller's
+    /// `NSE step7: persisted …` line used to fire unconditionally, so a
+    /// sysdiagnose read `persistProcessedMessage REFUSED …` immediately followed
+    /// by a claim that the write had landed. Forcing every caller to name the
+    /// outcome is what keeps that from coming back.
     static func persistProcessedMessage(
         db: DatabaseQueue,
         accountId: String, accountEmail: String, provider: String,
@@ -146,7 +202,7 @@ enum NSEStagingDB {
         summaryBlurb: String?, summaryTodos: String?, actionTag: String?,
         reminderDate: String?, reminderTime: String?, reminderContent: String?,
         historyId: String?, aiCompleted: Bool, notified: Bool
-    ) {
+    ) -> Bool {
         let id = "\(accountId):\(message.messageId)"
         let attachmentsJSON: String? = {
             guard let atts = renderedBody?.attachments, !atts.isEmpty else { return nil }
@@ -232,8 +288,10 @@ enum NSEStagingDB {
                     + "different message (IOS-NSE-006) — dropping a terminal write computed "
                     + "for the predecessor rather than replacing the successor's row")
             }
+            return !refused
         } catch {
             NSELog.error("persistProcessedMessage failed: \(error)")
+            return false
         }
     }
 
@@ -442,11 +500,17 @@ enum NSEStagingDB {
     /// provably gone from this address, the main app's body queue re-fetches for
     /// whoever holds the address now, and the refusal is written to the NSE's
     /// durable log channel rather than to a detached console (topic 105).
+    ///
+    /// Returns `true` only when the UPDATE actually ran. `false` covers all three
+    /// non-writing outcomes — nothing to stage (`renderedBody == nil`), the
+    /// identity guard refused, or the write threw — the latter two already logged
+    /// here with their reason. Deliberately NOT `@discardableResult`; see
+    /// `persistProcessedMessage` for why the caller must name the outcome.
     static func stageBody(
         db: DatabaseQueue,
         accountId: String, message: NSEMessageMetadata, renderedBody: RenderedBody?
-    ) {
-        guard let rb = renderedBody else { return }
+    ) -> Bool {
+        guard let rb = renderedBody else { return false }
         let id = "\(accountId):\(message.messageId)"
         let attachmentsJSON: String? = {
             guard !rb.attachments.isEmpty else { return nil }
@@ -476,8 +540,10 @@ enum NSEStagingDB {
                     "stageBody REFUSED at \(id): the staged row now names a different message "
                     + "(IOS-NSE-006) — dropping a body computed for the predecessor")
             }
+            return !refused
         } catch {
             NSELog.error("stageBody failed: \(error)")
+            return false
         }
     }
 

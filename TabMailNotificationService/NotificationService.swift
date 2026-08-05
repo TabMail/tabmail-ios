@@ -198,7 +198,15 @@ final class NotificationService: UNNotificationServiceExtension {
             }
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             if let n = notification as? UNMutableNotificationContent {
-                NSELog.step("NSE ━━━ DELIVERED (\(ms)ms) ━━━ title=\(n.title) level=\(n.interruptionLevel.rawValue) sound=\(n.sound == nil ? "nil" : "SET")")
+                // SHAPE, NOT CONTENT — same rule and same pattern as the step4 /
+                // step5 / step6a lines. `EmailNotificationBuilder.fill` sets the
+                // title to `"New email - <senderName>"`, so interpolating it puts
+                // a CORRESPONDENT'S NAME — a third party who never opted into
+                // anything — into `NSELog.step`'s always-on `privacy: .public`
+                // channel, which iOS persists and hands to a sysdiagnose. The
+                // field question is "did a real title reach the banner", and the
+                // length answers it completely.
+                NSELog.step("NSE ━━━ DELIVERED (\(ms)ms) ━━━ title=\(n.title.count) chars level=\(n.interruptionLevel.rawValue) sound=\(n.sound == nil ? "nil" : "SET")")
             } else {
                 NSELog.step("NSE ━━━ DELIVERED (\(ms)ms) ━━━ (immutable)")
             }
@@ -263,7 +271,8 @@ final class NotificationService: UNNotificationServiceExtension {
             guard let contentHandler, let content = bestAttemptContent else { return }
             guard delivered.tryFire() else { return }
             NotificationService.applyPartialOrBareFallback(c: content, partialHolder: partialHolder, source: "timeout")
-            NSELog.step("NSE timeout delivering: title=\(content.title) level=\(content.interruptionLevel.rawValue)")
+            // SHAPE, NOT CONTENT — see the DELIVERED line in `deliverOnce`.
+            NSELog.step("NSE timeout delivering: title=\(content.title.count) chars level=\(content.interruptionLevel.rawValue)")
             contentHandler(content)
         }
     }
@@ -602,8 +611,15 @@ final class NotificationService: UNNotificationServiceExtension {
             // that the staged row still names THIS message before adding the
             // body to it — `IOS-NSE-006`. The zombie checkpoint above is a
             // per-RUN question and does not answer that one.
-            NSEStagingDB.stageBody(db: db, accountId: accountId, message: msg, renderedBody: rendered)
-            NSELog.step("NSE stage2: body staged")
+            // Report the OUTCOME, not the mere fact that the call was made. The
+            // guard above can REFUSE this write, and this line used to claim
+            // "body staged" straight after `stageBody REFUSED …` landed on the
+            // same channel — a sysdiagnose then reads a refusal followed by a
+            // claim that it wrote anyway. `staged=NO` also covers "no body to
+            // stage", which the `NSE step5: body=0 chars` line above resolves.
+            let bodyStaged = NSEStagingDB.stageBody(
+                db: db, accountId: accountId, message: msg, renderedBody: rendered)
+            NSELog.step("NSE stage2: body staged=\(bodyStaged ? "YES" : "NO")")
         }
 
         // ── Step 5.5: AI cache probe — check peers + staging DB before running AI ──
@@ -648,7 +664,11 @@ final class NotificationService: UNNotificationServiceExtension {
             // Body is persisted even on peer cache hit so merge writes MessageBody + FTS
             // and the main app's body queue doesn't re-fetch.
             if let db {
-                NSEStagingDB.persistProcessedMessage(
+                // No trailing success line on this branch, so there is nothing
+                // here that could claim a write the guard refused: the writer's
+                // own `persistProcessedMessage REFUSED …` / `failed …` lines are
+                // the only statements made about this call, and both are true.
+                _ = NSEStagingDB.persistProcessedMessage(
                     db: db, accountId: accountId, accountEmail: accountEmail, provider: provider,
                     message: msg, renderedBody: rendered,
                     summaryBlurb: peerHit.summaryBlurb, summaryTodos: peerHit.summaryTodos,
@@ -661,7 +681,12 @@ final class NotificationService: UNNotificationServiceExtension {
             deliver(c); return
         }
         // Local staging DB check (handles NSE-to-NSE dedup)
-        if let db, let cached = NSEStagingDB.getCachedResult(db: db, accountId: accountId, messageId: msg.messageId) {
+        // `message:` (not a bare `messageId:`) so the probe can re-prove that the
+        // staged row still names THIS message before serving its AI as this
+        // message's notification — `IOS-NSE-006`. `stageHeader` running earlier is
+        // NOT that proof: it swallows a thrown write, so a row it failed to re-head
+        // is indistinguishable here from one it re-headed successfully.
+        if let db, let cached = NSEStagingDB.getCachedResult(db: db, accountId: accountId, message: msg) {
             NSELog.step("NSE step5.5: STAGING cache HIT — skipping AI calls")
             // Unified layout — builder picks active (.reply + sound) when the
             // cached row carries a reply tag; otherwise passive with summary (or
@@ -954,7 +979,10 @@ final class NotificationService: UNNotificationServiceExtension {
             return
         }
         if let db {
-            NSEStagingDB.persistProcessedMessage(
+            // Report the OUTCOME — see the stage2 line above. The terminal write
+            // is the one whose refusal matters most to read correctly, because
+            // `persisted=NO` means this run's whole AI result was dropped.
+            let persisted = NSEStagingDB.persistProcessedMessage(
                 db: db, accountId: accountId, accountEmail: accountEmail, provider: provider,
                 message: msg, renderedBody: rendered,
                 summaryBlurb: summaryBlurb, summaryTodos: summaryTodos,
@@ -962,7 +990,9 @@ final class NotificationService: UNNotificationServiceExtension {
                 reminderContent: reminderContent, historyId: info["historyId"],
                 aiCompleted: aiDone, notified: active
             )
-            NSELog.step("NSE step7: persisted ai=\(aiDone ? 1 : 0) notified=\(active ? 1 : 0)")
+            NSELog.step(
+                "NSE step7: persisted=\(persisted ? "YES" : "NO") "
+                + "ai=\(aiDone ? 1 : 0) notified=\(active ? 1 : 0)")
         }
 
         // ── Step 8: Build notification ──
@@ -1242,7 +1272,11 @@ final class NotificationService: UNNotificationServiceExtension {
         deliver: @escaping (UNNotificationContent) -> Void
     ) {
         applyPassiveSettings(c, overrideTitle: overrideTitle, overrideBody: overrideBody)
-        NSELog.step("NSE deliverPassive: title=\(c.title)")
+        // SHAPE, NOT CONTENT — see the DELIVERED line in `deliverOnce`. On the
+        // ordinary path this title is `"New email - <senderName>"`; the
+        // `overrideTitle` callers (auth failure, reconnect acknowledgement) pass
+        // fixed copy, and a length still separates those from the mail path.
+        NSELog.step("NSE deliverPassive: title=\(c.title.count) chars")
         deliver(c)
     }
 }

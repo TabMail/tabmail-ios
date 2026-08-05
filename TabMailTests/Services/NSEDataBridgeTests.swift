@@ -477,6 +477,18 @@ struct NSEDataBridgeTests {
     }
 
     // MARK: - Staging DB cache probe (local dedup)
+    //
+    // ⚠️ These three HAND-MIRROR `getCachedResult`'s `WHERE id = ? AND
+    // aiCompleted = 1` SELECT; they predate `NSEStagingDB` being compiled into
+    // this target and do NOT call the function. They cover the completion-flag
+    // semantics only. The function's IDENTITY guard (`IOS-NSE-006`) is upstream
+    // of the row they build, so a mirror structurally cannot exercise it — it is
+    // covered by `NSEStagingZombieWriterTests`
+    // (`cachedAiIsNeverCombinedWithADifferentMessagesHeader`, plus the
+    // unanswerable-identity anchor) and by
+    // `NSEStagingIdentitySplicingTests.stagingCacheProbeServesNothingOfThePredecessor`,
+    // all of which drive the REAL `NSEStagingDB.getCachedResult`. Do not read
+    // these names as coverage of the guard.
 
     @Test("getCachedResult returns nil for non-existent message")
     func cacheProbeNonExistent() throws {

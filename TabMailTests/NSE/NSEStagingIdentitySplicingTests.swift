@@ -137,7 +137,7 @@ struct NSEStagingIdentitySplicingTests {
         _ queue: DatabaseQueue, rfc822: String?, epoch: Int?
     ) {
         let token = Self.predecessorToken
-        NSEStagingDB.persistProcessedMessage(
+        _ = NSEStagingDB.persistProcessedMessage(
             db: queue, accountId: Self.accountId, accountEmail: "user@example.com",
             provider: "imap_new_mail",
             message: metadata(
@@ -271,7 +271,10 @@ struct NSEStagingIdentitySplicingTests {
         // account: `NotificationService` probes the staging cache before running
         // AI, and a hit fills the notification and returns.
         let cached = NSEStagingDB.getCachedResult(
-            db: queue, accountId: Self.accountId, messageId: Self.recycledUid)
+            db: queue, accountId: Self.accountId,
+            message: metadata(
+                rfc822: Self.successorRfc, epoch: Self.epochAfter,
+                subject: "Successor subject", snippet: "successor snippet"))
         #expect(
             cached == nil,
             """
@@ -301,7 +304,11 @@ struct NSEStagingIdentitySplicingTests {
         stageHeaderRun(queue, rfc822: Self.predecessorRfc, epoch: Self.epochBefore)
 
         let cached = NSEStagingDB.getCachedResult(
-            db: queue, accountId: Self.accountId, messageId: Self.recycledUid)
+            db: queue, accountId: Self.accountId,
+            message: metadata(
+                rfc822: Self.predecessorRfc, epoch: Self.epochBefore,
+                subject: "\(Self.predecessorToken) subject",
+                snippet: "\(Self.predecessorToken) snippet"))
         #expect(
             cached?.summaryBlurb == "\(Self.predecessorToken) summary",
             "a duplicate push discarded the AI the previous run paid for")
@@ -329,7 +336,11 @@ struct NSEStagingIdentitySplicingTests {
         stagePredecessorTerminal(queue, rfc822: nil, epoch: nil)
         stageHeaderRun(queue, rfc822: nil, epoch: nil)
         let cached = NSEStagingDB.getCachedResult(
-            db: queue, accountId: Self.accountId, messageId: Self.recycledUid)
+            db: queue, accountId: Self.accountId,
+            message: metadata(
+                rfc822: nil, epoch: nil,
+                subject: "\(Self.predecessorToken) subject",
+                snippet: "\(Self.predecessorToken) snippet"))
         #expect(
             cached?.summaryBlurb == "\(Self.predecessorToken) summary",
             "an unanswerable identity was treated as proof of a different message")

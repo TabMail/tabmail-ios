@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import UserNotifications
 @testable import TabMail
 
 /// `IOS-NSE-006` — the remainder `IOS-NSE-005` (`5813e44b1`) named and
@@ -148,7 +149,7 @@ struct NSEStagingZombieWriterTests {
     private func zombieStagesBody(
         _ queue: DatabaseQueue, rfc822: String? = predecessorRfc, epoch: Int? = epochBefore
     ) {
-        NSEStagingDB.stageBody(
+        _ = NSEStagingDB.stageBody(
             db: queue, accountId: Self.accountId,
             message: metadata(
                 rfc822: rfc822, epoch: epoch,
@@ -321,7 +322,7 @@ struct NSEStagingZombieWriterTests {
         // `INSERT OR REPLACE` rewrites the WHOLE row, so unguarded it destroys
         // the successor's staged push outright.
         let token = Self.predecessorToken
-        NSEStagingDB.persistProcessedMessage(
+        _ = NSEStagingDB.persistProcessedMessage(
             db: queue, accountId: Self.accountId, accountEmail: "user@example.com",
             provider: "imap_new_mail",
             message: metadata(
@@ -342,13 +343,123 @@ struct NSEStagingZombieWriterTests {
             "the staged row carries content the predecessor computed")
         // And the successor's own notification must not be served the zombie's AI.
         let cached = NSEStagingDB.getCachedResult(
-            db: queue, accountId: Self.accountId, messageId: Self.recycledUid)
+            db: queue, accountId: Self.accountId,
+            message: metadata(
+                rfc822: Self.successorRfc, epoch: Self.epochAfter,
+                subject: "Successor subject", snippet: "successor snippet"))
         #expect(
             cached == nil,
             """
             the staging cache serves the predecessor's AI as the successor's \
             notification: summary=\(String(describing: cached?.summaryBlurb))
             """)
+    }
+
+    @Test("""
+        A cached AI result is never combined with a different message's header — \
+        including when the identity re-head was thrown away by a swallowed \
+        staging write
+        """)
+    func cachedAiIsNeverCombinedWithADifferentMessagesHeader() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let (path, queue) = try makeStagingFile(in: dir)
+        defer { TestDatabaseTeardown.retire(pools: [], queues: [queue], directory: dir) }
+
+        // ① NSE run 1 completed for the PREDECESSOR at UID 42 — full AI,
+        //    `aiCompleted = 1`, action tag `reply`.
+        let token = Self.predecessorToken
+        _ = NSEStagingDB.persistProcessedMessage(
+            db: queue, accountId: Self.accountId, accountEmail: "user@example.com",
+            provider: "imap_new_mail",
+            message: metadata(
+                rfc822: Self.predecessorRfc, epoch: Self.epochBefore,
+                subject: "\(token) subject", snippet: "\(token) snippet"),
+            renderedBody: body("\(token) body"),
+            summaryBlurb: "\(token) summary", summaryTodos: "\(token) todo",
+            actionTag: "reply",
+            reminderDate: nil, reminderTime: nil, reminderContent: "\(token) reminder",
+            historyId: nil, aiCompleted: true, notified: true)
+
+        // ② A turnover reissues UID 42 to a DIFFERENT message and NSE run 2 starts.
+        //    Its `stageHeader` write THROWS — `stageHeader` returns `Void` and
+        //    swallows the error, so nothing downstream can tell the row was never
+        //    re-headed. Reproduced with a read-only connection to the same file,
+        //    which is deterministic where the real trigger (`SQLITE_BUSY` on a
+        //    non-WAL cross-process App Group database) is not.
+        var readOnlyConfig = Configuration()
+        readOnlyConfig.readonly = true
+        let readOnly = try DatabaseQueue(path: path, configuration: readOnlyConfig)
+        let successor = metadata(
+            rfc822: Self.successorRfc, epoch: Self.epochAfter,
+            subject: "Successor subject", snippet: "successor snippet")
+        NSEStagingDB.stageHeader(
+            db: readOnly, accountId: Self.accountId, accountEmail: "user@example.com",
+            provider: "imap_new_mail", message: successor, historyId: nil)
+
+        // NON-VACUITY: the precondition really holds — the re-head did NOT land,
+        // so the row at this address still carries the predecessor's identity and
+        // its completed AI. Without this the test could pass for the wrong reason.
+        #expect(
+            MessageIdentity.comparableRfc822Identity(try stagedRowRfc(queue))
+                == MessageIdentity.comparableRfc822Identity(Self.predecessorRfc),
+            "precondition: stageHeader's write must have been swallowed, leaving the predecessor's row")
+        #expect(
+            try stagedTokenHits(queue) == 1,
+            "precondition: the predecessor's completed AI must still be on the row")
+
+        // ③ The probe `NotificationService.process` makes before running its own
+        //    AI, on the successor's run.
+        let cached = NSEStagingDB.getCachedResult(
+            db: readOnly, accountId: Self.accountId, message: successor)
+
+        // ④ THE INVARIANT, asserted on the artifact the user actually sees rather
+        //    than on the columns the guard happens to suppress (`MIS-015`): the
+        //    delivered notification is built exactly as the staging-cache-hit arm
+        //    of `NotificationService.process` builds it.
+        let content = UNMutableNotificationContent()
+        let active = EmailNotificationBuilder.fill(
+            content,
+            signal: EmailNotificationBuilder.Signal(
+                senderName: successor.senderName,
+                senderEmail: successor.senderEmail,
+                subject: successor.subject,
+                summaryBlurb: cached?.summaryBlurb,
+                actionTag: cached?.actionTag,
+                reminderContent: cached?.reminderContent,
+                dueDate: cached?.reminderDate,
+                dueTime: cached?.reminderTime),
+            accountId: Self.accountId, messageId: successor.messageId)
+        let delivered = [content.title, content.subtitle, content.body].joined(separator: "\u{1}")
+        #expect(
+            delivered.contains(token) == false,
+            """
+            the delivered notification carries the predecessor's AI beside the \
+            successor's header: title=\(content.title) subtitle=\(content.subtitle) \
+            body=\(content.body)
+            """)
+        // The predecessor's `reply` tag would also RING for a message it was never
+        // computed for — the misattribution is not confined to the body text.
+        #expect(
+            active == false,
+            "the predecessor's `reply` tag escalated the successor's notification to active + sound")
+        // Non-vacuous the other way too: the notification really was built for the
+        // successor, so a green result is not an empty-signal artefact.
+        #expect(
+            content.subtitle == "Successor subject",
+            "the notification under test was not built for the successor")
+
+        // ⑤ ANCHOR, same artifact from the other side (`MIS-026`): the guard is
+        //    ONE-SIDED. The predecessor's own run — the message the row genuinely
+        //    names — still gets its cache hit, so nothing legitimate is refused.
+        let sameMessage = NSEStagingDB.getCachedResult(
+            db: readOnly, accountId: Self.accountId,
+            message: metadata(
+                rfc822: Self.predecessorRfc, epoch: Self.epochBefore,
+                subject: "\(token) subject", snippet: "\(token) snippet"))
+        #expect(
+            sameMessage?.summaryBlurb == "\(token) summary",
+            "the identity guard turned a same-message cache hit into a miss")
     }
 
     // MARK: - Anchors (the opposite direction — the write MUST land)
@@ -399,7 +510,7 @@ struct NSEStagingZombieWriterTests {
         // The same question on the terminal writer, whose refusal would drop the
         // whole run rather than one column group.
         let token = Self.predecessorToken
-        NSEStagingDB.persistProcessedMessage(
+        _ = NSEStagingDB.persistProcessedMessage(
             db: queue, accountId: Self.accountId, accountEmail: "user@example.com",
             provider: "imap_new_mail",
             message: metadata(
@@ -410,8 +521,14 @@ struct NSEStagingZombieWriterTests {
             actionTag: "reply",
             reminderDate: nil, reminderTime: nil, reminderContent: "\(token) reminder",
             historyId: nil, aiCompleted: true, notified: true)
+        // The READ half of the same anchor: a probe that cannot adjudicate the
+        // identity must still SERVE the hit. Refusing here would make every
+        // rfc-less, epoch-less message recompute its AI on every duplicate push.
         let cached = NSEStagingDB.getCachedResult(
-            db: queue, accountId: Self.accountId, messageId: Self.recycledUid)
+            db: queue, accountId: Self.accountId,
+            message: metadata(
+                rfc822: nil, epoch: nil,
+                subject: "\(token) subject", snippet: "\(token) snippet"))
         #expect(
             cached?.summaryBlurb == "\(token) summary",
             "an unanswerable identity suppressed a legitimate terminal write")
