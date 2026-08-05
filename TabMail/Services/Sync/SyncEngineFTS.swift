@@ -608,10 +608,23 @@ extension SyncEngine {
     /// `.body` joins `.searchIndex` from Stage D: `v70_dropMessageBodyHeaderFK`
     /// removed the FK cascade that used to reclaim `messageBody` as a side effect of
     /// each caller's header delete. Routing it here covers all six callers at once.
+    /// ⚠️ `.medium`, NOT `.utility` — ADR-IOS-031's floor for anything that touches
+    /// GRDB off the main actor. At `07a4bb703` this body called
+    /// `SearchIndex.shared.removeMessages`, which touches only `SearchIndex`'s own
+    /// private FTS pool, so `.utility` (QoS 17) cost the main pool nothing. It now
+    /// calls `MessageContentStore.releaseUnowned(…, pool:)`, which reads and runs
+    /// `DELETE FROM messageBody` on the MAIN pool — `dbPool`, `syncPool` and
+    /// `backgroundPool` all wrap the same `rawPool`, and `PrioritizedDatabase.priority`
+    /// is the DB write-queue TIER, not a `TaskPriority`, so it does nothing to QoS.
+    /// At `.utility` this became a QoS-17 reader/writer contending with MainActor
+    /// reads at `.userInitiated` (25): the 8-level inversion ADR-IOS-031 forbids, on
+    /// an ordinary primary path (six callers — every delta sync, full sync, and
+    /// deletion-reconcile pass). Scheduling priority is the only thing that changes;
+    /// the work performed, its ordering, and its failure handling are untouched.
     func removeHeadersFromFTS(_ headerIds: [String]) {
         guard !headerIds.isEmpty else { return }
         let pool = dbPool
-        Task.detached(priority: .utility) {
+        Task.detached(priority: .medium) {
             let released = await MessageContentStore.releaseUnowned(
                 headerIds.map(ContentKey.init(rawValue:)), stores: [.searchIndex, .body], pool: pool)
             print("[FTS] Removed \(released)/\(headerIds.count) messages from index")

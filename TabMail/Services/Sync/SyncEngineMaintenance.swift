@@ -106,8 +106,18 @@ extension SyncEngine {
                         // user is over their storage budget, and without it the
                         // bodies — the bulk of the bytes — would sit for up to
                         // `bodyCacheTTLHours` waiting on `runEvictStaleBodies`.
+                        //
+                        // ⚠️ `.medium`, NOT `.utility` — ADR-IOS-031's floor for any
+                        // background task that touches GRDB. `releaseUnowned` runs on
+                        // the MAIN pool (`dbPool`/`syncPool`/`backgroundPool` all wrap
+                        // the same `rawPool`; `PrioritizedDatabase.priority` is the DB
+                        // write-queue TIER, not a `TaskPriority`), so at QoS 17 it
+                        // contended both with MainActor reads at `.userInitiated` (25)
+                        // and with this function's own delete loop. Scheduling priority
+                        // is the only change; the work, its ordering and its failure
+                        // handling are untouched.
                         let keys = chunkIds.map(ContentKey.init(rawValue:))
-                        Task.detached(priority: .utility) {
+                        Task.detached(priority: .medium) {
                             await MessageContentStore.releaseUnowned(
                                 keys, stores: [.searchIndex, .body], pool: dbPool)
                         }
