@@ -1191,12 +1191,28 @@ enum BodyAssetStore {
 
             let knownFileIds: Set<String>
             if knownHeaderHashes.contains(name) {
+                // ⚑ HALF-OPEN PREFIX RANGE, NOT `substr(…) = ?` — the same rewrite,
+                // for the same reason, as `removeHeaderDirectoryIfIdle`'s idle check
+                // (see `prefixUpperBound` and the ⚑ comment there for the exactness
+                // argument and its negative case). `substr(id, 1, n) = ?` wraps the
+                // indexed column in a function, so `sqlite_autoindex_bodyAsset_1`
+                // cannot seek it and this is a full SCAN. It runs once per known
+                // header directory inside the 60s foreground sweep, i.e. O(D×N) over
+                // the manifest; as a range each iteration is
+                // `SEARCH … USING COVERING INDEX (id>? AND id<?)`.
+                //
+                // `name` is exactly `hashHexLength` characters (guarded above), which
+                // is the precondition that makes the two forms select the identical
+                // rows. A nil bound is unreachable for a 16-character name; if it ever
+                // happened, skipping the directory keeps every file in it — the same
+                // fail-closed answer the `catch` below gives.
+                guard let nameUpperBound = prefixUpperBound(name) else { continue }
                 do {
                     knownFileIds = try queue.read { db in
                         let rows = try String.fetchAll(
                             db,
-                            sql: "SELECT id FROM bodyAsset WHERE substr(id, 1, ?) = ?",
-                            arguments: [hashHexLength, name]
+                            sql: "SELECT id FROM bodyAsset WHERE id >= ? AND id < ?",
+                            arguments: [name, nameUpperBound]
                         )
                         return Set(rows)
                     }

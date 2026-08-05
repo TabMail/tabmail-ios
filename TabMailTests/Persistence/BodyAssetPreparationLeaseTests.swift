@@ -502,6 +502,144 @@ struct BodyAssetPreparationLeaseTests {
         #expect(leases == 0, "the abandoned lease itself must be reaped")
     }
 
+    // MARK: - Orphan sweep: which files under a hash the manifest already accounts for
+
+    /// Bytes on disk under `<store>/<hash>/<blob>`, aged past the sweep threshold so
+    /// only the manifest-side classification is left standing between them and the
+    /// physical deleter. Creates the header directory but deliberately does NOT age
+    /// it, so the directory reclaim (a different predicate, already covered above)
+    /// stays out of these tests.
+    private static func writeAgedBlobFile(_ blobId: String, bytes: Data) throws {
+        guard let storeDir = BodyAssetStore.storeDirectory() else {
+            Issue.record("store directory unavailable")
+            return
+        }
+        let url = storeDir.appendingPathComponent(blobId)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try bytes.write(to: url)
+        try ageOut(path: url.path)
+    }
+
+    /// A lease row whose `preparationId` is the EMPTY string, seeded fresh so the
+    /// sweep's table-wide abandoned-lease reap leaves it alone.
+    ///
+    /// This is a TRACER, not a production shape — production lease ids are UUIDs.
+    /// `removeBlobIfUnreferenced(_:releasingPreparationId:)` binds `""` when it has
+    /// no lease of its own to release, *precisely because* the empty preparation id
+    /// cannot match a UUID; a row that DOES carry that id is therefore consumed if
+    /// and only if the sweep put this blob through the physical-delete path.
+    ///
+    /// WHY A TRACER IS NEEDED AT ALL, stated so the next reader does not "simplify"
+    /// these tests into vacuity: the classification below cannot be observed through
+    /// file survival. `removeBlobIfUnreferenced` re-decides authoritatively under the
+    /// manifest writer lock (`SELECT … WHERE id = ?`), so a manifest-backed file
+    /// survives whether or not the sweep classified it correctly. What the
+    /// classification decides is whether the sweep takes a WRITE transaction per
+    /// already-accounted-for file — which is the whole point of the query, and which
+    /// only the tracer makes visible.
+    ///
+    /// `preparationId` is the table's PRIMARY KEY, so there is at most ONE tracer per
+    /// manifest; each test gets its own in-memory queue, and each seeds exactly one.
+    private static func insertTracerLease(blobId: String) throws {
+        guard let queue = BodyAssetStore.manifestQueue() else {
+            Issue.record("manifest queue unavailable")
+            return
+        }
+        try queue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO bodyAssetPreparation (preparationId, blobId, createdAt)
+                    VALUES (?, ?, ?)
+                    """,
+                arguments: ["", blobId, Int64(Date().timeIntervalSince1970 * 1000)]
+            )
+        }
+    }
+
+    private static func leaseCount(blobId: String) throws -> Int {
+        guard let queue = BodyAssetStore.manifestQueue() else { return -1 }
+        return try queue.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM bodyAssetPreparation WHERE blobId = ?",
+                arguments: [blobId]
+            ) ?? -1
+        }
+    }
+
+    /// THE SYSTEM PROPERTY: for a given header directory, `pruneOrphanFiles` counts a
+    /// file as already accounted for exactly when the manifest holds a row for that
+    /// blob id **under that hash** — so a file the manifest knows about is never
+    /// handed to the physical deleter, and a file it does not know about is.
+    ///
+    /// Both directions in one run, in the SAME directory, which is what makes this a
+    /// classification test rather than a "the sweep ran" test.
+    ///
+    /// ⚠ WHAT THIS TEST DOES **NOT** PIN, measured rather than assumed. It does not
+    /// pin the predicate's UPPER bound. Widening it (up to and including selecting the
+    /// whole table) leaves every assertion here GREEN, and that is a property of the
+    /// system, not a gap in the test: the returned ids are compared for full-string
+    /// equality against `"<hash>/<file>"`, so rows belonging to another hash can never
+    /// match, and the ids are drawn from `bodyAsset` itself, so a match always implies
+    /// a real row. Over-matching is therefore inert here — the reachable failure is
+    /// UNDER-matching, which is what the assertions below catch.
+    @Test("Orphan sweep: a manifest-backed file is spared the deleter while a true orphan beside it is not")
+    func orphanSweepClassifiesFilesUnderTheHashByTheManifest() throws {
+        let dir = try Self.setupTest()
+        defer { Self.teardown(dir) }
+
+        let hash = "aaaaaaaaaaaaaaaa"
+        let known = "\(hash)/1111111111111111"
+        let orphan = "\(hash)/2222222222222222"
+
+        try Self.insertManifestRow(blobId: known)
+        try Self.writeAgedBlobFile(known, bytes: Data("known-bytes".utf8))
+        try Self.writeAgedBlobFile(orphan, bytes: Data("orphan-bytes".utf8))
+        try Self.insertTracerLease(blobId: known)
+
+        BodyAssetStore.pruneOrphanFiles()
+
+        // ACCOUNTED FOR: the sweep never reaches the deleter for it.
+        let knownTracer = try Self.leaseCount(blobId: known)
+        #expect(knownTracer == 1,
+                "a file the manifest already accounts for must not be run through the physical-delete path")
+        #expect(Self.blobExists(known), "and its bytes must still be there")
+
+        // NON-VACUITY, same run, same directory: the sweep provably DID run and DID
+        // bite — otherwise the assertions above would pass on a sweep that did nothing.
+        #expect(!Self.blobExists(orphan),
+                "an unaccounted-for file's bytes must be reclaimed")
+    }
+
+    /// The same classification at the top of the hash alphabet, where the exclusive
+    /// upper bound of `ffffffffffffffff` is not a hex string at all. A hash that
+    /// cannot match its own files there would silently hand every cached attachment
+    /// of those messages to the deleter on every 60s foreground sweep.
+    @Test("Orphan sweep: the top of the hash alphabet still matches its own files")
+    func orphanSweepMatchesFilesAtTheTopOfTheHashAlphabet() throws {
+        let dir = try Self.setupTest()
+        defer { Self.teardown(dir) }
+
+        let hash = "ffffffffffffffff"
+        let known = "\(hash)/3333333333333333"
+        let orphan = "\(hash)/4444444444444444"
+
+        try Self.insertManifestRow(blobId: known)
+        try Self.writeAgedBlobFile(known, bytes: Data("known-bytes-at-the-top".utf8))
+        try Self.writeAgedBlobFile(orphan, bytes: Data("orphan-bytes-at-the-top".utf8))
+        try Self.insertTracerLease(blobId: known)
+
+        BodyAssetStore.pruneOrphanFiles()
+
+        let knownTracer = try Self.leaseCount(blobId: known)
+        #expect(knownTracer == 1,
+                "the highest possible hash must still match its own files")
+        #expect(Self.blobExists(known))
+
+        #expect(!Self.blobExists(orphan), "the orphan beside it must still be reclaimed")
+    }
+
     // MARK: - Schema convergence
 
     @Test("migratePreparationSchema is idempotent on a manifest that predates the lease table")
