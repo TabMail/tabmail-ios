@@ -85,11 +85,16 @@ struct AuthedHTTP: Sendable {
     /// alone (Law 4: only a provably authoritative signal may be treated as
     /// stale).
     ///
-    /// ⚠ THE CONSUMER LIST IS GMAIL ONLY, and this comment used to say
-    /// otherwise. It named *"Gmail label modify/lookup, Graph move"* — but the
-    /// Graph half was an intention, never a call site. At HEAD the consumers
-    /// are `GmailProvider.requestPreservingBadRequestBody` (its private
-    /// wrapper) and the Gmail label-lookup site, and nothing else;
+    /// ⚠ THE CONSUMER LIST IS ONE CALL SITE, and this comment has now been wrong
+    /// TWICE — corrected 2026-08-05 by round-5 Angle 3. It first named *"Gmail
+    /// label modify/lookup, Graph move"*; the Graph half was an intention, never a
+    /// call site. The correction then still named two Gmail consumers — the private
+    /// wrapper *"and the Gmail label-lookup site"* — and the second of those has no
+    /// call sites either. At HEAD there is exactly ONE caller of this function,
+    /// `GmailProvider.requestPreservingBadRequestBody` (its private wrapper), and
+    /// that wrapper in turn has exactly ONE caller, `GmailProvider.modifyMessage`.
+    /// No Gmail label-lookup path reaches here: the `/labels` catalog calls go
+    /// through the ordinary `request(...)`. Nothing else calls it;
     /// `ExchangeProvider.patchMessage` and `ExchangeProvider.moveMessage` both
     /// still call the body-dropping `request`, so every Graph mutation's `400`
     /// reaches `AccountManagerQueue.isPermanentlyInvalidError` bodyless and is

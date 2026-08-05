@@ -189,18 +189,41 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
 
 // MARK: - Sync Filter Snapshot
 //
-// Pending-op IDs queued by `AccountManagerActions` are `MessageHeader.stableId`:
-// - Gmail/Exchange: stableId == messageId (provider-stable IDs)
-// - IMAP:           stableId == rfc822MessageId when UID is numeric, else UID
+// 🚨 THIS BLOCK USED TO SAY pending-op ids queued by `AccountManagerActions` are
+// `MessageHeader.stableId` — rfc822 for IMAP. THAT IS NO LONGER TRUE, and the
+// correction matters because the conclusion (a two-key check) survives while its
+// stated reason does not. Invalidated in-range by `6ad327df9` and `065a827ca`;
+// corrected 2026-08-05 after round-5 audit finding `A3-R5-01`.
 //
-// Server-returned `MessageHeaderInfo` carries `messageId` plus optional
-// `rfc822MessageId`. A one-key check against `info.messageId` misses every IMAP
-// pending op (where the queued key is rfc822). A one-key check against rfc822
-// misses optimistic ops queued before the server assigned a Message-ID.
+// WHAT THE PRODUCERS ACTUALLY KEY BY TODAY:
 //
-// The only safe check is two-key: `messageId` OR `rfc822MessageId`. Every sync
-// path (Gmail delta, Exchange delta, IMAP fullSync, BackfillDeep) must use the
-// same snapshot so the filter can't drift between them.
+// * **Ordinary actions** (archive / delete / move / flag, and the user-label and
+//   outbox reply-flag producers routed through the same helper) key by the
+//   provider's NATIVE address. `AccountManagerActions.admittedOrdinaryActionTargets`
+//   returns `admitted.map(\.messageId)`, and on IMAP it only admits a member whose
+//   `messageId` is a bare canonical UID (`let uid = UInt32(message.messageId),
+//   uid > 0, message.messageId == String(uid)`). So on IMAP these keys are UIDs,
+//   NOT rfc822 Message-IDs.
+// * **`.setTag`** still enqueues `MessageHeader.stableId` — which IS rfc822 on
+//   IMAP when the UID is numeric. Those producers live in the SYNC ENGINES and the
+//   outbox, not in `AccountManagerActions`: `SyncEngine.swift`,
+//   `SyncEngineDeltaSync.swift` (×2), `SyncEngineFullSync.swift` (×2),
+//   `SyncEngineBackfillDeep.swift`, `ReplyParentResolver.swift`, and
+//   `AccountManagerOutbox.swift` — every one of them passes `…stableId`.
+//
+// ⚠️ SO THE TWO-KEY CHECK IS STILL REQUIRED — FOR THE `.setTag` PRODUCERS, NOT FOR
+// THE ORDINARY ONES. Server-returned `MessageHeaderInfo` carries `messageId` plus
+// an optional `rfc822MessageId`. A one-key check against `info.messageId` would
+// stop matching every IMAP `.setTag` op (whose key is rfc822); a one-key check
+// against rfc822 would stop matching every IMAP ordinary op (whose key is the UID)
+// AND every op queued before the server assigned a Message-ID. Both single-key
+// simplifications silently disarm the filter for one whole producer family, and
+// the failure is invisible: the op stays queued, and sync overwrites the flags,
+// tags or rows the user just acted on.
+//
+// Every sync path (Gmail delta, Exchange delta, IMAP fullSync, BackfillDeep) must
+// use the same snapshot so the filter can't drift between them. Registered
+// precedent for the stale-comment class: `IOS-QUEUE-004`.
 
 /// Snapshot of pending operation IDs for the sync filter. Always load INSIDE
 /// a write transaction — a separate read creates a TOCTOU window where a user
@@ -256,9 +279,17 @@ extension Set where Element == String {
     /// Two-key membership check for sync filters. Returns true if this set
     /// contains either `messageId` or a non-empty `rfc822MessageId`.
     ///
-    /// Required because `PendingOperation.messageIds` is keyed by
-    /// `MessageHeader.stableId` which is rfc822 for IMAP and messageId for
-    /// Gmail/Exchange — a single-key check misses IMAP pending ops.
+    /// ⚠️ REQUIRED BECAUSE THE QUEUE HAS **TWO** KEYING SCHEMES IN IT AT ONCE, not
+    /// because pending ops are uniformly `stableId` — that older reason is stale
+    /// (see the `Sync Filter Snapshot` banner above). Ordinary actions key by the
+    /// provider's native address, which on IMAP is a bare canonical UID; `.setTag`,
+    /// produced in the sync engines and the outbox, still keys by
+    /// `MessageHeader.stableId`, which on IMAP is the rfc822 Message-ID. Dropping
+    /// either key here disarms the filter for one whole producer family at EVERY
+    /// call site at once — 16 of them at `01550cdc6`, all under
+    /// `TabMail/Services/Sync/` (`SyncEngineDeltaSync` ×9, `SyncEngineFullSync` ×5,
+    /// `SyncEngineDeletionReconcile` ×1, `SyncEngineBackfillDeep` ×1) — and the
+    /// symptom is a silent overwrite of what the user just did, not an error.
     func containsAnyKey(messageId: String, rfc822MessageId: String?) -> Bool {
         if contains(messageId) { return true }
         if let rfc = rfc822MessageId, !rfc.isEmpty, contains(rfc) { return true }
