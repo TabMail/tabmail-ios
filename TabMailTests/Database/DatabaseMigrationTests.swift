@@ -998,15 +998,29 @@ struct V70CrossStoreInvariantTests {
         #expect(value == nil)
     }
 
-    /// The legacy-row rule for `actionTagSetAt`: every row already carrying a
-    /// tag when v81 runs is stamped AT MIGRATION TIME, so it gets a full
-    /// `SyncConfig.actionTagTTLSeconds` from the upgrade instead of being
-    /// instantly stale — and rows with no tag stay NULL, so the backfill
-    /// cannot invent a stamp with nothing to stamp. Two-sided on purpose: an
-    /// unconditional backfill fails the second assertion, a missing backfill
-    /// fails the first.
-    @Test("v81: backfills actionTagSetAt for pre-migration tagged rows and leaves untagged rows NULL")
-    func v81BackfillsStampForTaggedRowsOnly() throws {
+    /// The legacy-row rule for `actionTagSetAt` (2026-08-05): v81 is SCHEMA
+    /// ONLY. It adds the column and touches no row, so **every** row that
+    /// predates the upgrade emerges with a NULL stamp — including rows that
+    /// were already carrying an action tag.
+    ///
+    /// The state this test pins is not an implementation detail, it is the
+    /// input to a behaviour: `SyncEngineMaintenance.sweepStaleActionTags`
+    /// treats a NULL stamp as ALREADY EXPIRED (`if let setAt =
+    /// msg.actionTagSetAt, setAt > cutoff { continue }`), so a legacy tag on a
+    /// message that has already left the inbox is reclaimed on the next
+    /// maintenance pass instead of after a further TTL. That consequence is
+    /// pinned end-to-end by `SyncMaintenanceTests`' "NULL actionTagSetAt on an
+    /// out-of-inbox tag is swept (legacy-row fail-safe pin)"; this test pins
+    /// that v81 is what puts a legacy row INTO that state.
+    ///
+    /// ⚠️ Two-sided on purpose, and the second side is the important one. The
+    /// relaxation applies to pre-v81 rows and to NOTHING else: a
+    /// going-forward writer must still keep `actionTag != nil ⇒
+    /// actionTagSetAt != nil`, which `MessageHeader.setActionTag` enforces
+    /// atomically. A change that "simplified" the stamp away everywhere would
+    /// pass the first three assertions and fail the last one.
+    @Test("v81: adds actionTagSetAt without stamping any pre-migration row, and the going-forward stamp still holds")
+    func v81AddsNullableColumnAndStampsNothing() throws {
         var configuration = Configuration()
         configuration.foreignKeysEnabled = true
         let db = try DatabaseQueue(configuration: configuration)
@@ -1019,7 +1033,6 @@ struct V70CrossStoreInvariantTests {
         let taggedId = try insertPreV77Header(db, messageId: "81-tagged", actionTag: .reply)
         let untaggedId = try insertPreV77Header(db, messageId: "81-untagged", actionTag: nil)
 
-        let before = Date()
         var afterMigrator = DatabaseMigrator()
         AppDatabase.registerAllMigrations(on: &afterMigrator)
         try afterMigrator.migrate(db, upTo: "v81_addActionTagSetAt")
@@ -1029,12 +1042,31 @@ struct V70CrossStoreInvariantTests {
         #expect((column["notnull"] as Int) == 0)
 
         let tagged = try db.read { try MessageHeader.fetchOne($0, key: taggedId) }
-        let stamp = try #require(tagged?.actionTagSetAt, "an existing tagged row must survive the upgrade with a full TTL, not be instantly stale")
-        #expect(stamp >= before.addingTimeInterval(-1))
+        #expect(tagged?.actionTag == .reply, "the tag itself must survive the upgrade untouched")
+        #expect(
+            tagged?.actionTagSetAt == nil,
+            "a pre-v81 tagged row must emerge UNSTAMPED, so the sweep sees it as already expired"
+        )
 
         let untagged = try db.read { try MessageHeader.fetchOne($0, key: untaggedId) }
         #expect(untagged?.actionTag == nil)
         #expect(untagged?.actionTagSetAt == nil, "no tag means nothing to stamp")
+
+        // The going-forward side: v81 relaxes history, not the invariant.
+        var fresh = MessageHeader(
+            messageId: "81-post-upgrade", subject: "s", from: "Sender",
+            fromAddress: "sender@example.com", to: "recipient@example.com",
+            date: Date(), snippet: "snippet",
+            folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        fresh.setActionTag(.reply)
+        try db.write { try fresh.insert($0) }
+        let storedFresh = try db.read { try MessageHeader.fetchOne($0, key: fresh.id) }
+        #expect(storedFresh?.actionTag == .reply)
+        #expect(
+            storedFresh?.actionTagSetAt != nil,
+            "every writer after v81 must still keep actionTag != nil ⇒ actionTagSetAt != nil"
+        )
     }
 
     @Test("v81: a fresh install has a nullable actionTagSetAt column that round-trips a stamp")

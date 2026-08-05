@@ -2010,8 +2010,10 @@ final class AppDatabase: Sendable {
         //   • v70 — `DROP TABLE messageBody` + recreate. `messageBody` is a
         //     pure CHILD; nothing references it, so the implicit delete that
         //     `DROP TABLE` performs under enforced FKs cascades to nothing.
-        //   • v81 — `UPDATE messageHeader SET actionTagSetAt = …`.
-        //     `messageHeader` IS a parent, but see that migration's own note.
+        //   • v81 — `ADD COLUMN` only as of 2026-08-05; its
+        //     `UPDATE messageHeader SET actionTagSetAt = …` was removed (see that
+        //     migration's own note). `messageHeader` IS a parent, but adding a
+        //     column writes no key of either kind.
         //   • v83 — `CREATE INDEX`; changes no row. (Its `ANALYZE` moved to the
         //     background maintenance pass — ADR-IOS-029, 2026-08-05 amendment.)
         // `v71` and `v82` stay `.deferred`, each for a different reason — read
@@ -2468,44 +2470,69 @@ final class AppDatabase: Sendable {
         // SETTINGS.actionTTLSeconds — SyncConfig.actionTagTTLSeconds, 1 week).
         // Nullable, no default, NO INDEX: the sweep is a bounded ~15-minute
         // maintenance scan over out-of-inbox rows only (SyncEngineMaintenance.swift),
-        // so an index here is unjustified. Backfill every already-tagged row with a
-        // stamp AT MIGRATION TIME so it gets a full TTL from upgrade, keeping the
-        // invariant `actionTag != nil ⇒ actionTagSetAt != nil` true from day one —
-        // including for the historic v53/legacy raw-SQL rows whose actionTag is the
-        // string 'none' (still NOT NULL in SQL, so still covered by this WHERE
-        // clause). Convergence: a fresh install runs v53 then v81, an existing DB
-        // skips v53 and runs v81 — either way every row carrying a tag when v81
-        // runs leaves it stamped, and every untagged row leaves it NULL.
+        // so an index here is unjustified.
         //
-        // `foreignKeyChecks: .immediate` — SAFE, and one column away from not
+        // 🚨 SCHEMA ONLY — THERE IS DELIBERATELY NO BACKFILL. An earlier revision of
+        // this body followed the `ADD COLUMN` with
+        // `UPDATE messageHeader SET actionTagSetAt = ? WHERE actionTag IS NOT NULL`,
+        // binding `Date()`. It was removed 2026-08-05. Harness-measured at profile H
+        // (500k headers / 3.4 GB, `scratchpad/MIGRATION_COST`): the `UPDATE`
+        // statement alone took **1,320.8 ms**, and it was the ENTIRE reason this
+        // migration needed transient WAL headroom — peak file+WAL+shm fell from
+        // **3,697.7 MB to 3,388.1 MB** when it was removed, i.e. **309.6 MB** of
+        // required free space, one half of the documented precondition. The body is
+        // now 0.9 ms. A full consumer census shows what that bought.
+        //
+        // THE LEGACY-ROW RULE, which is what replaces it. A row that was already
+        // carrying an action tag when `v81` ran keeps `actionTagSetAt = NULL`.
+        // `actionTagSetAt` has exactly ONE production reader,
+        // `SyncEngineMaintenance.sweepStaleActionTags`, whose TTL test is
+        // `if let setAt = msg.actionTagSetAt, setAt > cutoff { continue }` — so a
+        // NULL stamp is treated as ALREADY EXPIRED. That is the deliberate fail-safe
+        // direction recorded at the sweep itself, and it matches TB's
+        // `purgeExpiredActionEntries`, where a missing timestamp is likewise treated
+        // as expired (ADR-IOS-008). The whole user-visible difference the backfill
+        // made: a legacy tag on a message that had ALREADY LEFT THE INBOX is cleared
+        // on the next maintenance pass instead of after a further week. The sweep
+        // iterates non-inbox folders only (`Folder.filter(… role != inbox)`), because
+        // action tags are inbox-scoped and the chip must not follow a message into
+        // Archive/Trash — so tags on inbox messages are unaffected either way, and
+        // clearing an out-of-inbox tag is precisely what the sweep exists to do.
+        // This state is not new: `ReplyParentResolver` documents a path that
+        // "Deliberately does NOT stamp `actionTagSetAt`", so
+        // `actionTag != nil ∧ actionTagSetAt == nil` is already designed for.
+        //
+        // ⚠️ NEGATIVE CASE, and it is the important half: this is NOT licence for a
+        // GOING-FORWARD writer to skip the stamp. Every writer after `v81` must keep
+        // `actionTag != nil ⇒ actionTagSetAt != nil`, which is exactly what
+        // `MessageHeader.setActionTag` enforces atomically. The relaxation applies to
+        // pre-`v81` rows and to nothing else.
+        //
+        // `foreignKeyChecks: .immediate` — SAFE, and one statement away from not
         // being. `messageHeader` is the PARENT of `messageReference` and
-        // `messageUserLabel`, and its own `accountId` is a CHILD key into
-        // `account`. The `SET` list below writes neither: only
-        // `actionTagSetAt`. ⚠️ NEGATIVE CASE: if this `UPDATE` were ever
-        // widened to touch `id`, `ON UPDATE NO ACTION` would ABORT it under
-        // `.immediate` while `.deferred` would pass whenever the final state
-        // happened to be consistent. Widening the SET list means re-deciding
-        // this mode.
+        // `messageUserLabel`, and its own `accountId` is a CHILD key into `account`.
+        // `ADD COLUMN` writes no key of either kind. ⚠️ NEGATIVE CASE: if a row-
+        // touching statement is ever added here and it writes `id`,
+        // `ON UPDATE NO ACTION` would ABORT it under `.immediate` while `.deferred`
+        // would pass whenever the final state happened to be consistent. Adding one
+        // means re-deciding this mode.
         //
-        // ⚠️ FREE SPACE. This body is ONE transaction over every tagged
-        // `messageHeader`, so the WAL holds ~300 MB at profile H (500k headers /
-        // 3.4 GB) before it commits. It does NOT leave the file larger — the pages
-        // return to the freelist — but a device with under ~300 MB free cannot
-        // complete it, and a migration that cannot complete is the "Updating…"
-        // boot-hang shape. `v82` has the same requirement. Registered as
-        // `IOS-MIGRATION-001` in `KNOWN_ISSUES.md`; do not widen either body into a
-        // second full-table pass without re-measuring the peak.
+        // ⚠️ FREE SPACE — REDUCED, NOT REMOVED. Dropping the backfill removes `v81`'s
+        // half of the transient WAL headroom requirement; `v82` still needs ~300 MB
+        // on its own and that is unavoidable (it is a genuine table rebuild). The
+        // precondition therefore stays open — registered as `IOS-MIGRATION-003` in
+        // `KNOWN_ISSUES.md` — and this body must not grow a full-table pass back
+        // without re-measuring the peak.
+        //
+        // CONVERGENCE (Data Integrity rule 5): additive and idempotent. A fresh
+        // install and an existing database both end with one nullable column and no
+        // row touched.
         migrator.registerTimedMigration(
             "v81_addActionTagSetAt", foreignKeyChecks: .immediate
         ) { db in
             try db.alter(table: "messageHeader") { t in
                 t.add(column: "actionTagSetAt", .datetime)
             }
-            try db.execute(sql: """
-                UPDATE messageHeader
-                SET actionTagSetAt = ?
-                WHERE actionTag IS NOT NULL
-                """, arguments: [Date()])
         }
 
         // v82: account-scoped `userLabel` identity (D10 / `IOS-LABEL-001`).
@@ -2576,7 +2603,10 @@ final class AppDatabase: Sendable {
         // (500k headers / 1M associations / 3.4 GB), held until the single
         // transaction commits. The file does NOT grow across the migration
         // (3,385.4 MB before → 3,385.4 MB after), so this is a transient headroom
-        // requirement, not a permanent one. Registered as `IOS-MIGRATION-001`.
+        // requirement, not a permanent one. Registered as `IOS-MIGRATION-003`
+        // (renumbered 2026-08-05: `IOS-MIGRATION-001` was in use for a different
+        // subject). Since `v81`'s backfill was dropped, THIS body is the only one
+        // in the range that carries the precondition.
         //
         // ✅ CLOSED DECISION — STEP 5's PLAN IS ALREADY OPTIMAL; DO NOT "OPTIMISE" IT.
         // The obvious idea is to index `messageUserLabel_v82_legacy` so step 5's

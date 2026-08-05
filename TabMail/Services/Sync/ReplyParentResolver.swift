@@ -149,10 +149,20 @@ enum ReplyParentResolver {
     /// Deliberately does NOT stamp `actionTagSetAt` (unlike the going-forward
     /// `markParentsReplied` path above): this runs inside migration v53, and on a
     /// fresh install the `actionTagSetAt` column does not exist yet — v81 adds it
-    /// afterwards. v81's backfill (`WHERE actionTag IS NOT NULL`) covers every row
-    /// this writes, because the `'none'` it assigns is NOT NULL in SQL. Migration
-    /// ordering, not a stamp here, is what keeps `actionTag != nil ⇒
-    /// actionTagSetAt != nil` true for these rows.
+    /// afterwards, and it cannot be stamped before it exists.
+    ///
+    /// ⚠️ Updated 2026-08-05: v81 used to backfill a stamp onto every already-tagged
+    /// row (which covered the rows this writes, because the `'none'` it assigns is
+    /// NOT NULL in SQL). That backfill is GONE — v81 is schema-only now. So these
+    /// rows carry `actionTag != nil` with a NULL `actionTagSetAt`, which is the
+    /// documented LEGACY-ROW state: `SyncEngineMaintenance.sweepStaleActionTags`
+    /// treats a NULL stamp as already expired, so such a tag is reclaimed on the
+    /// next maintenance pass once the message has left the inbox, rather than after
+    /// a further TTL. That is the intended fail-safe direction, and it is the same
+    /// direction TB's `purgeExpiredActionEntries` takes (ADR-IOS-008). The
+    /// going-forward invariant `actionTag != nil ⇒ actionTagSetAt != nil` is
+    /// enforced by `MessageHeader.setActionTag` and still holds for every writer
+    /// after v81; this v53-era path is not one of them.
     ///
     /// Returns the number of parent rows updated, for logging.
     @discardableResult
