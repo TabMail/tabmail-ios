@@ -855,8 +855,46 @@ extension SyncEngine {
                         let observation = try await workQueue.execute(priority: .headerFetch) {
                             try await imapProvider.getUidNextWithEpoch(folder: folder.path)
                         }
+                        // 🚨 ABSENCE OF EVIDENCE IS NOT A REPORT OF AN EMPTY
+                        // MAILBOX. `uidNext == nil` means this SELECT carried
+                        // no `* OK [UIDNEXT n]` at all (see
+                        // `IMAPProvider.getUidNextWithEpoch` — SwiftMail
+                        // defaults the field to `UID(0)` and RFC 3501 §6.3.1
+                        // types it `nz-number`, so zero is unreportable). It
+                        // used to arrive here as the number 0, produce
+                        // `initialCursor == -1`, and take the `< 1` early-out
+                        // below — which is written for UIDNEXT 1, the one
+                        // value that DOES prove the mailbox never held a
+                        // message. That marked the folder `backfillComplete`,
+                        // and completion excludes it from `remaining` on every
+                        // later pass, so nothing ever revisited it: a whole
+                        // mailbox silently outside automatic backfill forever.
+                        // `uidNext == 1` (evidence of empty) and no UIDNEXT
+                        // (absence of evidence) must not take the same branch
+                        // — `MIS-IOS-004`, the most repeated defect here.
+                        //
+                        // Declining leaves the row EXACTLY as this pass found
+                        // it — `backfillComplete` still false, no cursor, no
+                        // stamp — so the next call meets the same
+                        // preconditions and retries, same shape as the
+                        // bootstrap-write-failure decline below. The stamp is
+                        // deliberately NOT written on this path either: the
+                        // folder stays in `remaining`, so a later pass that
+                        // does see a UIDNEXT will stamp it (that is exactly
+                        // what NB3 required, and the requirement only bit
+                        // because the old branch marked the folder complete).
+                        // The decline set bounds this to ONE observation per
+                        // folder per call rather than a network-rate spin
+                        // against a nonconforming server.
+                        guard let observedUidNext = observation.uidNext else {
+                            epochDeclinedFolderIds.insert(folder.id)
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[Backfill] \(folder.name) declined: the walk-start SELECT reported no UIDNEXT — absence of evidence, not an empty mailbox; leaving the folder incomplete, retry next cycle")
+                            }
+                            continue
+                        }
                         walkEpoch = observation.observedEpoch
-                        walkStart = .fresh(uidNext: observation.uidNext)
+                        walkStart = .fresh(uidNext: observedUidNext)
                     }
 
                     // ── THE WALK-START EPOCH GATE ── one site, three outcomes.
@@ -1005,18 +1043,29 @@ extension SyncEngine {
                             .beforeFreshBookkeepingWrite(folderId: folderId))
                         #endif
                         if initialCursor < 1 {
-                            // NB3 (round 8): this early-out used to skip the epoch
-                            // bootstrap entirely. It must not: the walk-start
-                            // SELECT above observed the epoch, and this branch
-                            // fires both for a genuinely empty mailbox
-                            // (UIDNEXT == 1) and for a server that reported no
-                            // UIDNEXT at all (SwiftMail defaults it to 0, giving
-                            // `initialCursor == -1`). Both leave the folder
-                            // `backfillComplete` and never revisited — so a folder
+                            // This branch now fires for EXACTLY ONE input:
+                            // UIDNEXT == 1, giving `initialCursor == 0`. That is
+                            // positive evidence — RFC 3501 §2.3.1.1 assigns UIDs
+                            // strictly increasing from 1, so UIDNEXT 1 proves the
+                            // mailbox has never held a message — and marking it
+                            // `backfillComplete` is correct and must keep
+                            // settling, or the folder is re-crawled forever.
+                            //
+                            // The OTHER input it used to accept — a SELECT that
+                            // carried no UIDNEXT at all, which SwiftMail defaults
+                            // to 0 and which reached here as
+                            // `initialCursor == -1` — is refused above, at the
+                            // `.fresh` construction, where the observation is
+                            // still in hand. That was NB3's (round 8) live
+                            // hazard: both inputs left the folder
+                            // `backfillComplete` and never revisited, so a folder
                             // that took this branch could never be stamped by any
-                            // later pass. Same transaction as the completion write,
-                            // so a failure of either leaves the folder incomplete
-                            // and it is retried.
+                            // later pass. NB3's own remedy — bootstrap the epoch
+                            // in this same transaction — is retained below and
+                            // still load-bearing for the empty-mailbox case.
+                            // Same transaction as the completion write, so a
+                            // failure of either leaves the folder incomplete and
+                            // it is retried.
                             //
                             // 🚨 ROUND 12, BLOCKER A — THIS WRITE WAS UNGUARDED,
                             // and `9e0c4797e`'s message and `crawlWalkWriteAllowed`'s

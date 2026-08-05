@@ -99,6 +99,62 @@ enum InboxListReader {
             if query.filterUnread {
                 q = q.filter(Column("isRead") == false)
             }
+            // 🚨 THE LABEL FILTER RUNS HERE, IN SQL, BEFORE THIS QUERY'S `LIMIT`
+            // — NEVER only in memory after it. `InboxListComposer.compose`
+            // step 6 applies the identical `isSubset` predicate to D, P and S
+            // uniformly and REMAINS the authority for P and S (a P row is
+            // fetched by id, an S row synthesizes with `userLabels == []`).
+            // What it must not be is the FIRST place a DURABLE row meets the
+            // filter: the `limit(query.targetCount)` below IS the page, so a
+            // filter applied after it NARROWS the page instead of SELECTING
+            // it. Two decisions downstream then read a post-filter SURVIVOR
+            // count as a statement about the source:
+            //
+            //  * `InboxViewModel`'s `hasMoreMessages = loadedMessages.count >=
+            //    targetWindowSize` (`resetMessages`, `reloadMessages`) and
+            //    `>= SyncConfig.inboxPageSize` (`loadMoreMessages` phase 1).
+            //    Filtering by a label with 2 hits in the newest 50 rows made a
+            //    full page look short, flipped exhaustion true, and left every
+            //    older match unreachable by scrolling.
+            //  * The pagination cursor itself — `loadedMessages.last?.date` —
+            //    which named the oldest SURVIVING row rather than the oldest
+            //    row EXAMINED, and is `nil` outright when nothing survived.
+            //
+            // Both become honest for free once the `LIMIT` bounds MATCHING
+            // rows, which is why this is filtered here rather than compensated
+            // for downstream with a coverage signal (CLAUDE.md A3: the
+            // deviation was the sibling's ordering, not a missing mechanism).
+            //
+            // `filterLabelIds` is an AND (`isSubset`), so one `EXISTS` per id,
+            // ANDed; `.sorted()` keeps the statement shape stable for the
+            // cache. `userLabelId` is the account-prefixed surrogate
+            // (`"<accountId>:<providerLabelId>"`, D10 / `IOS-LABEL-001`), so
+            // this join cannot cross an account boundary any more than
+            // compose's in-memory set comparison can. Each probe is covered by
+            // `messageUserLabel`'s PRIMARY KEY (`messageId`, `userLabelId`).
+            //
+            // ⚠ Stated negatively: this is a SUPERSET of step 6's predicate by
+            // exactly one corner — step 6 compares against `userLabels`, which
+            // `UserLabelStore.loadLabels` has already narrowed by `isSystem`
+            // and `shouldExcludeLabel`, and neither is expressible here. A
+            // `filterLabelIds` naming a system or excluded label would pass
+            // SQL and still be dropped by step 6, re-creating the narrowing
+            // this removes. `LabelFilterPickerView` offers only
+            // `UserLabelStore.allLabels`, which excludes both, so no reachable
+            // filter can name one — do not widen `filterLabelIds`' producers
+            // without moving that narrowing here too.
+            for labelId in query.filterLabelIds.sorted() {
+                q = q.filter(
+                    sql: """
+                    EXISTS (
+                        SELECT 1 FROM messageUserLabel
+                        WHERE messageUserLabel.messageId = messageHeader.id
+                          AND messageUserLabel.userLabelId = ?
+                    )
+                    """,
+                    arguments: [labelId]
+                )
+            }
             if let cutoff = query.beforeDate {
                 q = q.filter(Column("date") < cutoff)
             }

@@ -157,6 +157,17 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// so this models the one wire shape that can hand the app a `0` and let
         /// it be mistaken for a real epoch. Empty for every pre-existing test.
         var selectUidValiditySuppressed: Set<String> = []
+        /// Mailboxes whose SELECT/EXAMINE response OMITS the
+        /// `* OK [UIDNEXT n]` line entirely (`suppressSelectUidNext`). The
+        /// exact sibling of `selectUidValiditySuppressed`, for the exact same
+        /// reason: RFC 3501 §6.3.1 lists UIDNEXT among SELECT's REQUIRED OK
+        /// untagged responses and §2.3.1.1 types it `nz-number`, so a server
+        /// omitting it is NONCONFORMING and `0` is not a value any conformant
+        /// server can send — yet SwiftMail defaults
+        /// `Mailbox.Selection.uidNext` to `UID(0)`, so omission is the only
+        /// deterministic way to produce the "the server did not say" wire
+        /// shape. Empty for every pre-existing test.
+        var selectUidNextSuppressed: Set<String> = []
         /// T3.4 — source UIDs this server COPIES normally but deliberately
         /// leaves OUT of its `COPYUID` response code. RFC 4315 §3 makes sending
         /// `COPYUID` a MAY, so a real UIDPLUS server withholding it (for some
@@ -943,6 +954,32 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { state in _ = state.selectUidValiditySuppressed.remove(mailbox) }
     }
 
+    /// Test seam: make this mailbox's SELECT/EXAMINE omit the
+    /// `* OK [UIDNEXT n]` untagged response entirely.
+    ///
+    /// ⚠ **This models a NONCONFORMING server**, exactly like
+    /// `suppressSelectUidValidity`. RFC 3501 §6.3.1 lists UIDNEXT among
+    /// SELECT's REQUIRED OK untagged responses; §2.3.1.1 types it `nz-number`.
+    /// It is nonetheless the only deterministic way to produce the wire shape
+    /// the backfill crawl's `.fresh` branch has to decide about, because
+    /// SwiftMail parses a missing line into `Mailbox.Selection.uidNext ==
+    /// UID(0)` — indistinguishable from a report unless the client normalises
+    /// it. `setMessages(…, [])` would instead make the fake send a real
+    /// `UIDNEXT 1`, which is the OPPOSITE case (positive evidence of an empty
+    /// mailbox), so the two are not interchangeable.
+    func suppressSelectUidNext(for mailbox: String) {
+        withState { state in _ = state.selectUidNextSuppressed.insert(mailbox) }
+    }
+
+    /// Undo `suppressSelectUidNext(for:)` — this mailbox's SELECT/EXAMINE
+    /// reports `* OK [UIDNEXT n]` again from the next SELECT on. Needed for
+    /// the same two-sided reason as `restoreSelectUidValidity`: a refusal that
+    /// keys off "this SELECT reported no UIDNEXT" must be shown both to recur
+    /// while the omission persists AND to clear on one conformant SELECT.
+    func restoreSelectUidNext(for mailbox: String) {
+        withState { state in _ = state.selectUidNextSuppressed.remove(mailbox) }
+    }
+
     /// Test seam: replace a mailbox's entire message list. Used to simulate
     /// the renumbering half of a UIDVALIDITY reset — a previously-meaningful
     /// UID now names a completely different ("decoy") message. Flags are
@@ -1519,11 +1556,12 @@ final class FakeIMAPServer: @unchecked Sendable {
                     : "\(tag) NO Mailbox does not exist\r\n"
             }
             selectedMailbox = mailbox
-            let (messages, uidValidity, suppressUidValidity) = withState { state in
+            let (messages, uidValidity, suppressUidValidity, suppressUidNext) = withState { state in
                 (
                     state.messagesByMailbox[mailbox] ?? [],
                     state.uidValidityByMailbox[mailbox] ?? 1,
-                    state.selectUidValiditySuppressed.contains(mailbox)
+                    state.selectUidValiditySuppressed.contains(mailbox),
+                    state.selectUidNextSuppressed.contains(mailbox)
                 )
             }
             let count = messages.count
@@ -1535,11 +1573,15 @@ final class FakeIMAPServer: @unchecked Sendable {
             let uidValidityLine = suppressUidValidity
                 ? ""
                 : "* OK [UIDVALIDITY \(uidValidity)] UIDs valid\r\n"
+            // Same reasoning for UIDNEXT: `nz-number`, so omission — not
+            // `UIDNEXT 0` — is the only faithful route to `UID(0)`.
+            let uidNextLine = suppressUidNext
+                ? ""
+                : "* OK [UIDNEXT \(uidnext)] Predicted next UID\r\n"
             return """
             * \(count) EXISTS\r
             * 0 RECENT\r
-            \(uidValidityLine)* OK [UIDNEXT \(uidnext)] Predicted next UID\r
-            * FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r
+            \(uidValidityLine)\(uidNextLine)* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r
             * OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft \\*)] Flags permitted\r
             \(tag) OK [READ-WRITE] SELECT completed\r
 

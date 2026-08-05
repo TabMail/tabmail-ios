@@ -76,8 +76,13 @@ struct ComposeInputs: Sendable {
     /// re-excluding the row) rather than "fixing" it — parity first, per the
     /// migration plan.
     ///
-    /// Label filter is NOT applied here — `compose` owns label filtering
-    /// uniformly for D/P/S (step 6).
+    /// Label filter: D arrives ALREADY filtered at the SQL level, BEFORE the
+    /// per-folder `LIMIT` — see `InboxListReader.gather`, which explains why
+    /// the ordering is load-bearing (a filter applied after the `LIMIT`
+    /// narrows the page instead of selecting it, and both `hasMoreMessages`
+    /// and the pagination cursor then read a survivor count). Step 6 below
+    /// still re-applies the same predicate uniformly, and remains the ONLY
+    /// place P and S meet it.
     let durable: [MessageSnapshot]
     /// P — overlay-pinned rows: overlay entries whose `folderId` mutation
     /// points INTO the displayed folder set but whose durable row is
@@ -248,6 +253,15 @@ enum InboxListComposer {
         // always drops them — the deliberate unification called out in
         // PLAN_INBOX_UNIFIED_READ.md §2.1 step 3 (today's `insertStagedRows`
         // skips this filter entirely; the reader unifies it).
+        //
+        // For D this is now a BELT: `InboxListReader.gather` applies the same
+        // predicate in SQL *before* the per-folder `LIMIT`, so a durable row
+        // reaching here already satisfies it — except in the one corner that
+        // SQL cannot express, a `filterLabelIds` naming an `isSystem` or
+        // `shouldExcludeLabel` label (unreachable from
+        // `LabelFilterPickerView`; see the reader's note). It is kept because
+        // P and S have no SQL leg at all: dropping it here would let every
+        // unlabeled staged row through an active filter.
         if !query.filterLabelIds.isEmpty {
             rows = rows.filter { snapshot in
                 query.filterLabelIds.isSubset(of: Set(snapshot.userLabels.map(\.id)))

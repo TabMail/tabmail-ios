@@ -1270,6 +1270,126 @@ struct BackfillOnlyFolderEpochTests {
         #expect(after?.backfillComplete == false && after?.backfillUidCursor == nil,
                 "a pass whose bookkeeping write failed must leave the folder exactly as it found it")
     }
+
+    // MARK: - Absence of a UIDNEXT is not a report of an empty mailbox
+
+    /// 🚨 `MIS-IOS-004`, the most repeated defect in this codebase: "could not
+    /// determine" treated as an authoritative answer.
+    ///
+    /// `Mailbox.Selection.uidNext` is non-optional with a `UID(0)` default and
+    /// `SelectHandler` assigns it only when the wire carried `* OK [UIDNEXT n]`,
+    /// so a SELECT that never mentioned UIDNEXT reached the crawl as the number
+    /// **0**. The `.fresh` branch computed `initialCursor = uidNext - 1 == -1`,
+    /// took the `initialCursor < 1` early-out — which exists for UIDNEXT **1**,
+    /// the one value that PROVES the mailbox never held a message (RFC 3501
+    /// §2.3.1.1: UIDs are assigned strictly increasing from 1) — and wrote
+    /// `backfillComplete = true`. Completion removes the folder from
+    /// `remaining` on every later pass, so nothing ever revisited it.
+    ///
+    /// THE INVARIANT, asserted as a system property rather than on which flag
+    /// the refusing pass set: **a folder whose UIDNEXT the server never
+    /// reported is never marked fully crawled, and its mail still arrives once
+    /// a SELECT does report one.** The second half is what makes the refusal a
+    /// deferral rather than a new dead end, and it is asserted on the MAIL, so
+    /// a "fix" that merely withholds the flag while still never crawling the
+    /// folder stays red.
+    @Test("A folder whose UIDNEXT the server never reported is never marked fully crawled")
+    @MainActor
+    func aFolderWithNoReportedUidNextIsNeverMarkedFullyCrawled() async throws {
+        let crawledRfc = "no-uidnext@example.com"
+        let server = FakeIMAPServer(
+            capabilities: Self.nonUidplusCapabilities,
+            mailboxes: [
+                "INBOX": [],
+                "Receipts": [Self.message(uid: 9, id: crawledRfc, subject: "reachable")],
+            ])
+        server.suppressSelectUidNext(for: "Receipts")
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "t13-no-uidnext"
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try Self.insertBackfillOnlyFolder(accountId: accountId, path: "Receipts", pool: pool, cursor: nil)
+
+        let imap = Self.provider(for: server)
+        try await imap.connect()
+        defer { Task { try? await imap.disconnect() } }
+        let engine = await Self.makeEngine(accountId: accountId, provider: imap)
+        _ = await engine.runBackfill(account: account)
+
+        let afterRefusal = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "Receipts", pool: pool)
+        #expect(afterRefusal?.backfillComplete == false,
+                """
+                a SELECT that reported no UIDNEXT marked the folder fully crawled — absence of \
+                evidence took the branch written for UIDNEXT 1, which is EVIDENCE of an empty \
+                mailbox; completion then excluded the folder from every later crawl
+                """)
+        #expect(afterRefusal?.backfillUidCursor == nil,
+                "a cursor was planted from a UIDNEXT the server never reported")
+
+        // THE RECOVERY, asserted on the mail: one conformant SELECT and the
+        // folder crawls normally. Pre-fix this is unreachable — the folder was
+        // already `backfillComplete`, so `remaining` never hands it back.
+        server.restoreSelectUidNext(for: "Receipts")
+        _ = await engine.runBackfill(account: account)
+
+        let rows = try Self.headers(pool, folderId: "\(accountId):Receipts")
+        #expect(rows.contains { $0.rfc822MessageId == crawledRfc },
+                """
+                the folder never recovered once the server reported a UIDNEXT — the refusal has \
+                to be a deferral, not a second permanent dead end
+                """)
+        let afterRecovery = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "Receipts", pool: pool)
+        #expect(afterRecovery?.backfillComplete == true,
+                "the recovered crawl never settled — the folder would be re-walked forever")
+    }
+
+    /// The negative case, and the two-sided non-vacuity anchor for the test
+    /// above: it must stay GREEN with that fix inverted. A genuinely empty
+    /// mailbox reports `UIDNEXT 1` — positive evidence — and MUST still settle,
+    /// or the refusal has simply been widened into the mirror-image defect
+    /// (`MIS-005`): an unbounded re-crawl of every empty folder, forever.
+    @Test("A genuinely empty mailbox (UIDNEXT 1) still settles as fully crawled, and stays settled")
+    @MainActor
+    func aGenuinelyEmptyMailboxStillSettles() async throws {
+        let server = FakeIMAPServer(
+            capabilities: Self.nonUidplusCapabilities,
+            mailboxes: ["INBOX": [], "Receipts": []])
+        server.setUidValidity(770_101, for: "Receipts")
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "t13-empty-settles"
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try Self.insertBackfillOnlyFolder(accountId: accountId, path: "Receipts", pool: pool, cursor: nil)
+
+        let imap = Self.provider(for: server)
+        try await imap.connect()
+        defer { Task { try? await imap.disconnect() } }
+        let engine = await Self.makeEngine(accountId: accountId, provider: imap)
+        _ = await engine.runBackfill(account: account)
+
+        let after = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "Receipts", pool: pool)
+        #expect(after?.backfillComplete == true,
+                "an empty mailbox reporting UIDNEXT 1 must settle — it is proven empty, not unknown")
+        #expect(after?.lastKnownUidNext == 1)
+        // NB3's requirement survives: the completion write stamps the epoch in
+        // the same transaction, so an empty folder is still gestureable.
+        #expect(after?.lastKnownUidValidity == 770_101,
+                "the empty-mailbox completion stopped stamping the epoch (NB3)")
+
+        // Still settled on a second pass — it is excluded from `remaining`, so
+        // nothing re-walks it.
+        _ = await engine.runBackfill(account: account)
+        let again = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "Receipts", pool: pool)
+        #expect(again?.backfillComplete == true, "a settled empty folder was re-opened by a later pass")
+    }
 }
 
 /// Signal gate for the two-walk interleaving above. Polled with a bounded

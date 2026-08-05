@@ -1052,4 +1052,189 @@ struct InboxListBehaviorPinningTests {
         #expect(vm.loadedMessages[0].snippet == "new snippet")
         #expect(vm.loadedMessages[0].computedThreadId == "thread-new")
     }
+
+    // MARK: - 17. The label filter selects the page; it never narrows it
+    //
+    // 🚨 EXHAUSTION IS A STATEMENT ABOUT WHAT THE SOURCE HAS LEFT, NEVER ABOUT
+    // HOW MANY ROWS SURVIVED IN-MEMORY NARROWING. `InboxViewModel`'s three
+    // `hasMoreMessages = <count> >= <page size>` sites (`resetMessages`,
+    // `reloadMessages`, `loadMoreMessages` phase 1) compare against
+    // `loadedMessages`, which is `InboxListComposer.compose`'s output. While
+    // the label filter ran only as compose step 6 — i.e. AFTER
+    // `InboxListReader.gather`'s per-folder SQL `LIMIT` — that count was a
+    // post-filter SURVIVOR count: a FULL page of durable rows containing two
+    // matches produced `2 >= 50 == false`, the scroller stopped, and every
+    // older match in the folder became unreachable by scrolling. The
+    // pagination cursor was wrong in the same way — `loadedMessages.last?.date`
+    // named the oldest SURVIVING row, not the oldest row EXAMINED.
+    //
+    // The invariant asserted here is the SYSTEM property, not the mechanism:
+    // **a page the query filled is never reported as exhausted, and every
+    // message matching an active label filter is reachable by paging.** It is
+    // asserted on reachability of the ids, so it stays red on any
+    // re-implementation that gets exhaustion right and the cursor wrong.
+
+    /// Seeds `INBOX` with 178 durable rows, newest first, and applies
+    /// `acc1:label-x` to indices 48..<178 — so exactly TWO matches fall inside
+    /// the newest 50 raw rows, and 130 match in total. Returns the ordered ids
+    /// of every matching row.
+    @discardableResult
+    private func seedLabelFilterFolder(pool: DatabasePool, inbox: Folder) async throws -> [String] {
+        let base = Date()
+        var matching: [String] = []
+        var headers: [MessageHeader] = []
+        for i in 0..<178 {
+            // Descending dates: index 0 is newest, so SQL `ORDER BY date DESC`
+            // returns them in index order.
+            let h = makeDurableHeader(
+                folder: inbox, messageId: "m\(String(format: "%03d", i))",
+                date: base.addingTimeInterval(TimeInterval(-i * 60))
+            )
+            if i >= 48 { matching.append(h.id) }
+            headers.append(h)
+        }
+        let captured = headers
+        try await pool.writeWithoutTransaction { db in
+            try UserLabel(accountId: "acc1", providerLabelId: "label-x", name: "Filtered", isSystem: false)
+                .insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "label-rare", name: "Rare", isSystem: false)
+                .insert(db)
+            for (i, h) in captured.enumerated() {
+                try h.insert(db)
+                if i >= 48 {
+                    try MessageUserLabel(messageId: h.id, userLabelId: "acc1:label-x").insert(db)
+                }
+            }
+        }
+        return matching
+    }
+
+    @Test("a full page of durable rows carrying two label matches is never reported as exhausted, and every match is reachable by paging")
+    func labelFilteredPagingReachesEveryMatch() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        let matching = try await seedLabelFilterFolder(pool: pool, inbox: inbox)
+        #expect(matching.count == 130)
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.filterLabelIds = ["acc1:label-x"]
+        vm.resetMessages()
+
+        // Page 1: the query had 130 matching rows to offer and was cut off by
+        // its own LIMIT, so the page is FULL and the folder is not exhausted.
+        // Pre-fix this was 2 rows and `hasMoreMessages == false`.
+        #expect(vm.loadedMessages.count == SyncConfig.inboxPageSize,
+                "page 1 under a label filter did not fill: got \(vm.loadedMessages.count) rows")
+        #expect(vm.hasMoreMessages,
+                """
+                a page the query FILLED was reported as exhausted — `hasMoreMessages` read a                 post-label-filter survivor count instead of what the source had left
+                """)
+
+        // Page to exhaustion, entirely from the local store. `loadMoreMessages`
+        // phase 1 returns a non-empty page every time here, so phase 2's
+        // network pull is never reached; a bound is asserted rather than
+        // assumed so a regression shows up as a failure, not a hang.
+        var iterations = 0
+        while vm.hasMoreMessages && iterations < 6 {
+            vm.loadMoreMessages()
+            iterations += 1
+        }
+        #expect(!vm.hasMoreMessages,
+                "paging never settled under a label filter (\(iterations) rounds)")
+        #expect(iterations <= 3, "paging took \(iterations) rounds for 130 matches at a page size of 50")
+        #expect(vm.error == nil, "paging fell through to the network path: \(vm.error ?? "")")
+
+        // THE INVARIANT: every matching message is reachable, exactly once,
+        // and nothing unlabeled leaked in.
+        let reached = vm.loadedMessages.map(\.id)
+        #expect(Set(reached).count == reached.count, "a message was paged in twice")
+        #expect(Set(reached) == Set(matching),
+                """
+                \(Set(matching).subtracting(reached).count) matching message(s) were unreachable by                 scrolling, and \(Set(reached).subtracting(matching).count) non-matching row(s) leaked in
+                """)
+    }
+
+    /// The negative case — a folder whose matches do NOT fill a page must still
+    /// report exhaustion, or "report more whenever anything was filtered out"
+    /// would pass the test above while never letting the scroller stop.
+    ///
+    /// ⚠ It is NOT the non-vacuity anchor, and an earlier version of this
+    /// comment claimed it was. It fails RED under the fix's inversion — by
+    /// `count == 2`, because pre-fix the second match (140 rows below the first
+    /// raw page) is never found at all — so it is a second red member, not a
+    /// control. The tests that stayed GREEN under the same inversion, and so
+    /// carry the two-sided burden here, are `twoSelectedLabelsAreAnded` below
+    /// (a fix that simply dropped the label filter would admit the one-label
+    /// row) and `InboxEndToEndInvariantTests.paginationCompletenessNormal`
+    /// (I9 — `hasMoreMessages` goes false only at true exhaustion).
+    @Test("a label filter whose matches do not fill a page still reports exhaustion, on the page that could not fill")
+    func labelFilterUnderOnePageStillReportsExhaustion() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        try await seedLabelFilterFolder(pool: pool, inbox: inbox)
+        // Two rows carry `label-rare`, one inside the newest 50 raw rows and
+        // one far below it — so a correct implementation must still SCAN past
+        // the first raw page to find the second, and then stop.
+        try await pool.writeWithoutTransaction { db in
+            try MessageUserLabel(messageId: "acc1:INBOX:m010", userLabelId: "acc1:label-rare").insert(db)
+            try MessageUserLabel(messageId: "acc1:INBOX:m150", userLabelId: "acc1:label-rare").insert(db)
+        }
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.filterLabelIds = ["acc1:label-rare"]
+        vm.resetMessages()
+
+        #expect(vm.loadedMessages.count == 2)
+        guard vm.loadedMessages.count == 2 else { return }
+        #expect(vm.loadedMessages.map(\.id) == ["acc1:INBOX:m010", "acc1:INBOX:m150"],
+                "the second match, 140 rows below the first raw page, was not found")
+        #expect(!vm.hasMoreMessages,
+                "a folder holding exactly two matches must report exhaustion, not keep the scroller armed")
+    }
+
+    /// `filterLabelIds` is an AND (`isSubset`), and it must stay one now that
+    /// the predicate is expressed as one `EXISTS` per id in SQL. A row
+    /// carrying only ONE of two selected labels must not appear.
+    @Test("two selected labels are ANDed, not ORed — a row carrying only one of them is excluded")
+    func twoSelectedLabelsAreAnded() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        let both = makeDurableHeader(folder: inbox, messageId: "m-both", date: Date())
+        let onlyX = makeDurableHeader(folder: inbox, messageId: "m-only-x", date: Date().addingTimeInterval(-60))
+        try await pool.writeWithoutTransaction { db in
+            let b = both; try b.insert(db)
+            let o = onlyX; try o.insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "label-x", name: "X", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "label-y", name: "Y", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: both.id, userLabelId: "acc1:label-x").insert(db)
+            try MessageUserLabel(messageId: both.id, userLabelId: "acc1:label-y").insert(db)
+            try MessageUserLabel(messageId: onlyX.id, userLabelId: "acc1:label-x").insert(db)
+        }
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.filterLabelIds = ["acc1:label-x", "acc1:label-y"]
+        vm.resetMessages()
+
+        #expect(vm.loadedMessages.count == 1)
+        guard vm.loadedMessages.count == 1 else { return }
+        #expect(vm.loadedMessages[0].id == both.id, "an OR would have admitted the row carrying only one label")
+    }
 }

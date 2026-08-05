@@ -5670,7 +5670,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `fetchMessageHeaders` (see `selectMailboxTracked`'s round-10 retraction).
     /// The mirror is sound only for the walk's per-chunk COMPARISON, which fails
     /// closed on disagreement; it is not sound for the value the walk writes.
-    func getUidNextWithEpoch(folder: String) async throws -> (uidNext: Int, observedEpoch: UInt32?) {
+    func getUidNextWithEpoch(folder: String) async throws -> (uidNext: Int?, observedEpoch: UInt32?) {
         try await withFolderConnection(folder: folder) { server in
             // T1.3 (round 8): TRACKED. This is the crawl's walk-start SELECT —
             // the one the walk's per-chunk checks compare against. A raw
@@ -5680,7 +5680,23 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // `selectMailboxTracked`'s scope note.
             let selection = try await selectMailboxTracked(server, folder: folder)
             let observed = selection.uidValidity.value
-            return (Int(selection.uidNext.value), observed != 0 ? observed : nil)
+            // 🚨 BOTH HALVES ARE NORMALISED FOR ABSENCE OF EVIDENCE, and only
+            // the epoch used to be. `Mailbox.Selection`'s UIDNEXT and
+            // UIDVALIDITY are BOTH non-optional with a zero default
+            // (`SwiftMail/IMAP/Models/Mailbox.swift`: `public var uidNext: UID
+            // = UID(0)`; `SelectHandler` assigns it only when the wire carried
+            // an `* OK [UIDNEXT n]` response code), and RFC 3501 §6.3.1 types
+            // both as `nz-number`, so ZERO is not a value any conformant
+            // server can report — it means THIS SELECT DID NOT SAY. Returning
+            // it as a number let `SyncEngineBackfillWalk`'s `.fresh` branch
+            // compute `initialCursor = 0 - 1 = -1`, take the `< 1` early-out
+            // written for a genuinely empty mailbox (UIDNEXT 1 ⇒ cursor 0) and
+            // mark the folder `backfillComplete` — permanently, since
+            // completion excludes it from every later crawl. "Could not
+            // determine" is not an authoritative answer (`MIS-IOS-004`);
+            // `nil` makes it unrepresentable as one at the decision site.
+            let next = selection.uidNext.value
+            return (next != 0 ? Int(next) : nil, observed != 0 ? observed : nil)
         }
     }
 
