@@ -34,6 +34,11 @@ struct SearchView: View {
     /// matches the row at its address, so `openResult` navigated nowhere. Without
     /// it the fail-closed refusal is an invisible dead tap.
     @State private var showStaleResultAlert = false
+    /// Raised when a tapped REMOTE result has no folder-native local row to open.
+    /// Separate from `showStaleResultAlert` because the CAUSE is different and the
+    /// copy must not lie: nothing here says the message is gone — only that this
+    /// device holds no copy of it to open.
+    @State private var showRemoteResultUnavailableAlert = false
     @FocusState private var isFieldFocused: Bool
 
     private let manager = AccountManager.shared
@@ -100,6 +105,11 @@ struct SearchView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text("This message is no longer where the search found it. Search again to see what's there now.")
+        }
+        .alert("Not downloaded yet", isPresented: $showRemoteResultUnavailableAlert) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("This result was found on the server, but the message isn't on this device yet, so there's nothing to open. Try again once this folder has finished syncing.")
         }
         .onAppear {
             if ScreenshotMode.isActive {
@@ -367,49 +377,83 @@ struct SearchView: View {
         return headerId
     }
 
+    /// What a tap on a search result does.
+    ///
+    /// 🚨 THERE IS DELIBERATELY NO SILENT CASE, and that absence is the invariant
+    /// this type exists to hold: *no result the user can tap is a no-op.* Both
+    /// resolvers are fail-CLOSED and return `nil` far more often than a reader
+    /// expects (a re-seated address, a remote hit with no local row at all), and
+    /// before this type the remote branch answered a `nil` by simply returning —
+    /// an invisible dead tap, indistinguishable from a broken app. A future
+    /// re-implementation may change how the outcome is DECIDED; it cannot
+    /// reintroduce silence without adding a case here.
+    enum ResultTapOutcome: Equatable {
+        /// Navigate. Carries the witness the resolve validated against, if any.
+        case open(OpenTarget)
+        /// A LOCAL result whose captured content witness no longer matches the row
+        /// at its address (or whose row is gone) — the message moved or was
+        /// replaced since the search ran.
+        case explainStaleLocalResult
+        /// A REMOTE result with no folder-native local row. The message exists on
+        /// the server; this device just has no copy to open.
+        case explainRemoteResultNotOnThisDevice
+    }
+
+    /// Turn a resolve into what the user sees.
+    ///
+    /// `resolvedHeaderId == nil` covers BOTH a refusal and a thrown read: neither
+    /// is evidence that the row is safe to open, and this navigation ends in a
+    /// durable mark-read, so both fail closed the same way.
+    ///
+    /// `nonisolated static` for the same reason as the two resolve helpers: it
+    /// touches no `@State` and needs no view, so a test can call it directly.
+    nonisolated static func tapOutcome(
+        for result: SearchResult, resolvedHeaderId: String?
+    ) -> ResultTapOutcome {
+        let isRemote = result.headerId == nil
+        guard let resolvedHeaderId else {
+            return isRemote ? .explainRemoteResultNotOnThisDevice : .explainStaleLocalResult
+        }
+        // A remote result carries NO content witness (there was no local row to
+        // capture one from) and its resolve validates nothing but the address, so
+        // it must hand `MessageDetailView` `nil` rather than an unproven value —
+        // a false proof is worse than none.
+        return .open(OpenTarget(
+            headerId: resolvedHeaderId,
+            provenRfc822MessageId: isRemote ? nil : result.capturedRfc822MessageId))
+    }
+
     private func openResult(_ result: SearchResult) {
         // Local result with headerId — the address is cached in an in-memory
         // `results` array that predates any re-seat, so prove the row still there
         // is the message this row RENDERED before opening (and durably marking) it.
+        // Remote result: resolve folder-scoped; never a cross-folder/-account guess.
         //
-        // A6 (DB-performance lens): one `MessageHeader` fetch BY PRIMARY KEY, one
-        // row, no scan — the same synchronous `dbPool.read` at the same call site
-        // the remote branch below has always taken, and only on a tap.
-        if let headerId = result.headerId {
-            // A thrown read is not a verdict, but it is also not evidence, and this
-            // navigation ends in a durable mark-read. Fail closed and let the user
-            // re-tap; nothing is queued, so no intention is dropped.
-            let resolved = try? dbPool.read { db in
-                try Self.resolveLocalResultHeaderId(
+        // A6 (DB-performance lens): one `MessageHeader` fetch, one row, no scan —
+        // the same synchronous `dbPool.read` at the same call site both branches
+        // have always taken, and only on a tap.
+        let resolved: String? = try? dbPool.read { db in
+            if let headerId = result.headerId {
+                return try Self.resolveLocalResultHeaderId(
                     headerId: headerId,
                     capturedRfc822MessageId: result.capturedRfc822MessageId,
                     db: db
                 )
             }
-            if let opened = resolved {
-                // Carry the witness this resolve just validated against — see
-                // `OpenTarget`. The proof is worth nothing to the consumer that
-                // actually mutates unless it travels with the address.
-                navigationPath.append(OpenTarget(
-                    headerId: opened,
-                    provenRfc822MessageId: result.capturedRfc822MessageId))
-            } else {
-                showStaleResultAlert = true
-            }
-            return
-        }
-        // Remote result: resolve folder-scoped; never a cross-folder/-account guess.
-        // A nil resolve navigates nowhere — nothing opens, nothing is marked read.
-        let resolved = try? dbPool.read { db in
-            try Self.resolveRemoteResultHeaderId(
+            return try Self.resolveRemoteResultHeaderId(
                 accountId: result.accountId,
                 messageId: result.messageId,
                 folderPath: result.folderPath,
                 db: db
             )
         }
-        if let headerId = resolved {
-            navigationPath.append(OpenTarget(headerId: headerId, provenRfc822MessageId: nil))
+        switch Self.tapOutcome(for: result, resolvedHeaderId: resolved) {
+        case .open(let target):
+            navigationPath.append(target)
+        case .explainStaleLocalResult:
+            showStaleResultAlert = true
+        case .explainRemoteResultNotOnThisDevice:
+            showRemoteResultUnavailableAlert = true
         }
     }
 
@@ -892,17 +936,57 @@ struct SearchView: View {
             print("[Search] \(email) \(folder.isEmpty ? "account-wide" : "folder=\(folder)") returned \(infos.count) results")
         }
 
-        return infos.map { info in
+        return Self.presentableRemoteResults(
+            from: infos, accountId: resultAccountId, accountEmail: email, folderPath: folder)
+    }
+
+    /// The remote hits this search may SHOW, from what the provider returned.
+    ///
+    /// 🚨 IOS-IMAP-001 — A MESSAGE THE SERVER REPORTS `\Deleted` IS NOT PRESENTED
+    /// (RFC 3501 §2.3.2 — the flag means "pending removal"). This is the FIFTH
+    /// consumer of `MessageHeaderInfo` that reaches the user, and the only one that
+    /// PRESENTS without MATERIALISING a `MessageHeader` — which is exactly why the
+    /// census that closed this row (noun: `MessageHeader` construction sites) could
+    /// not see it. The other four skip the same records at
+    /// `SyncEngineFullSync.selectStaleHeaders`, `SyncEngineFullSync.runSyncMessages`,
+    /// `SyncEngine.insertBackfillBatchGuardable` and `SyncEngine.fetchOlderMessages`.
+    ///
+    /// The user-visible defect on the server class this row is about (no UIDPLUS,
+    /// where the `COPYUID`-gated purge can never fire and soft-deleted move sources
+    /// accumulate): a search showed **two hits for one email**, and the residue was
+    /// the one with no local row, so tapping it did nothing at all.
+    ///
+    /// ⚑ PRESENTATION ONLY, established by search rather than by meaning (MIS-021).
+    /// `AccountManager.search` has exactly one caller — this view — so nothing
+    /// downstream of the dropped values is a wire op, a queued intention or a sync
+    /// decision. Inside `launchRemoteSearch` the only other consumer of these
+    /// results is the same-message merge (`isSameMessage` / `removeAll`), where
+    /// dropping a residue can only PRESERVE the local row it would have replaced.
+    ///
+    /// 🚨 AND THE FILTER STAYS HERE, NOT IN THE SEARCH CRITERIA. Adding a
+    /// `NOT DELETED` term to `IMAPProvider.searchOnConnection` would narrow what the
+    /// SERVER reports, which is the ADR-IOS-042 / `MIS-IOS-002` shape in a different
+    /// coordinate system — and it would cover IMAP only, leaving the invariant
+    /// provider-specific. Filtering the presented set uses the one true producer's
+    /// flag (`IMAPProvider.mapMessageInfo`) and holds for every provider, including
+    /// any future one that learns to observe it.
+    ///
+    /// `nonisolated static` for the same reason as the resolve helpers: it touches
+    /// no `@State` and needs no view, so a test can call it directly.
+    nonisolated static func presentableRemoteResults(
+        from infos: [MessageHeaderInfo], accountId: String, accountEmail: String, folderPath: String
+    ) -> [SearchResult] {
+        infos.filter { !$0.isDeletedOnServer }.map { info in
             SearchResult(
                 source: .remote,
-                accountId: resultAccountId,
-                accountEmail: email,
+                accountId: accountId,
+                accountEmail: accountEmail,
                 messageId: info.messageId,
                 // The folder this result was searched in. Empty for provider
                 // account-wide search (Gmail/Graph), where `messageId` is already
                 // globally unique. For IMAP this is the real folder path, which is
                 // required to disambiguate per-folder UIDs that collide across folders.
-                folderPath: folder,
+                folderPath: folderPath,
                 subject: info.subject,
                 from: info.from,
                 fromAddress: info.fromAddress,
