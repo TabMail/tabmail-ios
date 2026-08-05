@@ -177,3 +177,39 @@ final class EmbeddingService: @unchecked Sendable {
         case noOutput
     }
 }
+
+#if DEBUG
+/// DEBUG-only startup policy that keeps ordinary app-hosted unit-test launches
+/// from compiling the bundled CoreML model. Release builds have no XCTest
+/// branch or seam: `TabMailApp` calls `EmbeddingService.initialize()` directly.
+///
+/// Ported verbatim from `v2final` (`e28dd4edb`,
+/// `TabMail/Services/Search/EmbeddingService.swift`), which is a SIBLING of the
+/// shipped release and never ran on a user device — so behaviour is ported,
+/// nothing else. `EmbeddingService.initialize()`'s body is byte-identical
+/// between that tree and this one, which is what makes the port safe.
+enum EmbeddingStartupPolicy {
+    enum Decision: Equatable, Sendable {
+        case skippedUnitTestHost
+        case initialized
+    }
+
+    static func decision(environment: [String: String]) -> Decision {
+        if environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil {
+            return .skippedUnitTestHost
+        }
+        return .initialized
+    }
+
+    @discardableResult
+    static func initializeForAppStartup(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        initializer: @Sendable () -> Void = { EmbeddingService.initialize() }
+    ) -> Decision {
+        let resolved = decision(environment: environment)
+        if resolved == .initialized { initializer() }
+        return resolved
+    }
+}
+#endif

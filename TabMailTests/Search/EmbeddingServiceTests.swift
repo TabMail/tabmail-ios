@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import Synchronization
 @testable import TabMail
 
 @Suite("EmbeddingService.prepareEmailText")
@@ -69,6 +70,46 @@ struct EmbeddingServicePrepareTextTests {
         #expect(text.contains("Short email body"))
     }
 }
+
+#if DEBUG
+/// Restored from `v2final` (`e28dd4edb`,
+/// `TabMailTests/Search/EmbeddingServiceTests.swift`) together with the
+/// `EmbeddingStartupPolicy` seam it covers. Two-sided on purpose: the first test
+/// proves the suppression fires in the process it exists for, the second proves it
+/// does NOT fire for an ordinary DEBUG launch — a one-sided version would stay
+/// green on a policy that had degenerated into "never initialize".
+@Suite("EmbeddingService app-startup policy", .serialized)
+struct EmbeddingServiceStartupPolicyTests {
+    @Test("ordinary app-hosted unit-test startup skips CoreML initialization")
+    func unitTestHostSkipsCoreMLInitialization() throws {
+        let environment = ProcessInfo.processInfo.environment
+        let isXCTestHost = environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil
+        #expect(isXCTestHost, "this invariant must run in the ordinary XCTest app host")
+
+        let initializerCalls = Mutex(0)
+        let decision = EmbeddingStartupPolicy.initializeForAppStartup(
+            environment: environment,
+            initializer: { initializerCalls.withLock { $0 += 1 } }
+        )
+
+        #expect(decision == .skippedUnitTestHost)
+        #expect(initializerCalls.withLock { $0 } == 0)
+    }
+
+    @Test("non-test DEBUG startup still initializes exactly once")
+    func ordinaryDebugStartupInitializes() {
+        let initializerCalls = Mutex(0)
+        let decision = EmbeddingStartupPolicy.initializeForAppStartup(
+            environment: [:],
+            initializer: { initializerCalls.withLock { $0 += 1 } }
+        )
+
+        #expect(decision == .initialized)
+        #expect(initializerCalls.withLock { $0 } == 1)
+    }
+}
+#endif
 
 @Suite("FTSHeaderRecord")
 struct FTSHeaderRecordTests {

@@ -131,7 +131,20 @@ struct TabMailApp: App {
                 firstPaintTimeoutSeconds: SyncConfig.embeddingLoadGateTimeoutSeconds
             )
             BootProfiler.mark("EmbeddingService.initialize() START (CoreML ~45MB, .utility, post-first-paint)")
+            // Restored from `v2final` (`e28dd4edb`) — `EmbeddingStartupPolicy`.
+            // An app-hosted XCTest launch would otherwise compile and load the
+            // ~45 MB bundled CoreML model in every unit-test process, for tests
+            // that never embed anything. RELEASE BUILDS HAVE NO SEAM AND NO
+            // BRANCH: the `#else` arm is the plain call, so shipped behaviour is
+            // byte-for-byte what it was.
+            #if DEBUG
+            let embeddingDecision = EmbeddingStartupPolicy.initializeForAppStartup()
+            if embeddingDecision == .skippedUnitTestHost {
+                BootProfiler.mark("EmbeddingService.initialize() SKIPPED (unit-test host)")
+            }
+            #else
             EmbeddingService.initialize()
+            #endif
             BootProfiler.mark("EmbeddingService.initialize() DONE")
         }
         // SearchIndex's eager init is deliberately NOT here. Its 257k-doc FTS open
