@@ -211,21 +211,48 @@ enum MessageContentStore {
     /// 100k per folder (SQLite 3.51.0):
     ///
     /// ```
-    /// OR form, EMPTY sqlite_stat1:
+    /// OR form, NO STAT ROW FOR A FULL INDEX (regimes A and B below — identical):
     ///   SEARCH messageHeader USING INDEX messageHeader_folderId_uidInt (folderId=?)
-    /// OR form, post-ANALYZE:
+    /// OR form, post-ANALYZE on a populated table (regime C):
     ///   MULTI-INDEX OR
-    ///     INDEX 1: SEARCH … USING INDEX messageHeader_rfc822MessageId_date (rfc822MessageId=?)
+    ///     INDEX 1: SEARCH … USING INDEX messageHeader_rfc822MessageId (rfc822MessageId=?)
     ///     INDEX 2: SEARCH … USING INDEX messageHeader_folderId_messageId (folderId=? AND messageId=?)
     /// ```
     ///
-    /// The empty-statistics plan is a **walk of the whole folder, per key** — and
-    /// empty statistics are the ordinary state of a fresh install, because `ANALYZE`
-    /// has only ever run inside migration bodies, against an empty `messageHeader`.
-    /// Independently measured at 500 missing-key probes in **11.9 s** with empty
-    /// stats vs **<0.001 s** after `ANALYZE`, and ~16 ms vs ~0.2 ms per call at 100k
-    /// rows (Mac numbers, system SQLite — the ratio is the finding, not the
-    /// absolutes). Both arms below plan identically in BOTH regimes:
+    /// The stats-poor plan is a **walk of the whole folder, per key**, and it is the
+    /// ordinary state of a fresh install. Independently measured at 500 missing-key
+    /// probes in **11.9 s** in that regime vs **<0.001 s** after a populated
+    /// `ANALYZE`, and ~16 ms vs ~0.2 ms per call at 100k rows (Mac numbers, system
+    /// SQLite — the ratio is the finding, not the absolutes).
+    ///
+    /// ⚠️ THE REGIME IS "NO STAT ROW FOR A **FULL** INDEX", NOT "EMPTY
+    /// `sqlite_stat1`" — this doc said the latter until 2026-08-05 and it is false.
+    /// `ANALYZE` against an empty `messageHeader` does NOT leave `sqlite_stat1`
+    /// empty: it creates the table and writes one row per **partial** index
+    /// (measured at SQLite 3.51.0 over `messageHeader`'s own index set — 5 rows,
+    /// `…_headerIncomplete`, `…_aiIncomplete`, `…_embeddingIncomplete`,
+    /// `…_unreadSweep`, `…_reminderLookup`, each `0 0`; other tables' partial
+    /// indexes add their own), and NO row for any full index. A partial
+    /// index's row does not give the planner the table's row estimate, which is why
+    /// all three of these plan the OR form identically to a database that has never
+    /// been analysed at all:
+    ///
+    /// ```
+    /// A. no sqlite_stat1 at all           → messageHeader_folderId_uidInt (folderId=?)
+    /// B. ANALYZE on an EMPTY table        → messageHeader_folderId_uidInt (folderId=?)   ← fresh install
+    /// C. ANALYZE on 300k rows             → MULTI-INDEX OR (two seeks)
+    /// ```
+    ///
+    /// A "is `sqlite_stat1` empty?" check would therefore report *healthy* on a
+    /// fresh install and be wrong. The rows are there; the useful ones are not.
+    ///
+    /// Nor is it still true that `ANALYZE` runs only inside migration bodies: as of
+    /// the 2026-08-05 amendment to ADR-IOS-029 the background WAL maintenance pass
+    /// runs a whole-database `ANALYZE` once per schema change
+    /// (`SyncEngine.runRefreshPlannerStatisticsIfStale`). That pass is what moves a
+    /// real device from regime B to regime C — but it is background and deferred, so
+    /// this statement must not depend on having run. Both arms below plan
+    /// identically in ALL THREE regimes:
     ///
     /// ```
     /// COMPOUND QUERY
@@ -235,8 +262,8 @@ enum MessageContentStore {
     ///
     /// ⚠️ THE TWO INDEX NAMES ARE LOAD-BEARING, AND THE `INDEXED BY` HINTS ARE NOT
     /// DECORATION: without the hint on the second arm SQLite picks
-    /// `messageHeader_folderId_uidInt (folderId=?)` under empty statistics and walks
-    /// the folder anyway — the hint is what removes the stats dependency, not the
+    /// `messageHeader_folderId_uidInt (folderId=?)` in regimes A and B and walks the
+    /// folder anyway — the hint is what removes the stats dependency, not the
     /// `UNION ALL` by itself. A migration that renames or drops either index makes
     /// this statement throw, which `ownership(of:scope:db:)` turns into
     /// `.undetermined` — so every deletion path KEEPS its content. That is loud and

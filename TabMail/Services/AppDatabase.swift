@@ -2856,22 +2856,40 @@ final class AppDatabase: Sendable {
         // preferred.
         //
         // ⚠️ NEGATIVE CASE — STATISTICS THEMSELVES ARE NOT OPTIONAL, so "just delete
-        // the `ANALYZE`" would have been the wrong change. Measured on a synthetic
-        // 120k-row / 3-account / 8-folder database, the drain's per-member header
-        // lookup in `AccountManagerQueue` plans as `SEARCH messageHeader USING INDEX
-        // messageHeader_accountId (accountId=?)` — an account-wide scan — with an
-        // empty `sqlite_stat1`, and as a `MULTI-INDEX OR` over
-        // `messageHeader_messageId_accountId` + `messageHeader_rfc822MessageId_date`
-        // — two seeks — after `ANALYZE`. Statistics demonstrably change plans on at
-        // least one hot path. What moved is WHEN they are computed, never WHETHER.
-        // REPRODUCED at profile H on the post-chain state a real upgraded device now
-        // holds until its first background pass: the same lookup plans as
+        // the `ANALYZE`" would have been the wrong change. Measured at profile H on
+        // the post-chain state a real upgraded device holds until its first
+        // background pass, the drain's per-member header lookup in
+        // `AccountManagerQueue` plans as
         // `SEARCH … messageHeader_accountId_messageId (accountId=?)` — a 100k-row
-        // account-wide walk — with `sqlite_stat1` empty, and as the two-seek
-        // `MULTI-INDEX OR` (0.079 ms/lookup) once the background `ANALYZE` has run,
-        // which fills `sqlite_stat1` from 0 rows to 36. ⚠️ Probe with a value that
-        // EXISTS: an account id present in no row reports the same plan on both
-        // sides, which reads as "statistics change nothing" and is an artefact.
+        // account-wide walk — before the background `ANALYZE`, and as a two-seek
+        // `MULTI-INDEX OR` (0.079 ms/lookup) once it has run, which fills
+        // `sqlite_stat1` to 36 rows. Statistics demonstrably change plans on at least
+        // one hot path. What moved is WHEN they are computed, never WHETHER.
+        //
+        // ⚠️ Probe with a value that EXISTS: an account id present in no row reports
+        // the same plan on both sides, which reads as "statistics change nothing" and
+        // is an artefact.
+        //
+        // ⚠️ TWO CITATIONS WERE WRONG HERE UNTIL 2026-08-05; do not restore them from
+        // an older revision. (1) This paragraph used to quote the pre-`ANALYZE` plan
+        // as `SEARCH messageHeader USING INDEX messageHeader_accountId (accountId=?)`
+        // on a synthetic 120k-row database. That index is DROPPED by
+        // `v64_messageIdCompositeIndexes` (`DROP INDEX IF EXISTS
+        // messageHeader_accountId`, this file), so the plan it quotes cannot be
+        // produced at `v83` in any statistics regime — the measurement predates v64.
+        // The profile-H reproduction above survives because
+        // `messageHeader_accountId_messageId` is a v64 index that still exists.
+        // (2) The regime was described as "an empty `sqlite_stat1`". The accurate
+        // description is "no stat row for any FULL index on `messageHeader`" — see
+        // `MessageContentStore.owners`, which measures all three regimes. The 36-vs-0
+        // row counts above are this HARNESS's numbers, and its fixture is seeded
+        // directly at `v67` with `grdb_migrations` pre-stamped, so the five in-body
+        // `ANALYZE`s named in the SCOPE paragraph below (`v38`/`v39`/`v40`/`v50`/`v51`,
+        // all registered EARLIER in this file) never ran in it and its
+        // `sqlite_stat1` genuinely starts
+        // absent. A genuine fresh install is NOT that state — it starts with
+        // partial-index rows and zero full-index rows — but both plan identically,
+        // so the conclusion is unchanged.
         //
         // ⚠️ SCOPE, stated so the next reader does not "finish the job". FIVE older
         // migrations still carry their own in-body `ANALYZE` — `v38`, `v39`, `v40`,
@@ -2881,10 +2899,17 @@ final class AppDatabase: Sendable {
         // are also cheap where they sit for the reason that makes them useless: on
         // a fresh install they run against an EMPTY database, and on an upgrade
         // they were paid years ago. Their real legacy is the pre-state the
-        // background pass now corrects — a fresh install's `sqlite_stat1` records
-        // `messageHeader` as having ZERO rows, and before this amendment the device
-        // that later synced 100k messages carried that estimate forever. That exact
-        // pre-state is pinned by `SyncMaintenanceTests`'
+        // background pass now corrects: on a fresh install those five `ANALYZE`s
+        // create `sqlite_stat1` and populate it with rows for `messageHeader`'s
+        // PARTIAL indexes only (each `0 0`), leaving NO row for any of its full
+        // indexes — and a partial index's row does not give the planner the table's
+        // row estimate. So the device that later synced 100k messages carried that
+        // absence forever, planning exactly as if it had never been analysed. ⚠️ Not
+        // "records `messageHeader` as having ZERO rows", which is what this comment
+        // said until 2026-08-05: there is no such estimate to record, and a health
+        // check written against "is `sqlite_stat1` empty?" would report a fresh
+        // install as healthy. Measured three ways in `MessageContentStore.owners`.
+        // That exact pre-state is pinned by `SyncMaintenanceTests`'
         // `schemaChangeRearmsButRowTrafficDoesNot`.
         //
         // ⚠️ SECOND NEGATIVE CASE, because this is the sentence a future migration

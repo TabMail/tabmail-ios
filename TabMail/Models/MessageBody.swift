@@ -14,8 +14,33 @@ struct MessageBody: Codable, FetchableRecord, PersistableRecord, Identifiable, S
     /// construction. They stop being the same string once the content key's tail
     /// moves off the provider id (`ContentKeySpace`): a body belongs to the
     /// *content*, so it survives a `UIDVALIDITY` renumber that re-addresses the
-    /// header. Typed so a `messageHeader.id` cannot be handed to
-    /// `MessageBody.fetchOne(db, key:)` — or vice versa — without saying so.
+    /// header.
+    ///
+    /// ⚠ WHAT THE TYPE ACTUALLY BUYS — corrected 2026-08-05. This doc used to claim
+    /// the type meant *"a `messageHeader.id` cannot be handed to
+    /// `MessageBody.fetchOne(db, key:)` … without saying so."* **That is false, and
+    /// believing it is worse than not having the type.** GRDB's `key:` parameter is
+    /// generic over `DatabaseValueConvertible`, and `String` conforms — so a bare
+    /// `messageHeader.id` compiles at a `key:` lookup with no cast, no warning and no
+    /// diagnostic. Census over `TabMail` + `TabMailTests` + `Shared`: **57**
+    /// `MessageBody.<method>(db, key:)` sites, of which **22** wrap in
+    /// `ContentKey(...)` and **35** pass something unwrapped — most of them a genuine
+    /// bare `String` (`header.id`, `message.id`, string literals;
+    /// `MessageHeader.id` is declared `var id: String`).
+    ///
+    /// What the type DOES enforce is the **stored column and the construction path**:
+    /// `init(contentKey:)` and `create(contentKey:)` cannot be reached with a
+    /// `messageHeader.id` unless someone writes `ContentKey(rawValue:)` explicitly, so
+    /// every *mint* of a body's key is visible at the callsite. Lookups are not
+    /// covered; only construction is.
+    ///
+    /// This has **zero behavioural effect today** — the two key spaces are
+    /// byte-identical, so an unwrapped crossing resolves to the same row. It becomes
+    /// real at Stage E1, when the content key's tail moves off the provider id and the
+    /// two strings diverge. ⚑ The 35 unwrapped sites are DELIBERATELY left unwrapped:
+    /// wrapping them would paper over exactly the crossings this paragraph exists to
+    /// make searchable, and the `rg` above is currently the only way to enumerate
+    /// them. Wrap them when E1 lands, as part of E1 — not before.
     var id: ContentKey
     var htmlContent: String?
     /// JSON-encoded [AttachmentInfo] for attachment metadata

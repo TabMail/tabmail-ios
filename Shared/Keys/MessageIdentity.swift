@@ -99,14 +99,45 @@ public enum MessageIdentity {
     /// it is harmless there). A `:` in the `messageId` tail makes the row fail BOTH
     /// folder-scoping guards below — `headerIdBelongsToFolder` and
     /// `headerIdLikeNoDeeperColonSQLFragment` — which EXCLUDE rather than error, so
-    /// the row is SILENTLY skipped by every headerId-prefix purge (the FTS
-    /// `message_ids` sweep, the `chatIdMapping` sweep, the `BodyAssetStore` manifest
-    /// sweep) and its sidecar state orphans on a folder purge or a UIDVALIDITY reset.
+    /// the row is SILENTLY skipped by the purges that are PREFIX-KEYED, and its
+    /// sidecar state orphans on a folder purge or a UIDVALIDITY reset.
     ///
-    /// ⚠ THE FIX FOR THAT IS ALWAYS HERE, AT THE MINT — never a relaxation of the
-    /// guards. The guards are what makes folder scoping correct under a ':'-delimiter
-    /// IMAP server; widening them lets a nested sibling folder's rows into another
-    /// folder's purge, which is strictly worse than an orphan. Server-assigned message
+    /// ⚑ WHICH PURGES THOSE ACTUALLY ARE — corrected 2026-08-05, because this doc
+    /// used to say "every headerId-prefix purge" and the scope is narrower and more
+    /// useful than that. **The guard governs exactly the stores that have NO
+    /// `folderId` column of their own**, so the folder relation is unavailable and a
+    /// prefix match is the only handle:
+    ///
+    /// * `ChatIdTranslator.purgeMappingsForFolder` — `chatIdMapping`, matched
+    ///   entirely by this guard.
+    /// * `AccountManagerUidValidityReset.purgeBodyAssetsForFolder` — the
+    ///   `BodyAssetStore` manifest, matched entirely by this guard.
+    /// * `SearchIndex.removeMessagesForFolder`'s **H-2 orphan sweep** of
+    ///   `message_ids` — but NOT that function's primary delete.
+    /// * The in-memory queue filters in `ActiveBodyQueue` / `BackfillBodyQueue` and
+    ///   the `NSEDataBridge` folder filter.
+    ///
+    /// **The purges that key by the folder RELATION are immune and always were:**
+    /// `SearchIndex.removeMessagesForFolder`'s main delete (`WHERE meta.folderId =
+    /// ?`), `uidValidityResetPurgeTxn`'s subquery, and the reaction's step-3
+    /// `chatIdMapping` delete by `messageHeader.folderId`. A colon-bearing tail costs
+    /// sidecar orphans, NOT the message rows — which is why the accepted disposition
+    /// is an orphan rather than a data-loss defect.
+    ///
+    /// ⚠ THE MINT IS THE RIGHT PLACE TO FIX A COLON — but "ALWAYS HERE, AT THE MINT"
+    /// was too strong, and reading it that way hides a LIVE defect. Escaping here
+    /// only holds if nothing downstream re-introduces a `:` **after** the escape, and
+    /// something does: `PendingOperation.draftPlaceholderMessageId` escapes `draftId`
+    /// through this function and then appends `":\(instanceEpoch):\(count)"` in its
+    /// epoch arm — the arm `queueDraftSave` always takes. So a reply draft's
+    /// placeholder still reaches the guards with raw colons in its tail no matter what
+    /// this function does. Registered; do NOT "fix" it by re-keying here, which would
+    /// orphan every live placeholder and every in-flight draft at upgrade.
+    ///
+    /// What has NOT changed: never relax the guards. They are what makes folder
+    /// scoping correct under a ':'-delimiter IMAP server; widening them lets a nested
+    /// sibling folder's rows into another folder's purge, which is strictly worse than
+    /// an orphan. Server-assigned message
     /// ids (IMAP UIDs, Gmail/Graph ids) are colon-free by construction and need no
     /// escaping; TabMail-MINTED synthetic ids built from an internal key that may
     /// itself be a colon-joined composite (`AccountManager.queueDraftSave`'s
