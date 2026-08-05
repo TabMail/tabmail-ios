@@ -11,6 +11,43 @@ enum InboxMode: String, CaseIterable {
     case triage
 }
 
+/// Presentation decision for the inbox error banner — BOTH halves in one place.
+///
+/// 🚨 **The debug flag is an ARGUMENT here, never a branch condition in `body`.**
+/// Until 2026-08-04 the banner read
+/// `if let error = viewModel.error, DebugModeManager.isLoggingEnabled()`, which put
+/// the gate in the BRANCH CONDITION: it suppressed no log, it decided whether the
+/// banner was built at all. `InboxView` is the ONLY render site of
+/// `InboxViewModel.error` in `TabMail/Views/`, so in a production build the banner
+/// was unreachable and a user whose sync or infinite-scroll pagination failed got a
+/// silent no-op — the list simply stopped growing with no explanation.
+/// See `Companion/Memory/Current/105-a-print-is-not-production-observability-on-ios.md`
+/// §3 and its 2026-08-04 correction, which names this exact site.
+///
+/// Shape taken from the sibling that already solved this correctly —
+/// `MessageCardView.bodyContent`, byte-identical in shipped `07a4bb703`, in
+/// `v2final` and at HEAD: **the BRANCH is ungated so the user always learns
+/// something failed, and only the DETAIL is debug-gated**, because
+/// `error.localizedDescription` — what both `InboxViewModel` write sites store — is
+/// developer text, not user copy.
+enum InboxErrorBanner {
+    /// Generic production copy. Reuses `MessageCardView`'s existing register
+    /// ("Unable to load message. Pull to retry.") rather than inventing a new one;
+    /// the inbox and every folder list carry `.refreshable`, so pull-to-refresh is
+    /// genuinely the recovery gesture.
+    static let genericMessage = "Unable to refresh mail. Pull to retry."
+
+    /// The banner's text, or `nil` when there is nothing to show.
+    ///
+    /// **Presence depends ONLY on `error`; `loggingEnabled` selects the WORDING.**
+    /// That split IS the invariant — a debug unlock must never change whether the
+    /// user is told a failure happened. Pinned by `InboxErrorBannerTests`.
+    static func text(for error: String?, loggingEnabled: Bool) -> String? {
+        guard let error else { return nil }
+        return loggingEnabled ? error : genericMessage
+    }
+}
+
 struct InboxView: View {
     let title: String
     let folders: [Folder]
@@ -223,10 +260,13 @@ struct InboxView: View {
         @Bindable var vm = viewModel
         ZStack(alignment: .bottom) {
             VStack(spacing: 0) {
-                if let error = viewModel.error, DebugModeManager.isLoggingEnabled() {
+                if let bannerText = InboxErrorBanner.text(
+                    for: viewModel.error,
+                    loggingEnabled: DebugModeManager.isLoggingEnabled()
+                ) {
                     HStack {
                         Image(systemName: "exclamationmark.triangle.fill")
-                        Text(error)
+                        Text(bannerText)
                             .font(.caption)
                         Spacer()
                         Button {

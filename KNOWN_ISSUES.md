@@ -687,3 +687,50 @@ Two corrections to the scope this census was opened with, both in the direction 
 **Deliberately NOT swept:** the pre-existing ungated prints outside the range — `AccountManagerActions`
 alone carries ~25 of them. That is a decision not to widen the fix, not a "pre-existing" excuse; the
 count is recorded here so the number is not lost if someone later wants the sweep.
+
+## The gate-in-a-BRANCH-CONDITION census over `TabMail/Views/` (2026-08-04)
+
+**This is a different census from the ungated-`print` one above, and the distinction is the point.**
+That one asks *"is this diagnostic silenced in production?"*. This one asks *"does a debug flag decide
+CONTROL FLOW that must run in production?"* — i.e. whether the gate changes what the **user** sees. A
+debug flag genuinely participating in a condition is not automatically wrong; it is wrong only when the
+branch it selects is a user-visible surface.
+
+**Predicate, stated beside the number (`MIS-007` instance 11).** A comment-stripped, brace-matching
+walker over every `DebugModeManager` reference in `TabMail/Views/`, classifying each by whether it sits
+in an `if`/`guard`/`while` **condition** or guards a **body**, and by what the controlled body does.
+**Deliberately NOT a same-line predicate** — a multi-line `if DebugModeManager… { print(…) }` never puts
+gate and subject on one line, so a same-line test reads every correctly-gated site as *ungated*
+(`MIS-007` instance 12, and the `ExchangeProvider` section immediately above).
+
+**Count: 95 code references** (99 raw string hits − 4 doc-comment mentions).
+
+**Cross-check, two-way (`comm` in BOTH directions).** The walker's list and an independent `rg` list
+disagreed by exactly 4, all in `AutoSizingHTMLView.swift`. The disagreement was run down rather than
+averaged: the delta is precisely the `///`/`//` lines that *mention* `DebugModeManager` in prose, which
+the walker strips and `rg` counts. Same corpus-contaminated-by-its-own-prose shape as `MIS-008`
+instance 11 — read the hits, do not count them.
+
+**Three shape blind spots were closed by hand, because a walker encodes assumptions invisibly:**
+
+- `} else if DebugModeManager…` arms — 3 sites (`InboxView`, `ProviderSettingsView`, `ComposeView`),
+  **all log-only**. Latent per topic 105 §3 (a non-logging statement added to such an arm would silently
+  not run in production) but not defects today; deliberately left.
+- `guard DebugModeManager… else { return "" }` — 2 sites, both `AutoSizingHTMLView` debug-JS builders
+  (`htmlDebugReportJS`, `heightDiagnosticJS`). Correct.
+- **A gate hoisted into a local boolean** (`let isDbg = DebugModeManager.isLoggingEnabled(); if isDbg { … }`)
+  hides the branch condition from any walker keyed on the flag itself. Every such boolean in
+  `TabMail/Views/` was enumerated with its uses; all gate only `print` statements. The
+  `AutoSizingHTMLView` ones (`log`, `logEnabled`, `ll`, `dl`, `logBody`, `il`, `gl`, `logFn`, `debug`,
+  `idStampJS`) have **no branch-condition uses at all** — they are passed into JS-builder closures.
+
+**Result: exactly ONE site where a debug flag in a branch condition suppressed a surface the user must
+see in production** — `InboxView`'s error banner, fixed in this commit. One further site changes what
+the user sees and is **CORRECT**: `MailNavigationView`'s Debug-menu `NavigationLink` under
+`DebugModeManager.shared.isUnlocked` — the debug menu is *defined* by debug mode. Everything else is
+log-only. **Nothing here licenses a repo-wide gating sweep**; the count is recorded so it is not
+re-derived, per the range-not-corpus rule settled by `af98d92c7`.
+
+| ID | Status | Subsystem / keywords | Statement |
+|---|---|---|---|
+| IOS-SCROLL-003 | 🔓 **OPEN** — pre-existing, shipped verbatim in `v1.6.38` and `v2final`; **NOT introduced by the banner fix**; recoverable by one ordinary user gesture | Infinite scroll; `InboxViewModel.loadMoreMessages`; `SyncEngine.isConnectionError`; `self.error`; `AccountManagerState.lastSyncFailed`; connection error; offline pagination; silent no-op; error banner | Both `InboxViewModel.error` write sites are wrapped in `if !SyncEngine.isConnectionError(error)`. At the **`performSync`** catch that carve-out is covered by a second surface: `AccountManagerState.shared.lastSyncFailed = true` is set **unconditionally** in the same catch and drives the sync-status subtitle, so a connection failure is still reported. At the **infinite-scroll** catch there is **no such fallback** — no `lastSyncFailed`, no other surface — so a *connection* failure during pagination stays completely silent even now that the banner renders in production: the list stops growing and nothing says why. This is exactly the case companion topic 105's 2026-08-04 correction predicted (*"the guard suppresses that surface for connection errors, which is exactly when infinite scroll fails"*). **Registered rather than fixed because the change belongs in `InboxViewModel.swift`, outside the banner fix's file scope**, and because it is recoverable — the next successful pull-to-refresh or scroll re-attempts the page. The fix is not simply deleting the guard: connection blips are precisely what the carve-out exists to keep off-screen, so the right shape is likely the `performSync` one (an unconditional durable/status signal, with the banner still reserved for non-connection errors). |

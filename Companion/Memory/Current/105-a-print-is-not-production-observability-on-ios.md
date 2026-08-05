@@ -103,3 +103,46 @@ remains an ungated diagnostic print and a known, unfixed instance of the same cl
 > same edit. Reading the WRITER of a value proves it is set; only reading its READER proves anyone
 > sees it (`MIS-024`: a sentence handing responsibility to a named mechanism owes a grep of that
 > mechanism's call sites — here, of its render site).
+
+### 4. ✅ RESOLVED (2026-08-04) — the banner the correction above found is now a production surface
+
+The gate identified by the correction in §3 is **fixed**. `InboxView`'s error banner no longer spells
+the debug flag into its branch condition; a small `InboxErrorBanner.text(for:loggingEnabled:)` owns the
+whole presentation decision, and **the flag is an ARGUMENT to it rather than a term in a condition** —
+presence depends on `error` alone, the flag selects only the wording. The dismiss button, layout,
+colours and placement are untouched.
+
+**The shape was restored, not authored.** `MessageCardView.bodyContent` already solved the identical
+problem correctly and is **byte-identical in shipped `07a4bb703`, in `v2final` `e28dd4edb` and at
+HEAD**: the branch is ungated so the user always learns something failed, and only the DETAIL is
+debug-gated, because `error.localizedDescription` — what both `InboxViewModel` write sites store — is
+developer text, not user copy. The production string reuses that sibling's existing register rather
+than inventing a new one, and both `InboxView` list paths carry `.refreshable`, so the pull-to-refresh
+hint names a gesture that genuinely exists.
+
+**A1 verdict, stated because the answer is counter-intuitive: NONEXISTENT, not a regression.** Shipped
+`07a4bb703` carries the identical gated line at the identical position, as does `v2final`. So the
+production banner has *never* existed on a user's device and this is authored work — while the *shape*
+of the fix is restored from a sibling inside the same shipped tag. Both halves are true at once, and
+collapsing them either way gets the provenance wrong. (`A1` corollary 3 — the shipped release is a
+floor, not a ceiling: restore the property it genuinely had, do not inherit its weaknesses.)
+
+**The census this closed, and its predicate.** Block-aware over `TabMail/Views/`: **95 code references**
+to `DebugModeManager` (99 raw string hits − 4 doc-comment mentions), cross-checked two-way with `comm`
+against an independent `rg` list, with the 4-line disagreement run down rather than averaged. **Exactly
+one** site had a debug flag in a branch condition suppressing a user-visible surface — this one.
+`MailNavigationView`'s Debug-menu link under `isUnlocked` also changes what the user sees and is
+*correct*, because the debug menu is defined by debug mode. Full predicate, the three hand-closed shape
+blind spots (`} else if` arms, `guard … else { return "" }`, and **a gate hoisted into a local boolean**,
+which hides the condition from any walker keyed on the flag), and the register row are in
+`KNOWN_ISSUES.md`.
+
+> ⚠️ **What this does NOT close, and it is the half the §3 correction cared most about.** Both
+> `InboxViewModel.error` write sites are still wrapped in `if !SyncEngine.isConnectionError(error)`. At
+> the `performSync` catch that is covered — `AccountManagerState.shared.lastSyncFailed = true` is set
+> **unconditionally** in the same catch and drives the sync-status subtitle. At the **infinite-scroll**
+> catch there is no such fallback, so a **connection** failure during pagination is *still* silent, which
+> is precisely the case §3 named (*"exactly when infinite scroll fails"*). Registered as
+> `IOS-SCROLL-003`; the fix belongs in `InboxViewModel`, not in the view. **So the sentence "`self.error`
+> is a user-visible surface" is now TRUE — but only for non-connection errors.** State it with that
+> qualifier or it becomes the same over-broad claim the correction above was written to retract.
