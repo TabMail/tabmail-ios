@@ -1118,31 +1118,85 @@ private struct PushedMessageDestination: View {
 /// server-origin drafts intentionally fail closed; sync remains authoritative.
 struct ServerDraftComposeLoader: View {
     let header: MessageHeader
-    @State private var openAuthority: LocallyAuthoredDraftOpenAuthority?
-    @State private var isLoading = true
+    @State private var resolution: Resolution?
+
+    /// The three outcomes this view can reach. Mirrors
+    /// `DraftComposePresenter.LoadResult`'s shape on purpose — the same distinction,
+    /// one layer up — rather than inventing a parallel vocabulary.
+    ///
+    /// 🚨 **`.noLocalCopy` AND `.resolveFailed` ARE NOT THE SAME ANSWER.** Until this
+    /// split, `resolveLocallyAuthoredDraft` ended `} catch { openAuthority = nil }`,
+    /// so a THROWN `dbPool.read` — a busy or suspended database, a provider error —
+    /// rendered the very same authoritative "no editable copy of this draft was
+    /// found" card as a genuine, fully-determined absence. That is never-drop
+    /// clause 2's *"we could not determine the answer" treated as authoritative*,
+    /// the single most repeated defect class in this codebase's history, and the
+    /// neighbouring `DraftComposePresenter` already models the distinction with
+    /// `LoadResult.loadFailed`.
+    enum Resolution: Equatable {
+        /// A local, editable `Draft` was resolved AND re-authorized for this header.
+        case authorized(LocallyAuthoredDraftOpenAuthority)
+        /// AUTHORITATIVE ABSENCE. Every read completed and this device provably holds
+        /// no editable copy. Fail closed honestly — no retry prompt, because retrying
+        /// cannot change the answer.
+        case noLocalCopy
+        /// ⚑ NO REFERENCE — INVENTED, same rationale as
+        /// `DraftComposePresenter.LoadResult.loadFailed`. A read or a provider call
+        /// THREW, so whether a local copy exists is UNKNOWN. Retryable, never
+        /// authoritative.
+        case resolveFailed
+    }
 
     var body: some View {
         Group {
-            if isLoading {
+            switch resolution {
+            case nil:
                 ProgressView("Loading draft...")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let openAuthority {
+            case .authorized(let openAuthority):
                 DraftComposePresenter(
                     draftId: openAuthority.draftId,
                     openAuthority: openAuthority)
-            } else {
+            case .noLocalCopy:
                 // STATE ONLY THE OBSERVED FACT — do not promise a remedy. The
                 // refusal turns on LOCAL `Draft` state, and no sync path produces a
                 // `Draft` row (`Draft` has zero sync-engine construction sites), so
                 // the superseded copy — "Sync the Drafts folder and try again." —
                 // sent the user to do something that provably cannot help. Same
                 // precedent as `afa7889ee` (`IOS-IMAP-001`'s fifth-path closure).
-                // "was not found" also stays true on the `catch` path below, where a
-                // thrown read — not a proven absence — lands here.
+                //
+                // ⚠️ THIS ARM IS FOR A PROVEN ABSENCE ONLY. The thrown-read case used
+                // to land here too; it now has its own arm below. Do not merge them
+                // back — and equally, do not let the retryable arm swallow this one:
+                // a header with no local `Draft` must keep getting this honest card
+                // rather than an endless "try again" the user can never satisfy.
                 ContentUnavailableView(
                     "Draft unavailable",
                     systemImage: "exclamationmark.shield",
                     description: Text("No editable copy of this draft was found on this device."))
+            case .resolveFailed:
+                // Copy deliberately parallel to `DraftComposePresenter`'s
+                // `.loadFailed` arm. No "Close" button: this is detail-column
+                // content, not a sheet, so there is nothing to dismiss.
+                VStack(spacing: 16) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.largeTitle)
+                        .foregroundStyle(.secondary)
+                    Text("Couldn't open this draft")
+                        .font(.headline)
+                    Text("This draft didn't finish loading. Please try again in a moment.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
+                    Button("Try Again") {
+                        resolution = nil
+                        Task { await resolveLocallyAuthoredDraft() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(.systemBackground))
             }
         }
         .task {
@@ -1150,38 +1204,58 @@ struct ServerDraftComposeLoader: View {
         }
     }
 
-    private func resolveLocallyAuthoredDraft() async {
-        do {
-            guard let runtimeKind = await AccountManager.shared
-                .draftRuntimeIdentityKind(accountId: header.accountId),
-                  runtimeKind != .unknown else {
-                openAuthority = nil
-                isLoading = false
-                return
-            }
-
-            if runtimeKind == .gmail {
-                openAuthority = try await resolveGmailDraft()
-                isLoading = false
-                return
-            }
-
-            let candidate = try await AppDatabase.dbPool.read { db in
-                try LocallyAuthoredDraftOpenAuthority.resolve(
-                    db: db, header: header, runtimeKind: runtimeKind)
-            }
-            guard let candidate,
-                  await AccountManager.shared.draftRuntimeIdentityKind(
-                      accountId: candidate.accountId) == candidate.runtimeKind else {
-                openAuthority = nil
-                isLoading = false
-                return
-            }
-            openAuthority = candidate
-        } catch {
-            openAuthority = nil
+    /// The decision the third state exists for, isolated from SwiftUI so the
+    /// INVARIANT — *a throw is retryable, a completed read that found nothing is
+    /// authoritative* — is pinned by tests in BOTH directions instead of only
+    /// asserted in a comment.
+    static func classify(
+        _ outcome: Result<LocallyAuthoredDraftOpenAuthority?, any Error>
+    ) -> Resolution {
+        switch outcome {
+        case .success(let authority?): .authorized(authority)
+        case .success(nil): .noLocalCopy
+        case .failure: .resolveFailed
         }
-        isLoading = false
+    }
+
+    private func resolveLocallyAuthoredDraft() async {
+        let outcome: Result<LocallyAuthoredDraftOpenAuthority?, any Error>
+        do {
+            outcome = .success(try await resolveOpenAuthority())
+        } catch {
+            outcome = .failure(error)
+        }
+        resolution = Self.classify(outcome)
+    }
+
+    /// Returns the authority when this device provably holds an editable copy, `nil`
+    /// when it provably does not, and THROWS when the answer could not be determined.
+    ///
+    /// The `nil` returns below are all fully-determined refusals — a provider that is
+    /// not registered for this account, a runtime kind we do not open, a candidate
+    /// whose runtime kind changed under us. None of them is a thrown read, and none
+    /// changes behaviour here; only the `catch` in the caller does.
+    private func resolveOpenAuthority() async throws -> LocallyAuthoredDraftOpenAuthority? {
+        guard let runtimeKind = await AccountManager.shared
+            .draftRuntimeIdentityKind(accountId: header.accountId),
+              runtimeKind != .unknown else {
+            return nil
+        }
+
+        if runtimeKind == .gmail {
+            return try await resolveGmailDraft()
+        }
+
+        let candidate = try await AppDatabase.dbPool.read { db in
+            try LocallyAuthoredDraftOpenAuthority.resolve(
+                db: db, header: header, runtimeKind: runtimeKind)
+        }
+        guard let candidate,
+              await AccountManager.shared.draftRuntimeIdentityKind(
+                  accountId: candidate.accountId) == candidate.runtimeKind else {
+            return nil
+        }
+        return candidate
     }
 
     /// PORT — narrow v2final Gmail contained-MESSAGE → RESOURCE lookup. The

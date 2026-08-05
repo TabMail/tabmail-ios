@@ -378,6 +378,70 @@ struct LocallyAuthoredDraftResolutionTests {
     }
 }
 
+/// THE INVARIANT: **a Drafts header whose local state could not be READ is not the
+/// same answer as a Drafts header that provably has no local copy.**
+///
+/// `ServerDraftComposeLoader.resolveLocallyAuthoredDraft` used to end
+/// `} catch { openAuthority = nil }`, so a thrown `dbPool.read` (busy/suspended
+/// database, provider error) collapsed into the very same authoritative
+/// "No editable copy of this draft was found on this device." card as a
+/// fully-determined absence. That is never-drop clause 2 — *"we could not determine
+/// the answer" is NOT a provider-authoritative absence* — and it is stated here as
+/// a property of the OUTCOME (which card the user gets, and whether retrying can
+/// change it), not as a property of any particular `catch`.
+///
+/// ⚠️ **BOTH DIRECTIONS ARE ASSERTED, and the second one is the mirror image of the
+/// bug.** Fixing the throw case by routing everything through the retryable state
+/// would be the same defect reflected: a header that genuinely has no local `Draft`
+/// would get an endless "Try Again" the user can never satisfy, when the honest
+/// answer is available and final. A one-sided test would bless exactly that.
+@Suite("Server draft compose resolution states")
+@MainActor
+struct ServerDraftComposeLoaderResolutionTests {
+
+    private static let authority = LocallyAuthoredDraftOpenAuthority(
+        draftId: "draft-1", accountId: "acc1", instanceEpoch: "E1",
+        serverPushStatus: "pushed", runtimeKind: .imap,
+        address: .imap(folderPath: "Drafts", uidValidity: 900_001, uid: "7"))
+
+    private struct ReadFailed: Error {}
+
+    @Test("A thrown read is retryable, never an authoritative 'no local copy'")
+    func thrownReadIsRetryable() {
+        let resolution = ServerDraftComposeLoader.classify(.failure(ReadFailed()))
+
+        #expect(resolution == .resolveFailed,
+                """
+                a read that THREW resolved to \(resolution) — the answer is UNKNOWN, and \
+                treating unknown as a determined absence is never-drop clause 2's exact \
+                failure: the user is told their draft has no editable copy on the strength \
+                of a database that was merely busy
+                """)
+        #expect(resolution != .noLocalCopy)
+    }
+
+    @Test("A completed read that found nothing stays authoritative — no endless retry")
+    func completedAbsenceIsAuthoritative() {
+        let resolution = ServerDraftComposeLoader.classify(.success(nil))
+
+        #expect(resolution == .noLocalCopy,
+                """
+                a fully-determined absence resolved to \(resolution) — this is the MIRROR \
+                IMAGE of the bug being fixed: routing a proven "this device holds no \
+                editable copy" into the retryable state offers a "Try Again" that provably \
+                cannot succeed, because no sync path ever creates a `Draft` row
+                """)
+        #expect(resolution != .resolveFailed)
+    }
+
+    @Test("A resolved authority still opens the compose")
+    func resolvedAuthorityOpens() {
+        #expect(ServerDraftComposeLoader.classify(.success(Self.authority))
+                == .authorized(Self.authority),
+                "the success path must be unaffected by the added third state")
+    }
+}
+
 // MARK: - T5.8 — a reply's quoted body must belong to the message the user replied to
 //
 // The SYSTEM PROPERTY under test, stated once: whatever a reply/forward draft
