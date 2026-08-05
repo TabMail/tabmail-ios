@@ -5195,9 +5195,21 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
-    /// PORT/SUBTRACT of `v2final.deleteDraftStrong`: retain its exact epoch/UID
-    /// validation and absent-target no-op, but omit optional RFC corroboration because
-    /// v3's typed identity has no RFC leg.
+    /// PORT/SUBTRACT of `v2final.deleteDraftStrong`: retain its UID validation and
+    /// absent-target no-op, but omit optional RFC corroboration because v3's typed
+    /// identity has no RFC leg.
+    ///
+    /// ⚠ **DEVIATION FROM THE REFERENCE, DELIBERATE — do not "restore" it.** This
+    /// used to say it retained the reference's *exact epoch* validation, and it did:
+    /// `v2final:e28dd4edb:TabMail/Providers/IMAPProvider.swift` `deleteDraftStrong`
+    /// carries `guard selection.uidValidity.value == recordedUidValidity else {
+    /// throw ProviderError.actionIdentityResolutionFailed(…) }`, and its
+    /// `requireSameUidValidity` is likewise a bare two-outcome `guard stored ==
+    /// live`. The reference is a FLOOR, not a ceiling: that shape treats a live
+    /// epoch of ZERO — what SwiftMail yields when the server omits the untagged
+    /// UIDVALIDITY response — as a mismatch, and the drain destroys the durable op
+    /// on it. v3 replaced it with the file's own three-outcome
+    /// `requireUidValidity(live:expected:folder:)`; see the block at the comparison.
     private func deleteDraftStrong(
         uid: Int, uidValidity: Int, draftsFolderPath: String
     ) async throws {
@@ -5209,9 +5221,61 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             throw ProviderError.actionIdentityResolutionFailed(String(uid))
         }
         try await withActionConnectionSelection(folder: draftsFolderPath) { server, selection in
-            guard selection.uidValidity.value == recordedUidValidity else {
+            // 🚨 THIS COMPARISON MUST HAVE THREE OUTCOMES, NOT TWO — and it must be
+            // the file's ONE comparison, not a second copy of it.
+            //
+            // It used to be a bare `guard selection.uidValidity.value ==
+            // recordedUidValidity else { throw
+            // ProviderError.actionIdentityResolutionFailed(…) }`, inherited verbatim
+            // from `v2final`'s `deleteDraftStrong`. SwiftMail types
+            // `Mailbox.Selection.uidValidity` as non-optional with a `UIDValidity(0)`
+            // default, so a SELECT that omits the REQUIRED `* OK [UIDVALIDITY n]`
+            // untagged response (RFC 3501 §6.3.1) reaches this line as a live epoch
+            // of ZERO. Zero is never equal to a recorded `nz-number`, so the guard
+            // fired — and the drain DELETES the durable `PendingOperation` on
+            // `actionIdentityResolutionFailed`. "The server did not tell us" was
+            // taking a terminal exit: an intention destroyed on an ABSENCE of
+            // evidence, which `Companion/Rules/Active/never-drop-user-intention.md`
+            // forbids in the clause naming it "the single most repeated defect in
+            // this codebase's history". Every send on such a server left a permanent
+            // duplicate in Drafts, because the delete was annihilated rather than
+            // retried.
+            //
+            // `requireUidValidity(live:expected:folder:)` is that three-outcome
+            // comparison and already existed, ten screens up, for exactly this
+            // hazard — this leg was simply never routed through it. Do not add a
+            // second epoch checker here. What each outcome now means:
+            //  - equal, both real ⇒ proceed (unchanged);
+            //  - both real and DIFFERENT ⇒ `ProviderError.uidValidityChanged`, exit 4
+            //    of the never-drop rule. STILL TERMINAL — the drain retires the op —
+            //    and now under the classification that actually describes it, a
+            //    PROVEN turnover in this op's own address space, rather than a
+            //    verdict on the identity's parsability;
+            //  - either epoch zero ⇒ `IMAPEpochEvidenceMissing`, retryable, requeued
+            //    by the drain's `ProviderEvidenceUnavailable` arm.
+            //
+            // ⚠ THE EVIDENCE THIS OPERATION REQUIRES IS UNCHANGED — the refusal set
+            // only GREW. `deleteDraftStrong` is one of the two irreversible wire
+            // operations in this app (it destroys a draft outright instead of moving
+            // it to Trash), so nothing here may ever make it mutate on WEAKER proof.
+            // Zero previously reached the mutation only in the sense that it reached
+            // a terminal drop; it now reaches neither the mutation nor a drop.
+            do {
+                try self.requireUidValidity(
+                    selection, expected: recordedUidValidity, folder: draftsFolderPath)
+            } catch let missing as IMAPEpochEvidenceMissing {
+                // Debug-gated (rule 12): this is NEW diagnostic trace, and unlike the
+                // mismatch line below it does not witness a drop — the op stays
+                // durably queued and the drain's own `ProviderEvidenceUnavailable`
+                // arm already logs it. Gating it cannot hide a loss, because there
+                // is no loss.
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[IMAP] deleteDraft (strong): SELECT of \(draftsFolderPath) reported NO usable UIDVALIDITY for uid=\(uid) (recorded=\(uidValidity), current=\(selection.uidValidity.value)) — REFUSING and keeping the op QUEUED (absence of evidence is not a proven turnover; retries when the server reports one)")
+                }
+                throw missing
+            } catch {
                 print("[IMAP] deleteDraft (strong): UIDVALIDITY mismatch for uid=\(uid) in \(draftsFolderPath) (recorded=\(uidValidity), current=\(selection.uidValidity.value)) — REFUSING (fail closed; never rebind by rfc822)")
-                throw ProviderError.actionIdentityResolutionFailed(String(uid))
+                throw error
             }
             let targetSet = UIDSet(UID(targetUidValue))
             let infos = try await server.fetchMessageInfosBulk(using: targetSet)

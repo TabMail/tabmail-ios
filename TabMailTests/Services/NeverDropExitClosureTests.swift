@@ -1252,4 +1252,269 @@ struct NeverDropExitClosureTests {
         try? await provider.disconnect()
         await finish(f)
     }
+
+    // MARK: - A-4 (draft leg) — the same closure, on the IRREVERSIBLE draft delete
+
+    /// The A-4 defect survived on a third site. `IMAPProvider.deleteDraftStrong`
+    /// carried its own copy of the two-outcome comparison —
+    /// `guard selection.uidValidity.value == recordedUidValidity else { throw
+    /// ProviderError.actionIdentityResolutionFailed(…) }` — inherited verbatim from
+    /// `v2final`, which has the identical shape. A SELECT that omits the untagged
+    /// UIDVALIDITY response yields SwiftMail's `UIDValidity(0)` default, zero is
+    /// never equal to a recorded `nz-number`, and the drain DELETES the durable op
+    /// on `actionIdentityResolutionFailed`. "The server did not tell us" took a
+    /// terminal exit.
+    ///
+    /// THE PROPERTY: the user's delete intention survives an answer the server
+    /// declined to give, and the server-side draft is untouched. The test never
+    /// inspects the thrown error's type — it observes the durable row and the wire.
+    ///
+    /// The product cost of the defect: on such a server every send left a PERMANENT
+    /// duplicate in Drafts, because the post-send server-draft cleanup was
+    /// annihilated instead of retried.
+    ///
+    /// RED PROOF (recorded in the marker): restoring the two-outcome guard fails
+    /// this at `after.count == 1` — the row is gone.
+    @Test("A Drafts SELECT that reports no UIDVALIDITY leaves the draft delete queued and destroys nothing")
+    @MainActor
+    func unknownDraftsEpochLeavesTheDraftDeleteQueued() async throws {
+        let target = "unknown-drafts-epoch@example.com"
+        let server = FakeIMAPServer(mailboxes: ["Drafts": [Self.message(uid: 5, id: target)]])
+        // The mailbox's real epoch MATCHES the address the op recorded — the only
+        // thing missing is the server saying so.
+        server.setUidValidity(10, for: "Drafts")
+        server.suppressSelectUidValidity(for: "Drafts")
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(
+            accountId: "closure-draft-unknown-epoch",
+            folders: [("INBOX", .inbox, 10), ("Drafts", .drafts, 10)])
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let op = PendingOperation(
+            type: .deleteDraft, messageIds: ["5"], accountId: f.accountId,
+            folderPath: "Drafts",
+            observedUidValidity: 10, draftServerUidValidity: 10,
+            draftDeleteAddressKind: .providerResource)
+        try insert([op], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        let after = try operations(f.pool)
+        #expect(
+            after.count == 1,
+            "an unknown live epoch is an absence of evidence — the delete intention must stay queued, not be retired as an unresolvable identity"
+        )
+        guard after.count == 1 else {
+            try? await provider.disconnect()
+            await finish(f)
+            return
+        }
+        #expect(after[0].id == op.id)
+        #expect(after[0].status == PendingStatus.queued.rawValue)
+        // `deleteDraftStrong` is IRREVERSIBLE — refusing must also mean the draft is
+        // still there to delete on the retry.
+        #expect(server.messageIDs(in: "Drafts") == ["<\(target)>"])
+        #expect(
+            !server.flags(in: "Drafts", uid: 5).contains("\\Deleted"),
+            "not even the soft half of the destructive sequence may run on an unproven epoch")
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// NON-VACUITY partner: the same fixture with the suppression removed deletes
+    /// the draft and retires the op. Without this, the test above would pass
+    /// against a draft path that could never delete anything at all.
+    @Test("The same draft fixture with UIDVALIDITY reported deletes the draft and retires the op")
+    @MainActor
+    func reportedDraftsEpochCompletesTheDraftDelete() async throws {
+        let target = "known-drafts-epoch@example.com"
+        let server = FakeIMAPServer(mailboxes: ["Drafts": [Self.message(uid: 5, id: target)]])
+        server.setUidValidity(10, for: "Drafts")
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(
+            accountId: "closure-draft-known-epoch",
+            folders: [("INBOX", .inbox, 10), ("Drafts", .drafts, 10)])
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        try insert([PendingOperation(
+            type: .deleteDraft, messageIds: ["5"], accountId: f.accountId,
+            folderPath: "Drafts",
+            observedUidValidity: 10, draftServerUidValidity: 10,
+            draftDeleteAddressKind: .providerResource)], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(server.messageIDs(in: "Drafts").isEmpty)
+        #expect(try operations(f.pool).isEmpty)
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// THE OTHER DIRECTION, and it must not regress: two epochs that are BOTH real
+    /// and disagree is a PROVEN turnover in this op's own address space — exit 4.
+    /// The op is retired and the draft is not touched, because the UID it names now
+    /// addresses whatever the new numbering put there (C3).
+    ///
+    /// A one-sided fix that made every epoch disagreement retryable would pass the
+    /// test above while converting exit 4 into an unbounded retry against a
+    /// reassigned address. This is the half that keeps the fix honest.
+    @Test("A proven Drafts UIDVALIDITY turnover still retires the draft delete and mutates nothing")
+    @MainActor
+    func provenDraftsEpochTurnoverRetiresTheDraftDelete() async throws {
+        let occupant = "post-turnover-occupant@example.com"
+        let server = FakeIMAPServer(mailboxes: ["Drafts": [Self.message(uid: 5, id: occupant)]])
+        // The mailbox has rolled: uid 5 now names a DIFFERENT message.
+        server.setUidValidity(11, for: "Drafts")
+        // Arm the oracle on the draft the op INTENDED (which the turnover took with
+        // it), so any mutation landing on the occupant is recorded as a violation
+        // rather than silently licensed.
+        server.expectMutation(rfc822MessageId: "pre-turnover-intended-draft@example.com")
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(
+            accountId: "closure-draft-turnover",
+            folders: [("INBOX", .inbox, 10), ("Drafts", .drafts, 10)])
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        try insert([PendingOperation(
+            type: .deleteDraft, messageIds: ["5"], accountId: f.accountId,
+            folderPath: "Drafts",
+            observedUidValidity: 10, draftServerUidValidity: 10,
+            draftDeleteAddressKind: .providerResource)], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(
+            try operations(f.pool).isEmpty,
+            "a PROVEN turnover is exit 4 — every retry would fail identically and forever, so the op is retired"
+        )
+        #expect(
+            server.messageIDs(in: "Drafts") == ["<\(occupant)>"],
+            "the message the new numbering put at uid 5 must not be destroyed by an op that never observed that numbering (C3)"
+        )
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// THE WEDGE COROLLARY. Trading a dropped intention for a starved lane scores
+    /// zero: "an op that stays queued forever while starving other intentions has
+    /// not been preserved."
+    ///
+    /// The drain has NO retry budget for `ProviderEvidenceUnavailable` — it
+    /// requeues, bumps `retryCount` (diagnostics only for `PendingOperation`),
+    /// records the op in `evidenceRefused` and returns `.haltLane`. So a refusal
+    /// that can never clear halts ITS OWN lane indefinitely, and this test bounds
+    /// exactly what that costs.
+    ///
+    /// A lane is a connected component over `"accountId:folderPath:messageId"`
+    /// (`buildLanes`), so a `.deleteDraft` op's lane is `<account>:<Drafts>:<uid>`.
+    /// Three ops here, drained TWICE against a Drafts mailbox that never reports an
+    /// epoch:
+    ///  - the draft delete — must still be durably queued after both passes;
+    ///  - a same-lane `markRead` on the same Drafts UID — starved behind it, and
+    ///    that starvation must not destroy it either. (It could not have succeeded
+    ///    anyway: it reaches the same zero-epoch SELECT and raises the same
+    ///    refusal, so nothing SATISFIABLE is being starved.)
+    ///  - a different-lane `markRead` in INBOX, where the server does report an
+    ///    epoch — this one must reach the provider and retire. Asserted BOTH ways:
+    ///    a durable db assertion that its row is gone, and the wire flag it set.
+    ///    A test that only checked the first op survived would pass while the whole
+    ///    account was wedged.
+    ///
+    /// ⚠ REACHABILITY, established separately and worth recording: the "server
+    /// PERMANENTLY omits UIDVALIDITY" case cannot produce a `.deleteDraft` op at
+    /// all. `AccountManager.queueDraftDelete` is its only producer and its IMAP arm
+    /// admits only when `folder.lastKnownUidValidity == uidValidity` with
+    /// `uidValidity > 0`; every writer of that column normalises through
+    /// `SyncEngine.knownUidValidity`, which returns nil for `<= 0`, so on such a
+    /// server the column stays nil forever and the gesture is refused at admission
+    /// (`IOS-EPOCH-001`). The reachable population is a Drafts folder whose epoch
+    /// WAS observed and then stops being reported — indefinite, not permanent,
+    /// self-healing on the first conformant SELECT. This test still pins the
+    /// permanent shape, because a bound nobody checks is a hope.
+    @Test("A Drafts mailbox that never reports UIDVALIDITY keeps the draft delete durable and does not starve the account")
+    @MainActor
+    func epochlessDraftsMailboxKeepsTheDeleteDurableWithoutStarvingTheAccount() async throws {
+        let draft = "epochless-drafts-target@example.com"
+        let inboxTarget = "other-lane-target@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "Drafts": [Self.message(uid: 5, id: draft)],
+            "INBOX": [Self.message(uid: 7, id: inboxTarget)],
+        ])
+        server.setUidValidity(10, for: "Drafts")
+        server.setUidValidity(10, for: "INBOX")
+        // Permanent: never restored, on either drain.
+        server.suppressSelectUidValidity(for: "Drafts")
+        server.expectMutations([draft, inboxTarget])
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(
+            accountId: "closure-draft-epochless-lane",
+            folders: [("INBOX", .inbox, 10), ("Drafts", .drafts, 10)])
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        var deleteOp = PendingOperation(
+            type: .deleteDraft, messageIds: ["5"], accountId: f.accountId,
+            folderPath: "Drafts",
+            observedUidValidity: 10, draftServerUidValidity: 10,
+            draftDeleteAddressKind: .providerResource)
+        deleteOp.createdAt = base
+        // Same lane as `deleteOp`: same account, same folder, same member id. The
+        // explicit `createdAt` ordering is what puts it BEHIND the refusal.
+        var sameLane = PendingOperation(
+            type: .markRead, messageIds: ["5"], accountId: f.accountId,
+            folderPath: "Drafts", observedUidValidity: 10)
+        sameLane.createdAt = base.addingTimeInterval(1)
+        // A disjoint component — this is the intention that must not be starved.
+        var otherLane = PendingOperation(
+            type: .markRead, messageIds: ["7"], accountId: f.accountId,
+            folderPath: "INBOX", observedUidValidity: 10)
+        otherLane.createdAt = base.addingTimeInterval(2)
+        try insert([deleteOp, sameLane, otherLane], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+        await AccountManager.shared.drainPendingQueue()
+
+        let remaining = try operations(f.pool)
+        let remainingIds = Set(remaining.map(\.id))
+        #expect(
+            remainingIds.contains(deleteOp.id),
+            "the delete intention must survive a server that never answers — repeated refusals are not an exit"
+        )
+        #expect(
+            remainingIds.contains(sameLane.id),
+            "a starved same-lane op must be preserved too; halting a lane is not a licence to destroy what is behind it"
+        )
+        // DURABLE db assertion that the disjoint lane made real progress — a wire
+        // count alone would still pass against a queue that re-runs the same op
+        // forever without ever retiring it.
+        #expect(
+            !remainingIds.contains(otherLane.id),
+            "an unrelated intention in a disjoint lane must reach the provider and retire — a refusal on one lane may never wedge the account"
+        )
+        #expect(
+            server.flags(in: "INBOX", uid: 7).contains("\\Seen"),
+            "and it must have actually reached the wire, not merely left the queue"
+        )
+        #expect(
+            server.messageIDs(in: "Drafts") == ["<\(draft)>"],
+            "nothing irreversible may happen to the draft while its epoch is unproven"
+        )
+        #expect(
+            !server.flags(in: "Drafts", uid: 5).contains("\\Deleted"),
+            "not even the soft half of the destructive sequence"
+        )
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
 }
