@@ -78,7 +78,9 @@ struct LocallyAuthoredDraftOpenAuthorityTests {
         accountId: String = "acc1",
         epoch: String = "E1",
         serverId: String? = nil,
-        status: String? = "pushed"
+        status: String? = "pushed",
+        serverFolderPath: String? = "Drafts",
+        serverUidValidity: Int? = 900_001
     ) -> Draft {
         var value = Draft(
             id: "draft-1", accountId: accountId,
@@ -88,6 +90,8 @@ struct LocallyAuthoredDraftOpenAuthorityTests {
             serverDraftId: serverId, serverPushStatus: status,
             rfc822MessageId: "draft@example.com", attachmentsDirName: nil)
         value.instanceEpoch = epoch
+        value.serverDraftFolderPath = serverFolderPath
+        value.serverDraftUidValidity = serverUidValidity
         return value
     }
 
@@ -111,6 +115,11 @@ struct LocallyAuthoredDraftOpenAuthorityTests {
                 serverPushStatus: "pushed", runtimeKind: .outlook,
                 address: .outlook(graphId: "graph-1")),
              draft(serverId: "graph-1")),
+            (.init(
+                draftId: "draft-1", accountId: "acc1", instanceEpoch: "E1",
+                serverPushStatus: "pushed", runtimeKind: .imap,
+                address: .imap(folderPath: "Drafts", uidValidity: 900_001, uid: "7")),
+             draft(serverId: "7")),
             (.init(
                 draftId: "draft-1", accountId: "acc1", instanceEpoch: "E1",
                 serverPushStatus: "pushed", runtimeKind: .demo,
@@ -137,6 +146,235 @@ struct LocallyAuthoredDraftOpenAuthorityTests {
                 draft(serverId: original.serverDraftId == nil ? "unexpected" : "replacement"),
                 runtimeKind: authority.runtimeKind))
         }
+    }
+
+    /// A bare UID is a slot number, not an address. `matches` must reject a row that
+    /// carries the same UID under a different mailbox or a different numbering
+    /// space, otherwise the handoff re-check degenerates into "the number agrees".
+    @Test("An IMAP handoff rejects the same UID under another mailbox or another numbering space")
+    func imapHandoffRequiresTheWholeAddress() {
+        let authority = LocallyAuthoredDraftOpenAuthority(
+            draftId: "draft-1", accountId: "acc1", instanceEpoch: "E1",
+            serverPushStatus: "pushed", runtimeKind: .imap,
+            address: .imap(folderPath: "Drafts", uidValidity: 900_001, uid: "7"))
+
+        #expect(authority.matches(draft(serverId: "7"), runtimeKind: .imap),
+                "precondition: the exact recorded address is accepted")
+        #expect(!authority.matches(
+            draft(serverId: "7", serverFolderPath: "INBOX.Drafts"), runtimeKind: .imap),
+                """
+                UID 7 in a DIFFERENT mailbox was accepted as the authority for this draft — \
+                UIDs are folder-scoped, so this hands the user another mailbox's slot to edit
+                """)
+        #expect(!authority.matches(
+            draft(serverId: "7", serverUidValidity: 900_002), runtimeKind: .imap),
+                """
+                UID 7 in a DIFFERENT UIDVALIDITY numbering space was accepted — after a \
+                renumbering, slot 7 is a different message (C3)
+                """)
+        #expect(!authority.matches(
+            draft(serverId: "7", serverFolderPath: nil), runtimeKind: .imap),
+                "a row with no recorded mailbox has no provider-native address to agree with")
+        #expect(!authority.matches(
+            draft(serverId: "7", serverUidValidity: nil), runtimeKind: .imap),
+                "a row with no recorded epoch has no provider-native address to agree with")
+    }
+}
+
+/// THE INVARIANT: **a Drafts header opens a compose if and only if THIS device holds
+/// the locally-authored `Draft` row that was pushed to exactly that address.**
+///
+/// Stated as an end state rather than as a property of `matches`, because for the
+/// whole window this suite is written against, `matches` was correct and IMAP drafts
+/// were still unopenable: `resolve`'s switch had no `.imap` arm, so every pushed IMAP
+/// draft fell to `default: return nil` (`MIS-015` — a mechanism-pinning test stays
+/// green on a system that has the defect).
+///
+/// The held direction is equally load-bearing and is asserted on the same fixture:
+/// arbitrary SERVER-ORIGIN drafts have no local `Draft` row and must stay closed —
+/// sync remains authoritative for them.
+@Suite("Locally authored draft reopen resolution")
+struct LocallyAuthoredDraftResolutionTests {
+    private static let accountId = "acc-imap"
+    private static let draftsPath = "Drafts"
+    private static let liveEpoch = 900_001
+
+    /// Builds an account + a Drafts folder + one Drafts header at `headerUid`.
+    private func makeFixture(
+        _ db: DatabaseQueue,
+        folderEpoch: Int? = LocallyAuthoredDraftResolutionTests.liveEpoch,
+        headerUid: String = "7"
+    ) throws -> MessageHeader {
+        try TestDatabase.insertAccount(
+            db, id: Self.accountId, email: "imap@example.com", provider: .imap)
+        var folder = Folder(
+            name: "Drafts", path: Self.draftsPath, role: .drafts, accountId: Self.accountId)
+        folder.lastKnownUidValidity = folderEpoch
+        try db.write { try folder.insert($0) }
+        return try TestDatabase.insertMessageHeader(
+            db,
+            messageId: headerUid,
+            folderId: folder.id,
+            accountId: Self.accountId,
+            folderPath: Self.draftsPath,
+            isInInbox: false,
+            rfc822MessageId: "authored@example.com")
+    }
+
+    /// Inserts a locally-authored draft row. Defaults describe a draft whose IMAP
+    /// push SUCCEEDED against the fixture's folder and epoch.
+    @discardableResult
+    private func insertDraft(
+        _ db: DatabaseQueue,
+        id: String = "new:11111111-2222-3333-4444-555555555555",
+        epoch: String? = "E1",
+        serverDraftId: String? = "7",
+        serverFolderPath: String? = LocallyAuthoredDraftResolutionTests.draftsPath,
+        serverUidValidity: Int? = LocallyAuthoredDraftResolutionTests.liveEpoch
+    ) throws -> Draft {
+        var value = Draft(
+            id: id, accountId: Self.accountId,
+            toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+            subject: "authored on this device", body: "body", replyToId: nil,
+            isForward: false, editHistoryJSON: nil, createdAt: 1, updatedAt: 1,
+            serverDraftId: serverDraftId, serverPushStatus: "pushed",
+            rfc822MessageId: "authored@example.com", attachmentsDirName: nil)
+        value.instanceEpoch = epoch
+        value.serverDraftFolderPath = serverFolderPath
+        value.serverDraftUidValidity = serverUidValidity
+        try db.write { try value.insert($0) }
+        return value
+    }
+
+    private func resolve(
+        _ db: DatabaseQueue, _ header: MessageHeader
+    ) throws -> LocallyAuthoredDraftOpenAuthority? {
+        try db.read { db in
+            try LocallyAuthoredDraftOpenAuthority.resolve(
+                db: db, header: header, runtimeKind: .imap)
+        }
+    }
+
+    @Test("A locally-authored IMAP draft whose push succeeded reopens to its own Draft row")
+    func aPushedImapDraftReopens() throws {
+        let db = try TestDatabase.make()
+        let header = try makeFixture(db)
+        let draft = try insertDraft(db)
+
+        let authority = try resolve(db, header)
+
+        #expect(authority?.draftId == draft.id,
+                """
+                tapping a draft this device authored, after its first save reached the server, \
+                resolved to \(String(describing: authority?.draftId)) instead of \(draft.id) — \
+                the user's own draft is unopenable and for a `new:<UUID>` compose there is no \
+                other handle in the UI and no sync path that rebuilds the row
+                """)
+        #expect(
+            authority?.address == .imap(
+                folderPath: Self.draftsPath, uidValidity: Self.liveEpoch, uid: "7"),
+            "the handoff must carry the COMPLETE provider-native address, not the bare UID")
+        #expect(authority?.accountId == Self.accountId)
+        #expect(authority?.instanceEpoch == "E1")
+    }
+
+    @Test("An unpushed draft still reopens through its generation placeholder")
+    func anUnpushedDraftStillReopens() throws {
+        let db = try TestDatabase.make()
+        let placeholder = PendingOperation.draftPlaceholderMessageId(
+            draftId: "new:unpushed", instanceEpoch: "E1")
+        let header = try makeFixture(db, headerUid: placeholder)
+        try insertDraft(
+            db, id: "new:unpushed", serverDraftId: nil,
+            serverFolderPath: nil, serverUidValidity: nil)
+
+        #expect(try resolve(db, header)?.draftId == "new:unpushed",
+                "the pre-push placeholder arm must keep working — it is the only handle before the first save lands")
+    }
+
+    @Test("A Drafts header with no local Draft row stays closed")
+    func aServerOriginDraftStaysClosed() throws {
+        let db = try TestDatabase.make()
+        let header = try makeFixture(db)
+
+        #expect(try resolve(db, header) == nil,
+                """
+                a Drafts header with NO locally-authored row opened a compose — that is the \
+                MIRROR IMAGE of the bug being fixed: arbitrary server-origin drafts must fail \
+                closed, because nothing on this device holds the bytes the user would be editing
+                """)
+    }
+
+    @Test("A draft pushed to another mailbox does not authorize this header")
+    func aDraftFromAnotherMailboxStaysClosed() throws {
+        let db = try TestDatabase.make()
+        let header = try makeFixture(db)
+        try insertDraft(db, serverFolderPath: "Archive")
+
+        #expect(try resolve(db, header) == nil,
+                "UID 7 recorded against another mailbox is a different message — the UID is folder-scoped")
+    }
+
+    @Test("A draft recorded under a superseded numbering space does not authorize this header")
+    func aDraftFromAnotherEpochStaysClosed() throws {
+        let db = try TestDatabase.make()
+        let header = try makeFixture(db)
+        try insertDraft(db, serverUidValidity: 900_000)
+
+        #expect(try resolve(db, header) == nil,
+                """
+                a draft recorded under UIDVALIDITY 900000 authorized a header in the folder's \
+                CURRENT space 900001 — after a renumbering, slot 7 is somebody else's message (C3)
+                """)
+    }
+
+    @Test("A folder whose numbering space is unknown refuses the reopen")
+    func anUnstampedFolderStaysClosed() throws {
+        let db = try TestDatabase.make()
+        let header = try makeFixture(db, folderEpoch: nil)
+        try insertDraft(db)
+
+        #expect(try resolve(db, header) == nil,
+                """
+                the reopen was authorized against a folder with NO known UIDVALIDITY — unknown \
+                is never authoritative (`IOS-EPOCH-001`); the refusal is recovered by an \
+                ordinary sync that stamps the folder
+                """)
+    }
+
+    @Test("A draft holding a different UID does not authorize this header")
+    func aDraftWithAnotherUidStaysClosed() throws {
+        let db = try TestDatabase.make()
+        let header = try makeFixture(db)
+        try insertDraft(db, serverDraftId: "8")
+
+        #expect(try resolve(db, header) == nil,
+                "slot 8's draft must not open from slot 7's header")
+    }
+
+    @Test("Two local drafts claiming the same address refuse rather than guess")
+    func anAmbiguousAddressStaysClosed() throws {
+        let db = try TestDatabase.make()
+        let header = try makeFixture(db)
+        try insertDraft(db, id: "new:first")
+        try insertDraft(db, id: "new:second")
+
+        #expect(try resolve(db, header) == nil,
+                "two rows claim this address; picking either one is a coin flip over which bytes the user edits")
+    }
+
+    @Test("A pre-upgrade draft with no generation stamp stays closed")
+    func aDraftWithNoInstanceEpochStaysClosed() throws {
+        let db = try TestDatabase.make()
+        let header = try makeFixture(db)
+        try insertDraft(db, epoch: nil)
+
+        #expect(try resolve(db, header) == nil,
+                """
+                a `Draft` predating `v76_addDraftGenerationAndTypedIdentity` has no \
+                `instanceEpoch`; admitting it would mean fabricating a generation, and the \
+                generation is a single-writer CAS guard — registered in KNOWN_ISSUES.md, not backfilled
+                """)
     }
 }
 

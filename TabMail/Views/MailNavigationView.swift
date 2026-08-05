@@ -1131,10 +1131,18 @@ struct ServerDraftComposeLoader: View {
                     draftId: openAuthority.draftId,
                     openAuthority: openAuthority)
             } else {
+                // STATE ONLY THE OBSERVED FACT — do not promise a remedy. The
+                // refusal turns on LOCAL `Draft` state, and no sync path produces a
+                // `Draft` row (`Draft` has zero sync-engine construction sites), so
+                // the superseded copy — "Sync the Drafts folder and try again." —
+                // sent the user to do something that provably cannot help. Same
+                // precedent as `afa7889ee` (`IOS-IMAP-001`'s fifth-path closure).
+                // "was not found" also stays true on the `catch` path below, where a
+                // thrown read — not a proven absence — lands here.
                 ContentUnavailableView(
                     "Draft unavailable",
                     systemImage: "exclamationmark.shield",
-                    description: Text("Sync the Drafts folder and try again."))
+                    description: Text("No editable copy of this draft was found on this device."))
             }
         }
         .task {
@@ -1158,56 +1166,9 @@ struct ServerDraftComposeLoader: View {
                 return
             }
 
-            let candidate = try await AppDatabase.dbPool.read { db -> LocallyAuthoredDraftOpenAuthority? in
-                guard let current = try MessageHeader.fetchOne(db, key: header.id),
-                      current.accountId == header.accountId,
-                      current.folderId == header.folderId,
-                      current.folderPath == header.folderPath,
-                      current.messageId == header.messageId,
-                      current.rfc822MessageId == header.rfc822MessageId,
-                      try Folder.fetchOne(db, key: current.folderId)?.role == .drafts else {
-                    return nil
-                }
-                let drafts = try Draft
-                    .filter(Column("accountId") == current.accountId)
-                    .fetchAll(db)
-                let matches = drafts.compactMap { draft -> LocallyAuthoredDraftOpenAuthority? in
-                    guard let instanceEpoch = draft.instanceEpoch,
-                          !instanceEpoch.isEmpty else { return nil }
-                    if PendingOperation.draftPlaceholderMessageId(
-                        draftId: draft.id,
-                        instanceEpoch: draft.instanceEpoch) == current.messageId {
-                        return LocallyAuthoredDraftOpenAuthority(
-                            draftId: draft.id,
-                            accountId: draft.accountId,
-                            instanceEpoch: instanceEpoch,
-                            serverPushStatus: draft.serverPushStatus,
-                            runtimeKind: runtimeKind,
-                            address: .placeholder(messageId: current.messageId))
-                    }
-                    guard let serverId = draft.serverDraftId, !serverId.isEmpty else {
-                        return nil
-                    }
-                    switch runtimeKind {
-                    case .outlook where serverId == current.messageId:
-                        return LocallyAuthoredDraftOpenAuthority(
-                            draftId: draft.id, accountId: draft.accountId,
-                            instanceEpoch: instanceEpoch,
-                            serverPushStatus: draft.serverPushStatus,
-                            runtimeKind: runtimeKind,
-                            address: .outlook(graphId: serverId))
-                    case .demo where serverId == current.messageId:
-                        return LocallyAuthoredDraftOpenAuthority(
-                            draftId: draft.id, accountId: draft.accountId,
-                            instanceEpoch: instanceEpoch,
-                            serverPushStatus: draft.serverPushStatus,
-                            runtimeKind: runtimeKind,
-                            address: .demo(localId: serverId))
-                    default:
-                        return nil
-                    }
-                }
-                return matches.count == 1 ? matches.first : nil
+            let candidate = try await AppDatabase.dbPool.read { db in
+                try LocallyAuthoredDraftOpenAuthority.resolve(
+                    db: db, header: header, runtimeKind: runtimeKind)
             }
             guard let candidate,
                   await AccountManager.shared.draftRuntimeIdentityKind(

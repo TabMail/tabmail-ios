@@ -13,6 +13,13 @@ struct LocallyAuthoredDraftOpenAuthority: Sendable, Equatable {
         case placeholder(messageId: String)
         case gmail(resourceId: String, containedMessageId: String)
         case outlook(graphId: String)
+        /// The COMPLETE IMAP provider-native address of a pushed draft. A bare UID
+        /// is not an address: it is a slot number inside one mailbox's one
+        /// UIDVALIDITY numbering space, so `(folderPath, uidValidity, uid)` is the
+        /// smallest tuple that names a message (THE ADDRESS PROBLEM). Every
+        /// component is written by `DraftStore`'s `case (.imap, .imap(...))` push
+        /// arm — this case reads what that arm already recorded and invents nothing.
+        case imap(folderPath: String, uidValidity: Int, uid: String)
         case demo(localId: String)
     }
 
@@ -39,9 +46,125 @@ struct LocallyAuthoredDraftOpenAuthority: Sendable, Equatable {
             return currentRuntimeKind == .gmail && draft.serverDraftId == resourceId
         case .outlook(let graphId):
             return currentRuntimeKind == .outlook && draft.serverDraftId == graphId
+        case .imap(let folderPath, let uidValidity, let uid):
+            // All THREE components, because the UID alone is ambiguous across
+            // mailboxes and across numbering spaces. This re-check runs against a
+            // freshly-read `Draft` row at both handoffs; it deliberately does NOT
+            // re-read the live folder's epoch (no `Database` here, same as every
+            // other arm) — the folder-epoch agreement is proven once, inside the
+            // resolver's read transaction, where the folder row is already in hand.
+            return currentRuntimeKind == .imap
+                && draft.serverDraftId == uid
+                && draft.serverDraftFolderPath == folderPath
+                && draft.serverDraftUidValidity == uidValidity
         case .demo(let localId):
             return currentRuntimeKind == .demo && draft.serverDraftId == localId
         }
+    }
+
+    /// The database half of `ServerDraftComposeLoader.resolveLocallyAuthoredDraft`
+    /// for every runtime except Gmail (whose resolution needs a provider round trip
+    /// to turn a contained MESSAGE id into a draft RESOURCE id, so it cannot live in
+    /// a read transaction).
+    ///
+    /// Extracted so the INVARIANT — *given a database and a Drafts header, exactly
+    /// the locally-authored `Draft` that owns that header comes back, and nothing
+    /// else does* — is testable. Pinning `matches` alone pins a mechanism: it stayed
+    /// green for the whole window in which `.imap` fell through to `default: return
+    /// nil` and no IMAP draft could be reopened at all (`MIS-015`).
+    ///
+    /// FAIL CLOSED is the default on every axis. Arbitrary server-origin drafts have
+    /// no local `Draft` row, produce no match, and stay unopenable — sync remains
+    /// authoritative for them. An ambiguous result (two local rows claiming the same
+    /// header) refuses rather than guessing.
+    static func resolve(
+        db: Database,
+        header: MessageHeader,
+        runtimeKind: DraftRuntimeIdentityKind
+    ) throws -> LocallyAuthoredDraftOpenAuthority? {
+        guard let current = try MessageHeader.fetchOne(db, key: header.id),
+              current.accountId == header.accountId,
+              current.folderId == header.folderId,
+              current.folderPath == header.folderPath,
+              current.messageId == header.messageId,
+              current.rfc822MessageId == header.rfc822MessageId,
+              let draftsFolder = try Folder.fetchOne(db, key: current.folderId),
+              draftsFolder.role == .drafts else {
+            return nil
+        }
+        let drafts = try Draft
+            .filter(Column("accountId") == current.accountId)
+            .fetchAll(db)
+        let matches = drafts.compactMap { draft -> LocallyAuthoredDraftOpenAuthority? in
+            guard let instanceEpoch = draft.instanceEpoch,
+                  !instanceEpoch.isEmpty else { return nil }
+            if PendingOperation.draftPlaceholderMessageId(
+                draftId: draft.id,
+                instanceEpoch: draft.instanceEpoch) == current.messageId {
+                return LocallyAuthoredDraftOpenAuthority(
+                    draftId: draft.id,
+                    accountId: draft.accountId,
+                    instanceEpoch: instanceEpoch,
+                    serverPushStatus: draft.serverPushStatus,
+                    runtimeKind: runtimeKind,
+                    address: .placeholder(messageId: current.messageId))
+            }
+            guard let serverId = draft.serverDraftId, !serverId.isEmpty else {
+                return nil
+            }
+            switch runtimeKind {
+            case .outlook where serverId == current.messageId:
+                return LocallyAuthoredDraftOpenAuthority(
+                    draftId: draft.id, accountId: draft.accountId,
+                    instanceEpoch: instanceEpoch,
+                    serverPushStatus: draft.serverPushStatus,
+                    runtimeKind: runtimeKind,
+                    address: .outlook(graphId: serverId))
+            case .imap where serverId == current.messageId:
+                // The placeholder arm above stops matching the instant the push
+                // completes: `DraftStore`'s IMAP push arm rewrites the header's
+                // `messageId` to the bare UID, which never equals the placeholder
+                // string. From that moment this arm is the ONLY thing that can
+                // reopen a draft the user authored on this device.
+                //
+                // A bare UID match is NOT sufficient authority. It is a slot number
+                // in one mailbox's numbering space, so it must agree with the
+                // mailbox the draft was pushed to AND with the numbering space that
+                // mailbox is currently in — otherwise a renumbered Drafts folder
+                // would hand the user a different message's slot to edit (C3).
+                // A folder whose epoch is unknown (nil / <= 0) refuses: unknown is
+                // never authoritative (`IOS-EPOCH-001`), and the refusal is
+                // recovered by an ordinary sync that stamps the folder.
+                guard let recordedFolder = draft.serverDraftFolderPath,
+                      recordedFolder == current.folderPath,
+                      let recordedEpoch = draft.serverDraftUidValidity,
+                      recordedEpoch > 0,
+                      let liveEpoch = draftsFolder.lastKnownUidValidity,
+                      liveEpoch > 0,
+                      recordedEpoch == liveEpoch else {
+                    return nil
+                }
+                return LocallyAuthoredDraftOpenAuthority(
+                    draftId: draft.id, accountId: draft.accountId,
+                    instanceEpoch: instanceEpoch,
+                    serverPushStatus: draft.serverPushStatus,
+                    runtimeKind: runtimeKind,
+                    address: .imap(
+                        folderPath: recordedFolder,
+                        uidValidity: recordedEpoch,
+                        uid: serverId))
+            case .demo where serverId == current.messageId:
+                return LocallyAuthoredDraftOpenAuthority(
+                    draftId: draft.id, accountId: draft.accountId,
+                    instanceEpoch: instanceEpoch,
+                    serverPushStatus: draft.serverPushStatus,
+                    runtimeKind: runtimeKind,
+                    address: .demo(localId: serverId))
+            default:
+                return nil
+            }
+        }
+        return matches.count == 1 ? matches.first : nil
     }
 }
 
