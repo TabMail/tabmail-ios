@@ -812,9 +812,3 @@ actor DraftStore {
         return evictedCount
     }
 }
-
-/// Thrown as the last statement of `DraftStore.evictImpl`'s write transaction when
-/// a compose registered while the sweep was running, so GRDB rolls the eviction
-/// back. Private on purpose: it is a control-flow signal for exactly one `catch`,
-/// never an error any caller should see or handle.
-private struct ComposeRegisteredDuringEviction: Error {}

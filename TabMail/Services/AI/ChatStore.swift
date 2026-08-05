@@ -170,7 +170,12 @@ actor ChatStore {
         // `dbPool.write` opens, so a compose that calls `register(draftId)` after this
         // line is invisible to it — the stale-snapshot shape `DraftSessionRegistry`'s
         // header forbids. `enforceTurnBudgets` re-asks the registry LIVE inside the
-        // transaction and takes the union; see its doc comment.
+        // transaction, takes the union, AND re-checks the registration generation
+        // inside its own SAVEPOINT so a compose registering after that live read still
+        // rolls the sweep's deletions back. The savepoint scope matters: `turn.insert`
+        // below is the user's own new turn and is deliberately OUTSIDE it, so a
+        // rolled-back sweep never drops the intention this call exists to persist.
+        // See `enforceTurnBudgets`' doc comment.
         let activeComposeSessions = DraftSessionRegistry.shared.activeComposeSessionIds()
         let (evictedTurns, historyTurn) = try await AppDatabase.dbPool.write { db -> ([ChatTurn], ChatHistoryTurn) in
             try turn.insert(db)
@@ -249,13 +254,31 @@ actor ChatStore {
     /// that for no gain, because every deletion decision below is taken after this
     /// line and inside the same transaction.
     ///
-    /// RESIDUAL, stated precisely rather than claimed closed: the live read narrows
-    /// the exposure from [`appendTurn`'s pre-transaction sample .. commit] to [this
-    /// function's own read .. commit] — the insert of the new turn and its
-    /// `chatHistory` twin, plus the two sweeps. A `register` landing inside THAT
-    /// remnant still misses. It is the direction the mantra tolerates: the compose
-    /// keeps its text in memory and re-appends, and `chatHistory` (the memory
-    /// store, evicted separately) is unaffected by this sweep.
+    /// 🚨 **A LIVE PER-SWEEP READ IS STILL NOT ENOUGH ON ITS OWN** — the same gap
+    /// `DraftStore.evictImpl` closed in `20cd7b688`, which was left open here for one
+    /// round (`MIS-006`: fixed the instance, not the class). A compose that calls
+    /// `register` AFTER the read below but before the caller commits was absent from
+    /// `exemptSessions`, so its authored turns were already deleted inside the open
+    /// transaction and no re-ask can see it. So this function also records
+    /// `registrationGeneration()` beside that read and re-checks it as the LAST
+    /// statement of the sweep, rolling the deletions back when it moved.
+    ///
+    /// ⚠️ **THE ROLLBACK IS A SAVEPOINT, NOT THE WHOLE TRANSACTION — and that is the
+    /// one deliberate difference from `DraftStore.evictImpl`.** `evictImpl`'s
+    /// transaction contains nothing but eviction, so rolling all of it back is free.
+    /// THIS function runs inside `appendTurn`'s transaction, which also carries the
+    /// user's BRAND-NEW turn and its `chatHistory` twin. Rolling those back to save
+    /// an open compose's old turns would drop the intention the user just expressed —
+    /// the exact mirror image of the bug being fixed. `db.inSavepoint` scopes the
+    /// undo to the sweep: the deletions vanish, the insert commits. The caps are
+    /// already documented as SOFT, so skipping one sweep is in policy; the next
+    /// append re-runs it against a registry that now includes the new compose.
+    ///
+    /// RESIDUAL, stated precisely rather than claimed closed: the guard narrows the
+    /// exposure to a `register` landing between the final generation read and the
+    /// savepoint's release. It is not closable without holding a lock across a DB
+    /// write, which is forbidden here — the same irreducible remainder `evictImpl`
+    /// records as `IOS-DRAFT-012`.
     ///
     /// TERMINATION — each loop iterates a materialized array fetched BEFORE the
     /// loop. The measured variant is the number of unvisited elements of that array
@@ -277,36 +300,63 @@ actor ChatStore {
         // (Rule A6): once per sweep, never per row.
         let exemptSessions = activeComposeSessions
             .union(DraftSessionRegistry.shared.activeComposeSessionIds())
+        // Read AFTER the exemption set, matching `DraftStore.evictImpl`'s ordering. A
+        // `register` landing between the two readings is in the exemption set AND
+        // trips the guard — one redundant rollback, never a missed one.
+        let registrationsAtStart = DraftSessionRegistry.shared.registrationGeneration()
 
-        // Turn-COUNT budget. Scan oldest-first, SKIP active-compose turns, delete
-        // `excess` ELIGIBLE turns (a bare `.limit(excess)` could pick active ones).
-        // If too few inactive turns exist the cap stays SOFT — active history wins.
-        let totalTurns = try ChatTurn.fetchCount(db)
-        let maxMessages = Self.maxExchanges * 2
-        if totalTurns > maxMessages {
-            let excess = totalTurns - maxMessages
-            let oldestAll = try ChatTurn.order(Column("timestamp").asc).fetchAll(db)
-            var deleted = 0
-            for old in oldestAll {
-                if deleted >= excess { break }
-                if let sid = old.sessionId, exemptSessions.contains(sid) { continue }
-                try old.delete(db)
-                evictedTurns.append(old)
-                deleted += 1
+        do {
+            try db.inSavepoint {
+                // Turn-COUNT budget. Scan oldest-first, SKIP active-compose turns, delete
+                // `excess` ELIGIBLE turns (a bare `.limit(excess)` could pick active ones).
+                // If too few inactive turns exist the cap stays SOFT — active history wins.
+                let totalTurns = try ChatTurn.fetchCount(db)
+                let maxMessages = Self.maxExchanges * 2
+                if totalTurns > maxMessages {
+                    let excess = totalTurns - maxMessages
+                    let oldestAll = try ChatTurn.order(Column("timestamp").asc).fetchAll(db)
+                    var deleted = 0
+                    for old in oldestAll {
+                        if deleted >= excess { break }
+                        if let sid = old.sessionId, exemptSessions.contains(sid) { continue }
+                        try old.delete(db)
+                        evictedTurns.append(old)
+                        deleted += 1
+                    }
+                }
+
+                // CHAR budget — evict oldest (skipping active-compose) until under budget.
+                var totalChars = try Int.fetchOne(db, sql: "SELECT COALESCE(SUM(chars), 0) FROM chatTurn") ?? 0
+                let maxChars = Self.maxExchanges * Self.charsPerExchange
+                if totalChars > maxChars {
+                    let oldestTurns = try ChatTurn.order(Column("timestamp").asc).fetchAll(db)
+                    for oldest in oldestTurns {
+                        guard totalChars > maxChars else { break }
+                        if let sid = oldest.sessionId, exemptSessions.contains(sid) { continue }
+                        totalChars -= oldest.chars
+                        try oldest.delete(db)
+                        evictedTurns.append(oldest)
+                    }
+                }
+
+                // THE LAST STATEMENT INSIDE THE SAVEPOINT, deliberately. Every deletion
+                // above has already been decided against `exemptSessions`; this asks the
+                // one question those per-row checks cannot — did ANY compose open while
+                // this sweep was running? Only `register` moves the counter, so a compose
+                // that is merely open and untouched never trips it and the sweep is not
+                // starved.
+                guard DraftSessionRegistry.shared.registrationGeneration() == registrationsAtStart else {
+                    throw ComposeRegisteredDuringEviction()
+                }
+                return .commit
             }
-        }
-
-        // CHAR budget — evict oldest (skipping active-compose) until under budget.
-        var totalChars = try Int.fetchOne(db, sql: "SELECT COALESCE(SUM(chars), 0) FROM chatTurn") ?? 0
-        let maxChars = Self.maxExchanges * Self.charsPerExchange
-        if totalChars > maxChars {
-            let oldestTurns = try ChatTurn.order(Column("timestamp").asc).fetchAll(db)
-            for oldest in oldestTurns {
-                guard totalChars > maxChars else { break }
-                if let sid = oldest.sessionId, exemptSessions.contains(sid) { continue }
-                totalChars -= oldest.chars
-                try oldest.delete(db)
-                evictedTurns.append(oldest)
+        } catch is ComposeRegisteredDuringEviction {
+            // The savepoint rolled back, so nothing was deleted and the caller must not
+            // be told otherwise (it cascades these ids to the id translator). The
+            // caller's own INSERT sits OUTSIDE this savepoint and is untouched.
+            evictedTurns = []
+            if DebugModeManager.isLoggingEnabled() {
+                print("[ChatStore] Turn-budget sweep rolled back — a compose registered while it was in flight; the next append retries")
             }
         }
 
@@ -666,7 +716,20 @@ actor ChatStore {
         // header forbids, and the shape `DraftStore.evictImpl` carried until
         // `eda55f4ca` the same day. The exemption actually used is the union with a
         // LIVE read taken inside the write block, below.
+        //
+        // 🚨 **AND A LIVE RE-ASK IS STILL NOT ENOUGH ON ITS OWN.** A compose that
+        // registers AFTER the live read below but before the commit is absent from the
+        // `NOT IN` list, so its history rows are already selected and deleted inside
+        // the open transaction. Same class `DraftStore.evictImpl` closed in
+        // `20cd7b688` and left open here for one round (`MIS-006`). This function
+        // therefore also records `registrationGeneration()` before opening the write
+        // and re-checks it as the LAST statement inside it, throwing to roll the whole
+        // transaction back. That is safe here — unlike `enforceTurnBudgets`, this
+        // transaction contains NOTHING but the eviction, so nothing of the user's is
+        // discarded with it.
         let snapshotComposeSessions = DraftSessionRegistry.shared.activeComposeSessionIds()
+        let registrationsAtStart = DraftSessionRegistry.shared.registrationGeneration()
+        do {
         return try dbPool.write { db in
             let totalCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM chatHistory") ?? 0
             guard totalCount > maxTurns else { return [] }
@@ -717,7 +780,22 @@ actor ChatStore {
                 arguments: StatementArguments(evictedIds)
             )
             print("[ChatStore] Evicted \(evictedIds.count) history turns (cap=\(maxTurns), was=\(totalCount))")
+            // THE LAST STATEMENT INSIDE THE TRANSACTION — see the header. Only
+            // `register` moves the counter, so an already-open, untouched compose
+            // never trips it and the cap sweep is not starved.
+            guard DraftSessionRegistry.shared.registrationGeneration() == registrationsAtStart else {
+                throw ComposeRegisteredDuringEviction()
+            }
             return evictedIds
+        }
+        } catch is ComposeRegisteredDuringEviction {
+            // Rolled back — nothing was deleted, so the caller must cascade nothing to
+            // memory.db. The next maintenance pass retries against a registry that now
+            // includes the new compose.
+            if DebugModeManager.isLoggingEnabled() {
+                print("[ChatStore] History cap eviction rolled back — a compose registered while the sweep was in flight; retrying on the next pass")
+            }
+            return []
         }
     }
 
@@ -817,7 +895,19 @@ actor ChatStore {
         // `DraftSessionRegistry`'s doc header forbids, and the direct analogue of
         // `DraftStore.evictImpl`'s orphan-session loop, fixed in `eda55f4ca` the same
         // day. The loop below re-asks the registry LIVE at each deletion decision.
+        //
+        // 🚨 **AND THE PER-ROW LIVE RE-ASK IS STILL NOT ENOUGH ON ITS OWN.** A compose
+        // that registers AFTER its own session row was examined cannot be seen by any
+        // per-row check — its turns are by then deleted inside the open transaction.
+        // Same class `DraftStore.evictImpl` closed in `20cd7b688` and left open here
+        // for one round (`MIS-006`). This function therefore also records
+        // `registrationGeneration()` before opening the write and re-checks it as the
+        // LAST statement inside it, throwing to roll the whole transaction back. Safe
+        // here — unlike `enforceTurnBudgets`, this transaction contains nothing but
+        // the eviction.
         let activeComposeSessions = DraftSessionRegistry.shared.activeComposeSessionIds()
+        let registrationsAtStart = DraftSessionRegistry.shared.registrationGeneration()
+        do {
         return try dbPool.write { db in
             let sessionRows = try Row.fetchAll(db, sql: """
                 SELECT sessionId, MAX(timestamp) as maxTs
@@ -855,7 +945,21 @@ actor ChatStore {
             if evicted > 0 {
                 print("[ChatStore] Evicted \(evicted) compose sessions (ttl=\(ttlDays) days)")
             }
+            // THE LAST STATEMENT INSIDE THE TRANSACTION — see the header. Only
+            // `register` moves the counter, so an already-open, untouched compose
+            // never trips it and the TTL sweep is not starved.
+            guard DraftSessionRegistry.shared.registrationGeneration() == registrationsAtStart else {
+                throw ComposeRegisteredDuringEviction()
+            }
             return evicted
+        }
+        } catch is ComposeRegisteredDuringEviction {
+            // Rolled back — nothing was deleted. The next maintenance pass retries
+            // against a registry that now includes the new compose.
+            if DebugModeManager.isLoggingEnabled() {
+                print("[ChatStore] Compose-session TTL sweep rolled back — a compose registered while it was in flight; retrying on the next pass")
+            }
+            return 0
         }
     }
 

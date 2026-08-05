@@ -32,6 +32,17 @@ import Synchronization
 /// INSIDE the write block — both are nonisolated synchronous `Mutex` reads precisely
 /// so that is legal.
 ///
+/// 🚨 **AND A LIVE RE-ASK IS STILL NOT SUFFICIENT BY ITSELF.** A `register` that
+/// lands after a row/session has already been examined is invisible to every
+/// per-row check, because that row's deletion is by then staged inside the open
+/// transaction. So all four consumers ALSO record `registrationGeneration()` beside
+/// their live read and re-check it as the LAST statement of their write scope,
+/// throwing `ComposeRegisteredDuringEviction` to roll the deletions back. Rollback
+/// SCOPE differs by consumer and is not interchangeable: the three pure-eviction
+/// sweeps roll back their whole transaction, while `ChatStore.enforceTurnBudgets`
+/// uses a SAVEPOINT because its caller's transaction also carries the user's
+/// brand-new chat turn, which must survive.
+///
 /// REFCOUNTED: a deterministic draftId (`reply:{msg}` / `forward:{msg}`) can be
 /// open in two ComposeViews at once (two windows replying to the same message).
 /// A plain `Set` would collapse both registrations so the FIRST close exposes the
@@ -138,3 +149,17 @@ final class DraftSessionRegistry: Sendable {
         }
     }
 }
+
+/// Thrown as the last statement of a background eviction's write scope when
+/// `DraftSessionRegistry.registrationGeneration()` moved while that sweep was
+/// running, so the deletions it had already staged are rolled back.
+///
+/// It lives beside the counter rather than inside one store because it is ONE
+/// mechanism with FOUR users, and forking a second error type per store is how a
+/// guard drifts apart: `DraftStore.evictImpl` (whole transaction),
+/// `ChatStore.enforceTurnBudgets` (a SAVEPOINT — its caller's transaction also
+/// carries the user's brand-new turn, which must NOT roll back with the sweep),
+/// `ChatStore.evictHistoryBeyondCapImpl` and `ChatStore.evictComposeSessionsImpl`
+/// (whole transaction). Every one of them catches it and reports "evicted
+/// nothing"; no caller above them ever sees it.
+struct ComposeRegisteredDuringEviction: Error {}

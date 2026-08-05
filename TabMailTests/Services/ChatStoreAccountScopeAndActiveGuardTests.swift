@@ -681,10 +681,34 @@ struct ChatStoreLiveComposeRegistryGuardTests {
         }
         // THE INVARIANT — the newly-open compose's history survives.
         #expect(state.victim?.userMessage == "authored cap-victim")
-        // …and the cap was still enforced against the oldest EVICTABLE row.
-        #expect(state.control == nil)
+        // …and so does the control, because a registration anywhere inside the
+        // transaction now ROLLS THE WHOLE SWEEP BACK rather than deleting around the
+        // new compose (the generation guard, matching `DraftStore.evictImpl`). The
+        // sweep's selection was taken against a registry reading that is no longer
+        // current, and re-running it costs nothing. Non-vacuity for THIS direction —
+        // that the cap is still enforced at all — is carried by the second pass below.
+        #expect(state.control != nil)
         #expect(state.newest != nil)
-        #expect(evicted == ["cap-control"])
+        #expect(evicted.isEmpty, "a rolled-back sweep must report that it evicted nothing")
+
+        // THE MIRROR IMAGE — a rollback-on-registration must not starve the cap. The
+        // victim compose is STILL OPEN and untouched; only `register` bumps the
+        // generation, so this second pass observes an unchanged reading, completes,
+        // and reclaims the oldest EVICTABLE row.
+        let secondPass = try ChatStore.shared.evictHistoryBeyondCapSync(
+            dbPool: PrioritizedDatabase(pool: fixture.pool), maxTurns: 2)
+        #expect(secondPass == ["cap-control"],
+                """
+                the memory cap never completed while a compose was open — the generation \
+                guard is tripping on steady state, so chatHistory grows without bound for \
+                as long as the user has any compose on screen
+                """)
+        let after = try fixture.pool.read { db in
+            (victim: try ChatHistoryTurn.fetchOne(db, key: "cap-victim"),
+             control: try ChatHistoryTurn.fetchOne(db, key: "cap-control"))
+        }
+        #expect(after.victim != nil, "the open compose's history is still exempt on the second pass")
+        #expect(after.control == nil)
     }
 
     // MARK: Site 3 — the compose-session TTL sweep
@@ -728,8 +752,291 @@ struct ChatStoreLiveComposeRegistryGuardTests {
         }
         // THE INVARIANT — the newly-open compose keeps its authored turns.
         #expect(state.victim?.userMessage == "authored ttl-victim-turn")
-        // …and the identically-expired session nobody has open is still reclaimed.
-        #expect(state.control == nil)
-        #expect(evicted == 1)
+        // …and so does the identically-expired control session, because a registration
+        // anywhere inside the transaction now rolls the WHOLE sweep back rather than
+        // sweeping around the new compose. Non-vacuity for that direction is the
+        // second pass below.
+        #expect(state.control != nil)
+        #expect(evicted == 0, "a rolled-back sweep must report that it evicted nothing")
+
+        // THE MIRROR IMAGE — the TTL sweep must not starve while a compose is merely
+        // open. The victim is still registered and untouched, so the generation is
+        // unchanged and this pass completes.
+        let secondPass = try ChatStore.shared.evictComposeSessionsSync(
+            dbPool: PrioritizedDatabase(pool: fixture.pool), ttlDays: 1)
+        #expect(secondPass == 1,
+                """
+                the TTL sweep never completed while a compose was open — the generation \
+                guard is tripping on steady state, so expired compose sessions accumulate \
+                for as long as the user has any compose on screen
+                """)
+        let after = try fixture.pool.read { db in
+            (victim: try ChatTurn.fetchOne(db, key: "ttl-victim-turn"),
+             control: try ChatTurn.fetchOne(db, key: "ttl-control-turn"))
+        }
+        #expect(after.victim != nil, "the open compose is still exempt on the second pass")
+        #expect(after.control == nil)
+    }
+}
+
+// MARK: - (d) The window a live re-ask CANNOT see: registration after the row was examined
+
+/// THE INVARIANT is the same one as suite (c) — **turns belonging to a compose that
+/// registers before the eviction commits are still present afterwards** — asserted at
+/// the window no per-row/per-sweep live re-ask can reach: the registration lands
+/// AFTER the site has already taken its live registry read and staged the deletion
+/// inside its open transaction.
+///
+/// Suite (c) hooks a statement that runs BEFORE each site's live read, so it exercises
+/// the window round 1 closed and stays green on a system that still loses turns
+/// registered later — the `MIS-015` shape. These three hook each site's own `DELETE`,
+/// which is strictly after the exemption decision, and are therefore the tests that
+/// actually distinguish the generation guard.
+///
+/// `MIS-006` — `DraftStore.evictImpl` got this guard in `20cd7b688` and `ChatStore`'s
+/// three sites did not, for one round: the instance was fixed, the class was not. One
+/// test per site, because a single test would be a census that inherited its own
+/// search shape.
+///
+/// Every test carries its MIRROR IMAGE on the same fixture, because the naive fix is
+/// worse than the bug in two distinct ways: (1) rolling back on a compose that is
+/// merely OPEN would starve eviction forever, and (2) at `enforceTurnBudgets`
+/// specifically, rolling back the CALLER's transaction would discard the user's
+/// brand-new chat turn — which is why that one site rolls back a SAVEPOINT.
+@Suite("ChatStore eviction rolls back a sweep a compose registered during",
+       .serialized, .processGlobalState)
+struct ChatStoreEvictionGenerationGuardTests {
+
+    private func makeHookedPool(
+        hook: ChatStoreLateComposeHook
+    ) throws -> (pool: DatabasePool, directory: URL) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("chatstore-generation-guard-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        configuration.prepareDatabase { db in
+            db.trace(options: .statement) { event in
+                hook.observe(event.description)
+            }
+        }
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration)
+        try AppDatabase.runMigrations(on: pool)
+        return (pool, directory)
+    }
+
+    private func msAgo(days: Double) -> Double {
+        (Date().timeIntervalSince1970 - days * 86400) * 1000
+    }
+
+    private func turn(_ id: String, ts: Double, sessionId: String?, chars: Int = 12) -> ChatTurn {
+        ChatTurn(
+            id: id, timestamp: ts, role: "user",
+            content: String(repeating: "x", count: max(1, chars)),
+            userMessage: "authored \(id)", type: "normal", chars: chars,
+            renderedContent: nil, sessionId: sessionId, remindersSnapshot: nil,
+            emailContextJSON: nil, thinkingContent: nil)
+    }
+
+    private func historyTurn(_ id: String, ts: Double, sessionId: String) -> ChatHistoryTurn {
+        ChatHistoryTurn(
+            id: id, timestamp: ts, role: "user", content: "authored \(id)",
+            userMessage: "authored \(id)", sessionId: sessionId, chars: 12, type: "normal")
+    }
+
+    // MARK: Site 1 — the turn-budget sweep, whose rollback must NOT take the new turn
+
+    /// 🚨 **THE ASSERTION THAT MATTERS MOST HERE IS `budget-appended`.** This sweep runs
+    /// inside `appendTurn`'s transaction, which also carries the user's brand-new turn.
+    /// Copying `DraftStore.evictImpl`'s whole-transaction rollback would have discarded
+    /// it — dropping the very intention the call exists to persist, the exact mirror
+    /// image of the bug being fixed. The guard therefore scopes its undo to a SAVEPOINT.
+    @Test("A compose that opens after its own turn was deleted gets the sweep rolled back — and keeps the new turn")
+    func composeRegisteredAfterItsTurnWasDeletedRollsBackOnlyTheSweep() throws {
+        let victimDraftId = "new:budget-late-victim-\(UUID().uuidString)"
+        let victimSession = "compose:\(victimDraftId)"
+        let controlSession = "compose:new:budget-late-control-\(UUID().uuidString)"
+
+        // The sweep's OWN delete — strictly after `exemptSessions` was derived and after
+        // this row's exemption check passed. `INSERT INTO "chatTurn"` cannot match.
+        let hook = ChatStoreLateComposeHook(draftId: victimDraftId) { sql in
+            sql.contains("DELETE") && sql.contains("chatTurn")
+        }
+        let fixture = try makeHookedPool(hook: hook)
+        defer { TestDatabaseTeardown.retire(pool: fixture.pool, directory: fixture.directory) }
+        defer { DraftSessionRegistry.shared.unregister(victimDraftId) }
+
+        let seeded = ChatStore.maxExchanges * 2 + 1
+        try fixture.pool.write { db in
+            try turn("budget-late-victim", ts: 0, sessionId: victimSession).insert(db)
+            try turn("budget-late-control", ts: 1, sessionId: controlSession).insert(db)
+            for index in 2..<seeded {
+                try turn("budget-late-filler-\(index)", ts: Double(index),
+                         sessionId: "msg:acc1:filler@example.com").insert(db)
+            }
+        }
+
+        #expect(!DraftSessionRegistry.shared.isActive(victimDraftId),
+                "precondition: not open when the sweep begins, and not open when its turn is examined")
+        hook.arm()
+
+        // `appendTurn`'s shape: the user's new turn is inserted OUTSIDE the sweep's
+        // savepoint, then the sweep runs with the set sampled before the transaction.
+        let evicted = try fixture.pool.write { db -> [ChatTurn] in
+            try turn("budget-appended", ts: Double(seeded), sessionId: "msg:acc1:filler@example.com")
+                .insert(db)
+            return try ChatStore.enforceTurnBudgets(db: db, activeComposeSessions: [])
+        }
+
+        #expect(hook.didFire, "harness non-vacuity: the interleaving must actually have happened")
+        #expect(DraftSessionRegistry.shared.isActive(victimDraftId))
+
+        let state = try fixture.pool.read { db in
+            (victim: try ChatTurn.fetchOne(db, key: "budget-late-victim"),
+             control: try ChatTurn.fetchOne(db, key: "budget-late-control"),
+             appended: try ChatTurn.fetchOne(db, key: "budget-appended"))
+        }
+        #expect(state.victim?.userMessage == "authored budget-late-victim",
+                """
+                the authored turns of a compose that was still OPENING were deleted — it had \
+                registered but not yet loaded, so it holds nothing in memory to re-save
+                """)
+        #expect(state.control != nil, "the savepoint rolls back, so the control's eviction is undone too")
+        #expect(evicted.isEmpty, "a rolled-back sweep must report that it evicted nothing")
+        #expect(state.appended?.userMessage == "authored budget-appended",
+                """
+                the user's BRAND-NEW turn was rolled back with the sweep — that is the mirror \
+                image of the bug: the rollback must be a SAVEPOINT scoped to the eviction, not \
+                the caller's whole transaction, or every rolled-back sweep drops the intention \
+                `appendTurn` exists to persist
+                """)
+
+        // THE MIRROR IMAGE (starvation) — the compose stays open and untouched, so the
+        // next append's sweep observes an unchanged generation and completes.
+        let secondPass = try fixture.pool.write { db -> [ChatTurn] in
+            try ChatStore.enforceTurnBudgets(db: db, activeComposeSessions: [])
+        }
+        #expect(!secondPass.isEmpty,
+                """
+                the turn-budget sweep never completed while a compose was open — the generation \
+                guard is tripping on steady state, so chatTurn grows without bound for as long \
+                as the user has any compose on screen
+                """)
+        let after = try fixture.pool.read { db in
+            (victim: try ChatTurn.fetchOne(db, key: "budget-late-victim"),
+             control: try ChatTurn.fetchOne(db, key: "budget-late-control"))
+        }
+        #expect(after.victim != nil, "the open compose's turn is still exempt on the second pass")
+        #expect(after.control == nil, "the closed compose's turn is reclaimed once the sweep can run")
+    }
+
+    // MARK: Site 2 — the chatHistory memory cap
+
+    @Test("A compose that opens after its history row was deleted gets the cap sweep rolled back")
+    func composeRegisteredAfterItsHistoryWasDeletedRollsBackTheSweep() throws {
+        let victimDraftId = "new:cap-late-victim-\(UUID().uuidString)"
+
+        // `DELETE FROM chatHistory WHERE id IN (…)` — strictly after the exemption list
+        // was derived and after the victim's id was selected into the delete.
+        let hook = ChatStoreLateComposeHook(draftId: victimDraftId) { sql in
+            sql.contains("DELETE") && sql.contains("chatHistory")
+        }
+        let fixture = try makeHookedPool(hook: hook)
+        defer { TestDatabaseTeardown.retire(pool: fixture.pool, directory: fixture.directory) }
+        defer { DraftSessionRegistry.shared.unregister(victimDraftId) }
+
+        try fixture.pool.write { db in
+            try historyTurn("cap-late-victim", ts: msAgo(days: 3),
+                            sessionId: "compose:\(victimDraftId)").insert(db)
+            try historyTurn("cap-late-control", ts: msAgo(days: 2),
+                            sessionId: "msg:acc1:a@example.com").insert(db)
+            try historyTurn("cap-late-newest", ts: msAgo(days: 1),
+                            sessionId: "msg:acc1:b@example.com").insert(db)
+        }
+
+        #expect(!DraftSessionRegistry.shared.isActive(victimDraftId))
+        hook.arm()
+
+        let evicted = try ChatStore.shared.evictHistoryBeyondCapSync(
+            dbPool: PrioritizedDatabase(pool: fixture.pool), maxTurns: 2)
+
+        #expect(hook.didFire, "harness non-vacuity: the interleaving must actually have happened")
+        #expect(DraftSessionRegistry.shared.isActive(victimDraftId))
+
+        let state = try fixture.pool.read { db in
+            (victim: try ChatHistoryTurn.fetchOne(db, key: "cap-late-victim"),
+             control: try ChatHistoryTurn.fetchOne(db, key: "cap-late-control"))
+        }
+        #expect(state.victim?.userMessage == "authored cap-late-victim")
+        #expect(state.control != nil, "the whole transaction rolls back")
+        #expect(evicted.isEmpty,
+                """
+                a rolled-back sweep must report nothing, or the caller cascades phantom \
+                deletions into memory.db
+                """)
+
+        // THE MIRROR IMAGE (starvation).
+        let secondPass = try ChatStore.shared.evictHistoryBeyondCapSync(
+            dbPool: PrioritizedDatabase(pool: fixture.pool), maxTurns: 2)
+        #expect(secondPass == ["cap-late-control"],
+                "the cap never completes while a compose is open — chatHistory grows unbounded")
+        #expect(try fixture.pool.read { try ChatHistoryTurn.fetchOne($0, key: "cap-late-victim") } != nil)
+    }
+
+    // MARK: Site 3 — the compose-session TTL sweep
+
+    @Test("A compose that opens after its session was swept gets the TTL sweep rolled back")
+    func composeRegisteredAfterItsSessionWasSweptRollsBackTheSweep() throws {
+        let victimDraftId = "new:ttl-late-victim-\(UUID().uuidString)"
+        let controlDraftId = "new:ttl-late-control-\(UUID().uuidString)"
+
+        // The loop's own `DELETE FROM chatTurn WHERE sessionId = …`, which runs after
+        // that session's live `activeComposeSessionIds()` check has already passed.
+        let hook = ChatStoreLateComposeHook(draftId: victimDraftId) { sql in
+            sql.contains("DELETE") && sql.contains("chatTurn")
+        }
+        let fixture = try makeHookedPool(hook: hook)
+        defer { TestDatabaseTeardown.retire(pool: fixture.pool, directory: fixture.directory) }
+        defer { DraftSessionRegistry.shared.unregister(victimDraftId) }
+
+        try fixture.pool.write { db in
+            try turn("ttl-late-victim-turn", ts: msAgo(days: 30),
+                     sessionId: "compose:\(victimDraftId)").insert(db)
+            try turn("ttl-late-control-turn", ts: msAgo(days: 30),
+                     sessionId: "compose:\(controlDraftId)").insert(db)
+        }
+
+        #expect(!DraftSessionRegistry.shared.isActive(victimDraftId))
+        hook.arm()
+
+        let evicted = try ChatStore.shared.evictComposeSessionsSync(
+            dbPool: PrioritizedDatabase(pool: fixture.pool), ttlDays: 1)
+
+        #expect(hook.didFire, "harness non-vacuity: the interleaving must actually have happened")
+        #expect(DraftSessionRegistry.shared.isActive(victimDraftId))
+
+        // Whichever expired session the loop reached first, the registration landed
+        // inside the transaction, so BOTH sessions' turns are restored.
+        let state = try fixture.pool.read { db in
+            (victim: try ChatTurn.fetchOne(db, key: "ttl-late-victim-turn"),
+             control: try ChatTurn.fetchOne(db, key: "ttl-late-control-turn"))
+        }
+        #expect(state.victim?.userMessage == "authored ttl-late-victim-turn")
+        #expect(state.control != nil, "the whole transaction rolls back")
+        #expect(evicted == 0, "a rolled-back sweep must report that it evicted nothing")
+
+        // THE MIRROR IMAGE (starvation).
+        let secondPass = try ChatStore.shared.evictComposeSessionsSync(
+            dbPool: PrioritizedDatabase(pool: fixture.pool), ttlDays: 1)
+        #expect(secondPass == 1,
+                "the TTL sweep never completes while a compose is open — expired sessions accumulate")
+        let after = try fixture.pool.read { db in
+            (victim: try ChatTurn.fetchOne(db, key: "ttl-late-victim-turn"),
+             control: try ChatTurn.fetchOne(db, key: "ttl-late-control-turn"))
+        }
+        #expect(after.victim != nil, "the open compose is still exempt on the second pass")
+        #expect(after.control == nil)
     }
 }
