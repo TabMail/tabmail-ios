@@ -10,8 +10,9 @@ import GRDB
 /// Tests for the DB write patterns used by AccountManagerActions.
 /// AccountManager itself is a singleton coupled to AppDatabase.dbPool,
 /// so we test the underlying GRDB write logic directly with TestDatabase.
-/// This validates optimistic UI patterns, PendingOperation creation,
-/// and undo logic at the database level.
+/// This validates optimistic UI patterns and PendingOperation creation at the
+/// database level. Undo is NOT tested here — see the `// MARK: - Undo` note
+/// below and the real-path suites it points at.
 @Suite("AccountManagerActions - DB Patterns")
 struct AccountManagerActionsTests {
 
@@ -743,284 +744,28 @@ struct AccountManagerActionsTests {
         #expect(ops.isEmpty)
     }
 
-    // MARK: - Undo: cancel queued ops and restore
-
-    @Test("undoDestructiveAction: cancels queued op and restores message to original folder via save (upsert)")
-    func undoCancelsQueuedOp() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
-        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "1", folderId: "acc1:INBOX", folderPath: "INBOX", isInInbox: true
-        )
-
-        // Simulate archive: move to Archive
-        try db.write { dbConn in
-            try MessageHeader.filter(Column("id") == msg.id).updateAll(dbConn,
-                Column("folderId").set(to: "acc1:Archive"),
-                Column("folderPath").set(to: "Archive"),
-                Column("isInInbox").set(to: false)
-            )
-            try PendingOperation(type: .move, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX", destinationPath: "Archive").insert(dbConn)
-        }
-
-        // Simulate undo: cancel the queued op and restore
-        try db.write { dbConn in
-            let queuedOps = try PendingOperation
-                .filter(Column("accountId") == "acc1")
-                .filter(Column("status") == PendingStatus.queued.rawValue)
-                .fetchAll(dbConn)
-
-            let idsSet = Set([msg.messageId])
-            let stableIdsSet = Set([msg.stableId])
-            var cancelledOriginal = false
-
-            for op in queuedOps {
-                let opMsgIds = Set(op.messageIds)
-                if (!opMsgIds.isDisjoint(with: idsSet) || !opMsgIds.isDisjoint(with: stableIdsSet)) &&
-                   (op.type == .move || op.type == .removeTag) {
-                    var cancelled = op
-                    cancelled.status = PendingStatus.cancelled.rawValue
-                    try cancelled.save(dbConn)
-                    if op.type == .move { cancelledOriginal = true }
-                }
-            }
-
-            #expect(cancelledOriginal == true)
-
-            // Restore message — use save() (upsert)
-            var restored = msg
-            restored.folderId = "acc1:INBOX"
-            try restored.save(dbConn)
-        }
-
-        let restoredMsg = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
-        #expect(restoredMsg?.folderId == "acc1:INBOX")
-        #expect(restoredMsg?.isInInbox == true)
-
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 1)
-        #expect(ops[0].status == PendingStatus.cancelled.rawValue)
-    }
-
-    @Test("undoDestructiveAction: also cancels associated removeTag ops")
-    func undoCancelsRemoveTagOps() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
-        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "1", folderId: "acc1:INBOX", folderPath: "INBOX",
-            isInInbox: true, actionTag: .reply
-        )
-
-        // Simulate archive with tag removal
-        try db.write { dbConn in
-            try PendingOperation(type: .removeTag, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX", tagValue: "reply").insert(dbConn)
-            try PendingOperation(type: .move, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX", destinationPath: "Archive").insert(dbConn)
-        }
-
-        // Undo should cancel both removeTag AND move
-        try db.write { dbConn in
-            let queuedOps = try PendingOperation
-                .filter(Column("accountId") == "acc1")
-                .filter(Column("status") == PendingStatus.queued.rawValue)
-                .fetchAll(dbConn)
-
-            let stableIdsSet = Set([msg.stableId])
-            for op in queuedOps {
-                let opMsgIds = Set(op.messageIds)
-                if !opMsgIds.isDisjoint(with: stableIdsSet) &&
-                   (op.type == .move || op.type == .removeTag) {
-                    var cancelled = op
-                    cancelled.status = PendingStatus.cancelled.rawValue
-                    try cancelled.save(dbConn)
-                }
-            }
-        }
-
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        let allCancelled = ops.allSatisfy { $0.status == PendingStatus.cancelled.rawValue }
-        #expect(allCancelled, "Both removeTag and move ops should be cancelled")
-        #expect(ops.count == 2)
-    }
-
-    @Test("undoDestructiveAction: save() (upsert) re-creates message when drain deleted the row")
-    func undoUpsertRecreatesDeletedRow() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
-        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
-
-        // Create then delete (simulating drain cleanup)
-        let msg = try TestDatabase.insertMessageHeader(db, messageId: "1", folderId: "acc1:Archive", folderPath: "Archive", isInInbox: false)
-        try db.write { _ = try MessageHeader.deleteOne($0, key: msg.id) }
-
-        // Verify deleted
-        let deleted = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
-        #expect(deleted == nil)
-
-        // save() should re-insert the row
-        try db.write { dbConn in
-            var restored = msg
-            restored.folderId = "acc1:INBOX"
-            try restored.save(dbConn)
-        }
-
-        let header = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
-        #expect(header != nil, "save() should re-create the deleted row")
-        #expect(header?.folderId == "acc1:INBOX")
-    }
-
-    // MARK: - Undo: move-back when original already executed
-
-    @Test("undoDestructiveAction: queues move-back PendingOperation when original op is in-flight")
-    func undoQueuesMoveBackForInFlightOp() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, provider: .gmail)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
-        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "gmail-id-1", folderId: "acc1:INBOX", folderPath: "INBOX", isInInbox: true
-        )
-
-        // Simulate archive with in-flight status (already being executed)
-        try db.write { dbConn in
-            try MessageHeader.filter(Column("id") == msg.id).updateAll(dbConn,
-                Column("folderId").set(to: "acc1:Archive"),
-                Column("folderPath").set(to: "Archive"),
-                Column("isInInbox").set(to: false)
-            )
-            var op = PendingOperation(type: .move, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX", destinationPath: "Archive")
-            op.status = PendingStatus.inFlight.rawValue
-            try op.insert(dbConn)
-        }
-
-        // Simulate undo: no queued ops to cancel, so queue a move-back
-        try db.write { dbConn in
-            let queuedOps = try PendingOperation
-                .filter(Column("accountId") == "acc1")
-                .filter(Column("status") == PendingStatus.queued.rawValue)
-                .fetchAll(dbConn)
-
-            // No queued ops to cancel — in-flight ops are not cancellable
-            #expect(queuedOps.isEmpty)
-
-            // Restore message locally
-            var restored = msg
-            restored.folderId = "acc1:INBOX"
-            try restored.save(dbConn)
-
-            // Queue move-back — Gmail uses messageId (stable across moves)
-            let account = try Account.fetchOne(dbConn, key: "acc1")
-            let moveBackIds: [String]
-            if account?.provider == .imap || account?.provider == .icloud {
-                moveBackIds = [msg].compactMap(\.rfc822MessageId)
-            } else {
-                moveBackIds = [msg.messageId]
-            }
-            let moveBack = PendingOperation(type: .move, messageIds: moveBackIds, accountId: "acc1", folderPath: "Archive", destinationPath: "INBOX")
-            try moveBack.insert(dbConn)
-        }
-
-        let ops = try db.read { dbConn in
-            try PendingOperation.filter(Column("status") == PendingStatus.queued.rawValue).fetchAll(dbConn)
-        }
-        #expect(ops.count == 1)
-        #expect(ops[0].type == .move)
-        #expect(ops[0].folderPath == "Archive")
-        #expect(ops[0].destinationPath == "INBOX")
-        #expect(ops[0].messageIds == ["gmail-id-1"], "Gmail move-back uses messageId")
-    }
-
-    // MARK: - IMAP/iCloud undo uses rfc822MessageId for move-back
-
-    @Test("IMAP undo: move-back uses rfc822MessageId (UIDs change on MOVE)")
-    func imapUndoUsesRfc822MessageId() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", provider: .imap)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
-        try TestDatabase.insertFolder(db, name: "Trash", path: "Trash", role: .trash)
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "500", folderId: "acc1:Trash", accountId: "acc1",
-            folderPath: "Trash", isInInbox: false, rfc822MessageId: "<unique-msg@example.com>"
-        )
-
-        // Simulate undo for IMAP — no queued ops, must queue move-back
-        try db.write { dbConn in
-            var restored = msg
-            restored.folderId = "acc1:INBOX"
-            try restored.save(dbConn)
-
-            let account = try Account.fetchOne(dbConn, key: "acc1")
-            let moveBackIds: [String]
-            if account?.provider == .imap || account?.provider == .icloud {
-                moveBackIds = [msg].compactMap(\.rfc822MessageId)
-            } else {
-                moveBackIds = [msg.messageId]
-            }
-            try PendingOperation(type: .move, messageIds: moveBackIds, accountId: "acc1", folderPath: "Trash", destinationPath: "INBOX").insert(dbConn)
-        }
-
-        let ops = try db.read { try PendingOperation.filter(Column("type") == OperationType.move.rawValue).fetchAll($0) }
-        #expect(ops.count == 1)
-        #expect(ops[0].messageIds == ["<unique-msg@example.com>"], "IMAP undo still records its historical RFC identity pending T2.9 native re-keying")
-    }
-
-    @Test("iCloud undo: uses rfc822MessageId like IMAP")
-    func icloudUndoUsesRfc822MessageId() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", provider: .icloud)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
-        try TestDatabase.insertFolder(db, name: "Trash", path: "Trash", role: .trash)
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "300", folderId: "acc1:Trash", accountId: "acc1",
-            folderPath: "Trash", isInInbox: false, rfc822MessageId: "<icloud-msg@me.com>"
-        )
-
-        try db.write { dbConn in
-            let account = try Account.fetchOne(dbConn, key: "acc1")
-            let moveBackIds: [String]
-            if account?.provider == .imap || account?.provider == .icloud {
-                moveBackIds = [msg].compactMap(\.rfc822MessageId)
-            } else {
-                moveBackIds = [msg.messageId]
-            }
-            try PendingOperation(type: .move, messageIds: moveBackIds, accountId: "acc1", folderPath: "Trash", destinationPath: "INBOX").insert(dbConn)
-        }
-
-        let ops = try db.read { try PendingOperation.filter(Column("type") == OperationType.move.rawValue).fetchAll($0) }
-        #expect(ops[0].messageIds == ["<icloud-msg@me.com>"], "iCloud undo must use rfc822MessageId like IMAP")
-    }
-
-    // MARK: - Gmail undo uses messageId for move-back
-
-    @Test("Gmail undo: uses stable messageId for move-back (IDs don't change on move)")
-    func gmailUndoUsesMessageId() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", provider: .gmail)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
-        try TestDatabase.insertFolder(db, name: "TRASH", path: "TRASH", role: .trash)
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "gmail-stable-id", folderId: "acc1:TRASH", accountId: "acc1",
-            folderPath: "TRASH", isInInbox: false, rfc822MessageId: "<msg@example.com>"
-        )
-
-        try db.write { dbConn in
-            let account = try Account.fetchOne(dbConn, key: "acc1")
-            let moveBackIds: [String]
-            if account?.provider == .imap || account?.provider == .icloud {
-                moveBackIds = [msg].compactMap(\.rfc822MessageId)
-            } else {
-                moveBackIds = [msg.messageId]
-            }
-            try PendingOperation(type: .move, messageIds: moveBackIds, accountId: "acc1", folderPath: "TRASH", destinationPath: "INBOX").insert(dbConn)
-        }
-
-        let ops = try db.read { try PendingOperation.filter(Column("type") == OperationType.move.rawValue).fetchAll($0) }
-        #expect(ops[0].messageIds == ["gmail-stable-id"], "Gmail undo must use stable messageId")
-    }
+    // MARK: - Undo
+    //
+    // DELETED 2026-08-04 — SEVEN hand-simulated undo tests lived here. Each built
+    // a `TestDatabase.make()` queue, which is never installed into
+    // `AppDatabase.shared`, re-implemented `undoDestructiveAction`'s algorithm
+    // inside the test body — including production's own
+    // `provider == .imap || provider == .icloud` branch — and then asserted on its
+    // own copy, so it could only ever agree with itself. Inverting production
+    // could not turn any of them red.
+    //
+    // Four of them also pinned behaviour v3 deliberately REMOVED: a `.cancelled`
+    // tombstone (v3 physically deletes the annihilated operation), `.removeTag`
+    // cancellation (subtracted — tags are local-only, ADR-IOS-036), and the rfc822
+    // Message-ID as the IMAP/iCloud move-back identity, which is the BANNED
+    // mechanism (ADR-IOS-068 / D4, `IOS-IMAP-002`: a Message-ID `SEARCH` returns
+    // every copy sharing the id and mutates all of them).
+    //
+    // Every invariant they claimed is pinned against the real
+    // `AccountManager.undoDestructiveAction` in `UndoDestructiveActionTests` and
+    // `UndoProviderIdentitySafetyTests`; the former's header records the
+    // per-test disposition of the same cluster. Do not re-add a simulated undo
+    // to this suite — an undo test belongs in those two files, driving production.
 
     // MARK: - stableId computation
 
@@ -1300,85 +1045,14 @@ struct AccountManagerActionsTests {
         #expect(archive?.unreadCount == 2, "0 + 2 unread moved = 2")
     }
 
-    @Test("undo pattern: restores unread counts on both source and destination folders")
-    func undoRestoresUnreadCounts() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
-        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
-
-        // State after archive: inbox lost 2 unread, archive gained 2
-        try db.write {
-            try $0.execute(sql: "UPDATE folder SET unreadCount = 3 WHERE id = 'acc1:INBOX'")
-            try $0.execute(sql: "UPDATE folder SET unreadCount = 2 WHERE id = 'acc1:Archive'")
-        }
-
-        // Messages currently in archive (post-move), originally unread
-        let msg1 = try TestDatabase.insertMessageHeader(db, messageId: "1", folderId: "acc1:Archive", folderPath: "Archive", isInInbox: false, isRead: false)
-        let msg2 = try TestDatabase.insertMessageHeader(db, messageId: "2", folderId: "acc1:Archive", folderPath: "Archive", isInInbox: false, isRead: false)
-        let messages = [msg1, msg2]
-
-        // Replicate undoDestructiveAction inline unread count pattern
-        let toFolderId = "acc1:INBOX"
-        let fromFolderPath = "Archive"
-        let accountId = "acc1"
-
-        try db.write { dbConn in
-            // Restore messages
-            for msg in messages {
-                var restored = msg
-                restored.folderId = toFolderId
-                try restored.save(dbConn)
-            }
-
-            // Inline unread count update
-            let unreadRestored = messages.filter { !$0.isRead }.count
-            if unreadRestored > 0 {
-                let fromFolderId = "\(accountId):\(fromFolderPath)"
-                if !fromFolderPath.isEmpty {
-                    try dbConn.execute(sql: "UPDATE folder SET unreadCount = MAX(0, unreadCount - ?) WHERE id = ?", arguments: [unreadRestored, fromFolderId])
-                }
-                try dbConn.execute(sql: "UPDATE folder SET unreadCount = unreadCount + ? WHERE id = ?", arguments: [unreadRestored, toFolderId])
-            }
-        }
-
-        let inbox = try db.read { try Folder.fetchOne($0, key: "acc1:INBOX") }
-        let archive = try db.read { try Folder.fetchOne($0, key: "acc1:Archive") }
-        #expect(inbox?.unreadCount == 5, "3 + 2 restored unread = 5")
-        #expect(archive?.unreadCount == 0, "2 - 2 restored unread = 0")
-    }
-
-    @Test("undo pattern: read messages don't change unread counts")
-    func undoReadMessagesNoCountChange() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
-        try TestDatabase.insertFolder(db, name: "Trash", path: "Trash", role: .trash)
-
-        try db.write {
-            try $0.execute(sql: "UPDATE folder SET unreadCount = 1 WHERE id = 'acc1:INBOX'")
-            try $0.execute(sql: "UPDATE folder SET unreadCount = 0 WHERE id = 'acc1:Trash'")
-        }
-
-        let msg = try TestDatabase.insertMessageHeader(db, messageId: "1", folderId: "acc1:Trash", folderPath: "Trash", isInInbox: false, isRead: true)
-
-        try db.write { dbConn in
-            var restored = msg
-            restored.folderId = "acc1:INBOX"
-            try restored.save(dbConn)
-
-            let unreadRestored = [msg].filter { !$0.isRead }.count
-            if unreadRestored > 0 {
-                try dbConn.execute(sql: "UPDATE folder SET unreadCount = MAX(0, unreadCount - ?) WHERE id = ?", arguments: [unreadRestored, "acc1:Trash"])
-                try dbConn.execute(sql: "UPDATE folder SET unreadCount = unreadCount + ? WHERE id = ?", arguments: [unreadRestored, "acc1:INBOX"])
-            }
-        }
-
-        let inbox = try db.read { try Folder.fetchOne($0, key: "acc1:INBOX") }
-        let trash = try db.read { try Folder.fetchOne($0, key: "acc1:Trash") }
-        #expect(inbox?.unreadCount == 1, "No change — restored message was read")
-        #expect(trash?.unreadCount == 0, "No change — restored message was read")
-    }
+    // DELETED 2026-08-04 — `undo pattern: restores unread counts on both source and
+    // destination folders` and `undo pattern: read messages don't change unread
+    // counts` re-implemented `undoMove`'s unread arithmetic in the test body and
+    // counted `messages.filter { !$0.isRead }` off the CAPTURED SNAPSHOT.
+    // Production counts `currentRows.filter { !$0.isRead }` — the LIVE rows — and
+    // `UndoMember` carries no `isRead` field at all, so the rule those tests
+    // encoded is not representable in production. Both fixtures also made snapshot
+    // and live state agree, so neither discriminated between the two rules.
 }
 
 /// F6 (PLAN_OVERLAY_CALLSITE_AUDIT.md §6): actionTag clears locally the moment
