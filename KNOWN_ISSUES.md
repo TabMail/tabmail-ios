@@ -698,20 +698,20 @@ inherits the shape of its instrument). Measured at candidate `339bd4ce2` against
 `07a4bb703`:
 
 ```
-# 110 — WIDE. All three production trees; the filter is applied AFTER the diff, so no pathspec
-#       globbing is involved at all.
-git diff --name-only 07a4bb703..339bd4ce2 \
-  | rg -c '^(TabMail|Shared|TabMailNotificationService)/.*\.swift$'
-→ 110      # TabMail 93 + Shared 9 + TabMailNotificationService 8
+  # 110 — WIDE. All three production trees; the filter is applied AFTER the diff, so no
+  #       pathspec globbing is involved at all.
+  git diff --name-only 07a4bb703..339bd4ce2 \
+    | rg -c '^(TabMail|Shared|TabMailNotificationService)/.*\.swift$'
+  → 110      # TabMail 93 + Shared 9 + TabMailNotificationService 8
 
-# 102 — THREE-PATHSPEC. This is the form the round-4 brief actually specified.
-git diff --name-only 07a4bb703..339bd4ce2 \
-  -- 'TabMail/**/*.swift' 'Shared/**/*.swift' 'TabMailNotificationService/**/*.swift' | wc -l
-→ 102      # TabMail 93 + Shared 9 + TabMailNotificationService 0   ← note the zero
+  # 102 — THREE-PATHSPEC. This is the form the round-4 brief actually specified.
+  git diff --name-only 07a4bb703..339bd4ce2 \
+    -- 'TabMail/**/*.swift' 'Shared/**/*.swift' 'TabMailNotificationService/**/*.swift' | wc -l
+  → 102      # TabMail 93 + Shared 9 + TabMailNotificationService 0   ← note the zero
 
-# 93 — ONE-PATHSPEC. The `TabMail/` tree alone.
-git diff --name-only 07a4bb703..339bd4ce2 -- 'TabMail/**/*.swift' | wc -l
-→ 93
+  # 93 — ONE-PATHSPEC. The `TabMail/` tree alone.
+  git diff --name-only 07a4bb703..339bd4ce2 -- 'TabMail/**/*.swift' | wc -l
+  → 93
 ```
 
 **Use 110 / 102, and 93 if you pass only the `TabMail` pathspec** — and always say which one you mean.
