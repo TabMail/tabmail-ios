@@ -636,7 +636,12 @@ actor SyncEngine {
                 }
             } catch {
                 if SyncEngine.isSelectFailedError(error) {
-                    print("[InfiniteScroll] SELECT failed for \(folder.name) — skipping")
+                    // Gated: on a device `stdout` is discarded, so this print is not
+                    // the production-observability channel — the `logError` below is
+                    // (file-backed, exported by `DebugLogView`), and it is unchanged.
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[InfiniteScroll] SELECT failed for \(folder.name) — skipping")
+                    }
                     BackgroundSyncLogger.logError("SELECT failed for \(folder.name): \(error)", source: "infiniteScroll")
                     continue
                 }
@@ -753,11 +758,23 @@ actor SyncEngine {
             let newHeaders = writeResult.inserted
             ReplyParentResolver.postParentNotifications(writeResult.discoveredParents)
 
+            // 🚨 THE GATE IS IN THE BODY, NEVER IN THE BRANCH CONDITION. The second
+            // arm used to read `else if found > 0, DebugModeManager.isLoggingEnabled()`,
+            // which makes a debug unlock decide WHICH BRANCH IS TAKEN rather than
+            // merely whether a line is printed — so debug and release builds no longer
+            // share one control-flow graph, and any future non-logging statement added
+            // to that arm would silently not run in production. Nothing here has a
+            // non-logging effect today, which is why the hoist is behaviour-preserving;
+            // it is written this way so it stays that way (global CLAUDE.md rule 12).
             if !newHeaders.isEmpty {
                 await indexHeadersForFTS(newHeaders)
-                print("[InfiniteScroll] \(folder.name): +\(newHeaders.count) of \(found) older messages")
-            } else if found > 0, DebugModeManager.isLoggingEnabled() {
-                print("[InfiniteScroll] \(folder.name): server returned \(found) records, none materialised — this pull's cursor cannot advance, so paging stops")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[InfiniteScroll] \(folder.name): +\(newHeaders.count) of \(found) older messages")
+                }
+            } else if found > 0 {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[InfiniteScroll] \(folder.name): server returned \(found) records, none materialised — this pull's cursor cannot advance, so paging stops")
+                }
             }
             totalNew += newHeaders.count
 

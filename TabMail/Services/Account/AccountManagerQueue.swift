@@ -35,14 +35,30 @@ struct ExecutedOperation: Sendable {
 /// `NotificationActionRouter.log` and `MessageContentStore.log`.
 ///
 /// 🚨 THREE lines in this file are DELIBERATELY LEFT AS UNGATED `print` and
-/// must stay that way; each is marked `UNGATED BY DECISION` at its site. They
-/// are the only witness to a state that is NOT recoverable by a later sync or
-/// retry — a completed op that will re-execute, a partially-completed bundle
-/// requeued whole, and the F2b L4 terminal identity drop whose accepted cost
+/// must stay that way; each is marked `UNGATED BY DECISION` at its site. Each
+/// reports a state that is NOT recoverable by a later sync or retry — a
+/// completed op that will re-execute, a partially-completed bundle requeued
+/// whole, and the F2b L4 terminal identity drop whose accepted cost
 /// `KNOWN_ISSUES.md` `IOS-QUEUE-003` item 4 records as "bounded and VISIBLE".
 /// Gating them would make that visibility conditional on a debug unlock the
 /// affected user does not have, which is rule 12's own
 /// production-observability exception.
+///
+/// ⚠️ BUT A `print` COULD NEVER HAVE DELIVERED THAT EXCEPTION, so each site now
+/// also writes `BackgroundSyncLogger.logError` — ungated at the write,
+/// file-backed (`error.log`), exported by `DebugLogView`. There is no
+/// `freopen`/`dup2` anywhere in this tree (`rg -g '*.swift' 'freopen|dup2'`
+/// returns nothing), so on a device `stdout` goes nowhere and the
+/// "production observability" the exception buys from a bare `print` is zero.
+/// The prints and their gating are UNCHANGED — this is strictly additive, and
+/// changes no gating decision.
+///
+/// ⚠️ AND "the only witness" was overstated at two of the three: it is
+/// literally true only where the durable row does NOT survive the failure —
+/// the identity-refusal site, which DELETES the op. At the other two the
+/// `PendingOperation` row is still there (its delete failed / it was requeued
+/// whole), so the row itself is durable evidence of the op; what no durable
+/// artifact recorded was the FAILURE. Each site states its own case.
 private func queueLog(_ message: @autoclosure () -> String) {
     guard DebugModeManager.isLoggingEnabled() else { return }
     print(message())
@@ -758,10 +774,19 @@ extension AccountManager {
                 // exception). A completed op that could not be deleted WILL run
                 // again on the next drain, so the wire effect it already applied
                 // can be applied twice. No sync pass or retry recovers a
-                // duplicate that has already been made; this line is its only
-                // witness, and gating it would hide it behind a debug unlock the
-                // affected user does not have.
+                // duplicate that has already been made, and gating this would hide
+                // it behind a debug unlock the affected user does not have.
+                //
+                // ⚠️ CORRECTED — this line is NOT "its only witness". The DELETE is
+                // what failed, so the `PendingOperation` row SURVIVES and is itself
+                // durable evidence of the op that will re-run. What nothing durable
+                // records is the FAILURE, which is what the `logError` below writes.
+                // A bare `print` could not have been the witness in any case: with
+                // no `freopen`/`dup2` in this tree, `stdout` is discarded on device.
                 print("[Queue] CRITICAL: Failed to delete completed PendingOperation \(currentOp.id) after retries — will re-execute on next drain")
+                BackgroundSyncLogger.logError(
+                    "CRITICAL: failed to delete completed PendingOperation \(currentOp.id) (type \(opType)) after retries — it stays queued and WILL re-execute, so a wire effect already applied may be applied twice: \(error)",
+                    source: "actionQueue")
                 rekeyOutcome = ([], [])
             }
             await publishRekeys(rekeyOutcome.applied, collidedOldHeaderIds: rekeyOutcome.collided)
@@ -952,10 +977,21 @@ extension AccountManager {
                 // exception). This is the F2b L4 TERMINAL DROP of a durable user
                 // intention. `KNOWN_ISSUES.md` `IOS-QUEUE-003` item 4 accepts
                 // that cost expressly because the loss is "bounded and VISIBLE";
-                // this print is the whole of that visibility, so gating it would
-                // silently convert an accepted, observable drop into an
-                // unobservable one and weaken a recorded decision.
+                // gating this would silently convert an accepted, observable drop
+                // into an unobservable one and weaken a recorded decision.
+                //
+                // ✅ THE "ONLY WITNESS" CLAIM IS LITERALLY TRUE HERE, AND ONLY
+                // HERE, of the three sites: the write below DELETES the row, so
+                // after this arm no durable artifact of the intention remains.
+                // That is exactly why the file channel matters most at this site —
+                // a bare `print` reaches nobody on a device (`stdout` is discarded;
+                // there is no `freopen`/`dup2` in this tree), so before the
+                // `logError` below the "VISIBLE" half of the accepted cost was not
+                // actually being delivered.
                 print("[Queue] Identity refused in \(opType) (\(opMsgCount) id(s)): '\(refusedId)' is not a verifiable identity and never will be — dropping the op (the server-side object is untouched and remains visible for a re-issued gesture)")
+                BackgroundSyncLogger.logError(
+                    "TERMINAL DROP: identity refused in \(opType) (\(opMsgCount) id(s)) — '\(refusedId)' is not a verifiable identity and never will be, so the op is dropped (IOS-QUEUE-003 item 4; the server-side object is untouched and remains visible for a re-issued gesture)",
+                    source: "actionQueue")
                 try? await retryWrite(dbPool, label: "Queue") { db in
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                 }
@@ -1241,9 +1277,21 @@ extension AccountManager {
             // 🚨 UNGATED BY DECISION (rule 12's production-observability
             // exception). The requeued bundle re-copies members the provider
             // already proved, so this names a duplicate that WILL be created at
-            // the destination. Same reasoning as the sibling CRITICAL above: a
-            // duplicate already made is not recovered by a later sync.
+            // the destination, and a duplicate already made is not recovered by a
+            // later sync.
+            //
+            // ⚠️ CORRECTED — the sibling CRITICAL above used to call itself "its
+            // only witness" and this site inherited the claim. It is false in both
+            // places: the requeue below leaves the `PendingOperation` row in place,
+            // so the row is durable evidence of the bundle that will re-run. What
+            // nothing durable records is the NARROWING FAILURE and the duplication
+            // it implies — that is what the `logError` below writes, ungated and
+            // file-backed, because on a device `stdout` is discarded (no
+            // `freopen`/`dup2` exists in this tree).
             print("[Queue] CRITICAL: could not narrow partially-completed \(currentOp.id) after retries — requeuing the whole bundle (may duplicate already-moved members)")
+            BackgroundSyncLogger.logError(
+                "CRITICAL: could not narrow partially-completed \(currentOp.id) (type \(currentOp.type.rawValue)) after retries — requeuing the WHOLE bundle, so the \(provenMembers.count) member(s) the provider already proved will be re-applied and may duplicate at the destination: \(error)",
+                source: "actionQueue")
             try? await retryWrite(dbPool, label: "Queue") { db in
                 var queued = currentOp
                 queued.status = PendingStatus.queued.rawValue
