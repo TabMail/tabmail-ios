@@ -381,14 +381,28 @@ struct SearchView: View {
 
     /// What a tap on a search result does.
     ///
-    /// 🚨 THERE IS DELIBERATELY NO SILENT CASE, and that absence is the invariant
-    /// this type exists to hold: *no result the user can tap is a no-op.* Both
-    /// resolvers are fail-CLOSED and return `nil` far more often than a reader
-    /// expects (a re-seated address, a remote hit with no local row at all), and
-    /// before this type the remote branch answered a `nil` by simply returning —
-    /// an invisible dead tap, indistinguishable from a broken app. A future
-    /// re-implementation may change how the outcome is DECIDED; it cannot
-    /// reintroduce silence without adding a case here.
+    /// The invariant this type serves: *no result the user can tap is a no-op.*
+    /// Both resolvers are fail-CLOSED and return `nil` far more often than a
+    /// reader expects (a re-seated address, a remote hit with no local row at
+    /// all), and before this type the remote branch answered a `nil` by simply
+    /// returning — an invisible dead tap, indistinguishable from a broken app.
+    ///
+    /// 🚨 CORRECTION OF RECORD (2026-08-04). This comment used to claim *"THERE IS
+    /// DELIBERATELY NO SILENT CASE, and that absence is the invariant… a future
+    /// re-implementation cannot reintroduce silence without adding a case here."*
+    /// **That is false, and it was load-bearing false** — it was the stated reason
+    /// no test covered the wiring. **Swift exhaustiveness forces a case to EXIST,
+    /// not to DO anything.** `case .explainRemoteResultNotOnThisDevice: break`
+    /// compiles, adds no case, and restores the exact dead silent tap this type was
+    /// introduced to kill. Absence of a silent CASE is not absence of a silent
+    /// PATH, and an enum can only make a decision explicit — it can never make the
+    /// consumer act on it.
+    ///
+    /// What actually holds the invariant is `TapEffect` + `effect(of:)` below: the
+    /// mapping from outcome to visible consequence is a value a test can assert,
+    /// and `openResult` applies that value by unconditional assignment rather than
+    /// by re-deciding in a `switch` of its own. See `TapEffect` for exactly how far
+    /// that reaches and where it stops.
     enum ResultTapOutcome: Equatable {
         /// Navigate. Carries the witness the resolve validated against, if any.
         case open(OpenTarget)
@@ -454,6 +468,61 @@ struct SearchView: View {
             provenRfc822MessageId: result.capturedRfc822MessageId))
     }
 
+    /// The COMPLETE visible consequence of one tap, as a value.
+    ///
+    /// 🚨 THIS EXISTS BECAUSE THE ENUM ALONE NEVER HELD THE INVARIANT. Asserting
+    /// `tapOutcome` returns `.explainRemoteResultNotOnThisDevice` pins the
+    /// CLASSIFIER; the system property is *the user sees something*, which lives one
+    /// hop later, in what the view does with that answer. Those are different
+    /// propositions, and the whole tap suite asserted only the first — so
+    /// `case .explainRemoteResultNotOnThisDevice: break` in `openResult` restored the
+    /// dead silent tap with every one of those tests still GREEN (observed, not
+    /// reasoned — see the round-2 commit body). Testing rule 12: pin the invariant,
+    /// not the mechanism.
+    ///
+    /// ⚑ HOW FAR THIS REACHES, AND WHERE IT STOPS — stated because the claim it
+    /// replaces was an unfalsifiable absolute (MIS-019). `effect(of:)` is pure and
+    /// exhaustively asserted, so an outcome that maps to no visible consequence now
+    /// fails a test instead of compiling silently. The LAST hop — `openResult`
+    /// assigning these three fields onto `@State` — is still NOT covered by a unit
+    /// test, because it needs a hosted SwiftUI view. It is merely made harder to get
+    /// wrong: `openResult` no longer re-decides anything, so there is no branch left
+    /// in it to `break` out of, and a regression there has to be a visible DELETION
+    /// of an assignment rather than an empty case body. That is a real reduction, not
+    /// a proof, and it should not be described as one.
+    struct TapEffect: Equatable {
+        /// Non-nil ⇒ navigate to this target.
+        var navigate: OpenTarget?
+        /// The local result's content witness no longer matches the row at its address.
+        var explainStaleLocalResult: Bool
+        /// The remote hit has no folder-native local row on this device.
+        var explainRemoteResultNotOnThisDevice: Bool
+
+        /// The invariant, expressed so a test can assert it over every outcome:
+        /// a tap must always do at least one of navigate / explain.
+        var isVisible: Bool {
+            navigate != nil || explainStaleLocalResult || explainRemoteResultNotOnThisDevice
+        }
+    }
+
+    /// Map a decision onto its visible consequence. Pure; no `@State`, no view.
+    nonisolated static func effect(of outcome: ResultTapOutcome) -> TapEffect {
+        switch outcome {
+        case .open(let target):
+            return TapEffect(navigate: target,
+                             explainStaleLocalResult: false,
+                             explainRemoteResultNotOnThisDevice: false)
+        case .explainStaleLocalResult:
+            return TapEffect(navigate: nil,
+                             explainStaleLocalResult: true,
+                             explainRemoteResultNotOnThisDevice: false)
+        case .explainRemoteResultNotOnThisDevice:
+            return TapEffect(navigate: nil,
+                             explainStaleLocalResult: false,
+                             explainRemoteResultNotOnThisDevice: true)
+        }
+    }
+
     private func openResult(_ result: SearchResult) {
         // Local result with headerId — the address is cached in an in-memory
         // `results` array that predates any re-seat, so prove the row still there
@@ -478,14 +547,16 @@ struct SearchView: View {
                 db: db
             )
         }
-        switch Self.tapOutcome(for: result, resolvedHeaderId: resolved) {
-        case .open(let target):
+        // Decide once, then APPLY — no second decision lives here. The assignments
+        // are unconditional so the applied state is exactly the asserted value,
+        // including the falses: an open cannot leave a stale alert flag raised, and
+        // an explain cannot silently skip being raised.
+        let effect = Self.effect(of: Self.tapOutcome(for: result, resolvedHeaderId: resolved))
+        if let target = effect.navigate {
             navigationPath.append(target)
-        case .explainStaleLocalResult:
-            showStaleResultAlert = true
-        case .explainRemoteResultNotOnThisDevice:
-            showRemoteResultUnavailableAlert = true
         }
+        showStaleResultAlert = effect.explainStaleLocalResult
+        showRemoteResultUnavailableAlert = effect.explainRemoteResultNotOnThisDevice
     }
 
     // MARK: - Search Logic
@@ -950,29 +1021,61 @@ struct SearchView: View {
         }
         defer { timeoutTask.cancel() }
 
-        let infos: [MessageHeaderInfo]
-        do {
+        return await Self.remoteResults(
+            accountId: resultAccountId, accountEmail: email, folderPath: folder
+        ) {
             // Forward caller cancellation (query change, dismiss, new submit) into
             // the inner search task — a cancelled search resolves as empty results.
-            infos = try await withTaskCancellationHandler {
+            // Still registered on THIS task (an `await` into a nonisolated function
+            // is an executor hop, not a new task), so propagation is unchanged.
+            try await withTaskCancellationHandler {
                 try await searchTask.value
             } onCancel: {
                 searchTask.cancel()
             }
+        }
+    }
+
+    /// Everything between "the provider answered" and "the view has results" —
+    /// failure handling, the debug census, and the `\Deleted` presentation filter.
+    ///
+    /// 🚨 THIS SEAM EXISTS TO PIN THE WIRING, NOT TO ABSTRACT ANYTHING.
+    /// `SearchDeletedResiduePresentationTests` proved that `presentableRemoteResults`
+    /// DROPS a `\Deleted` residue, which is a property of a function nobody was
+    /// proven to call: the filter sat on the tail of a `@MainActor` view method that
+    /// builds two `Task`s and a timeout, so no test could reach the path the search
+    /// actually takes, and deleting the call would have left that suite green. With
+    /// the fetch injected, a test drives the REAL return path and the filter is
+    /// pinned where it runs.
+    ///
+    /// ⚑ WHAT REMAINS UNPINNED: that `searchAccount` calls this at all. That hop is
+    /// now a single `return await` with no branch and no second mapping, but it is
+    /// not covered, and calling this seam "wiring coverage" without that caveat would
+    /// repeat the error it was written to correct.
+    ///
+    /// Semantics are byte-for-byte the previous behaviour: `CancellationError` and
+    /// any other error both resolve to an empty result set, never a thrown search.
+    nonisolated static func remoteResults(
+        accountId: String, accountEmail: String, folderPath: String,
+        fetch: @Sendable () async throws -> [MessageHeaderInfo]
+    ) async -> [SearchResult] {
+        let infos: [MessageHeaderInfo]
+        do {
+            infos = try await fetch()
         } catch is CancellationError {
-            print("[Search] Cancelled/timed out searching \(email) — treating as empty")
+            print("[Search] Cancelled/timed out searching \(accountEmail) — treating as empty")
             return []
         } catch {
-            print("[Search] Error searching \(email): \(error)")
+            print("[Search] Error searching \(accountEmail): \(error)")
             return []
         }
 
         if DebugModeManager.isLoggingEnabled() {
-            print("[Search] \(email) \(folder.isEmpty ? "account-wide" : "folder=\(folder)") returned \(infos.count) results")
+            print("[Search] \(accountEmail) \(folderPath.isEmpty ? "account-wide" : "folder=\(folderPath)") returned \(infos.count) results")
         }
 
-        return Self.presentableRemoteResults(
-            from: infos, accountId: resultAccountId, accountEmail: email, folderPath: folder)
+        return presentableRemoteResults(
+            from: infos, accountId: accountId, accountEmail: accountEmail, folderPath: folderPath)
     }
 
     /// The remote hits this search may SHOW, from what the provider returned.

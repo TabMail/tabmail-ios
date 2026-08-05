@@ -19,9 +19,17 @@ import Foundation
 /// SHOWS after the values have travelled the real wire through the real producer
 /// (`IMAPProvider.mapMessageInfo`), so a re-implementation that filters somewhere
 /// else still passes and one that stops filtering still fails. The second is
-/// asserted on the OUTCOME of a tap, and `SearchView.ResultTapOutcome` has no
-/// silent case at all — a future refactor cannot reintroduce silence without
-/// adding one.
+/// asserted on the EFFECT of a tap — the visible consequence — not merely on the
+/// outcome the classifier returns.
+///
+/// 🚨 CORRECTED 2026-08-04. This paragraph used to read *"`SearchView
+/// .ResultTapOutcome` has no silent case at all — a future refactor cannot
+/// reintroduce silence without adding one."* **False, and it was the stated reason
+/// the wiring went untested.** Swift exhaustiveness forces a case to EXIST, not to
+/// DO anything: `case .explainRemoteResultNotOnThisDevice: break` compiles, adds no
+/// case, and restores the dead silent tap. That was run, not reasoned — every test
+/// in `SearchResultTapOutcomeTests` stayed GREEN through it. See
+/// `SearchTapEffectWiringTests` below for what replaced the claim.
 ///
 /// ## Why the census could not find this path (MIS-007 instance 5)
 ///
@@ -172,8 +180,16 @@ struct SearchDeletedResiduePresentationTests {
 /// which is the worst of the three possible behaviours: it is indistinguishable
 /// from a broken app, and it teaches the user that search results are not tappable.
 ///
-/// These assert the OUTCOME of a tap, which is the property; `ResultTapOutcome`
-/// carries no silent case, so the invariant is structural rather than asserted.
+/// ⚑ THESE ASSERT THE CLASSIFIER ONLY, AND THAT IS NOT THE SYSTEM PROPERTY.
+/// The doc here used to claim *"`ResultTapOutcome` carries no silent case, so the
+/// invariant is structural rather than asserted"* — false reasoning that justified
+/// leaving the wiring uncovered. Swift exhaustiveness forces a case to EXIST, not to
+/// DO anything; a `break` in the consumer reintroduces silence with every case still
+/// present and every test in this suite still green (observed 2026-08-04).
+///
+/// This suite is kept because "the classifier decides the right thing" is a real,
+/// useful proposition — it is just a strictly weaker one than "the user sees
+/// something". `SearchTapEffectWiringTests` below asserts the latter.
 /// Pure — no view, no database, no socket.
 @Suite("Search result taps always produce a visible outcome")
 struct SearchResultTapOutcomeTests {
@@ -262,5 +278,207 @@ struct SearchResultTapOutcomeTests {
         #expect(outcome == .open(SearchView.OpenTarget(
             headerId: "acc-a:INBOX:77", provenRfc822MessageId: "witness@example.com")),
                 "the proof is worth nothing to the consumer that mutates unless it travels with the address")
+    }
+}
+
+/// **THE SYSTEM PROPERTY: the user sees something.**
+///
+/// 🚨 WHY THIS SUITE EXISTS, AND WHAT IT REPLACES (Testing rule 12 — pin the
+/// INVARIANT, not the mechanism). `SearchResultTapOutcomeTests` above asserts what
+/// `tapOutcome` RETURNS. That is the classifier. The property the user experiences
+/// is one hop later: what the view DOES with that answer. Those are different
+/// propositions and only the weaker one was covered, defended by the false claim
+/// that an enum without a silent case makes silence impossible.
+///
+/// **The red proof, run rather than argued.** Replacing the consumer's branch with
+/// `case .explainRemoteResultNotOnThisDevice: break` compiles, adds no enum case,
+/// and restores the invisible dead tap — and every test in the suite above stayed
+/// GREEN through it. A test that cannot go red on the defect it names is not
+/// evidence (MIS-014).
+///
+/// So the branching moved out of the view into `SearchView.effect(of:)`, where the
+/// mapping from decision to visible consequence is a VALUE. An outcome that maps to
+/// nothing visible now fails `everyOutcomeProducesAVisibleEffect` instead of
+/// compiling in silence.
+///
+/// ⚑ THE HONEST BOUNDARY, stated because the claim this replaces was an
+/// unfalsifiable absolute (MIS-019): the final hop — `openResult` assigning these
+/// three fields onto `@State` — is still NOT covered here, because it needs a hosted
+/// SwiftUI view. What changed is that `openResult` no longer decides anything, so
+/// there is no branch left in it to `break` out of; a regression there must now be a
+/// visible deletion of an assignment. That is a reduction in exposure, not a proof,
+/// and calling it structural would repeat the exact error above.
+@Suite("Search taps — the visible effect, not just the classified outcome")
+struct SearchTapEffectWiringTests {
+
+    /// Every `ResultTapOutcome`, as a roster a test can iterate.
+    ///
+    /// 🚨 KEPT HONEST BY A COMPILE ERROR, NOT BY DILIGENCE (MIS-007 — a census
+    /// inherits its search shape). `discriminator(of:)` switches this enum
+    /// exhaustively, so ADDING A CASE STOPS COMPILING until it is handled, and
+    /// `everyOutcomeIsAccountedFor` then fails until this roster carries it too. A
+    /// hand-written roster with no such guard silently stops being complete on the
+    /// day a case is added — which is precisely how an uncovered path survives.
+    private static let allOutcomes: [SearchView.ResultTapOutcome] = [
+        .open(SearchView.OpenTarget(headerId: "acc-a:INBOX:77", provenRfc822MessageId: nil)),
+        .explainStaleLocalResult,
+        .explainRemoteResultNotOnThisDevice,
+    ]
+
+    private func discriminator(of outcome: SearchView.ResultTapOutcome) -> String {
+        switch outcome {
+        case .open: return "open"
+        case .explainStaleLocalResult: return "explainStaleLocalResult"
+        case .explainRemoteResultNotOnThisDevice: return "explainRemoteResultNotOnThisDevice"
+        }
+    }
+
+    @Test("The outcome roster covers every case exactly once")
+    func everyOutcomeIsAccountedFor() {
+        let tags = Self.allOutcomes.map(discriminator(of:))
+        #expect(Set(tags).count == tags.count, "the roster must not list one case twice")
+        #expect(Set(tags) == ["open", "explainStaleLocalResult", "explainRemoteResultNotOnThisDevice"],
+                "a case was added to ResultTapOutcome without being added to allOutcomes — the exhaustive switch in discriminator(of:) is what sent you here")
+    }
+
+    @Test("Every tap outcome produces a visible effect — no outcome is a no-op")
+    func everyOutcomeProducesAVisibleEffect() {
+        for outcome in Self.allOutcomes {
+            #expect(SearchView.effect(of: outcome).isVisible,
+                    "\(discriminator(of: outcome)) mapped to an effect that navigates nowhere and explains nothing — that IS the dead silent tap, restored")
+        }
+    }
+
+    @Test("A remote hit this device has no copy of raises its alert and navigates nowhere")
+    func remoteUnavailableRaisesExactlyItsOwnAlert() {
+        #expect(SearchView.effect(of: .explainRemoteResultNotOnThisDevice)
+            == SearchView.TapEffect(navigate: nil,
+                                    explainStaleLocalResult: false,
+                                    explainRemoteResultNotOnThisDevice: true),
+                "the end state, including the falses — a silent regression shows up here as an all-false effect")
+    }
+
+    @Test("A stale local result raises its alert and navigates nowhere")
+    func staleLocalRaisesExactlyItsOwnAlert() {
+        #expect(SearchView.effect(of: .explainStaleLocalResult)
+            == SearchView.TapEffect(navigate: nil,
+                                    explainStaleLocalResult: true,
+                                    explainRemoteResultNotOnThisDevice: false))
+    }
+
+    @Test("An open navigates and raises no alert at all")
+    func openNavigatesAndExplainsNothing() {
+        let target = SearchView.OpenTarget(
+            headerId: "acc-a:INBOX:77", provenRfc822MessageId: "witness@example.com")
+        #expect(SearchView.effect(of: .open(target))
+            == SearchView.TapEffect(navigate: target,
+                                    explainStaleLocalResult: false,
+                                    explainRemoteResultNotOnThisDevice: false),
+                "an open must also CLEAR the alert flags — the assignments in openResult are unconditional so a raised flag cannot survive into the next tap")
+    }
+
+    /// The whole chain a tap takes, minus the `@State` assignment: resolve result →
+    /// classify → visible effect. This is the proposition the old suite could not
+    /// state, because it stopped at the middle term.
+    @Test("An unresolvable remote tap ends in a visible explanation, end to end")
+    func anUnresolvableRemoteTapEndsVisible() {
+        let result = SearchResult(
+            source: .remote, accountId: "acc-a", accountEmail: "user@example.com",
+            messageId: "77", folderPath: "INBOX", subject: "quarterly invoice",
+            from: "Sender", fromAddress: "sender@example.com", date: Date(),
+            snippet: "", isRead: false, isFlagged: false, headerId: nil,
+            capturedRfc822MessageId: nil)
+        let effect = SearchView.effect(
+            of: SearchView.tapOutcome(for: result, resolvedHeaderId: nil))
+        #expect(effect.isVisible, "a tap that resolves to nothing must still tell the user something")
+        #expect(effect.explainRemoteResultNotOnThisDevice)
+        #expect(effect.navigate == nil)
+    }
+}
+
+/// **The `\Deleted` filter, pinned ON THE PATH THE SEARCH ACTUALLY RETURNS THROUGH.**
+///
+/// 🚨 THE GAP THIS CLOSES. `SearchDeletedResiduePresentationTests` above proves that
+/// `presentableRemoteResults` DROPS a residue — a property of a function nobody was
+/// proven to call. The filter sat on the tail of a `@MainActor` view method that
+/// builds two `Task`s and a timeout, so no test reached it, and deleting the call
+/// would have left that suite entirely green. `SearchView.remoteResults` injects the
+/// fetch so the real return path is exercised here.
+///
+/// ⚑ STILL UNPINNED: that `searchAccount` calls `remoteResults` at all. That hop is
+/// one `return await` with no branch, but it is not covered, and this suite must not
+/// be read as proving it.
+@Suite("Search remote path — the filter and the failure handling, where they run")
+struct SearchRemotePathWiringTests {
+
+    private struct FetchFailure: Error {}
+
+    private static func info(_ uid: String, deleted: Bool) -> MessageHeaderInfo {
+        var info = MessageHeaderInfo(
+            messageId: uid, rfc822MessageId: "server-\(uid)@example.com",
+            inReplyTo: nil, references: [], threadId: nil,
+            subject: "quarterly invoice", from: "Sender",
+            fromAddress: "sender@example.com", to: "user@example.com",
+            cc: "", bcc: "", replyTo: nil, date: Date(), snippet: "snippet",
+            isRead: false, isFlagged: false, hasAttachments: false,
+            isReplied: false, isForwarded: false, actionTag: nil)
+        info.isDeletedOnServer = deleted
+        return info
+    }
+
+    private static func results(_ infos: [MessageHeaderInfo]) async -> [SearchResult] {
+        await SearchView.remoteResults(
+            accountId: "acc-wiring", accountEmail: "user@example.com", folderPath: "INBOX",
+            fetch: { infos })
+    }
+
+    @Test("A residue the server still returns never reaches the view through the real return path")
+    func theReturnPathDropsTheResidue() async {
+        let presented = await Self.results([
+            Self.info("51", deleted: false),
+            Self.info("52", deleted: true),
+            Self.info("53", deleted: false),
+        ])
+        #expect(presented.map(\.messageId).sorted() == ["51", "53"],
+                "the filter must sit on the path searchAccount returns through, not merely in a function a test calls directly")
+    }
+
+    /// NON-VACUITY. The same three records with the flag cleared must all be
+    /// presented — otherwise the assertion above could pass because the path drops
+    /// everything, or returns nothing at all.
+    @Test("With no \\Deleted flag every record is presented — the filter is not just dropping everything")
+    func theReturnPathPresentsLiveRecords() async {
+        let presented = await Self.results([
+            Self.info("51", deleted: false),
+            Self.info("52", deleted: false),
+            Self.info("53", deleted: false),
+        ])
+        #expect(presented.map(\.messageId).sorted() == ["51", "52", "53"])
+    }
+
+    /// Ties `IOS-SEARCH-003`'s witness to the same real return path: the round-1 fix
+    /// is asserted where the search actually produces its results, not only where a
+    /// test calls the mapper directly.
+    @Test("The provider's Message-ID reaches the view as the result's content witness")
+    func theReturnPathCarriesTheWitness() async {
+        let presented = await Self.results([Self.info("51", deleted: false)])
+        #expect(presented.map(\.capturedRfc822MessageId) == ["server-51@example.com"],
+                "a remote open's durable mark-read is unwitnessed unless the witness travels this path")
+    }
+
+    @Test("A cancelled search resolves as empty results, never as a thrown search")
+    func cancellationResolvesEmpty() async {
+        let presented = await SearchView.remoteResults(
+            accountId: "acc-wiring", accountEmail: "user@example.com", folderPath: "INBOX",
+            fetch: { throw CancellationError() })
+        #expect(presented.isEmpty, "a query change or dismiss must degrade to no results, never propagate out of the search")
+    }
+
+    @Test("A failed search resolves as empty results rather than propagating")
+    func failureResolvesEmpty() async {
+        let presented = await SearchView.remoteResults(
+            accountId: "acc-wiring", accountEmail: "user@example.com", folderPath: "INBOX",
+            fetch: { throw FetchFailure() })
+        #expect(presented.isEmpty)
     }
 }
