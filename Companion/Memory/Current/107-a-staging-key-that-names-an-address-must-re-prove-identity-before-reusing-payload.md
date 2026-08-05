@@ -290,10 +290,53 @@ agrees and the guard is transparent.
 
 ## Left alone, with reasons (so the census is accountable)
 
-- **`getCachedResult`** keeps `WHERE id = ? AND aiCompleted = 1` with no identity term. `stageHeader`
+- ~~**`getCachedResult`** keeps `WHERE id = ? AND aiCompleted = 1` with no identity term. `stageHeader`
   runs strictly before it in `NotificationService.process`, so the row's identity is already this
   run's. **The ordering IS the guard**; a second term would be the redundant machinery A3 forbids.
-  Do not move that call later in the run.
+  Do not move that call later in the run.~~
+
+  > ⚠️ **RETRACTED 2026-08-05 (final audit train) — struck through above, kept verbatim so the error
+  > stays searchable. `getCachedResult` is the FOURTH member of this class and is now guarded.**
+  >
+  > **The false step is "the ordering IS the guard".** An ordering establishes that `stageHeader` was
+  > **CALLED**. It cannot establish that it **LANDED** — and `stageHeader` is precisely the shape that
+  > makes the difference invisible: it returns `Void` and wraps its entire write in
+  > `do { … } catch { NSELog.error("stageHeader failed: \(error)") }`, so a thrown write is logged and
+  > **swallowed** and no caller can observe the failure. The staging file is a **non-WAL, cross-process
+  > App Group** database, so `SQLITE_BUSY` under contention is a live outcome rather than a
+  > hypothetical. `MIS-024` in its purest form: reading a mechanism proves it is CORRECT, never that it
+  > RAN, nor that it ran BEFORE the damage — the same trap this very file records against
+  > `abandonedCutoff` two sections above, applied to an ordering instead of to a predicate.
+  >
+  > **The end state when it throws.** X's completed row survives untouched at `accountId:UID`.
+  > `getCachedResult` hits on address plus completion flag, and `NotificationService.process` hands
+  > `EmailNotificationBuilder.fill` **Y's** `senderName`/`senderEmail`/`subject` beside **X's**
+  > `summaryBlurb`, `actionTag` and reminder — and an `actionTag == "reply"` escalates the banner to
+  > `.active` with sound for a message it was never computed for. **Nothing recovers it:** the
+  > notification has been delivered and seen, which is what puts it in the non-recoverable set
+  > alongside the durable half, despite being pre-existing (byte-identical `getCachedResult` at shipped
+  > `07a4bb703` and at `v2final` `e28dd4edb` — AUTHORED, not restored).
+  >
+  > **The fix, and the direction that is NOT taken.** `getCachedResult` now takes the incoming
+  > `NSEMessageMetadata` and consults the same `stagedIdentityPositivelyDiffers`, rather than a second
+  > copy of the comparison (`MIS-018`: do not half-port a guard). Its fail direction is
+  > `stageHeader`'s, **not** `stageBody`'s — the question is *may I REUSE payload already on the row*,
+  > so an unanswerable identity still **SERVES**, and only positive evidence of a different message
+  > turns a hit into a miss. "Unknown ⇒ miss" is the mirror image (`MIS-005`) and is pinned RED by
+  > `unanswerableIdentityWritesRatherThanRefuses` and `unanswerableIdentityRetainsRatherThanClears`.
+  > A miss costs only that the run computes its own summary through the path that already works.
+  >
+  > **What still holds:** the ordering remains load-bearing for the WRITE half — `stageHeader` clearing
+  > a positively-different row before the probe is what makes a cleared `aiCompleted` visible to the
+  > probe at all — so **do not move that call later in the run**. It is simply not a substitute for the
+  > read having its own identity term.
+  >
+  > **How the error was made.** The carve-out reasoned from the CALL GRAPH ("A runs before B") and
+  > never asked what A does when it fails, in a function whose failure handling was three lines below
+  > the sentence being written. A temporal hand-off — *runs before*, *ages out*, *is reconciled later*
+  > — is only as strong as the callee's failure contract, and a `Void`-returning best-effort writer has
+  > none. Found by the codex half of the final audit train, angle A, 2026-08-05; mechanism verified
+  > line by line by the supervisor before acceptance.
 - **`AIOwnershipLease`'s writers.** Their predicates are `WHERE id = ? AND aiOwner = ?` and they write
   lease bookkeeping, not payload. ⚠️ **The lease is NOT this guard and must not be mistaken for it:**
   `tryClaim` gates the right to COMPUTE, never the right to WRITE, and both generations use `.nse`, so

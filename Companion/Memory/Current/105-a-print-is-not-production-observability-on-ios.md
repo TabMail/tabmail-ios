@@ -141,8 +141,10 @@ which hides the condition from any walker keyed on the flag), and the register r
 > correction lives because a commit body cannot be amended.** That commit's section A states: *"OF THE
 > 15, ZERO ARE DEFECTS ON THE MERITS … **All 15 arms are log-only**"*. The second clause is FALSE.
 > `InboxView`'s error banner is one of the 15, and its arm renders a **UI banner**, not a log — which
-> is precisely the defect §3's correction had already identified and that `3573574ed` fixed two
-> commits later. The **conclusion** of claim A survives (the census was clean of the class it was
+> is precisely the defect §3's correction had already identified and that `3573574ed` fixed **five**
+> commits later (`af98d92c7` → `be3db4785` → `ea20e3952` → `438f632cf` → `6713a21cb` → `3573574ed`;
+> reproduce with `git log --format='%h %s' 3573574ed~6..3573574ed`). The **conclusion** of claim A
+> survives (the census was clean of the class it was
 > opened to adjudicate, and `ThreadUtils.swift`'s site is correct as written); what fails is the
 > universal *"all 15 arms are log-only"*, asserted while the same commit's own section C described a
 > banner that was not.
