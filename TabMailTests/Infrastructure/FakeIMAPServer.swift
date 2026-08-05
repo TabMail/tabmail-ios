@@ -185,6 +185,19 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// downstream can detect the swap from the parsed mapping alone — the
         /// app must refuse the ORDERING. `false` for every pre-existing test.
         var copyUidDestinationsDescending = false
+        /// Round-4 H3 — this server COMMITS the copy and answers with a tagged
+        /// `OK`, but the `COPYUID` response code it attaches states one MORE
+        /// destination UID than source UID. That is exactly the shape
+        /// `CopyUID.init(nio:)` rejects with
+        /// `IMAPError.commandFailed("COPYUID source/destination cardinality
+        /// mismatch: …")`, and it is the ONLY way to reach that throw from the
+        /// wire — the other two throw sites need an inverted range or a
+        /// >1,000,000-UID expansion. It models a nonconforming server whose copy
+        /// PROVABLY HAPPENED (RFC 3501 §6.4.7: an unsuccessful COPY MUST leave
+        /// the destination as it was, so a tagged OK is a positive statement)
+        /// but whose description of it cannot be parsed. `false` for every
+        /// pre-existing test.
+        var copyUidCardinalityMismatch = false
         /// Whether UID SEARCH honours the RFC 3501 §6.4.4 `SINCE` / `BEFORE` date
         /// keys. `false` for every pre-existing test: this fake has always answered
         /// UID SEARCH with the WHOLE mailbox regardless of the window asked for, and
@@ -815,6 +828,26 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// to reach the wire rather than the parsed value.
     func reportCopyUIDDestinationsDescending() {
         withState { $0.copyUidDestinationsDescending = true }
+    }
+
+    /// Test seam (round-4 H3): the copies land exactly as they normally would and
+    /// the tagged response is still `OK`, but the `COPYUID` response code names
+    /// one MORE destination UID than source UID, so it cannot be parsed.
+    ///
+    /// ⚠ **THIS MODELS A NONCONFORMING SERVER, and — as with the G1 seam above —
+    /// that is the point.** The two `uid-set`s of RFC 4315 §3's `COPYUID` are
+    /// required to correspond one-to-one, so a conforming server cannot emit
+    /// this. It exists because `CopyUID.init(nio:)` throws
+    /// `IMAPError.commandFailed` on a cardinality mismatch, and the app must
+    /// treat that as NO EVIDENCE about a copy that DID happen rather than as a
+    /// failed copy: the tagged OK is a positive statement under RFC 3501 §6.4.7
+    /// (an unsuccessful COPY MUST leave the destination as it was), so retrying
+    /// seats another duplicate at the destination every drain, forever. This is
+    /// the only wire shape that reaches that throw with a single message; the
+    /// other two throw sites need an inverted range or an expansion over
+    /// 1,000,000 UIDs, neither of which a mailbox fixture can produce naturally.
+    func reportCopyUIDWithCardinalityMismatch() {
+        withState { $0.copyUidCardinalityMismatch = true }
     }
 
     /// Test seam (B1, ADR-IOS-068/D4): APPEND into `mailbox` still stores the
@@ -1943,8 +1976,8 @@ final class FakeIMAPServer: @unchecked Sendable {
             guard components.count == 2 else { return "\(tag) BAD Invalid UID COPY\r\n" }
             let uids = Set(parseUIDSet(components[0], in: mailbox))
             let destination = components[1].trimmingCharacters(in: .init(charactersIn: "\""))
-            let (copied, destinationUidValidity, withheld, descending) = withState {
-                state -> ([(source: Int, destination: Int)], Int, Set<Int>, Bool) in
+            let (copied, destinationUidValidity, withheld, descending, mismatched) = withState {
+                state -> ([(source: Int, destination: Int)], Int, Set<Int>, Bool, Bool) in
                 recordOracleCheck(command: "UID COPY", mailbox: mailbox, uids: uids, state: &state)
                 let sourceMessages = state.messagesByMailbox[mailbox] ?? []
                 let copying = sourceMessages.filter { uids.contains($0.uid) }
@@ -1965,7 +1998,8 @@ final class FakeIMAPServer: @unchecked Sendable {
                     pairs,
                     state.uidValidityByMailbox[destination] ?? 1,
                     state.copyUidWithheldSourceUIDs,
-                    state.copyUidDestinationsDescending
+                    state.copyUidDestinationsDescending,
+                    state.copyUidCardinalityMismatch
                 )
             }
             // RFC 4315 §3 — `COPYUID`. Mirrors the `APPENDUID` branch in
@@ -1988,7 +2022,14 @@ final class FakeIMAPServer: @unchecked Sendable {
             let destinationValues = descending
                 ? reported.map(\.destination).sorted(by: >)
                 : reported.map(\.destination)
-            let destinationSet = destinationValues.map(String.init).joined(separator: ",")
+            // Round-4 H3 seam — one EXTRA destination UID, so the two `uid-set`s
+            // no longer correspond one-to-one. The mailbox bookkeeping above is
+            // untouched: the copy really did land, exactly once, at the UID the
+            // pairs record. Only the advertisement is unparseable.
+            let advertisedDestinations = mismatched
+                ? destinationValues + [(destinationValues.max() ?? 0) + 1]
+                : destinationValues
+            let destinationSet = advertisedDestinations.map(String.init).joined(separator: ",")
             return "\(tag) OK [COPYUID \(destinationUidValidity) \(sourceSet) \(destinationSet)] UID COPY completed\r\n"
         default:
             return "\(tag) BAD Unknown UID subcommand\r\n"

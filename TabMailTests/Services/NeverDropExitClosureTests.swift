@@ -1038,6 +1038,132 @@ struct NeverDropExitClosureTests {
         await finish(f)
     }
 
+    // MARK: - Round-4 H3 — a COMMITTED copy the server described unparseably
+
+    /// **THE INVARIANT: a COPY the server acknowledged with a tagged OK is never
+    /// issued a second time, whatever its `COPYUID` looked like.**
+    ///
+    /// The direct sibling of `aWithheldCopyUidMoveCompletesAndReleasesItsLane`
+    /// above, and the same wedge in a shape that harness could not reach. That one
+    /// models a server with NO response code to give; this one models a server
+    /// that gives one we cannot parse. Both are RFC 3501 §6.4.7 tagged-OK copies —
+    /// an unsuccessful COPY MUST leave the destination as it was, so the copy
+    /// PROVABLY LANDED in both — and in both cases the app has no `COPYUID`
+    /// mapping to work from. Handling them differently is the defect.
+    ///
+    /// Before the fix, `let copyEvidence = try await server.copy(...)` had no
+    /// `catch`, so the `IMAPError.commandFailed` that `CopyUID.init(nio:)` throws
+    /// on a cardinality mismatch propagated out of `IMAPProvider.move` to the
+    /// generic arm in `AccountManagerQueue.executeSingleOp`, which requeues the op
+    /// and halts the lane. The throw happens BEFORE the `STORE \Deleted`, so the
+    /// source is untouched and the next drain re-runs the whole sequence and
+    /// issues ANOTHER `UID COPY`. One more duplicate at the destination per drain,
+    /// forever, on an op that can never retire — durable actions retry without a
+    /// cap. Sync cannot settle it, retrying makes it strictly worse, and no
+    /// ordinary user gesture clears it: the wedge corollary, which is in the
+    /// non-recoverable set, so this is a defect and not an accepted edge.
+    ///
+    /// **ASSERTED ON THE WIRE, deliberately.** The load-bearing assertion is the
+    /// COUNT OF `UID COPY` COMMANDS ACROSS TWO DRAINS, not a flag, not the queue
+    /// depth, and not the type of any error. A test that asserted "the catch
+    /// exists" or "`copyEvidence` is nil" would pin the fix's mechanism and stay
+    /// green on any future rewrite that reintroduced the re-copy by another route.
+    /// The destination message count corroborates it from the other side: the
+    /// bytes and the mailbox must agree.
+    ///
+    /// The source copy staying `\Deleted`-but-present is the accepted
+    /// `IOS-IMAP-001` cost and is the CORRECT outcome here: with no parseable
+    /// `COPYUID` there is no per-member proof, so `purgeAuthorizedUIDs` is empty
+    /// and the irreversible `UID EXPUNGE` is structurally unreachable. The
+    /// reversible half is authorized by the tagged OK ANDed with `liveSourceUIDs`.
+    ///
+    /// RED PROOF (recorded): against the pre-fix provider this fails at the
+    /// `UID COPY` count — 2 across two drains instead of 1 — and at the
+    /// destination holding two copies, at the `\Deleted` mark, and at the queue
+    /// being empty.
+    @Test("A tagged-OK copy whose COPYUID cannot be parsed is never re-issued")
+    @MainActor
+    func anUnparseableCopyUidMoveIsNeverReCopied() async throws {
+        let target = "unparseable-copyuid@example.com"
+        let bystander = "unparseable-copyuid-bystander@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 77, id: target), Self.message(uid: 88, id: bystander)],
+            "Archive": [],
+        ])
+        // UIDPLUS advertised and a `COPYUID` sent — but with one more destination
+        // UID than source UID, which is exactly what `CopyUID.init(nio:)` rejects
+        // with `IMAPError.commandFailed`.
+        server.reportCopyUIDWithCardinalityMismatch()
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Archive")
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "closure-unparseable-copyuid")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+
+        var move = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        move.createdAt = Date().addingTimeInterval(-60)
+        // Issued after the move on the SAME message, so `buildLanes` seats it in
+        // the move's lane behind it: if the move wedges, this starves.
+        var laneMate = PendingOperation(
+            type: .markFlagged, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", observedUidValidity: 10)
+        laneMate.createdAt = Date().addingTimeInterval(-40)
+        try insert([move, laneMate], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+        await AccountManager.shared.drainPendingQueue()
+
+        // THE INVARIANT, on the wire.
+        let copies = server.recordedCommands().filter { $0.uppercased().contains("UID COPY") }
+        #expect(
+            copies.count == 1,
+            """
+            the COPY was re-issued after the server had already acknowledged it — every drain seats \
+            another duplicate at the destination and the op can never retire — UID COPY commands: \
+            \(copies)
+            """)
+
+        // The same fact from the mailbox side.
+        #expect(
+            server.messageIDs(in: "Archive") == ["<\(target)>"],
+            """
+            the destination does not hold exactly one copy of the moved message after two drains — \
+            Archive: \(server.messageIDs(in: "Archive"))
+            """)
+
+        // The move completed: reversible half only.
+        let sourceFlags = server.flags(in: "INBOX", uid: 77)
+        #expect(
+            sourceFlags.contains("\\Deleted"),
+            "the source copy was not soft-deleted, so the move only half happened — flags: \(sourceFlags)")
+        #expect(server.messageIDs(in: "INBOX").contains("<\(bystander)>"))
+
+        // No irreversible half — with no parseable COPYUID there is no per-member
+        // proof, so nothing may be purged.
+        #expect(
+            server.recordedCommands().filter { $0.uppercased().contains("EXPUNGE") }.isEmpty,
+            "an expunge was issued without any per-member COPYUID proof")
+
+        // Nothing is starved: the op retired and its lane-mate executed.
+        #expect(
+            try operations(f.pool).isEmpty,
+            "an op remained queued after a move that completed, so the lane is still held")
+        #expect(
+            sourceFlags.contains("\\Flagged"),
+            """
+            the lane-mate gesture never reached the server — its predecessor completed, so nothing \
+            legitimately holds it — flags: \(sourceFlags)
+            """)
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
     // MARK: - A-6 — the completed-send flag producer, at the wire
 
     /// A-6, the OUTBOX half. `imapUserLabelGestureReachesTheWire` above pins the

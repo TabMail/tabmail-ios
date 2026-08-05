@@ -4726,8 +4726,89 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 let preCopy = try await self.selectMailboxTracked(server, folder: source)
                 try self.requireUidValidity(
                     preCopy, expected: admittedUidValidity, folder: source)
-                let copyEvidence = try await server.copy(
-                    messages: sourceUIDs, to: destination)
+                // 🚨 A COMMITTED COPY WHOSE `COPYUID` WILL NOT PARSE MUST NOT
+                // RE-COPY. In the pinned SwiftMail fork, `CopyHandler`
+                // (`IMAP/Handler/ServerHandlers.swift`) does this on a tagged OK:
+                //
+                //     do { succeedWithResult(try extractCopyUID(from: response)) }
+                //     catch { failWithError(error) }
+                //
+                // `extractCopyUID` returns `nil` when the server sent no `COPYUID`
+                // at all, and otherwise calls `CopyUID(nio:)`, whose only three
+                // throw sites (`Models/CopyUID.swift`) are all
+                // `IMAPError.commandFailed`: a source/destination cardinality
+                // mismatch, an invalid UID range, and an expansion over 1,000,000
+                // UIDs. So a server that COMMITTED the copy — tagged OK, and RFC
+                // 3501 §6.4.7 requires an unsuccessful COPY to leave the
+                // destination as it was — but described it in a way we cannot
+                // parse used to throw out of this line. That throw lands on the
+                // generic arm in `AccountManagerQueue.executeSingleOp`, which
+                // requeues the op and halts the lane BEFORE the `STORE \Deleted`,
+                // so the source is untouched and the next drain re-runs A1/A2/A3
+                // and issues ANOTHER `UID COPY` — one more duplicate at the
+                // destination per drain, forever, on an op that never completes.
+                // Durable actions retry without a cap. That is the wedge
+                // corollary: sync cannot settle it, retrying makes it strictly
+                // worse, and no ordinary user gesture clears it.
+                //
+                // Mapping it to `copyEvidence = nil` routes it into the
+                // ALREADY-DESIGNED no-evidence path below — the same path a
+                // server that withholds `COPYUID` entirely takes today. That path
+                // probes the source with `liveSourceUIDs` and authorizes at most
+                // the REVERSIBLE `\Deleted` STORE: `copyProvenUIDs` is empty, so
+                // `purgeAuthorizedUIDs` is empty, so the irreversible
+                // `UID EXPUNGE` branch is structurally unreachable.
+                //
+                // ⚠️ NEGATIVE CASE — WHY THE CATCH IS THIS NARROW, AND WHY
+                // WIDENING IT WOULD BE THE MIRROR-IMAGE DEFECT. `CopyHandler`
+                // OVERRIDES `handleTaggedErrorResponse` to fail with
+                // `IMAPError.copyFailed`, so a genuine tagged NO/BAD does NOT
+                // arrive here as `.commandFailed`; a timeout is `.timeout` and a
+                // dropped connection is `.connectionFailed`. Catching bare
+                // `IMAPError`, or a bare `catch`, would swallow those and convert
+                // a copy that PROVABLY DID NOT HAPPEN into "it may have landed",
+                // soft-deleting sources for copies that never occurred (MIS-005).
+                // Catch the one case; everything else propagates and requeues
+                // exactly as it does today. And do NOT reach for a string matcher
+                // on the message — `IOS-IMAP-005` rejected that and the rejection
+                // stands; what makes this admissible is that it discriminates by
+                // TYPE.
+                //
+                // ⚠️ THE CENSUS BEHIND THIS IS NOT AIRTIGHT, AND THE HONEST
+                // STATEMENT OF IT IS PART OF THE FIX. It is NOT true that
+                // `COPYUID` parsing is the only producer of `.commandFailed`
+                // inside this call. `CapabilityHandler.handleTaggedErrorResponse`
+                // also raises `.commandFailed`, and it is reachable from here by
+                // two doors: `IMAPServer.executeCommand` re-authenticates when
+                // `!primaryConnection.isAuthenticated` (this provider always sets
+                // `authentication` via `server.login`), and
+                // `IMAPConnection.executeCommandBody` reconnects when the channel
+                // has gone; both then call `refreshCapabilities`, which issues
+                // `CAPABILITY` and maps a tagged NO/BAD to `.commandFailed`.
+                // (`IMAPCommandQueue.acquire` is re-entrant for the same task, so
+                // the nesting does not deadlock.) That window is between two
+                // adjacent `await`s — A3's `selectMailboxTracked` immediately
+                // above went through the same lazy-auth/reconnect logic one round
+                // trip earlier — and it needs a server that answers `CAPABILITY`
+                // with NO/BAD *and* omits `[CAPABILITY]` from both its greeting
+                // and its LOGIN OK. If it ever happens, the disposition is
+                // exactly the one this arm gives: no copy evidence, no expunge
+                // possible, at most a reversible `\Deleted` on members the source
+                // still holds. The structural fix belongs upstream in
+                // `CopyHandler`, which has the tagged response in hand and should
+                // distinguish "tagged OK + unparseable COPYUID" from every other
+                // `.commandFailed`; until it does, this arm is correct but its
+                // precondition is broader than "the COPYUID did not parse".
+                let copyEvidence: CopyUID?
+                do {
+                    copyEvidence = try await server.copy(
+                        messages: sourceUIDs, to: destination)
+                } catch IMAPError.commandFailed(let detail) {
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[IMAP] move \(source)→\(destination): the server acknowledged the COPY but its COPYUID could not be parsed (\(detail)) — treating it as NO EVIDENCE rather than as a failed copy, so the copy is never re-issued; at most the reversible \\Deleted half can be authorized and no expunge is reachable")
+                    }
+                    copyEvidence = nil
+                }
 
                 // T3.12 PORT (`a75196398`) — mutation-step checkpoint. The
                 // reference also carried checkpoints inside its per-member
