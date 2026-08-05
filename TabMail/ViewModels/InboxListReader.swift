@@ -6,9 +6,16 @@ import Foundation
 import GRDB
 
 /// Thin I/O shell for `InboxListComposer` — PLAN_INBOX_UNIFIED_READ.md
-/// §2.1/§2.1b. NOT wired into any production call site yet (Phase 3 does the
-/// switch); this file exists so the shell + its shared gather logic can be
-/// integration-tested against a real GRDB pool ahead of the cutover.
+/// §2.1/§2.1b.
+///
+/// ⚠ **PHASE 3 HAS LANDED — this doc used to say "NOT wired into any production
+/// call site yet (Phase 3 does the switch)", and that is stale.** Both entry
+/// points are on the production inbox read path:
+/// `InboxViewModel.fetchFullRange()` calls `fetch(folders:query:)`, and
+/// `InboxViewModel.fetchPage(before:)` calls `fetchSync(folders:query:)`. The
+/// original rationale still holds for the *tests* — the shell and its shared
+/// `gather` logic are integration-tested against a real GRDB pool — but a
+/// change here now alters what the user sees, not just what a test asserts.
 ///
 /// Deliberately BORING: every decision (eligibility, precedence, dedup,
 /// filters, sort, trim) lives in `InboxListComposer.compose`. This file only

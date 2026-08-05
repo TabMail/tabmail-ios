@@ -357,8 +357,31 @@ struct SearchView: View {
     ///  3. **witnesses disagree** ⇒ `nil`. This is the C3 case: a different
     ///     physical message occupies the captured address. A row's
     ///     `rfc822MessageId` is never nulled once set (unlike `observedUidValidity`,
-    ///     which 15 production sites clear), so a captured-present/current-absent
+    ///     which many production sites clear), so a captured-present/current-absent
     ///     pair is a genuine disagreement, not an ordinary absence.
+    ///
+    ///     **THE COUNT, WITH ITS PREDICATE — it said "15" and drifted; state the
+    ///     predicate so the next reader can re-run it instead of trusting a
+    ///     number.** Predicate: *production Swift statements (excluding
+    ///     `TabMailTests/`) that ASSIGN `nil` to `MessageHeader
+    ///     .observedUidValidity`*, counting neither stored-property declarations
+    ///     whose default is `nil` nor the same-named field on other types
+    ///     (`PendingOperation`, `StagedInboxRow`, the NSE's `NSEMessageMetadata`).
+    ///     At HEAD that census is **19**: `MessageHeaderRekey` ×1,
+    ///     `AccountManagerActions` ×3 (two `Column("observedUidValidity")
+    ///     .set(to:)` arms plus the draft placeholder), `SyncEngineFullSync` ×9,
+    ///     `SyncEngineDeltaSync` ×5, `BackfillBodyQueue` ×1. Some of those write
+    ///     the `nil` onto a row being re-keyed or adopted under a new primary key
+    ///     rather than onto a row updated in place — **that distinction does not
+    ///     matter to this arm**, because either way the message ends up carrying a
+    ///     `nil` stamp it did not carry before, which is exactly the ordinary
+    ///     absence this comment warns against reading as disagreement.
+    ///
+    ///     **THE OTHER HALF IS THE ONE THE GUARD DEPENDS ON, AND IT IS EXACT: the
+    ///     same census for `rfc822MessageId` is ZERO.** No production statement
+    ///     assigns `nil` to `MessageHeader.rfc822MessageId`. That asymmetry — many
+    ///     versus none — is the whole reason a missing epoch is not evidence and a
+    ///     missing content witness is.
     ///
     /// `nonisolated static` for the same reason as the remote helper: it touches no
     /// `@State` and needs no view, so a test can call it with a bare `Database`.

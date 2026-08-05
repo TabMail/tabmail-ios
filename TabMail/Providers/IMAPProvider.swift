@@ -5311,9 +5311,35 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             //    by the drain's `ProviderEvidenceUnavailable` arm.
             //
             // ⚠ THE EVIDENCE THIS OPERATION REQUIRES IS UNCHANGED — the refusal set
-            // only GREW. `deleteDraftStrong` is one of the two irreversible wire
+            // only GREW. `deleteDraftStrong` is one of the FOUR irreversible wire
             // operations in this app (it destroys a draft outright instead of moving
             // it to Trash), so nothing here may ever make it mutate on WEAKER proof.
+            //
+            // "TWO" WAS WRONG, and the corrected enumeration is routed to
+            // `Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md`
+            // — that note is the authority; this comment is a pointer to it. The four:
+            // (1) `IMAPProvider.move`'s `COPYUID`-gated source expunge, which removes a
+            // proven DUPLICATE and is the only one that touches a message rather than a
+            // draft; (2) this function; (3) `saveDraft`'s old-copy replacement, which
+            // issues the same `STORE \Deleted` + `expungeScopedToTargets` pair against
+            // the previous draft UID on the ordinary save path; (4) Gmail's
+            // `DELETE /drafts/{id}`, which Google documents as immediate and permanent
+            // rather than a trash.
+            //
+            // NEGATIVE CASE, because an absolute without one is what produced the "two"
+            // in the first place: (2) and (3) are irreversible ONLY where the server
+            // advertises UIDPLUS — `expungeScopedToTargets` issues `UID EXPUNGE` there
+            // and NOTHING AT ALL otherwise, deliberately refusing to degrade to a
+            // mailbox-wide `EXPUNGE`, so on a non-UIDPLUS server the draft is left
+            // `\Deleted`-but-present and is recoverable. Ordinary mail is untouched by
+            // any of this: `.delete` on a message is still a move to Trash.
+            //
+            // A FIFTH was enumerated in scope by a 2026-08-05 audit and is deliberately
+            // NOT counted here: `ExchangeProvider.deleteDraft` issues
+            // `DELETE {baseURL}/messages/{id}`, and Graph exposes a SEPARATE
+            // `message: permanentDelete` action for the destroying semantic, so the
+            // plain `DELETE` is a soft delete into Deleted Items / Recoverable Items.
+            // Recoverable ⇒ not in this set. See the routed note for the evidence.
             // Zero previously reached the mutation only in the sense that it reached
             // a terminal drop; it now reaches neither the mutation nor a drop.
             do {

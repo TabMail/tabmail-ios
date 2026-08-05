@@ -43,6 +43,24 @@ its reader past three others. Enumerated below by symbol, each read at `e4dd08e9
   `DELETE {baseURL}/messages/{id}`; whether Graph hard-deletes or moves the item to Deleted Items is
   a server-side semantic TabMail neither chooses nor observes, so it is neither confirmed as a fifth
   irreversible op nor covered by "never permanently deletes". Verified at the wire call only.
+
+  📌 **RE-RAISED AS A FIFTH (2026-08-05) AND STILL NOT COUNTED — now on evidence rather than on the
+  absence of it.** An audit angle enumerated **five** irreversible wire operations in scope, the
+  fifth being this one, and asked that the fifth be recorded. Recording it: the call is
+  `performHTTPRequestWithRetry(url: baseURL + "/messages/\(encodedDraftId)", method: "DELETE", …)`
+  in `ExchangeProvider.deleteDraft`, gated on `case .outlook(let draftId)` of `DraftDeleteIdentity`
+  and treating a `404` as success ("Exchange may auto-delete drafts after send"). **It stays out of
+  the set, and the reason is now positive rather than "unobserved":** Microsoft Graph exposes a
+  **separate** `message: permanentDelete` action, documented as permanently deleting the message and
+  placing it in the *purges* folder of the mailbox dumpster — TabMail never calls it. A plain
+  `DELETE` on a mailbox item is the soft delete: the item lands in Deleted Items / Recoverable
+  Items' *Deletions* subfolder and is retained for the mailbox's deleted-item retention period
+  (14 days by default on Exchange Online). **Recoverable ⇒ not irreversible**, which is the same
+  test that keeps the non-UIDPLUS arms of (2) and (3) out of the set. The count stays **four**.
+  ⚠ If someone later routes a draft delete through `permanentDelete`, that call — not the plain
+  `DELETE` — becomes the fifth, and this note must be updated with it.
+  Sources: [message: delete](https://learn.microsoft.com/en-us/graph/api/message-delete?view=graph-rest-1.0),
+  [message: permanentDelete](https://learn.microsoft.com/en-us/graph/api/message-permanentdelete?view=graph-rest-1.0).
 - **Ordinary mail is unaffected.** `.delete` on a message is still a move to Trash; nothing here
   widens any message-deletion path. The falsification is scoped to **drafts**.
 
@@ -76,3 +94,11 @@ absolute was hiding.
 absolute (*"TabMail never permanently deletes"* / *"The one irreversible wire operation in the
 entire system…"*). That file was dirty in the owner's working tree when this entry was written and
 was deliberately not edited. It needs the same correction.
+
+✅ **HANDOFF DISCHARGED (2026-08-05).** `tabmail-ios/CLAUDE.md`'s THE MANTRA section now carries the
+correction inline — a *"Stated negatively, because this absolute was wrong for two years and walked
+reviewers past two live hazards"* block enumerating all four, scoping (2) and (3) to UIDPLUS, noting
+Gmail's `.gmailContainedMessage` arm trashes rather than destroys, declining to count
+`ExchangeProvider.deleteDraft`, and linking back to this file. The remaining stale copy of the
+absolute was `IMAPProvider.deleteDraftStrong`'s inline comment (*"one of the two irreversible wire
+operations"*); it was corrected to **four** on 2026-08-05 and now points here as the authority.

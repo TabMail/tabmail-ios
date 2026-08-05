@@ -80,10 +80,30 @@ struct AuthedHTTP: Sendable {
     /// failure throws `HTTPError.networkErrorWithBody` carrying the raw
     /// response bytes instead of the bodyless `.networkError`. Every other
     /// failure status still throws the ordinary `.networkError` — this is a
-    /// narrow opt-in for the handful of action-path call sites (Gmail label
-    /// modify/lookup, Graph move) that must structurally classify a `400`
-    /// error payload rather than guess from the status code alone (Law 4:
-    /// only a provably authoritative signal may be treated as stale).
+    /// narrow opt-in for the action-path call sites that must structurally
+    /// classify a `400` error payload rather than guess from the status code
+    /// alone (Law 4: only a provably authoritative signal may be treated as
+    /// stale).
+    ///
+    /// ⚠ THE CONSUMER LIST IS GMAIL ONLY, and this comment used to say
+    /// otherwise. It named *"Gmail label modify/lookup, Graph move"* — but the
+    /// Graph half was an intention, never a call site. At HEAD the consumers
+    /// are `GmailProvider.requestPreservingBadRequestBody` (its private
+    /// wrapper) and the Gmail label-lookup site, and nothing else;
+    /// `ExchangeProvider.patchMessage` and `ExchangeProvider.moveMessage` both
+    /// still call the body-dropping `request`, so every Graph mutation's `400`
+    /// reaches `AccountManagerQueue.isPermanentlyInvalidError` bodyless and is
+    /// unclassifiable — which is why that function is
+    /// `GmailProvider.isAuthoritativeActionRejection(error)` and nothing else.
+    ///
+    /// **The comment was corrected rather than the consumer added, deliberately.**
+    /// The gap is registered as `KNOWN_ISSUES.md` `IOS-GRAPH-004` and it fails
+    /// SAFE — an unclassifiable Graph `400` retries forever instead of retiring
+    /// the user's intention, and the lane grouping confines that stall to the
+    /// one message. Wiring Graph through here is only half a fix: without the
+    /// accompanying **narrow** body-parse that accepts a parsed
+    /// `ErrorInvalidIdMalformed` and nothing else, it re-creates `v1.6.38`'s
+    /// bare-status-code discard, which retired the intention on every `400`.
     func requestPreservingBadRequestBody(
         url: String,
         method: String,
