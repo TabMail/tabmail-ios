@@ -663,13 +663,26 @@ Two corrections to the scope this census was opened with, both in the direction 
   They were ungated before the range and after it, so **this range added no console noise there**.
 
   ⚠️ **"Two sites" is the brief's number and it is an UNDERCOUNT — do not reuse it.** It was taken
-  from a 23-line window, not from the file. `ExchangeProvider.swift` holds **21** `print(` against
-  only **2** `DebugModeManager` references (peer census, 2026-08-04). The two named above are merely
-  the two that fell inside the window someone happened to be reading. What survives re-derivation is
-  the *conclusion* — this commit range added no console noise to that file — not the count, which was
-  never a count of the file. The file is outside this agent's edit scope; the remaining ungated
-  `[Exchange]` sites are reported for the owner, unswept. Same failure shape as `MIS-007`: a number
-  whose corpus was someone's attention rather than the artifact.
+  from a 23-line window, not from the file. The two named above are merely the two that fell inside
+  the window someone happened to be reading. What survives re-derivation is the *conclusion* — this
+  commit range added no console noise to that file — not the count, which was never a count of the
+  file. Same failure shape as `MIS-007`: a number whose corpus was someone's attention rather than
+  the artifact.
+
+  **State of `ExchangeProvider.swift` as of `be3db4785`, re-derived from the tree:** 21 `print(`
+  total, **4 gated / 17 ungated**, and 4 `DebugModeManager` references. The 4 gated are the
+  `[MoveTrace]` prints (lines 631, 684, 695, 1252), swept by the agent that owns the file. The 17
+  ungated pre-existing `[Exchange]` prints are at lines 72, 84, 101, 204, 233, 283, 286, 356, 464,
+  645, 859, 955, 982, 1063, 1092, 1121, 1273 — **out of scope, deliberately not swept**, recorded so
+  the number survives.
+
+  🚨 **The obvious predicate for this file returns a FALSE answer, so write the right one down.**
+  `grep -n 'print(' | grep DebugModeManager` — a SAME-LINE test — reports **0 gated / 21 ungated**,
+  because the gate here is a multi-line `if DebugModeManager.isLoggingEnabled() { print(…) }` block
+  and therefore never shares a line with its `print`. The predicate that matches reality is
+  block-aware: *for each `print(` line, does a `DebugModeManager` reference appear in the preceding
+  ~8 lines?* That yields 4/17 and reproduces the owning agent's line numbers exactly. A same-line
+  gate census is only valid for a codebase whose gates are all one-liners; this one's are not.
 
 **Deliberately NOT swept:** the pre-existing ungated prints outside the range — `AccountManagerActions`
 alone carries ~25 of them. That is a decision not to widen the fix, not a "pre-existing" excuse; the
