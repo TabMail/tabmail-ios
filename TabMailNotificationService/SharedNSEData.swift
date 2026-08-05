@@ -4,6 +4,20 @@
 
 import Foundation
 
+// This file is compiled into the NSE target AND into `TabMailTests` (see the
+// `TabMailTests` sources list in `project.yml`, IOS-NSE-005), because
+// `NSEStagingDB.open()` reads `SharedNSEData.appGroupIdentifier`. In the test
+// target the two `Shared/` types named below (`NSEBadge`, `NSELogStore`) are
+// compiled into the main-app module and are internal, hence `@testable`; in the
+// NSE they are compiled in directly and no import is wanted. `TABMAIL_TESTS` is
+// set ONLY on the `TabMailTests` target — deliberately an explicit condition
+// rather than `canImport(TabMail)`, whose value in an app-extension target
+// depends on the module search paths and is not something this file should be
+// betting on.
+#if TABMAIL_TESTS
+@testable import TabMail
+#endif
+
 /// @unchecked Sendable: UserDefaults is inherently thread-safe.
 /// Per project convention, @unchecked Sendable is acceptable for thread-safe API wrappers.
 struct SendableUserDefaults: @unchecked Sendable {

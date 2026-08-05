@@ -119,8 +119,37 @@ targets:
     platform: iOS
     sources:
       - path: TabMailTests
+      # The NSE's staging-DB writers, compiled into the test target as well as
+      # the extension so `NSEStagingDB.stageHeader` / `getCachedResult` can be
+      # driven by the real code (IOS-NSE-005). Every other NSE staging test
+      # hand-mirrors the production SQL, and a mirrored row cannot red-prove a
+      # fix that lives INSIDE stageHeader — the fix is upstream of the row.
+      # These five files are NSE-only (they exist in no other target), so there
+      # is no duplicate symbol with `TabMail`. Each one is needed: NSEStagingDB
+      # is the code under test, and it names NSEMessageMetadata, NSEConfig
+      # (staging file name / busy timeout), NSELog (its error path) and
+      # SharedNSEData (the App Group identifier).
+      # ⚠️ The membership test for the guarded import below is "does this file
+      # name a type that, in THIS target, lives in the TabMail module" — NOT
+      # "did someone edit this file". Censusing by the latter noun is what let
+      # SharedNSEData.swift (unmodified, `import Foundation` only, but naming
+      # `NSEBadge` and `NSELogStore`) break the build for every agent.
+      - path: TabMailNotificationService/NSEStagingDB.swift
+      - path: TabMailNotificationService/NSEMessageMetadata.swift
+      - path: TabMailNotificationService/NSEConfig.swift
+      - path: TabMailNotificationService/NSELog.swift
+      - path: TabMailNotificationService/SharedNSEData.swift
     settings:
       GENERATE_INFOPLIST_FILE: YES
+      # Set ONLY here. The NSE files above that name `Shared` types —
+      # `NSEStagingDB` (`RenderedBody`, `MessageIdentity`), `NSELog`
+      # (`NSELogStore`, `NSEProviderSupport`) and `SharedNSEData` (`NSEBadge`,
+      # `NSELogStore`) — reach them through `#if TABMAIL_TESTS @testable import
+      # TabMail`, because in this target those types live in the main-app module
+      # and are internal. In the NSE target they are compiled in directly and
+      # the import must NOT appear. `NSEMessageMetadata` and `NSEConfig` name
+      # none, and carry no import.
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) TABMAIL_TESTS"
     dependencies:
       - target: TabMail
 

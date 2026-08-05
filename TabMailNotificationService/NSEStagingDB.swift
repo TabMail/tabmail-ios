@@ -5,6 +5,22 @@
 import Foundation
 import GRDB
 
+// This file is compiled into the NSE target AND into `TabMailTests` (see the
+// `TabMailTests` sources list in `project.yml`), so the staging writers can be
+// driven by the code under test instead of a hand-mirrored copy of their SQL —
+// a mirrored row cannot red-prove a fix that lives in `stageHeader`, because
+// the fix is upstream of the row. In the test target the `Shared` types this
+// file names (`RenderedBody`) belong to the main-app module and are internal,
+// hence `@testable`; in the NSE they are compiled in directly and no import is
+// wanted. `TABMAIL_TESTS` is set ONLY on the `TabMailTests` target
+// (`SWIFT_ACTIVE_COMPILATION_CONDITIONS` in `project.yml`) — deliberately an
+// explicit condition rather than `canImport(TabMail)`, whose value in an
+// app-extension target depends on the module search paths and is not something
+// this file should be betting on.
+#if TABMAIL_TESTS
+@testable import TabMail
+#endif
+
 enum NSEStagingDB {
     /// Open the shared staging database. Returns nil if unavailable.
     static func open() -> DatabaseQueue? {
@@ -200,6 +216,58 @@ enum NSEStagingDB {
     // land. The first writer (`stageHeader`) flips `populated=1`; `mergeNSEStagingData`
     // applies whatever subset is present and keeps the row until AI completes.
 
+    /// Is the row already staged at `id` POSITIVELY a different message than the
+    /// one now being staged? Returns `true` only on evidence of disagreement,
+    /// never on an absence of evidence that it is the same message.
+    ///
+    /// The two doors are `NSEDataBridge.nseMergeIdentityConfirmed`'s, with the
+    /// same precedence, so the staging side and the merge side cannot drift on
+    /// what "a different message" means:
+    ///  (a) RFC door — FIRST and UNCONDITIONAL. Both sides' normalized RFC 822
+    ///      Message-IDs present and UNEQUAL ⇒ different, and that verdict is
+    ///      never overridden by an epoch agreement.
+    ///  (b) Epoch door — consulted ONLY when the RFC door could not adjudicate.
+    ///      Both `observedUidValidity`s present and UNEQUAL ⇒ different: the two
+    ///      runs read the same folder under two different UIDVALIDITYs, so this
+    ///      row's UID-addressed `messageId` does not name the same message twice.
+    ///
+    /// Nil on either side of both doors ⇒ `false` (retain). That is the whole
+    /// point: a nil is an unanswered question, not a mismatch — the same rule
+    /// `NSEMessageMetadata.observedUidValidity` states for the durable side.
+    ///
+    /// ⚑ `nseMergeIdentityConfirmed`'s epoch door additionally requires
+    /// `!folderQuarantined`; that guard is deliberately NOT carried here, and the
+    /// invariant behind it does not apply. There it compares a live NSE
+    /// observation against the DURABLE `Folder.lastKnownUidValidity`, which lags
+    /// mid-reset, so a disagreement can mean "our stamp has not caught up". Here
+    /// BOTH values are live SELECT observations the NSE made itself, of the same
+    /// folder, at two different times — no third party's staleness can manufacture
+    /// a disagreement, so a disagreement is the turnover itself.
+    ///
+    /// Uses `MessageIdentity.comparableRfc822Identity` — the tree's single
+    /// identity-COMPARISON normalizer, deliberately NOT `usableRfc822Tail` (whose
+    /// extra `':'` rejection exists for key MINTING and would call a legitimate
+    /// `no-fold-literal` domain "not the same message").
+    private static func stagedIdentityPositivelyDiffers(
+        db: Database, id: String, message: NSEMessageMetadata
+    ) throws -> Bool {
+        guard let row = try Row.fetchOne(
+            db,
+            sql: "SELECT rfc822MessageId, observedUidValidity FROM nse_processed_message WHERE id = ?",
+            arguments: [id]
+        ) else { return false }
+
+        if let incoming = MessageIdentity.comparableRfc822Identity(message.rfc822MessageId),
+           let stored = MessageIdentity.comparableRfc822Identity(row["rfc822MessageId"]) {
+            return incoming != stored
+        }
+        if let incoming = message.observedUidValidity,
+           let stored = row["observedUidValidity"] as Int? {
+            return incoming != stored
+        }
+        return false
+    }
+
     /// Stage 1 — the message header (everything needed to DISPLAY the row) +
     /// `populated=1`, so the merge surfaces the message BEFORE body fetch and AI.
     /// UPSERT (not INSERT OR REPLACE) so a pre-existing row — a prior duplicate-
@@ -207,6 +275,39 @@ enum NSEStagingDB {
     /// — keeps those columns; only the header fields + `populated` are (re)written.
     /// `processedAt` is set on first insert only (it anchors the orphan/abandon age
     /// window); the conflict path leaves it untouched.
+    ///
+    /// ⚑ EXCEPT when the incoming identity POSITIVELY disagrees with the identity
+    /// already on the row (`IOS-NSE-005`). The staging key is
+    /// `"<accountId>:<messageId>"` — no folder, no epoch, no generation — and on
+    /// IMAP a UIDVALIDITY turnover can reissue the same UID to a DIFFERENT
+    /// message. Retaining the payload then splices the predecessor's body,
+    /// summary, todos, reminder and action tag onto the successor's identity, and
+    /// nothing downstream can tell: `getCachedResult` (`WHERE id = ? AND
+    /// aiCompleted = 1`) serves it as the successor's NOTIFICATION and returns
+    /// before this run's own terminal write, and the merge's new-header arm
+    /// (`NSEDataBridge.insertNewHeaderFromStaging`) writes it durably — poisoning
+    /// `messageAICache` under the successor's RFC key and queueing a `setTag`
+    /// keyword write for the predecessor's tag against the successor. That is a
+    /// C3 misattribution no sync pass repairs.
+    ///
+    /// So on positive disagreement the row is DELETED first, inside this same
+    /// write transaction, and the statement below lands as a plain INSERT — every
+    /// column stageHeader does not write returns to its schema default (payload
+    /// NULL, `aiCompleted`/`notified` 0, `processedAt` re-anchored to now, the
+    /// AI-ownership lease cleared, which is correct because a lease held for the
+    /// predecessor says nothing about the successor).
+    ///
+    /// Because `stageHeader` runs strictly BEFORE the peer probe and before
+    /// `getCachedResult` in `NotificationService.process`, clearing here closes
+    /// the notification half and the durable half with one write. That ordering
+    /// is load-bearing — do not move this call later in the run.
+    ///
+    /// The gate is POSITIVE evidence of a different message, never absence of
+    /// evidence that it is the same one. Clearing on any conflict would destroy
+    /// the two cases the retention exists for: a re-push of the SAME message
+    /// (which must keep the body and AI a previous run already paid for) and the
+    /// `AIOwnershipLease` placeholder (`populated = 0`, both identity columns
+    /// NULL), which must survive to be filled in.
     static func stageHeader(
         db: DatabaseQueue,
         accountId: String, accountEmail: String, provider: String,
@@ -223,6 +324,14 @@ enum NSEStagingDB {
         let providerLabelsJSON = encodeJSONArray(message.providerLabels)
         do {
             try db.write { db in
+                // IOS-NSE-005 — see the doc comment. The retained payload is
+                // only safe while the row still names the SAME message; on
+                // positive disagreement drop it so the statement below lands as
+                // a plain INSERT with the payload columns at their defaults.
+                if try stagedIdentityPositivelyDiffers(db: db, id: id, message: message) {
+                    try db.execute(
+                        sql: "DELETE FROM nse_processed_message WHERE id = ?", arguments: [id])
+                }
                 // `observedUidValidity` is on the ON CONFLICT SET list below
                 // because it is IDENTITY, not payload: a re-push must overwrite
                 // it with the epoch THIS run's SELECT observed, exactly as the

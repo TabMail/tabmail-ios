@@ -6,6 +6,14 @@ import Foundation
 import os.log
 import Synchronization
 
+// Compiled into `TabMailTests` alongside `NSEStagingDB` (see that file's header
+// and the `TabMailTests` sources list in `project.yml`). `NSELogStore` is
+// internal to the main-app module, hence `@testable`; in the NSE it is compiled
+// in directly and no import is wanted.
+#if TABMAIL_TESTS
+@testable import TabMail
+#endif
+
 /// Centralized NSE logging — dual-channel: `os_log` (Console.app / Xcode) AND
 /// the persistent `NSELogStore` file (App Group container, readable from the
 /// main app's Debug menu — `os_log` alone is invisible in the field).
