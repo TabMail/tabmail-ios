@@ -689,6 +689,41 @@ Two corrections to the scope this census was opened with, both in the direction 
 alone carries ~25 of them. That is a decision not to widen the fix, not a "pre-existing" excuse; the
 count is recorded here so the number is not lost if someone later wants the sweep.
 
+### C. Changed production Swift files in the release range — TRUE COUNT **110**, not 109 and not 102 (2026-08-05)
+
+Round-4 review briefs carried **109**; earlier ones carried **102**. Both are wrong, and they are
+wrong for *different* reasons, which is why both are recorded here rather than just the answer.
+
+**The predicate, stated beside the number** (`MIS-007`: a census inherits the shape of its
+instrument). Measured at candidate `339bd4ce2` against the release base `07a4bb703`:
+
+```
+git diff --name-only 07a4bb703..HEAD | rg '^(TabMail|Shared|TabMailNotificationService)/.*\.swift$' | wc -l
+→ 110      # TabMail 93, Shared 9, TabMailNotificationService 8
+```
+
+- **102 is a PATHSPEC artefact, and its error is bigger than it looks.** It came from the deprecated
+  `git diff --name-only … -- 'TabMail/**/*.swift'` form, which is scoped to the **`TabMail/` directory
+  alone** — it silently drops all 9 `Shared/` and all 8 `TabMailNotificationService/` files. ⚠️ **And
+  the number 102 does not reproduce at all**: that pathspec returns **93** at this candidate, so "102"
+  is neither the narrow count nor the wide one and should not be reused in either role. The
+  drop is **17 files, not 8**.
+- **109 is a STALE count, correct through `43604ec81` and superseded at `afa5b9e33`.** Verified by
+  bisecting the range: `07a4bb703..43604ec81` = **109**, `07a4bb703..afa5b9e33` = **110**, and every
+  commit after it (`9677d36f1`, `ae7dd105d`, `018677428`, `339bd4ce2`) = 110. The +1 file is
+  `TabMail/Services/MigrationTimingLedger.swift`, added by `afa5b9e33` ("Attribute foreign-key check
+  time to the migration that pays it").
+
+⚠️ **The competing attribution to `ae7dd105d` / `AutoSizingHTMLView.swift` is WRONG, and the way it is
+wrong is worth keeping.** `ae7dd105d` touches exactly one Swift file,
+`TabMail/Views/Shared/AutoSizingHTMLView.swift` — but that file was **already inside the range at
+`43604ec81`**, so modifying it again added nothing to a count of *distinct* changed files. The
+instrument that produces this error is "find a commit near the boundary that touched a `.swift`
+file"; the instrument that answers the question is "bisect the COUNT". A file's presence in the
+changed set is idempotent — only the FIRST commit to touch it can move the number.
+
+**Use 110 / 93 in any future brief**, and say which of the two you mean.
+
 ## The gate-in-a-BRANCH-CONDITION census over `TabMail/Views/` (2026-08-04)
 
 **This is a different census from the ungated-`print` one above, and the distinction is the point.**
