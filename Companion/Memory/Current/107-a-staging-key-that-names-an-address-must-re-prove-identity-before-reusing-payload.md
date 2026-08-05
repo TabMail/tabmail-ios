@@ -240,3 +240,78 @@ Also: `AppDatabase.createNSEStagingDB` deliberately does NOT own the `observedUi
 only `NSEStagingDB.ensureObservedUidValidityColumn` (called from `open()`, which needs an App Group
 container) adds it. A test that builds a staging file must ALTER it in, as
 `NSEStaleStagedRowInvalidationTests` already does.
+
+---
+
+# The second half — `IOS-NSE-006`, and the fail direction INVERTS between the two
+
+**Status:** Current · **Date:** 2026-08-04 · **Register row:** `IOS-NSE-006` (FIXED) · covers
+`NSEStagingDB.stageBody`, `stageSummary`, `persistProcessedMessage`.
+
+`IOS-NSE-005` fixed the writer that **REUSES** payload already on the row. The writers that **ADD**
+payload to it carried no identity term at all — `stageBody` and `stageSummary` were bare
+`UPDATE … WHERE id = ?`, `persistProcessedMessage` a bare `INSERT OR REPLACE`. Same key, same wrong
+assumption ("same id ⇒ same message"), arriving through the writer instead of through the UPSERT.
+
+## The transferable lesson: which way "safe" points depends on what the write DOES
+
+This is the part worth carrying to any other address-keyed store, because the two halves look
+identical and their safe answers are OPPOSITE:
+
+| The writer's question | Unanswerable identity ⇒ | Why |
+|---|---|---|
+| *May I KEEP payload already here?* (`stageHeader`) | **RETAIN** | Clearing on absence of evidence discards work a previous run paid for and deletes a live `AIOwnershipLease` placeholder |
+| *May I ADD payload to this row?* (`stageBody`, `stageSummary`, `persistProcessedMessage`) | **WRITE** | Suppressing on absence of evidence stops an rfc-less, epoch-less message ever accumulating a body or summary across wakes, and makes the terminal writer drop whole legitimate runs |
+
+**Both are the same rule** — *only POSITIVE evidence of a DIFFERENT message may change the default*,
+`MIS-IOS-004`'s "could not determine ≠ authoritative" — and the default itself is whatever preserves
+work. Reading "nil ⇒ retain" off `stageHeader` and applying it as "nil ⇒ skip the write" here would
+have been the mirror image (`MIS-005`), and it is an easy mistake because the words look the same.
+An ABSENT row also writes: that is the ordinary first insert.
+
+## Why the existing zombie checkpoints do not close it
+
+`IOS-NSE-005`'s closure named `OneShotFlag.hasFired()` as "the only thing standing in front of it".
+It does not stand in front of it at all, and the reason generalises: **`deliveredFlag` is per-RUN.**
+It asks *"did MY run's watchdog already deliver and release the lease"* — a question about this run's
+own exit path. It cannot see whether a LATER run has re-headed the row, so a predecessor whose
+watchdog never fired passes every checkpoint and writes. The two guards are complementary; neither
+subsumes the other, and the comment at the `stageSummary` call site says so now.
+
+## The third writer, and why it is in the class
+
+The finding named two writers. The class is *a writer keyed on an ADDRESS assuming it still names the
+same message*, and enumerating by the two that were named would be `MIS-006`. `persistProcessedMessage`
+is the third, and its damage DIFFERS rather than being smaller: `INSERT OR REPLACE` rewrites the whole
+row, so it does not splice mixed identities — it **destroys the successor's staged push outright** (a
+dropped message) and resurrects a predecessor the address no longer holds. Guarded on the same
+predicate; on the natural path the row was created by this run's own `stageHeader`, so the identity
+agrees and the guard is transparent.
+
+## Left alone, with reasons (so the census is accountable)
+
+- **`getCachedResult`** keeps `WHERE id = ? AND aiCompleted = 1` with no identity term. `stageHeader`
+  runs strictly before it in `NotificationService.process`, so the row's identity is already this
+  run's. **The ordering IS the guard**; a second term would be the redundant machinery A3 forbids.
+  Do not move that call later in the run.
+- **`AIOwnershipLease`'s writers.** Their predicates are `WHERE id = ? AND aiOwner = ?` and they write
+  lease bookkeeping, not payload. ⚠️ **The lease is NOT this guard and must not be mistaken for it:**
+  `tryClaim` gates the right to COMPUTE, never the right to WRITE, and both generations use `.nse`, so
+  it is generation-blind — a predecessor can refresh or release the successor's claim. A fix aimed
+  there leaves the real hole open, which is the classic mirror-image shape.
+
+## The refusal is logged, because a dropped write must not vanish
+
+Each guarded writer emits `NSELog.error` naming the id when it refuses — the NSE's durable file
+channel (`NSELogStore`), not a detached console. Topic 105's rule applies directly: *"this log is
+exempt because production needs to see it" is a claim about a CHANNEL*, and on iOS a bare `print` is
+not one. The dropped payload is safe to drop precisely because the guard fired — it was computed for
+a message provably no longer at that address, and whoever holds the address now re-fetches its body
+and computes its own AI through paths that already work.
+
+## A1 (rule R0)
+
+**AUTHORED, not restored** — same finding as `IOS-NSE-005`'s. Shipped `07a4bb703` and the `v2final`
+sibling `e28dd4edb` both have `stageBody`/`stageSummary` as bare `UPDATE … WHERE id = ?`, byte-identical
+to v3's; both share the defect, and `07a4bb703` is strictly weaker because `observedUidValidity` does
+not exist at that tag. There was no guard to port. NO schema change and NO migration.

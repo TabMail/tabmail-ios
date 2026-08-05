@@ -120,6 +120,24 @@ enum NSEStagingDB {
     /// app's merge can write MessageBody + FTS directly, avoiding a redundant
     /// re-fetch. `hasUnresolvedCIDs` flags whether the main app must re-render on
     /// first open (CIDs stayed as cid: refs because NSE has no attachment fetcher).
+    ///
+    /// ⚑ THE THIRD WRITER OF THE `IOS-NSE-006` CLASS, guarded here rather than
+    /// left as the one exception — the class is *"a writer keyed on an ADDRESS
+    /// assuming it still names the same message"*, and enumerating it by the two
+    /// writers a finding happened to name would be `MIS-006` (fixed the
+    /// instance, not the class). Its damage differs from the staging writers' and
+    /// is stated rather than assumed: `INSERT OR REPLACE` rewrites the WHOLE row,
+    /// so a zombie predecessor resuming past its terminal write does not splice
+    /// mixed identities — it REPLACES the successor's staged row outright,
+    /// destroying a push that was never merged (a dropped message) and
+    /// resurrecting a predecessor the address no longer holds.
+    ///
+    /// Same two doors, same fail direction as `stageBody`: an absent row and an
+    /// unanswerable identity both WRITE — the first is the ordinary first insert
+    /// and the second is the rfc-less message accumulating across wakes — and
+    /// only POSITIVE evidence of a different message suppresses it. On the
+    /// natural path the row was created by THIS run's `stageHeader`, so the
+    /// identity agrees and the guard is transparent.
     static func persistProcessedMessage(
         db: DatabaseQueue,
         accountId: String, accountEmail: String, provider: String,
@@ -147,7 +165,12 @@ enum NSEStagingDB {
         let referencesJSON = encodeJSONArray(message.references)
         let providerLabelsJSON = encodeJSONArray(message.providerLabels)
         do {
+            var refused = false
             try db.write { db in
+                if try stagedIdentityPositivelyDiffers(db: db, id: id, message: message) {
+                    refused = true
+                    return
+                }
                 try db.execute(sql: """
                     INSERT OR REPLACE INTO nse_processed_message
                     (id, accountId, accountEmail, provider, messageId, rfc822MessageId, threadId,
@@ -202,6 +225,12 @@ enum NSEStagingDB {
                         // `NSEMessageMetadata.observedUidValidity`.
                         message.observedUidValidity
                     ])
+            }
+            if refused {
+                NSELog.error(
+                    "persistProcessedMessage REFUSED at \(id): the staged row now names a "
+                    + "different message (IOS-NSE-006) — dropping a terminal write computed "
+                    + "for the predecessor rather than replacing the successor's row")
             }
         } catch {
             NSELog.error("persistProcessedMessage failed: \(error)")
@@ -383,18 +412,55 @@ enum NSEStagingDB {
 
     /// Stage 2 — add the rendered body to an already-staged header row. No-op if
     /// NSE didn't render one. Idempotent plain UPDATE.
+    ///
+    /// ⚑ ADDRESSED BY `id`, ADMITTED BY IDENTITY (`IOS-NSE-006`). `id` is
+    /// `"<accountId>:<messageId>"` and on IMAP `messageId` is the UID — an
+    /// ADDRESS in a numbering space, not an identity. This UPDATE used to carry
+    /// no identity term at all, so a PREDECESSOR run resuming from its body
+    /// fetch after a successor had re-headed the row wrote the predecessor's
+    /// body onto the successor: the merge then stores it as the successor's
+    /// `MessageBody`, indexes the predecessor's text under the successor's
+    /// header id and sets `bodyComplete = 1`, which the body queue
+    /// (`bodyComplete = 0`) never revisits. That is a C3 misattribution no sync
+    /// pass repairs — the same class `stageHeader` closes for the payload it
+    /// RETAINS, arriving through the writer instead of through the UPSERT.
+    ///
+    /// The admission test is `stagedIdentityPositivelyDiffers` — the SAME two
+    /// doors, in the same precedence, that `stageHeader` and
+    /// `NSEDataBridge.nseMergeIdentityConfirmed` use, so the three cannot drift
+    /// on what "a different message" means.
+    ///
+    /// FAIL DIRECTION, and it is the opposite of `stageHeader`'s: there the
+    /// question is "may I KEEP payload already on the row", here it is "may I
+    /// ADD payload to it", so the safe answer to an unanswerable identity is to
+    /// WRITE. Skipping on absence of evidence would stop an rfc-less, epoch-less
+    /// message ever accumulating a body across wakes (`MIS-IOS-004` — "could not
+    /// determine" is not "provider says different"). Only POSITIVE evidence of a
+    /// different message suppresses the write.
+    ///
+    /// The dropped payload is not silently lost: the row it was computed for is
+    /// provably gone from this address, the main app's body queue re-fetches for
+    /// whoever holds the address now, and the refusal is written to the NSE's
+    /// durable log channel rather than to a detached console (topic 105).
     static func stageBody(
         db: DatabaseQueue,
-        accountId: String, messageId: String, renderedBody: RenderedBody?
+        accountId: String, message: NSEMessageMetadata, renderedBody: RenderedBody?
     ) {
         guard let rb = renderedBody else { return }
-        let id = "\(accountId):\(messageId)"
+        let id = "\(accountId):\(message.messageId)"
         let attachmentsJSON: String? = {
             guard !rb.attachments.isEmpty else { return nil }
             return (try? JSONEncoder().encode(rb.attachments)).flatMap { String(data: $0, encoding: .utf8) }
         }()
         do {
+            // The identity read and the write share ONE transaction: a check
+            // outside it is a TOCTOU seam a concurrent re-head can slip through.
+            var refused = false
             try db.write { db in
+                if try stagedIdentityPositivelyDiffers(db: db, id: id, message: message) {
+                    refused = true
+                    return
+                }
                 try db.execute(sql: """
                     UPDATE nse_processed_message SET
                         htmlContent = ?, textContent = ?, attachmentsJSON = ?,
@@ -405,6 +471,11 @@ enum NSEStagingDB {
                         rb.icsText, rb.hasUnresolvedCIDs ? 1 : 0, id
                     ])
             }
+            if refused {
+                NSELog.error(
+                    "stageBody REFUSED at \(id): the staged row now names a different message "
+                    + "(IOS-NSE-006) — dropping a body computed for the predecessor")
+            }
         } catch {
             NSELog.error("stageBody failed: \(error)")
         }
@@ -414,15 +485,34 @@ enum NSEStagingDB {
     /// summary/reminder columns so a merge landing during the action vote shows
     /// the summary. Does NOT set `aiCompleted` — the terminal `persistProcessedMessage`
     /// flips that once the action lands.
+    ///
+    /// ⚑ ADDRESSED BY `id`, ADMITTED BY IDENTITY (`IOS-NSE-006`) — see
+    /// `stageBody` for the full statement of the class, the two doors and the
+    /// fail direction; this is the same guard on the AI half. It is the worse
+    /// half of the two: the summary/todos/reminder a predecessor computed are
+    /// merged durably onto the successor's header and cached in `messageAICache`
+    /// under the SUCCESSOR's RFC key, so the poisoning survives every later UID
+    /// re-key and is a permanent cache HIT.
+    ///
+    /// ⚠️ The existing `deliveredFlag.hasFired()` checkpoint at this call site is
+    /// NOT this guard and does not subsume it. That flag is per-RUN — it asks
+    /// "did MY run's watchdog already deliver", which says nothing about whether
+    /// a LATER run has since re-headed the row. The two are complementary and
+    /// both are load-bearing.
     static func stageSummary(
         db: DatabaseQueue,
-        accountId: String, messageId: String,
+        accountId: String, message: NSEMessageMetadata,
         summaryBlurb: String?, summaryTodos: String?,
         reminderDate: String?, reminderTime: String?, reminderContent: String?
     ) {
-        let id = "\(accountId):\(messageId)"
+        let id = "\(accountId):\(message.messageId)"
         do {
+            var refused = false
             try db.write { db in
+                if try stagedIdentityPositivelyDiffers(db: db, id: id, message: message) {
+                    refused = true
+                    return
+                }
                 try db.execute(sql: """
                     UPDATE nse_processed_message SET
                         summaryBlurb = ?, summaryTodos = ?,
@@ -432,6 +522,11 @@ enum NSEStagingDB {
                         summaryBlurb, summaryTodos,
                         reminderDate, reminderTime, reminderContent, id
                     ])
+            }
+            if refused {
+                NSELog.error(
+                    "stageSummary REFUSED at \(id): the staged row now names a different message "
+                    + "(IOS-NSE-006) — dropping AI computed for the predecessor")
             }
         } catch {
             NSELog.error("stageSummary failed: \(error)")

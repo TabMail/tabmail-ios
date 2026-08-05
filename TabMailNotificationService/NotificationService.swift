@@ -590,7 +590,11 @@ final class NotificationService: UNNotificationServiceExtension {
         // Attach the rendered body to the already-staged header so the merge can
         // write MessageBody + FTS (and the main app's body queue won't re-fetch).
         if let db {
-            NSEStagingDB.stageBody(db: db, accountId: accountId, messageId: msg.messageId, renderedBody: rendered)
+            // `message:` (not a bare `messageId:`) so the writer can re-prove
+            // that the staged row still names THIS message before adding the
+            // body to it — `IOS-NSE-006`. The zombie checkpoint above is a
+            // per-RUN question and does not answer that one.
+            NSEStagingDB.stageBody(db: db, accountId: accountId, message: msg, renderedBody: rendered)
             NSELog.step("NSE stage2: body staged")
         }
 
@@ -840,7 +844,7 @@ final class NotificationService: UNNotificationServiceExtension {
                 // landing mid-vote shows it. aiCompleted stays 0 until step 7.
                 if let db {
                     NSEStagingDB.stageSummary(
-                        db: db, accountId: accountId, messageId: msg.messageId,
+                        db: db, accountId: accountId, message: msg,
                         summaryBlurb: summaryBlurb, summaryTodos: summaryTodos,
                         reminderDate: reminderDate, reminderTime: reminderTime,
                         reminderContent: reminderContent)
