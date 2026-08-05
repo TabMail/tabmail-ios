@@ -535,7 +535,6 @@ extension SyncEngine {
             print("[ChatEviction] Turn cap eviction failed: \(error)")
         }
     }
-}
 
     // MARK: - Query-planner statistics (ADR-IOS-029 rule 5, deferred timing)
 
@@ -638,3 +637,4 @@ extension SyncEngine {
             return .abandoned
         }
     }
+}
