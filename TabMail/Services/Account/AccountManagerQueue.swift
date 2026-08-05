@@ -1812,6 +1812,21 @@ extension AccountManager {
             if cancelledCount > 0 {
                 queueLog("[Queue] Crash recovery: cleaned up \(cancelledCount) cancelled ops")
             }
+            // Same crash-recovery class as the inFlight reset above, for the OTHER
+            // in-flight state a previous session can leave behind: a draft push whose
+            // Stage A durably committed `"pushing"` and then died before the provider
+            // call returned. `pushDraftToServer` admits only `nil`/`"dirty"`, and its
+            // `.notApplied` is a NORMAL return, so without this the next drain retires
+            // the durable `.saveDraft` producer through the generic success arm — a
+            // dropped intention by none of the four exits. Launch-only is what makes
+            // this safe without a drain latch: nothing has drained yet in this process,
+            // so a `"pushing"` row is orphaned by definition. Full rationale, the
+            // mirror-image trap, and the accepted residual are on
+            // `DraftStore.resetOrphanedPushingDrafts`.
+            let reAdmittedPushes = try DraftStore.resetOrphanedPushingDrafts(db: db)
+            if reAdmittedPushes > 0 {
+                queueLog("[Queue] Crash recovery: re-admitted \(reAdmittedPushes) orphaned draft pushes")
+            }
         }
         await drainPendingQueue()
         await reconcileOutbox()

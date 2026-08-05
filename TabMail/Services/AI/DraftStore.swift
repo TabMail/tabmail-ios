@@ -629,6 +629,56 @@ actor DraftStore {
         }
     }
 
+    /// LAUNCH-ONLY crash recovery for the draft push's in-flight state. Returns the
+    /// number of rows re-admitted. Runs inside the caller's transaction — see
+    /// `AccountManager.reconcilePendingOperations`, which is its only caller.
+    ///
+    /// `performStageA` durably commits `"pushing"` BEFORE the provider call, and
+    /// `pushDraftToServer`'s entry guard admits only `nil` or `"dirty"`. Every
+    /// in-process failure arm already clears it (`applyPushCompletion` →
+    /// `nil`/`"pushed"`, `restorePushableAfterProviderThrow` → `"dirty"`), so the
+    /// only way a `"pushing"` row outlives its attempt is a CRASH in the network
+    /// window — a jetsam, a force-quit, a `0xdead10cc` suspension kill — where no
+    /// process is alive to run those arms. Left alone, the next drain's
+    /// `.notApplied` is a NORMAL return, so `executeOperation`'s `.saveDraft` arm
+    /// falls through to `.allMembers` and the durable Save producer is DELETED by
+    /// none of never-drop's four exits: the guard tests a local row state, and an
+    /// interrupted attempt is an UNKNOWN, which clause 2 makes retryable. Both
+    /// sibling queues already sweep their own in-flight state
+    /// (`PendingOperation.inFlight`, `OutboxMessage.sending`); this is the third.
+    ///
+    /// ⚠ WHY THE LAUNCH ENTRY AND NOT A FOREGROUND ONE. `reconcilePendingOperations`
+    /// is launch-only, so at that moment nothing has drained yet IN THIS PROCESS and
+    /// any `"pushing"` row is orphaned BY DEFINITION. That is what lets this carry no
+    /// drain latch, and it is not a shortcut — read the banner on
+    /// `AccountManagerOutbox.reconcileOutbox`, which records a real shipped bug where
+    /// a reset landed on a row whose send was already on the wire. Do NOT add a
+    /// foreground sweep: a foreground return within the same process cannot produce
+    /// `"pushing"` residue, because the in-process arms above clear it, so a
+    /// foreground sweep could only ever hit a LIVE attempt.
+    ///
+    /// ⚠ THE MIRROR IMAGE, and it is worse than the bug: do NOT instead make
+    /// `.notApplied` throw. That would requeue the four genuinely-stale cases forever
+    /// (`instanceEpoch` mismatch, `"pushed"`, a lost Stage-A CAS, a lost Stage-B CAS)
+    /// — a permanent lane wedge, which is in the non-recoverable set.
+    ///
+    /// ⚠ ACCEPTED RESIDUAL, registered as `IOS-DRAFT-016` (same family as
+    /// `IOS-DRAFT-015`): a `"pushing"` row whose Stage-B *reset write* fails
+    /// transiently inside a LIVE process stays stuck until the next launch. That is
+    /// recoverable — the next launch, or one authored edit via `applySave`'s remap —
+    /// and only the SERVER copy is stale; the local `Draft` content is intact. It is
+    /// deliberately not mechanised.
+    ///
+    /// ⚠ RE-PUSH DUPLICATE RISK, stated rather than hidden: if the APPEND landed
+    /// server-side before the crash, the retry can create a duplicate server draft.
+    /// That is exactly shipped `07a4bb703`'s behaviour, and the same trade the outbox
+    /// makes explicitly ("accepts the small double-send risk"). It is the correct
+    /// direction — a duplicate draft is recoverable, a dropped Save producer is not.
+    static func resetOrphanedPushingDrafts(db: Database) throws -> Int {
+        try Draft.filter(Column("serverPushStatus") == "pushing")
+            .updateAll(db, Column("serverPushStatus").set(to: "dirty"))
+    }
+
     /// Look up the Drafts folder path for an account.
     func draftsFolderPath(accountId: String) throws -> String {
         try AppDatabase.dbPool.read { db in

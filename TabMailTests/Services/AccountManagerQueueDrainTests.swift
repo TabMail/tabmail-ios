@@ -185,6 +185,90 @@ struct AccountManagerQueueDrainTests {
         #expect(queuedAfter?.retryCount == 0, "untouched op's retryCount is unaffected")
     }
 
+    // MARK: - 8b. Launch crash recovery for the draft push's own in-flight state
+
+    /// THE INVARIANT: a draft push interrupted by a CRASH must be admissible again
+    /// after the launch reconciliation — the durable `.saveDraft` producer is not
+    /// retired by an attempt that never completed.
+    ///
+    /// The hole this pins. `DraftStore.performStageA` durably commits
+    /// `serverPushStatus = "pushing"` in its own transaction BEFORE the provider
+    /// call; `pushDraftToServer`'s entry guard admits only `nil` or `"dirty"`; and
+    /// `.notApplied` is a NORMAL return, so `executeOperation`'s `.saveDraft` arm
+    /// falls through to `.allMembers` and `executeSingleOp` DELETES the
+    /// `PendingOperation`. The in-process failure arms do clear `"pushing"` — but a
+    /// jetsam / force-quit / `0xdead10cc` kill in the network window leaves no
+    /// process alive to run them, and an interrupted attempt is an UNKNOWN, which
+    /// never-drop clause 2 makes retryable. Both sibling queues sweep their own
+    /// in-flight state (`PendingOperation.inFlight` → this very function;
+    /// `OutboxMessage.sending` → `performOutboxReconciliation`); the draft push was
+    /// the one that did not.
+    ///
+    /// ASSERTED THROUGH THE PRODUCTION ADMISSION DECISION, not the column: the
+    /// oracle is whether `performStageA` — the same CAS `pushDraftToServer` runs —
+    /// admits a fresh attempt. A reimplementation that cleared the state to `nil`
+    /// instead of `"dirty"`, or moved the reset elsewhere, still passes; a system
+    /// where the producer stays wedged still fails. Asserting `== "dirty"` would be
+    /// the mechanism (`MIS-015`).
+    ///
+    /// TWO-SIDED on one fixture: the pre-sweep half proves the row really is stuck
+    /// (so the post-sweep half is not a trivially-admissible empty case).
+    @Test("A draft push orphaned by a crash is re-admitted at launch — the durable Save producer is not retired")
+    func launchReconciliationReAdmitsAnOrphanedDraftPush() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let accountId = "acc-orphan-push"
+        let draftId = "draft-orphaned-push"
+        let epoch = "E1"
+        try await pool.write { db in
+            var account = Account(
+                emailAddress: "\(accountId)@example.com", displayName: "Orphan",
+                provider: .gmail)
+            account.id = accountId
+            try account.insert(db)
+            var draft = Draft(
+                id: draftId, accountId: accountId, toJSON: "[\"to@example.com\"]",
+                ccJSON: "[]", bccJSON: "[]", subject: "subject", body: "body",
+                replyToId: nil, isForward: false, editHistoryJSON: nil,
+                createdAt: 1, updatedAt: 1)
+            draft.instanceEpoch = epoch
+            // Exactly what Stage A commits before the provider call.
+            draft.serverPushStatus = "pushing"
+            draft.pushAttemptVersion = 1
+            draft.rfc822MessageId = "draft-interrupted@example.com"
+            try draft.insert(db)
+        }
+
+        /// Does a fresh push attempt get admitted? Runs the real Stage-A CAS. A
+        /// refused attempt writes nothing, so the pre-sweep probe is side-effect
+        /// free.
+        func admitsAFreshPushAttempt(_ rfc: String) async throws -> Bool {
+            try await pool.write { db in
+                guard let current = try Draft.fetchOne(db, key: draftId) else { return false }
+                return try DraftStore.performStageA(
+                    initialDraft: current,
+                    expectedInstanceEpoch: epoch,
+                    previousIdentity: nil,
+                    freshRfc: rfc,
+                    db: db) != nil
+            }
+        }
+
+        // THE WEDGE, before the sweep: Stage A refuses, `pushDraftToServer` returns
+        // `.notApplied`, and the queue retires the producer through its generic
+        // success arm. Nothing else in the tree clears `"pushing"` except an
+        // authored edit via `applySave`'s remap.
+        #expect(try await admitsAFreshPushAttempt("draft-retry-a@example.com") == false,
+                "fixture must start wedged, or the post-sweep half proves nothing")
+
+        await AccountManager.shared.reconcilePendingOperations()
+
+        // THE INVARIANT: the intention survives the crash — the next drain can push.
+        #expect(try await admitsAFreshPushAttempt("draft-retry-b@example.com") == true,
+                "a push interrupted by a crash must be retryable after launch recovery")
+    }
+
     // MARK: - 9. GAP2: MockEmailProvider.setMoveThrowsOnId — partial-batch progress + requeue-then-retry
 
     @Test("Batch move [A,B,C] fails on B via a generic connection error (ProviderError.notConnected): the WHOLE op resets to queued (not split), retryCount+1, failedAccounts marked, movedIds shows only the successful prefix [A] — a cleared retry then completes the op")
