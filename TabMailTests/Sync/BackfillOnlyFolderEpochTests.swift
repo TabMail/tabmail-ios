@@ -1390,6 +1390,149 @@ struct BackfillOnlyFolderEpochTests {
         let again = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "Receipts", pool: pool)
         #expect(again?.backfillComplete == true, "a settled empty folder was re-opened by a later pass")
     }
+
+    // MARK: - Round 15 — the reset window the epoch CAS cannot see
+
+    /// THE INVARIANT: **mail that arrives under a folder's NEW numbering space is
+    /// still reached by automatic backfill after the reset that created it.**
+    ///
+    /// The CAS in `crawlWalkWriteAllowed` cannot enforce that on its own, and the
+    /// reason is structural rather than a race the CAS merely loses. The reset
+    /// reaction (`AccountManagerUidValidityReset`) arms `uidValidityResetPendingAt`,
+    /// purges the folder's headers and clears its crawl state, and DELIBERATELY
+    /// leaves `lastKnownUidValidity` at the OLD value until the very last step. So
+    /// for the whole reset window an old-epoch walk's premise still equals the
+    /// stored stamp: the CAS AGREES, and the walk is free to write
+    /// `backfillComplete = true` onto a folder that was just emptied.
+    ///
+    /// That end state is not recoverable by the crawl. `runBackfill` selects on
+    /// `backfillComplete == false`, and `resetEmptyFolderCrawlEpoch` — the one
+    /// clearer that could reopen it — requires ZERO local headers, which stops
+    /// being true the moment the post-reset sync inserts its first row. So the
+    /// folder's remaining mail is permanently outside automatic backfill.
+    ///
+    /// Asserted on the MAIL arriving after the reset completes, not on which branch
+    /// declined: `backfillComplete` is only the mechanism by which the mail is lost.
+    @Test("Mail under a folder's new numbering space is still crawled after a reset that overlapped a walk")
+    @MainActor
+    func aCrawlWriteIsRefusedWhileAUidValidityResetIsPending() async throws {
+        let oldEpoch = 951_001   // what the folder is stamped with, and what the walk premises
+        let newEpoch = 951_002   // what the reset will stamp once it finishes
+        let postResetRfc = "arrived-after-the-reset@example.com"
+
+        // EMPTY mailbox ⇒ UIDNEXT 1 ⇒ `initialCursor < 1` ⇒ the completion write.
+        let server = FakeIMAPServer(
+            capabilities: Self.nonUidplusCapabilities,
+            mailboxes: ["INBOX": [], "Receipts": []])
+        server.setUidValidity(oldEpoch, for: "Receipts")
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "t15-reset-window"
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try Self.insertBackfillOnlyFolder(
+            accountId: accountId, path: "Receipts", pool: pool, cursor: nil, epoch: oldEpoch)
+        let folderId = "\(accountId):Receipts"
+
+        // The reset reaction, landing in the window between this pass's walk-start
+        // SELECT and its bookkeeping write. It arms the durable flag and clears the
+        // crawl state — and leaves `lastKnownUidValidity` alone, exactly as
+        // `uidValidityResetArmFlag` + the purge do, so the CAS below still agrees.
+        SyncEngine.backfillWalkCheckpointHooksForTesting.withLock {
+            $0[.beforeFreshBookkeepingWrite(folderId: folderId)] = {
+                try? await pool.write { db in
+                    _ = try Folder.filter(Column("id") == folderId)
+                        .updateAll(db,
+                            Column("uidValidityResetPendingAt").set(to: Date()),
+                            Column("backfillComplete").set(to: false),
+                            Column("backfillUidCursor").set(to: nil as Int?))
+                }
+            }
+        }
+        defer { SyncEngine.backfillWalkCheckpointHooksForTesting.withLock { $0.removeAll() } }
+
+        let imap = Self.provider(for: server)
+        try await imap.connect()
+        defer { Task { try? await imap.disconnect() } }
+        let engine = await Self.makeEngine(accountId: accountId, provider: imap)
+
+        _ = await engine.runBackfill(account: account)   // the pass the reset overtook
+
+        let mid = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "Receipts", pool: pool)
+        #expect(mid?.uidValidityResetPendingAt != nil,
+                "precondition: the reset is still in flight when the overtaken pass tries to write")
+
+        // The reset finishes: fresh epoch stamped, flag cleared
+        // (`uidValidityResetStampFreshEpoch`), and the mailbox now holds mail under
+        // the new numbering space.
+        try await pool.write { db in
+            _ = try Folder.filter(Column("id") == folderId)
+                .updateAll(db,
+                    Column("lastKnownUidValidity").set(to: newEpoch),
+                    Column("uidValidityResetPendingAt").set(to: nil as Date?))
+        }
+        server.setUidValidity(newEpoch, for: "Receipts")
+        server.setMessages(
+            [Self.message(uid: 4, id: postResetRfc, subject: "arrived under the new epoch")],
+            in: "Receipts")
+
+        _ = await engine.runBackfill(account: account)   // the pass that must still crawl
+
+        let rows = try Self.headers(pool, folderId: folderId)
+        #expect(rows.contains { $0.rfc822MessageId == postResetRfc },
+                """
+                a walk premised on UIDVALIDITY \(oldEpoch) wrote `backfillComplete = true` while the \
+                folder's reset to \(newEpoch) was still in flight — the CAS agreed because the reset \
+                deliberately retains the OLD stamp until it finishes. Every later crawl cycle selects \
+                on `backfillComplete == false`, and `resetEmptyFolderCrawlEpoch` needs zero headers, \
+                so this folder's mail is permanently outside automatic backfill. \
+                Rows: \(rows.map { "\($0.messageId)=\($0.rfc822MessageId ?? "-")" })
+                """)
+    }
+
+    /// THE MIRROR IMAGE of the test above, and mandatory: a guard that refused
+    /// unconditionally would satisfy it while permanently disabling the crawl. The
+    /// flag is re-drive state, not admission arbitration — with no reset in flight,
+    /// an ordinary matching-epoch bookkeeping write must still land.
+    @Test("With no reset in flight, a matching-epoch crawl write is still admitted")
+    @MainActor
+    func aMatchingEpochCrawlWriteIsStillAdmittedWhenNoResetIsPending() async throws {
+        let epoch = 951_101
+
+        let server = FakeIMAPServer(
+            capabilities: Self.nonUidplusCapabilities,
+            mailboxes: ["INBOX": [], "Receipts": []])
+        server.setUidValidity(epoch, for: "Receipts")
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "t15-no-reset"
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try Self.insertBackfillOnlyFolder(
+            accountId: accountId, path: "Receipts", pool: pool, cursor: nil, epoch: epoch)
+
+        let imap = Self.provider(for: server)
+        try await imap.connect()
+        defer { Task { try? await imap.disconnect() } }
+        let engine = await Self.makeEngine(accountId: accountId, provider: imap)
+        _ = await engine.runBackfill(account: account)
+
+        let after = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "Receipts", pool: pool)
+        #expect(after?.backfillComplete == true,
+                """
+                a folder with a matching epoch and NO reset in flight was refused its completion \
+                write — the quarantine term must gate only the reset window, or every empty folder \
+                is re-crawled forever and the fix is strictly worse than the bug
+                """)
+        #expect(after?.lastKnownUidNext == 1,
+                "the same admitted transaction must still record the observed UIDNEXT")
+    }
 }
 
 /// Signal gate for the two-walk interleaving above. Polled with a bounded

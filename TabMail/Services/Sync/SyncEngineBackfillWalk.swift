@@ -483,9 +483,33 @@ extension SyncEngine {
     /// because the reference has no clearer — its `lastKnownUidValidity` is
     /// advanced by the reset reaction's purge-then-stamp, so "the row's stamp
     /// changed under me" is a state its quarantine flag already refuses. v3 has
-    /// the clearer and, since T4.S6, the flag as well — but this guard does not
-    /// read the flag, so the CAS is still doing the work and is still the
-    /// ⚑ INVENTED half.
+    /// the clearer, so the CAS is the ⚑ INVENTED half and does the work the
+    /// reference's comparison does.
+    ///
+    /// 🚨 **THE CAS ALONE IS NOT SUFFICIENT, AND THE QUARANTINE TERM NOW
+    /// TRANSFERS.** This guard used to read `lastKnownUidValidity` only, and the
+    /// text above used to record that as an accepted shape. It is not one. The
+    /// reset reaction (`AccountManagerUidValidityReset`) arms
+    /// `uidValidityResetPendingAt`, purges the folder's headers and clears its
+    /// crawl state, and **deliberately leaves `lastKnownUidValidity` at the OLD
+    /// value** for that whole interval — the fresh epoch is stamped only at the
+    /// very end, by `uidValidityResetStampFreshEpoch`. So an already-running
+    /// OLD-epoch walk still CASes successfully *after* the purge and can write
+    /// `backfillComplete = true` or re-plant a stale `backfillUidCursor` onto a
+    /// folder that has just been emptied. `resetEmptyFolderCrawlEpoch` does not
+    /// repair it: the new-epoch sync starts inserting rows immediately, so by the
+    /// time the stale walk commits the folder is non-empty and the clearer no
+    /// longer fires. A wrong `backfillComplete = true` then removes the folder
+    /// from every later crawl selection (`runBackfill` selects on
+    /// `backfillComplete == false`) — a PERMANENT completeness gap.
+    ///
+    /// The refusal it adds is transient in the only sense that matters: a refusal
+    /// writes NOTHING, so it cannot itself become a durable re-entry condition.
+    /// The flag is re-drive state — every abort leg of the reaction leaves it SET
+    /// on purpose so the folder is retryable and never half-reset — and while it
+    /// is set the folder is already excluded from ordinary sync, which branches
+    /// into the reaction instead. The instant a reset completes and clears it, the
+    /// next pass writes normally.
     nonisolated static func crawlWalkWriteAllowed(
         _ db: Database, folderId: String, premiseEpoch: UInt32?
     ) throws -> Bool {
@@ -493,6 +517,9 @@ extension SyncEngine {
         // the same as an unstamped row, which is compared below and legitimately
         // matches a nil premise (round 13 blocker 1 — see above).
         guard let folder = try Folder.fetchOne(db, key: folderId) else { return false }
+        // A reset is in flight: `lastKnownUidValidity` still holds the OLD epoch by
+        // design, so the CAS below would ADMIT the very walk the reset is undoing.
+        guard folder.uidValidityResetPendingAt == nil else { return false }
         let stored = knownUidValidity(folder.lastKnownUidValidity)
             .flatMap { UInt32(exactly: $0) }
         return stored == premiseEpoch
