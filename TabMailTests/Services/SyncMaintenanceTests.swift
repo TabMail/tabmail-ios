@@ -1597,6 +1597,91 @@ struct PlannerStatisticsRefreshTests {
         return condition()
     }
 
+    /// 🚨 THE INVARIANT THE TIER FIX IS ABOUT: **no production caller submits the WAL
+    /// maintenance pass — and therefore the whole-database `ANALYZE` inside it — above
+    /// `.background`.** `runWALMaintenance` takes its pool as a PARAMETER and cannot
+    /// enforce anything about it, so the property lives entirely at the call sites and
+    /// has to be asserted there.
+    ///
+    /// This is what `analyzeExecutesThroughTheWriteQueueAtTheCallersTier` below does
+    /// NOT cover, stated plainly rather than left implied (`MIS-015`): that test builds
+    /// a `.background` `PrioritizedDatabase` itself and observes a `.background` write,
+    /// which is true of `PrioritizedDatabase` by construction and says nothing about
+    /// what the two production callers choose. One of them passed `AppDatabase.dbPool`
+    /// (the DEFAULT `.priority` tier) while that test was green.
+    ///
+    /// Mechanical, in the shape of the existing wiring-contract test in
+    /// `ThreadFragmentMergeTests`: the call sites are DISCOVERED by walking the
+    /// production tree, never listed by hand, so a third caller added in a new file is
+    /// caught rather than silently uncovered (`MIS-007` — a hand-written census stops
+    /// being complete the day the thing it counts grows).
+    @Test("No production caller runs WAL maintenance above .background")
+    func everyWALMaintenanceCallSitePassesABackgroundPool() throws {
+        // …/tabmail-ios/TabMailTests/Services/<this file>
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let productionRoot = projectRoot.appendingPathComponent("TabMail")
+
+        var callSites: [(file: String, argument: String, source: String)] = []
+        let walker = FileManager.default.enumerator(
+            at: productionRoot, includingPropertiesForKeys: nil)
+        while let entry = walker?.nextObject() as? URL {
+            guard entry.pathExtension == "swift" else { continue }
+            guard let source = try? String(contentsOf: entry, encoding: .utf8) else { continue }
+            let relative = entry.path.replacingOccurrences(of: projectRoot.path + "/", with: "")
+            // A CALL, not the declaration and not a doc-comment mention of the name.
+            for (index, line) in source.components(separatedBy: "\n").enumerated()
+            where line.contains("SyncEngine.runWALMaintenance(")
+                && !line.trimmingCharacters(in: .whitespaces).hasPrefix("//")
+                && !line.trimmingCharacters(in: .whitespaces).hasPrefix("///") {
+                // The argument list may wrap; take the call line plus the next few.
+                let lines = source.components(separatedBy: "\n")
+                let window = lines[index..<min(index + 5, lines.count)].joined(separator: " ")
+                let parts = window.components(separatedBy: "dbPool:")
+                guard parts.count > 1 else { continue }
+                let argument = parts[1]
+                    .components(separatedBy: ",")[0]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                callSites.append((relative, argument, source))
+            }
+        }
+
+        // NON-VACUITY: if the walk finds nothing, every assertion below passes for
+        // free. Both known production callers must be present.
+        #expect(callSites.count >= 2,
+                "expected at least the two known production callers; found \(callSites.count)")
+
+        let failureNote = """
+            The pass ends in a whole-database ANALYZE, which takes SQLite's single \
+            writer; submitted above .background it can be taken ahead of a user-action \
+            write already queued in DatabaseWriteQueue.
+            """
+        for site in callSites {
+            if site.argument.hasPrefix("AppDatabase.") {
+                #expect(site.argument == "AppDatabase.backgroundPool",
+                        "\(site.file) passes \(site.argument). \(failureNote)")
+            } else if site.argument.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" }),
+                      !site.argument.isEmpty {
+                // The pool arrived through a local binding — resolve it in the same
+                // file rather than accepting the indirection.
+                #expect(site.source.contains("\(site.argument) = AppDatabase.backgroundPool"),
+                        """
+                        \(site.file) passes `\(site.argument)`, which is not bound to \
+                        AppDatabase.backgroundPool anywhere in that file. \(failureNote)
+                        """)
+            } else {
+                // FAIL CLOSED on a shape this test cannot read, rather than passing it.
+                Issue.record("""
+                    \(site.file) passes a WAL-maintenance pool this contract test cannot \
+                    resolve (`\(site.argument)`). Teach the test the new shape — do not \
+                    delete the assertion. \(failureNote)
+                    """)
+            }
+        }
+    }
+
     /// ⚑ THIS IS WHY THE FUNCTION IS `async`. Before the 2026-08-05 fix it was not,
     /// so `dbPool.write { }` bound `PrioritizedDatabase`'s SYNCHRONOUS overload —
     /// documented as *"Sync write — can't `await`, so it can't enter the queue;
@@ -1606,6 +1691,17 @@ struct PlannerStatisticsRefreshTests {
     /// `DatabaseWriteQueue`. The oracle is the queue's own execution observer, so
     /// this asserts what the SCHEDULER saw, not what the function returned: on the
     /// pre-fix code it records nothing for this label.
+    ///
+    /// ⚑ WHAT IT DOES NOT COVER, stated because the omission cost a whole round
+    /// (`MIS-015`): the tier assertion below is about a pool THIS TEST CONSTRUCTS, so
+    /// it pins "a `.background` pool produces a `.background` write" — true of
+    /// `PrioritizedDatabase` by construction — and covers NEITHER production caller.
+    /// One of them passed `AppDatabase.dbPool` while this test was green. The property
+    /// that actually matters lives at the call sites and is pinned by
+    /// `everyWALMaintenanceCallSitePassesABackgroundPool` above. What survives here,
+    /// and is worth keeping, is the QUEUE-ENTRY half: the `ANALYZE` reaches
+    /// `DatabaseWriteQueue` at all rather than binding the pass-through synchronous
+    /// overload that has no tier whatsoever.
     @Test("The deferred ANALYZE executes through the write queue, at the caller's tier")
     func analyzeExecutesThroughTheWriteQueueAtTheCallersTier() async throws {
         let fixture = try makeFixture()

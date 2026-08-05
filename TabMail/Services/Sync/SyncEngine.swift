@@ -59,6 +59,17 @@ actor SyncEngine {
     /// `PriorityGate.normal { }` override), so it survives the `Task.detached` the
     /// per-folder fullSync writes run in. Backfill / FTS self-heal / maintenance write
     /// via `AppDatabase.backgroundPool` directly (`.background`).
+    ///
+    /// ⚑ HOW THE MAINTENANCE HALF OF THAT SENTENCE IS TRUE, since it is not a property
+    /// this file can enforce: `runWALMaintenance` takes its pool as a PARAMETER, so the
+    /// tier is whatever each CALLER hands it. It holds because both production callers
+    /// name `AppDatabase.backgroundPool` — `scheduleMaintenanceInBackground` (the
+    /// foreground poll) and `SyncScheduler`'s `.full` BGProcessing drain. It was FALSE
+    /// until 2026-08-05, when the BGProcessing caller still passed `AppDatabase.dbPool`
+    /// (the default `.priority` tier) and the pass's trailing whole-database `ANALYZE`
+    /// could therefore take SQLite's single writer ahead of a queued user action.
+    /// A third caller re-breaks it silently, so the property is pinned at the call
+    /// sites by `everyWALMaintenanceCallSitePassesABackgroundPool`, not here.
     var dbPool: PrioritizedDatabase { AppDatabase.syncPool }
 
     /// Read current fast sync mode state from AccountManager (MainActor hop).

@@ -461,8 +461,14 @@ final class SyncScheduler {
             if !Task.isCancelled {
                 let undoIds = Set(UndoService.shared.undoStack.flatMap { $0.messages.map(\.id) })
                 await Task.detached(priority: .utility) {
+                    // `.background`, matching the foreground caller
+                    // (`SyncEngine.scheduleMaintenanceInBackground`). The pass ends in
+                    // a whole-database `ANALYZE` that takes SQLite's single writer, so
+                    // the DEFAULT pool (`AppDatabase.dbPool`, `.priority`) would let a
+                    // BGProcessing housekeeping write be taken ahead of a user-action
+                    // write already queued in `DatabaseWriteQueue`.
                     await SyncEngine.runWALMaintenance(
-                        dbPool: AppDatabase.dbPool, includePrune: true,
+                        dbPool: AppDatabase.backgroundPool, includePrune: true,
                         undoProtectedBodyIds: undoIds
                     )
                 }.value
