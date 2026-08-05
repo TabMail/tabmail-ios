@@ -114,6 +114,36 @@ by construction a removal candidate, so an **omission from this list is itself a
 | AI cross-device cache probe (`MessageIdentity.aiCacheKey`) | ADR-IOS-026B / ADR-IOS-010; shared with the Thunderbird addon. A provider id is device-local. |
 | Threading / `References` / `In-Reply-To` | RFC 5322 threading is *defined* on Message-ID. |
 | The two-key sync filter (`PendingOperation.containsAnyKey`) | Explicitly preserved by D4's scope boundary. Do not tidy. |
+| **Refuse-only equality witnesses** — a CATEGORY, not a site | Roughly twenty production sites (round-5 Angle-1 census `F2`, at `01550cdc6`). Not enumerated row by row; see the carve-out immediately below for the test that identifies one. |
+
+**⚠️ THE ABSOLUTE ABOVE HAS A NEGATIVE CASE, AND LEAVING IT UNSTATED WAS ITSELF THE `MIS-019` SHAPE
+(added 2026-08-05).** Every row in this table enumerates an RFC use that confers **authority** — a
+probe whose answer decides a delete, an APPEND dedup key, a wire id, a cache key, RFC 5322 threading,
+the two-key sync filter. Those are the sites where an RFC match makes something *happen*. They are
+**not** the whole population of RFC uses in production, and *"an unlisted RFC site is by construction
+a removal candidate"* is true **only of that authority class**.
+
+**The distinguishing test, applied one site at a time:** *does the RFC match AUTHORIZE an action, or
+only REFUSE one?* A **refuse-only witness** has two signatures: its sole output is a veto, and the
+ABSENCE of either id produces **no** verdict at all (never a refusal, never a licence). Removing one
+does not remove an RFC dependency — it removes a **refusal**, which fails in the dangerous direction.
+That is the same defect class as widening the `COPYUID`-gated expunge's evidence, and it is why these
+sites are neither listed here nor sweepable.
+
+Exemplars (3 of ~20 — the category is the normative part, not the list):
+
+- **`SyncEngineEpochVerify.classifyEpochVerificationSample`** — NEW IN THE v3 RANGE, which is exactly
+  why the unqualified absolute was dangerous. A server-returned `rfc822MessageId` that disagrees with
+  the stored one marks that sample a mismatch and blocks the UIDVALIDITY re-stamp; a sampled UID the
+  server did not return, or returned without an rfc822, is *"NOT RETURNED ⇒ no evidence. Never a
+  mismatch, never an agreement."*
+- **`ExpectedMessageIdentity.matches` / `.partition`** (`AccountManagerActions`) — the C3 content
+  witness on the re-resolve path. A header with no captured identity is KEPT (`guard let expected =
+  expectedIdentities[header.id] else { return true }`), so a match grants nothing the caller was not
+  already doing; only a positive disagreement refuses, and only for that one id.
+- **`NSEStagingDB.stagedIdentityPositivelyDiffers`** — named for the property. It returns `false`
+  unless BOTH sides are present and differ, so a staged AI result is served unless the RFC ids
+  *positively* disagree (`IOS-NSE-006`).
 
 **Rationale.**
 
