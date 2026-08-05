@@ -2183,21 +2183,30 @@ final class AppDatabase: Sendable {
             }
         }
 
-        // ⚠️ THIS MIGRATION KEEPS `foreignKeyChecks: .deferred` DELIBERATELY, AND
-        // IT IS THE ONLY WHOLE-DATABASE FK GATE IN THE v68…v83 RANGE. Do not
-        // "finish the optimisation" by flipping it — the trailing
+        // ⚠️ THIS MIGRATION KEEPS `foreignKeyChecks: .deferred` DELIBERATELY. Do
+        // not "finish the optimisation" by flipping it — the trailing
         // `PRAGMA foreign_key_check` GRDB runs on the deferred path is what
         // preserves detection of a PRE-EXISTING orphan, which `.immediate`
-        // cannot see (it only enforces writes the body itself makes), and it is
-        // what `v82`'s comment explicitly leans on ("every migration on this
-        // line ends with a full foreign-key check").
+        // cannot see (it only enforces writes the body itself makes).
+        //
+        // ⚠️ NEGATIVE CASE, recorded because an earlier revision of this very
+        // comment got it wrong: it claimed this was "THE ONLY whole-database FK
+        // gate in the v68…v83 range". That is FALSE. `v82` is also `.deferred`,
+        // so the range runs TWO whole-database gates — and `v82`'s own comment
+        // says so outright ("this migration and `v71` are the two exceptions").
+        // What is unique about THIS gate is its POSITION, not its existence.
+        // The same revision also attributed a sentence to `v82`'s comment that
+        // `v82` has never contained; do not reinstate that quotation.
         //
         // WHY HERE and not at v68 or at the end. `v70` has just removed the
         // `messageBody → messageHeader` FK, whose check reads every page of a
-        // multi-GB table for one column; that makes the surviving gate 2.4–2.5×
-        // cheaper here than the same gate at `v68` (3.6–3.8 s vs 9.1 s at 500k
-        // headers / 3.4 GB), while still running BEFORE `v82` mutates a row. A
-        // closing-only gate would be cheaper still, but migrations COMMIT
+        // multi-GB table for one column; that makes this gate 2.4–2.5× cheaper
+        // here than the same gate at `v68` (3.6–3.8 s vs 9.1 s at 500k headers /
+        // 3.4 GB), while still running BEFORE `v82` mutates a row — so a
+        // pre-existing orphan aborts the chain BEFORE the destructive label
+        // rebuild rather than after it. That earliness is the thing `v82`'s own
+        // trailing gate cannot provide, and it is the actual reason to keep this
+        // one. A closing-only gate would be cheaper still, but migrations COMMIT
         // INDIVIDUALLY: a failure there strands the database at v82 retrying
         // v83 forever, with 15 migrations' work already applied.
         migrator.registerTimedMigration("v71_addOutboxDraftRfc822MessageId") { db in
