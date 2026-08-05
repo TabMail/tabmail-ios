@@ -47,5 +47,12 @@ to hold on its tail.
 
 ### Related
 
-The `read` banner itself is being corrected in `TabMail/Services/PriorityGate.swift` under separate
-ownership; this entry records the cross-cutting consequence, which outlives any one comment fix.
+The `read` banner itself **has now been corrected** in `TabMail/Services/PriorityGate.swift`: the
+section banner states the negative case explicitly ("the ASYNC overload is NOT a passthrough…"), and
+`PrioritizedDatabase`'s type doc no longer claims async writes are the only added behaviour. This
+entry records the cross-cutting consequence, which outlives any one comment fix.
+
+The first defect this fact was proven to have caused is routed to
+[`104-a-latch-that-authorises-a-transition-must-be-held-across-the-write.md`](104-a-latch-that-authorises-a-transition-must-be-held-across-the-write.md)
+(`IOS-OUTBOX-006`) — outbox reconciliation read the "no drain in flight" latch, `await`ed a
+`dbPool.read`, and reset a row whose SMTP transaction was on the wire.

@@ -229,6 +229,14 @@ actor MockEmailProvider: EmailProvider {
     /// held while any gate is held: this fires entirely outside the queue's
     /// mutation gate, mirroring production.
     var moveHook: (@Sendable () async -> Void)?
+    /// Awaited from INSIDE `send(draft:)`, AFTER the draft is recorded, so a
+    /// test can act while the SMTP transaction is genuinely on the wire: the
+    /// outbox row is claimed `.sending`, `sentAt` is still NULL (it is stamped
+    /// only after this call RETURNS), and nothing downstream — Sent header, Sent
+    /// APPEND, finalize — has happened. That window is where the outbox's
+    /// reconcile-versus-drain hazard lives, and it cannot be observed from
+    /// before/after states.
+    var sendHook: (@Sendable () async -> Void)?
 
     // MARK: - Parameter Tracking
 
@@ -318,6 +326,7 @@ actor MockEmailProvider: EmailProvider {
     func send(draft: DraftMessage) async throws {
         callLog.append("send")
         sentDrafts.append(draft)
+        if let hook = sendHook { await hook() }
         if let error = sendThrows { throw error }
     }
 
@@ -393,6 +402,10 @@ actor MockEmailProvider: EmailProvider {
         moveHook = hook
     }
 
+    func setSendHook(_ hook: (@Sendable () async -> Void)?) {
+        sendHook = hook
+    }
+
     /// Reset all recorded state.
     func reset() {
         callLog.removeAll()
@@ -405,5 +418,6 @@ actor MockEmailProvider: EmailProvider {
         markReadHook = nil
         saveDraftHook = nil
         moveHook = nil
+        sendHook = nil
     }
 }

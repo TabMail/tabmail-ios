@@ -1360,7 +1360,79 @@ extension AccountManager {
     ///   crashed — reset to `queued` for retry (accepts the small double-send risk for
     ///   the case where send succeeded but sentAt write didn't).
     /// - Cleans up orphaned attachment directories that have no matching DB row.
+    ///
+    /// 🚨 THE DRAIN LATCH IS ACQUIRED HERE, IN THE SAME SYNCHRONOUS RUN AS THE
+    /// CHECK, AND HELD ACROSS THE RESET WRITE. Do not move the check to a caller
+    /// and do not "re-check it after the await" — that is the same race one
+    /// frame later.
+    ///
+    /// The reset below is the ONE transition in the outbox that makes a
+    /// `.sending` row claimable again, and durable state alone cannot tell the
+    /// two producers of `.sending`/`sentAt == nil` apart: crash residue from a
+    /// dead session (which MUST be reset) and a row a live in-process drain has
+    /// just claimed and put on the SMTP wire (which must NOT be). `sentAt` does
+    /// not separate them — it is stamped only AFTER `provider.send()` returns,
+    /// so an in-flight send carries `sentAt == nil` exactly like residue.
+    /// `isDrainingOutbox` is the only thing that separates them: `drainOutbox`
+    /// sets it synchronously, holds it for the whole drain and `await`s
+    /// `sendSingleOutboxMessage` inside that hold (its loop is that function's
+    /// only production caller — the sole other reference is a `#if DEBUG`
+    /// seam), and the NSE never sends.
+    ///
+    /// So the latch is what AUTHORISES the reset, and an authorising latch has
+    /// to be observed no later than the write it authorises. Observing it and
+    /// then suspending is not enough: `reconcileOutbox`'s first statement is an
+    /// `await dbPool.read`, `AccountManager` is an actor, and
+    /// `PrioritizedDatabase.read`'s async overload runs a full NSE staging merge
+    /// before it reads (measured at 7.6 s on a cold-I/O boot) — and staging is
+    /// pending precisely on foreground return. A drain starting in that window
+    /// claimed a row, put its SMTP transaction on the wire, and this function
+    /// then reset that row to `.queued` from a snapshot taken after the claim.
+    /// `discardOutboxMessageConfirmed` refuses `.sending` and `sentAt != nil`,
+    /// so a row reset that way became discardable WHILE ITS SEND WAS ON THE
+    /// WIRE: the row and its attachments were deleted, `stampSentAt` matched no
+    /// row, and the send returned at its guard — no optimistic Sent header, no
+    /// Sent APPEND, no finalize. The recipient received a message the user had
+    /// been told was discarded, and it never appeared in Sent. Outbox
+    /// Reliability Rules 3 and 10 both forbid that.
+    ///
+    /// Holding the latch here closes BOTH production reconciliation entries at
+    /// once — the launch one (`reconcilePendingOperations`, which had no check
+    /// at all) and the foreground one (`reconcileOutboxOnForeground`) — because
+    /// both funnel through this function.
+    ///
+    /// WHAT THE HOLD COSTS, stated as a fail-closed edge rather than hidden: a
+    /// drain trigger that fires while reconciliation is running is skipped, and
+    /// a reconciliation that finds a drain in flight returns without
+    /// reconciling. Neither drops an intention. The skipped drain is subsumed by
+    /// this function's own trailing `drainOutbox()`, which runs after the latch
+    /// is released and re-reads the table. The skipped reconciliation is
+    /// re-driven by the next reconciliation trigger — the next foreground return
+    /// or launch — which is exactly the recoverability `IOS-OUTBOX-001`
+    /// established; the orphan-attachment sweep it also skips is pure byte
+    /// reclamation and is idempotent on the next pass.
     func reconcileOutbox() async {
+        guard !isDrainingOutbox else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Outbox] Skipped reconcile — a drain owns the outbox; a send may be on the wire")
+            }
+            return
+        }
+        do {
+            isDrainingOutbox = true
+            defer { isDrainingOutbox = false }
+            await performOutboxReconciliation()
+        }
+        // Outside the hold, so the recovered rows this pass produced are
+        // actually drained. Anything a skipped trigger would have drained is
+        // re-selected here.
+        await drainOutbox()
+    }
+
+    /// The reconciliation itself. Split out ONLY so `reconcileOutbox` can hold
+    /// `isDrainingOutbox` across all of it and release it before the trailing
+    /// drain; the classification and its writes are otherwise unchanged.
+    private func performOutboxReconciliation() async {
         let stale: [OutboxMessage]
         do {
             stale = try await dbPool.read { db in
@@ -1400,7 +1472,6 @@ extension AccountManager {
             }
         }
         await cleanOrphanedAttachmentDirs()
-        await drainOutbox()
     }
 
     /// Second trigger for `reconcileOutbox()`: foreground return.
@@ -1416,29 +1487,29 @@ extension AccountManager {
     /// message would never send and never fail — a dropped user intention by the
     /// wedge corollary, recoverable only by a full process relaunch.
     ///
-    /// 🚨 THE `isDrainingOutbox` GUARD IS WHAT KEEPS THE DOUBLE-SEND FIREWALL
-    /// INTACT — do not relax it. `drainOutbox` is serial, sets
-    /// `isDrainingOutbox` for the whole drain, and `await`s
-    /// `sendSingleOutboxMessage` INSIDE it; that loop is
-    /// `sendSingleOutboxMessage`'s only production caller (the sole other
-    /// reference is a `#if DEBUG` seam). Therefore `isDrainingOutbox == false`
-    /// ⇒ no provider send is in flight in this process, and reconciliation's
-    /// `.sending`/`sentAt == nil` → `.queued` reset cannot make a row the drain
-    /// can re-claim while its SMTP transaction is still on the wire. The NSE
-    /// never sends.
+    /// ⚠️ THIS FUNCTION USED TO CARRY ITS OWN `isDrainingOutbox` GUARD, UNDER A
+    /// DO-NOT-RELAX BANNER ASSERTING THAT THE GUARD PROVED NO SEND WAS IN
+    /// FLIGHT. THAT ASSERTION WAS FALSE and the banner is deleted rather than
+    /// softened — a wrong invariant carrying a warning is worse than none. The
+    /// guard read the latch and then `await`ed `reconcileOutbox()`, whose first
+    /// statement suspends this actor for as long as an NSE staging merge takes;
+    /// a drain starting in that window claimed a row and put its SMTP
+    /// transaction on the wire, and the reset then landed on that row anyway.
+    /// Checking a latch before a suspension proves nothing about the state at
+    /// the write on the far side of it.
     ///
-    /// The reconciliation itself is reused UNCHANGED, so the
-    /// `sentAt`-before-delete asymmetry (Outbox Reliability Rule 3) travels with
-    /// this trigger exactly as it does with the launch one: a row carrying
-    /// `sentAt` is finalized or left to Sent-append recovery, and is NEVER
-    /// re-queued. Only `sentAt == nil` rows are reset.
+    /// The check now lives in `reconcileOutbox`, which ACQUIRES the latch in the
+    /// same synchronous run and HOLDS it across the reset — see the reasoning
+    /// there. This entry deliberately keeps no logic of its own, so the launch
+    /// entry (`reconcilePendingOperations`, which never had a check at all) and
+    /// this one are governed by exactly one piece of code.
+    ///
+    /// The reconciliation itself is unchanged, so the `sentAt`-before-delete
+    /// asymmetry (Outbox Reliability Rule 3) travels with this trigger exactly
+    /// as it does with the launch one: a row carrying `sentAt` is finalized or
+    /// left to Sent-append recovery, and is NEVER re-queued. Only
+    /// `sentAt == nil` rows are reset.
     func reconcileOutboxOnForeground() async {
-        guard !isDrainingOutbox else {
-            if DebugModeManager.isLoggingEnabled() {
-                print("[Outbox] Skipped foreground reconcile — a drain is already in flight")
-            }
-            return
-        }
         await reconcileOutbox()
     }
 

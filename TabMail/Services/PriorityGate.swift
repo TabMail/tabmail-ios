@@ -134,10 +134,14 @@ actor PriorityGate {
 /// APIs like `ValueObservation.publisher(in:)`).
 ///
 /// It mirrors the exact `write`/`read`/`writeWithoutTransaction` overload set the
-/// app uses, so it's a drop-in for the raw pool. The ONLY behavioral change is on
-/// ASYNC writes: they run through `DatabaseWriteQueue.execute(priority:)`, where a
-/// higher-tier write jumps ahead of queued lower-tier writes. Reads don't contend
-/// the single writer (WAL) and sync writes can't `await`, so both pass straight
+/// app uses, so it's a drop-in for the raw pool — but NOT a transparent one, and
+/// the two async overloads each add behaviour:
+/// - ASYNC WRITES run through `DatabaseWriteQueue.execute(priority:)`, where a
+///   higher-tier write jumps ahead of queued lower-tier writes.
+/// - ASYNC READS run the NSE read-through staging merge first and await it. See
+///   the banner on `read` — this is a genuine, potentially multi-second
+///   suspension, not a passthrough.
+/// The SYNCHRONOUS overloads of both cannot `await`, so those do pass straight
 /// through.
 struct PrioritizedDatabase: Sendable {
     let pool: DatabasePool
@@ -190,7 +194,27 @@ struct PrioritizedDatabase: Sendable {
         try pool.write(updates)
     }
 
-    // MARK: Read (passthrough — concurrent readers never block the writer)
+    // MARK: Read
+    //
+    // ⚠️ THE ASYNC OVERLOAD IS NOT A PASSTHROUGH. This banner used to read
+    // "Read (passthrough — concurrent readers never block the writer)", and the
+    // WAL half of that is still true: a read never blocks the single GRDB
+    // writer. The false half is "passthrough". `read` below runs a full NSE
+    // staging merge — durable header/body writes, an FTS flush — BEFORE it
+    // reads, and awaits all of it. Stated negatively, because the wrong reading
+    // of this banner cost a real defect: an `await dbPool.read` is NOT a cheap
+    // operation, it is NOT bounded by the closure you passed it, and it does NOT
+    // preserve your caller's actor isolation across the call. On an actor, it
+    // is a suspension long enough for other actor-isolated work to run to
+    // completion — measured at 7.6 s on a cold-I/O boot, and staging is pending
+    // precisely on foreground return. Any latch, snapshot or claim your caller
+    // established before it may be stale by the time the closure runs. The
+    // synchronous overload IS a passthrough (it cannot await the merge).
+    //
+    // The defect this comment exists to prevent: `AccountManager.reconcileOutbox`
+    // read the "no drain is in flight" latch, awaited this function, and by the
+    // time it wrote, a drain had claimed a row and put its SMTP transaction on
+    // the wire.
 
     func read<T: Sendable>(_ value: @Sendable (Database) throws -> T) async throws -> T {
         // READ-THROUGH staging merge: NSE staging is the delta of just-arrived mail.
