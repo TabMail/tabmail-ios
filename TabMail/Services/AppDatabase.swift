@@ -2198,8 +2198,20 @@ final class AppDatabase: Sendable {
         // so the range runs TWO whole-database gates — and `v82`'s own comment
         // says so outright ("this migration and `v71` are the two exceptions").
         // What is unique about THIS gate is its POSITION, not its existence.
-        // The same revision also attributed a sentence to `v82`'s comment that
-        // `v82` has never contained; do not reinstate that quotation.
+        // ⚠️ RETRACTION 2026-08-05 — the two lines that stood here were themselves
+        // wrong, and are removed rather than softened. They said the same revision
+        // "attributed a sentence to `v82`'s comment that `v82` has never contained"
+        // and instructed the reader not to reinstate that quotation. The quotation
+        // IS GENUINE: it lives in `v82`'s STEP-1 BODY comment, not in its header,
+        // hard-wrapped across two source lines — which is why a search for the
+        // unwrapped single-line form returned nothing, and that emptiness was read
+        // as proof of invention. A null grep is a claim about the QUERY first.
+        // The sentence was TRUE WHEN WRITTEN and was invalidated one commit later
+        // by `204590b34`; it is corrected in place at `v82` step 1, which is where
+        // its current wording lives — read it there rather than restating it here.
+        // Its content therefore no longer corroborates THIS gate, but that changes
+        // nothing above: `v71`'s justification rests on POSITION alone, which is
+        // exactly what the rest of this comment already says.
         //
         // WHY HERE and not at v68 or at the end. `v70` has just removed the
         // `messageBody → messageHeader` FK, whose check reads every page of a
@@ -2625,10 +2637,40 @@ final class AppDatabase: Sendable {
             //    carries, and the closing `foreign_key_check` would then fail the whole
             //    migration (a launch brick). It renders nothing to the user, and the
             //    server re-supplies the association on the next sync of that message.
-            //    Expected to match zero rows: `messageUserLabel.messageId` cascades from
-            //    `messageHeader`, and every migration on this line ends with a full
-            //    foreign-key check. Doing it explicitly makes step 5's totality a LOCAL
-            //    fact rather than an inherited cross-migration invariant.
+            //    Expected to match zero rows, for TWO independent reasons — name both,
+            //    because the first one alone is what an earlier revision of this comment
+            //    said and it is no longer true:
+            //      (a) `messageUserLabel.messageId` declares `onDelete: .cascade` from
+            //          `messageHeader`, so deleting a header takes its associations with
+            //          it. This is the real guarantee and it holds unconditionally.
+            //      (b) every PRIOR migration ends with a check that would have caught an
+            //          orphan — but the CHECK IS NOT THE SAME ONE EVERYWHERE.
+            //          ⚠️ CORRECTED 2026-08-05. This comment used to read "every migration
+            //          on this line ends with a full foreign-key check." That was TRUE
+            //          WHEN WRITTEN and was invalidated ONE COMMIT LATER by `204590b34`,
+            //          which converted 14 migrations to `foreignKeyChecks: .immediate`.
+            //          Census re-derived at HEAD: 83 registered migrations — 14 explicit
+            //          `.immediate`, 2 explicit `.deferred` (`v2`, `v82`), 67 taking
+            //          `registerTimedMigration`'s default, which IS `.deferred`. So
+            //          **69 of 83 end with a whole-database `PRAGMA foreign_key_check`
+            //          and 14 do not.** Confirmed against GRDB's own
+            //          `GRDB/Migration/Migration.swift`: `runWithDeferredForeignKeysChecks`
+            //          calls `db.checkForeignKeys()` before commit, while
+            //          `runWithImmediateForeignKeysChecks` calls NOTHING — it runs the body
+            //          with foreign keys left ON, i.e. per-statement enforcement.
+            //    ⚠️ NEGATIVE CASE — the correction changes nothing here, and saying why is
+            //    the point: an `.immediate` migration cannot create an orphan either, it
+            //    just proves it per statement instead of once at the end. So (b) is
+            //    weaker than it was but not absent, and (a) never depended on it. The
+            //    `DELETE` stays regardless, because doing it explicitly makes step 5's
+            //    totality a LOCAL fact rather than an inherited cross-migration invariant
+            //    — which is exactly the property that survived the invalidation.
+            //    📌 THE DURABLE LESSON, recorded here because this comment is the evidence:
+            //    a commit that changes a MODE, a DEFAULT, or a FLAG owes a grep for every
+            //    comment that asserted the old one. `204590b34` ("Run 14 of 16 range
+            //    migrations with immediate foreign-key checks") changed the mode and left
+            //    this sentence standing — and it was then cited as evidence, twice, before
+            //    anyone re-derived it.
             try db.execute(sql: """
                 DELETE FROM messageUserLabel
                 WHERE NOT EXISTS (
