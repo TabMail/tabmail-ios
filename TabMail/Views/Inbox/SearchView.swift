@@ -248,10 +248,12 @@ struct SearchView: View {
     /// view re-check the identity this view already proved, instead of trusting an
     /// address that had already been proved stale-able.
     ///
-    /// `provenRfc822MessageId` is nil for a REMOTE result: that branch resolves a
-    /// provider hit into a durable row and has no captured content witness to
-    /// carry, so it keeps today's behaviour (fail open — see
-    /// `ExpectedMessageIdentity`).
+    /// `provenRfc822MessageId` travels on BOTH branches. A local result captures it
+    /// from the row it rendered; a REMOTE result carries the provider's own
+    /// `MessageHeaderInfo.rfc822MessageId` for the record it rendered. It is nil
+    /// only when there is genuinely no witness to carry — a provider that supplied
+    /// no Message-ID, or `ScreenshotMode`'s seeded rows — and that population keeps
+    /// today's behaviour (fail open — see `ExpectedMessageIdentity`).
     struct OpenTarget: Hashable {
         let headerId: String
         let provenRfc822MessageId: String?
@@ -414,13 +416,42 @@ struct SearchView: View {
         guard let resolvedHeaderId else {
             return isRemote ? .explainRemoteResultNotOnThisDevice : .explainStaleLocalResult
         }
-        // A remote result carries NO content witness (there was no local row to
-        // capture one from) and its resolve validates nothing but the address, so
-        // it must hand `MessageDetailView` `nil` rather than an unproven value —
-        // a false proof is worse than none.
+        // 🚨 BOTH SOURCES CARRY THE WITNESS, AND THE CORRECTION OF RECORD FOR WHY
+        // THE REMOTE ONE USED TO BE DISCARDED. This previously read *"a remote
+        // result carries NO content witness (there was no local row to capture one
+        // from)"* and concluded, correctly from that premise, that "a false proof is
+        // worse than none". The premise was FALSE: the witness never needed a local
+        // row. `MessageHeaderInfo.rfc822MessageId` is the SERVER's Message-ID for
+        // the very record this row was rendered from, and
+        // `presentableRemoteResults` now carries it onto the `SearchResult` at zero
+        // extra I/O — the same field, from the same producer, that populates a local
+        // row's own column. Discarding it here was not caution; it threw away the
+        // only instrument that distinguishes the message the user was shown from
+        // whatever now occupies its address.
+        //
+        // IT IS SOUND EVEN THOUGH THE REMOTE RESOLVE DID NOT CHECK IT. The resolve
+        // (`resolveRemoteResultHeaderId`) still establishes EXISTENCE at an address
+        // and nothing more — unchanged. The witness's only consumer is
+        // `MessageDetailViewModel.markReadPermitted`, where it can REFUSE the
+        // durable mark-read and can never select, widen or nominate a target. That
+        // is the same direction as the local arm and the same reason neither is an
+        // ADR-IOS-068 / D4 violation.
+        //
+        // ⚑ WHAT THIS DOES NOT COVER, stated because the absolute above is
+        // otherwise unfalsifiable (MIS-019):
+        //  • A provider that supplies no Message-ID yields `nil` here,
+        //    `ExpectedMessageIdentity.init?` rejects it, and the open keeps today's
+        //    FAIL-OPEN mark-read exactly. No new branch exists for that population.
+        //  • The mirror-image population is NEW and fails CLOSED: a live local row
+        //    whose own `rfc822MessageId` is absent or differs while the server
+        //    reports one loses only its mark-read-on-open. The message still opens
+        //    and renders; it stays unread, which one ordinary gesture fixes.
+        //    Registered as `IOS-SEARCH-003`.
+        //  • Only the mark-read is gated. A re-seated address still OPENS — refusing
+        //    to render would be a regression with no C3 payoff, per `OpenTarget`.
         return .open(OpenTarget(
             headerId: resolvedHeaderId,
-            provenRfc822MessageId: isRemote ? nil : result.capturedRfc822MessageId))
+            provenRfc822MessageId: result.capturedRfc822MessageId))
     }
 
     private func openResult(_ result: SearchResult) {
@@ -674,10 +705,14 @@ struct SearchView: View {
                                 subject: result.subject, from: result.from,
                                 fromAddress: result.fromAddress, date: result.date, snippet: snippet,
                                 isRead: result.isRead, isFlagged: result.isFlagged, headerId: result.headerId,
-                                // Field-for-field rebuild: carry the content
-                                // witness too. Nil for every result reaching here
-                                // today (all remote), but a rebuild that silently
-                                // drops a field is how a guard loses its evidence.
+                                // Field-for-field rebuild: carry the content witness
+                                // too. Every result reaching here is remote, and
+                                // remote results NOW CARRY ONE (the provider's
+                                // `MessageHeaderInfo.rfc822MessageId`, populated in
+                                // `presentableRemoteResults`) — so this line is load
+                                // bearing rather than defensive, and the snippet
+                                // enrichment is the one place a rebuild could
+                                // silently strip the evidence back off again.
                                 capturedRfc822MessageId: result.capturedRfc822MessageId)
                         }
                         var merged = results
@@ -994,7 +1029,20 @@ struct SearchView: View {
                 snippet: EmailFilter.cleanSnippet(info.snippet),
                 isRead: info.isRead,
                 isFlagged: info.isFlagged,
-                headerId: nil
+                headerId: nil,
+                // 🚨 THE CONTENT WITNESS THE PROVIDER ALREADY HANDED US. The
+                // second field of `MessageHeaderInfo`, set by the same producer
+                // that populates a local row's `rfc822MessageId` column, for the
+                // very record this result renders. Costs zero extra I/O — it is
+                // already in the value being mapped. `SearchResult
+                // .capturedRfc822MessageId` is nil-DEFAULTED, so omitting it here
+                // was silent: nothing failed to compile and no test went red while
+                // every remote open travelled unwitnessed (a fail-DANGEROUS seam).
+                // `tapOutcome` carries it to `MessageDetailViewModel`, where it can
+                // only REFUSE that open's durable mark-read — see `tapOutcome` for
+                // why an unchecked-by-the-resolve witness is sound in that
+                // direction, and for the population this newly fails closed.
+                capturedRfc822MessageId: info.rfc822MessageId
             )
         }
     }
@@ -1086,9 +1134,14 @@ struct SearchResult: Identifiable {
     let isFlagged: Bool
     /// GRDB header ID (available for local results)
     let headerId: String?
-    /// 🚨 THE CONTENT WITNESS — the RFC 2822 Message-ID of the row this result was
-    /// RENDERED FROM, captured at search time. `nil` for remote results (there is
-    /// no local row to capture from) and for `ScreenshotMode`'s seeded rows.
+    /// 🚨 THE CONTENT WITNESS — the RFC 2822 Message-ID of the record this result
+    /// was RENDERED FROM, captured at search time. Local results take it from the
+    /// header row they read; REMOTE results take it from the provider's own
+    /// `MessageHeaderInfo.rfc822MessageId` (`presentableRemoteResults`), which needs
+    /// no local row and is set by the same producer as the local column.
+    ///
+    /// `nil` only where there is genuinely nothing to capture: a provider that
+    /// supplied no Message-ID, and `ScreenshotMode`'s seeded rows.
     ///
     /// `headerId` is an ADDRESS — `accountId:folderPath:messageId`, and on IMAP
     /// `messageId` IS the per-folder UID. An address can be RE-SEATED onto a

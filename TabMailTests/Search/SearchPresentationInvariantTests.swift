@@ -178,12 +178,13 @@ struct SearchDeletedResiduePresentationTests {
 @Suite("Search result taps always produce a visible outcome")
 struct SearchResultTapOutcomeTests {
 
-    private func remoteResult() -> SearchResult {
+    private func remoteResult(witness: String? = nil) -> SearchResult {
         SearchResult(
             source: .remote, accountId: "acc-a", accountEmail: "user@example.com",
             messageId: "77", folderPath: "INBOX", subject: "quarterly invoice",
             from: "Sender", fromAddress: "sender@example.com", date: Date(),
-            snippet: "", isRead: false, isFlagged: false, headerId: nil)
+            snippet: "", isRead: false, isFlagged: false, headerId: nil,
+            capturedRfc822MessageId: witness)
     }
 
     private func localResult(witness: String?) -> SearchResult {
@@ -213,13 +214,44 @@ struct SearchResultTapOutcomeTests {
     /// The negative case, stated because the absolute above is otherwise unfalsifiable:
     /// a REFUSAL is not the only outcome, so a fix that simply refused everything
     /// would satisfy the two cases above and fail these two.
-    @Test("A resolvable remote result opens — carrying no witness, because its resolve proved none")
-    func aResolvableRemoteResultOpensWithoutAnUnprovenWitness() {
+    /// 🚨 REWRITTEN, AND THE REASON IS THE WHOLE LESSON (2026-08-04). This case used
+    /// to be `aResolvableRemoteResultOpensWithoutAnUnprovenWitness`, asserting
+    /// `provenRfc822MessageId: nil` for a remote open with the rationale *"the remote
+    /// resolve validates an address only, so handing MessageDetailView a witness it
+    /// never checked would be a false proof."*
+    ///
+    /// **It blessed the defect, and — the dangerous part — it would have stayed
+    /// GREEN through the fix**, because its fixture hand-minted a `SearchResult` with
+    /// no witness at all, so `nil` in and `nil` out. A blessing test that cannot go
+    /// red is invisible to every gate; only reading it finds it. It is rewritten
+    /// rather than deleted because its subject — *a resolvable remote result opens* —
+    /// is a property that must hold; only its claim about the WITNESS was false
+    /// doctrine.
+    ///
+    /// Why the doctrine was false: a remote result's witness is
+    /// `MessageHeaderInfo.rfc822MessageId`, the SERVER's Message-ID for the record
+    /// the row rendered. It needs no local row, and it is not "unproven" in any
+    /// direction that matters — its only consumer can REFUSE a durable mark-read and
+    /// can never select or widen a target (ADR-IOS-068 / D4 permits exactly this
+    /// direction). The two cases below are the same tap with and without a witness
+    /// to carry, which is what makes each one falsifiable.
+    @Test("A resolvable remote result opens carrying the provider's Message-ID as its witness")
+    func aResolvableRemoteResultCarriesTheProviderWitness() {
+        let outcome = SearchView.tapOutcome(
+            for: remoteResult(witness: "<server-side@example.com>"),
+            resolvedHeaderId: "acc-a:INBOX:77")
+        #expect(outcome == .open(SearchView.OpenTarget(
+            headerId: "acc-a:INBOX:77", provenRfc822MessageId: "<server-side@example.com>")),
+                "the provider handed us the Message-ID of the record this row rendered; discarding it leaves the open's durable mark-read unwitnessed on a re-seatable address")
+    }
+
+    @Test("A resolvable remote result whose provider supplied no Message-ID opens carrying nil")
+    func aResolvableRemoteResultWithoutAWitnessOpensCarryingNil() {
         let outcome = SearchView.tapOutcome(
             for: remoteResult(), resolvedHeaderId: "acc-a:INBOX:77")
         #expect(outcome == .open(SearchView.OpenTarget(
             headerId: "acc-a:INBOX:77", provenRfc822MessageId: nil)),
-                "the remote resolve validates an address only, so handing MessageDetailView a witness it never checked would be a false proof")
+                "an absent witness must stay absent — inventing one is the false proof the original rationale correctly feared, and ExpectedMessageIdentity rejects it into today's fail-open behaviour")
     }
 
     @Test("A resolvable local result opens carrying the witness its resolve validated")
