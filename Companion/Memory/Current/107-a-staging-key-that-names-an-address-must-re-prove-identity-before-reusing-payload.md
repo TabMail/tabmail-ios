@@ -72,6 +72,44 @@ call site is downstream of the damage. The temporal hand-offs — *ages out*, *g
 *is reconciled later* — always require establishing the call site's POSITION by reading the statement
 order.)
 
+### The collision window is not push-to-push — it is bounded only by the next app launch
+
+Raised by the owner, 2026-08-04, and it is the fact that sets this defect's true exposure. The
+retraction above says the 60 s clock does not gate admission. The consequence goes further and is
+worth stating on its own, because "60 seconds" is the number a reader carries away and it implies a
+short-lived row:
+
+**Every `DELETE FROM nse_processed_message` that can remove a `populated = 1` row lives in
+`NSEDataBridge` — the MAIN APP** (`:592` folder purge, `:1148`, `:1410`, `:2392`, `:2423`, and the
+`:2496` orphan reap which only targets `populated = 0`). The single NSE-side delete is the identity
+clear this fix adds. Merging runs when the app runs. **So a staged row has no TTL: it lives until the
+user next launches TabMail.** A device that receives pushes for a week without the app being opened
+holds week-old rows at UID-keyed addresses.
+
+The trigger is therefore *staged-row lifetime ∩ UIDVALIDITY turnover*, not *inter-push interval ∩
+turnover*. A turnover rate of "once a year" does not make the collision once-a-year rare when one of
+the two intervals is unbounded. Do not describe this class of defect as rare without establishing
+BOTH intervals — `staleStagingWindowSeconds = 60` reads like the first one and is not.
+
+**What this does NOT change, and why the fix still holds across an unbounded window:** door (b) (epoch
+disagreement) is unavailable on nil-epoch folders, so it cannot be what carries a year-long window.
+Door (a) (RFC disagreement) can, and it is structurally reliable on IMAP for a reason independent of
+staging: `NotificationService.swift:513-514` resolves the push **by** Message-ID
+(`fetchIMAPMessage(accountId:rfc822MessageId: headId, …)` → `searchMessageId` → UID). The RFC id is
+the INPUT to the fetch, not a field parsed from its result, so it cannot be absent on that path. The
+residual unreachable-today hole is a stage carrying neither identity, which RETAINS by design (anchor
+test `unanswerableIdentityRetainsRatherThanClears`, because clearing on absence of evidence destroys a
+live `AIOwnershipLease` claim). It would become reachable only if an IMAP push were ever resolved by
+something other than Message-ID.
+
+**And the epoch half of the owner's question, answered from source:** the NSE already observes and
+persists its own epoch, with the same 0 → nil normalisation the main app uses —
+`NSEIMAPConnection.swift:110-114` (`observedUidValidity = value != 0 ? Int(value) : nil`, whose own
+comment cites `IMAPProvider.selectMailboxTracked` as the convention it is matching), stored in
+`nse_processed_message.observedUidValidity` via the `ALTER TABLE` at `NSEStagingDB.swift:83-85`. That
+was `IOS-NSE-001`. There is nothing further to persist NSE-side; the gap was never observation, it was
+that `stageHeader` did not CONSULT what had been observed.
+
 ## The fix, and why it is one line of policy rather than machinery
 
 `stageHeader` now reads the stored `(rfc822MessageId, observedUidValidity)` inside its existing write
