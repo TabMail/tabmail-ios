@@ -322,6 +322,10 @@ struct PendingSendServiceLifecycleTests {
             try Draft.fetchOne($0, key: replacement.id)
         }?.instanceEpoch == "E2")
         #expect(svc.current == nil)
+        // The OTHER side of `thrownAuthorityReadLeavesTheSendCancellable` below: a
+        // PROVEN mismatch still cancels, so refusing to cancel on an unknown cannot
+        // be satisfied by never cancelling at all.
+        #expect(svc.undoFailureMessage == nil)
     }
 
     @Test("Confirmed Undo retains and reopens only the exact Draft generation")
@@ -382,6 +386,62 @@ struct PendingSendServiceLifecycleTests {
             try Draft.fetchOne($0, key: retained.id)
         } != nil)
         #expect(svc.current?.id == pending.id)
+    }
+
+    /// THE INVARIANT: an Undo tap whose retained-authority read THREW must not
+    /// destroy the durable send. "We could not determine the answer" is never a
+    /// provider-authoritative verdict (never-drop clause 2), and here the cost of
+    /// getting it wrong is unrecoverable: cancelling deletes the `OutboxMessage`
+    /// *and* returns no reopen snapshot, so the user's authored text survives only
+    /// as a `Draft` row nothing can enumerate — `draft` is reachable BY KEY only,
+    /// and the send path mints no Drafts-folder header to supply one.
+    ///
+    /// Asserted AT THE STORE, as end state, not as a classifier's return value: the
+    /// `OutboxMessage` row is still there and the toast is still up, so Undo remains
+    /// available inside the hold window. Any reimplementation that keeps those two
+    /// facts passes; any that cancels on an unknown fails.
+    ///
+    /// TWO-SIDED, so this cannot pass by simply never cancelling: the proven-mismatch
+    /// direction is pinned by `generationMismatchStillCancels` above (row IS deleted,
+    /// toast IS cleared, and `undoFailureMessage` stays nil), on the same code path.
+    ///
+    /// The fault is real, not a seam: dropping `draft` makes the resolver's first
+    /// statement throw exactly as a suspended or otherwise unreadable database does
+    /// — the same mechanism `ReplyTargetThrownReadTests` uses. `outboxMessage` is
+    /// left intact precisely so its survival is the thing under test.
+    @Test("A thrown retained-authority read must not cancel the send or clear the toast")
+    func thrownAuthorityReadLeavesTheSendCancellable() throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let retained = draft(id: "draft-unknown", epoch: "E1")
+        let pending = outbox(draftId: retained.id, epoch: "E1")
+        try fixture.0.writeWithoutTransaction { db in
+            try retained.insert(db)
+            try pending.insert(db)
+        }
+        let svc = makeFreshService()
+        svc.present(
+            outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
+            toSummary: "To: to@example.com")
+
+        // NON-VACUITY: while the database is readable this exact pair resolves, so
+        // the refusal below is the failure firing and not an empty-fixture miss.
+        #expect(try fixture.0.read { try Draft.fetchOne($0, key: retained.id) } != nil)
+        #expect(try fixture.0.read { try OutboxMessage.fetchOne($0, key: pending.id) } != nil)
+
+        try fixture.0.writeWithoutTransaction { db in
+            try db.execute(sql: "DROP TABLE draft")
+        }
+
+        #expect(svc.undo() == nil)
+        // (a) the durable send survives — it is still queued and still cancellable.
+        #expect(try fixture.0.read {
+            try OutboxMessage.fetchOne($0, key: pending.id)
+        } != nil)
+        // (b) the toast survives, so the user can tap Undo again in the hold window.
+        #expect(svc.current?.id == pending.id)
+        // (c) and the tap is not a dead one: the user is told it did not take.
+        #expect(svc.undoFailureMessage != nil)
     }
 }
 

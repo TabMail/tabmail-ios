@@ -51,6 +51,13 @@ final class PendingSendService {
     }
 
     private(set) var current: Pending?
+
+    /// Non-nil ⇒ the last Undo tap could not be decided, so nothing was cancelled
+    /// and the toast was deliberately left up. The view renders this and clears it.
+    /// It states only the observed fact and never claims anything about what
+    /// happened to the message — at this point we genuinely do not know.
+    private(set) var undoFailureMessage: String?
+
     private var dismissTask: Task<Void, Never>?
 
     private init() {}
@@ -60,6 +67,7 @@ final class PendingSendService {
     /// its own schedule).
     func present(outboxId: String, draftId: String, instanceEpoch: String, toSummary: String) {
         dismissTask?.cancel()
+        undoFailureMessage = nil
         current = Pending(
             id: outboxId,
             draftId: draftId,
@@ -88,23 +96,77 @@ final class PendingSendService {
     /// User tapped Undo. Only reachable while the toast is in phase 1
     /// (the Undo button is rendered only while `elapsed < outboxUndoHoldSeconds`).
     ///
-    /// Read exact retained authority first, then always attempt confirmed
-    /// cancellation. A refused cancellation leaves the toast in place. Reopen
-    /// requires both the confirmed cancellation and exact retained authority.
+    /// Read exact retained authority first, then attempt confirmed cancellation.
+    /// A refused cancellation leaves the toast in place. Reopen requires both the
+    /// confirmed cancellation and exact retained authority.
+    ///
+    /// The read's THREE answers are routed separately — see
+    /// `RetainedAuthorityOutcome` for why collapsing them was the defect.
     func undo() -> ReopenSnapshot? {
         guard let p = current else { return nil }
-        let authority = retainedAuthority(for: p)
-        guard AccountManager.shared.discardOutboxMessageConfirmed(p.id) else {
+        switch retainedAuthorityOutcome(for: p) {
+        case .readFailed:
+            // We could not determine anything, so we decide nothing: the Outbox row
+            // and the toast are left exactly as they were, and the user is told.
+            // Do NOT reach for `discardOutboxMessageConfirmed` here — cancelling on
+            // an unknown is the direction that loses the content (see the enum).
+            undoFailureMessage = "Try again."
             return nil
+        case .mismatchOrAbsent:
+            // PROVEN not to be the generation this toast is holding. Cancel the send
+            // — the user asked for that and we know it is safe — but reopen nothing.
+            guard AccountManager.shared.discardOutboxMessageConfirmed(p.id) else {
+                return nil
+            }
+            dismissTask?.cancel()
+            current = nil
+            return nil
+        case .verified(let authority):
+            guard AccountManager.shared.discardOutboxMessageConfirmed(p.id) else {
+                return nil
+            }
+            dismissTask?.cancel()
+            current = nil
+            return ReopenSnapshot(id: p.id, authority: authority)
         }
-        dismissTask?.cancel()
-        current = nil
-        return authority.map { ReopenSnapshot(id: p.id, authority: $0) }
+    }
+
+    /// The three answers a retained-authority read can give, kept apart because two
+    /// of them used to arrive as the same `nil`.
+    ///
+    /// 🚨 `.readFailed` MUST NOT CANCEL, and the reason is the DIRECTION it is
+    /// chosen for, not a property of this code. Cancelling on an unknown destroys
+    /// the durable send *and* fails the reopen it promised, and the retained `Draft`
+    /// row is not recovery: nothing enumerates `draft` (rows are reachable BY KEY
+    /// only), and `send()` mints no Drafts-folder header to supply a key, so a
+    /// manually-composed message's authored text is stranded and eventually evicted.
+    /// No sync repairs local-only authored content, and retyping is not recovery.
+    /// Declining leaves the send pending and still cancellable — the user can tap
+    /// Undo again inside the hold window, and in the worst case the message is
+    /// *sent*, which puts the content in Sent where they can reach it. One direction
+    /// loses the content; the other keeps it.
+    ///
+    /// ⚠ THE MIRROR IMAGE, stated because the symmetrical fix would be worse than
+    /// the bug: `.mismatchOrAbsent` must STILL cancel. Refusing to cancel on every
+    /// `nil` would let a generation the user successfully undid go out.
+    ///
+    /// Shape follows `SearchView.ResultTapOutcome` (`afa7889ee`, `IOS-IMAP-001`) —
+    /// and its correction: an enum with no silent case does not by itself prevent a
+    /// silent path, so what actually holds the invariant here is that every arm of
+    /// `undo()` leaves an observable end state (a snapshot, a cleared toast, or
+    /// `undoFailureMessage`), which is what the tests assert.
+    private enum RetainedAuthorityOutcome {
+        /// Both rows read, and this toast's generation matches them exactly.
+        case verified(RetainedDraftAuthority)
+        /// The rows read, and the identity PROVABLY differs — or the row is absent.
+        case mismatchOrAbsent
+        /// The read threw. We could not determine the answer.
+        case readFailed
     }
 
     /// Exact owner/generation authority. No legacy generation, content, or
     /// absent-row fallback is accepted.
-    private func retainedAuthority(for p: Pending) -> RetainedDraftAuthority? {
+    private func retainedAuthorityOutcome(for p: Pending) -> RetainedAuthorityOutcome {
         do {
             return try AppDatabase.dbPool.read { db in
                 guard let draft = try Draft.fetchOne(db, key: p.draftId),
@@ -113,22 +175,28 @@ final class PendingSendService {
                       draft.instanceEpoch == p.instanceEpoch,
                       outbox.draftId == p.draftId,
                       outbox.instanceEpoch == p.instanceEpoch else {
-                    return nil
+                    return .mismatchOrAbsent
                 }
-                return RetainedDraftAuthority(
+                return .verified(RetainedDraftAuthority(
                     draftId: draft.id,
                     accountId: draft.accountId,
-                    instanceEpoch: p.instanceEpoch)
+                    instanceEpoch: p.instanceEpoch))
             }
         } catch {
-            return nil
+            return .readFailed
         }
+    }
+
+    /// The user acknowledged the "couldn't undo" alert.
+    func dismissUndoFailure() {
+        undoFailureMessage = nil
     }
 
     /// User tapped the × on the toast. Hides the toast but doesn't cancel the
     /// send — the message continues through its normal drain flow.
     func dismiss() {
         dismissTask?.cancel()
+        undoFailureMessage = nil
         current = nil
     }
 }

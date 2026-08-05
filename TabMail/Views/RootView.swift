@@ -281,6 +281,18 @@ struct RootView: View {
         } message: {
             Text(demoStartError ?? "")
         }
+        // Undo-send could not be decided. `PendingSendService.undo()` left both the
+        // Outbox row and the toast in place (a thrown read is not a verdict), so the
+        // send is still pending and still cancellable — this says only that, and
+        // claims nothing about what happened to the message.
+        .alert("Couldn't undo", isPresented: Binding(
+            get: { pendingSendService.undoFailureMessage != nil },
+            set: { if !$0 { pendingSendService.dismissUndoFailure() } }
+        )) {
+            Button("OK", role: .cancel) { pendingSendService.dismissUndoFailure() }
+        } message: {
+            Text(pendingSendService.undoFailureMessage ?? "")
+        }
         .onReceive(NotificationCenter.default.publisher(for: .demoModeDidExit)) { _ in
             demoSeedingComplete = false
         }
