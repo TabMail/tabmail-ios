@@ -1063,10 +1063,21 @@ struct SearchView: View {
         do {
             infos = try await fetch()
         } catch is CancellationError {
-            print("[Search] Cancelled/timed out searching \(accountEmail) — treating as empty")
+            // Gate the DIAGNOSTIC, never the control flow: `return []` stays
+            // outside, so a debug unlock cannot change what this function does.
+            // Ordinary transient-failure traces, NOT a C3 refusal — a refusal
+            // leaving no production trace would be an observability gap and would
+            // belong on an ungated durable channel instead (`af98d92c7`).
+            // Sharper reason to gate these two: they interpolate `accountEmail`,
+            // putting the user's own address into a production device log.
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Search] Cancelled/timed out searching \(accountEmail) — treating as empty")
+            }
             return []
         } catch {
-            print("[Search] Error searching \(accountEmail): \(error)")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Search] Error searching \(accountEmail): \(error)")
+            }
             return []
         }
 
