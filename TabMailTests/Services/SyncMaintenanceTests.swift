@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 // MARK: - Prune Algorithm Tests
@@ -1374,7 +1375,13 @@ struct SyncMaintenanceEdgeCaseTests {
 /// there, so "did this pass do the work?" is answered by whether that recorded count
 /// moved. A different latch (a table, `PRAGMA user_version`, a generation counter)
 /// would have to satisfy exactly these assertions.
-@Suite("Query-planner statistics refresh — ADR-IOS-029 deferred timing", .serialized)
+/// `.processGlobalState` (added 2026-08-05 with the priority-queue fix): the tier
+/// and single-flight cases install `DatabaseWriteQueue.shared`'s DEBUG test
+/// observer, which is a process-wide singleton — `.serialized` alone only orders
+/// this suite's own cases and would let a peer suite that also installs it (e.g.
+/// `WriteTierRoutingTests`) clear the observer mid-case.
+@Suite("Query-planner statistics refresh — ADR-IOS-029 deferred timing",
+       .serialized, .processGlobalState)
 struct PlannerStatisticsRefreshTests {
 
     private struct Fixture {
@@ -1434,7 +1441,7 @@ struct PlannerStatisticsRefreshTests {
     /// halves are asserted, because a latch that fires on row traffic would be a far
     /// more expensive defect than the one the amendment removed.
     @Test("A schema change re-arms the refresh; ordinary row traffic does not")
-    func schemaChangeRearmsButRowTrafficDoesNot() throws {
+    func schemaChangeRearmsButRowTrafficDoesNot() async throws {
         let fixture = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let defaults = UserDefaults.standard
@@ -1442,13 +1449,7 @@ struct PlannerStatisticsRefreshTests {
         defer { defaults.removeObject(forKey: key) }
         let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
 
-        try fixture.pool.write { db in
-            var account = Account(emailAddress: "a@example.com", displayName: "T", provider: .gmail)
-            account.id = "acc1"
-            try account.insert(db)
-            let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-            try folder.insert(db)
-        }
+        try seedAccountAndFolder(fixture.pool)
         try insertHeaders(fixture.pool, accountId: "acc1", count: 5, from: 0)
 
         // ⚠️ THE PRE-STATE IS NOT "no statistics" — it is WRONG statistics, and that
@@ -1461,26 +1462,26 @@ struct PlannerStatisticsRefreshTests {
         #expect(
             beforeFirstPass == 0,
             "a fresh install's migration-time ANALYZE should have recorded an EMPTY messageHeader; got \(String(describing: beforeFirstPass))")
-        #expect(SyncEngine.runRefreshPlannerStatisticsIfStale(
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
             dbPool: dbPool, defaults: defaults, markerKey: key) == .refreshed)
         #expect(try recordedRowCount(fixture.pool, table: "messageHeader") == 5)
 
         // Row traffic only — the planner's recorded count MUST stay stale, and the
         // pass MUST do nothing. This is the expensive mirror image of the fix.
         try insertHeaders(fixture.pool, accountId: "acc1", count: 40, from: 5)
-        #expect(SyncEngine.runRefreshPlannerStatisticsIfStale(
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
             dbPool: dbPool, defaults: defaults, markerKey: key) == .alreadyFresh)
         #expect(try recordedRowCount(fixture.pool, table: "messageHeader") == 5)
 
         // A schema change — exactly what an index-changing migration does — re-arms
         // it, and one pass brings the planner's input back in line with reality.
-        try fixture.pool.write { db in
+        try await fixture.pool.write { db in
             try db.execute(sql: "CREATE INDEX planner_stats_probe ON messageHeader(snippet)")
         }
-        #expect(SyncEngine.runRefreshPlannerStatisticsIfStale(
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
             dbPool: dbPool, defaults: defaults, markerKey: key) == .refreshed)
         #expect(try recordedRowCount(fixture.pool, table: "messageHeader") == 45)
-        let coversNewIndex = try fixture.pool.read { db in
+        let coversNewIndex = try await fixture.pool.read { db in
             try Int.fetchOne(
                 db, sql: "SELECT COUNT(*) FROM sqlite_stat1 WHERE idx = 'planner_stats_probe'") ?? 0
         }
@@ -1491,7 +1492,7 @@ struct PlannerStatisticsRefreshTests {
     /// over the same suite reads the same persisted store — the closest in-process
     /// analogue of a relaunch — and must see the work as already done.
     @Test("The completed refresh is durable beyond the object that recorded it")
-    func markerIsDurableAcrossObjectLifetime() throws {
+    func markerIsDurableAcrossObjectLifetime() async throws {
         let fixture = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let suiteName = "PlannerStatsSuite-\(UUID().uuidString)"
@@ -1503,16 +1504,10 @@ struct PlannerStatisticsRefreshTests {
         }
         let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
 
-        try fixture.pool.write { db in
-            var account = Account(emailAddress: "a@example.com", displayName: "T", provider: .gmail)
-            account.id = "acc1"
-            try account.insert(db)
-            let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-            try folder.insert(db)
-        }
+        try seedAccountAndFolder(fixture.pool)
         try insertHeaders(fixture.pool, accountId: "acc1", count: 3, from: 0)
 
-        #expect(SyncEngine.runRefreshPlannerStatisticsIfStale(
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
             dbPool: dbPool, defaults: first, markerKey: key) == .refreshed)
         #expect(try recordedRowCount(fixture.pool, table: "messageHeader") == 3)
 
@@ -1521,7 +1516,7 @@ struct PlannerStatisticsRefreshTests {
         // process (or one keyed on row counts) would redo the work here.
         try insertHeaders(fixture.pool, accountId: "acc1", count: 20, from: 3)
         let afterRelaunch = try #require(UserDefaults(suiteName: suiteName))
-        #expect(SyncEngine.runRefreshPlannerStatisticsIfStale(
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
             dbPool: dbPool, defaults: afterRelaunch, markerKey: key) == .alreadyFresh)
         #expect(try recordedRowCount(fixture.pool, table: "messageHeader") == 3)
     }
@@ -1530,20 +1525,14 @@ struct PlannerStatisticsRefreshTests {
     /// REAL failure — a read-only connection, so `ANALYZE` genuinely cannot write —
     /// rather than by an injected seam.
     @Test("A pass that cannot complete leaves the obligation outstanding")
-    func abandonedPassDoesNotConsumeTheObligation() throws {
+    func abandonedPassDoesNotConsumeTheObligation() async throws {
         let fixture = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let defaults = UserDefaults.standard
         let key = "analyzeMarker-\(UUID().uuidString)"
         defer { defaults.removeObject(forKey: key) }
 
-        try fixture.pool.write { db in
-            var account = Account(emailAddress: "a@example.com", displayName: "T", provider: .gmail)
-            account.id = "acc1"
-            try account.insert(db)
-            let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-            try folder.insert(db)
-        }
+        try seedAccountAndFolder(fixture.pool)
         try insertHeaders(fixture.pool, accountId: "acc1", count: 4, from: 0)
         // Checkpoint so the read-only connection below sees the committed rows
         // without needing to write the WAL.
@@ -1554,7 +1543,7 @@ struct PlannerStatisticsRefreshTests {
         var readOnlyConfiguration = Configuration()
         readOnlyConfiguration.readonly = true
         let readOnly = try DatabasePool(path: fixture.path, configuration: readOnlyConfiguration)
-        #expect(SyncEngine.runRefreshPlannerStatisticsIfStale(
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
             dbPool: PrioritizedDatabase(pool: readOnly, priority: .background),
             defaults: defaults, markerKey: key) == .abandoned)
         #expect(defaults.object(forKey: key) == nil)
@@ -1567,9 +1556,194 @@ struct PlannerStatisticsRefreshTests {
             "an abandoned pass must leave statistics exactly as it found them; got \(String(describing: afterAbandoned))")
 
         // The obligation survived: a later, writable pass still does the work.
-        #expect(SyncEngine.runRefreshPlannerStatisticsIfStale(
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
             dbPool: PrioritizedDatabase(pool: fixture.pool, priority: .background),
             defaults: defaults, markerKey: key) == .refreshed)
         #expect(try recordedRowCount(fixture.pool, table: "messageHeader") == 4)
+    }
+
+    // MARK: - The write-queue contract (2026-08-05 priority-queue fix)
+
+    /// `UserDefaults` is not `Sendable`, and the cancellation and overlap cases have
+    /// to hand one to a CHILD task — keeping the pass on the test's own task would
+    /// defeat the point of both. `UserDefaults` is documented thread-safe, so this is
+    /// the "type wrapping an inherently thread-safe API" carve-out in the Resilience
+    /// rule, stated explicitly rather than smuggled in as `nonisolated(unsafe)`.
+    private struct DefaultsBox: @unchecked Sendable {
+        let defaults: UserDefaults
+    }
+
+    private func seedAccountAndFolder(_ pool: DatabasePool) throws {
+        try pool.write { db in
+            var account = Account(emailAddress: "a@example.com", displayName: "T", provider: .gmail)
+            account.id = "acc1"
+            try account.insert(db)
+            let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+            try folder.insert(db)
+        }
+    }
+
+    /// Polls `condition` until it holds or `seconds` elapse, and RETURNS whether it
+    /// held so the caller asserts on it. Deliberately async-sleeping rather than
+    /// blocking: a `DispatchSemaphore.wait` here would occupy a cooperative thread —
+    /// possibly the one running the pass we are waiting for. A mistake fails the
+    /// test at the deadline instead of wedging the suite.
+    private func waitUntil(_ seconds: Double, _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return condition()
+    }
+
+    /// ⚑ THIS IS WHY THE FUNCTION IS `async`. Before the 2026-08-05 fix it was not,
+    /// so `dbPool.write { }` bound `PrioritizedDatabase`'s SYNCHRONOUS overload —
+    /// documented as *"Sync write — can't `await`, so it can't enter the queue;
+    /// passes through."* A pass-through write has no tier at all: the whole-database
+    /// `ANALYZE` (~8.5 s at 500k headers) went straight to GRDB's single writer,
+    /// ahead of every `.priority` user-action write already queued in
+    /// `DatabaseWriteQueue`. The oracle is the queue's own execution observer, so
+    /// this asserts what the SCHEDULER saw, not what the function returned: on the
+    /// pre-fix code it records nothing for this label.
+    @Test("The deferred ANALYZE executes through the write queue, at the caller's tier")
+    func analyzeExecutesThroughTheWriteQueueAtTheCallersTier() async throws {
+        let fixture = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let defaults = UserDefaults.standard
+        let key = "analyzeMarker-\(UUID().uuidString)"
+        defer { defaults.removeObject(forKey: key) }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        try seedAccountAndFolder(fixture.pool)
+        try insertHeaders(fixture.pool, accountId: "acc1", count: 3, from: 0)
+
+        let recorded = Mutex<[(WritePriority, String?)]>([])
+        await DatabaseWriteQueue.shared.setTestObserverForTesting { priority, label in
+            recorded.withLock { $0.append((priority, label)) }
+        }
+        let result = await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: defaults, markerKey: key)
+        await DatabaseWriteQueue.shared.setTestObserverForTesting(nil)
+
+        #expect(result == .refreshed)
+        let analyzeWrites = recorded.withLock { $0.filter { $0.1 == "AnalyzePlannerStatistics" } }
+        #expect(
+            analyzeWrites.count == 1,
+            "the ANALYZE must enter DatabaseWriteQueue exactly once; the queue saw \(analyzeWrites.count)")
+        #expect(
+            analyzeWrites.first?.0 == .background,
+            "it must execute at the maintenance caller's tier so a .priority write can jump it; got \(String(describing: analyzeWrites.first?.0))")
+        #expect(try recordedRowCount(fixture.pool, table: "messageHeader") == 3)
+    }
+
+    /// The pass waits twice for things it does not control — the priority queue's
+    /// slot, then SQLite's single writer — and `runWALMaintenance`'s `shouldRun()`
+    /// gate was evaluated before all of that. So cancellation is re-checked AFTER
+    /// the writer is acquired. Two halves are asserted, and the second matters more:
+    /// the cancelled pass must not consume the obligation, and must not leave the
+    /// single-flight latch held — a leaked latch would disable the refresh for the
+    /// rest of the process. The task spins until it OBSERVES its own cancellation
+    /// before calling, so this is deterministic rather than a race with the analysis.
+    @Test("A cancelled pass analyzes nothing, keeps the obligation, and releases the latch")
+    func cancelledPassAnalyzesNothingAndReleasesTheLatch() async throws {
+        let fixture = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let defaults = UserDefaults.standard
+        let key = "analyzeMarker-\(UUID().uuidString)"
+        defer { defaults.removeObject(forKey: key) }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        try seedAccountAndFolder(fixture.pool)
+        try insertHeaders(fixture.pool, accountId: "acc1", count: 6, from: 0)
+
+        let box = DefaultsBox(defaults: defaults)
+        let cancelledPass = Task {
+            while !Task.isCancelled { await Task.yield() }
+            return await SyncEngine.runRefreshPlannerStatisticsIfStale(
+                dbPool: dbPool, defaults: box.defaults, markerKey: key)
+        }
+        cancelledPass.cancel()
+        #expect(await cancelledPass.value == .abandoned)
+        #expect(defaults.object(forKey: key) == nil)
+        // Statistics untouched: still the empty-table numbers a migration-time
+        // `ANALYZE` recorded on this fresh fixture.
+        let afterCancelled = try recordedRowCount(fixture.pool, table: "messageHeader")
+        #expect(
+            afterCancelled == 0,
+            "a cancelled pass must not analyze; got \(String(describing: afterCancelled))")
+
+        // The latch did not leak with the cancellation: the next pass still runs.
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: defaults, markerKey: key) == .refreshed)
+        #expect(try recordedRowCount(fixture.pool, table: "messageHeader") == 6)
+    }
+
+    /// 🚨 THE MARKER IS NOT A LATCH — it is read, and written only after `ANALYZE`
+    /// returns, so two maintenance callers (`scheduleMaintenanceInBackground`'s
+    /// foreground poll and `SyncScheduler`'s BGProcessing drain, both detached) can
+    /// read it stale and both run a whole-database analysis, the second paying the
+    /// full cost for nothing behind SQLite's single writer.
+    ///
+    /// The overlap is forced deterministically rather than raced: a dedicated
+    /// (non-cooperative) queue holds the pool's writer, so the first pass parks
+    /// INSIDE its write while holding the latch, and the second pass is issued only
+    /// after the write queue has confirmed the first one started executing.
+    @Test("An overlapping second pass sees the single-flight latch and analyzes nothing")
+    func overlappingPassIsSingleFlighted() async throws {
+        let fixture = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let defaults = UserDefaults.standard
+        let key = "analyzeMarker-\(UUID().uuidString)"
+        defer { defaults.removeObject(forKey: key) }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        try seedAccountAndFolder(fixture.pool)
+        try insertHeaders(fixture.pool, accountId: "acc1", count: 4, from: 0)
+
+        // Hold the pool's single writer from a dedicated queue — never a cooperative
+        // thread, which blocking here could starve. Bounded on both sides so a
+        // mistake fails the test rather than hanging it.
+        let writerHeld = Mutex<Bool>(false)
+        let holderFinished = Mutex<Bool>(false)
+        let releaseWriter = DispatchSemaphore(value: 0)
+        let holderQueue = DispatchQueue(label: "planner-stats-writer-holder")
+        holderQueue.async {
+            fixture.pool.writeWithoutTransaction { _ in
+                writerHeld.withLock { $0 = true }
+                _ = releaseWriter.wait(timeout: .now() + 15)
+            }
+            holderFinished.withLock { $0 = true }
+        }
+        defer { releaseWriter.signal() }
+        #expect(await waitUntil(5) { writerHeld.withLock { $0 } })
+
+        let analyzeStarted = Mutex<Bool>(false)
+        await DatabaseWriteQueue.shared.setTestObserverForTesting { _, label in
+            if label == "AnalyzePlannerStatistics" { analyzeStarted.withLock { $0 = true } }
+        }
+        let box = DefaultsBox(defaults: defaults)
+        let firstPass = Task {
+            await SyncEngine.runRefreshPlannerStatisticsIfStale(
+                dbPool: dbPool, defaults: box.defaults, markerKey: key)
+        }
+        #expect(await waitUntil(5) { analyzeStarted.withLock { $0 } })
+
+        // The first pass is now parked inside its write, holding the latch.
+        let second = await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: defaults, markerKey: key)
+        #expect(second == .alreadyRunning)
+        // Statistics still untouched — the second pass did no work of its own.
+        let duringOverlap = try recordedRowCount(fixture.pool, table: "messageHeader")
+        #expect(
+            duringOverlap == 0,
+            "the second pass must analyze nothing; got \(String(describing: duringOverlap))")
+
+        releaseWriter.signal()
+        let firstResult = await firstPass.value
+        await DatabaseWriteQueue.shared.setTestObserverForTesting(nil)
+        #expect(firstResult == .refreshed)
+        #expect(try recordedRowCount(fixture.pool, table: "messageHeader") == 4)
+        // The obligation the second pass declined is now satisfied by the first.
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: defaults, markerKey: key) == .alreadyFresh)
+        #expect(await waitUntil(5) { holderFinished.withLock { $0 } })
     }
 }

@@ -170,7 +170,7 @@ actor SyncEngine {
             let undoProtectedBodyIds = await MainActor.run {
                 Set(UndoService.shared.undoStack.flatMap { $0.messages.map(\.id) })
             }
-            SyncEngine.runWALMaintenance(
+            await SyncEngine.runWALMaintenance(
                 dbPool: pool, includePrune: includePrune,
                 undoProtectedBodyIds: undoProtectedBodyIds
             )
@@ -197,11 +197,17 @@ actor SyncEngine {
     /// reliable, BGProcessing is opportunistic (iOS does not guarantee it runs), and we
     /// want maintenance to happen whenever EITHER fires. Abandons on suspend at each
     /// step (ADR-IOS-046).
+    ///
+    /// `async` ONLY because its last step is: the deferred `ANALYZE` has to reach
+    /// the priority write queue, and a non-async caller binds `PriorityGate`'s
+    /// pass-through synchronous `write` overload instead. Every other step here is
+    /// unchanged and still synchronous. Both callers already run inside detached
+    /// tasks, so this adds no new concurrency.
     nonisolated static func runWALMaintenance(
         dbPool: PrioritizedDatabase,
         includePrune: Bool,
         undoProtectedBodyIds: Set<String>
-    ) {
+    ) async {
         func shouldRun() -> Bool { !Task.isCancelled && !DatabaseSuspension.isSuspended }
         let t0 = CFAbsoluteTimeGetCurrent()
         if includePrune && shouldRun() {
@@ -227,7 +233,7 @@ actor SyncEngine {
         // WAL write (see `runRefreshPlannerStatisticsIfStale`, and ADR-IOS-046 for why
         // the `runBodyAssetMaintenance` side would be a `0xdead10cc` bug).
         if shouldRun() {
-            runRefreshPlannerStatisticsIfStale(dbPool: dbPool)
+            await runRefreshPlannerStatisticsIfStale(dbPool: dbPool)
         }
         let t5 = CFAbsoluteTimeGetCurrent()
         if includePrune {

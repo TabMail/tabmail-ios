@@ -461,7 +461,7 @@ final class SyncScheduler {
             if !Task.isCancelled {
                 let undoIds = Set(UndoService.shared.undoStack.flatMap { $0.messages.map(\.id) })
                 await Task.detached(priority: .utility) {
-                    SyncEngine.runWALMaintenance(
+                    await SyncEngine.runWALMaintenance(
                         dbPool: AppDatabase.dbPool, includePrune: true,
                         undoProtectedBodyIds: undoIds
                     )

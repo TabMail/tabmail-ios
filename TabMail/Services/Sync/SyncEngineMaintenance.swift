@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 
 extension SyncEngine {
 
@@ -560,6 +561,41 @@ extension SyncEngine {
         /// The pass could not read the schema version, or `ANALYZE` failed / was
         /// aborted. The marker is UNCHANGED, so the next pass retries.
         case abandoned
+        /// Another caller already holds the single-flight latch. This pass did
+        /// nothing and consumed no obligation — the in-flight one will advance the
+        /// marker, or leave it for the next pass. Distinct from `.alreadyFresh`
+        /// (which is a statement about the SCHEMA) and from `.abandoned` (which is
+        /// a statement about a FAILURE), so a test can tell the three apart.
+        case alreadyRunning
+    }
+
+    /// Single-flight latch for the whole-database `ANALYZE`.
+    ///
+    /// 🚨 THE MARKER IS NOT A LATCH. It is read, and then written only after
+    /// `ANALYZE` returns, so two callers can both read it stale and both run a
+    /// whole-database analysis — the second one paying the full cost for nothing,
+    /// serialized behind the first on SQLite's single writer. The two callers are
+    /// real and can overlap: `SyncEngine.scheduleMaintenanceInBackground` (the
+    /// foreground poll) and `SyncScheduler`'s BGProcessing drain both call
+    /// `runWALMaintenance`, from independent detached tasks.
+    ///
+    /// `Mutex` (SE-0433) per the Resilience rule — not `NSLock`, not
+    /// `nonisolated(unsafe)`.
+    private static let plannerStatisticsRefreshInFlight = Mutex<Bool>(false)
+
+    /// The SQLite `schema_version` right now, or `nil` if it could not be read.
+    ///
+    /// ⚠️ NOT `async`, AND THAT IS THE WHOLE POINT OF THIS FUNCTION EXISTING. Swift
+    /// binds the ASYNC overload of an overloaded call from an async context, and
+    /// `PrioritizedDatabase.read`'s awaited overload is explicitly NOT a passthrough:
+    /// it runs the NSE read-through staging merge — durable header/body writes and an
+    /// FTS flush, measured at 7.6 s on a cold-I/O boot — BEFORE it reads. Dragging
+    /// that into a `PRAGMA` probe that exists to decide whether to do maintenance
+    /// would be a new cost, not a fix. Keeping the probe in a non-async function is
+    /// the only way to bind the synchronous passthrough overload, so inlining this
+    /// back into the (async) caller silently reintroduces the merge.
+    private static func plannerStatisticsSchemaVersion(_ dbPool: PrioritizedDatabase) -> Int? {
+        try? dbPool.read { db in try Int.fetchOne(db, sql: "PRAGMA schema_version") ?? 0 }
     }
 
     /// `UserDefaults` key holding the SQLite `schema_version` in force when the last
@@ -605,18 +641,45 @@ extension SyncEngine {
     /// between an upgrade launch and the first maintenance pass is no worse than
     /// every shipped release, and strictly better once the pass runs.
     ///
-    /// COST WHILE IT RUNS: one write transaction, up to ~8.5 s at 500k headers, on
-    /// the caller's pool tier (`.background` from the foreground poll). It runs once
-    /// per schema change, never on the launch path, and never on a `.priority` write.
+    /// COST WHILE IT RUNS: one write transaction, up to ~8.5 s at 500k headers.
+    ///
+    /// ⚠️ THIS FUNCTION IS `async` FOR ONE REASON, AND THE PREVIOUS VERSION OF THIS
+    /// PARAGRAPH WAS WRONG. It used to claim the cost lands *"on the caller's pool
+    /// tier (`.background` from the foreground poll) … never on a `.priority`
+    /// write"*. It did not, and could not: the function was NOT async, so
+    /// `dbPool.write { }` bound `PrioritizedDatabase`'s SYNCHRONOUS overload, whose
+    /// own doc says *"Sync write — can't `await`, so it can't enter the queue;
+    /// passes through."* **A pass-through write has no tier at all.** It went
+    /// straight to GRDB's writer, holding SQLite's single writer for the whole
+    /// analysis, ahead of every `.priority` write already queued behind
+    /// `DatabaseWriteQueue` — the exact contention the tiering exists to prevent.
+    /// Being `async` is what makes the sentence true: the awaited overload enters
+    /// `DatabaseWriteQueue` at the caller's tier (`.background` from both
+    /// maintenance callers), so a user action's `.priority` write jumps ahead of
+    /// this instead of waiting behind it.
+    ///
+    /// The schema-version READ stays synchronous deliberately — see
+    /// `plannerStatisticsSchemaVersion`, which exists only to keep that binding.
+    ///
+    /// It runs at most once per schema change and never on the launch path.
     @discardableResult
     nonisolated static func runRefreshPlannerStatisticsIfStale(
         dbPool: PrioritizedDatabase,
         defaults: UserDefaults = .standard,
         markerKey: String = plannerStatisticsSchemaVersionKey
-    ) -> PlannerStatisticsRefresh {
-        guard let currentVersion = try? dbPool.read({ db in
-            try Int.fetchOne(db, sql: "PRAGMA schema_version") ?? 0
-        }) else {
+    ) async -> PlannerStatisticsRefresh {
+        // SINGLE-FLIGHT. Taken BEFORE the marker read, because the race is two
+        // callers both reading the marker stale — taking it after the read would
+        // leave exactly that window open.
+        let acquired = plannerStatisticsRefreshInFlight.withLock { inFlight -> Bool in
+            if inFlight { return false }
+            inFlight = true
+            return true
+        }
+        guard acquired else { return .alreadyRunning }
+        defer { plannerStatisticsRefreshInFlight.withLock { $0 = false } }
+
+        guard let currentVersion = plannerStatisticsSchemaVersion(dbPool) else {
             // Could not read the schema version ⇒ nothing is determined. Leave the
             // marker alone and retry next pass.
             return .abandoned
@@ -629,15 +692,48 @@ extension SyncEngine {
             return .alreadyFresh
         }
         let t0 = CFAbsoluteTimeGetCurrent()
+        // 🚨 CANCELLATION IS RE-CHECKED AFTER THE WRITER IS ACQUIRED, not only
+        // before entering. `runWALMaintenance`'s `shouldRun()` gate is evaluated
+        // before the call, and the awaited write then waits for the priority queue
+        // AND for SQLite's single writer — an unbounded delay during which the
+        // maintenance task can be cancelled (`SyncEngine.cancelMaintenance` on
+        // background entry) or the process suspended. Spending 8.5 s on an ANALYZE
+        // for a task that no longer exists is the cost this closes.
+        //
+        // It is a `Mutex`-backed flag rather than `Task.isCancelled` INSIDE the
+        // closure, and that is not a stylistic choice: GRDB dispatches the write
+        // closure onto its own writer queue, so it does not run inside the Swift
+        // concurrency task and `Task.isCancelled` there always reads `false`.
+        // `withTaskCancellationHandler` fires `onCancel` on the cancelling thread —
+        // and immediately, if the task is already cancelled — so the flag is
+        // readable from wherever the closure ends up running.
+        //
+        // ⚠️ THIS DELIBERATELY DEVIATES from `DatabaseWriteQueue`'s stated contract
+        // (*"a write already queued here runs to completion even if its Task is
+        // cancelled … never-drop-user-intention: a half-decided DB write must not be
+        // abandoned mid-flight"*). That contract protects writes that CARRY a user
+        // intention. `ANALYZE` carries none — it rewrites planner statistics only —
+        // and abandoning it drops nothing: the marker is left where it was, so the
+        // obligation stays outstanding and the next pass redoes it. The deviation is
+        // confined to this one write for exactly that reason.
+        let cancelledWhileQueued = Mutex<Bool>(false)
         do {
-            let settled: Int = try dbPool.write { db in
-                try db.execute(sql: "ANALYZE")
-                // Read AFTER, inside the same transaction. The FIRST `ANALYZE` on a
-                // database CREATES `sqlite_stat1`, which is itself DDL and bumps
-                // `schema_version`; storing the version read BEFORE would record a
-                // value the analysis had already invalidated and this pass would
-                // re-fire forever.
-                return try Int.fetchOne(db, sql: "PRAGMA schema_version") ?? currentVersion
+            let settled: Int = try await withTaskCancellationHandler {
+                try await dbPool.write(label: "AnalyzePlannerStatistics") { db in
+                    guard !cancelledWhileQueued.withLock({ $0 }),
+                          !DatabaseSuspension.isSuspended else {
+                        throw CancellationError()
+                    }
+                    try db.execute(sql: "ANALYZE")
+                    // Read AFTER, inside the same transaction. The FIRST `ANALYZE` on a
+                    // database CREATES `sqlite_stat1`, which is itself DDL and bumps
+                    // `schema_version`; storing the version read BEFORE would record a
+                    // value the analysis had already invalidated and this pass would
+                    // re-fire forever.
+                    return try Int.fetchOne(db, sql: "PRAGMA schema_version") ?? currentVersion
+                }
+            } onCancel: {
+                cancelledWhileQueued.withLock { $0 = true }
             }
             defaults.set(settled, forKey: markerKey)
             print("[Maintenance] ANALYZE refreshed query-planner statistics in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms (schema_version \(settled))")
