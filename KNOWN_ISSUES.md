@@ -689,40 +689,88 @@ Two corrections to the scope this census was opened with, both in the direction 
 alone carries ~25 of them. That is a decision not to widen the fix, not a "pre-existing" excuse; the
 count is recorded here so the number is not lost if someone later wants the sweep.
 
-### C. Changed production Swift files in the release range — TRUE COUNT **110**, not 109 and not 102 (2026-08-05)
+### C. Changed production Swift files in the release range — **110 / 102 / 93**, one number per command (2026-08-05, corrected 2026-08-05)
 
-Round-4 review briefs carried **109**; earlier ones carried **102**. Both are wrong, and they are
-wrong for *different* reasons, which is why both are recorded here rather than just the answer.
-
-**The predicate, stated beside the number** (`MIS-007`: a census inherits the shape of its
-instrument). Measured at candidate `339bd4ce2` against the release base `07a4bb703`:
+Three counts have circulated in this train: **110**, **102** and **93**. **All three are real and all
+three reproduce exactly.** They are answers to three *different* commands over the same range, and the
+only defect was ever quoting a number without the command that produced it (`MIS-007`: a census
+inherits the shape of its instrument). Measured at candidate `339bd4ce2` against the release base
+`07a4bb703`:
 
 ```
-git diff --name-only 07a4bb703..HEAD | rg '^(TabMail|Shared|TabMailNotificationService)/.*\.swift$' | wc -l
-→ 110      # TabMail 93, Shared 9, TabMailNotificationService 8
+# 110 — WIDE. All three production trees; the filter is applied AFTER the diff, so no pathspec
+#       globbing is involved at all.
+git diff --name-only 07a4bb703..339bd4ce2 \
+  | rg -c '^(TabMail|Shared|TabMailNotificationService)/.*\.swift$'
+→ 110      # TabMail 93 + Shared 9 + TabMailNotificationService 8
+
+# 102 — THREE-PATHSPEC. This is the form the round-4 brief actually specified.
+git diff --name-only 07a4bb703..339bd4ce2 \
+  -- 'TabMail/**/*.swift' 'Shared/**/*.swift' 'TabMailNotificationService/**/*.swift' | wc -l
+→ 102      # TabMail 93 + Shared 9 + TabMailNotificationService 0   ← note the zero
+
+# 93 — ONE-PATHSPEC. The `TabMail/` tree alone.
+git diff --name-only 07a4bb703..339bd4ce2 -- 'TabMail/**/*.swift' | wc -l
+→ 93
 ```
 
-- **102 is a PATHSPEC artefact, and its error is bigger than it looks.** It came from the deprecated
-  `git diff --name-only … -- 'TabMail/**/*.swift'` form, which is scoped to the **`TabMail/` directory
-  alone** — it silently drops all 9 `Shared/` and all 8 `TabMailNotificationService/` files. ⚠️ **And
-  the number 102 does not reproduce at all**: that pathspec returns **93** at this candidate, so "102"
-  is neither the narrow count nor the wide one and should not be reused in either role. The
-  drop is **17 files, not 8**.
-- **109 is a STALE count, correct through `43604ec81` and superseded at `afa5b9e33`.** Verified by
-  bisecting the range: `07a4bb703..43604ec81` = **109**, `07a4bb703..afa5b9e33` = **110**, and every
-  commit after it (`9677d36f1`, `ae7dd105d`, `018677428`, `339bd4ce2`) = 110. The +1 file is
-  `TabMail/Services/MigrationTimingLedger.swift`, added by `afa5b9e33` ("Attribute foreign-key check
-  time to the migration that pays it").
+**Use 110 / 102, and 93 if you pass only the `TabMail` pathspec** — and always say which one you mean.
 
-⚠️ **The competing attribution to `ae7dd105d` / `AutoSizingHTMLView.swift` is WRONG, and the way it is
-wrong is worth keeping.** `ae7dd105d` touches exactly one Swift file,
+**Why 102 is short by exactly 8, and why the 8 are the NSE files.** The three-pathspec form does pass a
+`TabMailNotificationService/` pathspec, so the loss is *not* "the pathspec only covers `TabMail/`". It
+is a **directory-depth** artefact of the `**/` segment: `<tree>/**/*.swift` requires a `/` between the
+`**` and the `*.swift`, i.e. at least one intervening directory level. Every changed `.swift` file
+under `TabMail/` and `Shared/` sits at depth ≥ 2, so both pathspecs match in full (93 and 9). All eight
+changed files under `TabMailNotificationService/` sit **directly in that directory** —
+`NotificationService.swift`, `NSEStagingDB.swift`, `NSELog.swift`, `NSEIMAPConnection.swift`,
+`NSEMessageMetadata.swift`, `GmailNSEClient.swift`, `OutlookNSEClient.swift`, `SharedNSEData.swift` —
+so the `**/` never matches and the tree contributes **0**. Confirmed both ways: the single-star form
+`-- 'TabMailNotificationService/*.swift'` returns **8**, and the plain directory-prefix pathspec
+`-- TabMail Shared TabMailNotificationService` filtered on `\.swift$` returns **110**, agreeing with the
+wide form.
+
+⚠️ **Stated negatively:** the 17-file gap (`110 − 93`) is also real, but it belongs to the
+*one*-pathspec form and to nothing else. `110 − 102 = 8` and `110 − 93 = 17` are both correct, of
+different commands. Neither figure refutes the other.
+
+#### ⚠️ RETRACTED: this section's own previous correction was wrong (recorded, not deleted)
+
+The first version of this section (commit `603cf0da2`) asserted that **"the number 102 does not
+reproduce at all"**, that the 102 form "is scoped to the `TabMail/` directory alone", and that **"the
+drop is 17 files, not 8"**. **All three claims are withdrawn.** 102 reproduces exactly, under the
+three-pathspec form quoted above; the disputed pathspec was not scoped to `TabMail/` alone; and the
+drop under that form is 8.
+
+**The diagnosis belongs in the text, because the mechanism is the durable part.** The refutation ran a
+**differently shaped command** than the one it was disputing — one pathspec where the brief had
+specified three — obtained a different number, and reported the disagreement as evidence that the
+*other* number was unreproducible. That is `MIS-007` (a census inherits its search shape) arriving with
+`MIS-008`'s consequence: a null-or-mismatched result read as a claim about the world rather than a
+claim about the query. It is the **third** self-invalidating correction in this session, after the
+`v71` "only whole-database FK gate" comment and the "fabricated quotation" accusation (both recorded in
+`MIS-019`).
+
+**The rule this earns: when refuting a count, run THEIR command first, verbatim, and only then your
+own.** A correction is the single highest-risk sentence to write, because its author has just proved
+someone else wrong and therefore feels least like checking themselves.
+
+#### Retained and re-verified: the 109 → 110 bisect
+
+**109 is a STALE count, correct through `43604ec81` and superseded at `afa5b9e33`.** Re-verified by
+bisecting the range under the wide predicate: `07a4bb703..43604ec81` = **109**,
+`07a4bb703..afa5b9e33` = **110**, and every commit after it (`9677d36f1`, `ae7dd105d`, `018677428`,
+`339bd4ce2`) = 110. The +1 file is `TabMail/Services/MigrationTimingLedger.swift`, added by `afa5b9e33`
+("Attribute foreign-key check time to the migration that pays it").
+
+#### Retained and re-verified: the `ae7dd105d` attribution is wrong
+
+⚠️ **The competing attribution of the +1 to `ae7dd105d` / `AutoSizingHTMLView.swift` is WRONG, and the
+way it is wrong is worth keeping.** `ae7dd105d` touches exactly one Swift file,
 `TabMail/Views/Shared/AutoSizingHTMLView.swift` — but that file was **already inside the range at
-`43604ec81`**, so modifying it again added nothing to a count of *distinct* changed files. The
-instrument that produces this error is "find a commit near the boundary that touched a `.swift`
-file"; the instrument that answers the question is "bisect the COUNT". A file's presence in the
-changed set is idempotent — only the FIRST commit to touch it can move the number.
-
-**Use 110 / 93 in any future brief**, and say which of the two you mean.
+`43604ec81`** (re-verified), so modifying it again added nothing to a count of *distinct* changed files.
+The instrument that produces this error is "find a commit near the boundary that touched a `.swift`
+file"; the instrument that answers the question is "bisect the COUNT". A file's presence in the changed
+set is idempotent — only the FIRST commit to touch it can move the number.
 
 ## The gate-in-a-BRANCH-CONDITION census over `TabMail/Views/` (2026-08-04)
 
