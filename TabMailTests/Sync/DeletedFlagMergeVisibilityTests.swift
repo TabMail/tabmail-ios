@@ -82,6 +82,16 @@ import GRDB
 /// merge re-evaluates the flag every pass. `clearingTheDeletedFlagRelistsTheMessage`
 /// is that recovery made mechanical rather than asserted.
 ///
+/// ## The sibling invariant this suite also pins
+///
+/// `\Deleted` is one of TWO ways a record the server DID return fails to become a
+/// local row; the other is `IMAPProvider.mapMessageInfo` refusing an unparseable
+/// date, and a short FETCH is a third way a covered message never reaches us at
+/// all. All three flow into the same two consumers, and the failure is identical:
+/// a count taken after the narrowing is a SURVIVOR count, and reading it as
+/// coverage deletes mail the fetch never went near. The final section drives the
+/// parse-failure and short-FETCH triggers over the same wire — see `FetchCoverage`.
+///
 /// `.serialized, .processGlobalState` — every case binds a listening socket via
 /// `FakeIMAPServer` (parallel cases would contend on ephemeral port allocation)
 /// and swaps `AppDatabase.shared`.
@@ -838,5 +848,319 @@ struct DeletedFlagMergeVisibilityTests {
                 "the undeleted records inside the window must stay listed")
         #expect(!listed.contains("14"),
                 "non-vacuity: the \\Deleted record INSIDE the window is still not presented — otherwise this passes by doing nothing at all")
+    }
+
+    // MARK: - Coverage is the SERVER's statement, never a survivor count
+
+    /// A fixture the SERVER covers and the CLIENT cannot materialise.
+    ///
+    /// `Date: not-a-date` is not an RFC 5322 date, so SwiftMail's
+    /// `parseEnvelopeDate` returns nil and leaves `MessageInfo.date` nil — silently
+    /// and by design, its own comment says so. Paired with
+    /// `FakeIMAPServer.suppressFetchInternalDate(in:uids:)` (which drops the
+    /// `INTERNALDATE` item from the FETCH record) BOTH of `mapMessageInfo`'s date
+    /// sources are gone, and it returns nil. That is production's own path, not an
+    /// invented one: its comment names the trigger — a message the server has not
+    /// finished indexing, "happens right after APPEND" — and
+    /// `ProviderBrokenDateTests` already pins that nil for all three providers.
+    ///
+    /// `internalDay` is restored on the fake's stored record (NOT on the wire) so
+    /// the message still matches a date-range UID SEARCH under
+    /// `honorSearchDateCriteria()`; `makeMessage` would otherwise derive its
+    /// `INTERNALDATE` from the broken `Date:` header and park it in 2026-01-01.
+    private static func unparseableDateMessage(
+        _ uid: Int, _ id: String, internalDay: Date = Date(timeIntervalSince1970: 1_700_000_000)
+    ) -> FakeIMAPServer.Message {
+        let imap = DateFormatter()
+        imap.locale = Locale(identifier: "en_US_POSIX")
+        imap.timeZone = TimeZone(identifier: "UTC")
+        imap.dateFormat = "dd-MMM-yyyy HH:mm:ss Z"
+        return FakeIMAPServer.makeMessage(uid: uid, rfc822Text: """
+        From: Sender <sender@example.com>\r
+        To: Recipient <recipient@example.com>\r
+        Subject: coverage fixture with an unparseable date\r
+        Date: not-a-date\r
+        Message-ID: <\(id)>\r
+        Content-Type: text/plain; charset=utf-8\r
+        \r
+        body\r
+
+        """).replacingInternalDate(imap.string(from: internalDay))
+    }
+
+    /// 🚨 **THE BLOCKING ONE. `messages.count < limit` WAS THE COMPLETE-KNOWLEDGE
+    /// TEST, AND `messages` IS THE PROVIDER'S POST-`compactMap` SURVIVOR ARRAY.**
+    /// One record the client cannot parse shrinks it, a FULL window then reads as
+    /// "the whole folder came back", and that branch has NO FLOOR: every local row
+    /// the fetch never went near is classified stale and deleted with its FTS
+    /// entry. In the field that is a 900-message folder losing ~851 rows to one
+    /// malformed date, and it does not recover — `selfHealRecentMessages` covers 90
+    /// days and the deep crawl only re-walks `backfillComplete == false` folders.
+    ///
+    /// `SyncEngineEpochVerify.classifyEpochVerificationSample` was explicitly
+    /// hardened against this exact reducer ("`mapMessageInfo` also DROPS rows
+    /// outright … this rule is what makes that safe"); the stale-delete consumer of
+    /// the same count never was. `v2final` (`e28dd4edb`) carries the identical
+    /// `fetched.count < limit` in the identical function, so it is a floor here,
+    /// not a ceiling.
+    ///
+    /// The fixture: eleven messages on the server (UIDs 10–18, 20, 21), a window of
+    /// five, and the newest record unparseable. Nothing about the SERVER changed —
+    /// it still holds eleven — so a windowed pass must decide only about UIDs 16+.
+    /// Two-sided: UID 19 is local-only and inside the window, and must still be
+    /// swept, or this passes by disabling stale detection altogether.
+    @Test("A record the client cannot parse never turns a windowed fetch into complete knowledge")
+    func anUnparseableRecordDoesNotManufactureCompleteKnowledge() async throws {
+        let serverUIDs = [10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21]
+        let brokenUID = 21
+        let messages: [FakeIMAPServer.Message] = serverUIDs.map { uid in
+            uid == brokenUID
+                ? Self.unparseableDateMessage(uid, "coverage-broken-\(uid)@example.com")
+                : Self.message(uid, "coverage-\(uid)@example.com")
+        }
+        let server = FakeIMAPServer(
+            capabilities: Self.nonUidplusCapabilities, mailboxes: ["Archive": messages])
+        server.setUidValidity(Int(Self.epoch), for: "Archive")
+        server.suppressFetchInternalDate(in: "Archive", uids: [brokenUID])
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "coverage-parse"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "Archive", role: .archive, pool: pool,
+            totalCount: serverUIDs.count, lastKnownUidValidity: Int(Self.epoch))
+        // Every server UID has a local row, plus UID 19 — inside the window and
+        // genuinely gone from the server.
+        try FolderEpochTestFixture.insertHeaders(
+            accountId: accountId, path: "Archive", uids: serverUIDs + [19], pool: pool)
+
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await Self.merge(
+            folderPath: "Archive", accountId: accountId, provider: provider, pool: pool, limit: 5)
+
+        let listed = try Self.listedUIDs(accountId: accountId, path: "Archive", pool: pool)
+        for uid in [10, 11, 12, 13, 14, 15] {
+            #expect(listed.contains(String(uid)), """
+                    UID \(uid) — a message the server still holds, far BELOW the fetch's window — \
+                    was deleted because a SIBLING record failed to parse. The server reported \
+                    eleven messages and the window was five, so this pass covered UIDs 16+ and \
+                    knows nothing whatever about \(uid). Measuring completeness by how many \
+                    records we managed to materialise is the ADR-IOS-042 / MIS-IOS-002 \
+                    mass-deletion shape reached through a different door. Surviving: \
+                    \(listed.sorted())
+                    """)
+        }
+        #expect(listed.contains(String(brokenUID)), """
+                the row for the message we could not parse was deleted. The server NAMED it in \
+                this window, so it is PRESENT — an unparseable record is a client-side failure \
+                and must never read as "the server no longer has this"
+                """)
+        #expect(listed.contains("20") && listed.contains("18"),
+                "the parseable records inside the window must stay listed")
+        #expect(!listed.contains("19"), """
+                non-vacuity, two-sided: UID 19 is inside the covered window and the server does \
+                not have it, so it must STILL be stale-deleted — otherwise this test passes by \
+                turning stale detection off
+                """)
+    }
+
+    /// The second, independent way to make a full window LOOK short: a SHORT FETCH.
+    /// The server reports N messages in `EXISTS` and then returns fewer than N
+    /// records for a range covering all of them. This is not hypothetical — the app
+    /// already logs it as `[IMAP-FETCH-GAP]`.
+    ///
+    /// It matters because the folder here IS small enough for genuine complete
+    /// knowledge (three messages, window of five), so `messageCount <= limit` alone
+    /// would say "whole folder". Only the second term — a record came back for
+    /// every message the server counted — separates a complete read from a partial
+    /// one, and without it the rows below the fetch's floor are swept.
+    ///
+    /// Accepted residual, stated rather than asserted: within the covered slice a
+    /// message whose record never arrived still reads as absent, because the client
+    /// was never told its id. That is the ordinary windowed-branch semantics
+    /// (ADR-IOS-042) and it is recoverable — the row is inside the newest-window and
+    /// comes straight back on the next pass.
+    @Test("A short FETCH never turns a whole-folder window into complete knowledge")
+    func aShortFetchDoesNotManufactureCompleteKnowledge() async throws {
+        let server = FakeIMAPServer(
+            capabilities: Self.nonUidplusCapabilities,
+            mailboxes: ["Archive": [
+                Self.message(10, "coverage-short-10@example.com"),
+                Self.message(12, "coverage-short-12@example.com"),
+                Self.message(13, "coverage-short-13@example.com"),
+            ]])
+        server.setUidValidity(Int(Self.epoch), for: "Archive")
+        // SELECT keeps counting UID 13 in EXISTS; its FETCH record never arrives.
+        server.suppressFetchRecord(in: "Archive", uids: [13])
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "coverage-short"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "Archive", role: .archive, pool: pool,
+            totalCount: 3, lastKnownUidValidity: Int(Self.epoch))
+        // UID 5 sits below anything this fetch can reach; UID 11 is inside the
+        // covered slice and genuinely gone from the server.
+        try FolderEpochTestFixture.insertHeaders(
+            accountId: accountId, path: "Archive", uids: [5, 10, 11, 12], pool: pool)
+
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await Self.merge(
+            folderPath: "Archive", accountId: accountId, provider: provider, pool: pool, limit: 5)
+
+        let listed = try Self.listedUIDs(accountId: accountId, path: "Archive", pool: pool)
+        #expect(listed.contains("5"), """
+                UID 5 was deleted on the strength of a fetch that did not return a record for \
+                every message the server counted. `EXISTS` said three and two records arrived, \
+                so this pass covered UIDs 10+ at best and proved nothing about 5. Surviving: \
+                \(listed.sorted())
+                """)
+        #expect(listed.contains("10") && listed.contains("12"),
+                "the records that DID arrive must stay listed")
+        #expect(!listed.contains("11"), """
+                non-vacuity, two-sided: UID 11 is inside the covered slice and the server does \
+                not have it, so the windowed sweep must still remove it
+                """)
+    }
+
+    /// The anchor that stops the two tests above passing by disabling the sweep:
+    /// when the server DOES prove whole-folder coverage — `EXISTS` at most the
+    /// limit, a record back for every one of them — the complete-knowledge branch
+    /// must still fire and remove rows the server no longer holds, including rows
+    /// far below any window floor. That is the whole reason the branch exists, and
+    /// a floor added to it (the tempting "fix" for the defect above) would destroy
+    /// exactly this.
+    @Test("Whole-folder coverage still stale-deletes rows the server no longer holds")
+    func provenWholeFolderCoverageStillSweeps() async throws {
+        let server = FakeIMAPServer(
+            capabilities: Self.nonUidplusCapabilities,
+            mailboxes: ["Archive": [
+                Self.message(10, "coverage-whole-10@example.com"),
+                Self.message(11, "coverage-whole-11@example.com"),
+                Self.message(12, "coverage-whole-12@example.com"),
+            ]])
+        server.setUidValidity(Int(Self.epoch), for: "Archive")
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "coverage-whole"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "Archive", role: .archive, pool: pool,
+            totalCount: 3, lastKnownUidValidity: Int(Self.epoch))
+        try FolderEpochTestFixture.insertHeaders(
+            accountId: accountId, path: "Archive", uids: [4, 7, 10, 11, 12], pool: pool)
+
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await Self.merge(
+            folderPath: "Archive", accountId: accountId, provider: provider, pool: pool, limit: 5)
+
+        let listed = try Self.listedUIDs(accountId: accountId, path: "Archive", pool: pool)
+        #expect(!listed.contains("4") && !listed.contains("7"), """
+                the server proved it holds exactly three messages and returned a record for each, \
+                so UIDs 4 and 7 are genuinely gone and must be swept even though they sit below \
+                every window floor. If this fails, honest coverage was traded for a floor — which \
+                turns the complete-knowledge branch into the windowed one and leaves ghosts \
+                forever (ADR-IOS-051's blind spot). Surviving: \(listed.sorted())
+                """)
+        #expect(listed == ["10", "11", "12"],
+                "exactly the messages the server holds must remain listed — listed=\(listed.sorted())")
+    }
+
+    /// Member 2, wire-level. `SyncEngine.fetchOlderMessages` derived its
+    /// continuation signal from `headers.count` under a comment claiming it was
+    /// "what the SERVER returned for the window we asked about". It was not:
+    /// `headers` is the provider's post-`compactMap` array, so ONE record whose
+    /// date will not parse made a FULL page look short, `mayHaveMore` went false,
+    /// and every message older than it became unreachable by scrolling.
+    ///
+    /// Same shape as `pagingContinuesPastAFullPageContainingASoftDeletedRecord`
+    /// (which pins the `\Deleted` trigger) with the other trigger of the same
+    /// class. The honest number was three lines away in the provider —
+    /// `searchDateRange`'s UID batch, taken before the FETCH.
+    @Test("Paging does not stop at a full page whose slots an unparseable record consumed")
+    func pagingContinuesPastAFullPageContainingAnUnparseableRecord() async throws {
+        let limit = SyncConfig.infiniteScrollFetchLimit
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        let noonYesterday = utc.date(byAdding: .hour, value: 12, to: utc.startOfDay(for: Date()))!
+            .addingTimeInterval(-86_400)
+        let brokenUID = 200 + limit + 1                     // newest, and unparseable
+        let deepestUID = brokenUID - limit                  // strictly older than the whole page
+        let messages: [FakeIMAPServer.Message] = (0...limit).map { index in
+            let uid = brokenUID - index
+            let day = noonYesterday.addingTimeInterval(-86_400 * Double(index))
+            return uid == brokenUID
+                ? Self.unparseableDateMessage(uid, "coverage-page-\(uid)@example.com", internalDay: day)
+                : Self.message(uid, "coverage-page-\(uid)@example.com", date: day)
+        }
+        let server = FakeIMAPServer(
+            capabilities: Self.nonUidplusCapabilities, mailboxes: ["Archive": messages])
+        // The scroller's cursor IS the search window, so a server that answered
+        // every window with the whole mailbox could not show a continuation at all.
+        server.honorSearchDateCriteria()
+        server.setUidValidity(Int(Self.epoch), for: "Archive")
+        server.suppressFetchInternalDate(in: "Archive", uids: [brokenUID])
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "coverage-page"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "Archive", role: .archive, pool: pool,
+            totalCount: messages.count, lastKnownUidValidity: Int(Self.epoch))
+        let folder = try #require(try FolderEpochTestFixture.readFolder(
+            accountId: accountId, path: "Archive", pool: pool))
+
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let engine = await Self.engine(accountId: accountId, provider: provider)
+
+        let maxPulls = 8
+        var pulls = 1
+        var pull = try await engine.fetchOlderMessages(folders: [folder])
+        while pull.mayHaveMore && pulls < maxPulls {
+            pull = try await engine.fetchOlderMessages(folders: [folder])
+            pulls += 1
+        }
+
+        let listed = try Self.listedUIDs(accountId: accountId, path: "Archive", pool: pool)
+        #expect(listed.contains(String(deepestUID)), """
+                a message OLDER than a full page containing one unparseable record is unreachable \
+                by scrolling. The server named a FULL page; one slot of it held a record whose \
+                date would not parse, so we could not materialise it. Measuring exhaustion by \
+                what we materialised turned that into "end of folder" and stranded the rest of \
+                the folder. Listed: \(listed.count)
+                """)
+        #expect(!listed.contains(String(brokenUID)),
+                "non-vacuity: the record whose date could not be parsed must NOT have been materialised — otherwise the fixture never exercised the drop")
+        #expect(!pull.mayHaveMore && pulls < maxPulls,
+                "paging never terminated on a folder the server had fully shown — the scroller would spin forever")
+        #expect(Self.mutatingCommands(server.recordedCommands()).isEmpty)
     }
 }

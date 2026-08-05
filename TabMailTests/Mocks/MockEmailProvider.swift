@@ -112,14 +112,31 @@ actor MockEmailProvider: EmailProvider {
         mockedBoundFetchEpochBox.withLock { $0[folderPath] = value }
     }
 
+    /// Coverage for the mock's own "server". `fetchMessagesResult` IS this
+    /// provider's entire mailbox and it is returned verbatim — the mock performs
+    /// NO client-side narrowing, no `compactMap`, no parse that can fail — so
+    /// `messages.count` here is a RAW server record count, not a survivor count,
+    /// and `< limit` is an honest whole-folder claim FOR THIS PROVIDER.
+    ///
+    /// ⚠ Do not copy this shape into a real provider. In `IMAPProvider`,
+    /// `GmailProvider` and `ExchangeProvider` the same expression is the defect
+    /// `FetchCoverage` exists to abolish; it is sound here only because the mock's
+    /// returned array and its server's records are the same objects. The
+    /// parse-failure shape is exercised end to end against a real
+    /// `IMAPProvider` + `FakeIMAPServer` instead — see
+    /// `DeletedFlagMergeVisibilityTests`.
     func fetchMessagesWithObservedEpoch(
         folder: String, limit: Int, offset: Int
-    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?) {
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage) {
         let messages = try await fetchMessages(folder: folder, limit: limit, offset: offset)
+        let coverage = FetchCoverage(
+            serverRecordCount: messages.count,
+            spansEntireFolder: messages.count < limit,
+            unmaterialisedIds: [])
         if let bound = mockedBoundFetchEpochBox.withLock({ $0[folder] }) {
-            return (messages, bound)
+            return (messages, bound, coverage)
         }
-        return (messages, lastObservedUidValidity(folderPath: folder))
+        return (messages, lastObservedUidValidity(folderPath: folder), coverage)
     }
 
     /// T4.S6b: the sample `SyncEngine.verifyAndBootstrapPrePopulatedFolderEpoch`

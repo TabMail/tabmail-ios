@@ -685,6 +685,13 @@ struct SelectSourcedFolderEpochTests {
                 explicit nil, or every type that forgets to override silently gets back the \
                 unbound value blocker 3 removed, and `runSyncMessages` stamps it
                 """)
+        #expect(inherited.coverage == .unproven,
+                """
+                the inherited default reported COVERAGE it cannot have. A conformer that does \
+                not override knows nothing about what the server covered, and the only safe \
+                answer is `.unproven` — deriving `spansEntireFolder` from the returned array's \
+                count is the survivor-count claim `FetchCoverage` exists to abolish
+                """)
 
         // The production witness: a real conformer really does inherit this.
         let demo = DemoProvider(accountId: accountId)
@@ -692,6 +699,8 @@ struct SelectSourcedFolderEpochTests {
             folder: "INBOX", limit: 50, offset: 0)
         #expect(demoFetched.observedEpoch == nil,
                 "a production conformer that does not override must contribute no epoch")
+        #expect(demoFetched.coverage == .unproven,
+                "a production conformer that does not override must claim no coverage either")
     }
 }
 

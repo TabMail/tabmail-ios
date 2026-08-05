@@ -133,6 +133,18 @@ enum ThreadUtils {
     ///
     /// `maxPasses` bounds pathological cases (e.g., a 100-message chain
     /// where each adoption walks one step). Returns total adoptions.
+    ///
+    /// ⚠️ KNOWN, DELIBERATELY UNFIXED — `KNOWN_ISSUES.md` `IOS-THREAD-001`.
+    /// `merged == 0` is a MUTATION count, not candidate coverage. Because
+    /// `findAdoptableThreadId` answers with the FIRST connected ctid it finds
+    /// (`LIMIT 1`, no ORDER BY), a row connected to two fragments whose probe
+    /// names the id it already carries never adopts — and the probe is
+    /// deterministic on unchanged state, so no later pass changes that answer.
+    /// Convergence can therefore be declared with fragments still split.
+    /// NOT fixed here because the only production caller is the APPLIED,
+    /// IMMUTABLE `v54` migration; the blast radius is display-only threading
+    /// of pre-v54 rows. If it is ever fixed, fix the PROBE (return the whole
+    /// connected set, adopt a deterministic minimum) — not this loop.
     @discardableResult
     static func runFragmentMergeToFixpoint(db: Database, maxPasses: Int = 20) throws -> Int {
         var totalMerged = 0
@@ -140,11 +152,11 @@ enum ThreadUtils {
             let merged = try runFragmentMergeOnce(db: db)
             totalMerged += merged
             if merged == 0 {
-                if pass > 1 { print("[ThreadUtils] Fragment merge converged after \(pass) pass(es), \(totalMerged) total adoption(s)") }
+                if pass > 1, DebugModeManager.isLoggingEnabled() { print("[ThreadUtils] Fragment merge converged after \(pass) pass(es), \(totalMerged) total adoption(s)") }
                 return totalMerged
             }
         }
-        print("[ThreadUtils] WARNING: Fragment merge did not converge in \(maxPasses) passes; \(totalMerged) adoption(s) so far")
+        if DebugModeManager.isLoggingEnabled() { print("[ThreadUtils] WARNING: Fragment merge did not converge in \(maxPasses) passes; \(totalMerged) adoption(s) so far") }
         return totalMerged
     }
 

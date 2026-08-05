@@ -120,6 +120,18 @@ actor ExchangeProvider: EmailProvider {
     // MARK: - Messages
 
     func fetchMessages(folder: String, limit: Int, offset: Int) async throws -> [MessageHeaderInfo] {
+        try await fetchMessagesWithObservedEpoch(folder: folder, limit: limit, offset: offset).messages
+    }
+
+    /// Graph has no UIDVALIDITY, so `observedEpoch` is nil forever (matching the
+    /// `EmailProvider` default). This override exists for `coverage`: the page
+    /// `response.value` is the only honest statement of what the SERVER covered,
+    /// and `parseGraphMessage` returns nil for a record without
+    /// `receivedDateTime`, so the returned array's count is a survivor count.
+    /// See `FetchCoverage`.
+    func fetchMessagesWithObservedEpoch(
+        folder: String, limit: Int, offset: Int
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage) {
         let fields = selectMessageHeaderFields
         let encodedFolder = try Self.encodedGraphPathSegment(folder, context: "Graph folder id")
         var path = "/mailFolders/\(encodedFolder)/messages?\(fields)&\(topParam(limit))&\(orderByReceived)"
@@ -128,7 +140,28 @@ actor ExchangeProvider: EmailProvider {
         }
         let data = try await request(path: path)
         let response = try JSONDecoder().decode(GraphMessageListResponse.self, from: data)
-        return response.value.compactMap { parseGraphMessage($0) }
+        let parsed = parseGraphPage(response.value)
+        return (parsed.messages, nil, FetchCoverage(
+            serverRecordCount: response.value.count,
+            // `@odata.nextLink` is Graph's own "there is more"; a page shorter
+            // than `$top` with no next link is the whole folder.
+            spansEntireFolder: response.value.count < limit && response.odataNextLink == nil,
+            unmaterialisedIds: parsed.unmaterialisedIds))
+    }
+
+    /// Split one Graph page into the records that materialised and the ids of the
+    /// ones that did not. A record the parser refuses is still a message the
+    /// server holds — its id must stay in the PRESENT set or the merge reads it
+    /// as gone and deletes the local row. See `FetchCoverage`.
+    private func parseGraphPage(
+        _ page: [GraphMessage]
+    ) -> (messages: [MessageHeaderInfo], unmaterialisedIds: Set<String>) {
+        var messages: [MessageHeaderInfo] = []
+        var unmaterialised = Set<String>()
+        for raw in page {
+            if let header = parseGraphMessage(raw) { messages.append(header) } else { unmaterialised.insert(raw.id) }
+        }
+        return (messages, unmaterialised)
     }
 
     func fetchMessage(id: String, folder: String) async throws -> FullMessageInfo {
@@ -870,12 +903,25 @@ actor ExchangeProvider: EmailProvider {
 
     /// Fetch older messages before a given date for infinite scroll.
     func fetchOlderMessages(folder: String, before: Date, limit: Int) async throws -> [MessageHeaderInfo] {
+        try await fetchOlderMessagesWithCoverage(folder: folder, before: before, limit: limit).messages
+    }
+
+    /// Infinite-scroll page plus what the SERVER covered for it. The paging
+    /// consumer's continuation signal is a coverage question, and
+    /// `parseGraphMessage` drops records — see `FetchCoverage`.
+    func fetchOlderMessagesWithCoverage(
+        folder: String, before: Date, limit: Int
+    ) async throws -> (messages: [MessageHeaderInfo], coverage: FetchCoverage) {
         let filter = "receivedDateTime lt \(iso8601DateTime(before))"
         let encodedFolder = try Self.encodedGraphPathSegment(folder, context: "Graph folder id")
         let path = "/mailFolders/\(encodedFolder)/messages?\(selectMessageHeaderFields)&$filter=\(filter)&\(topParam(limit))&\(orderByReceived)"
         let data = try await request(path: path)
         let response = try JSONDecoder().decode(GraphMessageListResponse.self, from: data)
-        return response.value.compactMap { parseGraphMessage($0) }
+        let parsed = parseGraphPage(response.value)
+        return (parsed.messages, FetchCoverage(
+            serverRecordCount: response.value.count,
+            spansEntireFolder: response.value.count < limit && response.odataNextLink == nil,
+            unmaterialisedIds: parsed.unmaterialisedIds))
     }
 
     // MARK: - Incremental Sync (Delta)
@@ -1283,8 +1329,14 @@ private struct GraphFolder: Decodable {
 
 private struct GraphMessageListResponse: Decodable {
     let value: [GraphMessage]
+    /// Graph's own "there is more beyond this page". Decoded (it was previously
+    /// dropped on the floor) because exhaustion is a statement about SERVER
+    /// coverage and this is the server making it — see `FetchCoverage`.
+    let odataNextLink: String?
+
     enum CodingKeys: String, CodingKey {
         case value
+        case odataNextLink = "@odata.nextLink"
     }
 }
 

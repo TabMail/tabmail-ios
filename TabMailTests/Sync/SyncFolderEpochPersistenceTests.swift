@@ -354,7 +354,8 @@ struct SyncFullSyncFolderEpochTests {
     /// because T1.2 is the item that established the epoch is durably readable,
     /// which is the precondition for ever closing it. `runSyncMessages` has no
     /// UIDVALIDITY guard: `selectStaleHeaders`'s complete-knowledge branch
-    /// (`fetched.count < limit`) classifies every local row the fetch did not
+    /// (`coverage.spansEntireFolder`; it read `fetched.count < limit` when this
+    /// suite was written) classifies every local row the fetch did not
     /// return as deleted-on-the-server. On a re-created mailbox that is true of
     /// EVERY row — the new numbering restarts beneath them all — so a folder that
     /// is fetched across a turnover loses its mail without the ADR-IOS-051

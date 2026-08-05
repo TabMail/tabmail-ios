@@ -751,8 +751,27 @@ extension SyncEngine {
     ///   - `.date` (Gmail/Exchange): fetch is most-recent-by-date, so a date floor IS
     ///     the covered slice (and their ids aren't numeric UIDs anyway).
     ///
-    /// `fetched.count < limit` ⇒ the whole folder came back ⇒ complete knowledge of
-    /// all of it ⇒ anything local-but-not-remote is genuinely gone.
+    /// 🚨 **COMPLETE KNOWLEDGE IS `coverage.spansEntireFolder` — A STATEMENT THE
+    /// SERVER MADE — AND NEVER A COUNT OF WHAT WE MATERIALISED.** This branch used
+    /// to read `fetched.count < limit`, and `fetched` is the post-`compactMap`
+    /// SURVIVOR array of a `fetchMessages` implementation that drops every record
+    /// it cannot parse (`IMAPProvider.mapMessageInfo`,
+    /// `ExchangeProvider.parseGraphMessage`, `GmailProvider`'s task group). One
+    /// malformed sibling in a FULL window therefore read as "the whole folder came
+    /// back", and this branch has NO floor: every local row the fetch never went
+    /// near was classified stale and deleted with its FTS entry. That is the
+    /// ADR-IOS-042 / MIS-IOS-002 mass-deletion shape reached through a different
+    /// door, and it is not recoverable — `selfHealRecentMessages` covers 90 days
+    /// and the deep crawl only re-walks folders with `backfillComplete == false`.
+    /// The fix is honest evidence, NOT a narrower blast radius: adding a floor here
+    /// would degenerate this branch into the windowed one and destroy its purpose
+    /// (deleting rows BELOW the window that the server dropped long ago).
+    /// `v2final` (`e28dd4edb`) carries the identical `fetched.count < limit` defect
+    /// in the identical function — it is a floor here, not a ceiling.
+    ///
+    /// `coverage.unmaterialisedIds` join `remoteIds` for the same reason in reverse:
+    /// the server NAMED those messages, so they are PRESENT. A record we could not
+    /// parse must never read as "the server no longer has it".
     ///
     /// **PRESENCE and COVERAGE are two different questions, and `\Deleted` answers
     /// only the first (`IOS-IMAP-001` / D3).** A message the server reports with
@@ -766,15 +785,20 @@ extension SyncEngine {
     nonisolated static func selectStaleHeaders(
         candidates: [MessageHeader],
         fetched: [MessageHeaderInfo],
-        limit: Int,
+        coverage: FetchCoverage,
         windowMode: StaleWindowMode
     ) -> [MessageHeader] {
         let remoteIds = Set(fetched.lazy.filter { !$0.isDeletedOnServer }.map(\.messageId))
-        if fetched.count < limit {
+            .union(coverage.unmaterialisedIds)
+        if coverage.spansEntireFolder {
             return candidates.filter { !remoteIds.contains($0.messageId) }
         }
         switch windowMode {
         case .uid:
+            // The floor is taken over MATERIALISED records only. A record we could
+            // not parse would only ever LOWER it, widening the candidate set — the
+            // fail-dangerous direction — while a higher floor merely defers a
+            // deletion to a later pass. Fail closed.
             guard let floorUID = fetched.compactMap({ Int64($0.messageId) }).min() else { return [] }
             return candidates.filter { row in
                 guard let uid = Int64(row.messageId) else { return false } // non-numeric id → never UID-stale
@@ -906,6 +930,11 @@ extension SyncEngine {
         let fetched = try await provider.fetchMessagesWithObservedEpoch(
             folder: folder.path, limit: limit, offset: 0)
         let messages = fetched.messages
+        // COVERAGE — what the SERVER said about the window, bound to this fetch and
+        // computed before any client-side narrowing. Every "did we see the whole
+        // folder?" decision below reads THIS, never `messages.count`. See
+        // `FetchCoverage` and `selectStaleHeaders`.
+        let coverage = fetched.coverage
         let observedEpochAtFetch = fetched.observedEpoch
         let sourceBoundEpoch = observedEpochAtFetch.flatMap { epoch in
             epoch > 0 ? Int(exactly: epoch) : nil
@@ -924,11 +953,13 @@ extension SyncEngine {
         // re-listed it in the Inbox after the protections expired.
         //
         // `messages` itself is deliberately NOT filtered. Every windowing decision
-        // below — `messages.count < limit`, the `CAST(messageId AS INTEGER)` floor,
-        // and `selectStaleHeaders`' own count/floor — must keep measuring the whole
-        // fetch, because they describe WHAT THE FETCH COVERED. Shrinking the fetch
-        // here would raise the floor and trip the complete-knowledge branch, and
-        // stale-delete rows the fetch never returned (ADR-IOS-042 / MIS-IOS-002).
+        // below — the `CAST(messageId AS INTEGER)` floor and `selectStaleHeaders`'
+        // own floor — must keep measuring the whole fetch, because they describe
+        // WHAT THE FETCH COVERED. Shrinking the fetch here would raise the floor
+        // and stale-delete rows the fetch never returned (ADR-IOS-042 /
+        // MIS-IOS-002). The complete-knowledge decision no longer reads `messages`
+        // at all — it reads `coverage.spansEntireFolder`, which the provider
+        // derived from the server's own EXISTS/page size.
         let deletedRemoteIds = Set(messages.lazy.filter(\.isDeletedOnServer).map(\.messageId))
         // Presence, not coverage: the id set every "does the server still have
         // this?" question is answered from. Feeds the UID-remap target map, so a
@@ -1096,15 +1127,24 @@ extension SyncEngine {
             let windowMode = provider.staleWindowMode
             // Complete-knowledge stale detection (treat the fetch as the whole folder and
             // stale-delete any local row not returned) is only safe AND bounded when the
-            // LOCAL side is also small. A LARGE folder that returns < limit is almost
-            // certainly a truncated/partial fetch, NOT genuine complete knowledge — so gate
-            // on a cheap index-backed COUNT (evaluated ONLY when the fetch came back short,
-            // via `&&` short-circuit) and fall through to the bounded windowed slice when
-            // the folder is large. This bounds the load (no whole-folder fetchAll on All
-            // Mail) AND prevents mass-stale-deleting rows a partial fetch never returned
-            // (ADR-IOS-042). selectStaleHeaders / windowMode are unchanged — this only
-            // decides WHICH candidate set they run against.
-            if messages.count < limit,
+            // LOCAL side is also small — so gate on a cheap index-backed COUNT (evaluated
+            // ONLY when the server proved whole-folder coverage, via `&&` short-circuit)
+            // and fall through to the bounded windowed slice when the folder is large.
+            // This bounds the load (no whole-folder fetchAll on All Mail).
+            //
+            // 🚨 The first term is `coverage.spansEntireFolder` — the SERVER's statement —
+            // and used to be `messages.count < limit`, a count taken AFTER the provider's
+            // `compactMap`. One unparseable record in a full window made that true for a
+            // 900-message folder, and this branch has no floor, so the other ~851 rows
+            // were deleted. `staleDetectionMaxFullScan` was never a defence against it
+            // (a 900-row folder is well under 2000). See `selectStaleHeaders`.
+            //
+            // `effectiveCoverage` is what `selectStaleHeaders` is told, and it is the
+            // decision ACTUALLY made here: a large folder falls to the windowed slice even
+            // when the server proved whole-folder coverage, so it must not then be handed
+            // a complete-knowledge claim over a bounded candidate set.
+            let effectiveCoverage: FetchCoverage
+            if coverage.spansEntireFolder,
                try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db) <= SyncConfig.staleDetectionMaxFullScan {
                 // Got everything AND the folder is small enough to trust — find local
                 // messages not in remote set
@@ -1118,14 +1158,20 @@ extension SyncEngine {
                         print("[Sync] \(folder.name) stale-check: local=\(allLocal.count) remote=\(messages.count) onlyLocal=\(Array(onlyLocal.prefix(5))) onlyRemote=\(Array(onlyRemote.prefix(5)))")
                     }
                 }
-                stale = Self.selectStaleHeaders(candidates: allLocal, fetched: messages, limit: limit, windowMode: windowMode)
+                effectiveCoverage = coverage
+                stale = Self.selectStaleHeaders(
+                    candidates: allLocal, fetched: messages, coverage: effectiveCoverage, windowMode: windowMode)
             } else {
-                // Folder is larger than the fetch window — OR it returned < limit but has
-                // more than `staleDetectionMaxFullScan` local rows, so a "complete" read is
-                // untrustworthy (likely a partial fetch; ADR-IOS-042). Load ONLY the bounded
-                // candidate slice (not the whole folder, per the memory budget) in the
-                // fetch-ordering dimension, then let selectStaleHeaders re-apply the
-                // same floor as the single source of truth.
+                // The server did not prove whole-folder coverage — OR it did but the folder
+                // holds more than `staleDetectionMaxFullScan` local rows, so a "complete"
+                // read is untrustworthy. Load ONLY the bounded candidate slice (not the
+                // whole folder, per the memory budget) in the fetch-ordering dimension,
+                // then let selectStaleHeaders re-apply the same floor as the single source
+                // of truth.
+                effectiveCoverage = FetchCoverage(
+                    serverRecordCount: coverage.serverRecordCount,
+                    spansEntireFolder: false,
+                    unmaterialisedIds: coverage.unmaterialisedIds)
                 let candidates: [MessageHeader]
                 switch windowMode {
                 case .uid:
@@ -1146,7 +1192,8 @@ extension SyncEngine {
                         candidates = []
                     }
                 }
-                stale = Self.selectStaleHeaders(candidates: candidates, fetched: messages, limit: limit, windowMode: windowMode)
+                stale = Self.selectStaleHeaders(
+                    candidates: candidates, fetched: messages, coverage: effectiveCoverage, windowMode: windowMode)
             }
             BootProfiler.mark("sync[\(folder.name)] staleDetect \(Int((CFAbsoluteTimeGetCurrent() - staleCandT0) * 1000))ms (stale=\(stale.count), remote=\(messages.count))")
             // Don't delete messages with pending operations or recently completed ops.

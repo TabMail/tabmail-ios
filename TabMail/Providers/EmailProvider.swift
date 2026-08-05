@@ -225,6 +225,51 @@ protocol MessageExistenceProbe: Sendable {
 /// - `.date`: Gmail/Exchange return the most recent by date → date-based window.
 enum StaleWindowMode: Sendable { case uid, date }
 
+/// What the SERVER reported about the window a windowed fetch asked for, stated
+/// BEFORE any client-side narrowing.
+///
+/// 🚨 **EXHAUSTION, COMPLETENESS AND "THE SERVER HAS NO MORE" ARE STATEMENTS
+/// ABOUT SERVER COVERAGE — NEVER ABOUT HOW MANY ROWS WE CHOSE TO MATERIALISE.**
+/// Every `fetchMessages` implementation ends in a client-side narrowing:
+/// `IMAPProvider.mapMessageInfo` returns nil when BOTH `internalDate` and the
+/// envelope `Date:` fail to parse, `ExchangeProvider.parseGraphMessage` returns
+/// nil without `receivedDateTime`, and `GmailProvider` drops the same nils inside
+/// its task group (`ProviderBrokenDateTests` proves those paths are intentional
+/// and reachable). So `.count` on the returned array means "returned AND
+/// parseable", and a survivor count can never prove coverage: one malformed
+/// sibling shrinks it, and a consumer reading it as "the whole folder came back"
+/// then deletes every local row the fetch never went near — the
+/// ADR-IOS-042 / MIS-IOS-002 mass-deletion shape reached through a different door.
+///
+/// The evidence carried here already existed at the fetch site and was discarded:
+/// IMAP reads `Mailbox.Selection.messageCount` two lines above its own FETCH, and
+/// the raw `infos.count` is already used by the `[IMAP-FETCH-GAP]` diagnostic;
+/// Gmail and Graph both know how many refs their list call returned.
+struct FetchCoverage: Sendable, Equatable {
+    /// How many records the SERVER named for the window this fetch asked about,
+    /// counted before any `compactMap`. `0` on `.unproven` means "no evidence",
+    /// and every consumer must read it that way — never as "the server is empty".
+    var serverRecordCount: Int
+
+    /// True ONLY when the server itself proved this window spans the ENTIRE
+    /// folder. For IMAP that is `SELECT`'s `EXISTS` being at most the requested
+    /// limit AND a FETCH record coming back for every one of them, so a SHORT
+    /// FETCH (the `[IMAP-FETCH-GAP]` diagnostic's subject) reads as a window
+    /// rather than as complete knowledge.
+    var spansEntireFolder: Bool
+
+    /// Ids the server NAMED in this window that the client could not
+    /// materialise. The server still holds those messages, so they are PRESENT —
+    /// a consumer asking "does the server still have this?" must answer yes, or
+    /// it deletes a message over a transient parse failure.
+    var unmaterialisedIds: Set<String>
+
+    /// Fail-closed: a provider that cannot report coverage proves nothing.
+    /// Never re-derive this from the returned array's count.
+    static let unproven = FetchCoverage(
+        serverRecordCount: 0, spansEntireFolder: false, unmaterialisedIds: [])
+}
+
 protocol EmailProvider: Sendable {
     func connect() async throws
     func disconnect() async throws
@@ -280,9 +325,14 @@ protocol EmailProvider: Sendable {
     /// the fetch and the read makes the pass stamp the live server's epoch over a
     /// batch that belongs to the previous one. See
     /// `IMAPProvider.fetchMessagesWithObservedEpoch` for the full rationale.
+    ///
+    /// `coverage` is bound the same way and for the same reason: the only place
+    /// that KNOWS what the server covered is the fetch site, and every consumer
+    /// downstream sees a post-`compactMap` array it cannot tell a short window
+    /// from. See `FetchCoverage`.
     func fetchMessagesWithObservedEpoch(
         folder: String, limit: Int, offset: Int
-    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?)
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage)
 
     /// T4.S6b: envelope-level sample of SPECIFIC UIDs, plus the UIDVALIDITY the
     /// SELECT that served it reported — BOUND together, same discipline as
@@ -451,11 +501,19 @@ extension EmailProvider {
     /// `SelectSourcedFolderEpochTests.aConformerThatDoesNotOverrideReportsNoEpoch`
     /// pins what that inheritance actually produces so this default can never be
     /// re-pointed at the mirror unnoticed.
+    ///
+    /// **Coverage is `.unproven` here, and that is fail-CLOSED.** A conformer that
+    /// does not override cannot say what the server covered, so the merge treats
+    /// its fetch as a WINDOW and never takes the complete-knowledge branch. The
+    /// tempting default — `spansEntireFolder: messages.count < limit` — is exactly
+    /// the survivor-count claim `FetchCoverage` exists to abolish; do not restore
+    /// it here. Every conformer whose sweep must keep working overrides
+    /// (`IMAPProvider`, `GmailProvider`, `ExchangeProvider`, `MockEmailProvider`).
     func fetchMessagesWithObservedEpoch(
         folder: String, limit: Int, offset: Int
-    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?) {
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage) {
         let messages = try await fetchMessages(folder: folder, limit: limit, offset: offset)
-        return (messages, nil)
+        return (messages, nil, .unproven)
     }
 
     /// Default: no sample, no epoch. **This default is fail-CLOSED here, and only

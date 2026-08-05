@@ -559,8 +559,15 @@ actor SyncEngine {
     /// not delete the dead functions as a side effect of reading this — that is
     /// its own decision.
     ///
+    /// **AND `found` IS THE PROVIDER'S OWN COVERAGE REPORT, NOT THE ARRAY'S COUNT.**
+    /// Every `fetchOlderMessages` implementation ends in a `compactMap` that drops
+    /// records it cannot parse, so the returned array's count is a SURVIVOR count.
+    /// `FetchCoverage.serverRecordCount` is computed at the fetch site from what the
+    /// server named (for IMAP, the UID batch `searchDateRange` returned) — see
+    /// `FetchCoverage`.
+    ///
     /// **TERMINATION.** Continuing requires BOTH halves, per folder:
-    /// 1. *coverage* — the server returned a page as large as the one we asked for
+    /// 1. *coverage* — the server named a page as large as the one we asked for
     ///    (`found >= SyncConfig.infiniteScrollFetchLimit`), so older mail may exist
     ///    beyond it; a short page means the server showed us everything it had; and
     /// 2. *progress* — that folder materialised at least one new row. This pull's
@@ -570,7 +577,13 @@ actor SyncEngine {
     ///    which is bounded by the server's finite message count.
     ///
     /// A full page in which nothing could be materialised therefore stops paging
-    /// (fail closed). That is recoverable without any user gesture, by
+    /// (fail closed). **Registered as `IOS-SCROLL-001`** — the reachable instance is
+    /// a page whose every record the server reports `\Deleted`, which happens on a
+    /// server without UIDPLUS where each completed move leaves a soft-deleted source
+    /// copy behind. It is an ACCEPTED limitation, not an oversight: the progress
+    /// half is a termination guard, not a coverage claim, and removing it would make
+    /// the scroller re-ask the identical window forever. That is recoverable without
+    /// any user gesture, by
     /// `SyncEngine.runBackfill`'s UID-range walk — whose cursor advances on
     /// COVERAGE (a confirmed range) and never on inserts — so the mail beyond it
     /// still arrives locally and the next reset re-arms the scroller. What
@@ -602,19 +615,24 @@ actor SyncEngine {
             }
 
             let pageLimit = SyncConfig.infiniteScrollFetchLimit
-            let fetched: (headers: [MessageHeaderInfo], observedEpoch: UInt32?)
+            let fetched: (headers: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage)
             do {
                 fetched = try await queue.execute(priority: .userAction) {
                     if let imapProvider = provider as? IMAPProvider {
                         let result = try await imapProvider.fetchOlderMessagesWithObservedEpoch(
                             folder: folder.path, before: oldestDate, limit: pageLimit)
-                        return (result.messages, result.observedEpoch)
+                        return (result.messages, result.observedEpoch, result.coverage)
                     } else if let gmailProvider = provider as? GmailProvider {
-                        return (try await gmailProvider.fetchOlderMessages(folder: folder.path, before: oldestDate, limit: pageLimit), nil)
+                        let result = try await gmailProvider.fetchOlderMessagesWithCoverage(
+                            folder: folder.path, before: oldestDate, limit: pageLimit)
+                        return (result.messages, nil, result.coverage)
                     } else if let exchangeProvider = provider as? ExchangeProvider {
-                        return (try await exchangeProvider.fetchOlderMessages(folder: folder.path, before: oldestDate, limit: pageLimit), nil)
+                        let result = try await exchangeProvider.fetchOlderMessagesWithCoverage(
+                            folder: folder.path, before: oldestDate, limit: pageLimit)
+                        return (result.messages, nil, result.coverage)
                     }
-                    return ([], nil)
+                    // No known provider: we asked nothing, so we proved nothing.
+                    return ([], nil, .unproven)
                 }
             } catch {
                 if SyncEngine.isSelectFailedError(error) {
@@ -625,14 +643,23 @@ actor SyncEngine {
                 throw error
             }
             let headers = fetched.headers
-            // COVERAGE — what the SERVER returned for the window we asked about.
-            // The `\Deleted` records the insert loop below deliberately skips are
-            // still counted here, exactly as the backfill walk confirms a UID
-            // range whose inserts were all skipped. Never narrow this to the
-            // insert count. (An earlier revision cited `backfillWindow`'s `found`
-            // here; that function is unreachable in production — see the
-            // `deepBackfillFolder` note on `fetchOlderMessages` above.)
-            let found = headers.count
+            // COVERAGE — what the SERVER named for the window we asked about,
+            // counted at the fetch site BEFORE any client-side narrowing
+            // (`FetchCoverage.serverRecordCount`; for IMAP it is the size of the
+            // UID batch `searchDateRange` returned, taken before the FETCH).
+            //
+            // 🚨 This used to read `headers.count` under this same "what the SERVER
+            // returned" comment, and that was FALSE: `headers` is the provider's
+            // post-`compactMap` survivor array, so a record whose date failed to
+            // parse shrank the number the continuation decision is made from. The
+            // `\Deleted` records the insert loop below deliberately skips ARE
+            // counted here — exactly as the backfill walk confirms a UID range
+            // whose inserts were all skipped. Never narrow this to the insert
+            // count, and never back to the materialised count. (An earlier
+            // revision cited `backfillWindow`'s `found` here; that function is
+            // unreachable in production — see the `deepBackfillFolder` note on
+            // `fetchOlderMessages` above.)
+            let found = fetched.coverage.serverRecordCount
             let sourceBoundEpoch = fetched.observedEpoch.flatMap { epoch in
                 epoch > 0 ? Int(exactly: epoch) : nil
             }

@@ -216,16 +216,22 @@ enum SyncConfig {
     /// hourly. Inbox is never skipped regardless.
     static let fullSyncDeepEveryN = 6
     /// Upper bound on local rows for the "complete-knowledge" stale-detection path
-    /// (`runSyncMessages`, the `messages.count < limit` branch). When the fetch returns
-    /// fewer than `syncMessageLimit` we normally treat it as the whole folder and may
-    /// stale-delete any local row not in the remote set. That is only SAFE (and bounded)
-    /// when the LOCAL side is also small: a LARGE folder that returns < limit is almost
-    /// certainly a truncated/partial fetch, and concluding "complete" there would both
-    /// load the whole folder into the writer AND risk mass-stale-deleting rows the
-    /// partial fetch never returned (the ADR-IOS-042 data-loss class). Above this count
-    /// we fall through to the bounded windowed slice instead (which can't conclude
-    /// anything outside its floor). Generous on purpose — normal folders sit well under
-    /// it; only pathologically large folders (Gmail All Mail / big Archives) trip it.
+    /// (`runSyncMessages`, the `coverage.spansEntireFolder` branch). When the SERVER
+    /// proves the fetch spanned the whole folder we may stale-delete any local row not
+    /// in the remote set. That is only BOUNDED when the LOCAL side is also small —
+    /// concluding "complete" on a huge folder would load the whole thing into the
+    /// writer — so above this count we fall through to the windowed slice instead
+    /// (which can't conclude anything outside its floor). Generous on purpose; only
+    /// pathologically large folders (Gmail All Mail / big Archives) trip it.
+    ///
+    /// 🚨 **This is a MEMORY bound, and it was never the safety bound.** The branch it
+    /// gates used to trip on `messages.count < syncMessageLimit` — a count taken AFTER
+    /// the provider's `compactMap` — so one unparseable record in a full window made a
+    /// 900-message folder look complete and stale-deleted ~851 rows, well under this
+    /// 2000-row ceiling. The safety property now comes from `FetchCoverage`, which the
+    /// provider derives from the server's own EXISTS / page size. Do not re-introduce
+    /// a survivor-count test here or at the branch, and do not read this constant as
+    /// protection against one.
     static let staleDetectionMaxFullScan = 2000
     /// Max bound parameters per SQL `IN (...)` chunk — stays under SQLite's variable
     /// limit. Used to chunk large id lists for membership / dedup queries.

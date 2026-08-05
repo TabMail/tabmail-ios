@@ -239,6 +239,17 @@ actor GmailProvider: EmailProvider {
     }
 
     func fetchMessages(folder: String, limit: Int, offset: Int) async throws -> [MessageHeaderInfo] {
+        try await fetchMessagesWithObservedEpoch(folder: folder, limit: limit, offset: offset).messages
+    }
+
+    /// Gmail has no UIDVALIDITY, so `observedEpoch` is nil forever (matching the
+    /// `EmailProvider` default). What this override exists for is `coverage`: the
+    /// `messages.list` page size is the only honest statement of what the SERVER
+    /// covered, and the task group below discards nils, so the returned array's
+    /// count is a survivor count. See `FetchCoverage`.
+    func fetchMessagesWithObservedEpoch(
+        folder: String, limit: Int, offset: Int
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage) {
         var path: String
         if folder == GmailProvider.archivePath {
             // "All Mail" archive: messages not in inbox, sent, trash, spam, or drafts
@@ -253,27 +264,44 @@ actor GmailProvider: EmailProvider {
         let data = try await request(path: path)
         let listResponse = try JSONDecoder().decode(GmailMessageListResponse.self, from: data)
 
-        guard let messageRefs = listResponse.messages else { return [] }
+        guard let messageRefs = listResponse.messages else {
+            // The list call itself returned nothing: the server covered zero
+            // records, and it covered the whole (empty) result set doing so.
+            return ([], nil, FetchCoverage(
+                serverRecordCount: 0, spansEntireFolder: true, unmaterialisedIds: []))
+        }
 
         // Fetch headers concurrently — messages.list only returns IDs,
         // so each message needs a separate messages.get call. Running them
         // in parallel cuts per-folder time from ~20s (50 × 400ms serial) to ~2-3s.
-        let headers: [MessageHeaderInfo] = try await withThrowingTaskGroup(of: MessageHeaderInfo?.self) { group in
+        // The group yields `(id, header?)` rather than `header?` so a record the
+        // parser refuses is still NAMED — it is a message the server holds, and
+        // dropping its id would let the merge read it as gone.
+        let page = try await withThrowingTaskGroup(of: (id: String, header: MessageHeaderInfo?).self) { group in
             for ref in messageRefs {
                 group.addTask {
                     let msgData = try await self.request(path: "/messages/\(ref.id)\(GmailAPI.metadataQuery)")
                     let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
-                    return await self.parseGmailMessage(msg)
+                    return (ref.id, await self.parseGmailMessage(msg))
                 }
             }
             var result: [MessageHeaderInfo] = []
-            for try await header in group {
-                if let header { result.append(header) }
+            var unmaterialised = Set<String>()
+            for try await entry in group {
+                if let header = entry.header { result.append(header) } else { unmaterialised.insert(entry.id) }
             }
-            return result
+            return (headers: result, unmaterialised: unmaterialised)
         }
 
-        return headers
+        // COVERAGE is `messageRefs.count` — what `messages.list` returned for the
+        // window we asked about. A short page means the label held no more; the
+        // materialised count means only that some of them parsed. `nextPageToken`
+        // is the server's own "there is more", so both terms are required: Gmail
+        // documents `maxResults` as approximate, and the token is authoritative.
+        return (page.headers, nil, FetchCoverage(
+            serverRecordCount: messageRefs.count,
+            spansEntireFolder: messageRefs.count < limit && listResponse.nextPageToken == nil,
+            unmaterialisedIds: page.unmaterialised))
     }
 
     func fetchMessage(id: String, folder: String) async throws -> FullMessageInfo {
@@ -996,6 +1024,15 @@ actor GmailProvider: EmailProvider {
     }
 
     func fetchOlderMessages(folder: String, before: Date, limit: Int) async throws -> [MessageHeaderInfo] {
+        try await fetchOlderMessagesWithCoverage(folder: folder, before: before, limit: limit).messages
+    }
+
+    /// Infinite-scroll page plus what the SERVER covered for it. The paging
+    /// consumer's continuation signal is a coverage question, and the loop below
+    /// drops records `parseGmailMessage` refuses — see `FetchCoverage`.
+    func fetchOlderMessagesWithCoverage(
+        folder: String, before: Date, limit: Int
+    ) async throws -> (messages: [MessageHeaderInfo], coverage: FetchCoverage) {
         let beforeEpoch = Int(before.timeIntervalSince1970)
         let requestPath: String
         if folder == GmailProvider.archivePath {
@@ -1009,18 +1046,26 @@ actor GmailProvider: EmailProvider {
         let data = try await request(path: requestPath)
         let listResponse = try JSONDecoder().decode(GmailMessageListResponse.self, from: data)
 
-        guard let messageRefs = listResponse.messages else { return [] }
+        guard let messageRefs = listResponse.messages else {
+            return ([], FetchCoverage(serverRecordCount: 0, spansEntireFolder: true, unmaterialisedIds: []))
+        }
 
         var headers: [MessageHeaderInfo] = []
+        var unmaterialised = Set<String>()
         for ref in messageRefs {
             let msgData = try await request(path: "/messages/\(ref.id)\(GmailAPI.metadataQuery)")
             let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
             if let header = parseGmailMessage(msg) {
                 headers.append(header)
+            } else {
+                unmaterialised.insert(ref.id)
             }
         }
 
-        return headers
+        return (headers, FetchCoverage(
+            serverRecordCount: messageRefs.count,
+            spansEntireFolder: messageRefs.count < limit && listResponse.nextPageToken == nil,
+            unmaterialisedIds: unmaterialised))
     }
 
     // MARK: - Incremental Sync

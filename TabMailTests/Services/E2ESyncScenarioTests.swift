@@ -104,9 +104,19 @@ private func simulateRunSyncMessages(
         // Stale detection — delegate to the production source of truth
         // (SyncEngine.selectStaleHeaders) so this harness can never drift from
         // real sync behavior. windowMode selects the UID (IMAP) vs date window.
+        // Coverage models a server that returned `messages` verbatim for a window of
+        // `limit` — the harness feeds `selectStaleHeaders` directly, so there is no
+        // provider narrowing between the two and `messages.count` IS the server's
+        // record count here. Real providers must NOT derive coverage this way; see
+        // `FetchCoverage`.
         let allLocal = try MessageHeader.filter(Column("folderId") == folderId).fetchAll(dbConn)
         let stale = SyncEngine.selectStaleHeaders(
-            candidates: allLocal, fetched: messages, limit: limit, windowMode: windowMode)
+            candidates: allLocal, fetched: messages,
+            coverage: FetchCoverage(
+                serverRecordCount: messages.count,
+                spansEntireFolder: messages.count < limit,
+                unmaterialisedIds: []),
+            windowMode: windowMode)
 
         let protectedIds = pendingAllIds.union(undoProtectedIds)
         let isProtected: (MessageHeader) -> Bool = { msg in

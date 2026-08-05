@@ -3366,6 +3366,44 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         try await fetchMessagesWithObservedEpoch(folder: folder, limit: limit, offset: offset).messages
     }
 
+    /// Coverage for one windowed `fetchMessages` pass, from the SELECT that served
+    /// it and the raw FETCH records it returned — computed here because this is the
+    /// only place both facts exist. See `FetchCoverage`.
+    ///
+    /// `spansEntireFolder` needs BOTH halves and neither alone is sound:
+    ///  - `messageCount <= limit` — the requested `selection.latest(limit)` range is
+    ///    then the whole mailbox, so nothing on the server sits outside it. Without
+    ///    this a 900-message folder that returned a full window would read as
+    ///    complete the moment one record failed to map.
+    ///  - `rawRecordCount == messageCount` — the server returned a record for every
+    ///    message in that range. A SHORT FETCH (already visible in production as the
+    ///    `[IMAP-FETCH-GAP]` diagnostic) otherwise manufactures the same false
+    ///    completeness from the other direction, and the messages whose records
+    ///    never came back would be stale-deleted.
+    ///
+    /// Records the client could not map are NOT excluded from either half — they
+    /// were covered. They are reported as `unmaterialisedIds` instead, so presence
+    /// stays true for them while coverage stays honest.
+    nonisolated static func coverage(
+        rawRecordCount: Int, serverMessageCount: Int, limit: Int, unmaterialisedIds: Set<String>
+    ) -> FetchCoverage {
+        FetchCoverage(
+            serverRecordCount: rawRecordCount,
+            spansEntireFolder: serverMessageCount <= limit && rawRecordCount == serverMessageCount,
+            unmaterialisedIds: unmaterialisedIds)
+    }
+
+    /// The ids of records the server NAMED that `mapMessageInfo` refused. Derived
+    /// from the SAME `IMAPFetchMapping.messageIdString` the mapper would have used,
+    /// so a dropped record is named by exactly the id its local row carries.
+    nonisolated static func unmaterialisedIds(
+        raw: [MessageInfo], mapped: [MessageHeaderInfo]
+    ) -> Set<String> {
+        guard raw.count != mapped.count else { return [] }
+        let mappedIds = Set(mapped.map(\.messageId))
+        return Set(raw.map { IMAPFetchMapping.messageIdString(from: $0) }).subtracting(mappedIds)
+    }
+
     /// `fetchMessages`, plus the UIDVALIDITY reported by the SELECT that served
     /// it — returned TOGETHER, from the same `Mailbox.Selection`.
     ///
@@ -3402,7 +3440,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// §2.3.1.1 types it `nz-number`).
     func fetchMessagesWithObservedEpoch(
         folder: String, limit: Int, offset: Int
-    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?) {
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage) {
         try await withFolderConnection(folder: folder) { server in
             // T1.2b: the SYNC path's own SELECT. `SyncEngine.runSyncMessages`
             // reaches the server through here (`provider.fetchMessages`), and that
@@ -3416,9 +3454,17 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             let selection = try await selectMailboxTracked(server, folder: folder)
             let observed = selection.uidValidity.value
             let observedEpoch: UInt32? = observed != 0 ? observed : nil
-            guard selection.messageCount > 0 else { return ([], observedEpoch) }
+            // `EXISTS 0` is the server stating the folder is EMPTY, which IS
+            // complete knowledge — and it must stay so, or an emptied folder's
+            // local rows would never be swept.
+            guard selection.messageCount > 0 else {
+                return ([], observedEpoch,
+                        FetchCoverage(serverRecordCount: 0, spansEntireFolder: true, unmaterialisedIds: []))
+            }
 
-            guard let range = selection.latest(limit) else { return ([], observedEpoch) }
+            // No representable range over a non-empty mailbox: we asked nothing,
+            // so we proved nothing.
+            guard let range = selection.latest(limit) else { return ([], observedEpoch, .unproven) }
 
             do {
                 let infos = try await server.fetchMessageInfosBulk(using: range)
@@ -3426,12 +3472,20 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     print("[IMAP-FETCH-GAP] \(folder): fetchMessages requested \(limit) (msgCount=\(selection.messageCount)), got \(infos.count)")
                 }
                 // compactMap: mapMessageInfo returns nil for unparseable messages (treated as fetch failure)
-                return (infos.compactMap { self.mapMessageInfo($0) }.sorted { $0.date > $1.date }, observedEpoch)
+                let mapped = infos.compactMap { self.mapMessageInfo($0) }.sorted { $0.date > $1.date }
+                // COVERAGE is measured on `infos` and `selection.messageCount` —
+                // the two things the SERVER said — never on `mapped`. See
+                // `IMAPProvider.coverage(rawRecordCount:serverMessageCount:limit:unmaterialisedIds:)`.
+                return (mapped, observedEpoch, Self.coverage(
+                    rawRecordCount: infos.count,
+                    serverMessageCount: selection.messageCount,
+                    limit: limit,
+                    unmaterialisedIds: Self.unmaterialisedIds(raw: infos, mapped: mapped)))
             } catch {
                 let msg = "\(error)"
                 if msg.contains("Invalid messageset") || msg.contains("invalid messageset") {
                     print("[IMAP] Invalid messageset for \(folder) (messageCount=\(selection.messageCount)) — skipping")
-                    return ([], observedEpoch)
+                    return ([], observedEpoch, .unproven)
                 }
                 throw error
             }
@@ -5939,9 +5993,19 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     /// Infinite-scroll headers paired with the SELECT that immediately served
     /// their UID FETCH. A search-window premise is not promoted into authority.
+    ///
+    /// `coverage.serverRecordCount` is the size of the batch the SERVER named for
+    /// this page (`allUIDs`, capped at `limit`) — computed before the FETCH and
+    /// therefore before `mapMessageInfo` drops anything. That is the number
+    /// `SyncEngine.fetchOlderMessages` needs for its continuation decision; the
+    /// materialised array's count is a survivor count and cannot answer "does the
+    /// server hold more beyond this page?".
+    ///
+    /// `spansEntireFolder` is always false here: a date-range SEARCH is a window by
+    /// construction and never proves anything about the whole folder.
     func fetchOlderMessagesWithObservedEpoch(
         folder: String, before: Date, limit: Int
-    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?) {
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage) {
         try await withActionConnection(folder: folder) { server in
             var windowDays = 90
             let maxWindowDays = 365 * 10
@@ -5963,16 +6027,24 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     let selection = try await self.selectMailboxTracked(server, folder: folder)
                     let infos = try await server.fetchMessageInfosBulk(using: uidSet)
                     let observed = selection.uidValidity.value
+                    let mapped = infos.compactMap { self.mapMessageInfo($0) }.sorted { $0.date > $1.date }
                     return (
-                        infos.compactMap { self.mapMessageInfo($0) }.sorted { $0.date > $1.date },
-                        observed != 0 ? observed : nil
+                        mapped,
+                        observed != 0 ? observed : nil,
+                        FetchCoverage(
+                            serverRecordCount: batch.count,
+                            spansEntireFolder: false,
+                            unmaterialisedIds: Self.unmaterialisedIds(raw: infos, mapped: mapped))
                     )
                 }
 
                 windowDays *= 2
             }
 
-            return ([], nil)
+            // Every widened window came back empty: the server named nothing at
+            // all, which is honest coverage of zero records — not "unproven".
+            return ([], nil, FetchCoverage(
+                serverRecordCount: 0, spansEntireFolder: false, unmaterialisedIds: []))
         }
     }
 

@@ -54,6 +54,34 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// Falls back to slicing `body` only when nil.
         let partBodies: [String: Data]?
 
+        /// The same message with a different server-side `INTERNALDATE`.
+        ///
+        /// Needed because `makeMessage(uid:rfc822Text:)` DERIVES `internalDate` from
+        /// the `Date:` header, so a fixture whose `Date:` is deliberately
+        /// unparseable also loses the timestamp UID SEARCH windows on
+        /// (`honorSearchDateCriteria`). Setting it back here keeps the message
+        /// findable by a date-range SEARCH while its envelope date stays broken —
+        /// which, paired with `suppressFetchInternalDate(in:uids:)`, is the wire
+        /// shape where the SERVER covers a message the CLIENT cannot materialise.
+        func replacingInternalDate(_ internalDate: String) -> Message {
+            Message(
+                uid: uid,
+                raw: raw,
+                subject: subject,
+                from: from,
+                to: to,
+                date: date,
+                internalDate: internalDate,
+                messageID: messageID,
+                contentType: contentType,
+                charset: charset,
+                body: body,
+                headerData: headerData,
+                customBodystructure: customBodystructure,
+                partBodies: partBodies
+            )
+        }
+
         func replacingUID(_ uid: Int) -> Message {
             Message(
                 uid: uid,
@@ -194,6 +222,19 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// and prove that an unanswerable probe never retires an operation.
         /// Empty for every pre-existing test.
         var fetchUidSuppressedByMailbox: [String: Set<Int>] = [:]
+        /// Per-mailbox UIDs whose FETCH records omit the `INTERNALDATE` data item
+        /// (`suppressFetchInternalDate(in:uids:)`). Paired with a fixture whose
+        /// `Date:` header is not an RFC 5322 date, this is the wire shape
+        /// `IMAPProvider.mapMessageInfo` already refuses — both date sources
+        /// unusable — so the SERVER covers the message and the CLIENT cannot
+        /// materialise it. Empty for every pre-existing test.
+        var fetchInternalDateSuppressedByMailbox: [String: Set<Int>] = [:]
+        /// Per-mailbox UIDs for which FETCH emits NO record at all
+        /// (`suppressFetchRecord(in:uids:)`) — the SHORT FETCH already observed in
+        /// production as the `[IMAP-FETCH-GAP]` diagnostic: `SELECT` reports N
+        /// messages, the FETCH over a range covering all N returns fewer than N.
+        /// Empty for every pre-existing test.
+        var fetchRecordSuppressedByMailbox: [String: Set<Int>] = [:]
         /// Invariant test layer (2026-07-16) — wrong-message wire oracle,
         /// deliverable 1. The rfc822 Message-ID(s) the CURRENT test's user
         /// intention(s) target, registered via `expectMutation(rfc822MessageId:)`.
@@ -829,6 +870,37 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// handler's extra condition is one `isEmpty` branch.
     func suppressFetchUid(in mailbox: String, uids: Set<Int>) {
         withState { $0.fetchUidSuppressedByMailbox[mailbox] = uids }
+    }
+
+    /// Test seam: make this mailbox's FETCH records omit the `INTERNALDATE` data
+    /// item for these UIDs even though the client asked for it.
+    ///
+    /// Pair it with a fixture whose `Date:` header is not an RFC 5322 date
+    /// (`SwiftMail`'s `parseEnvelopeDate` returns nil and leaves `MessageInfo.date`
+    /// nil, silently and by design) and the client receives a FETCH record for a
+    /// message it CANNOT materialise: `IMAPProvider.mapMessageInfo` returns nil
+    /// when both date sources fail, and its own comment names the production
+    /// trigger — a message the server has not finished indexing, "happens right
+    /// after APPEND".
+    ///
+    /// That asymmetry is the whole point and cannot be produced any other way: the
+    /// SERVER covered the message, the CLIENT dropped it, and every count taken
+    /// after the provider's `compactMap` is therefore a SURVIVOR count. See
+    /// `FetchCoverage`.
+    func suppressFetchInternalDate(in mailbox: String, uids: Set<Int>) {
+        withState { $0.fetchInternalDateSuppressedByMailbox[mailbox] = uids }
+    }
+
+    /// Test seam: emit NO FETCH record at all for these UIDs, while `SELECT` keeps
+    /// counting them in `EXISTS` and every other command still sees them.
+    ///
+    /// This is the SHORT FETCH the app already observes in production — the
+    /// `[IMAP-FETCH-GAP]` diagnostic exists precisely because a real server
+    /// sometimes returns fewer records than the requested range holds. It is the
+    /// second, independent way to make a full window LOOK short, and unlike a parse
+    /// failure it leaves the client with no id for the missing message at all.
+    func suppressFetchRecord(in mailbox: String, uids: Set<Int>) {
+        withState { $0.fetchRecordSuppressedByMailbox[mailbox] = uids }
     }
 
     /// Test seam (T1.2b): make this mailbox's SELECT/EXAMINE omit the
@@ -2145,13 +2217,19 @@ final class FakeIMAPServer: @unchecked Sendable {
             (
                 messages: state.messagesByMailbox[mailbox] ?? [],
                 flags: state.flagsByMailbox[mailbox] ?? [:],
-                uidSuppressed: state.fetchUidSuppressedByMailbox[mailbox] ?? []
+                uidSuppressed: state.fetchUidSuppressedByMailbox[mailbox] ?? [],
+                internalDateSuppressed: state.fetchInternalDateSuppressedByMailbox[mailbox] ?? [],
+                recordSuppressed: state.fetchRecordSuppressedByMailbox[mailbox] ?? []
             )
         }
         let matched = parseSequenceSet(seqStr, uidMode: uidMode, messages: snapshot.messages)
         var response = ""
 
         for msg in matched {
+            // `suppressFetchRecord(in:uids:)` — the SHORT FETCH. The message stays
+            // in the mailbox (so SELECT still counts it in EXISTS) but no record
+            // for it reaches the client.
+            if snapshot.recordSuppressed.contains(msg.uid) { continue }
             let seqnum = (snapshot.messages.firstIndex(where: { $0.uid == msg.uid }) ?? 0) + 1
             var fetchItems: [String] = []
 
@@ -2169,7 +2247,11 @@ final class FakeIMAPServer: @unchecked Sendable {
             if itemsStr.contains("ENVELOPE") {
                 fetchItems.append("ENVELOPE \(buildEnvelope(msg))")
             }
-            if itemsStr.contains("INTERNALDATE") {
+            // `suppressFetchInternalDate(in:uids:)` — the record still arrives, and
+            // every other item is unchanged; only the server's delivery timestamp
+            // is missing, so a fixture whose `Date:` header does not parse leaves
+            // `mapMessageInfo` with no usable date at all.
+            if itemsStr.contains("INTERNALDATE"), !snapshot.internalDateSuppressed.contains(msg.uid) {
                 fetchItems.append("INTERNALDATE \"\(msg.internalDate)\"")
             }
             if itemsStr.contains("RFC822.SIZE") {

@@ -82,7 +82,8 @@ import Synchronization
 /// The turnover must be isolated from a SECOND, independent deletion path that
 /// would otherwise mask it: `runSyncMessages`'s windowed stale sweep. That sweep
 /// has **no UIDVALIDITY guard at all** and its complete-knowledge branch
-/// (`selectStaleHeaders`, `fetched.count < limit`) deletes *every* local row not
+/// (`selectStaleHeaders`, `coverage.spansEntireFolder` — it read `fetched.count <
+/// limit` when this suite was written) deletes *every* local row not
 /// in the fetch — so any fixture where the server returns fewer than
 /// `SyncConfig.syncMessageLimit` messages loses all the local mail BEFORE the
 /// reconcile walk runs, on the pre-fix AND post-fix tree alike, and can prove
