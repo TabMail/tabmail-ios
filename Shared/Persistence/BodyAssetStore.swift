@@ -684,6 +684,22 @@ enum BodyAssetStore {
         }
     }
 
+    /// The EXCLUSIVE upper bound of the half-open range that selects exactly the
+    /// strings beginning with `prefix`, under SQLite's default BINARY collation:
+    /// `prefix` with its final Unicode scalar incremented by one.
+    ///
+    /// Used so a prefix test can be an indexable range instead of
+    /// `substr(col, 1, n) = ?`, which hides the column inside a function and
+    /// forces a table/index SCAN. Blob ids are hex + `'/'`, so the scalar being
+    /// incremented is always ASCII and the `+ 1` cannot leave Unicode's range;
+    /// `nil` is returned only for an empty prefix, whose callers treat it as
+    /// "cannot decide" and keep whatever they were considering removing.
+    private static func prefixUpperBound(_ prefix: String) -> String? {
+        guard let last = prefix.unicodeScalars.last,
+              let bumped = UnicodeScalar(last.value + 1) else { return nil }
+        return String(String.UnicodeScalarView(prefix.unicodeScalars.dropLast())) + String(bumped)
+    }
+
     /// Reclaims `<store>/<headerHash>/` once it is provably idle.
     ///
     /// "Idle" is decided under the manifest's cross-process writer lock: no
@@ -702,24 +718,51 @@ enum BodyAssetStore {
     /// in `pruneOrphanFiles`, not by a recursive delete that cannot tell an
     /// abandoned blob from one a concurrent writer is materialising right now.
     private static func removeHeaderDirectoryIfIdle(hashName: String) {
-        guard let queue = manifestQueue(), let dir = storeDirectory() else { return }
+        guard let queue = manifestQueue(), let dir = storeDirectory(),
+              let hashUpperBound = prefixUpperBound(hashName) else { return }
         let folderURL = dir.appendingPathComponent(hashName, isDirectory: true)
         do {
             try queue.write { db in
+                // ⚑ HALF-OPEN PREFIX RANGE, NOT `substr(…) = ?`. Both predicates ask
+                // the same question — "does any blob id start with this header hash?" —
+                // but `substr(id, 1, n) = ?` wraps the indexed column in a function, so
+                // neither `sqlite_autoindex_bodyAsset_1` nor
+                // `idx_bodyAssetPreparation_blob` can seek it and both arms became
+                // `SCAN`. This runs under the manifest's single WRITER lock, once per
+                // directory, while the sweep also does filesystem I/O — so an O(D×N)
+                // scan serialises every asset read and every NSE/main-app write behind
+                // it. As a range it is `SEARCH … USING (COVERING) INDEX` on both arms.
+                //
+                // The equivalence is exact, not approximate: under SQLite's default
+                // BINARY collation `p <= s < p⁺` (where `p⁺` is `p` with its final byte
+                // incremented) selects precisely the strings that begin with `p`, which
+                // is precisely `substr(s, 1, p.count) = p`. Blob ids are
+                // `"<16 hex>/<16 hex>"` and every caller passes exactly
+                // `hashHexLength` characters, so `p.count == hashHexLength` holds and
+                // the two forms agree on every row.
+                //
+                // NEGATIVE CASE: the forms diverge only for a `hashName` whose length is
+                // NOT `hashHexLength`, which no call site produces (all three derive it
+                // from `String(id.prefix(hashHexLength))` or `headerHash(_:)`, and
+                // `pruneOrphanFiles` additionally gates on `name.count == hashHexLength`).
+                // Were one to appear, the range would match MORE rows than the `substr`
+                // form, i.e. read as referenced and KEEP the directory — the fail-closed
+                // direction. An empty `hashName` has no successor and is refused above,
+                // also by keeping the directory.
                 guard let referenced = try Bool.fetchOne(
                     db,
                     sql: """
                         SELECT EXISTS(
                             SELECT 1 FROM bodyAsset
-                            WHERE substr(id, 1, ?) = ?
+                            WHERE id >= ? AND id < ?
                             UNION ALL
                             SELECT 1 FROM bodyAssetPreparation
-                            WHERE substr(blobId, 1, ?) = ? AND createdAt > ?
+                            WHERE blobId >= ? AND blobId < ? AND createdAt > ?
                         )
                         """,
                     arguments: [
-                        hashHexLength, hashName,
-                        hashHexLength, hashName,
+                        hashName, hashUpperBound,
+                        hashName, hashUpperBound,
                         abandonedPreparationCutoffMs(),
                     ]
                 ), !referenced else { return }

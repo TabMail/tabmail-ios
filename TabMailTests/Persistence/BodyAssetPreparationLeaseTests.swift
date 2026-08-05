@@ -318,6 +318,190 @@ struct BodyAssetPreparationLeaseTests {
         #expect(rows == 1)
     }
 
+    // MARK: - Header-directory reclaim: which blob ids count as "under this hash"
+
+    /// A manifest row for a blob id that has no file on disk. Reachable in
+    /// production whenever bytes are lost out of band (a partially-failed purge,
+    /// an OS-level cleanup) and it is the shape that isolates the RELATIONAL half
+    /// of the reclaim decision from the "is the directory empty" half.
+    private static func insertManifestRow(blobId: String) throws {
+        guard let queue = BodyAssetStore.manifestQueue() else {
+            Issue.record("manifest queue unavailable")
+            return
+        }
+        try queue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO bodyAsset
+                        (id, headerId, kind, contentId, attachmentSection,
+                         contentType, sizeBytes, createdAt, lastAccessedAt, identityStamp)
+                    VALUES (?, ?, 1, NULL, '2', 'application/pdf', 16, ?, NULL, NULL)
+                    """,
+                arguments: [
+                    blobId, "acc1:INBOX:\(blobId)",
+                    Int64(Date().timeIntervalSince1970 * 1000),
+                ]
+            )
+        }
+    }
+
+    /// A preparation lease with an explicit age. `ageSeconds == 0` is a live
+    /// writer; anything past `sweepMinAgeSeconds` is a writer presumed dead.
+    /// Computed from `Date()`, never a literal.
+    private static func insertLease(blobId: String, ageSeconds: TimeInterval) throws {
+        guard let queue = BodyAssetStore.manifestQueue() else {
+            Issue.record("manifest queue unavailable")
+            return
+        }
+        try queue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO bodyAssetPreparation (preparationId, blobId, createdAt)
+                    VALUES (?, ?, ?)
+                    """,
+                arguments: [
+                    UUID().uuidString, blobId,
+                    Int64((Date().timeIntervalSince1970 - ageSeconds) * 1000),
+                ]
+            )
+        }
+    }
+
+    /// An empty header directory, aged past the sweep threshold so only the
+    /// manifest-side decision is left standing between it and the reclaim.
+    private static func makeAgedEmptyDirectory(_ hashName: String) throws {
+        guard let storeDir = BodyAssetStore.storeDirectory() else {
+            Issue.record("store directory unavailable")
+            return
+        }
+        let url = storeDir.appendingPathComponent(hashName, isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try ageOut(path: url.path)
+    }
+
+    private static func directoryExists(_ hashName: String) -> Bool {
+        guard let storeDir = BodyAssetStore.storeDirectory() else { return false }
+        return FileManager.default.fileExists(
+            atPath: storeDir.appendingPathComponent(hashName, isDirectory: true).path)
+    }
+
+    /// THE SYSTEM PROPERTY: a header directory is reclaimed exactly when no blob id
+    /// **under that hash** is claimed by a manifest row or a live lease — and a blob
+    /// id under a DIFFERENT hash is never "under this one", however close the two
+    /// sort.
+    ///
+    /// Both directions in one run, which is what makes it a boundary test rather
+    /// than a policy test:
+    ///  - the claimed directory must SURVIVE — a predicate that stopped matching
+    ///    (too narrow) would unlink a directory whose bytes something still
+    ///    references;
+    ///  - its lexicographic PREDECESSOR, claimed by nothing, must be RECLAIMED — a
+    ///    predicate that matched too much (an unbounded `id >= prefix`, a prefix
+    ///    test that ignores where the hash ends) would report it referenced and leak
+    ///    the directory forever.
+    ///
+    /// Blob ids are `"<16 hex>/<16 hex>"`, so no header hash can be a proper prefix
+    /// of another and the classic prefix-range trap is unreachable by length. The
+    /// reachable trap is the ADJACENCY asserted here, plus the all-`f` case below
+    /// where the exclusive upper bound leaves the hex alphabet.
+    @Test("Header-directory reclaim: a claimed hash survives while its unclaimed neighbour is reclaimed")
+    func headerDirectoryReclaimHonoursTheHashBoundary() throws {
+        let dir = try Self.setupTest()
+        defer { Self.teardown(dir) }
+
+        let claimed = "bbbbbbbbbbbbbbbb"
+        let unclaimedPredecessor = "aaaaaaaaaaaaaaaa"
+        try Self.insertManifestRow(blobId: "\(claimed)/1111111111111111")
+        try Self.makeAgedEmptyDirectory(claimed)
+        try Self.makeAgedEmptyDirectory(unclaimedPredecessor)
+
+        BodyAssetStore.pruneOrphanFiles()
+
+        #expect(Self.directoryExists(claimed),
+                "a directory whose hash still has a manifest row must not be unlinked")
+        #expect(!Self.directoryExists(unclaimedPredecessor),
+                "a directory nothing claims must be reclaimed — a neighbouring hash's row is not a claim on it")
+    }
+
+    /// The successor boundary at the top of the hex alphabet: the exclusive upper
+    /// bound of `ffffffffffffffff` is not a hex string at all. A directory claimed
+    /// by a row must still survive there, and an unclaimed neighbour must still go.
+    @Test("Header-directory reclaim: the all-f hash boundary keeps its claimed directory")
+    func headerDirectoryReclaimHandlesTheTopOfTheHashAlphabet() throws {
+        let dir = try Self.setupTest()
+        defer { Self.teardown(dir) }
+
+        let claimed = "ffffffffffffffff"
+        let unclaimed = "eeeeeeeeeeeeeeee"
+        try Self.insertManifestRow(blobId: "\(claimed)/2222222222222222")
+        try Self.makeAgedEmptyDirectory(claimed)
+        try Self.makeAgedEmptyDirectory(unclaimed)
+
+        BodyAssetStore.pruneOrphanFiles()
+
+        #expect(Self.directoryExists(claimed),
+                "the highest possible hash must still match its own rows")
+        #expect(!Self.directoryExists(unclaimed),
+                "the unclaimed neighbour must still be reclaimed")
+    }
+
+    /// The lease arm of the same decision, in the exact race the lease exists for:
+    /// a writer that has inserted its lease and created the directory but has not
+    /// yet written bytes. The directory is EMPTY and aged, so nothing but the live
+    /// lease can save it.
+    @Test("Header-directory reclaim: a live preparation lease keeps an empty, aged directory")
+    func headerDirectoryReclaimRefusesWhileALeaseIsLive() throws {
+        let dir = try Self.setupTest()
+        defer { Self.teardown(dir) }
+
+        let leased = "cccccccccccccccc"
+        try Self.insertLease(blobId: "\(leased)/3333333333333333", ageSeconds: 0)
+        try Self.makeAgedEmptyDirectory(leased)
+
+        BodyAssetStore.pruneOrphanFiles()
+
+        #expect(Self.directoryExists(leased),
+                "unlinking here would race a writer between createDirectory and data.write")
+        let leases = try Self.leaseCount()
+        #expect(leases == 1, "a live lease must not be reaped by the sweep")
+    }
+
+    /// Non-vacuity for the leg above: the SAME shape with an EXPIRED lease must be
+    /// reclaimed. Without this, a reclaim that simply never fired would pass the
+    /// live-lease test.
+    ///
+    /// ⚠ WHAT THIS TEST DOES **NOT** PIN, measured rather than assumed. It does not
+    /// pin the reclaim predicate's `createdAt > ?` liveness THRESHOLD. Inverting that
+    /// term alone — `createdAt > (? - 999999999999)`, i.e. "every lease is live" —
+    /// leaves this test GREEN, verified under the build lock on 2026-08-05. The reason
+    /// is ordering inside `pruneOrphanFiles`: the abandoned-lease REAP runs before the
+    /// directory reclaim and has already deleted this row, so the reclaim's lease arm
+    /// finds nothing to evaluate the threshold against and the outcome is the same
+    /// either way. What IS pinned, and was proved RED in that same session by replacing
+    /// the arm's predicate with a constant-false one, is that the lease arm is
+    /// consulted at all — `headerDirectoryReclaimRefusesWhileALeaseIsLive` fails
+    /// immediately without it. The threshold's own reachability lives on the callers
+    /// that reclaim WITHOUT a preceding reap (`deleteAllAssets(forContentKey:)`), which
+    /// no test here exercises; stated so the gap is visible rather than assumed closed.
+    @Test("Header-directory reclaim: an expired preparation lease no longer keeps the directory")
+    func headerDirectoryReclaimProceedsOnceTheLeaseExpires() throws {
+        let dir = try Self.setupTest()
+        defer { Self.teardown(dir) }
+
+        let abandoned = "dddddddddddddddd"
+        try Self.insertLease(
+            blobId: "\(abandoned)/4444444444444444",
+            ageSeconds: BodyAssetStore.sweepMinAgeSeconds + 30)
+        try Self.makeAgedEmptyDirectory(abandoned)
+
+        BodyAssetStore.pruneOrphanFiles()
+
+        #expect(!Self.directoryExists(abandoned),
+                "a dead writer's lease may not pin an empty directory forever")
+        let leases = try Self.leaseCount()
+        #expect(leases == 0, "the abandoned lease itself must be reaped")
+    }
+
     // MARK: - Schema convergence
 
     @Test("migratePreparationSchema is idempotent on a manifest that predates the lease table")
