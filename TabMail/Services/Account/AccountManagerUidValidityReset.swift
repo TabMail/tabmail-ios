@@ -513,8 +513,19 @@ extension AccountManager {
         do {
             return try await dbPool.write { db -> UidValidityResetPurgeResult in
                 // (i) Pre-delete capture.
-                let headers = try MessageHeader.filter(Column("folderId") == folderId).fetchAll(db)
-                let purgedMessageIds = headers.map(\.messageId)
+                //
+                // ⚑ ONE COLUMN, NOT 48. Only `messageId` is consumed, and this runs
+                // INSIDE the write transaction — so materializing every column of
+                // every row in the folder holds SQLite's single writer for the whole
+                // decode. A `UIDVALIDITY` reset purges an ENTIRE folder, which is the
+                // largest row set this app ever deletes at once, so the row width is
+                // paid at the worst possible cardinality. Precedent for the shape:
+                // `SyncEngineDeletionReconcile`'s
+                // `MessageHeader.select(Column("messageId")).filter(Column("folderId") == folderId)`.
+                let purgedMessageIds = try String.fetchAll(
+                    db,
+                    MessageHeader.select(Column("messageId")).filter(Column("folderId") == folderId)
+                )
 
                 // (ii) Sidecars — exact relational ownership, while the owning
                 // headers still exist. The subqueries avoid a parameter-count cap.
