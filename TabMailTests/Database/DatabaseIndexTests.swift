@@ -55,6 +55,92 @@ struct DatabaseIndexTests {
                 "the CAST-range stale slice must seek via the v66 expression index: \(plan)")
     }
 
+    /// 🚨 v83 — `InboxViewModel.markAllAsRead`'s three statements must each seek via
+    /// `messageHeader_unreadSweep` AND sort from the index, never through a temp
+    /// B-tree.
+    ///
+    /// **This asserts the INVARIANT the regression violated, not the index's
+    /// existence.** The defect was never "an index is missing" — it was that every
+    /// pre-existing candidate orders by `date` while all three statements order by
+    /// `id`, so SQLite satisfied the WHERE from an index and then SORTED the whole
+    /// remaining unread set once per 50-row page. Measured on a production-shaped
+    /// 360k-row database carrying the statistics a shipped device actually has
+    /// (`sqlite_stat1` says `messageHeader` is empty, because `ANALYZE` runs only
+    /// inside migration bodies and a fresh install runs them against an empty table):
+    /// 100,000 unread swept in **199,425 ms** without this index and **6,300 ms**
+    /// with it. So `USE TEMP B-TREE FOR ORDER BY` is the thing that must stay absent,
+    /// and it is what these expectations pin.
+    ///
+    /// `INDEXED BY` is NOT used here, deliberately — the point is that the planner
+    /// CHOOSES this index for these predicates. Forcing it would prove only that the
+    /// index is capable, which is the weaker claim and would stay green on the exact
+    /// regression (the planner preferring a `date`-ordered index) this pins.
+    /// The test database is tiny, so the sort-elimination assertion carries the
+    /// weight; a `SCAN`-vs-`SEARCH` assertion alone would be size-dependent.
+    @Test("markAllAsRead's three statements sort from the v83 index, never a temp B-tree")
+    func markAllAsReadSweepUsesUnreadSweepIndex() throws {
+        let db = try TestDatabase.make()
+
+        // Verbatim from `InboxViewModel.markAllAsRead` — the frozen upper-bound
+        // probe, the first page, and the cursor page.
+        let upperBoundProbe = """
+            SELECT id FROM messageHeader
+            WHERE folderId = 'acc1:INBOX' AND isRead = 0
+            ORDER BY id COLLATE BINARY DESC
+            LIMIT 1
+            """
+        let firstPage = """
+            SELECT * FROM messageHeader
+            WHERE folderId = 'acc1:INBOX' AND isRead = 0
+              AND id COLLATE BINARY <= 'zzz' COLLATE BINARY
+            ORDER BY id COLLATE BINARY ASC
+            LIMIT 50
+            """
+        let cursorPage = """
+            SELECT * FROM messageHeader
+            WHERE folderId = 'acc1:INBOX' AND isRead = 0
+              AND id COLLATE BINARY > 'aaa' COLLATE BINARY
+              AND id COLLATE BINARY <= 'zzz' COLLATE BINARY
+            ORDER BY id COLLATE BINARY ASC
+            LIMIT 50
+            """
+
+        for (label, sql) in [("upper-bound probe", upperBoundProbe),
+                             ("first page", firstPage),
+                             ("cursor page", cursorPage)] {
+            let plan: String = try db.read { dbConn in
+                try Row.fetchAll(dbConn, sql: "EXPLAIN QUERY PLAN \(sql)")
+                    .map { $0["detail"] as String }
+                    .joined(separator: " | ")
+            }
+            #expect(plan.contains("messageHeader_unreadSweep"),
+                    "\(label): planner did not choose the v83 partial index: \(plan)")
+            #expect(!plan.contains("TEMP B-TREE"),
+                    "\(label): sort not eliminated — this is the O(U²/50) regression: \(plan)")
+        }
+    }
+
+    /// Two-sided control for the test above (MIS-026): the assertions must be capable
+    /// of failing. The same sweep shape ordered by `date` instead of `id` — which is
+    /// what every OTHER `messageHeader` index supports — must NOT choose
+    /// `messageHeader_unreadSweep`. If this ever starts matching, the test above has
+    /// stopped discriminating and is passing for the wrong reason.
+    @Test("The v83 index is not chosen for the date-ordered inbox display query")
+    func unreadSweepIndexIsNotChosenForDateOrderedReads() throws {
+        let db = try TestDatabase.make()
+        let plan: String = try db.read { dbConn in
+            try Row.fetchAll(dbConn, sql: """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM messageHeader
+                WHERE folderId = 'acc1:INBOX' AND isRead = 0
+                ORDER BY date DESC
+                LIMIT 50
+                """).map { $0["detail"] as String }.joined(separator: " | ")
+        }
+        #expect(!plan.contains("messageHeader_unreadSweep"),
+                "date-ordered display must not be served by the id-ordered v83 index: \(plan)")
+    }
+
     @Test("Canonicalize upsert lookup (messageId + folderId) uses an index, not a scan")
     func canonicalizeLookupUsesIndex() throws {
         // canonicalizeLocalRows runs once per remote message in every folder

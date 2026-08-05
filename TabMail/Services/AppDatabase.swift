@@ -2512,6 +2512,85 @@ final class AppDatabase: Sendable {
             try db.drop(table: "messageUserLabel_v82_legacy")
             try db.drop(table: "userLabel_v82_legacy")
         }
+
+        // v83: partial index for `InboxViewModel.markAllAsRead`'s keyset sweep.
+        //
+        // 🚨 THE DEFECT IS A PLAN, NOT A QUERY. `markAllAsRead` runs three statements
+        // per folder — a frozen upper-bound probe (`ORDER BY id COLLATE BINARY DESC
+        // LIMIT 1`), a first page, and a cursor page (`id > ? AND id <= ?`), all under
+        // `folderId = ? AND isRead = 0`, all ordered by `id`. EVERY pre-existing
+        // candidate index orders by `date` (`messageHeader_folderId_isRead_date`,
+        // `messageHeader_inbox_display`, …), so SQLite satisfies the WHERE from an
+        // index and then SORTS — `USE TEMP B-TREE FOR ORDER BY` — once per page, over
+        // the whole remaining unread set. That is the O(U²/50) shape. The sweep design
+        // itself (frozen upper bound + unconditional cursor advance) is correct and is
+        // NOT what this migration touches.
+        //
+        // ⚠️ WHY IT DOES NOT REPRODUCE UNDER `ANALYZE` — read this before "confirming"
+        // it on a freshly-analyzed database. The plan is a function of `sqlite_stat1`,
+        // and the two regimes diverge completely (measured, SHAPE M = 5 accounts ×
+        // 8 folders, unread interleaved with read, sweeping the 5-INBOX unified set,
+        // WAL, `batchSize = SyncConfig.inboxPageSize`, committed per page):
+        //
+        //     stats     U         no index      with this index    read-phase only
+        //     stale     20,000     6,289 ms          1,220 ms      5,217 → 124 ms
+        //     stale    100,000   199,425 ms          6,300 ms    193,053 → 986 ms
+        //     fresh    100,000     6,747 ms          6,469 ms      1,055 → 946 ms
+        //
+        // What this DOES NOT fix, stated so nobody re-measures expecting more: once
+        // the quadratic term is gone the sweep is WRITE-bound — 85–89% of the
+        // remaining wall clock is `UPDATE` + `COMMIT` across ~2,000 separate committed
+        // pages. No read-side index can touch that. This removes the quadratic; it
+        // does not make a 100k-message sweep fast in absolute terms.
+        //
+        // STALE IS THE SHIPPED REGIME. `ANALYZE` runs only inside migration bodies,
+        // never periodically — and on a FRESH INSTALL a migration's `ANALYZE` records
+        // stats for an EMPTY `messageHeader`, which IS the stale regime. A device that
+        // then syncs 100k messages carries "table is empty" statistics forever. So the
+        // index, not `ANALYZE`, is the load-bearing fix; the 1.0× "fresh" row above is
+        // the number you get if you measure on a database no user has.
+        //
+        // PARTIAL, not `(folderId, isRead, id)` — measured both:
+        //   • plan: partial serves all THREE statements with no temp B-tree
+        //     (`Q1 SEARCH … USING COVERING INDEX messageHeader_unreadSweep (folderId=?)`,
+        //      `Q2/Q3 … (folderId=? AND id<?)` / `(folderId=? AND id>? AND id<?)`).
+        //   • size at 100k rows / 10% unread: 377 KB (92 pages) vs 3.86 MB (942 pages).
+        //   • insert cost, 50k rows in one transaction: +1.38% vs +3.27%.
+        // It also shrinks as mail is read, which the three-column form does not.
+        //
+        // COLLATION. `messageHeader.id` is `TEXT PRIMARY KEY` with NO `COLLATE` clause,
+        // so its collation is BINARY — verified structurally (`PRAGMA index_xinfo` on
+        // `sqlite_autoindex_messageHeader_1` reports `coll=BINARY`) and behaviourally
+        // (`ORDER BY id` and `ORDER BY id COLLATE BINARY` agree; `COLLATE NOCASE`
+        // differs). The index therefore matches the queries' explicit `COLLATE BINARY`
+        // without needing one of its own.
+        //
+        // `ANALYZE` per ADR-IOS-029 rule 5 — KEPT DELIBERATELY, THOUGH THE MEASUREMENT
+        // ARGUED AGAINST IT, so nobody reads its cost as an oversight. Measured
+        // launch-time cost on a 360k-row database: `CREATE INDEX` 119 ms + `ANALYZE`
+        // ~850 ms ≈ 1.0 s, ONE TIME, on the upgrade launch only (a fresh install pays
+        // neither — empty table). It buys this fix nothing: the plan above is chosen
+        // identically WITH and WITHOUT statistics, which is the whole reason the
+        // partial form was preferred. It is kept because rule 5 is the project's
+        // standing decision and the v38/v40/v50/v51 bodies all do it; deviating from a
+        // recorded ADR is an architecture change that belongs in an ADR, not in an
+        // audit fix round. Same shape as
+        // `v51_headerIncompletePartialIndex`, which is also the partial-index
+        // precedent in this file (`messageHeader_headerIncomplete`, and see also
+        // `messageHeader_aiIncomplete` / `messageHeader_embeddingIncomplete` /
+        // `messageHeader_reminderLookup` — all raw-SQL partials).
+        //
+        // CONVERGENCE (Data Integrity rule 5): additive and idempotent. A fresh
+        // install creates the index over an empty table; an existing database creates
+        // it over real rows. Same schema either way. Nothing reads or writes a row.
+        migrator.registerTimedMigration("v83_markAllAsReadUnreadSweepIndex") { db in
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_unreadSweep
+                ON messageHeader(folderId, id)
+                WHERE isRead = 0
+            """)
+            try db.execute(sql: "ANALYZE")
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static
