@@ -49,8 +49,14 @@ extension IMAPProvider {
     /// ⚠ **The SELECT will never refuse on the consumer's behalf.**
     /// `IMAPProvider.selectMailboxTracked` in this tree is a bare mirror write: it
     /// carries no stored-vs-observed comparison and no
-    /// `ProviderError.uidValidityChanged` throw (`rg -n "uidValidityChanged"
-    /// TabMail/` finds no declaration and no throw site — every hit is prose). Every
+    /// `ProviderError.uidValidityChanged` throw. ⚠️ CORRECTED 2026-08-05: this
+    /// justified itself with "(`rg -n "uidValidityChanged" TabMail/` finds no
+    /// declaration and no throw site — every hit is prose)", which became false at
+    /// `065a827ca` (2026-08-02), inside the release range. The case is DECLARED in
+    /// `ProviderError` (`EmailProvider.swift`) and THROWN by
+    /// `IMAPProvider.requireUidValidity` — on the ACTION path, never in
+    /// `selectMailboxTracked`. The warning above is therefore still correct: this
+    /// SELECT will never refuse on the consumer's behalf. Every
     /// comparison is the consumer's own responsibility.
     ///
     /// ⚑ R0 — **NO REFERENCE in `v2final`**: `git grep -n

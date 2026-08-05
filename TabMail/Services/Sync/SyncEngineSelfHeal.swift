@@ -141,9 +141,15 @@ extension SyncEngine {
     /// by `uidValidityWriteAllowed`, which compares observed-vs-stored and is
     /// backstopped by the Stage-2 provider refusal
     /// (`selectMailboxTracked` there throws `ProviderError.uidValidityChanged`),
-    /// and v3 has deleted that term entirely (`rg -n 'uidValidityChanged'
-    /// TabMail/` finds no declaration and no throw site — every hit is prose,
-    /// including this one); (ii) v3's guard is a CAS against the
+    /// and v3's `selectMailboxTracked` does NOT — ⚠️ CORRECTED 2026-08-05: this said
+    /// "v3 has deleted that term entirely (`rg -n 'uidValidityChanged' TabMail/`
+    /// finds no declaration and no throw site — every hit is prose, including this
+    /// one)". That became false at `065a827ca` (2026-08-02), inside the release
+    /// range: the case is DECLARED in `ProviderError` (`EmailProvider.swift`) and
+    /// THROWN by `IMAPProvider.requireUidValidity`. The ground above survives
+    /// intact, because what it needs is that the SELECT helper provides no
+    /// backstop — and it still provides none; the throw is on the action path;
+    /// (ii) v3's guard is a CAS against the
     /// caller's PREMISE about the stamp, not a comparison against an observed
     /// epoch, so a mirror read is not even the right KIND of value to hand it.
     /// "`v2final` does it" is therefore not an argument here.

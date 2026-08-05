@@ -358,7 +358,10 @@ struct SearchView: View {
     ///     physical message occupies the captured address. A row's
     ///     `rfc822MessageId` is never nulled once set (unlike `observedUidValidity`,
     ///     which many production sites clear), so a captured-present/current-absent
-    ///     pair is a genuine disagreement, not an ordinary absence.
+    ///     pair is a genuine disagreement, not an ordinary absence. ⚠️ "never nulled
+    ///     once set" is OVERSTATED — see the CORRECTED 2026-08-05 block below before
+    ///     relying on it; the conclusion (refuse) is unchanged, the absoluteness is
+    ///     not.
     ///
     ///     **THE COUNT, WITH ITS PREDICATE — it said "15" and drifted; state the
     ///     predicate so the next reader can re-run it instead of trusting a
@@ -382,6 +385,46 @@ struct SearchView: View {
     ///     assigns `nil` to `MessageHeader.rfc822MessageId`. That asymmetry — many
     ///     versus none — is the whole reason a missing epoch is not evidence and a
     ///     missing content witness is.
+    ///
+    ///     ⚠️ **CORRECTED 2026-08-05 — the census above is TRUE AS STATED and is
+    ///     NOT sufficient to support arm 3's "never nulled once set" above.** The
+    ///     census counts *literal* `nil` assignments; it says nothing about a
+    ///     PROPAGATED nil. `MessageMetadata.rfc822MessageId` is `String?` by
+    ///     construction and IS nil whenever the provider payload omits the header
+    ///     (`GmailParse` derives it from `header("Message-Id")`, `GraphParse` from
+    ///     `internetMessageId`; both are `.map`-over-Optional). Three production
+    ///     statements then assign that Optional STRAIGHT ONTO AN EXISTING ROW
+    ///     without a nil check — `SyncEngine.gmailDeltaSync` ×1 and
+    ///     `SyncEngine.exchangeDeltaSync` ×2, all of the shape
+    ///     `existing.rfc822MessageId = info.rfc822MessageId` in
+    ///     `SyncEngineDeltaSync.swift`. (The two remaining assignments in that file
+    ///     write a freshly-built `header` that is about to be INSERTed, so they
+    ///     cannot null a stored value and are not counted.) So a stored
+    ///     `rfc822MessageId` CAN in principle go from present to absent, and the
+    ///     right claim is "no production statement nulls it *deliberately*", not
+    ///     "it is never nulled".
+    ///
+    ///     **The sibling path already carries the stricter form, and it is the one
+    ///     to copy if this is ever tightened:** `SyncEngine.performFullSync`
+    ///     (`SyncEngineFullSync.swift`) wraps the analogous merge in
+    ///     `if normalizedIncomingRfc822 != nil { existing.rfc822MessageId = … }`,
+    ///     and repeats the rule at the pre-sync inbox reclaim
+    ///     (`if normalizedIncomingRfc822 == nil { header.rfc822MessageId =
+    ///     preSync.rfc822MessageId }`) — "a nil incoming value carries no metadata
+    ///     signal and must never NULL a stored value".
+    ///
+    ///     **No guard is being added here, deliberately.** At the release base
+    ///     `07a4bb703` NEITHER file had any such guard (`normalizedIncomingRfc822`
+    ///     does not exist at that revision, and all five delta-sync assignments are
+    ///     already bare there), so the range NARROWS this exposure rather than
+    ///     regressing it, and guarding those three sites would be an unrequested
+    ///     behaviour change in a release-audit fix round. The residual is bounded
+    ///     and recoverable: a delta sync that nulls a stored id makes arm 3 read an
+    ///     ordinary absence as disagreement and return `nil` — a SPURIOUS REFUSAL,
+    ///     fail-closed, recovered by one ordinary gesture (re-run the search), which
+    ///     is exactly what the MANTRA says to leave alone. The direction that would
+    ///     matter — a wrong message being OPENED — is unreachable from this arm,
+    ///     because the arm's only output is refusal.
     ///
     /// `nonisolated static` for the same reason as the remote helper: it touches no
     /// `@State` and needs no view, so a test can call it with a bare `Database`.

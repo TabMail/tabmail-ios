@@ -54,8 +54,17 @@ enum ReplyParentResolver {
         // One SELECT for all candidate parents in this account that aren't
         // already marked. The `isReplied = 0` filter avoids no-op writes and
         // prevents re-firing the tag-clear PendingOperation on already-marked
-        // rows. Index-backed via `messageHeader_rfc822MessageId`
-        // (AppDatabase.swift:349).
+        // rows. Index-backed: with production statistics SQLite serves this with
+        // `messageHeader_rfc822MessageId_date` (`rfc822MessageId=?`), the composite
+        // that leads on `rfc822MessageId`; the narrower `messageHeader_rfc822MessageId`
+        // also exists and leads on the same column.
+        //
+        // ⚠️ CORRECTED 2026-08-05: this previously read "Index-backed via
+        // `messageHeader_rfc822MessageId` (AppDatabase.swift:349)". That line number
+        // is a COLUMN LIST (`"inReplyTo TEXT",`) — at the release base and at HEAD
+        // alike — not an index declaration. Cite indexes by NAME; a `file:line`
+        // anchor into a file as edited as `AppDatabase.swift` rots on the next
+        // migration (MIS-009).
         let placeholders = Array(repeating: "?", count: normalized.count).joined(separator: ",")
         // stableId is a Swift-side computed property on MessageHeader (rfc822 if
         // messageId is a numeric UID, else messageId) — fetch the inputs and

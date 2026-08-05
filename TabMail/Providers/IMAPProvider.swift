@@ -292,8 +292,17 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `onUidValidityObserved` (its change-reaction trigger) and carries the
     /// ADR-IOS-061 Stage-2 REFUSAL — `throw ProviderError.uidValidityChanged(…)`
     /// when `storedUidValidityForLedgerCompare` disagrees with the observation.
-    /// v3 has NEITHER term (`rg -n 'uidValidityChanged' TabMail/` finds no
-    /// declaration and no throw site — every hit is prose). This helper is
+    /// v3's `selectMailboxTracked` has NEITHER. ⚠️ CORRECTED 2026-08-05: this said
+    /// "v3 has NEITHER term (`rg -n 'uidValidityChanged' TabMail/` finds no
+    /// declaration and no throw site — every hit is prose)". That was true when
+    /// written and became false at `065a827ca` (2026-08-02, "Bind ordinary IMAP
+    /// actions to UID epochs"), which is INSIDE the release range.
+    /// `ProviderError.uidValidityChanged` is now DECLARED in `EmailProvider.swift`
+    /// (`enum ProviderError`, with its message arm in the same enum's
+    /// `errorDescription`) and THROWN in this file by `requireUidValidity`.
+    /// **The claim that matters here is unaffected and remains true:** the throw is
+    /// `requireUidValidity`'s, not `selectMailboxTracked`'s, so this helper still
+    /// carries no refusal of its own. This helper is
     /// therefore a BARE MIRROR WRITE: converting a call site adds no refusal and
     /// no throw the bare `server.selectMailbox` did not already have, so it
     /// structurally cannot turn any caller's error handling — including
@@ -344,6 +353,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     //    has only the SELECT's own failure. This narrows the set of errors a
     //    creation path can throw; it never widens it, so every guard below is
     //    reached under a subset of the reference's conditions.
+    //    ⚠️ Read "v3 has no `uidValidityChanged`" as "v3's SELECT helper does not
+    //    throw it". Since `065a827ca` the case IS declared (`ProviderError` in
+    //    `EmailProvider.swift`) and IS thrown — but by `requireUidValidity`, on
+    //    the action path, never by `selectMailboxTracked`. The deviation above
+    //    stands; only the "term does not exist" reading of it is wrong.
     //  * The reference names `move`/`moveToTrash`/`closeMailbox`/
     //    `unselectMailbox` nowhere in this contract and neither does v3 —
     //    `IMAPProvider` calls none of them on the SwiftMail server, and COPY /
@@ -3654,7 +3668,17 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// Batch fetch full messages on a single connection using pipelined part fetches.
     /// Flow: one SELECT → one bulk BODYSTRUCTURE → pipelined FETCH for all parts across all messages.
     /// Avoids redundant per-message BODYSTRUCTURE re-fetch that `fetchMessage(from:)` does internally.
-    /// PayloadTooLarge messages are marked bodyEmptyConfirmed and omitted from result.
+    /// ⚠️ CORRECTED 2026-08-05: this line previously read "PayloadTooLarge messages
+    /// are marked bodyEmptyConfirmed and omitted from result." That has not been
+    /// true on this path for some time and the identical stale line is present at
+    /// the release base `07a4bb703` too, so it is pre-existing rather than a
+    /// regression. **A `PayloadTooLargeError` is THROWN, not absorbed**: it
+    /// contaminates the NIO connection (unfulfilled promises crash on dealloc), so
+    /// the batch is failed and the connection released as unhealthy rather than
+    /// retried here. Deleting the `bodyEmptyConfirmed = 1` write was the CORRECT
+    /// change — an oversized body is the opposite of "content confirmed gone", and
+    /// marking it would violate the Data Integrity rule against marking unfetched
+    /// content as fetched. The message stays retryable.
     /// Throws on connection-level errors (caller should retry the batch).
     func fetchMessagesBatch(ids: [String], folder: String) async throws -> [String: FullMessageInfo] {
         // Defensive guard — see `EmailProvider.fetchMessagesBatch` extension default
@@ -5930,12 +5954,17 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `selectMailboxTracked` carries the ADR-IOS-061 Stage-2 refusal
     /// (`throw ProviderError.uidValidityChanged(…)` on a stored/observed
     /// disagreement), so a SELECT under a changed epoch never reaches an insert
-    /// at all. **v3 has no such error and no such refusal**: `rg -n
-    /// 'uidValidityChanged' TabMail/` finds no declaration and no throw site —
-    /// every hit is prose (this note, `SyncEngine.selfHealFolder`'s, and
-    /// `SyncEngineFullSync`'s note recording that the term was deliberately
-    /// dropped). So the reference's mirror read is load-bearing on a term v3
-    /// deleted, and does not transfer.
+    /// at all. **v3's `selectMailboxTracked` carries no such refusal.** ⚠️ CORRECTED
+    /// 2026-08-05: this said "**v3 has no such error and no such refusal**: `rg -n
+    /// 'uidValidityChanged' TabMail/` finds no declaration and no throw site — every
+    /// hit is prose". Both halves of that evidence are now false —
+    /// `ProviderError.uidValidityChanged` was DECLARED (`EmailProvider.swift`) and
+    /// THROWN (`requireUidValidity`, this file) by `065a827ca` (2026-08-02), inside
+    /// the release range. **The conclusion is unchanged**, because it never depended
+    /// on the term's absence, only on WHERE it is thrown: the throw is on the ACTION
+    /// path in `requireUidValidity`, so a SELECT under a changed epoch still reaches
+    /// an insert on this line. The reference's mirror read is load-bearing on a
+    /// refusal v3's SELECT helper does not have, and does not transfer.
     ///
     /// For a non-empty `uids`, `observedEpoch` is nil when — and only when — the
     /// batches were NOT all served under one reported epoch: any batch whose
