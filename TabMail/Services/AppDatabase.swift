@@ -445,6 +445,17 @@ final class AppDatabase: Sendable {
         var migrator = DatabaseMigrator()
         registerAllMigrations(on: &migrator)
         try migrator.migrate(writer)
+        // THE LAST MIGRATION HAS NO SUCCESSOR to close its post-body interval, so
+        // the chain-completion site closes it and emits the reconciliation line.
+        // Gated exactly like the per-migration lines, and a no-op when this writer
+        // ran no body at all — the already-migrated case, which is every launch
+        // after the upgrade one. `writeWithoutTransaction` (not a barrier) because
+        // all it needs is the writer's own `Database`, which is the key the ledger
+        // recorded the chain under; it opens no transaction and touches no row.
+        guard MigrationTimingGate.isRecording else { return }
+        writer.writeWithoutTransaction { db -> Void in
+            MigrationTimingLedger.shared.finish(db: db)
+        }
     }
 
     /// One-time heal for ADR-IOS-042 (IMAP Archive "missing months" data-loss):
@@ -2800,18 +2811,6 @@ final class AppDatabase: Sendable {
 /// deliberately the one thing around them that is not part of that identity.
 private extension DatabaseMigrator {
 
-    /// `Duration.components` splits into (seconds, attoseconds), so rendering the
-    /// fractional part in milliseconds needs these unit factors. Not tunables:
-    /// 1 s = 1e3 ms and 1 ms = 1e-3 s = 1e15 as.
-    static let millisecondsPerSecond: Int64 = 1_000
-    static let attosecondsPerMillisecond: Int64 = 1_000_000_000_000_000
-
-    /// Whole elapsed milliseconds, matching the aggregate line's `Nms` format.
-    static func wholeMilliseconds(_ duration: Duration) -> Int {
-        let (seconds, attoseconds) = duration.components
-        return Int(seconds * millisecondsPerSecond + attoseconds / attosecondsPerMillisecond)
-    }
-
     /// `registerMigration`, plus a **debug-gated** per-migration duration line
     /// that distinguishes success from failure. Errors propagate unchanged.
     ///
@@ -2827,26 +2826,55 @@ private extension DatabaseMigrator {
     ///   and the error, and is then re-thrown UNCHANGED so GRDB still rolls the
     ///   migration back. Without this, a body that dies 40s in is invisible —
     ///   the aggregate line never prints because `init` throws first.
+    ///
+    /// 🚨 **THE BODY TIMER IS NOT THE MIGRATION'S COST, AND SAYING SO IS THE
+    /// POINT OF `MigrationTimingLedger`.** `try migrate(db)` returns BEFORE GRDB
+    /// runs `PRAGMA foreign_key_check` (on the `.deferred` path), the COMMIT and
+    /// its `grdb_migrations` bookkeeping — so this clock measures the cheapest
+    /// part of an expensive migration. The old line said *"applied in 0ms"* for
+    /// `v68`, whose real cost at 500k headers is ~9 s, essentially all of it the
+    /// foreign-key check. The ledger closes each migration's post-body interval
+    /// when the NEXT body starts and emits a `total = body + fkCheck/commit`
+    /// line, so a reader never has to do the subtraction — and never has to know
+    /// that the subtraction was needed. ⚠️ Do not "simplify" this back to a
+    /// single timer around the body; the number it produces is not wrong by a
+    /// little, it points at the wrong migration.
     mutating func registerTimedMigration(
         _ identifier: String,
         foreignKeyChecks: ForeignKeyChecks = .deferred,
         migrate: @escaping @Sendable (Database) throws -> Void
     ) {
+        // Captured once at REGISTRATION, so the per-body path builds no string.
+        let modeLabel: String
+        switch foreignKeyChecks {
+        case .deferred: modeLabel = "deferred"
+        case .immediate: modeLabel = "immediate"
+        }
         registerMigration(identifier, foreignKeyChecks: foreignKeyChecks) { db in
-            guard DebugModeManager.isLoggingEnabled() else {
+            guard MigrationTimingGate.isRecording else {
                 try migrate(db)
                 return
             }
+            let ledger = MigrationTimingLedger.shared
+            // Closes the PREVIOUS migration's post-body interval: everything
+            // between that body returning and this line is its foreign-key
+            // check + commit + bookkeeping.
+            ledger.bodyWillStart(db: db)
             let start = ContinuousClock.now
             // `start.duration(to: .now)` rather than `.now - start`: reads as
             // "elapsed since start", so no sign convention has to be recalled.
             do {
                 try migrate(db)
-                let elapsed = DatabaseMigrator.wholeMilliseconds(start.duration(to: ContinuousClock.now))
-                BackgroundSyncLogger.log("AppDatabase: migration \(identifier) applied in \(elapsed)ms")
+                let elapsed = MigrationTimingLedger.wholeMilliseconds(start.duration(to: ContinuousClock.now))
+                BackgroundSyncLogger.log("AppDatabase: migration \(identifier) body \(elapsed)ms")
+                ledger.bodyDidFinish(
+                    db: db, identifier: identifier, mode: modeLabel, bodyMs: elapsed)
             } catch {
-                let elapsed = DatabaseMigrator.wholeMilliseconds(start.duration(to: ContinuousClock.now))
+                let elapsed = MigrationTimingLedger.wholeMilliseconds(start.duration(to: ContinuousClock.now))
                 BackgroundSyncLogger.log("AppDatabase: migration \(identifier) FAILED after \(elapsed)ms: \(error)")
+                // A reconciliation over a chain that did not complete would be a
+                // number that does not mean what it says.
+                ledger.abandon(db: db)
                 throw error
             }
         }
