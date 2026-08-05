@@ -16,7 +16,18 @@ import GRDB
 /// reads the header directly — header.folderId is still the destination
 /// (e.g. Archive), fails the `folderIds.contains(header.folderId)` check,
 /// and the undone row never reappears until the next full reload.
-@Suite("InboxViewModel insertUndoneMessages overlay", .serialized)
+/// ⚠️ `.processGlobalState` is REQUIRED, not decorative. `makeTestDB` replaces
+/// `AppDatabase.shared` (and the tests clear `AccountManager.shared`'s optimistic
+/// overlay), and `.serialized` orders cases only WITHIN this suite — it does not
+/// join the cross-suite `ProcessGlobalTestState` lock. Without the trait, a
+/// concurrently running suite's `AccountManager.dbPool` (which re-resolves
+/// `AppDatabase.shared` at every access) can execute its `UPDATE … SET isRead=1`
+/// against THIS suite's fixture: zero rows touched, nothing thrown, and the
+/// victim then reads its own pool and sees `isRead == false`. That was task #91,
+/// the `SearchLocalResultIdentityTests.identityPreservingMidFlightWriteStillMarksRead`
+/// flake — a harness defect, not a product race. Of the suites that write the
+/// global, this was the single genuine outlier.
+@Suite("InboxViewModel insertUndoneMessages overlay", .serialized, .processGlobalState)
 struct InboxViewModelInsertUndoneTests {
 
     @MainActor
