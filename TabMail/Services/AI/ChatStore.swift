@@ -165,6 +165,12 @@ actor ChatStore {
         // globally-OLDEST turns during a normal append. Exempt the compose sessions the
         // user currently has OPEN so an append in ANOTHER session can't evict an active
         // reopened compose's turns.
+        //
+        // 🚨 THIS IS THE CHEAP FIRST FILTER, NOT THE AUTHORITY. It is read BEFORE
+        // `dbPool.write` opens, so a compose that calls `register(draftId)` after this
+        // line is invisible to it — the stale-snapshot shape `DraftSessionRegistry`'s
+        // header forbids. `enforceTurnBudgets` re-asks the registry LIVE inside the
+        // transaction and takes the union; see its doc comment.
         let activeComposeSessions = DraftSessionRegistry.shared.activeComposeSessionIds()
         let (evictedTurns, historyTurn) = try await AppDatabase.dbPool.write { db -> ([ChatTurn], ChatHistoryTurn) in
             try turn.insert(db)
@@ -223,6 +229,34 @@ actor ChatStore {
     /// maintenance pass reclaims it. Both caps therefore stay SOFT rather than
     /// disabled — every INACTIVE turn is still fully evictable.
     ///
+    /// 🚨 **THE `activeComposeSessions` PARAMETER IS A SNAPSHOT, SO THIS FUNCTION
+    /// RE-ASKS THE REGISTRY LIVE.** ⚠️ CORRECTED 2026-08-05: the paragraph above
+    /// said "a compose the user has OPEN must not lose its turns" as though the
+    /// parameter delivered that. It did not. `appendTurn` samples the registry
+    /// BEFORE opening `dbPool.write`, so a compose that called `register` between
+    /// that sample and the commit was absent from the set and its authored turns
+    /// were deleted by the very next append in another session — the stale-snapshot
+    /// shape `DraftSessionRegistry`'s doc header forbids and that `DraftStore`
+    /// carried until `eda55f4ca` the same day. The exemption set used below is
+    /// therefore the UNION of the caller's snapshot and a LIVE read taken inside the
+    /// caller's write transaction.
+    ///
+    /// COST (Rule A6) — the live read is taken ONCE at the top of this function, not
+    /// per row. This helper runs on the ORDINARY append path, and both loops below
+    /// walk every `chatTurn` row (`ChatTurn.order(…).fetchAll`, bounded by the count
+    /// cap `maxExchanges * 2` plus the excess that triggered the sweep). One
+    /// uncontended `Mutex` read per append is the cost; a per-row read would be ~100×
+    /// that for no gain, because every deletion decision below is taken after this
+    /// line and inside the same transaction.
+    ///
+    /// RESIDUAL, stated precisely rather than claimed closed: the live read narrows
+    /// the exposure from [`appendTurn`'s pre-transaction sample .. commit] to [this
+    /// function's own read .. commit] — the insert of the new turn and its
+    /// `chatHistory` twin, plus the two sweeps. A `register` landing inside THAT
+    /// remnant still misses. It is the direction the mantra tolerates: the compose
+    /// keeps its text in memory and re-appends, and `chatHistory` (the memory
+    /// store, evicted separately) is unaffected by this sweep.
+    ///
     /// TERMINATION — each loop iterates a materialized array fetched BEFORE the
     /// loop. The measured variant is the number of unvisited elements of that array
     /// (strictly decreasing by exactly 1 per iteration, lower bound 0); the exempt
@@ -235,6 +269,15 @@ actor ChatStore {
     static func enforceTurnBudgets(db: Database, activeComposeSessions: Set<String>) throws -> [ChatTurn] {
         var evictedTurns: [ChatTurn] = []
 
+        // Snapshot ∪ LIVE — see the header. `activeComposeSessions` was sampled before
+        // the caller opened its write transaction; this read happens INSIDE it, which
+        // is what makes it the authority. `activeComposeSessionIds()` is the registry's
+        // OWN derivation of the `compose:<id>` / `demo:compose:<id>` forms, so deriving
+        // them here would fork the key format. Hoisted out of both loops on purpose
+        // (Rule A6): once per sweep, never per row.
+        let exemptSessions = activeComposeSessions
+            .union(DraftSessionRegistry.shared.activeComposeSessionIds())
+
         // Turn-COUNT budget. Scan oldest-first, SKIP active-compose turns, delete
         // `excess` ELIGIBLE turns (a bare `.limit(excess)` could pick active ones).
         // If too few inactive turns exist the cap stays SOFT — active history wins.
@@ -246,7 +289,7 @@ actor ChatStore {
             var deleted = 0
             for old in oldestAll {
                 if deleted >= excess { break }
-                if let sid = old.sessionId, activeComposeSessions.contains(sid) { continue }
+                if let sid = old.sessionId, exemptSessions.contains(sid) { continue }
                 try old.delete(db)
                 evictedTurns.append(old)
                 deleted += 1
@@ -260,7 +303,7 @@ actor ChatStore {
             let oldestTurns = try ChatTurn.order(Column("timestamp").asc).fetchAll(db)
             for oldest in oldestTurns {
                 guard totalChars > maxChars else { break }
-                if let sid = oldest.sessionId, activeComposeSessions.contains(sid) { continue }
+                if let sid = oldest.sessionId, exemptSessions.contains(sid) { continue }
                 totalChars -= oldest.chars
                 try oldest.delete(db)
                 evictedTurns.append(oldest)
@@ -614,11 +657,37 @@ actor ChatStore {
         // turns of a compose session the user currently has OPEN. The cap stays a SOFT
         // target: only the oldest INACTIVE turns are selected, so active compose history
         // survives even if it keeps total > cap.
-        let activeComposeSessions = DraftSessionRegistry.shared.activeComposeSessionIds()
+        //
+        // 🚨 CHEAP FIRST FILTER ONLY. ⚠️ CORRECTED 2026-08-05: "never cap-evict history
+        // turns of a compose the user currently has OPEN" was not what this code did.
+        // This read happens BEFORE `dbPool.write` opens, so a compose that called
+        // `register` in between was absent from the exemption and its history rows were
+        // selected and DELETED — the stale-snapshot shape `DraftSessionRegistry`'s doc
+        // header forbids, and the shape `DraftStore.evictImpl` carried until
+        // `eda55f4ca` the same day. The exemption actually used is the union with a
+        // LIVE read taken inside the write block, below.
+        let snapshotComposeSessions = DraftSessionRegistry.shared.activeComposeSessionIds()
         return try dbPool.write { db in
             let totalCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM chatHistory") ?? 0
             guard totalCount > maxTurns else { return [] }
             let excess = totalCount - maxTurns
+            // Snapshot ∪ LIVE, INSIDE the transaction and AT the deletion decision —
+            // that is what makes it the authority. This site builds its exemption into
+            // the SELECT's `NOT IN` list, so "live" means deriving that list here
+            // rather than before the write opened.
+            //
+            // ONCE per sweep (Rule A6), and deliberately AFTER the `guard` above: the
+            // set feeds one SQL statement, so there is no per-row question to ask, and
+            // the common under-cap no-op path now takes no registry read at all.
+            //
+            // RESIDUAL, stated precisely rather than claimed closed: the window narrows
+            // from [pre-transaction sample .. commit] to [this line .. commit] — the id
+            // SELECT and the DELETE. A `register` landing inside that remnant still
+            // misses. `chatTurn` (the resumable session rows the open compose actually
+            // renders) is a different table and is untouched here, so the loss in that
+            // remnant is memory-search recall, not the text on screen.
+            let activeComposeSessions = snapshotComposeSessions
+                .union(DraftSessionRegistry.shared.activeComposeSessionIds())
             // Capture the IDs BEFORE deletion so we can cascade to memory.db. Select
             // the oldest EVICTABLE ids: exclude active compose sessions. NULL-safe —
             // `sessionId IS NULL OR sessionId NOT IN (...)` keeps null/non-compose rows
@@ -739,6 +808,15 @@ actor ChatStore {
         // session the user currently has OPEN. A REOPENED compose whose turns are all
         // older than the TTL would otherwise lose its live chat history while on screen
         // (no race required).
+        //
+        // 🚨 CHEAP FIRST FILTER ONLY — and the race the parenthetical above did not
+        // cover was real. ⚠️ CORRECTED 2026-08-05: this read happens BEFORE
+        // `dbPool.write` opens, so a compose REOPENED after this line but before the
+        // commit was absent from the exemption and the sweep deleted its authored turns
+        // while it was on screen. That is the stale-snapshot shape
+        // `DraftSessionRegistry`'s doc header forbids, and the direct analogue of
+        // `DraftStore.evictImpl`'s orphan-session loop, fixed in `eda55f4ca` the same
+        // day. The loop below re-asks the registry LIVE at each deletion decision.
         let activeComposeSessions = DraftSessionRegistry.shared.activeComposeSessionIds()
         return try dbPool.write { db in
             let sessionRows = try Row.fetchAll(db, sql: """
@@ -752,7 +830,25 @@ actor ChatStore {
             var evicted = 0
             for row in sessionRows {
                 let sid: String = row["sessionId"]
-                if activeComposeSessions.contains(sid) { continue }
+                // Snapshot first (cheap), then the LIVE registry as the authority —
+                // this is the point at which THIS session's deletion is decided, so
+                // this is where the question has to be asked. Mirrors
+                // `DraftStore.evictImpl`'s orphan-session loop exactly.
+                //
+                // Per-row is affordable here and is NOT the `enforceTurnBudgets` case
+                // (Rule A6): `sessionRows` is the DISTINCT expired `compose:%` sessions
+                // in `chatTurn`, and `chatTurn` is itself capped at
+                // `maxExchanges * 2` rows by `enforceTurnBudgets`, so this loop is tens
+                // of iterations on a background maintenance pass, not thousands on the
+                // append path. `activeComposeSessionIds()` is O(open composes) — 0–2.
+                //
+                // RESIDUAL, stated precisely rather than claimed closed: the window
+                // narrows from [pre-transaction sample .. commit] to [this session's
+                // own check .. commit]. A `register` landing after this session has
+                // already been examined still misses, because the rows are by then
+                // deleted inside the open transaction.
+                if activeComposeSessions.contains(sid)
+                    || DraftSessionRegistry.shared.activeComposeSessionIds().contains(sid) { continue }
                 _ = try ChatTurn.filter(Column("sessionId") == sid).deleteAll(db)
                 evicted += 1
             }

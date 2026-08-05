@@ -22,9 +22,15 @@ import Synchronization
 /// `activeComposeSessionIds()` once and then opens a write transaction has only a
 /// STALE answer: a compose that calls `register` in between is invisible to it, and
 /// the sweep deletes the draft the user is typing into. `DraftStore.evictImpl` did
-/// exactly that until 2026-08-05. Use the snapshot as a cheap first filter if you
-/// like, but re-ask `isActive(_:)` / `activeComposeSessionIds()` INSIDE the write
-/// block — both are nonisolated synchronous `Mutex` reads precisely so that is legal.
+/// exactly that until 2026-08-05, and so did all THREE of `ChatStore`'s consumers
+/// (`enforceTurnBudgets` via `appendTurn`, `evictHistoryBeyondCapImpl`,
+/// `evictComposeSessionsImpl`) until later the same day — the rule is a statement
+/// about every consumer, so the census is
+/// `rg -ln 'DraftSessionRegistry' TabMail/` (4 production files: this one, the two
+/// stores, and `ComposeView` as the sole producer). Use the snapshot as a cheap
+/// first filter if you like, but re-ask `isActive(_:)` / `activeComposeSessionIds()`
+/// INSIDE the write block — both are nonisolated synchronous `Mutex` reads precisely
+/// so that is legal.
 ///
 /// REFCOUNTED: a deterministic draftId (`reply:{msg}` / `forward:{msg}`) can be
 /// open in two ComposeViews at once (two windows replying to the same message).

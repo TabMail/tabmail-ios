@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -458,5 +459,277 @@ struct ChatStoreMaintenanceActiveGuardTests {
         guard evicted.count == 1 else { return }
         #expect(evicted[0] == "h-open")
         #expect(try fixture.pool.read { try ChatHistoryTurn.fetchOne($0, key: "h-open") } == nil)
+    }
+}
+
+// MARK: - (c) The register-vs-commit interleaving, at all three ChatStore sites
+
+/// Fires ONE `DraftSessionRegistry.register` from INSIDE a `ChatStore` eviction's own
+/// write transaction, by hooking SQLite's statement trace on the pool's connections.
+///
+/// This reproduces the interleaving the 2026-08-05 fix closes: a ComposeView opening
+/// AFTER the sweep sampled `activeComposeSessionIds()` but BEFORE its write commits.
+/// Nothing else in this file can express it — every other test here registers before
+/// the sweep starts (or passes an explicit set), which the pre-fix and post-fix code
+/// handle identically.
+///
+/// Armed explicitly, so the fixture's own inserts (which run on the same traced
+/// connections) cannot trip it early, and it fires at most once. `marker` selects a
+/// statement the target executes INSIDE its transaction but BEFORE it takes its live
+/// registry read, so the registration always lands in the window under test.
+private final class ChatStoreLateComposeHook: Sendable {
+    private let armed = Mutex<Bool>(false)
+    private let fired = Mutex<Bool>(false)
+    private let draftId: String
+    private let marker: @Sendable (String) -> Bool
+
+    init(draftId: String, marker: @escaping @Sendable (String) -> Bool) {
+        self.draftId = draftId
+        self.marker = marker
+    }
+
+    /// Arm after fixture setup, immediately before the sweep.
+    func arm() { armed.withLock { $0 = true } }
+
+    /// True once the registration actually landed — every test asserts this, so a hook
+    /// that silently never fired cannot make the invariant pass vacuously.
+    var didFire: Bool { fired.withLock { $0 } }
+
+    func observe(_ sql: String) {
+        guard marker(sql) else { return }
+        let shouldFire = armed.withLock { flag -> Bool in
+            guard flag else { return false }
+            flag = false
+            return true
+        }
+        guard shouldFire else { return }
+        DraftSessionRegistry.shared.register(draftId)
+        fired.withLock { $0 = true }
+    }
+}
+
+/// THE INVARIANT, one test per `ChatStore` deletion site: **chat turns belonging to a
+/// compose session that registers before the eviction transaction commits are still
+/// present after the eviction returns.** Asserted on the persisted rows, never on what
+/// some set contained.
+///
+/// All three sites read `DraftSessionRegistry.shared.activeComposeSessionIds()` BEFORE
+/// opening `dbPool.write` and consumed that frozen answer inside it, so a compose that
+/// opened during the sweep was invisible and its authored turns were deleted:
+/// `enforceTurnBudgets` (reached from the ORDINARY `appendTurn` path),
+/// `evictHistoryBeyondCapImpl`, and `evictComposeSessionsImpl`. That is the shape
+/// `DraftSessionRegistry`'s doc header forbids and that `DraftStore.evictImpl` carried
+/// until `eda55f4ca`. Three sites, three tests — one test would be a census that
+/// inherited its own search shape.
+///
+/// `.processGlobalState` + `.serialized`: these drive the production sweeps, which read
+/// the process-wide `DraftSessionRegistry.shared`. Every registration is balanced.
+@Suite("ChatStore eviction consults the live compose registry", .serialized, .processGlobalState)
+struct ChatStoreLiveComposeRegistryGuardTests {
+
+    private func makeHookedPool(
+        hook: ChatStoreLateComposeHook
+    ) throws -> (pool: DatabasePool, directory: URL) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("chatstore-live-registry-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        configuration.prepareDatabase { db in
+            db.trace(options: .statement) { event in
+                hook.observe(event.description)
+            }
+        }
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration)
+        try AppDatabase.runMigrations(on: pool)
+        try pool.write { db in
+            var account = Account(
+                emailAddress: "acc1@example.com", displayName: "Test", provider: .outlook)
+            account.id = "acc1"
+            try account.insert(db)
+        }
+        return (pool, directory)
+    }
+
+    /// Milliseconds since epoch, `daysAgo` days back from now. Derived from `Date()` so
+    /// the fixture can never go stale against a TTL.
+    private func msAgo(days: Double) -> Double {
+        (Date().timeIntervalSince1970 - days * 86400) * 1000
+    }
+
+    private func turn(_ id: String, ts: Double, sessionId: String?, chars: Int = 12) -> ChatTurn {
+        ChatTurn(
+            id: id, timestamp: ts, role: "user",
+            content: String(repeating: "x", count: max(1, chars)),
+            userMessage: "authored \(id)", type: "normal", chars: chars,
+            renderedContent: nil, sessionId: sessionId, remindersSnapshot: nil,
+            emailContextJSON: nil, thinkingContent: nil)
+    }
+
+    private func historyTurn(_ id: String, ts: Double, sessionId: String) -> ChatHistoryTurn {
+        ChatHistoryTurn(
+            id: id, timestamp: ts, role: "user", content: "authored \(id)",
+            userMessage: "authored \(id)", sessionId: sessionId, chars: 12, type: "normal")
+    }
+
+    // MARK: Site 1 — the turn-budget sweep on the ordinary append path
+
+    /// `appendTurn` samples the registry, opens `dbPool.write`, inserts the new turn and
+    /// its `chatHistory` twin, and only then runs the budget sweep. The hook therefore
+    /// fires on that insert: inside the transaction, ahead of the deletion decision, and
+    /// with the sampled set (the `activeComposeSessions` argument) still empty — exactly
+    /// what `appendTurn` computed before the compose existed.
+    @Test("A compose that opens inside the turn-budget transaction keeps its authored turns")
+    func composeRegisteredInsideTurnBudgetTransactionKeepsItsTurns() throws {
+        let victimDraftId = "new:budget-victim-\(UUID().uuidString)"
+        let victimSession = "compose:\(victimDraftId)"
+        let controlSession = "compose:new:budget-control-\(UUID().uuidString)"
+
+        let hook = ChatStoreLateComposeHook(draftId: victimDraftId) { sql in
+            sql.contains("INSERT INTO") && sql.contains("chatTurn")
+        }
+        let fixture = try makeHookedPool(hook: hook)
+        defer { TestDatabaseTeardown.retire(pool: fixture.pool, directory: fixture.directory) }
+        defer { DraftSessionRegistry.shared.unregister(victimDraftId) }
+
+        // One turn OVER the count budget before the append, so the append pushes it two
+        // over and the sweep must delete exactly two. The victim compose owns the
+        // globally OLDEST turn — the FIFO victim the guard has to spare.
+        let seeded = ChatStore.maxExchanges * 2 + 1
+        try fixture.pool.write { db in
+            try turn("budget-victim", ts: 0, sessionId: victimSession).insert(db)
+            try turn("budget-control", ts: 1, sessionId: controlSession).insert(db)
+            for index in 2..<seeded {
+                try turn("budget-filler-\(index)", ts: Double(index),
+                         sessionId: "msg:acc1:filler@example.com").insert(db)
+            }
+        }
+
+        // Precondition: NOT open when the sweep begins. This is what the pre-transaction
+        // sample would have missed, and it is the whole point of the test.
+        #expect(!DraftSessionRegistry.shared.isActive(victimDraftId))
+        hook.arm()
+
+        // Mirrors `appendTurn`'s write block: insert, then sweep with the set that was
+        // sampled BEFORE the transaction opened (empty — no compose was open then).
+        let evicted = try fixture.pool.write { db -> [ChatTurn] in
+            try turn("budget-appended", ts: Double(seeded), sessionId: "msg:acc1:filler@example.com")
+                .insert(db)
+            return try ChatStore.enforceTurnBudgets(db: db, activeComposeSessions: [])
+        }
+
+        // Harness non-vacuity: no interleaving ⇒ the assertions below prove nothing.
+        #expect(hook.didFire)
+        #expect(DraftSessionRegistry.shared.isActive(victimDraftId))
+
+        let state = try fixture.pool.read { db in
+            (victim: try ChatTurn.fetchOne(db, key: "budget-victim"),
+             control: try ChatTurn.fetchOne(db, key: "budget-control"))
+        }
+        // THE INVARIANT — the open compose's authored turn survives the sweep.
+        #expect(state.victim?.userMessage == "authored budget-victim")
+        // …and the sweep still reclaimed its quota from the next-oldest EVICTABLE turns,
+        // so the exemption skipped a row rather than disabling eviction.
+        #expect(state.control == nil)
+        #expect(evicted.count == 2)
+    }
+
+    // MARK: Site 2 — the chatHistory memory cap
+
+    /// `evictHistoryBeyondCapImpl`'s first statement inside its write transaction is the
+    /// `COUNT(*)` probe, which runs before it derives the exemption list — so the hook
+    /// lands the registration in the window between the pre-transaction sample and the
+    /// deletion decision.
+    @Test("A compose that opens inside the memory-cap transaction keeps its history turns")
+    func composeRegisteredInsideHistoryCapTransactionKeepsItsHistory() throws {
+        let victimDraftId = "new:cap-victim-\(UUID().uuidString)"
+
+        let hook = ChatStoreLateComposeHook(draftId: victimDraftId) { sql in
+            sql.contains("chatHistory") && sql.contains("COUNT(")
+        }
+        let fixture = try makeHookedPool(hook: hook)
+        defer { TestDatabaseTeardown.retire(pool: fixture.pool, directory: fixture.directory) }
+        defer { DraftSessionRegistry.shared.unregister(victimDraftId) }
+
+        // The OLDEST history row belongs to the compose that is about to open — the
+        // cap's first victim.
+        try fixture.pool.write { db in
+            try historyTurn("cap-victim", ts: msAgo(days: 3),
+                            sessionId: "compose:\(victimDraftId)").insert(db)
+            try historyTurn("cap-control", ts: msAgo(days: 2),
+                            sessionId: "msg:acc1:a@example.com").insert(db)
+            try historyTurn("cap-newest", ts: msAgo(days: 1),
+                            sessionId: "msg:acc1:b@example.com").insert(db)
+        }
+
+        #expect(!DraftSessionRegistry.shared.isActive(victimDraftId))
+        hook.arm()
+
+        // cap 2, total 3 → evict exactly one.
+        let evicted = try ChatStore.shared.evictHistoryBeyondCapSync(
+            dbPool: PrioritizedDatabase(pool: fixture.pool), maxTurns: 2)
+
+        #expect(hook.didFire)
+        #expect(DraftSessionRegistry.shared.isActive(victimDraftId))
+
+        let state = try fixture.pool.read { db in
+            (victim: try ChatHistoryTurn.fetchOne(db, key: "cap-victim"),
+             control: try ChatHistoryTurn.fetchOne(db, key: "cap-control"),
+             newest: try ChatHistoryTurn.fetchOne(db, key: "cap-newest"))
+        }
+        // THE INVARIANT — the newly-open compose's history survives.
+        #expect(state.victim?.userMessage == "authored cap-victim")
+        // …and the cap was still enforced against the oldest EVICTABLE row.
+        #expect(state.control == nil)
+        #expect(state.newest != nil)
+        #expect(evicted == ["cap-control"])
+    }
+
+    // MARK: Site 3 — the compose-session TTL sweep
+
+    /// `evictComposeSessionsImpl`'s first statement inside its write transaction is the
+    /// expired-`compose:%` session SELECT, which runs before the loop takes any live
+    /// registry read — so the hook lands the registration inside the window.
+    @Test("A compose that opens inside the TTL-sweep transaction keeps its session turns")
+    func composeRegisteredInsideTTLSweepTransactionKeepsItsSession() throws {
+        let victimDraftId = "new:ttl-victim-\(UUID().uuidString)"
+        let controlDraftId = "new:ttl-control-\(UUID().uuidString)"
+
+        let hook = ChatStoreLateComposeHook(draftId: victimDraftId) { sql in
+            sql.contains("compose:%")
+        }
+        let fixture = try makeHookedPool(hook: hook)
+        defer { TestDatabaseTeardown.retire(pool: fixture.pool, directory: fixture.directory) }
+        defer { DraftSessionRegistry.shared.unregister(victimDraftId) }
+
+        // Both sessions are FAR past a 1-day TTL, so both are sweep candidates and the
+        // only thing separating them is the registration.
+        try fixture.pool.write { db in
+            try turn("ttl-victim-turn", ts: msAgo(days: 30),
+                     sessionId: "compose:\(victimDraftId)").insert(db)
+            try turn("ttl-control-turn", ts: msAgo(days: 30),
+                     sessionId: "compose:\(controlDraftId)").insert(db)
+        }
+
+        #expect(!DraftSessionRegistry.shared.isActive(victimDraftId))
+        hook.arm()
+
+        let evicted = try ChatStore.shared.evictComposeSessionsSync(
+            dbPool: PrioritizedDatabase(pool: fixture.pool), ttlDays: 1)
+
+        #expect(hook.didFire)
+        #expect(DraftSessionRegistry.shared.isActive(victimDraftId))
+
+        let state = try fixture.pool.read { db in
+            (victim: try ChatTurn.fetchOne(db, key: "ttl-victim-turn"),
+             control: try ChatTurn.fetchOne(db, key: "ttl-control-turn"))
+        }
+        // THE INVARIANT — the newly-open compose keeps its authored turns.
+        #expect(state.victim?.userMessage == "authored ttl-victim-turn")
+        // …and the identically-expired session nobody has open is still reclaimed.
+        #expect(state.control == nil)
+        #expect(evicted == 1)
     }
 }
