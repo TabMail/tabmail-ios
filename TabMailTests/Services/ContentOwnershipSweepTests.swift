@@ -806,4 +806,75 @@ struct ContentOwnershipSweepTests {
 
         await cleanup(accountId: accountId, keys: keys)
     }
+
+    // MARK: - The asset sweep's decision set, pinned as a whole
+
+    /// THE SWEEP'S OUTPUT IS AN EXACT SET, and this asserts all four membership
+    /// answers in ONE run so no leg can pass by a policy the others contradict.
+    /// A manifest holding a live key, a protected-but-dead key, a dead key inside
+    /// a resolvable scope and a dead key whose scope resolves to nothing must come
+    /// out of `pruneOrphans()` holding exactly the first two.
+    ///
+    /// ⚑ WHY THIS IS AN INVARIANT TEST AND NOT A MECHANISM ONE (`MIS-015`). It says
+    /// nothing about how the sweep decides — not which keys the ownership gate is
+    /// asked about, not how many queries it issues, not that any particular helper
+    /// was called. Re-implement the decision any way at all and this test still
+    /// answers the only question that matters: did the user lose cached content
+    /// that something still claims, and did content nothing claims get reclaimed.
+    /// That is exactly the property a narrowing of the gate's INPUT must preserve,
+    /// and it is why the same assertions hold identically before and after one.
+    ///
+    /// Sensitivity is not assumed — it is red-provable from both sides: drop
+    /// `.subtracting(protected)` and the quarantined key dies; break the live-header
+    /// probe and the live key dies; refuse everything and the two dead keys survive.
+    @Test("Asset sweep decision set: exactly the dead, unprotected manifest keys are released")
+    func assetSweepReleasesExactlyTheDeadUnprotectedKeys() async throws {
+        let dir = try Self.makeAssetEnvironment()
+        defer { Self.teardownAssets(dir) }
+        let accountId = "stageC-asset-decision-set"
+        try await seedScope(accountId: accountId, folderPath: "INBOX", provider: .imap)
+        try await seedScope(
+            accountId: accountId, folderPath: "Resetting", provider: .imap, quarantined: true)
+
+        // 1. LIVE — a header still mints this key.
+        let liveHeader = try await seedHeader(
+            accountId: accountId, folderPath: "INBOX", messageId: "5001")
+        let liveKey = ContentKey(rawValue: liveHeader.id)
+        // 2. DEAD but PROTECTED — no header, but its folder is mid-UIDVALIDITY-reset.
+        let quarantinedKey = ContentKey(rawValue: "\(accountId):Resetting:5002")
+        // 3. DEAD, scope resolves, nothing owns it, no recovery (IMAP is not
+        //    recoverable by provider id) — the sweep must reclaim it.
+        let deadKey = ContentKey(rawValue: "\(accountId):INBOX:5003")
+        // 4. DEAD and UNSCOPED — no `Folder` row claims this prefix. Deliberately
+        //    NOT protected: protecting it would make a removed account's assets
+        //    permanently unreclaimable.
+        let unscopedKey = ContentKey(rawValue: "\(accountId):DeletedFolder:5004")
+
+        for (index, key) in [liveKey, quarantinedKey, deadKey, unscopedKey].enumerated() {
+            #expect(BodyAssetStore.writeAttachment(
+                contentKey: key, section: "2", contentType: "application/pdf",
+                data: Data(repeating: UInt8(index + 1), count: 32),
+                identityStamp: "rfc:decision-\(index)@example.com") != nil)
+        }
+        let seeded = manifestKeys()
+        #expect(seeded.contains(liveKey) && seeded.contains(quarantinedKey)
+                && seeded.contains(deadKey) && seeded.contains(unscopedKey),
+                "precondition: all four keys are in the manifest before the sweep")
+
+        await BodyAssetMaintenance.pruneOrphans()
+
+        let after = manifestKeys()
+        #expect(after.contains(liveKey),
+                "a key a live header still mints must never be released")
+        #expect(after.contains(quarantinedKey),
+                "a key whose folder is under a UIDVALIDITY quarantine must never be released")
+        #expect(!after.contains(deadKey),
+                "a key nothing owns, in a settled folder, must still be reclaimed")
+        #expect(!after.contains(unscopedKey),
+                "a key no folder claims must still be reclaimable — otherwise a removed account leaks forever")
+
+        await cleanup(
+            accountId: accountId,
+            keys: [liveKey, quarantinedKey, deadKey, unscopedKey])
+    }
 }

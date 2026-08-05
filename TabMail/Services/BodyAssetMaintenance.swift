@@ -216,7 +216,34 @@ enum BodyAssetMaintenance {
                         sql: "SELECT id FROM messageHeader WHERE id IN (\(placeholders))",
                         arguments: args
                     )
-                    return (Set(ids), try MessageContentStore.protectedKeys(among: keys, db: db))
+                    let live = Set(ids)
+                    // ⚑ THE GATE IS ASKED ONLY ABOUT THE DEAD CANDIDATES, and that is
+                    // identical BY CONSTRUCTION rather than by care. `protected` has
+                    // exactly one consumer, the next statement, and it is
+                    // `manifestKeys.subtracting(liveKeys).subtracting(protected)` — so a
+                    // key that is already in `liveKeys` has been excluded before
+                    // `protected` is consulted and its protection status cannot change
+                    // the result. Subtracting a set element that is not in the minuend
+                    // is a no-op, so narrowing the INPUT to `manifestKeys - liveKeys`
+                    // yields the same `dead` set for every possible database state.
+                    //
+                    // Why it matters: `protectedKeys` issues one ownership query PER KEY
+                    // (`MessageContentStore.owners`), and this runs on the 60-second
+                    // foreground maintenance poll. Asked about the whole manifest that
+                    // is O(manifest); asked about the dead candidates it is O(what we
+                    // were about to delete), normally zero — in which case `protectedKeys`
+                    // returns on its own empty guard.
+                    //
+                    // NEGATIVE CASE, because this is an equivalence claim and an
+                    // unqualified one would be an absolute without its scope: the ONE
+                    // observable difference is that an empty dead set no longer reads the
+                    // folder/account roster, so a roster read that would have THROWN now
+                    // does not. That cannot change any deletion — with no dead candidates
+                    // there is nothing to delete either way — and whenever a candidate
+                    // does exist the roster is read and a throw propagates to the
+                    // fail-safe `catch` exactly as before.
+                    let deadCandidates = keys.filter { !live.contains($0) }
+                    return (live, try MessageContentStore.protectedKeys(among: deadCandidates, db: db))
                 }
                 let dead = manifestKeys.subtracting(liveKeys).subtracting(protected)
                 guard !dead.isEmpty else {
