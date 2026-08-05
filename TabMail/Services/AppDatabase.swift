@@ -1949,7 +1949,64 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerTimedMigration("v68_addFolderUidValidityResetPending") { db in
+        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v83 RANGE ─────────────────────
+        //
+        // `registerTimedMigration`'s DEFAULT stays `.deferred` and is NOT
+        // changed. v1…v67 have never been adjudicated for `.immediate` safety,
+        // and a device sitting at an intermediate version would run the
+        // unadjudicated ones against populated data. Only the migrations that
+        // spell `foreignKeyChecks: .immediate` out below run that way.
+        //
+        // WHY. GRDB's `.deferred` path (`Migration.runWithDeferredForeignKeys
+        // Checks`) wraps each body in `PRAGMA foreign_keys = OFF` and then a
+        // WHOLE-DATABASE `PRAGMA foreign_key_check` before COMMIT. That check
+        // scans every FK-bearing row in the file regardless of what the body
+        // touched, and it is paid once per migration. Measured on a 500k-header
+        // / 1M-association / 3.4 GB database, v68…v83 cost 61.8–87.4 s, of
+        // which 42.5–65.0 s (69–74%) was those sixteen checks — `v68` alone is
+        // one `ALTER TABLE folder ADD COLUMN` with a 0.3 ms body and an
+        // 8.8–10.7 s check. `.immediate` keeps foreign keys ENFORCED LIVE
+        // inside the body and runs no trailing whole-database scan. Same
+        // statements, same rows, byte-identical resulting schema; the same
+        // chain measures 27.6–29.0 s. On device (×2–4) that is 2.1–5.8 min →
+        // 0.9–1.9 min. Harness + raw output: `scratchpad/MIGRATION_COST/`.
+        //
+        // NOT A BODY CHANGE. `foreignKeyChecks:` is an argument to
+        // `registerMigration`, not part of the migration body, so Data
+        // Integrity rule 5 (a registered migration is immutable once ANY
+        // database has run it) is not engaged: a database that already applied
+        // a migration SKIPS it entirely and the mode never runs; a database
+        // that has not applies it under the new mode and reaches the identical
+        // schema.
+        //
+        // WHEN `.immediate` IS SAFE. It differs from `.deferred` only for a
+        // body that TRANSIENTLY violates an FK and repairs it before COMMIT.
+        // The v67 FK graph is `account ← {caldavConfig, draft, folder,
+        // messageHeader, outboxMessage, pendingCalendarOperation, userLabel}`,
+        // `messageHeader ← {messageBody (until v70), messageReference,
+        // messageUserLabel}`, `userLabel ← {messageUserLabel}` — every one
+        // `ON DELETE CASCADE` / `ON UPDATE NO ACTION`. Against that graph:
+        //   • v68 v69 v71 v72 v75 v76 v77 v80 — `ADD COLUMN` only. None of the
+        //     21 columns these add declares `.references`, and adding a column
+        //     writes no key.
+        //   • v73 v78 v79 — `ADD COLUMN` + an `UPDATE` of
+        //     `serverDraftId`/`serverPushStatus`/`serverDraft*` /
+        //     `everAttempted` / `lastTouchedSeq`. SQLite re-validates an FK only
+        //     when a parent- or child-key column is written; none of these is
+        //     one.
+        //   • v74 — `DELETE FROM pendingOperation`. That table declares no FK
+        //     and NOTHING references it, so the delete fires no FK action.
+        //   • v70 — `DROP TABLE messageBody` + recreate. `messageBody` is a
+        //     pure CHILD; nothing references it, so the implicit delete that
+        //     `DROP TABLE` performs under enforced FKs cascades to nothing.
+        //   • v81 — `UPDATE messageHeader SET actionTagSetAt = …`.
+        //     `messageHeader` IS a parent, but see that migration's own note.
+        //   • v83 — `CREATE INDEX` + `ANALYZE`; changes no row.
+        // `v71` and `v82` stay `.deferred`, each for a different reason — read
+        // their own comments before changing either.
+        migrator.registerTimedMigration(
+            "v68_addFolderUidValidityResetPending", foreignKeyChecks: .immediate
+        ) { db in
             // T4.S6 — the UIDVALIDITY purge-and-resync reaction's own quarantine
             // state. Non-nil ⇒ `AccountManager.runUidValidityResetReaction` armed
             // this folder and has not yet stamped the fresh epoch. Nullable with no
@@ -1964,7 +2021,9 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerTimedMigration("v69_addPendingOperationObservedUidValidity") { db in
+        migrator.registerTimedMigration(
+            "v69_addPendingOperationObservedUidValidity", foreignKeyChecks: .immediate
+        ) { db in
             // T4.S6 follow-up — the admission-time UIDVALIDITY stamp for a durable op
             // that will be executed by BARE UID (see `PendingOperation
             // .observedUidValidity`). Nullable, no default and no backfill: a
@@ -1984,7 +2043,9 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerTimedMigration("v70_dropMessageBodyHeaderFK") { db in
+        migrator.registerTimedMigration(
+            "v70_dropMessageBodyHeaderFK", foreignKeyChecks: .immediate
+        ) { db in
             // #37 Stage D. `messageBody.id` is a CONTENT key, not a header id
             // (`ContentKeySpace`). Once its tail becomes the RFC 822 Message-ID at
             // Stage E1 the reference is invalid in BOTH directions: the FK REJECTS
@@ -2018,9 +2079,20 @@ final class AppDatabase: Sendable {
             // class of event those sweeps produce every day, not a new one, and the
             // OWNER HAS EXPLICITLY ACCEPTED the one-time cache loss on upgrade.
             //
-            // Measured: drop+create is 0.319 s with ZERO extra disk, and the
-            // freelist those pages return to is consumed again as the cache refills
-            // — so the file never grows and no `VACUUM` is ever needed.
+            // ⚠️ **THE DECISION RESTS ON THE DISK CLAIM, NOT ON THE SPEED RATIO.**
+            // Both halves were re-measured 2026-08-05 and only one of them
+            // generalises:
+            //   • ZERO EXTRA DISK holds at EVERY scale — peak overhead ≤ +2.6 MB.
+            //     This is the load-bearing fact and it is why the rebuild was
+            //     rejected; do not weaken it.
+            //   • The old "0.319 s" was a 100 MB-scale number read as universal.
+            //     `DROP TABLE messageBody` is strongly SUPER-LINEAR: 100 MB → 18 ms,
+            //     500 MB → 87 ms, 1.2 GB → 2,182 ms, 2.6 GB → 7,886 ms. So the
+            //     advantage over the ~11 s rebuild is ~35× at 100 MB but only ~1.4×
+            //     at 2.6 GB. A reader sizing this migration on a large device should
+            //     expect SECONDS, not milliseconds.
+            // The freelist those pages return to is consumed again as the cache
+            // refills — so the file never grows and no `VACUUM` is ever needed.
             //
             // The two alternatives were costed and REJECTED:
             // - The textbook 12-step rebuild (`v2_dropMessageHeaderFolderFK` here,
@@ -2100,6 +2172,23 @@ final class AppDatabase: Sendable {
             }
         }
 
+        // ⚠️ THIS MIGRATION KEEPS `foreignKeyChecks: .deferred` DELIBERATELY, AND
+        // IT IS THE ONLY WHOLE-DATABASE FK GATE IN THE v68…v83 RANGE. Do not
+        // "finish the optimisation" by flipping it — the trailing
+        // `PRAGMA foreign_key_check` GRDB runs on the deferred path is what
+        // preserves detection of a PRE-EXISTING orphan, which `.immediate`
+        // cannot see (it only enforces writes the body itself makes), and it is
+        // what `v82`'s comment explicitly leans on ("every migration on this
+        // line ends with a full foreign-key check").
+        //
+        // WHY HERE and not at v68 or at the end. `v70` has just removed the
+        // `messageBody → messageHeader` FK, whose check reads every page of a
+        // multi-GB table for one column; that makes the surviving gate 2.4–2.5×
+        // cheaper here than the same gate at `v68` (3.6–3.8 s vs 9.1 s at 500k
+        // headers / 3.4 GB), while still running BEFORE `v82` mutates a row. A
+        // closing-only gate would be cheaper still, but migrations COMMIT
+        // INDIVIDUALLY: a failure there strands the database at v82 retrying
+        // v83 forever, with 15 migrations' work already applied.
         migrator.registerTimedMigration("v71_addOutboxDraftRfc822MessageId") { db in
             // The DRAFT's own RFC 822 Message-ID, snapshotted at queue-send time so
             // the post-send server-draft cleanup can name the Drafts copy by an
@@ -2127,7 +2216,9 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerTimedMigration("v72_addDraftServerUidValidity") { db in
+        migrator.registerTimedMigration(
+            "v72_addDraftServerUidValidity", foreignKeyChecks: .immediate
+        ) { db in
             // The UIDVALIDITY EPOCH the draft's server address (`serverDraftId`, a bare
             // IMAP UID) was MINTED under, carried beside that address everywhere the
             // address goes: the `draft` row that owns it, the `outboxMessage` snapshot
@@ -2185,7 +2276,9 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerTimedMigration("v73_bindDraftUidToMailbox") { db in
+        migrator.registerTimedMigration(
+            "v73_bindDraftUidToMailbox", foreignKeyChecks: .immediate
+        ) { db in
             try db.alter(table: "draft") { t in
                 t.add(column: "serverDraftFolderPath", .text)
             }
@@ -2209,21 +2302,27 @@ final class AppDatabase: Sendable {
                 """)
         }
 
-        migrator.registerTimedMigration("v74_purgeLegacyPendingOperations") { db in
+        migrator.registerTimedMigration(
+            "v74_purgeLegacyPendingOperations", foreignKeyChecks: .immediate
+        ) { db in
             // ⚑ NO REFERENCE — INVENTED. Owner-approved C6 upgrade boundary:
             // superseded in-flight operations are discarded without decoding.
             // Draft, Outbox, authored content and attachments remain untouched.
             try db.execute(sql: "DELETE FROM pendingOperation")
         }
 
-        migrator.registerTimedMigration("v75_addDraftPushAttemptVersion") { db in
+        migrator.registerTimedMigration(
+            "v75_addDraftPushAttemptVersion", foreignKeyChecks: .immediate
+        ) { db in
             // PORT — v2final v81 conflict version, with recovery fields omitted.
             try db.alter(table: "draft") { t in
                 t.add(column: "pushAttemptVersion", .integer).notNull().defaults(to: 0)
             }
         }
 
-        migrator.registerTimedMigration("v76_addDraftGenerationAndTypedIdentity") { db in
+        migrator.registerTimedMigration(
+            "v76_addDraftGenerationAndTypedIdentity", foreignKeyChecks: .immediate
+        ) { db in
             // PORT — reduced generation/provider-native schema. No backfill and
             // no pending/outbox compatibility: nil generations fail closed until
             // an ordinary compose admission acquires the existing Draft.
@@ -2241,7 +2340,9 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerTimedMigration("v77_addMessageHeaderObservedUidValidity") { db in
+        migrator.registerTimedMigration(
+            "v77_addMessageHeaderObservedUidValidity", foreignKeyChecks: .immediate
+        ) { db in
             // ⚑ NO REFERENCE — INVENTED. Source-bound IMAP epoch transport,
             // explicitly deferred by v2final commit 486bafd4b. Nullable, with no
             // default and no backfill: existing rows remain unproven rather than
@@ -2251,7 +2352,9 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerTimedMigration("v78_addPendingOperationEverAttempted") { db in
+        migrator.registerTimedMigration(
+            "v78_addPendingOperationEverAttempted", foreignKeyChecks: .immediate
+        ) { db in
             // PORT — v2final v73 (`d1d4f01ce`). Annihilation is only an
             // optimization, so pre-existing rows take the conservative TRUE
             // backfill: a false positive costs one inverse provider call;
@@ -2279,7 +2382,18 @@ final class AppDatabase: Sendable {
         // 1-based position in `(updatedAt ASC, id ASC)` — the recency signal the app
         // already displays by, and the best available legacy proxy. `applySave`'s
         // `MAX+1` then continues from N. Additive; no data reshape; no row deleted.
-        migrator.registerTimedMigration("v79_addDraftLastTouchedSeq") { db in
+        migrator.registerTimedMigration(
+            "v79_addDraftLastTouchedSeq", foreignKeyChecks: .immediate
+        ) { db in
+            // ⚠️ `seedDraftLastTouchedSeq`'s correlated subquery is QUADRATIC in the
+            // number of `draft` rows — measured 2.9 ms → 252 ms for a 10× row count.
+            // It is safe ONLY because the table is capped: `SyncEngineMaintenance`
+            // evicts drafts down to `SyncConfig.maxComposeDraftSessions` (10), so the
+            // realistic input is tens of rows, not thousands. **Raising that config
+            // makes this migration quadratically more expensive for every device that
+            // has not yet run it** — a database sitting at v78 today still pays the
+            // new cost tomorrow. If the cap ever grows past ~1,000, re-measure this
+            // body or replace the subquery with a window function before shipping.
             try db.alter(table: "draft") { t in
                 t.add(column: "lastTouchedSeq", .integer).notNull().defaults(to: 0)
             }
@@ -2317,7 +2431,9 @@ final class AppDatabase: Sendable {
         //
         // Never 0 for the epoch: RFC 3501 §2.3.1.1 types UIDVALIDITY as `nz-number`,
         // so a synthesised zero would compare equal to another synthesised zero.
-        migrator.registerTimedMigration("v80_addDraftReplyTargetAddress") { db in
+        migrator.registerTimedMigration(
+            "v80_addDraftReplyTargetAddress", foreignKeyChecks: .immediate
+        ) { db in
             try db.alter(table: "draft") { t in
                 t.add(column: "replyToProviderMessageId", .text)
                 t.add(column: "replyToUidValidity", .integer)
@@ -2339,7 +2455,28 @@ final class AppDatabase: Sendable {
         // clause). Convergence: a fresh install runs v53 then v81, an existing DB
         // skips v53 and runs v81 — either way every row carrying a tag when v81
         // runs leaves it stamped, and every untagged row leaves it NULL.
-        migrator.registerTimedMigration("v81_addActionTagSetAt") { db in
+        //
+        // `foreignKeyChecks: .immediate` — SAFE, and one column away from not
+        // being. `messageHeader` is the PARENT of `messageReference` and
+        // `messageUserLabel`, and its own `accountId` is a CHILD key into
+        // `account`. The `SET` list below writes neither: only
+        // `actionTagSetAt`. ⚠️ NEGATIVE CASE: if this `UPDATE` were ever
+        // widened to touch `id`, `ON UPDATE NO ACTION` would ABORT it under
+        // `.immediate` while `.deferred` would pass whenever the final state
+        // happened to be consistent. Widening the SET list means re-deciding
+        // this mode.
+        //
+        // ⚠️ FREE SPACE. This body is ONE transaction over every tagged
+        // `messageHeader`, so the WAL holds ~300 MB at profile H (500k headers /
+        // 3.4 GB) before it commits. It does NOT leave the file larger — the pages
+        // return to the freelist — but a device with under ~300 MB free cannot
+        // complete it, and a migration that cannot complete is the "Updating…"
+        // boot-hang shape. `v82` has the same requirement. Registered as
+        // `IOS-MIGRATION-001` in `KNOWN_ISSUES.md`; do not widen either body into a
+        // second full-table pass without re-measuring the peak.
+        migrator.registerTimedMigration(
+            "v81_addActionTagSetAt", foreignKeyChecks: .immediate
+        ) { db in
             try db.alter(table: "messageHeader") { t in
                 t.add(column: "actionTagSetAt", .datetime)
             }
@@ -2395,10 +2532,39 @@ final class AppDatabase: Sendable {
         // recreating `userLabel` cannot delete a single association row — and the final
         // check proves every rebuilt reference resolves.
         //
+        // The rest of the v68…v83 range runs `.immediate` (see the block comment above
+        // `v68`); this migration and `v71` are the two exceptions. This body would in
+        // fact SURVIVE `.immediate` — the child `messageUserLabel` is dropped BEFORE
+        // the parent `userLabel`, and steps 3a/3b insert every id step 5 writes while
+        // step 5's `JOIN messageHeader` guarantees the other reference, so the rebuild
+        // is total by construction. It is kept `.deferred` on COST, not on safety:
+        // `.immediate` pays per-row FK enforcement on the 1M-row step-5 insert and
+        // measures SLOWER (8,571 ms body vs 6,309 ms deferred at 500k headers).
+        // ⚠️ NEGATIVE CASE, recorded because the two lines are adjacent and read as
+        // interchangeable: swapping the `db.drop` calls below so `userLabel` goes first
+        // would leave its surviving children violating on the parent's implicit delete
+        // — silently fine under `.deferred`, an abort under `.immediate`. If this ever
+        // moves to `.immediate`, that ordering becomes load-bearing.
+        //
         // BEST-EFFORT `name`. A row reconstructed for account B in step 3a inherits
         // whatever `name`/`isSystem` the hijacked shared row was carrying, because that
         // is the only evidence in the database. The SERVER is the source of truth and
         // the next sync of that account overwrites both. No lookup is invented here.
+        //
+        // ⚠️ FREE SPACE — same requirement as `v81`: ~300 MB of WAL at profile H
+        // (500k headers / 1M associations / 3.4 GB), held until the single
+        // transaction commits. The file does NOT grow across the migration
+        // (3,385.4 MB before → 3,385.4 MB after), so this is a transient headroom
+        // requirement, not a permanent one. Registered as `IOS-MIGRATION-001`.
+        //
+        // ✅ CLOSED DECISION — STEP 5's PLAN IS ALREADY OPTIMAL; DO NOT "OPTIMISE" IT.
+        // The obvious idea is to index `messageUserLabel_v82_legacy` so step 5's
+        // `JOIN messageHeader` has a driving index. Measured at profile H, that is a
+        // PESSIMIZATION: 11,279 ms with the snapshot index vs 10,424 ms without.
+        // Building the index costs more than the hash join it replaces, and the
+        // snapshot table is dropped four statements later, so the index is never
+        // reused. Same for step 3a — the `DISTINCT` already reduces the join input to
+        // the tiny pair set, which is why it is written that way.
         migrator.registerTimedMigration(
             "v82_accountScopedUserLabelIdentity", foreignKeyChecks: .deferred
         ) { db in
@@ -2583,7 +2749,9 @@ final class AppDatabase: Sendable {
         // CONVERGENCE (Data Integrity rule 5): additive and idempotent. A fresh
         // install creates the index over an empty table; an existing database creates
         // it over real rows. Same schema either way. Nothing reads or writes a row.
-        migrator.registerTimedMigration("v83_markAllAsReadUnreadSweepIndex") { db in
+        migrator.registerTimedMigration(
+            "v83_markAllAsReadUnreadSweepIndex", foreignKeyChecks: .immediate
+        ) { db in
             try db.execute(sql: """
                 CREATE INDEX IF NOT EXISTS messageHeader_unreadSweep
                 ON messageHeader(folderId, id)
