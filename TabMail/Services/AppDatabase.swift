@@ -2864,6 +2864,14 @@ final class AppDatabase: Sendable {
 /// the O(mailbox-size) bodies (v9 / v27 / v47 / v53 / v54 …) spent it — the
 /// attribution the "hang on boot" reports need.
 ///
+        // REPRODUCED at profile H on the post-chain state a real upgraded device now
+        // holds until its first background pass: the same lookup plans as
+        // `SEARCH … messageHeader_accountId_messageId (accountId=?)` — a 100k-row
+        // account-wide walk — with `sqlite_stat1` empty, and as the two-seek
+        // `MULTI-INDEX OR` (0.079 ms/lookup) once the background `ANALYZE` has run,
+        // which fills `sqlite_stat1` from 0 rows to 36. ⚠️ Probe with a value that
+        // EXISTS: an account id present in no row reports the same plan on both
+        // sides, which reads as "statistics change nothing" and is an artefact.
 /// **The applied-migrations ledger is untouched.** The identifier string and the
 /// migrate closure are forwarded to GRDB byte-for-byte; the only change is an
 /// outer closure that calls `migrate(db)`. GRDB keys `grdb_migrations` by
