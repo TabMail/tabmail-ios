@@ -17,6 +17,15 @@ import Synchronization
 /// user-initiated destructive ops (discard, send, session-clear, account-cascade
 /// delete) are NOT vetoed — the user asked for those.
 ///
+/// 🚨 **CONSULTING THIS REGISTRY MEANS ASKING IT AT THE DELETION DECISION, NOT
+/// BEFORE THE TRANSACTION.** A deletion site that reads `snapshot()` /
+/// `activeComposeSessionIds()` once and then opens a write transaction has only a
+/// STALE answer: a compose that calls `register` in between is invisible to it, and
+/// the sweep deletes the draft the user is typing into. `DraftStore.evictImpl` did
+/// exactly that until 2026-08-05. Use the snapshot as a cheap first filter if you
+/// like, but re-ask `isActive(_:)` / `activeComposeSessionIds()` INSIDE the write
+/// block — both are nonisolated synchronous `Mutex` reads precisely so that is legal.
+///
 /// REFCOUNTED: a deterministic draftId (`reply:{msg}` / `forward:{msg}`) can be
 /// open in two ComposeViews at once (two windows replying to the same message).
 /// A plain `Set` would collapse both registrations so the FIRST close exposes the
@@ -26,6 +35,13 @@ import Synchronization
 /// over-RETAINS (the safe direction — a draft is kept, never wrongly deleted) and
 /// self-heals at launch: the dict starts empty, and at launch no compose is open,
 /// so the next maintenance pass reclaims anything genuinely stale.
+///
+/// ⚠️ **THAT SENTENCE IS ABOUT A MISSED `unregister` ONLY — it is NOT a statement
+/// that this registry has just one failure direction.** A missed `unregister` is
+/// safe. A LATE `register` — one that lands after a deletion site sampled the
+/// registry — is the opposite and is NOT safe: it reads as "no compose is open" and
+/// the sweep deletes live authored bytes. That is why the rule above is about
+/// *when* the registry is asked, not merely *that* it is asked.
 ///
 /// SUBTRACT — this is the ONE file carried from the reference's draft-lineage
 /// bucket. It depends on nothing but `Synchronization`, so `DraftStoreStageAB`,

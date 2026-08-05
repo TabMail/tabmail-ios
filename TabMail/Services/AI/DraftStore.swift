@@ -612,10 +612,32 @@ actor DraftStore {
         // (or its authored chat turns) mid-compose. Both guard forms are derived from
         // ONE snapshot so the draft-row guard and the orphan-session guard can never
         // disagree (a register/unregister landing between two separate reads would
-        // otherwise protect one but not the other). The register-vs-commit window (a
-        // compose registering AFTER this read but before the write commits) is the
-        // accepted narrow interleaving; it only ever costs a retention, and the next
-        // maintenance pass reclaims a genuinely stale row.
+        // otherwise protect one but not the other).
+        //
+        // 🚨 THIS SNAPSHOT IS THE CHEAP FIRST FILTER, NOT THE AUTHORITY. It is read
+        // BEFORE `dbPool.write` opens, so a compose that calls `register(draftId)`
+        // after this line is invisible to it. ⚠️ CORRECTED 2026-08-05: this comment
+        // previously claimed the register-vs-commit window "only ever costs a
+        // retention, and the next maintenance pass reclaims a genuinely stale row".
+        // That was the exact OPPOSITE of the truth — a compose registering after the
+        // snapshot was not exempt, so the sweep deleted its draft row, its authored
+        // compose chat turns and its attachment directory while the user was typing
+        // into it. That is a loss of authored user bytes, not a retention.
+        //
+        // Both loops below therefore re-ask the registry LIVE, inside the write
+        // transaction, at the point the deletion decision for that row is taken.
+        // `DraftSessionRegistry` is a `Sendable final class` over a `Mutex`, so its
+        // reads are nonisolated and synchronous and are legal inside this block.
+        //
+        // RESIDUAL, stated precisely rather than claimed closed: the live check moves
+        // the exposure from [snapshot .. commit] down to [this row's own check ..
+        // commit]. A `register` that lands after this row has already been examined
+        // still misses, because the row is by then deleted inside the open
+        // transaction. That remnant is microseconds of straight-line code rather than
+        // the whole sweep, and it is the direction the mantra tolerates: the compose
+        // holds the draft in memory and its next save re-inserts the row. The
+        // attachment directory is the one part that is not re-derivable, and it is
+        // deleted only after the transaction commits (see the loop at the end).
         let activeDraftIds = DraftSessionRegistry.shared.snapshot()
         let activeComposeSessions = Set(activeDraftIds.flatMap { ["compose:\($0)", "demo:compose:\($0)"] })
 
@@ -633,7 +655,14 @@ actor DraftStore {
                 // PORT — a brand-new compose has chat turns BEFORE its first Draft-row
                 // save, so it looks "orphaned" here. Never delete an ACTIVE compose's
                 // turns: the user is mid-conversation and those are authored bytes.
-                if activeComposeSessions.contains(sid) { continue }
+                //
+                // Snapshot first (cheap), then the LIVE registry as the authority —
+                // see the header comment above. `activeComposeSessionIds()` is the
+                // registry's OWN derivation of the `compose:<id>` / `demo:compose:<id>`
+                // forms; deriving them here by hand would fork the key format. Its cost
+                // is O(open composes) — 0–2 in practice — not O(orphans).
+                if activeComposeSessions.contains(sid)
+                    || DraftSessionRegistry.shared.activeComposeSessionIds().contains(sid) { continue }
                 _ = try ChatTurn.filter(Column("sessionId") == sid).deleteAll(db)
                 orphanEvicted += 1
             }
@@ -656,7 +685,12 @@ actor DraftStore {
                 // PORT — never evict a draft the user currently has OPEN in a
                 // ComposeView (mirrors the inbox-tied exemption below: `continue`, so
                 // it is neither evicted nor counted toward `kept`).
-                if activeDraftIds.contains(draft.id) { continue }
+                //
+                // Snapshot first (cheap), then the LIVE registry as the authority —
+                // see the header comment above. This is the point at which THIS row's
+                // eviction is decided, so this is where the question has to be asked.
+                if activeDraftIds.contains(draft.id)
+                    || DraftSessionRegistry.shared.isActive(draft.id) { continue }
                 // Exempt: reply/forward drafts where the original message is still in inbox.
                 // Strategy 1: lookup by GRDB PK (replyToId).
                 // Strategy 2: if PK stale (IMAP MOVE), extract stableId from draft key
