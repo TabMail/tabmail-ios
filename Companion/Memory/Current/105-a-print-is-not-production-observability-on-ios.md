@@ -137,6 +137,22 @@ blind spots (`} else if` arms, `guard … else { return "" }`, and **a gate hois
 which hides the condition from any walker keyed on the flag), and the register row are in
 `KNOWN_ISSUES.md`.
 
+> ⚠️ **RETRACTION (2026-08-05) — `af98d92c7`'s claim A over-claims, and this file is where the
+> correction lives because a commit body cannot be amended.** That commit's section A states: *"OF THE
+> 15, ZERO ARE DEFECTS ON THE MERITS … **All 15 arms are log-only**"*. The second clause is FALSE.
+> `InboxView`'s error banner is one of the 15, and its arm renders a **UI banner**, not a log — which
+> is precisely the defect §3's correction had already identified and that `3573574ed` fixed two
+> commits later. The **conclusion** of claim A survives (the census was clean of the class it was
+> opened to adjudicate, and `ThreadUtils.swift`'s site is correct as written); what fails is the
+> universal *"all 15 arms are log-only"*, asserted while the same commit's own section C described a
+> banner that was not.
+>
+> **How the error was made:** the commit enumerated 15 sites, classified them, and wrote the summary
+> sentence from the classification's *majority* rather than from its exceptions — the same shape as
+> `MIS-019` (an absolute stated without checking its negative case), and one the same commit was in
+> the middle of retracting elsewhere. **A census summary must be written from the rows that disagree
+> with it, not the rows that agree.** Found by the final-train Claude audit half, 2026-08-05.
+
 > ⚠️ **What this does NOT close, and it is the half the §3 correction cared most about.** Both
 > `InboxViewModel.error` write sites are still wrapped in `if !SyncEngine.isConnectionError(error)`. At
 > the `performSync` catch that is covered — `AccountManagerState.shared.lastSyncFailed = true` is set

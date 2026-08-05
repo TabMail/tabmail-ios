@@ -26,8 +26,23 @@ import Testing
 /// `bannerPresenceIsIndependentOfTheDebugFlag` is the load-bearing test. Asserting
 /// "with logging off, a non-nil error yields a banner" pins one instance; asserting
 /// that PRESENCE is the same function of `error` under both flag values pins the
-/// property, so any future re-gating fails regardless of which direction it is
-/// written in (`MIS-015` — pin the invariant, never the fix's mechanism).
+/// property, so any future re-gating **of `InboxErrorBanner.text(for:loggingEnabled:)`**
+/// fails regardless of which direction it is written in (`MIS-015` — pin the
+/// invariant, never the fix's mechanism).
+///
+/// > ⚠️ **The qualifier above is load-bearing, and without it this doc claimed reach
+/// > the suite does not have** (`MIS-019` — an absolute owes its negative case).
+/// > Every test here exercises the PURE function; **none constructs `InboxView`**.
+/// > So the last hop — from the function's return value to the view actually
+/// > rendering it — is covered by no test, and re-adding
+/// > `, DebugModeManager.isLoggingEnabled()` to the view's `if` restores the exact
+/// > original defect with all five tests GREEN. That is the same shape as the defect
+/// > this file was written to close, which is why it is stated rather than assumed
+/// > away. Closing it needs a ViewInspector-style render assertion or a snapshot
+/// > test; the repo has neither, and adding that harness for one banner is
+/// > machinery `A3`/`MIS-003` forbids. **The guard is therefore this sentence plus
+/// > the topic-105 §4 note, not a test** — if you re-gate the view, nothing will
+/// > catch you. Found by the final-train Claude audit half, 2026-08-05.
 ///
 /// ## Non-vacuity is two-sided, and it was measured, not reasoned
 ///
