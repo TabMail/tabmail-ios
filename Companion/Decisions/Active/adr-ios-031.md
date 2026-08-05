@@ -1,3 +1,43 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note — ⚠️ the EMPIRICAL CORRECTION below was RELOCATED, not rewritten (2026-08-05).**
+>
+> The preserved ADR body under this wrapper is pinned byte-for-byte to `v1.6.38:DECISIONS.md` lines
+> 910-966, which is what `ruby Scripts/compact_companion_docs.rb verify` reconstructs and hashes.
+> Commit `9430ef418` (2026-08-04, "Close the register: every id now carries exactly one disposition")
+> wrote the correction **inline**, inside that pinned body, and appended a pointer to the falsified
+> sentence. Both edits changed the fragment's bytes, so `verify` aborted with
+> `hash mismatch: Companion/Decisions/Active/adr-ios-031.md` **before reaching any of its later
+> checks** — the landing proof for the whole Decisions tree was dead from that commit until this one.
+>
+> This delimited wrapper is the mechanism the compaction script provides for exactly this case:
+> `exact_body` strips a leading `COMPANION-CURRENT-NOTE` block before hashing, so an amendment stays
+> visible to every reader and to `rg` while the preserved body stays byte-identical. The README says
+> so outright — *"`verify` is the landing proof against that source revision, not a permanent ban on
+> later documented amendments"*.
+>
+> **Nothing was deleted.** The correction is reproduced verbatim below. Two reading notes, because
+> the text was written to sit *after* the sentence it corrects and now sits *before* it:
+>
+> - Read its opening phrase **"the sentence above"** as **"the sentence in the preserved body
+>   below"** — the one beginning *"`.medium` stays below `.userInitiated` …"* and ending
+>   *"… won't stall MainActor waiting on it."*
+> - The inline pointer `9430ef418` appended to that sentence is removed from the body (it is what
+>   broke the hash) and is preserved here verbatim instead:
+>   **⚠️ The clause "below iOS's priority-inversion detection threshold" is FALSIFIED by this project's own tooling and is corrected immediately below; the DECISION above is unaffected.**
+>
+> **⚠️ EMPIRICAL CORRECTION (2026-08-04) — the sentence above is kept verbatim rather than rewritten, so the claim a reader may already have cited stays findable beside its refutation.**
+>
+> **What is falsified:** only the clause *"below iOS's priority-inversion detection threshold"*. **The Thread Performance Checker's own output contradicts it.** In two archived full-suite `xcodebuild test` logs, **19 of 23 and 18 of 22 recorded waits name a *Default*-QoS holder — and Default QoS (21) IS `.medium`, the very tier this ADR prescribes as the safe floor.** The tier described here as undetectable is in fact the tier the checker reports most often. This was found while taking the static half of `KNOWN_ISSUES.md` `IOS-PERF-001`.
+>
+> **This is the `MIS-019` / `feedback_absolutes_need_the_negative_case` pattern** — an absolute stated without its negative case — sitting live in an Active ADR. It is amended rather than deleted, per this repo's standing convention (the same one `508e0e468` used for `IOS-DATE-001`, and the one the register's own *Mandatory final review guard* was corrected under).
+>
+> **Two consequences, stated because they change what a future reader would DO:**
+>
+> 1. **Promoting the residual `.utility` violations to `.medium` would NOT clear the checker.** It would relabel those waits into the Default family, not remove them. **The fix for a reported inversion is therefore not a tier bump**, and anyone who reaches for one should expect the wait count to stay flat.
+> 2. This is **direct empirical support for `IOS-PERF-001`'s standing policy** of routing the residual class to **harness isolation** rather than churning production priority tiers. Until now that policy rested on judgement; it now rests on measurement.
+>
+> **What is NOT changed — read this before acting on the correction.** The **Decision** stands in full and is still correct: never `.low` / `.utility` / `.background` for GRDB-touching work. The originating stack trace in the Context above is a *real* inversion caused by a `.low` (QoS 17) holder, and nothing here excuses an 8-level gap. What the correction removes is only the *inference* that `.medium` is invisible to the checker. **`.medium` remains the mandated floor**, for the reason the Rationale already gives — it is the minimum tier that does not open a large QoS gap below MainActor — and not because it silences a diagnostic. **Do not read this correction as licence to use a lower tier, and do not "fix" a Default-QoS wait by raising the holder to `.userInitiated`**, which the Rationale already rejects as defeating the purpose of a background designation.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ## ADR-IOS-031: Background Tasks Touching GRDB MUST Use `.medium` Priority (Never `.low` / `.utility` / `.background`)
 
@@ -27,20 +67,7 @@ MainActor (user-initiated QoS 25) was blocked waiting on a GRDB reader held by a
 | `.low` / `.utility` | utility | 17 | ❌ NEVER for GRDB work |
 | `.background` | background | 9 | ❌ NEVER for GRDB work |
 
-`.medium` stays below `.userInitiated` so user-triggered operations retain priority, but only by 4 QoS levels — below iOS's priority-inversion detection threshold, and close enough that the scheduler won't stall MainActor waiting on it. **⚠️ The clause "below iOS's priority-inversion detection threshold" is FALSIFIED by this project's own tooling and is corrected immediately below; the DECISION above is unaffected.**
-
-> **⚠️ EMPIRICAL CORRECTION (2026-08-04) — the sentence above is kept verbatim rather than rewritten, so the claim a reader may already have cited stays findable beside its refutation.**
->
-> **What is falsified:** only the clause *"below iOS's priority-inversion detection threshold"*. **The Thread Performance Checker's own output contradicts it.** In two archived full-suite `xcodebuild test` logs, **19 of 23 and 18 of 22 recorded waits name a *Default*-QoS holder — and Default QoS (21) IS `.medium`, the very tier this ADR prescribes as the safe floor.** The tier described here as undetectable is in fact the tier the checker reports most often. This was found while taking the static half of `KNOWN_ISSUES.md` `IOS-PERF-001`.
->
-> **This is the `MIS-019` / `feedback_absolutes_need_the_negative_case` pattern** — an absolute stated without its negative case — sitting live in an Active ADR. It is amended rather than deleted, per this repo's standing convention (the same one `508e0e468` used for `IOS-DATE-001`, and the one the register's own *Mandatory final review guard* was corrected under).
->
-> **Two consequences, stated because they change what a future reader would DO:**
->
-> 1. **Promoting the residual `.utility` violations to `.medium` would NOT clear the checker.** It would relabel those waits into the Default family, not remove them. **The fix for a reported inversion is therefore not a tier bump**, and anyone who reaches for one should expect the wait count to stay flat.
-> 2. This is **direct empirical support for `IOS-PERF-001`'s standing policy** of routing the residual class to **harness isolation** rather than churning production priority tiers. Until now that policy rested on judgement; it now rests on measurement.
->
-> **What is NOT changed — read this before acting on the correction.** The **Decision** stands in full and is still correct: never `.low` / `.utility` / `.background` for GRDB-touching work. The originating stack trace in the Context above is a *real* inversion caused by a `.low` (QoS 17) holder, and nothing here excuses an 8-level gap. What the correction removes is only the *inference* that `.medium` is invisible to the checker. **`.medium` remains the mandated floor**, for the reason the Rationale already gives — it is the minimum tier that does not open a large QoS gap below MainActor — and not because it silences a diagnostic. **Do not read this correction as licence to use a lower tier, and do not "fix" a Default-QoS wait by raising the holder to `.userInitiated`**, which the Rationale already rejects as defeating the purpose of a background designation.
+`.medium` stays below `.userInitiated` so user-triggered operations retain priority, but only by 4 QoS levels — below iOS's priority-inversion detection threshold, and close enough that the scheduler won't stall MainActor waiting on it.
 
 **Rationale:**
 
