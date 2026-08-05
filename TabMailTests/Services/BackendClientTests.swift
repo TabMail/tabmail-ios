@@ -6,35 +6,34 @@ import Testing
 import Foundation
 @testable import TabMail
 
-@Suite("BackendClient 403 Backoff Constants")
-struct BackendClient403Tests {
+// NOTE — there is deliberately NO test here for the 403 backoff constants.
+// `BackendClient.forbiddenInitialDelay` / `forbiddenMaxDelay` are
+// `private static let`, and `@testable import` raises `internal` to public,
+// not `private`. Two tests named after those values used to live here and
+// asserted `#expect(true)`; a green test named "Max backoff delay is 300
+// seconds" reads as coverage to the next reader and to the next audit while
+// measuring nothing, so they were deleted rather than repaired. Do NOT loosen
+// the production access level to make them assertable — the constants are
+// exercised through the backoff BEHAVIOUR (`recordForbidden` /
+// `checkForbiddenBackoff`), which is where a real test belongs.
+@Suite("BackendClient Construction")
+struct BackendClientConstructionTests {
 
-    @Test("Initial backoff delay is 1 second")
-    func initialDelay() {
-        // The static constant is private, but we can test the behavior through the actor
-        // BackendClient.forbiddenInitialDelay = 1
-        // We verify the documented behavior via integration
-        #expect(true) // Existence test — constants tested via BackendError
-    }
-
-    @Test("Max backoff delay is 300 seconds (5 min)")
-    func maxDelay() {
-        // BackendClient.forbiddenMaxDelay = 300
-        #expect(true) // Architecture guard
-    }
-
-    @Test("BackendClient initializes with default URL")
+    @Test("BackendClient() constructs without trapping")
     func defaultInit() {
+        // THE ASSERTION IS THE CONSTRUCTION ITSELF. `init` builds the ephemeral
+        // LLM URLSession and the actor's stored state; reaching the line after
+        // it is the property under test, and `#expect(Bool(true))` is the
+        // compiler's own remedy for an assertion whose subject is "we got here"
+        // (a bare `#expect(true)` is diagnosed as always-passing).
+        //
+        // Deliberately NOT asserting on `BackendConfig.apiBaseURL`: it branches
+        // on `UserDefaults.standard` (`debug_mode_unlocked` +
+        // `debug_use_dev_servers`), a process-global any sibling suite can have
+        // flipped, so a value assertion would be environment-dependent and would
+        // print the configured endpoint into the failure message.
         _ = BackendClient()
-        // If this doesn't crash, the default URL is valid
-        #expect(true)
-    }
-
-    @Test("BackendClient initializes with default init")
-    func customURLInit() {
-        // BackendClient uses BackendConfig.apiBaseURL (no custom init)
-        _ = BackendClient()
-        #expect(true)
+        #expect(Bool(true))
     }
 }
 
