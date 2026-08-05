@@ -93,14 +93,49 @@ BOTH intervals — `staleStagingWindowSeconds = 60` reads like the first one and
 
 **What this does NOT change, and why the fix still holds across an unbounded window:** door (b) (epoch
 disagreement) is unavailable on nil-epoch folders, so it cannot be what carries a year-long window.
-Door (a) (RFC disagreement) can, and it is structurally reliable on IMAP for a reason independent of
-staging: `NotificationService.swift:513-514` resolves the push **by** Message-ID
-(`fetchIMAPMessage(accountId:rfc822MessageId: headId, …)` → `searchMessageId` → UID). The RFC id is
-the INPUT to the fetch, not a field parsed from its result, so it cannot be absent on that path. The
-residual unreachable-today hole is a stage carrying neither identity, which RETAINS by design (anchor
-test `unanswerableIdentityRetainsRatherThanClears`, because clearing on absence of evidence destroys a
-live `AIOwnershipLease` claim). It would become reachable only if an IMAP push were ever resolved by
-something other than Message-ID.
+Door (a) (RFC disagreement) carries it — and door (b) is **NOT redundant**, because door (a) can be
+unavailable too. Both doors are load-bearing. A stage carrying neither identity RETAINS by design
+(anchor test `unanswerableIdentityRetainsRatherThanClears`, because clearing on absence of evidence
+destroys a live `AIOwnershipLease` claim).
+
+> ### ⚠️ RETRACTED — the paragraph above previously argued door (a) could never be unavailable, and it was wrong
+>
+> **What it said, verbatim, so the error stays searchable:** *"Door (a) (RFC disagreement) can, and it
+> is structurally reliable on IMAP for a reason independent of staging: `NotificationService.swift:513-514`
+> resolves the push **by** Message-ID (`fetchIMAPMessage(accountId:rfc822MessageId: headId, …)` →
+> `searchMessageId` → UID). The RFC id is the INPUT to the fetch, not a field parsed from its result, so
+> it cannot be absent on that path. The residual unreachable-today hole is a stage carrying neither
+> identity … It would become reachable only if an IMAP push were ever resolved by something other than
+> Message-ID."* Same claim is in the body of commit `6391de9a5`, which cannot be edited; this is its
+> retraction of record.
+>
+> **Why it is false.** The premise confuses two different values that share a name. The push *is*
+> resolved by Message-ID — `NotificationService.swift:512-516` really does pass
+> `rfc822MessageId: headId` as the fetch INPUT, which is what made the claim look checked. But the
+> value that gets **staged on the row**, and therefore the value door (a) compares, is a *different*
+> value from a *different* source: `NSEIMAPConnection.swift:241-242` computes
+> `let rfc822 = IMAPFetchMapping.rfc822MessageId(from: info)` from the **FETCH ENVELOPE**, and
+> `Shared/Parse/IMAPFetchMapping.swift:61-63` is
+> `info.messageId.map { EmailFilter.normalizeMessageId("\($0.localPart)@\($0.domain)") }` — **nil**
+> whenever SwiftMail cannot parse the header into `localPart@domain`. A nil staged RFC id is therefore
+> reachable on the IMAP push path, with no change to how pushes are resolved.
+>
+> **What is NOT affected:** nothing in `NSEStagingDB.swift`. The shipped behaviour of `5813e44b1` is
+> correct as written — this retraction changes the *justification*, not the code. Real exposure stays
+> narrow: both doors must be unavailable at once, i.e. an unparseable Message-ID **and** an absent
+> epoch.
+>
+> **Why it was worth a commit anyway, and the reason this block exists rather than a silent edit:** the
+> false premise argued away the guard that covers the case the premise gets wrong. A reader who trusts
+> "door (a) cannot be absent" concludes door (b) is dead code and **deletes it** — and the deletion
+> would look like tidying, with a companion file cited as authority. A wrong rationale is more durable
+> than a wrong line of code, because nothing compiles it and no test fails on it.
+>
+> **The class.** I generalised from the one call site I had open (`NotificationService.swift:513`) to
+> "every path", without following the value to the site that actually WRITES the column. That is a
+> census enumerated by the NAME `rfc822MessageId` instead of by the STATE "what value lands in the
+> row" — `MIS-007`'s shape, in prose rather than in a `grep`. Caught by the Claude half of the
+> confirming audit on `6391de9a5`, 2026-08-02; verified at source by the supervisor before acceptance.
 
 **And the epoch half of the owner's question, answered from source:** the NSE already observes and
 persists its own epoch, with the same 0 → nil normalisation the main app uses —
