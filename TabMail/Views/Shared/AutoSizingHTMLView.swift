@@ -226,6 +226,29 @@ extension Notification.Name {
 /// split-view resize, a seed can be briefly wrong — the recreated WKWebView's
 /// idempotent re-measure corrects it in one snap (~200 ms), which is the
 /// pre-cache behavior. Not worth keying by width.
+///
+/// ⚠️ DO NOT KEY THIS CACHE BY CONTENT. Adding `html` to the key looks like an
+/// obvious tightening and would silently resurrect the bug `f93cf685f` fixed.
+/// Keying by message ALONE is what makes a `List`-recycled row find its seed,
+/// because SwiftUI hands the recreated row an equal-but-not-identical `html`
+/// String. Key by `(headerId, html)` and every recycled row misses its seed,
+/// starts un-revealed, and — since `html` is unchanged, so `updateUIView` runs
+/// no reload and JS `reveal()` never fires again — sits under the "Loading
+/// message…" placeholder until the 4-second backstop in `.task(id: html)`
+/// releases it, on top of a body that is already fully rendered.
+///
+/// The accepted cost of message-only keying is its mirror image: after a
+/// pull-to-refresh replaces a body, the seed written for the OLD content
+/// survives, so a recreated row can start revealed for content that has never
+/// rendered. That is deliberate and strictly cheaper — there `html` genuinely
+/// differs, so `updateUIView` DOES reload and `reveal()` DOES fire, bounding the
+/// exposure to one document load (~200 ms–1 s) of correct content with no
+/// spinner. Fail-open costs a missing spinner; the fail-closed version cost four
+/// seconds of hidden content. Anyone revisiting this must land the change with a
+/// red-first test asserting a recycled row with UNCHANGED content still starts
+/// revealed — `AutoSizingHTMLViewRevealSeedingTests` covers the seeded-true and
+/// seeded-false halves but cannot express the changed-content case, precisely
+/// because the key carries no content.
 final class HeightSeedCache: Sendable {
     static let shared = HeightSeedCache()
     /// Bound on retained entries — one per opened message per session, so the
