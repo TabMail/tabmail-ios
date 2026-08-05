@@ -115,19 +115,28 @@ private func simulateRunSyncMessages(
         var staleIds: [String] = []
         var replyDetectIds: [String] = []
 
-        // Stale detection
-        let stale: [MessageHeader]
-        if messages.count < limit {
-            let allLocal = try MessageHeader.filter(Column("folderId") == folderId).fetchAll(dbConn)
-            stale = allLocal.filter { !remoteIds.contains($0.messageId) }
-        } else if let fetchCutoff = messages.min(by: { $0.date < $1.date })?.date {
-            let candidates = try MessageHeader
-                .filter(Column("folderId") == folderId && Column("date") >= fetchCutoff)
-                .fetchAll(dbConn)
-            stale = candidates.filter { !remoteIds.contains($0.messageId) }
-        } else {
-            stale = []
-        }
+        // Stale detection — delegate to the production source of truth
+        // (`SyncEngine.selectStaleHeaders`, ADR-IOS-042) so this harness can never
+        // drift from real sync behavior. Same idiom as the sibling harness in
+        // `E2ESyncScenarioTests`.
+        //
+        // Coverage models a server that returned `messages` verbatim for a window of
+        // `limit` — the harness feeds `selectStaleHeaders` directly, so there is no
+        // provider narrowing between the two and `messages.count` IS the server's
+        // record count here. Real providers must NOT derive coverage this way; see
+        // `FetchCoverage`.
+        //
+        // `.date` preserves the window this harness has always applied. The
+        // UID-vs-date choice itself is pinned against real providers in
+        // `E2ESyncScenarioTests`; nothing here decides it.
+        let allLocal = try MessageHeader.filter(Column("folderId") == folderId).fetchAll(dbConn)
+        let stale = SyncEngine.selectStaleHeaders(
+            candidates: allLocal, fetched: messages,
+            coverage: FetchCoverage(
+                serverRecordCount: messages.count,
+                spansEntireFolder: messages.count < limit,
+                unmaterialisedIds: []),
+            windowMode: .date)
 
         let protectedIds = pendingAllIds.union(undoProtectedIds)
 
@@ -442,6 +451,7 @@ struct RunSyncStaleDetectionTests {
         let result = try simulateRunSyncMessages(db: db, folder: folder, messages: remoteMessages, limit: 50)
 
         #expect(result.staleIds.count == 1)
+        guard result.staleIds.count == 1 else { return }
         #expect(result.staleIds[0] == "acc1:INBOX:3")
 
         let remaining = try db.read { try MessageHeader.filter(Column("folderId") == folder.id).fetchAll($0) }
@@ -473,6 +483,7 @@ struct RunSyncStaleDetectionTests {
         let result = try simulateRunSyncMessages(db: db, folder: folder, messages: remoteMessages, limit: limit)
 
         #expect(result.staleIds.count == 1)
+        guard result.staleIds.count == 1 else { return }
         #expect(result.staleIds[0] == "acc1:INBOX:stale-in-window")
 
         // "old" message should still be in the DB (outside date window)
@@ -660,6 +671,7 @@ struct RunSyncReplyDetectTests {
 
         // ReplyDetect should fire
         #expect(result.replyDetectIds.count == 1)
+        guard result.replyDetectIds.count == 1 else { return }
         #expect(result.replyDetectIds[0] == "acc1:INBOX:80")
 
         // Header should have actionTag = ActionTag.none (not .reply)
@@ -871,6 +883,7 @@ struct RunSyncPendingOpProtectionTests {
 
         // Only message "43" should be inserted — "42" skipped due to pending destructive op
         #expect(result.newHeaders.count == 1)
+        guard result.newHeaders.count == 1 else { return }
         #expect(result.newHeaders[0].messageId == "43")
 
         let msg42 = try db.read { try MessageHeader.fetchOne($0, key: "acc1:INBOX:42") }

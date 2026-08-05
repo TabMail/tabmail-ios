@@ -730,6 +730,7 @@ struct E2ESyncIncrementalTests {
         let result = try simulateRunSyncMessages(db: db, folder: folder, messages: secondBatch, limit: 50)
 
         #expect(result.staleIds.count == 1)
+        guard result.staleIds.count == 1 else { return }
         #expect(result.staleIds[0] == "acc1:INBOX:102")
 
         let countAfterSecond = try db.read { try MessageHeader.filter(Column("folderId") == folder.id).fetchCount($0) }

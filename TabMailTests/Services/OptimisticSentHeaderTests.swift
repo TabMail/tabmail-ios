@@ -197,14 +197,30 @@ private func simulateSyncForSentFolder(
         var newHeaders: [MessageHeader] = []
         var staleIds: [String] = []
 
-        // Stale detection
-        let stale: [MessageHeader]
-        if messages.count < limit {
-            let allLocal = try MessageHeader.filter(Column("folderId") == folderId).fetchAll(dbConn)
-            stale = allLocal.filter { !remoteIds.contains($0.messageId) }
-        } else {
-            stale = []
-        }
+        // Stale detection — delegate to the production source of truth
+        // (`SyncEngine.selectStaleHeaders`, ADR-IOS-042) so this harness can never
+        // drift from real sync behavior. Same idiom as the sibling harness in
+        // `E2ESyncScenarioTests`.
+        //
+        // Coverage models a server that returned `messages` verbatim for a window of
+        // `limit` — the harness feeds `selectStaleHeaders` directly, so there is no
+        // provider narrowing between the two and `messages.count` IS the server's
+        // record count here. Real providers must NOT derive coverage this way; see
+        // `FetchCoverage`.
+        //
+        // `.date` is the windowed branch for the non-IMAP folders these fixtures
+        // use. Every caller passes at most a handful of messages against the
+        // default `limit` of 500, so coverage always spans the folder and the
+        // windowed branch is unreachable here; it is supplied rather than
+        // hardcoded to `[]` so the harness matches production if that changes.
+        let allLocal = try MessageHeader.filter(Column("folderId") == folderId).fetchAll(dbConn)
+        let stale = SyncEngine.selectStaleHeaders(
+            candidates: allLocal, fetched: messages,
+            coverage: FetchCoverage(
+                serverRecordCount: messages.count,
+                spansEntireFolder: messages.count < limit,
+                unmaterialisedIds: []),
+            windowMode: .date)
 
         // Outbox protection for optimistic sent headers
         var outboxProtectedRfc822s = Set<String>()
