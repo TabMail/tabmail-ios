@@ -736,10 +736,14 @@ extension SyncEngine {
                 cancelledWhileQueued.withLock { $0 = true }
             }
             defaults.set(settled, forKey: markerKey)
-            print("[Maintenance] ANALYZE refreshed query-planner statistics in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms (schema_version \(settled))")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Maintenance] ANALYZE refreshed query-planner statistics in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms (schema_version \(settled))")
+            }
             return .refreshed
         } catch {
-            print("[Maintenance] ANALYZE abandoned after \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms — statistics stay stale, retrying next pass: \(error)")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Maintenance] ANALYZE abandoned after \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms — statistics stay stale, retrying next pass: \(error)")
+            }
             return .abandoned
         }
     }
