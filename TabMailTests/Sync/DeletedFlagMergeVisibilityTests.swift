@@ -458,12 +458,25 @@ struct DeletedFlagMergeVisibilityTests {
 
     // MARK: - Non-vacuity control: the COPYUID-gated purge is untouched
 
-    /// The other direction, and the one that matters more. The single irreversible
-    /// wire operation in this system is the `COPYUID`-gated source expunge, and
-    /// nothing here may widen or narrow its evidence. On a UIDPLUS server the move
-    /// must still purge exactly the named source UID, must still spare a
-    /// co-resident message somebody else marked `\Deleted`, and must still never
-    /// reach a mailbox-wide `EXPUNGE`.
+    /// The other direction, and the one that matters more. The `COPYUID`-gated
+    /// source expunge is the only irreversible operation performed on a MESSAGE —
+    /// it removes a duplicate the COPY already proved landed — and nothing here
+    /// may widen or narrow its evidence. On a UIDPLUS server the move must still
+    /// purge exactly the named source UID, must still spare a co-resident message
+    /// somebody else marked `\Deleted`, and must still never reach a mailbox-wide
+    /// `EXPUNGE`.
+    ///
+    /// ⚠️ This comment used to call it "the SINGLE irreversible wire operation in
+    /// this system". That absolute is false and is corrected here because it
+    /// walks a reviewer past three siblings. **Drafts are the negative case:**
+    /// `IMAPProvider.deleteDraftStrong` and `saveDraft`'s old-copy replacement
+    /// both `STORE \Deleted` then `expungeScopedToTargets` (UIDPLUS only; fail
+    /// closed otherwise), and `GmailProvider.deleteDraft`'s resource arm issues
+    /// `DELETE /drafts/{id}`, which Google documents as permanent and not a
+    /// trash. Those DESTROY a draft rather than moving it to Trash, so
+    /// "TabMail never permanently deletes" holds for messages, not for drafts.
+    /// Full enumeration:
+    /// `Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md`.
     @Test("A UIDPLUS move still purges only the named UID and spares a co-resident deleted message")
     func aUidPlusMoveStillPurgesOnlyTheNamedUID() async throws {
         let target = "d3-uidplus-target@example.com"
@@ -508,6 +521,15 @@ struct DeletedFlagMergeVisibilityTests {
     /// read the flag: `SyncEngine.insertBackfillBatchGuardable` — the single funnel
     /// for `backfillWindow`, `deepBackfillFolder`, the header-crawl walk and
     /// self-heal — and `SyncEngine.fetchOlderMessages`, the "load older" pull.
+    /// ⚠️ That funnel list is a STRUCTURAL enumeration, not a reachability claim:
+    /// `deepBackfillFolder` has zero callers and `backfillWindow` is reached only
+    /// from inside it, so the live feeders are the walk and self-heal.
+    ///
+    /// ⚠️ And the census behind "four" enumerated `MessageHeader` CONSTRUCTION
+    /// sites, so it structurally could not see a path that PRESENTS a message
+    /// without constructing one. `SearchView.searchAccount` is exactly that —
+    /// a fifth path, still OPEN on `KNOWN_ISSUES.md` `IOS-IMAP-001`, out of scope
+    /// for this file's assertions (which are all at the local store).
     ///
     /// The reachable scenario is the one this whole file is about: on a server
     /// without UIDPLUS a move soft-deletes the source, `runSyncMessages` hides it

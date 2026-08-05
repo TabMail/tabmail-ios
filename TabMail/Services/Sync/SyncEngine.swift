@@ -545,9 +545,19 @@ actor SyncEngine {
     /// NOT inserted below (IOS-IMAP-001 / D3), so `inserted < found` is routine and
     /// says nothing about whether the folder is exhausted. Deriving exhaustion from
     /// `inserted` strands every message older than the first soft-deleted one.
-    /// `deepBackfillFolder` makes the same distinction — it terminates on
-    /// `found == 0` and never on `inserted == 0`, with a comment at that site
-    /// recording why — and this is the same rule for the paging pull.
+    /// The backfill crawl makes the same distinction — `UIDWalkCursor`'s
+    /// `confirmedCursor` advances through `confirmRange`, which fires once a UID
+    /// range is ACCOUNTED FOR (SEARCH reported it empty, or its FETCH+insert leg
+    /// completed), so a range that inserts zero rows still advances it — and this
+    /// is the same rule for the paging pull.
+    ///
+    /// ⚠️ An earlier revision of this comment cited `deepBackfillFolder`'s
+    /// `found == 0` termination here instead. That function has ZERO callers
+    /// (`rg -n 'deepBackfillFolder' TabMail/` finds one declaration and comments
+    /// only), as does its callee `backfillWindow` outside it, so it proved
+    /// nothing about the shipping crawl. Do not restore that citation, and do
+    /// not delete the dead functions as a side effect of reading this — that is
+    /// its own decision.
     ///
     /// **TERMINATION.** Continuing requires BOTH halves, per folder:
     /// 1. *coverage* — the server returned a page as large as the one we asked for
@@ -560,9 +570,21 @@ actor SyncEngine {
     ///    which is bounded by the server's finite message count.
     ///
     /// A full page in which nothing could be materialised therefore stops paging
-    /// (fail closed). That is recoverable without any user gesture: the deep
-    /// backfill crawl advances by DATE WINDOW independently of insertion, so the
-    /// mail beyond it still arrives locally and the next reset re-arms the scroller.
+    /// (fail closed). That is recoverable without any user gesture, by
+    /// `SyncEngine.runBackfill`'s UID-range walk — whose cursor advances on
+    /// COVERAGE (a confirmed range) and never on inserts — so the mail beyond it
+    /// still arrives locally and the next reset re-arms the scroller. What
+    /// INVOKES that walk, because "covered by X" is a claim about the path that
+    /// reaches X: `SyncEngine.startBackfill`'s per-account crawl loop (started
+    /// from `sync` after every sync) and `SyncScheduler`'s BGProcessing pass via
+    /// `AccountManager.runBackfill` → `SyncEngine.performBackfill`.
+    ///
+    /// Negative case: `runBackfill` only walks folders with
+    /// `backfillComplete == false`. A completed folder is never re-walked — but
+    /// its UID space was already covered down to UID 1, so no older mail is left
+    /// unreached. The exception is a folder wrongly marked complete by the
+    /// `.fresh` branch when the server reports no UIDNEXT; that is registered and
+    /// is not recoverable by ordinary sync.
     func fetchOlderMessages(folders: [Folder]) async throws -> (inserted: Int, mayHaveMore: Bool) {
         var totalNew = 0
         var mayHaveMore = false
@@ -605,8 +627,11 @@ actor SyncEngine {
             let headers = fetched.headers
             // COVERAGE — what the SERVER returned for the window we asked about.
             // The `\Deleted` records the insert loop below deliberately skips are
-            // still counted here, exactly as `backfillWindow`'s `found` counts the
-            // records its own dedupe skips. Never narrow this to the insert count.
+            // still counted here, exactly as the backfill walk confirms a UID
+            // range whose inserts were all skipped. Never narrow this to the
+            // insert count. (An earlier revision cited `backfillWindow`'s `found`
+            // here; that function is unreachable in production — see the
+            // `deepBackfillFolder` note on `fetchOlderMessages` above.)
             let found = headers.count
             let sourceBoundEpoch = fetched.observedEpoch.flatMap { epoch in
                 epoch > 0 ? Int(exactly: epoch) : nil

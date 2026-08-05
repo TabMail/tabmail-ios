@@ -1,0 +1,78 @@
+## There are FOUR irreversible wire operations, not one — the draft family destroys drafts outright (2026-08-04)
+
+**The absolute this corrects, and where it is written.** The mental model repeated across this
+codebase is: *"TabMail never permanently deletes — `.delete` is a move to Trash — and the ONE
+irreversible wire operation in the entire system is expunging a source copy after a proven
+`COPY`."* Both halves of that sentence do work: the first is why fail-closed is always safe here,
+the second is why the `COPYUID` gate is the single most load-bearing guard in the tree.
+
+**The first half is FALSE FOR DRAFTS, and the second half misses two siblings of the very
+operation it names.** A brief or review prompt that says *"the single irreversible operation"* walks
+its reader past three others. Enumerated below by symbol, each read at `e4dd08e92`.
+
+### The four, by symbol
+
+1. **The `COPYUID`-gated move source expunge** — `IMAPProvider.move`'s purge leg,
+   `try await server.expunge(messages: purgeAuthorizedUIDs)`. This is the one the absolute names.
+   It removes a **duplicate** the COPY already proved landed, never a message. Its evidence is
+   `COPYUID` and **must never be widened**; that prohibition is unchanged by this entry.
+2. **`IMAPProvider.deleteDraftStrong`** — after validating epoch + UID and re-FETCHing the target,
+   it issues `STORE \Deleted` then `expungeScopedToTargets(targetSet, …)`. On a UIDPLUS server that
+   is `UID EXPUNGE`: **the draft is destroyed, not moved to Trash.**
+3. **`IMAPProvider.saveDraft`'s old-copy replacement** — before APPENDing the new revision, when the
+   prior identity validates (same folder, epoch match, UID present on FETCH), it issues the same
+   `STORE \Deleted` + `expungeScopedToTargets` pair against the OLD draft UID. Same destruction, on
+   the ordinary save path rather than an explicit delete gesture.
+4. **`GmailProvider.deleteDraft`'s resource arm** — `DELETE {baseURL}/drafts/{draftId}`. Google
+   documents `users.drafts.delete` as *"Immediately and permanently deletes the specified draft.
+   Does not simply trash it."* There is no Trash copy and no undo.
+
+### The negative cases — because an absolute without one is unfinished
+
+- **(2) and (3) are irreversible only where the server advertises UIDPLUS.** `expungeScopedToTargets`
+  issues `UID EXPUNGE` on UIDPLUS and **nothing at all** otherwise — it explicitly refuses to
+  degrade to a mailbox-wide `EXPUNGE`, so on a non-UIDPLUS server the draft is left
+  `\Deleted`-but-present and is recoverable. The fail-closed arm is deliberate and documented at
+  the function; do not "fix" it into a bare expunge.
+- **All four are UID- or resource-scoped. None is mailbox-wide.** That distinction is the whole
+  point of `expungeScopedToTargets` and is separate from reversibility.
+- **`GmailProvider.deleteDraft`'s OTHER arm is reversible** — the `.gmailContainedMessage` branch
+  calls `trashContainedDraftMessage`, i.e. a trash, not a delete. The irreversible claim is about
+  the `.gmail(resourceId)` arm only.
+- **`ExchangeProvider.deleteDraft` is NOT counted above.** It issues
+  `DELETE {baseURL}/messages/{id}`; whether Graph hard-deletes or moves the item to Deleted Items is
+  a server-side semantic TabMail neither chooses nor observes, so it is neither confirmed as a fifth
+  irreversible op nor covered by "never permanently deletes". Verified at the wire call only.
+- **Ordinary mail is unaffected.** `.delete` on a message is still a move to Trash; nothing here
+  widens any message-deletion path. The falsification is scoped to **drafts**.
+
+### The true half, which is load-bearing and stays
+
+Verified by grep at `e4dd08e92`, and worth keeping quotable:
+
+- **v3 has ZERO bare `server.expunge()` call sites.** `rg -n '\.expunge\(\)' TabMail/` returns one
+  hit and it is a *comment* in `expungeScopedToTargets` recording that an earlier revision did this
+  and why the reasoning was wrong. Every live expunge names its targets.
+- **Shipped `07a4bb703` had FOUR bare `server.expunge()` call sites**, all in
+  `TabMail/Providers/IMAPProvider.swift` (a fifth `expunge(` site at that tag is the UID-scoped
+  `server.expunge(messages: srcUIDs)` — five expunge sites, four of them bare). The shipped release
+  also reached SwiftMail's `server.move`, whose non-UIDPLUS fallback falls through to a bare
+  mailbox-wide `expunge()`; v3 no longer calls `server.move` at all. ⚠️ **A swarm report circulated
+  the count as "five bare sites" — it is four bare of five total. Cite the number you counted.**
+- **The `COPYUID` gate's evidence must never be widened.** A source copy left `\Deleted`-but-present
+  is an accepted, recoverable cost; expunging without proof is a wrong-message deletion (C3).
+  `aUidPlusMoveStillPurgesOnlyTheNamedUID` in `DeletedFlagMergeVisibilityTests` is the standing
+  control.
+
+### How to write it from now on
+
+Not *"the single irreversible wire operation"*. Instead: *"the only irreversible operation on a
+**message** is the `COPYUID`-gated source expunge, which removes a proven duplicate. **Drafts are
+different**: `deleteDraftStrong`, `saveDraft`'s old-copy replacement and Gmail's `drafts.delete`
+destroy a draft outright."* State drafts explicitly, every time — that is the negative case the
+absolute was hiding.
+
+**Handoff note:** `tabmail-ios/CLAUDE.md`'s THE MANTRA section still carries the uncorrected
+absolute (*"TabMail never permanently deletes"* / *"The one irreversible wire operation in the
+entire system…"*). That file was dirty in the owner's working tree when this entry was written and
+was deliberately not edited. It needs the same correction.
