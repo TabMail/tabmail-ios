@@ -85,3 +85,21 @@ every **non-connection** error its sibling sets `self.error`, a user-visible sur
 case is not the same silent-channel problem — but the `if !SyncEngine.isConnectionError(error)` guard
 suppresses that surface for connection errors, which is exactly when infinite scroll fails. It
 remains an ungated diagnostic print and a known, unfixed instance of the same class.
+
+> ⚠️ **CORRECTION (2026-08-04) — the sentence above is WRONG about the escape hatch, and wrong in the
+> direction that made the site look safer than it is.** *"its sibling sets `self.error`, a
+> user-visible surface"* does not hold in a production build. `InboxViewModel.error` is written at two
+> sites and RENDERED at exactly one — `InboxView`'s error banner — and that banner is itself gated:
+> `if let error = viewModel.error, DebugModeManager.isLoggingEnabled()`. **With logging locked, the
+> banner never renders, so `self.error` is not a user-visible surface at all** and the "common case"
+> carve-out evaporates: the non-connection case is the SAME silent-channel problem as the connection
+> case, not a milder one. The decision to leave the print alone is unchanged (still a different file,
+> still outside the member), but it must not be justified by a surface that does not exist on a user's
+> device.
+>
+> **How the error was made, because it is this file's own lesson turned back on itself.** §1 above
+> says: *"before claiming an exemption, NAME THE CHANNEL AND CHECK IT EXISTS ON THE DEVICE"* — and
+> then the paragraph below it named a channel (`self.error` → the UI) and did not check it, in the
+> same edit. Reading the WRITER of a value proves it is set; only reading its READER proves anyone
+> sees it (`MIS-024`: a sentence handing responsibility to a named mechanism owes a grep of that
+> mechanism's call sites — here, of its render site).

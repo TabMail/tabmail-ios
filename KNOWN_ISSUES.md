@@ -590,3 +590,87 @@ arrival time (Gmail `internalDate`, Graph `receivedDateTime`).
 > reference behavior, the `REFERENCE:` anchor in its plan row names the exact `v2final` site to
 > compare against; that is the replacement for the second comparison target, not an excuse to skip
 > one.
+
+## Two census counts, re-derived because the previous ones were scoped by a NOUN (2026-08-04)
+
+Both numbers below replace a claim that was true *for the term someone grepped* and false for the
+class (`MIS-007`). Neither is a new defect class; both are the count itself being wrong.
+
+### A. `4a65117d5`'s "EVERY SITE OF THE CLASS" — retracted, TRUE COUNT 15
+
+That commit's body claimed it had fixed **every** site where a `DebugModeManager.isLoggingEnabled()`
+gate sits inside a branch CONDITION rather than guarding a log body. **That holds only for the
+`[InfiniteScroll]` log tag it enumerated.** Re-derived by STATE — *a debug-flag call appearing in an
+`if`/`guard`/`else if` condition alongside at least one other term* — over `TabMail/`, `Shared/` and
+`TabMailNotificationService/`: **18 raw hits, of which 3 are corpus contamination and 15 are live
+sites.** The 3 excluded: `AIAction.swift` and `AISummary.swift` matched because the comma lives
+*inside the print's string literal*, not in the condition, and `SyncEngine.swift:762` is a COMMENT
+describing the arm `4a65117d5` already fixed — i.e. **the fix enlarged the corpus it would later be
+counted in** (`MIS-008` ×11). The deliberately BROADER predicate — gate anywhere in a branch
+condition, compound or not — returns **315**, which is the body-guard population and not this class;
+it is recorded so the narrowing is visible rather than assumed.
+
+`isLoggingEnabled()` is `DebugModeManager`'s only gate accessor, so the accessor set is not a further
+source of undercount. Predicate: `rg -o 'DebugModeManager\.[a-zA-Z]+'` over every `.swift` returns
+exactly three members — `isLoggingEnabled` 353, `shared` 15, `invalidateLoggingCache` 11 — and
+neither of the other two gates anything. **353 is as of this commit and drifts as peers land gated
+logs; the load-bearing claim is the member SET, not that integer.**
+
+**Of the 15, ZERO are defects on the merits, and that is the finding.** The rule is not "a gate must
+never appear in a condition" — it is *the gate must not decide CONTROL FLOW that must run in
+production*. All 15 arms are log-only, and in the two cases where the enclosing block also returns
+(`ThreadUtils.runFragmentMergeToFixpoint`, `Draft` Strategy-2 refusal) the `return` sits OUTSIDE the
+gated `if`, so control flow is identical in both build configurations. `ThreadUtils.swift`'s
+`if pass > 1, DebugModeManager.isLoggingEnabled()` — added in range by `6d460aa99` and the specific
+site this census was opened to adjudicate — is therefore **correct as written and was left alone**.
+So the retraction is of the WORD "every", not of the work: the phrasing asserted a class-wide census
+that had not been run, and running it found the class clean.
+
+**Two sites are worth a reader's attention even though neither is a rule-12 violation**, recorded so
+the census is accountable rather than merely reassuring:
+
+- `AutoSizingHTMLView`'s `contentSizeObservation` KVO is created only when logging is unlocked. The
+  arm ASSIGNS a stored property, so this one really is a gate controlling state — but the observation's
+  entire body is a `print`, and the functional zoom KVO beside it is explicitly "always on", so not
+  creating it in production is the intent rather than a lost behaviour.
+- 🚨 **`InboxView`'s error banner is debug-gated** (`if let error = viewModel.error,
+  DebugModeManager.isLoggingEnabled()`), and that is its ONLY render site — `viewModel.error` is
+  written at two places in `InboxViewModel` and read at exactly one, this one. **In a production build
+  the inbox error banner therefore never appears.** Reported and NOT fixed here: `InboxView.swift` is
+  outside this agent's edit scope, and whether user-facing raw error text is *wanted* is a product
+  decision, not a mechanical one. Its consequence for the record is in the memory-topic correction
+  noted under B.
+
+### B. Ungated diagnostic logs added in `da57fde6f^..6391de9a5` — TRUE COUNT 3
+
+Enumerated by DIFF (`git diff -U0 <range> -- '*.swift'`, `+` lines matching
+`(^|[^A-Za-z0-9_.])(print|NSLog|os_log)\(`), then each candidate's gating read from the COMMITTED
+blob rather than from the hunk — a `+print(` inside a pre-existing `isLoggingEnabled()` block is
+gated and does not count. Range: 14 commits, 49 `.swift` files.
+
+**3 ungated diagnostic logs were ADDED**, all in `AccountManagerActions.swift` (25 `print(` sites
+before the range, 28 after): the pre-resolve C3 refusal, the execution-time C3 refusal, and the
+per-member undo refusal (`[UndoStack]`). **All three sit on C3 REFUSAL paths**, where a refusal that
+leaves no production trace is a genuine observability gap rather than noise — so the correct channel
+is the ungated durable one, not a debug gate that would silence them (`Companion/Memory/Current/105`).
+
+Two corrections to the scope this census was opened with, both in the direction of *fewer* sites:
+
+- `AccountManagerActions`' **absence-probe** print is byte-identical before and after the range. It is
+  a real pre-existing ungated `print`, but it was **not added here**.
+- `ExchangeProvider`'s two sites appear as `+` lines **only because the enclosing block was
+  re-indented** when `move` became `moveProvingDestinations`; the text is otherwise byte-identical.
+  They were ungated before the range and after it, so **this range added no console noise there**.
+
+  ⚠️ **"Two sites" is the brief's number and it is an UNDERCOUNT — do not reuse it.** It was taken
+  from a 23-line window, not from the file. `ExchangeProvider.swift` holds **21** `print(` against
+  only **2** `DebugModeManager` references (peer census, 2026-08-04). The two named above are merely
+  the two that fell inside the window someone happened to be reading. What survives re-derivation is
+  the *conclusion* — this commit range added no console noise to that file — not the count, which was
+  never a count of the file. The file is outside this agent's edit scope; the remaining ungated
+  `[Exchange]` sites are reported for the owner, unswept. Same failure shape as `MIS-007`: a number
+  whose corpus was someone's attention rather than the artifact.
+
+**Deliberately NOT swept:** the pre-existing ungated prints outside the range — `AccountManagerActions`
+alone carries ~25 of them. That is a decision not to widen the fix, not a "pre-existing" excuse; the
+count is recorded here so the number is not lost if someone later wants the sweep.
