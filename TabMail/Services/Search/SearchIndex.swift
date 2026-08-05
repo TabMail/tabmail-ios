@@ -1324,7 +1324,24 @@ actor SearchIndex {
                 : .clearAndAdopt
         }
 
-        if resetOrder == .incomingNewer {
+        // A reset marker may only CLEAR when the stored side actually has one. The
+        // `.incomingNewer` case is produced by `resetMarkerOrder` for BOTH
+        // `(.some, .some)` where incoming is newer AND `(.none, .some)` — and that
+        // second shape is the ABSENCE of a stored marker, not a disagreement with
+        // one. Without the `oldResetAtMs != nil` requirement a stored row carrying
+        // NO marker was cleared by an incoming record that merely stated one,
+        // emptying the indexed body and deleting the embedding on missing evidence
+        // — the exact write ADR-IOS-072's PRESERVE RULE forbids ("a NULL identity
+        // stamp means RE-FETCH, NEVER DESTROY — only a positive mismatch clears
+        // anything") and the exact claim this function's own doc block above makes
+        // ("there is no arm where the ABSENCE of a value clears anything").
+        //
+        // 🚨 NARROW THE CONSUMER, NOT `resetMarkerOrder`. That mapping is a verbatim
+        // port and `(.none, .some) ⇒ .incomingNewer` is CORRECT for the
+        // `.incomingOlder` refusal above, which relies on the symmetric
+        // `(.some, .none) ⇒ .incomingOlder`. Changing it there would break the
+        // refusal arm.
+        if resetOrder == .incomingNewer, oldResetAtMs != nil {
             return .clearAndAdopt
         }
 

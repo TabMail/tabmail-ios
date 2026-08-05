@@ -1066,6 +1066,80 @@ struct SearchIndexHeaderUpsertTests {
         try? await index.removeMessages(contentKeys: [target, control])
     }
 
+    // MARK: A stored NULL reset marker is also unverified, not mismatched
+
+    /// THE INVARIANT: a stored row whose `identityResetAtMs` is NULL is never
+    /// cleared by an incoming record that merely STATES one.
+    ///
+    /// `resetMarkerOrder` maps `(.none, .some) ⇒ .incomingNewer`, which is correct
+    /// for the `.incomingOlder` refusal it also feeds. But the `.clearAndAdopt`
+    /// consumer used to accept `.incomingNewer` unconditionally, so the ABSENCE of a
+    /// stored marker took the CLEARING arm — emptying the indexed body and deleting
+    /// the embedding on missing evidence. That is the third flavour of the same rule
+    /// as the two tests above, and it contradicted `identityWriteDisposition`'s own
+    /// doc block ("there is no arm where the ABSENCE of a value clears anything").
+    ///
+    /// Reaching this arm requires stepping past the earlier decisions: the incoming
+    /// record states NO provider space (so DECISION 2 is skipped) and NO RFC id (so
+    /// DECISION 3 is skipped), leaving the reset marker as the only evidence.
+    @Test("A stored NULL identityResetAtMs preserves the body even though the incoming record states a reset marker")
+    func nullStoredResetMarkerPreservesTheBody() async throws {
+        let account = "ftsupsertnoreset-\(UUID().uuidString)"
+        let target = key(account, "1")
+
+        // Stamped with the current token version and a full identity EXCEPT a reset
+        // marker — `resetAtMs` defaults to nil, so `identityResetAtMs` is NULL.
+        let inserted = try await index.indexHeaders([record(
+            target, subject: "Noresetzarquon subject", from: "noreset@example.com",
+            rfc822MessageId: "<noreset@example.com>", uidValidity: 100,
+            contentKeySpace: .uidAddressed)])
+        try #require(inserted == 1)
+        try await index.updateBody(contentKey: target, body: "Noresetbodyzarquon text")
+        let seeded = try await index.rawFTSBody(contentKey: target)
+        try #require(seeded?.contains("Noresetbodyzarquon") == true,
+                     "precondition: the row with no stored reset marker carries an indexed body")
+
+        // States a reset marker and NOTHING else. There is no stored marker to
+        // disagree with, so this is missing evidence, not a mismatch.
+        _ = try await index.indexHeaders([record(
+            target, subject: "Noresetfreshzarquon subject", from: "fresh@example.com",
+            resetAtMs: nowMs)])
+
+        let survivingBody = try await index.rawFTSBody(contentKey: target)
+        #expect(survivingBody?.contains("Noresetbodyzarquon") == true,
+                "🚨 A stored NULL reset marker MUST preserve the body — absence of evidence is never evidence of mismatch, and clearing here destroys the indexed body and the embedding of a message nothing proved was different.")
+        let bodyHits = try await hits("noresetbodyzarquon")
+        #expect(bodyHits.contains(target.rawValue),
+                "and it must remain SEARCHABLE, not merely present in the row")
+        let adoptedHits = try await hits("noresetfreshzarquon")
+        #expect(adoptedHits.contains(target.rawValue),
+                "the header fields are still adopted")
+
+        // TWO-SIDED, IN THE SAME RUN: give the STORED side a marker too, and the
+        // very same incoming record — two present markers that differ — DOES clear.
+        // Without this the preserve above passes vacuously against a system that
+        // never clears on a reset marker at all.
+        let control = key(account, "2")
+        let controlInserted = try await index.indexHeaders([record(
+            control, subject: "Resetoriginzarquon subject", from: "origin@example.com",
+            rfc822MessageId: "<origin@example.com>", uidValidity: 100,
+            resetAtMs: nowMs - 10_000, contentKeySpace: .uidAddressed)])
+        try #require(controlInserted == 1)
+        try await index.updateBody(contentKey: control, body: "Resetbodyzarquon text")
+        let controlSeeded = try await index.rawFTSBody(contentKey: control)
+        try #require(controlSeeded?.contains("Resetbodyzarquon") == true,
+                     "precondition: the control's body is indexed")
+
+        _ = try await index.indexHeaders([record(
+            control, subject: "Resetfreshzarquon subject", from: "fresh@example.com",
+            resetAtMs: nowMs)])
+        let controlBody = try await index.rawFTSBody(contentKey: control)
+        #expect(controlBody?.isEmpty == true,
+                "the control MUST clear — the only difference is that the stored side HAD a marker, so the two markers positively disagree")
+
+        try? await index.removeMessages(contentKeys: [target, control])
+    }
+
     // MARK: The third arm — an older generation may not overwrite newer state
 
     @Test("An older-generation write is refused outright — its header fields never land on top of newer state")
