@@ -169,7 +169,8 @@ non-UIDPLUS server, where soft-deleted move sources accumulate: the user searche
 for one email**, and tapping the residue does **nothing** — `SearchView.openResult`'s remote branch
 (`headerId == nil`) resolves via `resolveRemoteResultHeaderId` and, on a nil resolve, simply returns
 without navigating; the `showStaleResultAlert` arm exists only in the local branch. Registered
-**OPEN** on `KNOWN_ISSUES.md` `IOS-IMAP-001`; a separate task owns the code fix.
+**OPEN** on `KNOWN_ISSUES.md` `IOS-IMAP-001`. ✅ **CLOSED by `afa7889ee`** — both halves; see *THE FIFTH
+PATH IS CLOSED* at the end of this file, which also states the noun the closing census enumerated.
 
 Pinned by `DeletedFlagMergeVisibilityTests.pagingContinuesPastAFullPageContainingASoftDeletedRecord`,
 which asserts at the STORE that the message BEHIND a full `\Deleted`-bearing page is reachable — a
@@ -199,3 +200,49 @@ stayed green across the whole suite while reintroducing that shape, which is why
 `remoteIds` sets unfiltered — it avoided this relist with a mailbox-wide `EXPUNGE`, which is banned
 here. The shipped architecture for this problem is NONEXISTENT, so this is an incompleteness of new
 work rather than a regression, and the shipped sequence must not be restored as a "fix".
+
+### ✅ THE FIFTH PATH IS CLOSED — and the closing census names its noun (`afa7889ee`, 2026-08-04)
+
+**The noun this closure enumerated: CONSUMERS OF `MessageHeaderInfo`** (`rg -n 'MessageHeaderInfo'
+TabMail/ Shared/` — 18 files), not producers of `MessageHeader`. Under that noun there are **EIGHT**
+consumers, and every one is accounted for (`MIS-006`):
+
+1. `SyncEngineFullSync.selectStaleHeaders` — reads the flag.
+2. `SyncEngineFullSync.runSyncMessages` — reads the flag.
+3. `SyncEngine.insertBackfillBatchGuardable` — the funnel (fed by `SyncEngineBackfillWalk` ×2 and
+   `SyncEngineBackfillDeep` ×2) — reads the flag.
+4. `SyncEngine.fetchOlderMessages` — reads the flag.
+5. **`SearchView.searchAccount` — the presentation path, closed here.**
+6. `SyncEngineDeltaSync`'s Gmail arm (`detail.header`) — materialises, **LEFT ALONE**: only
+   `IMAPProvider.mapMessageInfo` ever sets `isDeletedOnServer`, and `IMAPProvider.fetchHistory`
+   returns nil, so IMAP never reaches the delta path. Structurally cannot carry the flag.
+7. `SyncEngineDeltaSync`'s Exchange arm — same, **LEFT ALONE**.
+8. `SyncEngineEpochVerify.classifyEpochVerificationSample` — compares rfc822 ids for epoch
+   verification; materialises nothing, presents nothing. **LEFT ALONE.**
+
+**No sixth presentation path exists**: `AccountManager.search` has exactly ONE caller,
+`SearchView.searchAccount` — established by grep, not by meaning (`MIS-021`).
+
+**The fix, in two halves.**
+(a) `SearchView.presentableRemoteResults` drops every `isDeletedOnServer` record before a
+`SearchResult` is built, so the invariant holds for every provider rather than for IMAP only.
+(b) `SearchView.tapOutcome` returns a three-case `ResultTapOutcome` with **no silent case** and
+`openResult` switches over it, so a remote nil-resolve raises its own alert ("Not downloaded yet",
+worded to state only the observed fact — this device holds no copy — rather than claiming the message
+is gone) instead of returning.
+
+🚨 **The `NOT DELETED` term was deliberately NOT added to `IMAPProvider.searchOnConnection`; the
+SEARCH criteria are byte-identical.** Narrowing what the SERVER reports is the ADR-IOS-042 /
+`MIS-IOS-002` shape in another coordinate system, and it would cover IMAP only.
+
+**A1:** neither `07a4bb703` nor `v2final` (`e28dd4edb`) has `isDeletedOnServer`, a `NOT DELETED`
+term, or an alert on the remote branch — **both return silently on a nil remote resolve exactly as
+v3 did**, so the dead tap is longstanding shipped behaviour, not a v3 regression.
+
+**Accepted residual, with the recovering mechanism's CALLER named (`MIS-024`):** a remote hit for a
+message this device has not downloaded still cannot be opened — it is now EXPLAINED rather than
+silent. It becomes openable when the header lands locally via `SyncEngine.runBackfill`'s UID-range
+walk, invoked by `SyncEngine.startBackfill`'s crawl loop (from `SyncEngine.sync`) and by
+`SyncScheduler` → `AccountManager.runBackfill` → `SyncEngine.performBackfill`. **The non-recovering
+case, named:** a folder wrongly marked complete by `runBackfill`'s `.fresh` branch when the server
+reports no UIDNEXT — already registered. Fetch-on-tap was not built; shipped never did it.
