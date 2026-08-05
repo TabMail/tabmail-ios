@@ -10,6 +10,39 @@ the second is why the `COPYUID` gate is the single most load-bearing guard in th
 operation it names.** A brief or review prompt that says *"the single irreversible operation"* walks
 its reader past three others. Enumerated below by symbol, each read at `e4dd08e92`.
 
+**SCOPE — this note enumerates the MAIL/DRAFT family, and says so because an unscoped absolute is
+how the "one" got written in the first place (`MIS-019`: an absolute without its negative case).**
+The four below are the message/draft destructive wire operations. They are **not** the only
+destructive wire calls in the tree: `ExchangeCalendarProvider.deleteEvent` issues
+`DELETE /events/{id}` and `GoogleCalendarProvider.deleteEvent` issues
+`DELETE /calendars/{cal}/events/{id}?sendUpdates=…` (verified by symbol 2026-08-05, not by line —
+`MIS-009`). **Neither is counted, and — following this note's own precedent for
+`ExchangeProvider.deleteDraft` — the reason is POSITIVE rather than "unobserved". Both pass the
+same `Recoverable ⇒ not irreversible` test that keeps the non-UIDPLUS arms of (2) and (3) out of
+the set:**
+
+- **Graph.** A plain `DELETE` on an event is the SOFT delete — the item lands in Deleted Items /
+  Recoverable Items. Graph exposes a **separate** `event: permanentDelete` action, documented as
+  placing the event in the *Purges* folder of the mailbox dumpster where Outlook cannot reach it.
+  **TabMail never calls it.** Identical shape, identical reasoning and identical conclusion to the
+  `ExchangeProvider.deleteDraft` adjudication further down this file.
+- **Google Calendar.** A deleted event goes to the calendar's **Trash and is restorable for 30
+  days**. ⚠️ **The negative case, because this one has a real exception:** deleting a recurring
+  series with *"this and following"* is NOT trashed and cannot be restored. It does not apply here —
+  `GoogleCalendarProvider.deleteEvent` takes a single `eventId` and issues one resource `DELETE`;
+  the tree's occurrence paths (`updateOccurrence`, the `/instances` resolution) address a single
+  instance resource by its own id. **If a range/series delete is ever added, re-adjudicate: that
+  call WOULD be irreversible and would belong in the set.**
+
+Both calendar files are **byte-identical to `v1.6.38`** (`git diff 07a4bb703..HEAD --` on them is
+empty), so nothing in the v3 range changed that surface. Do not read this note as a census of every
+destructive call in the tree; it is the mail/draft family, plus this adjudication of the calendar
+pair. Recorded 2026-08-05, round 3 angle 2.
+
+Sources: [Graph `event: delete`](https://learn.microsoft.com/en-us/graph/api/event-delete?view=graph-rest-1.0),
+[Graph `event: permanentDelete`](https://learn.microsoft.com/en-us/graph/api/event-permanentdelete?view=graph-rest-1.0),
+[Google Calendar — delete an event](https://support.google.com/calendar/answer/37113?hl=en&co=GENIE.Platform%3DDesktop).
+
 ### The four, by symbol
 
 1. **The `COPYUID`-gated move source expunge** — `IMAPProvider.move`'s purge leg,
