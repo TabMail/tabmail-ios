@@ -3583,9 +3583,23 @@ enum NSEDataBridge {
         )
 
         // Persist rendered body even on freshly-created headers.
-        let newHeaderId = try String.fetchOne(db, sql: """
-            SELECT id FROM messageHeader WHERE accountId = ? AND messageId = ?
-            """, arguments: [msg.accountId, msg.messageId]) ?? ""
+        //
+        // 🚨 C3 — bind the content to the header it was INSERTED as, never to a
+        // re-lookup. This used to re-acquire the row with
+        // `SELECT id FROM messageHeader WHERE accountId = ? AND messageId = ?`,
+        // which is not a unique predicate: on IMAP `messageId` is the UID, and a
+        // UID is FOLDER-SCOPED, so Archive UID 7 and Inbox UID 7 are two different
+        // messages with identical `(accountId, messageId)`. `fetchOne` then returned
+        // an arbitrary one of them and the body, the thread references and the
+        // user-label junctions below all landed on that row — a wrong-message
+        // misattribution, and `MessageBody` inserts use `onConflict: .ignore`, so a
+        // wrong cached body is not guaranteed to self-repair.
+        //
+        // `header.id` is the right answer and is already in hand: `messageHeader`'s
+        // only key is `t.primaryKey("id", .text)` and the `(messageId, accountId)`
+        // index is NOT unique, so the ignored insert above can only have conflicted
+        // on the primary key — meaning the row exists under exactly this id.
+        let newHeaderId = header.id
         if !newHeaderId.isEmpty {
             // `headerOnly` (phase-1 pre-pass) SKIPS the (potentially multi-MB)
             // body blob persist — phase 2 writes it later. The thread-continuity

@@ -539,4 +539,89 @@ struct NSEMergeFullHeaderTests {
         #expect(header?.actionTag == .reply)
         #expect(header?.tagSortOrder == ActionTag.reply.sortOrder)
     }
+
+    // MARK: - C3 — staged content lands on the header it was inserted as
+
+    /// THE INVARIANT: **the body, thread references and user labels a staged
+    /// message carries land on the header that message was inserted as, and on no
+    /// other row.**
+    ///
+    /// The wrong-message family again, in the merge path rather than on the wire.
+    /// On IMAP `messageHeader.messageId` is the UID, and a UID is FOLDER-SCOPED:
+    /// Archive UID 7 and Inbox UID 7 are two different messages sharing one
+    /// `(accountId, messageId)` pair, and `messageHeader` has no unique index over
+    /// that pair — only `t.primaryKey("id", .text)` and a NON-unique
+    /// `(messageId, accountId)` index. So the merge's re-acquisition
+    /// `SELECT id FROM messageHeader WHERE accountId = ? AND messageId = ?`
+    /// returned an ARBITRARY one of them, and every subsequent write in the block
+    /// followed it onto the wrong message. `MessageBody` inserts use
+    /// `onConflict: .ignore`, so a wrong cached body is not guaranteed to
+    /// self-repair on the next sync.
+    ///
+    /// This predicate is present in `v1.6.38` and is not a regression of this
+    /// release range; C3 is absolute rather than relative, so it is fixed anyway.
+    @Test("Staged content attaches to the merged header, not to another folder's row with the same UID")
+    func stagedContentBindsToTheInsertedHeader() throws {
+        let db = try makeDB()
+        try TestDatabase.insertFolder(
+            db, name: "Archive", path: "Archive", role: .archive, accountId: "acc1")
+        // The DECOY: same account, same UID, DIFFERENT mailbox — and inserted
+        // first, so a folder-blind lookup finds it ahead of the merged row.
+        let decoy = try TestDatabase.insertMessageHeader(
+            db, messageId: "7",
+            folderId: "acc1:Archive", accountId: "acc1", folderPath: "Archive",
+            isInInbox: false, rfc822MessageId: "archive-seven@example.com")
+
+        let msg = staged(
+            messageId: "7",
+            provider: "imap_new_mail",
+            rfc822: "inbox-seven@example.com",
+            inReplyTo: "inbox-parent@example.com",
+            references: ["inbox-root@example.com"],
+            providerLabels: ["work"],
+            htmlContent: "<p>the INBOX message body</p>",
+            textContent: "the INBOX message body")
+        let (inserted, mergedId) = try insert(msg, into: db)
+        #expect(inserted, "precondition: the Inbox row is a genuinely new header")
+        #expect(mergedId != decoy.id, "precondition: the two headers are distinct rows")
+
+        func referenceCount(_ headerId: String) throws -> Int {
+            try db.read { try Int.fetchOne($0, sql: """
+                SELECT COUNT(*) FROM messageReference WHERE messageHeaderId = ?
+                """, arguments: [headerId]) } ?? -1
+        }
+        func labelCount(_ headerId: String) throws -> Int {
+            try db.read { try Int.fetchOne($0, sql: """
+                SELECT COUNT(*) FROM messageUserLabel WHERE messageId = ?
+                """, arguments: [headerId]) } ?? -1
+        }
+        func bodyCount(_ headerId: String) throws -> Int {
+            try db.read { try MessageBody.filter(Column("id") == headerId).fetchCount($0) }
+        }
+
+        #expect(try referenceCount(mergedId) > 0,
+                "the merged header must carry its own thread references")
+        #expect(try labelCount(mergedId) == 1,
+                "the merged header must carry its own user-label junction row")
+        #expect(try bodyCount(mergedId) == 1,
+                "the merged header must carry its own rendered body")
+
+        #expect(try referenceCount(decoy.id) == 0,
+                """
+                the Inbox message's thread references were attached to the ARCHIVE header that \
+                merely shares its UID — the reply chain now walks from the wrong message
+                """)
+        #expect(try labelCount(decoy.id) == 0,
+                """
+                the Inbox message's user labels were attached to the ARCHIVE header that merely \
+                shares its UID — the label UI now shows the wrong message under that label
+                """)
+        #expect(try bodyCount(decoy.id) == 0,
+                """
+                the Inbox message's rendered body was cached against the ARCHIVE header that \
+                merely shares its UID — opening the Archive message shows the Inbox message's \
+                content, and `MessageBody` inserts use `onConflict: .ignore`, so the next sync is \
+                not guaranteed to overwrite it (C3)
+                """)
+    }
 }
