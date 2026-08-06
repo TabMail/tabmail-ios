@@ -762,8 +762,31 @@ private final class FakeCalDAVStore: Sendable {
 
     private let state = Mutex(State())
 
+    /// Whether this server returns an `ETag` response header on `GET`.
+    ///
+    /// **Non-defaulted on purpose.** RFC 4791 says a CalDAV server SHOULD
+    /// return entity tags, not MUST, and `CalendarSetupView.connectCalDAV()`
+    /// hands `addCalDAVAccount` an arbitrary user-entered server URL — so the
+    /// no-ETag branch is a real server population, not an iCloud
+    /// hypothetical. That branch stayed invisible through repeated review
+    /// precisely because every fixture silently modelled the ETag-serving
+    /// server; making the choice unstateable-by-omission is what stops that
+    /// recurring.
+    private let servesETags: Bool
+
+    init(servesETags: Bool) {
+        self.servesETags = servesETags
+    }
+
     func seed(path: String, ics: String) {
         state.withLock { $0.resources[path] = Resource(ics: ics, etag: "\"seed\"") }
+    }
+
+    /// The entity tag this store currently holds for `path`, or nil when it is
+    /// absent — used by the held-direction assertions to prove an `If-Match`
+    /// carried the CURRENT tag rather than merely being non-nil.
+    func storedETag(path: String) -> String? {
+        state.withLock { $0.resources[path]?.etag }
     }
 
     func storedICS(path: String) -> String? {
@@ -779,9 +802,11 @@ private final class FakeCalDAVStore: Sendable {
         guard let resource = state.withLock({ $0.resources[path] }) else {
             return .raw(statusCode: 404)
         }
+        var headers = ["Content-Type": "text/calendar; charset=utf-8"]
+        if servesETags { headers["ETag"] = resource.etag }
         return .raw(
             statusCode: 200,
-            headers: ["Content-Type": "text/calendar; charset=utf-8", "ETag": resource.etag],
+            headers: headers,
             body: Data(resource.ics.utf8)
         )
     }
@@ -813,24 +838,27 @@ private final class FakeCalDAVStore: Sendable {
     }
 }
 
-@Suite("CalDAVProvider — splitSeries rollback", .serialized)
-struct CalDAVSplitRollbackTests {
+/// The shared wire fixture for every `CalDAVProvider`-over-HTTP suite in this
+/// file. ONE fixture, deliberately: the rollback suite and the precondition
+/// suite must exercise the same master resource and the same provider wiring,
+/// or a change to one silently stops covering the other.
+private enum CalDAVWireFixture {
 
-    private static let calendarHome = URL(string: "https://caldav.example.com/cal/")!
-    private static let calendarId = "/cal/"
-    private static let masterEventId = "/cal/master.ics"
-    private static let masterPath = "/cal/master.ics"
+    static let calendarHome = URL(string: "https://caldav.example.com/cal/")!
+    static let calendarId = "/cal/"
+    static let masterEventId = "/cal/master.ics"
+    static let masterPath = "/cal/master.ics"
 
     /// Naive wall-clock ISO in the device zone — the exact shape
-    /// `splitSeries` accepts as a `recurrence_id`.
-    private static func naiveISO(_ date: Date) -> String {
+    /// `splitSeries` and `updateOccurrence` accept as a `recurrence_id`.
+    static func naiveISO(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
         formatter.timeZone = .current
         return formatter.string(from: date)
     }
 
-    private static func icsUTC(_ date: Date) -> String {
+    static func icsUTC(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
         formatter.timeZone = TimeZone(identifier: "UTC")
@@ -839,12 +867,12 @@ struct CalDAVSplitRollbackTests {
 
     /// Dates are derived from `Date()`, never written as literals — a literal
     /// here goes stale silently and fails months later for the wrong reason.
-    private struct Fixture {
+    struct Fixture {
         let masterICS: String
         let recurrenceId: String
     }
 
-    private static func makeFixture() -> Fixture {
+    static func make() -> Fixture {
         let start = Date().addingTimeInterval(7 * 24 * 60 * 60)
         let end = start.addingTimeInterval(45 * 60)
         let splitAt = Date().addingTimeInterval(21 * 24 * 60 * 60)
@@ -865,13 +893,27 @@ struct CalDAVSplitRollbackTests {
         return Fixture(masterICS: ics, recurrenceId: naiveISO(splitAt))
     }
 
-    private static func makeProvider(_ scenario: FakeHTTP.Scenario) -> CalDAVProvider {
+    static func makeProvider(_ scenario: FakeHTTP.Scenario) -> CalDAVProvider {
         CalDAVProvider(
             client: CalDAVClient(
                 username: "user@example.com", password: "pw", session: scenario.session),
             calendarHomeURL: calendarHome,
             serverBaseURL: calendarHome
         )
+    }
+}
+
+@Suite("CalDAVProvider — splitSeries rollback", .serialized)
+struct CalDAVSplitRollbackTests {
+
+    private static let calendarId = CalDAVWireFixture.calendarId
+    private static let masterEventId = CalDAVWireFixture.masterEventId
+    private static let masterPath = CalDAVWireFixture.masterPath
+
+    private static func makeFixture() -> CalDAVWireFixture.Fixture { CalDAVWireFixture.make() }
+
+    private static func makeProvider(_ scenario: FakeHTTP.Scenario) -> CalDAVProvider {
+        CalDAVWireFixture.makeProvider(scenario)
     }
 
     @Test("""
@@ -882,7 +924,7 @@ struct CalDAVSplitRollbackTests {
     func failedSuccessorWriteRestoresTheMasterSeries() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let store = FakeCalDAVStore()
+        let store = FakeCalDAVStore(servesETags: true)
         let fixture = Self.makeFixture()
         store.seed(path: Self.masterPath, ics: fixture.masterICS)
 
@@ -938,7 +980,7 @@ struct CalDAVSplitRollbackTests {
     func createOnlyPutsStillRefuseAnExistingResource() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let store = FakeCalDAVStore()
+        let store = FakeCalDAVStore(servesETags: true)
         let fixture = Self.makeFixture()
         // A resource ALREADY sits at the id createEvent will derive.
         store.seed(path: "/cal/taken-id.ics", ics: fixture.masterICS)
@@ -965,5 +1007,227 @@ struct CalDAVSplitRollbackTests {
         // everything, and the create path still carries `If-None-Match: *`.
         #expect(store.storedICS(path: "/cal/taken-id.ics") == fixture.masterICS)
         #expect(store.recordedPuts().last?.ifNoneMatch == "*")
+    }
+}
+
+// MARK: - Update PUTs never assert the resource is absent
+
+/// **THE INVARIANT: an update against a server that returns no ETag still
+/// LANDS, and never asserts the resource is absent.**
+///
+/// `updateEvent`, `updateOccurrence` and the `splitSeries` master cap each GET
+/// the resource first and throw on an empty body, so reaching their PUT is
+/// PROOF the resource exists. Sending `If-None-Match: *` there — *"apply only
+/// if this resource does NOT exist"* — contradicts what the code just observed
+/// and is a guaranteed 412, not a conservative choice.
+///
+/// **Why the ETag-absent branch is reachable rather than dead code.** RFC 4791
+/// says a CalDAV server SHOULD return entity tags, not MUST, and
+/// `CalendarSetupView.connectCalDAV()` passes an arbitrary user-entered
+/// `serverURL` to `addCalDAVAccount` — TabMail talks to whatever CalDAV server
+/// the user names, not only iCloud.
+///
+/// **Why a 412 here is a wedge and not a fail-closed refusal.**
+/// `CalDAVError.preconditionFailed` is a dedicated case, so
+/// `AccountManagerCalendarQueue.isCalendarBadRequestError` — which matches
+/// `CalDAVError.httpError`, and whose own comment says "401/404/412 already map
+/// to dedicated cases" — returns false for it. It is not `notFound`,
+/// `missingScope`, `authFailed`, `unsupported` or `inconsistentState` either.
+/// So it falls to the generic arm ("Transient errors — always retry. NEVER drop
+/// on age alone"), is requeued with `retryCount += 1`, re-sends the identical
+/// `If-None-Match: *`, and 412s again forever. The drain then skips every later
+/// op on that account (`failedAccounts`), so the lane never drains. A
+/// permanently starving op plus a blocked account lane is the wedge corollary —
+/// in THE MANTRA's non-recoverable set, so "fail closed and let it be" does not
+/// cover it.
+@Suite("CalDAVProvider — update PUTs never assert absence", .serialized)
+struct CalDAVUpdatePreconditionTests {
+
+    private static let calendarId = CalDAVWireFixture.calendarId
+
+    private static func makeProvider(_ scenario: FakeHTTP.Scenario) -> CalDAVProvider {
+        CalDAVWireFixture.makeProvider(scenario)
+    }
+
+    /// Wire the fake so every request under the calendar home reaches `store`.
+    private static func route(_ http: FakeHTTP.Scenario, to store: FakeCalDAVStore) {
+        http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+        http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+    }
+
+    @Test("""
+    An edit lands against a CalDAV server that returns no ETag: the merged ICS \
+    reaches the resource, and the PUT never claims the resource is absent — \
+    which, against a resource the preceding GET just proved exists, is a \
+    guaranteed 412 that wedges the account's whole calendar lane
+    """)
+    func editLandsWhenTheServerReturnsNoETag() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore(servesETags: false)
+        let fixture = CalDAVWireFixture.make()
+        let path = "/cal/edit-no-etag.ics"
+        store.seed(path: path, ics: fixture.masterICS)
+        Self.route(http, to: store)
+
+        let provider = Self.makeProvider(http)
+        var patch = GCalEventInput()
+        patch.summary = "Renamed by the user"
+
+        do {
+            _ = try await provider.updateEvent(
+                calendarId: Self.calendarId, eventId: path,
+                event: patch, sendUpdates: "none")
+        } catch {
+            Issue.record("the edit must land against a server that returns no ETag — threw: \(error)")
+        }
+
+        // THE INVARIANT, at the resource: the user's edit is on the server.
+        let stored = store.storedICS(path: path)
+        #expect(stored?.contains("SUMMARY:Renamed by the user") == true,
+                "the edited summary must be what the resource now holds")
+        #expect(stored != fixture.masterICS,
+                "non-vacuity: the resource actually changed, so this is not asserting on the seed")
+
+        // WHY it can land, stated at the wire.
+        let puts = store.recordedPuts().filter { $0.path == path }
+        #expect(puts.count == 1)
+        guard puts.count == 1 else { return }
+        #expect(puts[0].ifNoneMatch == nil,
+                "`If-None-Match: *` asserts the resource is ABSENT — the GET above just proved it is not")
+        #expect(puts[0].ifMatch == nil,
+                "there is no ETag to match on; inventing one would be a different bug")
+    }
+
+    @Test("""
+    A single-occurrence override lands against a CalDAV server that returns no \
+    ETag: the spliced RECURRENCE-ID reaches the resource and the PUT never \
+    claims the resource is absent
+    """)
+    func occurrenceOverrideLandsWhenTheServerReturnsNoETag() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore(servesETags: false)
+        let fixture = CalDAVWireFixture.make()
+        let path = "/cal/occurrence-no-etag.ics"
+        store.seed(path: path, ics: fixture.masterICS)
+        Self.route(http, to: store)
+
+        let provider = Self.makeProvider(http)
+        var patch = GCalEventInput()
+        patch.summary = "Just this one"
+
+        do {
+            _ = try await provider.updateOccurrence(
+                calendarId: Self.calendarId, eventId: path,
+                recurrenceId: fixture.recurrenceId, event: patch, sendUpdates: "none")
+        } catch {
+            Issue.record("the override must land against a server that returns no ETag — threw: \(error)")
+        }
+
+        let stored = store.storedICS(path: path)
+        #expect(stored?.contains("RECURRENCE-ID") == true,
+                "the override VEVENT must be what the resource now holds")
+        #expect(stored?.contains("SUMMARY:Just this one") == true)
+        #expect(stored != fixture.masterICS, "non-vacuity: the resource actually changed")
+
+        let puts = store.recordedPuts().filter { $0.path == path }
+        #expect(puts.count == 1)
+        guard puts.count == 1 else { return }
+        #expect(puts[0].ifNoneMatch == nil)
+        #expect(puts[0].ifMatch == nil)
+    }
+
+    @Test("""
+    A series split lands against a CalDAV server that returns no ETag — and \
+    two-sided: the master CAP asserts nothing about existence while the \
+    SUCCESSOR write is still create-only, so the idempotent-retry guard that \
+    stops a lost ACK duplicating the series is not weakened
+    """)
+    func seriesSplitCapLandsWhileTheSuccessorStaysCreateOnly() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore(servesETags: false)
+        let fixture = CalDAVWireFixture.make()
+        let masterPath = "/cal/split-no-etag.ics"
+        store.seed(path: masterPath, ics: fixture.masterICS)
+        Self.route(http, to: store)
+
+        let provider = Self.makeProvider(http)
+        do {
+            _ = try await provider.splitSeries(
+                calendarId: Self.calendarId, eventId: masterPath,
+                recurrenceId: fixture.recurrenceId,
+                patch: GCalEventInput(), sendUpdates: "none")
+        } catch {
+            Issue.record("the split must land against a server that returns no ETag — threw: \(error)")
+        }
+
+        // THE INVARIANT: the split actually happened — master capped, successor
+        // created. Pre-fix the cap 412s at step 3, before any rollback arm, so
+        // neither of these exists.
+        let master = store.storedICS(path: masterPath)
+        #expect(master?.contains("UNTIL=") == true, "the master series must be capped")
+        let successorPath = "/cal/\(GoogleCalendarProvider.deterministicSplitEventId(masterId: masterPath, recurrenceId: fixture.recurrenceId)).ics"
+        #expect(store.storedICS(path: successorPath) != nil, "the successor series must exist")
+
+        let capPuts = store.recordedPuts().filter { $0.path == masterPath }
+        #expect(capPuts.count == 1, "exactly one cap PUT — a second means the rollback arm ran")
+        guard capPuts.count == 1 else { return }
+        #expect(capPuts[0].ifNoneMatch == nil)
+        #expect(capPuts[0].ifMatch == nil)
+
+        // HELD DIRECTION, same flow: the create site is untouched.
+        let successorPuts = store.recordedPuts().filter { $0.path == successorPath }
+        #expect(successorPuts.count == 1)
+        guard successorPuts.count == 1 else { return }
+        #expect(successorPuts[0].ifNoneMatch == "*",
+                "the successor write stays CREATE-ONLY — widening it trades a 412 for silently replacing a series someone may have edited")
+    }
+
+    @Test("""
+    HELD DIRECTION — when the server DOES return an ETag, all three update \
+    sites still send `If-Match` carrying that exact tag: the fix relaxes only \
+    the no-ETag branch and must not cost the lost-update protection that an \
+    entity tag buys
+    """)
+    func updatesStillCarryIfMatchWhenTheServerReturnsAnETag() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore(servesETags: true)
+        let fixture = CalDAVWireFixture.make()
+        let editPath = "/cal/held-edit.ics"
+        let occurrencePath = "/cal/held-occurrence.ics"
+        let splitPath = "/cal/held-split.ics"
+        for path in [editPath, occurrencePath, splitPath] {
+            store.seed(path: path, ics: fixture.masterICS)
+        }
+        // The tag every one of these three PUTs must echo back.
+        let seedETag = store.storedETag(path: editPath)
+        #expect(seedETag != nil, "non-vacuity: this store really does serve entity tags")
+        Self.route(http, to: store)
+
+        let provider = Self.makeProvider(http)
+        var patch = GCalEventInput()
+        patch.summary = "Edited"
+
+        _ = try await provider.updateEvent(
+            calendarId: Self.calendarId, eventId: editPath, event: patch, sendUpdates: "none")
+        _ = try await provider.updateOccurrence(
+            calendarId: Self.calendarId, eventId: occurrencePath,
+            recurrenceId: fixture.recurrenceId, event: patch, sendUpdates: "none")
+        _ = try await provider.splitSeries(
+            calendarId: Self.calendarId, eventId: splitPath,
+            recurrenceId: fixture.recurrenceId,
+            patch: GCalEventInput(), sendUpdates: "none")
+
+        for path in [editPath, occurrencePath, splitPath] {
+            let puts = store.recordedPuts().filter { $0.path == path }
+            #expect(puts.count == 1, "expected exactly one PUT at \(path)")
+            guard puts.count == 1 else { continue }
+            #expect(puts[0].ifMatch == seedETag,
+                    "the update at \(path) must still be conditional on the tag the GET returned")
+            #expect(puts[0].ifNoneMatch == nil, "an If-Match update never also asserts absence")
+        }
     }
 }

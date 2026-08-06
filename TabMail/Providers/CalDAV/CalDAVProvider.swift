@@ -288,9 +288,18 @@ actor CalDAVProvider: CalendarProvider {
         let etag = getResponse.value(forHTTPHeaderField: "ETag")
 
         let mergedICS = Self.mergePatchIntoICS(existingICS, patch: event)
+        // No ETag ⇒ `.unconditional`, NEVER `.ifNoneMatchAny`. The GET above
+        // returned a non-empty body for this exact URL, so the resource
+        // PROVABLY exists; `If-None-Match: *` asserts it does NOT, which
+        // contradicts what we just observed and is a guaranteed 412 rather than
+        // a conservative choice. RFC 4791 says servers SHOULD return an ETag,
+        // not MUST, and `CalendarSetupView.connectCalDAV()` accepts an
+        // arbitrary user-entered server URL — so the no-ETag branch is reachable
+        // and is not an iCloud-only hypothetical. See `revertMasterCap` below
+        // for the same defect at the rollback site.
         let (_, _) = try await client.put(
             url: eventURL, body: mergedICS,
-            precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .ifNoneMatchAny)
+            precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
 
         // Clear cached ETag (it changed)
         etagCache.removeValue(forKey: eventId)
@@ -401,9 +410,12 @@ actor CalDAVProvider: CalendarProvider {
         )
 
         // 5. PUT back — atomic at the CalDAV resource level (one HTTP call).
+        //    No ETag ⇒ `.unconditional`: step 1's GET proved this resource
+        //    exists (we spliced the override into the body it returned), so
+        //    `If-None-Match: *` would assert the opposite of what we observed.
         _ = try await client.put(
             url: eventURL, body: updatedICS,
-            precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .ifNoneMatchAny)
+            precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
         etagCache.removeValue(forKey: eventId)
 
         return GCalEvent(
@@ -448,10 +460,15 @@ actor CalDAVProvider: CalendarProvider {
         let cappedRRule = GoogleCalendarProvider.replaceOrAppendUntil(in: originalRRule, untilValue: untilValue)
         let cappedICS = Self.replaceRRule(in: masterICS, newRRule: cappedRRule)
 
-        // 3. PUT capped master back.
+        // 3. PUT capped master back. No ETag ⇒ `.unconditional`: step 1's GET
+        //    proved the master resource exists (its ICS is what we just capped),
+        //    so `If-None-Match: *` would assert the opposite. It is also the
+        //    precondition `revertMasterCap` must later be able to undo — a cap
+        //    that 412s never happens, but a cap that lands under a precondition
+        //    the revert cannot reproduce is the split-rollback defect again.
         _ = try await client.put(
             url: eventURL, body: cappedICS,
-            precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .ifNoneMatchAny)
+            precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
         etagCache.removeValue(forKey: eventId)
 
         // 4. Build new series and PUT to a .ics resource. The UID/filename is
