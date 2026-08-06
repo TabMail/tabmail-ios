@@ -144,3 +144,85 @@ Persistent NSE log file + watchdog partial-result delivery (2026-07-09) and audi
 🚨 **THE ADDRESS PROBLEM HAS TWO ADDRESS SPACES — Graph's `/move` RESPONSE IS THE `COPYUID`** — `59423bb7d` fixed one coordinate system; `ExchangeProvider.moveMessage` was `let _ = try await request("/messages/{id}/move")` and Microsoft Graph returns the moved message **with its new `id`**, so on the default mutable-id scheme (no `Prefer: IdType="ImmutableId"` anywhere in the tree) the next gesture named a dead address, Graph 404'd, `isMessageNotFoundError` read it as exit 2 and `PendingOperation.deleteOne` destroyed a durable intention whose optimistic local move had already landed (`IOS-GRAPH-002`, BLOCKING). FIXED by decoding the response id and carrying it through `moveProvingDestinations -> MoveOutcome` → `ExecutedOperation.provenDestinations` → the **existing** `MessageHeaderRekey.finishMove`; `ProvenDestinationAddress` became provider-neutral (`sourceProviderId`/`destinationProviderId` as `String`, optional epoch). **The `COPYUID` census missed it because it enumerated the MECHANISM, not the PROPERTY** (`MIS-006` ×5, `MIS-IOS-003` ×5) — enumerate by *"which provider ops RETURN the mutated resource and what do we do with the return?"*, then intersect with all three arms: IMAP fixed and fail-CLOSED (its admission gate hid the same root cause), **Gmail genuinely EXEMPT** (`messages.modify` never changes the id), Exchange fail-OPEN. ⚠ Reclassifying the 404 as retryable **without** re-keying is a LANE WEDGE (`buildLanes` keys on `accountId:folderPath:messageId`) — the re-key is what makes retry TERMINATE; `Prefer: IdType="ImmutableId"` changes id format ACCOUNT-WIDE (every `MessageHeader.messageId`, `MessageIdentity.headerId`, `PendingOperation.messageIds`, `aiCacheKey`, `nse_processed_message.id`, Graph `Folder.path`, plus the NSE's separate `Shared/API/GraphAPI`) and is a follow-up ON TOP, never instead. Epoch stays NIL for Graph (an invented stamp is the `.terminalStale` positive disagreement). `v2final` `e28dd4edb` shares the discard and dodges only the consequence via an RFC `$filter` search **banned in v3** (ADR-IOS-068/D4, `IOS-IMAP-002`); shipped `07a4bb703` shares the defect byte-for-byte — A1 step 3 is **INAPPLICABLE, not nonexistent**
 <!-- END VERBATIM ROW 163 -->
 
+
+---
+
+# Second pass — 2026-08-05, source `e3bd752b8`
+
+The 2026-08-05 pass above brought `PROJECT_MEMORY.md` to 24,552 B against a 25,000 B
+budget — 1.8% headroom over a ~21 KB structural floor of link rows. Five ordinary topic
+additions later the file stood at 25,243 B, over budget again, exactly as that pass
+predicted. This second pass routes the eight most verbose remaining *Topic / search terms*
+cells by the same mechanical rule, with two rows deliberately exempt: source line 155
+(the five-irreversible-wire-operations row, corrected hours earlier and whose keywords are
+load-bearing) and its neighbour source line 154, whose *FOUR… plus a FIFTH* phrasing is
+confusable with 155's count.
+
+Cells below are byte-for-byte as the index carried them at `e3bd752b8`; some already have a
+*first pass* section earlier in this file holding their pre-2026-08-05 wording, so the
+markers here are qualified with the source revision. The linked topic file named in each
+heading remains the normative source for the underlying knowledge.
+
+---
+
+## Source line 152 — Current → `099-persistent-nse-log-file-watchdog-partial-delivery-audit-rounds.md`
+
+<!-- BEGIN VERBATIM ROW 152 @ e3bd752b8 -->
+Persistent NSE log + watchdog partial-result delivery, audit rounds 1–7: `NSELogStore`/`nse.log`, `PartialSignalHolder`; **idle-timer-vs-SSE** root cause (a 26.4 s summary missed the 27 s watchdog by 9 ms); zombie-resume `OneShotFlag.hasFired()`
+<!-- END VERBATIM ROW 152 @ e3bd752b8 -->
+
+---
+
+## Source line 156 — Current → `103-await-dbpool-read-is-not-a-short-suspension.md`
+
+<!-- BEGIN VERBATIM ROW 156 @ e3bd752b8 -->
+🚨 **`await dbPool.read` is NOT a short suspension** — the ASYNC overload first `await`s `NSEDataBridge.mergeIfStagingPending()`, a **measured 7.6 s** cold-boot write pending on foreground return; check-then-act across it is never BOUNDED
+<!-- END VERBATIM ROW 156 @ e3bd752b8 -->
+
+---
+
+## Source line 157 — Current → `104-a-latch-that-authorises-a-transition-must-be-held-across-the-write.md`
+
+<!-- BEGIN VERBATIM ROW 157 @ e3bd752b8 -->
+🚨 **A latch that AUTHORISES a transition must be HELD across the write** — reading `isDrainingOutbox` then `await`ing proves nothing; ACQUIRE it. `IOS-OUTBOX-006`: `reconcileOutbox` reset a row whose SMTP was on the wire ⇒ no Sent APPEND
+<!-- END VERBATIM ROW 157 @ e3bd752b8 -->
+
+---
+
+## Source line 158 — Current → `105-a-print-is-not-production-observability-on-ios.md`
+
+<!-- BEGIN VERBATIM ROW 158 @ e3bd752b8 -->
+🚨 **A BARE `print` IS NOT PRODUCTION OBSERVABILITY ON iOS** — no `freopen`/`dup2`, so `stdout` is DISCARDED on device; use a GATED `print` **plus** `BackgroundSyncLogger.logError`. An `isLoggingEnabled()` gate inside a BRANCH CONDITION picks the branch (`MIS-019`)
+<!-- END VERBATIM ROW 158 @ e3bd752b8 -->
+
+---
+
+## Source line 159 — Current → `106-a-filter-after-the-limit-narrows-the-page-instead-of-selecting-it.md`
+
+<!-- BEGIN VERBATIM ROW 159 @ e3bd752b8 -->
+🚨 **A FILTER APPLIED AFTER A QUERY'S `LIMIT` NARROWS THE PAGE INSTEAD OF SELECTING IT** (`6d460aa99`): the label filter ran after `InboxListReader.gather`'s `LIMIT` so `hasMoreMessages` read a survivor count (`IOS-SCROLL-002`, `IOS-BACKFILL-001`)
+<!-- END VERBATIM ROW 159 @ e3bd752b8 -->
+
+---
+
+## Source line 160 — Current → `107-a-staging-key-that-names-an-address-must-re-prove-identity-before-reusing-payload.md`
+
+<!-- BEGIN VERBATIM ROW 160 @ e3bd752b8 -->
+🚨 **A STAGING KEY THAT NAMES AN ADDRESS MUST RE-PROVE IDENTITY BEFORE IT REUSES PAYLOAD** — `nse_processed_message`'s PK holds a UID, so `stageHeader`'s `ON CONFLICT` spliced a predecessor's payload onto the successor (`IOS-NSE-005`, BLOCKING C3 misattribution)
+<!-- END VERBATIM ROW 160 @ e3bd752b8 -->
+
+---
+
+## Source line 163 — Current → `108-the-address-problem-has-two-address-spaces-graph-move-response-is-the-copyuid.md`
+
+<!-- BEGIN VERBATIM ROW 163 @ e3bd752b8 -->
+🚨 **THE ADDRESS PROBLEM HAS TWO ADDRESS SPACES — Graph's `/move` RESPONSE IS THE `COPYUID`** — `ExchangeProvider.moveMessage` discarded the new `id`, so Graph 404'd and `PendingOperation.deleteOne` destroyed a durable intention (`IOS-GRAPH-002`, `MIS-006`)
+<!-- END VERBATIM ROW 163 @ e3bd752b8 -->
+
+---
+
+## Source line 164 — Current → `112-uidvalidityresetpendingat-is-a-redrive-flag-that-stays-armed-on-purpose.md`
+
+<!-- BEGIN VERBATIM ROW 164 @ e3bd752b8 -->
+🚨 **`uidValidityResetPendingAt` STAYS ARMED ON PURPOSE — NEVER DEMAND PROOF OF TRANSIENCE** — every abort leg leaves the re-drive flag SET; discharge via "a refusal writes nothing" + `crawlWalkWriteAllowed` was the LAST consumer writing under an armed flag (`16ecafd93`)
+<!-- END VERBATIM ROW 164 @ e3bd752b8 -->
