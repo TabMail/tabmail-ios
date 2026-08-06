@@ -119,6 +119,52 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return toGCalEvent(event)
     }
 
+    /// The exact JSON body `createEvent` POSTs — `toGraphEventJSON` plus Graph's
+    /// client-supplied idempotency key.
+    ///
+    /// 🚨 A PLAIN `POST /events` IS NOT IDEMPOTENT, AND THE QUEUE NOW RETRIES IT
+    /// (R12-T5). `AccountManagerCalendarQueue` classifies `408 Request Timeout`
+    /// as INDETERMINATE — correctly: the server gave up waiting and the write may
+    /// or may not have landed, so retiring the op would drop the user's
+    /// intention. But `toGraphEventJSON` never reads `input.id`, so a retry after
+    /// a committed-then-408 create sent Graph a brand-new event: **two events on
+    /// the calendar, and potentially two invitations to every attendee**. Both
+    /// are authoritative server objects, so no sync converges them back to one
+    /// and the user has to find and delete the duplicate by hand.
+    ///
+    /// Graph dedupes POSTs by `transactionId` within a bounded window, which is
+    /// exactly this problem — and `ExchangeCalendarProvider.splitSeries` already
+    /// uses that mechanism for lost-ACK dedup on its own create. This follows
+    /// that existing pattern rather than inventing one; the drain's
+    /// `catch ExchangeCalendarError.httpError(409, _)` arm already treats Graph's
+    /// duplicate-transaction refusal as success.
+    ///
+    /// The key is the queue's own durable pre-generated event id
+    /// (`if let pregenId = op.eventId { input.id = pregenId }`), so it is stable
+    /// across retries of ONE op and distinct for every distinct user create —
+    /// two genuinely separate "book the same meeting twice" requests carry
+    /// different UUID-derived ids and both go through.
+    ///
+    /// ⚠️ THE COUNTERFACTUAL. Doing nothing keeps the duplicate-event exposure.
+    /// The mirror image — restoring shipped's "408 retires the op" — reinstates
+    /// the dropped intention the round-11 fix removed, and drops it on
+    /// *"we could not determine the answer"*, which never-drop clause 2 names as
+    /// retryable, never authoritative. Idempotency is the disposition that is
+    /// neither.
+    ///
+    /// ⚠️ The length guard is a real Graph constraint (`transactionId` is capped
+    /// at 256 characters), not defensive padding: an over-long value makes Graph
+    /// reject the whole create with a 400, which `isCalendarBadRequestError`
+    /// retires — turning an idempotency measure into a dropped intention. An id
+    /// past the cap simply degrades to today's non-idempotent behaviour.
+    nonisolated func createEventJSON(_ event: GCalEventInput) -> [String: Any] {
+        var json = toGraphEventJSON(event)
+        if let pregenId = event.id, !pregenId.isEmpty, pregenId.count <= 256 {
+            json["transactionId"] = pregenId
+        }
+        return json
+    }
+
     func createEvent(
         calendarId: String = "primary",
         event: GCalEventInput,
@@ -132,7 +178,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             calPath = "/calendars/\(encodedCalId)"
         }
 
-        let body = try JSONSerialization.data(withJSONObject: toGraphEventJSON(event))
+        let body = try JSONSerialization.data(withJSONObject: createEventJSON(event))
         if let bodyStr = String(data: body, encoding: .utf8) {
             print("[ExchangeCalendar] createEvent POST body=\(bodyStr.prefix(4000))")
         }

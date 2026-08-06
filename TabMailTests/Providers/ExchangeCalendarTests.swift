@@ -427,6 +427,61 @@ struct ExchangeCalendarRecurringTests {
         #expect(range?["startDate"] as? String == "2026-04-08")
     }
 
+    // MARK: - R12-T5 — a retried calendar create must not duplicate the event
+
+    /// INVARIANT (system property): **a queued calendar create that is retried
+    /// produces at most ONE event on the user's calendar.** Not "the payload has
+    /// a field named transactionId" — the property is that the create the
+    /// provider issues carries a client-supplied key derived from the queue's own
+    /// DURABLE pre-generated event id, so the server can recognise the retry as
+    /// the same intent.
+    ///
+    /// Why this became reachable: `AccountManagerCalendarQueue` classifies
+    /// `408 Request Timeout` as INDETERMINATE, so the op is requeued rather than
+    /// retired (retiring it would drop the user's intention on "we could not
+    /// determine the answer"). If Graph committed the POST and then answered 408,
+    /// a plain non-idempotent `POST /events` produced a SECOND event and a second
+    /// round of invitations to every attendee. Both are authoritative server
+    /// objects; sync never converges them.
+    ///
+    /// ⚠️ TWO-SIDED, and the second half is the one that keeps this honest: a
+    /// create with NO pre-generated id must carry NO key, or two genuinely
+    /// distinct user creates could be collapsed into one by the server — the
+    /// mirror image (a dropped intention wearing an idempotency hat).
+    @Test("Exchange create carries the durable pre-generated id as Graph's transactionId, so a retried create cannot duplicate the event")
+    func createEventCarriesIdempotencyKey() async {
+        let provider = makeProvider()
+        var input = GCalEventInput()
+        input.summary = "Quarterly review"
+        input.startDateTime = "2026-04-08T17:00:00-07:00"
+        input.endDateTime = "2026-04-08T18:00:00-07:00"
+        // Exactly what `AccountManagerCalendarQueue` stamps onto the input:
+        // `if let pregenId = op.eventId { input.id = pregenId }`, where
+        // `op.eventId` is the durable id generated when the op was queued.
+        input.id = PendingCalendarOperation.generateGoogleEventId(from: UUID().uuidString)
+
+        let json = provider.createEventJSON(input)
+        #expect(json["transactionId"] as? String == input.id,
+                "the Graph create carries no client-supplied idempotency key, so a retry after a committed-then-408 POST creates a SECOND event and re-invites every attendee — and the queue now retries 408 by design")
+
+        // NEGATIVE CASE — no durable id, no key.
+        var anonymous = GCalEventInput()
+        anonymous.summary = "Ad-hoc"
+        anonymous.startDateTime = "2026-04-08T17:00:00-07:00"
+        let anonJSON = provider.createEventJSON(anonymous)
+        #expect(anonJSON["transactionId"] == nil,
+                "a create with no durable pre-generated id must not invent a key — two genuinely distinct user creates would be deduped into one by the server")
+
+        // ⚠️ SIBLING PARITY (`feedback_half_port_drops_the_guard`): Google's
+        // create is idempotent by a DIFFERENT mechanism — the client-supplied
+        // event `id` itself, which the server 409s on duplicate and the drain
+        // catches as success. Pinned here so a future change to
+        // `GCalEventInput.toJSON()` that drops `id` cannot silently un-protect
+        // the Google path while this test keeps passing for Exchange.
+        #expect(input.toJSON()["id"] as? String == input.id,
+                "Google's create relies on the client-supplied event id being in the body — dropping it makes the Google retry path non-idempotent too")
+    }
+
     // MARK: - toGCalEvent recurrence reconstruction (Graph pattern → RFC 5545 RRULE)
 
     @Test("toGCalEvent maps Graph absoluteMonthly → FREQ=MONTHLY;BYMONTHDAY (not invalid FREQ=ABSOLUTEMONTHLY)")
