@@ -534,7 +534,6 @@ struct DatabaseNSEStagingTests {
     @Test("A staged row's UIDVALIDITY stamp is durable across processes: it reads back through a fresh connection after the writing handle is gone, and an unstamped row reads back NULL — distinguishable, never conflated with a stamped one")
     func observedUidValidityStampIsDurableAcrossConnections() throws {
         let (path, dir) = try makeStagingFile()
-        defer { try? FileManager.default.removeItem(at: dir) }
 
         // ── The NSE process: ensure the column, stage two rows, then go away.
         do {
@@ -552,7 +551,16 @@ struct DatabaseNSEStagingTests {
         }
 
         // ── The main app: a brand-new connection, as the merge would open.
+        //
+        // Retired through the shared close-before-unlink boundary, NOT a bare
+        // `removeItem(at: dir)`. `mergeHandle` is a function-scope binding that is
+        // still alive when a `defer` runs, so unlinking there would remove the
+        // db/WAL/SHM out from under a live SQLite vnode — the process-wide
+        // libsqlite3 API violation `TestDatabaseTeardown` documents, which can
+        // corrupt unrelated suites' SQLite state in the same test host
+        // (`IOS-TEST-009`).
         let mergeHandle = try DatabaseQueue(path: path)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(queue: mergeHandle, directory: dir) }
         let rows = try mergeHandle.read { db in
             try Row.fetchAll(
                 db,
