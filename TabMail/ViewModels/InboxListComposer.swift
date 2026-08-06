@@ -40,13 +40,62 @@ enum InboxOrdering {
     ///
     /// ⚠️ Must stay equivalent to `InboxListReader.gather`'s
     /// `ORDER BY tagSortOrder ASC, date DESC, id ASC` (triage) /
-    /// `ORDER BY date DESC, id ASC` (normal). SQLite compares `id` under BINARY
-    /// (UTF-8 byte) collation while this uses Swift `String` comparison; that
-    /// accepted residual is documented on `InboxPageCursor`.
+    /// `ORDER BY date DESC, id ASC` (normal), **and to that query's keyset
+    /// predicate `id > ?`**.
+    ///
+    /// 🚨 **THE TIE-BREAK COMPARES UTF-8 BYTES, NOT `String`, AND THAT IS NOT A
+    /// STYLE CHOICE.** `messageHeader.id` is `TEXT PRIMARY KEY` with no
+    /// `COLLATE` clause, so SQLite orders it under **BINARY** — a byte-wise
+    /// `memcmp`. Swift's `String` `<` orders by *canonically normalized* Unicode
+    /// scalars. The two agree on pure ASCII and **disagree the moment an id is
+    /// not**, which is reachable: an id is `"<accountId>:<folderPath>:<uid>"`
+    /// (`MessageIdentity.headerId`) and a folder path is whatever the account
+    /// actually names its mailboxes — Japanese, Korean, Cyrillic, accented.
+    /// Measured disagreements (`ORDER BY id` verified byte-wise against
+    /// `pragma_index_xinfo` reporting `coll=BINARY`):
+    ///
+    ///  * **Strict opposites.** `"…:\u{212B}:m"` (ANGSTROM SIGN, which NFC-maps
+    ///    to `U+00C5`) sorts BEFORE `"…:\u{0100}:m"` in Swift and AFTER it in
+    ///    bytes (`E2 84 AB` vs `C4 80`). Same for a decomposed Hangul syllable
+    ///    `U+1100 U+1161` — Swift normalizes it to `U+AC00`, bytes keep it at
+    ///    `E1 84 80 …`. Decomposed forms are ordinary, not exotic: APFS/HFS+
+    ///    hand back NFD.
+    ///  * **Swift is not even a TOTAL order here.** NFC `"…:\u{00E9}:m"` and NFD
+    ///    `"…:e\u{0301}:m"` are two distinct BINARY primary keys (verified: both
+    ///    rows insert) that Swift `String` reports **equal**. A comparator that
+    ///    calls two distinct rows equal cannot induce the total order the keyset
+    ///    cursor requires.
+    ///
+    /// What the disagreement costs is the header's own failure mode, not a
+    /// cosmetic reshuffle: `page.last` is the Swift-maximal row, the SQL asks
+    /// for `id > ` that row under BINARY, and every row that is byte-smaller but
+    /// Swift-larger is **never returned by any later page** — a refresh rebuilds
+    /// the same initial window rather than reaching it.
+    /// `InboxListReaderIntegrationTests.pagingReachesEveryRowWhenIdsDisagreeAcrossCollations`
+    /// pins it (3 of 5 rows were unreachable before this).
+    ///
+    /// ⚠️ **THE COUNTERFACTUAL — why the SWIFT side moved and not the SQL.**
+    /// Making the SQL match Swift instead (a GRDB custom/Unicode collation on
+    /// `id`) breaks four ways, and the first is fatal on its own:
+    ///  1. It is not expressible. Swift's order is not antisymmetric over this
+    ///     domain (the NFC/NFD pair above), so there is no SQL collation that
+    ///     both reproduces it and keeps `id` a usable PRIMARY KEY.
+    ///  2. The primary-key index IS BINARY. An `ORDER BY id COLLATE <other>` and
+    ///     a keyset `id > ? COLLATE <other>` cannot use it, so the reader's
+    ///     carefully sargable `range AND (range OR tie)` predicate degrades to a
+    ///     full-folder scan plus a temp B-tree — the A6 cost `InboxListReader`'s
+    ///     header explains it was shaped to avoid.
+    ///  3. A custom collation is registered per-`Configuration`. The NSE opens
+    ///     its own pool; a process that did not register it fails the query
+    ///     outright ("no such collation sequence"), and an index built under one
+    ///     implementation is silently wrong for another (an ICU/stdlib revision
+    ///     reorders it).
+    ///  4. Direction of safety: BINARY is what is already durably persisted. The
+    ///     Swift side is pure computation — changing it changes nothing on disk.
     static func areInIncreasingOrder(_ a: Key, _ b: Key, mode: InboxMode) -> Bool {
         if mode == .triage, a.tagSortOrder != b.tagSortOrder { return a.tagSortOrder < b.tagSortOrder }
         if a.date != b.date { return a.date > b.date }
-        return a.id < b.id
+        return a.id.utf8.lexicographicallyPrecedes(b.id.utf8)
     }
 
     static func areInIncreasingOrder(_ a: MessageSnapshot, _ b: MessageSnapshot, mode: InboxMode) -> Bool {

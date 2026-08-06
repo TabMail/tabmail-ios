@@ -724,20 +724,29 @@ struct InboxComposeScenarioTests {
             composed.count <= query.targetCount,
             "I7 window-sanity VIOLATED: \(composed.count) rows > window \(query.targetCount) — \(detail)"
         )
+        // ⚠️ THE FULL ORDERING KEY, VIA THE ONE SHARED COMPARATOR — NOT `date >=`.
+        // This used to assert `a.date >= b.date` (plus the triage bucket), which
+        // is satisfied by EITHER arrangement of a tied pair and so could not
+        // catch a comparator that drops the `id` tie-break — precisely the
+        // defect `fc9aac00f` landed to fix. `InboxOrdering.areInIncreasingOrder`
+        // is asserted STRICTLY: `id` is the primary key, so the order is total
+        // and consecutive rows are never merely "not out of order".
+        //
+        // Calling the shared comparator rather than restating the key is the
+        // point — an N-th agreeing copy in a test is how this class regenerated.
+        // The comparator itself is pinned against the SQL non-circularly by
+        // `InboxListReaderIntegrationTests.pagingReachesEveryRowWhenIdsDisagreeAcrossCollations`.
         if composed.count >= 2 {
             for i in 0..<(composed.count - 1) {
                 let a = composed[i], b = composed[i + 1]
-                let ordered: Bool
-                switch query.mode {
-                case .triage:
-                    ordered = a.tagSortOrder < b.tagSortOrder
-                        || (a.tagSortOrder == b.tagSortOrder && a.date >= b.date)
-                case .normal:
-                    ordered = a.date >= b.date
-                }
                 #expect(
-                    ordered,
-                    "I7 window-sanity VIOLATED: rows \(i)/\(i + 1) out of \(query.mode) order — \(detail)"
+                    InboxOrdering.areInIncreasingOrder(a, b, mode: query.mode),
+                    """
+                    I7 window-sanity VIOLATED: rows \(i)/\(i + 1) out of \(query.mode) order under the \
+                    FULL key (tagSortOrder, date, id) — \
+                    a=(\(a.tagSortOrder), \(a.date.timeIntervalSinceReferenceDate), \(a.id)) \
+                    b=(\(b.tagSortOrder), \(b.date.timeIntervalSinceReferenceDate), \(b.id)) — \(detail)
+                    """
                 )
             }
         }
@@ -1608,6 +1617,79 @@ struct InboxComposeScenarioTests {
             messages: [SimWorld.spec("m1", uid: "101", minutesAgo: 5, tag: "reply", blurb: "b1")],
             scenario: "overlayDrainVsPhase2Commit"
         )
+    }
+
+    /// 🚨 **THE TIED FIXTURE THAT MAKES I7 LOAD-BEARING IN THIS SUITE.**
+    ///
+    /// Every other scenario here (and the fuzz pool) gives its messages
+    /// DISTINCT `minutesAgo`, so the ordering key's `id` tie-break was never
+    /// reached and I7's old `a.date >= b.date` form was satisfied by either
+    /// arrangement of any pair it ever saw. Nothing here was blessing a bug —
+    /// the question simply was not posed. This poses it: three messages on ONE
+    /// date, walked through the whole lifecycle, with I7 (now the full
+    /// `InboxOrdering` key) asserted after every step and again across a
+    /// compose storm.
+    ///
+    /// ⚠️ **RED EVIDENCE (testing rule 12).** Inverting `InboxListComposer`
+    /// step 7's tie-break — `rows.sort { … }` reversed to order tied rows by
+    /// DESCENDING `id` — fails this on the very first compose that holds two
+    /// tied rows, with I7 reporting rows 0/1 out of `normal` order under the
+    /// full key. The pre-strengthening `a.date >= b.date` form of I7 stays
+    /// GREEN on that same inverted arrangement.
+    ///
+    /// ⚠️ **AND WHAT THIS DOES NOT PROVE, STATED PLAINLY.** `compose` step 7
+    /// sorts with `InboxOrdering` and I7 now checks with `InboxOrdering`, so
+    /// this cannot catch a bug INSIDE the comparator — only a step 7 that stops
+    /// calling it (a fifth spelling reintroduced) or a dedup/trim that reorders.
+    /// The comparator itself is pinned against the SQL non-circularly by
+    /// `InboxListReaderIntegrationTests.pagingReachesEveryRowWhenIdsDisagreeAcrossCollations`,
+    /// and the VM's sorted-INSERT paths (which do NOT sort by it) by
+    /// `InboxEndToEndInvariantTests.tiedDatesInsertInIdOrderScenario`. Asserting
+    /// against the shared comparator instead of restating the key is deliberate:
+    /// an N-th agreeing copy of the order — in a test as much as in production —
+    /// is how this class regenerated in the first place.
+    @Test("tiedDates: three rows sharing ONE date stay in id order through the whole lifecycle and across a compose storm (I7 full ordering key)")
+    func tiedDatesHoldFullOrderingKey() {
+        // Identical `minutesAgo` — `id` is the only discriminator left.
+        var world = SimWorld.standard(messages: [
+            SimWorld.spec("t1", uid: "101", minutesAgo: 5),
+            SimWorld.spec("t2", uid: "102", minutesAgo: 5),
+            SimWorld.spec("t3", uid: "103", minutesAgo: 5),
+        ])
+        var ai = AITracker()
+        let scenario = "tiedDatesHoldFullOrderingKey"
+
+        // Staged-only first: S rows carry the tie before any durable row exists.
+        runSteps([
+            (.stagePush, "t3"),
+            (.stagePush, "t1"),
+            (.stagePush, "t2"),
+        ], world: &world, ai: &ai, scenario: scenario)
+
+        var composed = composeRepeatedly(
+            20, world: world, ai: &ai, scenario: scenario, note: "staged-only tie")
+        #expect(composed.count == 3,
+                "fixture did not compose 3 tied staged rows — every ordering claim here would be vacuous. Got \(composed.map(\.id))")
+        guard composed.count == 3 else { return }
+        #expect(composed.map(\.messageId) == ["101", "102", "103"],
+                "tied staged rows not in id order — got \(composed.map(\.messageId))")
+
+        // Now make them durable, in a THIRD order, so the D-side tie is exercised
+        // independently of the order the staged rows arrived in.
+        runSteps([
+            (.phase1Commit, "t2"), (.ftsFlushCommit, "t2"),
+            (.phase1Commit, "t3"), (.ftsFlushCommit, "t3"),
+            (.phase1Commit, "t1"), (.ftsFlushCommit, "t1"),
+            (.phase2Commit, "t1"), (.phase2Commit, "t2"), (.phase2Commit, "t3"),
+            (.drainStaging, "t1"), (.drainStaging, "t2"), (.drainStaging, "t3"),
+        ], world: &world, ai: &ai, scenario: scenario)
+
+        composed = composeRepeatedly(
+            20, world: world, ai: &ai, scenario: scenario, note: "durable tie")
+        #expect(composed.count == 3, "expected 3 durable tied rows, got \(composed.map(\.id))")
+        guard composed.count == 3 else { return }
+        #expect(composed.map(\.messageId) == ["101", "102", "103"],
+                "tied durable rows not in id order — got \(composed.map(\.messageId))")
     }
 
     // MARK: - Seeded fuzz (§5A.1 — explores the orderings nobody named)

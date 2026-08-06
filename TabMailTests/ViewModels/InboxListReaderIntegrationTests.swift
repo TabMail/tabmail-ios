@@ -652,4 +652,117 @@ struct InboxListReaderIntegrationTests {
                 "paging over six same-second rows produced \(ordered.count) rows, not 6 — a repeat burns a SQL LIMIT slot, a skip loses a message")
         #expect(Set(ordered).count == ordered.count, "a row was emitted on more than one page")
     }
+
+    // MARK: - Collation parity: the Swift tie-break vs SQLite BINARY
+
+    /// 🚨 **THE COMPARATOR AND THE `ORDER BY` MUST BREAK THE TIE THE SAME WAY.**
+    ///
+    /// `messageHeader.id` is `TEXT PRIMARY KEY` with no `COLLATE` clause, so both
+    /// the reader's `ORDER BY … id ASC` and its keyset `id > ?` run under
+    /// **BINARY** — a UTF-8 `memcmp`. `InboxOrdering` used to break the same tie
+    /// with Swift `String` `<`, which orders by canonically *normalized* Unicode
+    /// scalars. Pure ASCII ids hide the difference; a non-ASCII folder path does
+    /// not, and an id is `"<accountId>:<folderPath>:<uid>"`.
+    ///
+    /// The fixture is five one-message folders whose paths are chosen so the two
+    /// collations disagree by construction (each is a real, measured
+    /// disagreement — see `InboxOrdering`'s header):
+    ///
+    /// ```
+    ///   path            utf8 of the id                     BINARY rank   Swift rank
+    ///   U+00C0  À       …:C3 80:m                                1            1
+    ///   U+0100  Ā       …:C4 80:m                                2            3
+    ///   U+1100 U+1161 가 (NFD)  …:E1 84 80 E1 85 A1:m            3            5   (NFC → U+AC00)
+    ///   U+1200  ሀ       …:E1 88 80:m                             4            4
+    ///   U+212B  Å       …:E2 84 AB:m                             5            2   (NFC → U+00C5)
+    /// ```
+    ///
+    /// Every row shares one date, so `id` is the ONLY discriminator and the
+    /// disagreement is forced through the cursor. With `targetCount = 2` the
+    /// Swift order puts the BYTE-MAXIMAL row (`U+212B`) at the end of page 1, so
+    /// the cursor is byte-maximal, `id > cursor` matches nothing, and paging
+    /// stops with **3 of 5 rows permanently unreachable** — a later page only
+    /// ever asks for something byte-greater, and a refresh rebuilds the same
+    /// initial window. That is `InboxPageCursor`'s documented loss shape,
+    /// reproduced through the collation instead of through a bare date cutoff.
+    ///
+    /// ⚠️ **RED EVIDENCE (required by testing rule 12).** Against `fc9aac00f`'s
+    /// `return a.id < b.id` this test fails on the reachability expectation with
+    /// `paging reached 2 of 5`. It is an INVARIANT test, not a mechanism test:
+    /// it asserts *every stored row is reachable by paging*, which stays the
+    /// right assertion whatever spelling the tie-break ends up with.
+    ///
+    /// FIVE FOLDERS, not five messages in one folder, on purpose. The reader
+    /// applies its `LIMIT` **per folder**, so a single folder's SQL always hands
+    /// back a byte-ordered PREFIX and the composer's trim cannot select outside
+    /// it — no row can be skipped, only re-emitted. The union across folders is
+    /// where a Swift-ordered trim can pick a set the byte order would not, which
+    /// is exactly the production shape (a unified inbox spans folders).
+    @Test("paging reaches every row when ids disagree between Swift String order and SQLite BINARY (non-ASCII folder paths)")
+    func pagingReachesEveryRowWhenIdsDisagreeAcrossCollations() async throws {
+        let (pool, _, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        // Written as escapes, not literals, so the bytes under test survive any
+        // editor/normalization pass over this file.
+        let paths = [
+            "\u{00C0}",            // À
+            "\u{0100}",            // Ā
+            "\u{1100}\u{1161}",    // 가, DECOMPOSED (what APFS/HFS+ hands back)
+            "\u{1200}",            // ሀ
+            "\u{212B}",            // ANGSTROM SIGN (NFC-maps to U+00C5)
+        ]
+        let folders = paths.map { Folder(name: $0, path: $0, role: .custom, accountId: "acc1") }
+        let now = Date()
+        let headers = folders.map { makeDurableHeader(folder: $0, messageId: "m", date: now) }
+        try await pool.writeWithoutTransaction { db in
+            for f in folders { try f.insert(db) }
+            for h in headers { try h.insert(db) }
+        }
+
+        // ⚠️ ANCHOR THE FIXTURE FIRST (`MIS-030`): prove the two collations
+        // genuinely disagree on THESE ids, so a green run cannot come from a
+        // fixture that never posed the question. If Swift's `String` order ever
+        // becomes byte order, this fails loudly rather than passing vacuously.
+        let ids = folders.map { MessageIdentity.headerId(accountId: "acc1", folderPath: $0.path, messageId: "m") }
+        #expect(Set(ids).count == 5, "fixture ids collided — the disagreement below would be vacuous")
+        let swiftOrder = ids.sorted(by: <)
+        let byteOrder = ids.sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
+        #expect(swiftOrder != byteOrder,
+                "fixture no longer poses the question: Swift String order and UTF-8 byte order agree on these ids, so nothing here can distinguish the two tie-breaks")
+
+        // …and that all five are actually visible to an unpaged read, so
+        // "unreachable by paging" below cannot be satisfied by a row that was
+        // never stored.
+        let unpaged = InboxListReader.fetchSync(
+            folders: folders,
+            query: query(folders: folders, targetCount: 50))
+        #expect(unpaged.count == 5,
+                "fixture did not stage 5 visible rows — the reachability claim would be vacuous. Got \(unpaged.count)")
+        guard unpaged.count == 5 else { return }
+
+        let (ordered, pages) = pageThroughEverything(folders: folders, mode: .normal, pageSize: 2)
+        #expect(pages < 12, "paging did not terminate")
+        #expect(Set(ordered) == Set(unpaged.map(\.id)),
+                """
+                paging reached \(Set(ordered).count) of 5 — the comparator's tie-break and the SQL's \
+                do not agree on these ids, so the cursor taken from `page.last` is not the maximal \
+                row under the order the SQL walks. Every row byte-smaller than that cursor is \
+                excluded by `id > ?` on every later page and never comes back. \
+                missing=\(Set(unpaged.map(\.id)).subtracting(ordered).count) pages=\(pages)
+                """)
+        #expect(ordered.count == Set(ordered).count,
+                "paging returned the same row twice — the mirror image: a cursor below the true maximum re-admits rows that then burn SQL LIMIT slots (IOS-SCROLL-002's shape)")
+
+        // BOTH SIDES. Reachability alone is satisfied by a comparator that
+        // merely happens not to lose anything on this fixture; the arrangement
+        // must actually BE the SQL's arrangement.
+        #expect(ordered == byteOrder,
+                "paged arrangement is not the BINARY arrangement the reader's ORDER BY produces — got \(ordered), expected \(byteOrder)")
+    }
 }

@@ -384,18 +384,29 @@ struct InboxEndToEndInvariantTests {
         // I7 window-sanity: sort order + label filter. (Length-vs-window is
         // not checked generically here — `targetWindowSize` is VM-private;
         // the dedicated I9 scenarios check window growth explicitly.)
+        // ⚠️ THE FULL ORDERING KEY, VIA THE ONE SHARED COMPARATOR — NOT `date >=`.
+        // This used to assert `a.date >= b.date` (plus the triage bucket), which
+        // either arrangement of a tied pair satisfies, so it could not catch a
+        // sorted-INSERT that drops the `id` tie-break — the exact defect
+        // `fc9aac00f` landed to fix, and the exact thing this suite is best
+        // placed to see: `composed` here is the REAL `vm.loadedMessages`, built
+        // by `insertUndoneMessages` / `insertStagedRows` / `reloadMessages`'
+        // Pass-2 `firstIndex` searches, none of which is the composer's `sort`.
+        // A wrong insertion slot therefore shows up as an array that is not
+        // sorted under the shared comparator — non-circularly, because nothing
+        // in the VM's insert path sorts by it.
         if composed.count >= 2 {
             for i in 0..<(composed.count - 1) {
                 let a = composed[i], b = composed[i + 1]
-                let ordered: Bool
-                switch vm.mode {
-                case .triage:
-                    ordered = a.tagSortOrder < b.tagSortOrder
-                        || (a.tagSortOrder == b.tagSortOrder && a.date >= b.date)
-                case .normal:
-                    ordered = a.date >= b.date
-                }
-                #expect(ordered, "I7 window-sanity VIOLATED: rows \(i)/\(i + 1) out of \(vm.mode) order — \(detail)")
+                #expect(
+                    InboxOrdering.areInIncreasingOrder(a, b, mode: vm.mode),
+                    """
+                    I7 window-sanity VIOLATED: rows \(i)/\(i + 1) out of \(vm.mode) order under the \
+                    FULL key (tagSortOrder, date, id) — \
+                    a=(\(a.tagSortOrder), \(a.date.timeIntervalSinceReferenceDate), \(a.id)) \
+                    b=(\(b.tagSortOrder), \(b.date.timeIntervalSinceReferenceDate), \(b.id)) — \(detail)
+                    """
+                )
             }
         }
         if !vm.filterLabelIds.isEmpty {
@@ -861,6 +872,82 @@ struct InboxEndToEndInvariantTests {
         #expect(containsIdentity(vm, world, "mLabeledDurable"), "labeled durable row dropped by the active label filter — positive path failed")
         #expect(!containsIdentity(vm, world, "mUnlabeledStaged"), "staged (unlabeled) row leaked through an active label filter — negative path failed")
         #expect(vm.loadedMessages.first?.userLabels.map(\.id) == ["\(fixture.accountId):label-x"], "userLabels not carried onto the composed durable row")
+    }
+
+    /// 🚨 **THE TIED FIXTURE THAT MAKES I7 LOAD-BEARING.**
+    ///
+    /// I7 used to assert `a.date >= b.date`, which EITHER arrangement of a tied
+    /// pair satisfies — so no fixture in this suite could have caught a sorted
+    /// INSERT that drops the `id` tie-break, the exact defect `fc9aac00f`
+    /// landed to fix. Every other scenario here gives its messages distinct
+    /// `minutesAgo`, so the tie-break was never even reached. This one ties all
+    /// three rows on one date, making `id` the ONLY discriminator.
+    ///
+    /// The push ORDER is 101, 103, **102** on purpose: the last arrival belongs
+    /// in the MIDDLE of the tie block. `reloadMessages`' Pass-2 diff inserts it
+    /// with `firstIndex { InboxOrdering.areInIncreasingOrder(fresh, $0, …) }`,
+    /// and pre-`fc9aac00f` that predicate was `firstIndex { $0.date < fresh.date }`
+    /// — no row in a tie block is strictly older, so the search fell through to
+    /// `endIndex` and parked every tied arrival at the END of its block.
+    ///
+    /// ⚠️ **RED EVIDENCE (testing rule 12).** Restoring that one line to
+    /// `loadedMessages.firstIndex { $0.date < fresh.date } ?? loadedMessages.endIndex`
+    /// makes this fail with `["101", "103", "102"]` and trips the strengthened
+    /// I7 on rows 1/2; the pre-strengthening `a.date >= b.date` form of I7 stays
+    /// GREEN on that same array, which is the whole point.
+    ///
+    /// Ties are the ordinary case, not a contrivance: IMAP `INTERNALDATE` has
+    /// second granularity, so burst delivery and initial sync produce them
+    /// routinely (see `InboxOrdering`).
+    @Test("tiedDatesInsertInIdOrder — REAL VM: a durable arrival tied on date with the rows already on screen lands in the slot the reader gives it, not at the end of its tie block (I7 full ordering key)")
+    func tiedDatesInsertInIdOrderScenario() async throws {
+        let fixture = try makeFixture()
+        defer { cleanup(fixture) }
+        let world = E2EWorld(
+            pool: fixture.pool, stagingPath: fixture.stagingPath, stagingQueue: fixture.stagingQueue,
+            accountId: fixture.accountId, inbox: fixture.inbox, archive: fixture.archive
+        )
+        defer { world.teardown() }
+        // ONE `minutesAgo` for all three — the tie is the fixture.
+        let base = Date()
+        world.addMessage("t101", uid: "101", minutesAgo: 5, base: base)
+        world.addMessage("t103", uid: "103", minutesAgo: 5, base: base)
+        world.addMessage("t102", uid: "102", minutesAgo: 5, base: base)
+
+        let vm = InboxViewModel(folders: [fixture.inbox])
+        var ai = E2EAITracker()
+        let scenario = "tiedDatesInsertInIdOrder"
+
+        try await applyAndSettle(.pushArrives, "t101", world: world, vm: vm, ai: &ai, scenario: scenario)
+        try await applyAndSettle(.pushArrives, "t103", world: world, vm: vm, ai: &ai, scenario: scenario)
+
+        // ⚠️ ANCHOR THE CARDINALITY BEFORE ASSERTING AN ARRANGEMENT (`MIS-030`):
+        // a two-element array is trivially "ordered" if one row silently failed
+        // to land, and the interesting assertion is the three-element one below.
+        #expect(vm.loadedMessages.count == 2,
+                "fixture did not land 2 rows before the middle arrival — the ordering claim below would be vacuous. Got \(vm.loadedMessages.map(\.messageId))")
+        guard vm.loadedMessages.count == 2 else { return }
+
+        // The arrival that belongs in the MIDDLE of the tie block.
+        try await applyAndSettle(.pushArrives, "t102", world: world, vm: vm, ai: &ai, scenario: scenario)
+
+        #expect(vm.loadedMessages.count == 3,
+                "expected 3 tied rows on screen, got \(vm.loadedMessages.map(\.messageId))")
+        guard vm.loadedMessages.count == 3 else { return }
+        #expect(vm.loadedMessages.map(\.messageId) == ["101", "102", "103"],
+                """
+                tied rows are not in `id` order — got \(vm.loadedMessages.map(\.messageId)). \
+                The Pass-2 sorted INSERT put the tied arrival at the end of its tie block instead of \
+                the slot `InboxListReader` gives it, so `loadedMessages.last` is not the maximal row \
+                under the reader's order and `loadMoreMessages`' keyset cursor is read off it.
+                """)
+
+        // And the arrangement must survive a reload storm (the reader's own
+        // step-7 sort must agree with the slot the insert path picked — that
+        // agreement IS the invariant `fc9aac00f` exists to hold).
+        try await reloadRepeatedly(5, world: world, vm: vm, ai: &ai, scenario: scenario, note: "post tied insert")
+        #expect(vm.loadedMessages.map(\.messageId) == ["101", "102", "103"],
+                "tied arrangement drifted across reloads — got \(vm.loadedMessages.map(\.messageId))")
     }
 
     @Test("triageOrder — REAL durable rows sort by tagSortOrder asc then date desc through the real VM in .triage mode")
