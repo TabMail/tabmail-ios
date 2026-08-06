@@ -239,13 +239,6 @@ actor DraftStore {
         _ = try ChatTurn.filter(sessionIds.contains(Column("sessionId"))).deleteAll(db)
     }
 
-    /// Delete a draft by its key (without deleting chat turns).
-    func deleteDraftOnly(id: String) throws {
-        _ = try AppDatabase.dbPool.write { db in
-            try Draft.deleteOne(db, key: id)
-        }
-    }
-
     // MARK: - Query
 
     /// Check if a draft exists for a given key.
@@ -524,8 +517,26 @@ actor DraftStore {
         runtimeKind: DraftRuntimeIdentityKind,
         draftsFolderPath: String
     ) async throws -> PushDisposition {
-        guard runtimeKind != .unknown,
-              let initialDraft = try load(id: draftId),
+        // ⚠️ AN UNRESOLVABLE PROVIDER KIND IS NOT AN EXIT (R11-C, 2026-08-06).
+        // `.notApplied` is exit 3 — a newer generation won the Stage A/B CAS — and
+        // the `.saveDraft` arm that calls this treats EVERY returned disposition as
+        // a RETIREMENT of the user's Save intention. `runtimeKind == .unknown` is an
+        // ABSENCE OF EVIDENCE, which never-drop clause 2 names as retryable
+        // ("an unresolvable identity"), never a provider-authoritative result. So it
+        // THROWS, exactly as the sibling `.deleteDraft` arm in the same switch
+        // already does (`case .unknown: throw ProviderError
+        // .actionIdentityResolutionFailed(encodedId)`), and the queue's classifier
+        // requeues the op instead of dropping it. Unreachable in production today —
+        // `AccountManager.draftRuntimeIdentityKind(for:)` covers all four concrete
+        // provider classes and its `default: .unknown` is test-only — which is
+        // precisely why it had to be fixed by classification rather than by relying
+        // on the caller never producing it.
+        guard runtimeKind != .unknown else {
+            throw ProviderError.actionIdentityResolutionFailed(draftId)
+        }
+        // The remaining three ARE exit 3: the row is gone, a newer generation
+        // replaced it, or another push already owns it.
+        guard let initialDraft = try load(id: draftId),
               initialDraft.instanceEpoch == expectedInstanceEpoch,
               initialDraft.serverPushStatus == nil || initialDraft.serverPushStatus == "dirty" else {
             return .notApplied

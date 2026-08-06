@@ -329,6 +329,76 @@ struct DraftGenerationSafetyTests {
         #expect(succeedingCalls.filter { $0.hasPrefix("saveDraft") }.count == 1)
     }
 
+    /// **THE INVARIANT (R11-E): an unresolvable provider identity keeps the user's
+    /// Save intention QUEUED, and only a lost generation CAS retires it.**
+    ///
+    /// The `.saveDraft` arm in `AccountManagerQueue.executeSingleOp` states outright
+    /// that "EVERY DISPOSITION THAT REACHES THIS LINE IS A RETIREMENT", so a returned
+    /// `.notApplied` drops the intention. `runtimeKind == .unknown` is an ABSENCE OF
+    /// EVIDENCE — never-drop clause 2 names "an unresolvable identity" as retryable,
+    /// not provider-authoritative — so it must leave through the THROW that the queue
+    /// classifies as a retry, exactly as the sibling `.deleteDraft` arm in the same
+    /// switch already does.
+    ///
+    /// ⚠️ TWO-SIDED (`feedback_non_vacuity_must_be_two_sided`). A guard that simply
+    /// threw for everything would satisfy the first leg alone, so the second leg pins
+    /// the opposite verdict on the same call: a genuinely lost CAS still returns
+    /// `.notApplied` and is still retired. Both legs also assert the PROVIDER CALL
+    /// COUNT, so "did not retire" cannot be confused with "sent the draft anyway".
+    @Test("An unresolvable provider kind throws instead of retiring the Save, while a lost CAS still retires")
+    func unknownRuntimeKindThrowsAndLostCasStillRetires() async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let initial = draft()
+        try await fixture.0.writeWithoutTransaction { try initial.insert($0) }
+
+        // LEG 1 — the draft is perfectly pushable; only the runtime kind is
+        // unresolvable. It must THROW, touch no provider, and stay pushable.
+        let unusedProvider = MockEmailProvider(
+            saveDraftResult: .created(.outlook(graphId: "must-not-be-used")))
+        var thrown: Error?
+        do {
+            _ = try await DraftStore.shared.pushDraftToServer(
+                draftId: initial.id, expectedInstanceEpoch: "E1", provider: unusedProvider,
+                runtimeKind: .unknown, draftsFolderPath: "Drafts")
+        } catch { thrown = error }
+        guard let providerError = thrown as? ProviderError,
+              case .actionIdentityResolutionFailed = providerError else {
+            Issue.record(
+                "an unknown runtime kind returned normally — the `.saveDraft` arm reads any normal return as a retirement and drops the user's Save intention (got \(String(describing: thrown)))")
+            return
+        }
+        let unusedCalls = await unusedProvider.callLog
+        #expect(unusedCalls.filter { $0.hasPrefix("saveDraft") }.isEmpty)
+
+        // The intention survives intact: a later drain that CAN resolve the kind
+        // lands the very same row.
+        let retryProvider = MockEmailProvider(
+            saveDraftResult: .created(.outlook(graphId: "resolved-resource")))
+        let retry = try await DraftStore.shared.pushDraftToServer(
+            draftId: initial.id, expectedInstanceEpoch: "E1", provider: retryProvider,
+            runtimeKind: .outlook, draftsFolderPath: "Drafts")
+        #expect(retry == .completed)
+        let live = try await fixture.0.read { try Draft.fetchOne($0, key: initial.id) }
+        #expect(live?.serverDraftId == "resolved-resource")
+
+        // LEG 2 — a genuinely lost generation CAS is exit 3 and STILL retires. A
+        // FRESH row (never pushed, status nil) so the ONLY failing condition is the
+        // epoch: on `initial` the completed push above would also have failed the
+        // status test, and the verdict would not be attributable to the CAS.
+        let superseded = draft(id: "draft-2", epoch: "E1")
+        try await fixture.0.writeWithoutTransaction { try superseded.insert($0) }
+        let staleProvider = MockEmailProvider(
+            saveDraftResult: .created(.outlook(graphId: "must-not-be-used-either")))
+        let stale = try await DraftStore.shared.pushDraftToServer(
+            draftId: superseded.id, expectedInstanceEpoch: "E0-superseded", provider: staleProvider,
+            runtimeKind: .outlook, draftsFolderPath: "Drafts")
+        #expect(stale == .notApplied,
+                "a superseded generation is a provider-authoritative exit 3 and must still retire")
+        let staleCalls = await staleProvider.callLog
+        #expect(staleCalls.filter { $0.hasPrefix("saveDraft") }.isEmpty)
+    }
+
     /// ⚑ NO REFERENCE — INVENTED: the approved minimum local arbitration proof for
     /// the observed suspended Agent-versus-Send race; it adds no lifecycle machinery.
     @Test("Agent and Send claims are mutually exclusive and release restores admission")
