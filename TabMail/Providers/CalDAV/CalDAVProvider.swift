@@ -588,22 +588,31 @@ actor CalDAVProvider: CalendarProvider {
     ///  - revert ALSO fails → throws `CalDAVError.inconsistentState` so the
     ///    queue surfaces a clear "needs manual attention" message instead of
     ///    silently leaving the master capped with no successor series.
-    /// The revert PUT carries `.ifMatch(capETag)` where `capETag` is the entity
-    /// tag the CAP PUT's own 2xx response returned — by construction the tag of
-    /// the body we ourselves just stored. That is what makes the rollback safe
-    /// AND targeted: it overwrites our own write, and it refuses to overwrite a
-    /// concurrent editor's, which an unconditional PUT would silently destroy
-    /// (a lost user edit is not recoverable by syncing).
+    /// WHEN `capETag` IS PRESENT the revert PUT carries `.ifMatch(capETag)`, where
+    /// `capETag` is the entity tag the CAP PUT's own 2xx response returned — by
+    /// construction the tag of the body we ourselves just stored. That is what makes
+    /// the rollback safe AND targeted: it overwrites our own write, and it refuses to
+    /// overwrite a concurrent editor's, which an unconditional PUT would silently
+    /// destroy (a lost user edit is not recoverable by syncing).
     ///
-    /// A 412 here therefore means "the master is no longer what we capped", and
-    /// the correct response is the failure arm below (`inconsistentState`, which
+    /// A 412 in THAT case therefore means "the master is no longer what we capped",
+    /// and the correct response is the failure arm below (`inconsistentState`, which
     /// the queue retires with a user-visible message), NOT a retry loop.
     ///
-    /// `capETag == nil` (a server that returns no ETag on PUT — RFC 4791 §5.3.4
-    /// says SHOULD, not MUST) falls back to `.unconditional`, the round-9
-    /// behaviour. It must never fall back to `.ifNoneMatchAny`: that asserts
-    /// absence at a resource we just proved present, which is the round-9 bug
-    /// this function was rewritten to kill.
+    /// ⚠️ CORRECTED 2026-08-06 — THE GUARANTEE IS CONDITIONAL, NOT UNCONDITIONAL.
+    /// This block used to open "The revert PUT carries `.ifMatch(capETag)`" flatly,
+    /// which reads as a property of the path rather than of one branch of it. When
+    /// `capETag == nil` — a server that returns no ETag on PUT, which RFC 4791 §5.3.4
+    /// permits (SHOULD, not MUST) — the revert falls back to `.unconditional` and has
+    /// NONE of the properties in the paragraph above: it is a blind overwrite that
+    /// can silently destroy a concurrent editor's change, i.e. precisely the outcome
+    /// the paragraph claims the path prevents. That is an ACCEPTED cost, registered
+    /// as `KNOWN_ISSUES.md` `IOS-CAL-002`, not an oversight: the alternative
+    /// (`.ifNoneMatchAny`) asserts ABSENCE at a resource we just proved present, so a
+    /// conforming server answers 412 to every revert and the rollback can never
+    /// succeed — a permanently broken feature rather than a recoverable edge. That
+    /// was the round-9 bug this function was rewritten to kill, and it must never be
+    /// reintroduced as a "safer default".
     ///
     /// ⚠ This comment said "unconditional (`etag: nil`)" from the day it was
     /// written until 2026-08-05, and the code did the OPPOSITE of what it

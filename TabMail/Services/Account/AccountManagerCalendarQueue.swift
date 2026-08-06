@@ -300,7 +300,7 @@ extension AccountManager {
                     // Permanent malformed-request errors — drop. Retrying the
                     // same broken payload never succeeds. Logged at error level
                     // so the user sees this in DebugLog.
-                    if isCalendarBadRequestError(error) {
+                    if Self.isCalendarBadRequestError(error) {
                         print("[CalendarQueue] Bad request for \(opType) (\(error)) — dropping (will not retry)")
                         do {
                             try await dbPool.write { db in
@@ -558,9 +558,34 @@ extension AccountManager {
     /// the same payload can never succeed, so we drop the op rather than
     /// clogging the queue indefinitely. Logged loudly so the user can see what
     /// happened (e.g. a "Missing end time" payload from a buggy create).
-    private func isCalendarBadRequestError(_ error: Error) -> Bool {
-        if case GoogleCalendarError.httpError(let code, _) = error, (400...499).contains(code), code != 401 && code != 403 && code != 404 && code != 429 { return true }
-        if case ExchangeCalendarError.httpError(let code, _) = error, (400...499).contains(code), code != 401 && code != 403 && code != 404 && code != 429 { return true }
+    ///
+    /// ⚠️ INDETERMINATE 4xx CODES ARE NOT AUTHORITATIVE (R11-C, 2026-08-06).
+    /// `CLAUDE.md`'s never-drop clause 2 retires an op only on a
+    /// PROVIDER-AUTHORITATIVE stale/no-op result; *"we could not determine the
+    /// answer"* is retryable, never authoritative. `408 Request Timeout`,
+    /// `409 Conflict`, `423 Locked` and `425 Too Early` are all of the second
+    /// kind — the server is telling us to come back, not that the payload is
+    /// broken — so they are excluded from ALL THREE arms and fall through to the
+    /// transient/retry arm, exactly where `429` already goes. `423 Locked` is the
+    /// WebDAV-native transient code, which is why the CalDAV arm needs the
+    /// exclusion most even though its blanket-4xx shape looks deliberate.
+    ///
+    /// ⚠️ NEGATIVE CASE — the classifier itself STAYS. A genuinely malformed
+    /// 400/415/422 that retried forever would wedge the calendar lane, and a wedge
+    /// (an op that starves and never recovers) is in the same non-recoverable set
+    /// as a dropped intention. The fix narrows the code set; deleting the arm
+    /// would be the mirror image of the bug.
+    /// `static` (hence nonisolated) so the classification can be table-driven in
+    /// tests against real provider error values rather than inferred from the
+    /// drain loop's side effects.
+    static func isCalendarBadRequestError(_ error: Error) -> Bool {
+        // Indeterminate — "come back later", not "your payload is broken".
+        // Shared by all three arms so they cannot drift apart.
+        func isIndeterminate(_ code: Int) -> Bool {
+            code == 408 || code == 409 || code == 423 || code == 425 || code == 429
+        }
+        if case GoogleCalendarError.httpError(let code, _) = error, (400...499).contains(code), code != 401 && code != 403 && code != 404 && !isIndeterminate(code) { return true }
+        if case ExchangeCalendarError.httpError(let code, _) = error, (400...499).contains(code), code != 401 && code != 403 && code != 404 && !isIndeterminate(code) { return true }
         // CalDAV: 401/404/412 already map to dedicated cases (authFailed /
         // notFound / preconditionFailed). Everything else in 4xx arrives here
         // as `httpError(code, body)`. iCloud returns an opaque 403 for many
@@ -570,7 +595,7 @@ extension AccountManager {
         // subsequent ops on the same account (the user sees the chat hang
         // because the next queued create's `awaitCalendarOpOutcome` times
         // out behind it). Treat all unclassified CalDAV 4xx as permanent.
-        if case CalDAVError.httpError(let code, _) = error, (400...499).contains(code), code != 429 { return true }
+        if case CalDAVError.httpError(let code, _) = error, (400...499).contains(code), !isIndeterminate(code) { return true }
         return false
     }
 
