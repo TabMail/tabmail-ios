@@ -2016,8 +2016,20 @@ final class AppDatabase: Sendable {
         //     column writes no key of either kind.
         //   • v83 — `CREATE INDEX`; changes no row. (Its `ANALYZE` moved to the
         //     background maintenance pass — ADR-IOS-029, 2026-08-05 amendment.)
-        // `v71` and `v82` stay `.deferred`, each for a different reason — read
-        // their own comments before changing either.
+        //
+        // ⚑ AMENDED 2026-08-06. The sentence that stood here said *"`v71` and `v82`
+        // stay `.deferred`, each for a different reason"*, and the `ADD COLUMN`
+        // bullet above listed `v71` among the migrations that *would be* safe under
+        // `.immediate` — an invitation the closing sentence then walked back. Both
+        // halves are gone: **`v71` now RUNS `.immediate`**, so the bullet above is
+        // simply a statement of what it does, with nothing to walk back. `v82` is
+        // the last `.deferred` migration left in this range; read its own comment
+        // before changing it.
+        //
+        // WHY, in one line, with the rest at `v71`'s registration: on the owner's
+        // device (v67 → v83, 5 accounts / 78 folders) the chain cost 27,601 ms, of
+        // which 19,312 ms was `PRAGMA foreign_key_check` and 12,083 ms of that was
+        // `v71`'s gate alone, guarding a one-statement `ADD COLUMN`.
         migrator.registerTimedMigration(
             "v68_addFolderUidValidityResetPending", foreignKeyChecks: .immediate
         ) { db in
@@ -2186,67 +2198,101 @@ final class AppDatabase: Sendable {
             }
         }
 
-        // ⚠️ THIS MIGRATION KEEPS `foreignKeyChecks: .deferred` DELIBERATELY. Do
-        // not "finish the optimisation" by flipping it — the trailing
-        // `PRAGMA foreign_key_check` GRDB runs on the deferred path is what
-        // preserves detection of a PRE-EXISTING orphan, which `.immediate`
-        // cannot see (it only enforces writes the body itself makes).
+        // ⚑ THIS MIGRATION RUNS `foreignKeyChecks: .immediate` AS OF 2026-08-06.
         //
-        // ⚠️ NEGATIVE CASE, recorded because an earlier revision of this very
-        // comment got it wrong: it claimed this was "THE ONLY whole-database FK
-        // gate in the v68…v83 range". That is FALSE. `v82` is also `.deferred`,
-        // so the range runs TWO whole-database gates — and `v82`'s own comment
-        // says so outright ("this migration and `v71` are the two exceptions").
-        // What is unique about THIS gate is its POSITION, not its existence.
-        // ⚠️ RETRACTION 2026-08-05 — the two lines that stood here were themselves
-        // wrong, and are removed rather than softened. They said the same revision
-        // "attributed a sentence to `v82`'s comment that `v82` has never contained"
-        // and instructed the reader not to reinstate that quotation. The quotation
-        // IS GENUINE: it lives in `v82`'s STEP-1 BODY comment, not in its header,
-        // hard-wrapped across two source lines — which is why a search for the
-        // unwrapped single-line form returned nothing, and that emptiness was read
-        // as proof of invention. A null grep is a claim about the QUERY first.
-        // The sentence was TRUE WHEN WRITTEN and was invalidated one commit later
-        // by `204590b34`; it is corrected in place at `v82` step 1, which is where
-        // its current wording lives — read it there rather than restating it here.
-        // Its content therefore no longer corroborates THIS gate, but that changes
-        // nothing above: `v71`'s justification rests on POSITION alone, which is
-        // exactly what the rest of this comment already says.
+        // It used to be the range's POSITIONED WHOLE-DATABASE ORPHAN GATE, and this
+        // comment used to carry the instruction *"Do not 'finish the optimisation'
+        // by flipping it"* together with a `⚑ .deferred MADE EXPLICIT` paragraph
+        // whose stated purpose was to make a future sweep DELETE an explicit choice
+        // rather than merely add an argument. **This is that sweep, and the
+        // instruction is WITHDRAWN on the owner's directive.** The original
+        // rationale is preserved below in the past tense rather than deleted: it was
+        // right about what the gate DID and wrong only about whether it was worth
+        // its price.
         //
-        // WHY HERE and not at v68 or at the end. `v70` has just removed the
-        // `messageBody → messageHeader` FK, whose check reads every page of a
-        // multi-GB table for one column; that makes this gate 2.4–2.5× cheaper
-        // here than the same gate at `v68` (3.6–3.8 s vs 9.1 s at 500k headers /
-        // 3.4 GB), while still running BEFORE `v82` mutates a row — so a
-        // pre-existing orphan aborts the chain BEFORE the destructive label
-        // rebuild rather than after it. That earliness is the thing `v82`'s own
-        // trailing gate cannot provide, and it is the actual reason to keep this
-        // one. A closing-only gate would be cheaper still, but migrations COMMIT
-        // INDIVIDUALLY: a failure there strands the database at v82 retrying
-        // v83 forever, with 15 migrations' work already applied.
-        // ⚑ `foreignKeyChecks: .deferred` MADE EXPLICIT 2026-08-06 (round-11 R11-K).
-        // This is a NO-OP at runtime and no SQL, no statement and no migration name
-        // changed: `registerTimedMigration`'s declared default IS `.deferred`, and it
-        // forwards the argument verbatim to `registerMigration`, so a database that
-        // has already applied v71 skips it entirely and one that has not applies it
-        // under the identical mode. Data-integrity rule 5 is not engaged — the
-        // argument is not part of the body's executed statements, exactly as the
-        // "NOT A BODY CHANGE" paragraph in the FK-MODE block above already
-        // adjudicates for the whole v68…v83 range.
+        // 🚨 WHAT IT COST, on real hardware rather than on the harness. The owner
+        // measured a device upgrading v67 → v83 with 5 accounts / 78 folders;
+        // `MigrationTimingLedger` attributed:
+        //     v71 total 12,084ms = body 1ms + fkCheck/commit 12,083ms [.deferred]
+        // — one `ALTER TABLE outboxMessage ADD COLUMN`, and twelve seconds of
+        // whole-database `PRAGMA foreign_key_check` charged to it. The whole chain
+        // was 27,601 ms, of which 19,312 ms (70%) was foreign-key checking rather
+        // than work, and first paint came at 33.1 s.
         //
-        // WHY MAKE IT EXPLICIT HERE AND NOWHERE ELSE. 67 of the 83 registrations take
-        // the default, and spelling it out on all of them would be noise. v71 is the
-        // one migration whose DEFAULT is LOAD-BEARING: its whole-database
-        // `PRAGMA foreign_key_check` is the positioned orphan gate documented
-        // immediately above, and the FK-MODE block lists v71 among the "`ADD COLUMN`
-        // only" migrations that would be SAFE under `.immediate` — an invitation a
-        // later reader can act on, walked back only by that block's closing sentence.
-        // `v82`, the other deliberately-`.deferred` migration named in that same
-        // sentence, already spells it out. Writing it here means a future sweep to
-        // `.immediate` has to DELETE an explicit choice rather than merely add an
-        // argument to a bare call.
+        // WHY THE GATE IS NOT WORTH THAT — three independent facts.
+        //
+        //  1. ORPHANS ARE STRUCTURALLY PREVENTED, so the gate guards a state the
+        //     schema already forbids. `AppDatabase.makeConfiguration` sets
+        //     `config.foreignKeysEnabled = true`, and EVERY foreign key this schema
+        //     declares carries `ON DELETE CASCADE`. Censused over
+        //     `TabMail/ Shared/ TabMailNotificationService/`: `rg '\.references\("'`
+        //     returns 19 lines, 3 of which are prose in comments, leaving 16 DDL
+        //     declarations — and all 16 spell `onDelete: .cascade`, zero bare.
+        //     Four differently-shaped predicates for the same fact (a
+        //     `.references("x")` with no `onDelete`; raw-SQL `REFERENCES`;
+        //     `foreignKey(`; `t.belongsTo`) each return nothing, so the count is not
+        //     merely the shape of one grep (`MIS-007`). Deleting a parent takes its
+        //     children with it; no application path can strand one.
+        //  2. IT IS REDUNDANT WITH THE REST OF THE CHAIN. The large majority of the
+        //     83 migrations still end with their own whole-database check — the
+        //     exact figure is re-derived in `v82`'s step-1 comment below, which is
+        //     the single place this file keeps that census — so anything the CHAIN
+        //     ITSELF created would abort at its own migration, not here. The only
+        //     thing this gate uniquely caught is an orphan that PRE-EXISTED in the
+        //     v67 database.
+        //  3. ITS REMEDY ON FIRING IS A BRICK. A failed check throws → `AppDatabase`
+        //     init throws → `AppDatabase.rawPool`'s force-unwrap crashes at launch.
+        //     Per THE MANTRA (`tabmail-ios/CLAUDE.md`) a brick is in the
+        //     NON-RECOVERABLE set, while the condition it detects — a dangling
+        //     `messageUserLabel` row, i.e. a label chip that does not resolve — is
+        //     RECOVERABLE: it renders nothing, and the server re-supplies the
+        //     association on the next sync of that message. The gate traded a
+        //     recoverable cosmetic defect for a non-recoverable brick and charged
+        //     12 s of every upgrade launch for the trade.
+        //
+        // AND THE CLASS IT GUARDED IS REPAIRED DOWNSTREAM ANYWAY — this is the fact
+        // the old rationale never checked. `v82` handles BOTH `messageUserLabel`
+        // orphan classes locally: its step 1 explicitly `DELETE`s an association
+        // whose `messageHeader` is gone, and its step 3a `LEFT JOIN`s the legacy
+        // label snapshot so an association pointing at a MISSING `userLabel` still
+        // gets a rebuilt parent row (named by its bare provider id). So the orphan
+        // this gate ran early specifically to catch BEFORE `v82` is the orphan `v82`
+        // itself fixes.
+        //
+        // ⚠️ NEGATIVE CASE — what flipping this does NOT claim. It does not claim
+        // the check was useless: it was the only thing that would have found a
+        // pre-existing orphan on an edge no range migration rebuilds (e.g.
+        // `messageReference → messageHeader`), and after this flip nothing in
+        // v68…v83 detects one. Such a row now survives the chain, renders nothing,
+        // and is swept by nothing. That residual is ACCEPTED and registered —
+        // `KNOWN_ISSUES.md` `IOS-MIGRATION-002`, whose own text used to say
+        // "Neither gate may be flipped to `.immediate`" and is corrected there.
+        //
+        // HISTORY, kept because it explains why the gate sat HERE and not at v68 or
+        // at the end, and a future reader proposing to reinstate a gate needs it:
+        // `v70` has just removed the `messageBody → messageHeader` FK, whose check
+        // reads every page of a multi-GB table for one column, which made this gate
+        // 2.4–2.5× cheaper here than the same gate at `v68` (3.6–3.8 s vs 9.1 s at
+        // 500k headers / 3.4 GB) while still running BEFORE `v82` mutates a row. A
+        // closing-only gate would have been cheaper still, but migrations COMMIT
+        // INDIVIDUALLY: a failure there strands the database at v82 retrying v83
+        // forever, with 15 migrations' work already applied. Also kept from the
+        // superseded text, because it was itself a correction and deleting it would
+        // re-open the question: an earlier revision claimed this was "THE ONLY
+        // whole-database FK gate in the v68…v83 range", which was false (`v82` was
+        // also `.deferred`), and a follow-up accused that revision of fabricating a
+        // quotation from `v82`, which was ALSO false — the quotation is genuine and
+        // hard-wrapped across two lines in `v82`'s step-1 body comment. A null grep
+        // is a claim about the QUERY first (`MIS-008`).
+        //
+        // NOT A BODY CHANGE. `foreignKeyChecks:` is an argument to
+        // `registerMigration`, not part of the migration body, so Data Integrity
+        // rule 5 is not engaged: a database that has already applied v71 SKIPS it
+        // entirely and never runs the new mode; one that has not applies the
+        // identical single `ALTER TABLE … ADD COLUMN` under it and reaches the same
+        // schema. No SQL, no statement and no migration name changed.
         migrator.registerTimedMigration(
-            "v71_addOutboxDraftRfc822MessageId", foreignKeyChecks: .deferred
+            "v71_addOutboxDraftRfc822MessageId", foreignKeyChecks: .immediate
         ) { db in
             // ⚠ THIS COLUMN IS INERT AS OF `e0d3d30e0` ("Bind draft mutations to
             // provider UID, epoch, and generation"). The matching
@@ -2667,7 +2713,9 @@ final class AppDatabase: Sendable {
         // check proves every rebuilt reference resolves.
         //
         // The rest of the v68…v83 range runs `.immediate` (see the block comment above
-        // `v68`); this migration and `v71` are the two exceptions. This body would in
+        // `v68`); this migration is now the ONLY exception. ⚠️ It said "this migration
+        // and `v71` are the two exceptions" until 2026-08-06, when `v71`'s gate was
+        // retired — read `v71`'s own registration comment for why. This body would in
         // fact SURVIVE `.immediate` — the child `messageUserLabel` is dropped BEFORE
         // the parent `userLabel`, and steps 3a/3b insert every id step 5 writes while
         // step 5's `JOIN messageHeader` guarantees the other reference, so the rebuild
@@ -2723,16 +2771,14 @@ final class AppDatabase: Sendable {
             //          on this line ends with a full foreign-key check." That was TRUE
             //          WHEN WRITTEN and was invalidated ONE COMMIT LATER by `204590b34`,
             //          which converted 14 migrations to `foreignKeyChecks: .immediate`.
-            //          Census re-derived at HEAD: 83 registered migrations — 14 explicit
-            //          `.immediate`, 3 explicit `.deferred` (`v2`, `v71`, `v82`), 66
-            //          taking `registerTimedMigration`'s default, which IS `.deferred`.
-            //          (`v71` moved from the default column to the explicit one on
-            //          2026-08-06, round-11 R11-K — a no-op at runtime; see its own
-            //          registration comment for why that one migration spells it out.
-            //          The 69/14 split below is about EFFECTIVE mode and is unchanged
-            //          by that move.) So
-            //          **69 of 83 end with a whole-database `PRAGMA foreign_key_check`
-            //          and 14 do not.** Confirmed against GRDB's own
+            //          ⚠️ RE-DERIVED AGAIN 2026-08-06, mechanically and not by arithmetic
+            //          on the previous figures, because `v71` changed mode: 83 registered
+            //          migrations — **15** explicit `.immediate`, **2** explicit
+            //          `.deferred` (`v2`, `v82`), **66** taking
+            //          `registerTimedMigration`'s default, which IS `.deferred`. So
+            //          **68 of 83 end with a whole-database `PRAGMA foreign_key_check`
+            //          and 15 do not.** (Was 69/14 while `v71` was still `.deferred`.)
+            //          Confirmed against GRDB's own
             //          `GRDB/Migration/Migration.swift`: `runWithDeferredForeignKeysChecks`
             //          calls `db.checkForeignKeys()` before commit, while
             //          `runWithImmediateForeignKeysChecks` calls NOTHING — it runs the body
@@ -3054,7 +3100,18 @@ final class AppDatabase: Sendable {
 /// identifier, so every already-applied migration stays applied and its body is
 /// never re-run — migrations are immutable once applied, and this wrapper is
 /// deliberately the one thing around them that is not part of that identity.
-private extension DatabaseMigrator {
+///
+/// ⚑ INTERNAL RATHER THAN `private` AS OF 2026-08-06, for exactly one reason.
+/// `MigrationTimingAttributionTests`' non-vacuity control used to be the SHIPPING
+/// pair `v68` (`.immediate`) vs `v71` (`.deferred`) — two identical
+/// `ALTER TABLE … ADD COLUMN` bodies with opposite foreign-key modes. `v71` is now
+/// `.immediate` too, so that pair no longer exists anywhere in the chain and the
+/// control has to register its own probe migrations THROUGH THIS WRAPPER (going
+/// around it to GRDB's raw `registerMigration` would test a reimplementation of the
+/// thing under test — `MIS-015`). Nothing in the app calls this outside
+/// `registerAllMigrations`; the widening buys the test the production code path and
+/// nothing else.
+extension DatabaseMigrator {
 
     /// `registerMigration`, plus a **debug-gated** per-migration duration line
     /// that distinguishes success from failure. Errors propagate unchanged.

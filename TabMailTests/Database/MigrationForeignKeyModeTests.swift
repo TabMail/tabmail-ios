@@ -11,9 +11,10 @@ import GRDB
 ///
 /// `v68…v83` used to run on the wrapper's `.deferred` default, which made GRDB
 /// append a whole-database `PRAGMA foreign_key_check` to EVERY one of the 16
-/// migrations — measured at 69–74% of the entire upgrade's wall clock. Fourteen
-/// of them now declare `.immediate` instead, which enforces foreign keys LIVE on
-/// the writes the body actually makes and runs no trailing scan.
+/// migrations — measured at 69–74% of the entire upgrade's wall clock, and at
+/// 70% of it (19,312 ms of 27,601 ms) on the owner's real device. Fifteen of them
+/// now declare `.immediate` instead, which enforces foreign keys LIVE on the
+/// writes the body actually makes and runs no trailing scan.
 ///
 /// 🚨 **THE PROPERTY PINNED HERE IS THE END STATE, NOT THE MODE TABLE.** A test
 /// that asserted "v72 is `.immediate`" would pass on a chain that leaves the
@@ -21,17 +22,19 @@ import GRDB
 /// correctly re-adjudicated — it would pin the fix's mechanism instead of the
 /// system property the mechanism exists to preserve. What matters is that a
 /// populated, FK-bearing database that walks the whole chain comes out with zero
-/// foreign-key violations, and that a database carrying an orphan is still
-/// CAUGHT rather than waved through.
+/// foreign-key violations.
 ///
-/// The second test is the non-vacuity proof. Red-first is not available here —
-/// there was no pre-existing bug, the chain was already clean — so instead the
-/// orphan case demonstrates the first test is actually checking something: with
-/// one dangling child row the chain must FAIL, and it must fail at
-/// `v71_addOutboxDraftRfc822MessageId`, the single whole-database gate the
-/// range deliberately keeps. `.immediate` cannot see a PRE-EXISTING orphan (it
-/// only enforces writes the body itself makes), so if v71 were ever flipped too,
-/// that second test goes green-by-omission and this suite says so.
+/// The second test is the non-vacuity proof: with one dangling child row the
+/// chain must FAIL rather than wave it through, and it must fail at
+/// `v82_accountScopedUserLabelIdentity` — the LAST whole-database gate left in
+/// the range. ⚠️ **This used to name `v71_addOutboxDraftRfc822MessageId` and call
+/// it "the single whole-database gate the range deliberately keeps".** `v71` was
+/// deliberately flipped to `.immediate` on 2026-08-06: its gate cost 12,083 ms of
+/// the owner's 27,601 ms upgrade to guard a single `ALTER TABLE … ADD COLUMN`,
+/// and the orphan class it ran early to catch is the one `v82` repairs itself
+/// (step 1 deletes associations whose header is gone; step 3a rebuilds a parent
+/// for a dangling label id). Read `v71`'s registration comment for the full
+/// argument.
 @Suite("Migration foreign-key modes (v68…v83)")
 struct MigrationForeignKeyModeTests {
 
@@ -211,8 +214,8 @@ struct MigrationForeignKeyModeTests {
 
     // MARK: - 2. Non-vacuity — the check above is actually checking
 
-    @Test("A pre-existing orphan still FAILS the chain, at the v71 whole-database gate")
-    func preExistingOrphanFailsTheChainAtV71() throws {
+    @Test("A pre-existing orphan still FAILS the chain, at the v82 whole-database gate")
+    func preExistingOrphanFailsTheChainAtV82() throws {
         let db = try Self.makeV67Database()
         try Self.seed(db)
 
@@ -249,17 +252,18 @@ struct MigrationForeignKeyModeTests {
 
         let applied = try Self.appliedIdentifiers(db)
         #expect(
-            applied.contains("v70_dropMessageBodyHeaderFK"),
+            applied.contains("v71_addOutboxDraftRfc822MessageId"),
             """
-            the three `.immediate` migrations before the gate should still apply — \
+            every `.immediate` migration before the gate should still apply — \
             `.immediate` enforces only the writes the body makes, and none of them \
-            touch the orphan
+            touch the orphan. (`v71` is in this set as of 2026-08-06; it used to be \
+            the gate and is now one of the migrations that walks past the orphan.)
             """)
         #expect(
-            !applied.contains("v71_addOutboxDraftRfc822MessageId"),
+            !applied.contains("v82_accountScopedUserLabelIdentity"),
             """
-            v71 is the single whole-database FK gate in this range; if it stopped being \
-            `.deferred`, nothing catches a pre-existing orphan at all
+            v82 is the LAST whole-database FK gate in this range; if it stopped being \
+            `.deferred`, nothing in v68…v83 catches a pre-existing orphan at all
             """)
         #expect(!applied.contains("v83_markAllAsReadUnreadSweepIndex"))
     }

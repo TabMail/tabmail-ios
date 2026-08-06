@@ -28,13 +28,26 @@ import GRDB
 /// difference IS the whole-database foreign-key check. Without it, a version
 /// that measures nothing and logs zeros passes.
 ///
-/// The control pair is taken from the SHIPPING chain rather than from synthetic
-/// probe migrations: `v68` and `v71` are both a single
-/// `ALTER TABLE … ADD COLUMN` against a table holding a handful of rows, so
-/// their bodies cost the same nothing — and `v68` runs `.immediate` while `v71`
-/// is the one deliberately-kept whole-database gate. Measuring the real pair
-/// means the control also fails if `v71`'s mode is ever quietly flipped, which a
-/// pair of throwaway probes would not notice.
+/// ⚑ THE CONTROL PAIR IS NOW SYNTHETIC, AND THE PARAGRAPH THAT STOOD HERE SAID
+/// THE OPPOSITE. It read: *"The control pair is taken from the SHIPPING chain
+/// rather than from synthetic probe migrations: `v68` and `v71` are both a single
+/// `ALTER TABLE … ADD COLUMN` … Measuring the real pair means the control also
+/// fails if `v71`'s mode is ever quietly flipped, which a pair of throwaway probes
+/// would not notice."* That reasoning was sound and is now inapplicable: **`v71`
+/// was deliberately flipped to `.immediate` on 2026-08-06** (it cost 12,083 ms of
+/// whole-database `PRAGMA foreign_key_check` on the owner's device to guard one
+/// `ADD COLUMN`), and `v82` followed, so **no matched `.deferred`/`.immediate`
+/// pair with equal body cost exists in the shipping chain any more.** `v82` is not
+/// a substitute — its body rebuilds two tables, so a difference in post-body
+/// interval would not isolate the check.
+///
+/// The duty the real pair used to carry — *noticing a quiet mode flip* — has moved
+/// to `MigrationForeignKeyModeTests`, which asserts the END STATE the range is
+/// deliberately in. What is left here is the ledger's own arithmetic, and for that
+/// two probe migrations registered through the PRODUCTION wrapper
+/// (`DatabaseMigrator.registerTimedMigration`, made internal for this) are a
+/// strictly better control: identical bodies, opposite modes, same database, same
+/// instant.
 ///
 /// `.serialized` + `.processGlobalState`: `MigrationTimingGate.forcedForTesting`
 /// is process-wide. The ledger itself is keyed by `Database` identity, so a
@@ -44,6 +57,13 @@ import GRDB
 struct MigrationTimingAttributionTests {
 
     private static let v67 = "v67_addUidResolutionRetryCount"
+
+    /// Probe identifiers for the non-vacuity control. Deliberately NOT `vNN_`
+    /// shaped: they are appended to a throwaway migrator inside one test, never
+    /// registered by `AppDatabase.registerAllMigrations`, and must be impossible to
+    /// mistake for a shipping migration in a log line or a `grdb_migrations` dump.
+    private static let probeImmediate = "probe_timingControl_immediate"
+    private static let probeDeferred = "probe_timingControl_deferred"
 
     /// A v67-shaped database with `refs` foreign-key-bearing child rows, built
     /// with the recording gate OFF so the setup migrations are not recorded.
@@ -170,10 +190,13 @@ struct MigrationTimingAttributionTests {
         // The mode label is the diagnostic: it is what lets a reader see that a
         // multi-second gap is a whole-database check and not a slow commit.
         let deferred = Set(report.entries.filter { $0.mode == "deferred" }.map(\.identifier))
-        #expect(deferred == [
-            "v71_addOutboxDraftRfc822MessageId",
-            "v82_accountScopedUserLabelIdentity",
-        ], "the two deliberately-deferred migrations must be labelled as such")
+        #expect(deferred == ["v82_accountScopedUserLabelIdentity"],
+                """
+                `v82` is the last deliberately-deferred migration in the v68…v83 range \
+                (`v71` was flipped to `.immediate` on 2026-08-06) and must be labelled \
+                as such — the mode label is what tells a reader a multi-second gap is a \
+                whole-database check and not a slow commit
+                """)
         #expect(report.entries.allSatisfy { $0.mode == "deferred" || $0.mode == "immediate" })
     }
 
@@ -188,10 +211,30 @@ struct MigrationTimingAttributionTests {
         // margin that thin would turn into a flake on faster hardware.
         let db = try Self.makeSeededV67Database(headers: 2_000, refs: 120_000)
 
+        // THE MATCHED PAIR, registered through the production wrapper and appended
+        // AFTER the real chain: one `ALTER TABLE outboxMessage ADD COLUMN` each,
+        // against a table holding zero rows, so the bodies cost the same nothing.
+        // The only difference between them is the foreign-key mode, which is
+        // precisely what the post-body interval is supposed to be measuring.
         let report: MigrationTimingLedger.Report? = try Self.withRecording {
-            try AppDatabase.runMigrations(on: db)
-            return db.writeWithoutTransaction {
-                MigrationTimingLedger.shared.consumeReport(db: $0)
+            var migrator = DatabaseMigrator()
+            AppDatabase.registerAllMigrations(on: &migrator)
+            migrator.registerTimedMigration(
+                Self.probeImmediate, foreignKeyChecks: .immediate
+            ) { db in
+                try db.alter(table: "outboxMessage") { $0.add(column: "probeImmediate", .text) }
+            }
+            migrator.registerTimedMigration(
+                Self.probeDeferred, foreignKeyChecks: .deferred
+            ) { db in
+                try db.alter(table: "outboxMessage") { $0.add(column: "probeDeferred", .text) }
+            }
+            try migrator.migrate(db)
+            return db.writeWithoutTransaction { db -> MigrationTimingLedger.Report? in
+                // The last body has no successor to close its interval, exactly as
+                // in `AppDatabase.runMigrations`.
+                MigrationTimingLedger.shared.finish(db: db)
+                return MigrationTimingLedger.shared.consumeReport(db: db)
             }
         }
         guard let report else {
@@ -199,26 +242,23 @@ struct MigrationTimingAttributionTests {
             return
         }
 
-        // The matched pair: one `ALTER TABLE … ADD COLUMN` each, against `folder`
-        // (1 row) and `outboxMessage` (0 rows) respectively. Same body cost,
-        // opposite foreign-key mode.
         guard
-            let immediate = report.entries.first(where: {
-                $0.identifier == "v68_addFolderUidValidityResetPending"
-            }),
-            let deferred = report.entries.first(where: {
-                $0.identifier == "v71_addOutboxDraftRfc822MessageId"
-            })
+            let immediate = report.entries.first(where: { $0.identifier == Self.probeImmediate }),
+            let deferred = report.entries.first(where: { $0.identifier == Self.probeDeferred })
         else {
-            Issue.record("the v68/v71 control pair is missing from the report")
+            Issue.record("""
+                the probe control pair is missing from the report — it carried \
+                \(report.entries.count) entries ending \
+                \(report.entries.suffix(3).map(\.identifier))
+                """)
             return
         }
         #expect(immediate.mode == "immediate")
         #expect(deferred.mode == "deferred",
                 """
-                v71 is the range's single whole-database gate; if it ever becomes \
-                `.immediate` this control silently stops controlling anything, so the \
-                mode is asserted rather than assumed
+                the probes must reach GRDB with the modes they declared; if the wrapper \
+                ever stopped forwarding `foreignKeyChecks:` this control would silently \
+                stop controlling anything, so the mode is asserted rather than assumed
                 """)
 
         let immediateGap = immediate.postBodyMs ?? -1
