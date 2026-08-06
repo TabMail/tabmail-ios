@@ -131,8 +131,13 @@ public enum MessageIdentity {
     /// through this function and then appends `":\(instanceEpoch):\(count)"` in its
     /// epoch arm — the arm `queueDraftSave` always takes. So a reply draft's
     /// placeholder still reaches the guards with raw colons in its tail no matter what
-    /// this function does. Registered; do NOT "fix" it by re-keying here, which would
-    /// orphan every live placeholder and every in-flight draft at upgrade.
+    /// this function does. Registered as **`IOS-IDENTITY-002`** in
+    /// `tabmail-ios/KNOWN_ISSUES.md` — read that row for the recoverability and the
+    /// named non-recovering case. (This said only "Registered", with no id, until
+    /// 2026-08-05: a citation with no referent is the same defect as a stale
+    /// `file:line` — it reads as discharged and cannot be checked.) Do NOT "fix" it
+    /// by re-keying here, which would orphan every live placeholder and every
+    /// in-flight draft at upgrade.
     ///
     /// What has NOT changed: never relax the guards. They are what makes folder
     /// scoping correct under a ':'-delimiter IMAP server; widening them lets a nested

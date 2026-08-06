@@ -142,10 +142,26 @@ Sources: [Graph `event: delete`](https://learn.microsoft.com/en-us/graph/api/eve
    set on `put`, never on `delete`), no confirmation re-read, and no epoch/identity gate — it
    resolves a URL from the event id and issues the `DELETE`.
 
-   **NOT a range regression.** `git diff 07a4bb703..HEAD --` over `TabMail/Providers/CalDAV/`,
-   `AccountManagerCalendarQueue.swift`, `GoogleCalendarProvider.swift` and
-   `ExchangeCalendarProvider.swift` is **empty**. This is a pre-existing surface that the previous
-   enumeration could not see, not something v3 introduced.
+   **NOT a range regression — the CONCLUSION survives, the EVIDENCE as originally written does
+   not.** ⚠️ **CORRECTED 2026-08-05 (round-10 F5b).** This paragraph said: *"`git diff
+   07a4bb703..HEAD --` over `TabMail/Providers/CalDAV/`, `AccountManagerCalendarQueue.swift`,
+   `GoogleCalendarProvider.swift` and `ExchangeCalendarProvider.swift` is **empty**."* **It is not
+   empty, and it was already not empty when written.** Re-run with an EXPLICIT revision range —
+   `git diff --numstat 07a4bb703..3974e4280 -- TabMail/Providers/CalDAV/` — it reports
+   **`CalDAVClient.swift` 39 insertions / 4 deletions** and **`CalDAVProvider.swift` 58 insertions /
+   12 deletions**; the other three paths ARE unchanged over that range. The CalDAV delta is the
+   round-9 remediation that introduced `CalDAVPutPrecondition` and rewrote `revertMasterCap`.
+
+   **The conclusion is unaffected**, and that is the point of correcting it rather than deleting it:
+   none of those 97 changed lines touches `deleteEvent` or `CalDAVClient.delete`, so `deleteEvent` IS
+   pre-existing and IS a surface the earlier enumeration could not see. The defect was the
+   INSTRUMENT, twice over: (a) it cited **`..HEAD`**, a moving target, so the command's answer
+   changes under a durable document that quotes it — never write `..HEAD` in a durable document,
+   always pin both ends (`feedback_line_citations_go_stale`); and (b) it read a directory-level diff
+   as a proxy for a symbol-level question, so a real change to a SIBLING symbol in the same directory
+   was reported as "empty". Ask the question you mean: *did `deleteEvent` or `CalDAVClient.delete`
+   change in this range?* — `git log -L` on the symbol, or `git diff <base>..<rev> -- <file>` read
+   for the hunk that contains it.
 
    **Consequence for design, which is the only reason this matters:** a fail-closed argument for a
    *calendar* path may not lean on "nothing is ever destroyed". For CalDAV specifically, a wrong or
@@ -156,6 +172,89 @@ Sources: [Graph `event: delete`](https://learn.microsoft.com/en-us/graph/api/eve
    [RFC 4791 (CalDAV)](https://datatracker.ietf.org/doc/html/rfc4791),
    [Apple — Restore your calendars and events on iCloud.com](https://support.apple.com/guide/icloud/restore-your-calendars-and-events-mm7478c562f3/icloud),
    [Nextcloud calendar trashbin regression #30096](https://github.com/nextcloud/server/issues/30096).
+
+### ⚠️ MEMBERSHIP IS DEFINED BY A PROPERTY, NOT BY A VERB — and the three greps are a LOWER BOUND, not the enumeration (added 2026-08-05, round-10 F4)
+
+**Everything above this heading stands and nothing in it is retracted.** What is corrected is the
+*shape of the question*. The three `--multiline` searches recorded at the top of this file
+(`method\s*:\s*"DELETE"`, `httpMethod\s*=\s*"DELETE"`, `expunge\(`) are all searches for a
+**verb**. The set they are supposed to enumerate is defined by a **property**:
+
+> **THE PROPERTY.** A wire call belongs to this set when, **at the moment it succeeds**, some
+> user-authored content that existed on the server no longer exists there, and TabMail cannot name a
+> documented per-item recovery path that its own call actually reaches.
+
+Read that predicate and then read the three greps: **a verb-shaped search cannot see a destructive
+call that is not spelled with a destructive verb.** The property is about the *effect on the stored
+representation*, and an HTTP `PUT` replaces a representation — the previous bytes are gone. So the
+enumeration was structurally blind to an entire axis, and the blindness is not a counting error that
+a more careful re-run of the same three patterns would catch. `MIS-007` again, one level up: the
+first correction fixed the SPELLING of a verb (`method:` vs `httpMethod =`) while leaving the
+*category* — "destructive means DELETE" — unexamined.
+
+**THE REPLACEMENT AXIS — run these too, and treat them exactly as the DELETE patterns are treated:
+as a lower bound on the property, never as its definition.**
+
+| # | pattern | hits at `3974e4280` | disposition |
+|---|---|---|---|
+| D | `httpMethod\s*=\s*"PUT"` | 2 | `CalDAVClient.swift:82` — the CalDAV `PUT`; adjudicated below. `TabMailAuthService.swift:273` — TabMail's own backend, not user content on a mail/calendar server; excluded. |
+| E | `method\s*:\s*"PUT"` | 2 | `AuthedHTTP.swift:50` is the generic helper, not a wire op. `GmailProvider.swift:655` — `PUT /drafts/{existingId}`; adjudicated below. |
+
+**⚠️ NEVER WRITE A BARE INTEGER FOR THIS SET WITHOUT THE REVISION IT WAS DERIVED AT.** Every count in
+this file — 5, 7, 3, 4, 2, 2 — is a measurement of one tree at one commit, and this file has already
+carried a stale one past the code it described (`MIS-007`, 43 recorded instances). Write *"five at
+`3e63335b2`"*, not *"five"*. If you are restating a number from this file into a brief, a review
+prompt, or `CLAUDE.md`, carry the revision with it or do not carry the number.
+
+#### Adjudication — `CalDAVProvider.splitSeries` **IS IN THE SET** (the cap `PUT`)
+
+`splitSeries` step 3 issues `client.put(url: eventURL, body: cappedICS, …)` against the **existing
+master event resource**. That PUT replaces the master's representation with one whose `RRULE` carries
+an `UNTIL=` cap: **every occurrence after the split point ceases to exist on the server**, and the
+pre-cap representation is gone. WebDAV defines no versioning, no undelete, and no restore for it
+(RFC 4918) — the same absence that puts `CalDAVProvider.deleteEvent` in the set as (5). It satisfies
+THE PROPERTY exactly, and no `DELETE`-shaped or `expunge`-shaped search could ever have found it.
+
+It is **not** a sixth numbered member of the list above, and the distinction is worth stating because
+it is the reusable part: entries (1)–(5) are *deletion* operations, and `splitSeries` is a
+*replacement* operation. Both destroy; only one is spelled like it. The list above is the **deletion
+family**; this section is the **replacement family**, and the two together are the property's current
+membership at `3974e4280`.
+
+**Consequence for design, which is the whole reason this matters.** `splitSeries` is a
+**multi-step** irreversible operation — cap the master, then create the successor — and its rollback
+is a best-effort compensating `PUT`, not a transaction. Round 10 (F1, F2) closed the two ways that
+compensation went wrong: the rollback now carries `.ifMatch(capETag)` using the tag the cap PUT's own
+2xx returned, so it overwrites **our own** write and refuses a concurrent editor's; and a 412 from
+the create-only successor PUT is discriminated by probing the deterministic successor URL for our own
+UID, so a lost ACK retires the op instead of un-capping a master that already has a live successor
+(which would duplicate every post-split occurrence) or wedging the account's calendar lane forever on
+an error `AccountManagerCalendarQueue.isCalendarBadRequestError` does not classify. **Do not widen
+the successor PUT past `.ifNoneMatchAny`, and do not make the rollback unconditional again.**
+
+#### Adjudication — `GmailProvider.saveDraft`'s update arm is **NOT** in the set
+
+`PUT /drafts/{existingId}` replaces a Gmail draft's content, so it destroys the previous revision of
+user-authored bytes. It is nevertheless **excluded, on positive evidence rather than on absence** —
+the same standard this file applies to `ExchangeProvider.deleteDraft` and the two non-CalDAV calendar
+providers: the content it replaces is a draft revision the local `draft` row still holds, and the
+call is the *mechanism by which the user's own newest text reaches the server*. Refusing it does not
+preserve a user intention; it drops one. ⚠️ **The negative case:** this exclusion is about a draft
+overwriting ITSELF with a newer authored revision. If a code path ever PUTs a draft resource with
+content it did not derive from that draft's own current local state — a merge, a template, a
+regeneration keyed on a stale snapshot — that call destroys authored bytes with no local copy behind
+them and belongs in the set. The Stage A/B CAS in `DraftStore.applySave` is what currently makes that
+impossible; if it is removed, re-adjudicate this line.
+
+#### What would falsify THIS section
+
+(a) A third destructive-by-replacement spelling appears — `PATCH` that replaces rather than merges
+(Graph's `PATCH /events/{id}` in `ExchangeCalendarProvider.splitSeries` merges named fields and is
+excluded on that basis, but a full-resource `PATCH` would not be), a `POST` that overwrites, or a
+`URLRequest` whose method is computed. (b) A CalDAV or CardDAV `PUT` is added on a path whose prior
+representation has no local copy. (c) `splitSeries` gains a third wire step, which would widen the
+window its compensating rollback has to cover. (d) The property itself is restated more narrowly by
+someone reading "irreversible" as "spelled DELETE" — which is the error this section exists to stop.
 
 ### The negative cases — because an absolute without one is unfinished
 
@@ -232,3 +331,14 @@ Gmail's `.gmailContainedMessage` arm trashes rather than destroys, declining to 
 `ExchangeProvider.deleteDraft`, and linking back to this file. The remaining stale copy of the
 absolute was `IMAPProvider.deleteDraftStrong`'s inline comment (*"one of the two irreversible wire
 operations"*); it was corrected to **four** on 2026-08-05 and now points here as the authority.
+
+⚠️ **A SECOND HANDOFF IS OPEN (2026-08-05, round-10 F4).** `tabmail-ios/CLAUDE.md`'s THE MANTRA block
+now enumerates **five** operations and lists **three** census patterns — all of them
+`DELETE`/`expunge`-shaped. It therefore inherits exactly the blindness the *"MEMBERSHIP IS DEFINED BY
+A PROPERTY"* section above corrects: it states the set by verb, and it carries the bare integer
+"five" with the rev only in the routed detail. **That file was dirty in the owner's working tree when
+this entry was written and was deliberately NOT edited** — the same reason the first handoff was
+deferred. It needs: membership stated by THE PROPERTY, the three greps demoted to a lower-bound
+cross-check, patterns D and E added, `CalDAVProvider.splitSeries` adjudicated in, and the integer
+never restated without its revision. Until that edit lands, **this file is the authority** and
+`CLAUDE.md`'s MANTRA already says so (*"Detail and evidence: …102-…"*).
