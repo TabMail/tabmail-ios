@@ -135,9 +135,18 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// Graph dedupes POSTs by `transactionId` within a bounded window, which is
     /// exactly this problem — and `ExchangeCalendarProvider.splitSeries` already
     /// uses that mechanism for lost-ACK dedup on its own create. This follows
-    /// that existing pattern rather than inventing one; the drain's
+    /// that existing pattern rather than inventing one.
+    ///
+    /// ⚠️ CORRECTED 2026-08-06 (R13-U3). This paragraph used to end *"the drain's
     /// `catch ExchangeCalendarError.httpError(409, _)` arm already treats Graph's
-    /// duplicate-transaction refusal as success.
+    /// duplicate-transaction refusal as success"* — and that arm has been removed,
+    /// because Microsoft documents no such refusal. `transactionId` is defined as a
+    /// value *"for the server to AVOID REDUNDANT POST operations in case of client
+    /// retries"*: a deduped retry receives the ORIGINAL success response, not a
+    /// conflict. Graph's calendar-POST 409s are store-level save conflicts. The
+    /// idempotency this method provides is therefore what makes the RETRY safe, and
+    /// it never depended on a 409 arm; the arm was leaning on this comment and this
+    /// comment was leaning on the arm.
     ///
     /// The key is the queue's own durable pre-generated event id
     /// (`if let pregenId = op.eventId { input.id = pregenId }`), so it is stable
@@ -397,27 +406,49 @@ actor ExchangeCalendarProvider: CalendarProvider {
             }
             let created = try JSONDecoder().decode(MSEvent.self, from: data)
             return toGCalEvent(created)
-        } catch ExchangeCalendarError.httpError(409, _) {
-            // 409 Conflict — Graph rejected the POST as a duplicate
-            // transactionId, i.e. the new series was already created on a
-            // prior (lost-ACK) attempt. The split already completed; do NOT
-            // revert the master cap. The queue only logs the returned id, so
-            // surface a minimal success marker.
-            print("[ExchangeCalendar] splitSeries: new series already exists (duplicate transactionId) — treating as success")
-            return GCalEvent(
-                id: "", summary: newSeriesInput.summary, location: newSeriesInput.location,
-                description: newSeriesInput.description, start: nil, end: nil, attendees: nil,
-                organizer: nil, recurrence: [rruleWithoutCap], transparency: newSeriesInput.transparency,
-                status: "confirmed", htmlLink: nil, created: nil, updated: nil
-            )
         } catch {
-            // Best-effort revert: restore the master's original recurrence.
+            // ⚠️ THERE IS DELIBERATELY NO `catch ExchangeCalendarError.httpError(409, _)`
+            // AHEAD OF THIS (R13-U3). Until 2026-08-06 a 409 here returned a
+            // FABRICATED `GCalEvent(id: "")` — a synthetic success with no id, no
+            // start and no end, built entirely from the request we had just failed
+            // to send. The queue then reported the split done and deleted the
+            // durable op, leaving a truncated master with no successor series.
+            //
+            // Its premise — "Graph rejected the POST as a duplicate transactionId"
+            // — is not what Microsoft documents. The `event` resource defines
+            // `transactionId` as a value *"for the server to AVOID REDUNDANT POST
+            // operations in case of client retries"*: a deduped retry receives the
+            // ORIGINAL success response, so a 409 is evidence AGAINST the dedup
+            // reading, not for it. Graph's observed calendar-POST 409s are
+            // store-level save conflicts (`ConcurrentItemSave`,
+            // `IrresolvableConflict`) which say nothing about whether the item
+            // exists. A 409 therefore takes this arm now: the master cap is
+            // reverted and the error is rethrown for the drain to classify as
+            // indeterminate-and-retryable, and the retry re-runs the whole split
+            // against an uncapped master.
+            //
+            // 🚨 R13-U4 — A FAILED ROLLBACK IS NOT THE SAME OUTCOME AS A SUCCESSFUL
+            // ONE, and this used to report them identically via `try?`. If the
+            // create failed with a 400/415/422, `isCalendarBadRequestError` claims
+            // the rethrown error and the drain DELETES the durable row — so when
+            // the revert had also failed, the master was left permanently capped,
+            // with no successor and no queued work to make one. Later sync imports
+            // the truncated master and cannot reconstruct the original recurrence.
+            //
+            // On a revert failure this now raises `CalDAVError.inconsistentState`,
+            // which the drain claims at its own dedicated arm with exactly this
+            // rationale already written there (*"retrying would re-cap an
+            // already-capped master and create duplicate successor series"*). That
+            // arm is terminal-with-a-reason and surfaces the message to the user —
+            // NOT transient: this is deliberately not "make every rollback failure
+            // retryable", which would put a two-step write that has already half
+            // landed into an unbounded retry.
+            var revertInput = GCalEventInput()
+            revertInput.recurrence = masterRecurrence
             // SAME Graph quirk as the cap PATCH above — sending ONLY
             // `recurrence` causes Graph to silently rewrite the master's
             // start/end to UTC midnight at `range.startDate`. Include the
             // master's existing start/end so its first occurrence stays put.
-            var revertInput = GCalEventInput()
-            revertInput.recurrence = masterRecurrence
             if let startISO = master.start?.dateTime,
                let startTz = master.start?.timeZone {
                 revertInput.startDateTime = startISO
@@ -428,14 +459,25 @@ actor ExchangeCalendarProvider: CalendarProvider {
                 revertInput.endDateTime = endISO
                 revertInput.endTimeZone = endTz
             }
-            let revertBody = try? JSONSerialization.data(withJSONObject: toGraphEventJSON(revertInput))
-            if let revertBody {
+            var revertFailure: Error?
+            if let revertBody = try? JSONSerialization.data(withJSONObject: toGraphEventJSON(revertInput)) {
                 if let bodyStr = String(data: revertBody, encoding: .utf8) {
                     print("[ExchangeCalendar] splitSeries revert PATCH body=\(bodyStr.prefix(4000))")
                 }
-                _ = try? await request(path: "/events/\(encodedMasterId)", method: "PATCH", body: revertBody)
+                do {
+                    _ = try await request(path: "/events/\(encodedMasterId)", method: "PATCH", body: revertBody)
+                } catch let revertError {
+                    revertFailure = revertError
+                    print("[ExchangeCalendar] splitSeries revert PATCH FAILED: \(revertError)")
+                }
+            } else {
+                // The revert request could not even be built, so the master is
+                // still capped — the same end state as a failed PATCH, and it must
+                // not be reported as a successful rollback.
+                revertFailure = CalendarProviderError.notSupported("the revert payload could not be encoded")
+                print("[ExchangeCalendar] splitSeries revert PATCH body could not be encoded — master left capped")
             }
-            throw error
+            throw GoogleCalendarProvider.splitRollbackError(original: error, revertFailure: revertFailure)
         }
     }
 

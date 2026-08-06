@@ -273,6 +273,54 @@ struct CalendarBadRequestClassificationTests {
         }
     }
 
+    @Test("R13-U4 — a split whose ROLLBACK also failed never leaves through the malformed-payload door")
+    func aFailedSplitRollbackDoesNotRetireAsABadRequest() {
+        // SYSTEM PROPERTY: a series that has been CAPPED on the server, with no
+        // successor created and no rollback, must not be retired by the arm that
+        // exists for "your payload is broken" — because that arm deletes the
+        // durable row silently, and the user is left with a recurring series that
+        // ends early, no queued work to fix it, and no way for sync to know.
+        //
+        // The pre-fix shape reported both rollback outcomes identically
+        // (`_ = try? await updateEvent(… revertInput …)` then `throw error`), so
+        // whether the master was still capped made no difference to the queue's
+        // disposition at all. This composes the real classifier used by BOTH
+        // providers with the drain's real terminal roster.
+        //
+        // 400 is chosen deliberately: it is exactly the code that makes the
+        // difference visible. `isCalendarBadRequestError` claims a bare 400, so
+        // pre-fix the whole half-landed split vanished through it.
+        let original = ExchangeCalendarError.httpError(400, nil)
+
+        // ROLLBACK SUCCEEDED — the master is back to its pre-split state, so the
+        // pre-existing disposition is still correct and must NOT change. Pinning
+        // this side is what stops the fix from over-reaching into "every split
+        // failure is now inconsistentState".
+        let recovered = GoogleCalendarProvider.splitRollbackError(original: original, revertFailure: nil)
+        #expect(AccountManager.isCalendarBadRequestError(recovered),
+                "a split whose rollback succeeded leaves nothing half-written; retiring the malformed 400 is right and this fix must not have changed it")
+
+        // ROLLBACK FAILED — the server is in a state no retry of this op can
+        // repair (a retry re-caps an already-capped master), and no silent
+        // deletion may claim it.
+        let stranded = GoogleCalendarProvider.splitRollbackError(
+            original: original, revertFailure: URLError(.timedOut))
+        #expect(AccountManager.isCalendarBadRequestError(stranded) == false,
+                "the half-landed split was retired as a malformed request — the durable row is deleted and the truncated master is left on the server with nothing queued to repair it")
+        #expect(claimedByATerminalArm(stranded),
+                "it must still reach SOME terminal arm — falling into the transient arm would head-of-line-block every later calendar op on the account, which is the wedge this suite's other tests guard against")
+
+        // The user has to fix this by hand, so both causes must survive into the
+        // reason string the drain surfaces.
+        guard case CalDAVError.inconsistentState(let reason) = stranded else {
+            Issue.record("expected inconsistentState, got \(stranded)")
+            return
+        }
+        #expect(reason.contains("400"), "the original create failure must survive into the reason: \(reason)")
+        #expect(reason.lowercased().contains("timed out") || reason.contains("-1001"),
+                "the rollback failure must survive into the reason too, or the user is told only half the story: \(reason)")
+    }
+
     @Test("Non-4xx statuses and non-HTTP errors are never classified as malformed")
     func nonClientErrorsAreNeverRetired() {
         for code in [200, 302, 500, 502, 503] {

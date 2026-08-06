@@ -413,6 +413,21 @@ actor GoogleCalendarProvider: CalendarProvider {
             // Best-effort revert of step 1 so we don't leave the master truncated
             // with no replacement series. Same defensive include-start/end as
             // the cap above — partial PATCH could in principle re-anchor.
+            //
+            // 🚨 R13-U4 — A FAILED ROLLBACK IS NOT THE SAME OUTCOME AS A SUCCESSFUL
+            // ONE, and `try?` reported them identically. If the create failed with a
+            // 400/415/422, `isCalendarBadRequestError` claims the rethrown error and
+            // the drain DELETES the durable row — so when the revert had also
+            // failed, the master was left permanently capped, with no successor and
+            // no queued work to make one. Later sync imports the truncated master
+            // and cannot reconstruct the original recurrence.
+            //
+            // On a revert failure this raises `CalDAVError.inconsistentState`, whose
+            // drain arm is terminal-with-a-reason and surfaces the message to the
+            // user — deliberately NOT transient, because retrying a two-step write
+            // that has already half landed re-caps an already-capped master.
+            // Identical treatment to the Exchange sibling: one invariant, two
+            // spellings, kept in step on purpose.
             var revertInput = GCalEventInput()
             revertInput.recurrence = masterRecurrence
             if master.isAllDay {
@@ -424,14 +439,58 @@ actor GoogleCalendarProvider: CalendarProvider {
                 if let e = master.end?.dateTime { revertInput.endDateTime = e }
                 if let tz = master.end?.timeZone { revertInput.endTimeZone = tz }
             }
-            _ = try? await updateEvent(
-                calendarId: calendarId,
-                eventId: eventId,
-                event: revertInput,
-                sendUpdates: "none"
-            )
-            throw error
+            var revertFailure: Error?
+            do {
+                _ = try await updateEvent(
+                    calendarId: calendarId,
+                    eventId: eventId,
+                    event: revertInput,
+                    sendUpdates: "none"
+                )
+            } catch let revertError {
+                revertFailure = revertError
+                print("[GoogleCalendar] splitSeries revert FAILED: \(revertError)")
+            }
+            throw Self.splitRollbackError(original: error, revertFailure: revertFailure)
         }
+    }
+
+    /// 🚨 **R13-U4 — the error a half-landed split reports depends on whether its
+    /// ROLLBACK worked.** Shared by both `splitSeries` implementations so the two
+    /// spellings of one invariant cannot drift apart.
+    ///
+    /// A split is cap-then-create. If the create fails, both providers try to
+    /// restore the master's original recurrence and then rethrow. Until
+    /// 2026-08-06 the restore was `_ = try? await updateEvent(…)`, which reports a
+    /// failed rollback and a successful one IDENTICALLY. That matters because the
+    /// rethrown error decides the queue's disposition: when the create failed with
+    /// a 400/415/422, `isCalendarBadRequestError` claims it and the drain DELETES
+    /// the durable row — so a rollback that had ALSO failed left the master
+    /// permanently capped, with no successor series and no queued work to make
+    /// one. Later sync imports the truncated master and cannot reconstruct the
+    /// original recurrence.
+    ///
+    /// - `revertFailure == nil` ⇒ the original error, verbatim. The master is back
+    ///   to its pre-split state, so the pre-existing disposition is still right and
+    ///   this deliberately changes nothing about it.
+    /// - `revertFailure != nil` ⇒ `CalDAVError.inconsistentState`, carrying BOTH
+    ///   causes. The drain has a dedicated arm for that case whose own comment
+    ///   already states the rationale (*"retrying would re-cap an already-capped
+    ///   master and create duplicate successor series"*): terminal, with the reason
+    ///   surfaced to the user.
+    ///
+    /// ⚠️ NOT "make every rollback failure retryable" — that is the mirror image,
+    /// and it would put a two-step write that has already half landed into an
+    /// unbounded retry against a master that is already capped. Terminal-with-a-
+    /// reason is the disposition that is neither a silent drop nor a wedge.
+    ///
+    /// The case is `CalDAVError.inconsistentState` rather than a Google- or
+    /// Graph-domain twin because that is the case the drain already claims;
+    /// inventing a third spelling of one state is how classifiers drift.
+    static func splitRollbackError(original: Error, revertFailure: Error?) -> Error {
+        guard let revertFailure else { return original }
+        return CalDAVError.inconsistentState(
+            "the recurring series was capped but its replacement series could not be created (\(original)), and restoring the original recurrence also failed (\(revertFailure)). The series now ends early on the server and needs its recurrence fixed by hand.")
     }
 
     // MARK: - Recurring helpers

@@ -463,15 +463,57 @@ extension AccountManager {
                 if let realId = created.id, !realId.isEmpty {
                     createdRealId = realId
                 }
-            } catch GoogleCalendarError.httpError(409, _) {
-                // 409 Conflict — event already exists (crash recovery duplicate). Success.
-                print("[CalendarQueue] Event already exists (409) — treating as success")
-            } catch ExchangeCalendarError.httpError(409, _) {
-                print("[CalendarQueue] Event already exists (409) — treating as success")
+            } catch GoogleCalendarError.httpError(409, let body)
+                        where op.eventId != nil && Self.isGoogleDuplicateIdConflict(body) {
+                // 🚨 R13-U3 — POSITIVELY IDENTIFIED, not assumed.
+                // Google documents exactly two 409s on `events.insert`
+                // (developers.google.com/workspace/calendar/api/guides/errors):
+                // reason `"duplicate"` — *"The requested identifier already
+                // exists"* — and reason `"conflict"`, an `events.batch`
+                // operational conflict. Only the first is proof the event is
+                // there. Both arms of this `catch` are required: the reason must
+                // be `duplicate` AND we must have supplied the id in the first
+                // place (`op.eventId != nil` ⇒ `input.id = pregenId` above), or
+                // "the identifier already exists" is not a statement about OUR
+                // event. Everything else — including a bare 409 with no body —
+                // falls through to the drain, which round 12 deliberately
+                // classified as indeterminate-and-retryable.
+                //
+                // Google echoes the client-supplied id back as the event id, so
+                // the duplicate's real id IS our pre-generated one. Recording it
+                // is what keeps the agent's follow-up edit/delete addressed at the
+                // event instead of at a nil id.
+                print("[CalendarQueue] Google reports our pre-generated id already exists (409 duplicate) — the create already landed")
+                createdRealId = op.eventId
             } catch CalDAVError.preconditionFailed {
                 // 412 Precondition Failed — CalDAV idempotent create (If-None-Match: *). Event exists. Success.
+                // Positive by construction, unlike the two 409s: the provider sent
+                // `If-None-Match: *`, so 412 is the server answering the exact
+                // question "does this resource already exist?" with yes.
                 print("[CalendarQueue] CalDAV event already exists (412) — treating as success")
             }
+            // ⚠️ THERE IS DELIBERATELY NO `catch ExchangeCalendarError.httpError(409, _)`
+            // HERE (R13-U3). It existed until 2026-08-06 and converted EVERY Graph
+            // 409 into success — deleting the durable row and reporting the create
+            // done, with `createdRealId` nil, on an outcome that is not proof of
+            // anything. **Microsoft documents no 409 for a repeated
+            // `transactionId`.** The `event` resource defines that property as
+            // *"a custom identifier specified by a client app for the server to
+            // AVOID REDUNDANT POST OPERATIONS in case of client retries"* — i.e. a
+            // deduped retry gets the original success response, not a conflict. A
+            // 409 from Graph's calendar POST is a store-level save conflict
+            // (`ConcurrentItemSave`, `IrresolvableConflict`), which is exactly the
+            // *"we could not determine the answer"* that never-drop clause 2 makes
+            // retryable — and which round 12 already classified as indeterminate in
+            // `isCalendarBadRequestError`. This catch was silently nullifying that.
+            //
+            // RETRY-SAFETY CLAIM, stated because making an outcome retryable is one
+            // (`MIS-005`): the operation newly admitted to retry is the Exchange
+            // `.create`, and it is duplicate-safe because `createEventJSON` stamps
+            // `transactionId` from the queue's DURABLE `op.eventId` — stable across
+            // every retry of one op, distinct for every distinct user create. That
+            // is the whole point of `6ace24d7e`; without it this removal would
+            // reinstate the duplicate-event exposure R12-T5 closed.
             return (nil, createdRealId)
 
         case .edit:
@@ -767,6 +809,37 @@ extension AccountManager {
         // already claimed by `isCalendarUnsupportedError` at the arm above.
         if case GoogleCalendarError.invalidPathSegment = error { return true }
         return false
+    }
+
+    /// Does this Google Calendar 409 body positively say *"the identifier you
+    /// supplied already exists"* (R13-U3)?
+    ///
+    /// Google documents exactly two 409 reasons on `events.insert`:
+    ///   * `"duplicate"` — *"The requested identifier already exists."* The event
+    ///     is there. This is the only one that is proof of anything.
+    ///   * `"conflict"` — *"a batched item inside an `events.batch` operation
+    ///     can't be executed due to an operational conflict."* Transient, and
+    ///     retryable per Google's own guidance.
+    /// Source: developers.google.com/workspace/calendar/api/guides/errors.
+    ///
+    /// ⚠️ FAIL-CLOSED, and the direction is load-bearing. Unparseable, empty and
+    /// unrecognised bodies all return `false`, which routes the error to the
+    /// drain's indeterminate/retry path — the SAFE side, because the retry is
+    /// duplicate-safe (Google rejects a second insert of the same client-supplied
+    /// id) while a wrong `true` would delete the user's intention on a conflict
+    /// that never created anything. A nil-defaulted or optimistic reading here
+    /// would be fail-DANGEROUS.
+    ///
+    /// `static` (hence nonisolated) so the discrimination is table-testable
+    /// against real Google error payloads, exactly like `isCalendarBadRequestError`.
+    static func isGoogleDuplicateIdConflict(_ body: Data?) -> Bool {
+        guard let body, !body.isEmpty,
+              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let err = json["error"] as? [String: Any] else { return false }
+        // Google puts the machine-readable reason on the per-error entries; the
+        // top-level object carries only `code` and `message`.
+        guard let errors = err["errors"] as? [[String: Any]] else { return false }
+        return errors.contains { ($0["reason"] as? String) == "duplicate" }
     }
 
     /// Best-effort extract of the server's reason string from a 4xx so the LLM
