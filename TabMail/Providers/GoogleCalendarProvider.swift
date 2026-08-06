@@ -118,6 +118,50 @@ actor GoogleCalendarProvider: CalendarProvider {
         return calendars.first(where: { $0.primary == true })?.id ?? "primary"
     }
 
+    // MARK: - Path segment encoding
+
+    /// 🚨 **R13-U1 — a calendar/event/instance id must occupy exactly ONE URL path
+    /// segment.** Every id below is interpolated into `/calendars/{id}/events/{id}`,
+    /// and `.urlPathAllowed` **passes `/` through unescaped** — so an id containing
+    /// `/` silently adds path segments, and `..` segments let the result walk out of
+    /// `/calendar/v3/` into a sibling Google API surface under the same OAuth token.
+    /// Reachable with an agent-authored `event_id`: the three calendar tools accept a
+    /// non-numeric `event_id` verbatim (see the note in `CalendarEventReadTool`).
+    ///
+    /// **Why this VALIDATES rather than re-encoding.** `GraphAPI.encodedGraphPathSegment`
+    /// is the sibling for Exchange and is deliberately NOT reused here: it allows only
+    /// RFC 3986 *unreserved*, which would newly percent-encode the `@` that every
+    /// Google secondary-calendar id contains (`x@group.calendar.google.com` →
+    /// `x%40group…`). `%40` and `@` are not formally equivalent in a path segment
+    /// (RFC 3986 §6.2.2.2 — `@` is a `pchar`, not unreserved), so adopting it would be
+    /// a wire change to a working primary path in the name of a hazard that only `/`
+    /// and dot-segments create. Instead the existing charset is kept byte-for-byte and
+    /// the OUTPUT is checked for the structural property that actually matters. Every
+    /// id that works today still produces the identical bytes.
+    ///
+    /// ⚠️ The `?? id` fallbacks this replaces were unreachable in practice
+    /// (`addingPercentEncoding` returns nil only for invalid Unicode, which a Swift
+    /// `String` cannot hold) — but per the precedent stated in
+    /// `AccountManagerCalendarQueue`, *"the caller never produces the value" is a
+    /// property of today's callers, not an invariant*, and the fallback's behaviour
+    /// was to emit the RAW id, i.e. the exact string this guard exists to refuse.
+    ///
+    /// Internal rather than private so `CalendarPathContainmentTests` can assert
+    /// the *bytes* this produces for an ordinary secondary-calendar id. That
+    /// assertion cannot be made through the provider: `GoogleCalendarProvider`
+    /// takes no `URLSession`, and adding a nil-defaulted one purely to observe the
+    /// wire would be a fail-DANGEROUS seam (a dropped injection silently reaches
+    /// the live internet).
+    static func encodedPathSegment(_ value: String, _ role: String) throws -> String {
+        guard let encoded = value.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
+            throw GoogleCalendarError.invalidPathSegment(role)
+        }
+        guard !encoded.contains("/"), encoded != ".", encoded != ".." else {
+            throw GoogleCalendarError.invalidPathSegment(role)
+        }
+        return encoded
+    }
+
     // MARK: - Events
 
     func listEvents(
@@ -129,7 +173,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         maxResults: Int = 250,
         orderBy: String = "startTime"
     ) async throws -> [GCalEvent] {
-        let encodedCalId = calendarId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? calendarId
+        let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
         var queryItems: [String] = []
         // Restrict to default calendar entries; excludes workingLocation / focusTime /
         // outOfOffice / birthday / fromGmail (these often have empty `summary` and
@@ -172,8 +216,8 @@ actor GoogleCalendarProvider: CalendarProvider {
     }
 
     func getEvent(calendarId: String = "primary", eventId: String) async throws -> GCalEvent {
-        let encodedCalId = calendarId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? calendarId
-        let encodedEventId = eventId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? eventId
+        let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
+        let encodedEventId = try Self.encodedPathSegment(eventId, "Google event id")
         let data = try await request(path: "/calendars/\(encodedCalId)/events/\(encodedEventId)")
         return try JSONDecoder().decode(GCalEvent.self, from: data)
     }
@@ -183,7 +227,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         event: GCalEventInput,
         sendUpdates: String = "all"
     ) async throws -> GCalEvent {
-        let encodedCalId = calendarId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? calendarId
+        let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
         let body = try JSONSerialization.data(withJSONObject: event.toJSON())
         let data = try await request(
             path: "/calendars/\(encodedCalId)/events?sendUpdates=\(sendUpdates)",
@@ -207,8 +251,8 @@ actor GoogleCalendarProvider: CalendarProvider {
         // recurrence silently rewrote start/end. Defense-in-depth.
         let existing = try await getEvent(calendarId: calendarId, eventId: eventId)
         let merged = Self.mergeExistingEventWithPatch(existing: existing, patch: event)
-        let encodedCalId = calendarId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? calendarId
-        let encodedEventId = eventId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? eventId
+        let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
+        let encodedEventId = try Self.encodedPathSegment(eventId, "Google event id")
         let body = try JSONSerialization.data(withJSONObject: merged.toJSON())
         let data = try await request(
             path: "/calendars/\(encodedCalId)/events/\(encodedEventId)?sendUpdates=\(sendUpdates)",
@@ -223,8 +267,8 @@ actor GoogleCalendarProvider: CalendarProvider {
         eventId: String,
         sendUpdates: String = "all"
     ) async throws {
-        let encodedCalId = calendarId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? calendarId
-        let encodedEventId = eventId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? eventId
+        let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
+        let encodedEventId = try Self.encodedPathSegment(eventId, "Google event id")
         _ = try await request(
             path: "/calendars/\(encodedCalId)/events/\(encodedEventId)?sendUpdates=\(sendUpdates)",
             method: "DELETE"
@@ -249,8 +293,8 @@ actor GoogleCalendarProvider: CalendarProvider {
         // instance returns 400. Resolve up front via the instance's
         // `recurringEventId` pointer.
         let (eventId, _) = try await resolveToMaster(calendarId: calendarId, eventId: eventId)
-        let encodedCalId = calendarId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? calendarId
-        let encodedMasterId = eventId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? eventId
+        let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
+        let encodedMasterId = try Self.encodedPathSegment(eventId, "Google master event id")
 
         // Find the instance whose start matches recurrenceId. Google's instances
         // endpoint accepts originalStart query (in RFC 3339) but parsing that
@@ -261,7 +305,7 @@ actor GoogleCalendarProvider: CalendarProvider {
             masterId: encodedMasterId,
             recurrenceId: recurrenceId
         )
-        let encodedInstanceId = instanceId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? instanceId
+        let encodedInstanceId = try Self.encodedPathSegment(instanceId, "Google occurrence id")
 
         // Fetch the actual instance event and merge the patch onto it — same
         // defensive full-payload pattern as `updateEvent`. Then strip
@@ -830,6 +874,13 @@ enum GoogleCalendarError: Error {
     case missingScope
     case httpError(Int, Data?)
     case eventNotFound
+    /// R13-U1 — a calendar/event/instance id could not be expressed as ONE URL
+    /// path segment, so the request was never issued. Deterministic in the stored
+    /// id, therefore never transient: `isCalendarBadRequestError` claims it so the
+    /// drain retires the op with a reason instead of retrying it forever.
+    /// Payload is the id's ROLE (e.g. "Google calendar id"), never the id itself —
+    /// this string reaches the user-facing failure reason.
+    case invalidPathSegment(String)
 }
 
 // MARK: - Response Models

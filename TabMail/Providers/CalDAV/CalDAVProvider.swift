@@ -128,7 +128,7 @@ actor CalDAVProvider: CalendarProvider {
         maxResults: Int,
         orderBy: String
     ) async throws -> [GCalEvent] {
-        let calURL = resolveURL(calendarId)
+        let calURL = try resolveURL(calendarId)
 
         // Build inner VEVENT filter parts — RFC 4791 allows combining time-range + prop-filter (ANDed)
         var innerParts = ""
@@ -211,7 +211,7 @@ actor CalDAVProvider: CalendarProvider {
     }
 
     func getEvent(calendarId: String, eventId: String) async throws -> GCalEvent {
-        let eventURL = resolveEventURL(eventId, calendarId: calendarId)
+        let eventURL = try resolveEventURL(eventId, calendarId: calendarId)
 
         let (data, response) = try await client.get(url: eventURL)
         guard let icsText = String(data: data, encoding: .utf8), !icsText.isEmpty else {
@@ -238,7 +238,7 @@ actor CalDAVProvider: CalendarProvider {
         // Use pre-generated event.id for idempotent retries (same filename → If-None-Match:* catches duplicates)
         let uid = event.id ?? UUID().uuidString
         let filename = "\(uid).ics"
-        let calURL = resolveURL(calendarId)
+        let calURL = try resolveURL(calendarId)
         let eventURL = calURL.appendingPathComponent(filename)
 
         let icsBody = event.toICS(uid: uid)
@@ -274,7 +274,7 @@ actor CalDAVProvider: CalendarProvider {
         event: GCalEventInput,
         sendUpdates: String
     ) async throws -> GCalEvent {
-        let eventURL = resolveEventURL(eventId, calendarId: calendarId)
+        let eventURL = try resolveEventURL(eventId, calendarId: calendarId)
 
         // CalDAV PUT is a FULL-RESOURCE replace, not a PATCH — sending only the
         // patched fields wipes DTSTART/SUMMARY/VTIMEZONE/etc. (iCloud rejects
@@ -327,7 +327,7 @@ actor CalDAVProvider: CalendarProvider {
         eventId: String,
         sendUpdates: String
     ) async throws {
-        let eventURL = resolveEventURL(eventId, calendarId: calendarId)
+        let eventURL = try resolveEventURL(eventId, calendarId: calendarId)
         let (_, _) = try await client.delete(url: eventURL)
         etagCache.removeValue(forKey: eventId)
         print("[CalDAV] Deleted event \(eventId)")
@@ -344,7 +344,7 @@ actor CalDAVProvider: CalendarProvider {
         event: GCalEventInput,
         sendUpdates: String
     ) async throws -> GCalEvent {
-        let eventURL = resolveEventURL(eventId, calendarId: calendarId)
+        let eventURL = try resolveEventURL(eventId, calendarId: calendarId)
 
         // 1. GET current ICS + ETag
         let (data, getResponse) = try await client.get(url: eventURL)
@@ -437,7 +437,7 @@ actor CalDAVProvider: CalendarProvider {
         patch: GCalEventInput,
         sendUpdates: String
     ) async throws -> GCalEvent {
-        let eventURL = resolveEventURL(eventId, calendarId: calendarId)
+        let eventURL = try resolveEventURL(eventId, calendarId: calendarId)
 
         // 1. GET master ICS + ETag
         let (data, getResponse) = try await client.get(url: eventURL)
@@ -516,7 +516,7 @@ actor CalDAVProvider: CalendarProvider {
                                            originalICS: masterICS,
                                            capETag: capETag, cause: error)
         }
-        let calURL = resolveURL(calendarId)
+        let calURL = try resolveURL(calendarId)
         let newEventURL = calURL.appendingPathComponent("\(newUid).ics")
         let newICS = newSeriesInput.toICS(uid: newUid)
 
@@ -1643,12 +1643,12 @@ actor CalDAVProvider: CalendarProvider {
     /// Short IDs (no `/`) come from the create flow (e.g., `tmXXX`). These must be
     /// resolved as `calendarURL/tmXXX.ics` — the same way createEvent builds the URL.
     /// Full hrefs (containing `/`) come from listEvents and are resolved normally.
-    private func resolveEventURL(_ eventId: String, calendarId: String) -> URL {
+    private func resolveEventURL(_ eventId: String, calendarId: String) throws -> URL {
         if eventId.contains("/") {
-            return resolveURL(eventId)
+            return try resolveURL(eventId)
         }
         // Short ID — build URL the same way createEvent does: calendar + id.ics
-        let calURL = resolveURL(calendarId)
+        let calURL = try resolveURL(calendarId)
         let filename = eventId.hasSuffix(".ics") ? eventId : "\(eventId).ics"
         return calURL.appendingPathComponent(filename)
     }
@@ -1658,14 +1658,73 @@ actor CalDAVProvider: CalendarProvider {
     /// caldav.icloud.com → pXX-caldav.icloud.com. The calendarHomeURL has the correct
     /// post-redirect host. Using serverBaseURL would hit the pre-redirect host, and
     /// URLSession's 301/302 handling changes REPORT/PUT/DELETE to GET (losing the body).
-    private func resolveURL(_ path: String) -> URL {
+    ///
+    /// 🚨 **R13-U1 — ORIGIN CONTAINMENT. The returned URL's origin is checked, not
+    /// assumed.** `CalDAVClient.setAuthHeader` attaches `Authorization: Basic …`
+    /// UNCONDITIONALLY, with no host check and no `URLSession` delegate, so whatever
+    /// origin this function returns is an origin the account's password is sent to.
+    /// Two shapes reach here from a string this actor did not mint:
+    ///   * an absolute `http(s)://…` — returned VERBATIM by the branch below; and
+    ///   * an RFC 3986 **network-path reference** (`//host/path`), which is not
+    ///     caught by the `hasPrefix` test yet takes its **authority from the string**
+    ///     when resolved against a base, so `//attacker.example/x` resolves to
+    ///     `https://attacker.example/x`.
+    /// Both are reachable with an agent-authored `event_id`: the three calendar
+    /// tools accept a non-numeric `event_id` verbatim (see the note in
+    /// `CalendarEventReadTool`), and `resolveEventURL` routes anything containing
+    /// `/` straight here.
+    ///
+    /// The check is **scheme + host + port only, never path**. Path containment
+    /// would be wrong: on iCloud a calendar shared by another user lives under the
+    /// OWNER's principal path (`/<their-id>/calendars/…`), outside our
+    /// `calendarHomeURL`, and rejecting that would break shared calendars. Both
+    /// configured origins are accepted because `calendarHomeURL` is the
+    /// post-redirect host and a server may still hand back hrefs on the
+    /// pre-redirect `serverBaseURL` host; both come from account configuration and
+    /// neither is agent-authored.
+    ///
+    /// ⚠️ MIRROR IMAGE, deliberately avoided: this does NOT reject an id merely for
+    /// being unfamiliar, and it does NOT normalize or rewrite the URL. Rewriting a
+    /// foreign origin to ours would send the request somewhere the caller did not
+    /// name; silently dropping it would lose the intention. It throws
+    /// `CalendarProviderError.notSupported`, which `isCalendarUnsupportedError`
+    /// already claims as a terminal drain arm — the same disposition
+    /// `73be05616` gave its three other unexecutable-op guards. A request that can
+    /// never be issued safely can never become issuable by retrying it.
+    private func resolveURL(_ path: String) throws -> URL {
+        let resolved: URL
         if path.hasPrefix("http://") || path.hasPrefix("https://"),
            let url = URL(string: path) {
-            return url
+            resolved = url
+        } else if let url = URL(string: path, relativeTo: calendarHomeURL)?.absoluteURL {
+            // Resolve against calendarHomeURL (has correct post-redirect host for iCloud)
+            resolved = url
+        } else {
+            resolved = calendarHomeURL.appendingPathComponent(path)
         }
-        // Resolve against calendarHomeURL (has correct post-redirect host for iCloud)
-        return URL(string: path, relativeTo: calendarHomeURL)?.absoluteURL
-            ?? calendarHomeURL.appendingPathComponent(path)
+
+        guard Self.sameOrigin(resolved, calendarHomeURL) || Self.sameOrigin(resolved, serverBaseURL) else {
+            throw CalendarProviderError.notSupported(
+                "CalDAV path '\(path)' resolves to a different origin than this account's calendar server; refusing to send the account credential there")
+        }
+        return resolved
+    }
+
+    /// Scheme + host + port equality, with the default port filled in so
+    /// `https://h/x` and `https://h:443/x` compare equal. Host and scheme compare
+    /// case-insensitively per RFC 3986 §3.1/§3.2.2.
+    private static func sameOrigin(_ lhs: URL, _ rhs: URL) -> Bool {
+        func port(_ url: URL) -> Int? {
+            if let p = url.port { return p }
+            switch url.scheme?.lowercased() {
+            case "https": return 443
+            case "http": return 80
+            default: return nil
+            }
+        }
+        guard let lHost = lhs.host?.lowercased(), let rHost = rhs.host?.lowercased(), lHost == rHost else { return false }
+        guard lhs.scheme?.lowercased() == rhs.scheme?.lowercased() else { return false }
+        return port(lhs) == port(rhs)
     }
 
     /// Format date as CalDAV UTC: YYYYMMDDTHHMMSSZ

@@ -28,9 +28,17 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         }
 
         // LLM sends numeric IDs (translated by processToolOutputForLLM) — resolve back to compound event ID
+        // R13-U1: a numeric id the translator cannot resolve is REFUSED rather than
+        // used as a literal event id (mail-tool parity). Full rationale, including
+        // why the non-numeric branch is deliberately kept, is on the same block in
+        // `CalendarEventReadTool.execute`.
         let compoundId: String
         let numericId: Int?
-        if let n = Int(rawEventId), let realId = await ctx.translator.toRealId(n) {
+        if let n = Int(rawEventId) {
+            guard let realId = await ctx.translator.toRealId(n) else {
+                print("[CalendarEventEditTool] Failed to resolve numeric id \(n)")
+                return #"{"error": "calendar_event_edit failed: no event found for the given event_id. Call calendar_event_read or calendar_search to look up the event again, then retry."}"#
+            }
             compoundId = realId
             numericId = n
             print("[CalendarEventEditTool] Resolved numeric id \(n) → \(realId.prefix(50))...")

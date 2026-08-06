@@ -28,9 +28,20 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
         }
 
         // LLM sends numeric IDs (translated by processToolOutputForLLM) — resolve back to compound event ID
+        // R13-U1: a numeric id the translator cannot resolve is REFUSED rather than
+        // used as a literal event id (mail-tool parity). Full rationale, including
+        // why the non-numeric branch is deliberately kept, is on the same block in
+        // `CalendarEventReadTool.execute`. This tool reaches irreversible wire op #5
+        // (`CalDAVProvider.deleteEvent` — RFC 4918/4791 define no trash), so the
+        // refusal matters most here; it happens before `queueCalendarOperation`, so
+        // nothing durable and nothing acknowledged is discarded.
         let compoundId: String
         let numericId: Int?
-        if let n = Int(rawEventId), let realId = await ctx.translator.toRealId(n) {
+        if let n = Int(rawEventId) {
+            guard let realId = await ctx.translator.toRealId(n) else {
+                print("[CalendarEventDeleteTool] Failed to resolve numeric id \(n)")
+                return #"{"error": "calendar_event_delete failed: no event found for the given event_id. Call calendar_event_read or calendar_search to look up the event again, then retry."}"#
+            }
             compoundId = realId
             numericId = n
             print("[CalendarEventDeleteTool] Resolved numeric id \(n) → \(realId.prefix(50))...")

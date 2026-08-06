@@ -251,6 +251,28 @@ struct CalendarBadRequestClassificationTests {
                 "an id that can never be turned into a URL is unexecutable, not indeterminate — leaving it in the transient arm wedges the account's calendar lane")
     }
 
+    @Test("Every id refused BEFORE the request is formed reaches a terminal arm — all three providers")
+    func idsRefusedBeforeTheRequestIsFormedAreTerminal() {
+        // R13-U1/U7. Enumerated by the PROPERTY — "the provider refused to build
+        // the request out of an id it holds" — and NOT by provider name, which is
+        // exactly the census shape that let `9c786c57d` fix Exchange while leaving
+        // its two siblings building the same URLs from the same ids (`MIS-007`).
+        // All three are pure functions of the stored id, so a retry reproduces
+        // each one identically and forever: transient classification is a wedge.
+        let refusals: [(label: String, error: Error)] = [
+            ("Exchange — unencodable Graph path segment",
+             ExchangeCalendarError.invalidPathSegment("Graph event id")),
+            ("Google — id would not stay in one path segment",
+             GoogleCalendarError.invalidPathSegment("Google event id")),
+            ("CalDAV — id resolves to a different origin",
+             CalendarProviderError.notSupported("CalDAV path '//attacker.example/x' resolves to a different origin than this account's calendar server; refusing to send the account credential there")),
+        ]
+        for (label, error) in refusals {
+            #expect(claimedByATerminalArm(error),
+                    "\(label): an id that can never be turned into a safe URL is unexecutable, not indeterminate — leaving it in the transient arm wedges the account's calendar lane")
+        }
+    }
+
     @Test("Non-4xx statuses and non-HTTP errors are never classified as malformed")
     func nonClientErrorsAreNeverRetired() {
         for code in [200, 302, 500, 502, 503] {

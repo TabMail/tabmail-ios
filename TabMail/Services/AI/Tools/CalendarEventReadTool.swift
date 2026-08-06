@@ -22,9 +22,39 @@ struct CalendarEventReadTool: AgentTool, Sendable {
         let titleFilter = CalendarToolHelpers.stringArg(arguments, "title")
 
         // LLM sends numeric IDs (translated by processToolOutputForLLM) — resolve back to compound event ID
+        //
+        // 🚨 **R13-U1 — a numeric id the translator cannot resolve is REFUSED, not
+        // passed through as a literal event id.** This is the contract all four mail
+        // tools already had (`EmailReadTool`: `guard let realId = await
+        // translator.toRealId(numericId) else { return … }`) and the three calendar
+        // tools did not. `ChatIdTranslator` evicts orphan mappings at
+        // `Config.maxMappings`, so `toRealId` returning nil is an ordinary
+        // occurrence in a long session — and continuing with the numeral itself
+        // addresses whatever event happens to be named "42" on the server. The
+        // agent is told to re-look-up instead, which is exactly what it does with a
+        // stale `unique_id` today.
+        //
+        // ⚠️ **The non-numeric branch is deliberately KEPT, and that is not an
+        // oversight.** These tools' own failure strings interpolate the raw
+        // `compoundId` into prose (`CalendarEventEditTool` / `CalendarEventDeleteTool`
+        // "could not find event with id '…'"), and `processToolOutputForLLM` only
+        // rewrites ids on a `event_id: <value>` LINE — so a real compound id does
+        // reach the model untranslated, and echoing it back is a *working recovery
+        // path*, not an attack. Refusing it would be the mirror image of the defect:
+        // it removes a legitimate path while the hazard it is aimed at lives
+        // somewhere else entirely. The hazard — an agent-authored string becoming a
+        // URL **authority** or extra path segments, with the account credential
+        // attached — is closed at the boundary where it actually happens and where
+        // the string's provenance no longer matters: `CalDAVProvider.resolveURL`
+        // (origin containment) and `GoogleCalendarProvider.encodedPathSegment`
+        // (one-path-segment containment).
         let compoundId: String
         let numericId: Int?
-        if !rawEventId.isEmpty, let n = Int(rawEventId), let realId = await ctx.translator.toRealId(n) {
+        if !rawEventId.isEmpty, let n = Int(rawEventId) {
+            guard let realId = await ctx.translator.toRealId(n) else {
+                print("[CalendarEventReadTool] Failed to resolve numeric id \(n)")
+                return #"{"error": "no event found for the given event_id. Call calendar_search or calendar_read to look up the event again, then retry."}"#
+            }
             compoundId = realId
             numericId = n
             print("[CalendarEventReadTool] Resolved numeric id \(n) → \(realId.prefix(50))...")

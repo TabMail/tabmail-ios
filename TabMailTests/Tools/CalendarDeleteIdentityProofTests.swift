@@ -118,6 +118,55 @@ struct CalendarDeleteIdentityProofTests {
                 "the agent must be told to re-look-up the id rather than be told the delete succeeded — got: \(output)")
     }
 
+    @Test("R13-U1 — a numeric event_id the translator cannot resolve is REFUSED, not used as a literal event id")
+    func unresolvableNumericIdIsRefusedAndNeverQueued() async throws {
+        // The same INVARIANT as the suite header, reached one step earlier: the
+        // delete's target must be an event the app can name, not a numeral the
+        // model emitted. `ChatIdTranslator` evicts orphan mappings at
+        // `Config.maxMappings`, so `toRealId` returning nil is ordinary in a long
+        // session — and the pre-fix `else` branch then used the numeral ITSELF as
+        // the event id, i.e. it would delete whatever event happens to be called
+        // "71" on the server. All four mail tools already refused here
+        // (`EmailReadTool`: `guard let realId = … else { return … }`); the three
+        // calendar tools did not, and the DESTRUCTIVE one was again among the
+        // permissive ones.
+        //
+        // The translator is deliberately left UNSEEDED — that is the whole
+        // fixture. The control test below shares this harness and seeds it, which
+        // is what makes the two absences here non-vacuous (`MIS-030`).
+        let accountId = "cal-r13-u1-unresolvable"
+        let (pool, dir, previous) = try makeTestDB(accountId: accountId)
+        let mock = MockCalendarProvider()
+        await mock.setGetEventResult(GCalEvent(
+            id: "71", summary: "Whatever event is called 71", location: nil, description: nil,
+            start: nil, end: nil, attendees: nil, organizer: nil, recurrence: nil,
+            transparency: nil, status: "confirmed", htmlLink: nil, created: nil, updated: nil
+        ))
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer {
+            Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+        }
+
+        let translator = MockChatIdTranslator()
+        let tool = CalendarEventDeleteTool(context: ToolContext(db: pool, translator: translator))
+        let sink = AutoConfirmSink()
+        let output = try await tool.execute(
+            arguments: ["event_id": .string("71")],
+            invocation: ToolInvocation(uiSink: sink, sessionKey: "r13-u1-unresolvable"))
+
+        let wireDeletes = await mock.deletedEvents
+        #expect(wireDeletes.isEmpty,
+                "the numeral was used as a literal event id and an irreversible delete reached the wire against it. Got \(wireDeletes.count): \(wireDeletes.map { $0.eventId })")
+
+        let queued = try await pool.read { db in try PendingCalendarOperation.fetchAll(db) }
+        #expect(queued.isEmpty,
+                "the delete was persisted rather than refused — the next drain issues it, so an empty wire count alone proves nothing. Got \(queued.count) queued op(s)")
+
+        #expect(output.contains("no event found"),
+                "the agent must be told to re-look-up the id rather than be told the delete succeeded — got: \(output)")
+    }
+
     @Test("Control: an event the tool CAN dereference is still deleted — the refusal is not 'refuse everything'")
     func readableEventIsStillDeleted() async throws {
         let accountId = "cal-r12-t2-control"

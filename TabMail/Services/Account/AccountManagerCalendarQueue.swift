@@ -755,6 +755,17 @@ extension AccountManager {
         // *"the caller never produces the value" is a property of today's
         // callers, not an invariant.*
         if case ExchangeCalendarError.invalidPathSegment = error { return true }
+        // Google's sibling of the same refusal (R13-U1). Different mechanism —
+        // Google keeps `.urlPathAllowed` and rejects on the ENCODED result's
+        // structure (a `/` or a dot-segment, i.e. an id that would not stay in one
+        // path segment) — but the same disposition and for the same reason: the
+        // check is a pure function of the stored id, so it can never be transient.
+        // Enumerated by the PROPERTY "an id refused before the request is formed",
+        // not by provider name, which is how the Exchange half was missed for a
+        // round (`MIS-007`). CalDAV's third sibling is deliberately NOT here: its
+        // origin-containment refusal throws `CalendarProviderError.notSupported`,
+        // already claimed by `isCalendarUnsupportedError` at the arm above.
+        if case GoogleCalendarError.invalidPathSegment = error { return true }
         return false
     }
 
@@ -764,6 +775,9 @@ extension AccountManager {
     private func badRequestReason(_ error: Error) -> String {
         if case ExchangeCalendarError.invalidPathSegment(let context) = error {
             return "the stored \(context) cannot be expressed as a URL path segment, so this request can never be sent — the event id needs to be re-read from the server"
+        }
+        if case GoogleCalendarError.invalidPathSegment(let context) = error {
+            return "the stored \(context) cannot be expressed as a single URL path segment, so this request can never be sent — the event id needs to be re-read from the server"
         }
         if case GoogleCalendarError.httpError(let code, let body) = error {
             return parseHttpReason(code: code, body: body, source: "Google Calendar")
