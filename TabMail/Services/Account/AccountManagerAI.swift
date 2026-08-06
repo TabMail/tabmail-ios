@@ -259,12 +259,24 @@ struct AIWriteTarget: Sendable, Equatable {
     ///     a replacement bearing a `nil` stamp while the folder stayed on the
     ///     captured epoch — arms 6a, 6b and 7 all passed on a row that was not the
     ///     captured message, binding X's summary onto Y (a C3 hole). And it refused
-    ///     an UNREPLACED row whose stamp was merely absent — 15 production sites
-    ///     null that column against 4 that set it, so absence is the ORDINARY
-    ///     state, not evidence of a turnover — which left `summaryBlurb`/`actionTag`
+    ///     an UNREPLACED row whose stamp was merely absent — **18 production
+    ///     statements write only `nil` to that column (20 counting the two that
+    ///     write nil-or-epoch by a branch) against 5 that write only a proven
+    ///     epoch**, so absence is the ORDINARY state, not evidence of a turnover
+    ///     — which left `summaryBlurb`/`actionTag`
     ///     nil, so `needsSummary`/`needsAction` stayed true, so the next open
     ///     re-ran the LLM and dropped it again: a paid API call repeated forever
     ///     for a summary that could never land.
+    ///
+    ///     ⚠️ **That ratio is the ARGUMENT, not decoration — invert it and this
+    ///     conclusion inverts — so it has ONE owner and this is not it.** The
+    ///     figure said "15 against 4"; it entered at `e4751e438` and the
+    ///     correcting pass landed in `SearchView.swift` only, leaving this
+    ///     sibling stale for a whole train. The predicate, the members by
+    ///     enclosing symbol, and the exclusive/inclusive split live in the
+    ///     doc comment on `SearchView.resolveLocalResultHeaderId`
+    ///     ("THE COUNT, WITH ITS PREDICATE AND ITS MEMBERS"). **Re-derive there
+    ///     and update there; do not restate a bare integer here.**
     ///
     ///     Reading the row's own stamp closes the first half. It does NOT close the
     ///     second, and must not be mistaken for doing so: captured-nil against

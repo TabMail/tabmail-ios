@@ -618,11 +618,23 @@ extension AccountManager {
     ///    ⚠ SURVIVING THIS SWEEP IS NOT THE SAME AS BEING SAFE TO EXECUTE, and
     ///    reading it that way was a confirmed C3 defect (2026-07-31). "Carries a
     ///    non-numeric id" is a property of the ROW, not authority. `.deleteDraft`
-    ///    also needs its typed address/identity bundle:
-    ///    `AccountManager.queueDraftDelete` records `[uid, rfc822]` while
-    ///    `executeOperation` used to pass `messageIds.first`, the UID, alone to
-    ///    `provider.deleteDraft`. Such an op is NOT address-only, survives here,
-    ///    and would then execute against a bare UID in the discarded numbering.
+    ///    also needs its typed address/identity bundle, and `executeOperation`
+    ///    used to pass `messageIds.first`, the UID, alone to
+    ///    `provider.deleteDraft` — which would execute against a bare UID in the
+    ///    discarded numbering.
+    ///    ⚠ CORRECTED 2026-08-05 — this used to say *"`queueDraftDelete` records
+    ///    `[uid, rfc822]` … such an op is NOT address-only, survives here"*. It
+    ///    does not and it is not. The producer inserts a ONE-element
+    ///    `messageIds: [encodedId]`, and on the `.imap` arm `encodedId` is
+    ///    `String(uid)` — a canonical bare UID. So `opIsAddressOnly` returns
+    ///    TRUE for an IMAP `.deleteDraft` op and, once `opIsProvenInvalidatedByReset`'s
+    ///    second conjunct also holds (the op recorded a positive
+    ///    `observedUidValidity` that disagrees with `fresh`), the op **IS swept
+    ///    here** rather than surviving. The drift was in the safe direction — the
+    ///    op is dropped at the reset boundary, which is exit 4 and correct — but
+    ///    a reviewer who trusted the old sentence would conclude `.deleteDraft`
+    ///    ops reach the executor after a reset, and design the next guard for a
+    ///    population that does not exist.
     ///    The closure is `PendingOperation.observedUidValidity`, compared in
     ///    `AccountManager.drainPendingQueue`'s claim transaction — a per-op record
     ///    of the epoch it was recorded under, which cannot be defeated by a future

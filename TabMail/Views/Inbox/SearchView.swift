@@ -363,22 +363,56 @@ struct SearchView: View {
     ///     relying on it; the conclusion (refuse) is unchanged, the absoluteness is
     ///     not.
     ///
-    ///     **THE COUNT, WITH ITS PREDICATE — it said "15" and drifted; state the
-    ///     predicate so the next reader can re-run it instead of trusting a
-    ///     number.** Predicate: *production Swift statements (excluding
-    ///     `TabMailTests/`) that ASSIGN `nil` to `MessageHeader
-    ///     .observedUidValidity`*, counting neither stored-property declarations
-    ///     whose default is `nil` nor the same-named field on other types
-    ///     (`PendingOperation`, `StagedInboxRow`, the NSE's `NSEMessageMetadata`).
-    ///     At HEAD that census is **19**: `MessageHeaderRekey` ×1,
-    ///     `AccountManagerActions` ×3 (two `Column("observedUidValidity")
-    ///     .set(to:)` arms plus the draft placeholder), `SyncEngineFullSync` ×9,
-    ///     `SyncEngineDeltaSync` ×5, `BackfillBodyQueue` ×1. Some of those write
-    ///     the `nil` onto a row being re-keyed or adopted under a new primary key
-    ///     rather than onto a row updated in place — **that distinction does not
-    ///     matter to this arm**, because either way the message ends up carrying a
-    ///     `nil` stamp it did not carry before, which is exactly the ordinary
-    ///     absence this comment warns against reading as disagreement.
+    ///     **THE COUNT, WITH ITS PREDICATE AND ITS MEMBERS — it said "15", then
+    ///     "19", and both drifted. Enumerate, do not restate an integer**
+    ///     (ADR-IOS-068 clause 5). The predicate is: *production Swift statements
+    ///     (excluding `TabMailTests/`) that ASSIGN to
+    ///     `MessageHeader.observedUidValidity`*, counting neither
+    ///     stored-property declarations whose default is `nil`, nor reads or
+    ///     comparisons, nor the same-named field on other types
+    ///     (`PendingOperation`, `StagedInboxRow`, `MessageSnapshot`, the NSE's
+    ///     `NSEMessageMetadata` / `nse_processed_message` staging column).
+    ///
+    ///     ⚠️ **"19" was reachable under NO single predicate** — it counted
+    ///     `SyncEngineFullSync`'s ternary as a nil-write (inclusive) while
+    ///     omitting `AccountManagerActions`' identically-shaped one (exclusive).
+    ///     Applied uniformly the answer is 18 exclusive / 20 inclusive. The
+    ///     census must also be `--multiline` with `\s*` at EVERY join: the
+    ///     `AccountManagerActions` ternary wraps at `.set(` → `to:`, so
+    ///     `\.set\(to:` misses it (MIS-007 instances 36–37).
+    ///
+    ///     **Writes ONLY `nil` — 18, by enclosing symbol:**
+    ///     `AccountManagerActions.optimisticMoveToFolder` ×2 (its two `updateAll`
+    ///     arms) · `AccountManagerActions.queueDraftSave` ×1 ·
+    ///     `MessageHeaderRekey.finishMove` ×1 (its no-proven-epoch else arm) ·
+    ///     `BackfillBodyQueue.rekeyRemappedHeader` ×1 ·
+    ///     `SyncEngineDeltaSync.gmailDeltaSync` ×2 ·
+    ///     `SyncEngineDeltaSync.exchangeDeltaSync` ×3 ·
+    ///     `SyncEngineFullSync.canonicalizeLocalRows` ×2 ·
+    ///     `SyncEngineFullSync.runSyncMessages` ×6.
+    ///
+    ///     **Writes `nil` OR an epoch, by a branch inside the statement — 2:**
+    ///     `SyncEngineFullSync.runSyncMessages`'s
+    ///     `recon.sourceAddressProven ? sourceBoundEpoch : nil` ·
+    ///     `AccountManagerActions.exactPayload`'s
+    ///     `restoreSourceEpoch ? member.sourceObservedUidValidity : nil`.
+    ///
+    ///     **Writes ONLY a proven epoch — 5:** `MessageHeaderRekey.finishMove` ·
+    ///     `SyncEngine.fetchOlderMessages` ·
+    ///     `SyncEngineBackfillDeep.insertBackfillBatchGuardable` ·
+    ///     `SyncEngineFullSync.runSyncMessages` ×2 (the proven merge and the
+    ///     insert). `NSEDataBridge.insertNewHeaderFromStaging` is in NEITHER
+    ///     class: it copies whatever the NSE staged, so the value's provenance is
+    ///     the staging row rather than this pass.
+    ///
+    ///     Some nil-writers write onto a row being re-keyed or adopted under a
+    ///     new primary key rather than onto a row updated in place — **that
+    ///     distinction does not matter to this arm**, because either way the
+    ///     message ends up carrying a `nil` stamp it did not carry before, which
+    ///     is exactly the ordinary absence this comment warns against reading as
+    ///     disagreement. The load-bearing fact is the RATIO's direction (18–20
+    ///     against 5), not its magnitude — invert it and this arm's conclusion
+    ///     inverts with it.
     ///
     ///     **THE OTHER HALF IS THE ONE THE GUARD DEPENDS ON, AND IT IS EXACT: the
     ///     same census for `rfc822MessageId` is ZERO.** No production statement

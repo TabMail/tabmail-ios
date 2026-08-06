@@ -192,9 +192,29 @@ struct ExpectedMessageIdentity: Sendable, Equatable {
 
     /// True when `header` is the same physical message this identity was captured
     /// from. A replacement is a different email and therefore carries a different
-    /// Message-ID, so this witness cannot admit one. A row's `rfc822MessageId` is
-    /// never nulled once set, so a captured-present/current-absent pair is a
-    /// genuine disagreement rather than an ordinary absence.
+    /// Message-ID, so this witness cannot admit one. **No production statement
+    /// nulls a row's `rfc822MessageId` deliberately**, so a
+    /// captured-present/current-absent pair is treated as a genuine disagreement
+    /// rather than an ordinary absence.
+    ///
+    /// ⚠️ That is the qualified form and the qualification is load-bearing — the
+    /// absolute "never nulled once set" is OVERSTATED and this is the C3 witness,
+    /// so it is the worst place in the tree to carry an absolute that is false.
+    /// `MessageMetadata.rfc822MessageId` is `String?` by construction (nil
+    /// whenever the provider payload omits the header) and three production
+    /// statements assign that Optional straight onto an EXISTING row with no nil
+    /// check — `SyncEngine.gmailDeltaSync` ×1 and `SyncEngine.exchangeDeltaSync`
+    /// ×2 — so a stored identity can go from present to absent by PROPAGATION
+    /// even though nothing nulls it literally. **The failure direction is why
+    /// this stays as-is rather than being tightened:** this type is a VETO only,
+    /// so a propagated nil causes a spurious refusal, which one ordinary gesture
+    /// recovers; the alternative direction would admit a wrong message. Full
+    /// derivation, the census predicate, and the stricter in-tree shape to copy
+    /// if this is ever tightened (`SyncEngine.performFullSync`'s
+    /// `if normalizedIncomingRfc822 != nil` merge guard): the ⚠️ CORRECTED
+    /// 2026-08-05 block in the doc comment on
+    /// `SearchView.resolveLocalResultHeaderId`, which also records why no guard
+    /// is being added at those three sites.
     func matches(_ header: MessageHeader) -> Bool {
         rfc822MessageId == MessageIdentity.comparableRfc822Identity(header.rfc822MessageId)
     }
