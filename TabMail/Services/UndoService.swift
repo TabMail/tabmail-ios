@@ -227,7 +227,16 @@ final class UndoService {
                     undoStack[actionIndex].commands[commandIndex].members[memberIndex].rekey(
                         newHeaderId: record.newHeaderId,
                         newProviderMessageId: record.newProviderMessageId)
-                    print("[UndoStack] REKEY member \(record.oldHeaderId) → \(record.newHeaderId)")
+                    // Debug-gated: this witnesses the ordinary drain SUCCESS path
+                    // (`AccountManagerQueue.publishRekeys`), so it fires once per
+                    // re-keyed member on every drained move an undo entry names.
+                    // `../CLAUDE.md` rule 12 — a new diagnostic must be a no-op in
+                    // production. It claims no observability exception: the three
+                    // `UNGATED BY DECISION` prints in `AccountManagerQueue` sit on
+                    // C3 refusal paths, and that carve-out does not reach a success.
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[UndoStack] REKEY member \(record.oldHeaderId) → \(record.newHeaderId)")
+                    }
                 }
             }
         }
