@@ -62,11 +62,7 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
         let calendarName = calInfo?.calendarName
 
         // Fetch current event details from API for confirmation card
-        var confirmTitle = "(Event)"
-        var confirmStart = Date()
-        var confirmEnd = Date()
-        var confirmIsAllDay = false
-        var confirmNotes: String?
+        var fetchedEvent: GCalEvent?
 
         let provider: (any CalendarProvider)?
         if !resolvedAccountId.isEmpty {
@@ -76,12 +72,8 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
         }
 
         if let provider, let calId = calendarId {
-            if let event = try? await provider.getEvent(calendarId: calId, eventId: eventId) {
-                confirmTitle = (event.summary ?? "").isEmpty ? "(No title)" : event.summary!
-                confirmStart = event.startDate ?? Date()
-                confirmEnd = event.endDate ?? Date()
-                confirmIsAllDay = event.isAllDay
-                confirmNotes = event.description
+            fetchedEvent = try? await provider.getEvent(calendarId: calId, eventId: eventId)
+            if let event = fetchedEvent {
                 Task {
                     await CalendarToolHelpers.cacheEventDetailsForPills(
                         [event], accountId: resolvedAccountId, calendarId: calId,
@@ -91,12 +83,8 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
             }
         } else if let provider {
             let defaultCalId = await CalendarProviderDispatch.defaultCalendarIdForCreation(for: provider)
-            if let event = try? await provider.getEvent(calendarId: defaultCalId, eventId: eventId) {
-                confirmTitle = (event.summary ?? "").isEmpty ? "(No title)" : event.summary!
-                confirmStart = event.startDate ?? Date()
-                confirmEnd = event.endDate ?? Date()
-                confirmIsAllDay = event.isAllDay
-                confirmNotes = event.description
+            fetchedEvent = try? await provider.getEvent(calendarId: defaultCalId, eventId: eventId)
+            if let event = fetchedEvent {
                 // Update cache with discovered calendarId for this session
                 Task {
                     await CalendarToolHelpers.cacheEventDetailsForPills(
@@ -106,6 +94,45 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
                 }
             }
         }
+
+        // 🚨 A DELETE IS NOT CONFIRMABLE ON AN UNESTABLISHED IDENTITY (R12-T2).
+        // This mirrors `CalendarEventEditTool`'s existing refusal, verbatim in
+        // shape, because the two tools were disagreeing and the DESTRUCTIVE one was
+        // the permissive one. Without this guard the confirmation card rendered the
+        // placeholder title "(Event)" with `Date()` for both ends — the user
+        // confirmed THAT — and `queueCalendarDelete` then persisted an
+        // irreversible delete against an href whose current occupant had never been
+        // read. On CalDAV that reaches `CalDAVProvider.deleteEvent`, a WebDAV
+        // `DELETE` for which RFC 4918/4791 define no trash, undelete or restore, so
+        // being wrong there cannot be undone (C3).
+        //
+        // ⚠️ THIS IS NOT A DROPPED INTENTION, and the distinction is the whole
+        // argument: the refusal happens BEFORE `queueCalendarOperation`, so no
+        // `PendingCalendarOperation` row and no user-visible acknowledgement exists
+        // yet. Never-drop governs intentions that were persisted or acknowledged;
+        // this one is neither. The agent is handed a structured error naming the
+        // re-lookup tools and can retry with a real id.
+        //
+        // ⚠️ THE COUNTERFACTUAL. Keeping the permissive path would buy exactly one
+        // thing — deleting an event whose id we hold but cannot read (a transient
+        // provider outage during the confirmation). That is recoverable by one
+        // ordinary gesture (ask again once the provider answers). Its opposite,
+        // deleting the wrong or an already-replaced event, is not recoverable at
+        // all. Fail closed.
+        guard let resolvedEvent = fetchedEvent else {
+            print("[CalendarEventDeleteTool] Could not dereference event_id='\(eventId.prefix(50))' (compound='\(compoundId.prefix(50))') — refusing delete")
+            return ToolJSON.string(from: [
+                "ok": false,
+                "error": "calendar_event_delete failed: could not find event with id '\(compoundId)'. The id may be wrong or the event may have been deleted. Call calendar_event_read or calendar_search to look up the correct event, then retry.",
+                "event_id": compoundId,
+            ] as [String: Any])
+        }
+
+        let confirmTitle = (resolvedEvent.summary ?? "").isEmpty ? "(No title)" : resolvedEvent.summary!
+        let confirmStart = resolvedEvent.startDate ?? Date()
+        let confirmEnd = resolvedEvent.endDate ?? Date()
+        let confirmIsAllDay = resolvedEvent.isAllDay
+        let confirmNotes = resolvedEvent.description
 
         // ADR-IOS-024: Show confirmation card and await user response
         let (confirmed, cardState) = await AgentToolRouter.ActionConfirmation.awaitConfirmation(

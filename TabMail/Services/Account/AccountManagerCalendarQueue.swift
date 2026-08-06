@@ -72,8 +72,42 @@ extension AccountManager {
         calendarOpAwaiters[opId] = continuation
     }
 
+    /// 🚨 THE TIMEOUT ARM MUST RESUME THE CONTINUATION IT TAKES (R12-T6).
+    /// This used to be a bare `calendarOpAwaiters.removeValue(forKey: opId)` with
+    /// the return value discarded. `signalCalendarOpOutcome` could then never
+    /// resume it either (the entry was already gone), `withCheckedContinuation`
+    /// is not cancellation-aware so `group.cancelAll()` did not release it, and
+    /// `withTaskGroup` awaits its remaining children at scope exit — so
+    /// `awaitCalendarOpOutcome` NEVER RETURNED. Every agent calendar
+    /// create/edit/delete that reached the timeout hung its chat turn outright,
+    /// and nothing above bounds a hung tool (`ToolRegistry.execute` has no
+    /// timeout of its own).
+    ///
+    /// The primary trigger is ORDINARY: `drainCalendarQueue` returns early on
+    /// `guard NetworkMonitor.checkConnected()` — i.e. offline — before any
+    /// `signalCalendarOpOutcome`. The `!isDrainingCalendar` guard and any
+    /// provider round-trip over the caller's 10 s budget do the same.
+    ///
+    /// ⚠️ THE COUNTERFACTUAL IS EMPTY, which is what makes this unambiguous.
+    /// `AccountManager` is an `actor`, so `removeValue` is atomic under actor
+    /// isolation: exactly one of drop and signal can obtain the continuation and
+    /// a double-resume is structurally impossible. The only behaviour change is
+    /// that `.timedOut` becomes DELIVERABLE — which the function's own doc
+    /// ("or after `timeoutSeconds` elapses"), the `CalendarOpOutcome.timedOut`
+    /// case, and `CalendarEventCreateTool`'s live `case .stillQueued, .timedOut:`
+    /// arm all already assumed.
+    ///
+    /// ⚠️ DELIBERATELY NOT `AgentToolRouter.ContinuationGuard` /
+    /// `ComposeContinuationGuard`. Those pair a stored continuation with an
+    /// `NSLock` because their owners are NOT isolated — a MainActor router
+    /// resumed from arbitrary UI callbacks. Here the dictionary lives on an
+    /// actor, so take-and-resume is already serialized; an `NSLock` would add a
+    /// second, redundant mutual-exclusion layer over state that cannot race, and
+    /// it would not have prevented this defect at all — the bug was a discarded
+    /// return value, not a missing lock. Same invariant (exactly-once resume),
+    /// enforced by the mechanism this file already has.
     private func dropCalendarOpAwaiter(opId: String) {
-        calendarOpAwaiters.removeValue(forKey: opId)
+        calendarOpAwaiters.removeValue(forKey: opId)?.resume(returning: .timedOut)
     }
 
     /// Drain-side notification: resolve any pending awaiter for `opId` with
@@ -211,7 +245,7 @@ extension AccountManager {
                     let ageHours = Date().timeIntervalSince(currentOp.createdAt) / 3600
 
                     // Permanent errors — drop immediately, no retry
-                    if isCalendarNotFoundError(error) {
+                    if Self.isCalendarNotFoundError(error) {
                         print("[CalendarQueue] Event not found for \(opType) — dropping (server wins)")
                         do {
                             try await dbPool.write { db in
@@ -224,7 +258,7 @@ extension AccountManager {
                         signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: "event not found on server"))
                         continue
                     }
-                    if isCalendarMissingScopeError(error) {
+                    if Self.isCalendarMissingScopeError(error) {
                         print("[CalendarQueue] Calendar scope not granted for \(opType) — dropping. User must re-authenticate in Settings.")
                         do {
                             try await dbPool.write { db in
@@ -238,24 +272,38 @@ extension AccountManager {
                         signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: "calendar permission missing — user must re-authenticate in Settings"))
                         continue
                     }
-                    // CalDAV auth failure — semi-permanent, mark needsReauth (L12)
-                    if isCalendarAuthError(error) {
-                        print("[CalendarQueue] CalDAV auth failed for \(opType) — marking needsReauth, stopping retries")
+                    // Auth failure — semi-permanent, needs re-authentication (L12).
+                    // Covers CalDAV's typed `authFailed` AND a POST-REFRESH raw 401
+                    // from Google/Exchange; see `isCalendarAuthError` for why the
+                    // second one is safe to treat as terminal (the providers force a
+                    // token refresh and only rethrow the SECOND 401).
+                    if Self.isCalendarAuthError(error) {
+                        let isCalDAV = Self.isCalDAVAuthError(error)
+                        print("[CalendarQueue] Auth failed for \(opType) (\(isCalDAV ? "CalDAV" : "OAuth")) — stopping retries, user must re-authenticate")
                         do {
                             try await dbPool.write { db in
                                 _ = try PendingCalendarOperation.deleteOne(db, key: currentOp.id)
-                                // Mark CalDAV config as needing re-auth
-                                try db.execute(
-                                    sql: "UPDATE caldavConfig SET needsReauth = 1 WHERE accountId = ?",
-                                    arguments: [currentOp.accountId]
-                                )
+                                // Only CalDAV accounts have a `caldavConfig` row —
+                                // running this for an OAuth account would match zero
+                                // rows and read as if we had marked something.
+                                if isCalDAV {
+                                    try db.execute(
+                                        sql: "UPDATE caldavConfig SET needsReauth = 1 WHERE accountId = ?",
+                                        arguments: [currentOp.accountId]
+                                    )
+                                }
                             }
                         } catch {
                             print("[CalendarQueue] Failed to handle auth failure for op \(currentOp.id): \(error)")
                         }
                         executedAny = true
                         failedAccounts.insert(currentOp.accountId)
-                        signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: "CalDAV authentication failed — user must re-authenticate in Settings"))
+                        signalCalendarOpOutcome(
+                            opId: currentOp.id,
+                            outcome: .permanentFailure(
+                                reason: isCalDAV
+                                    ? "CalDAV authentication failed — user must re-authenticate in Settings"
+                                    : "calendar authentication failed (the account's access was refused again after a token refresh) — user must re-authenticate in Settings"))
                         continue
                     }
 
@@ -263,7 +311,7 @@ extension AccountManager {
                     // (e.g. this_only / this_and_following against Exchange or
                     // CalDAV before those backends implement it). Drop the op
                     // and surface a clear reason — retrying won't help.
-                    if isCalendarUnsupportedError(error) {
+                    if Self.isCalendarUnsupportedError(error) {
                         let reason = unsupportedReason(error)
                         print("[CalendarQueue] Unsupported \(opType) (\(reason)) — dropping (no retry)")
                         do {
@@ -347,9 +395,42 @@ extension AccountManager {
         provider: any CalendarProvider
     ) async throws -> (newSeriesId: String?, createdRealId: String?) {
         let args = op.arguments
+        // 🚨 A NORMAL RETURN FROM THIS FUNCTION IS THE DRAIN'S SUCCESS PATH
+        // (R12-T8). The three guards below used to `return (nil, nil)` after
+        // logging "dropping" — which deletes the row AND fires
+        // `signalCalendarOpOutcome(.success(…))`, so the tool told the LLM
+        // "Calendar event deleted successfully." for work that never happened.
+        // The log said one thing and the mechanism did the opposite.
+        //
+        // They now throw `CalendarProviderError.notSupported`, which
+        // `isCalendarUnsupportedError` claims → the drain deletes the row and
+        // signals `.permanentFailure(reason:)` with this string surfaced to the
+        // agent verbatim. Same disposition, honest outcome. This reuses the
+        // classification three sibling guards in this very function already use
+        // for a malformed persisted request (`edit_scope='…' is not
+        // recognized`) rather than adding a parallel one.
+        //
+        // ⚠️ THE COUNTERFACTUAL, BOTH WAYS.
+        //  * `.success` (what it did): lies to the agent and to the user, and is
+        //    exit-2 abuse — nothing provider-authoritative said the work was done
+        //    or inapplicable.
+        //  * A throw the TRANSIENT arm claims (the naive alternative): a
+        //    persisted `operationType` that no `CalendarOperationType` recognises
+        //    is deterministic, so it would retry forever, and
+        //    `failedAccounts.insert` would head-of-line-block every later op on
+        //    that account on every drain. That is a wedge — the mirror image, and
+        //    in the same non-recoverable set as a dropped intention.
+        // The terminal-with-a-reason disposition is the only one that is neither.
+        //
+        // Reachability today is NONE — every producer is an agent tool passing a
+        // typed `CalendarOperationType` and a non-optional `eventId: String`. It
+        // is fixed by classification anyway, exactly as `eff3ddd`'s
+        // production-unreachable identity refusal was, because "the caller never
+        // produces the value" is a property of today's callers, not an invariant.
         guard let type = CalendarOperationType(rawValue: op.operationType) else {
-            print("[CalendarQueue] Unknown operation type: \(op.operationType) — dropping")
-            return (nil, nil)
+            print("[CalendarQueue] Unknown operation type: \(op.operationType) — retiring as a permanent failure")
+            throw CalendarProviderError.notSupported(
+                "the queued calendar operation has an unrecognised type '\(op.operationType)' and can never be executed")
         }
 
         let calId: String
@@ -394,9 +475,12 @@ extension AccountManager {
             return (nil, createdRealId)
 
         case .edit:
+            // See the `operationType` guard above for why this throws a
+            // TERMINAL-classified error instead of returning (which is success).
             guard let eventId = op.eventId else {
-                print("[CalendarQueue] Edit op missing eventId — dropping")
-                return (nil, nil)
+                print("[CalendarQueue] Edit op missing eventId — retiring as a permanent failure")
+                throw CalendarProviderError.notSupported(
+                    "the queued calendar edit carries no event id and can never be executed")
             }
             let allDay = CalendarToolHelpers.boolArg(args, "all_day")
             // calendar_event_edit-v1.5.21+: attendees are delta-based. If args carries
@@ -453,9 +537,13 @@ extension AccountManager {
             }
 
         case .delete:
+            // See the `operationType` guard above. This one matters most: a
+            // `.success` here told the agent "Calendar event deleted
+            // successfully." for a delete that never reached the wire.
             guard let eventId = op.eventId else {
-                print("[CalendarQueue] Delete op missing eventId — dropping")
-                return (nil, nil)
+                print("[CalendarQueue] Delete op missing eventId — retiring as a permanent failure")
+                throw CalendarProviderError.notSupported(
+                    "the queued calendar delete carries no event id and can never be executed")
             }
             try await provider.deleteEvent(calendarId: calId, eventId: eventId, sendUpdates: "all")
             print("[CalendarQueue] Deleted event id=\(eventId)")
@@ -524,7 +612,17 @@ extension AccountManager {
     /// recurring-occurrence + split paths yet). The drain loop drops the op and
     /// surfaces the message to the LLM so it can either pivot (e.g. propose a
     /// whole-series edit) or relay the limitation to the user.
-    private func isCalendarUnsupportedError(_ error: Error) -> Bool {
+    /// The four classifiers below are `static` (hence nonisolated) for the same
+    /// reason `isCalendarBadRequestError` is: the drain's disposition can then be
+    /// asserted in tests against real provider error values, rather than inferred
+    /// from the drain loop's side effects. Every one of them answers the same
+    /// system-level question — *does SOME terminal arm claim this error?* — and an
+    /// error no arm claims falls through to the transient arm, which requeues it
+    /// and inserts the account into `failedAccounts`, head-of-line-blocking every
+    /// later op on that account on every subsequent drain. That starvation is a
+    /// wedge, and the wedge corollary sits in the same non-recoverable set as a
+    /// dropped intention — it never recovers via sync.
+    static func isCalendarUnsupportedError(_ error: Error) -> Bool {
         if case CalendarProviderError.notSupported = error { return true }
         return false
     }
@@ -534,7 +632,7 @@ extension AccountManager {
         return "operation not supported on this calendar provider"
     }
 
-    private func isCalendarNotFoundError(_ error: Error) -> Bool {
+    static func isCalendarNotFoundError(_ error: Error) -> Bool {
         if case GoogleCalendarError.httpError(404, _) = error { return true }
         if case GoogleCalendarError.eventNotFound = error { return true }
         if case ExchangeCalendarError.httpError(404, _) = error { return true }
@@ -543,13 +641,60 @@ extension AccountManager {
         return false
     }
 
-    private func isCalendarMissingScopeError(_ error: Error) -> Bool {
+    /// ⚠️ THE TYPED `.missingScope` IS NOT THE ONLY SPELLING (R12-T1, 2026-08-06).
+    /// `GoogleCalendarProvider.request` / `ExchangeCalendarProvider.request` map a
+    /// 403 to the typed case only on the FIRST response. When the first response
+    /// was a 401, both force a token refresh and re-issue, and the retry's status
+    /// is rethrown RAW — `throw GoogleCalendarError.httpError(retry.statusCode, nil)`.
+    /// So a 401-then-403 arrives here as `httpError(403, nil)`, which the typed
+    /// match cannot see and which `isCalendarBadRequestError` deliberately excludes
+    /// (403 is not a malformed payload). Before this arm covered the raw form, that
+    /// error was claimed by NO terminal arm and wedged the account's calendar lane.
+    static func isCalendarMissingScopeError(_ error: Error) -> Bool {
         if case GoogleCalendarError.missingScope = error { return true }
         if case ExchangeCalendarError.missingScope = error { return true }
+        if case GoogleCalendarError.httpError(403, _) = error { return true }
+        if case ExchangeCalendarError.httpError(403, _) = error { return true }
         return false
     }
 
-    private func isCalendarAuthError(_ error: Error) -> Bool {
+    /// An authentication failure that no amount of retrying can clear — the user
+    /// must re-authenticate.
+    ///
+    /// - **CalDAV:** `CalDAVError.authFailed`, raised by `CalDAVClient` on a 401.
+    ///   The stored credentials are rejected outright; there is no refresh to try.
+    /// - **Google / Exchange:** a raw `httpError(401, …)`.
+    ///
+    /// ⚠️ **THE COUNTERFACTUAL — why treating a Google/Exchange 401 as PERMANENT
+    /// does not break ordinary token refresh, and what would make it start
+    /// breaking it.** Treating the *first* 401 as permanent WOULD break refresh:
+    /// an expired access token is the ordinary, expected cause of a 401 and is
+    /// cleared by minting a new one. The first 401 never reaches this classifier.
+    /// `GoogleCalendarProvider.request` and `ExchangeCalendarProvider.request` both
+    /// intercept it, call `accessToken(true)` to FORCE a refresh, re-issue the
+    /// request with the fresh token, and only then rethrow — as
+    /// `httpError(retry.statusCode, nil)`. So a 401 arriving here is the SECOND
+    /// one, observed with a token minted seconds earlier: the grant itself is
+    /// revoked/expired, and every future drain reproduces it identically.
+    ///
+    /// **This safety rests entirely on that provider behaviour.** If either
+    /// `request` ever stops force-refreshing before rethrowing — or a new calendar
+    /// provider is added whose first 401 reaches the queue raw — this arm starts
+    /// retiring ops that a token refresh would have fixed. Re-read both `request`
+    /// implementations before changing this.
+    static func isCalendarAuthError(_ error: Error) -> Bool {
+        if case CalDAVError.authFailed = error { return true }
+        if case GoogleCalendarError.httpError(401, _) = error { return true }
+        if case ExchangeCalendarError.httpError(401, _) = error { return true }
+        return false
+    }
+
+    /// True only for the CalDAV spelling of an auth failure. CalDAV accounts own a
+    /// `caldavConfig` row whose `needsReauth` column is the persistent, user-visible
+    /// signal (`ToolSettingsView` reads it); OAuth accounts have no such row, so the
+    /// drain must not issue an `UPDATE` that silently matches zero rows and reads as
+    /// "we marked it".
+    static func isCalDAVAuthError(_ error: Error) -> Bool {
         if case CalDAVError.authFailed = error { return true }
         return false
     }

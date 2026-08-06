@@ -28,11 +28,37 @@ import Foundation
 // Both halves are asserted: the malformed codes must still be retired.
 //
 // 401/403/404 are absent from the Google/Exchange arms because dedicated earlier
-// arms (`isCalendarAuthError`, `isCalendarMissingScopeError`,
-// `isCalendarNotFoundError`) already claim them; CalDAV's 403 is deliberately
-// retired HERE, because iCloud returns an opaque 403 for permanent policy
-// refusals (attendee-without-organizer, shared-calendar writes) that no retry
-// fixes. That asymmetry is pinned below so a future "tidy-up" cannot collapse it.
+// arms claim them — but ⚠️ **CORRECTED CLAUSE BY CLAUSE (R12-T1, 2026-08-06); the
+// version of this paragraph that shipped with the R11-C fix was wrong about two of
+// the three codes, and one of those errors was a live lane wedge.**
+//
+//   * **404 — TRUE as originally written.** `isCalendarNotFoundError` matches the
+//     RAW HTTP form on both providers (`GoogleCalendarError.httpError(404, _)`,
+//     `ExchangeCalendarError.httpError(404, _)`) as well as the typed
+//     `.eventNotFound` and CalDAV's `.notFound`, so every spelling is claimed.
+//   * **403 — TRUE, but the original REASON was wrong, and the wrong reason hid a
+//     wedge.** The claim used to be that `isCalendarMissingScopeError` claims it.
+//     It did not: that predicate matched only the TYPED `.missingScope`. What
+//     actually converts a 403 is the PROVIDER — `GoogleCalendarProvider.request`
+//     and `ExchangeCalendarProvider.request` map `statusCode == 403` to
+//     `.missingScope` before throwing. ⚠️ But they do that only on the FIRST
+//     response: after a 401 both force a token refresh, re-issue, and rethrow the
+//     retry's status RAW (`httpError(retry.statusCode, nil)`). A 401-then-403
+//     therefore arrived as `httpError(403, nil)`, which no arm claimed.
+//     `isCalendarMissingScopeError` now matches the raw form too.
+//   * **401 — FALSE as originally written.** `isCalendarAuthError` was CalDAV-only
+//     (`CalDAVError.authFailed`), so a POST-REFRESH Google/Exchange 401 was not an
+//     auth error, not a bad request, and not a not-found: it fell through to the
+//     TRANSIENT arm, which requeues and inserts the account into `failedAccounts`
+//     — and the drain's `if failedAccounts.contains(…) { continue }` then skips
+//     every later op for that account on every subsequent drain. No retry can ever
+//     clear a revoked grant, so that is a permanent starvation, i.e. a wedge.
+//     `isCalendarAuthError` now claims the raw 401 on both providers.
+//
+// CalDAV's 403 is deliberately retired by `isCalendarBadRequestError`, because
+// iCloud returns an opaque 403 for permanent policy refusals
+// (attendee-without-organizer, shared-calendar writes) that no retry fixes. That
+// asymmetry is pinned below so a future "tidy-up" cannot collapse it.
 
 @Suite("Calendar queue — bad-request classification")
 struct CalendarBadRequestClassificationTests {
@@ -70,6 +96,69 @@ struct CalendarBadRequestClassificationTests {
                 #expect(AccountManager.isCalendarBadRequestError(error) == true,
                         "\(label) HTTP \(code) is authoritative — retrying forever wedges the calendar drain")
             }
+        }
+    }
+
+    // MARK: - R12-T1 — no provider error may be left to starve in the transient arm
+
+    /// The drain's terminal dispositions, in the order `drainCalendarQueue` tests
+    /// them. Anything this returns `false` for takes the drain's LAST arm, which
+    /// requeues the op AND does `failedAccounts.insert(currentOp.accountId)` — and
+    /// the drain's `if failedAccounts.contains(currentOp.accountId) { continue }`
+    /// then skips every later op for that account, on this drain and on every
+    /// subsequent one.
+    ///
+    /// ⚠️ This roster MIRRORS the drain; if an arm is added to or removed from
+    /// `drainCalendarQueue`, update it here. It is deliberately not an assertion
+    /// about WHICH arm claims an error — that would pin a mechanism. The property
+    /// under test is only *does the error reach a terminal disposition at all*.
+    private func claimedByATerminalArm(_ error: Error) -> Bool {
+        if AccountManager.isCalendarNotFoundError(error) { return true }
+        if AccountManager.isCalendarMissingScopeError(error) { return true }
+        if AccountManager.isCalendarAuthError(error) { return true }
+        if AccountManager.isCalendarUnsupportedError(error) { return true }
+        if case CalDAVError.inconsistentState = error { return true }
+        if AccountManager.isCalendarBadRequestError(error) { return true }
+        return false
+    }
+
+    @Test("A post-refresh 401/403 reaches a terminal arm instead of starving the account's calendar lane")
+    func postRefreshAuthFailuresAreTerminal() {
+        // These are the exact values `GoogleCalendarProvider.request` /
+        // `ExchangeCalendarProvider.request` rethrow after they have ALREADY forced
+        // a token refresh and re-issued the request:
+        //     throw GoogleCalendarError.httpError(retry.statusCode, nil)
+        // so the grant is revoked and no retry can ever clear it.
+        let postRefresh: [(label: String, error: Error)] = [
+            ("Google 401", GoogleCalendarError.httpError(401, nil)),
+            ("Exchange 401", ExchangeCalendarError.httpError(401, nil)),
+            ("Google 403", GoogleCalendarError.httpError(403, nil)),
+            ("Exchange 403", ExchangeCalendarError.httpError(403, nil)),
+        ]
+        for (label, error) in postRefresh {
+            #expect(claimedByATerminalArm(error),
+                    "\(label) is claimed by NO terminal arm, so the drain requeues it and inserts the account into failedAccounts — every later calendar op on that account is skipped forever. A wedge is in the same non-recoverable set as a dropped intention.")
+        }
+    }
+
+    @Test("A genuinely transient failure still reaches NO terminal arm, so it stays retryable")
+    func transientFailuresAreStillRetryable() {
+        // ⚠️ THE NEGATIVE CASE. The mirror-image "fix" — widening the terminal arms
+        // until nothing falls through — would retire ops on failures a retry
+        // resolves, which is the dropped-intention half of the same invariant. Both
+        // directions are asserted so neither can be traded for the other.
+        let transient: [(label: String, error: Error)] = [
+            ("connection lost", URLError(.networkConnectionLost)),
+            ("Google 500", GoogleCalendarError.httpError(500, nil)),
+            ("Exchange 503", ExchangeCalendarError.httpError(503, nil)),
+            ("CalDAV 503", CalDAVError.httpError(503, nil)),
+            ("Google 408", GoogleCalendarError.httpError(408, nil)),
+            ("Exchange 429", ExchangeCalendarError.httpError(429, nil)),
+            ("CalDAV 423", CalDAVError.httpError(423, nil)),
+        ]
+        for (label, error) in transient {
+            #expect(claimedByATerminalArm(error) == false,
+                    "\(label) is indeterminate or transient — a terminal arm claiming it retires the user's intention on 'we could not determine the answer'")
         }
     }
 

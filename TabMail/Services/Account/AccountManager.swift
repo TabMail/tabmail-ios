@@ -384,6 +384,21 @@ actor AccountManager {
         workQueues.removeValue(forKey: accountId)
     }
 
+    /// Test seam: the calendar sibling of `registerProviderForTesting`, so the
+    /// calendar tools and `drainCalendarQueue` can be exercised against a
+    /// `MockCalendarProvider` without a network account. Same replace-on-call
+    /// semantics as `registerDemoProviders`. Deliberately an EXPLICIT
+    /// registration rather than a nil-defaulted injection point: a seam that
+    /// silently falls back to the real provider lookup fails DANGEROUS.
+    func registerCalendarProviderForTesting(accountId: String, provider: any CalendarProvider) {
+        calendarProviders[accountId] = provider
+    }
+
+    /// Test seam: undo `registerCalendarProviderForTesting`.
+    func unregisterCalendarProviderForTesting(accountId: String) {
+        calendarProviders.removeValue(forKey: accountId)
+    }
+
     /// Guard for pending queue drain (used by AccountManagerQueue).
     var isDraining = false
     /// Set when drainPendingQueue() is called while isDraining — triggers re-drain on completion.
