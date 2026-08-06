@@ -977,10 +977,18 @@ extension SyncEngine {
     /// `bootstrapVerifiedFolderUidValidity`. Until that runs the column stays nil,
     /// which is the `IOS-EPOCH-001` accepted window (gestures refused, the reconcile
     /// walk refuses, NO data touched) — not data loss.
+    ///
+    /// - Returns: whether the UPDATE actually stamped a row. Every term in the
+    ///   statement can legitimately match nothing — an already-stamped folder, a
+    ///   folder that holds headers, a folder row that vanished — and a caller that
+    ///   reports "stamped" is making a claim about durable state, so the row count
+    ///   is the only honest answer. `@discardableResult` because most callers are
+    ///   fire-and-forget bootstraps that have no premise riding on it.
+    @discardableResult
     nonisolated static func bootstrapFolderUidValidity(
         _ db: Database, folderId: String, observed: Int?
-    ) throws {
-        guard let epoch = knownUidValidity(observed) else { return }
+    ) throws -> Bool {
+        guard let epoch = knownUidValidity(observed) else { return false }
         try db.execute(
             sql: """
                 UPDATE folder SET lastKnownUidValidity = :epoch
@@ -990,6 +998,7 @@ extension SyncEngine {
                 """,
             arguments: ["epoch": epoch, "folderId": folderId]
         )
+        return db.changesCount > 0
     }
 
     /// The VERIFIED bootstrap write — `bootstrapFolderUidValidity` minus ONLY the
@@ -1024,7 +1033,9 @@ extension SyncEngine {
     func bootstrapFolderUidValidity(folderId: String, observed: Int?) async throws {
         guard Self.knownUidValidity(observed) != nil else { return }
         try await dbPool.write { db in
-            try Self.bootstrapFolderUidValidity(db, folderId: folderId, observed: observed)
+            // Explicit discard so the closure stays `Void`-returning now that the
+            // static reports whether its UPDATE matched.
+            _ = try Self.bootstrapFolderUidValidity(db, folderId: folderId, observed: observed)
         }
     }
 

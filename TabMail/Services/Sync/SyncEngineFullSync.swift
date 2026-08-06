@@ -101,8 +101,16 @@ extension SyncEngine {
                     // a record it is already updating, so it discharges the same term in
                     // Swift — sound HERE and only here, because the count is read inside
                     // THIS write transaction with no suspension before the `update`.
-                    let existingHoldsRows = try MessageHeader
-                        .filter(Column("folderId") == existing.id).fetchCount(db) > 0
+                    // `isEmpty` compiles to `SELECT EXISTS(SELECT … LIMIT 1)`, which
+                    // stops at the first index entry. `fetchCount` walks every entry
+                    // for a folder — pure waste for a question that is answered by
+                    // one row, inside the single GRDB writer. Same shape as the
+                    // `NOT EXISTS (SELECT 1 FROM messageHeader WHERE folderId = …)`
+                    // term already inside `bootstrapFolderUidValidity`'s statement;
+                    // this site must stay in Swift (see the note above), so it ports
+                    // the predicate's SHAPE rather than its location.
+                    let existingHoldsRows = try !MessageHeader
+                        .filter(Column("folderId") == existing.id).isEmpty(db)
                     if let bootstrap = Self.uidValidityBootstrapWrite(
                         observed: info.uidValidity, stored: existing.lastKnownUidValidity,
                         folderHoldsRows: existingHoldsRows) {
@@ -124,8 +132,9 @@ extension SyncEngine {
                     // leaves its headers orphaned, so a re-created path RE-ADOPTS old-epoch
                     // rows the instant this insert lands. The term is therefore required on
                     // BOTH arms.
-                    let recreatedHoldsRows = try MessageHeader
-                        .filter(Column("folderId") == folder.id).fetchCount(db) > 0
+                    // Existence test, not a count — see the sibling arm above.
+                    let recreatedHoldsRows = try !MessageHeader
+                        .filter(Column("folderId") == folder.id).isEmpty(db)
                     folder.lastKnownUidValidity = Self.uidValidityBootstrapWrite(
                         observed: info.uidValidity, stored: nil,
                         folderHoldsRows: recreatedHoldsRows)
@@ -567,9 +576,29 @@ extension SyncEngine {
     /// minimum provider-native proof absent from v2final after the Header,
     /// Snapshot, ingress/re-key call-site, and SyncEngineFullSync history
     /// census. An optimistic cross-mailbox row cannot satisfy it. Such a row is
-    /// left in place with a nil observation stamp; sync may reconcile it later.
-    /// No RFC adoption, compatibility, recovery, or Folder-current epoch
-    /// synthesis is performed here.
+    /// left in place with a nil observation stamp. No RFC adoption, no
+    /// compatibility shim, and no Folder-current epoch synthesis is performed
+    /// here.
+    ///
+    /// ⚠️ **"Sync may reconcile it later" was the unverified half of that claim
+    /// and it is now stated precisely, because it decides whether a refusal
+    /// hides a message.** When the refused rows are the ONLY rows at this
+    /// address, returning one of them makes the caller take its
+    /// `sourceAddressProven` arm, which `continue`s BEFORE the insert — so the
+    /// message the server just reported is neither merged nor inserted, and
+    /// nothing else re-offers it: `selectStaleHeaders` cannot reach the remnant
+    /// (its UID is in `remoteIds` on all three arms) and
+    /// `SyncEngineBackfillDeep`'s `missingUIDs` is keyed on
+    /// (folderId, messageId), so the remnant answers for the UID and the deep
+    /// crawl never re-fetches it. `incomingRfc822Identity` is what lets this
+    /// function tell "a retained row might BE this message" (keep refusing)
+    /// apart from "every retained row provably is NOT" (admit the insert) —
+    /// see the refusal path for the gate and its fail directions.
+    ///
+    /// - Parameter incomingRfc822Identity: the NORMALIZED RFC 822 identity of
+    ///   the message this pass is offering (`normalizedRfc822Identity`), or nil
+    ///   when the envelope carries none. Used ONLY as a negative discriminator
+    ///   in the refusal path; nil is the fail-closed value everywhere.
     nonisolated static func canonicalizeLocalRows(
         accountId: String,
         folderPath: String,
@@ -578,6 +607,7 @@ extension SyncEngine {
         isInInbox: Bool,
         windowMode: StaleWindowMode,
         sourceBoundEpoch: Int?,
+        incomingRfc822Identity: String?,
         db: Database
     ) throws -> (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?, sourceAddressProven: Bool) {
         let allRows = try MessageHeader
@@ -603,7 +633,46 @@ extension SyncEngine {
             element.1 ? element.0 : nil
         }
         guard !rows.isEmpty else {
-            BackgroundSyncLogger.log("[Sync] canonicalize REFUSED at (folderId=\(folderId), msgId=\(messageId)) — no row proves provider-address ownership")
+            // No retained row owns this provider address. The disposition below
+            // decides whether the message the server just reported ever becomes
+            // visible, so it is gated on POSITIVE evidence of non-identity and
+            // never on the mere absence of proof.
+            //
+            // Admit the caller's ordinary INSERT (return nil) only when:
+            //   * the incoming envelope carries an identity, AND
+            //   * every retained row carries one and every one of them DIFFERS,
+            //     AND
+            //   * no retained row already holds the canonical PK.
+            // Then no retained row can be this message, and refusing would hide
+            // it permanently (see this function's doc comment for why neither
+            // healer reaches it).
+            //
+            // Same direction and same rationale as the R15-F1 identity gate on
+            // the pre-sync inbox reclaim in `runSyncMessages`: RFC EQUALITY
+            // never proves a provider address — that discriminator stays
+            // subtracted — but RFC INEQUALITY does prove two rows are not the
+            // same message. Every ambiguous shape keeps the refusal: a nil
+            // identity on either side, an equal identity, or an occupied
+            // canonical PK. The occupied-PK arm also keeps the insert away from
+            // a PK it could not take.
+            //
+            // The admitted row is not a duplicate of the retained ones and
+            // cannot become a wrong-message mutation target: the insert stamps
+            // `observedUidValidity = sourceBoundEpoch` while an optimistic
+            // remnant's stamp is nil, and `admittedOrdinaryActionTargets`
+            // admits a gesture only when `observedUidValidity == liveEpoch`, so
+            // the remnant stays exactly as gesture-inert as it was before.
+            let admitIncomingAsNewRow: Bool = {
+                guard let incoming = incomingRfc822Identity,
+                      !retainedRows.contains(where: { $0.id == canonicalId })
+                else { return false }
+                return retainedRows.allSatisfy { row in
+                    guard let stored = normalizedRfc822Identity(row.rfc822MessageId) else { return false }
+                    return stored != incoming
+                }
+            }()
+            BackgroundSyncLogger.log("[Sync] canonicalize REFUSED at (folderId=\(folderId), msgId=\(messageId)) — no row proves provider-address ownership; the incoming message is \(admitIncomingAsNewRow ? "ADMITTED as a new row (every retained row provably denotes a different message)" : "NOT admitted (no positive evidence of non-identity)")")
+            if admitIncomingAsNewRow { return (nil, [], nil, false) }
             return (retainedRows.first(where: { $0.id == canonicalId }) ?? retainedRows[0], [], nil, false)
         }
         // Fast path — a single row already under the canonical PK is the
@@ -1396,7 +1465,8 @@ extension SyncEngine {
                         folderId: folderId, messageId: info.messageId,
                         isInInbox: isInInbox,
                         windowMode: windowMode,
-                        sourceBoundEpoch: sourceBoundEpoch, db: db
+                        sourceBoundEpoch: sourceBoundEpoch,
+                        incomingRfc822Identity: normalizedIncomingRfc822, db: db
                     )
                 }
                 upsReconSeconds += CFAbsoluteTimeGetCurrent() - reconT0

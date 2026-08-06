@@ -664,10 +664,21 @@ extension SyncEngine {
         _ db: Database, folderId: String, observed: UInt32?
     ) throws -> Bool {
         guard let observed, let epoch = knownUidValidity(Int(observed)) else { return false }
-        let localHeaders = try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db)
-        guard localHeaders == 0 else { return false }
-        try Self.bootstrapFolderUidValidity(db, folderId: folderId, observed: epoch)
-        return true
+        // Existence test, not a count: `isEmpty` compiles to
+        // `SELECT EXISTS(SELECT … LIMIT 1)` and stops at the first index entry,
+        // where `fetchCount` walked every entry for the folder inside the writer.
+        guard try MessageHeader.filter(Column("folderId") == folderId).isEmpty(db) else { return false }
+        // The return describes what the UPDATE actually did. Its statement carries
+        // `AND lastKnownUidValidity IS NULL`, so a folder this pass finds already
+        // stamped — with `crawlEpochGate` having proven that stamp IS `walkEpoch`
+        // — matches zero rows, and the old unconditional `true` claimed a write
+        // that never happened. Inert at every call site today (all three use it
+        // only to advance `premiseEpoch` to `walkEpoch`, which in that state it
+        // already equals) and it stays inert in both directions; the correction is
+        // so that the flag keeps meaning what its callers read it as. The
+        // header-existence gate above is UNCHANGED — narrowing `true` is not
+        // widening what may be stamped.
+        return try Self.bootstrapFolderUidValidity(db, folderId: folderId, observed: epoch)
     }
 
     // MARK: - Unified Backfill Walk

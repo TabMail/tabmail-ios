@@ -146,7 +146,8 @@ struct MessageHeaderObservationEpochTests {
             let result = try SyncEngine.canonicalizeLocalRows(
                 accountId: "acc1", folderPath: "Archive", folderId: "acc1:Archive",
                 messageId: "7", isInInbox: false, windowMode: .uid,
-                sourceBoundEpoch: 100, db: connection)
+                sourceBoundEpoch: 100,
+                incomingRfc822Identity: nil, db: connection)
             #expect(result.sourceAddressProven == false)
             #expect(result.row?.observedUidValidity == nil)
             #expect(result.ftsRekey == nil,

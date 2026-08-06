@@ -197,6 +197,10 @@ struct RFC822IdentityMergeGuardTests {
         try pool.read { try MessageHeader.filter(Column("messageId") == messageId).fetchAll($0) }
     }
 
+    private func headers(_ pool: DatabasePool, rfc822: String) throws -> [MessageHeader] {
+        try pool.read { try MessageHeader.filter(Column("rfc822MessageId") == rfc822).fetchAll($0) }
+    }
+
     private func insertPendingArchive(
         _ pool: DatabasePool, stableId: String, from source: String, to destination: String
     ) throws {
@@ -326,6 +330,133 @@ struct RFC822IdentityMergeGuardTests {
         guard rows.count == 1 else { return }
         #expect(rows[0].id == canonicalId, "the folder-native canonical PK wins")
         #expect(try header(pool, id: remnantId) == nil)
+    }
+
+    // MARK: - D4 — the refusal must not swallow the incoming message
+
+    /// **THE SYSTEM PROPERTY: a message the server reports in a folder, and that
+    /// has no local row anywhere, ends up present locally.**
+    ///
+    /// The assertion is deliberately on presence-and-content of the SERVER's
+    /// message, never on what `canonicalizeLocalRows` returns — a
+    /// mechanism-pinning test inherits a wrong spec's error and stays green on a
+    /// broken system.
+    ///
+    /// Reachability, with no UIDVALIDITY reset anywhere: the user archives INBOX
+    /// UID 500 on a server whose `COPYUID` evidence never arrives (no UIDPLUS),
+    /// so `MessageHeaderRekey.finishMove`'s G4 arm leaves the row in Archive
+    /// still carrying the INBOX UID in its `messageId` column and a nil epoch
+    /// stamp. Archive's OWN UID 500 is a different message that is not local
+    /// yet. Pre-fix the refusal returned that remnant, the caller's
+    /// `sourceAddressProven` arm `continue`d before the insert, and nothing else
+    /// ever re-offered the message: `selectStaleHeaders` cannot reach the
+    /// remnant (UID 500 is in `remoteIds`) and `SyncEngineBackfillDeep`'s
+    /// `missingUIDs` is keyed on (folderId, messageId), so the remnant answers
+    /// for UID 500 and the deep crawl filters the real message out. The user has
+    /// no reason to connect a message they can see to a different one they
+    /// cannot, so "delete the remnant and the UID frees up" is a path, not a
+    /// recovery (`MIS-IOS-008`).
+    @Test("A server message absent locally becomes present even when a foreign remnant occupies its UID")
+    func serverMessageAbsentLocallyBecomesPresentDespiteForeignRemnantAtItsUid() async throws {
+        let (pool, dir, previous) = try makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        try seedAccountAndFolders(pool)
+
+        // The user's archived message: still keyed by the INBOX UID it was
+        // addressed under, sitting in Archive, epoch stamp cleared by the move.
+        let movedId = try insertHeader(
+            pool, messageId: "500", rfc822: "moved@example.com",
+            pkFolderPath: "INBOX", folderPath: "Archive",
+            subject: "The user's archived message", bodyHTML: "<p>the user's body</p>")
+        #expect(movedId == "acc1:INBOX:500")
+        // Archive's OWN UID 500 is a DIFFERENT message and has no local row.
+        #expect(try headers(pool, messageId: "500").count == 1,
+                "precondition: the server's message is absent locally")
+
+        let provider = await mock(
+            [headerInfo(messageId: "500", rfc822: "native@example.com",
+                        subject: "Archive's own message")],
+            observedUidValidity: 202, folderPath: "Archive")
+        _ = try await sync(pool, folderId: "acc1:Archive", provider: provider)
+
+        // THE INVARIANT.
+        let landed = try headers(pool, rfc822: "native@example.com")
+        #expect(landed.count == 1,
+                "the server reported this message in Archive and nothing local could be it — it must exist locally")
+        guard landed.count == 1 else { return }
+        #expect(landed[0].folderId == "acc1:Archive", "and it must be in the folder the server reported it in")
+        #expect(landed[0].subject == "Archive's own message")
+        #expect(landed[0].observedUidValidity == 202,
+                "it carries the epoch bound to the serving FETCH, which is what makes it gesture-addressable")
+
+        // The mirror image this admission must NOT produce: the user's moved
+        // message is still here, unmerged, with its own identity and body.
+        let moved = try header(pool, id: movedId)
+        #expect(moved != nil, "the user's archived message must not be traded away for the incoming one")
+        #expect(moved?.rfc822MessageId == "moved@example.com")
+        #expect(moved?.folderPath == "Archive", "its optimistic move must not be undone")
+        #expect(moved?.observedUidValidity == nil,
+                "and it stays epoch-less, so `admittedOrdinaryActionTargets` keeps refusing gestures on it")
+        #expect(try bodyHTML(pool, id: movedId) == "<p>the user's body</p>")
+        #expect(try header(pool, id: movedId)?.subject == "The user's archived message",
+                "its content must not be overwritten by the incoming message's")
+    }
+
+    /// The deliberately-held other side: without POSITIVE evidence that the
+    /// retained row is a different message, the refusal stands. A remnant that
+    /// carries no RFC identity might BE the incoming message, so admitting an
+    /// insert there would risk a genuine duplicate — and, on the inbox, would
+    /// hand the row to the pre-sync reclaim whose R15-F1 gate cannot exclude a
+    /// nil stored identity, which deletes the user's moved row outright.
+    /// Failing closed here costs visibility of one message; the alternative
+    /// costs the user's message.
+    @Test("An identity-less remnant keeps the refusal — no insert, and the remnant is untouched")
+    func identitylessRemnantKeepsTheRefusal() async throws {
+        let (pool, dir, previous) = try makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        try seedAccountAndFolders(pool)
+
+        let movedId = try insertHeader(
+            pool, messageId: "502", rfc822: nil,
+            pkFolderPath: "INBOX", folderPath: "Archive",
+            subject: "The user's archived message", bodyHTML: "<p>the user's body</p>")
+
+        let provider = await mock(
+            [headerInfo(messageId: "502", rfc822: "native@example.com",
+                        subject: "Archive's own message")],
+            observedUidValidity: 202, folderPath: "Archive")
+        _ = try await sync(pool, folderId: "acc1:Archive", provider: provider)
+
+        let rows = try headers(pool, messageId: "502")
+        #expect(rows.count == 1,
+                "no positive evidence of non-identity — the incoming message must not be admitted as a second row")
+        #expect(try header(pool, id: movedId) != nil,
+                "and the user's moved message must survive the refusal")
+        #expect(try header(pool, id: movedId)?.subject == "The user's archived message")
+        #expect(try bodyHTML(pool, id: movedId) == "<p>the user's body</p>")
+    }
+
+    /// The same hold from the other ambiguous direction: an incoming envelope
+    /// with no Message-ID cannot prove non-identity either.
+    @Test("An identity-less incoming envelope keeps the refusal")
+    func identitylessIncomingEnvelopeKeepsTheRefusal() async throws {
+        let (pool, dir, previous) = try makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        try seedAccountAndFolders(pool)
+
+        let movedId = try insertHeader(
+            pool, messageId: "503", rfc822: "moved@example.com",
+            pkFolderPath: "INBOX", folderPath: "Archive",
+            subject: "The user's archived message")
+
+        let provider = await mock(
+            [headerInfo(messageId: "503", rfc822: nil, subject: "Archive's own message")],
+            observedUidValidity: 202, folderPath: "Archive")
+        _ = try await sync(pool, folderId: "acc1:Archive", provider: provider)
+
+        let rows = try headers(pool, messageId: "503")
+        #expect(rows.count == 1, "a nil incoming identity proves nothing — the refusal stands")
+        #expect(try header(pool, id: movedId)?.rfc822MessageId == "moved@example.com")
     }
 
     // MARK: - D2 — the `existing` merge branch

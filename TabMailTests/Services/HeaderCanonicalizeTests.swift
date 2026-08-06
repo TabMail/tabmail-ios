@@ -74,7 +74,8 @@ struct HeaderCanonicalizeTests {
                 accountId: "acc1", folderPath: trashPath,
                 folderId: trashFolderId, messageId: messageId,
                 isInInbox: false, windowMode: .date,
-                sourceBoundEpoch: nil, db: dbConn
+                sourceBoundEpoch: nil,
+                incomingRfc822Identity: nil, db: dbConn
             )
         }
     }
