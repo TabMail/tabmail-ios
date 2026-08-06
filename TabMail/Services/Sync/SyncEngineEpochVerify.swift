@@ -170,12 +170,19 @@ extension SyncEngine {
     /// typically restarts low, so every HIGH local UID is simply absent. "All
     /// missing" is the renumber's NORMAL shape and must not be read as consent.
     ///
-    /// **Both sides are normalized HERE, explicitly.** Elsewhere in the tree
-    /// (`AccountManager.expandWithSiblingsByRfc822`) a stored value is compared
-    /// against the column with no re-normalization; that is safe only because every
-    /// write path normalizes — an invariant held by DISCIPLINE, not construction. In
-    /// that site a `<a@x>` vs `a@x` skew costs a missed sibling flip, reconciled by
-    /// the next delta sync. HERE the same skew would produce a FALSE MISMATCH on
+    /// **Both sides are normalized HERE, explicitly.** The exemplar this paragraph
+    /// used to cite — `AccountManager.expandWithSiblingsByRfc822`, which compared a
+    /// stored value against the column with no re-normalization — **no longer
+    /// exists**: it was REMOVED by `065a827ca` as a deliberate D4 subtract, because
+    /// selecting mutation targets by RFC 822 Message-ID is exactly what ADR-IOS-068
+    /// clause 2 bans (the fan-out defect `IOS-IMAP-002`). It is named here only to
+    /// keep the reasoning legible, and must NOT be read as a live call site.
+    ///
+    /// The ARGUMENT it illustrated is unchanged and is why this comparison
+    /// normalizes both sides itself: relying on every write path to normalize is an
+    /// invariant held by DISCIPLINE, not construction. In that now-removed site a
+    /// `<a@x>` vs `a@x` skew merely cost a missed sibling flip. HERE the same skew
+    /// would produce a FALSE MISMATCH on
     /// every sampled row of every folder, which drives the reaction, which PURGES
     /// AND RE-DOWNLOADS the entire mailbox. This design promotes that bug class from
     /// cosmetic to destructive, so the comparison must not inherit any other path's

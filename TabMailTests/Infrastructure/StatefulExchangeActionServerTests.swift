@@ -60,16 +60,24 @@ import Testing
 /// **⚠ ADAPTER BOUNDARY, NOT SYSTEM BOUNDARY.** Everything this suite proves
 /// about duplicate RFC identities is a property of `ExchangeProvider` — the
 /// layer where `ids` are already Graph resource ids. It is NOT a property of
-/// the system. `AccountManager.markRead`/`markUnread` call
-/// `expandWithSiblingsByRfc822` BEFORE anything is queued, and that helper
-/// selects every `messageHeader` row sharing the RFC 822 Message-ID for the
-/// account — no folder filter, no provider-id qualification — then queues each
-/// sibling's native id. So at the SYSTEM boundary a duplicate-RFC gesture still
-/// fans out. Tracked as **D-26** in `PLAN_IOS_REFACTOR_V3.md`; the
-/// system-boundary proof is still OWED and must be written as a red-first test
-/// against `AccountManager`, not lowered to this boundary. `v2final` has the
-/// identical helper with identical SQL, so narrowing it is a production
-/// behaviour change needing its own tier — do not smuggle it into a test fix.
+/// the system.
+///
+/// ⚠️ **CORRECTED 2026-08-05 — the paragraph that stood here described a fan-out
+/// that NO LONGER EXISTS, and it must not be used to "restore" one.** It read:
+/// *"`AccountManager.markRead`/`markUnread` call `expandWithSiblingsByRfc822`
+/// BEFORE anything is queued … So at the SYSTEM boundary a duplicate-RFC gesture
+/// still fans out. Tracked as **D-26**; the system-boundary proof is still OWED."*
+/// `expandWithSiblingsByRfc822` was **REMOVED** by `065a827ca` as a deliberate D4
+/// subtract and has **no declaration anywhere in the tree**. `markRead`/`markUnread`
+/// now group only the rows the user gestured on and admit them through
+/// `AccountManager.admittedOrdinaryActionTargets`, which keys the `PendingOperation`
+/// by `admission.providerIds` (the provider's NATIVE address) under a proven
+/// `observedUidValidity`. **The system boundary no longer fans out by RFC**, so the
+/// OWED proof is discharged by the removal itself and D-26 is closed by subtraction.
+/// Selecting mutation targets by RFC is what ADR-IOS-068 clause 2 bans and what
+/// `IOS-IMAP-002` records; reintroducing it here or in production is a D4 violation.
+/// The scope caveat above still stands on its own: this suite proves an
+/// `ExchangeProvider` property, not a system property.
 ///
 /// **No `.processGlobalState`.** `v2final` leaves both Stateful*ActionServer
 /// suites unannotated, and neither swaps `AppDatabase.shared` nor mutates

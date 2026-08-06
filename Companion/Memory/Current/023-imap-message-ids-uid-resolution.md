@@ -1,3 +1,42 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **⚠️ CURRENT ROUTING NOTE (2026-08-05) — the `markRead`/`markUnread` bullet below is STALE and its
+> mechanism NO LONGER EXISTS. Read this before that bullet; the body is preserved unedited because
+> its bytes are hash-pinned in `Companion/Memory/manifest.tsv` and reconstruct `PROJECT_MEMORY.md`.**
+>
+> The bullet beginning *"**Self-send appears as two `MessageHeader` rows (INBOX + Sent) with the same
+> `rfc822MessageId`.**"* asserts **in the present tense** that *"`markRead`/`markUnread` use
+> `expandWithSiblingsByRfc822` … to flip BOTH rows in one transaction, decrement BOTH folders'
+> `unreadCount`, and queue ONE `PendingOperation` per folder"*, and that *"Sync is the safety net if
+> rfc822 is missing."* **Every clause of that is now false.**
+>
+> `AccountManager.expandWithSiblingsByRfc822` was **REMOVED** by `065a827ca` ("Bind ordinary IMAP
+> actions to UID epochs") as a deliberate **D4 SUBTRACT** — the plan records it as *"⚑ NO REFERENCE —
+> INVENTED: remove `expandWithSiblingsByRfc822` from ordinary IMAP"*. It had **3 production + 8 test**
+> hits at shipped `07a4bb703` (`git grep -c 'expandWithSiblingsByRfc822' 07a4bb703 -- '*.swift'`);
+> at `1d1557187` there is **no declaration anywhere in the tree** (`rg -n 'func
+> expandWithSiblingsByRfc822' TabMail/ Shared/ TabMailNotificationService/ TabMailTests/` → exit 1).
+>
+> **What the code does now.** `markRead`/`markUnread` group **only the rows the user actually
+> gestured on**, by `accountId|folderPath`, and admit each group through
+> `AccountManager.admittedOrdinaryActionTargets`, which requires a live, equal `observedUidValidity`
+> and keys the `PendingOperation` by `admission.providerIds` — the provider's **native** address.
+> Shipped, by contrast, expanded to `stableId`s (the RFC) and queued the fan-out.
+>
+> **THE BEHAVIOUR DELTA, registered because it was previously unregistered:** on plain IMAP, marking
+> the INBOX copy of a self-sent message read **no longer flips the same-RFC Sent copy in the same
+> gesture**. Registered as `IOS-IMAP-011` in `KNOWN_ISSUES.md`.
+>
+> ⚠️ **Do NOT repeat the phrasing that "sync reconciles" it.** We no longer issue the sibling
+> `STORE`, so there is no server-side flag change for a later sync to observe. This is a **deliberate
+> feature removal on D4 grounds**, not a defect and not a dropped intention: the user's gesture
+> targeted the row they acted on and it executed. Two same-RFC rows in different folders are
+> **different messages**, and expanding a mutation across them by RFC is precisely what D4 bans
+> (ADR-IOS-068 clause 2; the fan-out defect it closed is `IOS-IMAP-002`).
+>
+> **Reintroducing RFC-keyed expansion on any mutation path is BANNED** — it re-opens exactly the hole
+> `IOS-IMAP-002` closed and is a D4 violation. Equally, do not read the current non-expanding
+> behaviour as a regression to be "restored".
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ### IMAP Message IDs & UID Resolution
 - `info.messageId` from SwiftMail is often `nil` (many messages lack Message-ID header)
