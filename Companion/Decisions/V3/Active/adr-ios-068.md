@@ -87,8 +87,29 @@ under *Fixed by D4* in `KNOWN_ISSUES.md`.
    concrete IMAP action APIs and compares it after the wrapper SELECT and every inner source
    re-SELECT. A failure at either **deletes the whole op** — never a passing subset — and if that
    delete write fails, the original op is requeued unchanged. Checkpoint A is **type-scoped to the
-   13 action types**: `executeSingleOp` receives every op type and draft ops' `messageIds` are not
+   11 action types**: `executeSingleOp` receives every op type and draft ops' `messageIds` are not
    header ids at all, so an unscoped checkpoint would misclassify them.
+
+   ⚠️ **COUNT CORRECTED 2026-08-05 — this clause said "13 action types", and a bare integer with no
+   member list is exactly what let it drift.** The set is `AccountManagerQueue.swift`'s
+   `nonDraftTypes`, and at `1d1557187` it has **eleven** members, enumerated here so the next reader
+   checks membership rather than arithmetic:
+
+   `.archive`, `.delete`, `.move`, `.markRead`, `.markUnread`, `.markFlagged`, `.markUnflagged`,
+   `.markReplied`, `.markForwarded`, `.addUserLabel`, `.removeUserLabel`.
+
+   **`.setTag` and `.removeTag` are excluded DELIBERATELY, and re-adding them would be a defect.**
+   They were removed from the set by `b78a9303d`, which left an in-tree comment saying so. Action
+   tags are **local-only** (ADR-IOS-036): their `executeOperation` arm is a bare `break` with no
+   provider write at all, so they touch no wire address and stamp **no `observedUidValidity`**.
+   Checkpoint A's unstamped arm would therefore begin REFUSING them — a self-inflicted intention drop
+   on a path that has no wire hazard to protect against. The exclusion is correct; only the number
+   was stale.
+
+   📌 **`065a827ca`'s COMMIT BODY carries the same stale 13** (*"Enforce transactional Checkpoint A
+   across all 13 non-draft operation types"*). A commit message cannot be amended on this
+   no-rewrite branch, so the correction is recorded here instead — do not treat that sentence as
+   evidence that two types are missing from the set.
 
 6. **A folder role is never identity** (the surviving principle of the unreleased ADR-IOS-059).
    Undo resolves by the **recorded tuple** — account, mailbox, native id, epoch — and **drops on any
