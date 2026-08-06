@@ -635,8 +635,17 @@ extension SyncEngine {
     nonisolated static func resetEmptyFolderCrawlEpoch(
         _ db: Database, folderId: String, expectedStoredEpoch: UInt32
     ) throws -> Bool {
-        let localHeaders = try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db)
-        guard localHeaders == 0 else { return false }
+        // `isEmpty`, not `fetchCount == 0`. The result is only ever compared
+        // against zero, and this runs INSIDE the serialized writer: `fetchCount`
+        // is `SELECT COUNT(*)`, which must visit every row of the folder's index
+        // range before it can answer, while `isEmpty` compiles to `SELECT EXISTS`
+        // and stops at the first one. On the folders this gate actually protects
+        // (a folder that IS empty) the two cost the same; on every other folder
+        // the count is paid in full, holds the write lock for the whole scan, and
+        // is then thrown away after a single `== 0` test.
+        guard try MessageHeader.filter(Column("folderId") == folderId).isEmpty(db) else {
+            return false
+        }
         guard let current = try Folder.fetchOne(db, key: folderId),
               current.backfillComplete == false,
               knownUidValidity(current.lastKnownUidValidity).flatMap({ UInt32(exactly: $0) })

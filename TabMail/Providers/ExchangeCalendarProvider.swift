@@ -61,7 +61,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if calendarId == "primary" {
             calPath = ""
         } else {
-            let encodedCalId = calendarId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? calendarId
+            let encodedCalId = try Self.encodedGraphPathSegment(calendarId, context: "Graph calendar id")
             calPath = "/calendars/\(encodedCalId)"
         }
 
@@ -113,7 +113,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
     }
 
     func getEvent(calendarId: String = "primary", eventId: String) async throws -> GCalEvent {
-        let encodedEventId = eventId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? eventId
+        let encodedEventId = try Self.encodedGraphPathSegment(eventId, context: "Graph event id")
         let data = try await request(path: "/events/\(encodedEventId)?$select=id,subject,location,bodyPreview,start,end,attendees,organizer,recurrence,showAs,isCancelled,webLink,createdDateTime,lastModifiedDateTime,isAllDay,seriesMasterId")
         let event = try JSONDecoder().decode(MSEvent.self, from: data)
         return toGCalEvent(event)
@@ -128,7 +128,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if calendarId == "primary" {
             calPath = ""
         } else {
-            let encodedCalId = calendarId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? calendarId
+            let encodedCalId = try Self.encodedGraphPathSegment(calendarId, context: "Graph calendar id")
             calPath = "/calendars/\(encodedCalId)"
         }
 
@@ -160,7 +160,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // own "prefer GET + UPDATE over PATCH" recommendation.
         let existing = try await getEvent(calendarId: calendarId, eventId: eventId)
         let merged = GoogleCalendarProvider.mergeExistingEventWithPatch(existing: existing, patch: event)
-        let encodedEventId = eventId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? eventId
+        let encodedEventId = try Self.encodedGraphPathSegment(eventId, context: "Graph event id")
         let body = try JSONSerialization.data(withJSONObject: toGraphEventJSON(merged))
         // Dump the body so we can diagnose date/tz drift in smoke tests.
         // Graph responses are silent on success; without this we can't tell
@@ -181,7 +181,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         eventId: String,
         sendUpdates: String = "all"
     ) async throws {
-        let encodedEventId = eventId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? eventId
+        let encodedEventId = try Self.encodedGraphPathSegment(eventId, context: "Graph event id")
         print("[ExchangeCalendar] deleteEvent id=\(eventId)")
         _ = try await request(path: "/events/\(encodedEventId)", method: "DELETE")
         print("[ExchangeCalendar] deleteEvent success")
@@ -204,7 +204,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // via seriesMasterId before the instance lookup.
         let (eventId, _) = try await resolveToMaster(eventId: eventId)
         let instanceId = try await resolveInstanceId(masterId: eventId, recurrenceId: recurrenceId)
-        let encodedInstanceId = instanceId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? instanceId
+        let encodedInstanceId = try Self.encodedGraphPathSegment(instanceId, context: "Graph event instance id")
         // Same defensive full-payload approach as `updateEvent` — fetch the
         // instance, merge the patch onto it, send everything. Without this an
         // instance PATCH that touches only `attendees` (or some other field)
@@ -306,7 +306,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if let bodyStr = String(data: cappedBody, encoding: .utf8) {
             print("[ExchangeCalendar] splitSeries cap PATCH body=\(bodyStr.prefix(4000))")
         }
-        let encodedMasterId = eventId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? eventId
+        let encodedMasterId = try Self.encodedGraphPathSegment(eventId, context: "Graph series master id")
         let capRespData = try await request(path: "/events/\(encodedMasterId)", method: "PATCH", body: cappedBody)
         // Log the response so we can see what Graph stored — particularly the
         // master's start/end/recurrence after capping, to diagnose visible
@@ -337,7 +337,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if calendarId == "primary" {
             calPath = ""
         } else {
-            let encodedCalId = calendarId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? calendarId
+            let encodedCalId = try Self.encodedGraphPathSegment(calendarId, context: "Graph calendar id")
             calPath = "/calendars/\(encodedCalId)"
         }
         do {
@@ -472,7 +472,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let startQS = utcFmt.string(from: minDate)
         let endQS = utcFmt.string(from: maxDate)
 
-        let encodedMaster = masterId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? masterId
+        let encodedMaster = try Self.encodedGraphPathSegment(masterId, context: "Graph series master id")
         let encodedStart = startQS.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? startQS
         let encodedEnd = endQS.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? endQS
         let data = try await request(path: "/events/\(encodedMaster)/instances?startDateTime=\(encodedStart)&endDateTime=\(encodedEnd)&$select=id,start")
@@ -494,6 +494,36 @@ actor ExchangeCalendarProvider: CalendarProvider {
     }
 
     // MARK: - HTTP
+
+    /// Encode `value` as exactly ONE Graph path segment, or throw.
+    ///
+    /// Every id below is a Graph resource id: opaque, server-minted, and free to
+    /// contain `/`, `+`, `=`, `?` or `#`. This used to be
+    /// `value.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? value`
+    /// at nine sites, which is wrong twice over:
+    ///
+    ///  - `.urlPathAllowed` is a PATH set, not a SEGMENT set — it permits `/`,
+    ///    `;`, `=`, `+`, `@` and `,` literally. A `/` inside an event or calendar
+    ///    id therefore survives encoding and changes which ROUTE Graph selects,
+    ///    so a PATCH or DELETE meant for one resource can address another. On a
+    ///    calendar path that is a wrong-event mutation.
+    ///  - `?? value` fell back to the RAW string on failure. A fail-dangerous
+    ///    default on a guard is worse than no guard: it is silent, and it fires
+    ///    exactly on the inputs the guard exists for.
+    ///
+    /// `GraphAPI.encodedGraphPathSegment` is the single source of truth for the
+    /// allowed set (RFC 3986 unreserved) and is already what `ExchangeProvider`
+    /// uses on the mail side; this wrapper exists only to put the failure in
+    /// THIS type's error domain, exactly as `ExchangeProvider`'s does.
+    private static func encodedGraphPathSegment(
+        _ value: String,
+        context: String
+    ) throws -> String {
+        guard let encoded = GraphAPI.encodedGraphPathSegment(value) else {
+            throw ExchangeCalendarError.invalidPathSegment(context)
+        }
+        return encoded
+    }
 
     private func request(path: String, method: String = "GET", body: Data? = nil) async throws -> Data {
         let token = try await accessToken(false)
@@ -977,6 +1007,10 @@ enum ExchangeCalendarError: Error {
     case missingScope
     case httpError(Int, Data?)
     case eventNotFound
+    /// A Graph resource id could not be encoded as one strict path segment.
+    /// The associated value names which id, matching `ProviderError.invalidURL`'s
+    /// contract on the mail side.
+    case invalidPathSegment(String)
 }
 
 // MARK: - Microsoft Graph Calendar Response Models
