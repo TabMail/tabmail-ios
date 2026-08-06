@@ -448,7 +448,7 @@ struct SettingsView: View {
                 Task { await nukeDatabase() }
             }
         } message: {
-            Text("This deletes all emails, search index, and cached data. Your emails will re-sync automatically from your servers. Accounts and credentials are preserved.")
+            Text("Downloaded emails, the search index and cached data are deleted, then re-downloaded from your servers. Queued actions that haven't reached your server yet — archive, delete, read, flag — are discarded rather than re-synced. Your Outbox, accounts and credentials are preserved.")
         }
         .alert("Delete All Email Attachments?", isPresented: $showAttachmentsWipeConfirm) {
             Button("Cancel", role: .cancel) {}
@@ -498,6 +498,47 @@ struct SettingsView: View {
         return String(format: "%.2f GB", mb / 1024.0)
     }
 
+    /// The exact GRDB statements "Delete All Email Index Data" runs, in order.
+    ///
+    /// Named and separated so the boundary of this gesture is a thing that can be
+    /// EXECUTED by a test against the real schema, rather than a list buried in a
+    /// closure that no test can reach.
+    ///
+    /// ⚠ **`outboxMessage` IS NOT HERE, and that is the point.** It was, until
+    /// 2026-08-05. An Outbox row is a send the user composed that has **never
+    /// reached a server**, so it cannot "re-sync automatically from your servers"
+    /// — deleting it destroyed the message outright while the confirmation alert
+    /// promised the opposite. `Companion/Rules/Active/never-drop-user-intention.md`
+    /// states the limit of the lifecycle carve-out outright: it "does not extend
+    /// past queue state: Outbox sends, user-authored drafts, bodies, attachments
+    /// and FTS content are never dropped under it." An `outboxMessage` row is also
+    /// self-contained — it carries its own payload and its own attachment subtree
+    /// and references none of the tables below — so keeping it costs no
+    /// consistency.
+    ///
+    /// `pendingOperation` DOES stay: those rows address `messageHeader` rows this
+    /// same transaction destroys, so leaving them would queue mutations against
+    /// addresses that no longer exist locally.
+    nonisolated static let localIndexWipeStatements: [String] = [
+        "DELETE FROM messageHeader",
+        "DELETE FROM messageBody",
+        "DELETE FROM messageAICache",
+        "DELETE FROM chatTurn",
+        "DELETE FROM chatHistory",
+        "DELETE FROM pendingOperation",
+        "DELETE FROM pendingRender",
+        "DELETE FROM pendingCalendarOperation",
+        // Reset folder cursors so backfill re-walks from top
+        """
+        UPDATE folder SET
+            backfillComplete = 0,
+            oldestSyncedDate = NULL,
+            backfillUidCursor = NULL,
+            backfillPageToken = NULL
+        WHERE path != ''
+        """
+    ]
+
     private func nukeDatabase() async {
         isNuking = true
 
@@ -506,24 +547,9 @@ struct SettingsView: View {
 
         // 2. Delete all email data from GRDB (preserve accounts + folders)
         try? await AppDatabase.dbPool.write { db in
-            try db.execute(sql: "DELETE FROM messageHeader")
-            try db.execute(sql: "DELETE FROM messageBody")
-            try db.execute(sql: "DELETE FROM messageAICache")
-            try db.execute(sql: "DELETE FROM chatTurn")
-            try db.execute(sql: "DELETE FROM chatHistory")
-            try db.execute(sql: "DELETE FROM pendingOperation")
-            try db.execute(sql: "DELETE FROM outboxMessage")
-            try db.execute(sql: "DELETE FROM pendingRender")
-            try db.execute(sql: "DELETE FROM pendingCalendarOperation")
-            // Reset folder cursors so backfill re-walks from top
-            try db.execute(sql: """
-                UPDATE folder SET
-                    backfillComplete = 0,
-                    oldestSyncedDate = NULL,
-                    backfillUidCursor = NULL,
-                    backfillPageToken = NULL
-                WHERE path != ''
-            """)
+            for sql in Self.localIndexWipeStatements {
+                try db.execute(sql: sql)
+            }
         }
         // Wipe memory.db (ADR-IOS-034)
         await MemoryIndex.shared.deleteAll()

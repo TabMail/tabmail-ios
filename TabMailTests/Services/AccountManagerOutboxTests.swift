@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import GRDB
 @testable import TabMail
 
 // MARK: - AccountManager.generateMessageId
@@ -299,5 +300,91 @@ struct OutboxMessageDatabaseConfigTests {
     func baseDir() {
         let baseDir = OutboxMessage.attachmentsBaseDir
         #expect(baseDir.lastPathComponent == "outbox_attachments")
+    }
+}
+
+// MARK: - Round-9: "Delete All Email Index Data" and the Outbox
+
+/// The local-index wipe is a **lifecycle** boundary — owner-approved, explicit,
+/// outside the drain — and `Companion/Rules/Active/never-drop-user-intention.md`
+/// states the limit of that carve-out outright: it *"does not extend past queue
+/// state: Outbox sends, user-authored drafts, bodies, attachments and FTS content
+/// are never dropped under it."*
+///
+/// These tests execute the PRODUCTION statement list against the PRODUCTION
+/// schema, so they cannot drift from what the gesture actually runs.
+@Suite("Local index wipe — Outbox survival")
+struct LocalIndexWipeOutboxTests {
+
+    private func runWipe(_ db: DatabaseQueue) throws {
+        try db.write { connection in
+            for sql in SettingsView.localIndexWipeStatements {
+                try connection.execute(sql: sql)
+            }
+        }
+    }
+
+    @Test("""
+    A queued Outbox send survives the local index wipe with its payload intact — \
+    it has never reached a server, so it cannot "re-sync automatically from your \
+    servers" and deleting it destroys the message outright
+    """)
+    func queuedOutboxSendSurvivesTheWipe() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        try TestDatabase.insertMessageHeader(db)
+
+        let authoredBody = "Text the user composed that has never left this device."
+        var queued = OutboxMessage(
+            accountId: "acc1",
+            draft: DraftMessage(
+                to: ["recipient@example.com"], subject: "Unsent", body: authoredBody))
+        queued.id = "outbox-1"
+        queued.status = OutboxStatus.queued.rawValue
+        let insertable = queued
+        try db.write { try insertable.insert($0) }
+
+        try runWipe(db)
+
+        let survivor = try db.read { try OutboxMessage.fetchOne($0, key: "outbox-1") }
+        guard let survivor else {
+            Issue.record("the queued send was destroyed by the local index wipe")
+            return
+        }
+        #expect(survivor.body == authoredBody, "and it survives with its payload, not as a husk")
+        #expect(survivor.subject == "Unsent")
+        #expect(survivor.status == OutboxStatus.queued.rawValue,
+                "still drainable — surviving in a state the drain skips is not survival")
+
+        // NON-VACUITY: the wipe really ran. Without this the test above passes on
+        // a statement list that does nothing at all.
+        #expect(try db.read { try MessageHeader.fetchCount($0) } == 0)
+    }
+
+    @Test("""
+    HELD DIRECTION — queued message ACTIONS are still purged: they address \
+    messageHeader rows the same transaction destroys, so leaving them would queue \
+    mutations against addresses that no longer exist locally
+    """)
+    func queuedMessageActionsAreStillPurged() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+
+        let op = PendingOperation(
+            type: .move,
+            messageIds: ["msg-1"],
+            accountId: "acc1",
+            folderPath: "INBOX",
+            destinationPath: "Archive"
+        )
+        try db.write { try op.insert($0) }
+        #expect(try db.read { try PendingOperation.fetchCount($0) } == 1)
+
+        try runWipe(db)
+
+        #expect(try db.read { try PendingOperation.fetchCount($0) } == 0,
+                "the pendingOperation purge is deliberate and must not be removed with the outbox one")
     }
 }
