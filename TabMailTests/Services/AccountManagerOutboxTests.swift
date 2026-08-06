@@ -388,3 +388,131 @@ struct LocalIndexWipeOutboxTests {
                 "the pendingOperation purge is deliberate and must not be removed with the outbox one")
     }
 }
+
+// MARK: - Round-9 closing pass: the same class, at the calendar queue
+
+/// `pendingCalendarOperation` is the same class as `outboxMessage`, and it
+/// stayed in the wipe list one commit longer.
+///
+/// A queued `.create` carries the user's authored event — title, time,
+/// location, attendees — in `argumentsJSON` for an event that exists on **no
+/// server**, so it can no more "re-sync automatically from your servers" than a
+/// queued send can. It also has none of `pendingOperation`'s consistency
+/// justification: its only foreign key is `accountId → account`, accounts
+/// survive this transaction, its `eventId`/`calendarId` name SERVER-side
+/// resources, and the statement list contains no calendar table at all. So it
+/// addresses nothing the wipe destroys.
+///
+/// Executes the PRODUCTION statement list against the PRODUCTION schema, so it
+/// cannot drift from what the gesture actually runs.
+@Suite("Local index wipe — queued calendar intentions")
+struct LocalIndexWipeCalendarTests {
+
+    private func runWipe(_ db: DatabaseQueue) throws {
+        try db.write { connection in
+            for sql in SettingsView.localIndexWipeStatements {
+                try connection.execute(sql: sql)
+            }
+        }
+    }
+
+    @Test("""
+    A queued calendar intention the user authored survives the local index wipe \
+    with its arguments intact — the event has never reached a server, so \
+    deleting the op destroys the only copy of what the user asked for
+    """)
+    func queuedCalendarIntentionSurvivesTheWipe() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        try TestDatabase.insertMessageHeader(db)
+
+        // Derived from `Date()`, never a literal — a hardcoded date here goes
+        // stale silently.
+        let start = Date().addingTimeInterval(3 * 24 * 60 * 60)
+        let authoredTitle = "Quarterly planning with the design team"
+        let op = PendingCalendarOperation(
+            operationType: .create,
+            accountId: "acc1",
+            eventId: "tmpregenerated1",
+            calendarId: "primary",
+            arguments: [
+                "title": .string(authoredTitle),
+                "start": .string(ISO8601DateFormatter().string(from: start)),
+                "attendees": .array([.string("colleague@example.com")])
+            ]
+        )
+        let opId = op.id
+        try db.write { try op.insert($0) }
+
+        try runWipe(db)
+
+        let survivor = try db.read { try PendingCalendarOperation.fetchOne($0, key: opId) }
+        guard let survivor else {
+            Issue.record("the queued calendar intention was destroyed by the local index wipe")
+            return
+        }
+        // Survives with its PAYLOAD — the authored event data, not a husk.
+        // `JSONValue` is not `Equatable`, so match the cases explicitly.
+        if case .string(let title) = survivor.arguments["title"] {
+            #expect(title == authoredTitle, "the event the user authored must still be there to send")
+        } else {
+            Issue.record("the authored title did not survive as a string argument")
+        }
+        if case .array(let attendees) = survivor.arguments["attendees"] {
+            #expect(attendees.count == 1)
+            guard attendees.count == 1 else { return }
+            if case .string(let email) = attendees[0] {
+                #expect(email == "colleague@example.com")
+            } else {
+                Issue.record("the attendee did not survive as a string")
+            }
+        } else {
+            Issue.record("the authored attendee list did not survive")
+        }
+        #expect(survivor.status == PendingStatus.queued.rawValue,
+                "still drainable — surviving in a state the drain skips is not survival")
+
+        // NON-VACUITY: the wipe really ran. Without this the assertions above
+        // pass on a statement list that does nothing at all.
+        #expect(try db.read { try MessageHeader.fetchCount($0) } == 0)
+    }
+
+    @Test("""
+    HELD DIRECTION — the wipe still does its job around it: queued message \
+    ACTIONS are purged in the very same transaction that spares the calendar \
+    op, so this is a narrowing of the wipe and not a disabling of it
+    """)
+    func messageActionsAreStillPurgedAlongsideTheSurvivingCalendarOp() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+
+        let calendarOp = PendingCalendarOperation(
+            operationType: .edit,
+            accountId: "acc1",
+            eventId: "server-side-event-id",
+            calendarId: "primary",
+            arguments: ["title": .string("Moved to Thursday")]
+        )
+        let messageOp = PendingOperation(
+            type: .archive,
+            messageIds: ["msg-1"],
+            accountId: "acc1",
+            folderPath: "INBOX"
+        )
+        try db.write { db in
+            try calendarOp.insert(db)
+            try messageOp.insert(db)
+        }
+        #expect(try db.read { try PendingCalendarOperation.fetchCount($0) } == 1)
+        #expect(try db.read { try PendingOperation.fetchCount($0) } == 1)
+
+        try runWipe(db)
+
+        #expect(try db.read { try PendingOperation.fetchCount($0) } == 0,
+                "the pendingOperation purge is deliberate — those rows address messageHeader rows this transaction destroys")
+        #expect(try db.read { try PendingCalendarOperation.fetchCount($0) } == 1,
+                "the calendar op addresses nothing the wipe destroys, so it must not be collateral")
+    }
+}

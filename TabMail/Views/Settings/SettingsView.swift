@@ -448,7 +448,7 @@ struct SettingsView: View {
                 Task { await nukeDatabase() }
             }
         } message: {
-            Text("Downloaded emails, the search index and cached data are deleted, then re-downloaded from your servers. Queued actions that haven't reached your server yet — archive, delete, read, flag — are discarded rather than re-synced. Your Outbox, accounts and credentials are preserved.")
+            Text("Downloaded emails, the search index and cached data are deleted, then re-downloaded from your servers. Queued message actions that haven't reached your server yet — archive, delete, read, flag — are discarded rather than re-synced. Your Outbox, queued calendar changes, accounts and credentials are preserved.")
         }
         .alert("Delete All Email Attachments?", isPresented: $showAttachmentsWipeConfirm) {
             Button("Cancel", role: .cancel) {}
@@ -516,6 +516,21 @@ struct SettingsView: View {
     /// and references none of the tables below — so keeping it costs no
     /// consistency.
     ///
+    /// ⚠ **`pendingCalendarOperation` IS NOT HERE EITHER, for the same reason.**
+    /// It was, until 2026-08-05. A queued `.create` carries the user's authored
+    /// event — title, time, location, attendees — in its `argumentsJSON` for an
+    /// event that exists on **no server**, and a queued `.edit` carries the new
+    /// values the user chose. Deleting those destroys authored content that
+    /// exists nowhere else, exactly as `outboxMessage` did.
+    ///
+    /// It also has none of `pendingOperation`'s consistency justification. Its
+    /// only foreign key is `accountId → account`, and accounts survive this
+    /// transaction (`v8_createPendingCalendarOperation`); its `eventId` and
+    /// `calendarId` name SERVER-side resources; and the list below contains no
+    /// calendar table at all. So a calendar op addresses nothing this wipe
+    /// destroys, and purging it bought exactly zero consistency — the same
+    /// asymmetry that made the `outboxMessage` line indefensible.
+    ///
     /// `pendingOperation` DOES stay: those rows address `messageHeader` rows this
     /// same transaction destroys, so leaving them would queue mutations against
     /// addresses that no longer exist locally.
@@ -527,7 +542,6 @@ struct SettingsView: View {
         "DELETE FROM chatHistory",
         "DELETE FROM pendingOperation",
         "DELETE FROM pendingRender",
-        "DELETE FROM pendingCalendarOperation",
         // Reset folder cursors so backfill re-walks from top
         """
         UPDATE folder SET
