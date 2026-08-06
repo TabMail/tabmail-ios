@@ -417,6 +417,140 @@ struct CalDAVRecurringHelpersTests {
         #expect(d == TimeInterval(45 * 60))
     }
 
+    // MARK: - R13-U2 — the DTSTART + DURATION form
+
+    /// Format `date` as an ICS UTC (zulu) datetime value, e.g. `20260520T170000Z`.
+    /// Derived from `Date()` at call time so no fixture date can go stale
+    /// (project testing rule 7); the start instant is irrelevant to duration
+    /// arithmetic, and the zulu form keeps DST out of it entirely.
+    private func icsZulu(_ date: Date) -> String {
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        fmt.timeZone = TimeZone(identifier: "UTC")
+        return fmt.string(from: date)
+    }
+
+    private func durationOnlyMaster(duration: String, start: String) -> String {
+        [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "BEGIN:VEVENT",
+            "UID:duration-master",
+            "DTSTART:\(start)",
+            "DURATION:\(duration)",
+            "SUMMARY:Standup",
+            "RRULE:FREQ=WEEKLY",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ].joined(separator: "\r\n") + "\r\n"
+    }
+
+    @Test("extractMasterDuration reads the DTSTART + DURATION form (RFC 5545 §3.6.1)")
+    func extractMasterDurationFromDurationProperty() {
+        // DTEND and DURATION are ALTERNATIVES in RFC 5545 §3.6.1, and plenty of
+        // clients emit the second. Reading DTEND only returned nil here, which
+        // made an ordinary recurring master unsplittable.
+        let start = icsZulu(Date())
+        #expect(CalDAVProvider.extractMasterDuration(
+            from: durationOnlyMaster(duration: "PT1H30M", start: start)) == TimeInterval(90 * 60))
+        #expect(CalDAVProvider.extractMasterDuration(
+            from: durationOnlyMaster(duration: "PT45M", start: start)) == TimeInterval(45 * 60))
+        #expect(CalDAVProvider.extractMasterDuration(
+            from: durationOnlyMaster(duration: "P1D", start: start)) == TimeInterval(86400))
+    }
+
+    @Test("extractMasterDuration still returns nil for an unparseable or non-positive DURATION")
+    func extractMasterDurationRejectsBadDuration() {
+        // ⚠️ THE NEGATIVE CASE. The mirror image of the fix above is inventing a
+        // duration from garbage — a new series of the wrong length is a silent
+        // wrong-data write, which is worse than the refusal.
+        let start = icsZulu(Date())
+        #expect(CalDAVProvider.extractMasterDuration(
+            from: durationOnlyMaster(duration: "1H30M", start: start)) == nil)   // no leading P
+        #expect(CalDAVProvider.extractMasterDuration(
+            from: durationOnlyMaster(duration: "PT0S", start: start)) == nil)    // zero length
+        #expect(CalDAVProvider.extractMasterDuration(
+            from: durationOnlyMaster(duration: "", start: start)) == nil)
+    }
+
+    @Test("DTEND wins over DURATION on a non-conforming master that carries both")
+    func extractMasterDurationPrefersDTEND() {
+        // RFC 5545 forbids both in one VEVENT. If a server sends both anyway,
+        // the pre-existing DTEND reading must not silently change meaning.
+        let now = Date()
+        let ics = [
+            "BEGIN:VCALENDAR",
+            "BEGIN:VEVENT",
+            "UID:both-master",
+            "DTSTART:\(icsZulu(now))",
+            "DTEND:\(icsZulu(now.addingTimeInterval(15 * 60)))",
+            "DURATION:PT9H",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ].joined(separator: "\r\n") + "\r\n"
+        #expect(CalDAVProvider.extractMasterDuration(from: ics) == TimeInterval(15 * 60))
+    }
+
+    @Test("The DURATION arm stays scoped to the master VEVENT, ignoring VTIMEZONE and override blocks")
+    func extractMasterDurationDurationIsVEventScoped() {
+        // The scoping this function already had must survive the new arm: a
+        // VTIMEZONE's own DTSTART lines and an override VEVENT's DURATION must
+        // both be invisible.
+        let start = icsZulu(Date())
+        let ics = [
+            "BEGIN:VCALENDAR",
+            "BEGIN:VTIMEZONE",
+            "TZID:America/Los_Angeles",
+            "BEGIN:DAYLIGHT",
+            "DTSTART:20070311T020000",
+            "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+            "END:DAYLIGHT",
+            "END:VTIMEZONE",
+            "BEGIN:VEVENT",
+            "UID:scoped-master",
+            "DTSTART:\(start)",
+            "DURATION:PT30M",
+            "RRULE:FREQ=WEEKLY",
+            "END:VEVENT",
+            "BEGIN:VEVENT",
+            "UID:scoped-master",
+            "RECURRENCE-ID:\(start)",
+            "DTSTART:\(start)",
+            "DURATION:PT8H",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ].joined(separator: "\r\n") + "\r\n"
+        #expect(CalDAVProvider.extractMasterDuration(from: ics) == TimeInterval(30 * 60),
+                "the override's PT8H or the VTIMEZONE's DTSTART leaked into the master's duration")
+    }
+
+    @Test("buildNewSeriesInput succeeds on an ordinary DURATION-only recurring master")
+    func buildNewSeriesInputAcceptsDurationOnlyMaster() throws {
+        // This is the wedge's actual trigger: a recurring event created by any
+        // other client as DTSTART + DURATION made the split throw, and the throw
+        // was claimed by no terminal arm, so the account's calendar lane starved
+        // forever. Ordinary server data, no adversary.
+        let start = Date()
+        let ics = durationOnlyMaster(duration: "PT1H", start: icsZulu(start))
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        fmt.timeZone = .current
+        let newStart = fmt.string(from: start.addingTimeInterval(7 * 86400))
+
+        let out = try CalDAVProvider.buildNewSeriesInput(
+            masterICS: ics, patch: GCalEventInput(),
+            newStartNaiveISO: newStart,
+            newRRule: "RRULE:FREQ=WEEKLY"
+        )
+        #expect(out.summary == "Standup")
+        let s = try #require(out.startDateTime.flatMap { Date.fromISO8601($0) })
+        let e = try #require(out.endDateTime.flatMap { Date.fromISO8601($0) })
+        #expect(Int(e.timeIntervalSince(s)) == 3600,
+                "the new series must inherit the master's DURATION-expressed length")
+    }
+
     @Test("VEVENT-scoped extractors ignore a leading VTIMEZONE block (RRULE/DTSTART/UID/duration)")
     func extractorsIgnoreVTimezone() {
         // A real CalDAV .ics resource leads with a VTIMEZONE whose

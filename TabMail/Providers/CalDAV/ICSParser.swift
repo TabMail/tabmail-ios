@@ -304,7 +304,12 @@ enum ICSParser {
     }
 
     /// Parse ISO 8601 duration (e.g., PT1H30M, P1D) and add to a date.
-    private static func addDuration(_ duration: String, to date: Date) -> Date? {
+    ///
+    /// Internal rather than private because it is the tree's ONLY RFC 5545
+    /// `DURATION` parser and `CalDAVProvider.extractMasterDuration` reuses it
+    /// for the `DTSTART` + `DURATION` form of a VEVENT. A second copy is how
+    /// two spellings of one grammar drift apart.
+    static func addDuration(_ duration: String, to date: Date) -> Date? {
         var d = duration
         guard d.hasPrefix("P") else { return nil }
         d = String(d.dropFirst())

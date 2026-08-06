@@ -177,6 +177,80 @@ struct CalendarBadRequestClassificationTests {
         #expect(AccountManager.isCalendarBadRequestError(CalDAVError.notFound) == false)
     }
 
+    // MARK: - R13-U2 / R13-U7 — the two errors that reached no terminal arm
+
+    /// An ICS master VEVENT with `DTSTART` but neither `DTEND` nor `DURATION`.
+    /// `CalDAVProvider.buildNewSeriesInput` cannot recover a duration from it,
+    /// which is the production path this test drives.
+    private func masterWithNoRecoverableDuration() -> String {
+        [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "BEGIN:VEVENT",
+            "UID:no-duration-master",
+            "SUMMARY:Broken master",
+            "RRULE:FREQ=WEEKLY",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ].joined(separator: "\r\n") + "\r\n"
+    }
+
+    @Test("A split whose new series cannot be constructed reaches a terminal arm instead of wedging the account's lane")
+    func unconstructibleSplitIsTerminal() throws {
+        // SYSTEM PROPERTY, not mechanism: whatever error the REAL production
+        // function emits when the requested work can never be executed, some
+        // terminal arm must claim it. The test never names the error type —
+        // `buildNewSeriesInput` is free to change which case it throws, and this
+        // stays honest as long as the drain can retire it.
+        //
+        // Pre-fix this threw `CalDAVError.parseError`, which no arm claims
+        // (`rg parseError AccountManagerCalendarQueue.swift` → rc=1), so the
+        // drain requeued the op AND inserted the account into `failedAccounts`,
+        // skipping every later calendar op on that account on every subsequent
+        // drain, forever. `ops` is ordered `createdAt ASC`, so the wedged op is
+        // first on every pass, and no UI clears a `pendingCalendarOperation`.
+        var thrown: Error?
+        do {
+            _ = try CalDAVProvider.buildNewSeriesInput(
+                masterICS: masterWithNoRecoverableDuration(),
+                patch: GCalEventInput(),
+                newStartNaiveISO: "2026-05-20T17:00:00",
+                newRRule: "RRULE:FREQ=WEEKLY"
+            )
+        } catch {
+            thrown = error
+        }
+        // MIS-030: anchor the PRESENCE the absence-free assertion depends on.
+        // Without this, a `buildNewSeriesInput` that silently returned a
+        // defaulted duration would make the assertion below unreachable rather
+        // than false.
+        let error = try #require(thrown, "buildNewSeriesInput must refuse to invent a duration it could not recover")
+        #expect(claimedByATerminalArm(error),
+                "an unexecutable split is claimed by NO terminal arm, so the drain requeues it forever and head-of-line blocks every later calendar op on the account — a wedge, which sits in the same non-recoverable set as a dropped intention")
+    }
+
+    @Test("An empty or truncated response body stays retryable — the terminal reclassification is scoped, not wholesale")
+    func emptyResponseBodyIsStillTransient() {
+        // ⚠️ THE MIRROR IMAGE OF THE FIX ABOVE, pinned so it cannot be traded in.
+        // `CalDAVProvider.getEvent`, `updateEvent`, `updateOccurrence` and
+        // `splitSeries` raise the SAME `CalDAVError.parseError` case for an
+        // empty/unreadable response body. That is "we could not determine the
+        // answer", which never-drop clause 2 makes retryable — so claiming
+        // `parseError` terminal WHOLESALE would retire a user intention on an
+        // indeterminate read. Only the deterministic construction failures moved.
+        #expect(claimedByATerminalArm(CalDAVError.parseError("Empty response for event evt-1")) == false,
+                "an empty response body is indeterminate; retiring the op on it drops the user's intention")
+    }
+
+    @Test("A Graph id that cannot be encoded as a path segment reaches a terminal arm")
+    func invalidPathSegmentIsTerminal() {
+        // R13-U7. Deterministic — a pure function of the persisted id — so if it
+        // is ever reached, a retry reproduces it identically and the lane wedges.
+        // It can never be transient, which is why the classification is free.
+        #expect(claimedByATerminalArm(ExchangeCalendarError.invalidPathSegment("Graph event id")),
+                "an id that can never be turned into a URL is unexecutable, not indeterminate — leaving it in the transient arm wedges the account's calendar lane")
+    }
+
     @Test("Non-4xx statuses and non-HTTP errors are never classified as malformed")
     func nonClientErrorsAreNeverRetired() {
         for code in [200, 302, 500, 502, 503] {

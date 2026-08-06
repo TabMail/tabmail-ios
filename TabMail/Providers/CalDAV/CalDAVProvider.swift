@@ -1361,9 +1361,32 @@ actor CalDAVProvider: CalendarProvider {
     /// title/location/description/transparency from the source ICS unless the
     /// patch overrides; copies attendees from patch (already resolved) or
     /// falls back to the master.
-    /// Throws `CalDAVError.parseError` if the master's start/end can't be
-    /// recovered — silently defaulting the duration would produce a new series
-    /// with wrong length, which is worse than failing fast.
+    /// Throws `CalendarProviderError.notSupported` if the master's start/end or
+    /// the requested new start can't be recovered — silently defaulting the
+    /// duration would produce a new series with wrong length, which is worse
+    /// than failing fast.
+    ///
+    /// ⚠️ THE ERROR DOMAIN IS PART OF THE CONTRACT (R13-U2). These three throws
+    /// used to be `CalDAVError.parseError`, which
+    /// `AccountManagerCalendarQueue` claims in **no** terminal arm — so the
+    /// drain requeued the op and did `failedAccounts.insert`, head-of-line
+    /// blocking every later calendar op on that account on every subsequent
+    /// drain, forever, with no retry ceiling and no UI that can clear a
+    /// `pendingCalendarOperation` row. Every condition below is a pure function
+    /// of the persisted arguments and the master ICS, so a retry reproduces it
+    /// identically: it is unexecutable, not indeterminate.
+    /// `isCalendarUnsupportedError` claims `notSupported`, giving the same
+    /// disposition the three unexecutable-op guards in
+    /// `executeCalendarOperation` already use — terminal WITH A REASON, which
+    /// `unsupportedReason` surfaces to the agent verbatim.
+    ///
+    /// ⚠️ THE MIRROR IMAGE, stated so it is not "tidied" back in: this must NOT
+    /// become a blanket reclassification of `CalDAVError.parseError`. The four
+    /// `"Empty response for event …"` sites in `getEvent`/`updateEvent`/
+    /// `updateOccurrence`/`splitSeries` raise the SAME case for an empty or
+    /// truncated response body — genuinely indeterminate, "we could not
+    /// determine the answer" — and retiring those would drop a user intention,
+    /// which is the defect this fix exists to avoid, pointed the other way.
     static func buildNewSeriesInput(
         masterICS: String,
         patch: GCalEventInput,
@@ -1388,7 +1411,7 @@ actor CalDAVProvider: CalendarProvider {
         // Inherit duration from master's DTSTART/DTEND. If we can't recover it,
         // refuse to invent one — the caller surfaces the error to the LLM/user.
         guard let duration = extractMasterDuration(from: masterICS) else {
-            throw CalDAVError.parseError("buildNewSeriesInput: could not extract master event duration from ICS")
+            throw CalendarProviderError.notSupported("buildNewSeriesInput: could not extract master event duration from ICS")
         }
 
         // CRITICAL: preserve the master's all-day-ness. An all-day master must
@@ -1405,7 +1428,7 @@ actor CalDAVProvider: CalendarProvider {
             // silently ignores a move the LLM was asked to perform.
             let preferredStart = patch.startDate ?? newStartNaiveISO
             guard let startDate = dateFmt.date(from: String(preferredStart.prefix(10))) else {
-                throw CalDAVError.parseError("buildNewSeriesInput: invalid start '\(preferredStart)'")
+                throw CalendarProviderError.notSupported("buildNewSeriesInput: invalid start '\(preferredStart)'")
             }
             var cal = Calendar(identifier: .gregorian)
             cal.timeZone = .current
@@ -1442,7 +1465,7 @@ actor CalDAVProvider: CalendarProvider {
                 return fmt.date(from: newStartNaiveISO)
             }()
             guard let startDate = startInstant else {
-                throw CalDAVError.parseError("buildNewSeriesInput: invalid start (patch.startDateTime='\(patch.startDateTime ?? "")', newStartNaiveISO='\(newStartNaiveISO)')")
+                throw CalendarProviderError.notSupported("buildNewSeriesInput: invalid start (patch.startDateTime='\(patch.startDateTime ?? "")', newStartNaiveISO='\(newStartNaiveISO)')")
             }
             let endDate: Date = {
                 if let pISO = patch.endDateTime, let d = Date.fromISO8601(pISO) { return d }
@@ -1482,21 +1505,44 @@ actor CalDAVProvider: CalendarProvider {
         return nil
     }
 
-    /// Parse the MASTER VEVENT's DTSTART/DTEND lines (with or without TZID) and
-    /// return the duration in seconds. Returns nil if either line is
-    /// missing/unparseable. Scoped to the master VEVENT so a VTIMEZONE's own
-    /// `DTSTART:…T020000` lines can't be mistaken for the event's.
+    /// Parse the MASTER VEVENT's `DTSTART` plus **either** `DTEND` **or**
+    /// `DURATION` (RFC 5545 §3.6.1 makes them alternatives, and forbids both in
+    /// one VEVENT) and return the duration in seconds. Returns nil if the start
+    /// is missing/unparseable or neither end form can be recovered. Scoped to
+    /// the master VEVENT so a VTIMEZONE's own `DTSTART:…T020000` lines can't be
+    /// mistaken for the event's.
+    ///
+    /// ⚠️ The `DURATION` arm is not a nicety. This function read `DTEND` only
+    /// until 2026-08-06, so an ordinary recurring master written by any other
+    /// client as `DTSTART` + `DURATION:PT1H` returned nil,
+    /// `buildNewSeriesInput` threw, and — because the throw was classified by
+    /// no terminal arm — the account's whole calendar lane wedged. Reuses
+    /// `ICSParser.addDuration`, the tree's existing ISO-8601 duration parser,
+    /// rather than adding a second grammar.
     static func extractMasterDuration(from ics: String) -> TimeInterval? {
         var startDate: Date?
         var endDate: Date?
+        var durationValue: String?
         for line in masterVEventLines(from: ics) {
             if line.hasPrefix("DTSTART") {
                 startDate = parseICSDateTime(line)
             } else if line.hasPrefix("DTEND") {
                 endDate = parseICSDateTime(line)
+            } else if line.hasPrefix("DURATION") {
+                guard let colonIdx = line.firstIndex(of: ":") else { continue }
+                durationValue = String(line[line.index(after: colonIdx)...])
+                    .trimmingCharacters(in: .whitespaces)
             }
         }
-        guard let s = startDate, let e = endDate, e > s else { return nil }
+        guard let s = startDate else { return nil }
+        // DTEND wins when present. A non-conforming resource carrying both then
+        // keeps the pre-existing reading rather than silently changing meaning.
+        if let e = endDate {
+            guard e > s else { return nil }
+            return e.timeIntervalSince(s)
+        }
+        guard let raw = durationValue,
+              let e = ICSParser.addDuration(raw, to: s), e > s else { return nil }
         return e.timeIntervalSince(s)
     }
 

@@ -741,6 +741,20 @@ extension AccountManager {
         // because the next queued create's `awaitCalendarOpOutcome` times
         // out behind it). Treat all unclassified CalDAV 4xx as permanent.
         if case CalDAVError.httpError(let code, _) = error, (400...499).contains(code), !isIndeterminate(code) { return true }
+        // A persisted Graph id that cannot be expressed as one strict path
+        // segment (R13-U7). Added by the v3 range together with the strict
+        // encoder and claimed by NO arm until 2026-08-06. It is a pure function
+        // of the stored id — `GraphAPI.encodedGraphPathSegment` is a single
+        // `addingPercentEncoding` call with a fixed allowed set — so every
+        // retry reproduces it identically and the account's lane wedges. It can
+        // never be transient, which is what makes the terminal classification
+        // free: there is no population this newly retires that a retry would
+        // have fixed. Practically unreachable today (`addingPercentEncoding`
+        // returns nil only for invalid Unicode, which a Swift `String` cannot
+        // hold), and classified anyway on this file's own stated precedent —
+        // *"the caller never produces the value" is a property of today's
+        // callers, not an invariant.*
+        if case ExchangeCalendarError.invalidPathSegment = error { return true }
         return false
     }
 
@@ -748,6 +762,9 @@ extension AccountManager {
     /// has something concrete to react to (e.g. "Missing end time"). Falls back
     /// to a code-only summary when the body is empty or unparseable.
     private func badRequestReason(_ error: Error) -> String {
+        if case ExchangeCalendarError.invalidPathSegment(let context) = error {
+            return "the stored \(context) cannot be expressed as a URL path segment, so this request can never be sent — the event id needs to be re-read from the server"
+        }
         if case GoogleCalendarError.httpError(let code, let body) = error {
             return parseHttpReason(code: code, body: body, source: "Google Calendar")
         }
