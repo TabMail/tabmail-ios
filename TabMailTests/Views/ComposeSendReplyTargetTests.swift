@@ -685,9 +685,18 @@ struct ReplyTargetThrownReadTests {
                 "no save may overwrite a row read from a database we could not read")
         #expect(!ComposeDraftGuards.discardMayDelete(readState: state),
                 "no discard may delete it either")
-        #expect(ComposeDraftGuards.closeAction(
-            readState: state, hasContent: true, hasChanges: true) == .dismiss,
-                "close must dismiss without prompting to save over an unknown row")
+        // ⚠ This read `== .dismiss` until 2026-08-05 and BLESSED a silent drop of
+        // authored edits. The property it means — and the one the sentence beside
+        // it always described — is "no Save is offered over a row we could not
+        // read", not "the compose vanishes without asking".
+        let closeDecision = ComposeDraftGuards.closeAction(
+            readState: state, hasContent: true, hasChanges: true)
+        #expect(closeDecision != .promptSave,
+                "close must not prompt to save over an unknown row")
+        #expect(!ComposeDraftGuards.closeActionWrites(closeDecision),
+                "and must authorize no write of any kind")
+        #expect(closeDecision == .promptDiscardEdits,
+                "but it must still ASK before dropping the edits the user authored")
 
         // THE INTENTION SURVIVES: the draft row is untouched, so one reopen re-runs
         // the read and the send proceeds.

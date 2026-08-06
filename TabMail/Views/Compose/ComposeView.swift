@@ -73,13 +73,41 @@ enum ComposeDraftGuards {
         case dismiss           // nothing to persist / read-error → dismiss, no mutation
         case deleteThenDismiss // brand-new / absent empty draft → safe to delete on close
         case promptDelete      // loaded EXISTING draft cleared to nothing → confirm before delete
+        /// ⚑ NO REFERENCE — INVENTED. A read-error compose that nonetheless holds
+        /// unsaved authored edits: confirm the DISCARD, with **no Save option**.
+        /// Distinct from `.promptSave` because saving here would overwrite a draft
+        /// row we failed to read, and distinct from `.dismiss` because dropping a
+        /// user's edits without asking is what every other content-bearing close
+        /// path in this view refuses to do.
+        case promptDiscardEdits
+    }
+
+    /// Whether a close decision authorizes any WRITE — a save, an overwrite or a
+    /// delete. This is the property the read-error firewall is actually about, so
+    /// tests pin THIS rather than an exact case: a decision may be added or
+    /// renamed, but `.error` must never reach one that writes.
+    static func closeActionWrites(_ action: CloseAction) -> Bool {
+        switch action {
+        case .promptSave, .deleteThenDismiss, .promptDelete: return true
+        case .dismiss, .promptDiscardEdits: return false
+        }
     }
 
     /// PORT — `v2final:ComposeDraftGuards.closeAction`.
     static func closeAction(readState: ReadState, hasContent: Bool, hasChanges: Bool) -> CloseAction {
         // .error blocks EVERY mutation — never delete/overwrite a draft that
         // merely failed to load. Dismiss, leaving the row intact.
-        if readState == .error { return .dismiss }
+        //
+        // …but "no mutation" is not the same as "no confirmation". A compose that
+        // holds unsaved authored edits must ASK before those edits are dropped,
+        // and it must ask WITHOUT offering Save: saving would write a snapshot
+        // built from a read that never saw the row, which is the exact overwrite
+        // the shipped release performed (`loadDraftOrPrepopulate`: read failure ⇒
+        // `prepopulate()` ⇒ clobber). Both halves are load-bearing — `.error` never
+        // writes, AND a close that would drop authored edits always asks first.
+        if readState == .error {
+            return hasContent && hasChanges ? .promptDiscardEdits : .dismiss
+        }
         if hasContent && hasChanges { return .promptSave }
         if !hasContent {
             // Emptied to nothing: a LOADED existing row must PROMPT before delete
@@ -88,6 +116,32 @@ enum ComposeDraftGuards {
             return readState == .loaded ? .promptDelete : .deleteThenDismiss
         }
         return .dismiss // hasContent && !hasChanges
+    }
+
+    /// The account an explicit SAVE writes the draft against, or a refusal.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED **shape**; the CONTRACT is the sibling
+    /// `sendReplyTarget`'s, and the BEHAVIOUR is `ComposeView.send`'s, which
+    /// already refuses a nil account by surfacing `sendError` and returning
+    /// **without dismissing**.
+    ///
+    /// `saveDraftAndDismiss` dismissed instead — before committing the pending
+    /// recipient input and before writing the `Draft`, its header, its body or the
+    /// durable `.saveDraft` operation. The authored text had therefore entered no
+    /// store at all and was unrecoverable, on the one gesture whose entire purpose
+    /// is to keep it. Reachable whenever `navigationStore.accounts` is empty at
+    /// `prepopulate()` time and via `MessageDetailView`'s bare `ComposeView()`.
+    enum SaveAccount {
+        /// Write the draft against this account.
+        case save(Account)
+        /// BLOCK the save. Surface the reason and keep the compose OPEN — this is
+        /// a refusal, never a completed save, so it must never reach `dismiss()`.
+        case blocked
+    }
+
+    static func saveAccount(resolved: Account?) -> SaveAccount {
+        guard let resolved else { return .blocked }
+        return .save(resolved)
     }
 
     /// PORT — `v2final:ComposeDraftGuards.saveMayMutate`.
@@ -438,6 +492,11 @@ struct ComposeView: View {
     /// existing draft the user emptied to nothing. Closing must never make that row
     /// silently vanish — the user is asked first.
     @State private var showClearedDraftDeletePrompt = false
+    /// Confirmation for `ComposeDraftGuards.CloseAction.promptDiscardEdits`: the
+    /// draft row could not be read AND the compose holds unsaved authored edits.
+    /// Confirming DISMISSES ONLY — it writes nothing, so the unread row on disk is
+    /// left exactly as it was.
+    @State private var showErrorDiscardEditsPrompt = false
     @State private var showEmptyBodyPrompt = false
     @State private var isSavingDraft = false
     @State private var loadedDraft = false
@@ -594,6 +653,13 @@ struct ComposeView: View {
     private static let unresolvedReplyTargetMessage =
         "The message this draft replies to can no longer be identified, so it can't be sent. "
         + "Your text is safe — save or discard this draft, or start again from the original message."
+
+    /// Shown when an explicit Save cannot resolve an account to write the draft
+    /// against. States the block and, crucially, that the text is still here —
+    /// the compose stays open, which is the user's only remaining copy of it.
+    private static let noSaveAccountMessage =
+        "There's no account available to save this draft to. "
+        + "Your text is still here — add an account, or copy it out before closing."
 
     // MARK: - Recipient cap
     /// Total recipients across To + Cc + Bcc. Tokens only; pending input text
@@ -1091,6 +1157,9 @@ struct ComposeView: View {
             } message: {
                 Text("This draft is now empty. Delete it?")
             }
+            .modifier(DiscardUnsavedEditsAlert(
+                isPresented: $showErrorDiscardEditsPrompt,
+                onDiscard: { dismiss() }))
             .alert("Empty Body", isPresented: $showEmptyBodyPrompt) {
                 if showingSuggestion, currentSuggestion != nil {
                     Button("Use Suggestion & Send") {
@@ -2006,6 +2075,11 @@ struct ComposeView: View {
         case .promptDelete:
             // A LOADED existing draft cleared to nothing — confirm before delete.
             showClearedDraftDeletePrompt = true
+        case .promptDiscardEdits:
+            // S5: read-error AND unsaved authored edits. Ask before dropping
+            // them — and offer NO Save, because a save here would overwrite a row
+            // we failed to read.
+            showErrorDiscardEditsPrompt = true
         case .deleteThenDismiss:
             // Brand-new / absent empty draft — safe to delete on close. R5: the
             // delete is CHECKED and `dismiss` runs only after it lands. `false`
@@ -2057,7 +2131,19 @@ struct ComposeView: View {
             sendError = "This draft did not finish loading. Close and reopen it before saving."
             return
         }
-        guard let account = resolvedAccount else { dismiss(); return }
+        // S4: a save that cannot resolve an account is a BLOCKED save, not a
+        // completed one. Surfacing and returning — rather than dismissing — is
+        // exactly what `send()` two screens down already does, and what the two
+        // guards immediately above do. Dismissing here destroyed the user's text
+        // before a single byte of it had been written anywhere.
+        let account: Account
+        switch ComposeDraftGuards.saveAccount(resolved: resolvedAccount) {
+        case .blocked:
+            sendError = Self.noSaveAccountMessage
+            return
+        case .save(let resolved):
+            account = resolved
+        }
         // F3: commit any pending in-progress recipient so it is PERSISTED (not
         // dropped) by this save. Reached directly from the close prompt's "Save",
         // which does not go back through `closeCompose`.
@@ -2942,6 +3028,32 @@ struct ComposeView: View {
         dismiss()
     }
 
+}
+
+// MARK: - Discard-unsaved-edits confirmation
+
+/// S5. The draft row could not be READ, so no Save is offered — saving would
+/// overwrite a row we never saw. But the compose holds unsaved authored edits,
+/// so closing must ask before dropping them. Confirming dismisses and writes
+/// NOTHING; Cancel keeps the compose open.
+///
+/// This lives in its own `ViewModifier` rather than inline in `ComposeView.body`
+/// because the body's alert chain is already at the type-checker's budget:
+/// adding one more inline `.alert` there fails to compile with "unable to
+/// type-check this expression in reasonable time". A modifier's body is checked
+/// independently, so the cost does not land on the chain.
+private struct DiscardUnsavedEditsAlert: ViewModifier {
+    @Binding var isPresented: Bool
+    let onDiscard: () -> Void
+
+    func body(content: Content) -> some View {
+        content.alert("Discard Changes?", isPresented: $isPresented) {
+            Button("Discard Changes", role: .destructive) { onDiscard() }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This draft didn't finish loading, so your changes can't be saved to it. Closing now discards them.")
+        }
+    }
 }
 
 // MARK: - Token Field (email chips with search dropdown)

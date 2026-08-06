@@ -397,12 +397,32 @@ struct ComposeDraftGuardTests {
         #expect(!ComposeDraftGuards.saveMayMutate(readState: state))
         #expect(!ComposeDraftGuards.discardMayDelete(readState: state))
         // …and NO combination of content/changes turns the close into a mutation.
+        //
+        // ⚠ This assertion read `== .dismiss` until 2026-08-05 and was a BLESSING
+        // TEST: it pinned the DECISION rather than the property, so it held the
+        // `.error` + unsaved-edits case at "dismiss silently" — dropping the
+        // user's authored text with none of the confirmation every other
+        // content-bearing close shows. The invariant was always "`.error` never
+        // authorizes a WRITE", which `closeActionWrites` states directly; a close
+        // that merely ASKS before discarding satisfies it.
         for hasContent in [true, false] {
             for hasChanges in [true, false] {
-                #expect(ComposeDraftGuards.closeAction(
-                    readState: state, hasContent: hasContent, hasChanges: hasChanges) == .dismiss)
+                let action = ComposeDraftGuards.closeAction(
+                    readState: state, hasContent: hasContent, hasChanges: hasChanges)
+                #expect(!ComposeDraftGuards.closeActionWrites(action),
+                        "a thrown read must never authorize a save, overwrite or delete")
+                #expect(action != .promptSave,
+                        "and must never offer Save, which would overwrite a row we could not read")
             }
         }
+        // The other half, which the old assertion hid: a close that WOULD drop
+        // authored edits asks first, even under a read error.
+        #expect(ComposeDraftGuards.closeAction(
+            readState: state, hasContent: true, hasChanges: true) == .promptDiscardEdits)
+        // …and one with nothing to lose still just dismisses, so the prompt has
+        // not simply been made unconditional.
+        #expect(ComposeDraftGuards.closeAction(
+            readState: state, hasContent: true, hasChanges: false) == .dismiss)
         // The sticky firewall: a later SUCCESSFUL per-op read does not reopen it.
         #expect(ComposeDraftGuards.effectiveMutationState(
             initialLoad: state, perOp: .loaded) == .error)
@@ -427,7 +447,9 @@ struct ComposeDraftGuardTests {
             try db.write {
                 try DraftStore.applyDelete(id: row.id, expectedInstanceEpoch: "E1", db: $0)
             }
-        case .promptSave, .dismiss:
+        case .promptSave, .dismiss, .promptDiscardEdits:
+            // `.promptDiscardEdits` confirms then DISMISSES — it writes nothing,
+            // so the unread row on disk is left exactly as it was.
             break
         }
         #expect(try db.read { try Draft.fetchOne($0, key: row.id) } != nil)
@@ -689,5 +711,126 @@ struct ComposeDraftGuardTests {
         // equality on the OWNER, not a non-nil check.
         #expect(!ComposeDraftGuards.mayBindPersistedDraft(
             draftAccountId: owned.accountId, resolvedAccountId: "other-acct"))
+    }
+}
+
+// MARK: - Round-9: the two compose gestures that dropped authored content
+
+/// Both invariants here are about the same thing from opposite ends: a compose
+/// window is frequently the ONLY copy of what the user just wrote, so no gesture
+/// may end its life while that text has not reached a store — and where the text
+/// genuinely cannot be saved, the user is asked rather than told afterwards.
+@Suite("Compose authored-content guards")
+struct ComposeAuthoredContentGuardTests {
+
+    // MARK: S4 — an explicit Save that cannot resolve an account
+
+    @Test("""
+    An explicit Save with no resolvable account is BLOCKED, never a silent \
+    dismiss: the compose stays open holding the user's text instead of being \
+    torn down before a single byte of it has been written anywhere
+    """)
+    func explicitSaveWithoutAnAccountIsBlockedNotDismissed() {
+        // The production consequence, mirrored: `.blocked` surfaces and RETURNS,
+        // `.save` goes on to write and eventually dismiss. `saveDraftAndDismiss`
+        // switches on exactly this verdict, and its `.blocked` arm is a bare
+        // `return` — it dismissed instead until 2026-08-05, discarding the
+        // composer BEFORE committing the pending recipient input and before
+        // writing the Draft, its header, its body or the durable `.saveDraft`
+        // operation.
+        var dismissed = false
+        var wroteAnything = false
+        var surfacedReason = false
+
+        func applyExplicitSaveDecision(resolved: Account?) {
+            switch ComposeDraftGuards.saveAccount(resolved: resolved) {
+            case .blocked:
+                surfacedReason = true
+            case .save:
+                wroteAnything = true
+                dismissed = true
+            }
+        }
+
+        applyExplicitSaveDecision(resolved: nil)
+        #expect(!dismissed,
+                "the Save gesture must not tear down the compose that holds the only copy of the text")
+        #expect(!wroteAnything, "and it must not half-write either")
+        #expect(surfacedReason, "the user must be told why the save did not happen")
+    }
+
+    @Test("""
+    Non-vacuity — a resolvable account still saves, against EXACTLY that \
+    account, so the refusal above is not a blanket refusal
+    """)
+    func resolvableAccountStillSaves() {
+        let account = Account(
+            emailAddress: "user@example.com", displayName: "User", provider: .gmail)
+        switch ComposeDraftGuards.saveAccount(resolved: account) {
+        case .blocked:
+            Issue.record("a resolvable account must not be refused")
+        case .save(let bound):
+            #expect(bound.id == account.id)
+            #expect(bound.emailAddress == "user@example.com")
+        }
+    }
+
+    // MARK: S5 — a read-error close that would drop unsaved edits
+
+    @Test("""
+    A close that would drop authored edits ALWAYS asks first — including under a \
+    draft read error, where the compose used to be dismissed with none of the \
+    confirmation every other content-bearing close shows
+    """)
+    func readErrorCloseWithUnsavedEditsAsksBeforeDiscarding() {
+        let decision = ComposeDraftGuards.closeAction(
+            readState: .error, hasContent: true, hasChanges: true)
+        #expect(decision == .promptDiscardEdits)
+        // …and the same is true for every other read state that holds unsaved
+        // edits, so "ask before dropping authored edits" is the property, not a
+        // special case bolted onto one branch.
+        #expect(ComposeDraftGuards.closeAction(
+            readState: .loaded, hasContent: true, hasChanges: true) == .promptSave)
+        #expect(ComposeDraftGuards.closeAction(
+            readState: .notFound, hasContent: true, hasChanges: true) == .promptSave)
+    }
+
+    @Test("""
+    HELD DIRECTION — a read error still authorizes NO write, in every \
+    combination: the prompt added above offers no Save, because saving would \
+    overwrite a draft row we failed to read
+    """)
+    func readErrorStillAuthorizesNoWrite() {
+        for hasContent in [true, false] {
+            for hasChanges in [true, false] {
+                let decision = ComposeDraftGuards.closeAction(
+                    readState: .error, hasContent: hasContent, hasChanges: hasChanges)
+                #expect(!ComposeDraftGuards.closeActionWrites(decision))
+                #expect(decision != .promptSave)
+                #expect(decision != .promptDelete)
+                #expect(decision != .deleteThenDismiss)
+            }
+        }
+        // Non-vacuity for the loop: `closeActionWrites` does not simply answer
+        // `false` for everything — the writing decisions are still writing ones.
+        #expect(ComposeDraftGuards.closeActionWrites(.promptSave))
+        #expect(ComposeDraftGuards.closeActionWrites(.promptDelete))
+        #expect(ComposeDraftGuards.closeActionWrites(.deleteThenDismiss))
+        #expect(!ComposeDraftGuards.closeActionWrites(.dismiss))
+        #expect(!ComposeDraftGuards.closeActionWrites(.promptDiscardEdits))
+    }
+
+    @Test("""
+    A read-error close with nothing unsaved still dismisses outright — the new \
+    confirmation is scoped to edits that would otherwise be lost, not made \
+    unconditional
+    """)
+    func readErrorCloseWithoutUnsavedEditsStillDismisses() {
+        #expect(ComposeDraftGuards.closeAction(
+            readState: .error, hasContent: true, hasChanges: false) == .dismiss)
+        #expect(ComposeDraftGuards.closeAction(
+            readState: .error, hasContent: false, hasChanges: false) == .dismiss)
+        #expect(ComposeDraftGuards.closeAction(
+            readState: .error, hasContent: false, hasChanges: true) == .dismiss)
     }
 }
