@@ -1054,4 +1054,136 @@ struct NSEStagedRowEpochGuardTests {
 
         try? await Task.sleep(for: .milliseconds(300))
     }
+
+    // MARK: - R11-B: the epoch door's operand must be the REF's folder
+    //
+    // INVARIANT (system property, not mechanism): a staged message may never be
+    // merged onto a durable row in a DIFFERENT folder on epoch evidence alone.
+    // `DurableIdentityLookup.find` step 2 is folder-blind and its rfc-nil tail is
+    // deliberately retained, so it can hand the merge a ref from another folder;
+    // on IMAP `messageId` IS the UID and UIDs are folder-scoped, so Inbox UID 7 and
+    // Archive UID 7 are routinely different messages. `observedUidValidity` is the
+    // STAGED folder's numbering — comparing it to any folder's stored epoch is only
+    // meaningful when the durable row lives in that same folder.
+    //
+    // ⚠️ TWO-SIDED. Door (a), the RFC door, MUST keep resolving cross-folder
+    // matches: an RFC 822 Message-ID is a global identity and a Gmail/Graph row
+    // that moved folders between the NSE fetch and the merge has to reach its
+    // durable row, or the duplicate-header class re-opens. Only door (b) is
+    // folder-scoped. Both directions are asserted below.
+    //
+    // ⚑ REACHABILITY, stated honestly. `performMerge` runs `detectStaleByMoveRows`
+    // BEFORE phase 1 and filters out every staged row whose durable ref is in a
+    // different folder, so in the steady state a cross-folder ref does not reach
+    // this door at all. It reaches it when that filter does not apply: the filter
+    // reads through `AppDatabase.rawPool` inside `try? await` and yields an EMPTY
+    // stale set on a read failure (fail-open), and it is a separate, earlier read
+    // than the phase-1/phase-2 lookups, so a durable row moved by sync or by the
+    // user in between is seen as same-folder by the filter and cross-folder by the
+    // merge. That is why these tests drive the door directly instead of through
+    // `mergeNSEStagingData`: an end-to-end assertion here would pass for the
+    // filter's reason rather than the door's, and prove nothing about the door.
+    // A guard whose correctness rests on a fail-open caller-side filter is not a
+    // guard (C3 is in the non-recoverable set).
+
+    /// A minimal staged row for driving `nseMergeIdentityConfirmed` directly.
+    private func makeStaged(
+        accountId: String = "acc1", folderPath: String, messageId: String,
+        rfc822: String?, observedUidValidity: Int?
+    ) -> NSEDataBridge.StagedMessage {
+        NSEDataBridge.StagedMessage(
+            id: "\(accountId):\(messageId)",
+            accountId: accountId,
+            accountEmail: "\(accountId)@example.com",
+            provider: "imap_new_mail",
+            messageId: messageId,
+            rfc822MessageId: rfc822,
+            threadId: nil,
+            folderPath: folderPath,
+            subject: "Staged subject",
+            senderName: "Sender",
+            senderEmail: "sender@example.com",
+            snippet: "staged snippet",
+            date: Date().timeIntervalSince1970,
+            to: "one@example.com", cc: "", bcc: "", replyTo: nil,
+            inReplyTo: nil,
+            references: [],
+            isRead: false, isFlagged: false, hasAttachments: false,
+            isReplied: false, isForwarded: false,
+            providerLabels: [],
+            summaryBlurb: nil, summaryTodos: nil, actionTag: nil,
+            reminderDate: nil, reminderTime: nil, reminderContent: nil,
+            processedAt: Date().timeIntervalSince1970,
+            aiCompleted: true, notified: false,
+            htmlContent: nil, textContent: nil, attachmentsJSON: nil,
+            icsText: nil, hasUnresolvedCIDs: false,
+            observedUidValidity: observedUidValidity
+        )
+    }
+
+    @Test("Epoch evidence alone never confirms a durable row in a different folder, and does confirm one in the same folder")
+    func epochDoorIsScopedToTheRefsOwnFolder() {
+        // rfc-less on BOTH sides, so the RFC door cannot adjudicate and door (b)
+        // is the only one in play — the exact population step 2's retained
+        // rfc-nil tail hands over.
+        let staged = makeStaged(folderPath: "INBOX", messageId: "5",
+                                rfc822: nil, observedUidValidity: Self.epochB)
+
+        // CROSS-FOLDER: the ref is the Archive row that happens to share UID 5.
+        // The epoch offered is INBOX's — correct for the staged row, and evidence
+        // about a folder the ref does not live in.
+        #expect(NSEDataBridge.nseMergeIdentityConfirmed(
+            msg: staged, existingRfc: nil,
+            existingFolderId: MessageIdentity.folderId(accountId: "acc1", folderPath: "Archive"),
+            folderEpoch: Self.epochB, folderQuarantined: false
+        ) == false, "a UID-vs-epoch agreement in one folder says nothing about a row in another")
+
+        // SAME FOLDER: unchanged behaviour — this is what makes the refusal above
+        // attributable to the folder operand and not to a blanket denial.
+        #expect(NSEDataBridge.nseMergeIdentityConfirmed(
+            msg: staged, existingRfc: nil,
+            existingFolderId: MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX"),
+            folderEpoch: Self.epochB, folderQuarantined: false
+        ) == true, "the rfc-less epoch door must still confirm a same-folder row under a settled epoch")
+
+        // Same folder, DISAGREEING epoch — the pre-existing refusal is intact.
+        #expect(NSEDataBridge.nseMergeIdentityConfirmed(
+            msg: staged, existingRfc: nil,
+            existingFolderId: MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX"),
+            folderEpoch: Self.epochA, folderQuarantined: false
+        ) == false)
+
+        // Same folder, QUARANTINED — the pre-existing refusal is intact.
+        #expect(NSEDataBridge.nseMergeIdentityConfirmed(
+            msg: staged, existingRfc: nil,
+            existingFolderId: MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX"),
+            folderEpoch: Self.epochB, folderQuarantined: true
+        ) == false)
+    }
+
+    @Test("The RFC door still resolves a cross-folder match, and still refuses a cross-folder disagreement")
+    func rfcDoorRemainsCrossFolder() {
+        let archiveFolderId = MessageIdentity.folderId(accountId: "acc1", folderPath: "Archive")
+
+        // A Gmail/Graph-shaped row: global id, no observed epoch. It moved folders
+        // between the NSE fetch and the merge, and MUST still reach its durable row
+        // — folder-scoping the RFC door would re-open the duplicate-header class.
+        let moved = makeStaged(folderPath: "INBOX", messageId: "7",
+                               rfc822: "rfc-moved@example.com", observedUidValidity: nil)
+        #expect(NSEDataBridge.nseMergeIdentityConfirmed(
+            msg: moved, existingRfc: "rfc-moved@example.com",
+            existingFolderId: archiveFolderId,
+            folderEpoch: nil, folderQuarantined: false
+        ) == true, "an RFC 822 Message-ID is a global identity — door (a) is not folder-scoped")
+
+        // And a positive RFC disagreement still wins over everything, including an
+        // epoch agreement in the staged row's own folder.
+        let collided = makeStaged(folderPath: "INBOX", messageId: "7",
+                                  rfc822: "rfc-staged@example.com", observedUidValidity: Self.epochB)
+        #expect(NSEDataBridge.nseMergeIdentityConfirmed(
+            msg: collided, existingRfc: "rfc-durable@example.com",
+            existingFolderId: MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX"),
+            folderEpoch: Self.epochB, folderQuarantined: false
+        ) == false, "RFC disagreement is proof of two different messages and outranks the epoch door")
+    }
 }

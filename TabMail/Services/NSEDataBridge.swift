@@ -1071,18 +1071,42 @@ enum NSEDataBridge {
     ///  (a) RFC MATCH — both sides' normalized RFC Message-IDs are present and
     ///      EQUAL. Present-and-DISAGREE ⇒ NOT confirmed, and RFC disagreement WINS
     ///      even when the epochs agree (evaluated first, unconditionally).
-    ///  (b) EPOCH CONFIRMED (the rfc-less door) — the staged `observedUidValidity`
-    ///      and the folder's `lastKnownUidValidity` are both present and EQUAL and
-    ///      the folder is NOT quarantined ⇒ the UID is provably meaningful under the
-    ///      folder's CURRENT epoch.
+    ///  (b) EPOCH CONFIRMED (the rfc-less door) — the durable row lives in the SAME
+    ///      folder the staged message was observed in, AND the staged
+    ///      `observedUidValidity` and that folder's `lastKnownUidValidity` are both
+    ///      present and EQUAL and the folder is NOT quarantined ⇒ the UID is
+    ///      provably meaningful under the folder's CURRENT epoch.
     ///
     /// Anything else — rfc unusable on either side AND no epoch agreement — is NOT
     /// confirmed. Provider-blind by design: Gmail/Graph rows leave
     /// `observedUidValidity` nil but always carry an RFC, so they confirm through
     /// (a); the only population this refuses is the rfc-less IMAP/iCloud row with no
     /// epoch baseline.
+    ///
+    /// ⚠️ WHY DOOR (b) IS FOLDER-SCOPED AND DOOR (a) IS NOT (R11-A audit, 2026-08-06).
+    /// `DurableIdentityLookup.find` step 2 is folder-BLIND, so `existingFolderId` may
+    /// name a different folder than the staged message's. Door (b)'s only evidence is
+    /// a UID that agrees with an epoch — and on IMAP a UID is folder-scoped, so Inbox
+    /// UID 7 and Archive UID 7 are routinely different messages. The staged
+    /// `observedUidValidity` is the STAGED folder's numbering, and neither folder's
+    /// stored epoch says anything about the other's: comparing across folders is not
+    /// weak evidence, it is evidence about the wrong thing, and blessing it stamps a
+    /// foreign body + `bodyComplete` + AI cache onto the wrong message (C3
+    /// misattribution, the non-recoverable set).
+    ///
+    /// Door (a) deliberately stays cross-folder: an RFC 822 Message-ID is a global
+    /// identity, and a Gmail/Graph row that moved folders between the NSE fetch and
+    /// the merge MUST still resolve to its durable row — folder-scoping the RFC door
+    /// would re-open the duplicate-header class it exists to close. Failing door (b)
+    /// closed only costs a skipped NSE merge; ordinary sync performs it later.
+    ///
+    /// The lookup's own breadth is NOT narrowed here on purpose: its retention on an
+    /// absent RFC is documented as "a deliberately conservative default that preserves
+    /// today's behavior when there's no evidence to reject it", and every consumer —
+    /// including the two `isSameLogicalMessage` inbox call sites — depends on it.
     static func nseMergeIdentityConfirmed(
-        msg: StagedMessage, existingRfc: String?, folderEpoch: Int?, folderQuarantined: Bool
+        msg: StagedMessage, existingRfc: String?, existingFolderId: String,
+        folderEpoch: Int?, folderQuarantined: Bool
     ) -> Bool {
         // (a) RFC door — unconditional and first: a positive disagreement is proof
         // of two different messages and no epoch agreement may override it.
@@ -1090,8 +1114,12 @@ enum NSEDataBridge {
            let durableRfc = MessageIdentity.comparableRfc822Identity(existingRfc) {
             return stagedRfc == durableRfc
         }
-        // (b) Epoch door — only for rows the RFC door could not adjudicate.
-        guard !folderQuarantined,
+        // (b) Epoch door — only for rows the RFC door could not adjudicate, and only
+        // when the durable row is in the folder the epoch was observed in.
+        let stagedFolderId = MessageIdentity.folderId(
+            accountId: msg.accountId, folderPath: msg.folderPath)
+        guard existingFolderId == stagedFolderId,
+              !folderQuarantined,
               let observed = msg.observedUidValidity,
               let stored = folderEpoch
         else { return false }
@@ -1638,6 +1666,7 @@ enum NSEDataBridge {
                                     let folderStatus = folderEpochCache[msgFolderId]
                                     guard Self.nseMergeIdentityConfirmed(
                                         msg: msg, existingRfc: ref.rfc822MessageId,
+                                        existingFolderId: ref.folderId,
                                         folderEpoch: folderStatus?.lastKnownUidValidity,
                                         folderQuarantined: folderStatus?.isQuarantined ?? false
                                     ) else {
@@ -1977,6 +2006,7 @@ enum NSEDataBridge {
                                     let folderStatus = folderEpochCache[msgFolderId]
                                     guard Self.nseMergeIdentityConfirmed(
                                         msg: msg, existingRfc: existingRfc822,
+                                        existingFolderId: ref.folderId,
                                         folderEpoch: folderStatus?.lastKnownUidValidity,
                                         folderQuarantined: folderStatus?.isQuarantined ?? false
                                     ) else {

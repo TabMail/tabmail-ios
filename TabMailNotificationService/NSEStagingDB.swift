@@ -331,6 +331,15 @@ enum NSEStagingDB {
     /// folder, at two different times — no third party's staleness can manufacture
     /// a disagreement, so a disagreement is the turnover itself.
     ///
+    /// ⚑ Since 2026-08-06 `nseMergeIdentityConfirmed`'s epoch door also requires the
+    /// durable row to be in the SAME folder the staged message was observed in,
+    /// because `DurableIdentityLookup.find` step 2 is folder-blind and can hand it a
+    /// row from another folder, where a UID-vs-epoch comparison is evidence about the
+    /// wrong thing. That guard is likewise not carried here and cannot be: this
+    /// function compares two observations of ONE staging row, so there is no second
+    /// folder to disagree with. The precedence of the two doors is still identical;
+    /// only the merge side's operand set is wider.
+    ///
     /// Uses `MessageIdentity.comparableRfc822Identity` — the tree's single
     /// identity-COMPARISON normalizer, deliberately NOT `usableRfc822Tail` (whose
     /// extra `':'` rejection exists for key MINTING and would call a legitimate
