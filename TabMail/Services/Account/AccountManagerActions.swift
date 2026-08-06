@@ -1804,14 +1804,25 @@ extension AccountManager {
     }
     /// Queue a draft delete from the server's Drafts folder via PendingOperation.
     /// Optimistically removes the MessageHeader from the Drafts folder immediately.
-    /// Requires the serverDraftId (IMAP UID / Gmail ID) from the Draft record.
-    /// Pass rfc822MessageId to also remove optimistic headers (which use placeholder messageIds).
-    /// - Parameter uidValidity: the UIDVALIDITY epoch `serverDraftId` was MINTED under
-    ///   (`Draft.serverDraftUidValidity` / `OutboxMessage.draftServerUidValidity`), when
-    ///   the call site has it. Recorded on the op so `IMAPProvider.deleteDraft` can take
-    ///   its epoch-corroborated STRONG arm instead of a Message-ID search that cannot
-    ///   tell this draft from a legitimate same-Message-ID sibling. nil (no Draft/outbox
-    ///   row in hand, non-IMAP, or a pre-v72 row) keeps the op on the unchanged arm.
+    ///
+    /// - Parameter identity: the PROVIDER-NATIVE address of the server copy, already
+    ///   typed by provider — `.imap(folder, uidValidity, uid)`, `.gmail(resourceId:)`,
+    ///   `.gmailContainedMessage(messageId:)`, `.outlook(graphId:)`, `.demo(localId:)`.
+    ///   The IMAP case carries its own minted epoch, which is validated here against
+    ///   the folder's `lastKnownUidValidity` and recorded on the op as
+    ///   `draftServerUidValidity` so `IMAPProvider.deleteDraft` can take its STRONG
+    ///   arm. A `.imap` identity that fails that validation is REFUSED rather than
+    ///   downgraded — there is no weaker arm.
+    ///
+    /// ⚠️ CORRECTED 2026-08-06. This doc block described a `uidValidity:` parameter
+    /// and an `rfc822MessageId:` parameter, NEITHER OF WHICH EXISTS on this function
+    /// — the epoch moved inside `DraftDeleteIdentity.imap` and the RFC leg was
+    /// deleted with the Message-ID-search path. It also said a nil epoch "keeps the
+    /// op on the unchanged arm", implying a Message-ID search that ADR-IOS-068/D4
+    /// bans (an RFC 822 Message-ID never selects or authorizes a mutation target).
+    /// A parameter doc that names parameters the signature does not have is worse
+    /// than none: it tells the next editor to pass something, and what it tells them
+    /// to pass is the banned identity.
     @discardableResult
     func queueDraftDelete(
         identity: DraftDeleteIdentity,

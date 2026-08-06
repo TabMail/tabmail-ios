@@ -61,11 +61,39 @@ destructive wire calls in the tree: `ExchangeCalendarProvider.deleteEvent` issue
 same `Recoverable ⇒ not irreversible` test that keeps the non-UIDPLUS arms of (2) and (3) out of
 the set:**
 
-- **Graph.** A plain `DELETE` on an event is the SOFT delete — the item lands in Deleted Items /
-  Recoverable Items. Graph exposes a **separate** `event: permanentDelete` action, documented as
-  placing the event in the *Purges* folder of the mailbox dumpster where Outlook cannot reach it.
-  **TabMail never calls it.** Identical shape, identical reasoning and identical conclusion to the
-  `ExchangeProvider.deleteDraft` adjudication further down this file.
+- **Graph.** ⚠️ **RESTATED 2026-08-06 (round-11 R11-J) BY RECOVERY PROPERTY, NOT BY VERB — the
+  count is unchanged; only the test is.** The exclusion used to read "a plain `DELETE` on an event
+  is the SOFT delete … Graph exposes a **separate** `event: permanentDelete` action … **TabMail
+  never calls it**", which states the criterion as *which HTTP verb we spell* and the evidence as an
+  unstated search. That is the very shape this file's own "THE SET IS DEFINED BY A PROPERTY" section
+  warns about, and it fails silently in exactly the case that section names: `permanentDelete` is a
+  **`POST` action** (`POST /me/events/{id}/permanentDelete`), so none of the three verb greps that
+  produce this note's integer could ever see it, and a future call to it would be excluded by a test
+  that never looked.
+
+  **The property that excludes this call:** after it returns, the item is in a state from which the
+  USER can restore it, per item, without our help — Deleted Items / Recoverable Items, 14 days by
+  default on Exchange Online. Recovery is a fact about the RESOURCE AFTER the call, and it is what
+  membership in this set turns on; the verb is only how we happened to ask.
+
+  **The predicate that keeps the exclusion honest, so it is checkable rather than asserted:** search
+  the ACTION NAMES and the destructive MODES, never the verb — `rg -n 'permanentDelete|batchDelete|
+  DeleteType|HardDelete|SoftDelete|/purges?/' TabMail/ Shared/ TabMailNotificationService/`. Run at
+  `e1e8724bc` it returns **two hits, BOTH PROSE, ZERO call sites**: `IMAPProvider.swift`'s comment
+  naming Graph's `message: permanentDelete` as the destroying semantic we do *not* use, and
+  `SyncEngine.swift`'s "evict/purge/prune" describing LOCAL database maintenance. ⚠️ Report the hits
+  rather than the phrase "returns nothing" — a predicate reported as empty when it is not is how the
+  next reader concludes the census was never run. **Zero call sites** — not "we only issue `DELETE`"
+  — is the evidence. The exclusion is
+  **falsified**, and the call joins the set, the moment ANY of these becomes true regardless of
+  spelling: the tree calls `permanentDelete` or any dumpster/`Purges`-targeting action; a deletion
+  is tunnelled through a `POST` batch or a computed/enum verb; an EWS `DeleteItem` with
+  `DeleteType=HardDelete` appears; or Microsoft retires Recoverable Items retention for the
+  populations we serve.
+
+  Identical shape, identical reasoning and identical conclusion to the
+  `ExchangeProvider.deleteDraft` adjudication further down this file — which should be read the same
+  way, by recovery property rather than by the verb it is spelled with.
 - **Google Calendar.** A deleted event goes to the calendar's **Trash and is restorable for 30
   days**. ⚠️ **The negative case, because this one has a real exception:** deleting a recurring
   series with *"this and following"* is NOT trashed and cannot be restored. It does not apply here —

@@ -374,14 +374,25 @@ extension AccountManager {
                         // new epoch had reassigned. The admission-time stamp compared
                         // below is the second check, and the one that does not depend on
                         // guessing an op's id shapes.
-                        // ⚑ UPDATE (2026-08-01): `IMAPProvider.deleteDraft` no longer
-                        // executes a bare UID on the strength of the number alone — it
-                        // either verifies an rfc822 identity on the wire, or (v72)
-                        // corroborates the UID against the recorded epoch it was minted
-                        // in — so that provider is now guarded at BOTH ends. This check
-                        // stays: it is provider-agnostic, it is what keeps an op recorded
-                        // under a discarded numbering from running at all, and the
-                        // reasoning above is what it exists for.
+                        // ⚑ UPDATE (2026-08-01, CORRECTED 2026-08-06):
+                        // `IMAPProvider.deleteDraft` no longer executes a bare UID on the
+                        // strength of the number alone — it requires the typed
+                        // `.imap(folder, uidValidity, uid)` address and compares the live
+                        // SELECT's epoch against the recorded (v72) minted epoch, failing
+                        // closed on a provable mismatch AND on an epoch the server did not
+                        // report. So that provider is now guarded at BOTH ends. The
+                        // 2026-08-01 wording said it "either verifies an rfc822 identity
+                        // on the wire, or (v72) corroborates the UID against the recorded
+                        // epoch": there is no rfc822 leg — `e0d3d30e0` removed it, and
+                        // ADR-IOS-068/D4 bans an RFC 822 Message-ID from selecting or
+                        // authorizing a mutation target — so the epoch arm is the only
+                        // arm. This check stays: it is provider-agnostic, it is what keeps
+                        // an op recorded under a discarded numbering from running at all,
+                        // and the reasoning above is what it exists for. (The paragraph
+                        // above describing `queueDraftDelete` recording `[uid, rfc822]` is
+                        // HISTORY — it explains why this check was added; today's
+                        // `.deleteDraft` records a single typed address plus
+                        // `draftServerUidValidity`.)
                         let sourceFolderId = MessageIdentity.folderId(
                             accountId: fetched.accountId, folderPath: fetched.folderPath)
                         let sourceFolder = try Folder.fetchOne(db, key: sourceFolderId)

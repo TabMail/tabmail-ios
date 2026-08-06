@@ -97,13 +97,24 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     /// `OutboxMessage.draftServerUidValidity`. Non-nil therefore means: slot 0 is
     /// a UID that is meaningful in EXACTLY this epoch and no other, and
     /// `IMAPProvider.deleteDraft` may take its STRONG arm — compare the live
-    /// SELECT's UIDVALIDITY against it, fail closed on any disagreement, and only
-    /// then FETCH that UID and corroborate its Message-ID.
+    /// SELECT's UIDVALIDITY against it and fail closed on any disagreement.
     ///
-    /// nil means UNKNOWN — never "current", never zero — and keeps the op on the
-    /// unchanged Message-ID-search arm. Stamped only when slot 0 is numeric: an
-    /// rfc822-addressed op is epoch-immune and an epoch beside it would be an
-    /// asymmetric identity the provider refuses outright.
+    /// nil means UNKNOWN — never "current", never zero — and an IMAP `.deleteDraft`
+    /// with a nil epoch cannot be addressed at all, so `AccountManagerQueue`'s
+    /// `.deleteDraft` arm throws `actionIdentityResolutionFailed` (retryable) rather
+    /// than issuing anything. Stamped only when slot 0 is numeric: a non-numeric
+    /// slot 0 is a Gmail/Graph resource id, which is stable and epoch-free, and an
+    /// epoch beside it would be an asymmetric identity the provider refuses outright.
+    ///
+    /// ⚠️ CORRECTED 2026-08-06. This used to say the strong arm goes on to "FETCH
+    /// that UID and corroborate its Message-ID", and that a nil epoch "keeps the op
+    /// on the unchanged Message-ID-search arm". v3 has neither: `deleteDraft
+    /// (identity:)` accepts only `.imap(folder, uidValidity, uid)` and
+    /// `deleteDraftStrong`'s doc records that it omits RFC corroboration "because
+    /// v3's typed identity has no RFC leg". The two live `searchByMessageId` callers
+    /// (`currentUIDs`, `appendToSentFolder`) are both NON-MUTATING. A Message-ID
+    /// search that selects a delete target is the banned D4 direction (ADR-IOS-068),
+    /// so a doc comment describing one is an instruction to reintroduce it.
     ///
     /// ⚑ The reference (`v2final`) carries this as positional slot 2 of
     /// `messageIds` with a typed decoder. A TYPED COLUMN is used here instead

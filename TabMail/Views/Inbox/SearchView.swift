@@ -426,17 +426,35 @@ struct SearchView: View {
     ///     PROPAGATED nil. `MessageMetadata.rfc822MessageId` is `String?` by
     ///     construction and IS nil whenever the provider payload omits the header
     ///     (`GmailParse` derives it from `header("Message-Id")`, `GraphParse` from
-    ///     `internetMessageId`; both are `.map`-over-Optional). Three production
-    ///     statements then assign that Optional STRAIGHT ONTO AN EXISTING ROW
-    ///     without a nil check — `SyncEngine.gmailDeltaSync` ×1 and
-    ///     `SyncEngine.exchangeDeltaSync` ×2, all of the shape
-    ///     `existing.rfc822MessageId = info.rfc822MessageId` in
-    ///     `SyncEngineDeltaSync.swift`. (The two remaining assignments in that file
-    ///     write a freshly-built `header` that is about to be INSERTed, so they
-    ///     cannot null a stored value and are not counted.) So a stored
-    ///     `rfc822MessageId` CAN in principle go from present to absent, and the
-    ///     right claim is "no production statement nulls it *deliberately*", not
-    ///     "it is never nulled".
+    ///     `internetMessageId`; both are `.map`-over-Optional). **FIVE** production
+    ///     statements then assign that Optional STRAIGHT ONTO A STORED ROW without a
+    ///     nil check — `SyncEngine.gmailDeltaSync` ×2 and
+    ///     `SyncEngine.exchangeDeltaSync` ×3, in `SyncEngineDeltaSync.swift`, in
+    ///     **TWO different shapes**:
+    ///       • `existing.rfc822MessageId = info.rfc822MessageId` … `existing.update(db)`
+    ///         — the in-place merge arm (gmail ×1, exchange ×2); and
+    ///       • `orphaned.rfc822MessageId = header.rfc822MessageId` … `orphaned.update(db)`
+    ///         — the ORPHAN-RECLAIM arm (gmail ×1, exchange ×1), where a row found
+    ///         outside the synced folder is re-pointed at it and re-stamped from the
+    ///         freshly parsed `header`. `header.rfc822MessageId` is assigned from the
+    ///         same `info.rfc822MessageId` Optional a few lines earlier, so it nulls a
+    ///         stored value under exactly the same conditions.
+    ///     (The two remaining assignments in that file write a freshly-built `header`
+    ///     that is about to be INSERTed, so they cannot null a stored value and are
+    ///     not counted. Seven assignments total.) So a stored `rfc822MessageId` CAN in
+    ///     principle go from present to absent, and the right claim is "no production
+    ///     statement nulls it *deliberately*", not "it is never nulled".
+    ///
+    ///     ⚠️ **RE-CENSUSED 2026-08-06 (round-11 R11-I): this said THREE, and the
+    ///     miss is the reason both shapes are now named.** The original census
+    ///     searched the shape it already had in mind — `existing.rfc822MessageId =`
+    ///     — so it saw only the in-place merge arm and was structurally blind to the
+    ///     orphan-reclaim arm, which writes the identical value through a differently
+    ///     named variable onto an equally stored row (`MIS-007`, *a census inherits
+    ///     its search shape*). The correct predicate is by PROPERTY — *an assignment
+    ///     to `rfc822MessageId` on a row that is subsequently `update`d rather than
+    ///     `insert`ed* — not by receiver name. Re-derive it that way, and restate the
+    ///     integer beside the predicate, before relying on it again.
     ///
     ///     **The sibling path already carries the stricter form, and it is the one
     ///     to copy if this is ever tightened:** `SyncEngine.performFullSync`

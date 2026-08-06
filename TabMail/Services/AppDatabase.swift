@@ -2224,7 +2224,30 @@ final class AppDatabase: Sendable {
         // one. A closing-only gate would be cheaper still, but migrations COMMIT
         // INDIVIDUALLY: a failure there strands the database at v82 retrying
         // v83 forever, with 15 migrations' work already applied.
-        migrator.registerTimedMigration("v71_addOutboxDraftRfc822MessageId") { db in
+        // ⚑ `foreignKeyChecks: .deferred` MADE EXPLICIT 2026-08-06 (round-11 R11-K).
+        // This is a NO-OP at runtime and no SQL, no statement and no migration name
+        // changed: `registerTimedMigration`'s declared default IS `.deferred`, and it
+        // forwards the argument verbatim to `registerMigration`, so a database that
+        // has already applied v71 skips it entirely and one that has not applies it
+        // under the identical mode. Data-integrity rule 5 is not engaged — the
+        // argument is not part of the body's executed statements, exactly as the
+        // "NOT A BODY CHANGE" paragraph in the FK-MODE block above already
+        // adjudicates for the whole v68…v83 range.
+        //
+        // WHY MAKE IT EXPLICIT HERE AND NOWHERE ELSE. 67 of the 83 registrations take
+        // the default, and spelling it out on all of them would be noise. v71 is the
+        // one migration whose DEFAULT is LOAD-BEARING: its whole-database
+        // `PRAGMA foreign_key_check` is the positioned orphan gate documented
+        // immediately above, and the FK-MODE block lists v71 among the "`ADD COLUMN`
+        // only" migrations that would be SAFE under `.immediate` — an invitation a
+        // later reader can act on, walked back only by that block's closing sentence.
+        // `v82`, the other deliberately-`.deferred` migration named in that same
+        // sentence, already spells it out. Writing it here means a future sweep to
+        // `.immediate` has to DELETE an explicit choice rather than merely add an
+        // argument to a bare call.
+        migrator.registerTimedMigration(
+            "v71_addOutboxDraftRfc822MessageId", foreignKeyChecks: .deferred
+        ) { db in
             // ⚠ THIS COLUMN IS INERT AS OF `e0d3d30e0` ("Bind draft mutations to
             // provider UID, epoch, and generation"). The matching
             // `OutboxMessage.draftRfc822MessageId` property was deleted 2026-08-05;
@@ -2283,11 +2306,23 @@ final class AppDatabase: Sendable {
             // sibling — and deleting it is a wrong-message delete (C3).
             //
             // With the epoch, that delete resolves through the STRONG arm instead:
-            // SELECT reports the live UIDVALIDITY, it must EQUAL the recorded one (a
-            // mismatch fails closed), and only then may the recorded UID be FETCHed and
-            // corroborated against the recorded rfc822. If the gesture's target is gone
-            // the FETCH finds nothing and the delete is a clean no-op — the sibling is
-            // never even a candidate.
+            // SELECT reports the live UIDVALIDITY and it must EQUAL the recorded one (a
+            // provable mismatch fails closed; an epoch the server omitted is UNKNOWN and
+            // also fails closed, retryably). The delete is then issued against the
+            // recorded UID alone. If the gesture's target is already gone that UID
+            // addresses nothing and the delete is a clean no-op — the sibling is never
+            // even a candidate, because no search ever runs.
+            //
+            // ⚠️ COMMENT CORRECTED 2026-08-06 (no statement changed — this migration is
+            // applied and immutable). The paragraph above used to end "and only then may
+            // the recorded UID be FETCHed and corroborated against the recorded rfc822.
+            // If the gesture's target is gone the FETCH finds nothing". That FETCH does
+            // not exist on v3: `e0d3d30e0` removed the RFC leg entirely, v71's column is
+            // inert, and `IMAPProvider.deleteDraftStrong`'s own doc records that it omits
+            // the reference's optional RFC corroboration "because v3's typed identity has
+            // no RFC leg". The "WHY v71 ALONE WAS NOT THE CLOSURE" paragraph above is
+            // kept verbatim because it is the historical argument for THIS migration and
+            // is accurate about what v71 did; it describes a path that no longer exists.
             //
             // PORTED from the reference's `v85_addOutboxDraftServerUidValidity`
             // (`OutboxMessage.draftServerUidValidity`) and `Draft.serverDraftUidValidity`
@@ -2689,8 +2724,13 @@ final class AppDatabase: Sendable {
             //          WHEN WRITTEN and was invalidated ONE COMMIT LATER by `204590b34`,
             //          which converted 14 migrations to `foreignKeyChecks: .immediate`.
             //          Census re-derived at HEAD: 83 registered migrations — 14 explicit
-            //          `.immediate`, 2 explicit `.deferred` (`v2`, `v82`), 67 taking
-            //          `registerTimedMigration`'s default, which IS `.deferred`. So
+            //          `.immediate`, 3 explicit `.deferred` (`v2`, `v71`, `v82`), 66
+            //          taking `registerTimedMigration`'s default, which IS `.deferred`.
+            //          (`v71` moved from the default column to the explicit one on
+            //          2026-08-06, round-11 R11-K — a no-op at runtime; see its own
+            //          registration comment for why that one migration spells it out.
+            //          The 69/14 split below is about EFFECTIVE mode and is unchanged
+            //          by that move.) So
             //          **69 of 83 end with a whole-database `PRAGMA foreign_key_check`
             //          and 14 do not.** Confirmed against GRDB's own
             //          `GRDB/Migration/Migration.swift`: `runWithDeferredForeignKeysChecks`

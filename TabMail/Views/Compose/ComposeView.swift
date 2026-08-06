@@ -2918,8 +2918,12 @@ struct ComposeView: View {
             ownedDraft.rfc822MessageId = draftRecord?.rfc822MessageId
             // …and v72's epoch, which travels with `serverDraftId` and is meaningless
             // apart from it. Carrying the address forward while dropping the numbering
-            // it belongs to would leave a UID nothing can trust, silently demoting every
-            // later delete of this draft to the Message-ID-search arm.
+            // it belongs to would leave a UID nothing can trust, so every later delete
+            // of this draft would REFUSE (`actionIdentityResolutionFailed`) and the
+            // server copy would outlive the local one. (Corrected 2026-08-06: this used
+            // to say such a delete was "silently demot[ed] to the Message-ID-search
+            // arm" — v3 has no such arm; `IMAPProvider.deleteDraft` accepts only a
+            // typed `.imap(folder, uidValidity, uid)` address, per ADR-IOS-068/D4.)
             ownedDraft.serverDraftUidValidity = draftRecord?.serverDraftUidValidity
             ownedDraft.serverDraftFolderPath = draftRecord?.serverDraftFolderPath
             // T5.8 — the reply-target ADDRESS stamp must be taken from the SAME

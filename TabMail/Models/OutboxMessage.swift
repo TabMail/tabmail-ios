@@ -83,12 +83,25 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
     /// primary delete already did — finds exactly one remaining exact match, the
     /// SIBLING, and destroys it. That is a wrong-message delete. With the epoch
     /// the same delete resolves through `IMAPProvider.deleteDraft`'s STRONG arm:
-    /// live UIDVALIDITY must equal this value, then the recorded UID is FETCHed
-    /// and corroborated, and a target that is already gone is a clean no-op.
+    /// live UIDVALIDITY must equal this value, and a target that is already gone
+    /// is a clean no-op.
     ///
     /// nil for non-IMAP providers, for a draft that was never pushed, and for
-    /// any row written before v72 — all of which keep that row on the unchanged
-    /// Message-ID-search arm.
+    /// any row written before v72. For an IMAP row a nil epoch means the delete
+    /// cannot be addressed at all and REFUSES (`actionIdentityResolutionFailed`,
+    /// a retryable throw); for Gmail/Graph the address is a stable epoch-free
+    /// resource id and nothing is missing.
+    ///
+    /// ⚠️ CORRECTED 2026-08-06. This used to say the recorded UID "is FETCHed and
+    /// corroborated" after the epoch check, and that a nil epoch kept the row "on
+    /// the unchanged Message-ID-search arm". Neither exists on v3:
+    /// `deleteDraft(identity:)` accepts only `.imap(folder, uidValidity, uid)` and
+    /// `deleteDraftStrong` states in its own doc that it omits RFC corroboration
+    /// "because v3's typed identity has no RFC leg" — there is no Message-ID-search
+    /// arm left to fall back to. Restoring one would be the banned D4 direction
+    /// (ADR-IOS-068: an RFC 822 Message-ID never selects or authorizes a mutation
+    /// target), which is exactly what the paragraph above argues against, so the
+    /// stale wording contradicted its own point.
     ///
     /// Ported from `v2final:TabMail/Models/OutboxMessage.swift`'s
     /// `draftServerUidValidity` (its migration `v85`).
