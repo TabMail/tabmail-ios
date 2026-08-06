@@ -880,6 +880,29 @@ struct NSEStagedRowEpochGuardTests {
 
     // MARK: - Scoping
 
+    /// ⚠️ THE SIBLING-FOLDER ROW MUST NOT REUSE THE DROPPED ROW'S UID, AND THAT IS A
+    /// PROPERTY OF THE STAGING SCHEMA, NOT A WEAKENING OF THIS TEST.
+    /// `nse_processed_message`'s primary key is `"<accountId>:<messageId>"` — no
+    /// folder, no epoch (see `NSEStagingDB`'s doc, and `stageRow` above composes the
+    /// same key production does). So within ONE account, two staged rows carrying the
+    /// same `messageId` in DIFFERENT folders **cannot coexist**: the second
+    /// `INSERT OR REPLACE` silently evicts the first.
+    ///
+    /// This test previously staged `acc1`/INBOX/UID 5 and `acc1`/Archive/UID 5 and
+    /// believed it held both. It held only the Archive one, so the load-bearing
+    /// `dropped.exists == false` assertion passed because the INBOX row had never been
+    /// staged — **not** because the epoch guard dropped it. Verified 2026-08-06: with
+    /// `uidValidityStagingRowStatus`'s `isOldEpoch` hardwired to `false` (the guard
+    /// fully disarmed), the old shape still reported `✔ … passed`. The sibling row
+    /// therefore carries UID 6; **do not "restore" it to 5** — that re-collides the key
+    /// and re-vacuates arm (a).
+    ///
+    /// Folder scoping is still pinned, by the EPOCHS rather than by a shared UID: the
+    /// three folders hold three distinct epochs, so an implementation that resolved any
+    /// row's epoch against the wrong folder (or the wrong account) would find a
+    /// disagreement and drop that row. The same-UID-different-folder question at the
+    /// identity door itself is pinned directly, and without the schema's key collision,
+    /// by `epochDoorIsScopedToTheRefsOwnFolder` below.
     @Test("The epoch drop is scoped to its own folder and account — a sibling folder's and another account's staged rows merge untouched in the same pass")
     func epochDropIsScopedToItsOwnFolderAndAccount() async throws {
         let world = try makeWorld()
@@ -893,14 +916,25 @@ struct NSEStagedRowEpochGuardTests {
         // Only this one disagrees with its own folder.
         try stageRow(world.stagingQueue, accountId: "acc1", folderPath: "INBOX", messageId: "5",
                      rfc822: "rfc-inbox@example.com", observedUidValidity: Self.epochA)
-        // Same UID, sibling folder, agreeing epoch.
-        try stageRow(world.stagingQueue, accountId: "acc1", folderPath: "Archive", messageId: "5",
+        // Sibling folder, SAME account, agreeing epoch — distinct UID, see the note above.
+        try stageRow(world.stagingQueue, accountId: "acc1", folderPath: "Archive", messageId: "6",
                      rfc822: "rfc-archive@example.com", observedUidValidity: Self.siblingEpoch,
                      subject: "Sibling folder subject")
-        // Same UID again, different ACCOUNT, agreeing epoch.
+        // Same UID as the dropped row, different ACCOUNT, agreeing epoch. This one does
+        // not collide — the key is account-prefixed — so the UID is shared on purpose.
         try stageRow(world.stagingQueue, accountId: "acc2", folderPath: "INBOX", messageId: "5",
                      rfc822: "rfc-other-account@example.com", observedUidValidity: Self.otherAccountEpoch,
                      subject: "Other account subject")
+
+        // NON-VACUITY ANCHOR, asserted BEFORE the merge: all three rows are actually in
+        // the staging file. If a future edit re-collides two ids, this fails loudly here
+        // instead of silently turning the drop assertion below into a tautology.
+        #expect(try stagingRowExists(world.stagingQueue, id: "acc1:5"),
+                "the old-epoch row under test was never staged — the drop assertion below would be vacuous")
+        #expect(try stagingRowExists(world.stagingQueue, id: "acc1:6"),
+                "the sibling-folder row was never staged — its unaffected-ness would be vacuous")
+        #expect(try stagingRowExists(world.stagingQueue, id: "acc2:5"),
+                "the other-account row was never staged — its unaffected-ness would be vacuous")
 
         await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: world.stagingPath)
         try await Task.sleep(for: .milliseconds(200))
@@ -908,7 +942,7 @@ struct NSEStagedRowEpochGuardTests {
         let dropped = try await landed(world.pool, headerId: "acc1:INBOX:5")
         #expect(dropped.exists == false, "the old-epoch row must not create a header at the UID it no longer owns")
 
-        let sibling = try await landed(world.pool, headerId: "acc1:Archive:5")
+        let sibling = try await landed(world.pool, headerId: "acc1:Archive:6")
         #expect(sibling.exists, "a sibling folder's staged row must be unaffected by another folder's turnover")
         #expect(sibling.subject == "Sibling folder subject")
         #expect(sibling.hasBody)
