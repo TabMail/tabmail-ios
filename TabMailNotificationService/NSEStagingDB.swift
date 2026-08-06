@@ -340,10 +340,17 @@ enum NSEStagingDB {
     /// folder to disagree with. The precedence of the two doors is still identical;
     /// only the merge side's operand set is wider.
     ///
-    /// Uses `MessageIdentity.comparableRfc822Identity` — the tree's single
-    /// identity-COMPARISON normalizer, deliberately NOT `usableRfc822Tail` (whose
-    /// extra `':'` rejection exists for key MINTING and would call a legitimate
-    /// `no-fold-literal` domain "not the same message").
+    /// Uses `MessageIdentity.comparableRfc822Identity`, deliberately NOT
+    /// `usableRfc822Tail` (whose extra `':'` rejection exists for key MINTING and
+    /// would call a legitimate `no-fold-literal` domain "not the same message").
+    ///
+    /// ⚠ THIS SAID "the tree's SINGLE identity-COMPARISON normalizer" until
+    /// R13-U8, and it is not — `SyncEngineEpochVerify` compares through
+    /// `EmailFilter.normalizeMessageId` directly at three sites. See the same
+    /// correction on `NSEDataBridge.nseMergeIdentityConfirmed` for why both exist:
+    /// `comparableRfc822Identity` is `normalizeMessageId` plus REJECTION, so it
+    /// answers `nil` where the raw normalizer answers a string, and an identity
+    /// DOOR must not let a malformed value confirm anything.
     private static func stagedIdentityPositivelyDiffers(
         db: Database, id: String, message: NSEMessageMetadata
     ) throws -> Bool {

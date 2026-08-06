@@ -1062,10 +1062,24 @@ enum NSEDataBridge {
     /// reference delegates to `MessageIdentity.fetchedContentIdentityConfirmed`,
     /// which does NOT exist on v3 (no such symbol tree-wide), so the two doors are
     /// expressed directly here. The RFC normalization goes through v3's
-    /// `MessageIdentity.comparableRfc822Identity` — the tree's single
-    /// identity-COMPARISON normalizer (deliberately NOT `usableRfc822Tail`, whose
-    /// extra `':'` rejection exists for key MINTING and would answer "never the same
-    /// message" for a legitimate `no-fold-literal` domain).
+    /// `MessageIdentity.comparableRfc822Identity` — deliberately NOT
+    /// `usableRfc822Tail`, whose extra `':'` rejection exists for key MINTING and
+    /// would answer "never the same message" for a legitimate `no-fold-literal`
+    /// domain.
+    ///
+    /// ⚠ THIS SAID "the tree's SINGLE identity-COMPARISON normalizer" until
+    /// R13-U8, and it is not: `SyncEngineEpochVerify` compares identities through
+    /// `EmailFilter.normalizeMessageId` directly, at three sites (sample capture,
+    /// the server-side map, and the durable re-read). The two are not
+    /// interchangeable and neither is wrong — `comparableRfc822Identity` IS
+    /// `normalizeMessageId` plus REJECTION (embedded CR/LF, unbalanced angle
+    /// brackets, residual whitespace/controls, an empty result), so it answers
+    /// `nil` — "no usable identity" — where the raw normalizer answers a string.
+    /// Epoch verification wants the raw form because it has already discarded
+    /// empties itself and is comparing two values it read from the same wire; the
+    /// identity doors here want the rejecting form because a malformed value must
+    /// not be allowed to CONFIRM anything. Do not "unify" them without deciding
+    /// which side of that asymmetry each caller needs.
     ///
     /// Confirmed when EITHER:
     ///  (a) RFC MATCH — both sides' normalized RFC Message-IDs are present and

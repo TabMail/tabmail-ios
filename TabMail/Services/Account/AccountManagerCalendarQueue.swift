@@ -61,9 +61,30 @@ extension AccountManager {
     }
 
     private func registerCalendarOpAwaiter(opId: String, continuation: CheckedContinuation<CalendarOpOutcome, Never>) {
-        // If the drain already finished and signalled before we registered,
-        // there's no recorded outcome to read — return stillQueued so the LLM
-        // gets a meaningful fallback rather than hanging forever.
+        // ⚠ R13-U8 — THIS COMMENT USED TO DESCRIBE A MECHANISM THAT DOES NOT
+        // EXIST. It read: *"If the drain already finished and signalled before
+        // we registered, there's no recorded outcome to read — return
+        // stillQueued so the LLM gets a meaningful fallback rather than hanging
+        // forever."* There is no recorded-outcome store anywhere in this file:
+        // `signalCalendarOpOutcome` resolves the awaiter it finds and RETURNS
+        // (`guard let cont = … else { return }`), writing nothing down. The
+        // branch below is not a signal-before-register check at all — it fires
+        // only on a SECOND registration for the same op id, and it resumes the
+        // PRIOR continuation (an awaiter that is provably still suspended,
+        // since the map holds exactly the un-resumed ones) so the earlier
+        // caller cannot be stranded when its entry is overwritten on the next
+        // line. Resumed-exactly-once is upheld by the map being the single
+        // ownership token: every resume path (`signal`, `drop`, here) takes the
+        // continuation out of the map, or replaces it having just resumed it.
+        //
+        // The real signal-before-register case is handled by the TIMEOUT, not
+        // here: `signalCalendarOpOutcome` no-ops against an empty map, this
+        // registration then suspends with nothing left to wake it, and
+        // `awaitCalendarOpOutcome`'s sibling sleep task resolves the caller at
+        // `timeoutSeconds` (R12-T6 is why that arm must also `dropCalendarOpAwaiter`).
+        // Do not "restore" the described behaviour by inventing an outcome
+        // cache without deciding its eviction — an outcome kept for an op
+        // nobody awaits is a leak, and one evicted too early is this race again.
         if calendarOpAwaiters[opId] != nil {
             // A second register for the same id is a programming error;
             // resume the prior one defensively.
@@ -444,7 +465,24 @@ extension AccountManager {
         case .create:
             let allDay = CalendarToolHelpers.boolArg(args, "all_day")
             var input = CalendarToolHelpers.buildGCalEventInput(args, isAllDay: allDay)
-            // Use pre-generated event ID for idempotent retries (Google only — Exchange ignores it)
+            // Use the pre-generated event id for idempotent retries.
+            //
+            // ⚠ THIS SAID "(Google only — Exchange ignores it)" UNTIL R13-U8 AND
+            // WAS FALSE ON BOTH HALVES. All THREE providers consume it, each in
+            // its own idempotency currency, which is why `op.eventId` is set
+            // unconditionally rather than per-provider:
+            //  - Google — sent as the resource `id` on `events.insert`; a
+            //    replay answers 409 `duplicate`, which `isGoogleDuplicateIdConflict`
+            //    reads as "already created" (R13-U3).
+            //  - Exchange — `ExchangeCalendarProvider.createEventJSON` maps it to
+            //    Graph's `transactionId` (skipped past 256 chars, which is Graph's
+            //    documented cap; over-long simply degrades to non-idempotent).
+            //  - CalDAV — `CalDAVProvider.createEvent` uses it as the `.ics`
+            //    RESOURCE FILENAME and PUTs with `If-None-Match: *`, so a replay
+            //    lands on the same URL and answers 412 instead of duplicating.
+            // What none of them does is echo it back as the id we should keep:
+            // Google echoes it, Exchange and CalDAV each assign their own, which
+            // is what `createdRealId` below exists to capture.
             if let pregenId = op.eventId {
                 input.id = pregenId
             }

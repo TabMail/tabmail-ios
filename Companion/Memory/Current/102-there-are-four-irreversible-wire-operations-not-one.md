@@ -102,8 +102,20 @@ the set:**
   instance resource by its own id. **If a range/series delete is ever added, re-adjudicate: that
   call WOULD be irreversible and would belong in the set.**
 
-Both calendar files are **byte-identical to `v1.6.38`** (`git diff 07a4bb703..HEAD --` on them is
-empty), so nothing in the v3 range changed that surface. Do not read this note as a census of every
+⚠️ **THE SENTENCE THAT FOLLOWS IS FALSE AND IS KEPT VERBATIM BECAUSE IT IS THE PREMISE ANYONE
+RE-DERIVING THIS ADJUDICATION WOULD LEAN ON (round-13 U8 item 3).** *"Both calendar files are
+**byte-identical to `v1.6.38`** (`git diff 07a4bb703..HEAD --` on them is empty), so nothing in the
+v3 range changed that surface."* Google was, when this was written. **Exchange was not**, and by
+round 13 neither is: measured at `c77d70675`, `git diff --stat 07a4bb703..HEAD --` reports
+`GoogleCalendarProvider.swift` **+146/−…**, `ExchangeCalendarProvider.swift` **+182/−…**, and
+`CalDAVProvider.swift` **+349/−…** (587 insertions, 90 deletions across the three). A
+"byte-identical to shipped" claim is a measurement with a timestamp, not a property — restate it
+only with the revision beside it, or it silently becomes an argument for not re-checking the very
+surface it describes.
+
+The ADJUDICATION below still holds — it rests on what the calls DO and on the providers'
+documented recovery, not on the files being unchanged — but it must be re-derived against HEAD
+rather than inherited. Do not read this note as a census of every
 destructive call in the tree; it is the mail/draft family, plus this adjudication of the calendar
 pair. Recorded 2026-08-05, round 3 angle 2.
 
@@ -114,6 +126,25 @@ the census that produced it keyed on the `method: "DELETE"` argument form and Ca
 2026-08-05. It is counted now, as **(5)** below. The lesson is the one this file already teaches
 about `ExchangeProvider.deleteDraft`: **exclusion needs positive evidence**, and "I did not see it"
 is not evidence — but neither is "I searched", if the search could not have seen it.
+
+⚠️ **THE REPLACEMENT-AXIS CENSUS COUNTS A PATTERN LINE, NOT THE WIRE OPERATIONS BEHIND IT
+(round-13 U9).** Pattern D (`httpMethod\s*=\s*"PUT"`) yields exactly one CalDAV hit,
+`CalDAVClient.swift`'s request builder, and this file adjudicates exactly one thing behind it —
+`splitSeries`' cap `PUT`. **That single line is reached by seven distinct operations.** Two of them,
+`CalDAVProvider.updateEvent` and `CalDAVProvider.updateOccurrence`, replace a WebDAV representation
+wholesale with no restore — the identical shape that was used to admit the cap `PUT` — and are named
+neither as included nor as excluded. A census whose unit is a grep hit rather than a caller reports
+"one site, adjudicated" when seven operations share it; the count is a property of the SEARCH, not
+of the surface (`MIS-007`).
+
+Separately, the falsification clause excludes Graph `PATCH` on the ground that it *"merges named
+fields"*. That condition is **already false in this tree**: both `ExchangeCalendarProvider` and
+`GoogleCalendarProvider` GET the event and send the full merged payload, and both say so in their
+own comments. The exclusion therefore rests on a premise the code contradicts.
+
+**What is wrong is the CENSUS-COMPLETENESS claim, and only that.** The substantive lost-update risk
+these operations carry is owned and closed by `KNOWN_ISSUES.md` `IOS-CAL-002` — **do not re-file the
+lost-update class here.** Recorded 2026-08-06, round 13.
 
 Sources: [Graph `event: delete`](https://learn.microsoft.com/en-us/graph/api/event-delete?view=graph-rest-1.0),
 [Graph `event: permanentDelete`](https://learn.microsoft.com/en-us/graph/api/event-permanentdelete?view=graph-rest-1.0),
