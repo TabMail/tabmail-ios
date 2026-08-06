@@ -43,8 +43,15 @@ enum ThreadGroupBuilder {
 
         var result = groupOrder.compactMap { key -> ThreadGroup? in
             guard var members = groups[key], !members.isEmpty else { return nil }
-            // Sort members by date descending (most recent first)
-            members.sort { $0.date > $1.date }
+            // Sort members by date descending (most recent first), with the shared
+            // `id` tie-break so `representative` and `allSenders` are a function of
+            // the data and not of `Array.sort`'s (deliberately unspecified)
+            // stability. `.normal` is passed DELIBERATELY, not by omission: a
+            // thread's internal order is newest-first in BOTH list modes — triage's
+            // `tagSortOrder` ranks the GROUP against other groups
+            // (`areInIncreasingOrder` below, via `threadTag`), never one member
+            // against its siblings. Only the tie-break is shared here.
+            members.sort { InboxOrdering.areInIncreasingOrder($0, $1, mode: .normal) }
             let representative = members[0]
 
             // Collect unique senders (preserving order of most-recent-first)

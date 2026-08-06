@@ -1040,4 +1040,239 @@ struct InboxViewModelDiffTests {
         #expect(!vm.folders.contains { $0.id == staleFolder.id }, "stale folder should be replaced")
         #expect(vm.loadedMessages.contains { $0.id == ids[0] }, "message in the healed folder should load")
     }
+
+    // MARK: - R13 — ONE inbox ordering key, agreed by every spelling of it
+
+    /// 🚨 **THE INVARIANT: the order the view model's in-memory positioning
+    /// produces IS the order the reader produces.** Not "the comparator ends in
+    /// `id`" — that pins the mechanism and would stay green if the reference
+    /// order itself moved. The system property is agreement: whatever the SQL
+    /// `ORDER BY` + `InboxListComposer` step 7 decide the list looks like, the
+    /// VM's sorted inserts must land rows in exactly that arrangement.
+    ///
+    /// **Why it is load-bearing and not cosmetic.** `loadMoreMessages` takes its
+    /// keyset cursor from `loadedMessages.last` (R12-T3, `3b31fdb4d`). If the
+    /// array is not in the reader's total order, `last` is not the maximal row
+    /// under that order, so the keyset predicate re-admits rows the VM already
+    /// holds. Those rows consume slots in the reader's per-folder SQL `LIMIT`
+    /// and are only dropped afterwards by `excludeIds`/the VM belt — the
+    /// filter-after-LIMIT shape `IOS-SCROLL-002` was filed for. The short page
+    /// then sets `hasMoreMessages = nextPage.count >= inboxPageSize` false and
+    /// **every older message in the mailbox becomes unreachable by scrolling.**
+    /// Ties on the ordering key are ordinary: IMAP `INTERNALDATE` has second
+    /// granularity, and in triage the primary key is `tagSortOrder`, where a
+    /// whole bucket shares one value.
+    ///
+    /// The oracle is deliberately the READER, never a second copy of the
+    /// comparator written here.
+    @MainActor
+    private func readerOrder(_ vm: InboxViewModel) -> [String] {
+        let query = InboxListQuery(
+            displayedFolderIds: Set(vm.folders.map(\.id)),
+            filterUnread: vm.filterUnread,
+            filterLabelIds: vm.filterLabelIds,
+            mode: vm.mode,
+            targetCount: SyncConfig.inboxPageSize,
+            before: nil
+        )
+        return InboxListReader.fetchSync(folders: vm.folders, query: query).map(\.id)
+    }
+
+    /// Insert one durable, inbox-visible header with an explicit date and tag.
+    /// `insertMessages` above cannot set `actionTag`/`tagSortOrder`, which the
+    /// triage arm of the ordering key needs.
+    @MainActor
+    private func insertOrderingRow(
+        _ pool: DatabasePool, messageId: String, date: Date, tag: ActionTag? = nil, folderId: String
+    ) throws -> String {
+        var header = MessageHeader(
+            messageId: messageId,
+            subject: "Subj \(messageId)",
+            from: "\(messageId)@test.com",
+            fromAddress: "\(messageId)@test.com",
+            to: "test@example.com",
+            date: date,
+            snippet: "snip",
+            folderId: folderId,
+            accountId: "acc1",
+            folderPath: "INBOX",
+            isInInbox: true
+        )
+        header.computedThreadId = "thread-\(messageId)"
+        header.headerComplete = true
+        header.actionTag = tag
+        header.tagSortOrder = tag?.sortOrder ?? 99
+        try pool.writeWithoutTransaction { db in try header.insert(db) }
+        return header.id
+    }
+
+    @Test("reload-diff places a row tied on the ordering key exactly where the reader does (normal mode)")
+    @MainActor func reloadDiffAgreesWithReaderOnTiesNormal() async throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        // Two rows share ONE second; a third is strictly older so the tie block
+        // is not the whole list (a fix that merely appended would still pass).
+        let tied = baseDate
+        _ = try insertOrderingRow(pool, messageId: "m-b", date: tied, folderId: folder.id)
+        _ = try insertOrderingRow(pool, messageId: "m-d", date: tied, folderId: folder.id)
+        _ = try insertOrderingRow(pool, messageId: "m-y", date: tied.addingTimeInterval(-60), folderId: folder.id)
+
+        let vm = InboxViewModel(folders: [folder])
+        vm.start()
+        vm.loadInitialPage()
+        // ⚠️ Anchor the fixture before asserting an arrangement (MIS-030): three
+        // rows must actually be visible, or the comparison below is vacuous.
+        #expect(vm.loadedMessages.count == 3, "fixture did not stage 3 visible rows; got \(vm.loadedMessages.count)")
+        guard vm.loadedMessages.count == 3 else { return }
+        #expect(vm.loadedMessages.map(\.id) == readerOrder(vm), "the initial page already disagreed with the reader — the diff assertion below would be testing the wrong thing")
+
+        // A new row arrives tied on the SAME second, with an id that sorts BEFORE
+        // both loaded tied rows. Under the reader's `(date DESC, id ASC)` it
+        // belongs at the HEAD of the tie block, not at its end.
+        _ = try insertOrderingRow(pool, messageId: "m-a", date: tied, folderId: folder.id)
+
+        await vm.reloadMessages()
+
+        #expect(vm.loadedMessages.count == 4)
+        #expect(
+            vm.loadedMessages.map(\.id) == readerOrder(vm),
+            """
+            the reload-diff's in-memory arrangement disagrees with the reader's. \
+            `loadMoreMessages` keys its pagination cursor off `loadedMessages.last`, \
+            so a list that is not in the reader's total order re-requests rows it \
+            already holds; they burn SQL LIMIT slots, the page comes back short, and \
+            `hasMoreMessages` goes false with mail still unread below.
+            vm     = \(vm.loadedMessages.map(\.id))
+            reader = \(readerOrder(vm))
+            """)
+    }
+
+    @Test("reload-diff places a row tied on the ordering key exactly where the reader does (triage mode)")
+    @MainActor func reloadDiffAgreesWithReaderOnTiesTriage() async throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        // Triage orders `tagSortOrder ASC, date DESC`. The reply bucket (0) is
+        // OLDER than the untagged row (99) — the ordinary shape, and the reason
+        // this order is not date-monotonic.
+        let tied = baseDate
+        _ = try insertOrderingRow(pool, messageId: "m-b", date: tied, tag: .reply, folderId: folder.id)
+        _ = try insertOrderingRow(pool, messageId: "m-d", date: tied, tag: .reply, folderId: folder.id)
+        _ = try insertOrderingRow(pool, messageId: "m-z", date: tied.addingTimeInterval(3600), folderId: folder.id)
+
+        let vm = InboxViewModel(folders: [folder])
+        vm.mode = .triage
+        vm.start()
+        // `init` already ran `loadInitialPage()` in `.normal`, and that call is
+        // one-shot — `resetMessages()` is the only way to re-seed page 1 under
+        // the new mode. Calling `loadInitialPage()` here would silently leave a
+        // NORMAL-ordered list and the triage arm would never be exercised.
+        vm.resetMessages()
+        #expect(vm.loadedMessages.count == 3, "fixture did not stage 3 visible rows; got \(vm.loadedMessages.count)")
+        guard vm.loadedMessages.count == 3 else { return }
+        #expect(vm.loadedMessages.map(\.id) == readerOrder(vm), "the initial triage page already disagreed with the reader")
+
+        // Tied on BOTH tagSortOrder and date; its id sorts first.
+        _ = try insertOrderingRow(pool, messageId: "m-a", date: tied, tag: .reply, folderId: folder.id)
+
+        await vm.reloadMessages()
+
+        #expect(vm.loadedMessages.count == 4)
+        #expect(
+            vm.loadedMessages.map(\.id) == readerOrder(vm),
+            """
+            the triage reload-diff's arrangement disagrees with the reader's.
+            vm     = \(vm.loadedMessages.map(\.id))
+            reader = \(readerOrder(vm))
+            """)
+    }
+
+    @Test("insertUndoneMessages places an undone row tied on the ordering key exactly where the reader does")
+    @MainActor func insertUndoneAgreesWithReaderOnTies() async throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let tied = baseDate
+        _ = try insertOrderingRow(pool, messageId: "m-b", date: tied, folderId: folder.id)
+        _ = try insertOrderingRow(pool, messageId: "m-d", date: tied, folderId: folder.id)
+        _ = try insertOrderingRow(pool, messageId: "m-y", date: tied.addingTimeInterval(-60), folderId: folder.id)
+
+        let vm = InboxViewModel(folders: [folder])
+        vm.start()
+        vm.loadInitialPage()
+        #expect(vm.loadedMessages.count == 3, "fixture did not stage 3 visible rows; got \(vm.loadedMessages.count)")
+        guard vm.loadedMessages.count == 3 else { return }
+
+        // The undone row is restored to the inbox in GRDB, then re-inserted into
+        // the on-screen list by the targeted undo path (not by a full reload).
+        let undoneId = try insertOrderingRow(pool, messageId: "m-a", date: tied, folderId: folder.id)
+        vm.insertUndoneMessages([undoneId])
+
+        #expect(vm.loadedMessages.count == 4)
+        #expect(
+            vm.loadedMessages.map(\.id) == readerOrder(vm),
+            """
+            the undo path's targeted insert disagrees with the reader's arrangement.
+            vm     = \(vm.loadedMessages.map(\.id))
+            reader = \(readerOrder(vm))
+            """)
+    }
+
+    @Test("insertStagedRows places a staged row tied on the ordering key exactly where the reader will")
+    @MainActor func insertStagedAgreesWithReaderOnTies() async throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let tied = baseDate
+        _ = try insertOrderingRow(pool, messageId: "m-b", date: tied, folderId: folder.id)
+        _ = try insertOrderingRow(pool, messageId: "m-d", date: tied, folderId: folder.id)
+        _ = try insertOrderingRow(pool, messageId: "m-y", date: tied.addingTimeInterval(-60), folderId: folder.id)
+
+        let vm = InboxViewModel(folders: [folder])
+        vm.start()
+        vm.loadInitialPage()
+        #expect(vm.loadedMessages.count == 3, "fixture did not stage 3 visible rows; got \(vm.loadedMessages.count)")
+        guard vm.loadedMessages.count == 3 else { return }
+
+        // ADR-IOS-049's zero-I/O instant insert. The property under test is that
+        // the slot it picks is the slot the DURABLE read will pick once the merge
+        // lands — otherwise the row visibly jumps on the next reload, and until
+        // then the array is out of the reader's order with the cursor read off it.
+        vm.insertStagedRows([
+            StagedInboxRow(
+                accountId: "acc1", folderPath: "INBOX", messageId: "m-a",
+                rfc822MessageId: nil, threadId: nil, inReplyTo: nil, references: [],
+                subject: "Subj m-a", senderName: "Sender", senderAddress: "m-a@test.com",
+                to: "test@example.com", snippet: "snip", date: tied,
+                isRead: false, isFlagged: false, hasAttachments: false, isReplied: false,
+                isForwarded: false, actionTag: nil, summaryBlurb: nil
+            )
+        ])
+        #expect(vm.loadedMessages.count == 4)
+
+        // Now let the merge land: the same row becomes durable, so the reader can
+        // speak for where it belongs.
+        _ = try insertOrderingRow(pool, messageId: "m-a", date: tied, folderId: folder.id)
+
+        #expect(
+            vm.loadedMessages.map(\.id) == readerOrder(vm),
+            """
+            the staged instant-insert put the row in a slot the durable read does not agree with.
+            vm     = \(vm.loadedMessages.map(\.id))
+            reader = \(readerOrder(vm))
+            """)
+    }
 }

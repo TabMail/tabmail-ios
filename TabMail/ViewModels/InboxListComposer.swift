@@ -4,6 +4,56 @@
 
 import Foundation
 
+/// 🚨 **THE INBOX ORDERING KEY — ONE DEFINITION. EVERY SITE CALLS THIS ONE.**
+///
+/// The inbox list is ordered by `(tagSortOrder ASC, date DESC, id ASC)` in
+/// `.triage` and by `(date DESC, id ASC)` in `.normal`. That key used to have
+/// **six** independent spellings: the SQL `ORDER BY` and the keyset predicate in
+/// `InboxListReader.gather`, `InboxPageCursor.precedes`, `InboxListComposer`'s
+/// step-7 sort, and three sorted-insert searches in `InboxViewModel`
+/// (`insertUndoneMessages`, `insertStagedRows`, and `reloadMessages`' Pass-2
+/// diff). `3b31fdb4d` gave the first three the `id` tie-break and its own commit
+/// body had to report the last three as still missing it — **N agreeing copies is
+/// exactly how this class regenerates**, so there is now one copy.
+///
+/// ⚠️ **A comparator without the tie-break is not cosmetic here.**
+/// `InboxViewModel.loadMoreMessages` takes its keyset cursor from
+/// `loadedMessages.last`. If the array is not in the reader's TOTAL order, `last`
+/// is not the maximal row under that order, so the keyset predicate re-admits
+/// rows already on screen. Those rows consume slots in the reader's per-folder
+/// SQL `LIMIT` and are only dropped afterwards by `excludeIds` / the VM's belt —
+/// the filter-after-LIMIT shape `IOS-SCROLL-002` was filed for. The resulting
+/// short page sets `hasMoreMessages = nextPage.count >= inboxPageSize` **false**,
+/// and every older message in the mailbox stops being reachable by scrolling.
+///
+/// Ties are ordinary, not exotic: IMAP `INTERNALDATE` has second granularity, so
+/// burst delivery and initial sync produce them routinely, and in `.triage` an
+/// entire tag bucket shares one `tagSortOrder`.
+enum InboxOrdering {
+    /// The whole ordering key of one row. `id` is `MessageHeader`'s primary key,
+    /// so the key is unique and the order it induces is TOTAL.
+    typealias Key = (tagSortOrder: Int, date: Date, id: String)
+
+    static func key(_ row: MessageSnapshot) -> Key { (row.tagSortOrder, row.date, row.id) }
+
+    /// Strict less-than: `a` sorts BEFORE `b` — nearer the top of the list.
+    ///
+    /// ⚠️ Must stay equivalent to `InboxListReader.gather`'s
+    /// `ORDER BY tagSortOrder ASC, date DESC, id ASC` (triage) /
+    /// `ORDER BY date DESC, id ASC` (normal). SQLite compares `id` under BINARY
+    /// (UTF-8 byte) collation while this uses Swift `String` comparison; that
+    /// accepted residual is documented on `InboxPageCursor`.
+    static func areInIncreasingOrder(_ a: Key, _ b: Key, mode: InboxMode) -> Bool {
+        if mode == .triage, a.tagSortOrder != b.tagSortOrder { return a.tagSortOrder < b.tagSortOrder }
+        if a.date != b.date { return a.date > b.date }
+        return a.id < b.id
+    }
+
+    static func areInIncreasingOrder(_ a: MessageSnapshot, _ b: MessageSnapshot, mode: InboxMode) -> Bool {
+        areInIncreasingOrder(key(a), key(b), mode: mode)
+    }
+}
+
 /// The FULL ordering key of the last row on the previous page — the keyset
 /// pagination cursor (R12-T3).
 ///
@@ -51,20 +101,19 @@ struct InboxPageCursor: Equatable, Sendable {
         self.init(tagSortOrder: row.tagSortOrder, date: row.date, id: row.id)
     }
 
+    /// This cursor's row, as an ordering key.
+    var key: InboxOrdering.Key { (tagSortOrder, date, id) }
+
     /// True when `row` sorts strictly AFTER this cursor under `mode`'s total
     /// order — i.e. the row belongs on a LATER page and has not been seen.
     ///
-    /// ⚠️ This must stay byte-for-byte equivalent to the SQL predicate in
-    /// `InboxListReader.gather` and to `InboxListComposer.compose`'s step-7
-    /// comparators. Three spellings of one order is already one too many; if you
-    /// change any of them, change all three. The composer applies this to P and
-    /// S rows, which have no SQL leg at all.
+    /// ⚠️ This must stay equivalent to the SQL predicate in
+    /// `InboxListReader.gather`. It no longer restates the ordering key: that
+    /// lives once, in `InboxOrdering`, so this cutoff and every sort/insert in
+    /// the list cannot drift apart. The composer applies this to P and S rows,
+    /// which have no SQL leg at all.
     func precedes(_ row: MessageSnapshot, mode: InboxMode) -> Bool {
-        if mode == .triage, row.tagSortOrder != tagSortOrder {
-            return row.tagSortOrder > tagSortOrder
-        }
-        if row.date != date { return row.date < date }
-        return row.id > id
+        InboxOrdering.areInIncreasingOrder(key, InboxOrdering.key(row), mode: mode)
     }
 }
 
@@ -343,8 +392,8 @@ enum InboxListComposer {
         }
 
         // MARK: Step 7 — sort (mode-aware), dedup by id, trim to window.
-        // G2 audit fix (PLAN_INBOX_UNIFIED_READ.md): every comparator ends in
-        // a total-order `id` tie-break. `byId.values` (step 1) iterates a
+        // G2 audit fix (PLAN_INBOX_UNIFIED_READ.md): the comparator ends in a
+        // total-order `id` tie-break. `byId.values` (step 1) iterates a
         // Swift `Dictionary` — its order is NOT a function of insertion
         // order alone and is not guaranteed stable across otherwise-identical
         // composes. Without a final tie-break, rows that compare EQUAL on
@@ -353,20 +402,9 @@ enum InboxListComposer {
         // a tied row appears on one reload and disappears on the next, with
         // nothing in the underlying data having changed (trim-boundary
         // churn). `id` is unique per row and stable, so it's a safe total
-        // order to fall back to.
-        switch query.mode {
-        case .triage:
-            rows.sort { a, b in
-                if a.tagSortOrder != b.tagSortOrder { return a.tagSortOrder < b.tagSortOrder }
-                if a.date != b.date { return a.date > b.date }
-                return a.id < b.id
-            }
-        case .normal:
-            rows.sort { a, b in
-                if a.date != b.date { return a.date > b.date }
-                return a.id < b.id
-            }
-        }
+        // order to fall back to. R13: the key itself lives in `InboxOrdering`
+        // so this sort and the view model's sorted inserts cannot disagree.
+        rows.sort { InboxOrdering.areInIncreasingOrder($0, $1, mode: query.mode) }
 
         var seen: Set<String> = []
         seen.reserveCapacity(rows.count)

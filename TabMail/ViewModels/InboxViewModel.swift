@@ -704,17 +704,16 @@ final class InboxViewModel {
             // loaded real labels above so it can match the reader exactly.
             if !filterLabelIds.isEmpty && !filterLabelIds.isSubset(of: Set(labels.map(\.id))) { continue }
             let snapshot = MessageSnapshot(from: header, userLabels: labels)
-            // Insert at correct sorted position (by date, descending)
-            let insertionIndex: Int
-            if mode == .triage {
-                // Triage: tagSortOrder ascending, then date descending
-                insertionIndex = loadedMessages.firstIndex {
-                    $0.tagSortOrder > snapshot.tagSortOrder ||
-                    ($0.tagSortOrder == snapshot.tagSortOrder && $0.date < snapshot.date)
-                } ?? loadedMessages.endIndex
-            } else {
-                insertionIndex = loadedMessages.firstIndex { $0.date < snapshot.date } ?? loadedMessages.endIndex
-            }
+            // Insert at the slot the READER would have put this row in — the one
+            // shared ordering key (`InboxOrdering`, R13), not a local restatement
+            // of it. Before this, the triage arm compared `(tagSortOrder, date)`
+            // and the normal arm compared `date` alone, with no `id` tie-break at
+            // either, so an undone row tied on the boundary landed at the END of
+            // its tie block while every other spelling of the order placed it by
+            // `id`. See `InboxOrdering` for why that reaches pagination.
+            let insertionIndex = loadedMessages.firstIndex {
+                InboxOrdering.areInIncreasingOrder(snapshot, $0, mode: mode)
+            } ?? loadedMessages.endIndex
             loadedMessages.insert(snapshot, at: insertionIndex)
             loadedIds.insert(id)
             inserted = true
@@ -800,15 +799,14 @@ final class InboxViewModel {
                 header.computedThreadId = adopted
             }
             let snapshot = MessageSnapshot(from: header)
-            let insertionIndex: Int
-            if mode == .triage {
-                insertionIndex = loadedMessages.firstIndex {
-                    $0.tagSortOrder > snapshot.tagSortOrder ||
-                    ($0.tagSortOrder == snapshot.tagSortOrder && $0.date < snapshot.date)
-                } ?? loadedMessages.endIndex
-            } else {
-                insertionIndex = loadedMessages.firstIndex { $0.date < snapshot.date } ?? loadedMessages.endIndex
-            }
+            // The one shared ordering key (`InboxOrdering`, R13). The slot picked
+            // here must be the slot the DURABLE read picks once the merge lands,
+            // or the row visibly jumps on the next reload — and until then the
+            // array is out of the reader's order with `loadMoreMessages`' cursor
+            // read off its tail.
+            let insertionIndex = loadedMessages.firstIndex {
+                InboxOrdering.areInIncreasingOrder(snapshot, $0, mode: mode)
+            } ?? loadedMessages.endIndex
             loadedMessages.insert(snapshot, at: insertionIndex)
             loadedIds.insert(id)
             insertedCount += 1
@@ -970,17 +968,15 @@ final class InboxViewModel {
                 loadedMessages.remove(at: i)
             }
 
-            // Pass 2: Insert new messages at correct sorted position
+            // Pass 2: Insert new messages at the slot the reader put them in.
+            // `freshMessages` arrives from `InboxListReader` already in the total
+            // order; this diff must reproduce that order in-place, so it uses the
+            // SAME comparator the reader's step-7 sort does (`InboxOrdering`,
+            // R13) rather than a fourth restatement of the key.
             for fresh in freshMessages where !survivingIds.contains(fresh.id) {
-                let insertAt: Int
-                if mode == .triage {
-                    insertAt = loadedMessages.firstIndex {
-                        $0.tagSortOrder > fresh.tagSortOrder ||
-                        ($0.tagSortOrder == fresh.tagSortOrder && $0.date < fresh.date)
-                    } ?? loadedMessages.endIndex
-                } else {
-                    insertAt = loadedMessages.firstIndex { $0.date < fresh.date } ?? loadedMessages.endIndex
-                }
+                let insertAt = loadedMessages.firstIndex {
+                    InboxOrdering.areInIncreasingOrder(fresh, $0, mode: mode)
+                } ?? loadedMessages.endIndex
                 loadedMessages.insert(fresh, at: insertAt)
             }
 
