@@ -584,7 +584,6 @@ struct DatabaseNSEStagingTests {
     @Test("The main app's staging schema pass is a no-op over the NSE-added observedUidValidity column — it reports success, keeps every pre-existing column, and leaves an already-written stamp untouched")
     func mainAppSchemaPassPreservesNSEAddedEpochColumn() throws {
         let (path, dir) = try makeStagingFile()
-        defer { try? FileManager.default.removeItem(at: dir) }
 
         let beforeEnsure = try stagingColumns(path)
         #expect(!beforeEnsure.contains("observedUidValidity"))
@@ -610,7 +609,20 @@ struct DatabaseNSEStagingTests {
         // Additive only: convergence means the union, never a replacement.
         #expect(beforeEnsure.isSubset(of: afterPass))
 
-        let survivingStamp: Int? = try DatabaseQueue(path: path).read { db -> Int? in
+        // Retired through the shared close-before-unlink boundary, NOT a bare
+        // `removeItem(at: dir)`. Every handle this test opens happens to die
+        // before the old top-of-function `defer` ran — `nseHandle` is scoped to
+        // its `do` block, and the reads below were unbound temporaries — so the
+        // ordering hazard was latent rather than live. That is precisely the
+        // problem: "no handle outlives the unlink" is an invisible property that
+        // any later edit binding a handle to a function-local silently breaks,
+        // with no diagnostic and no census hit (`f5d63f687`'s census is
+        // file-scoped, and this file now references `TestDatabaseTeardown` for
+        // its sibling test, so this fixture had become permanently invisible to
+        // it). Registering the boundary makes close-before-unlink structural.
+        let verifyHandle = try DatabaseQueue(path: path)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(queue: verifyHandle, directory: dir) }
+        let survivingStamp: Int? = try verifyHandle.read { db -> Int? in
             guard let row = try Row.fetchOne(
                 db, sql: "SELECT * FROM nse_processed_message WHERE id = ?",
                 arguments: ["acct-b:77"]
