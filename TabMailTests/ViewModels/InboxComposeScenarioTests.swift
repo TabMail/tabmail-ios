@@ -262,7 +262,7 @@ struct SimWorld {
         InboxListQuery(
             displayedFolderIds: [MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX")],
             filterUnread: false, filterLabelIds: [], mode: .normal,
-            targetCount: 50, beforeDate: nil
+            targetCount: 50, before: nil
         )
     }
 
@@ -494,15 +494,25 @@ struct SimWorld {
         for folderId in query.displayedFolderIds.sorted() {
             var rows = durableRows.filter { $0.folderId == folderId && $0.headerComplete }
             if query.filterUnread { rows = rows.filter { !$0.isRead } }
-            if let cutoff = query.beforeDate { rows = rows.filter { $0.date < cutoff } }
+            // Mirrors the shell's KEYSET predicate + total ORDER BY (R12-T3).
+            // The sim's D-gather has to walk the same total order the SQL does,
+            // or a scenario's page boundary here would not be the boundary
+            // production produces.
+            if let cursor = query.before {
+                rows = rows.filter { cursor.precedes($0.toSnapshot(), mode: query.mode) }
+            }
             switch query.mode {
             case .triage:
                 rows.sort { a, b in
                     if a.tagSortOrder != b.tagSortOrder { return a.tagSortOrder < b.tagSortOrder }
-                    return a.date > b.date
+                    if a.date != b.date { return a.date > b.date }
+                    return a.id < b.id
                 }
             case .normal:
-                rows.sort { $0.date > $1.date }
+                rows.sort { a, b in
+                    if a.date != b.date { return a.date > b.date }
+                    return a.id < b.id
+                }
             }
             durableSnaps.append(contentsOf: rows.prefix(query.targetCount).map { $0.toSnapshot() })
         }
@@ -589,7 +599,7 @@ struct InboxComposeScenarioTests {
         // window legitimately excludes rows (window trim can displace the
         // oldest row — §4.3).
         let presenceApplies = query.filterLabelIds.isEmpty && !query.filterUnread
-            && query.beforeDate == nil && composed.count < query.targetCount
+            && query.before == nil && composed.count < query.targetCount
 
         for key in world.messageKeys {
             guard let state = world.states[key] else { continue }
@@ -1017,7 +1027,7 @@ struct InboxComposeScenarioTests {
         var ai = AITracker()
         let query = InboxListQuery(
             displayedFolderIds: world.displayedFolderIds, filterUnread: true,
-            filterLabelIds: [], mode: .normal, targetCount: 50, beforeDate: nil
+            filterLabelIds: [], mode: .normal, targetCount: 50, before: nil
         )
         let composed = runSteps([
             (.stagePush, "mReadStaged"),
@@ -1047,7 +1057,7 @@ struct InboxComposeScenarioTests {
         var ai = AITracker()
         let query = InboxListQuery(
             displayedFolderIds: world.displayedFolderIds, filterUnread: false,
-            filterLabelIds: ["label-x"], mode: .normal, targetCount: 50, beforeDate: nil
+            filterLabelIds: ["label-x"], mode: .normal, targetCount: 50, before: nil
         )
         let composed = runSteps([
             (.stagePush, "m1"),
@@ -1125,7 +1135,7 @@ struct InboxComposeScenarioTests {
             // The filter names the label's SURROGATE id, which is what
             // `snapshot.userLabels.map(\.id)` carries (D10 / `IOS-LABEL-001`).
             displayedFolderIds: [folderId], filterUnread: false, filterLabelIds: ["\(accountId):label-x"],
-            mode: .normal, targetCount: 50, beforeDate: nil
+            mode: .normal, targetCount: 50, before: nil
         )
         let composed = InboxListComposer.compose(ComposeInputs(
             durable: [dLabeled, dUnlabeled], pinned: [pLabeled, pUnlabeled], staged: [staged],
@@ -1160,7 +1170,7 @@ struct InboxComposeScenarioTests {
         var ai = AITracker()
         let query = InboxListQuery(
             displayedFolderIds: world.displayedFolderIds, filterUnread: false,
-            filterLabelIds: [], mode: .triage, targetCount: 50, beforeDate: nil
+            filterLabelIds: [], mode: .triage, targetCount: 50, before: nil
         )
         let composed = runSteps([
             (.stagePush, "mReplyOld"),
@@ -1194,7 +1204,7 @@ struct InboxComposeScenarioTests {
         var ai = AITracker()
         let query = InboxListQuery(
             displayedFolderIds: world.displayedFolderIds, filterUnread: false,
-            filterLabelIds: [], mode: .normal, targetCount: 3, beforeDate: nil
+            filterLabelIds: [], mode: .normal, targetCount: 3, before: nil
         )
         let composed = runSteps([
             (.stagePush, "d1"), (.phase1Commit, "d1"), (.ftsFlushCommit, "d1"),
@@ -1213,7 +1223,7 @@ struct InboxComposeScenarioTests {
         #expect(!contains(composed, world, "d3"), "oldest durable row not displaced by the window trim")
     }
 
-    @Test("paginationCutoff — beforeDate applies to S (and P) rows, matching D's SQL cutoff")
+    @Test("paginationCutoff — the page cursor applies to S (and P) rows, matching D's SQL cutoff")
     func paginationCutoffScenario() {
         var world = SimWorld.standard(messages: [
             SimWorld.spec("sNewer", uid: "101", minutesAgo: 1),
@@ -1221,10 +1231,15 @@ struct InboxComposeScenarioTests {
             SimWorld.spec("dOlder", uid: "103", minutesAgo: 90),
         ])
         var ai = AITracker()
-        let cutoff = SimWorld.baseDate.addingTimeInterval(-60 * 60)  // 60 minutes ago
+        // R12-T3: the cutoff is now the previous page's last-row ordering key.
+        // `id: ""` sorts before every real id, so under the total order
+        // `(date DESC, id ASC)` a row tied on `date` is still "after" it — which
+        // keeps this scenario's meaning (dates here are distinct by design).
+        let cursor = InboxPageCursor(
+            tagSortOrder: 99, date: SimWorld.baseDate.addingTimeInterval(-60 * 60), id: "")
         let query = InboxListQuery(
             displayedFolderIds: world.displayedFolderIds, filterUnread: false,
-            filterLabelIds: [], mode: .normal, targetCount: 50, beforeDate: cutoff
+            filterLabelIds: [], mode: .normal, targetCount: 50, before: cursor
         )
         let composed = runSteps([
             (.stagePush, "sNewer"),
@@ -1288,7 +1303,7 @@ struct InboxComposeScenarioTests {
 
         let query = InboxListQuery(
             displayedFolderIds: [folderId], filterUnread: false, filterLabelIds: [],
-            mode: .triage, targetCount: 3, beforeDate: nil, excludeIds: [rExcluded.id]
+            mode: .triage, targetCount: 3, before: nil, excludeIds: [rExcluded.id]
         )
         let composed = InboxListComposer.compose(ComposeInputs(
             durable: [rExcluded, r2, r3, r4], pinned: [], staged: [],
@@ -1370,7 +1385,7 @@ struct InboxComposeScenarioTests {
 
         let query = InboxListQuery(
             displayedFolderIds: [folderId], filterUnread: false, filterLabelIds: [],
-            mode: .normal, targetCount: 50, beforeDate: nil, excludeIds: [d1.id]
+            mode: .normal, targetCount: 50, before: nil, excludeIds: [d1.id]
         )
         let composed = InboxListComposer.compose(ComposeInputs(
             durable: [d1, d2], pinned: [], staged: [s1],
@@ -1389,7 +1404,7 @@ struct InboxComposeScenarioTests {
     /// F2 normal-mode invariance (coordinator addendum): in `.normal` mode
     /// with a date-monotonic pagination window, an already-loaded id never
     /// re-enters a later page's D query in the first place (the SQL
-    /// `date < beforeDate` cutoff guarantees every returned row is strictly
+    /// `date`-keyed cutoff guaranteed every returned row is strictly
     /// older than every previously-loaded row) — so `excludeIds` has nothing
     /// to remove and composing with vs. without it produces the IDENTICAL
     /// page. Pins that the fix only changes behavior where the bug actually
@@ -1413,8 +1428,8 @@ struct InboxComposeScenarioTests {
         }
 
         // Page 2's D input under NORMAL mode: every row is STRICTLY older
-        // than the page-1 cursor — exactly what the SQL `date < beforeDate`
-        // cutoff guarantees in production, so no already-loaded id can
+        // than the page-1 cursor — exactly what the SQL keyset predicate
+        // guarantees in production, so no already-loaded id can
         // appear here.
         let durable = [
             makeDurable("p2-1", minutesAgo: 61),
@@ -1431,18 +1446,24 @@ struct InboxComposeScenarioTests {
             MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: "p1-2"),
         ]
 
+        // R12-T3: page 1's last-row ordering key. Every `durable` row above is
+        // strictly older, so it is "after" this cursor under the total order.
+        let page1Cursor = InboxPageCursor(
+            tagSortOrder: 99, date: now.addingTimeInterval(-60 * 60),
+            id: MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: "p1-2"))
+
         let inputsNoExclude = ComposeInputs(
             durable: durable, pinned: [], staged: [], stagedResolutions: [:], overlay: [:],
             query: InboxListQuery(
                 displayedFolderIds: [folderId], filterUnread: false, filterLabelIds: [],
-                mode: .normal, targetCount: 4, beforeDate: now.addingTimeInterval(-60 * 60)
+                mode: .normal, targetCount: 4, before: page1Cursor
             )
         )
         let inputsWithExclude = ComposeInputs(
             durable: durable, pinned: [], staged: [], stagedResolutions: [:], overlay: [:],
             query: InboxListQuery(
                 displayedFolderIds: [folderId], filterUnread: false, filterLabelIds: [],
-                mode: .normal, targetCount: 4, beforeDate: now.addingTimeInterval(-60 * 60),
+                mode: .normal, targetCount: 4, before: page1Cursor,
                 excludeIds: loadedIds
             )
         )
@@ -1516,7 +1537,7 @@ struct InboxComposeScenarioTests {
 
         let query = InboxListQuery(
             displayedFolderIds: [folderId], filterUnread: false, filterLabelIds: [],
-            mode: .normal, targetCount: 50, beforeDate: nil
+            mode: .normal, targetCount: 50, before: nil
         )
         let composed = InboxListComposer.compose(ComposeInputs(
             durable: [d1], pinned: [], staged: [s1, s2],
@@ -1679,7 +1700,7 @@ struct InboxComposeScenarioTests {
             let durable = shuffledIds.map { tiedSnapshot(id: $0, date: now) }
             let query = InboxListQuery(
                 displayedFolderIds: [MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX")],
-                filterUnread: false, filterLabelIds: [], mode: .normal, targetCount: 3, beforeDate: nil
+                filterUnread: false, filterLabelIds: [], mode: .normal, targetCount: 3, before: nil
             )
             let composed = InboxListComposer.compose(ComposeInputs(
                 durable: durable, pinned: [], staged: [], stagedResolutions: [:], overlay: [:], query: query
@@ -1711,7 +1732,7 @@ struct InboxComposeScenarioTests {
             let durable = shuffledIds.map { tiedSnapshot(id: $0, date: now, tagSortOrder: 5) }
             let query = InboxListQuery(
                 displayedFolderIds: [MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX")],
-                filterUnread: false, filterLabelIds: [], mode: .triage, targetCount: 3, beforeDate: nil
+                filterUnread: false, filterLabelIds: [], mode: .triage, targetCount: 3, before: nil
             )
             let composed = InboxListComposer.compose(ComposeInputs(
                 durable: durable, pinned: [], staged: [], stagedResolutions: [:], overlay: [:], query: query
@@ -1781,7 +1802,7 @@ struct InboxComposeScenarioTests {
 
         let query = InboxListQuery(
             displayedFolderIds: [inboxFolderId], filterUnread: false, filterLabelIds: [],
-            mode: .normal, targetCount: 50, beforeDate: nil
+            mode: .normal, targetCount: 50, before: nil
         )
         let composed = InboxListComposer.compose(ComposeInputs(
             durable: [], pinned: [pinnedSnapshot], staged: [stagedRow],

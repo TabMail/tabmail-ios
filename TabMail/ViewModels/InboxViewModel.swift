@@ -1096,7 +1096,7 @@ final class InboxViewModel {
             filterLabelIds: filterLabelIds,
             mode: mode,
             targetCount: targetWindowSize,
-            beforeDate: nil,
+            before: nil,
             // F2 audit: a full-range reload's diff MUST include already-loaded
             // rows (that's the point of the diff) — never exclude here.
             excludeIds: []
@@ -1108,10 +1108,18 @@ final class InboxViewModel {
     /// Phase 1: local GRDB query (instant). Phase 2: network fetch if local exhausted.
     func loadMoreMessages() {
         guard !isLoadingOlder, hasMoreMessages else { return }
-        let lastDate = loadedMessages.last?.date
+        // 🚨 THE CURSOR IS THE FULL ORDERING KEY OF THE LAST ROW, NOT ITS DATE
+        // (R12-T3). `loadedMessages.last?.date` alone skipped every row tied on
+        // the boundary second in `.normal` mode, and every row in a later tag
+        // bucket in `.triage` mode (whose order is not date-monotonic). Both
+        // were permanent: a later page never asks for them and a refresh
+        // rebuilds the same initial window. See `InboxPageCursor`.
+        // `loadedMessages.last` stays the deepest row across eviction —
+        // `scheduleEvictionIfNeeded` trims with `removeFirst`, never the tail.
+        let cursor = loadedMessages.last.map(InboxPageCursor.init(row:))
 
         // Phase 1: try local data first
-        let nextPage = fetchPage(before: lastDate)
+        let nextPage = fetchPage(before: cursor)
 
         if !nextPage.isEmpty {
             for msg in nextPage { loadedIds.insert(msg.id) }
@@ -1131,7 +1139,7 @@ final class InboxViewModel {
                 let pull = try await manager.fetchOlderMessages(folders: folders)
                 if pull.inserted > 0 {
                     // Network fetch added messages to GRDB; now load them locally
-                    let freshPage = fetchPage(before: lastDate)
+                    let freshPage = fetchPage(before: cursor)
                     for msg in freshPage { loadedIds.insert(msg.id) }
                     loadedMessages.append(contentsOf: freshPage)
                     targetWindowSize += SyncConfig.inboxPageSize
@@ -1169,7 +1177,7 @@ final class InboxViewModel {
     /// staged (S) rows the same way `fetchFullRange` now does. This is why
     /// `resetMessages`' page-1 fetch (`fetchPage(before: nil)`) already returns
     /// staged rows — its trailing `insertStagedRows` re-seed is now a no-op belt.
-    private func fetchPage(before: Date?) -> [MessageSnapshot] {
+    private func fetchPage(before: InboxPageCursor?) -> [MessageSnapshot] {
         let pageSize = SyncConfig.inboxPageSize
         let tStart = CFAbsoluteTimeGetCurrent()
 
@@ -1179,7 +1187,7 @@ final class InboxViewModel {
             filterLabelIds: filterLabelIds,
             mode: mode,
             targetCount: pageSize,
-            beforeDate: before,
+            before: before,
             // F2 audit: exclude already-loaded ids INSIDE compose, before its
             // targetCount trim — an old already-loaded row (triage mode's
             // sort is not date-monotonic) must not eat a trim slot from a

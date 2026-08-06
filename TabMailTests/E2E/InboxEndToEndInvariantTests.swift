@@ -427,7 +427,7 @@ struct InboxEndToEndInvariantTests {
         let query = InboxListQuery(
             displayedFolderIds: displayedFolderIds, filterUnread: vm.filterUnread,
             filterLabelIds: vm.filterLabelIds, mode: vm.mode,
-            targetCount: SyncConfig.inboxPageSize, beforeDate: nil
+            targetCount: SyncConfig.inboxPageSize, before: nil
         )
         let readerTruth = InboxListReader.fetchSync(folders: vm.folders, query: query)
         #expect(
@@ -915,7 +915,7 @@ struct InboxEndToEndInvariantTests {
 
         let query = InboxListQuery(
             displayedFolderIds: [fixture.inbox.id], filterUnread: false, filterLabelIds: [],
-            mode: .normal, targetCount: 3, beforeDate: nil
+            mode: .normal, targetCount: 3, before: nil
         )
         let composed = InboxListReader.fetchSync(folders: [fixture.inbox], query: query)
         #expect(composed.count == 3)

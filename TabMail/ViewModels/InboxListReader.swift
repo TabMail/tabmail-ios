@@ -162,13 +162,47 @@ enum InboxListReader {
                     arguments: [labelId]
                 )
             }
-            if let cutoff = query.beforeDate {
-                q = q.filter(Column("date") < cutoff)
+            // 🚨 KEYSET CURSOR — THE PAGE BOUNDARY IS THE WHOLE ORDERING KEY,
+            // NEVER JUST THE DATE (R12-T3). See `InboxPageCursor` for the two
+            // defects a bare `date < cutoff` caused (tied-second rows skipped
+            // permanently in `.normal`; an entire later tag bucket excluded in
+            // `.triage`, whose order is not date-monotonic at all).
+            //
+            // ⚠️ THE PREDICATE IS SPELT AS `range AND (range OR tie)` ON PURPOSE
+            // — A6/database-performance. A bare `date < ? OR (date = ? AND id > ?)`
+            // is a top-level OR, which SQLite cannot turn into a single index
+            // range on `messageHeader_inbox_display (folderId, headerComplete,
+            // date)`; it would fall back to scanning the whole folder. Leading
+            // with the redundant-but-sargable `date <= ?` keeps the index range
+            // and demotes the tie-break to a residual filter over the boundary
+            // block only. Same shape for triage against
+            // `messageHeader_triage_display (folderId, headerComplete,
+            // tagSortOrder, date)`.
+            //
+            // ⚠️ `id ASC` is added to BOTH `ORDER BY`s so the SQL order is total
+            // and matches `InboxListComposer.compose` step 7 exactly. Normal mode
+            // now pays a block sort on the last term (`USE TEMP B-TREE FOR LAST
+            // TERM OF ORDER BY`) — bounded by the `LIMIT`, and only within rows
+            // sharing a second. Triage already paid one before this change and
+            // its block size is unchanged (blocks are keyed by the
+            // index-ordered `tagSortOrder`, then `date`).
+            if let cursor = query.before {
+                if query.mode == .triage {
+                    q = q.filter(
+                        sql: "tagSortOrder >= ? AND (tagSortOrder > ? OR date < ? OR (date = ? AND id > ?))",
+                        arguments: [cursor.tagSortOrder, cursor.tagSortOrder, cursor.date, cursor.date, cursor.id]
+                    )
+                } else {
+                    q = q.filter(
+                        sql: "date <= ? AND (date < ? OR id > ?)",
+                        arguments: [cursor.date, cursor.date, cursor.id]
+                    )
+                }
             }
             if query.mode == .triage {
-                q = q.order(Column("tagSortOrder").asc, Column("date").desc)
+                q = q.order(Column("tagSortOrder").asc, Column("date").desc, Column("id").asc)
             } else {
-                q = q.order(Column("date").desc)
+                q = q.order(Column("date").desc, Column("id").asc)
             }
             allHeaders.append(contentsOf: try q.limit(query.targetCount).fetchAll(db))
         }

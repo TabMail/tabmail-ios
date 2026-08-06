@@ -110,11 +110,11 @@ struct InboxListReaderIntegrationTests {
         filterLabelIds: Set<String> = [],
         mode: InboxMode = .normal,
         targetCount: Int = 50,
-        beforeDate: Date? = nil
+        before: InboxPageCursor? = nil
     ) -> InboxListQuery {
         InboxListQuery(
             displayedFolderIds: Set(folders.map(\.id)), filterUnread: filterUnread,
-            filterLabelIds: filterLabelIds, mode: mode, targetCount: targetCount, beforeDate: beforeDate
+            filterLabelIds: filterLabelIds, mode: mode, targetCount: targetCount, before: before
         )
     }
 
@@ -476,5 +476,180 @@ struct InboxListReaderIntegrationTests {
 
         let syncResult = InboxListReader.fetchSync(folders: [inbox], query: q)
         #expect(syncResult == asyncResult, "fetch and fetchSync diverged inside the FTS-flush window")
+    }
+
+    // MARK: - R12-T3 — paging must reach EVERY locally stored inbox row
+
+    /// INVARIANT (system property): **paging visits every locally stored inbox
+    /// row exactly once.** Not "the cursor uses column X" — that would pin the
+    /// mechanism. The property is completeness: scroll to the bottom and you
+    /// have seen everything the device holds for that folder.
+    ///
+    /// The defect this pins: the page cursor was `loadedMessages.last?.date`
+    /// and the reader applied a strict `date < cutoff`. Neither ordering this
+    /// list uses is keyed by date alone, so rows fell through the boundary and
+    /// **never came back** — a later page asks for something strictly older, and
+    /// a refresh rebuilds the same initial window rather than reaching them.
+    ///
+    /// This walks the cursor exactly as `InboxViewModel.loadMoreMessages` does
+    /// (last row of the page just appended, `excludeIds = loadedIds`), so the
+    /// harness cannot pass by paging in a way production does not.
+    private func pageThroughEverything(
+        folders: [Folder], mode: InboxMode, pageSize: Int, maxPages: Int = 12
+    ) -> (ordered: [String], pages: Int) {
+        var cursor: InboxPageCursor?
+        var loadedIds: Set<String> = []
+        var ordered: [String] = []
+        var pages = 0
+        while pages < maxPages {
+            let q = InboxListQuery(
+                displayedFolderIds: Set(folders.map(\.id)), filterUnread: false,
+                filterLabelIds: [], mode: mode, targetCount: pageSize,
+                before: cursor, excludeIds: loadedIds
+            )
+            // Mirrors `fetchPage`'s belt filter + `prefix(pageSize)`.
+            let page = Array(
+                InboxListReader.fetchSync(folders: folders, query: q)
+                    .filter { !loadedIds.contains($0.id) }
+                    .prefix(pageSize))
+            if page.isEmpty { break }
+            pages += 1
+            for row in page { loadedIds.insert(row.id); ordered.append(row.id) }
+            cursor = page.last.map(InboxPageCursor.init(row:))
+        }
+        return (ordered, pages)
+    }
+
+    @Test("normal mode: rows sharing the boundary timestamp are still reachable by paging — no locally stored row is skipped")
+    func normalModePagingReachesTiedBoundaryRows() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        // FOUR rows share one second, and the page size is THREE — so the tie
+        // straddles the page boundary. IMAP `INTERNALDATE` has second
+        // granularity, so burst delivery and initial sync produce exactly this.
+        let now = Date()
+        let headers = [
+            makeDurableHeader(folder: inbox, messageId: "m-0", date: now),
+            makeDurableHeader(folder: inbox, messageId: "m-1", date: now),
+            makeDurableHeader(folder: inbox, messageId: "m-2", date: now),
+            makeDurableHeader(folder: inbox, messageId: "m-3", date: now),
+            makeDurableHeader(folder: inbox, messageId: "m-4", date: now.addingTimeInterval(-60)),
+            makeDurableHeader(folder: inbox, messageId: "m-5", date: now.addingTimeInterval(-120)),
+            makeDurableHeader(folder: inbox, messageId: "m-6", date: now.addingTimeInterval(-180)),
+        ]
+        try await pool.writeWithoutTransaction { db in
+            for h in headers { try h.insert(db) }
+        }
+
+        // ⚠️ ANCHOR THE FIXTURE BEFORE ASSERTING AN ABSENCE (`MIS-030`): prove
+        // all seven rows are visible to an UNPAGED read, so a later "row N is
+        // missing from the union" cannot be satisfied by a row that was never
+        // stored (e.g. a primary-key collision silently evicting a sibling).
+        let unpaged = InboxListReader.fetchSync(
+            folders: [inbox],
+            query: query(folders: [inbox], targetCount: 50))
+        #expect(unpaged.count == 7,
+                "fixture did not stage 7 visible rows — every reachability claim below would be vacuous. Got \(unpaged.count): \(unpaged.map(\.messageId))")
+        guard unpaged.count == 7 else { return }
+
+        let (ordered, pages) = pageThroughEverything(folders: [inbox], mode: .normal, pageSize: 3)
+        #expect(pages < 12, "paging did not terminate")
+        #expect(Set(ordered) == Set(unpaged.map(\.id)),
+                "paging did not reach every locally stored inbox row — missing \(Set(unpaged.map(\.id)).subtracting(ordered).count) of 7. A row that falls through the page boundary never returns: later pages ask for something strictly older and a refresh rebuilds the same initial window. Saw \(ordered.count) rows in \(pages) pages.")
+        #expect(ordered.count == Set(ordered).count,
+                "paging returned the same row twice — the boundary predicate re-emits rows instead of advancing past them, which also lets already-seen rows consume the SQL LIMIT (IOS-SCROLL-002's shape)")
+    }
+
+    @Test("triage mode: a later tag bucket holding NEWER dates is still reachable by paging — the order is not date-monotonic")
+    func triageModePagingReachesLaterTagBuckets() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        // Triage orders `tagSortOrder ASC, date DESC`. The FIRST bucket here is
+        // entirely OLDER than the second, which is the ordinary shape (a tagged
+        // backlog under a stream of fresh untagged mail) — and it means the last
+        // row of page 1 carries a date OLDER than every row on page 2.
+        let now = Date()
+        let headers = [
+            makeDurableHeader(folder: inbox, messageId: "m-a0", date: now.addingTimeInterval(-600), actionTag: .reply),
+            makeDurableHeader(folder: inbox, messageId: "m-a1", date: now.addingTimeInterval(-660), actionTag: .reply),
+            makeDurableHeader(folder: inbox, messageId: "m-a2", date: now.addingTimeInterval(-720), actionTag: .reply),
+            makeDurableHeader(folder: inbox, messageId: "m-b0", date: now),
+            makeDurableHeader(folder: inbox, messageId: "m-b1", date: now.addingTimeInterval(-60)),
+        ]
+        try await pool.writeWithoutTransaction { db in
+            for h in headers { try h.insert(db) }
+        }
+
+        let unpaged = InboxListReader.fetchSync(
+            folders: [inbox],
+            query: query(folders: [inbox], mode: .triage, targetCount: 50))
+        #expect(unpaged.count == 5,
+                "fixture did not stage 5 visible rows — the reachability claim below would be vacuous. Got \(unpaged.count)")
+        guard unpaged.count == 5 else { return }
+
+        let (ordered, pages) = pageThroughEverything(folders: [inbox], mode: .triage, pageSize: 3)
+        #expect(pages < 12, "paging did not terminate")
+        #expect(Set(ordered) == Set(unpaged.map(\.id)),
+                "paging did not reach every locally stored inbox row in triage mode — missing \(Set(unpaged.map(\.id)).subtracting(ordered).count) of 5. A date-keyed cutoff excludes an entire later tag bucket whose rows are NEWER than the previous page's last row. Saw \(ordered.count) rows in \(pages) pages.")
+        #expect(ordered.count == Set(ordered).count, "paging returned the same row twice in triage mode")
+    }
+
+    @Test("NEGATIVE CASE: paging never returns a row twice and never re-emits the cursor row itself")
+    func pagingDoesNotDuplicateBoundaryRows() async throws {
+        // ⚠️ THE MIRROR IMAGE. The one-character "fix" for the skip — relaxing
+        // the strict `date <` to `<=` — makes every boundary row come back on
+        // the NEXT page as a duplicate, where it consumes a slot in the reader's
+        // per-folder SQL `LIMIT` before the VM's dedup ever sees it. That is the
+        // filter-after-LIMIT shape `IOS-SCROLL-002` was filed for: the page is
+        // narrowed after being selected, so `hasMoreMessages` and the cursor both
+        // read a survivor count. Both directions are asserted so neither can be
+        // traded for the other.
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        let now = Date()
+        // Every row shares ONE second — the worst case for a `<=` cursor.
+        let headers = (0..<6).map { i in
+            makeDurableHeader(folder: inbox, messageId: "t-\(i)", date: now)
+        }
+        try await pool.writeWithoutTransaction { db in
+            for h in headers { try h.insert(db) }
+        }
+
+        // Deliberately paged WITHOUT `excludeIds`, so the reader's own predicate
+        // is the only thing preventing a repeat. With `excludeIds` supplying the
+        // dedup, a `<=` cursor would still pass this while quietly burning
+        // LIMIT slots.
+        var cursor: InboxPageCursor?
+        var ordered: [String] = []
+        for _ in 0..<12 {
+            let q = InboxListQuery(
+                displayedFolderIds: [inbox.id], filterUnread: false, filterLabelIds: [],
+                mode: .normal, targetCount: 2, before: cursor, excludeIds: [])
+            let page = InboxListReader.fetchSync(folders: [inbox], query: q)
+            if page.isEmpty { break }
+            ordered.append(contentsOf: page.map(\.id))
+            cursor = page.last.map(InboxPageCursor.init(row:))
+        }
+        #expect(ordered.count == 6,
+                "paging over six same-second rows produced \(ordered.count) rows, not 6 — a repeat burns a SQL LIMIT slot, a skip loses a message")
+        #expect(Set(ordered).count == ordered.count, "a row was emitted on more than one page")
     }
 }

@@ -4,6 +4,70 @@
 
 import Foundation
 
+/// The FULL ordering key of the last row on the previous page — the keyset
+/// pagination cursor (R12-T3).
+///
+/// 🚨 **A DATE ALONE IS NOT A CURSOR HERE, AND THAT COST WHOLE PAGES OF MAIL.**
+/// Pagination used to carry `beforeDate: Date?` and the reader applied a strict
+/// `date < cutoff`. Neither ordering this list uses is *keyed* by date alone:
+///
+///  * `.normal` orders `date DESC` — **not unique**. IMAP `INTERNALDATE` has
+///    second granularity, so burst delivery and initial sync routinely produce
+///    ties. Every row sharing the boundary second with the previous page's last
+///    row was skipped **permanently**: it is older-or-equal, so no later page
+///    ever asks for it, and a refresh rebuilds the same initial window rather
+///    than reaching it.
+///  * `.triage` orders `tagSortOrder ASC, date DESC` — **not date-monotonic at
+///    all**. A later tag bucket routinely holds dates NEWER than the previous
+///    page's last row, and a date cutoff excluded that entire bucket.
+///
+/// The fix is to make the cursor the whole ordering key and the ordering total.
+/// `id` is the header's primary key, so `(tagSortOrder, date, id)` is unique and
+/// `InboxListComposer`'s step-7 comparators — which already ended in `id` after
+/// the G2 audit — become exactly the order this cursor walks.
+///
+/// ⚠️ **THE COUNTERFACTUAL, because the one-character version is a trap.**
+/// Relaxing the strict `date < cutoff` to `<=` is wrong on its own: the boundary
+/// rows come back as duplicates and consume slots in the reader's per-folder SQL
+/// `LIMIT`, which re-creates the filter-after-LIMIT shape `IOS-SCROLL-002` was
+/// filed for (the page is NARROWED after being selected, so `hasMoreMessages`
+/// and the cursor both read a survivor count). A keyset predicate returns the
+/// boundary's *unseen* rows only, so the `LIMIT` still bounds matching rows.
+struct InboxPageCursor: Equatable, Sendable {
+    /// Always carried, including in `.normal` mode, so the value is a property
+    /// of the ROW rather than of the mode that happened to be active when it was
+    /// captured. `.normal`'s predicate simply ignores it.
+    let tagSortOrder: Int
+    let date: Date
+    let id: String
+
+    init(tagSortOrder: Int, date: Date, id: String) {
+        self.tagSortOrder = tagSortOrder
+        self.date = date
+        self.id = id
+    }
+
+    init(row: MessageSnapshot) {
+        self.init(tagSortOrder: row.tagSortOrder, date: row.date, id: row.id)
+    }
+
+    /// True when `row` sorts strictly AFTER this cursor under `mode`'s total
+    /// order — i.e. the row belongs on a LATER page and has not been seen.
+    ///
+    /// ⚠️ This must stay byte-for-byte equivalent to the SQL predicate in
+    /// `InboxListReader.gather` and to `InboxListComposer.compose`'s step-7
+    /// comparators. Three spellings of one order is already one too many; if you
+    /// change any of them, change all three. The composer applies this to P and
+    /// S rows, which have no SQL leg at all.
+    func precedes(_ row: MessageSnapshot, mode: InboxMode) -> Bool {
+        if mode == .triage, row.tagSortOrder != tagSortOrder {
+            return row.tagSortOrder > tagSortOrder
+        }
+        if row.date != date { return row.date < date }
+        return row.id > id
+    }
+}
+
 /// Everything the composer needs to know about "what list is being asked
 /// for" — folder scope, filters, sort mode, and window size.
 /// PLAN_INBOX_UNIFIED_READ.md §2.1.
@@ -16,10 +80,12 @@ struct InboxListQuery: Equatable, Sendable {
     /// Window size: `targetWindowSize` (full-range reload) or `pageSize` (a
     /// single page). Rows are trimmed to this count after sort.
     let targetCount: Int
-    /// Pagination cutoff (`fetchPage(before:)`). `nil` for a full-range
-    /// reload. When non-nil, `S` and `P` rows are cut in `compose` (D
-    /// arrives already cut by the shell's SQL `date < beforeDate`).
-    let beforeDate: Date?
+    /// Keyset pagination cursor (`fetchPage(before:)`) — the full ordering key
+    /// of the previous page's last row. `nil` for a full-range reload. When
+    /// non-nil, `S` and `P` rows are cut in `compose` (D arrives already cut by
+    /// the shell's equivalent SQL keyset predicate). See `InboxPageCursor` for
+    /// why a bare `Date` was not sufficient.
+    let before: InboxPageCursor?
     /// Ids to drop AFTER S-eligibility/carry-over decisions but BEFORE
     /// sort/trim (F2 audit fix). `fetchPage` passes the VM's `loadedIds` so
     /// an already-on-screen row can't eat a `targetCount` trim slot from a
@@ -35,7 +101,7 @@ struct InboxListQuery: Equatable, Sendable {
         filterLabelIds: Set<String>,
         mode: InboxMode,
         targetCount: Int,
-        beforeDate: Date?,
+        before: InboxPageCursor?,
         excludeIds: Set<String> = []
     ) {
         self.displayedFolderIds = displayedFolderIds
@@ -43,7 +109,7 @@ struct InboxListQuery: Equatable, Sendable {
         self.filterLabelIds = filterLabelIds
         self.mode = mode
         self.targetCount = targetCount
-        self.beforeDate = beforeDate
+        self.before = before
         self.excludeIds = excludeIds
     }
 }
@@ -241,11 +307,19 @@ enum InboxListComposer {
             rows.removeAll { stagedIncludedIds.contains($0.id) && $0.isRead }
         }
 
-        // MARK: Step 5 — pagination cutoff. D arrives already cut by SQL
-        // (`date < beforeDate`); apply the same cutoff to non-durable rows
-        // (P and S) here.
-        if let cutoff = query.beforeDate {
-            rows.removeAll { !durableIds.contains($0.id) && $0.date >= cutoff }
+        // MARK: Step 5 — pagination cutoff. D arrives already cut by SQL (the
+        // keyset predicate in `InboxListReader.gather`); apply the SAME cutoff
+        // to non-durable rows (P and S) here, via the one shared comparator on
+        // `InboxPageCursor` so the two legs cannot drift.
+        //
+        // ⚠️ R12-T3: this used to be `$0.date >= cutoff` against a bare `Date`.
+        // In `.triage` that dropped every P/S row in a LATER tag bucket whose
+        // date happened to be newer than the previous page's last row — and the
+        // triage order is `tagSortOrder ASC` first, so those rows genuinely
+        // belong on this page. In `.normal` it dropped rows tied on the boundary
+        // second that the previous page had not shown.
+        if let cursor = query.before {
+            rows.removeAll { !durableIds.contains($0.id) && !cursor.precedes($0, mode: query.mode) }
         }
 
         // MARK: Step 6 — label filter, uniformly over D, P, and S. S rows
