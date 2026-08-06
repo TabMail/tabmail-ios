@@ -752,6 +752,12 @@ private final class FakeCalDAVStore: Sendable {
         let path: String
         let ifMatch: String?
         let ifNoneMatch: String?
+        /// The entity tag this PUT's own response carried, or nil when it was
+        /// refused (412). A later PUT's `If-Match` can then be compared against
+        /// the tag an EARLIER PUT minted, which is the only way to state "the
+        /// rollback is conditional on the body we ourselves wrote" without
+        /// hardcoding the fake's tag numbering.
+        let returnedETag: String?
     }
 
     private struct State: Sendable {
@@ -821,19 +827,36 @@ private final class FakeCalDAVStore: Sendable {
         let body = request.body.flatMap { String(data: $0, encoding: .utf8) } ?? ""
 
         return state.withLock { value -> FakeHTTP.CannedResponse in
-            value.puts.append(RecordedPut(
-                path: path, ifMatch: ifMatch, ifNoneMatch: ifNoneMatch))
+            func record(_ returnedETag: String?) {
+                value.puts.append(RecordedPut(
+                    path: path, ifMatch: ifMatch, ifNoneMatch: ifNoneMatch,
+                    returnedETag: returnedETag))
+            }
             let existing = value.resources[path]
             if ifNoneMatch == "*", existing != nil {
+                record(nil)
                 return .raw(statusCode: 412)
             }
             if let ifMatch, existing?.etag != ifMatch {
+                record(nil)
                 return .raw(statusCode: 412)
             }
             let etag = "\"v\(value.nextETag)\""
             value.nextETag += 1
             value.resources[path] = Resource(ics: body, etag: etag)
+            record(etag)
             return .raw(statusCode: 204, headers: ["ETag": etag])
+        }
+    }
+
+    /// A DIFFERENT client replaces `path`, minting a tag that is distinguishable
+    /// from anything this client wrote. Models the only window that matters for
+    /// the rollback: between our cap PUT and our revert PUT.
+    func replaceOutOfBand(path: String, ics: String) {
+        state.withLock { value in
+            let etag = "\"other-\(value.nextETag)\""
+            value.nextETag += 1
+            value.resources[path] = Resource(ics: ics, etag: etag)
         }
     }
 }
@@ -959,17 +982,177 @@ struct CalDAVSplitRollbackTests {
         // The successor resource was never created, so nothing dangles.
         #expect(store.storedICS(path: "/cal/\(newUid).ics") == nil)
 
-        // WHY it can succeed, stated at the wire: the rollback PUT asserts
-        // nothing about the resource's existence. `If-None-Match: *` here is a
+        // WHY it can succeed, stated at the wire. `If-None-Match: *` here is a
         // guaranteed 412 against a resource we had just written ourselves, which
-        // is what made this rollback structurally impossible.
+        // is what made this rollback structurally impossible — so it must stay
+        // absent. `If-Match` is the opposite: it must name the entity tag the
+        // CAP PUT's own response returned, because that tag IS the body we
+        // wrote, so the rollback overwrites our own write and only our own.
+        // Asserting against the cap's returned tag rather than a literal keeps
+        // this independent of the fake's tag numbering.
         let puts = store.recordedPuts()
-        guard let revert = puts.last(where: { $0.path == Self.masterPath }) else {
+        let masterPuts = puts.filter { $0.path == Self.masterPath }
+        #expect(masterPuts.count == 2, "expected exactly a cap PUT and a rollback PUT")
+        guard masterPuts.count == 2 else {
             Issue.record("expected a rollback PUT against the master resource")
             return
         }
+        let cap = masterPuts[0]
+        let revert = masterPuts[1]
         #expect(revert.ifNoneMatch == nil)
-        #expect(revert.ifMatch == nil)
+        #expect(cap.returnedETag != nil,
+                "the cap PUT must have been accepted for its tag to exist")
+        #expect(revert.ifMatch == cap.returnedETag,
+                "the rollback must be conditional on the tag the CAP PUT returned — the body we ourselves stored")
+    }
+
+    @Test("""
+    A rollback never destroys a concurrent edit: when the master is changed by \
+    someone else between the cap and the rollback, the rollback is REFUSED and \
+    the other client's body survives
+    """)
+    func rollbackRefusesToOverwriteAConcurrentEdit() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore(servesETags: true)
+        let fixture = Self.makeFixture()
+        store.seed(path: Self.masterPath, ics: fixture.masterICS)
+
+        // What another client puts there while our split is in flight. Any body
+        // distinguishable from both the original and the capped variant will do.
+        let concurrentICS = fixture.masterICS
+            .replacingOccurrences(of: "SUMMARY:Weekly sync", with: "SUMMARY:Renamed by another client")
+
+        http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+        http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+        let newUid = GoogleCalendarProvider.deterministicSplitEventId(
+            masterId: Self.masterEventId, recurrenceId: fixture.recurrenceId)
+        http.register(path: "/cal/\(newUid).ics", method: "PUT") { _ in
+            // The ONLY window this can happen in: after our cap committed and
+            // before our rollback runs. Modelled at the successor PUT because
+            // that is the call whose failure triggers the rollback.
+            store.replaceOutOfBand(path: Self.masterPath, ics: concurrentICS)
+            return .raw(statusCode: 500)
+        }
+
+        let provider = Self.makeProvider(http)
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.splitSeries(
+                calendarId: Self.calendarId,
+                eventId: Self.masterEventId,
+                recurrenceId: fixture.recurrenceId,
+                patch: GCalEventInput(),
+                sendUpdates: "none")
+        }
+
+        // THE INVARIANT: a rollback is a repair of OUR write, never a licence to
+        // discard someone else's. An unconditional rollback silently replaces
+        // the other client's edit with a body derived from a GET that is now
+        // stale — a lost user edit, which no sync recovers.
+        #expect(store.storedICS(path: Self.masterPath) == concurrentICS,
+                "the concurrent edit must survive; the rollback must not overwrite a body we did not write")
+        #expect(store.storedICS(path: Self.masterPath) != fixture.masterICS,
+                "the pre-fix unconditional rollback restores the ORIGINAL body, destroying the other client's change")
+    }
+
+    @Test("""
+    Lost ACK — when the deterministic successor resource already exists and \
+    carries OUR derived UID, the split retires instead of un-capping the master \
+    and instead of wedging the account's calendar queue on a 412
+    """)
+    func splitRetiresWhenItsOwnSuccessorAlreadyExists() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore(servesETags: true)
+        let fixture = Self.makeFixture()
+        store.seed(path: Self.masterPath, ics: fixture.masterICS)
+
+        let newUid = GoogleCalendarProvider.deterministicSplitEventId(
+            masterId: Self.masterEventId, recurrenceId: fixture.recurrenceId)
+        let successorPath = "/cal/\(newUid).ics"
+        // The state a lost ACK leaves behind: a previous attempt's successor PUT
+        // committed, so the resource is present and its master VEVENT carries the
+        // deterministic UID this call would derive.
+        let existingSuccessorICS = fixture.masterICS
+            .replacingOccurrences(of: "UID:master-1", with: "UID:\(newUid)")
+        store.seed(path: successorPath, ics: existingSuccessorICS)
+
+        http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+        http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+
+        let provider = Self.makeProvider(http)
+        let result = try await provider.splitSeries(
+            calendarId: Self.calendarId,
+            eventId: Self.masterEventId,
+            recurrenceId: fixture.recurrenceId,
+            patch: GCalEventInput(),
+            sendUpdates: "none")
+
+        // THE INVARIANT, three ways — the split is COMPLETE and stays complete.
+        // 1. The call returns, so the queue takes its success exit. Throwing here
+        //    throws `CalDAVError.preconditionFailed`, which
+        //    `AccountManagerCalendarQueue.isCalendarBadRequestError` does not
+        //    classify, so the op requeues forever and its account joins
+        //    `failedAccounts` — the wedge, which is a dropped user intention.
+        #expect(result.id == successorPath)
+        // 2. The master stays CAPPED. Rolling back here leaves an uncapped master
+        //    beside a live open-ended successor: every occurrence after the split
+        //    point renders twice on the user's calendar.
+        let master = store.storedICS(path: Self.masterPath)
+        #expect(master?.contains("UNTIL=") == true,
+                "the master must remain capped — un-capping it duplicates every post-split occurrence")
+        // 3. The successor is byte-unchanged. Recognising it must never become a
+        //    licence to overwrite a series the user may have edited.
+        #expect(store.storedICS(path: successorPath) == existingSuccessorICS,
+                "the existing successor must not be rewritten")
+        let successorPuts = store.recordedPuts().filter { $0.path == successorPath }
+        #expect(successorPuts.count == 1)
+        #expect(successorPuts.first?.ifNoneMatch == "*",
+                "the successor PUT stays CREATE-ONLY — the held direction is not weakened by the lost-ACK exit")
+        #expect(store.recordedPuts().filter { $0.path == Self.masterPath }.count == 1,
+                "exactly the cap PUT — a second master PUT is the rollback that must not happen")
+    }
+
+    @Test("""
+    Held direction — a foreign resource sitting at the successor URL is NOT \
+    mistaken for our own write: the split still rolls the master cap back \
+    rather than reporting a success it has no evidence for
+    """)
+    func foreignResourceAtTheSuccessorURLStillRollsBack() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore(servesETags: true)
+        let fixture = Self.makeFixture()
+        store.seed(path: Self.masterPath, ics: fixture.masterICS)
+
+        let newUid = GoogleCalendarProvider.deterministicSplitEventId(
+            masterId: Self.masterEventId, recurrenceId: fixture.recurrenceId)
+        let successorPath = "/cal/\(newUid).ics"
+        // Same URL, DIFFERENT content owner. `newEventURL` is a path we chose, so
+        // occupancy alone proves nothing; only the UID inside the body does.
+        let foreignICS = fixture.masterICS
+            .replacingOccurrences(of: "UID:master-1", with: "UID:somebody-elses-event")
+        store.seed(path: successorPath, ics: foreignICS)
+
+        http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+        http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+
+        let provider = Self.makeProvider(http)
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.splitSeries(
+                calendarId: Self.calendarId,
+                eventId: Self.masterEventId,
+                recurrenceId: fixture.recurrenceId,
+                patch: GCalEventInput(),
+                sendUpdates: "none")
+        }
+
+        // THE INVARIANT: absence of evidence is never permission. Without a
+        // positive UID match the split has NOT happened, so the master goes back.
+        #expect(store.storedICS(path: Self.masterPath) == fixture.masterICS,
+                "the master must be restored when the successor URL holds someone else's event")
+        #expect(store.storedICS(path: successorPath) == foreignICS,
+                "the foreign resource must be untouched")
     }
 
     @Test("""

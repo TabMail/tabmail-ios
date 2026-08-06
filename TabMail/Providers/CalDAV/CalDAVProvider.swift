@@ -466,9 +466,26 @@ actor CalDAVProvider: CalendarProvider {
         //    precondition `revertMasterCap` must later be able to undo — a cap
         //    that 412s never happens, but a cap that lands under a precondition
         //    the revert cannot reproduce is the split-rollback defect again.
-        _ = try await client.put(
+        let (_, capResponse) = try await client.put(
             url: eventURL, body: cappedICS,
             precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
+        // The entity tag the server assigned to the body we JUST wrote. This is
+        // the only witness `revertMasterCap` can use to make its rollback
+        // conditional: `.ifMatch(capETag)` overwrites our own capped write and
+        // REFUSES to overwrite anything a concurrent editor has put there since.
+        // `etag` (step 1's GET tag) is already stale by this line, and
+        // `etagCache` is cleared immediately below for exactly that reason, so
+        // the response header is the only place this value exists.
+        //
+        // RFC 4791 §5.3.4 says a server SHOULD return an ETag on a successful
+        // PUT, not MUST. When it does not, the rollback falls back to
+        // `.unconditional` — the round-9 behaviour, byte-identical for that
+        // server population — because the alternative (refusing to roll back at
+        // all) leaves the master capped with no successor, which is strictly
+        // worse than a best-effort overwrite. Note it must NOT fall back to
+        // `.ifNoneMatchAny`: that asserts the master is absent at a resource we
+        // just proved present, which is the round-9 bug (`MIS-005`'s chain).
+        let capETag = capResponse.value(forHTTPHeaderField: "ETag")
         etagCache.removeValue(forKey: eventId)
 
         // 4. Build new series and PUT to a .ics resource. The UID/filename is
@@ -496,7 +513,8 @@ actor CalDAVProvider: CalendarProvider {
             // Couldn't construct the new series — revert the master cap before
             // bailing so the calendar isn't left truncated with no replacement.
             try await Self.revertMasterCap(client: client, eventURL: eventURL,
-                                           originalICS: masterICS, cause: error)
+                                           originalICS: masterICS,
+                                           capETag: capETag, cause: error)
         }
         let calURL = resolveURL(calendarId)
         let newEventURL = calURL.appendingPathComponent("\(newUid).ics")
@@ -505,11 +523,54 @@ actor CalDAVProvider: CalendarProvider {
         do {
             _ = try await client.put(
                 url: newEventURL, body: newICS, precondition: .ifNoneMatchAny)
+        } catch CalDAVError.preconditionFailed {
+            // 412 from the CREATE-ONLY successor PUT means something already
+            // occupies the DETERMINISTIC successor URL. The overwhelmingly
+            // likely cause is a LOST ACK: a previous attempt's successor PUT
+            // committed, its response never reached us, the queue retried, and
+            // this attempt has just re-capped the master and collided with its
+            // own earlier write.
+            //
+            // Neither of the two unconditional responses is acceptable there:
+            //  - rolling back un-caps the master while a live open-ended
+            //    successor still exists ⇒ every occurrence after the split point
+            //    is duplicated on the user's calendar;
+            //  - rethrowing wedges the account. `preconditionFailed` is a
+            //    dedicated `CalDAVError` case that
+            //    `AccountManagerCalendarQueue.isCalendarBadRequestError` (which
+            //    only matches `.httpError`) does not classify, so the op lands
+            //    on the "transient — always retry" arm and its account goes into
+            //    `failedAccounts`, skipping every later calendar op on that
+            //    account, forever. That is the wedge corollary of the
+            //    never-drop-a-user-intention rule, not a recoverable edge.
+            //
+            // So DISCRIMINATE rather than assume. Read the resource back and
+            // require POSITIVE evidence that it is the successor THIS call
+            // derived (its ICS carries our deterministic UID). Only that is
+            // provider-authoritative "already done". A probe that throws, 404s,
+            // returns an unparseable body, or names a different UID keeps the
+            // pre-existing rollback — absence of evidence never becomes
+            // permission (the queue's exit-2 rule: "we could not determine" is
+            // not "the provider says it is complete").
+            //
+            // The successor PUT itself stays `.ifNoneMatchAny`. Widening it to
+            // an overwrite would silently replace a series the user may have
+            // edited; that direction is deliberately held (`MIS-026`).
+            guard await Self.successorIsOurs(client: client, url: newEventURL, uid: newUid) else {
+                try await Self.revertMasterCap(client: client, eventURL: eventURL,
+                                               originalICS: masterICS,
+                                               capETag: capETag,
+                                               cause: CalDAVError.preconditionFailed)
+            }
+            if DebugModeManager.isLoggingEnabled() {
+                print("[CalDAV] splitSeries: successor \(newUid) already exists and is ours — treating the split as already complete (lost ACK)")
+            }
         } catch {
             // Revert the master cap so the calendar isn't left truncated with
             // no replacement series.
             try await Self.revertMasterCap(client: client, eventURL: eventURL,
-                                           originalICS: masterICS, cause: error)
+                                           originalICS: masterICS,
+                                           capETag: capETag, cause: error)
         }
 
         return GCalEvent(
@@ -527,10 +588,22 @@ actor CalDAVProvider: CalendarProvider {
     ///  - revert ALSO fails → throws `CalDAVError.inconsistentState` so the
     ///    queue surfaces a clear "needs manual attention" message instead of
     ///    silently leaving the master capped with no successor series.
-    /// The revert PUT carries `.unconditional` — NEITHER `If-Match` NOR
-    /// `If-None-Match` — on purpose: we just wrote the capped version ourselves,
-    /// so any cached ETag is stale, and a best-effort recovery must not 412
-    /// against our own write.
+    /// The revert PUT carries `.ifMatch(capETag)` where `capETag` is the entity
+    /// tag the CAP PUT's own 2xx response returned — by construction the tag of
+    /// the body we ourselves just stored. That is what makes the rollback safe
+    /// AND targeted: it overwrites our own write, and it refuses to overwrite a
+    /// concurrent editor's, which an unconditional PUT would silently destroy
+    /// (a lost user edit is not recoverable by syncing).
+    ///
+    /// A 412 here therefore means "the master is no longer what we capped", and
+    /// the correct response is the failure arm below (`inconsistentState`, which
+    /// the queue retires with a user-visible message), NOT a retry loop.
+    ///
+    /// `capETag == nil` (a server that returns no ETag on PUT — RFC 4791 §5.3.4
+    /// says SHOULD, not MUST) falls back to `.unconditional`, the round-9
+    /// behaviour. It must never fall back to `.ifNoneMatchAny`: that asserts
+    /// absence at a resource we just proved present, which is the round-9 bug
+    /// this function was rewritten to kill.
     ///
     /// ⚠ This comment said "unconditional (`etag: nil`)" from the day it was
     /// written until 2026-08-05, and the code did the OPPOSITE of what it
@@ -541,11 +614,13 @@ actor CalDAVProvider: CalendarProvider {
     /// `CalDAVPutPrecondition` now makes the three states distinct so the
     /// comment and the request cannot drift apart again.
     private static func revertMasterCap(
-        client: CalDAVClient, eventURL: URL, originalICS: String, cause: Error
+        client: CalDAVClient, eventURL: URL, originalICS: String,
+        capETag: String?, cause: Error
     ) async throws -> Never {
         do {
             _ = try await client.put(
-                url: eventURL, body: originalICS, precondition: .unconditional)
+                url: eventURL, body: originalICS,
+                precondition: capETag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
         } catch {
             // The revert PUT itself failed — the master is capped with no
             // replacement. Surface loudly so the queue/LLM/user knows.
@@ -559,6 +634,36 @@ actor CalDAVProvider: CalendarProvider {
         // by our own revert handler) so the queue can retry the split cleanly.
         print("[CalDAV] splitSeries: reverted master cap after failure: \(cause)")
         throw cause
+    }
+
+    /// POSITIVE evidence that the resource now occupying `url` is the successor
+    /// series THIS split derived — i.e. the server serves it and its master
+    /// VEVENT carries `uid`, the deterministic id built from
+    /// (master id, recurrence id).
+    ///
+    /// Every other outcome answers `false`: a throw, a 404, a body that will not
+    /// decode, a body with no master UID, or a UID that is somebody else's. The
+    /// caller must treat `false` as "roll back", so this function's failure
+    /// direction is the pre-existing behaviour and a probe outage can never
+    /// manufacture a success. Deliberately `async` but not `throws` for that
+    /// reason: there is no error path a caller could widen.
+    ///
+    /// The URL match alone is NOT sufficient. `newEventURL` is a path we chose,
+    /// so an unrelated resource could sit there (a user-created `.ics`, a
+    /// server that reuses hrefs). The UID inside the body is the only thing that
+    /// says the *content* is ours, and content ownership is what "the split
+    /// already happened" actually claims.
+    private static func successorIsOurs(client: CalDAVClient, url: URL, uid: String) async -> Bool {
+        do {
+            let (data, _) = try await client.get(url: url)
+            guard let ics = String(data: data, encoding: .utf8), !ics.isEmpty else { return false }
+            return Self.extractUID(from: ics) == uid
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[CalDAV] splitSeries: successor probe failed for \(url.path) — rolling back. error=\(error)")
+            }
+            return false
+        }
     }
 
     // MARK: - ICS Helpers (recurring edits)
