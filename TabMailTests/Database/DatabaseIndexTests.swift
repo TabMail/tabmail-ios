@@ -252,6 +252,110 @@ struct DatabaseIndexTests {
                 "the composite's leading accountId column must serve account-only queries (drop safety): \(forcedPlan)")
     }
 
+    // MARK: - R13-U12 — the two plans this range regressed
+
+    /// `EXPLAIN QUERY PLAN` for `sql`, as one line. SQLite still binds
+    /// placeholders when explaining, so every `?` gets a throwaway value; the
+    /// plan does not depend on them (no partial indexes are involved here).
+    private func plan(_ db: DatabaseQueue, _ sql: String) throws -> String {
+        let arguments = StatementArguments(Array(repeating: "x", count: sql.filter { $0 == "?" }.count))
+        return try db.read { dbConn in
+            try Row.fetchAll(dbConn, sql: "EXPLAIN QUERY PLAN " + sql, arguments: arguments)
+                .map { $0["detail"] as String }
+                .joined(separator: " | ")
+        }
+    }
+
+    /// 🚨 R13-U6 — INVARIANT: **the triage first page never sorts the whole
+    /// folder.** Not "it uses index X" — the mechanism is a hint and a hint is
+    /// replaceable; what must stay true is that the `ORDER BY` is satisfied
+    /// from an index prefix and only a bounded block is sorted. `USE TEMP
+    /// B-TREE FOR ORDER BY` (no `LAST n TERMS`) is SQLite saying it sorted
+    /// everything the WHERE admitted, which for a triage inbox is the folder.
+    ///
+    /// Asserted against `InboxListReader.durableQuerySQL` — production's own
+    /// statement builder, not a copy — so a change to the predicate, the
+    /// `ORDER BY` or the hint is seen here (`MessageContentStore.ownersSQL`
+    /// precedent).
+    ///
+    /// The empty schema is enough: the regression reproduces in EVERY
+    /// statistics regime, which is the finding. Measured at 100k rows the same
+    /// two plans cost 18.28 ms and 1.91 ms.
+    @Test("R13-U6 — the triage first page satisfies its ORDER BY from an index, never by sorting the folder")
+    func triageFirstPageDoesNotSortTheWholeFolder() throws {
+        let db = try TestDatabase.make()
+        let query = InboxListQuery(
+            displayedFolderIds: ["acc1:INBOX"], filterUnread: false, filterLabelIds: [],
+            mode: .triage, targetCount: 50, before: nil)
+        let production = InboxListReader.durableQuerySQL(folderId: "acc1:INBOX", query: query).sql
+
+        let p = try plan(db, production)
+        #expect(!p.contains("USE TEMP B-TREE FOR ORDER BY"),
+                "the triage first page sorted the whole folder — an 8× regression on a @MainActor blocking read that runs once per displayed folder on every paint and every scroll page: \(p)")
+        #expect(p.contains("SEARCH"), "the triage first page must seek, not scan: \(p)")
+
+        // TWO-SIDED (MIS-030). Without the hint — the exact pre-fix statement —
+        // SQLite abandons the triage index and sorts everything. Without this,
+        // the assertion above is satisfiable by a planner that never sorts at
+        // all and pins nothing.
+        let preFix = production.replacingOccurrences(
+            of: " INDEXED BY messageHeader_triage_display", with: "")
+        #expect(preFix != production, "the production statement no longer carries the hint this test exists to pin")
+        let pre = try plan(db, preFix)
+        #expect(pre.contains("USE TEMP B-TREE FOR ORDER BY"),
+                "the un-hinted form must still exhibit the regression, or the assertion above proves nothing: \(pre)")
+    }
+
+    /// 🚨 R13-U6, THE HELD SIDE — the hint is deliberately absent when the
+    /// unread filter is on, and that absence is load-bearing, not an
+    /// oversight. `messageHeader_folderId_isRead`'s selectivity is the whole
+    /// point of that mode; measured on a 100k folder with three unread rows,
+    /// forcing the triage index costs **18.891 ms vs 0.022 ms**. Adding the
+    /// hint there would be the mirror image of the defect (`MIS-005`), so this
+    /// test fails if someone "completes" the fix by applying it uniformly.
+    @Test("R13-U6 — the unread-filtered triage page keeps the planner's selective index, hint withheld on purpose")
+    func unreadFilteredTriagePageIsNotForcedOntoTheTriageIndex() throws {
+        let db = try TestDatabase.make()
+        let query = InboxListQuery(
+            displayedFolderIds: ["acc1:INBOX"], filterUnread: true, filterLabelIds: [],
+            mode: .triage, targetCount: 50, before: nil)
+        let production = InboxListReader.durableQuerySQL(folderId: "acc1:INBOX", query: query).sql
+        #expect(!production.contains("INDEXED BY"),
+                "forcing an index here removes the unread predicate's selectivity: 0.022 ms → 18.891 ms on a 100k folder with three unread rows")
+        let p = try plan(db, production)
+        #expect(p.contains("isRead=?"),
+                "the unread predicate must still be the seek, not a residual filter: \(p)")
+    }
+
+    /// 🚨 R13-U11 — INVARIANT: **the chat stable-id resolve seeks the RFC id,
+    /// it does not walk the account.** The `accountId` scope added by this
+    /// range is correct and stays; what regressed is that with no stat row for
+    /// a full index — the ordinary state of a fresh install — SQLite preferred
+    /// `messageHeader_accountId_messageId (accountId=?)`. Measured at 90k rows
+    /// in the account: 13.161 ms vs 0.013 ms.
+    ///
+    /// Reachable stats-poor: `evictMessageDetailSessionsImpl` loops every
+    /// `msg:%` session inside `dbPool.write`, and `runWALMaintenance` runs chat
+    /// eviction BEFORE its one-shot whole-DB `ANALYZE`.
+    @Test("R13-U11 — findByStableId seeks rfc822MessageId, it does not walk the account")
+    func findByStableIdSeeksTheRfcIdNotTheAccount() throws {
+        let db = try TestDatabase.make()
+        let p = try plan(db, ChatStore.findByStableIdSQL)
+        #expect(p.contains("rfc822MessageId=?"),
+                "the resolve must seek the RFC id: \(p)")
+        #expect(!p.contains("messageHeader_accountId_messageId"),
+                "the resolve walked the account instead of seeking the RFC id: \(p)")
+
+        // TWO-SIDED (MIS-030): the pre-fix query-interface form, verbatim.
+        let pre = try plan(db, """
+            SELECT * FROM "messageHeader"
+            WHERE ("accountId" = ?) AND ("rfc822MessageId" = ?)
+            ORDER BY "isInInbox" DESC, "id" ASC LIMIT 1
+            """)
+        #expect(pre.contains("messageHeader_accountId_messageId"),
+                "the un-hinted form must still exhibit the regression, or the assertions above prove nothing: \(pre)")
+    }
+
     @Test("MessageHeader ordered by date DESC for inbox view")
     func messageHeaderOrderByDate() throws {
         let db = try TestDatabase.make()

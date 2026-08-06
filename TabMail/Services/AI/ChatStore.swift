@@ -672,13 +672,51 @@ actor ChatStore {
     /// Deterministic inbox-preferred pick among same-account, same-RFC copies
     /// (siblings = one logical message), so a resolve never flip-flops between an
     /// Inbox row and its Archive twin.
+    ///
+    /// 🚨 `INDEXED BY messageHeader_rfc822MessageId` IS NOT DECORATION, AND THE
+    /// HINT — NOT THE `accountId` SCOPE — IS WHAT THIS DEFENDS (R13-U11). Adding
+    /// the scope was correct and stays; what it did to the PLAN was not. With no
+    /// stat row for a full index — the ordinary state of a fresh install, see
+    /// `MessageContentStore.ownersSQL` for why an `ANALYZE`d-but-empty table is
+    /// still that regime — SQLite preferred `messageHeader_accountId_messageId
+    /// (accountId=?)` and WALKED THE ACCOUNT instead of seeking the RFC id.
+    /// Measured on the v83 schema, 100k rows, 90k in the account, SQLite 3.51.0
+    /// (Mac; a device is 2–4× slower), median of 7:
+    ///
+    /// ```
+    ///                     empty stats   ANALYZEd
+    ///   no hint             13.161 ms    0.048 ms   ← accountId=? walk, then seek
+    ///   INDEXED BY rfc822    0.013 ms    0.043 ms
+    /// ```
+    ///
+    /// ~1000× in the regime that matters and no cost in the other, because the
+    /// hint names the index the planner picks anyway once it has statistics.
+    /// It is reachable there: `evictMessageDetailSessionsImpl` loops every
+    /// `msg:%` session INSIDE `dbPool.write`, `isMessageInInbox` falls through
+    /// to this function exactly when the PK lookup fails (i.e. on the sessions
+    /// that sweep targets), and in `SyncEngine.runWALMaintenance` chat eviction
+    /// runs BEFORE the one-shot whole-DB `ANALYZE` — so the first maintenance
+    /// pass after a fresh install runs this loop stats-poor while holding the
+    /// single writer.
+    ///
+    /// ⚠️ Fail-safe: a migration that renames or drops the index makes this
+    /// statement THROW rather than silently walk. The callers treat a throw as
+    /// "unresolved", which is the same disposition as "no row", never a wrong
+    /// binding.
     static func findByStableId(_ anchor: String, accountId: String, db: Database) throws -> MessageHeader? {
         guard let canonical = MessageIdentity.comparableRfc822Identity(anchor) else { return nil }
-        return try MessageHeader
-            .filter(Column("accountId") == accountId && Column("rfc822MessageId") == canonical)
-            .order(Column("isInInbox").desc, Column("id").asc)
-            .fetchOne(db)
+        return try MessageHeader.fetchOne(db, sql: findByStableIdSQL, arguments: [canonical, accountId])
     }
+
+    /// The statement `findByStableId` runs, named so the plan invariant is
+    /// asserted against production's own SQL (`MessageContentStore.ownersSQL`
+    /// precedent) rather than a copy that could drift.
+    static let findByStableIdSQL = """
+        SELECT * FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
+        WHERE rfc822MessageId = ? AND accountId = ?
+        ORDER BY isInInbox DESC, id ASC
+        LIMIT 1
+        """
 
     // MARK: - Memory Turn Cap Eviction
 

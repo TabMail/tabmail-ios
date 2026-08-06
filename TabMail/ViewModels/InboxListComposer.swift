@@ -38,7 +38,7 @@ enum InboxOrdering {
 
     /// Strict less-than: `a` sorts BEFORE `b` — nearer the top of the list.
     ///
-    /// ⚠️ Must stay equivalent to `InboxListReader.gather`'s
+    /// ⚠️ Must stay equivalent to `InboxListReader.durableQuerySQL`'s
     /// `ORDER BY tagSortOrder ASC, date DESC, id ASC` (triage) /
     /// `ORDER BY date DESC, id ASC` (normal), **and to that query's keyset
     /// predicate `id > ?`**.
@@ -157,7 +157,7 @@ struct InboxPageCursor: Equatable, Sendable {
     /// order — i.e. the row belongs on a LATER page and has not been seen.
     ///
     /// ⚠️ This must stay equivalent to the SQL predicate in
-    /// `InboxListReader.gather`. It no longer restates the ordering key: that
+    /// `InboxListReader.durableQuerySQL`. It no longer restates the ordering key: that
     /// lives once, in `InboxOrdering`, so this cutoff and every sort/insert in
     /// the list cannot drift apart. The composer applies this to P and S rows,
     /// which have no SQL leg at all.
@@ -241,7 +241,7 @@ struct ComposeInputs: Sendable {
     /// migration plan.
     ///
     /// Label filter: D arrives ALREADY filtered at the SQL level, BEFORE the
-    /// per-folder `LIMIT` — see `InboxListReader.gather`, which explains why
+    /// per-folder `LIMIT` — see `InboxListReader.durableQuerySQL`, which explains why
     /// the ordering is load-bearing (a filter applied after the `LIMIT`
     /// narrows the page instead of selecting it, and both `hasMoreMessages`
     /// and the pagination cursor then read a survivor count). Step 6 below
@@ -406,7 +406,7 @@ enum InboxListComposer {
         }
 
         // MARK: Step 5 — pagination cutoff. D arrives already cut by SQL (the
-        // keyset predicate in `InboxListReader.gather`); apply the SAME cutoff
+        // keyset predicate in `InboxListReader.durableQuerySQL`); apply the SAME cutoff
         // to non-durable rows (P and S) here, via the one shared comparator on
         // `InboxPageCursor` so the two legs cannot drift.
         //
@@ -426,7 +426,7 @@ enum InboxListComposer {
         // PLAN_INBOX_UNIFIED_READ.md §2.1 step 3 (today's `insertStagedRows`
         // skips this filter entirely; the reader unifies it).
         //
-        // For D this is now a BELT: `InboxListReader.gather` applies the same
+        // For D this is now a BELT: `InboxListReader.durableQuerySQL` applies the same
         // predicate in SQL *before* the per-folder `LIMIT`, so a durable row
         // reaching here already satisfies it — except in the one corner that
         // SQL cannot express, a `filterLabelIds` naming an `isSystem` or
