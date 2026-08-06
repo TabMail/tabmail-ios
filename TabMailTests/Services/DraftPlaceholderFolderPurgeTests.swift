@@ -157,6 +157,66 @@ struct DraftPlaceholderFolderPurgeTests {
         }
     }
 
+    // MARK: - R7 non-vacuity: the refusal the compose guard exists for is REAL
+
+    /// NON-VACUITY PARTNER to `ComposeDraftGuardTests.refusedDurableSaveKeepsTheComposeOpen`.
+    ///
+    /// That guard test drives the disposition with a literal `false`. This one proves
+    /// the `false` is **producible through production code** and that the state it
+    /// leaves behind is exactly the unreachable one the guard exists to prevent
+    /// acknowledging — the `MIS-024` instance-6 question, *does anything actually
+    /// produce this state?*, asked of the real writer rather than assumed.
+    ///
+    /// `queueDraftSave`'s `guard let ftsInfo else { return false }` arm is reached
+    /// whenever the draft is missing or carries an empty `instanceEpoch`. What
+    /// survives is a `Draft` row holding the user's authored text with **no**
+    /// Drafts-folder `MessageHeader` naming it — and drafts open header-led, so that
+    /// text is unreachable by the user and is eventually evicted outright.
+    @Test("An epoch-less draft is refused by queueDraftSave and leaves unreachable content")
+    @MainActor
+    func epochlessDraftIsRefusedAndMintsNoHeader() async throws {
+        let accountId = "purgetest-\(UUID().uuidString)"
+        let (pool, dir, previous) = try makeTestDB(accountId: accountId)
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        // A draft carrying the user's text but NO instance epoch — the exact shape
+        // `queueDraftSave`'s guard refuses.
+        let draftId = UUID().uuidString
+        let authored = "Zanzibarquixotic body the user typed"
+        var epochless = Draft(
+            id: draftId, accountId: accountId,
+            toJSON: "[\"recipient@example.com\"]", ccJSON: "[]", bccJSON: "[]",
+            subject: "Refused draft", body: authored,
+            replyToId: nil, isForward: false, editHistoryJSON: nil,
+            createdAt: Date().timeIntervalSince1970,
+            updatedAt: Date().timeIntervalSince1970,
+            serverDraftId: nil, serverPushStatus: nil,
+            rfc822MessageId: nil, attachmentsDirName: nil)
+        epochless.instanceEpoch = ""
+        let toInsert = epochless
+        try await pool.write { db in try toInsert.insert(db) }
+
+        let admitted = await AccountManager.shared.queueDraftSave(
+            draftId: draftId, accountId: accountId)
+        #expect(!admitted, "an empty instanceEpoch must NOT be admitted by the durable producer")
+
+        // The content is retained…
+        let storedBody = try await pool.read { db in
+            try Draft.fetchOne(db, key: draftId)?.body
+        }
+        #expect(storedBody == authored, "the authored text is still committed to `Draft`")
+
+        // …and RETAINED IS NOT REACHABLE: no Drafts-folder header names it, which is
+        // the only route a user has to reopen it.
+        let headersNamingTheDraft = try await pool.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM messageHeader WHERE id LIKE ?",
+                arguments: ["%\(draftId)%"]) ?? 0
+        }
+        #expect(headersNamingTheDraft == 0,
+                "the refused save minted no header, so the retained draft is unreachable")
+    }
+
     // MARK: - The defect + its over-refusal controls, in ONE end-state scenario
 
     @Test("A reply draft's FTS entry and chat mapping are GONE after its folder is purged")

@@ -145,6 +145,38 @@ enum ComposeDraftGuards {
         }
     }
 
+    /// ⚑ NO REFERENCE — INVENTED **shape**; the CONTRACT is the sibling
+    /// `runCheckedLocalDeleteThenDismiss`'s (R5), applied to the durable draft-queue
+    /// producer, whose verdict is a `Bool` rather than a throw.
+    ///
+    /// `AccountManager.queueDraftSave` mints the visible Drafts-folder
+    /// `MessageHeader`, the `MessageBody` AND the durable `.saveDraft`
+    /// `PendingOperation` in ONE write transaction, so `false` (a thrown
+    /// transaction, or a missing draft / empty `instanceEpoch`) means the user's
+    /// authored text committed to `Draft` but gained NO route back to it: drafts
+    /// open header-led, and `DraftStore.loadAll()` has zero production callers, so a
+    /// header-less row is unreachable by the user and is then evicted outright once
+    /// `SyncEngineMaintenance` trims to `SyncConfig.maxComposeDraftSessions`.
+    /// **Retained is not reachable** — the row surviving is not recovery.
+    ///
+    /// So `dismiss` runs ONLY on `true`; on `false` `onAdmissionFailure` surfaces the
+    /// error and the compose is KEPT OPEN, which is the user's last chance to retry
+    /// with the text still on screen (`../CLAUDE.md` § *Never Drop User Intention*
+    /// point 1 — *"If persistence fails, the UI shows an error and does NOT
+    /// dismiss."*).
+    @MainActor
+    static func runCheckedDurableSaveThenDismiss(
+        save: () async -> Bool,
+        dismiss: () -> Void,
+        onAdmissionFailure: () -> Void
+    ) async {
+        if await save() {
+            dismiss()
+        } else {
+            onAdmissionFailure()
+        }
+    }
+
     /// PORT — `v2final:ServerDraftOpen.mayBindPersistedDraft` (commits `a8eb813b5`,
     /// `69a9bae88`), relocated here because this forward-port has no
     /// `ServerDraftOpen` enum.
@@ -2198,9 +2230,27 @@ struct ComposeView: View {
         // reach any attachment-dir delete. Queue server push via PendingOperation
         // (crash-safe, retries on failure); queueDraftSave also refreshes the
         // Drafts-folder MessageHeader's snippet so the row preview reflects the body.
-        await AccountManager.shared.queueDraftSave(draftId: draftId, accountId: account.id)
-        isSavingDraft = false
-        dismiss()
+        //
+        // CONSUME THE VERDICT — never dismiss on failure. `queueDraftSave` returns
+        // `false` when the durable producer did not admit the save, which leaves the
+        // authored text committed to `Draft` but unreachable (see
+        // `ComposeDraftGuards.runCheckedDurableSaveThenDismiss` for why retained is
+        // not reachable here). Same disposition as this function's three sibling
+        // failure arms above, and as `send()`'s queueSend catch: clear the spinner,
+        // surface the error, stay open so one ordinary gesture retries.
+        await ComposeDraftGuards.runCheckedDurableSaveThenDismiss(
+            save: {
+                await AccountManager.shared.queueDraftSave(
+                    draftId: draftId, accountId: account.id)
+            },
+            dismiss: {
+                isSavingDraft = false
+                dismiss()
+            },
+            onAdmissionFailure: {
+                isSavingDraft = false
+                sendError = "This draft couldn't be saved to your Drafts folder. Your message is still here — tap Save to try again."
+            })
     }
 
     private func discardDraftAndDismiss() async {

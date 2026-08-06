@@ -584,6 +584,69 @@ struct ComposeDraftGuardTests {
         #expect(try await db.read { try Draft.fetchOne($0, key: row.id) } == nil)
     }
 
+    // MARK: R7 — a refused DURABLE draft-queue admission must not dismiss
+
+    /// 🚨 THE INVARIANT THIS PINS — stated as the system property, not as the
+    /// mechanism (`MIS-015`): **when the durable draft-queue admission fails, the
+    /// compose is NOT dismissed and the user is told.**
+    ///
+    /// It is deliberately NOT "the `Bool` is read". `AccountManager.queueDraftSave`
+    /// mints the visible Drafts-folder `MessageHeader`, the `MessageBody` and the
+    /// durable `.saveDraft` `PendingOperation` in one write transaction, so on
+    /// `false` the user's authored text is committed to `Draft` but has no route
+    /// back to it — drafts open header-led and `DraftStore.loadAll()` has zero
+    /// production callers — and `SyncEngineMaintenance` later evicts it outright.
+    /// Dismissing there acknowledges a save whose content is unreachable and is then
+    /// destroyed: a dropped user intention with no sync recovery. The compose is the
+    /// user's last chance, exactly as Outbox Reliability Rule 1 has it for `send()`.
+    @Test("A refused durable draft-save keeps the compose open instead of dismissing")
+    func refusedDurableSaveKeepsTheComposeOpen() async {
+        var dismissed = false
+        var toldTheUser = false
+        await ComposeDraftGuards.runCheckedDurableSaveThenDismiss(
+            save: { false },
+            dismiss: { dismissed = true },
+            onAdmissionFailure: { toldTheUser = true })
+        // The whole property: the authored text stays on screen, AND the failure is
+        // surfaced rather than swallowed. Both halves, or the user silently loses it.
+        #expect(!dismissed, "a refused durable save must never dismiss the compose")
+        #expect(toldTheUser, "a refused durable save must surface an error")
+    }
+
+    /// TWO-SIDED NON-VACUITY ANCHOR. Without this, `refusedDurableSaveKeepsTheComposeOpen`
+    /// would still pass against a guard that never dismisses at all — which would be a
+    /// different defect (the compose could never be closed by Save). This is the side
+    /// that must stay GREEN when the fix is inverted, and it is written from the
+    /// inversion's printed output rather than from reading the guard (`MIS-024` #4).
+    @Test("An admitted durable draft-save dismisses and surfaces nothing")
+    func admittedDurableSaveDismisses() async {
+        var dismissed = false
+        var toldTheUser = false
+        await ComposeDraftGuards.runCheckedDurableSaveThenDismiss(
+            save: { true },
+            dismiss: { dismissed = true },
+            onAdmissionFailure: { toldTheUser = true })
+        #expect(dismissed, "an admitted durable save must dismiss")
+        #expect(!toldTheUser, "an admitted durable save must not surface an error")
+    }
+
+    /// ORDER, not just outcome — the sibling `dismissRunsAfterTheDeleteLands` applied
+    /// to this path: at the instant the UI acknowledges the save, the durable
+    /// producer must already have returned its verdict.
+    @Test("Dismiss runs only after the durable save has reported success")
+    func dismissRunsOnlyAfterTheDurableSaveReports() async {
+        var saveCompleted = false
+        var saveHadCompletedAtDismiss: Bool?
+        await ComposeDraftGuards.runCheckedDurableSaveThenDismiss(
+            save: {
+                saveCompleted = true
+                return true
+            },
+            dismiss: { saveHadCompletedAtDismiss = saveCompleted },
+            onAdmissionFailure: { })
+        #expect(saveHadCompletedAtDismiss == true)
+    }
+
     // MARK: D8 — fail-closed account binding
 
     @Test("A persisted draft whose owning account is unresolvable binds nothing")
