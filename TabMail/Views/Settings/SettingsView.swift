@@ -448,7 +448,7 @@ struct SettingsView: View {
                 Task { await nukeDatabase() }
             }
         } message: {
-            Text("Downloaded emails, the search index and cached data are deleted, then re-downloaded from your servers. Queued message actions that haven't reached your server yet — archive, delete, read, flag — are discarded rather than re-synced. Your Outbox, queued calendar changes, accounts and credentials are preserved.")
+            Text("Downloaded emails, the search index and cached data are deleted, then re-downloaded from your servers. Agent Chat history is deleted permanently — it is stored only on this device and cannot be re-downloaded. Queued message actions that haven't reached your server yet — archive, delete, read, flag — are discarded rather than re-synced. Your Outbox, unsent drafts, queued calendar changes, accounts and credentials are preserved.")
         }
         .alert("Delete All Email Attachments?", isPresented: $showAttachmentsWipeConfirm) {
             Button("Cancel", role: .cancel) {}
@@ -531,16 +531,49 @@ struct SettingsView: View {
     /// destroys, and purging it bought exactly zero consistency — the same
     /// asymmetry that made the `outboxMessage` line indefensible.
     ///
-    /// `pendingOperation` DOES stay: those rows address `messageHeader` rows this
-    /// same transaction destroys, so leaving them would queue mutations against
-    /// addresses that no longer exist locally.
+    /// `pendingOperation` DOES stay — but **not `.saveDraft`**, and that
+    /// exception is the same principle a third time (added 2026-08-05).
+    ///
+    /// The consistency argument for purging `pendingOperation` is that those rows
+    /// address `messageHeader` rows this same transaction destroys, so leaving
+    /// them would queue mutations against addresses that no longer exist locally.
+    /// **That argument does not reach `.saveDraft`.** A save producer addresses a
+    /// `draft` row by `draftId` plus its `instanceEpoch`
+    /// (`AccountManagerQueue.executeOperation`'s `.saveDraft` arm →
+    /// `DraftStore.pushDraftToServer(draftId:expectedInstanceEpoch:…)`); it never
+    /// reads the placeholder header, and `draft` is not in this list.
+    ///
+    /// And it is the ONLY route back. For an authored draft that has never
+    /// reached a server, this transaction deletes the placeholder `messageHeader`
+    /// that surfaces it in the Drafts folder and the `messageBody` beside it,
+    /// while nothing re-downloads it, because it is on no server to re-download
+    /// from. The `draft` row survives but no view lists it and no drain pushes
+    /// it: purging the producer strands authored content in a table nothing
+    /// reads. Keeping the producer means the very next drain pushes the draft to
+    /// the server, after which ordinary sync restores the header — i.e. keeping
+    /// it is precisely what makes the alert's "re-downloaded from your servers"
+    /// true of drafts.
+    ///
+    /// The filter interpolates `OperationType.saveDraft.rawValue` rather than a
+    /// literal so renaming the case cannot silently un-protect the drafts.
     nonisolated static let localIndexWipeStatements: [String] = [
         "DELETE FROM messageHeader",
         "DELETE FROM messageBody",
         "DELETE FROM messageAICache",
+        // ⚠ Agent Chat turns are user-authored and exist on NO server, so these
+        // two lines are a PERMANENT deletion, not a cache drop. They are kept
+        // deliberately — this gesture also wipes `memory.db`
+        // (`MemoryIndex.shared.deleteAll()` in `nukeDatabase`), and `chatHistory`
+        // IS that memory store, so excising chat here would leave the two halves
+        // of one feature inconsistent; chat turns also carry raw `[Email](N)`
+        // references into the `messageHeader` rows this transaction destroys.
+        // What was wrong was that the confirmation alert never said so. The alert
+        // now names Agent Chat as permanently deleted (`IOS-SETTINGS-001`), which
+        // is the consent defect actually at issue. Do not remove these lines
+        // without also revisiting `MemoryIndex.deleteAll()`.
         "DELETE FROM chatTurn",
         "DELETE FROM chatHistory",
-        "DELETE FROM pendingOperation",
+        "DELETE FROM pendingOperation WHERE type != '\(OperationType.saveDraft.rawValue)'",
         "DELETE FROM pendingRender",
         // Reset folder cursors so backfill re-walks from top
         """

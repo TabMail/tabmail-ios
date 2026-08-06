@@ -387,6 +387,79 @@ struct LocalIndexWipeOutboxTests {
         #expect(try db.read { try PendingOperation.fetchCount($0) } == 0,
                 "the pendingOperation purge is deliberate and must not be removed with the outbox one")
     }
+
+    @Test("""
+    An unsent authored draft is still reachable after the local index wipe: the \
+    save producer that is its ONLY route to a server survives, so the draft can \
+    be pushed and then re-downloaded like the alert promises
+    """)
+    func unsentAuthoredDraftSurvivesTheWipe() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+
+        let authoredBody = "A reply the user typed that has never reached any server."
+        let draftId = "new:\(UUID().uuidString)"
+        let now = Date().timeIntervalSince1970
+        let draft = Draft(
+            id: draftId,
+            accountId: "acc1",
+            toJSON: #"["recipient@example.com"]"#,
+            ccJSON: "[]",
+            bccJSON: "[]",
+            subject: "Authored, never sent",
+            body: authoredBody,
+            replyToId: nil,
+            isForward: false,
+            editHistoryJSON: nil,
+            createdAt: now,
+            updatedAt: now
+        )
+        let save = PendingOperation(
+            type: .saveDraft,
+            messageIds: [draftId, "placeholder-message-id"],
+            accountId: "acc1",
+            folderPath: "Drafts",
+            instanceEpoch: "epoch-1",
+            draftId: draftId
+        )
+        let saveId = save.id
+        try db.write { connection in
+            try draft.insert(connection)
+            try save.insert(connection)
+        }
+
+        try runWipe(db)
+
+        // THE INVARIANT: the authored draft is still reachable. Not "the row is
+        // there" — reachable, meaning something will still carry it to a server.
+        // The wipe deletes the placeholder messageHeader/messageBody that surface
+        // a draft in the Drafts folder, and nothing re-downloads a draft that is
+        // on no server, so the save producer is the last route back. Without it
+        // the `draft` row is stranded in a table no view lists and no drain reads.
+        let survivor = try db.read { try PendingOperation.fetchOne($0, key: saveId) }
+        guard let survivor else {
+            Issue.record("the save producer was destroyed — the unsent draft is now unreachable")
+            return
+        }
+        #expect(survivor.type == .saveDraft)
+        #expect(survivor.draftId == draftId,
+                "the producer must still name the draft it pushes")
+        let storedDraft = try db.read { try Draft.fetchOne($0, key: draftId) }
+        #expect(storedDraft?.body == authoredBody,
+                "the authored text itself must survive alongside its producer")
+
+        // NON-VACUITY, two-sided: the wipe really ran (a header would be gone),
+        // and the narrowing is a NARROWING — an ordinary action in the same table
+        // is still purged, so this is not "the statement stopped deleting".
+        let move = PendingOperation(
+            type: .move, messageIds: ["msg-1"], accountId: "acc1",
+            folderPath: "INBOX", destinationPath: "Archive")
+        try db.write { try move.insert($0) }
+        try runWipe(db)
+        #expect(try db.read { try PendingOperation.fetchCount($0) } == 1,
+                "exactly the save producer remains — the move was purged")
+    }
 }
 
 // MARK: - Round-9 closing pass: the same class, at the calendar queue
