@@ -5426,17 +5426,55 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // silently. THE PREDICATE: *every wire call that destroys, or may destroy,
             // user-authored content on a server, where TabMail has no positive
             // documented per-item recovery path that its own call actually reaches.*
-            // Membership is re-derived — not remembered — by three `--multiline`
-            // searches over `TabMail/ Shared/ TabMailNotificationService/`:
-            // `method\s*:\s*"DELETE"`, `httpMethod\s*=\s*"DELETE"` and `expunge\(`.
-            // BOTH HTTP spellings must be searched: a census keyed on only the first is
-            // exactly how the enumeration missed `CalDAVProvider.deleteEvent` (`MIS-007`
-            // — a census inherits its search shape). The authority for current
+            //
+            // ⚠️ THE SEARCHES BELOW ARE A LOWER BOUND ON THAT PREDICATE, NEVER ITS
+            // DEFINITION — corrected 2026-08-06 (R12-T9), because the previous wording
+            // said membership "is re-derived by three searches" and every one of those
+            // three searches is for a destructive **verb**, while the predicate is about
+            // the **effect on the stored representation**. An HTTP `PUT` replaces a
+            // representation, so the previous bytes are gone; no `DELETE`-shaped or
+            // `expunge`-shaped pattern can ever see it. That is `MIS-007` one level up:
+            // the first correction fixed the SPELLING of a verb (`method:` versus
+            // `httpMethod =`) and left the CATEGORY — "destructive means DELETE" —
+            // unexamined. Run BOTH axes, over
+            // `TabMail/ Shared/ TabMailNotificationService/`, `--multiline`:
+            //  - deletion axis: `method\s*:\s*"DELETE"`, `httpMethod\s*=\s*"DELETE"`,
+            //    `expunge\(`;
+            //  - replacement axis: `httpMethod\s*=\s*"PUT"`, `method\s*:\s*"PUT"` — and
+            //    treat a full-resource `PATCH`, an overwriting `POST`, or a computed
+            //    `URLRequest.httpMethod` as the next spellings to look for, since a
+            //    verb-shaped census is blind to each of them in turn.
+            // Then adjudicate every hit against THE PROPERTY; a pattern proposes a
+            // candidate, it never decides membership.
+            //
+            // ⚠️ THE SET HAS TWO FAMILIES, AND `splitSeries` IS IN IT. The five members
+            // listed below are the **deletion family**. `CalDAVProvider.splitSeries`
+            // step 3 `PUT`s a capped ICS over the EXISTING master event resource, so
+            // every occurrence after the split point ceases to exist on the server and
+            // the pre-cap representation is gone — the same WebDAV absence of trash,
+            // undelete and restore that puts `CalDAVProvider.deleteEvent` in the set. It
+            // satisfies THE PROPERTY exactly. It is deliberately **NOT** a sixth
+            // numbered member: it is the **replacement family**, and the routed
+            // authority adjudicates it that way so the distinction stays reusable
+            // (both destroy; only one is spelled like it). Consequence for design: it is
+            // a MULTI-STEP irreversible operation whose rollback is a best-effort
+            // compensating `PUT`, not a transaction — do not widen the successor PUT
+            // past `.ifNoneMatchAny`, and do not make the rollback unconditional again.
+            // `GmailProvider.saveDraft`'s `PUT /drafts/{existingId}` is the replacement
+            // axis' NEGATIVE case: excluded on positive evidence (the bytes it replaces
+            // are a revision the local `draft` row still holds, and refusing it would
+            // drop a user intention rather than preserve one), and that exclusion is
+            // void the moment a path PUTs a draft with content not derived from that
+            // draft's own current local state.
+            //
+            // The authority for current
             // membership, and for the POSITIVE evidence behind every exclusion, is
             // `Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md`
             // (its filename is a frozen slug, not the count); this comment is a pointer
-            // to it, and where they differ that note wins. Members as adjudicated
-            // 2026-08-05: `IMAPProvider.move`'s `COPYUID`-gated source expunge (which
+            // to it, and where they differ that note wins. DELETION-FAMILY members as
+            // adjudicated 2026-08-05 (the replacement family is stated above, and this
+            // enumeration is not the whole set without it):
+            // `IMAPProvider.move`'s `COPYUID`-gated source expunge (which
             // removes a proven DUPLICATE and is the only member that touches a message
             // rather than a draft or an event); THIS function; `saveDraft`'s old-copy
             // replacement, which issues the same `STORE \Deleted` +
