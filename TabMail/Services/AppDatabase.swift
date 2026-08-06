@@ -2225,14 +2225,26 @@ final class AppDatabase: Sendable {
         // INDIVIDUALLY: a failure there strands the database at v82 retrying
         // v83 forever, with 15 migrations' work already applied.
         migrator.registerTimedMigration("v71_addOutboxDraftRfc822MessageId") { db in
-            // The DRAFT's own RFC 822 Message-ID, snapshotted at queue-send time so
-            // the post-send server-draft cleanup can name the Drafts copy by an
-            // identity instead of by the bare IMAP UID `IMAPProvider.saveDraft`
-            // returns. Without it, `finalizeOutboxMessage` and `reconcileOutbox`
-            // queued a `.deleteDraft` carrying nothing but that UID — which
-            // `IMAPProvider.deleteDraft` refuses (a UID is an ADDRESS, not an
-            // identity), so the op could only fail and be dropped while the sent
-            // draft stayed on the server.
+            // ⚠ THIS COLUMN IS INERT AS OF `e0d3d30e0` ("Bind draft mutations to
+            // provider UID, epoch, and generation"). The matching
+            // `OutboxMessage.draftRfc822MessageId` property was deleted 2026-08-05;
+            // nothing reads or writes the column. The migration STAYS REGISTERED
+            // and unchanged because a migration is immutable once applied — every
+            // database that has run v71 has this column, and removing or editing
+            // the migration would diverge fresh installs from existing ones.
+            // Everything below is the ORIGINAL justification, kept verbatim as
+            // history and stated in the past tense; it is not a live mechanism.
+            //
+            // It carried the DRAFT's own RFC 822 Message-ID, snapshotted at
+            // queue-send time so the post-send server-draft cleanup could name the
+            // Drafts copy by an identity instead of by the bare IMAP UID
+            // `IMAPProvider.saveDraft` returns. Without it, `finalizeOutboxMessage`
+            // and `reconcileOutbox` queued a `.deleteDraft` carrying nothing but
+            // that UID — which `IMAPProvider.deleteDraft` refuses (a UID is an
+            // ADDRESS, not an identity), so the op could only fail and be dropped
+            // while the sent draft stayed on the server. `e0d3d30e0` replaced that
+            // scheme with the strong address+epoch arm keyed on `v72`'s
+            // `draftServerUidValidity`, which is why this one went dark.
             //
             // This is NOT `sentMessageId`: that is the SENT message's own
             // independently-generated id, which the Drafts copy never carries, so
@@ -2422,13 +2434,40 @@ final class AppDatabase: Sendable {
         ) { db in
             // ⚠️ `seedDraftLastTouchedSeq`'s correlated subquery is QUADRATIC in the
             // number of `draft` rows — measured 2.9 ms → 252 ms for a 10× row count.
-            // It is safe ONLY because the table is capped: `SyncEngineMaintenance`
-            // evicts drafts down to `SyncConfig.maxComposeDraftSessions` (10), so the
-            // realistic input is tens of rows, not thousands. **Raising that config
-            // makes this migration quadratically more expensive for every device that
-            // has not yet run it** — a database sitting at v78 today still pays the
-            // new cost tomorrow. If the cap ever grows past ~1,000, re-measure this
-            // body or replace the subquery with a window function before shipping.
+            // ⚠️ **THE ORIGINAL JUSTIFICATION NAMED A CAP THAT DOES NOT BOUND THIS
+            // TABLE — corrected 2026-08-05 (round-10 F12), registered as
+            // `IOS-DRAFT-017`. The MIGRATION BODY IS UNCHANGED and must stay so (a
+            // migration is immutable once applied), and the eviction exemption below
+            // is UNCHANGED and deliberate. This is a comment-only correction.**
+            //
+            // Retained verbatim as the original claim: *"It is safe ONLY because the
+            // table is capped: `SyncEngineMaintenance` evicts drafts down to
+            // `SyncConfig.maxComposeDraftSessions` (10), so the realistic input is
+            // tens of rows, not thousands."*
+            //
+            // `DraftStore.evictImpl` `continue`s over inbox-tied EXEMPT drafts
+            // WITHOUT counting them toward `kept`. An exempt row is therefore not
+            // merely retained past the cap — it does not CONSUME the cap. The
+            // retained set is `maxComposeDraftSessions + |exempt|`, and `|exempt|` is
+            // bounded by the size of the user's inbox, not by any config. So the cap
+            // bounds the non-exempt population only, and "tens of rows, not
+            // thousands" is an assumption about a user's inbox, not a guarantee the
+            // code makes.
+            //
+            // What IS true is that the cost is measured rather than assumed, and it
+            // stays bounded and one-time. Round-8 (A4) timings of this body, on a
+            // Mac — device-adjusted ×2–4 per this repo's standing rule, because Mac
+            // timings understate device by that factor:
+            //   100 rows → 2 ms · 300 rows → 9 ms · 1,000 rows → 93 ms ·
+            //   3,000 rows → 841 ms.
+            //
+            // **Raising `maxComposeDraftSessions` makes this migration quadratically
+            // more expensive for every device that has not yet run it** — a database
+            // sitting at v78 today still pays the new cost tomorrow — and so does
+            // anything that widens the exemption predicate, which is the input this
+            // comment used to be blind to. If the RETAINED count (cap + exempt, not
+            // the cap alone) can reach ~1,000, re-measure this body or replace the
+            // subquery with a window function before shipping.
             try db.alter(table: "draft") { t in
                 t.add(column: "lastTouchedSeq", .integer).notNull().defaults(to: 0)
             }

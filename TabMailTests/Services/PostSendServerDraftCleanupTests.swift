@@ -32,11 +32,18 @@ import GRDB
 /// re-fetched the draft and it came back as a permanent duplicate of the message
 /// the user had just sent.
 ///
-/// The closure is `OutboxMessage.draftRfc822MessageId` (v71): the DRAFT's own
+/// The closure WAS `OutboxMessage.draftRfc822MessageId` (v71): the DRAFT's own
 /// RFC 822 Message-ID, snapshotted at queue-send time from the same caller
-/// snapshot as `serverDraftId`, so both backstops can name the Drafts copy by an
-/// identity that survives any renumbering. ⚠ NOT `sentMessageId` — that belongs
-/// to the message SMTP delivered, which the Drafts copy never carries.
+/// snapshot as `serverDraftId`, so both backstops could name the Drafts copy by
+/// an identity that survives any renumbering. ⚠ NOT `sentMessageId` — that
+/// belonged to the message SMTP delivered, which the Drafts copy never carries.
+///
+/// `e0d3d30e0` ("Bind draft mutations to provider UID, epoch, and generation")
+/// superseded that identity-first scheme with the strong address+epoch arm, and
+/// the property was deleted 2026-08-05 once a census showed no production reader
+/// (the v71 COLUMN stays — migrations are immutable once applied). The cases
+/// below are unchanged and still assert exactly the same wire invariants: they
+/// never depended on the snapshot, which is precisely how it went dead unnoticed.
 ///
 /// **…and identity alone was never enough.** A Message-ID is not unique across a
 /// Drafts folder, and a bare UID is an address in a numbering nothing recorded, so
@@ -109,7 +116,6 @@ struct PostSendServerDraftCleanupTests {
     private static func insertCompletedSend(
         accountId: String,
         serverDraftId: String,
-        draftRfc822: String?,
         draftUidValidity: Int? = nil,
         draftServerFolderPath: String? = nil,
         pool: DatabasePool
@@ -124,7 +130,6 @@ struct PostSendServerDraftCleanupTests {
         msg.appendedToSent = true
         msg.sentMessageId = "sent-message-not-the-draft@example.com"
         msg.serverDraftId = serverDraftId
-        msg.draftRfc822MessageId = draftRfc822
         msg.draftServerUidValidity = draftUidValidity
         msg.draftServerFolderPath = draftServerFolderPath
         let toInsert = msg
@@ -195,7 +200,6 @@ struct PostSendServerDraftCleanupTests {
         // persisted folder field; the v3 address must keep the UID in its minted space.
         try Self.insertCompletedSend(
             accountId: accountId, serverDraftId: "\(draftUID)",
-            draftRfc822: draftRfc822,
             draftUidValidity: Self.draftsEpoch,
             draftServerFolderPath: "Drafts",
             pool: pool)
@@ -281,8 +285,7 @@ struct PostSendServerDraftCleanupTests {
             accountId: accountId, uid: reusedUID, rfc822MessageId: strangerRfc822, pool: pool)
         // …and the cleanup that names the address, with no identity of its own to give.
         try Self.insertCompletedSend(
-            accountId: accountId, serverDraftId: "\(reusedUID)",
-            draftRfc822: nil, pool: pool)
+            accountId: accountId, serverDraftId: "\(reusedUID)", pool: pool)
 
         let provider = Self.provider(for: server)
         try await provider.connect()
@@ -350,7 +353,6 @@ struct PostSendServerDraftCleanupTests {
 
         try Self.insertCompletedSend(
             accountId: accountId, serverDraftId: "\(sentDraftUID)",
-            draftRfc822: sharedRfc822,
             draftUidValidity: Self.draftsEpoch,
             draftServerFolderPath: "Drafts",
             pool: pool)

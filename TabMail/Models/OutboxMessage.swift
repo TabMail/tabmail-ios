@@ -52,29 +52,32 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
     /// Server draft ID captured from local Draft table before deletion.
     /// Used to delete the server draft after send confirmation in drainOutbox.
     var serverDraftId: String?
-    /// The DRAFT's own RFC 822 Message-ID, captured at queue-send time from
-    /// `Draft.rfc822MessageId` and paired with `serverDraftId` from the same
-    /// caller snapshot. (v71)
+    /// ⚠️ `draftRfc822MessageId` USED TO BE DECLARED HERE (v71) and was removed
+    /// 2026-08-05. It carried the DRAFT's own RFC 822 Message-ID, snapshotted at
+    /// queue-send time, so the post-send backstops could name the Drafts copy by
+    /// an identity rather than by the bare IMAP UID `IMAPProvider.saveDraft`
+    /// returns. `e0d3d30e0` ("Bind draft mutations to provider UID, epoch, and
+    /// generation") replaced that identity-search cleanup with the strong
+    /// address+epoch arm below, and from that commit onward NO production code
+    /// read or wrote the property — it survived only as a declaration, a
+    /// migration, and comments in the present tense describing a mechanism that
+    /// no longer existed.
     ///
-    /// ⚠️ NOT `sentMessageId`. Those are two different messages: `sentMessageId`
-    /// belongs to the message SMTP delivered and IMAP appended to Sent, and the
-    /// copy sitting in Drafts never carries it — keying the post-send cleanup by
-    /// it searches Drafts and finds nothing.
+    /// The COLUMN stays: `v71_addOutboxDraftRfc822MessageId` remains registered
+    /// and inert (a migration is immutable once applied), and GRDB's `Codable`
+    /// decoding ignores a column no property claims. Do not re-add the property
+    /// to "use up" the column; if a future cleanup needs a draft identity, decide
+    /// on its own merits whether identity or address+epoch is the right key —
+    /// `e0d3d30e0`'s answer was address+epoch, for the wrong-sibling reason
+    /// spelled out immediately below.
     ///
-    /// Exists because `IMAPProvider.saveDraft` returns a bare numeric UID as
-    /// `serverDraftId`, and a UID is a mutable ADDRESS that `IMAPProvider
-    /// .deleteDraft` refuses to build a destructive command from. This column is
-    /// what lets the post-send backstops (`finalizeOutboxMessage`, and
-    /// `reconcileOutbox` after a crash — neither of which has a live `Draft` row
-    /// to read) hand `queueDraftDelete` an identity that can actually resolve.
-    var draftRfc822MessageId: String?
     /// The UIDVALIDITY epoch `serverDraftId` was minted under, snapshotted at
     /// queue-send time from `Draft.serverDraftUidValidity` in the same caller
-    /// snapshot as `serverDraftId` and `draftRfc822MessageId`. (v72)
+    /// snapshot as `serverDraftId`. (v72)
     ///
-    /// The rfc822 column above gives the backstops an IDENTITY; this one gives
-    /// them the epoch that identity's ADDRESS belongs to, and they are not
-    /// interchangeable. Two legitimately distinct drafts can share a Message-ID
+    /// This column gives the backstops the epoch their ADDRESS belongs to, which
+    /// is what `e0d3d30e0` made the cleanup resolve on. Identity alone was never
+    /// enough: two legitimately distinct drafts can share a Message-ID
     /// (a copy, another client's save), so with the identity alone a delete
     /// issued after its own target has gone — another client removed it, or the
     /// primary delete already did — finds exactly one remaining exact match, the
