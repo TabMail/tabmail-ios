@@ -1,4 +1,10 @@
-## There are FOUR irreversible wire operations, not one — the draft family destroys drafts outright (2026-08-04)
+## There are FIVE irreversible wire operations, not one — the draft family destroys drafts outright, and CalDAV destroys calendar events (2026-08-04; corrected FOUR→FIVE 2026-08-05)
+
+> ⚠️ **The FILENAME still says `four`, and that is deliberate.** Four files cite this path —
+> `PROJECT_MEMORY.md`, `Companion/Memory/History/110-…`, production `TabMail/Providers/IMAPProvider.swift`,
+> and `TabMailTests/Sync/DeletedFlagMergeVisibilityTests.swift`. Renaming breaks every one of
+> them, so the slug is frozen and the COUNT lives in this heading and in the body. If you are
+> reading the filename as the claim, you are reading a stable id, not a fact.
 
 > ⚠ **THE COUNT IS NOW FIVE (corrected 2026-08-05, round-8 Q3).** The original title and every
 > "four" below are preserved as written — the correction is additive, not a rewrite. The fifth is
