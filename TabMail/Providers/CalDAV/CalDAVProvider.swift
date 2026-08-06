@@ -242,7 +242,11 @@ actor CalDAVProvider: CalendarProvider {
         let eventURL = calURL.appendingPathComponent(filename)
 
         let icsBody = event.toICS(uid: uid)
-        let (_, _) = try await client.put(url: eventURL, body: icsBody, etag: nil)
+        // CREATE ONLY on purpose — see the pre-generated-id comment above: the
+        // 412 from `If-None-Match: *` is what makes an idempotent retry land on
+        // the same resource instead of duplicating the event.
+        let (_, _) = try await client.put(
+            url: eventURL, body: icsBody, precondition: .ifNoneMatchAny)
 
         // Fetch back the created event to return it
         let href = eventURL.path
@@ -284,7 +288,9 @@ actor CalDAVProvider: CalendarProvider {
         let etag = getResponse.value(forHTTPHeaderField: "ETag")
 
         let mergedICS = Self.mergePatchIntoICS(existingICS, patch: event)
-        let (_, _) = try await client.put(url: eventURL, body: mergedICS, etag: etag)
+        let (_, _) = try await client.put(
+            url: eventURL, body: mergedICS,
+            precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .ifNoneMatchAny)
 
         // Clear cached ETag (it changed)
         etagCache.removeValue(forKey: eventId)
@@ -395,7 +401,9 @@ actor CalDAVProvider: CalendarProvider {
         )
 
         // 5. PUT back — atomic at the CalDAV resource level (one HTTP call).
-        _ = try await client.put(url: eventURL, body: updatedICS, etag: etag)
+        _ = try await client.put(
+            url: eventURL, body: updatedICS,
+            precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .ifNoneMatchAny)
         etagCache.removeValue(forKey: eventId)
 
         return GCalEvent(
@@ -441,14 +449,23 @@ actor CalDAVProvider: CalendarProvider {
         let cappedICS = Self.replaceRRule(in: masterICS, newRRule: cappedRRule)
 
         // 3. PUT capped master back.
-        _ = try await client.put(url: eventURL, body: cappedICS, etag: etag)
+        _ = try await client.put(
+            url: eventURL, body: cappedICS,
+            precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .ifNoneMatchAny)
         etagCache.removeValue(forKey: eventId)
 
         // 4. Build new series and PUT to a .ics resource. The UID/filename is
         //    DETERMINISTIC (derived from master id + recurrence_id) so a retry
         //    after a lost ACK on the PUT below re-targets the SAME resource
-        //    (unconditional PUT → overwrite) instead of creating a duplicate
-        //    series at a fresh random URL.
+        //    instead of creating a duplicate series at a fresh random URL.
+        //    ⚠ That PUT is CREATE-ONLY (`.ifNoneMatchAny`), not an overwrite —
+        //    this comment claimed "unconditional PUT → overwrite" until
+        //    2026-08-05, which the code has never done. The consequence is
+        //    deliberate and unchanged here: a retry after a lost ACK gets 412
+        //    rather than silently replacing the successor series someone may
+        //    have edited in the meantime, and the 412 routes to the rollback
+        //    below. Do not "fix" the comment by widening the precondition —
+        //    that is a behaviour change with its own overwrite risk.
         let newUid = GoogleCalendarProvider.deterministicSplitEventId(masterId: eventId, recurrenceId: recurrenceId)
         let rruleWithoutCap = GoogleCalendarProvider.stripUntilAndCount(originalRRule)
         let newSeriesInput: GCalEventInput
@@ -469,7 +486,8 @@ actor CalDAVProvider: CalendarProvider {
         let newICS = newSeriesInput.toICS(uid: newUid)
 
         do {
-            _ = try await client.put(url: newEventURL, body: newICS, etag: nil)
+            _ = try await client.put(
+                url: newEventURL, body: newICS, precondition: .ifNoneMatchAny)
         } catch {
             // Revert the master cap so the calendar isn't left truncated with
             // no replacement series.
@@ -492,14 +510,25 @@ actor CalDAVProvider: CalendarProvider {
     ///  - revert ALSO fails → throws `CalDAVError.inconsistentState` so the
     ///    queue surfaces a clear "needs manual attention" message instead of
     ///    silently leaving the master capped with no successor series.
-    /// The revert PUT is unconditional (`etag: nil`) on purpose: we just wrote
-    /// the capped version ourselves, so the cached ETag is stale, and a
-    /// best-effort recovery shouldn't 412 against our own write.
+    /// The revert PUT carries `.unconditional` — NEITHER `If-Match` NOR
+    /// `If-None-Match` — on purpose: we just wrote the capped version ourselves,
+    /// so any cached ETag is stale, and a best-effort recovery must not 412
+    /// against our own write.
+    ///
+    /// ⚠ This comment said "unconditional (`etag: nil`)" from the day it was
+    /// written until 2026-08-05, and the code did the OPPOSITE of what it
+    /// claimed: `etag: nil` was the *assert-absence* mode (`If-None-Match: *`),
+    /// so a compliant server answered 412 to every revert of a master resource
+    /// that — by construction, we had just PUT to it — existed. The rollback
+    /// could never succeed and this function always took its own failure arm.
+    /// `CalDAVPutPrecondition` now makes the three states distinct so the
+    /// comment and the request cannot drift apart again.
     private static func revertMasterCap(
         client: CalDAVClient, eventURL: URL, originalICS: String, cause: Error
     ) async throws -> Never {
         do {
-            _ = try await client.put(url: eventURL, body: originalICS, etag: nil)
+            _ = try await client.put(
+                url: eventURL, body: originalICS, precondition: .unconditional)
         } catch {
             // The revert PUT itself failed — the master is capped with no
             // replacement. Surface loudly so the queue/LLM/user knows.

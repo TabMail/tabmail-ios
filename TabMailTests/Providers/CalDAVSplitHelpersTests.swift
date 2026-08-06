@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import Synchronization
 @testable import TabMail
 
 // Tests for the pure ICS-manipulation helpers used by CalDAVProvider's
@@ -726,5 +727,243 @@ struct CalDAVMergePatchTests {
         let rruleIdx = lines.firstIndex { $0.hasPrefix("RRULE:") }
         let endIdx = lines.firstIndex(of: "END:VEVENT")
         if let r = rruleIdx, let e = endIdx { #expect(r < e) }
+    }
+}
+
+// MARK: - splitSeries rollback over the wire
+
+/// A minimal WebDAV/CalDAV resource store: enough of RFC 4918 §10.4 for a
+/// `PUT`'s precondition to decide its own response.
+///
+/// **Modelling the precondition is the entire point.** A fake that answers 200
+/// to every `PUT` cannot tell a rollback that WORKS from one that is
+/// structurally guaranteed to fail, so it would have stayed green against the
+/// defect this suite exists to pin — and a green suite over an impossible
+/// rollback is exactly how that defect survived repeated review.
+private final class FakeCalDAVStore: Sendable {
+    private struct Resource: Sendable {
+        var ics: String
+        var etag: String
+    }
+
+    /// One recorded `PUT`, so a test can assert on the conditional headers that
+    /// actually left the client rather than on the outcome alone.
+    struct RecordedPut: Sendable {
+        let path: String
+        let ifMatch: String?
+        let ifNoneMatch: String?
+    }
+
+    private struct State: Sendable {
+        var resources: [String: Resource] = [:]
+        var puts: [RecordedPut] = []
+        var nextETag = 1
+    }
+
+    private let state = Mutex(State())
+
+    func seed(path: String, ics: String) {
+        state.withLock { $0.resources[path] = Resource(ics: ics, etag: "\"seed\"") }
+    }
+
+    func storedICS(path: String) -> String? {
+        state.withLock { $0.resources[path]?.ics }
+    }
+
+    func recordedPuts() -> [RecordedPut] {
+        state.withLock { $0.puts }
+    }
+
+    func handleGET(_ request: FakeHTTP.Request) -> FakeHTTP.CannedResponse {
+        let path = request.url.path
+        guard let resource = state.withLock({ $0.resources[path] }) else {
+            return .raw(statusCode: 404)
+        }
+        return .raw(
+            statusCode: 200,
+            headers: ["Content-Type": "text/calendar; charset=utf-8", "ETag": resource.etag],
+            body: Data(resource.ics.utf8)
+        )
+    }
+
+    /// RFC 4918 §10.4 / RFC 9110 §13.1: `If-None-Match: *` succeeds only when
+    /// the resource is ABSENT; `If-Match` succeeds only when the current entity
+    /// tag matches. Neither header present ⇒ unconditional overwrite.
+    func handlePUT(_ request: FakeHTTP.Request) -> FakeHTTP.CannedResponse {
+        let path = request.url.path
+        let ifMatch = request.header("If-Match")
+        let ifNoneMatch = request.header("If-None-Match")
+        let body = request.body.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+
+        return state.withLock { value -> FakeHTTP.CannedResponse in
+            value.puts.append(RecordedPut(
+                path: path, ifMatch: ifMatch, ifNoneMatch: ifNoneMatch))
+            let existing = value.resources[path]
+            if ifNoneMatch == "*", existing != nil {
+                return .raw(statusCode: 412)
+            }
+            if let ifMatch, existing?.etag != ifMatch {
+                return .raw(statusCode: 412)
+            }
+            let etag = "\"v\(value.nextETag)\""
+            value.nextETag += 1
+            value.resources[path] = Resource(ics: body, etag: etag)
+            return .raw(statusCode: 204, headers: ["ETag": etag])
+        }
+    }
+}
+
+@Suite("CalDAVProvider — splitSeries rollback", .serialized)
+struct CalDAVSplitRollbackTests {
+
+    private static let calendarHome = URL(string: "https://caldav.example.com/cal/")!
+    private static let calendarId = "/cal/"
+    private static let masterEventId = "/cal/master.ics"
+    private static let masterPath = "/cal/master.ics"
+
+    /// Naive wall-clock ISO in the device zone — the exact shape
+    /// `splitSeries` accepts as a `recurrence_id`.
+    private static func naiveISO(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        formatter.timeZone = .current
+        return formatter.string(from: date)
+    }
+
+    private static func icsUTC(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        return formatter.string(from: date)
+    }
+
+    /// Dates are derived from `Date()`, never written as literals — a literal
+    /// here goes stale silently and fails months later for the wrong reason.
+    private struct Fixture {
+        let masterICS: String
+        let recurrenceId: String
+    }
+
+    private static func makeFixture() -> Fixture {
+        let start = Date().addingTimeInterval(7 * 24 * 60 * 60)
+        let end = start.addingTimeInterval(45 * 60)
+        let splitAt = Date().addingTimeInterval(21 * 24 * 60 * 60)
+        let ics = """
+        BEGIN:VCALENDAR
+        VERSION:2.0
+        PRODID:-//TabMail//Test//EN
+        BEGIN:VEVENT
+        UID:master-1
+        DTSTAMP:\(icsUTC(start))
+        DTSTART:\(icsUTC(start))
+        DTEND:\(icsUTC(end))
+        SUMMARY:Weekly sync
+        RRULE:FREQ=WEEKLY;BYDAY=WE
+        END:VEVENT
+        END:VCALENDAR
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        return Fixture(masterICS: ics, recurrenceId: naiveISO(splitAt))
+    }
+
+    private static func makeProvider(_ scenario: FakeHTTP.Scenario) -> CalDAVProvider {
+        CalDAVProvider(
+            client: CalDAVClient(
+                username: "user@example.com", password: "pw", session: scenario.session),
+            calendarHomeURL: calendarHome,
+            serverBaseURL: calendarHome
+        )
+    }
+
+    @Test("""
+    When the successor-series write fails, the master series is RESTORED: the \
+    resource that splitSeries capped ends the call holding its original \
+    uncapped RRULE, not a truncated series with no replacement
+    """)
+    func failedSuccessorWriteRestoresTheMasterSeries() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore()
+        let fixture = Self.makeFixture()
+        store.seed(path: Self.masterPath, ics: fixture.masterICS)
+
+        http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+        http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+        // The successor series fails at the server. Longest-prefix wins, so this
+        // route claims the new resource's PUT while the master keeps the store.
+        let newUid = GoogleCalendarProvider.deterministicSplitEventId(
+            masterId: Self.masterEventId, recurrenceId: fixture.recurrenceId)
+        http.register(
+            path: "/cal/\(newUid).ics", method: "PUT", response: .status(500))
+
+        let provider = Self.makeProvider(http)
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.splitSeries(
+                calendarId: Self.calendarId,
+                eventId: Self.masterEventId,
+                recurrenceId: fixture.recurrenceId,
+                patch: GCalEventInput(),
+                sendUpdates: "none")
+        }
+
+        // THE INVARIANT: the user's recurring series is intact. Not "the revert
+        // was attempted", not "an error of the right type was thrown" — the
+        // series the split truncated is back.
+        let master = store.storedICS(path: Self.masterPath)
+        #expect(master == fixture.masterICS,
+                "the master resource must hold its ORIGINAL body after the rollback")
+        #expect(master?.contains("UNTIL=") == false,
+                "a surviving UNTIL= means the series is still truncated with no successor")
+
+        // The successor resource was never created, so nothing dangles.
+        #expect(store.storedICS(path: "/cal/\(newUid).ics") == nil)
+
+        // WHY it can succeed, stated at the wire: the rollback PUT asserts
+        // nothing about the resource's existence. `If-None-Match: *` here is a
+        // guaranteed 412 against a resource we had just written ourselves, which
+        // is what made this rollback structurally impossible.
+        let puts = store.recordedPuts()
+        guard let revert = puts.last(where: { $0.path == Self.masterPath }) else {
+            Issue.record("expected a rollback PUT against the master resource")
+            return
+        }
+        #expect(revert.ifNoneMatch == nil)
+        #expect(revert.ifMatch == nil)
+    }
+
+    @Test("""
+    Held direction — create-only PUTs still assert absence: creating an event \
+    whose resource already exists is REFUSED, so the new-resource guard that \
+    makes retries idempotent is not weakened by the rollback fix
+    """)
+    func createOnlyPutsStillRefuseAnExistingResource() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore()
+        let fixture = Self.makeFixture()
+        // A resource ALREADY sits at the id createEvent will derive.
+        store.seed(path: "/cal/taken-id.ics", ics: fixture.masterICS)
+
+        http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+        http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+
+        let provider = Self.makeProvider(http)
+        var input = GCalEventInput()
+        input.id = "taken-id"
+        input.summary = "Should not overwrite"
+
+        // `CalDAVError` is not `Equatable`, so match the case explicitly.
+        let thrown = await #expect(throws: CalDAVError.self) {
+            _ = try await provider.createEvent(
+                calendarId: Self.calendarId, event: input, sendUpdates: "none")
+        }
+        if case .preconditionFailed = thrown {
+            // expected
+        } else {
+            Issue.record("expected CalDAVError.preconditionFailed, got \(String(describing: thrown))")
+        }
+        // NON-VACUITY for the test above: this fake does not answer 200 to
+        // everything, and the create path still carries `If-None-Match: *`.
+        #expect(store.storedICS(path: "/cal/taken-id.ics") == fixture.masterICS)
+        #expect(store.recordedPuts().last?.ifNoneMatch == "*")
     }
 }

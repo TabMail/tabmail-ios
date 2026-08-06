@@ -93,6 +93,18 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
             CannedResponse(statusCode: code, headers: [:], body: Data())
         }
 
+        /// Arbitrary status + response headers + body, for a handler that must
+        /// control a header the factories above do not model — a CalDAV `ETag`,
+        /// say, without which a provider's next conditional request cannot be
+        /// exercised at all.
+        static func raw(
+            statusCode: Int,
+            headers: [String: String] = [:],
+            body: Data = Data()
+        ) -> CannedResponse {
+            CannedResponse(statusCode: statusCode, headers: headers, body: body)
+        }
+
         /// Fail the request at the URL-loading boundary without fabricating an
         /// HTTP response. This pins provider behavior for real transport errors.
         static func transportError(_ code: URLError.Code) -> CannedResponse {
@@ -113,6 +125,20 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
         let method: String
         let url: URL
         let body: Data?
+        /// Every header the request carried, verbatim. Needed by handlers that
+        /// must model a CONDITIONAL request — a WebDAV/CalDAV `PUT` whose
+        /// `If-Match` / `If-None-Match` decides between 200 and 412 — because a
+        /// handler that cannot see the precondition cannot distinguish "create
+        /// only" from "overwrite" and silently blesses either one.
+        let headers: [String: String]
+
+        /// Case-insensitive lookup. HTTP field names are case-insensitive
+        /// (RFC 9110 §5.1) and `URLSession` normalises some of them on the way
+        /// out, so a test that indexed `headers` directly would be asserting on
+        /// Foundation's capitalisation rather than on the request.
+        func header(_ name: String) -> String? {
+            headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
+        }
     }
 
     fileprivate enum RegisteredResponse: Sendable {
@@ -155,7 +181,9 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
             }
         }
 
-        func take(method: String, url: URL, body: Data?) -> CannedResponse? {
+        func take(
+            method: String, url: URL, body: Data?, headers: [String: String]
+        ) -> CannedResponse? {
             let registered: RegisteredResponse? = state.withLock { value in
                 value.calls.append((method: method.uppercased(), url: url.absoluteString, body: body))
                 var best: (length: Int, response: RegisteredResponse)?
@@ -173,7 +201,8 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
             return registered?.response(for: Request(
                 method: method.uppercased(),
                 url: url,
-                body: body
+                body: body,
+                headers: headers
             ))
         }
 
@@ -363,7 +392,12 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
         } else {
             box = legacyScenario.box
         }
-        return box?.take(method: method, url: url, body: body)
+        return box?.take(
+            method: method,
+            url: url,
+            body: body,
+            headers: request.allHTTPHeaderFields ?? [:]
+        )
     }
 
     /// Return every request the fake has served so far.
