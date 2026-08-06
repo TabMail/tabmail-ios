@@ -1282,4 +1282,64 @@ struct AccountManagerActionsTagClearTests {
         let snapshot = AccountManager.shared.overlayAdjustedSnapshot(header)
         #expect(snapshot.actionTag == .reply, "the undo snapshot must carry the overlay's queued intent, not the stale DB nil")
     }
+
+    /// 🚨 R13-U13 — INVARIANT: **no snapshot leaves this function carrying a tag
+    /// and a sort order that disagree.** `actionTag` and `tagSortOrder` are one
+    /// fact stored twice; `UndoMember.init(header:)` reads BOTH off this
+    /// snapshot and the undo restore writes BOTH durably, so an inconsistent
+    /// pair here is a durably corrupt row: the chip says one thing and triage
+    /// files it somewhere else. It is the exact shape migration `v58` was
+    /// written to heal once (`AppDatabase` names `(actionTag='reply',
+    /// tagSortOrder=99)`), and a one-time heal does not re-run.
+    ///
+    /// Pinned as the PAIRING, not as "the field is assigned": the expectation
+    /// is `snapshot.tagSortOrder == snapshot.actionTag?.sortOrder ?? 99`, which
+    /// stays honest if the sort-order mapping ever changes.
+    @Test("R13-U13 — overlayAdjustedSnapshot never emits a tag whose sort order disagrees with it")
+    func overlayAdjustedSnapshotMirrorsTagSortOrder() async throws {
+        let (pool, inbox, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        // SET: an untagged DB row (tagSortOrder 99) the overlay tags `.reply`
+        // (sortOrder 0). This is a tag-then-archive-before-the-FIFO-drains, then
+        // undo — the sequence that wrote the corrupt pair.
+        let header = makeDurableHeader(folder: inbox, messageId: "m-u13-set")
+        #expect(header.actionTag == nil && header.tagSortOrder == 99, "setup: the DB row is untagged")
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        AccountManager.shared.registerMutation(id: header.id, mutation: .init(actionTag: .some(ActionTag.reply)))
+
+        let tagged = AccountManager.shared.overlayAdjustedSnapshot(header)
+        #expect(tagged.actionTag == .reply)
+        #expect(tagged.tagSortOrder == ActionTag.reply.sortOrder,
+                "undo would durably restore (actionTag: reply, tagSortOrder: \(tagged.tagSortOrder)) — the chip says reply and triage files it at the bottom")
+        #expect(tagged.tagSortOrder == (tagged.actionTag?.sortOrder ?? 99),
+                "the pair must agree whatever the mapping is")
+
+        // CLEAR — the other direction, so the fix cannot be "always write the
+        // tag's sort order" while leaving the clear path broken.
+        clearOverlay()
+        let alreadyTagged: MessageHeader = {
+            var h = makeDurableHeader(folder: inbox, messageId: "m-u13-clear")
+            h.setActionTag(.archive)
+            return h
+        }()
+        #expect(alreadyTagged.tagSortOrder == ActionTag.archive.sortOrder, "setup: the DB row is tagged")
+        try await pool.writeWithoutTransaction { [alreadyTagged] db in try alreadyTagged.insert(db) }
+        AccountManager.shared.registerMutation(id: alreadyTagged.id, mutation: .init(actionTag: .some(nil)))
+
+        let cleared = AccountManager.shared.overlayAdjustedSnapshot(alreadyTagged)
+        #expect(cleared.actionTag == nil)
+        #expect(cleared.tagSortOrder == 99,
+                "a cleared tag must fall back to the untagged sort order, not keep the old tag's bucket")
+        #expect(cleared.tagSortOrder == (cleared.actionTag?.sortOrder ?? 99))
+
+        // CONTROL (MIS-030): with NO overlay entry the snapshot is the row
+        // untouched, so the two assertions above are about the overlay path and
+        // not about a function that rewrites `tagSortOrder` unconditionally.
+        clearOverlay()
+        #expect(AccountManager.shared.overlayAdjustedSnapshot(alreadyTagged).tagSortOrder
+                    == ActionTag.archive.sortOrder,
+                "with no overlay the row must pass through unchanged")
+    }
 }

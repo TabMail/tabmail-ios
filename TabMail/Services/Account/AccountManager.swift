@@ -603,7 +603,23 @@ actor AccountManager {
         var h = header
         if let isRead = m.isRead { h.isRead = isRead }
         if let isFlagged = m.isFlagged { h.isFlagged = isFlagged }
-        if let actionTag = m.actionTag { h.actionTag = actionTag }
+        // 🚨 `tagSortOrder` IS MIRRORED, NOT DERIVED LATER (R13-U13). The two
+        // fields are ONE fact stored twice, and `UndoMember.init(header:)` reads
+        // BOTH off this snapshot and restores BOTH durably. Setting the tag
+        // without its sort order wrote e.g. `(actionTag: .reply,
+        // tagSortOrder: 99)` to the row on undo: the chip says reply, triage
+        // files it at the bottom. This is the exact corruption migration `v58`
+        // was written to heal once, and a one-time heal does not re-run.
+        //
+        // Expression is `MessageHeader.setActionTag`'s, verbatim — that is the
+        // pairing's source of truth. It is inlined rather than called because
+        // `setActionTag` also stamps `actionTagSetAt`, which the overlay does
+        // not carry and `UndoMember` does not record; stamping it here would
+        // invent a fact rather than mirror one.
+        if let actionTag = m.actionTag {
+            h.actionTag = actionTag
+            h.tagSortOrder = actionTag?.sortOrder ?? 99
+        }
         return h
     }
 

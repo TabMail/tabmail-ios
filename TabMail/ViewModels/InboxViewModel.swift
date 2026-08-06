@@ -1112,7 +1112,39 @@ final class InboxViewModel {
         // rebuilds the same initial window. See `InboxPageCursor`.
         // `loadedMessages.last` stays the deepest row across eviction —
         // `scheduleEvictionIfNeeded` trims with `removeFirst`, never the tail.
-        let cursor = loadedMessages.last.map(InboxPageCursor.init(row:))
+        //
+        // 🚨 THE CURSOR IS THE ARRAY'S MAXIMUM UNDER THE ORDER, NOT ITS LAST
+        // ELEMENT (R13-U14). Those coincide only while `loadedMessages` is
+        // sorted, and it is sorted when BUILT but does not stay that way:
+        // `tagSortOrder` is not immutable for a loaded row (the AI queue, delta
+        // and full sync, and manual tagging all change it) and `reloadMessages`
+        // Pass 1 writes a fresh row into the STALE row's index without
+        // repositioning it. `rg 'loadedMessages\.sort'` → no matches; nothing
+        // re-sorts it. In `.triage` a loaded row re-tagged into a later bucket
+        // then sorts AFTER `.last`, is re-admitted by the SQL keyset predicate,
+        // burns a `LIMIT` slot, and is dropped by `excludeIds` only after the
+        // limit — enough of them and the page comes back short and
+        // `hasMoreMessages` flips false.
+        //
+        // Shipped read only `date`, which a row's lifetime never changes, so
+        // its Pass-1-in-place was harmless to the cursor; `3b31fdb4d` put a
+        // MUTABLE field into the key without giving Pass 1 a reposition.
+        //
+        // ⚠️ THE FIX IS HERE AND NOT IN PASS 1 ON PURPOSE. Repositioning rows
+        // during a reload is exactly what `reloadMessages`' Pass 1 guard above
+        // defends against — it writes in place and skips the assignment
+        // entirely when nothing changed, precisely to avoid the `@Observable`
+        // churn that shifts layout and jumps the scroll position. Taking the
+        // maximum costs one O(n) pass over an
+        // already-bounded window and changes no render behaviour.
+        //
+        // `.normal` is unaffected either way — neither its comparator nor its
+        // SQL predicate reads `tagSortOrder` — but the cursor is taken this way
+        // in both modes so there is one rule, not a mode-conditional one.
+        let deepest = loadedMessages.max { a, b in
+            InboxOrdering.areInIncreasingOrder(a, b, mode: mode)
+        }
+        let cursor = deepest.map(InboxPageCursor.init(row:))
 
         // Phase 1: try local data first
         let nextPage = fetchPage(before: cursor)
