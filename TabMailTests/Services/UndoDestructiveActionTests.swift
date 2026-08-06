@@ -113,6 +113,7 @@ struct UndoDestructiveActionTests {
 
     private struct Fixture {
         let pool: DatabasePool
+        let directory: URL
         let previous: AppDatabase?
         let accountId: String
     }
@@ -151,15 +152,33 @@ struct UndoDestructiveActionTests {
             archive.lastKnownUidValidity = Self.destinationEpoch
             try archive.insert(db)
         }
-        return Fixture(pool: pool, previous: previous, accountId: accountId)
+        return Fixture(pool: pool, directory: directory, previous: previous, accountId: accountId)
     }
 
     @MainActor
     private func uninstall(_ fixture: Fixture) {
-        AppDatabase.shared.withLock { $0 = fixture.previous }
-        // The fixture still owns an open DatabasePool until the test returns.
-        // Leave its unique temp directory for the OS sweep rather than unlinking
-        // SQLite/WAL files under an open descriptor.
+        // Hand the fixture to the shared registry rather than abandoning it.
+        //
+        // "Leave the directory for the OS sweep" was true of the hazard it named
+        // — unlinking SQLite/WAL under an open descriptor is the process-wide
+        // libsqlite3 API violation `TestDatabaseTeardown` exists to prevent —
+        // but it discharged that hazard by leaking instead of by ordering. Each
+        // `install()` here mints a fresh UUID directory under
+        // `FileManager.default.temporaryDirectory`, which on the simulator is
+        // per-process and NOT swept between runs, so nine of these accumulate
+        // every run of this suite and no boundary ever collects them.
+        //
+        // `InstalledTestDatabaseLifetime.finish` is the correct route for a
+        // fixture installed into the `AppDatabase` singleton: it restores a real
+        // predecessor, leaves a nil predecessor installed (escaped drain work can
+        // outlive any explicit barrier here), and retains the whole group until
+        // process exit, where the registry CLOSES the pool before unlinking the
+        // directory. Do NOT "fix" this by returning to an in-memory pool —
+        // these tests drive production code that reopens the shared pool.
+        InstalledTestDatabaseLifetime.finish(
+            previous: fixture.previous,
+            pool: fixture.pool,
+            directory: fixture.directory)
     }
 
     /// The row exactly as the drain leaves it after `MessageHeaderRekey`

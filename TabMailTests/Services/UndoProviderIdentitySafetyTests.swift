@@ -55,10 +55,16 @@ struct UndoProviderIdentitySafetyTests {
 
     @MainActor
     private func uninstall(_ fixture: Fixture) {
-        AppDatabase.shared.withLock { $0 = fixture.previous }
-        // The fixture still owns an open DatabasePool until the test returns.
-        // Leave its unique temp directory for the OS sweep rather than unlinking
-        // SQLite/WAL files under an open descriptor.
+        // See `UndoDestructiveActionTests.uninstall` for the full reasoning.
+        // Short version: the old comment named a real hazard (unlinking
+        // SQLite/WAL under an open descriptor) and discharged it by leaking —
+        // six fresh UUID directories per run of this suite, collected by
+        // nothing. The registry closes before it unlinks, which is the ordering
+        // the comment was reaching for.
+        InstalledTestDatabaseLifetime.finish(
+            previous: fixture.previous,
+            pool: fixture.pool,
+            directory: fixture.directory)
     }
 
     private func sourceHeader(
