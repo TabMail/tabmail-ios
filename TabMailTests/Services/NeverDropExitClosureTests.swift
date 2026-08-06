@@ -1759,4 +1759,117 @@ struct NeverDropExitClosureTests {
         await finish(f)
     }
 
+    // MARK: - R12-T4 — the OTHER throw type the `.saveDraft` arm can now raise
+
+    /// **THE INVARIANT, and it is the DELIBERATELY HELD direction — read the
+    /// adjudication before "fixing" what this test pins.** A `.saveDraft` op whose
+    /// provider kind is unresolvable throws `ProviderError.actionIdentityResolutionFailed`,
+    /// and the drain **TERMINALIZES** that error: the durable `PendingOperation` row
+    /// is DELETED. This test asserts that end state on the ASSEMBLED SYSTEM, together
+    /// with the two bounds that make it acceptable — nothing reached the wire, and the
+    /// user's authored text survives in the local `Draft` row and is still pushable.
+    ///
+    /// ⚠️ **WHY THIS TEST EXISTS AT ALL.** Round 11's `eff3ded9d` replaced a normal
+    /// return with `throw ProviderError.actionIdentityResolutionFailed(draftId)`,
+    /// believing the classifier would requeue. It does not — that error is the drain's
+    /// drop-now signal — so the fix changed the PATH and not the OUTCOME, and three
+    /// production comments plus the commit body stated the opposite. Nothing caught it,
+    /// because the only test covering the new throw
+    /// (`DraftGenerationSafetyTests.unknownRuntimeKindThrowsAndLostCasStillRetires`)
+    /// calls `pushDraftToServer` **directly** and never runs the drain classifier, and
+    /// the drain-level sibling above drives a GENERIC throw that lands in the generic
+    /// requeue arm. The throw TYPE was covered by no drain-level test at all. This is
+    /// that test: whatever a future round decides the disposition should be, it will
+    /// now have to decide it deliberately.
+    ///
+    /// ⚠️ **THIS IS AN ANCHOR, NOT A BLESSING** (`MIS-026` — the two are the same
+    /// artifact seen from opposite sides, told apart by asking what breaks if it goes
+    /// the other way). The other way is `ProviderEvidenceUnavailable`, which requeues
+    /// with `retryCount += 1` and `.haltLane`. `draftRuntimeIdentityKind(for:)` is
+    /// DETERMINISTIC PER PROVIDER CLASS, so an `.unknown` kind is `.unknown` on every
+    /// retry: the op would starve forever and halt its lane behind it — the wedge
+    /// corollary, which is in the non-recoverable set. The held direction loses strictly
+    /// less, and the loss is bounded to the queue producer. Adjudicated at
+    /// `KNOWN_ISSUES.md` `IOS-QUEUE-003` item 4 and `IOS-DRAFT-018`.
+    ///
+    /// ⚠️ **ASSERTED ON THE END STATE, deliberately** (`MIS-015`): the durable queue's
+    /// contents, the provider call log, and the `Draft` row's authored body — never the
+    /// throw type, never the disposition enum, never a status column. A test that pinned
+    /// the throw type would pin `eff3ded9d`'s mechanism and would have stayed green on
+    /// exactly the defect that produced this item.
+    @Test("An unresolvable draft provider kind retires the Save producer, and the authored text survives")
+    @MainActor
+    func anUnresolvableDraftKindRetiresTheProducerButNotTheAuthoredText() async throws {
+        let f = try fixture(
+            accountId: "closure-draft-unknown-kind",
+            folders: [("INBOX", .inbox, 10), ("Drafts", .drafts, 10)])
+
+        // A provider that is NOT one of the four concrete classes
+        // `draftRuntimeIdentityKind(for:)` maps, so it resolves to `.unknown`.
+        let mock = MockEmailProvider()
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: f.accountId, provider: mock)
+        defer {
+            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: f.accountId) }
+        }
+
+        let draftId = "draft-unknown-kind-1"
+        let authored = "the user typed this and it must not vanish"
+        try await f.pool.write { db in
+            var draft = Draft(
+                id: draftId, accountId: f.accountId, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "closure draft", body: authored, replyToId: nil, isForward: false,
+                editHistoryJSON: nil, createdAt: 1, updatedAt: 1,
+                serverDraftId: nil, serverPushStatus: nil,
+                rfc822MessageId: nil, attachmentsDirName: nil)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+        }
+        var save = PendingOperation(
+            type: .saveDraft, messageIds: [draftId], accountId: f.accountId,
+            folderPath: "Drafts", instanceEpoch: "E1", draftId: draftId)
+        save.createdAt = Date().addingTimeInterval(-60)
+        try insert([save], into: f.pool)
+
+        // ANCHOR THE FIXTURE BEFORE ASSERTING AN ABSENCE (`MIS-030`): the producer and
+        // the authored row both exist before the drain, so a later "it is gone" is a
+        // statement about the drain and not about a row that was never created.
+        let queuedBefore = try operations(f.pool)
+        #expect(queuedBefore.map(\.id) == [save.id],
+                "precondition: the Save producer is durably queued")
+        let draftBefore = try await f.pool.read { try Draft.fetchOne($0, key: draftId) }
+        #expect(draftBefore?.body == authored,
+                "precondition: the authored text is in the local Draft row")
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // THE HELD DISPOSITION — the durable producer is retired, not requeued.
+        let remaining = try operations(f.pool)
+        #expect(
+            remaining.isEmpty,
+            """
+            the `.saveDraft` producer survived an `actionIdentityResolutionFailed` throw. \
+            That is a REAL CHANGE OF DISPOSITION, not a test failure to paper over: read \
+            `IOS-QUEUE-003` item 4 and `IOS-DRAFT-018` and update them, or restore the \
+            terminalizing arm — remaining: \(remaining.map(\.type))
+            """)
+
+        // BOUND 1 — the throw is PRE-WIRE. Nothing was sent, so no server-side object
+        // exists that the retirement could have orphaned.
+        let calls = await mock.callLog
+        #expect(
+            calls.filter { $0.hasPrefix("saveDraft") }.isEmpty,
+            "the unresolvable kind must be refused BEFORE the provider is touched: \(calls)")
+
+        // BOUND 2 — and this is what makes the retirement survivable: the user's text
+        // is still on disk, unchanged, and still pushable once the kind resolves.
+        let live = try await f.pool.read { try Draft.fetchOne($0, key: draftId) }
+        #expect(
+            live?.body == authored,
+            "the authored text was destroyed along with the producer — that would be a real data loss, not a bounded one")
+        #expect(live?.serverDraftId == nil, "and nothing was recorded as pushed")
+
+        await finish(f)
+    }
+
 }

@@ -371,8 +371,24 @@ struct DraftGenerationSafetyTests {
         let unusedCalls = await unusedProvider.callLog
         #expect(unusedCalls.filter { $0.hasPrefix("saveDraft") }.isEmpty)
 
-        // The intention survives intact: a later drain that CAN resolve the kind
-        // lands the very same row.
+        // ⚠️ CORRECTED 2026-08-06 (R12-T4). This used to read "The intention survives
+        // intact: a later drain that CAN resolve the kind lands the very same row."
+        // **That is false of the ASSEMBLED SYSTEM and it is the sentence that let
+        // round 11's `eff3ded9d` ship believing it had stopped a drop.** This test
+        // calls `pushDraftToServer` DIRECTLY and never runs the drain's classifier;
+        // in the real drain `ProviderError.actionIdentityResolutionFailed` is the
+        // TERMINAL-DROP signal, so the durable `PendingOperation` row IS deleted and
+        // no later drain re-attempts anything. What genuinely survives — and all this
+        // leg may claim — is the LOCAL `Draft` row: the authored text is intact and
+        // remains pushable by any caller that can resolve the kind, which is what the
+        // next four lines actually demonstrate.
+        //
+        // The assembled-system property is pinned where it belongs, at the drain:
+        // `NeverDropExitClosureTests.anUnresolvableDraftKindRetiresTheProducerButNotTheAuthoredText`.
+        // Read that test's adjudication (`IOS-QUEUE-003` item 4, `IOS-DRAFT-018`)
+        // before changing either.
+        //
+        // The local row is still pushable once the kind resolves:
         let retryProvider = MockEmailProvider(
             saveDraftResult: .created(.outlook(graphId: "resolved-resource")))
         let retry = try await DraftStore.shared.pushDraftToServer(

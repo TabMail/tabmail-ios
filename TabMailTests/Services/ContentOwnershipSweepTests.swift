@@ -427,6 +427,119 @@ struct ContentOwnershipSweepTests {
         await cleanup(accountId: accountId, keys: [oldKey, newKey])
     }
 
+    // MARK: - R12-T7: the id-CHANGING move shape
+
+    /// ⚠ THE TEST ABOVE CANNOT REACH THIS SHAPE, which is why this one exists
+    /// rather than replacing it. `movedMessagesAssetsAreRekeyed` seeds
+    /// `provider: .gmail` and reuses the SAME `providerMessageId` on both keys,
+    /// varying only the folder — the id-**stable** shape, and the only shape
+    /// `MessageContentStore.recoverMovedContentKey` can recover, because that
+    /// leg is gated on `.gmail || .outlook` AND matches on an unchanged
+    /// `providerMessageId`.
+    ///
+    /// `MessageHeaderRekey.finishMove` produces the id-**changing** shape: the
+    /// drain re-keys a moved row to the destination UID `COPYUID` proved, so the
+    /// key's tail is a DIFFERENT value. The sweep's recovery leg is structurally
+    /// blind to it — IMAP is excluded by the provider gate, Outlook passes the
+    /// gate and misses the lookup — so the next `pruneOrphans` classified a live
+    /// message's cached attachment as an orphan and deleted it.
+    ///
+    /// The property asserted is the SYSTEM one — *the moved message's cached
+    /// bytes are still reachable through the address the message now has* — not
+    /// the mechanism ("`rekeyContentKey` was called").
+    @Test("A drain-time re-key carries the moved row's cached assets to its new address")
+    func drainTimeRekeyCarriesAssetsToTheNewAddress() async throws {
+        let dir = try Self.makeAssetEnvironment()
+        defer { Self.teardownAssets(dir) }
+        let accountId = "r12t7-idchanging"
+        let stamp = "rfc:r12t7-moved@example.com"
+        let oldHeaderId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: "INBOX", messageId: "77")
+        let newHeaderId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: "Archive", messageId: "5")
+        let oldKey = ContentKey(rawValue: oldHeaderId)
+        let newKey = ContentKey(rawValue: newHeaderId)
+
+        let assetId = BodyAssetStore.writeAttachment(
+            contentKey: oldKey, section: "2", contentType: "application/pdf",
+            data: Data(repeating: 7, count: 128), identityStamp: stamp)
+        // MIS-030 — anchor the fixture before asserting anything about absence.
+        #expect(assetId != nil, "precondition: the moved message has a cached attachment")
+        #expect(manifestKeys().contains(oldKey),
+                "precondition: that attachment is filed under the SOURCE address")
+
+        await AccountManager.shared.publishRekeys(
+            [HeaderRekeyRecord(
+                oldHeaderId: oldHeaderId, newHeaderId: newHeaderId, newProviderMessageId: "5")],
+            collidedOldHeaderIds: [])
+
+        let keys = manifestKeys()
+        #expect(!keys.contains(oldKey),
+                "no asset may stay filed under an address the message no longer has")
+        #expect(keys.contains(newKey),
+                """
+                the moved message's cached attachment must follow it to its new address — \
+                left at the old key it is an orphan the next sweep deletes, while the \
+                carried-over messageBody row at the new key still references it
+                """)
+        if let assetId {
+            #expect(BodyAssetStore.read(assetId: assetId) != nil,
+                    "the cached bytes must survive the re-key")
+            #expect(
+                BodyAssetStore.attachmentAssetId(
+                    contentKey: newKey, section: "2", identityStamp: stamp) == assetId,
+                """
+                and must be REACHABLE by the address the message now has — \
+                attachmentAssetId looks up by headerId, so a stale key is a silent re-download
+                """)
+        }
+        await cleanup(accountId: accountId, keys: [oldKey, newKey])
+    }
+
+    /// The other half of the split, and the counterfactual to the fix above: a
+    /// COLLIDED re-key must not merge the loser's assets onto the survivor's key.
+    /// `MessageHeaderRekey.apply` deletes the old row before its collision
+    /// return, so a blind mirror would file two messages' attachments under one
+    /// content key and a later `attachmentAssetId` at that key could hand back
+    /// the OTHER message's bytes — content misattribution, C3-adjacent.
+    @Test("A collided drain-time re-key never merges the loser's assets onto the survivor")
+    func collidedRekeyNeverMergesAssetsOntoTheSurvivor() async throws {
+        let dir = try Self.makeAssetEnvironment()
+        defer { Self.teardownAssets(dir) }
+        let accountId = "r12t7-collided"
+        let loserStamp = "rfc:r12t7-loser@example.com"
+        let survivorStamp = "rfc:r12t7-survivor@example.com"
+        let oldHeaderId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: "INBOX", messageId: "77")
+        let newHeaderId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: "Archive", messageId: "5")
+        let oldKey = ContentKey(rawValue: oldHeaderId)
+        let newKey = ContentKey(rawValue: newHeaderId)
+
+        let loserAssetId = BodyAssetStore.writeAttachment(
+            contentKey: oldKey, section: "2", contentType: "application/pdf",
+            data: Data(repeating: 1, count: 64), identityStamp: loserStamp)
+        let survivorAssetId = BodyAssetStore.writeAttachment(
+            contentKey: newKey, section: "2", contentType: "application/pdf",
+            data: Data(repeating: 2, count: 64), identityStamp: survivorStamp)
+        #expect(loserAssetId != nil && survivorAssetId != nil,
+                "precondition: BOTH addresses carry their own cached attachment")
+        #expect(manifestKeys().isSuperset(of: [oldKey, newKey]),
+                "precondition: the collision is real — both keys are in the manifest")
+
+        await AccountManager.shared.publishRekeys([], collidedOldHeaderIds: [oldHeaderId])
+
+        let keys = manifestKeys()
+        #expect(!keys.contains(oldKey),
+                "the collision loser's row is gone, so nothing may still be filed under its address")
+        #expect(keys.contains(newKey), "the survivor keeps its own assets")
+        #expect(
+            BodyAssetStore.attachmentAssetId(
+                contentKey: newKey, section: "2", identityStamp: survivorStamp) == survivorAssetId,
+            "and the survivor's address must still resolve to the survivor's OWN bytes")
+        await cleanup(accountId: accountId, keys: [oldKey, newKey])
+    }
+
     // MARK: - R3: the ordering contract
 
     /// The ordering contract, pinned DIRECTLY rather than by outcome: the SAME key

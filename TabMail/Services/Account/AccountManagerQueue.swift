@@ -947,22 +947,54 @@ extension AccountManager {
             // "`.deleteDraft` — the only op that raises this error". A refusal that
             // depends on server behaviour is an ABSENCE OF EVIDENCE, not an
             // authoritative verdict on an identity, and retiring an op on it is a
-            // never-drop violation. `IMAPProvider.move` therefore no longer raises
-            // this error at all: audit round 2 routed its evidence gates to the
-            // dedicated `ProviderEvidenceUnavailable` arm below — requeue and retry
-            // WITHOUT poisoning the account, rather than the generic connection arm
-            // it originally fell through to — and audit round 4 removed the
-            // withheld-`COPYUID` gate entirely, so what is left of that arm refuses
-            // only BEFORE any wire mutation. The premises below are once again true
-            // of every op that reaches here.
+            // never-drop violation. Audit round 2 routed `IMAPProvider.move`'s
+            // evidence gates to the dedicated `ProviderEvidenceUnavailable` arm
+            // below — requeue and retry WITHOUT poisoning the account, rather than
+            // the generic connection arm it originally fell through to — and audit
+            // round 4 removed the withheld-`COPYUID` gate entirely, so what is left
+            // of that arm refuses only BEFORE any wire mutation.
+            //
+            // ⚠️ CORRECTED 2026-08-06 (R12-T4). This paragraph used to conclude
+            // "`IMAPProvider.move` therefore no longer raises this error at all",
+            // which is LITERALLY FALSE and should never have been written as an
+            // absolute. BOTH overloads can still raise it: the epoch-less
+            // `move(ids:from:to:)` raises it as its ENTIRE BODY, and the
+            // epoch-bearing overload raises it via `nativeUIDSet`, which refuses
+            // any id that is not a bare positive integer.
+            //
+            // The CONCLUSION survives, but by a different argument — and it is that
+            // argument, not the false absolute, that a future reader must check: an
+            // IMAP op cannot REACH either raise, because Checkpoint A refuses to
+            // claim an IMAP non-draft op at all unless `idsAreCanonicalUIDs` holds
+            // AND a positive admitted epoch is established. By the time the executor
+            // runs, the ids are exactly what `nativeUIDSet` accepts and the
+            // epoch-bearing overload is the one selected. The guarantee lives in the
+            // ADMISSION guard, not in the provider method: weaken Checkpoint A and
+            // the premises below stop holding.
             //
             // Ported from `v2final:AccountManagerQueue`'s `.deleteDraft` arm
             // ("TERMINAL drop of a provider-authoritative identity refusal").
             if case ProviderError.actionIdentityResolutionFailed(let refusedId) = error {
+                // ⚠️ TWO OP CLASSES REACH THIS ARM, NOT ONE (corrected 2026-08-06,
+                // R12-T4). `.deleteDraft` raises it from its own identity switch,
+                // and since `eff3ded9d` `.saveDraft` raises it too, via
+                // `DraftStore.pushDraftToServer`'s `runtimeKind == .unknown` guard.
+                // The sentence below used to name `.deleteDraft` as "the op class
+                // that raises this error", and a comment that names a sole claimant
+                // which has since gained a sibling is how a later reader concludes
+                // the arm's reasoning covers their case when it was never written
+                // about it. For `.saveDraft` the ids are not an address/identity
+                // pair at all, so the never-split rule below is vacuously satisfied
+                // rather than reasoned about — and what a `.saveDraft` drop costs is
+                // NOT what the paragraph two below describes: there is no
+                // server-side object yet. What survives instead is the LOCAL `Draft`
+                // row, which this arm never touches, so the user's authored content
+                // stays visible in Drafts and a later edit re-queues the Save.
+                //
                 // ⚑ NEVER SPLIT THIS ONE. A revision of this branch, on seeing an op
                 // with more than one id, split it into one op per id so "the sibling the
                 // provider CAN verify" could execute. For `.deleteDraft` — the op class
-                // that raises this error — the ids are not siblings: slot 0 is the
+                // this rule was written about — the ids are not siblings: slot 0 is the
                 // ADDRESS and slot 1 is the IDENTITY *of the same draft*, and splitting
                 // them manufactured an identity-only op that resolves by Message-ID
                 // SEARCH. Run after the addressed target has gone, that search returns a
@@ -1142,6 +1174,50 @@ extension AccountManager {
     /// unfindable* class — a search hit whose header is gone, at a composite id
     /// a later message can re-occupy. The sync caller already compensates by
     /// routing the id down its `staleIds` path; this is the drain's equivalent.
+    ///
+    /// 🚨 THE BODY-ASSET MANIFEST IS THE **THIRD** STORE KEYED BY
+    /// `messageHeader.id` OUTSIDE GRDB, AND IT USED TO BE MISSING FROM HERE
+    /// (R12-T7). `MessageHeaderRekey.apply`'s doc calls `bodyAsset`
+    /// *"deliberately out of scope … swept by its own headerId-prefix
+    /// maintenance path"*, and that was true while the drain never re-keyed —
+    /// at `v1.6.38` the id stayed live, so `BodyAssetMaintenance.pruneOrphans`
+    /// never saw the key as dead. It stopped being true the moment this
+    /// function started finishing moves locally, because that sweep's ONLY
+    /// recovery leg, `MessageContentStore.recoverMovedContentKey`, is gated on
+    /// `provider == .gmail || .outlook` **and** matches on an **unchanged**
+    /// `providerMessageId` — and `finishMove` re-keys precisely because the
+    /// tail CHANGED. IMAP is excluded by the gate; Outlook passes the gate and
+    /// misses the lookup. The sweep therefore reclassified a live message's
+    /// cached inline images and attachments as orphans and deleted them, while
+    /// the carried-over `messageBody` row at the NEW key still referenced them
+    /// through `tabmail-asset://`, and `attachmentAssetId(contentKey:…)` — which
+    /// looks up by `headerId` — could no longer find the bytes it had.
+    ///
+    /// ⚠ THIS IS A REGRESSION, NOT MERELY AN EDGE, which is why it is fixed
+    /// rather than registered under THE MANTRA. It self-heals at
+    /// `SyncConfig.bodyCacheTTLHours`, so it clears the recoverability test —
+    /// but the path that reaches it is *archive or move a message you just
+    /// read*, an ordinary primary path that `v1.6.38` handled correctly.
+    ///
+    /// ⚠ THE COLLISION SPLIT IS LOAD-BEARING HERE FOR A DIFFERENT REASON THAN
+    /// IT IS FOR FTS. A collided re-key means a row ALREADY occupies the
+    /// destination address; mirroring the re-key blindly would file two
+    /// messages' attachments under one content key, and every later
+    /// `attachmentAssetId` lookup at that key could return the OTHER message's
+    /// bytes — a content misattribution, C3-adjacent. So the collided ids take
+    /// `deleteAllAssets` exactly as they take `removeMessages` above: the
+    /// destination row is the survivor and owns its own assets, and the loser's
+    /// cache is re-downloadable. `rekeyContentKey` independently makes the same
+    /// choice if it races (`newExists` ⇒ delete the old key), so the two agree.
+    ///
+    /// ⚠ COST (A6). This adds ONE bounded `UPDATE` per applied record on the
+    /// manifest queue — the same cardinality as the FTS mirror immediately
+    /// above, on a store whose primary key is `id` and whose `headerId` is the
+    /// column the sweep already scans. Both stores are separate SQLite pools;
+    /// this one is synchronous because `BodyAssetStore` is a nonisolated `enum`
+    /// serving the NSE and the main app identically. A missing App Group
+    /// container makes `manifestQueue()` nil and every call a no-op returning 0,
+    /// which is the correct fail-safe: no assets means nothing to orphan.
     func publishRekeys(
         _ applied: [HeaderRekeyRecord],
         collidedOldHeaderIds: [String]
@@ -1160,11 +1236,33 @@ extension AccountManager {
                  newKey: ContentKey(rawValue: $0.newHeaderId),
                  newMessageId: $0.newProviderMessageId)
             })
+            // The body-asset manifest keys by the same header id. See the
+            // R12-T7 block above: `pruneOrphans`' recovery leg structurally
+            // cannot see the id-CHANGING shape this function produces, so
+            // without this the next sweep deletes a live message's cached
+            // bodies and attachments.
+            var rekeyedAssetKeys = 0
+            for record in applied {
+                if BodyAssetStore.rekeyContentKey(
+                    from: ContentKey(rawValue: record.oldHeaderId),
+                    to: ContentKey(rawValue: record.newHeaderId)) > 0 {
+                    rekeyedAssetKeys += 1
+                }
+            }
+            if rekeyedAssetKeys > 0 {
+                queueLog("[MoveTrace] executeSingleOp — re-keyed \(rekeyedAssetKeys) moved row(s)' cached body assets")
+            }
         }
         if !collidedOldHeaderIds.isEmpty {
             queueLog("[MoveTrace] executeSingleOp — dropped \(collidedOldHeaderIds.count) FTS entry(s) whose re-key collided; the destination row is the survivor")
             try? await SearchIndex.shared.removeMessages(
                 contentKeys: collidedOldHeaderIds.map { ContentKey(rawValue: $0) })
+            // Same disposition for the assets, and for a stronger reason —
+            // merging them onto the survivor's key would misattribute one
+            // message's attachment bytes to another.
+            for oldId in collidedOldHeaderIds {
+                _ = BodyAssetStore.deleteAllAssets(forContentKey: ContentKey(rawValue: oldId))
+            }
         }
     }
 

@@ -101,8 +101,21 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     ///
     /// nil means UNKNOWN — never "current", never zero — and an IMAP `.deleteDraft`
     /// with a nil epoch cannot be addressed at all, so `AccountManagerQueue`'s
-    /// `.deleteDraft` arm throws `actionIdentityResolutionFailed` (retryable) rather
-    /// than issuing anything. Stamped only when slot 0 is numeric: a non-numeric
+    /// `.deleteDraft` arm throws `actionIdentityResolutionFailed` rather than
+    /// issuing anything.
+    ///
+    /// ⚠️ CORRECTED 2026-08-06 (R12-T4): this line used to annotate that throw
+    /// **"(retryable)"**. It is not. The drain's
+    /// `.actionIdentityResolutionFailed` arm is a TERMINAL DROP — it logs
+    /// `"TERMINAL DROP: identity refused…"` and executes
+    /// `PendingOperation.deleteOne`, per `KNOWN_ISSUES.md` `IOS-QUEUE-003` item 4,
+    /// which accepts that cost expressly because the loss is bounded and visible.
+    /// `EmailProvider`'s declaration of the case states the same thing
+    /// (*"DETERMINISTIC and PRE-WIRE… The drain terminalizes it instead"*). Two
+    /// production comments claiming opposite dispositions for one error is how a
+    /// later fix comes to route a SECOND op class into an arm believing it
+    /// requeues; do not reintroduce the annotation. Stamped only when slot 0 is
+    /// numeric: a non-numeric
     /// slot 0 is a Gmail/Graph resource id, which is stable and epoch-free, and an
     /// epoch beside it would be an asymmetric identity the provider refuses outright.
     ///

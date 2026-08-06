@@ -525,12 +525,46 @@ actor DraftStore {
         // ("an unresolvable identity"), never a provider-authoritative result. So it
         // THROWS, exactly as the sibling `.deleteDraft` arm in the same switch
         // already does (`case .unknown: throw ProviderError
-        // .actionIdentityResolutionFailed(encodedId)`), and the queue's classifier
-        // requeues the op instead of dropping it. Unreachable in production today —
-        // `AccountManager.draftRuntimeIdentityKind(for:)` covers all four concrete
-        // provider classes and its `default: .unknown` is test-only — which is
-        // precisely why it had to be fixed by classification rather than by relying
-        // on the caller never producing it.
+        // .actionIdentityResolutionFailed(encodedId)`).
+        //
+        // 🚨 CORRECTED 2026-08-06 (R12-T4). This paragraph used to end *"and the
+        // queue's classifier REQUEUES the op instead of dropping it."* **That is
+        // false, and it was the load-bearing half of the sentence.**
+        // `AccountManagerQueue`'s `.actionIdentityResolutionFailed` arm is the
+        // drain's TERMINAL DROP: it logs `"TERMINAL DROP: identity refused…"` and
+        // executes `PendingOperation.deleteOne`. `EmailProvider`'s own declaration
+        // of the case says so plainly — *"DETERMINISTIC and PRE-WIRE… The drain
+        // TERMINALIZES it instead."* So this throw changes the PATH, not the
+        // outcome: the op is still retired. The disposition is the one
+        // `KNOWN_ISSUES.md` `IOS-QUEUE-003` item 4 adjudicates and accepts.
+        //
+        // ⚠️ AND DO NOT "FIX" IT BY SWAPPING THE THROW TYPE. The obvious
+        // alternative, `ProviderEvidenceUnavailable`, lands in the requeue +
+        // `retryCount += 1` + `.haltLane` arm — and because
+        // `draftRuntimeIdentityKind(for:)` is DETERMINISTIC PER PROVIDER CLASS,
+        // every retry reproduces `.unknown` identically and forever. That is a
+        // permanent lane wedge, which the wedge corollary puts in the same
+        // non-recoverable set as a dropped intention. Swapping the type trades a
+        // drop for a wedge: the mirror image of this bug, which is exactly how
+        // this comment came to be wrong in the first place.
+        //
+        // WHAT IS ACTUALLY LOST IF THIS FIRES: the op row only. The local `Draft`
+        // row is untouched, so the user's authored content survives and remains
+        // visible in Drafts — it simply never reaches the server until the next
+        // edit re-queues a Save. That bound is why the accepted terminal drop is
+        // tolerable here and why no disposition change is being made under it.
+        //
+        // Unreachable in production today — `AccountManager
+        // .draftRuntimeIdentityKind(for:)` switches over the four concrete
+        // production `EmailProvider` conformers (`GmailProvider`,
+        // `ExchangeProvider`, `IMAPProvider`, `DemoProvider`) and its
+        // `default: .unknown` can only be reached by a TEST conformer injected via
+        // `registerProviderForTesting`. It is fixed by classification anyway,
+        // because "no caller produces the value" is a property of today's callers
+        // rather than an invariant, and `.unknown` cannot be removed from the enum:
+        // it is the fail-closed sentinel `MailNavigationView`'s
+        // `runtimeKind != .unknown` guard and the `.deleteDraft` switch both rely
+        // on, and a protocol can always gain another conformer.
         guard runtimeKind != .unknown else {
             throw ProviderError.actionIdentityResolutionFailed(draftId)
         }
