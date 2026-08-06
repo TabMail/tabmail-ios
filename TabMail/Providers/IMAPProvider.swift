@@ -5416,35 +5416,56 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             //    by the drain's `ProviderEvidenceUnavailable` arm.
             //
             // ⚠ THE EVIDENCE THIS OPERATION REQUIRES IS UNCHANGED — the refusal set
-            // only GREW. `deleteDraftStrong` is one of the FOUR irreversible wire
-            // operations in this app (it destroys a draft outright instead of moving
-            // it to Trash), so nothing here may ever make it mutate on WEAKER proof.
+            // only GREW. `deleteDraftStrong` is an irreversible wire operation (it
+            // destroys a draft outright instead of moving it to Trash), so nothing here
+            // may ever make it mutate on WEAKER proof.
             //
-            // "TWO" WAS WRONG, and the corrected enumeration is routed to
+            // ⚠ DO NOT WRITE A COUNT HERE. This comment said "TWO", was corrected to
+            // "FOUR", and "FOUR" was wrong within two days as well — the set is defined
+            // by a PREDICATE, never by an integer, and an integer is what goes stale
+            // silently. THE PREDICATE: *every wire call that destroys, or may destroy,
+            // user-authored content on a server, where TabMail has no positive
+            // documented per-item recovery path that its own call actually reaches.*
+            // Membership is re-derived — not remembered — by three `--multiline`
+            // searches over `TabMail/ Shared/ TabMailNotificationService/`:
+            // `method\s*:\s*"DELETE"`, `httpMethod\s*=\s*"DELETE"` and `expunge\(`.
+            // BOTH HTTP spellings must be searched: a census keyed on only the first is
+            // exactly how the enumeration missed `CalDAVProvider.deleteEvent` (`MIS-007`
+            // — a census inherits its search shape). The authority for current
+            // membership, and for the POSITIVE evidence behind every exclusion, is
             // `Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md`
-            // — that note is the authority; this comment is a pointer to it. The four:
-            // (1) `IMAPProvider.move`'s `COPYUID`-gated source expunge, which removes a
-            // proven DUPLICATE and is the only one that touches a message rather than a
-            // draft; (2) this function; (3) `saveDraft`'s old-copy replacement, which
-            // issues the same `STORE \Deleted` + `expungeScopedToTargets` pair against
-            // the previous draft UID on the ordinary save path; (4) Gmail's
-            // `DELETE /drafts/{id}`, which Google documents as immediate and permanent
-            // rather than a trash.
+            // (its filename is a frozen slug, not the count); this comment is a pointer
+            // to it, and where they differ that note wins. Members as adjudicated
+            // 2026-08-05: `IMAPProvider.move`'s `COPYUID`-gated source expunge (which
+            // removes a proven DUPLICATE and is the only member that touches a message
+            // rather than a draft or an event); THIS function; `saveDraft`'s old-copy
+            // replacement, which issues the same `STORE \Deleted` +
+            // `expungeScopedToTargets` pair against the previous draft UID on the
+            // ordinary save path; Gmail's `DELETE /drafts/{id}`, which Google documents
+            // as immediate and permanent rather than a trash; and
+            // `CalDAVProvider.deleteEvent`, a WebDAV `DELETE` on the event's own `.ics`
+            // for which RFC 4918/4791 define no trash, undelete or restore.
             //
-            // NEGATIVE CASE, because an absolute without one is what produced the "two"
-            // in the first place: (2) and (3) are irreversible ONLY where the server
-            // advertises UIDPLUS — `expungeScopedToTargets` issues `UID EXPUNGE` there
-            // and NOTHING AT ALL otherwise, deliberately refusing to degrade to a
-            // mailbox-wide `EXPUNGE`, so on a non-UIDPLUS server the draft is left
-            // `\Deleted`-but-present and is recoverable. Ordinary mail is untouched by
-            // any of this: `.delete` on a message is still a move to Trash.
+            // NEGATIVE CASE, because an absolute without one is what produced the wrong
+            // enumeration twice: this function and `saveDraft`'s replacement are
+            // irreversible ONLY where the server advertises UIDPLUS —
+            // `expungeScopedToTargets` issues `UID EXPUNGE` there and NOTHING AT ALL
+            // otherwise, deliberately refusing to degrade to a mailbox-wide `EXPUNGE`,
+            // so on a non-UIDPLUS server the draft is left `\Deleted`-but-present and is
+            // recoverable. Ordinary mail is untouched by any of this: `.delete` on a
+            // message is still a move to Trash.
             //
-            // A FIFTH was enumerated in scope by a 2026-08-05 audit and is deliberately
-            // NOT counted here: `ExchangeProvider.deleteDraft` issues
+            // EXCLUDED ON POSITIVE EVIDENCE, never on absence of it — the distinction
+            // that decides membership. `ExchangeProvider.deleteDraft` issues
             // `DELETE {baseURL}/messages/{id}`, and Graph exposes a SEPARATE
             // `message: permanentDelete` action for the destroying semantic, so the
-            // plain `DELETE` is a soft delete into Deleted Items / Recoverable Items.
-            // Recoverable ⇒ not in this set. See the routed note for the evidence.
+            // plain `DELETE` is a soft delete into Deleted Items / Recoverable Items;
+            // `ExchangeCalendarProvider.deleteEvent` and `GoogleCalendarProvider`'s
+            // single-event delete are excluded the same way (Graph soft delete; Google
+            // Calendar's documented 30-day event trash). Recoverable ⇒ out of the set.
+            // CalDAV has no such documented path on any server TabMail supports, which
+            // is why it is IN rather than merely unobserved.
+            //
             // Zero previously reached the mutation only in the sense that it reached
             // a terminal drop; it now reaches neither the mutation nor a drop.
             do {
