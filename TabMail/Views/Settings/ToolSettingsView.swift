@@ -123,6 +123,224 @@ struct ContactContainerPickerView: View {
 
 // MARK: - Calendar Settings
 
+/// The calendar picker's per-account load state, and the ONE write that can
+/// change the stored create-target preference.
+///
+/// Extracted out of `CalendarPickerView` for the same reason `UserLabelMenuModel`
+/// was extracted out of `UserLabelMenuView`: the invariants below are properties
+/// of `accounts` *while the load is still running*, and a `View`'s `@State`
+/// cannot be observed from a test.
+///
+/// 🚨 **THE INVARIANT — the stored create-target preference may only be
+/// re-resolved against a FULLY resolved entry set.** `resolveSelection` does two
+/// things: it auto-selects a default create target when none is stored, and it
+/// CLEARS a stored preference whose calendar it cannot find among the writable
+/// ones. Run it while any account is still in flight and it wipes a perfectly
+/// valid saved choice merely because that account had not answered yet — the
+/// exact mirror image of the blank-list bug the incremental publish fixes. The
+/// guard therefore lives *inside* `resolveSelection` (it returns `nil` — meaning
+/// "change nothing" — unless every entry has `isLoading == false`), not at the
+/// call site, so a future caller cannot reintroduce the trap by forgetting to
+/// check.
+@Observable
+@MainActor
+final class CalendarPickerModel {
+    /// Per-account state: still loading, calendars loaded, failed, or needing re-auth.
+    struct AccountEntry: Identifiable {
+        let account: Account
+        let provider: any CalendarProvider
+        var calendars: [GCalCalendar] = []
+        /// True from the moment the row is published until THIS account's
+        /// `listCalendars()` returns or throws. Drives the per-row spinner and
+        /// gates `resolveSelection`.
+        var isLoading = true
+        var needsReauth = false
+        var errorMessage: String?
+        var id: String { account.id }
+    }
+
+    var accounts: [AccountEntry] = []
+    /// True once `resolveAll()` has answered — i.e. once we know how many
+    /// accounts there are. This is NOT "every account finished"; that question is
+    /// `accounts.allSatisfy { !$0.isLoading }`.
+    var loaded = false
+
+    private let defaults: UserDefaults
+    private let resolveBackends: @Sendable () async -> [(provider: any CalendarProvider, account: Account)]
+
+    /// The defaulted arguments are the production wiring. Tests inject an
+    /// isolated `UserDefaults(suiteName:)` and a stub backend list; a test that
+    /// forgot to inject would see zero accounts and fail loudly rather than pass.
+    init(
+        defaults: UserDefaults = .standard,
+        resolveBackends: @escaping @Sendable () async -> [(provider: any CalendarProvider, account: Account)]
+            = { await CalendarProviderDispatch.resolveAll() }
+    ) {
+        self.defaults = defaults
+        self.resolveBackends = resolveBackends
+    }
+
+    nonisolated static func isWritable(_ cal: GCalCalendar) -> Bool {
+        cal.accessRole == "owner" || cal.accessRole == "writer"
+    }
+
+    // MARK: - Loading
+
+    /// Publish one row per account immediately, then fill each row in place as
+    /// its provider answers.
+    ///
+    /// This used to be a serial `for` loop with a single publish at the end, so
+    /// the screen stayed completely blank for the SUM of every account's network
+    /// round trip rather than the max of them — which read as an empty calendar
+    /// list on a multi-account device.
+    func loadData() async {
+        let backends = await resolveBackends()
+
+        // Paint the account rows BEFORE any network call.
+        accounts = backends.map { AccountEntry(account: $0.account, provider: $0.provider) }
+        loaded = true
+
+        // Fan out, one task per account. Mirrors
+        // `CalendarToolHelpers.fetchEventsFromAllCalendars`, which already fans
+        // `listCalendars()` out across accounts this way.
+        await withTaskGroup(of: (String, LoadOutcome).self) { group in
+            for backend in backends {
+                let provider = backend.provider
+                let accountId = backend.account.id
+                let emailAddress = backend.account.emailAddress
+                group.addTask {
+                    (accountId, await Self.fetchCalendars(provider: provider, emailAddress: emailAddress))
+                }
+            }
+            for await (accountId, outcome) in group {
+                // A cancelled run must not write into `accounts`: a restarted
+                // `.task` may already have replaced it with a fresh, still-
+                // loading set, and clearing those rows' spinners would be a lie.
+                if Task.isCancelled { continue }
+                guard let idx = accounts.firstIndex(where: { $0.id == accountId }) else { continue }
+                accounts[idx].calendars = outcome.calendars
+                accounts[idx].needsReauth = outcome.needsReauth
+                accounts[idx].errorMessage = outcome.errorMessage
+                accounts[idx].isLoading = false
+            }
+        }
+
+        // Selection / stale-clearing runs EXACTLY ONCE, after every account has
+        // resolved — including the ones that failed. A cancelled load leaves
+        // entries that are no longer loading but never got an answer, so skip it
+        // entirely there: the stored choice stays untouched until a real load
+        // completes.
+        guard !Task.isCancelled else { return }
+        applyResolvedSelection()
+    }
+
+    /// One account's `listCalendars()` result, in the three shapes the UI renders.
+    private struct LoadOutcome: Sendable {
+        var calendars: [GCalCalendar] = []
+        var needsReauth = false
+        var errorMessage: String?
+    }
+
+    private nonisolated static func fetchCalendars(
+        provider: any CalendarProvider,
+        emailAddress: String
+    ) async -> LoadOutcome {
+        var outcome = LoadOutcome()
+        do {
+            outcome.calendars = try await provider.listCalendars()
+            print("[CalendarPickerView] \(emailAddress): loaded \(outcome.calendars.count) calendars (\(outcome.calendars.filter { $0.accessRole == "owner" || $0.accessRole == "writer" }.count) writable)")
+        } catch GoogleCalendarError.missingScope {
+            outcome.needsReauth = true
+            print("[CalendarPickerView] \(emailAddress): Google calendar scope not granted")
+        } catch ExchangeCalendarError.missingScope {
+            outcome.needsReauth = true
+            print("[CalendarPickerView] \(emailAddress): Exchange calendar scope not granted")
+        } catch CalDAVError.authFailed {
+            outcome.needsReauth = true
+            print("[CalendarPickerView] \(emailAddress): CalDAV auth failed — needs re-auth")
+        } catch {
+            outcome.errorMessage = SyncEngine.isConnectionError(error) ? "Connection failed. Please check your network and try again." : error.userFacingDescription
+            print("[CalendarPickerView] \(emailAddress): failed to fetch calendars: \(error)")
+        }
+        return outcome
+    }
+
+    // MARK: - Create-target preference
+
+    /// Re-resolve the stored create-target preference against the loaded
+    /// calendars.
+    ///
+    /// Returns `nil` — change nothing — when ANY entry is still loading. See the
+    /// type comment: this function is also the one that CLEARS a stored
+    /// preference, so running it against a partial set destroys valid user state.
+    static func resolveSelection(
+        entries: [AccountEntry],
+        storedAccountId: String,
+        storedCalendarId: String
+    ) -> (accountId: String, calendarId: String)? {
+        guard entries.allSatisfy({ !$0.isLoading }) else { return nil }
+
+        var accountId = storedAccountId
+        var calendarId = storedCalendarId
+
+        // Auto-select the first account's primary writable calendar if no
+        // preference is stored.
+        if accountId.isEmpty || calendarId.isEmpty {
+            if let (acct, cal) = firstWritablePrimary(entries) {
+                accountId = acct.id
+                calendarId = cal.id
+            }
+        }
+
+        // Clear (or re-point) a stored preference whose calendar no longer
+        // exists among the writable ones.
+        if !calendarId.isEmpty {
+            let writableCalIds = entries.flatMap { entry in
+                entry.calendars.filter { isWritable($0) }.map(\.id)
+            }
+            if !writableCalIds.contains(calendarId) {
+                if let (acct, cal) = firstWritablePrimary(entries) {
+                    accountId = acct.id
+                    calendarId = cal.id
+                } else {
+                    accountId = ""
+                    calendarId = ""
+                }
+            }
+        }
+
+        return (accountId, calendarId)
+    }
+
+    static func firstWritablePrimary(_ entries: [AccountEntry]) -> (Account, GCalCalendar)? {
+        for entry in entries where !entry.needsReauth {
+            let writable = entry.calendars.filter { isWritable($0) }
+            if let primary = writable.first(where: { $0.primary == true }) ?? writable.first {
+                return (entry.account, primary)
+            }
+        }
+        return nil
+    }
+
+    private func applyResolvedSelection() {
+        let storedAccountId = defaults.string(forKey: CalendarProviderDispatch.preferredCalendarAccountKey) ?? ""
+        let storedCalendarId = defaults.string(forKey: CalendarProviderDispatch.preferredCalendarKey) ?? ""
+        guard let resolved = Self.resolveSelection(
+            entries: accounts,
+            storedAccountId: storedAccountId,
+            storedCalendarId: storedCalendarId
+        ) else { return }
+        // The view reads these two keys through `@AppStorage`, which observes the
+        // defaults store — so writing them here re-renders the checkmark.
+        if resolved.accountId != storedAccountId {
+            defaults.set(resolved.accountId, forKey: CalendarProviderDispatch.preferredCalendarAccountKey)
+        }
+        if resolved.calendarId != storedCalendarId {
+            defaults.set(resolved.calendarId, forKey: CalendarProviderDispatch.preferredCalendarKey)
+        }
+    }
+}
+
 struct CalendarPickerView: View {
     @AppStorage(CalendarProviderDispatch.preferredCalendarKey) private var selectedGCalId = ""
     @AppStorage(CalendarProviderDispatch.preferredCalendarAccountKey) private var selectedAccountId = ""
@@ -134,18 +352,11 @@ struct CalendarPickerView: View {
     /// Picker presets — user-friendly choices for typical meetings.
     private let durationOptions: [Int] = [15, 30, 45, 60, 90, 120]
 
-    /// Per-account state: calendars loaded, or needing re-auth.
-    struct AccountEntry: Identifiable {
-        let account: Account
-        let provider: any CalendarProvider
-        var calendars: [GCalCalendar] = []
-        var needsReauth = false
-        var errorMessage: String?
-        var id: String { account.id }
-    }
-
-    @State private var accounts: [AccountEntry] = []
-    @State private var loaded = false
+    /// Load state lives on the model so the incremental publish is observable
+    /// from a test. Constructing one is two property assignments — no I/O, no
+    /// work — so the throwaway instances `@State` builds on parent re-renders
+    /// cost nothing (cf. `InboxViewModelHolder`, where they did not).
+    @State private var model = CalendarPickerModel()
     @State private var reauthingAccountId: String?
     /// Trigger re-render when a visibility toggle is flipped. The truth lives
     /// in `CalendarVisibilityStore` (UserDefaults); this counter just nudges
@@ -153,7 +364,7 @@ struct CalendarPickerView: View {
     @State private var visibilityTick: Int = 0
 
     private func isWritable(_ cal: GCalCalendar) -> Bool {
-        cal.accessRole == "owner" || cal.accessRole == "writer"
+        CalendarPickerModel.isWritable(cal)
     }
 
     private func isDefaultForCreate(_ cal: GCalCalendar, accountId: String) -> Bool {
@@ -278,9 +489,24 @@ struct CalendarPickerView: View {
                     .foregroundStyle(.secondary)
             }
 
-            if !accounts.isEmpty {
-                ForEach(accounts) { entry in
-                    if entry.needsReauth {
+            if !model.accounts.isEmpty {
+                ForEach(model.accounts) { entry in
+                    if entry.isLoading {
+                        // This account's row paints as soon as we know it exists;
+                        // only its calendar list is still in flight. A slow
+                        // account no longer holds the whole screen blank.
+                        Section {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Loading calendars…")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } header: {
+                            Text(entry.account.emailAddress)
+                        }
+                    } else if entry.needsReauth {
                         Section {
                             VStack(alignment: .leading, spacing: 8) {
                                 Label("Calendar Access Required", systemImage: "exclamationmark.triangle.fill")
@@ -337,7 +563,7 @@ struct CalendarPickerView: View {
                         }
                     }
                 }
-            } else if loaded {
+            } else if model.loaded {
                 Section {
                     HStack(spacing: 12) {
                         Image(systemName: "info.circle")
@@ -353,6 +579,8 @@ struct CalendarPickerView: View {
                     Text("Calendar")
                 }
             } else {
+                // Only visible until `CalendarProviderDispatch.resolveAll()`
+                // answers (a local DB read) — the network wait is now per-row.
                 Section {
                     HStack { Spacer(); ProgressView(); Spacer() }
                 }
@@ -363,7 +591,7 @@ struct CalendarPickerView: View {
         .background(Palette.previewPaneBg)
         .navigationTitle("Calendar")
         .toolbar {
-            if !accounts.isEmpty {
+            if !model.accounts.isEmpty {
                 ToolbarItem(placement: .topBarTrailing) {
                     NavigationLink {
                         CalendarSetupView()
@@ -374,62 +602,8 @@ struct CalendarPickerView: View {
             }
         }
         .task {
-            await loadData()
+            await model.loadData()
         }
-    }
-
-    private func loadData() async {
-        let backends = await CalendarProviderDispatch.resolveAll()
-        var entries: [AccountEntry] = []
-
-        for (provider, account) in backends {
-            var entry = AccountEntry(account: account, provider: provider)
-            do {
-                entry.calendars = try await provider.listCalendars()
-                print("[CalendarPickerView] \(account.emailAddress): loaded \(entry.calendars.count) calendars (\(entry.calendars.filter { $0.accessRole == "owner" || $0.accessRole == "writer" }.count) writable)")
-            } catch GoogleCalendarError.missingScope {
-                entry.needsReauth = true
-                print("[CalendarPickerView] \(account.emailAddress): Google calendar scope not granted")
-            } catch ExchangeCalendarError.missingScope {
-                entry.needsReauth = true
-                print("[CalendarPickerView] \(account.emailAddress): Exchange calendar scope not granted")
-            } catch CalDAVError.authFailed {
-                entry.needsReauth = true
-                print("[CalendarPickerView] \(account.emailAddress): CalDAV auth failed — needs re-auth")
-            } catch {
-                entry.errorMessage = SyncEngine.isConnectionError(error) ? "Connection failed. Please check your network and try again." : error.userFacingDescription
-                print("[CalendarPickerView] \(account.emailAddress): failed to fetch calendars: \(error)")
-            }
-            entries.append(entry)
-        }
-
-        accounts = entries
-
-        // Auto-select first account's primary writable calendar if no preference stored
-        if selectedAccountId.isEmpty || selectedGCalId.isEmpty {
-            if let (acct, cal) = firstWritablePrimary(entries) {
-                selectedAccountId = acct.id
-                selectedGCalId = cal.id
-            }
-        }
-
-        // Clear stale preference if stored calendar/account no longer exists
-        if !selectedGCalId.isEmpty {
-            let writableCalIds = entries.flatMap { entry in
-                entry.calendars.filter { $0.accessRole == "owner" || $0.accessRole == "writer" }.map(\.id)
-            }
-            if !writableCalIds.contains(selectedGCalId) {
-                if let (acct, cal) = firstWritablePrimary(entries) {
-                    selectedAccountId = acct.id
-                    selectedGCalId = cal.id
-                } else {
-                    selectedAccountId = ""
-                    selectedGCalId = ""
-                }
-            }
-        }
-
-        loaded = true
     }
 
     private func formatDuration(_ minutes: Int) -> String {
@@ -438,16 +612,6 @@ struct CalendarPickerView: View {
         let rem = minutes % 60
         if rem == 0 { return hours == 1 ? "1 hour" : "\(hours) hours" }
         return "\(hours)h \(rem)m"
-    }
-
-    private func firstWritablePrimary(_ entries: [AccountEntry]) -> (Account, GCalCalendar)? {
-        for entry in entries where !entry.needsReauth {
-            let writable = entry.calendars.filter { $0.accessRole == "owner" || $0.accessRole == "writer" }
-            if let primary = writable.first(where: { $0.primary == true }) ?? writable.first {
-                return (entry.account, primary)
-            }
-        }
-        return nil
     }
 
     private func grantCalendarAccess(account: Account) async {
@@ -465,7 +629,7 @@ struct CalendarPickerView: View {
                 // This is handled by CalendarSetupView / iCloud setup flow
                 break
             }
-            await loadData()
+            await model.loadData()
         } catch {
             print("[CalendarPickerView] Re-auth failed for \(account.emailAddress): \(error)")
         }
