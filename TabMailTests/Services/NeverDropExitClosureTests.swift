@@ -1661,10 +1661,16 @@ struct NeverDropExitClosureTests {
     /// provider call is an ABSENCE OF EVIDENCE — none of the four exits — and
     /// shipped `07a4bb703` awaited the throwing call directly and let the queue
     /// retry it. The mirror image, "keep the op queued but leave the row
-    /// `unconfirmed`", is a permanent WEDGE: the push entry guard admits only
-    /// `nil`/`dirty`, so every retry would return `.notApplied` forever. Only a
+    /// `unconfirmed`", is a permanent WEDGE: the push entry guard never admits
+    /// `"unconfirmed"`, so every retry would return `.notApplied` forever. Only a
     /// drain that REACHES THE WIRE distinguishes the fix from that wedge, which is
     /// why the second drain is asserted on `APPEND` commands and on the mailbox.
+    ///
+    /// 🚨 CORRECTED 2026-08-06. That sentence used to read *"the push entry guard
+    /// admits only `nil`/`dirty`"*. The reasoning it supports is unchanged —
+    /// `"unconfirmed"` is still refused — but the absolute is no longer true: the
+    /// entry also admits a `"pushing"` row when this process holds no live claim on
+    /// the draft (`DraftStore.reAdmitOrphanedPushingDraft`, `IOS-DRAFT-016`).
     ///
     /// **ASSERTED ON THE WIRE, deliberately.** The load-bearing assertions are the
     /// count of `APPEND` commands across the two drains and the Drafts mailbox's
@@ -1869,6 +1875,129 @@ struct NeverDropExitClosureTests {
             "the authored text was destroyed along with the producer — that would be a real data loss, not a bounded one")
         #expect(live?.serverDraftId == nil, "and nothing was recorded as pushed")
 
+        await finish(f)
+    }
+
+    // MARK: - R13-U5 — `"pushing"` residue left INSIDE a live process
+
+    /// **THE INVARIANT: a `.saveDraft` intention whose attempt left `"pushing"`
+    /// residue behind in this same process still terminates honestly — it is either
+    /// still durably queued, or it actually reached the wire. It is never retired on
+    /// the residue itself.**
+    ///
+    /// The hole this pins, and why the launch sweep does not cover it.
+    /// `performStageA` durably commits `serverPushStatus = "pushing"` before the
+    /// provider call, and every in-process arm that clears it does so with a DB
+    /// WRITE THAT CAN ITSELF THROW — `restorePushableAfterProviderThrow` on the
+    /// provider-throw path, `applyPushCompletion` on the success path. When one of
+    /// those writes throws, the error propagates, the op requeues (correct so far),
+    /// and the row is left `"pushing"` **while the process runs on**. The very next
+    /// drain then re-claimed the op, `pushDraftToServer`'s entry guard refused the
+    /// row, `.notApplied` returned NORMALLY, and `executeOperation`'s `.saveDraft`
+    /// arm fell through to `.allMembers` — so `executeSingleOp` DELETED the durable
+    /// Save producer. `DraftStore.resetOrphanedPushingDrafts` runs only at launch,
+    /// by which time the `PendingOperation` is already gone; the row it then flips
+    /// to `"dirty"` has no producer left to re-admit. A local row state meaning "an
+    /// attempt was interrupted" is an UNKNOWN, and never-drop clause 2 names a
+    /// failed durable write as retryable, never provider-authoritative.
+    /// (`KNOWN_ISSUES.md` `IOS-DRAFT-016`, whose original closure premise —
+    /// "recoverable at the next launch" — this falsifies.)
+    ///
+    /// **ASSERTED THROUGH `IntentionLedger`, deliberately.** The oracle is the
+    /// never-drop law itself: the recorded intention must settle `.executed` (no
+    /// `PendingOperation` still carries the draft id AND the end state was reached)
+    /// or be reported. A test that asserted the disposition enum, the entry guard's
+    /// verdict, or `serverPushStatus == "dirty"` would pin the fix's MECHANISM
+    /// (`MIS-015`) and would stay green on any re-implementation that re-admitted
+    /// the row while still dropping the op. The wire assertions below are the second
+    /// half of the same property: "did not drop" must not be satisfiable by "did
+    /// nothing".
+    ///
+    /// **THE MIRROR IMAGE IS PINNED SEPARATELY** — a `"pushing"` row whose push is
+    /// GENUINELY LIVE in this process must NOT be re-pushed, or this fix would
+    /// duplicate a draft under a live race, which is strictly worse than the bug it
+    /// closes. That direction is
+    /// `DraftGenerationSafetyTests.aLivePushBlocksASecondPushForTheSameDraft`.
+    ///
+    /// RED PROOF (recorded): against the pre-fix `DraftStore` this fails twice —
+    /// `IntentionLedger: 1/1 intention(s) UNACCOUNTED FOR (never-drop violation)`
+    /// with `stillQueued=false endStateAchieved=false`, and zero `APPEND` commands
+    /// on the wire.
+    @Test("A draft push orphaned INSIDE a live process keeps its Save producer and reaches the wire")
+    @MainActor
+    func inProcessPushingResidueNeverRetiresItsSaveProducer() async throws {
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [], "Drafts": []])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Drafts")
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(
+            accountId: "closure-draft-residue",
+            folders: [("INBOX", .inbox, 10), ("Drafts", .drafts, 10)])
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+
+        let draftId = "draft-residue-1"
+        let authored = "the user typed this and it must reach the server"
+        try await f.pool.write { db in
+            var draft = Draft(
+                id: draftId, accountId: f.accountId, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "closure draft", body: authored, replyToId: nil, isForward: false,
+                editHistoryJSON: nil, createdAt: 1, updatedAt: 1,
+                serverDraftId: nil, serverPushStatus: nil,
+                rfc822MessageId: nil, attachmentsDirName: nil)
+            draft.instanceEpoch = "E1"
+            // EXACTLY the state Stage A commits before the provider call, left behind
+            // by an in-process arm whose own write threw. `serverDraftId` stays nil
+            // because that attempt never reached `applyPushCompletion`.
+            draft.serverPushStatus = "pushing"
+            draft.pushAttemptVersion = 1
+            draft.rfc822MessageId = "draft-interrupted@example.com"
+            try draft.insert(db)
+        }
+        var save = PendingOperation(
+            type: .saveDraft, messageIds: [draftId], accountId: f.accountId,
+            folderPath: "Drafts", instanceEpoch: "E1", draftId: draftId)
+        save.createdAt = Date().addingTimeInterval(-60)
+        try insert([save], into: f.pool)
+
+        // ANCHOR THE FIXTURE BEFORE ASSERTING ANYTHING ABOUT IT (`MIS-030`): the
+        // producer exists, and the server holds nothing, so a later "one copy
+        // landed" is a statement about this drain.
+        #expect(try operations(f.pool).map(\.id) == [save.id],
+                "precondition: the Save producer is durably queued")
+        #expect(server.messageIDs(in: "Drafts").isEmpty,
+                "precondition: the interrupted attempt landed nothing")
+
+        let ledger = IntentionLedger()
+        ledger.record(label: "saveDraft \(draftId)", durableIdentity: draftId) { db in
+            try Draft.fetchOne(db, key: draftId)?.serverPushStatus == "pushed"
+        }
+        #expect(ledger.recordedCount == 1)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // THE INVARIANT — the never-drop law, mechanised. Pre-fix this settles
+        // `.unaccounted`: the op is gone and the end state was never reached.
+        await ledger.settle(pool: f.pool, reportedIds: [])
+
+        // AND "DID NOT DROP" MUST NOT BE SATISFIABLE BY "DID NOTHING".
+        let appends = server.recordedCommands().filter { $0.uppercased().contains("APPEND") }
+        #expect(
+            appends.count == 1,
+            """
+            the drain never issued an APPEND — the `"pushing"` residue left the draft in a state \
+            the push entry guard refuses, so the user's Save reached neither the wire nor a \
+            surviving queue entry — APPEND commands: \(appends)
+            """)
+        let landed = server.messageIDs(in: "Drafts")
+        #expect(
+            landed.count == 1,
+            "the retry did not land exactly one copy of the draft in the Drafts mailbox: \(landed)")
+        let live = try await f.pool.read { try Draft.fetchOne($0, key: draftId) }
+        #expect(live?.body == authored, "the authored text must survive the re-admission")
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
         await finish(f)
     }
 

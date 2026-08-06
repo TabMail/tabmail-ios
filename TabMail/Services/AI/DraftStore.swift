@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 
 /// Persistent draft storage for compose sessions.
 /// Saves/loads/deletes drafts and their associated chat turns.
@@ -21,10 +22,42 @@ actor DraftStore {
     /// `restorePushableAfterProviderThrow`. The removed `.terminalUnconfirmed`
     /// case existed only to report a never-drop violation to a caller that then
     /// retired the op on it.
+    ///
+    /// ⚑ AND THERE IS NO "another push owns this draft" DISPOSITION, for the same
+    /// reason: `PushClaimError.alreadyInFlight` is thrown, never returned. Every
+    /// value of this enum that reaches `AccountManagerQueue`'s `.saveDraft` arm
+    /// RETIRES the user's Save intention, so only an outcome that is one of
+    /// never-drop's four exits may be expressed here. "A concurrent attempt is on
+    /// the wire and I do not know how it ended" is an UNKNOWN, which clause 2 makes
+    /// retryable.
     enum PushDisposition: Sendable, Equatable {
         case completed
         /// A replacement/edit won the exact Stage A/B CAS. This producer is stale.
         case notApplied
+    }
+
+    /// Raised when a second push for the SAME draft is attempted while one is
+    /// already live in this process — see `pushesInFlight`.
+    ///
+    /// Deliberately a plain `Error`: it must land in `executeSingleOp`'s GENERIC
+    /// transient arm (requeue + `retryCount += 1` + `.haltLane`), which is the arm
+    /// that preserves the durable producer. It must NOT be
+    /// `ProviderError.actionIdentityResolutionFailed` (the drain's terminal-drop
+    /// signal) and must NOT conform to `ProviderEvidenceUnavailable` (whose skip
+    /// contract is about a provider that could not obtain a proof). Its
+    /// `description` deliberately contains none of the substrings
+    /// `AccountManager.isMessageNotFoundError` matches on
+    /// (`no such message` / `UID not found` / `Message not found` / `NONEXISTENT`),
+    /// so it cannot be misclassified as a provider-authoritative "already gone".
+    enum PushClaimError: Error, CustomStringConvertible {
+        case alreadyInFlight(draftId: String)
+
+        var description: String {
+            switch self {
+            case .alreadyInFlight(let draftId):
+                return "a draft push for \(draftId) is already live in this process"
+            }
+        }
     }
 
     enum DraftEpochAdmissionError: Error, LocalizedError {
@@ -257,6 +290,65 @@ actor DraftStore {
 
     // MARK: - Server Push
 
+    /// 🚨 THE POSITIVE WITNESS THAT SEPARATES ORPHANED `"pushing"` RESIDUE FROM A
+    /// LIVE ATTEMPT. It is the entire reason `pushDraftToServer`'s entry may
+    /// re-admit a `"pushing"` row instead of retiring the user's Save intention on
+    /// it, and the entire reason doing so is not the mirror-image defect.
+    ///
+    /// `performStageA` durably commits `serverPushStatus = "pushing"` BEFORE the
+    /// provider call, and the DURABLE STATE ALONE CANNOT TELL ITS TWO PRODUCERS
+    /// APART:
+    ///  - residue from an attempt no live code will ever finish — a crash in the
+    ///    network window, a `restorePushableAfterProviderThrow` write that itself
+    ///    threw, an `applyPushCompletion` write that itself threw. Re-pushing it is
+    ///    REQUIRED: an interrupted attempt is an UNKNOWN, and never-drop clause 2
+    ///    makes an unknown retryable, never provider-authoritative.
+    ///  - a row whose APPEND is on the wire RIGHT NOW. Re-pushing THAT duplicates a
+    ///    draft under a live race, which is strictly worse than the bug — it is the
+    ///    `IOS-OUTBOX-006` shape (`MIS-005`, the mirror image).
+    ///
+    /// This set is what makes the two distinguishable. `pushDraftToServer` is the
+    /// only production writer of `"pushing"` (through `performStageA`, its only
+    /// production caller), it inserts the draft id here BEFORE that write, and it
+    /// removes the id in a `defer` that runs only after the provider call has
+    /// returned or thrown AND after the completion/restore write. So membership is
+    /// exactly "a push for this draft is live in THIS process", and ABSENCE is a
+    /// positive proof of orphanhood rather than an inference from a process
+    /// boundary.
+    ///
+    /// **WHY A `Mutex` AND NOT ACTOR STATE.** `DraftStore` is an `actor` and
+    /// `pushDraftToServer` `await`s across the provider call, so actor isolation
+    /// does NOT exclude a second attempt entering during that suspension — that
+    /// reentrancy is precisely the question `KNOWN_ISSUES.md` `IOS-DRAFT-016` left
+    /// open, and a claim answers it without needing a reentrancy proof. `Mutex`
+    /// (SE-0433) rather than `NSLock` or `nonisolated(unsafe)` is the project
+    /// Resilience Rule. Same claim/release shape as `ComposeAgentSendFence`, which
+    /// arbitrates the only other pair of asynchronous compose owners that may race.
+    ///
+    /// ⚠ THE CLAIM IS NOT A LATCH READ BEFORE A SUSPENSION. `AccountManagerOutbox
+    /// .reconcileOutbox` records the shipped bug where exactly that was done — a
+    /// latch observed, then `await`ed across, then used to authorise a write on the
+    /// far side. Here the claim is ACQUIRED and HELD for the whole attempt, and the
+    /// decision it authorises is taken while holding it.
+    private static let pushesInFlight = Mutex<Set<String>>([])
+
+    /// Atomically claim the in-process push slot for `draftId`. `true` iff no other
+    /// push for this draft was live; a successful claim MUST be paired with
+    /// `releasePushSlot` in a `defer`.
+    private static func claimPushSlot(_ draftId: String) -> Bool {
+        pushesInFlight.withLock { $0.insert(draftId).inserted }
+    }
+
+    private static func releasePushSlot(_ draftId: String) {
+        pushesInFlight.withLock { _ = $0.remove(draftId) }
+    }
+
+    /// Test-only observation of the claim set — used to prove the claim is released
+    /// on every exit path (success, disposition return, and throw).
+    static func isPushInFlightForTesting(_ draftId: String) -> Bool {
+        pushesInFlight.withLock { $0.contains(draftId) }
+    }
+
     /// Push a local draft to the server's Drafts folder.
     /// Builds a DraftMessage from the local Draft, calls provider.saveDraft(),
     /// and stores the returned server draft ID.
@@ -442,12 +534,21 @@ actor DraftStore {
     /// both put it on the retry side.
     ///
     /// ⚠️ THE FIX IS **BOTH HALVES**, and neither alone. The row is restored to
-    /// `"dirty"` — the only non-nil value `pushDraftToServer`'s entry guard admits
-    /// — AND the caller rethrows. Keeping the op queued while leaving the row
-    /// `"unconfirmed"` would make every retry fall out of that entry guard with
+    /// `"dirty"` AND the caller rethrows. Keeping the op queued while leaving the
+    /// row `"unconfirmed"` would make every retry fall out of that entry guard with
     /// `.notApplied` forever: a permanent lane wedge, which is in the
     /// NON-recoverable set. Restoring the row without rethrowing would retire the
     /// op exactly as before.
+    ///
+    /// 🚨 CORRECTED 2026-08-06. This paragraph used to call `"dirty"` *"the only
+    /// non-nil value `pushDraftToServer`'s entry guard admits"*. That is no longer
+    /// true and the sentence was load-bearing here: the entry now ALSO admits a
+    /// `"pushing"` row when this process holds no live claim on the draft
+    /// (`pushesInFlight` / `reAdmitOrphanedPushingDraft`), because a row this
+    /// function FAILED to restore — its `try draft.update(db)` threw — is orphaned
+    /// residue, not a stale result. The restore below stays exactly as it is: it is
+    /// the cheap, exact-ownership path, and the re-admission is the backstop for
+    /// when it does not run.
     ///
     /// SUBTRACT — still no `v2final` recovery/ghost/redrive machinery, and none is
     /// needed: restoring shipped behaviour requires no sweeper, no reconciler and
@@ -568,11 +669,92 @@ actor DraftStore {
         guard runtimeKind != .unknown else {
             throw ProviderError.actionIdentityResolutionFailed(draftId)
         }
-        // The remaining three ARE exit 3: the row is gone, a newer generation
-        // replaced it, or another push already owns it.
-        guard let initialDraft = try load(id: draftId),
-              initialDraft.instanceEpoch == expectedInstanceEpoch,
-              initialDraft.serverPushStatus == nil || initialDraft.serverPushStatus == "dirty" else {
+
+        // 🚨 CLAIM THE IN-PROCESS PUSH SLOT BEFORE READING THE ROW, AND HOLD IT
+        // ACROSS THE PROVIDER CALL. The claim (see `pushesInFlight`) is what makes
+        // a `"pushing"` row observed below PROVABLY orphaned rather than possibly
+        // live, so it must be taken BEFORE the read whose verdict depends on it and
+        // BEFORE Stage A's durable `"pushing"` write, and released only on the far
+        // side of the provider call.
+        //
+        // ⚠ A REFUSED CLAIM IS AN UNKNOWN, NOT AN EXIT, so it THROWS rather than
+        // returning a disposition — every disposition the `.saveDraft` arm receives
+        // retires the durable Save producer. `PushClaimError` is a plain error, so
+        // it lands in `executeSingleOp`'s GENERIC transient arm: the op is written
+        // back `queued` with `retryCount += 1`, and the account is skipped for the
+        // REMAINDER OF THIS DRAIN PASS only — `DrainContext.failedAccounts` is a
+        // per-drain `var` whose own comment reads "prevents hammering within a
+        // single drain". The next drain re-claims and re-attempts. Bounded and
+        // recoverable: the fail-closed side of THE MANTRA.
+        //
+        // ⚠ AND IT IS REACHABLE IN PRODUCTION, not defensive. `executeSingleOp`
+        // wraps `executeOperation` in `withTimeout`, whose own doc comment says the
+        // operation task is "abandoned"; cancellation is cooperative, so a slow
+        // APPEND can still be live when a later drain re-claims the same durable op
+        // and calls this function again for the same draft. Without the claim that
+        // second call would re-push a draft whose APPEND is on the wire.
+        guard Self.claimPushSlot(draftId) else {
+            throw PushClaimError.alreadyInFlight(draftId: draftId)
+        }
+        defer { Self.releasePushSlot(draftId) }
+
+        guard let loadedDraft = try load(id: draftId),
+              loadedDraft.instanceEpoch == expectedInstanceEpoch else {
+            // Exit 3: the row is gone, or a newer generation replaced it.
+            return .notApplied
+        }
+
+        // 🚨 `"pushing"` HERE IS ORPHANED RESIDUE, AND RESIDUE IS RETRYABLE.
+        // We hold this process's only claim on `draftId`, and every production
+        // writer of `"pushing"` holds the claim for the whole of its attempt — so a
+        // `"pushing"` row read here belongs to no live attempt. It is the same
+        // "nothing is in flight ⇒ orphaned" reasoning `resetOrphanedPushingDrafts`
+        // uses at launch, with a POSITIVE live witness instead of the
+        // process-boundary proxy, which is why it is safe to run inside a live
+        // process where that proxy is not available.
+        //
+        // ⚠ WHY THIS IS NOT OPTIONAL. Without it the row falls out of the guard
+        // below with `.notApplied` — a NORMAL RETURN — and `executeOperation`'s
+        // `.saveDraft` arm falls through to `.allMembers`, so `executeSingleOp`
+        // DELETES the durable Save producer. The guard tests a LOCAL ROW STATE
+        // meaning "an attempt was interrupted", which is an unknown; never-drop
+        // clause 2 names a failed durable write as retryable, never authoritative.
+        // The launch sweep does not save it either: the producer is already gone by
+        // the time the process restarts.
+        //
+        // ⚠ ACCEPTED COST, and it is the standing ranking rather than a new trade:
+        // if the orphaned attempt had actually committed on the server, the retry
+        // still carries the pre-attempt `previousIdentity`, so it leaves one stray
+        // Drafts-folder message — exactly `IOS-DRAFT-015`/`IOS-DRAFT-011`'s
+        // accounting, deletable by the ordinary path. "A duplicate draft is
+        // recoverable, a dropped Save producer is not" (`resetOrphanedPushingDrafts`
+        // adjudicates the identical trade; Outbox Reliability Rule 4).
+        //
+        // `let` (assigned in both arms), never a `var`: it is captured by the Stage A
+        // write closure below, and a mutable capture in concurrently-executing code
+        // does not compile under Swift 6 strict concurrency.
+        let initialDraft: Draft
+        if loadedDraft.serverPushStatus == "pushing" {
+            let expectedVersion = loadedDraft.pushAttemptVersion
+            guard let reAdmitted = try await AppDatabase.dbPool.write({ db in
+                try Self.reAdmitOrphanedPushingDraft(
+                    draftId: draftId,
+                    expectedInstanceEpoch: expectedInstanceEpoch,
+                    expectedPushAttemptVersion: expectedVersion,
+                    db: db)
+            }) else {
+                // The row was deleted between the read and the write. Exit 3.
+                return .notApplied
+            }
+            initialDraft = reAdmitted
+        } else {
+            initialDraft = loadedDraft
+        }
+
+        // The remaining cases ARE exit 3: `"pushed"` (this producer's work is
+        // already done), or a status a newer authored edit has since moved on from.
+        guard initialDraft.serverPushStatus == nil
+                || initialDraft.serverPushStatus == "dirty" else {
             return .notApplied
         }
 
@@ -625,11 +807,28 @@ actor DraftStore {
             // see `restorePushableAfterProviderThrow`. Rethrowing is what keeps the
             // durable `.saveDraft` producer queued: the error reaches
             // `AccountManagerQueue.executeSingleOp`'s classifier, which requeues it
-            // exactly as it does for every other provider throw. If the restore
-            // WRITE itself throws, that error propagates instead and the op still
-            // requeues (the generic arm) — the row is then left `"pushing"` until an
-            // authored edit remaps it, an accepted cost recoverable by one ordinary
-            // gesture, and the same exposure the pre-fix code already had.
+            // exactly as it does for every other provider throw.
+            //
+            // 🚨 CORRECTED 2026-08-06. This used to end: *"If the restore WRITE
+            // itself throws, that error propagates instead and the op still requeues
+            // (the generic arm) — the row is then left `"pushing"` until an authored
+            // edit remaps it, an accepted cost recoverable by one ordinary
+            // gesture."* The first clause is still true; **the accounting was
+            // false.** A `"pushing"` row inside a LIVE process was not merely
+            // "stuck": the very NEXT drain re-claimed the op, this function's entry
+            // guard refused the row, `.notApplied` returned normally, and
+            // `executeOperation`'s `.saveDraft` arm DELETED the durable Save
+            // producer — before any launch could sweep anything. The recovery the
+            // sentence named did not exist. That hole is now closed at the entry
+            // (`reAdmitOrphanedPushingDraft`, authorised by the in-process claim),
+            // so a failed restore write costs one extra drain round trip and
+            // nothing else.
+            //
+            // The same correction covers the sibling residue producer below: if
+            // `applyPushCompletion`'s write throws after a SUCCESSFUL provider call,
+            // the row is left `"pushing"` too, and the retry is re-admitted by the
+            // same path (with `IOS-DRAFT-015`'s one-stray cost, since
+            // `serverDraftId` was never advanced).
             try await AppDatabase.dbPool.write { db in
                 _ = try Self.restorePushableAfterProviderThrow(context: context, db: db)
             }
@@ -679,40 +878,56 @@ actor DraftStore {
     /// `AccountManager.reconcilePendingOperations`, which is its only caller.
     ///
     /// `performStageA` durably commits `"pushing"` BEFORE the provider call, and
-    /// `pushDraftToServer`'s entry guard admits only `nil` or `"dirty"`. Every
-    /// in-process failure arm already clears it (`applyPushCompletion` →
-    /// `nil`/`"pushed"`, `restorePushableAfterProviderThrow` → `"dirty"`), so the
-    /// only way a `"pushing"` row outlives its attempt is a CRASH in the network
-    /// window — a jetsam, a force-quit, a `0xdead10cc` suspension kill — where no
-    /// process is alive to run those arms. Left alone, the next drain's
-    /// `.notApplied` is a NORMAL return, so `executeOperation`'s `.saveDraft` arm
-    /// falls through to `.allMembers` and the durable Save producer is DELETED by
-    /// none of never-drop's four exits: the guard tests a local row state, and an
-    /// interrupted attempt is an UNKNOWN, which clause 2 makes retryable. Both
-    /// sibling queues already sweep their own in-flight state
+    /// `pushDraftToServer`'s entry guard admits `nil`, `"dirty"`, and — only when
+    /// this process holds no live claim on the draft — orphaned `"pushing"` residue.
+    /// The commonest way a `"pushing"` row outlives its attempt is a CRASH in the
+    /// network window — a jetsam, a force-quit, a `0xdead10cc` suspension kill —
+    /// where no process is alive to run the in-process arms at all. Left alone, the
+    /// next drain's `.notApplied` is a NORMAL return, so `executeOperation`'s
+    /// `.saveDraft` arm falls through to `.allMembers` and the durable Save producer
+    /// is DELETED by none of never-drop's four exits: the guard tests a local row
+    /// state, and an interrupted attempt is an UNKNOWN, which clause 2 makes
+    /// retryable. Both sibling queues already sweep their own in-flight state
     /// (`PendingOperation.inFlight`, `OutboxMessage.sending`); this is the third.
     ///
-    /// ⚠ WHY THE LAUNCH ENTRY AND NOT A FOREGROUND ONE. `reconcilePendingOperations`
-    /// is launch-only, so at that moment nothing has drained yet IN THIS PROCESS and
-    /// any `"pushing"` row is orphaned BY DEFINITION. That is what lets this carry no
-    /// drain latch, and it is not a shortcut — read the banner on
-    /// `AccountManagerOutbox.reconcileOutbox`, which records a real shipped bug where
-    /// a reset landed on a row whose send was already on the wire. Do NOT add a
-    /// foreground sweep: a foreground return within the same process cannot produce
-    /// `"pushing"` residue, because the in-process arms above clear it, so a
-    /// foreground sweep could only ever hit a LIVE attempt.
+    /// 🚨 CORRECTED 2026-08-06 — TWO SENTENCES IN THIS BANNER WERE FALSE, AND THE
+    /// FALSE ONES WERE THE LOAD-BEARING HALF OF ITS SAFETY ARGUMENT.
+    ///  1. *"Every in-process failure arm already clears it (`applyPushCompletion` →
+    ///     `nil`/`"pushed"`, `restorePushableAfterProviderThrow` → `"dirty"`), so
+    ///     the only way a `"pushing"` row outlives its attempt is a CRASH."*
+    ///     **False.** Those arms clear it only when their own WRITE succeeds. If
+    ///     `restorePushableAfterProviderThrow`'s `try draft.update(db)` throws — or
+    ///     `applyPushCompletion`'s, after a successful provider call — the error
+    ///     propagates, the op requeues, and the row is left `"pushing"` inside a
+    ///     fully LIVE process.
+    ///  2. *"Do NOT add a foreground sweep: a foreground return within the same
+    ///     process cannot produce `"pushing"` residue … so a foreground sweep could
+    ///     only ever hit a LIVE attempt."* **False for the same reason**, and it is
+    ///     what made the residue look harmless: the very next drain in that same
+    ///     process re-claimed the op, was refused by the entry guard, and DELETED
+    ///     the durable Save producer — long before the launch this function runs at.
+    /// The remedy is NOT a foreground sweep (the objection to a blind one still
+    /// stands, and it is why this one is launch-only): it is
+    /// `reAdmitOrphanedPushingDraft` below, which is per-draft and authorised by the
+    /// in-process claim `pushesInFlight`, so it can distinguish residue from a live
+    /// attempt in a way a blind predicate sweep cannot.
+    ///
+    /// ⚠ WHY THE LAUNCH ENTRY, STILL. At `reconcilePendingOperations` nothing has
+    /// drained yet IN THIS PROCESS, so no claim can be held and any `"pushing"` row
+    /// is orphaned — which is what lets this carry no drain latch. That remains the
+    /// correct scope for a BLIND, predicate-only, whole-table reset: read the banner
+    /// on `AccountManagerOutbox.reconcileOutbox`, which records a real shipped bug
+    /// where a reset landed on a row whose send was already on the wire. This
+    /// function is also still load-bearing after the entry re-admission, because it
+    /// normalises rows no `.saveDraft` producer will ever visit (a producer already
+    /// retired by the pre-fix behaviour, or one annihilated some other way) —
+    /// `MailNavigationView`'s server-draft open path filters on
+    /// `["pushed", "dirty"]` and would otherwise skip them forever.
     ///
     /// ⚠ THE MIRROR IMAGE, and it is worse than the bug: do NOT instead make
     /// `.notApplied` throw. That would requeue the four genuinely-stale cases forever
     /// (`instanceEpoch` mismatch, `"pushed"`, a lost Stage-A CAS, a lost Stage-B CAS)
     /// — a permanent lane wedge, which is in the non-recoverable set.
-    ///
-    /// ⚠ ACCEPTED RESIDUAL, registered as `IOS-DRAFT-016` (same family as
-    /// `IOS-DRAFT-015`): a `"pushing"` row whose Stage-B *reset write* fails
-    /// transiently inside a LIVE process stays stuck until the next launch. That is
-    /// recoverable — the next launch, or one authored edit via `applySave`'s remap —
-    /// and only the SERVER copy is stale; the local `Draft` content is intact. It is
-    /// deliberately not mechanised.
     ///
     /// ⚠ RE-PUSH DUPLICATE RISK, stated rather than hidden: if the APPEND landed
     /// server-side before the crash, the retry can create a duplicate server draft.
@@ -722,6 +937,40 @@ actor DraftStore {
     static func resetOrphanedPushingDrafts(db: Database) throws -> Int {
         try Draft.filter(Column("serverPushStatus") == "pushing")
             .updateAll(db, Column("serverPushStatus").set(to: "dirty"))
+    }
+
+    /// The TARGETED, CLAIM-AUTHORISED sibling of `resetOrphanedPushingDrafts` —
+    /// re-admit ONE draft's orphaned `"pushing"` residue inside a live process.
+    /// Returns the row as it now stands, or `nil` if it no longer exists.
+    ///
+    /// Its only caller is `pushDraftToServer`, which calls it while holding that
+    /// draft's `pushesInFlight` claim. THAT CLAIM IS THE WHOLE AUTHORISATION: every
+    /// production writer of `"pushing"` holds the claim for the entire attempt, so a
+    /// `"pushing"` row observed by the claim holder belongs to no live attempt. It is
+    /// the launch sweep's "nothing is in flight ⇒ orphaned" reasoning with a POSITIVE
+    /// live witness in place of the process-boundary proxy — which is exactly what
+    /// makes it safe where a blind foreground sweep is not.
+    ///
+    /// The CAS is the same exact-ownership shape as
+    /// `restorePushableAfterProviderThrow`: a row whose generation or attempt version
+    /// has moved on is left untouched and returned as-is, so the caller's own entry
+    /// guard adjudicates it (and a newer authored edit's `applySave` remap, which
+    /// already turns `"pushing"` into `"dirty"`, still wins).
+    static func reAdmitOrphanedPushingDraft(
+        draftId: String,
+        expectedInstanceEpoch: String,
+        expectedPushAttemptVersion: Int,
+        db: Database
+    ) throws -> Draft? {
+        guard var draft = try Draft.fetchOne(db, key: draftId) else { return nil }
+        guard draft.serverPushStatus == "pushing",
+              draft.instanceEpoch == expectedInstanceEpoch,
+              draft.pushAttemptVersion == expectedPushAttemptVersion else {
+            return draft
+        }
+        draft.serverPushStatus = "dirty"
+        try draft.update(db)
+        return draft
     }
 
     /// Look up the Drafts folder path for an account.

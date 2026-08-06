@@ -1797,6 +1797,21 @@ extension AccountManager {
             // below, which requeues the op — restoring shipped `07a4bb703`. It used
             // to be swallowed into a `.terminalUnconfirmed` return, which retired the
             // user's Save intention after one network failure (`IOS-DRAFT-015`).
+            //
+            // TWO MORE UNKNOWNS LEAVE THAT FUNCTION AS THROWS RATHER THAN
+            // DISPOSITIONS, for this exact reason:
+            //  - `DraftStore.PushClaimError.alreadyInFlight` — a push for the same
+            //    draft is still live in this process (reachable because `withTimeout`
+            //    ABANDONS its operation task, so a slow APPEND outlives the drain
+            //    that started it). Lands in the generic transient arm below.
+            //  - `ProviderError.actionIdentityResolutionFailed` — an unresolvable
+            //    runtime kind. That one is TERMINAL here, deliberately and with its
+            //    cost adjudicated at `IOS-QUEUE-003` item 4; read that arm's comment
+            //    before changing either.
+            // What is NO LONGER an unknown reaching this line: a `serverPushStatus
+            // == "pushing"` row. It used to return `.notApplied` and be retired here;
+            // `pushDraftToServer` now re-admits provably-orphaned residue itself
+            // (`DraftStore.reAdmitOrphanedPushingDraft`).
             let disposition = try await DraftStore.shared.pushDraftToServer(
                 draftId: draftId,
                 expectedInstanceEpoch: instanceEpoch,
@@ -1924,14 +1939,25 @@ extension AccountManager {
             // Same crash-recovery class as the inFlight reset above, for the OTHER
             // in-flight state a previous session can leave behind: a draft push whose
             // Stage A durably committed `"pushing"` and then died before the provider
-            // call returned. `pushDraftToServer` admits only `nil`/`"dirty"`, and its
-            // `.notApplied` is a NORMAL return, so without this the next drain retires
-            // the durable `.saveDraft` producer through the generic success arm — a
-            // dropped intention by none of the four exits. Launch-only is what makes
-            // this safe without a drain latch: nothing has drained yet in this process,
-            // so a `"pushing"` row is orphaned by definition. Full rationale, the
-            // mirror-image trap, and the accepted residual are on
-            // `DraftStore.resetOrphanedPushingDrafts`.
+            // call returned. Left alone, `pushDraftToServer`'s `.notApplied` is a
+            // NORMAL return, so the next drain retires the durable `.saveDraft`
+            // producer through the generic success arm — a dropped intention by none
+            // of the four exits.
+            //
+            // 🚨 CORRECTED 2026-08-06. This comment used to end: *"Launch-only is
+            // what makes this safe without a drain latch: nothing has drained yet in
+            // this process, so a `"pushing"` row is orphaned by definition."* The
+            // first half is still exactly why THIS blind whole-table reset is safe
+            // HERE. The second half was being read as a claim that `"pushing"` residue
+            // can ONLY arise across a process boundary, and that is FALSE: an
+            // in-process `restorePushableAfterProviderThrow` (or
+            // `applyPushCompletion`) write that itself throws leaves the row
+            // `"pushing"` while the process runs on, and the very next drain then
+            // deleted the producer — before this launch entry ever ran again. That
+            // hole is closed inside `pushDraftToServer` by a per-draft in-process
+            // claim, not here. Full rationale, the mirror-image trap, and the residue
+            // census are on `DraftStore.resetOrphanedPushingDrafts` and
+            // `DraftStore.reAdmitOrphanedPushingDraft`.
             let reAdmittedPushes = try DraftStore.resetOrphanedPushingDrafts(db: db)
             if reAdmittedPushes > 0 {
                 queueLog("[Queue] Crash recovery: re-admitted \(reAdmittedPushes) orphaned draft pushes")

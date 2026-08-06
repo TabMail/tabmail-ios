@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -413,6 +414,119 @@ struct DraftGenerationSafetyTests {
                 "a superseded generation is a provider-authoritative exit 3 and must still retire")
         let staleCalls = await staleProvider.callLog
         #expect(staleCalls.filter { $0.hasPrefix("saveDraft") }.isEmpty)
+    }
+
+    /// **THE MIRROR IMAGE OF THE `"pushing"`-RESIDUE FIX, AND IT IS WORSE THAN THE
+    /// BUG (`MIS-005`): a draft whose provider save is GENUINELY LIVE in this
+    /// process must never be pushed a second time.**
+    ///
+    /// `pushDraftToServer` now re-admits a `serverPushStatus == "pushing"` row
+    /// instead of returning `.notApplied` on it, because that residue can be
+    /// orphaned inside a live process (an in-process clear-arm whose own DB write
+    /// threw) and retiring the durable Save producer on it drops a user intention —
+    /// pinned at
+    /// `NeverDropExitClosureTests.inProcessPushingResidueNeverRetiresItsSaveProducer`.
+    /// Read naively, that re-admission would also fire while the first attempt's
+    /// APPEND is still on the wire, duplicating the draft under a live race. That is
+    /// the `IOS-OUTBOX-006` shape, and it is the direction this test holds shut.
+    ///
+    /// **IT IS REACHABLE, NOT DEFENSIVE.** `executeSingleOp` wraps `executeOperation`
+    /// in `withTimeout`, whose own doc comment says the operation task is
+    /// "abandoned", and cancellation is cooperative — so a slow APPEND is still live
+    /// when a later drain re-claims the same durable op. `DraftStore` is an `actor`
+    /// and `pushDraftToServer` `await`s across the provider call, so actor isolation
+    /// alone does not exclude the second entry; that reentrancy is exactly the
+    /// question `KNOWN_ISSUES.md` `IOS-DRAFT-016` left open, and the in-process
+    /// claim answers it without needing a reentrancy proof.
+    ///
+    /// **TWO-SIDED** (`feedback_non_vacuity_must_be_two_sided`): a claim that simply
+    /// refused forever would satisfy leg 1 alone, so leg 2 pins RELEASE — after the
+    /// first push returns, the claim is gone and an ordinary later push reaches a
+    /// provider and completes. The refusal is also asserted to be a THROW rather
+    /// than a returned disposition, because every disposition the `.saveDraft` arm
+    /// receives retires the durable producer.
+    @Test("A live push blocks a second push for the same draft, and releasing restores admission")
+    func aLivePushBlocksASecondPushForTheSameDraft() async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let initial = draft()
+        try await fixture.0.writeWithoutTransaction { try initial.insert($0) }
+
+        // The SECOND push gets its own provider, so a wrongly-admitted re-entry
+        // records a `saveDraft` call HERE rather than recursing into the hook.
+        let concurrentProvider = MockEmailProvider(
+            saveDraftResult: .created(.outlook(graphId: "must-not-be-created")))
+        let secondAttempt = Mutex<String>("never ran")
+        let claimedDuringCall = Mutex<Bool>(false)
+
+        let firstProvider = MockEmailProvider(
+            saveDraftResult: .created(.outlook(graphId: "first-resource")))
+        await firstProvider.setSaveDraftHook { [id = initial.id] in
+            // Runs INSIDE the provider call: the row is durably `"pushing"` and the
+            // save is genuinely on the wire — the window no before/after snapshot
+            // can observe.
+            claimedDuringCall.withLock { $0 = DraftStore.isPushInFlightForTesting(id) }
+            do {
+                let disposition = try await DraftStore.shared.pushDraftToServer(
+                    draftId: id, expectedInstanceEpoch: "E1", provider: concurrentProvider,
+                    runtimeKind: .outlook, draftsFolderPath: "Drafts")
+                secondAttempt.withLock { $0 = "returned \(disposition)" }
+            } catch {
+                secondAttempt.withLock { $0 = "threw" }
+            }
+        }
+
+        let first = try await DraftStore.shared.pushDraftToServer(
+            draftId: initial.id, expectedInstanceEpoch: "E1", provider: firstProvider,
+            runtimeKind: .outlook, draftsFolderPath: "Drafts")
+
+        // LEG 1 — nothing was pushed twice, and the refusal was not a disposition.
+        let concurrentCalls = await concurrentProvider.callLog
+        #expect(
+            concurrentCalls.filter { $0.hasPrefix("saveDraft") }.isEmpty,
+            """
+            a second push reached the provider while the first was still on the wire — that \
+            duplicates the user's draft on the server under a live race, which is strictly worse \
+            than the dropped producer the re-admission exists to prevent: \(concurrentCalls)
+            """)
+        #expect(
+            secondAttempt.withLock({ $0 }) == "threw",
+            """
+            the concurrent push returned a disposition instead of throwing; every disposition the \
+            `.saveDraft` arm receives RETIRES the durable Save producer, so a returned value here \
+            drops the intention that the live attempt may yet fail to satisfy — got \
+            \(secondAttempt.withLock { $0 })
+            """)
+        #expect(claimedDuringCall.withLock { $0 },
+                "the claim must be HELD across the provider call, not merely around the DB writes")
+
+        // The first attempt itself is unaffected.
+        #expect(first == .completed)
+        let firstCalls = await firstProvider.callLog
+        #expect(firstCalls.filter { $0.hasPrefix("saveDraft") }.count == 1)
+        let pushed = try await fixture.0.read { try Draft.fetchOne($0, key: initial.id) }
+        #expect(pushed?.serverDraftId == "first-resource")
+
+        // LEG 2 — RELEASE. A claim that never released would be a permanent wedge,
+        // which the wedge corollary puts in the same non-recoverable set as a drop.
+        #expect(!DraftStore.isPushInFlightForTesting(initial.id),
+                "the claim outlived the push — every later attempt on this draft would be refused forever")
+        try await fixture.0.write { db in
+            guard var edited = try Draft.fetchOne(db, key: initial.id) else { return }
+            edited.body = "second edit"
+            edited.updatedAt += 1
+            _ = try DraftStore.applySave(edited, db: db)
+        }
+        let laterProvider = MockEmailProvider(
+            saveDraftResult: .created(.outlook(graphId: "second-resource")))
+        let later = try await DraftStore.shared.pushDraftToServer(
+            draftId: initial.id, expectedInstanceEpoch: "E1", provider: laterProvider,
+            runtimeKind: .outlook, draftsFolderPath: "Drafts")
+        #expect(later == .completed)
+        let laterCalls = await laterProvider.callLog
+        #expect(
+            laterCalls.filter { $0.hasPrefix("saveDraft") }.count == 1,
+            "an ordinary later push never reached the provider — the claim is a wedge, not a fence: \(laterCalls)")
     }
 
     /// ⚑ NO REFERENCE — INVENTED: the approved minimum local arbitration proof for

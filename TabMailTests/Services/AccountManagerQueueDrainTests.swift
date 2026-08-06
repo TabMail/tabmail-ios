@@ -193,16 +193,25 @@ struct AccountManagerQueueDrainTests {
     ///
     /// The hole this pins. `DraftStore.performStageA` durably commits
     /// `serverPushStatus = "pushing"` in its own transaction BEFORE the provider
-    /// call; `pushDraftToServer`'s entry guard admits only `nil` or `"dirty"`; and
+    /// call; the Stage-A CAS admits only `nil` or `"dirty"` (unchanged — the push
+    /// ENTRY additionally re-admits claim-proven residue, but that is a different
+    /// layer and not what this test probes); and
     /// `.notApplied` is a NORMAL return, so `executeOperation`'s `.saveDraft` arm
     /// falls through to `.allMembers` and `executeSingleOp` DELETES the
-    /// `PendingOperation`. The in-process failure arms do clear `"pushing"` — but a
-    /// jetsam / force-quit / `0xdead10cc` kill in the network window leaves no
-    /// process alive to run them, and an interrupted attempt is an UNKNOWN, which
-    /// never-drop clause 2 makes retryable. Both sibling queues sweep their own
-    /// in-flight state (`PendingOperation.inFlight` → this very function;
-    /// `OutboxMessage.sending` → `performOutboxReconciliation`); the draft push was
-    /// the one that did not.
+    /// `PendingOperation`. A jetsam / force-quit / `0xdead10cc` kill in the network
+    /// window leaves no process alive to run the in-process clear-arms at all, and
+    /// an interrupted attempt is an UNKNOWN, which never-drop clause 2 makes
+    /// retryable. Both sibling queues sweep their own in-flight state
+    /// (`PendingOperation.inFlight` → this very function; `OutboxMessage.sending` →
+    /// `performOutboxReconciliation`); the draft push was the one that did not.
+    ///
+    /// 🚨 CORRECTED 2026-08-06. This paragraph used to open *"The in-process failure
+    /// arms DO clear `"pushing"`"* — unqualified — which is what made a crash look
+    /// like the only producer of residue. Those arms clear it only when their own DB
+    /// write succeeds; when it throws, the row is left `"pushing"` inside a live
+    /// process. That case is NOT this test's subject and is not fixed here: it is
+    /// closed inside `pushDraftToServer` by a per-draft in-process claim, and pinned
+    /// by `NeverDropExitClosureTests.inProcessPushingResidueNeverRetiresItsSaveProducer`.
     ///
     /// ASSERTED THROUGH THE PRODUCTION ADMISSION DECISION, not the column: the
     /// oracle is whether `performStageA` — the same CAS `pushDraftToServer` runs —
@@ -255,10 +264,16 @@ struct AccountManagerQueueDrainTests {
             }
         }
 
-        // THE WEDGE, before the sweep: Stage A refuses, `pushDraftToServer` returns
-        // `.notApplied`, and the queue retires the producer through its generic
-        // success arm. Nothing else in the tree clears `"pushing"` except an
-        // authored edit via `applySave`'s remap.
+        // THE WEDGE, before the sweep: the Stage-A CAS refuses a `"pushing"` row
+        // outright, so nothing this probe can do admits a fresh attempt.
+        //
+        // 🚨 CORRECTED 2026-08-06. This used to add *"Nothing else in the tree clears
+        // `"pushing"` except an authored edit via `applySave`'s remap."* That is no
+        // longer true: `pushDraftToServer` re-admits provably-orphaned residue via
+        // `DraftStore.reAdmitOrphanedPushingDraft`, authorised by an in-process
+        // claim. This probe deliberately calls `performStageA` DIRECTLY — the CAS,
+        // not the push entry — so it holds no claim and the assertion below still
+        // describes the Stage-A layer this test is about.
         #expect(try await admitsAFreshPushAttempt("draft-retry-a@example.com") == false,
                 "fixture must start wedged, or the post-sweep half proves nothing")
 
