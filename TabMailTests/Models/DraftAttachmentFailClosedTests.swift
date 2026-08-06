@@ -349,4 +349,126 @@ struct DraftAttachmentFailClosedTests {
         #expect(loaded[0].mimeType == "application/octet-stream")
         #expect(loaded[0].isAlternative == false)
     }
+
+    // MARK: - R11-A — path containment for every storage entry point
+    //
+    // INVARIANT (the system property, not the mechanism): no
+    // `DraftAttachmentStorage` entry point may read, write, or delete outside the
+    // storage root. `save` and `load` throw; `delete` is a no-op. The escape
+    // primitive is real on upgraded installs — the WRITE side was ported to
+    // `newStagingDirName()` but the DELETE side was not, so `DraftStore
+    // .deleteAsync` still passes a raw draft id and every other call site passes
+    // a persisted `attachmentsDirName` that on a `v1.6.38 → v3` upgrade holds
+    // shipped's `draftId` value.
+    //
+    // ⚠️ TWO-SIDED, deliberately. The mirror-image fix — refuse any `dirName`
+    // containing `/` — would make legacy nested-but-CONTAINED attachment
+    // directories permanently unloadable and unreclaimable, i.e. silent loss of
+    // user content, which is strictly worse than the containment bug. So the
+    // contained-nesting cases below are not decoration: they are the half of the
+    // invariant that a naive predicate breaks.
+
+    /// The `DraftAttachmentStorageError` `body` threw, or nil if it threw
+    /// something else or did not throw.
+    private func storageError(_ body: () throws -> Void) -> DraftAttachmentStorageError? {
+        do {
+            try body()
+            return nil
+        } catch let error as DraftAttachmentStorageError {
+            return error
+        } catch {
+            return nil
+        }
+    }
+
+    @Test("A dirName that escapes the storage root is refused by save, load and delete")
+    func escapingDirNameIsRefusedByEveryEntryPoint() throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // A sibling of the storage root: what a `..`-bearing name would reach.
+        let outside = root.deletingLastPathComponent()
+            .appendingPathComponent("DraftAttachEscapee-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: outside) }
+        let escaping = "../\(outside.lastPathComponent)"
+
+        // SAVE must throw and must create nothing outside the root.
+        let saveError = storageError {
+            try DraftAttachmentStorage.saveAttachments(
+                [DraftAttachment(filename: "a.txt", mimeType: "text/plain", data: Data("aaa".utf8))],
+                dirName: escaping, root: root)
+        }
+        guard case .escapesStorageRoot(let savedName)? = saveError else {
+            Issue.record("expected .escapesStorageRoot from save, got \(String(describing: saveError))")
+            return
+        }
+        #expect(savedName == escaping)
+        #expect(!FileManager.default.fileExists(atPath: outside.path))
+
+        // LOAD must throw rather than read bytes from outside the root. Plant a
+        // real, readable attachment out there so a passing load would be a
+        // genuine out-of-root read and not merely an ENOENT.
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data("planted".utf8).write(to: outside.appendingPathComponent("0_planted.txt"))
+        let loadFailure = storageError {
+            _ = try DraftAttachmentStorage.loadAttachments(dirName: escaping, root: root)
+        }
+        guard case .escapesStorageRoot? = loadFailure else {
+            Issue.record("expected .escapesStorageRoot from load, got \(String(describing: loadFailure))")
+            return
+        }
+
+        // DELETE must be a no-op: the planted directory survives.
+        DraftAttachmentStorage.deleteAttachments(dirName: escaping, root: root)
+        #expect(FileManager.default.fileExists(atPath: outside.appendingPathComponent("0_planted.txt").path))
+    }
+
+    @Test("A legacy nested-but-contained dirName still saves, loads and deletes")
+    func containedNestedDirNameStillRoundTrips() throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // Exactly the shape a shipped reply draft persisted: the raw draft id,
+        // whose Message-ID local part legally contains `/`. Shipped's
+        // `withIntermediateDirectories: true` really put the attachments there.
+        let legacy = "reply:user@example.com:a/b/c@example.com"
+        let attachments = [
+            DraftAttachment(filename: "contract.pdf", mimeType: "application/pdf",
+                            data: Data("legacy-contract".utf8)),
+        ]
+        try DraftAttachmentStorage.saveAttachments(attachments, dirName: legacy, root: root)
+
+        let loaded = try DraftAttachmentStorage.loadAttachments(dirName: legacy, root: root)
+        #expect(loaded.count == 1)
+        guard loaded.count == 1 else { return }
+        #expect(loaded[0].filename == "contract.pdf")
+        #expect(loaded[0].data == Data("legacy-contract".utf8))
+
+        DraftAttachmentStorage.deleteAttachments(dirName: legacy, root: root)
+        #expect(!FileManager.default.fileExists(
+            atPath: DraftAttachmentStorage.dirURL(for: legacy, root: root).path))
+    }
+
+    @Test("A UUID staging name is unaffected and a root-resolving name is refused")
+    func containmentPredicateBoundaries() throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // The ordinary production case is untouched.
+        let staging = DraftAttachmentStorage.newStagingDirName()
+        #expect(DraftAttachmentStorage.containedDirURL(for: staging, root: root)?.lastPathComponent
+                == staging)
+
+        // A name that resolves to the ROOT ITSELF is not a draft's slot, and a
+        // recursive delete of it would take every other draft's attachments.
+        #expect(DraftAttachmentStorage.containedDirURL(for: "", root: root) == nil)
+        #expect(DraftAttachmentStorage.containedDirURL(for: ".", root: root) == nil)
+        #expect(DraftAttachmentStorage.containedDirURL(for: "..", root: root) == nil)
+        #expect(DraftAttachmentStorage.containedDirURL(for: "../..", root: root) == nil)
+        #expect(DraftAttachmentStorage.containedDirURL(for: "a/../../b", root: root) == nil)
+
+        // Contained nesting, including a `..` that stays inside, is allowed.
+        #expect(DraftAttachmentStorage.containedDirURL(for: "a/b@x", root: root) != nil)
+        #expect(DraftAttachmentStorage.containedDirURL(for: "a/../b", root: root) != nil)
+    }
 }

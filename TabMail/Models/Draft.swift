@@ -74,10 +74,21 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// still-valid address from one the server has since re-pointed at a different
     /// message, so a bare UID with a nil or stale epoch must never activate a
     /// destructive match. Carrying the epoch is what lets
-    /// `IMAPProvider.deleteDraft` take its STRONG arm — verify the live epoch
-    /// EQUALS this one, then FETCH and corroborate — instead of degrading to a
-    /// Message-ID search that cannot distinguish this draft from a legitimate
-    /// same-Message-ID sibling.
+    /// `IMAPProvider.deleteDraft` take its STRONG arm at all: `deleteDraftStrong`
+    /// compares the live SELECT's epoch against this one (three outcomes — equal,
+    /// provably different, or unknown-because-the-server-omitted-it) and deletes the
+    /// addressed UID only on equality.
+    ///
+    /// ⚠️ CORRECTED 2026-08-06. This used to say the strong arm "FETCH[es] and
+    /// corroborate[s]" the Message-ID and that the alternative was "degrading to a
+    /// Message-ID search". Neither exists on v3: `deleteDraft(identity:)` accepts
+    /// ONLY `.imap(folder, uidValidity, uid)` and `deleteDraftStrong`'s own doc
+    /// states it omits the reference's optional RFC corroboration "because v3's
+    /// typed identity has no RFC leg". There is no weaker arm to degrade TO — the
+    /// alternative to a usable epoch is REFUSAL (`actionIdentityResolutionFailed`),
+    /// which is a retryable throw, not a delete. An RFC 822 Message-ID never selects
+    /// or authorizes a mutation target (ADR-IOS-068/D4), so a comment describing one
+    /// is not merely stale: it reads as an instruction to restore the banned path.
     ///
     /// nil for a never-pushed draft, for every non-IMAP provider (Gmail/Graph
     /// resource ids are stable and epoch-free), and for any row written before
@@ -637,6 +648,15 @@ enum DraftAttachmentLoadError: Error {
     case ambiguousMetaFilename(name: String)
 }
 
+/// Failure modes that are about the storage LOCATION rather than about a file's
+/// contents, so they are shared by `saveAttachments` and `loadAttachments`
+/// (`DraftAttachmentLoadError` is a verbatim `v2final` port and stays that way).
+enum DraftAttachmentStorageError: Error {
+    /// The constructed directory is NOT a descendant of the storage root, so the
+    /// operation was refused. See `DraftAttachmentStorage.containedDirURL`.
+    case escapesStorageRoot(dirName: String)
+}
+
 /// Mirrors OutboxMessage's attachment storage pattern for drafts.
 /// Attachments stored under `Application Support/TabMail/draft_attachments/{dirName}/`.
 enum DraftAttachmentStorage {
@@ -648,8 +668,53 @@ enum DraftAttachmentStorage {
 
     /// `root` is a test seam: when nil (production) the global `baseDir` is used;
     /// tests inject a temporary directory so they can create/mutate real files.
+    ///
+    /// ⚠️ RAW CONSTRUCTION — performs NO containment check, because a `dirName`
+    /// containing `/` or `..` escapes the storage root (see `newStagingDirName`'s
+    /// doc for why a `draftId` is not a safe path component). Every entry point
+    /// that actually touches the filesystem goes through `containedDirURL`
+    /// instead. This one stays raw so a test can still ask "where would this name
+    /// land?" without the answer being filtered.
     static func dirURL(for dirName: String, root: URL? = nil) -> URL {
         (root ?? baseDir).appendingPathComponent(dirName, isDirectory: true)
+    }
+
+    /// THE containment chokepoint for every filesystem-touching entry point
+    /// (`saveAttachments`, `loadAttachments`, `deleteAttachments`, and eviction
+    /// via `deleteAttachments`). Returns the directory URL iff it is a strict
+    /// DESCENDANT of the storage root; `nil` means the caller must fail closed.
+    ///
+    /// WHY IT IS "CONTAINMENT", NOT "REJECT ANY `/`". v3 fixed only the WRITE
+    /// side of the unsafe-path-component hazard — both `ComposeView` COW staging
+    /// sites now mint `newStagingDirName()` — but the DELETE side was never
+    /// ported: `DraftStore.deleteAsync` still passes the raw draft id, and every
+    /// other call site passes a persisted `attachmentsDirName` which, on a
+    /// `v1.6.38 → v3` upgrade, holds shipped's `draftId` value. Shipped saved
+    /// those with `createDirectory(withIntermediateDirectories: true)`, so a
+    /// legacy reply draft whose id is `reply:<acct>:<local/part>@<domain>` REALLY
+    /// HAS its attachments at a nested-but-contained path under the root.
+    ///
+    /// ⚠️ NEGATIVE CASE, stated because the mirror-image fix is the tempting one:
+    /// a predicate of "refuse any `dirName` containing `/`" would make exactly
+    /// those legacy attachments permanently unloadable and unreclaimable — it
+    /// would trade a containment bug for silent loss of user content, which is
+    /// strictly worse. Contained nesting MUST keep working; only escape ABOVE the
+    /// root is refused. An empty or `.`-only name is also refused: it resolves to
+    /// the root itself, which is not a draft's slot and whose recursive delete
+    /// would take every other draft's attachments with it.
+    ///
+    /// Symlinks are deliberately NOT resolved (`standardizedFileURL`, not
+    /// `resolvingSymlinksInPath()`): the candidate usually does not exist yet, so
+    /// symlink resolution is partial and asymmetric with the root's, which would
+    /// refuse legitimate saves. Textual `..` collapsing is what the escape
+    /// primitive actually needs.
+    static func containedDirURL(for dirName: String, root: URL? = nil) -> URL? {
+        let base = (root ?? baseDir).standardizedFileURL
+        let candidate = dirURL(for: dirName, root: root).standardizedFileURL
+        let basePath = base.path
+        let prefix = basePath.hasSuffix("/") ? basePath : basePath + "/"
+        guard candidate.path.hasPrefix(prefix) else { return nil }
+        return candidate
     }
 
     /// PORT — `v2final:TabMail/Models/Draft.swift`'s
@@ -682,10 +747,14 @@ enum DraftAttachmentStorage {
         UUID().uuidString
     }
 
-    /// Save attachments to disk. Throws if any write fails.
+    /// Save attachments to disk. Throws if any write fails, and throws
+    /// `DraftAttachmentStorageError.escapesStorageRoot` rather than creating
+    /// directories and writing attachment bytes outside the storage root.
     static func saveAttachments(_ attachments: [DraftAttachment], dirName: String, root: URL? = nil) throws {
         guard !attachments.isEmpty else { return }
-        let dir = dirURL(for: dirName, root: root)
+        guard let dir = containedDirURL(for: dirName, root: root) else {
+            throw DraftAttachmentStorageError.escapesStorageRoot(dirName: dirName)
+        }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         for (index, att) in attachments.enumerated() {
             let dataName = "\(index)_\(att.filename)"
@@ -709,7 +778,11 @@ enum DraftAttachmentStorage {
     static func loadAttachments(dirName: String?, root: URL? = nil) throws -> [DraftAttachment] {
         // nil dirName is the ONLY clean attachment-less case.
         guard let dirName else { return [] }
-        let dir = dirURL(for: dirName, root: root)
+        // A name that escapes the storage root is refused before any read: fail
+        // closed rather than load bytes from outside the slot.
+        guard let dir = containedDirURL(for: dirName, root: root) else {
+            throw DraftAttachmentStorageError.escapesStorageRoot(dirName: dirName)
+        }
         // A referenced-but-absent directory (or an enumeration failure) is NOT
         // "no attachments" — fail closed instead of returning [].
         let files: [URL]
@@ -762,9 +835,12 @@ enum DraftAttachmentStorage {
         }
     }
 
-    /// Delete attachments directory for a draft.
+    /// Delete attachments directory for a draft. A name that escapes the storage
+    /// root is a NO-OP — a recursive `removeItem` on an out-of-root path is the
+    /// most damaging of the three entry points, and there is nothing to reclaim
+    /// there anyway because save refuses to write there.
     static func deleteAttachments(dirName: String, root: URL? = nil) {
-        let dir = dirURL(for: dirName, root: root)
+        guard let dir = containedDirURL(for: dirName, root: root) else { return }
         try? FileManager.default.removeItem(at: dir)
     }
 }
