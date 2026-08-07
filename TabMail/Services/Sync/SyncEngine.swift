@@ -240,6 +240,15 @@ actor SyncEngine {
         if shouldRun() {
             runEvictChatSessions(dbPool: dbPool)
         }
+        if shouldRun() {
+            // R17-3 — reclaim terminally-retired calendar ops. Same reclaim class
+            // as the three steps above: bounded, chunked, dropping only rows no
+            // production reader can reach. It rides here rather than in a
+            // migration because the table it bounds is what `drainCalendarQueue`
+            // full-scans, and the owner's directive keeps non-blocking work off
+            // the launch chain. See `runReclaimRetiredCalendarOps`.
+            runReclaimRetiredCalendarOps(dbPool: dbPool)
+        }
         let t4 = CFAbsoluteTimeGetCurrent()
         // 🚨 BEFORE THE `ANALYZE`, NOT AFTER — the order is the convergence argument.
         // `CREATE INDEX` is DDL and bumps SQLite's `schema_version`, which is the very

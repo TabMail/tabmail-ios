@@ -341,6 +341,20 @@ enum SyncConfig {
     /// AI cache TTL — MessageAICache entries not refreshed within this period are purged.
     /// Entries are touched during inbox sync; entries for messages that leave inbox expire.
     static let aiCacheTTLDays = 7
+    /// Age after which a TERMINALLY-RETIRED calendar operation
+    /// (`PendingStatus.failed`) is reclaimed by
+    /// `SyncEngine.runReclaimRetiredCalendarOps`.
+    ///
+    /// R16-1 changed the six terminal arms from deleting the row to retaining it
+    /// as `failed`, and NOTHING swept it — so `pendingCalendarOperation` grew
+    /// monotonically and `drainCalendarQueue`'s
+    /// `filter(status == queued).order(createdAt)` full-scan-plus-temp-sort (the
+    /// table has no index on `status`) got slower forever. The window is a
+    /// retention period for a diagnostic record, not a correctness bound: a
+    /// `failed` row is invisible to the drain, to reconciliation and to every
+    /// production reader, so reclaiming it can neither drop nor revive an
+    /// intention.
+    static let retiredCalendarOpRetentionDays = 30
     /// Max message-detail chat sessions to keep (non-inbox messages only; inbox exempt).
     static let maxMessageChatSessions = 10
     /// Max compose drafts to keep (drafts for inbox reply/forward exempt).

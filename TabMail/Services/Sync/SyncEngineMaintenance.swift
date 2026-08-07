@@ -372,6 +372,81 @@ extension SyncEngine {
         }
     }
 
+    // MARK: - Retired calendar operation reclaim
+
+    /// Reclaim TERMINALLY-RETIRED calendar operations once they are older than
+    /// `SyncConfig.retiredCalendarOpRetentionDays`. Nonisolated, chunked at
+    /// `SyncConfig.pruneChunkSize`, runs entirely off the main thread — the same
+    /// shape as `runPurgeExpiredAICache` beside it.
+    ///
+    /// 🚨 **WHY THIS EXISTS (R17-3): R16-1 GAVE THE ROW A TERMINAL STATE AND NO
+    /// EXIT.** The six terminal arms used to `PendingCalendarOperation.deleteOne`;
+    /// they now retain the row as `PendingStatus.failed` with a `failureReason` so
+    /// the outcome outlives the in-memory awaiter. That is right — but nothing
+    /// swept the retained rows, so `pendingCalendarOperation` became
+    /// monotonically growing, and `drainCalendarQueue` reads it with
+    /// `filter(Column("status") == queued).order(createdAt).fetchAll` against a
+    /// table whose only DDL is `v8`'s create, `v28` and `v84` — **no index on
+    /// `status`**. Every drain therefore pays a full scan plus a temp B-tree sort
+    /// over a table that never shrinks.
+    ///
+    /// 🚨 **NOT AN INDEX AND NOT A MIGRATION, DELIBERATELY.** The owner's standing
+    /// directive is that startup migrations carry only what is blocking and
+    /// everything else belongs in the heal/sync/background queues. Bounding the
+    /// table's CARDINALITY here fixes the scan at its cause; an index would make
+    /// the scan cheaper while the table still grew forever, at the price of a
+    /// migration on the launch-blocking chain.
+    ///
+    /// **Aged by `createdAt`, which is the only timestamp the row has** — there is
+    /// no `failedAt` and adding one would be the migration this deliberately
+    /// avoids. `createdAt <= (the moment it was retired)`, so this reclaims no
+    /// LATER than a true failure-age window would, never earlier than the op
+    /// existed. That asymmetry is acceptable precisely because a `failed` row is
+    /// inert: it is outside `drainCalendarQueue`'s `status == queued` filter and
+    /// outside `reconcileCalendarQueue`'s `inFlight` reset, so it can never be
+    /// re-executed and can never starve a later op. Reclaiming one drops a
+    /// diagnostic record, never a user intention.
+    nonisolated static func runReclaimRetiredCalendarOps(dbPool: PrioritizedDatabase) {
+        let cutoff = Calendar.current.date(
+            byAdding: .day, value: -SyncConfig.retiredCalendarOpRetentionDays, to: Date()
+        ) ?? Date.distantPast
+        let chunkSize = SyncConfig.pruneChunkSize
+        let terminal = PendingStatus.failed.rawValue
+
+        var reclaimed = 0
+        while true {
+            do {
+                let batch = try dbPool.write { db -> Int in
+                    let ids = try String.fetchAll(
+                        db,
+                        sql: """
+                            SELECT id FROM pendingCalendarOperation
+                            WHERE status = ? AND createdAt < ?
+                            LIMIT ?
+                            """,
+                        arguments: [terminal, cutoff, chunkSize])
+                    guard !ids.isEmpty else { return 0 }
+                    // Each batch deletes exactly the rows it just selected, so the
+                    // loop is monotone and needs no offset cursor — unlike the AI
+                    // cache purge, which RESCUES some rows and must skip past them.
+                    let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+                    try db.execute(
+                        sql: "DELETE FROM pendingCalendarOperation WHERE id IN (\(placeholders))",
+                        arguments: StatementArguments(ids))
+                    return ids.count
+                }
+                if batch == 0 { break }
+                reclaimed += batch
+            } catch {
+                print("[CalendarQueue] Retired-op reclaim failed: \(error)")
+                break
+            }
+        }
+        if reclaimed > 0 {
+            print("[CalendarQueue] Reclaimed \(reclaimed) retired calendar ops older than \(SyncConfig.retiredCalendarOpRetentionDays)d")
+        }
+    }
+
     // MARK: - Stale Action Tag Sweep
 
     /// Clear local `actionTag` on non-inbox messages. Action tags are
