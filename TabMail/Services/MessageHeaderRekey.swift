@@ -148,9 +148,19 @@ enum MessageHeaderRekey {
     ///    only surviving statements are two DELETEs — `SettingsView`'s reset
     ///    list and `AccountManagerUidValidityReset`'s step (iv). It has no rows
     ///    to orphan and no headerId-prefix sweep of its own, so naming it here
-    ///    described a hazard that does not exist. (The empty table is left in
-    ///    place because a registered migration is immutable; do not "clean it
-    ///    up" with a DROP.)
+    ///    described a hazard that does not exist. ⚠ The retention REASON given
+    ///    here was wrong and is corrected: *"a registered migration is
+    ///    immutable"* freezes `v32`'s NAME and BODY (Data Integrity rule 5), and
+    ///    says nothing about whether a NEW `v84` may `DROP TABLE pendingRender`
+    ///    — it may. The actual reason is the launch path: a drop can only be
+    ///    reached through a registered migration, the blocking chain was just
+    ///    cut 27,601 ms → ~3,241 ms by moving work OFF it, and dropping a table
+    ///    that is provably empty in every database reclaims nothing. The two
+    ///    surviving DELETEs are kept for a second, independent reason — both
+    ///    are members of safety ENUMERATIONS, so removing them is fail-dangerous
+    ///    if body staging is ever revived. Adjudicated in `KNOWN_ISSUES.md`
+    ///    `IOS-MIGRATION-005`; the conclusion (do not "clean it up" with a DROP)
+    ///    is unchanged.
     ///  - **`chatIdMapping`** is the one the original sentence still fits:
     ///    swept by `ChatIdTranslator.purgeMappingsForFolder`, which matches
     ///    `realId` with `MessageIdentity.headerIdBelongsToFolder`. Pre-existing
