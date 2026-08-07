@@ -1162,6 +1162,27 @@ actor ExchangeProvider: EmailProvider {
         return built
     }
 
+    /// ⚑ THE `default` ARM TRAPS; IT MUST NEVER DOWNGRADE TO `GET`. Until R15-FIX-3
+    /// it was `return try await authedHTTP.get(url)`, which is silent and
+    /// fail-DANGEROUS: an unhandled verb returns a SUCCESSFUL `GET`, so the caller
+    /// records success for a mutation that never reached the server. That exact
+    /// absence has already produced a real incident in this repo — a `PUT` silently
+    /// became a `GET` and Gmail draft updates "succeeded" in the logs for multiple
+    /// sessions (memory `feedback_authedhttp_method_switch`).
+    ///
+    /// The sibling already carries this guard, byte-for-byte in shape:
+    /// `GmailProvider.request` and `GmailProvider.requestPreservingBadRequestBody`
+    /// both trap on their `default`. This is the same guard, not a new policy.
+    ///
+    /// ⚠ NEGATIVE CASE, because `fatalError` is an absolute and an unqualified one
+    /// would be `MIS-019`: `fatalError` is correct HERE because the condition is a
+    /// PROGRAMMER error unreachable by construction — every call site in this file
+    /// passes a string literal (`"POST"`, `"PATCH"`, and the `"GET"` default), there
+    /// is no computed verb, and `deleteDraft`'s `DELETE` bypasses this switch
+    /// entirely via `performHTTPRequest` with an absolute `url:`. It must NOT be
+    /// widened into a runtime trap for conditions that are genuinely reachable —
+    /// server-, network- or user-driven — and it must not be copied into any other
+    /// switch on that reasoning alone.
     private func request(path: String, method: String = "GET", body: Data? = nil) async throws -> Data {
         let url = baseURL + path
         do {
@@ -1170,7 +1191,7 @@ actor ExchangeProvider: EmailProvider {
             case "POST": return try await authedHTTP.post(url, body: body ?? Data())
             case "PATCH": return try await authedHTTP.patch(url, body: body ?? Data())
             case "DELETE": return try await authedHTTP.delete(url)
-            default: return try await authedHTTP.get(url)
+            default: fatalError("ExchangeProvider.request: unsupported HTTP method \(method)")
             }
         } catch let e as HTTPError {
             throw ProviderError.networkError(underlying: e)
