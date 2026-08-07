@@ -71,6 +71,48 @@ private actor GatedCalendarProvider: CalendarProvider {
     }
 }
 
+/// A gate for the `resolveBackends` seam, plus the one production behaviour that
+/// makes a cancelled calendar-picker load *user-visible* rather than merely slow.
+///
+/// `CalendarProviderDispatch.resolveAll()` resolves each account with
+/// `try? await dbReader.read { … }`. GRDB's async read runs
+/// `try Task.checkCancellation()` before the block (`SerializedDatabase.execute`,
+/// GRDB 7.10.0), so on a cancelled task **every** read throws `CancellationError`,
+/// the `try?` drops that account, and `resolveAll()` answers `[]` — the sentence
+/// *"there are no calendar accounts"* — rather than *"I could not tell"*.
+/// `loadData()` then latches that into `accounts = []` / `loaded = true`, which is
+/// the "Add Calendar" empty state on a device with five connected accounts.
+///
+/// The stub below reproduces exactly that: block, then answer `[]` if the calling
+/// task was cancelled while it waited. `openedWhileCancelled` is the non-vacuity
+/// instrument — it is positive proof the resolve actually observed a cancelled
+/// task, so a green result cannot come from the cancellation simply never landing.
+private actor BackendResolutionGate {
+    private var gate: CheckedContinuation<Void, Never>?
+    private var opened = false
+    private(set) var observedCancellation = false
+
+    func open() {
+        guard !opened else { return }
+        opened = true
+        gate?.resume()
+        gate = nil
+    }
+
+    /// Called from inside the `resolveBackends` closure, i.e. on the task whose
+    /// cancellation is under test.
+    func waitThenReportCancellation() async -> Bool {
+        if !opened {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                gate = continuation
+            }
+        }
+        let cancelled = Task.isCancelled
+        if cancelled { observedCancellation = true }
+        return cancelled
+    }
+}
+
 // MARK: - Suite
 
 /// Invariants of `CalendarPickerModel.loadData()`, the calendar picker's load.
@@ -355,7 +397,85 @@ struct CalendarPickerModelTests {
         #expect(model.loaded == true)
     }
 
-    // MARK: - 7. The guard itself
+    // MARK: - 7. The appearance task's cancellation must not empty the picker
+
+    /// **THE INVARIANT: the picker publishes the calendar accounts that exist,
+    /// even when the task that started the load is cancelled underneath it.**
+    ///
+    /// Not "`startLoad` uses an unstructured `Task`" — that is the mechanism, and
+    /// a test pinning it would stay green on a screen that is still blank. What
+    /// is asserted is the end state the user sees: one row per connected calendar
+    /// account, never the latched `accounts == [] && loaded == true` empty state.
+    ///
+    /// Why the cancellation is not hypothetical: `CalendarPickerView` is a
+    /// content-column page of a collapsed `NavigationSplitView`
+    /// (`SettingsContentColumn`, `case .calendar`), and that transition fires ONE
+    /// spurious `onDisappear` on a freshly-appeared page — view still visible,
+    /// **no re-appear** — which cancels a structured `.task` mid-load exactly
+    /// once. Root-caused on device 2026-07-08 on `AccountDashboardView`; see the
+    /// stuck-`isLoading` memory topic. The user-visible result was that the
+    /// calendar list was empty on first entry and only appeared after pushing to
+    /// `CalendarSetupView` and popping back, which fires `.task` again.
+    ///
+    /// Red proof: replace `startLoad()`'s `Task { … }` with a bare
+    /// `await loadData()` (the pre-fix view code) and this test fails on the
+    /// `accounts` assertion with `[]`.
+    @Test("A cancelled appearance task must not latch an empty account list")
+    func loadSurvivesAppearanceTaskCancellation() async {
+        let (defaults, suiteName) = Self.makeDefaults(storedAccountId: "", storedCalendarId: "")
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let gate = BackendResolutionGate()
+        let provider = MockCalendarProvider()
+        await provider.setListCalendarsResult([Self.makeCal("cal-1", primary: true)])
+        let backends: [(provider: any CalendarProvider, account: Account)] = [
+            (provider: provider, account: Self.makeAccount(id: "acct-1", email: "one@example.com"))
+        ]
+
+        let model = CalendarPickerModel(defaults: defaults, resolveBackends: {
+            // Stands in for `CalendarProviderDispatch.resolveAll()`: blocks on a
+            // database read, and answers "no accounts" if that read was
+            // cancelled — see `BackendResolutionGate`'s comment for why that is
+            // what the real one does.
+            if await gate.waitThenReportCancellation() { return [] }
+            return backends
+        })
+
+        // The view's `.task`. Cancelling it is what the ONE spurious
+        // `onDisappear` does; the `sleep` keeps the task alive so the cancel
+        // lands on a task that is still running, as it does in the app.
+        let appearance = Task { @MainActor in
+            await model.startLoad()
+            try? await Task.sleep(for: .seconds(30))
+        }
+        defer { appearance.cancel() }
+
+        // The load has begun and cannot have finished: the gate is still shut.
+        #expect(await Self.waitUntil { model.loadInFlight })
+
+        appearance.cancel()
+        // Non-vacuity: the cancellation provably landed BEFORE the resolve was
+        // allowed to answer. Without this the test could pass simply because the
+        // cancel arrived too late to matter.
+        #expect(appearance.isCancelled)
+        await gate.open()
+
+        #expect(await Self.waitUntil { model.loaded && !model.loadInFlight })
+
+        // THE ASSERTION. `[]` here is the reported bug: `loaded == true` with no
+        // rows renders the "Add Calendar" empty state on a device that has a
+        // connected calendar account.
+        #expect(model.accounts.map(\.id) == ["acct-1"])
+        #expect(self.entry(model, "acct-1")?.calendars.map(\.id) == ["cal-1"])
+
+        // Direction check (what breaks if it goes the other way): the resolve
+        // must NOT have seen a cancelled task. If it does, the picker is once
+        // again reading "I could not tell" as "there are no calendar accounts".
+        let sawCancellation = await gate.observedCancellation
+        #expect(sawCancellation == false)
+    }
+
+    // MARK: - 8. The guard itself
 
     @Test("resolveSelection refuses to touch the preference while any entry is loading")
     func resolveSelectionRefusesPartialSet() {

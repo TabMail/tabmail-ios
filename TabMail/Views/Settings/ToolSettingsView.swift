@@ -165,6 +165,10 @@ final class CalendarPickerModel {
     /// `accounts.allSatisfy { !$0.isLoading }`.
     var loaded = false
 
+    /// Dedup guard for `startLoad()`. Lives on the model (not the view) so the
+    /// invariant it protects is observable from a test.
+    private(set) var loadInFlight = false
+
     private let defaults: UserDefaults
     private let resolveBackends: @Sendable () async -> [(provider: any CalendarProvider, account: Account)]
 
@@ -185,6 +189,50 @@ final class CalendarPickerModel {
     }
 
     // MARK: - Loading
+
+    /// Kick the initial load off the view's `.task`. **This, not `loadData()`,
+    /// is what a view appearance must call.**
+    ///
+    /// 🚨 The load runs on an UNSTRUCTURED `Task`, deliberately detached from the
+    /// caller's cancellation. The collapsed-`NavigationSplitView` transition
+    /// fires ONE spurious `onDisappear` on a freshly-appeared content-column page
+    /// (view still visible, **no re-appear** to restart anything) — root-caused
+    /// on device 2026-07-08 on `AccountDashboardView`, whose fix is this same
+    /// pattern; see the stuck-`isLoading` memory topic. `CalendarPickerView` is
+    /// such a page (`SettingsContentColumn`, `case .calendar`), and a structured
+    /// `.task { await loadData() }` there is cancelled mid-load by that one
+    /// disappear.
+    ///
+    /// What made it user-visible rather than merely slow: the very first `await`
+    /// in `loadData()` is `resolveBackends()` → `CalendarProviderDispatch
+    /// .resolveAll()`, which resolves each account with
+    /// `try? await dbReader.read { … }`. GRDB's async read runs
+    /// `try Task.checkCancellation()` before the block
+    /// (`SerializedDatabase.execute`), so on a cancelled task every read throws
+    /// `CancellationError` and the `try?` drops that account. `resolveAll()`
+    /// answers `[]` — *"there are no calendar accounts"* — and `loadData()`
+    /// latches that into `accounts = []` / `loaded = true`, which renders the
+    /// "Add Calendar" empty state on a device with five connected accounts. Only
+    /// a genuine disappear+re-appear (push to `CalendarSetupView` and pop) fired
+    /// `.task` again and revealed the list.
+    ///
+    /// `loadInFlight` dedups genuine re-appears, and is strictly *fewer*
+    /// concurrent `loadData()` runs than an un-guarded restart — so it cannot
+    /// introduce a partial-set re-resolve of the create-target preference.
+    /// `async` so the view reads `.task { await model.startLoad() }` — and so the
+    /// red proof for `loadSurvivesAppearanceTaskCancellation` is the exact
+    /// pre-fix code: replace the `Task { … }` below with a bare
+    /// `await loadData()` and the load inherits the appearance task's
+    /// cancellation again. Nothing here suspends, so `.task`'s cancellation
+    /// cannot interrupt it.
+    func startLoad() async {
+        guard !loadInFlight else { return }
+        loadInFlight = true
+        Task { @MainActor in
+            defer { loadInFlight = false }
+            await loadData()
+        }
+    }
 
     /// Publish one row per account immediately, then fill each row in place as
     /// its provider answers.
@@ -213,9 +261,17 @@ final class CalendarPickerModel {
                 }
             }
             for await (accountId, outcome) in group {
-                // A cancelled run must not write into `accounts`: a restarted
-                // `.task` may already have replaced it with a fresh, still-
-                // loading set, and clearing those rows' spinners would be a lie.
+                // A cancelled run must not write into `accounts`: a concurrent
+                // run may already have replaced it with a fresh, still-loading
+                // set, and clearing those rows' spinners would be a lie.
+                //
+                // The view-appearance path can no longer reach this — it goes
+                // through `startLoad()`, whose unstructured `Task` is not
+                // cancelled by the view lifecycle and whose `loadInFlight` guard
+                // is what now prevents a second run from overlapping the first.
+                // This stays for the direct callers of `loadData()`
+                // (`grantCalendarAccess`), which run on their own cancellable
+                // tasks.
                 if Task.isCancelled { continue }
                 guard let idx = accounts.firstIndex(where: { $0.id == accountId }) else { continue }
                 accounts[idx].calendars = outcome.calendars
@@ -627,7 +683,11 @@ struct CalendarPickerView: View {
             }
         }
         .task {
-            await model.loadData()
+            // NOT `await model.loadData()`. See `startLoad()`: one spurious
+            // disappear from the collapsed-split-view transition cancels a
+            // structured load here, and a cancelled `resolveAll()` answers
+            // "no calendar accounts" — which this screen then latches.
+            await model.startLoad()
         }
     }
 
