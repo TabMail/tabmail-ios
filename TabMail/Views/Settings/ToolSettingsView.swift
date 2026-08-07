@@ -511,20 +511,45 @@ struct CalendarPickerView: View {
                             VStack(alignment: .leading, spacing: 8) {
                                 Label("Calendar Access Required", systemImage: "exclamationmark.triangle.fill")
                                     .foregroundStyle(Palette.archive)
-                                Text("Re-sign in to grant calendar access.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Button {
-                                    Task { await grantCalendarAccess(account: entry.account) }
-                                } label: {
-                                    if reauthingAccountId == entry.account.id {
-                                        ProgressView()
-                                            .controlSize(.small)
-                                    } else {
-                                        Text("Grant Access")
+                                // 🚨 THE CONTROL MUST MATCH WHAT THE APP CAN ACTUALLY DO.
+                                // This section used to render "Grant Access" for EVERY
+                                // provider, but `grantCalendarAccess` only drives an OAuth
+                                // refresh — its `.imap / .icloud / .caldav` arm is a bare
+                                // `break`. For those accounts the button reloaded the same
+                                // failing state and returned, so the user was told what was
+                                // wrong, handed a control, and got nothing: a UI that lies
+                                // about its own capability. Registered as `IOS-CAL-007`.
+                                //
+                                // These credentials are app-specific passwords the user holds;
+                                // there is no token this app can refresh on their behalf. The
+                                // honest surface is the setup flow that already accepts a new
+                                // one — the same `CalendarSetupView` this screen links to from
+                                // its toolbar and its empty state. Building a bespoke
+                                // credential re-entry sheet here is product work and is
+                                // deliberately NOT done.
+                                if Self.canReauthInPlace(entry.account.provider) {
+                                    Text("Re-sign in to grant calendar access.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Button {
+                                        Task { await grantCalendarAccess(account: entry.account) }
+                                    } label: {
+                                        if reauthingAccountId == entry.account.id {
+                                            ProgressView()
+                                                .controlSize(.small)
+                                        } else {
+                                            Text("Grant Access")
+                                        }
+                                    }
+                                    .disabled(reauthingAccountId != nil)
+                                } else {
+                                    Text("This account signs in with an app-specific password, which TabMail can't renew for you. Add the calendar account again with a new password to restore access.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    NavigationLink("Update Calendar Account") {
+                                        CalendarSetupView()
                                     }
                                 }
-                                .disabled(reauthingAccountId != nil)
                             }
                         } header: {
                             Text(entry.account.emailAddress)
@@ -614,6 +639,25 @@ struct CalendarPickerView: View {
         return "\(hours)h \(rem)m"
     }
 
+    /// Whether TabMail can itself re-grant calendar access for this provider.
+    ///
+    /// True only for the OAuth providers, where `grantCalendarAccess` drives a
+    /// real token refresh. The password-based providers authenticate with an
+    /// app-specific password the user holds — there is nothing this app can
+    /// refresh on their behalf, so the "Grant Access" affordance MUST NOT be
+    /// offered for them (`IOS-CAL-007`); the caller renders the setup-flow link
+    /// instead. Keep this predicate and `grantCalendarAccess`'s switch in step:
+    /// a provider that returns true here and hits the no-op arm there is exactly
+    /// the inert button this exists to prevent.
+    static func canReauthInPlace(_ provider: AccountProvider) -> Bool {
+        switch provider {
+        case .gmail, .outlook:
+            return true
+        case .imap, .icloud, .caldav:
+            return false
+        }
+    }
+
     private func grantCalendarAccess(account: Account) async {
         reauthingAccountId = account.id
         defer { reauthingAccountId = nil }
@@ -625,8 +669,11 @@ struct CalendarPickerView: View {
             case .outlook:
                 try await manager.reauthenticateMicrosoft(for: account)
             case .imap, .icloud, .caldav:
-                // CalDAV re-auth requires user to enter a new app-specific password
-                // This is handled by CalendarSetupView / iCloud setup flow
+                // Unreachable from the calendar section: `canReauthInPlace`
+                // returns false for these, so the view renders the
+                // `CalendarSetupView` link instead of a button that calls this.
+                // Kept for switch exhaustiveness, and deliberately NOT a silent
+                // success — see the comment at the call site.
                 break
             }
             await model.loadData()
