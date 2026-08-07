@@ -480,10 +480,19 @@ actor CalDAVProvider: CalendarProvider {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
         // The new series' DTSTART, by contrast, is a WALL CLOCK the successor
-        // resource carries in the master's frame — `buildNewSeriesInput` parses
-        // it in the master's zone, so it must be handed a master-frame value.
-        // Capping in one frame while starting the successor in another is how a
-        // split duplicates or drops the boundary occurrence.
+        // resource carries in the master's frame, so it must be handed a
+        // master-frame value AND the frame that value is now in. Capping in one
+        // frame while starting the successor in another is how a split
+        // duplicates or drops the boundary occurrence.
+        //
+        // ⚠️ THIS COMMENT SAID "`buildNewSeriesInput` parses it in the master's
+        // zone" UNTIL ROUND 18d, AND THAT WAS ONLY TRUE OF A `.zoned` MASTER.
+        // For a `.utc` master the function read the value in `.current`, so the
+        // conversion two lines below rendered into UTC and the reader parsed it
+        // back in the device zone — the successor's start ended up off by the
+        // device's UTC offset while `untilValue` above stayed on the correct
+        // absolute instant. `newStartZone:` is what closes that; see
+        // `masterFrameZone`.
         let masterKindForSplit = Self.masterDTStartKind(from: masterICS)
         guard let masterFrameRecurrenceId = Self.recurrenceIdInMasterFrame(
             recurrenceId, declaredZone: recurrenceIdZone, kind: masterKindForSplit
@@ -542,6 +551,7 @@ actor CalDAVProvider: CalendarProvider {
             newSeriesInput = try Self.buildNewSeriesInput(
                 masterICS: masterICS, patch: patch,
                 newStartNaiveISO: masterFrameRecurrenceId,
+                newStartZone: recurrenceIdZone,
                 newRRule: rruleWithoutCap
             )
         } catch {
@@ -572,7 +582,7 @@ actor CalDAVProvider: CalendarProvider {
             //    is duplicated on the user's calendar;
             //  - rethrowing wedges the account. `preconditionFailed` is a
             //    dedicated `CalDAVError` case that
-            //    `AccountManagerCalendarQueue.isCalendarBadRequestError` (which
+            //    `AccountManager.isCalendarBadRequestError` (which
             //    only matches `.httpError`) does not classify, so the op lands
             //    on the "transient — always retry" arm and its account goes into
             //    `failedAccounts`, skipping every later calendar op on that
@@ -1181,7 +1191,7 @@ actor CalDAVProvider: CalendarProvider {
     }
 
     /// RFC 5545 §3.3.11 text-value escape (`\` `;` `,` `\n`). Matches the impl
-    /// in `GCalEventInputICS.toICS` — duplicated here because that file's
+    /// in `GCalEventInput.toICS` — duplicated here because that file's
     /// version is private; calling sites are local so the duplication is
     /// cheap and prevents the `GCalEventInput` extension from leaking helpers.
     private static func escapeICSText(_ text: String) -> String {
@@ -1241,6 +1251,64 @@ actor CalDAVProvider: CalendarProvider {
         case .zoned(let tzid):
             guard let masterZone = TimeZone(identifier: tzid) else { return nil }
             return RecurrenceOccurrenceResolver.renderNaive(recurrenceId, from: declaredZone, to: masterZone)
+        }
+    }
+
+    /// The frame `recurrenceIdInMasterFrame` renders a value **into**, for a
+    /// given master `DTSTART` kind. It is the exact inverse of that function and
+    /// exists so the two cannot drift: whoever READS a master-frame naive value
+    /// must read it in the frame that produced it.
+    ///
+    /// 🚨 **THIS PAIRING IS THE WHOLE OF R18d-G2, and its absence was live.**
+    /// `splitSeries` computes two things from one `recurrence_id`:
+    ///
+    ///  * the RRULE cap, via `GoogleCalendarProvider.googleUntilString(…, zone:
+    ///    recurrenceIdZone)` — parsed in the DECLARED zone and emitted as an
+    ///    absolute UTC instant, which is frame-free and always correct; and
+    ///  * the successor series' `DTSTART`, via `buildNewSeriesInput`, which is
+    ///    handed `recurrenceIdInMasterFrame`'s output.
+    ///
+    /// Until round 18d `buildNewSeriesInput` derived its read frame as *"the
+    /// master's TZID if there is one, else `.current`"*. For a **`.utc`** master
+    /// (`DTSTART:20260521T000000Z`) that means the value was rendered into UTC
+    /// and then read back in the DEVICE zone, so the successor's start instant
+    /// was off by the device's UTC offset — seven hours on a Vancouver device.
+    /// The cap therefore excluded the boundary occurrence and the successor
+    /// began somewhere else entirely, which on a `this_and_following` edit
+    /// **drops that occurrence outright**. Round 18c introduced the exposure
+    /// when it changed the argument from the raw `recurrenceId` to the
+    /// master-frame value without changing the reader; before that the two
+    /// happened to agree whenever the declared zone was the device zone.
+    ///
+    /// The `.floating` arm is the same class one step quieter: the value is
+    /// passed through in the DECLARED frame, so reading it in `.current` is
+    /// correct only while the caller supplied no `timezone` argument.
+    ///
+    /// ⚠️ **WHAT BREAKS THE OTHER WAY (`MIS-026`).** The alternative was to keep
+    /// `buildNewSeriesInput` reading in `.current` and instead stop converting
+    /// for `.utc` masters. That re-opens the defect 18c closed — `RECURRENCE-ID`
+    /// and the successor `DTSTART` would name a wall clock no occurrence has —
+    /// and it puts the two writers back into different frames, which is the
+    /// mirror image rather than the fix (`MIS-005`). Converting once and reading
+    /// in the frame you converted into is the only arrangement where the cap and
+    /// the successor agree on the boundary instant.
+    static func masterFrameZone(_ kind: MasterDTStartKind, declaredZone: TimeZone) -> TimeZone {
+        switch kind {
+        case .zoned(let tzid):
+            // Unreachable from `splitSeries` — `recurrenceIdInMasterFrame`
+            // already returned nil and the split failed closed. The fallback
+            // exists for direct callers, and it is the declared zone rather than
+            // `.current` so no arm of this switch can silently reintroduce a
+            // third frame.
+            return TimeZone(identifier: tzid) ?? declaredZone
+        case .utc:
+            return TimeZone(identifier: "UTC") ?? declaredZone
+        case .floating, .allDay:
+            // Both are pass-throughs in `recurrenceIdInMasterFrame`, so the
+            // value is still in the frame the caller declared. (`.allDay` values
+            // are read by the date-only branch, which is zone-neutral; it is
+            // listed here so the switch stays exhaustive by construction.)
+            return declaredZone
         }
     }
 
@@ -1473,10 +1541,20 @@ actor CalDAVProvider: CalendarProvider {
     /// truncated response body — genuinely indeterminate, "we could not
     /// determine the answer" — and retiring those would drop a user intention,
     /// which is the defect this fix exists to avoid, pointed the other way.
+    ///
+    /// `newStartNaiveISO` is a naive wall clock **already expressed in the
+    /// master's frame** (`recurrenceIdInMasterFrame`), and `newStartZone` is the
+    /// zone the caller declared for the original `recurrence_id`. The pair is
+    /// what lets this function read the value back in the frame it was written
+    /// in — see `masterFrameZone`, which is the inverse of the conversion and
+    /// carries the full rationale. There is deliberately **no default** on
+    /// `newStartZone`: a dropped frame is silent, and the whole class of defect
+    /// this parameter closes is "the value was read in a frame nobody chose".
     static func buildNewSeriesInput(
         masterICS: String,
         patch: GCalEventInput,
         newStartNaiveISO: String,
+        newStartZone: TimeZone,
         newRRule: String
     ) throws -> GCalEventInput {
         var out = GCalEventInput()
@@ -1529,19 +1607,21 @@ actor CalDAVProvider: CalendarProvider {
                 }
             }
         } else {
-            // The naive recurrence_id is the occurrence's wall-clock time IN
-            // THE MASTER'S ZONE — parse it there, not in the device zone, so
-            // the absolute instant is correct even when they differ. The new
-            // series then inherits the master's zone (via startTimeZone), so
-            // `toICS` emits `DTSTART;TZID=…` + a matching VTIMEZONE instead of
-            // a UTC time that would drift across DST.
+            // `newStartNaiveISO` arrives in the MASTER'S frame, so read it in
+            // that frame — `masterFrameZone` is the exact inverse of
+            // `recurrenceIdInMasterFrame`, and reading in any other zone is the
+            // two-framed split that drops the boundary occurrence. The new
+            // series then inherits the master's zone (via startTimeZone) when
+            // there is one, so `toICS` emits `DTSTART;TZID=…` + a matching
+            // VTIMEZONE instead of a UTC time that would drift across DST.
+            //
+            // ⚠️ THIS READ `zone = .current` FOR EVERY NON-`.zoned` MASTER UNTIL
+            // ROUND 18d. For a `.utc` master the caller hands in a UTC wall
+            // clock, so parsing it in the device zone moved the successor's
+            // start by the device's UTC offset while the RRULE cap stayed on the
+            // correct absolute instant.
             let masterKind = Self.masterDTStartKind(from: masterICS)
-            let zone: TimeZone
-            if case .zoned(let tzid) = masterKind, let tz = TimeZone(identifier: tzid) {
-                zone = tz
-            } else {
-                zone = .current
-            }
+            let zone = Self.masterFrameZone(masterKind, declaredZone: newStartZone)
             let fmt = DateFormatter()
             fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
             fmt.timeZone = zone

@@ -231,6 +231,7 @@ struct CalendarBadRequestClassificationTests {
                 masterICS: masterWithNoRecoverableDuration(),
                 patch: GCalEventInput(),
                 newStartNaiveISO: "2026-05-20T17:00:00",
+                newStartZone: TimeZone(identifier: "UTC")!,
                 newRRule: "RRULE:FREQ=WEEKLY"
             )
         } catch {
@@ -563,7 +564,7 @@ struct CalendarBadRequestClassificationTests {
         // ⚠️ This comment continued *"— only CalDAV accounts did, via
         // `caldavConfig.needsReauth`"* until round 18, which established that CalDAV
         // had no working signal either: nothing ever cleared that column, no UI read
-        // it (`ToolSettingsView`'s `needsReauth` is a different, in-memory symbol),
+        // it (`CalendarPickerModel`'s `needsReauth` is a different, in-memory symbol),
         // and its only reader made `AccountManager.createCalDAVProvider` return nil
         // forever — starving the account's calendar lane and removing it from the
         // picker where the one live re-auth prompt lives. The write is gone; the

@@ -349,9 +349,12 @@ struct CalDAVRecurringHelpersTests {
     func buildNewSeriesInput() throws {
         var patch = GCalEventInput()
         patch.attendees = [(email: "alice@example.com", name: "Alice"), (email: "carol@example.com", name: "Carol")]
+        // `masterICS` above is `DTSTART:20260513T170000Z` — a `.utc` master — so
+        // the master-frame wall clock handed in here is a UTC one.
         let out = try CalDAVProvider.buildNewSeriesInput(
             masterICS: masterICS, patch: patch,
             newStartNaiveISO: "2026-05-20T17:00:00",
+            newStartZone: TimeZone(identifier: "UTC")!,
             newRRule: "RRULE:FREQ=WEEKLY;BYDAY=WE"
         )
         // Inherited from master:
@@ -536,12 +539,15 @@ struct CalDAVRecurringHelpersTests {
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        fmt.timeZone = .current
+        // `durationOnlyMaster` writes `icsZulu`, i.e. a `.utc` master, so the
+        // master-frame wall clock is rendered in UTC too.
+        fmt.timeZone = TimeZone(identifier: "UTC")!
         let newStart = fmt.string(from: start.addingTimeInterval(7 * 86400))
 
         let out = try CalDAVProvider.buildNewSeriesInput(
             masterICS: ics, patch: GCalEventInput(),
             newStartNaiveISO: newStart,
+            newStartZone: TimeZone(identifier: "UTC")!,
             newRRule: "RRULE:FREQ=WEEKLY"
         )
         #expect(out.summary == "Standup")
@@ -732,6 +738,7 @@ struct CalDAVRecurringHelpersTests {
         let out = try CalDAVProvider.buildNewSeriesInput(
             masterICS: ics, patch: GCalEventInput(),
             newStartNaiveISO: "2026-05-27T17:00:00",
+            newStartZone: TimeZone(identifier: "UTC")!,
             newRRule: "RRULE:FREQ=WEEKLY"
         )
         #expect(out.description == longDesc, "description was truncated by folding: got '\(out.description ?? "nil")'")
@@ -752,6 +759,7 @@ struct CalDAVRecurringHelpersTests {
             _ = try CalDAVProvider.buildNewSeriesInput(
                 masterICS: brokenICS, patch: patch,
                 newStartNaiveISO: "2026-05-20T17:00:00",
+                newStartZone: TimeZone(identifier: "UTC")!,
                 newRRule: "RRULE:FREQ=WEEKLY"
             )
         } catch {
@@ -1228,7 +1236,7 @@ struct CalDAVSplitRollbackTests {
         // THE INVARIANT, three ways — the split is COMPLETE and stays complete.
         // 1. The call returns, so the queue takes its success exit. Throwing here
         //    throws `CalDAVError.preconditionFailed`, which
-        //    `AccountManagerCalendarQueue.isCalendarBadRequestError` does not
+        //    `AccountManager.isCalendarBadRequestError` does not
         //    classify, so the op requeues forever and its account joins
         //    `failedAccounts` — the wedge, which is a dropped user intention.
         #expect(result.id == successorPath)
@@ -1350,7 +1358,7 @@ struct CalDAVSplitRollbackTests {
 ///
 /// **Why a 412 here is a wedge and not a fail-closed refusal.**
 /// `CalDAVError.preconditionFailed` is a dedicated case, so
-/// `AccountManagerCalendarQueue.isCalendarBadRequestError` — which matches
+/// `AccountManager.isCalendarBadRequestError` — which matches
 /// `CalDAVError.httpError`, and whose own comment says "401/404/412 already map
 /// to dedicated cases" — returns false for it. It is not `notFound`,
 /// `missingScope`, `authFailed`, `unsupported` or `inconsistentState` either.
@@ -1551,6 +1559,172 @@ struct CalDAVUpdatePreconditionTests {
             #expect(puts[0].ifMatch == seedETag,
                     "the update at \(path) must still be conditional on the tag the GET returned")
             #expect(puts[0].ifNoneMatch == nil, "an If-Match update never also asserts absence")
+        }
+    }
+}
+
+// MARK: - R18d-G2 — the split's two writers must agree on the boundary instant
+
+/// `splitSeries` derives TWO values from ONE `recurrence_id`:
+///
+///  * the RRULE cap on the master, via
+///    `GoogleCalendarProvider.googleUntilString(…, zone: recurrenceIdZone)` —
+///    parsed in the DECLARED zone and emitted as an absolute UTC instant; and
+///  * the successor series' `DTSTART`, via `CalDAVProvider.buildNewSeriesInput`,
+///    which is handed `recurrenceIdInMasterFrame`'s output.
+///
+/// The SYSTEM PROPERTY, stated without reference to how either is computed:
+/// **the successor series starts exactly one second after the cap.** The cap is
+/// `boundary − 1s` and the successor starts at `boundary`, so any other gap
+/// means the split dropped the boundary occurrence (successor late) or
+/// duplicated it (successor early). `splitSeries`'s cap `PUT` is an
+/// irreversible replacement-family write with only a compensating rollback, so
+/// a wrong cap destroys the master's post-split occurrences.
+///
+/// This suite deliberately does NOT test `masterFrameZone`. It never names a
+/// frame, an offset, or `.current` — it asserts only that two independently
+/// computed instants meet. A mechanism assertion ("the reader uses the master's
+/// zone") would stay green under the mirror-image arrangement that puts the two
+/// writers back in different frames.
+@Suite("CalDAVProvider splitSeries — cap and successor agree on the boundary instant")
+struct CalDAVSplitBoundaryInstantTests {
+
+    private static let vancouver = TimeZone(identifier: "America/Vancouver")!
+    private static let tokyo = TimeZone(identifier: "Asia/Tokyo")!
+    private static let utcZone = TimeZone(identifier: "UTC")!
+
+    /// A weekly recurring master whose only variable is the DTSTART/DTEND form,
+    /// so `masterDTStartKind` classification is what each test is selecting.
+    private func master(dtstart: String, dtend: String) -> String {
+        [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "BEGIN:VEVENT",
+            "UID:boundary-master",
+            "SUMMARY:Boundary",
+            dtstart,
+            dtend,
+            "RRULE:FREQ=WEEKLY",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ].joined(separator: "\r\n") + "\r\n"
+    }
+
+    /// Parse the absolute UTC `UNTIL` form `googleUntilString` emits for a timed
+    /// series (`yyyyMMdd'T'HHmmss'Z'`).
+    private func capInstant(_ until: String) throws -> Date {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        f.timeZone = Self.utcZone
+        return try #require(f.date(from: until), "unparseable UNTIL '\(until)'")
+    }
+
+    /// Run the exact production pair for one master + declared zone and return
+    /// the two instants a split must reconcile.
+    private func boundary(
+        masterICS: String, recurrenceId: String, declared: TimeZone
+    ) throws -> (cap: Date, successor: Date) {
+        let until = try #require(
+            GoogleCalendarProvider.googleUntilString(
+                beforeNaiveISO: recurrenceId, allDay: false, zone: declared),
+            "the cap must be computable for a timed master"
+        )
+        let kind = CalDAVProvider.masterDTStartKind(from: masterICS)
+        let masterFrameId = try #require(
+            CalDAVProvider.recurrenceIdInMasterFrame(
+                recurrenceId, declaredZone: declared, kind: kind),
+            "the recurrence_id must be expressible in the master's frame"
+        )
+        let out = try CalDAVProvider.buildNewSeriesInput(
+            masterICS: masterICS, patch: GCalEventInput(),
+            newStartNaiveISO: masterFrameId,
+            newStartZone: declared,
+            newRRule: "RRULE:FREQ=WEEKLY"
+        )
+        let successor = try #require(
+            out.startDateTime.flatMap { Date.fromISO8601($0) },
+            "the successor series must carry a parseable start"
+        )
+        return (try capInstant(until), successor)
+    }
+
+    @Test("a UTC-anchored master: the successor starts one second after the cap")
+    func utcMasterBoundaryAgrees() throws {
+        // 09:00 America/Vancouver on 2026-05-20 is 16:00Z (PDT, UTC−7), so this
+        // master really is the series the declared recurrence_id names.
+        //
+        // RED BEFORE THE FIX: `buildNewSeriesInput` read the master-frame value
+        // in the DEVICE zone for every non-`.zoned` master, so on any device not
+        // running UTC the successor landed the device's offset away from the cap
+        // (7h + 1s on a Vancouver simulator) — the boundary occurrence excluded
+        // by the cap and not restored by the successor, i.e. dropped.
+        let ics = master(dtstart: "DTSTART:20260520T160000Z", dtend: "DTEND:20260520T164500Z")
+        let (cap, successor) = try boundary(
+            masterICS: ics, recurrenceId: "2026-05-27T09:00:00", declared: Self.vancouver)
+        #expect(successor.timeIntervalSince(cap) == 1,
+                "a UTC master's split left a \(successor.timeIntervalSince(cap))s gap between the cap and the successor; the boundary occurrence is dropped unless that gap is exactly 1s")
+    }
+
+    @Test("a floating master: the successor starts one second after the cap in EVERY declared zone")
+    func floatingMasterBoundaryAgreesInEveryDeclaredZone() throws {
+        // Two declared zones 16 hours apart. Whatever zone the test device runs
+        // in, it can equal at most ONE of them, so this case is red before the
+        // fix on ANY device — unlike the UTC arm above, whose redness needs a
+        // non-UTC device.
+        let ics = master(dtstart: "DTSTART:20260520T090000", dtend: "DTEND:20260520T094500")
+        for declared in [Self.vancouver, Self.tokyo] {
+            let (cap, successor) = try boundary(
+                masterICS: ics, recurrenceId: "2026-05-27T09:00:00", declared: declared)
+            #expect(successor.timeIntervalSince(cap) == 1,
+                    "a floating master's split left a \(successor.timeIntervalSince(cap))s gap in \(declared.identifier); the cap is computed in the declared zone, so the successor must be read there too")
+        }
+    }
+
+    @Test("a TZID-qualified master still agrees — the arm that was already correct")
+    func zonedMasterBoundaryStillAgrees() throws {
+        // NON-VACUITY / anti-mirror-image control. This arm read the master's
+        // zone before the fix and reads it after, so it must be green on BOTH
+        // sides. If a change makes this red, the fix moved the defect rather
+        // than closing it.
+        let ics = master(
+            dtstart: "DTSTART;TZID=Asia/Tokyo:20260520T090000",
+            dtend: "DTEND;TZID=Asia/Tokyo:20260520T094500")
+        let (cap, successor) = try boundary(
+            masterICS: ics, recurrenceId: "2026-05-26T17:00:00", declared: Self.vancouver)
+        #expect(successor.timeIntervalSince(cap) == 1,
+                "a TZID master's split left a \(successor.timeIntervalSince(cap))s gap; this arm was correct before the fix and must stay correct")
+    }
+
+    @Test("an all-day master: the cap names the day before the boundary and the successor starts on it, in every declared zone")
+    func allDayMasterBoundaryIsFrameFree() throws {
+        // The all-day arm is frame-free by construction (RFC 5545 DATE has no
+        // zone), which is exactly why it must NOT move with the declared zone.
+        // This is the anchor for the frame-free half of the invariant: without
+        // it, a "fix" that ran all-day values through a zone conversion could
+        // pass every timed assertion above.
+        let ics = master(
+            dtstart: "DTSTART;VALUE=DATE:20260520",
+            dtend: "DTEND;VALUE=DATE:20260521")
+        for declared in [Self.vancouver, Self.tokyo, Self.utcZone] {
+            let until = try #require(
+                GoogleCalendarProvider.googleUntilString(
+                    beforeNaiveISO: "2026-05-27T00:00:00", allDay: true, zone: declared))
+            #expect(until == "20260526",
+                    "an all-day cap moved with the declared zone \(declared.identifier): got '\(until)'")
+            let masterFrameId = try #require(
+                CalDAVProvider.recurrenceIdInMasterFrame(
+                    "2026-05-27T00:00:00", declaredZone: declared, kind: .allDay))
+            let out = try CalDAVProvider.buildNewSeriesInput(
+                masterICS: ics, patch: GCalEventInput(),
+                newStartNaiveISO: masterFrameId,
+                newStartZone: declared,
+                newRRule: "RRULE:FREQ=WEEKLY"
+            )
+            #expect(out.startDate == "2026-05-27",
+                    "an all-day successor's start moved with the declared zone \(declared.identifier): got '\(out.startDate ?? "nil")'")
+            #expect(out.startDateTime == nil,
+                    "an all-day master must produce an all-day successor, not a timed one")
         }
     }
 }
