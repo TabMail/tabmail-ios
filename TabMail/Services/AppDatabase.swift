@@ -2017,19 +2017,34 @@ final class AppDatabase: Sendable {
         //   • v83 — `CREATE INDEX`; changes no row. (Its `ANALYZE` moved to the
         //     background maintenance pass — ADR-IOS-029, 2026-08-05 amendment.)
         //
-        // ⚑ AMENDED 2026-08-06. The sentence that stood here said *"`v71` and `v82`
-        // stay `.deferred`, each for a different reason"*, and the `ADD COLUMN`
-        // bullet above listed `v71` among the migrations that *would be* safe under
-        // `.immediate` — an invitation the closing sentence then walked back. Both
-        // halves are gone: **`v71` now RUNS `.immediate`**, so the bullet above is
-        // simply a statement of what it does, with nothing to walk back. `v82` is
-        // the last `.deferred` migration left in this range; read its own comment
-        // before changing it.
+        //   • v82 — `DROP`/`CREATE` of `userLabel` + `messageUserLabel`. FK-clean
+        //     per statement because the CHILD is dropped before the PARENT and
+        //     recreated after it is repopulated; verified statement by statement
+        //     in that migration's own comment, which is where the argument lives.
         //
-        // WHY, in one line, with the rest at `v71`'s registration: on the owner's
-        // device (v67 → v83, 5 accounts / 78 folders) the chain cost 27,601 ms, of
-        // which 19,312 ms was `PRAGMA foreign_key_check` and 12,083 ms of that was
-        // `v71`'s gate alone, guarding a one-statement `ADD COLUMN`.
+        // ⚑ AMENDED 2026-08-06 — **EVERY MIGRATION IN v68…v83 NOW RUNS `.immediate`,
+        // so this range runs ZERO whole-database foreign-key checks.** The sentence
+        // that stood here said *"`v71` and `v82` stay `.deferred`, each for a
+        // different reason — read their own comments before changing either"*, and
+        // the `ADD COLUMN` bullet above listed `v71` among the migrations that
+        // *would be* safe under `.immediate` — an invitation the closing sentence
+        // then walked back. All of that is gone. The bullets above are now simply a
+        // statement of what these migrations do, with nothing to walk back.
+        //
+        // WHY, in one line each, with the full arguments at the two registrations:
+        // on the owner's device (v67 → v83, 5 accounts / 78 folders) the chain cost
+        // 27,601 ms, of which 19,312 ms (70%) was `PRAGMA foreign_key_check` —
+        // 12,083 ms of it `v71`'s gate guarding a one-statement `ADD COLUMN` whose
+        // body took 1 ms, and 7,228 ms `v82`'s guarding a body that took 7 ms.
+        //
+        // ⚠️ NEGATIVE CASE, and it is the whole cost of this change: an orphan that
+        // PRE-EXISTED in the v67 database, on an edge no migration in this range
+        // rebuilds, is no longer detected by the chain at all. It survives, renders
+        // nothing, loses nothing, and is re-supplied by the next sync of its owning
+        // message — recoverable, so per THE MANTRA it is registered rather than
+        // mechanised (`KNOWN_ISSUES.md` `IOS-MIGRATION-002`). What this does NOT
+        // license: adding a NEW migration that transiently violates an FK. The
+        // adjudication above is per-migration and a new one owes its own.
         migrator.registerTimedMigration(
             "v68_addFolderUidValidityResetPending", foreignKeyChecks: .immediate
         ) { db in
@@ -2260,13 +2275,18 @@ final class AppDatabase: Sendable {
         // itself fixes.
         //
         // ⚠️ NEGATIVE CASE — what flipping this does NOT claim. It does not claim
-        // the check was useless: it was the only thing that would have found a
-        // pre-existing orphan on an edge no range migration rebuilds (e.g.
-        // `messageReference → messageHeader`), and after this flip nothing in
-        // v68…v83 detects one. Such a row now survives the chain, renders nothing,
-        // and is swept by nothing. That residual is ACCEPTED and registered —
+        // the check was useless: it was one of the two things that would have found
+        // a pre-existing orphan on an edge no range migration rebuilds (e.g.
+        // `messageReference → messageHeader`). `v82`'s gate was the other, and it
+        // was retired in the very next commit, so **nothing in v68…v83 detects one
+        // any more.** Such a row now survives the chain, renders nothing, and is
+        // swept by nothing. That residual is ACCEPTED and registered —
         // `KNOWN_ISSUES.md` `IOS-MIGRATION-002`, whose own text used to say
         // "Neither gate may be flipped to `.immediate`" and is corrected there.
+        // ⚠️ This paragraph read *"and after this flip nothing in v68…v83 detects
+        // one"* in the commit that flipped `v71` ALONE, which was false for exactly
+        // one commit — `v82`'s gate was still standing. Corrected here rather than
+        // left as a sentence that happened to become true.
         //
         // HISTORY, kept because it explains why the gate sat HERE and not at v68 or
         // at the end, and a future reader proposing to reinstate a gate needs it:
@@ -2703,30 +2723,92 @@ final class AppDatabase: Sendable {
         // changes. An existing database runs the same body over real rows and rewrites
         // their ids. Both reach the identical schema and the identical id shape.
         //
-        // FOREIGN KEYS / THE CASCADE. `foreignKeyChecks: .deferred` — spelled out rather
-        // than left to the wrapper's default because it is load-bearing here, exactly as
-        // in `v2_dropMessageHeaderFolderFK`. GRDB runs the whole body under
-        // `PRAGMA foreign_keys = OFF` and then a full `PRAGMA foreign_key_check` before
-        // commit. That makes consequence (2)'s cascade a STRUCTURAL no-op rather than an
-        // argued one: no FK action can fire while the body runs, so dropping and
-        // recreating `userLabel` cannot delete a single association row — and the final
-        // check proves every rebuilt reference resolves.
+        // 🚨 FOREIGN KEYS / THE CASCADE — READ THIS BEFORE TOUCHING A SINGLE STATEMENT
+        // OF THE BODY. `foreignKeyChecks: .immediate` AS OF 2026-08-06, so foreign keys
+        // are ENFORCED LIVE, PER STATEMENT, while the body runs.
         //
-        // The rest of the v68…v83 range runs `.immediate` (see the block comment above
-        // `v68`); this migration is now the ONLY exception. ⚠️ It said "this migration
-        // and `v71` are the two exceptions" until 2026-08-06, when `v71`'s gate was
-        // retired — read `v71`'s own registration comment for why. This body would in
-        // fact SURVIVE `.immediate` — the child `messageUserLabel` is dropped BEFORE
-        // the parent `userLabel`, and steps 3a/3b insert every id step 5 writes while
-        // step 5's `JOIN messageHeader` guarantees the other reference, so the rebuild
-        // is total by construction. It is kept `.deferred` on COST, not on safety:
-        // `.immediate` pays per-row FK enforcement on the 1M-row step-5 insert and
-        // measures SLOWER (8,571 ms body vs 6,309 ms deferred at 500k headers).
-        // ⚠️ NEGATIVE CASE, recorded because the two lines are adjacent and read as
-        // interchangeable: swapping the `db.drop` calls below so `userLabel` goes first
-        // would leave its surviving children violating on the parent's implicit delete
-        // — silently fine under `.deferred`, an abort under `.immediate`. If this ever
-        // moves to `.immediate`, that ordering becomes load-bearing.
+        // ⚠️ THIS PARAGRAPH SAID THE OPPOSITE UNTIL 2026-08-06 and the superseded
+        // reasoning is stated here rather than deleted, because it is the reasoning a
+        // reader will otherwise re-derive: it ran `.deferred`, i.e. the whole body under
+        // `PRAGMA foreign_keys = OFF` followed by a full `PRAGMA foreign_key_check`
+        // before commit, and it argued that this made consequence (2)'s cascade a
+        // STRUCTURAL no-op — no FK action CAN fire when foreign keys are off — while the
+        // trailing check proved every rebuilt reference resolved. Both halves were true.
+        // Neither is load-bearing any more, and here is the replacement for each.
+        //
+        //  • THE CASCADE CANNOT REACH ANYTHING THAT MATTERS. With foreign keys ON,
+        //    `DROP TABLE` performs an implicit `DELETE FROM`, which fires
+        //    `ON DELETE CASCADE` on children. The body drops the CHILD
+        //    (`messageUserLabel`) BEFORE the PARENT (`userLabel`) and recreates the
+        //    child only AFTER the parent is repopulated, so the parent's implicit
+        //    delete finds no child to cascade to and no cascade fires at all.
+        //    Verified per statement, all thirteen of them, against a census of the
+        //    referrers: `references("userLabel"` returns exactly TWO hits in
+        //    `TabMail/ Shared/ TabMailNotificationService/` (`v33`'s create and step 4
+        //    below), BOTH of them `messageUserLabel`, and `references("messageUserLabel"`
+        //    returns ZERO — nothing else can be cascaded into. The two
+        //    `CREATE TABLE … AS SELECT` snapshots carry no constraints (SQLite copies
+        //    none through CTAS), so they neither block a drop nor participate in a
+        //    cascade. There are no triggers anywhere in the tree
+        //    (`rg -i 'CREATE TRIGGER'` → zero), and SQLite's implicit delete does not
+        //    fire them in any case.
+        //  • THE TRAILING PROOF IS NOW A PER-STATEMENT PROOF. Step 5 writes the SAME
+        //    expression over the SAME join that step 3a inserted from, so every parent
+        //    it names provably exists; step 3a's `accountId` comes from
+        //    `messageHeader.accountId`, itself an enforced FK to `account`; step 3b's
+        //    comes from the legacy snapshot of `userLabel.accountId`, also an enforced
+        //    FK. A dangling value in 3b would abort at that statement instead of at the
+        //    closing check — the SAME outcome (the migration rolls back, launch bricks),
+        //    reached one statement earlier. What is genuinely LOST is the sweep over
+        //    tables this migration never touches; see the negative case below.
+        //
+        // ⚠️ THE DROP ORDER IS **NOT** LOAD-BEARING — SAID PLAINLY BECAUSE TWO
+        // SUCCESSIVE REVISIONS OF THIS COMMENT CLAIMED IT WAS. The previous revision
+        // recorded a conditional — *"If this ever moves to `.immediate`, that ordering
+        // becomes load-bearing"* — and the first draft of THIS revision (2026-08-06)
+        // upgraded it to *"the drop order is load-bearing now"* on the strength of that
+        // inherited sentence rather than on a measurement. Then it was measured, and it
+        // is false. Swapping the two `db.drop` calls so `userLabel` goes first was
+        // built and run against `MigrationForeignKeyModeTests`: all three tests still
+        // pass, all 14 seeded memberships survive with their correct re-pointed ids,
+        // and the database is still foreign-key clean. Nothing aborts.
+        //
+        // WHY it is harmless, which is the fact worth keeping: **step 2's snapshots are
+        // the safety mechanism, not the ordering.** After step 2, every subsequent
+        // statement reads exclusively from `messageUserLabel_v82_legacy`,
+        // `userLabel_v82_legacy` and `messageHeader` — NOTHING reads the live
+        // `messageUserLabel` again. So a cascade that empties it before it is dropped
+        // destroys a table whose contents are already copied and which is dropped on
+        // the next line regardless. Dropping child-first is the `v2` house pattern and
+        // is worth keeping for that reason; it is not what makes this body safe.
+        //
+        // 🚨 THE REAL LOAD-BEARING STATEMENT IS STEP 2. Deleting either snapshot, or
+        // re-sourcing step 3a/5 from the live `messageUserLabel` instead of the
+        // snapshot, silently rebuilds an EMPTY join table — every user label chip in
+        // the app disappears and the database is still perfectly foreign-key clean, so
+        // the violation-count test cannot see it. That is the mutation
+        // `v82PreservesLabelMembershipsAcrossTheRebuild` is red against (verified by
+        // pointing step 5 at the live table: 0 of 14 memberships survive).
+        //
+        // WHY IT MOVED — cost, measured on hardware. On the owner's device upgrading
+        // v67 → v83 (5 accounts / 78 folders) `MigrationTimingLedger` attributed
+        // `v82 total 7,235ms = body 7ms + fkCheck/commit 7,228ms [.deferred]`: the
+        // whole-database check cost a THOUSAND TIMES the body. ⚠️ The claim this
+        // replaces — *"It is kept `.deferred` on COST, not on safety: `.immediate` pays
+        // per-row FK enforcement on the 1M-row step-5 insert and measures SLOWER
+        // (8,571 ms body vs 6,309 ms deferred at 500k headers)"* — was a harness
+        // measurement at profile H (500k headers / 1M associations) and it is not
+        // retracted: at THAT shape `.immediate` really does cost ~+2,262 ms of body.
+        // It is outweighed, because the check it removes is a whole-database scan
+        // (the same post-`v70` gate measured 3.6–3.8 s at profile H when `v71` ran it).
+        // ⚠️ The number NOT measured, named so nobody quotes an inference as data:
+        // `v82`'s OWN `.deferred` check at profile H was never isolated. If this trade
+        // is ever revisited, measure that — do not re-argue it from `v71`'s figure, and
+        // do not restore the gate as a cost instrument; it is a correctness one.
+        //
+        // With this change the v68…v83 range runs ZERO whole-database foreign-key
+        // gates. `v2_dropMessageHeaderFolderFK` is the only explicitly `.deferred`
+        // migration left in the file, and it applied on every shipped device long ago.
         //
         // BEST-EFFORT `name`. A row reconstructed for account B in step 3a inherits
         // whatever `name`/`isSystem` the hijacked shared row was carrying, because that
@@ -2751,7 +2833,7 @@ final class AppDatabase: Sendable {
         // reused. Same for step 3a — the `DISTINCT` already reduces the join input to
         // the tiny pair set, which is why it is written that way.
         migrator.registerTimedMigration(
-            "v82_accountScopedUserLabelIdentity", foreignKeyChecks: .deferred
+            "v82_accountScopedUserLabelIdentity", foreignKeyChecks: .immediate
         ) { db in
             // 1. An association whose owning message is gone cannot be re-pointed —
             //    steps 3a and 5 need `messageHeader.accountId` to name the owner. Leaving
@@ -2772,12 +2854,16 @@ final class AppDatabase: Sendable {
             //          WHEN WRITTEN and was invalidated ONE COMMIT LATER by `204590b34`,
             //          which converted 14 migrations to `foreignKeyChecks: .immediate`.
             //          ⚠️ RE-DERIVED AGAIN 2026-08-06, mechanically and not by arithmetic
-            //          on the previous figures, because `v71` changed mode: 83 registered
-            //          migrations — **15** explicit `.immediate`, **2** explicit
-            //          `.deferred` (`v2`, `v82`), **66** taking
+            //          on the previous figures, because BOTH `v71` and `v82` changed
+            //          mode: 83 registered migrations — **16** explicit `.immediate`,
+            //          **1** explicit `.deferred` (`v2` alone), **66** taking
             //          `registerTimedMigration`'s default, which IS `.deferred`. So
-            //          **68 of 83 end with a whole-database `PRAGMA foreign_key_check`
-            //          and 15 do not.** (Was 69/14 while `v71` was still `.deferred`.)
+            //          **67 of 83 end with a whole-database `PRAGMA foreign_key_check`
+            //          and 16 do not** — and NONE of the 67 is in the v68…v83 range,
+            //          which now runs no whole-database gate at all. (It was 69/14 with
+            //          both gates, 68/15 with only `v82`'s.) ⚠️ THIS MIGRATION IS ONE OF
+            //          THE 16: reason (b) below is now a statement about migrations that
+            //          ran on shipped devices long ago, not about this chain.
             //          Confirmed against GRDB's own
             //          `GRDB/Migration/Migration.swift`: `runWithDeferredForeignKeysChecks`
             //          calls `db.checkForeignKeys()` before commit, while

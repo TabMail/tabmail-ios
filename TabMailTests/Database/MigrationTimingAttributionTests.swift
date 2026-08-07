@@ -190,12 +190,15 @@ struct MigrationTimingAttributionTests {
         // The mode label is the diagnostic: it is what lets a reader see that a
         // multi-second gap is a whole-database check and not a slow commit.
         let deferred = Set(report.entries.filter { $0.mode == "deferred" }.map(\.identifier))
-        #expect(deferred == ["v82_accountScopedUserLabelIdentity"],
+        #expect(deferred.isEmpty,
                 """
-                `v82` is the last deliberately-deferred migration in the v68…v83 range \
-                (`v71` was flipped to `.immediate` on 2026-08-06) and must be labelled \
-                as such — the mode label is what tells a reader a multi-second gap is a \
-                whole-database check and not a slow commit
+                every migration in the v68…v83 range runs `foreignKeyChecks: .immediate` \
+                as of 2026-08-06, so the range runs no whole-database \
+                `PRAGMA foreign_key_check` at all — \(deferred.sorted()) is/are still \
+                deferred. This is an ANCHOR, not a style rule: on the owner's device the \
+                two gates that used to sit here (v71, v82) cost 19,311 ms of a 27,601 ms \
+                upgrade to guard bodies measuring 1 ms and 7 ms. Re-adding one puts that \
+                back on the launch path.
                 """)
         #expect(report.entries.allSatisfy { $0.mode == "deferred" || $0.mode == "immediate" })
     }
