@@ -1600,8 +1600,35 @@ struct DynamicIslandChat: View {
         }
 
         // Queue server push via PendingOperation (crash-safe, retried on failure/launch).
+        //
+        // 🚨 R14-F3 — CONSUME THE VERDICT. This was a bare
+        // `await AccountManager.shared.queueDraftSave(…)`; the producer is
+        // `@discardableResult`, so `false` was silently thrown away here while the
+        // ONLY other production caller (`ComposeView.saveDraftAndDismiss`) has
+        // consumed it since R5. `false` means the Drafts-folder `MessageHeader`,
+        // the `MessageBody` and the durable `.saveDraft` `PendingOperation` were
+        // NOT minted, so the text this function just committed to `Draft` has no
+        // route back to it and `SyncEngineMaintenance` eventually trims it —
+        // see `ComposeDraftGuards.runCheckedDurableAutoSave` for the full argument
+        // and for why NOT rolling the local row back is load-bearing.
+        //
+        // Surfaced as a chat `.warning`, which is this surface's own failure
+        // channel — the same one `sendComposeEdit`'s two catch arms use — and which
+        // persists in the transcript. `agentToast` is deliberately NOT used: it
+        // renders only while the pill is collapsed (`!isExpanded`), and the compose
+        // sheet this message is about is on screen precisely when it is expanded.
         if let savedAccountId {
-            await AccountManager.shared.queueDraftSave(draftId: draftKey, accountId: savedAccountId)
+            await ComposeDraftGuards.runCheckedDurableAutoSave(
+                save: {
+                    await AccountManager.shared.queueDraftSave(
+                        draftId: draftKey, accountId: savedAccountId)
+                },
+                onAdmissionFailure: {
+                    chatMessages.append(ChatMessage(
+                        role: .warning,
+                        content: "This draft couldn't be saved to your Drafts folder. Your text is still here — tap Save to try again.",
+                        timestamp: Date()))
+                })
         }
         if DebugModeManager.isLoggingEnabled() {
             let totalMs = Int(Date().timeIntervalSince(entryTime) * 1000)

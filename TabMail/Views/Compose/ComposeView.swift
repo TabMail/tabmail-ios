@@ -231,6 +231,50 @@ enum ComposeDraftGuards {
         }
     }
 
+    /// ⚑ NO REFERENCE — INVENTED **shape**; the CONTRACT is the sibling
+    /// `runCheckedDurableSaveThenDismiss`'s (directly above), applied to the one
+    /// authored-content path that has NOTHING TO DISMISS.
+    ///
+    /// The agent-chat compose surface auto-saves after every compose-edit turn
+    /// (`DynamicIslandChat.autoSaveDraft`) and then simply carries on: the sheet was
+    /// already open and stays open either way, so there is no acknowledgement to
+    /// gate. Passing the sibling an empty `dismiss` closure would say the opposite
+    /// of the truth — that this path deliberately declines to close — which is why
+    /// this is a separate two-parameter guard rather than a reuse.
+    ///
+    /// 🚨 WHAT IS ACTUALLY AT STAKE HERE IS VISIBILITY, NOT DISMISSAL.
+    /// `AccountManager.queueDraftSave` mints the visible Drafts-folder
+    /// `MessageHeader`, the `MessageBody` AND the durable `.saveDraft`
+    /// `PendingOperation` in ONE write transaction, so `false` means the user's
+    /// authored text committed to `Draft` but gained NO route back to it — drafts
+    /// open header-led, `DraftStore.loadAll()` has zero production callers, and
+    /// `SyncEngineMaintenance` later trims the row outright once it exceeds
+    /// `SyncConfig.maxComposeDraftSessions`. **Retained is not reachable.**
+    /// Until R14-F3 the chat path discarded the verdict entirely
+    /// (`await AccountManager.shared.queueDraftSave(…)` as a bare statement, the
+    /// producer being `@discardableResult`), which made that outcome
+    /// indistinguishable from a successful save: the user closes the sheet
+    /// believing the draft is in Drafts, and it is not. Nothing later contradicts
+    /// them — no sync pass recreates a header for a row it cannot see — so this is
+    /// not a recoverable edge, it is a dropped intention.
+    ///
+    /// ⚠️ **NOT A ROLLBACK, and that is the mirror image.** The local `Draft` row
+    /// stays exactly as saved. Deleting it on a refused admission would destroy the
+    /// very text this guard exists to protect, and would turn a recoverable
+    /// "unreachable but present" state into an unrecoverable one. The disposition
+    /// is: keep the content, tell the user, and let ONE ordinary gesture — tapping
+    /// Save in the still-open compose sheet, which runs
+    /// `runCheckedDurableSaveThenDismiss` above — retry it.
+    @MainActor
+    static func runCheckedDurableAutoSave(
+        save: () async -> Bool,
+        onAdmissionFailure: () -> Void
+    ) async {
+        if await save() == false {
+            onAdmissionFailure()
+        }
+    }
+
     /// PORT — `v2final:ServerDraftOpen.mayBindPersistedDraft` (commits `a8eb813b5`,
     /// `69a9bae88`), relocated here because this forward-port has no
     /// `ServerDraftOpen` enum.

@@ -852,6 +852,50 @@ struct ComposeDraftGuardTests {
         #expect(!toldTheUser, "an admitted durable save must not surface an error")
     }
 
+    // MARK: R14-F3 — the same verdict on the path with nothing to dismiss
+
+    /// 🚨 THE INVARIANT THIS PINS — the system property, not the mechanism
+    /// (`MIS-015`): **when the durable draft-queue producer REFUSES, the user is
+    /// told, so the authored content is still reachable by one ordinary gesture.**
+    ///
+    /// The agent-chat compose surface (`DynamicIslandChat.autoSaveDraft`) auto-saves
+    /// after every compose-edit turn and has no dismissal to gate — the sheet is
+    /// open before and after. So the sibling's "does not dismiss" half is vacuous
+    /// here and the whole property rests on the OTHER half: a refusal that is not
+    /// surfaced is indistinguishable from a save that worked. Until R14-F3 the
+    /// verdict was discarded outright (`queueDraftSave` is `@discardableResult`),
+    /// which left the user's text committed to `Draft` with no Drafts-folder
+    /// `MessageHeader` to open it by, and `SyncEngineMaintenance` trimming the row
+    /// later — a dropped intention with no sync recovery, exactly as on the
+    /// `ComposeView` path.
+    ///
+    /// ⚠️ It is deliberately NOT "the local `Draft` row is rolled back". That is the
+    /// mirror image: it would destroy the authored text this guard exists to keep.
+    @Test("A refused durable auto-save surfaces the failure instead of passing silently")
+    func refusedDurableAutoSaveSurfacesTheFailure() async {
+        var toldTheUser = false
+        await ComposeDraftGuards.runCheckedDurableAutoSave(
+            save: { false },
+            onAdmissionFailure: { toldTheUser = true })
+        #expect(toldTheUser,
+                "a refused durable auto-save must surface the failure — on this path nothing else can, because there is no dismissal to withhold and the compose sheet looks identical either way")
+    }
+
+    /// TWO-SIDED NON-VACUITY ANCHOR (`MIS-030`). Without this,
+    /// `refusedDurableAutoSaveSurfacesTheFailure` would still pass against a guard
+    /// that warns on EVERY save — which would be its own defect: a warning the user
+    /// sees after every successful agent compose-edit turn is noise they learn to
+    /// ignore, and it would be showing on the exact path that is working. This is
+    /// the side that must stay GREEN when the fix is inverted.
+    @Test("An admitted durable auto-save surfaces nothing")
+    func admittedDurableAutoSaveSurfacesNothing() async {
+        var toldTheUser = false
+        await ComposeDraftGuards.runCheckedDurableAutoSave(
+            save: { true },
+            onAdmissionFailure: { toldTheUser = true })
+        #expect(!toldTheUser, "an admitted durable auto-save must not warn the user")
+    }
+
     /// ORDER, not just outcome — the sibling `dismissRunsAfterTheDeleteLands` applied
     /// to this path: at the instant the UI acknowledges the save, the durable
     /// producer must already have returned its verdict.
