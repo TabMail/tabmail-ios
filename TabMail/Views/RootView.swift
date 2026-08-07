@@ -309,16 +309,31 @@ struct RootView: View {
             // Re-trigger when accounts transition from empty → non-empty
             guard !navigationStore.accounts.isEmpty else { return }
 
+            // INSTRUMENTATION (2026-08-06): everything from here down to the
+            // inner `Task {}` below runs SYNCHRONOUSLY on the main actor, and it
+            // is kicked post-first-paint — i.e. straight into the ~1320ms
+            // main-thread block a device capture showed immediately after first
+            // paint, ~606ms of which held no marks at all. Only two of these
+            // steps logged anything (`[Keychain] Migrated…`, `NetworkMonitor:
+            // start()`), and neither line carries a timestamp, so the stretch
+            // was unattributable. Mark each boundary.
+            let postPaintSetupT0 = CFAbsoluteTimeGetCurrent()
+            BootProfiler.mark("RootView: post-paint @MainActor setup START (keychain migrate + network monitor + reminder cache)")
+
             // Start lightweight setup immediately (these are fast and don't block UI).
             KeychainHelper.migrateAccessibility()
+            let keychainDoneAt = CFAbsoluteTimeGetCurrent()
+            BootProfiler.mark("RootView: KeychainHelper.migrateAccessibility \(Int((keychainDoneAt - postPaintSetupT0) * 1000))ms @MainActor")
             NetworkMonitor.shared.start()
             ReminderBuilder.setupCacheInvalidation()
+            BootProfiler.mark("RootView: NetworkMonitor.start + ReminderBuilder.setupCacheInvalidation \(Int((CFAbsoluteTimeGetCurrent() - keychainDoneAt) * 1000))ms @MainActor")
 
             // For returning users, isStartupComplete is already true from init —
             // inbox is visible immediately with cached GRDB data.
             // For new users, show inbox now (one-time data resets already ran
             // synchronously in AppDatabase.init, so the DB is already migrated).
             isStartupComplete = true
+            BootProfiler.mark("RootView: isStartupComplete=true (@MainActor state write — triggers a re-render)")
 
             // In screenshot mode, skip all provider connections and sync —
             // the seeded GRDB data is sufficient for rendering screenshots.
@@ -499,6 +514,7 @@ struct RootView: View {
             if hasTabMailSession {
                 DeviceSyncService.shared.connect()
             }
+            BootProfiler.mark("RootView: post-paint @MainActor setup DONE \(Int((CFAbsoluteTimeGetCurrent() - postPaintSetupT0) * 1000))ms total (probe handler installed, deviceSync=\(hasTabMailSession))")
         }
         .task(id: hasTabMailSession) {
             // Check if user already consented on web/TB — auto-skip consent gate

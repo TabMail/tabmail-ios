@@ -245,14 +245,35 @@ struct TabMailApp: App {
     @MainActor private static func warmUpWebKitIfNeeded() {
         guard !hasWarmedUpWebKit else { return }
         hasWarmedUpWebKit = true
+        let kickedAt = CFAbsoluteTimeGetCurrent()
         Task { @MainActor in
             // Brief settle so the inbox's first frame paints before we spin up
             // the (cold) WebKit content process.
             try? await Task.sleep(for: .milliseconds(500))
+            // INSTRUMENTATION (2026-08-06): the post-paint window carried a
+            // ~1320ms main-thread block with ~606ms of it holding no marks at
+            // all, and this warm-up is the only @MainActor consumer kicked from
+            // `body.task` that was completely unmarked. Both facts below are
+            // needed to read the next capture:
+            //   • `resumedAfter` — the sleep is 500ms but the continuation
+            //     resumes ON THE MAIN ACTOR, so a value >500ms means the main
+            //     actor was still busy (first render) when the warm-up came
+            //     due, and the WebKit spin-up below therefore lands INSIDE that
+            //     busy window instead of after it.
+            //   • the per-step deltas — `WKWebView(frame:.zero)` on a cold
+            //     process launches the WebContent/GPU/Networking processes and
+            //     is synchronous main-thread work.
+            let resumedAfter = Int((CFAbsoluteTimeGetCurrent() - kickedAt) * 1000)
+            BootProfiler.mark("webkit warm-up: settle resumed on main actor after \(resumedAfter)ms (nominal 500ms — excess = main actor was busy)")
+            let allocT0 = CFAbsoluteTimeGetCurrent()
             let warmup = WKWebView(frame: .zero)
+            BootProfiler.mark("webkit warm-up: WKWebView(frame:.zero) init \(Int((CFAbsoluteTimeGetCurrent() - allocT0) * 1000))ms — @MainActor, cold WebContent/GPU process launch")
+            let loadT0 = CFAbsoluteTimeGetCurrent()
             warmup.loadHTMLString(" ", baseURL: nil)
+            BootProfiler.mark("webkit warm-up: loadHTMLString \(Int((CFAbsoluteTimeGetCurrent() - loadT0) * 1000))ms — @MainActor")
             try? await Task.sleep(for: .milliseconds(500))
             _ = warmup
+            BootProfiler.mark("webkit warm-up DONE (\(Int((CFAbsoluteTimeGetCurrent() - kickedAt) * 1000))ms since the body.task kick, incl. two 500ms settles)")
         }
     }
 
@@ -270,10 +291,17 @@ struct TabMailApp: App {
         Task.detached {
             // Settle past the inbox first-render stall before the FTS open.
             try? await Task.sleep(for: .milliseconds(500))
-            BootProfiler.mark("SearchIndex.initialize() START (FTS open, post-paint +500ms)")
+            // ISOLATION, stated explicitly so a boot capture is not misread
+            // (2026-08-06): `SearchIndex` is a plain `actor` (no global-actor
+            // annotation) reached from a `Task.detached`, so `initialize()` —
+            // the 250k-doc / 17-shard FTS open — runs on the SearchIndex actor's
+            // executor on the cooperative pool, NOT on the main actor. The Δ
+            // between these two marks is therefore ELAPSED time, not main-thread
+            // time: it overlaps the first render, it does not constitute it.
+            BootProfiler.mark("SearchIndex.initialize() START (FTS open, post-paint +500ms; SearchIndex actor executor — NOT main actor)")
             do {
                 try await SearchIndex.shared.initialize()
-                BootProfiler.mark("SearchIndex.initialize() DONE (FTS ready)")
+                BootProfiler.mark("SearchIndex.initialize() DONE (FTS ready; off-main — this Δ is elapsed, not main-thread, time)")
             } catch {
                 print("[TabMailApp] FTS index initialization failed: \(error)")
             }
@@ -304,7 +332,16 @@ struct TabMailApp: App {
                     RootView()
                         .environment(navigationStore)
                         .environment(storeKitManager)
-                        .task { storeKitManager.start() }
+                        .task {
+                            // Post-paint @MainActor deferral (previously unmarked;
+                            // its `[StoreKit] Loading products` line lands inside the
+                            // post-first-paint main-thread block). `start()` itself is
+                            // synchronous — it spawns the transaction listener and the
+                            // product load — so this Δ is the main-actor cost only.
+                            let storeKitT0 = CFAbsoluteTimeGetCurrent()
+                            storeKitManager.start()
+                            BootProfiler.mark("post-paint: storeKitManager.start() \(Int((CFAbsoluteTimeGetCurrent() - storeKitT0) * 1000))ms @MainActor (product load continues async)")
+                        }
                         .onOpenURL { url in
                             guard let request = MailtoRequest.parse(url) else { return }
                             NotificationCenter.default.post(

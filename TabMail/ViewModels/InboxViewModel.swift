@@ -145,6 +145,16 @@ final class InboxViewModel {
     /// thread during foreground return — the warm-foreground hang — so it was
     /// removed; `reloadMessages` below heals off-main (and was already healing).
     func listDidAppear() {
+        // BootProfile anchor (2026-08-06). The `[InboxLog]` lines around inbox
+        // appearance carry NO timestamp, so on a cold boot this milestone — the
+        // tail of `InboxView.onAppear`, which lands inside the ~1320ms
+        // main-thread block that follows first paint — had nothing in the
+        // BootProfile timeline to place it against, leaving ~606ms of that
+        // block unattributable. Marked HERE rather than in the view's
+        // `.onAppear` closure because that closure is already at the Swift
+        // type-checker's expression budget: one more statement in it fails the
+        // build with "unable to type-check this expression in reasonable time".
+        BootProfiler.mark("InboxViewModel.listDidAppear — @MainActor, tail of InboxView.onAppear (loaded=\(loadedMessages.count) folders=\(folders.count))")
         BackgroundSyncLogger.logInbox("[\(instanceTag)] listDidAppear hasLoaded=\(hasLoadedInitialPage) loadedCount=\(loadedMessages.count) folders=\(folders.count)")
         Task { @MainActor [weak self] in
             guard let self else { return }
