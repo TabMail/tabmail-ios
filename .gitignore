@@ -49,6 +49,11 @@ Secrets.xcconfig.bak
 # once (PLAN_NSE_ENHANCE.md); this rule prevents a recurrence.
 PLAN_*.md
 
+# Agent/automation tooling is private infrastructure — never in the public repo.
+AGENTS.md
+.agents/
+.codex/
+
 # v3 refactor recon + vet evidence — internal design notes, same class as PLAN_*.md above.
 analysis/v3-recon/
 scratchpad/*
