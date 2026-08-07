@@ -27,7 +27,7 @@ just made fail closed → MIS-IOS-008** · **edit anything under `Companion/` �
 ## Build & test ops
 
 - **[MIS-IOS-005](Companion/Mistakes/Active/MIS-IOS-005-bare-xcodegen-broke-nse-signing.md)** — ran bare `xcodegen generate`; literal `${DEVELOPMENT_TEAM}` → NSE never launches → smart push silently dies while background push still works. (×2)
-- **[MIS-IOS-006](Companion/Mistakes/Active/MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md)** — recorded a baseline from a stale `.xctest`; verify new tests ran **by name**, never by total count. (×3)
+- **[MIS-IOS-006](Companion/Mistakes/Active/MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md)** — recorded a baseline from a stale `.xctest`; verify new tests ran **by name**, never by total count. A NEW test file is not in the target until `./Scripts/xcodegen.sh` runs, so it reports `** TEST SUCCEEDED **` having executed ZERO of it. *Tell: green plus relief, faster than expected, with no count.* (×4)
 
 ## Companion tree — the proof that stopped running
 
