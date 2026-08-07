@@ -274,6 +274,14 @@ extension AccountManager {
     /// NOT members: `.success` follows a completed provider write (true whatever
     /// the local delete did) and `.stillQueued` is the transient arm, which is
     /// already non-terminal.
+    ///
+    /// ⚠️ R17b-B2 — that `.success` sentence is TRUE and INCOMPLETE, and the
+    /// missing half is what a reader needs: the announcement is honest, but a
+    /// failed local delete leaves the row claimable, so the OP re-executes even
+    /// though the OUTCOME was reported correctly. The announcement and the
+    /// bookkeeping are separate questions; this gate answers only the first.
+    /// The second is discharged at the success arm itself and registered as
+    /// `IOS-CAL-008`.
     private func retireAndAnnounce(
         _ op: PendingCalendarOperation,
         reason: String,
@@ -393,11 +401,47 @@ extension AccountManager {
                 do {
                     let ids = try await executeCalendarOperation(currentOp, provider: calProvider)
                     // Post-execution delete MUST succeed — remote op already completed.
+                    //
+                    // 🚨 R17b-B2 — OF THE THREE DURABLE BOOKKEEPING WRITES IN THIS
+                    // DRAIN, THIS IS THE ONLY ONE WHOSE FAILURE CAN CHANGE WHAT THE
+                    // SERVER SEES, AND IT IS DELIBERATELY NOT GATED. (The other two:
+                    // mark-in-flight is checked and `continue`s, leaving the op
+                    // `queued`; the transient requeue below only delays the op to the
+                    // next launch. The six TERMINAL arms are gated on
+                    // `retireCalendarOperation`'s Bool, R17-2.)
+                    // If the delete never commits, the row stays
+                    // `inFlight`, `reconcileCalendarQueue` returns it to `queued` at
+                    // next launch, and the drain RE-EXECUTES work the server already
+                    // did. Registered as `IOS-CAL-008`; read that row before changing
+                    // anything here.
+                    //
+                    // Why re-execution is tolerable rather than a defect: every
+                    // operation this queue can replay is idempotent under a DURABLE,
+                    // deterministic id the queue itself pre-generates
+                    // (`PendingCalendarOperation.eventId`, and
+                    // `GoogleCalendarProvider.deterministicSplitEventId` for the
+                    // successor of a `this_and_following` split), so a replay is
+                    // recognised by the server rather than duplicated. Re-derive the
+                    // provider half with a predicate this comment cannot satisfy
+                    // (`MIS-033`):
+                    //   rg -n --pcre2 '^(?!\s*(///|//)).*deterministicSplitEventId' \
+                    //      TabMail/Providers/
+                    // → 4 at R17b: the definition plus one consumer in each of the
+                    // Google, Exchange and CalDAV split paths.
+                    //
+                    // 🚨 DO NOT make this arm terminal-on-failure. Retiring an op
+                    // because a LOCAL delete failed drops an intention whose remote
+                    // half may not have happened; a duplicate calendar event is
+                    // recoverable by one user gesture and a dropped intention is not
+                    // (`MIS-005`, and Outbox rule 4 — "prefer double-send over drop").
                     do {
                         try await retryWrite(dbPool, label: "CalendarQueue") { db in
                             _ = try PendingCalendarOperation.deleteOne(db, key: currentOp.id)
                         }
                     } catch {
+                        BackgroundSyncLogger.logError(
+                            "[CalendarQueue] CRITICAL: failed to delete completed op \(currentOp.id) — it stays claimable and will re-execute after reconcileCalendarQueue: \(error)",
+                            source: "CalendarQueue")
                         print("[CalendarQueue] CRITICAL: Failed to delete completed op \(currentOp.id) — will re-execute on next drain")
                     }
                     executedAny = true
@@ -549,11 +593,31 @@ extension AccountManager {
                     // See `retireAndAnnounce`, which is now the single terminal
                     // announcement gate, and `retireCalendarOperation` beneath it.
                     print("[CalendarQueue] Failed \(opType): \(error) (age \(String(format: "%.1f", ageHours))h) — will retry")
-                    try? await retryWrite(dbPool, label: "CalendarQueue") { db in
-                        var updated = currentOp
-                        updated.status = PendingStatus.queued.rawValue
-                        updated.retryCount += 1
-                        try updated.save(db)
+                    // 🚨 R17b-B2 — RECORDED, NOT SWALLOWED. This was `try? await`
+                    // until R17b: the requeue is a durable bookkeeping write and a
+                    // silently-dropped failure leaves the row `inFlight`, where the
+                    // drain's `status == queued` filter skips it for the rest of the
+                    // session with nothing in the log to say so. The DISPOSITION is
+                    // deliberately unchanged — `reconcileCalendarQueue` returns the
+                    // row to `queued` at next launch, and `.stillQueued` below is
+                    // truthful in BOTH branches (the op is still queued, or still
+                    // claimable at `inFlight`), so there is nothing to decide here,
+                    // only something to see. Same shape as
+                    // `retireCalendarOperation`'s catch and the in-flight marker
+                    // above; Outbox rule 2 ("never `try?` on queue state
+                    // transitions") is the stated precedent.
+                    do {
+                        try await retryWrite(dbPool, label: "CalendarQueue") { db in
+                            var updated = currentOp
+                            updated.status = PendingStatus.queued.rawValue
+                            updated.retryCount += 1
+                            try updated.save(db)
+                        }
+                    } catch {
+                        BackgroundSyncLogger.logError(
+                            "[CalendarQueue] WARNING: failed to requeue transient op \(currentOp.id) — it stays inFlight until reconcileCalendarQueue at next launch: \(error)",
+                            source: "CalendarQueue")
+                        print("[CalendarQueue] WARNING: Could not requeue \(currentOp.id) — stays in-flight until next launch: \(error)")
                     }
                     failedAccounts.insert(currentOp.accountId)
                     // Surface the still-queued status so the agent at least
