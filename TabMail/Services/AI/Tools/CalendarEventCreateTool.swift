@@ -39,11 +39,37 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
         // Resolve end date — when missing, apply the user's default duration
         // (Settings → Calendar → Default event duration). Computed client-side
         // so the LLM never has to.
+        //
+        // 🚨 THE ALL-DAY CONVENTION IS HALF-OPEN — `[start, end)`, END EXCLUSIVE
+        // (R16-6). Stated here explicitly because leaving it implicit is exactly the
+        // trap that produced the bug: this branch read `endDate = startDate`, which
+        // for a TIMED event would be a zero-length event and for an ALL-DAY event is
+        // an event covering NO days at all.
+        //
+        // All three providers use the exclusive form and `buildGCalEventInput` passes
+        // the date strings through verbatim (`String(endIso.prefix(10))`) with no
+        // normalization anywhere downstream, so whatever is computed here is what
+        // reaches the wire: Google `end.date`, Graph's midnight-to-midnight values,
+        // and CalDAV's `DTEND;VALUE=DATE`. The tree's own anchor for the convention
+        // is `GoogleCalendarTypesTests.mergeMasterAndPatchAllDayPreserved` —
+        // *"1-day all-day event → end is exclusive next day"*, `start=2026-05-27`,
+        // `end=2026-05-28`.
+        //
+        // ⚠️ ONLY THE DEFAULT MOVES. A caller-supplied `end_iso` is taken verbatim by
+        // the first branch, so an explicit multi-day range is untouched, and the
+        // timed default still uses the user's `defaultEventDurationMinutes`. The
+        // mirror image would be normalising every all-day end by +1 day, which would
+        // silently extend every explicit range the agent already computed correctly.
         let endDate: Date
         if !endIso.isEmpty, let parsed = EKEventStoreHelper.parseNaiveISO(endIso, timeZone: tz) {
             endDate = parsed
         } else if allDay == true {
-            endDate = startDate
+            // Default = ONE day, which under the half-open convention is the next
+            // calendar day. Computed with the resolved calendar/timezone rather than
+            // `+86400` so a DST transition day cannot land it on the wrong date.
+            var cal = Calendar(identifier: .gregorian)
+            cal.timeZone = tz
+            endDate = cal.date(byAdding: .day, value: 1, to: startDate) ?? startDate
         } else {
             let minutes = CalendarProviderDispatch.defaultEventDurationMinutes
             endDate = startDate.addingTimeInterval(TimeInterval(minutes * 60))
