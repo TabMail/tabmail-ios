@@ -488,7 +488,15 @@ actor GoogleCalendarProvider: CalendarProvider {
                 // against the already-capped master — which re-conflicts, re-proves
                 // the duplicate, and retries the read. The server state is stable
                 // across that retry, so it terminates as soon as the GET succeeds.
-                print("[GoogleCalendar] splitSeries proof-GET for \(newSeriesId) FAILED after a proven duplicate: \(error) — keeping the operation queued")
+                // Rule 12 — a NEW diagnostic must be a no-op in production. This file
+                // carries 9 ungated `print`s and 0 `DebugModeManager` references, so
+                // the local habit is ungated; that pre-existing corpus is a closed
+                // decision about code that already existed, not a licence to add to
+                // it. A bare `print` reaches nothing in a production iOS build
+                // anyway, so this is not exception (b) either.
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[GoogleCalendar] splitSeries proof-GET for \(newSeriesId) FAILED after a proven duplicate: \(error) — keeping the operation queued")
+                }
                 throw GoogleCalendarError.httpError(409, conflictBody)
             }
         } catch {
