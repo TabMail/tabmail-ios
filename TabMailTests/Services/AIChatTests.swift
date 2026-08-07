@@ -6,7 +6,13 @@ import Testing
 import Foundation
 @testable import TabMail
 
-@Suite("AIService.parseActionResponse")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "AIService.parseActionResponse" — it collided
+// with `AIActionParsingTests` in `AIActionParsingTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("AIService.parseActionResponse — plain-JSON and fence variants")
 struct AIActionParsingExtendedTests {
 
     @Test("Parses delete action from plain JSON")
@@ -87,7 +93,13 @@ struct AIActionParsingExtendedTests {
     }
 }
 
-@Suite("ChatIdTranslator.collectRefs")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "ChatIdTranslator.collectRefs" — it collided
+// with `CollectRefsTests` in `ChatIdTranslatorTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("ChatIdTranslator.collectRefs — pill-pattern extraction")
 struct ChatIdTranslatorCollectRefsTests {
 
     @Test("Extracts Email refs")

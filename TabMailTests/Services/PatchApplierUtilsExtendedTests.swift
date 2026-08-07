@@ -6,7 +6,13 @@ import Testing
 import Foundation
 @testable import TabMail
 
-@Suite("PatchApplierUtils.normalizeContent")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "PatchApplierUtils.normalizeContent" — it collided
+// with `PatchApplierUtilsNormalizeTests` in `PatchApplierUtilsTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("PatchApplierUtils.normalizeContent — extended cases")
 struct NormalizeContentTests {
 
     @Test("Adds bullet prefix and period suffix")
@@ -70,7 +76,13 @@ struct NormalizeContentTests {
     }
 }
 
-@Suite("PatchApplierUtils.isDuplicate")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "PatchApplierUtils.isDuplicate" — it collided
+// with `PatchApplierUtilsIsDuplicateTests` in `PatchApplierUtilsTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("PatchApplierUtils.isDuplicate — extended cases")
 struct IsDuplicateTests {
 
     @Test("Exact match is duplicate")
@@ -115,7 +127,13 @@ struct IsDuplicateTests {
     }
 }
 
-@Suite("PatchApplierUtils.parseOperations")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "PatchApplierUtils.parseOperations" — it collided
+// with `PatchApplierUtilsParseOperationsTests` in `PatchApplierUtilsTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("PatchApplierUtils.parseOperations — extended cases")
 struct ParseOperationsTests {
 
     // MARK: - Without action type (KB patches)

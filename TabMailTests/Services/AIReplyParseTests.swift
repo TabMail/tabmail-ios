@@ -99,7 +99,13 @@ struct AIReplyParseTests {
     }
 }
 
-@Suite("AIService.parseInlineEditResponse")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "AIService.parseInlineEditResponse" — it collided
+// with `ParseInlineEditResponseTests` in `AIInlineEditTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("AIService.parseInlineEditResponse — marker-section extraction")
 struct AIInlineEditParseTests {
 
     @Test("Extracts all three sections")

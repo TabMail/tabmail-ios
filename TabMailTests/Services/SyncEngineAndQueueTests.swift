@@ -193,7 +193,13 @@ struct BackfillProfileTierTests {
 
 // MARK: - SyncEngine Static Error Classification
 
-@Suite("SyncEngine.isSelectFailedError")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "SyncEngine.isSelectFailedError" — it collided
+// with `IsSelectFailedErrorTests` in `ErrorClassificationTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("SyncEngine.isSelectFailedError — error-string matching")
 struct SyncEngineSelectFailedErrorTests {
 
     @Test("Detects 'Select mailbox failed' error")
@@ -215,7 +221,13 @@ struct SyncEngineSelectFailedErrorTests {
     }
 }
 
-@Suite("SyncEngine.isConnectionError")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "SyncEngine.isConnectionError" — it collided
+// with `IsConnectionErrorTests` in `ErrorClassificationTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("SyncEngine.isConnectionError — error-string substring matrix")
 struct SyncEngineConnectionErrorTests {
 
     @Test("Detects 'notConnected' in error string")
@@ -390,7 +402,13 @@ struct SearchConfigExtendedTests {
 
 // MARK: - EmbeddingService.prepareEmailText
 
-@Suite("EmbeddingService.prepareEmailText")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "EmbeddingService.prepareEmailText" — it collided
+// with `EmbeddingServicePrepareTextTests` in `EmbeddingServiceTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("EmbeddingService.prepareEmailText — field assembly and truncation")
 struct EmbeddingServicePrepareEmailTextTests {
 
     @Test("Includes subject twice (intentional for embedding emphasis)")

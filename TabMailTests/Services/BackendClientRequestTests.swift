@@ -281,7 +281,13 @@ struct BackendConfigConstantTests {
     }
 }
 
-@Suite("BackendError Extended")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "BackendError Extended" — it collided
+// with `BackendErrorExtendedTests` in `BackendErrorExtendedTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("BackendError errorDescription and isRetriable — edge cases")
 struct BackendErrorExtendedEdgeCaseTests {
 
     @Test("errorDescription for requestFailed includes code")

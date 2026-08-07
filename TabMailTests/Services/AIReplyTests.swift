@@ -6,7 +6,13 @@ import Testing
 import Foundation
 @testable import TabMail
 
-@Suite("AIService.parseComposeResponse")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "AIService.parseComposeResponse" — it collided
+// with `AIReplyParseTests` in `AIReplyParseTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("AIService.parseComposeResponse — reply-composition cases")
 struct AIReplyTests {
 
     // MARK: - Body: Extraction

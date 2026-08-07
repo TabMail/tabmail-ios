@@ -6,7 +6,13 @@ import Testing
 import Foundation
 @testable import TabMail
 
-@Suite("BackendError Extended")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "BackendError Extended" — it collided
+// with `BackendErrorExtendedTests` in `BackendErrorExtendedTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("BackendError isRetriable — status-code matrix")
 struct BackendErrorExtTests {
 
     @Test("isRetriable: 0 (network failure) is retriable")
@@ -312,7 +318,13 @@ struct DynamicCodingKeyExtTests {
     }
 }
 
-@Suite("JSONValue Encoding")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "JSONValue Encoding" — it collided
+// with `JSONValueTests` in `CompletionsMessageTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("JSONValue Encoding — backend request payloads")
 struct JSONValueEncodingTests {
 
     @Test("String encodes correctly")
@@ -429,7 +441,13 @@ struct CompletionsMessageEncodingExtendedTests {
     }
 }
 
-@Suite("BackendClient clientVersion")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "BackendClient clientVersion" — it collided
+// with `BackendClientVersionTests` in `BackendClientTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("BackendClient clientVersion — extended coverage")
 struct BackendClientClientVersionTests {
 
     @Test("clientVersion returns a string")

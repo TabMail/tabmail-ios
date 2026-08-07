@@ -78,7 +78,13 @@ struct EmailComposeParseStringArrayTests {
     }
 }
 
-@Suite("EmailDeleteTool.parseUniqueIds")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "EmailDeleteTool.parseUniqueIds" — it collided
+// with `EmailDeleteToolParseTests` in `EmailDeleteToolParseTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("EmailDeleteTool.parseUniqueIds — argument-shape coverage")
 struct EmailDeleteParseUniqueIdsTests {
 
     @Test("Array of ints")

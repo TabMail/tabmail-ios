@@ -8,7 +8,13 @@ import Foundation
 
 // MARK: - GCalEvent Computed Properties
 
-@Suite("GCalEvent Computed Properties")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "GCalEvent Computed Properties" — it collided
+// with `GCalEventHelperTests` in `GCalEventHelperTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("GCalEvent Computed Properties — core date and all-day derivation")
 struct GCalEventComputedTests {
 
     @Test("isAllDay true when start has date but no dateTime")
@@ -307,7 +313,13 @@ struct GCalEventInputTests {
 
 // MARK: - CalendarToolHelpers.buildGCalEventInput
 
-@Suite("CalendarToolHelpers buildGCalEventInput")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "CalendarToolHelpers buildGCalEventInput" — it collided
+// with `CalendarToolHelpersBuildInputTests` in `CalendarToolHelpersTests.swift`. The run log prints DISPLAY names, so
+// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
+// two apart, and a suite that silently ran zero tests would have been covered
+// by its twin's line. `-only-testing:` was never affected: it selects by Swift
+// TYPE name, and the two types were always distinct.
+@Suite("CalendarToolHelpers buildGCalEventInput — GCalEvent-side shapes")
 struct BuildGCalEventInputTests {
 
     @Test("buildGCalEventInput with title and location")
