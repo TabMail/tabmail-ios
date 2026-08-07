@@ -67,7 +67,8 @@ struct ContentOwnershipSweepTests {
 
     @discardableResult
     private func seedHeader(
-        accountId: String, folderPath: String, messageId: String, rfc822: String? = nil
+        accountId: String, folderPath: String, messageId: String, rfc822: String? = nil,
+        inReplyTo: String? = nil
     ) async throws -> MessageHeader {
         let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)
         var header = MessageHeader(
@@ -78,9 +79,49 @@ struct ContentOwnershipSweepTests {
             isInInbox: false
         )
         header.rfc822MessageId = rfc822
+        header.inReplyTo = inReplyTo
         let inserted = header
-        try await AppDatabase.dbPool.write { db in try inserted.insert(db) }
+        try await AppDatabase.dbPool.write { db in
+            try inserted.insert(db)
+            try ThreadUtils.insertMessageReferences(for: inserted, db: db)
+        }
         return inserted
+    }
+
+    /// Apply a user label to a header, creating the `userLabel` parent row if
+    /// needed. Mirrors the production writer (`UserLabelStore` / the sync insert):
+    /// the join FK is the account-prefixed SURROGATE `userLabel.id`, never the bare
+    /// provider value (D10 / `IOS-LABEL-001`).
+    @discardableResult
+    private func seedUserLabel(
+        accountId: String, headerId: String, providerLabelId: String
+    ) async throws -> String {
+        let row = UserLabel(
+            accountId: accountId, providerLabelId: providerLabelId,
+            name: providerLabelId, isSystem: false)
+        try await AppDatabase.dbPool.write { db in
+            try row.insert(db, onConflict: .ignore)
+            try MessageUserLabel(messageId: headerId, userLabelId: row.id)
+                .insert(db, onConflict: .ignore)
+        }
+        return row.id
+    }
+
+    private func userLabelIds(for headerId: String) async -> [String] {
+        let rows = try? await AppDatabase.dbPool.read { db in
+            try MessageUserLabel.filter(Column("messageId") == headerId).fetchAll(db)
+        }
+        return (rows ?? []).map(\.userLabelId).sorted()
+    }
+
+    private func referencedIds(for headerId: String) async -> [String] {
+        let rows = try? await AppDatabase.dbPool.read { db in
+            try String.fetchAll(
+                db,
+                sql: "SELECT referencedRfc822Id FROM messageReference WHERE messageHeaderId = ?",
+                arguments: [headerId])
+        }
+        return (rows ?? []).sorted()
     }
 
     /// Index an FTS row under `key` with real body text, WITHOUT a `messageHeader`
@@ -123,6 +164,9 @@ struct ContentOwnershipSweepTests {
                 sql: #"DELETE FROM messageBody WHERE id LIKE ? ESCAPE '\'"#,
                 arguments: [MessageIdentity.escapeForLike(accountId) + ":%"])
             try db.execute(sql: "DELETE FROM folder WHERE accountId = ?", arguments: [accountId])
+            // `userLabel` is not a child of `messageHeader`, so the delete above does
+            // not reach it. Scoped by the same accountId as everything else here.
+            try db.execute(sql: "DELETE FROM userLabel WHERE accountId = ?", arguments: [accountId])
             try db.execute(sql: "DELETE FROM account WHERE id = ?", arguments: [accountId])
         }
     }
@@ -547,10 +591,26 @@ struct ContentOwnershipSweepTests {
     /// discovered by the BODY QUEUE takes a different function entirely —
     /// `BackfillBodyQueue.rekeyRemappedHeader` — which had the FTS half of the
     /// mirror (`SearchIndex.rekeyHeaders`) and not the asset half: a half-port
-    /// (`MIS-018`), and the one carrier `MessageContentStore.recoverMovedContentKey`
-    /// structurally cannot rescue, because that leg is gated
-    /// `provider == .gmail || .outlook` and IMAP is the only family that reaches
-    /// this path.
+    /// (`MIS-018`). `MessageContentStore.recoverMovedContentKey` cannot rescue it,
+    /// because that leg is gated `provider == .gmail || .outlook` and IMAP is the
+    /// only family that reaches this path.
+    ///
+    /// ⚠️ IT IS **NOT** "THE ONE CARRIER" `recoverMovedContentKey` CANNOT RESCUE,
+    /// WHICH IS WHAT THIS COMMENT CLAIMED UNTIL R16-7 (corrected 2026-08-06) — and
+    /// the refutation was sitting 100 lines ABOVE it in this same file: the
+    /// `drainTimeRekeyCarriesAssetsToTheNewAddress` header says the drain-time
+    /// re-key (`MessageHeaderRekey.finishMove` → `AccountManagerQueue.publishRekeys`)
+    /// is *"structurally blind"* to the same recovery leg for the same reason. Two
+    /// tests, one file, contradicting each other on a uniqueness absolute. R16-8
+    /// then added two more — `SyncEngineFullSync`'s DraftDedup and pre-sync-reclaim
+    /// blocks. A uniqueness claim about carriers is exactly the sentence that will
+    /// be quoted to justify NOT auditing the next one, so state the census instead:
+    ///   `rg -n --pcre2 '^(?!\s*(///|//)).*SearchIndex\.shared\.rekeyHeaders'
+    ///    TabMail/ Shared/ TabMailNotificationService/` enumerates the id-changing
+    ///   re-key sites, and every one of them owes the same three-store mirror. The
+    ///   `recoverMovedContentKey` gate — `provider == .gmail || .outlook` **and** an
+    ///   UNCHANGED `providerMessageId` — rescues an id-STABLE move and nothing else,
+    ///   so it rescues NONE of the id-changing carriers, not "all but one".
     ///
     /// The property asserted is the SYSTEM one — *after a UID remap carries a body
     /// to a new key, that body's assets are reachable under the new key* — not the
@@ -733,6 +793,130 @@ struct ContentOwnershipSweepTests {
                     "the dropped duplicate's cached bytes are reclaimed, not orphaned")
         }
         await cleanup(accountId: accountId, keys: [oldKey, newKey])
+    }
+
+    // MARK: - R16-2: the re-key must carry the header's CASCADING CHILDREN
+
+    /// 🚨 THE INVARIANT, as the system property and not the mechanism (`MIS-015`):
+    /// **after a backfill UID remap, the message's user labels and its threading
+    /// edges still exist against the address the message now has.** Nothing here
+    /// asserts that `MessageHeaderRekey.apply` was called; any carrier that keeps the
+    /// user's labels reachable passes.
+    ///
+    /// The defect: `rekeyRemappedHeader` hand-rolled fetch-body → `header.delete(db)`
+    /// → delete body → collision guard → insert → re-insert body. That sequence
+    /// carried the BODY and nothing else, so the header delete fired
+    /// `ON DELETE CASCADE` on BOTH surviving children and the re-insert restored
+    /// NEITHER:
+    ///   * `messageUserLabel` — every label the user applied to a deep-history
+    ///     message, destroyed with **no rebuild source anywhere in the database**.
+    ///     Nothing else knows which labels the user chose.
+    ///   * `messageReference` — the RFC 5322 threading edges. Rebuildable from the
+    ///     header's own In-Reply-To/References, but nothing rebuilt them here.
+    /// Both losses are PERMANENT: every production writer of `MessageUserLabel` and
+    /// every caller of `insertMessageReferences` sits immediately after a
+    /// `header.insert(db)`, so once the row exists at the new id later syncs take the
+    /// merge branch and never re-create them.
+    ///
+    /// ⚠️ The two ASSET tests above cannot see this. They assert on
+    /// `BodyAssetStore`'s manifest, which the hand-rolled version already mirrored —
+    /// the cascade victims are GRDB rows in two other tables entirely.
+    @Test("A backfill UID remap carries the user's labels and threading edges to the new address")
+    func backfillUidRemapCarriesLabelsAndThreadEdges() async throws {
+        let accountId = "r16-2-backfill-children"
+        let parentRfc = "rfc:r16-2-parent@example.com"
+        try await seedScope(accountId: accountId, folderPath: "Archive", provider: .imap)
+        let old = try await seedHeader(
+            accountId: accountId, folderPath: "Archive", messageId: "77",
+            rfc822: "rfc:r16-2-child@example.com", inReplyTo: parentRfc)
+        let newHeaderId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: "Archive", messageId: "78")
+        let labelId = try await seedUserLabel(
+            accountId: accountId, headerId: old.id, providerLabelId: "receipts")
+
+        // MIS-030 — anchor the fixture before asserting anything about survival.
+        #expect(await userLabelIds(for: old.id) == [labelId],
+                "precondition: the remapped message carries a user label at its OLD address")
+        #expect(await referencedIds(for: old.id) == [parentRfc],
+                "precondition: and a threading edge to its parent")
+
+        let outcome = await BackfillBodyQueue().rekeyRemappedHeader(
+            item: BackfillBodyQueue.Item(
+                headerId: old.id, accountId: accountId,
+                folderPath: "Archive", messageId: "77", isInInbox: false),
+            newUID: "78")
+        guard case .migrated = outcome else {
+            Issue.record("precondition: the remap must have MIGRATED, got \(outcome)")
+            await cleanup(accountId: accountId, keys: [ContentKey(rawValue: old.id), ContentKey(rawValue: newHeaderId)])
+            return
+        }
+
+        #expect(await userLabelIds(for: newHeaderId) == [labelId],
+                """
+                the user's label must follow the message to the address it now has — the \
+                header delete cascades `messageUserLabel`, and NOTHING in the database can \
+                rebuild it, so a re-key that does not carry it destroys the label silently \
+                and permanently
+                """)
+        #expect(await referencedIds(for: newHeaderId) == [parentRfc],
+                """
+                and the threading edge must exist at the new address, or the message drops \
+                out of its own conversation until a full resync rebuilds the row
+                """)
+        #expect(await userLabelIds(for: old.id).isEmpty,
+                "and nothing may be left filed under the dead UID")
+        await cleanup(
+            accountId: accountId,
+            keys: [ContentKey(rawValue: old.id), ContentKey(rawValue: newHeaderId)])
+    }
+
+    /// TWO-SIDED ANCHOR — the DELIBERATELY HELD direction (`MIS-026`). On the
+    /// `.duplicateDropped` leg the new UID was independently backfilled and is a
+    /// DIFFERENT row that owns its own state; the loser is discarded, not migrated.
+    /// A blanket "always carry the children" mirror would file the dropped
+    /// duplicate's labels onto the survivor — a label the user never applied to that
+    /// message, which is misattribution rather than loss. This is the side that must
+    /// stay GREEN when the fix is inverted toward an unconditional carry.
+    @Test("A dropped-duplicate backfill remap never files the loser's labels onto the survivor")
+    func backfillUidRemapDropNeverFilesLabelsOntoTheSurvivor() async throws {
+        let accountId = "r16-2-backfill-dropped"
+        try await seedScope(accountId: accountId, folderPath: "Archive", provider: .imap)
+        let old = try await seedHeader(
+            accountId: accountId, folderPath: "Archive", messageId: "77",
+            rfc822: "rfc:r16-2-loser@example.com", inReplyTo: "rfc:r16-2-loser-parent@example.com")
+        let survivor = try await seedHeader(
+            accountId: accountId, folderPath: "Archive", messageId: "78",
+            rfc822: "rfc:r16-2-survivor@example.com")
+        let loserLabelId = try await seedUserLabel(
+            accountId: accountId, headerId: old.id, providerLabelId: "loser-only")
+
+        #expect(await userLabelIds(for: old.id) == [loserLabelId],
+                "precondition: only the LOSER carries this label")
+        #expect(await userLabelIds(for: survivor.id).isEmpty,
+                "precondition: the survivor has none of its own — the only fixture in which a blanket carry is observable")
+
+        let outcome = await BackfillBodyQueue().rekeyRemappedHeader(
+            item: BackfillBodyQueue.Item(
+                headerId: old.id, accountId: accountId,
+                folderPath: "Archive", messageId: "77", isInInbox: false),
+            newUID: "78")
+        guard case .duplicateDropped = outcome else {
+            Issue.record("precondition: the remap must have DROPPED the duplicate, got \(outcome)")
+            await cleanup(accountId: accountId, keys: [ContentKey(rawValue: old.id), ContentKey(rawValue: survivor.id)])
+            return
+        }
+
+        #expect(await userLabelIds(for: survivor.id).isEmpty,
+                """
+                the survivor is a DIFFERENT message that was independently backfilled — the \
+                dropped duplicate's label must not be grafted onto it, or the user sees a \
+                label they never applied to that message
+                """)
+        #expect(await userLabelIds(for: old.id).isEmpty,
+                "and the dropped duplicate's own row is gone with its associations")
+        await cleanup(
+            accountId: accountId,
+            keys: [ContentKey(rawValue: old.id), ContentKey(rawValue: survivor.id)])
     }
 
     // MARK: - R3: the ordering contract

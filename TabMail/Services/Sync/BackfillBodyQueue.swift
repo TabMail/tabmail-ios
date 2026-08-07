@@ -151,7 +151,14 @@ actor BackfillBodyQueue {
     // MARK: - Public API
 
     /// Guarded admission — the SINGLE gate every enqueue site in this actor routes
-    /// through: skip a headerId already deferred as oversized so a deferred item is
+    /// through. Predicate, comments excluded so this sentence cannot satisfy it
+    /// (R16-7): `rg -n --pcre2 '^(?!\s*(///|//)).*(func admit|admit\()'
+    /// TabMail/Services/Sync/BackfillBodyQueue.swift` → **6** lines = this
+    /// definition plus **5** enqueue sites. Same warning as the identical gate in
+    /// `ActiveBodyQueue`: a new enqueue path that skips `admit` re-admits a
+    /// deferred oversized item for the whole process lifetime.
+    ///
+    /// The gate itself: skip a headerId already deferred as oversized so a deferred item is
     /// never re-admitted this process lifetime. The repopulate/drain SELECTs still
     /// return the row (`bodyComplete = 0 / bodyEmptyConfirmed = 0` is truthfully
     /// retryable — the row is NOT lied about), but this gate keeps it out of the
@@ -896,6 +903,12 @@ actor BackfillBodyQueue {
     /// again. What Stage D does change is that the old body row must now be deleted
     /// EXPLICITLY, on every exit including `duplicateDropped`.
     ///
+    /// 🚨 **THE DELETE+REINSERT IS NOW DELEGATED TO `MessageHeaderRekey.apply`
+    /// (R16-2)**, which owns all four carrier legs. It is the same shape, not a new
+    /// one — see the block comment at the call site for what the local copy was
+    /// silently destroying, and `MessageHeaderRekey.apply`'s own doc for the two
+    /// cascading child tables and why one is carried and the other rebuilt.
+    ///
     /// Exposed as `internal` (not private) so tests can drive it directly.
     func rekeyRemappedHeader(item: Item, newUID: String) async -> RekeyOutcome {
         let newHeaderId = MessageIdentity.headerId(
@@ -904,33 +917,46 @@ actor BackfillBodyQueue {
         let outcome: RekeyOutcome
         do {
             outcome = try await dbPool.write { db -> RekeyOutcome in
-                guard var header = try MessageHeader.fetchOne(db, key: item.headerId) else {
+                guard let header = try MessageHeader.fetchOne(db, key: item.headerId) else {
                     // Row already gone (raced with sync/prune) — nothing to migrate.
                     return .duplicateDropped
                 }
-                // Fetch the body BEFORE deleting the header, then delete its row
-                // EXPLICITLY (Stage D removed the FK cascade that used to). Both
-                // statements sit ABOVE the `duplicateDropped` guard on purpose: that
-                // leg returns with the header already gone, so a body delete placed
-                // after it would strand the row exactly on the branch that discards
-                // the message.
-                let oldBody = try MessageBody.fetchOne(db, key: ContentKey(rawValue: item.headerId))
-                try header.delete(db)
-                _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: item.headerId))
-                guard try MessageHeader.fetchOne(db, key: newHeaderId) == nil else {
-                    // The new UID was independently backfilled — old row was a duplicate.
-                    return .duplicateDropped
-                }
-                header.id = newHeaderId
-                header.messageId = newUID
-                header.missFetchCount = 0
+                var migrated = header
+                migrated.id = newHeaderId
+                migrated.messageId = newUID
+                migrated.missFetchCount = 0
                 // This unbound body-queue re-key did not observe the replacement
                 // UID beside a UIDVALIDITY. Sync must prove it before admission.
-                header.observedUidValidity = nil
-                try header.insert(db)
-                if var body = oldBody {
-                    body.id = ContentKey(rawValue: newHeaderId)
-                    try body.insert(db)
+                migrated.observedUidValidity = nil
+                // 🚨 R16-2 — THE CARRIER IS SHARED, NOT REIMPLEMENTED. This block
+                // used to hand-roll fetch-body → delete header → delete body →
+                // collision guard → insert → re-insert body. That sequence carried
+                // the BODY and nothing else, so `header.delete(db)` fired
+                // `ON DELETE CASCADE` on both surviving children of `messageHeader`
+                // and the re-insert restored NEITHER:
+                //   * `messageUserLabel` (`AppDatabase` `v82`'s create, cascade on
+                //     the `messageId` FK) — every label the user applied to a
+                //     deep-history message, destroyed with NO rebuild source. Nothing
+                //     else in the database knows which labels the user chose.
+                //   * `messageReference` (threading edges, cascade on its
+                //     `messageId` FK) — rebuildable from the header's own
+                //     References/In-Reply-To, but nothing rebuilt them here.
+                // Both losses are PERMANENT: every production writer of
+                // `MessageUserLabel` and every caller of `insertMessageReferences`
+                // sits immediately after a `header.insert(db)`, so once the row
+                // exists at the new id later syncs take the merge branch and never
+                // re-create them.
+                //
+                // `MessageHeaderRekey.apply` is the sibling carrier that has always
+                // done all four legs (body carry, label CARRY — there is no rebuild
+                // source — reference REBUILD, and the collision guard), and it is
+                // safe on BOTH legs here: it deletes the old row and its body before
+                // the collision check and returns `false` WITHOUT inserting anything,
+                // so a dropped duplicate's labels can never be filed onto the
+                // survivor. That collision return is exactly `.duplicateDropped`.
+                guard try MessageHeaderRekey.apply(from: header, to: migrated, db: db) else {
+                    // The new UID was independently backfilled — old row was a duplicate.
+                    return .duplicateDropped
                 }
                 return .migrated(Item(
                     headerId: newHeaderId, accountId: item.accountId,

@@ -587,25 +587,27 @@ actor DraftStore {
         freshRfc: String,
         db: Database
     ) throws -> Bool {
-        guard var placeholder = try MessageHeader.fetchOne(db, key: migration.oldHeaderId) else {
+        guard let placeholder = try MessageHeader.fetchOne(db, key: migration.oldHeaderId) else {
             return false
         }
-        if try MessageHeader.fetchOne(db, key: migration.newHeaderId) != nil {
-            _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: placeholder.id))
-            try placeholder.delete(db)
-            return false
-        }
-        try placeholder.delete(db)
-        placeholder.id = migration.newHeaderId
-        placeholder.messageId = migration.newMessageId
-        placeholder.rfc822MessageId = freshRfc
-        try placeholder.insert(db)
-        if var body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: migration.oldHeaderId)) {
-            try body.delete(db)
-            body.id = ContentKey(rawValue: migration.newHeaderId)
-            try body.insert(db)
-        }
-        return true
+        var migrated = placeholder
+        migrated.id = migration.newHeaderId
+        migrated.messageId = migration.newMessageId
+        migrated.rfc822MessageId = freshRfc
+        // 🚨 R16-2 — SAME CENSUS, SAME CARRIER. This is a header PRIMARY-KEY change,
+        // so it is a member of the class enumerated by *"every code path that changes
+        // a header's primary key"*, and it had the same gap
+        // `BackfillBodyQueue.rekeyRemappedHeader` did: it carried the BODY and let
+        // `placeholder.delete(db)` cascade `messageUserLabel` and `messageReference`
+        // away. `messageReference` is the one that bites here — a REPLY draft carries
+        // `In-Reply-To`, so its threading edge to the message being replied to was
+        // destroyed exactly when the placeholder was promoted to the server's real
+        // identity. `MessageHeaderRekey.apply` carries the labels, rebuilds the
+        // references from the migrated header's own content, and its collision
+        // return (`false`, after both deletes) is byte-for-byte the disposition this
+        // function's own early return had — which is why the caller's `rekeyed`
+        // false-branch (`MessageContentStore.releaseUnowned`) still applies unchanged.
+        return try MessageHeaderRekey.apply(from: placeholder, to: migrated, db: db)
     }
 
     /// PORT — exact pre-A initialDraft/payload + StageAContext shape. Stage A
