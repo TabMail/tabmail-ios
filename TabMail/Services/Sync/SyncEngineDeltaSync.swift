@@ -302,12 +302,37 @@ extension SyncEngine {
                                 // Dedup optimistic sent headers by rfc822MessageId.
                                 // Defer body insert until after header insert (FK constraint).
                                 var deferredSentBody: MessageBody?
+                                var carriedUserLabelIds: [String] = []
                                 if folder.role == .sent,
                                    let rfc822 = header.rfc822MessageId, !rfc822.isEmpty,
                                    let optimistic = try MessageHeader
                                     .filter(Column("folderId") == folder.id && Column("rfc822MessageId") == rfc822 && Column("messageId") != header.messageId)
                                     .fetchOne(db) {
                                     let oldId = optimistic.id
+                                    // 🚨 CARRY THE USER-APPLIED LABEL MEMBERSHIP ACROSS THE
+                                    // REPLACEMENT. `messageUserLabel.messageId` declares
+                                    // `.references("messageHeader", onDelete: .cascade)`, so the
+                                    // `optimistic.delete(db)` below ERASES this message's junction
+                                    // rows. The rebuild further down is driven by
+                                    // `info.userLabelIds` — the INCOMING set — which on Gmail is
+                                    // legitimately EMPTY and non-authoritative whenever the label
+                                    // catalog has not loaded yet (`GmailUserLabelCatalogState
+                                    // .isAuthoritative == false` ⇒ `extractUserLabelIds` filters
+                                    // everything out), and which never contains a label the user
+                                    // applied locally whose `.addUserLabel` op has not drained.
+                                    // Either way the rebuild restores nothing and the user's label
+                                    // is silently gone.
+                                    //
+                                    // The evidence this carry rests on is EXACTLY the evidence the
+                                    // body carry below already rests on — the same
+                                    // `(folderId, rfc822MessageId, messageId != …)` match — and a
+                                    // body is strictly more damaging to misattribute than a label.
+                                    // So this introduces no evidence weaker than what is already
+                                    // load-bearing here.
+                                    carriedUserLabelIds = try MessageUserLabel
+                                        .filter(Column("messageId") == oldId)
+                                        .fetchAll(db)
+                                        .map(\.userLabelId)
                                     if let body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) {
                                         var newBody = body
                                         newBody.id = ContentKey(rawValue: header.id)
@@ -337,6 +362,16 @@ extension SyncEngine {
                                     // The join FK is `userLabel.id` — the account-prefixed SURROGATE, never
                                     // the bare provider value (D10 / `IOS-LABEL-001`).
                                     try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
+                                        .insert(db, onConflict: .ignore)
+                                }
+                                // Re-attach the membership the Sent dedup above carried off the
+                                // replaced header. These ids are already `userLabel.id` surrogates
+                                // and their parent rows are untouched by the header delete (the
+                                // cascade runs from `messageHeader`, not from `userLabel`), so no
+                                // `UserLabel` insert is needed. `.ignore` because the incoming set
+                                // may legitimately name the same label.
+                                for carriedUserLabelId in carriedUserLabelIds {
+                                    try MessageUserLabel(messageId: header.id, userLabelId: carriedUserLabelId)
                                         .insert(db, onConflict: .ignore)
                                 }
 
@@ -665,12 +700,25 @@ extension SyncEngine {
                             // Dedup optimistic sent headers by rfc822MessageId.
                             // Defer body insert until after header insert (FK constraint).
                             var deferredSentBody: MessageBody?
+                            var carriedUserLabelIds: [String] = []
                             if folder.role == .sent,
                                let rfc822 = header.rfc822MessageId, !rfc822.isEmpty,
                                let optimistic = try MessageHeader
                                 .filter(Column("folderId") == folder.id && Column("rfc822MessageId") == rfc822 && Column("messageId") != header.messageId)
                                 .fetchOne(db) {
                                 let oldId = optimistic.id
+                                // 🚨 CARRY THE USER-APPLIED LABEL MEMBERSHIP — see the identical
+                                // block on the Gmail delta path above for the full reasoning.
+                                // `messageUserLabel.messageId` cascades on `messageHeader` delete,
+                                // so `optimistic.delete(db)` erases it, and the rebuild below is
+                                // driven by the INCOMING set only. On Exchange `info.userLabelIds`
+                                // is `msg.categories` and IS authoritative, but it still cannot
+                                // contain a category the user applied locally whose
+                                // `.addUserLabel` op has not yet drained to Graph.
+                                carriedUserLabelIds = try MessageUserLabel
+                                    .filter(Column("messageId") == oldId)
+                                    .fetchAll(db)
+                                    .map(\.userLabelId)
                                 if let body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) {
                                     var newBody = body
                                     newBody.id = ContentKey(rawValue: header.id)
@@ -689,13 +737,25 @@ extension SyncEngine {
                             if let sentBody = deferredSentBody { try sentBody.insert(db) }
                             try ThreadUtils.insertMessageReferences(for: header, db: db)
 
-                            // Insert user label associations (Exchange: empty for now)
+                            // Insert user label associations. ⚠️ This said "(Exchange: empty
+                            // for now)" until round 18 and was FALSE at this candidate:
+                            // `ExchangeProvider.parseGraphMessage` maps `msg.categories` into
+                            // `userLabelIds` (filtered only for legacy `tm_*`) and stamps
+                            // `userLabelIdsAreAuthoritative: true`. A stale comment that
+                            // CONFIRMS a hypothesis is the expensive kind — this one nearly
+                            // produced a false HIGH in the round-18 audit.
                             for labelId in info.userLabelIds {
                                 let labelRow = UserLabel(accountId: account.id, providerLabelId: labelId, name: labelId, isSystem: false)
                                 try labelRow.insert(db, onConflict: .ignore)
                                 // The join FK is `userLabel.id` — the account-prefixed SURROGATE, never
                                 // the bare provider value (D10 / `IOS-LABEL-001`).
                                 try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
+                                    .insert(db, onConflict: .ignore)
+                            }
+                            // Re-attach the membership the Sent dedup above carried off the
+                            // replaced header — see the Gmail path for the full reasoning.
+                            for carriedUserLabelId in carriedUserLabelIds {
+                                try MessageUserLabel(messageId: header.id, userLabelId: carriedUserLabelId)
                                     .insert(db, onConflict: .ignore)
                             }
 

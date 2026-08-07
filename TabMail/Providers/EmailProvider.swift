@@ -112,16 +112,29 @@ struct MessageHeaderInfo: Sendable {
     ///
     /// ⚑ CURRENTLY UNCONSUMED ON v3. The reference reads it in
     /// `SyncEngineFullSync` as `remoteSetIsAuthoritative:`, which gates a
-    /// reconcile that REPLACES local membership with the remote set. v3's
-    /// label writers are insert-only (`MessageUserLabel(...).insert(db,
-    /// onConflict: .ignore)` in `SyncEngineFullSync`, `SyncEngineDeltaSync`,
-    /// `SyncEngineBackfillDeep`) and never delete a junction row, so there is
-    /// nothing here yet that could erase membership. The flag lands with the
-    /// catalog it describes so the guard exists BEFORE a reconcile does — a
-    /// reconcile added later against a defaulted-true or absent flag is the
-    /// half-port shape. `IMAPProvider` must set it `true` (its keyword FETCH
-    /// is authoritative, as in the reference) at the same time any consumer
-    /// lands, or IMAP labels fail closed forever.
+    /// reconcile that REPLACES local membership with the remote set. The flag
+    /// lands with the catalog it describes so the guard exists BEFORE a
+    /// reconcile does — a reconcile added later against a defaulted-true or
+    /// absent flag is the half-port shape. `IMAPProvider` must set it `true`
+    /// (its keyword FETCH is authoritative, as in the reference) at the same
+    /// time any consumer lands, or IMAP labels fail closed forever.
+    ///
+    /// ⚠️ THIS BLOCK ALSO ASSERTED, UNTIL ROUND 18, THAT *"v3's label writers
+    /// are insert-only … and never delete a junction row, so there is nothing
+    /// here yet that could erase membership."* **The first clause is true and
+    /// the conclusion drawn from it was FALSE.** The eraser is not a label
+    /// writer at all, so a census of label writers structurally could not see
+    /// it (`MIS-008` — a grep result is a claim about the DATA MODEL it
+    /// assumes): `messageUserLabel.messageId` declares
+    /// `.references("messageHeader", onDelete: .cascade)`, so **deleting a
+    /// `messageHeader` row erases that message's junction rows**, and the two
+    /// optimistic-Sent dedup blocks in `SyncEngineDeltaSync` (the Gmail one and
+    /// the Exchange one) do exactly that before re-inserting the incoming
+    /// header. Both now carry the replaced header's `MessageUserLabel` rows
+    /// across the replacement, alongside the body they already carried, so the
+    /// erasure is mitigated at those two sites — but the general fact stands
+    /// and any NEW header deleter inherits it. Pinned by
+    /// `SentDedupUserLabelCarryTests`.
     var userLabelIdsAreAuthoritative = false
     /// The server reports this message with the `\Deleted` system flag — RFC 3501
     /// §2.3.2, *"the message is 'deleted' for removal by later EXPUNGE"*. The
