@@ -295,3 +295,81 @@ struct MigrationTimingAttributionTests {
                 """)
     }
 }
+/// The chain-attribution line answers *how long*; this pair answers *over what*.
+///
+/// 🚨 THE DEFECT IT EXISTS TO FIX. The owner's device reported a **27,601 ms**
+/// migration chain and the log gave no denominator, so "slow migrations" and "a very
+/// large mailbox" were indistinguishable — and they have OPPOSITE remedies. A
+/// duration with no denominator is not observability.
+///
+/// Unlike everything else in `MigrationTimingLedger`, `measureChainScale` /
+/// `logChainScale` are ALWAYS ON (project rule 12 exception (b)), which is why the
+/// cost containment is asserted here rather than assumed: the caller emits the line
+/// only when the chain has unapplied migrations, so an ordinary launch pays one
+/// `grdb_migrations` read and nothing else.
+@Suite("Migration chain scale calibration")
+struct MigrationChainScaleTests {
+
+    /// A fresh install is measured BEFORE `v1` runs, so none of the four tables
+    /// exists. `nil` and `0` must stay distinguishable: rendering both as `0` would
+    /// make a fresh install read exactly like a user who deleted all their mail, and
+    /// the whole point of this line is telling those apart.
+    @Test("A pre-schema database reports absent counts, not zero counts")
+    func preSchemaDatabaseReportsAbsentNotZero() throws {
+        let db = try DatabaseQueue()
+        let scale = try db.read { db in
+            MigrationTimingLedger.measureChainScale(db, pendingMigrations: 83)
+        }
+        #expect(scale.messageHeaders == nil)
+        #expect(scale.messageBodies == nil)
+        #expect(scale.accounts == nil)
+        #expect(scale.folders == nil)
+        #expect(scale.pendingMigrations == 83)
+        // The page pragmas answer on any database, schema or not — that is the one
+        // figure a fresh install can still report.
+        #expect(scale.databaseBytes != nil)
+    }
+
+    /// The other side, and the one that makes the first non-vacuous: on a migrated,
+    /// populated database every count is present and reports what was seeded.
+    @Test("A populated database reports the counts the chain is about to walk")
+    func populatedDatabaseReportsItsScale() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        for i in 0..<7 {
+            try TestDatabase.insertMessageHeader(db, messageId: "\(i)", date: Date())
+        }
+
+        let scale = try db.read { db in
+            MigrationTimingLedger.measureChainScale(db, pendingMigrations: 0)
+        }
+        #expect(scale.messageHeaders == 7,
+                "seeded 7 headers, measured \(String(describing: scale.messageHeaders))")
+        #expect(scale.accounts == 1)
+        #expect(scale.folders == 1)
+        #expect(scale.messageBodies != nil,
+                "messageBody exists in the migrated schema, so its count must not be absent")
+        #expect((scale.databaseBytes ?? 0) > 0)
+    }
+
+    /// 🚨 THE COST CONTAINMENT, asserted rather than assumed. This measurement runs
+    /// INSIDE the window the aggregate *"schema migrations completed in Nms"* line
+    /// covers, so it inflates the very number it calibrates. It is reported inline so
+    /// it is subtractable — and a value that is present but never plausible would mean
+    /// the four `COUNT(*)`s had quietly become the expensive part.
+    @Test("The measurement reports its own cost, and that cost is small")
+    func measurementReportsAndBoundsItsOwnCost() throws {
+        let db = try TestDatabase.make()
+        let scale = try db.read { db in
+            MigrationTimingLedger.measureChainScale(db, pendingMigrations: 1)
+        }
+        #expect(scale.measurementMs >= 0)
+        #expect(scale.measurementMs < 1_000,
+                """
+                counting four empty tables took \(scale.measurementMs)ms — on this \
+                fixture it should be single-digit, and anything near a second means \
+                the calibration has become a cost of its own
+                """)
+    }
+}

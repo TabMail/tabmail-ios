@@ -444,6 +444,42 @@ final class AppDatabase: Sendable {
     static func runMigrations(on writer: any DatabaseWriter) throws {
         var migrator = DatabaseMigrator()
         registerAllMigrations(on: &migrator)
+
+        // 🚨 CALIBRATION — ALWAYS ON, AND ONLY WHEN THE CHAIN HAS WORK TO DO.
+        //
+        // A duration with no denominator is not observability. The owner's device
+        // reported a 27,601 ms chain and nobody could say whether that meant "slow
+        // migrations" or "a very large mailbox" — and those have OPPOSITE remedies.
+        // This emits the denominator once, immediately before the first body runs:
+        // header count, body count, accounts, folders, and the database's page
+        // footprint. See `MigrationTimingLedger.measureChainScale`.
+        //
+        // The `unapplied.isEmpty` guard is what keeps this off the ordinary launch
+        // path. An already-migrated database pays ONE read of `grdb_migrations` — the
+        // same read `migrator.migrate` is about to do anyway — and emits nothing. The
+        // four `COUNT(*)`s are paid at most once per app upgrade.
+        //
+        // ⚠️ IT IS INSIDE THE WINDOW IT MEASURES. `AppDatabase.init` brackets this
+        // whole function with the aggregate *"schema migrations completed in Nms"*
+        // line, so the measurement inflates that number. `ChainScale.measurementMs`
+        // is printed on the same line for exactly that reason — subtractable rather
+        // than invisible. Moving the measurement outside the bracket was considered
+        // and rejected: `runMigrations` is the only place that knows what is
+        // unapplied, and duplicating that read in the caller is how the two drift.
+        //
+        // ⚠️ IT MUST NEVER THROW. A diagnostic that can fail a migration chain is a
+        // brick, which is in the non-recoverable set; a missing number is not. Every
+        // read inside `measureChainScale` is individually optional, and this whole
+        // block is `try?` — on a fresh install `messageHeader` does not exist yet.
+        let scale: MigrationTimingLedger.ChainScale? = (try? writer.read { db in
+            let completed = Set(try migrator.completedMigrations(db))
+            let unapplied = migrator.migrations.filter { !completed.contains($0) }
+            guard !unapplied.isEmpty else { return nil }
+            return MigrationTimingLedger.measureChainScale(
+                db, pendingMigrations: unapplied.count)
+        }) ?? nil
+        if let scale { MigrationTimingLedger.logChainScale(scale) }
+
         try migrator.migrate(writer)
         // THE LAST MIGRATION HAS NO SUCCESSOR to close its post-body interval, so
         // the chain-completion site closes it and emits the reconciliation line.
