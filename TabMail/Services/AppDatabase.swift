@@ -2225,7 +2225,7 @@ final class AppDatabase: Sendable {
             // present" needs no flag — the `messageBody` row's existence IS that
             // state, and every reader already computes it live
             // (`MessageDetailViewModel.loadThreadMessageBody`,
-            // `AccountManagerFetch.fetchBodyIfNeeded`) and fetches on cache-miss.
+            // `AccountManager.fetchBodyIfNeeded`) and fetches on cache-miss.
             // `v2final`'s `repairPayloadTooLargeEmptyBodies` DOES pair a body delete
             // with `bodyComplete = 0`, but only for bodies that were never VALIDLY
             // fetched (`bodyEmptyConfirmed = 1 AND emptyFetchCount < 3`) — the
@@ -2724,7 +2724,7 @@ final class AppDatabase: Sendable {
         // THE LEGACY-ROW RULE, which is what replaces it. A row that was already
         // carrying an action tag when `v81` ran keeps `actionTagSetAt = NULL`.
         // `actionTagSetAt` has exactly ONE production reader,
-        // `SyncEngineMaintenance.sweepStaleActionTags`, whose TTL test is
+        // `SyncEngine.sweepStaleActionTags`, whose TTL test is
         // `if let setAt = msg.actionTagSetAt, setAt > cutoff { continue }` — so a
         // NULL stamp is treated as ALREADY EXPIRED. That is the deliberate fail-safe
         // direction recorded at the sweep itself, and it matches TB's

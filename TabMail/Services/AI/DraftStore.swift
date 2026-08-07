@@ -136,7 +136,7 @@ actor DraftStore {
     /// its `rfc822MessageId` twin) is deliberately NOT ported. Census over every v3
     /// producer of a `Draft` reaching this function — `ComposeView.saveDraftAndDismiss`
     /// (`draftToSave`), `ComposeView.send` (`ownedDraft`), and
-    /// `DynamicIslandChatButton.autoSaveDraft` (both branches) — shows each one takes
+    /// `DynamicIslandChat.autoSaveDraft` (both branches) — shows each one takes
     /// its linkage from a prior read of THIS row or leaves it nil; v3 has no
     /// `ServerDraftOpen.seedServerLinkage` equivalent, and its open path
     /// (`ServerDraftComposeLoader` → `LocallyAuthoredDraftOpenAuthority.matches`)
@@ -514,7 +514,7 @@ actor DraftStore {
     ///
     /// This used to stamp `serverPushStatus = "unconfirmed"` and let
     /// `pushDraftToServer` RETURN `.terminalUnconfirmed` — a normal return — so
-    /// `AccountManagerQueue.executeSingleOp`'s SUCCESS path ran
+    /// `AccountManager.executeSingleOp`'s SUCCESS path ran
     /// `PendingOperation.deleteOne` and the user's Save intention was retired
     /// after ONE attempt, on an ordinary mobile network drop. Nothing re-enqueues
     /// on `serverPushStatus` (`IOS-DRAFT-011` states that outright), so only a
@@ -808,7 +808,7 @@ actor DraftStore {
             // Re-admit the row FIRST, then RETHROW. Both halves are load-bearing —
             // see `restorePushableAfterProviderThrow`. Rethrowing is what keeps the
             // durable `.saveDraft` producer queued: the error reaches
-            // `AccountManagerQueue.executeSingleOp`'s classifier, which requeues it
+            // `AccountManager.executeSingleOp`'s classifier, which requeues it
             // exactly as it does for every other provider throw.
             //
             // 🚨 CORRECTED 2026-08-06. This used to end: *"If the restore WRITE
@@ -918,7 +918,7 @@ actor DraftStore {
     /// drained yet IN THIS PROCESS, so no claim can be held and any `"pushing"` row
     /// is orphaned — which is what lets this carry no drain latch. That remains the
     /// correct scope for a BLIND, predicate-only, whole-table reset: read the banner
-    /// on `AccountManagerOutbox.reconcileOutbox`, which records a real shipped bug
+    /// on `AccountManager.reconcileOutbox`, which records a real shipped bug
     /// where a reset landed on a row whose send was already on the wire. This
     /// function is also still load-bearing after the entry re-admission, because it
     /// normalises rows no `.saveDraft` producer will ever visit (a producer already

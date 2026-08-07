@@ -1160,7 +1160,7 @@ actor AccountManager {
         // 🚨 `config.needsReauth` IS DELIBERATELY NOT READ HERE (round 18, item B).
         // This used to be `if config.needsReauth { return nil }`, and that gate was
         // a durable wedge rather than a signal. The column had exactly one writer
-        // (`AccountManagerCalendarQueue.retireCalendarOperation`'s
+        // (`AccountManager.retireCalendarOperation`'s
         // `UPDATE caldavConfig SET needsReauth = 1`), exactly one reader (this
         // guard), and NOTHING that ever cleared it — the only other write is
         // `CalDAVConfig.init`'s `false`, reached only when the CalDAV setup path
@@ -1176,7 +1176,7 @@ actor AccountManager {
         //     `CalendarProviderDispatch.resolveAll()`, which iterates
         //     `AccountManager.calendarProviders` — so the account also vanished
         //     from the calendar picker, and the ONE working re-auth signal
-        //     (`ToolSettingsView`'s live `listCalendars()` probe → its OWN,
+        //     (`CalendarPickerModel`'s live `listCalendars()` probe → its OWN,
         //     unrelated `AccountEntry.needsReauth` field → the "Calendar Access
         //     Required" section) could never render for it. The durable column
         //     defeated the live probe. Two different `needsReauth`s with the same

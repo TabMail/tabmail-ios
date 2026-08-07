@@ -110,7 +110,7 @@ public enum MessageIdentity {
     ///
     /// * `ChatIdTranslator.purgeMappingsForFolder` — `chatIdMapping`, matched
     ///   entirely by this guard.
-    /// * `AccountManagerUidValidityReset.purgeBodyAssetsForFolder` — the
+    /// * `AccountManager.purgeBodyAssetsForFolder` — the
     ///   `BodyAssetStore` manifest, matched entirely by this guard.
     /// * `SearchIndex.removeMessagesForFolder`'s **H-2 orphan sweep** of
     ///   `message_ids` — but NOT that function's primary delete.

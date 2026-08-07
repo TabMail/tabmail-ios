@@ -150,7 +150,7 @@ final class DemoModeService {
         NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
         // The chat pill's first ValueObservation emission can race the seed
         // writes (count=0 on first emit; 2s debounced refresh on the next).
-        // Post `.remindersDidChange` directly so DynamicIslandChatButton's
+        // Post `.remindersDidChange` directly so DynamicIslandChat's
         // onReceive fires `regenerateReminders` immediately, no race window.
         NotificationCenter.default.post(name: .remindersDidChange, object: nil)
         NotificationCenter.default.post(name: .demoSeedingComplete, object: nil)

@@ -38,7 +38,7 @@ import Synchronization
 /// So this suite does not assert "the mock has a method". It asserts the SYSTEM
 /// property that the missing override destroyed: **an epoch the provider
 /// observes during a sync pass reaches `Folder.lastKnownUidValidity`.** The real
-/// production capture site is `SyncEngineFullSync.runSyncMessages`
+/// production capture site is `SyncEngine.runSyncMessages`
 /// (`SyncEngineFullSync.swift:693`), which reads the observation into a local
 /// immediately after its own `fetchMessages` and persists it through
 /// `SyncEngine.bootstrapFolderUidValidity` (`SyncEngineDeltaSync.swift:844`)
@@ -70,7 +70,7 @@ import Synchronization
 /// exactly the shape that passes vacuously — which is the defect this file
 /// was written to make impossible. Nothing about the three tests below is
 /// adapted from a reference test; they are authored against v3's one existing
-/// production consumer, `SyncEngineFullSync.runSyncMessages`.
+/// production consumer, `SyncEngine.runSyncMessages`.
 ///
 /// ## Red-first evidence — MEASURED 2026-07-30, quoted verbatim
 ///

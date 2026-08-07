@@ -587,7 +587,7 @@ struct ContentOwnershipSweepTests {
     // MARK: - R15-FIX-2: the SEVENTH carrier — the backfill body queue's UID remap
 
     /// ⚠ THE TWO TESTS ABOVE CANNOT REACH THIS CARRIER. They drive
-    /// `AccountManagerQueue.publishRekeys`, the drain-time re-key. A UID remap
+    /// `AccountManager.publishRekeys`, the drain-time re-key. A UID remap
     /// discovered by the BODY QUEUE takes a different function entirely —
     /// `BackfillBodyQueue.rekeyRemappedHeader` — which had the FTS half of the
     /// mirror (`SearchIndex.rekeyHeaders`) and not the asset half: a half-port
@@ -599,7 +599,7 @@ struct ContentOwnershipSweepTests {
     /// WHICH IS WHAT THIS COMMENT CLAIMED UNTIL R16-7 (corrected 2026-08-06) — and
     /// the refutation was sitting 100 lines ABOVE it in this same file: the
     /// `drainTimeRekeyCarriesAssetsToTheNewAddress` header says the drain-time
-    /// re-key (`MessageHeaderRekey.finishMove` → `AccountManagerQueue.publishRekeys`)
+    /// re-key (`MessageHeaderRekey.finishMove` → `AccountManager.publishRekeys`)
     /// is *"structurally blind"* to the same recovery leg for the same reason. Two
     /// tests, one file, contradicting each other on a uniqueness absolute. R16-8
     /// then added two more — `SyncEngineFullSync`'s DraftDedup and pre-sync-reclaim

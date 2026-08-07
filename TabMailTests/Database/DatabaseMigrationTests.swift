@@ -1004,7 +1004,7 @@ struct V70CrossStoreInvariantTests {
     /// were already carrying an action tag.
     ///
     /// The state this test pins is not an implementation detail, it is the
-    /// input to a behaviour: `SyncEngineMaintenance.sweepStaleActionTags`
+    /// input to a behaviour: `SyncEngine.sweepStaleActionTags`
     /// treats a NULL stamp as ALREADY EXPIRED (`if let setAt =
     /// msg.actionTagSetAt, setAt > cutoff { continue }`), so a legacy tag on a
     /// message that has already left the inbox is reclaimed on the next

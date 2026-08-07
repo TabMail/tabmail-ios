@@ -51,7 +51,7 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
         // normalization anywhere downstream, so whatever is computed here is what
         // reaches the wire: Google `end.date`, Graph's midnight-to-midnight values,
         // and CalDAV's `DTEND;VALUE=DATE`. The tree's own anchor for the convention
-        // is `GoogleCalendarTypesTests.mergeMasterAndPatchAllDayPreserved` —
+        // is `GoogleCalendarSplitHelpersTests.mergeMasterAndPatchAllDayPreserved` —
         // *"1-day all-day event → end is exclusive next day"*, `start=2026-05-27`,
         // `end=2026-05-28`.
         //

@@ -101,7 +101,7 @@ struct SyncEngineFTSTests {
             )
         }
 
-        // Replicate the mapping from SyncEngineFTS.indexHeadersForFTS
+        // Replicate the mapping from SyncEngine.indexHeadersForFTS
         let records = headers.map { header in
             FTSHeaderRecord( contentKey: ContentKey(rawValue: header.id),
                 headerId: header.id,

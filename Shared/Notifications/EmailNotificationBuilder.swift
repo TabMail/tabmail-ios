@@ -6,7 +6,7 @@ import Foundation
 import UserNotifications
 
 /// Single source of truth for user-facing email notification content. Used by
-/// both the main-app silent-push / BGAppRefresh path (`AccountManagerAI.post-
+/// both the main-app silent-push / BGAppRefresh path (`AccountManager.post-
 /// ReplyNotificationIfNeeded`) and the NSE (`NotificationService`).
 ///
 /// Rule:

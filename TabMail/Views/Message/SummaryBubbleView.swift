@@ -52,7 +52,7 @@ struct SummaryBubbleView: View {
         demoSuppressed: Bool
     ) -> DisplayMode {
         if demoSuppressed { return .hidden }
-        // AI summary is inbox-scoped on both compute (AccountManagerAI.processOpenedMessage
+        // AI summary is inbox-scoped on both compute (AccountManager.processOpenedMessage
         // guards on isInInbox) and display. Cached summaries / no-content stubs left on
         // MessageHeader rows from a prior inbox stay must not surface for non-inbox views
         // (e.g. opening a Sent/Archive/Trash message via search).

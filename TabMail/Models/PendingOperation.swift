@@ -234,7 +234,7 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
 //
 // * **Ordinary actions** (archive / delete / move / flag, and the user-label and
 //   outbox reply-flag producers routed through the same helper) key by the
-//   provider's NATIVE address. `AccountManagerActions.admittedOrdinaryActionTargets`
+//   provider's NATIVE address. `AccountManager.admittedOrdinaryActionTargets`
 //   returns `admitted.map(\.messageId)`, and on IMAP it only admits a member whose
 //   `messageId` is a bare canonical UID (`let uid = UInt32(message.messageId),
 //   uid > 0, message.messageId == String(uid)`). So on IMAP these keys are UIDs,

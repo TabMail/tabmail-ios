@@ -539,7 +539,7 @@ struct SettingsView: View {
     /// them would queue mutations against addresses that no longer exist locally.
     /// **That argument does not reach `.saveDraft`.** A save producer addresses a
     /// `draft` row by `draftId` plus its `instanceEpoch`
-    /// (`AccountManagerQueue.executeOperation`'s `.saveDraft` arm →
+    /// (`AccountManager.executeOperation`'s `.saveDraft` arm →
     /// `DraftStore.pushDraftToServer(draftId:expectedInstanceEpoch:…)`); it never
     /// reads the placeholder header, and `draft` is not in this list.
     ///

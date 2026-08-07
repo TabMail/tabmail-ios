@@ -480,7 +480,7 @@ struct AccountManagerQueueDrainTests {
     // `GmailProvider.modifyMessage` now issues its POST through
     // `AuthedHTTP.requestPreservingBadRequestBody`, so a final 400 arrives as
     // `HTTPError.networkErrorWithBody(400, body)` rather than the bodyless
-    // `.networkError(400)`. `AccountManagerQueue.isPermanentlyInvalidError` was
+    // `.networkError(400)`. `AccountManager.isPermanentlyInvalidError` was
     // widened in the same change to classify the two identically.
     //
     // 🚨 CORRECTED (audit round 1, finding B-3). The first of these tests used

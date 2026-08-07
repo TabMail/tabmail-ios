@@ -120,7 +120,7 @@ struct ProviderNativeActionAdmissionTests {
     /// `AccountManagerActions`. The producer set is strictly larger: `archive` and
     /// `delete` are covered by `archiveDeleteUseMove` below, and
     /// `AppDelegate`'s two `NotificationActionRouter` cold-queue sites and
-    /// `AccountManagerOutbox`'s `markReplied` / `markForwarded` are NOT covered
+    /// `AccountManager`'s `markReplied` / `markForwarded` are NOT covered
     /// here at all — they stamp their epoch through
     /// `AccountManager.admissionEpochForNewGesture` and `flagAdmission
     /// .observedUidValidity` respectively, and each is proved by its own suite.

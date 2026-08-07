@@ -28,9 +28,9 @@ import Testing
 /// Message-ID, which is folder- and account-agnostic by construction and is what
 /// keeps an optimistically-moved row alive at its DESTINATION while its source
 /// address is what the drain recorded. Every consumer
-/// (`SyncEngineFullSync.runSyncMessages`' `isRecentlyCompleted` /
+/// (`SyncEngine.runSyncMessages`' `isRecentlyCompleted` /
 /// `isProtectedByRecent` / `isProtected`,
-/// `SyncEngineDeletionReconcile.deleteConfirmedGhostHeaders`) uses the map only to
+/// `SyncEngine.deleteConfirmedGhostHeaders`) uses the map only to
 /// SKIP a delete or an overwrite, so an over-broad match costs at most one sync
 /// pass and can never remove protection — while narrowing the key deletes local
 /// rows the server still has. Shipped `v1.6.38` keys it identically

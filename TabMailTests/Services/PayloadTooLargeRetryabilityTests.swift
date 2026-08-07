@@ -147,7 +147,7 @@ struct PayloadTooLargeRetryabilityTests {
         await provider.setFetchMessageThrows(StubPayloadTooLargeError())
 
         // The production entry point for this branch: the user-open path calls
-        // `fetchAndProcess` (see `AccountManagerFetch.fetchBodyIfNeeded`).
+        // `fetchAndProcess` (see `AccountManager.fetchBodyIfNeeded`).
         let result = await BodyFetchProcessor.fetchAndProcess(
             item: makeItem(header), provider: provider, enableAI: false
         )

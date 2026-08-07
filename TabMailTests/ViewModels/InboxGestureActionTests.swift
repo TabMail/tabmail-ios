@@ -1500,7 +1500,7 @@ struct InboxGestureActionTests {
         #expect(vm.loadedMessages.first?.actionTag == nil)
 
         // Gesture: tag a row that is not durable anywhere yet. Pre-round-2,
-        // AccountManagerAI.applyManualTag never called ensureDurable, so its
+        // AccountManager.applyManualTag never called ensureDurable, so its
         // fetchOne-guarded Step-1 write silently no-op'd for staged rows and
         // the tag vanished with no error/retry. Post-fix the executor path
         // forces ensureDurable first. HONESTY NOTE (round-3 audit): in the
@@ -1610,7 +1610,7 @@ struct InboxGestureActionTests {
     /// (`lastKnownUidValidity == nil`, i.e. its first sync has not completed).
     ///
     /// That is the cheapest *production-reachable* way to make
-    /// `AccountManagerActions.admittedOrdinaryActionTargets` refuse a whole
+    /// `AccountManager.admittedOrdinaryActionTargets` refuse a whole
     /// group: it bails at the folder guard, so `markRead` writes no row and
     /// queues no op and the page comes back still `isRead = 0`. The refusal is
     /// RETRYABLE, not authoritative (an unread epoch is an ABSENCE of evidence
@@ -1883,7 +1883,7 @@ struct InboxGestureActionTests {
         let http = FakeHTTP.Scenario()
         // 🚨 NO `defer { http.close() }`, and this is not an oversight —
         // `IOS-TEST-009`. `InboxViewModel.delete` reaches
-        // `AccountManagerActions.queueDraftDelete`, which ends with an
+        // `AccountManager.queueDraftDelete`, which ends with an
         // UNSTRUCTURED `Task { await drainPendingQueue() }` that outlives this
         // test body BY DESIGN (a user gesture must not block on its wire
         // drain). Invalidating this session while that drain is in flight makes

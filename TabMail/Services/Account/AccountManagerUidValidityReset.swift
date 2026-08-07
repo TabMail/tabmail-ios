@@ -520,7 +520,7 @@ extension AccountManager {
                 // decode. A `UIDVALIDITY` reset purges an ENTIRE folder, which is the
                 // largest row set this app ever deletes at once, so the row width is
                 // paid at the worst possible cardinality. Precedent for the shape:
-                // `SyncEngineDeletionReconcile`'s
+                // `SyncEngine`'s
                 // `MessageHeader.select(Column("messageId")).filter(Column("folderId") == folderId)`.
                 let purgedMessageIds = try String.fetchAll(
                     db,

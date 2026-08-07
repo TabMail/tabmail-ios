@@ -2373,7 +2373,7 @@ struct IMAPProviderPoolInvariantTests {
     //  D-23  `connect()` plants `actionServer = try await createServer()`
     //        UNCONDITIONALLY, overwriting a live non-nil slot (leaking the old
     //        logged-in connection) and racing any concurrent create.
-    //        `AccountManagerSync.ensureConnected` calls `connect()` on an
+    //        `AccountManager.ensureConnected` calls `connect()` on an
     //        already-connected provider as a matter of course, so this is not a
     //        rare interleaving — it is the normal second sync of a session.
     //        (Reference: finding B-3. Its fix is to route `connect()` through

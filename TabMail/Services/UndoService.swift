@@ -228,7 +228,7 @@ final class UndoService {
                         newHeaderId: record.newHeaderId,
                         newProviderMessageId: record.newProviderMessageId)
                     // Debug-gated: this witnesses the ordinary drain SUCCESS path
-                    // (`AccountManagerQueue.publishRekeys`), so it fires once per
+                    // (`AccountManager.publishRekeys`), so it fires once per
                     // re-keyed member on every drained move an undo entry names.
                     // `../CLAUDE.md` rule 12 — a new diagnostic must be a no-op in
                     // production. It claims no observability exception: the three

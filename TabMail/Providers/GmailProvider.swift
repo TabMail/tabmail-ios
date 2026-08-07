@@ -1377,7 +1377,7 @@ actor GmailProvider: EmailProvider {
     /// absence of evidence; treating it as authority is the clause-2 conflation
     /// `Companion/Rules/Active/never-drop-user-intention.md` names as the single
     /// most repeated defect in this codebase's history, and
-    /// `AccountManagerQueue.isPermanentlyInvalidError` committed it for EVERY
+    /// `AccountManager.isPermanentlyInvalidError` committed it for EVERY
     /// `400` — bare status codes included — until this classifier replaced it.
     ///
     /// The two recognised messages are Gmail's own literal wordings, both of
@@ -1422,7 +1422,7 @@ actor GmailProvider: EmailProvider {
     ///
     /// ⚠ CORRECTED (audit round 1, finding B-3). This paragraph used to end
     /// "Rethrowing unchanged keeps v3's shipped terminal disposition for a Gmail
-    /// action `400` (`AccountManagerQueue.isPermanentlyInvalidError` → drop the
+    /// action `400` (`AccountManager.isPermanentlyInvalidError` → drop the
     /// op)". That disposition was itself the defect: the matcher bound the body
     /// to `_` and retired the op on the bare STATUS, so an unrecognised `400`
     /// destroyed the user's action rather than wedging. It no longer does —
@@ -1450,7 +1450,7 @@ actor GmailProvider: EmailProvider {
     /// SUBTRACT — the reference's leading `guard !isHttpGoneStatus(error)`.
     /// A `404`/`410` is not a `400`, so `requestPreservingBadRequestBody`
     /// leaves it as the bodyless `.networkError` exactly as `request()` did;
-    /// v3 routes it to `AccountManagerQueue.isMessageNotFoundError` /
+    /// v3 routes it to `AccountManager.isMessageNotFoundError` /
     /// `isConfirmedGoneError`, which is the pre-existing v3 behavior for this
     /// method and is untouched by this change.
     func modifyMessage(id: String, addLabelIds: [String] = [], removeLabelIds: [String] = []) async throws {

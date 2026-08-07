@@ -140,7 +140,7 @@ struct AIWriteTarget: Sendable, Equatable {
 
     /// Whether this target's address space can be RENUMBERED under it. Account-side
     /// mirror of `staleWindowMode == .uid`, matching
-    /// `AccountManagerActions.admittedOrdinaryActionTargets`: `.icloud` is IMAP, and
+    /// `AccountManager.admittedOrdinaryActionTargets`: `.icloud` is IMAP, and
     /// the demo account is stored as `.imap` but served by `DemoProvider`, so it has
     /// no server, no SELECT and no epoch, ever.
     private var isEpochAddressed: Bool {

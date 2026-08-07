@@ -2704,7 +2704,7 @@ enum NSEDataBridge {
                         deletedTotal += db.changesCount
                         successfullyConsumedIds.append(removal.id)
                         // ⚠ STAGE E1: a header id is handed here as a content key, the
-                        // same crossing `SyncEngineFTS.removeHeadersFromFTS` and
+                        // same crossing `SyncEngine.removeHeadersFromFTS` and
                         // `pruneOldMessages` already carry. Convert at the mint when
                         // the two key spaces diverge.
                         releasedContentKeys.append(contentsOf: doomedIds.map(ContentKey.init(rawValue:)))

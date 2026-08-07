@@ -251,7 +251,7 @@ struct DraftGenerationSafetyTests {
     /// `providerThrowThenAuthoredEdit`, asserted `first == .terminalUnconfirmed`
     /// and `serverPushStatus == "unconfirmed"` — i.e. it asserted that swallowing
     /// the throw into a NORMAL RETURN was correct. That normal return is what let
-    /// `AccountManagerQueue.executeSingleOp`'s success path retire the durable
+    /// `AccountManager.executeSingleOp`'s success path retire the durable
     /// `.saveDraft` producer after one network failure. Its premise was the defect,
     /// so it is rewritten rather than repaired.
     ///
@@ -333,7 +333,7 @@ struct DraftGenerationSafetyTests {
     /// **THE INVARIANT (R11-E): an unresolvable provider identity keeps the user's
     /// Save intention QUEUED, and only a lost generation CAS retires it.**
     ///
-    /// The `.saveDraft` arm in `AccountManagerQueue.executeSingleOp` states outright
+    /// The `.saveDraft` arm in `AccountManager.executeSingleOp` states outright
     /// that "EVERY DISPOSITION THAT REACHES THIS LINE IS A RETIREMENT", so a returned
     /// `.notApplied` drops the intention. `runtimeKind == .unknown` is an ABSENCE OF
     /// EVIDENCE — never-drop clause 2 names "an unresolvable identity" as retryable,

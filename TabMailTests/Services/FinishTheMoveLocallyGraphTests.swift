@@ -307,7 +307,7 @@ struct FinishTheMoveLocallyGraphTests {
     /// destination address the wire had already supplied for the first member —
     /// re-creating, one mid-batch failure later, exactly the state this change
     /// exists to prevent. The proven prefix is returned instead, which is the
-    /// input `AccountManagerQueue.retirePartiallyCompletedOp` re-keys from
+    /// input `AccountManager.retirePartiallyCompletedOp` re-keys from
     /// (covered end-to-end by `QueueCoreInvariantTests`).
     ///
     /// Driven at the provider boundary because the member ORDER is what decides

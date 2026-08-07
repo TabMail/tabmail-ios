@@ -109,7 +109,7 @@ struct HeaderCompleteFTSIndexingTests {
         let inserted = try await index.indexHeaders([ftsRecord])
         #expect(inserted == 1)
 
-        // Simulate what SyncEngineFTS.indexHeadersForFTS does after FTS indexing:
+        // Simulate what SyncEngine.indexHeadersForFTS does after FTS indexing:
         // set headerComplete=1 in GRDB
         try await db.write { dbConn in
             try dbConn.execute(

@@ -97,7 +97,7 @@ struct AuthedHTTP: Sendable {
     /// through the ordinary `request(...)`. Nothing else calls it;
     /// `ExchangeProvider.patchMessage` and `ExchangeProvider.moveMessage` both
     /// still call the body-dropping `request`, so every Graph mutation's `400`
-    /// reaches `AccountManagerQueue.isPermanentlyInvalidError` bodyless and is
+    /// reaches `AccountManager.isPermanentlyInvalidError` bodyless and is
     /// unclassifiable — which is why that function is
     /// `GmailProvider.isAuthoritativeActionRejection(error)` and nothing else.
     ///

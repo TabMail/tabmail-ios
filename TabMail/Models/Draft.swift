@@ -508,7 +508,7 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         // LONGER DOES. It was true of this function (which only omits a quote) and
         // false of the system: a refusal ALSO left `ComposeView.send` with no
         // reply parent, so the reply left as a brand-new message — no `In-Reply-To`,
-        // no `References`, and `AccountManagerOutbox.persistQueuedSend` skipped the
+        // no `References`, and `AccountManager.persistQueuedSend` skipped the
         // parent's `isReplied`/`isForwarded` write and the Reply action-tag clear —
         // while the compose dismissed and the draft became deletable on delivery.
         // The cost was adjudicated as "quote and attribution only" on that

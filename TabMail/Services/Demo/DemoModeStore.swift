@@ -211,7 +211,7 @@ enum DemoError: Error, LocalizedError {
     /// either would drop valid work on "we could not determine the answer", which
     /// never-drop clause 2 forbids. Only this case is a positive fact about the
     /// record, so only this case may be terminal. Same signal-vs-disposition split
-    /// `AccountManagerCalendarQueue.isGrantLevelOAuthFailure` uses for OAuth codes.
+    /// `AccountManager.isGrantLevelOAuthFailure` uses for OAuth codes.
     case eventNotFound
 
     var errorDescription: String? {

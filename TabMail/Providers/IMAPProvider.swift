@@ -2437,7 +2437,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // T3.7 PORT (D-23 / R6 finding B-3) — routed through the
         // single-flighted `ensureServer()` instead of an unconditional
         // `actionServer = try await createServer()`.
-        // `AccountManagerSync.ensureConnected` calls `connect()` on
+        // `AccountManager.ensureConnected` calls `connect()` on
         // possibly-already-connected providers as a matter of course: the
         // unconditional plant overwrote a live non-nil `actionServer` (leaking
         // the old logged-in connection — cross-field invariant #2) and raced
@@ -4141,7 +4141,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// (`optimisticMoveToFolder` inserts one row carrying every provider id),
     /// and `SettingsView.archiveOldMessages` selects every inbox message older
     /// than the cutoff with no limit. `SyncConfig.pendingOperationTimeoutSeconds`
-    /// (15s, applied in `AccountManagerQueue.executeSingleOp`) bounds the whole
+    /// (15s, applied in `AccountManager.executeSingleOp`) bounds the whole
     /// provider operation, so on a server that withholds `COPYUID` a large
     /// archive completed its `UID COPY` and then blew that deadline inside this
     /// probe. The throw lands in the drain's generic arm: the op is requeued,
@@ -4214,7 +4214,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// safety gate needs and did not get a usable one, so nothing is determined
     /// about this op — and nothing about the ACCOUNT either.
     ///
-    /// That arm in `AccountManagerQueue.executeSingleOp` requeues the op, bumps
+    /// That arm in `AccountManager.executeSingleOp` requeues the op, bumps
     /// `retryCount`, inserts it into `evidenceRefused` and halts only this lane,
     /// WITHOUT inserting the account into `failedAccounts`. Every one of those
     /// properties is wanted here, and `evidenceRefused` especially: this refusal
@@ -4226,7 +4226,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `ProviderError.actionIdentityResolutionFailed` (the drain DELETES on it,
     /// and a malformed response is not a verdict on an identity). Its case name
     /// and labels carry none of the substrings
-    /// `AccountManagerQueue.isMessageNotFoundError` matches, so it cannot be
+    /// `AccountManager.isMessageNotFoundError` matches, so it cannot be
     /// mistaken for a confirmed-stale message — the same posture, with the same
     /// server-supplied `folder` payload, as `IMAPEpochEvidenceMissing`.
     private enum IMAPLivenessProbeInconclusive: ProviderEvidenceUnavailable {
@@ -4267,7 +4267,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// / not-proven-in-my-own-space stays retryable forever" disposition. It is
     /// `private`, so it can never become a classification input anywhere else,
     /// and its description carries none of the substrings
-    /// `AccountManagerQueue.isMessageNotFoundError` matches, so it cannot be
+    /// `AccountManager.isMessageNotFoundError` matches, so it cannot be
     /// mistaken for a confirmed-stale message.
     // 🚨 AUDIT ROUND 4 — `IMAPMoveEvidenceUnavailable` IS DELETED, AND ITS
     // ABSENCE IS THE SECOND HALF OF THIS ROUND'S FIX. History, kept because
@@ -4361,7 +4361,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `private` and unclassified, exactly like its destination sibling, so it
     /// lands in the drain's generic arm — requeue, bump `retryCount`, retry
     /// forever if the server never conforms. Its description carries none of the
-    /// substrings `AccountManagerQueue.isMessageNotFoundError` matches, so it
+    /// substrings `AccountManager.isMessageNotFoundError` matches, so it
     /// cannot be mistaken for a confirmed-stale message.
     private enum IMAPEpochEvidenceMissing: ProviderEvidenceUnavailable {
         /// The SELECT reported no usable UIDVALIDITY for `folder`.
@@ -4575,7 +4575,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// longer in the source folder, which is exit 2 and leaves nothing to do.
     /// There is no third state left to leave queued, so no member can ride out
     /// of the queue on a sibling's evidence and none can be stranded on the
-    /// absence of its own. `AccountManagerQueue.retirePartiallyCompletedOp`
+    /// absence of its own. `AccountManager.retirePartiallyCompletedOp`
     /// therefore has no producer here any more; it remains the drain's contract
     /// for any provider that does return a strict subset.
     ///
@@ -4762,7 +4762,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // 3501 §6.4.7 requires an unsuccessful COPY to leave the
                 // destination as it was — but described it in a way we cannot
                 // parse used to throw out of this line. That throw lands on the
-                // generic arm in `AccountManagerQueue.executeSingleOp`, which
+                // generic arm in `AccountManager.executeSingleOp`, which
                 // requeues the op and halts the lane BEFORE the `STORE \Deleted`,
                 // so the source is untouched and the next drain re-runs A1/A2/A3
                 // and issues ANOTHER `UID COPY` — one more duplicate at the

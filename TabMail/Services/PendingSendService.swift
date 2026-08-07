@@ -149,7 +149,7 @@ final class PendingSendService {
 
     /// The ONE string for "the cancellation was not confirmed, so nothing was
     /// changed" (R16-9). Held in one place for the same reason
-    /// `DynamicIslandChatButton.autoSaveDidNotLandWarning` is: **three** exits
+    /// `DynamicIslandChat.autoSaveDidNotLandWarning` is: **three** exits
     /// surface it and a fourth must not arrive with a fourth wording.
     ///
     /// Predicate, and note the SHAPE — it excludes comment lines

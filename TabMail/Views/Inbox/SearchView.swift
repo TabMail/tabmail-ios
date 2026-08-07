@@ -382,25 +382,25 @@ struct SearchView: View {
     ///     `\.set\(to:` misses it (MIS-007 instances 36–37).
     ///
     ///     **Writes ONLY `nil` — 18, by enclosing symbol:**
-    ///     `AccountManagerActions.optimisticMoveToFolder` ×2 (its two `updateAll`
-    ///     arms) · `AccountManagerActions.queueDraftSave` ×1 ·
+    ///     `AccountManager.optimisticMoveToFolder` ×2 (its two `updateAll`
+    ///     arms) · `AccountManager.queueDraftSave` ×1 ·
     ///     `MessageHeaderRekey.finishMove` ×1 (its no-proven-epoch else arm) ·
     ///     `BackfillBodyQueue.rekeyRemappedHeader` ×1 ·
-    ///     `SyncEngineDeltaSync.gmailDeltaSync` ×2 ·
-    ///     `SyncEngineDeltaSync.exchangeDeltaSync` ×3 ·
-    ///     `SyncEngineFullSync.canonicalizeLocalRows` ×2 ·
-    ///     `SyncEngineFullSync.runSyncMessages` ×6.
+    ///     `SyncEngine.gmailDeltaSync` ×2 ·
+    ///     `SyncEngine.exchangeDeltaSync` ×3 ·
+    ///     `SyncEngine.canonicalizeLocalRows` ×2 ·
+    ///     `SyncEngine.runSyncMessages` ×6.
     ///
     ///     **Writes `nil` OR an epoch, by a branch inside the statement — 2:**
-    ///     `SyncEngineFullSync.runSyncMessages`'s
+    ///     `SyncEngine.runSyncMessages`'s
     ///     `recon.sourceAddressProven ? sourceBoundEpoch : nil` ·
-    ///     `AccountManagerActions.exactPayload`'s
+    ///     `AccountManager.exactPayload`'s
     ///     `restoreSourceEpoch ? member.sourceObservedUidValidity : nil`.
     ///
     ///     **Writes ONLY a proven epoch — 5:** `MessageHeaderRekey.finishMove` ·
     ///     `SyncEngine.fetchOlderMessages` ·
-    ///     `SyncEngineBackfillDeep.insertBackfillBatchGuardable` ·
-    ///     `SyncEngineFullSync.runSyncMessages` ×2 (the proven merge and the
+    ///     `SyncEngine.insertBackfillBatchGuardable` ·
+    ///     `SyncEngine.runSyncMessages` ×2 (the proven merge and the
     ///     insert). **TWO statements are in NEITHER class** — they copy whatever
     ///     the NSE staged, so the value's provenance is the staging row rather
     ///     than this pass: `NSEDataBridge.insertNewHeaderFromStaging` and
@@ -1237,7 +1237,7 @@ struct SearchView: View {
     /// PRESENTS without MATERIALISING a `MessageHeader` — which is exactly why the
     /// census that closed this row (noun: `MessageHeader` construction sites) could
     /// not see it. The other four skip the same records at
-    /// `SyncEngineFullSync.selectStaleHeaders`, `SyncEngineFullSync.runSyncMessages`,
+    /// `SyncEngine.selectStaleHeaders`, `SyncEngine.runSyncMessages`,
     /// `SyncEngine.insertBackfillBatchGuardable` and `SyncEngine.fetchOlderMessages`.
     ///
     /// The user-visible defect on the server class this row is about (no UIDPLUS,

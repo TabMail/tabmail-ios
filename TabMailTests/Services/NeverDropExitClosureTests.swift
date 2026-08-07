@@ -1054,7 +1054,7 @@ struct NeverDropExitClosureTests {
     /// Before the fix, `let copyEvidence = try await server.copy(...)` had no
     /// `catch`, so the `IMAPError.commandFailed` that `CopyUID.init(nio:)` throws
     /// on a cardinality mismatch propagated out of `IMAPProvider.move` to the
-    /// generic arm in `AccountManagerQueue.executeSingleOp`, which requeues the op
+    /// generic arm in `AccountManager.executeSingleOp`, which requeues the op
     /// and halts the lane. The throw happens BEFORE the `STORE \Deleted`, so the
     /// source is untouched and the next drain re-runs the whole sequence and
     /// issues ANOTHER `UID COPY`. One more duplicate at the destination per drain,
@@ -1168,7 +1168,7 @@ struct NeverDropExitClosureTests {
 
     /// A-6, the OUTBOX half. `imapUserLabelGestureReachesTheWire` above pins the
     /// user-label producer; this pins the other one.
-    /// `AccountManagerOutbox.deleteCompletedSendAtomic` queued its `.markReplied` /
+    /// `AccountManager.deleteCompletedSendAtomic` queued its `.markReplied` /
     /// `.markForwarded` op naming `original.stableId` — an rfc822 Message-ID on
     /// IMAP — with no `observedUidValidity`. Checkpoint A can only SKIP that shape
     /// and the `.markReplied` executor arm can only no-op on it, so the parent's
@@ -1283,7 +1283,7 @@ struct NeverDropExitClosureTests {
     /// ⚠ SCOPE — READ THE NAME LITERALLY. This covers the COMPLETION producer,
     /// `deleteCompletedSendAtomic`, and nothing else. It is deliberately NOT named
     /// as an end-to-end guarantee, because there is not one: the OTHER producer,
-    /// `AccountManagerOutbox.persistQueuedSend`, writes
+    /// `AccountManager.persistQueuedSend`, writes
     /// `UPDATE messageHeader SET isReplied = 1` optimistically at QUEUE time with no
     /// admission gate, so on the full queue→send→complete path the local claim still
     /// outlives an unaddressable parent. That write is verbatim in the shipped

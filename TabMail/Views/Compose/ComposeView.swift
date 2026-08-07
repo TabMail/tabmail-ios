@@ -472,7 +472,7 @@ enum ComposeDraftGuards {
     /// parent from the parameter there shipped the reply as a BRAND-NEW message:
     /// `ThreadUtils.outgoingThreadHeaders(replyTo: nil)` returns `.none`, so no
     /// `In-Reply-To` and no `References`, and
-    /// `AccountManagerOutbox.persistQueuedSend` skipped the parent's
+    /// `AccountManager.persistQueuedSend` skipped the parent's
     /// `isReplied`/`isForwarded` write and the Reply action-tag clear.
     enum PersistedReplyTargetClaim: Equatable {
         /// The row names no reply/forward parent AND none could be established from
@@ -621,7 +621,7 @@ struct ComposeView: View {
         /// the parent the OUTBOUND message threads against, which on a reopened
         /// draft is the row's guarded resolution — and after a folder move that is
         /// the parent's CURRENT primary key, which is what
-        /// `AccountManagerOutbox.persistQueuedSend` needs to find the row it marks
+        /// `AccountManager.persistQueuedSend` needs to find the row it marks
         /// replied.
         let resolvedReplyTarget: MessageHeader?
         let isForward: Bool
@@ -3060,7 +3060,7 @@ struct ComposeView: View {
         // reopen compose with the exact contents (subject, body, recipients,
         // attachments). Flow: user hits Send → save draft → queue send.
         // The local draft is deleted on send COMPLETION
-        // (AccountManagerOutbox.finalizeOutboxMessage), NOT at claim time —
+        // (AccountManager.finalizeOutboxMessage), NOT at claim time —
         // transient SMTP failures leave the draft available for retry/edit.
         // PORT — v2final `send()`'s F0d COPY-ON-WRITE staging. The superseded form
         // wrote into `draftRecord?.attachmentsDirName ?? snapshot.draftId`: the LIVE

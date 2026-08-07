@@ -206,7 +206,7 @@ struct CalendarConflictDispositionTests {
     // every non-2xx and puts the server's bytes in `errorBody`, while
     // `GoogleCalendarProvider.request` threw `httpError(status, result.data)` — a
     // line reachable ONLY when `result.data == nil`. So
-    // the duplicate-id classifier (then `AccountManagerCalendarQueue.isGoogleDuplicateIdConflict`,
+    // the duplicate-id classifier (then `AccountManager.isGoogleDuplicateIdConflict`,
     // now `GoogleCalendarProvider.isDuplicateIdConflict`) returned `false` at its first `guard let body`
     // on every real 409, the arm could never fire, and a Google create whose
     // response was lost fell to the transient arm and head-of-line-blocked that

@@ -471,7 +471,7 @@ struct AIWriteIdentityGuardTests {
     }
 
     /// The MULTI-FIELD guarded mutation, shaped like production site 5
-    /// (`AccountManagerAI.processMessage`): one AI job stamps the summary, the action
+    /// (`AccountManager.processMessage`): one AI job stamps the summary, the action
     /// tag, the precomputed reply and the `notified` flag through the same choke
     /// point. The misattribution pins use it because the invariant is *no AI field of
     /// X lands on Y*, not *one particular field did not*.
@@ -941,7 +941,7 @@ struct AIWriteIdentityGuardTests {
         // The system property the cost half is really about: the job is DONE, so the
         // arbiter stops re-driving it.
         // `needsSummary` is not a column — it is the arbiter's own derived predicate
-        // (`AccountManagerAI.processMessage`: `summaryBlurb == nil || summaryBlurb?.isEmpty == true`).
+        // (`AccountManager.processMessage`: `summaryBlurb == nil || summaryBlurb?.isEmpty == true`).
         // Re-deriving it here rather than asserting on `summaryBlurb` directly is
         // deliberate: the property under test is "the arbiter stops re-driving this
         // job", so the assertion has to ask the question the arbiter asks.

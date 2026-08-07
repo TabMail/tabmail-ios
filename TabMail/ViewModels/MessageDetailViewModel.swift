@@ -734,7 +734,7 @@ final class MessageDetailViewModel {
     /// here `message` / `threadMessages` are `MessageHeader`s and the SAME
     /// values are handed straight to `UndoableAction(messages:)` by
     /// `archiveMessage` / `deleteMessage` / `moveMessage`. `UndoMember.init(header:)`
-    /// records BOTH fields off them and `AccountManagerActions.undoMove` writes
+    /// records BOTH fields off them and `AccountManager.undoMove` writes
     /// BOTH durably, so a pair written apart on a "display" header becomes a
     /// durably corrupt row — the chip says one thing and triage files it
     /// somewhere else. That is the exact shape migration `v58` was written to

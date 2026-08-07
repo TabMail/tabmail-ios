@@ -10,8 +10,8 @@ import GRDB
 /// ever being observed nil inside the test process.
 ///
 /// **The defect this closes.** Production spawns fire-and-forget tasks that
-/// OUTLIVE the test that triggered them — `AccountManagerOutbox.queueSend` →
-/// `Task { drainOutbox() }`, `AccountManagerOutbox.retryOutboxMessage` →
+/// OUTLIVE the test that triggered them — `AccountManager.queueSend` →
+/// `Task { drainOutbox() }`, `AccountManager.retryOutboxMessage` →
 /// `Task { drainOutbox() }`, `DraftStore.save` → `Task { redriveDurableQueue() }`.
 /// Every DB test tears down with `AppDatabase.shared.withLock { $0 = previous }`
 /// (300+ sites across 85 files), and `previous` is **nil** for any test that

@@ -2149,7 +2149,7 @@ final class InboxViewModel {
     /// truth, so the intention remains visible and the gesture re-issuable.
     /// The refusal is never converted into "these are read now" — see the
     /// retryable/terminal split documented on
-    /// `AccountManagerActions.roleMoveRejectDispositions`.
+    /// `AccountManager.roleMoveRejectDispositions`.
     func markAllAsRead() {
         let batchSize = SyncConfig.inboxPageSize
         let foldersCopy = folders

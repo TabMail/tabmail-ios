@@ -139,7 +139,7 @@ private func loadClaim(
 
 /// Reproduces `ComposeView.send()`'s reply-target decision and the two consumers
 /// it feeds — `ThreadUtils.outgoingThreadHeaders` and
-/// `AccountManagerOutbox.persistQueuedSend`'s `replyToHeaderId`. A BLOCKED send
+/// `AccountManager.persistQueuedSend`'s `replyToHeaderId`. A BLOCKED send
 /// returns before the outbox is touched at all, exactly as `send()` does.
 private func driveSend(
     pool: DatabasePool,
@@ -381,7 +381,7 @@ struct ComposeSendReplyTargetTests {
     /// argument is passed.
     ///
     /// Why the end state and not the flag: `OutboxMessage.isForward` is what
-    /// `AccountManagerOutbox.deleteCompletedSendAtomic` reads on delivery to queue
+    /// `AccountManager.deleteCompletedSendAtomic` reads on delivery to queue
     /// `.markForwarded` rather than `.markReplied`, and `IMAPProvider.markReplied`
     /// STOREs `\Answered` — a server-side flag the user has no in-app way to clear,
     /// which sync then re-asserts over the locally-correct forwarded badge.

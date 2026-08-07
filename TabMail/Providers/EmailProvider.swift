@@ -676,7 +676,7 @@ struct BackfillResult: Sendable {
 /// nothing about the ACCOUNT was determined either.
 ///
 /// That second half is the whole reason this marker exists. These refusals used to
-/// land in `AccountManagerQueue.executeSingleOp`'s generic connection/transient arm,
+/// land in `AccountManager.executeSingleOp`'s generic connection/transient arm,
 /// which inserts the account into `DrainContext.failedAccounts`. That set exists to
 /// stop hammering an account whose PROVIDER IS DOWN — a connectivity fact — and it
 /// is account-wide, so one op the server would never prove stopped every later

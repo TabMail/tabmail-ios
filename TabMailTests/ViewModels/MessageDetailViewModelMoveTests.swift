@@ -287,7 +287,7 @@ struct MessageDetailViewModelMoveTests {
     /// `threadMessages` and hands those very values to
     /// `UndoableAction(messages:)`. Any display write that touched one field and
     /// not the other therefore travelled into `UndoMember.init(header:)` — which
-    /// records BOTH — and out of `AccountManagerActions.undoMove`, which writes
+    /// records BOTH — and out of `AccountManager.undoMove`, which writes
     /// BOTH durably.
     ///
     /// PINNED AS THE END STATE, NOT THE MECHANISM: the assertion is

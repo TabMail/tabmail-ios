@@ -464,7 +464,7 @@ enum ScreenshotMode {
         // and the comment above it asserted that bare shape as current. PORT
         // `3f2cc4c34` changed the format to `compose:<epochByteCount>:<epoch><draftId>`
         // and moved it behind `ActiveAgentTracker.composeSessionKey`, whose namespace
-        // `ChatPillState.session(for:)` shares — `DynamicIslandChatButton.sessionKey`
+        // `ChatPillState.session(for:)` shares — `DynamicIslandChat.sessionKey`
         // and `ComposeView` both mint their `ChatPillState` key through that symbol.
         // R15-FIX-4b ported ONE of the two known consumers (`InboxView`'s
         // `.composeDraft` decode); this is a third that neither that fix nor its

@@ -588,7 +588,7 @@ extension SyncEngine {
     /// message the server just reported is neither merged nor inserted, and
     /// nothing else re-offers it: `selectStaleHeaders` cannot reach the remnant
     /// (its UID is in `remoteIds` on all three arms) and
-    /// `SyncEngineBackfillDeep`'s `missingUIDs` is keyed on
+    /// `SyncEngine`'s `missingUIDs` is keyed on
     /// (folderId, messageId), so the remnant answers for the UID and the deep
     /// crawl never re-fetches it. `incomingRfc822Identity` is what lets this
     /// function tell "a retained row might BE this message" (keep refusing)

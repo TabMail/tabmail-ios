@@ -155,7 +155,7 @@ enum ReplyParentResolver {
     /// row (which covered the rows this writes, because the `'none'` it assigns is
     /// NOT NULL in SQL). That backfill is GONE — v81 is schema-only now. So these
     /// rows carry `actionTag != nil` with a NULL `actionTagSetAt`, which is the
-    /// documented LEGACY-ROW state: `SyncEngineMaintenance.sweepStaleActionTags`
+    /// documented LEGACY-ROW state: `SyncEngine.sweepStaleActionTags`
     /// treats a NULL stamp as already expired, so such a tag is reclaimed on the
     /// next maintenance pass once the message has left the inbox, rather than after
     /// a further TTL. That is the intended fail-safe direction, and it is the same

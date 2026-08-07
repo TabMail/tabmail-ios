@@ -212,7 +212,7 @@ actor TaskEvaluationService {
         let sessionId = "task:\(hash)"
         print("[TaskEval] Executing task \(hash): \"\(task.instruction.prefix(80))...\"")
 
-        // Build system prompt — same as normal chat (AIChat.sendChatMessage)
+        // Build system prompt — same as normal chat (AIService.sendChatMessage)
         let aiService = AIService.shared
         let userName = AIService.chatUserName()
         let kbText = PromptStore.kbTextSnapshot()

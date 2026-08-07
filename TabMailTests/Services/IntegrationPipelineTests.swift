@@ -40,7 +40,7 @@ struct FTSHeaderIndexingIntegrationTests {
         // Clean up any stale FTS entry
         try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
 
-        // Index into FTS and set headerComplete=1 (replicating SyncEngineFTS.indexHeadersForFTS)
+        // Index into FTS and set headerComplete=1 (replicating SyncEngine.indexHeadersForFTS)
         let ftsRecord = FTSHeaderRecord( contentKey: ContentKey(rawValue: header.id),
             headerId: header.id,
             messageId: header.messageId,
@@ -112,7 +112,7 @@ struct RecoverIncompleteHeadersIntegrationTests {
         let ftsBeforeExists = try await index.isIndexed( contentKey: ContentKey(rawValue: header.id))
         #expect(ftsBeforeExists == false)
 
-        // Run the recovery logic (mirrors SyncEngineFTS.recoverIncompleteHeaders)
+        // Run the recovery logic (mirrors SyncEngine.recoverIncompleteHeaders)
         let incomplete: [MessageHeader] = try await db.read { dbConn in
             try MessageHeader
                 .filter(Column("headerComplete") == false)

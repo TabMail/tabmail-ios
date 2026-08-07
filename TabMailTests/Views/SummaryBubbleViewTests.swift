@@ -24,7 +24,7 @@ struct SummaryBubbleViewTests {
 
     @Test("inbox message with the no-content stub still renders content (stub is in-inbox AI-skip path)")
     func inboxWithNoContentStubShowsContent() {
-        // The "no content" stub is written by AccountManagerAI.processOpenedMessage
+        // The "no content" stub is written by AccountManager.processOpenedMessage
         // when an opened inbox message has no body/attachments. While in the inbox
         // it should display, mirroring TB's stub behavior.
         let mode = SummaryBubbleView.displayMode(

@@ -93,7 +93,7 @@ private func insertOptimisticSentHeader(
         header.cc = cc
         header.bcc = bcc
         header.isRead = true
-        // Mirror production behavior (AccountManagerOutbox.insertOptimisticSentHeader):
+        // Mirror production behavior (AccountManager.insertOptimisticSentHeader):
         // - headerComplete=1 after FTS indexing so the optimistic header is visible
         //   in folder queries immediately.
         // - bodyComplete=1 because the body is already persisted locally — without

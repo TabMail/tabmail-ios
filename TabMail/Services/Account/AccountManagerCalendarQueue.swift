@@ -224,7 +224,7 @@ extension AccountManager {
     /// FALSE IN BOTH HALVES.** The rider ran
     /// `UPDATE caldavConfig SET needsReauth = 1` in this transaction; nothing ever
     /// cleared that column, its only reader was `AccountManager.createCalDAVProvider`'s
-    /// early `return nil`, and no UI read it at all (`ToolSettingsView`'s
+    /// early `return nil`, and no UI read it at all (`CalendarPickerModel`'s
     /// `needsReauth` is a DIFFERENT symbol — a local `AccountEntry` field written
     /// from a live `listCalendars()` probe). So the rider did not make anything
     /// recoverable; it made the account's whole calendar lane UNrecoverable, by
@@ -538,7 +538,7 @@ extension AccountManager {
                     // incomparability is now one-sided in a different way and worth
                     // stating plainly: a CalDAV auth failure retires THIS op and
                     // raises NO persistent signal of its own. The user-facing
-                    // channel for it is `ToolSettingsView`'s live `listCalendars()`
+                    // channel for it is `CalendarPickerModel`'s live `listCalendars()`
                     // probe, which renders "Calendar Access Required" for the
                     // account the next time the calendar picker opens — and which
                     // only works because the provider still exists. That gap is
@@ -1105,8 +1105,8 @@ extension AccountManager {
     /// GRANT the server has positively refused, as opposed to a token endpoint that
     /// merely could not answer.
     ///
-    /// `GoogleAuthService.refreshGoogleToken` and
-    /// `MicrosoftAuthService.refreshMicrosoftToken` both raise
+    /// `OAuthService.refreshGoogleToken` and
+    /// `OAuthService.refreshMicrosoftToken` both raise
     /// `OAuthError.tokenExchangeFailed(response.error ?? "unknown")`, so the payload
     /// is the server's own machine-readable code — the same evidence standard the
     /// calendar queue already applies to Google's 409 bodies.
@@ -1215,7 +1215,7 @@ extension AccountManager {
     /// ⚠️ **THIS DOC SAID, UNTIL ROUND 18: *"CalDAV accounts own a `caldavConfig`
     /// row whose `needsReauth` column is the persistent, user-visible signal
     /// (`ToolSettingsView` reads it)"*. BOTH HALVES WERE FALSE, and the
-    /// parenthetical is the instructive one: `ToolSettingsView` reads a DIFFERENT
+    /// parenthetical is the instructive one: `CalendarPickerModel` reads a DIFFERENT
     /// `needsReauth` — a local `CalendarPickerModel.AccountEntry` field set from a
     /// LIVE `listCalendars()` probe's catch arms — and never touches the durable
     /// column. Two unrelated symbols with the same spelling, one of which had a

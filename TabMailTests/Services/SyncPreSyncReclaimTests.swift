@@ -23,7 +23,7 @@ struct SyncPreSyncReclaimTests {
 
     /// Simulates the production reclaim branch (minus ThreadUtils + user-
     /// label plumbing which are orthogonal). Keep in sync with
-    /// `SyncEngineFullSync.syncFolderMessages` around the "pre-sync
+    /// `SyncEngine.syncFolderMessages` around the "pre-sync
     /// reclaim" comment block.
     @discardableResult
     private func reclaim(

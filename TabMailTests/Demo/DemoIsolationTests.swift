@@ -344,7 +344,7 @@ struct DemoIsolationTests {
 /// destination-folder primary key, so it is a member of the class *"every code
 /// path that changes a header's primary key"* — the same class as
 /// `BackfillBodyQueue.rekeyRemappedHeader`, `DraftStore.migrateExactPlaceholder`
-/// and `SyncEngineFullSync.canonicalizeLocalRows`.
+/// and `SyncEngine.canonicalizeLocalRows`.
 ///
 /// It is separated from `DemoIsolationTests` because it drives the real provider
 /// against an installed `AppDatabase.shared`, so unlike that suite it does mutate

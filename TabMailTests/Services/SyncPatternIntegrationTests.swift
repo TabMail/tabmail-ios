@@ -168,7 +168,7 @@ struct MessageHeaderInfoToMessageHeaderInsertTests {
     /// not the rule; it is a restatement of the answer.
     ///
     /// It is now TWO-SIDED and derives the gate the way production derives it —
-    /// `SyncEngineFullSync`'s `let isInInbox = folder.role == .inbox`, read off the
+    /// `SyncEngine`'s `let isInInbox = folder.role == .inbox`, read off the
     /// real `Folder` row this test inserted, feeding the same `if isInInbox` guard
     /// that wraps `header.actionTag = info.actionTag`. The inbox cell makes that arm
     /// execute (so the archive cell's `nil` is a refusal, not an absence), and the

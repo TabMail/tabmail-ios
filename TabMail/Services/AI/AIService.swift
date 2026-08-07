@@ -172,7 +172,7 @@ actor AIService {
         // Every seeded inbox message has its
         // summary/action/cachedReply pre-baked in DemoSeed. If we reach this
         // method for a demo session, something is wrong upstream (the GRDB
-        // short-circuit in `AccountManagerAI.processOpenedMessage` at line
+        // short-circuit in `AccountManager.processOpenedMessage` at line
         // 113 should have caught it). Hard-fail to empty results rather than
         // spending a real LLM round-trip — this keeps the budget invariant.
         let inDemo = await MainActor.run { DemoModeStore.shared.isActive }

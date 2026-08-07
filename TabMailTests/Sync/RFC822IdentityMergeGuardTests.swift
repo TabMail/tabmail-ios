@@ -350,7 +350,7 @@ struct RFC822IdentityMergeGuardTests {
     /// yet. Pre-fix the refusal returned that remnant, the caller's
     /// `sourceAddressProven` arm `continue`d before the insert, and nothing else
     /// ever re-offered the message: `selectStaleHeaders` cannot reach the
-    /// remnant (UID 500 is in `remoteIds`) and `SyncEngineBackfillDeep`'s
+    /// remnant (UID 500 is in `remoteIds`) and `SyncEngine`'s
     /// `missingUIDs` is keyed on (folderId, messageId), so the remnant answers
     /// for UID 500 and the deep crawl filters the real message out. The user has
     /// no reason to connect a message they can see to a different one they

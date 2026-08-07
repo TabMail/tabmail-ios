@@ -93,7 +93,7 @@ struct DatabaseSchemaValidationTests {
     ///
     /// The half that must NOT regress is `account → folder → messageHeader`.
     /// The half that moved is the body, and it did not merely become someone
-    /// else's problem — `AccountManagerSetup.removeAccountRowsTxn` deletes it in
+    /// else's problem — `AccountManager.removeAccountRowsTxn` deletes it in
     /// the same transaction, which is pinned by
     /// `removeAccountLeavesNoCachedMailBehind` below. Read the two together: this
     /// one says the schema no longer does it, that one says the production path

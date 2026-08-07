@@ -290,7 +290,7 @@ struct OutboxForegroundRecoveryTests {
     /// mechanism and would stay green on a system re-broken a different way.
     ///
     /// The blessing gap this closes, stated plainly: `futureHeldRowIsNotShadowed`
-    /// above and `ComposeThrottleTests.PostLoopWakeUpQueryTests.guardAgainstPastHold`
+    /// above and `PostLoopWakeUpQueryTests.guardAgainstPastHold`
     /// both check the selected row is STILL future at a later instant, using
     /// comfortable 300 s / 5 s deadlines. Neither exercises the boundary, so both
     /// bless the two-instant shape as sufficient. They remain correct and untouched.

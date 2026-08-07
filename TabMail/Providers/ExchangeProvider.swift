@@ -618,7 +618,7 @@ actor ExchangeProvider: EmailProvider {
     /// attempt away would discard that address and leave exactly the state this
     /// method exists to prevent, one mid-batch failure later. Returning the
     /// proven prefix routes it through
-    /// `AccountManagerQueue.retirePartiallyCompletedOp`, which retires and
+    /// `AccountManager.retirePartiallyCompletedOp`, which retires and
     /// re-keys those members and leaves the remainder durably queued — the
     /// drain's standing contract for a provider that returns a strict subset,
     /// which this arm is now the producer for. The error is re-thrown whenever

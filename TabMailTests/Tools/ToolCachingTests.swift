@@ -347,7 +347,7 @@ struct ContactToolOutputFormatTests {
 /// calendar backend uses, "one day" means `end == start + 1 day`; `end == start` is
 /// an event covering NO days at all, which is what `CalendarEventCreateTool` used to
 /// produce. The tree's own anchor for the convention is
-/// `GoogleCalendarTypesTests.mergeMasterAndPatchAllDayPreserved` — *"1-day all-day
+/// `GoogleCalendarSplitHelpersTests.mergeMasterAndPatchAllDayPreserved` — *"1-day all-day
 /// event → end is exclusive next day"*.
 ///
 /// ⚠️ WHY THE ASSERTION IS AT THE CONFIRMATION CARD AND NOT AT THE PROVIDER.

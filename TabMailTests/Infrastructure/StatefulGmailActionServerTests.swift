@@ -643,7 +643,7 @@ struct StatefulGmailActionServerTests {
     /// It additionally pins the SHAPE that reaches the queue: the body-preserving
     /// `HTTPError.networkErrorWithBody(400, _)`, not the bodyless
     /// `.networkError(400)`. That shape change is precisely what
-    /// `AccountManagerQueue.isPermanentlyInvalidError` had to be widened for; if
+    /// `AccountManager.isPermanentlyInvalidError` had to be widened for; if
     /// this assertion is ever relaxed, the widening's motivation disappears with
     /// it and the guard silently stops matching.
     @Test("an UNCLASSIFIED 400 on modify still throws — and reaches the queue body-preserving")

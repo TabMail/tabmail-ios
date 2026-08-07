@@ -140,7 +140,7 @@ struct WriteTierRoutingTests {
             headerId: header.id, accountId: header.accountId,
             folderPath: header.folderPath, messageId: header.messageId
         )
-        // No PriorityGate wrap — mirrors AccountManagerFetch.fetchBody / the
+        // No PriorityGate wrap — mirrors AccountManager.fetchBody / the
         // InboxViewModel SnippetLoader tier-2 on-demand fetch, both of which call
         // BodyFetchProcessor directly and must stay .priority (a live user action).
         _ = await BodyFetchProcessor.process(fetchResult: fetchResult, enableAI: false)

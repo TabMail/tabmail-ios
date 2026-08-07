@@ -897,7 +897,7 @@ struct DeletedFlagMergeVisibilityTests {
     /// malformed date, and it does not recover — `selfHealRecentMessages` covers 90
     /// days and the deep crawl only re-walks `backfillComplete == false` folders.
     ///
-    /// `SyncEngineEpochVerify.classifyEpochVerificationSample` was explicitly
+    /// `SyncEngine.classifyEpochVerificationSample` was explicitly
     /// hardened against this exact reducer ("`mapMessageInfo` also DROPS rows
     /// outright … this rule is what makes that safe"); the stale-delete consumer of
     /// the same count never was. `v2final` (`e28dd4edb`) carries the identical

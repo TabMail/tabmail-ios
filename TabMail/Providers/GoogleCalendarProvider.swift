@@ -794,7 +794,7 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// would be fail-DANGEROUS.
     ///
     /// ⚠️ **IT LIVES HERE, NOT ON THE QUEUE (R14-F2).** It was
-    /// `AccountManagerCalendarQueue`'s `isGoogleDuplicateIdConflict` until
+    /// `AccountManager`'s `isGoogleDuplicateIdConflict` until
     /// 2026-08-06, and `splitSeries` — in THIS file — needs the identical
     /// question answered before it may treat a 409 as proof the successor series
     /// exists. Copying it in would have produced two spellings of one invariant,
@@ -849,7 +849,7 @@ actor GoogleCalendarProvider: CalendarProvider {
     ///
     /// 🚨 **THE THREE FAILURES ARE DIFFERENT FACTS AND MUST NOT SHARE AN ERROR.**
     /// Until 2026-08-07 every failure here threw `GoogleCalendarError.eventNotFound`,
-    /// which `AccountManagerCalendarQueue.isCalendarNotFoundError` classifies as
+    /// which `AccountManager.isCalendarNotFoundError` classifies as
     /// provider-authoritative and retires the durable operation with
     /// *"event not found on server"*. A malformed `recurrence_id` and an
     /// undecodable payload are statements about US, not about the server:
@@ -1044,7 +1044,7 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// fields (Graph/Google treat re-sent attendees as newly invited). We
     /// only include attendees when `patch` explicitly changes them; the
     /// caller is responsible for delta-resolving against the existing list
-    /// (see `AccountManagerCalendarQueue.resolveAttendeeDelta`).
+    /// (see `AccountManager.resolveAttendeeDelta`).
     static func mergeExistingEventWithPatch(existing: GCalEvent, patch: GCalEventInput) -> GCalEventInput {
         var merged = GCalEventInput()
         merged.summary = patch.summary ?? existing.summary
@@ -1267,7 +1267,7 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// bytes the server sent in `errorBody` (`HTTPRequestResult`'s own doc states
     /// this). Both throws below reached this line only because `result.data` was
     /// nil, so `httpError(_, result.data)` could never carry anything but `nil` —
-    /// which made `AccountManagerCalendarQueue.isGoogleDuplicateIdConflict`
+    /// which made `AccountManager.isGoogleDuplicateIdConflict`
     /// VACUOUS in production (it returns `false` at its first `guard let body`)
     /// and left `badRequestReason` / `parseHttpReason` permanently on their
     /// code-only fallback. The classifier was provably correct and provably

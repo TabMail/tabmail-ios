@@ -59,7 +59,7 @@ struct ProvenDestinationAddress: Sendable, Equatable {
 /// Top-level rather than nested in `IMAPProvider` because it has TWO producers:
 /// `IMAPProvider.move(ids:from:to:admittedUidValidity:)` and
 /// `ExchangeProvider.moveProvingDestinations(ids:from:to:)`. Both feed the same
-/// consumer — `AccountManagerQueue.executeOperation`'s `.move` case — so one
+/// consumer — `AccountManager.executeOperation`'s `.move` case — so one
 /// type keeps the two arms from drifting.
 struct MoveOutcome: Sendable {
     /// The subset of the requested ids this attempt DISPOSITIONED (per-member
@@ -75,7 +75,7 @@ struct MoveOutcome: Sendable {
 ///
 /// Consumed OUTSIDE the GRDB write by the THREE stores that key by
 /// `messageHeader.id` but do not live in that database — all of them through
-/// the one mirror point, `AccountManagerQueue.publishRekeys`: the FTS index
+/// the one mirror point, `AccountManager.publishRekeys`: the FTS index
 /// (`SearchIndex.rekeyHeaders`, a separate SQLite pool), the in-memory undo
 /// stack (`UndoService.applyRekeys`), and the body-asset manifest
 /// (`BodyAssetStore.rekeyContentKey`, a third SQLite pool in the App Group
@@ -139,7 +139,7 @@ enum MessageHeaderRekey {
     ///    (`MessageContentStore.recoverMovedContentKey`) matches an UNCHANGED
     ///    `providerMessageId` — and a re-key is exactly the shape that changes
     ///    it. It is now mirrored outside this write by
-    ///    `AccountManagerQueue.publishRekeys` → `BodyAssetStore.rekeyContentKey`.
+    ///    `AccountManager.publishRekeys` → `BodyAssetStore.rekeyContentKey`.
     ///    ⚠ A caller of `apply` that does not route through `publishRekeys`
     ///    still owes that mirror; this function cannot do it (different pool,
     ///    and it must not run inside the GRDB write).
@@ -158,12 +158,12 @@ enum MessageHeaderRekey {
     ///       TabMail/ Shared/ TabMailNotificationService/
     ///    ```
     ///    → 5 at R17-1 (was 3), and **still 5 at R18-D5**. Check each hit
-    ///    against `AccountManagerQueue.publishRekeys`; the ones that do NOT
+    ///    against `AccountManager.publishRekeys`; the ones that do NOT
     ///    reach it are:
     ///     * the **UID-remap block in `SyncEngineFullSync`** — the
     ///       `guard try MessageHeaderRekey.apply(…)` inside the stale-message
     ///       loop;
-    ///     * **`SyncEngineFullSync.canonicalizeLocalRows`** — the `willRekey`
+    ///     * **`SyncEngine.canonicalizeLocalRows`** — the `willRekey`
     ///       leg, which became a caller in R17-1 (it hand-rolled the identical
     ///       delete+reinsert before that, destroying both children outright, so
     ///       adopting this carrier strictly reduced its loss);
@@ -323,7 +323,7 @@ enum MessageHeaderRekey {
     /// the op is retired and the rows are re-keyed, or neither happened and the
     /// op re-executes (idempotently).
     ///
-    /// WHY THIS EXISTS. `AccountManagerActions.optimisticMoveToFolder` moves the
+    /// WHY THIS EXISTS. `AccountManager.optimisticMoveToFolder` moves the
     /// row's `folderId`/`folderPath` to the destination, NILS
     /// `observedUidValidity`, and leaves the primary key and `messageId` at
     /// their SOURCE values. Until something repairs that, the row is refused by
@@ -347,7 +347,7 @@ enum MessageHeaderRekey {
     /// `Folder.lastKnownUidValidity`; otherwise the row is re-keyed and the
     /// stamp is left NIL. `Folder.lastKnownUidValidity` is written only by sync
     /// paths, so a drain-time stamp can leave the row FRESHER than the folder
-    /// row — and `AccountManagerActions.roleMoveRejectDispositions` treats a
+    /// row — and `AccountManager.roleMoveRejectDispositions` treats a
     /// POSITIVE disagreement (`observed != nil && observed != liveEpoch`) as
     /// `.terminalStale`, its ONLY terminal arm. Stamping optimistically would
     /// therefore TERMINALLY DROP the user's next gesture: the exact inverse of

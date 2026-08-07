@@ -14,7 +14,7 @@ import Testing
 /// NOT-NULL `folderPath`/`createdAt` columns — the INSERT always threw,
 /// silently dropping the user's tap. Even a successful insert would have been
 /// inert: `.archive`/`.delete` are legacy no-op `OperationType`s in the drain
-/// (`AccountManagerQueue.executeOperation`).
+/// (`AccountManager.executeOperation`).
 ///
 /// Five properties are pinned:
 /// 1. A durable header + ARCHIVE routes through the coordinated move path —
