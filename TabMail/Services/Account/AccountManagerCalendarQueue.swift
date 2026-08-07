@@ -219,27 +219,30 @@ extension AccountManager {
     ///   the R16 candidate. The number is expected to move; what must not move is
     ///   that every TERMINAL outcome also reaches `BackgroundSyncLogger`.
     ///
-    /// - Parameter caldavReauthAccountId: when non-nil, `caldavConfig.needsReauth`
-    ///   is set for that account IN THIS SAME TRANSACTION. It rides here rather
-    ///   than in its own write because the auth arm's delete and its `needsReauth`
-    ///   update were atomic before this change, and splitting them would let the
-    ///   retirement land without the persistent signal that makes it recoverable.
+    /// ⚠️ **THIS TOOK A `caldavReauthAccountId` UNTIL ROUND 18, AND ITS DOC SAID THE
+    /// RIDER CARRIED *"the persistent signal that makes it recoverable"*. THAT WAS
+    /// FALSE IN BOTH HALVES.** The rider ran
+    /// `UPDATE caldavConfig SET needsReauth = 1` in this transaction; nothing ever
+    /// cleared that column, its only reader was `AccountManager.createCalDAVProvider`'s
+    /// early `return nil`, and no UI read it at all (`ToolSettingsView`'s
+    /// `needsReauth` is a DIFFERENT symbol — a local `AccountEntry` field written
+    /// from a live `listCalendars()` probe). So the rider did not make anything
+    /// recoverable; it made the account's whole calendar lane UNrecoverable, by
+    /// removing the account from `calendarProviders` — which both starved every op
+    /// queued on it (`drainCalendarQueue`'s `guard let calProvider … else
+    /// { continue }`) and removed the account from the calendar picker, where the
+    /// one working re-auth prompt lives. Removed in round 18; see the banner on
+    /// `AccountManager.createCalDAVProvider` for the full chain, and
+    /// `CalDAVReauthWedgeTests` for the pin.
     private func retireCalendarOperation(
         _ op: PendingCalendarOperation,
-        reason: String,
-        caldavReauthAccountId: String? = nil
+        reason: String
     ) async -> Bool {
         BackgroundSyncLogger.logError(
             "[CalendarQueue] TERMINAL \(op.operationType) op=\(op.id) account=\(op.accountId) event=\(op.eventId ?? "new"): \(reason)",
             source: "CalendarQueue")
         do {
             try await retryWrite(dbPool, label: "CalendarQueue") { db in
-                if let caldavAccountId = caldavReauthAccountId {
-                    try db.execute(
-                        sql: "UPDATE caldavConfig SET needsReauth = 1 WHERE accountId = ?",
-                        arguments: [caldavAccountId]
-                    )
-                }
                 guard var row = try PendingCalendarOperation.fetchOne(db, key: op.id) else { return }
                 row.status = PendingStatus.failed.rawValue
                 row.failureReason = reason
@@ -284,11 +287,9 @@ extension AccountManager {
     /// `IOS-CAL-008`.
     private func retireAndAnnounce(
         _ op: PendingCalendarOperation,
-        reason: String,
-        caldavReauthAccountId: String? = nil
+        reason: String
     ) async {
-        let retired = await retireCalendarOperation(
-            op, reason: reason, caldavReauthAccountId: caldavReauthAccountId)
+        let retired = await retireCalendarOperation(op, reason: reason)
         signalCalendarOpOutcome(
             opId: op.id,
             outcome: retired ? .permanentFailure(reason: reason) : .stillQueued)
@@ -462,10 +463,16 @@ extension AccountManager {
                     // about the OP. Those are different questions and conflating them
                     // is how this went unnoticed: `rg -c authFailedAccounts` over this
                     // file returned ZERO, so an OAuth calendar account whose grant had
-                    // been revoked produced no persistent, user-visible signal at all
-                    // — only CalDAV accounts did, through their `caldavConfig`
-                    // `needsReauth` column. `authFailedAccounts` is the OAuth
-                    // equivalent: `AccountManager`'s `didSet` mirrors it into
+                    // been revoked produced no persistent, user-visible signal at all.
+                    // ⚠️ This sentence continued *"— only CalDAV accounts did, through
+                    // their `caldavConfig` `needsReauth` column"*, and round 18
+                    // established that CalDAV had no working signal either: nothing
+                    // cleared that column, no UI read it, and its one reader wedged
+                    // the account's calendar lane permanently. The write is gone.
+                    // OAuth is now the only auth family here with a persistent signal;
+                    // the CalDAV gap is registered as `IOS-CAL-007`.
+                    // `authFailedAccounts` is that OAuth signal:
+                    // `AccountManager`'s `didSet` mirrors it into
                     // `AccountManagerState`, which `RootView`, `SettingsView` and
                     // `AccountDetailView` all render as a "re-authenticate" prompt,
                     // and a successful re-auth clears it (`AccountManagerSetup`).
@@ -493,12 +500,15 @@ extension AccountManager {
                         // GESTURE — and until now nothing told the user to make it.
                         // `isCalendarOAuthReauthRequired` is FALSE for both spellings
                         // this arm claims (`missingScope` and a raw `httpError(403,…)`),
-                        // so the R14-F4 signal above does not fire, and unlike the
-                        // CalDAV auth arm there is no `caldavConfig.needsReauth` write
-                        // either. `IOS-CAL-003`'s stated discharge was therefore false
-                        // for its own namesake case — the same shape as R15's
-                        // `IOS-QUEUE-009` on the mail lane, one lane fixed and the
-                        // sibling left (`MIS-006`).
+                        // so the R14-F4 signal above does not fire. `IOS-CAL-003`'s
+                        // stated discharge was therefore false for its own namesake
+                        // case — the same shape as R15's `IOS-QUEUE-009` on the mail
+                        // lane, one lane fixed and the sibling left (`MIS-006`).
+                        // ⚠️ This sentence used to end *"and unlike the CalDAV auth
+                        // arm there is no `caldavConfig.needsReauth` write either"*,
+                        // which round 18 falsified from the other side: there is now
+                        // no such write anywhere, because it was a durable wedge
+                        // rather than a signal (see the auth arm below).
                         markAuthFailed(currentOp.accountId)
                         let reason = "calendar permission missing — user must re-authenticate in Settings"
                         await retireAndAnnounce(currentOp, reason: reason)
@@ -517,21 +527,29 @@ extension AccountManager {
                     //
                     // ⚠️ THE SIGNAL IS RAISED FOR AN INCOMPARABLE SET, NOT A LARGER
                     // ONE (R16-10). `isCalendarOAuthReauthRequired` above does NOT
-                    // claim `CalDAVError.authFailed`, which this arm does claim —
-                    // CalDAV's persistent signal is the `caldavConfig.needsReauth`
-                    // write below instead. See that predicate's doc for the exact
-                    // set difference in both directions.
+                    // claim `CalDAVError.authFailed`, which this arm does claim.
+                    //
+                    // ⚠️ THIS BLOCK SAID *"CalDAV's persistent signal is the
+                    // `caldavConfig.needsReauth` write below instead"* UNTIL ROUND
+                    // 18, AND THAT WRITE HAS BEEN REMOVED BECAUSE IT WAS A WEDGE,
+                    // NOT A SIGNAL — nothing cleared it, no UI read it, and its one
+                    // reader removed the account from `calendarProviders` forever
+                    // (banner on `AccountManager.createCalDAVProvider`). So the
+                    // incomparability is now one-sided in a different way and worth
+                    // stating plainly: a CalDAV auth failure retires THIS op and
+                    // raises NO persistent signal of its own. The user-facing
+                    // channel for it is `ToolSettingsView`'s live `listCalendars()`
+                    // probe, which renders "Calendar Access Required" for the
+                    // account the next time the calendar picker opens — and which
+                    // only works because the provider still exists. That gap is
+                    // registered as `KNOWN_ISSUES.md` `IOS-CAL-007`, which round 18
+                    // widened to cover the CalDAV auth class it previously carved
+                    // out on the strength of that false sentence.
                     if Self.isCalendarAuthError(error) {
                         let isCalDAV = Self.isCalDAVAuthError(error)
                         print("[CalendarQueue] Auth failed for \(opType) (\(isCalDAV ? "CalDAV" : "OAuth")) — stopping retries, user must re-authenticate")
                         let reason = Self.calendarAuthFailureReason(error)
-                        // Only CalDAV accounts have a `caldavConfig` row — running
-                        // the UPDATE for an OAuth account would match zero rows and
-                        // read as if we had marked something. It travels INSIDE the
-                        // retirement write so the two cannot come apart.
-                        await retireAndAnnounce(
-                            currentOp, reason: reason,
-                            caldavReauthAccountId: isCalDAV ? currentOp.accountId : nil)
+                        await retireAndAnnounce(currentOp, reason: reason)
                         executedAny = true
                         failedAccounts.insert(currentOp.accountId)
                         continue
@@ -952,8 +970,11 @@ extension AccountManager {
     /// trust: a classifier belongs to the disposition set iff it appears in
     /// `claimedByATerminalArm`'s roster in
     /// `TabMailTests/Queues/CalendarBadRequestClassificationTests.swift`; the other
-    /// two are read only for `markAuthFailed` (:432) and for the
-    /// `caldavConfig.needsReauth` rider (:481).
+    /// two are read only for `markAuthFailed` and — since round 18 removed the
+    /// `caldavConfig.needsReauth` rider this sentence used to name — for the
+    /// CalDAV/OAuth label in the auth arm's log line. (Cited by SYMBOL: the two
+    /// `:432` / `:481` line references this sentence carried were already stale,
+    /// `feedback_line_citations_go_stale`.)
     ///
     /// For the FOUR that do answer *does SOME terminal arm claim this error?*, an
     /// error no arm claims falls through to the transient arm, which requeues it
@@ -1115,9 +1136,16 @@ extension AccountManager {
     ///   * signal ∖ terminal = `ProviderError.authenticationFailed` — deliberately
     ///     retryable (see below), so it raises the prompt without retiring the op.
     ///   * terminal ∖ signal = `CalDAVError.authFailed` — retired without going
-    ///     through THIS predicate, because CalDAV's persistent signal is the
-    ///     `caldavConfig.needsReauth` write in the same arm rather than
-    ///     `authFailedAccounts`.
+    ///     through THIS predicate. ⚠️ **Until round 18 this bullet ended *"because
+    ///     CalDAV's persistent signal is the `caldavConfig.needsReauth` write in
+    ///     the same arm rather than `authFailedAccounts`"*, and that reason was
+    ///     FALSE.** That write was never a signal — nothing cleared it, no UI read
+    ///     it, and its sole reader made `AccountManager.createCalDAVProvider`
+    ///     return nil forever, which starved the account's whole calendar lane.
+    ///     It has been removed. The bullet's SET MEMBERSHIP is unchanged and still
+    ///     correct; only its justification was wrong. A CalDAV auth failure now
+    ///     raises no persistent signal at all, which is registered as
+    ///     `KNOWN_ISSUES.md` `IOS-CAL-007` rather than papered over here.
     /// Both halves shared: the two raw 401s and the three grant-level OAuth codes.
     /// The behaviour is correct; the SENTENCE was the problem, and it was copied
     /// verbatim into `KNOWN_ISSUES.md`, where a reviewer read it as evidence that
@@ -1169,11 +1197,25 @@ extension AccountManager {
         return "calendar authentication failed (the account's access was refused again after a token refresh) — user must re-authenticate in Settings"
     }
 
-    /// True only for the CalDAV spelling of an auth failure. CalDAV accounts own a
-    /// `caldavConfig` row whose `needsReauth` column is the persistent, user-visible
-    /// signal (`ToolSettingsView` reads it); OAuth accounts have no such row, so the
-    /// drain must not issue an `UPDATE` that silently matches zero rows and reads as
-    /// "we marked it".
+    /// True only for the CalDAV spelling of an auth failure.
+    ///
+    /// ⚠️ **THIS DOC SAID, UNTIL ROUND 18: *"CalDAV accounts own a `caldavConfig`
+    /// row whose `needsReauth` column is the persistent, user-visible signal
+    /// (`ToolSettingsView` reads it)"*. BOTH HALVES WERE FALSE, and the
+    /// parenthetical is the instructive one: `ToolSettingsView` reads a DIFFERENT
+    /// `needsReauth` — a local `CalendarPickerModel.AccountEntry` field set from a
+    /// LIVE `listCalendars()` probe's catch arms — and never touches the durable
+    /// column. Two unrelated symbols with the same spelling, one of which had a
+    /// real UI behind it, is exactly how a dead column read as a working signal
+    /// (`MIS-008` — a grep result is a claim about the DATA MODEL it assumes).
+    /// The durable write is gone as of round 18; the live probe is the signal, and
+    /// it only reaches the user because the provider now still exists.
+    ///
+    /// What this predicate is still FOR: labelling the auth arm's log line
+    /// `CalDAV` vs `OAuth`. It is deliberately kept rather than deleted — the two
+    /// failures need different remedies (re-enter an app-specific password vs.
+    /// re-run an OAuth grant) and a future credential re-entry flow is the thing
+    /// that would consume it.
     static func isCalDAVAuthError(_ error: Error) -> Bool {
         if case CalDAVError.authFailed = error { return true }
         return false

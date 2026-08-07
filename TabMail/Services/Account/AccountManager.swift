@@ -1157,10 +1157,39 @@ actor AccountManager {
             return nil
         }
 
-        if config.needsReauth {
-            print("[AccountManager] CalDAV config for \(account.emailAddress) needs re-auth — skipping provider creation")
-            return nil
-        }
+        // 🚨 `config.needsReauth` IS DELIBERATELY NOT READ HERE (round 18, item B).
+        // This used to be `if config.needsReauth { return nil }`, and that gate was
+        // a durable wedge rather than a signal. The column had exactly one writer
+        // (`AccountManagerCalendarQueue.retireCalendarOperation`'s
+        // `UPDATE caldavConfig SET needsReauth = 1`), exactly one reader (this
+        // guard), and NOTHING that ever cleared it — the only other write is
+        // `CalDAVConfig.init`'s `false`, reached only when the CalDAV setup path
+        // creates a NEW config row. So one auth failure removed the account from
+        // `calendarProviders` permanently, and from there:
+        //   * `drainCalendarQueue`'s `guard let calProvider = calendarProviders[…]
+        //     else { continue }` skipped every op queued on that account on every
+        //     subsequent drain, forever — no execution, no retirement, no user
+        //     signal. That is the never-drop WEDGE COROLLARY, which sits in the
+        //     non-recoverable set and is therefore NOT eligible for
+        //     fail-closed-and-register.
+        //   * `CalendarPickerModel.loadData` enumerates
+        //     `CalendarProviderDispatch.resolveAll()`, which iterates
+        //     `AccountManager.calendarProviders` — so the account also vanished
+        //     from the calendar picker, and the ONE working re-auth signal
+        //     (`ToolSettingsView`'s live `listCalendars()` probe → its OWN,
+        //     unrelated `AccountEntry.needsReauth` field → the "Calendar Access
+        //     Required" section) could never render for it. The durable column
+        //     defeated the live probe. Two different `needsReauth`s with the same
+        //     spelling is why this read as covered.
+        // Removing the gate lets the provider be created, so the live probe
+        // surfaces the prompt and queued ops keep reaching the drain. It does not
+        // create a hammering loop: `drainCalendarQueue`'s LOCAL
+        // `var failedAccounts = Set<String>()` is tested before the provider
+        // lookup, and the CalDAV auth arm inserts into it, so an account with dead
+        // credentials makes at most ONE wire attempt per drain pass.
+        // The COLUMN stays in the schema (migrations are immutable, and a future
+        // credential re-entry flow is the thing that would read it) — it is simply
+        // no longer written and no longer read.
 
         guard let password = KeychainHelper.loadString(key: "caldav_password_\(config.id)") else {
             print("[AccountManager] No CalDAV password in Keychain for config \(config.id)")

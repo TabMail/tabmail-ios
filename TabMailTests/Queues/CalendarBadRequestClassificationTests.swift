@@ -559,7 +559,15 @@ struct CalendarBadRequestClassificationTests {
         // this file's drain never touched `authFailedAccounts` at all
         // (`rg -c authFailedAccounts AccountManagerCalendarQueue.swift` → 0), so an
         // OAuth calendar account whose grant was revoked produced no persistent
-        // user-visible prompt — only CalDAV accounts did, via `caldavConfig.needsReauth`.
+        // user-visible prompt.
+        // ⚠️ This comment continued *"— only CalDAV accounts did, via
+        // `caldavConfig.needsReauth`"* until round 18, which established that CalDAV
+        // had no working signal either: nothing ever cleared that column, no UI read
+        // it (`ToolSettingsView`'s `needsReauth` is a different, in-memory symbol),
+        // and its only reader made `AccountManager.createCalDAVProvider` return nil
+        // forever — starving the account's calendar lane and removing it from the
+        // picker where the one live re-auth prompt lives. The write is gone; the
+        // CalDAV signal gap is registered as `IOS-CAL-007`.
         for (label, error) in [
             ("Google post-refresh 401", GoogleCalendarError.httpError(401, nil) as Error),
             ("Exchange post-refresh 401", ExchangeCalendarError.httpError(401, nil)),
@@ -588,7 +596,14 @@ struct CalendarBadRequestClassificationTests {
             ("missing scope", ExchangeCalendarError.missingScope),
             ("connection lost", URLError(.networkConnectionLost)),
             ("indeterminate token endpoint", OAuthError.tokenExchangeFailed("temporarily_unavailable")),
-            ("CalDAV — has its own needsReauth column", CalDAVError.authFailed),
+            // Was "CalDAV — has its own needsReauth column" until round 18. The
+            // membership is unchanged and still correct — `CalDAVError.authFailed`
+            // must not raise the OAUTH prompt, which would tell a CalDAV user to
+            // re-run a grant that does not exist. What changed is the REASON: there
+            // is no CalDAV column signal any more (it was a wedge, now removed), so
+            // this row is the deliberately-unsignalled case registered as
+            // `IOS-CAL-007`, not a case covered elsewhere.
+            ("CalDAV — the OAuth prompt is the wrong remedy for it", CalDAVError.authFailed),
         ] {
             #expect(AccountManager.isCalendarOAuthReauthRequired(error) == false,
                     "\(label) must not raise the OAuth re-auth prompt")
