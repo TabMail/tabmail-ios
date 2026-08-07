@@ -1692,10 +1692,29 @@ extension SyncEngine {
                         } else {
                             print("[Sync] Dedup: SKIPPING insert for id=\(header.id) — already exists (post-snapshot)")
                         }
+                        // R16-8 — THE REMOVAL CHANNEL, because this leg discards
+                        // rather than migrates. `optimistic` is already deleted and
+                        // `deferredBody` is never inserted, so `oldId` names content
+                        // that no longer exists; without this it rode NEITHER
+                        // `ftsRekeys` nor `staleIds` and left a permanent FTS orphan.
+                        staleIds.append(oldId)
                         continue
                     }
                     try header.insert(db)
                     if let body = deferredBody { try body.insert(db) }
+                    // R16-8 — THE RE-KEY CHANNEL. The body (and with it the indexed
+                    // text and its embedding) was CARRIED to `header.id`, so the FTS
+                    // entry must MOVE, not be removed. This block ends in `continue`,
+                    // which bypasses every shared disposition below, so the old id
+                    // has to be routed here explicitly — the UID-remap carrier in
+                    // this same function already does exactly this, which is what
+                    // made these two blocks unswept MEMBERS rather than a whole-path
+                    // omission. ⚠️ Not a "the next sync repairs it" case: the
+                    // compensating sweep `pruneFTSOrphans` has ONE production caller,
+                    // `oneTimeFTSReconciliation`, gated on a `UserDefaults` flag it
+                    // sets on first success with no production reset — so it
+                    // provably cannot run again (`MIS-024`).
+                    ftsRekeys.append((oldId: oldId, newId: header.id, newMessageId: header.messageId))
                     try ThreadUtils.insertMessageReferences(for: header, db: db)
                     // Insert user label associations
                     for labelId in info.userLabelIds {
@@ -1836,6 +1855,12 @@ extension SyncEngine {
                     try preSync.delete(db)
                     try header.insert(db)
                     if let body = deferredBody { try body.insert(db) }
+                    // R16-8 — THE RE-KEY CHANNEL, same reason as the DraftDedup block
+                    // above: the body is carried to `header.id`, this block ends in
+                    // `continue`, and `pruneFTSOrphans` provably cannot run a second
+                    // time. Without this the reclaimed row's indexed text stays filed
+                    // under a header id that no longer exists.
+                    ftsRekeys.append((oldId: oldId, newId: header.id, newMessageId: header.messageId))
                     try ThreadUtils.insertMessageReferences(for: header, db: db)
                     for labelId in info.userLabelIds {
                         let labelRow = UserLabel(accountId: accountId, providerLabelId: labelId, name: labelId, isSystem: false)
@@ -1865,6 +1890,12 @@ extension SyncEngine {
                         }
                         try MessageBody.deleteOne(db, key: extraId)
                         try extra.delete(db)
+                        // R16-8 — THE REMOVAL CHANNEL. These tail duplicates are
+                        // DELETED, not migrated, so their FTS entries must go with
+                        // them. Third member of the same class as the two re-key
+                        // legs: enumerated by *"a header row this block destroys or
+                        // re-keys"*, not by *"a block that re-keys"*.
+                        staleIds.append(extraId)
                         print("[Sync] Pre-sync reclaim: removed duplicate inbox row \(extraId)")
                     }
                     continue

@@ -1077,6 +1077,252 @@ struct RunSyncUIDRemapFtsRekeyTests {
     }
 }
 
+// MARK: - Suite: R16-8 — the dedup / reclaim carriers must route their old ids
+
+/// 🚨 THE INVARIANT, as the system property and not the mechanism (`MIS-015`):
+/// **no FTS entry survives at an id that names no header** ("indexed but
+/// unfindable"), and **a re-keyed header's FTS entry MOVES to the new id rather
+/// than being left behind**.
+///
+/// `runSyncMessages` owns two channels out of its write closure: `ftsRekeys` (the
+/// entry moves in place, preserving the indexed body text and the `messages_vec`
+/// embedding) and `staleIds` (the entry is deleted). Its UID-remap carrier routes
+/// through both correctly. Four sibling legs in the SAME closure did not: the
+/// DraftDedup block's collision and success legs, and the pre-sync reclaim's
+/// success leg and its `dropFirst()` tail deletes. Each of those blocks ends in
+/// `continue`, which bypasses every shared disposition below, so an old id that is
+/// not routed EXPLICITLY rides neither channel and is simply forgotten.
+///
+/// ⚠️ NOT a "the next sync repairs it" case. The compensating sweep
+/// `pruneFTSOrphans` has ONE production caller, `oneTimeFTSReconciliation`, gated on
+/// a `UserDefaults` flag it sets on first success with no production reset — so it
+/// provably cannot run a second time (`MIS-024`). The leak is permanent.
+///
+/// Asserted on the RESULT CHANNELS rather than on `SearchIndex` itself because the
+/// channels are what `syncMessages` hands to `SearchIndex.rekeyHeaders` /
+/// `removeHeadersFromFTS` verbatim, and driving the real FTS store would make the
+/// fixture, not the routing, the thing under test. This is the tightest seam that
+/// still runs the REAL `runSyncMessages`.
+@Suite("runSyncMessages — R16-8 dedup/reclaim FTS routing", .serialized, .processGlobalState)
+struct RunSyncDedupReclaimFtsRoutingTests {
+
+    private func makePool() throws -> (DatabasePool, URL) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path)
+        try AppDatabase.runMigrations(on: pool)
+        return (pool, dir)
+    }
+
+    private static let syncDate = Date(timeIntervalSince1970: 1_700_000_000)
+
+    /// A local row, inserted verbatim (no id derivation), so a fixture can express
+    /// folder drift.
+    private static func insertHeader(
+        _ db: Database, messageId: String, folderPath: String, folderId: String,
+        rfc822: String?, isInInbox: Bool
+    ) throws -> MessageHeader {
+        var header = MessageHeader(
+            messageId: messageId, subject: "fixture", from: "a@x", fromAddress: "a@x",
+            to: "b@x", date: Self.syncDate, snippet: "s",
+            folderId: folderId, accountId: "racc", folderPath: folderPath,
+            isInInbox: isInInbox)
+        header.rfc822MessageId = rfc822
+        header.headerComplete = true
+        header.bodyComplete = true
+        try header.insert(db)
+        return header
+    }
+
+    /// THE SUCCESS LEG of the DraftDedup block: the optimistic placeholder's body is
+    /// CARRIED to the server-assigned address, so its FTS entry must move with it.
+    @Test("DraftDedup replacing an optimistic placeholder re-keys the FTS entry instead of orphaning it")
+    func draftDedupSuccessRoutesTheOldIdToFtsRekeys() async throws {
+        let (pool, dir) = try makePool()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+        let rfc = "draft-r16-8@example.com"
+        let placeholderId = MessageIdentity.headerId(
+            accountId: "racc", folderPath: "Drafts", messageId: "draft-local-1")
+        try await pool.write { db in
+            var acc = Account(emailAddress: "d@example.com", displayName: "T", provider: .imap)
+            acc.id = "racc"
+            try acc.insert(db)
+            try Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "racc").insert(db)
+            _ = try Self.insertHeader(
+                db, messageId: "draft-local-1", folderPath: "Drafts",
+                folderId: "racc:Drafts", rfc822: rfc, isInInbox: false)
+            try MessageBody(
+                contentKey: ContentKey(rawValue: placeholderId),
+                htmlContent: "<p>authored</p>").insert(db)
+        }
+
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:Drafts")! }
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult([
+            makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: Self.syncDate)
+        ])
+
+        // limit == message count ⇒ the mock reports a PARTIAL fetch, so complete-
+        // knowledge stale detection is off and the non-numeric placeholder id is not
+        // a UID-stale candidate. Without that the placeholder would be deleted by the
+        // stale channel and this leg would never run.
+        let result = try await SyncEngine.runSyncMessages(
+            for: folder, provider: mock, limit: 1, dbPool: PrioritizedDatabase(pool: pool))
+
+        // Non-vacuity: the dedup really did replace the placeholder with the server row.
+        #expect(try await pool.read { try MessageHeader.fetchOne($0, key: placeholderId) } == nil,
+                "setup: the optimistic placeholder must have been replaced — got a surviving row")
+        #expect(try await pool.read { try MessageHeader.fetchOne($0, key: "racc:Drafts:42") } != nil,
+                "setup: the server-addressed row must exist")
+        #expect(try await pool.read { try MessageBody.fetchOne($0, key: "racc:Drafts:42") }?.htmlContent
+                == "<p>authored</p>",
+                "setup: the body was CARRIED, which is why the FTS entry must move rather than be deleted")
+
+        #expect(result.ftsRekeys.contains {
+            $0.oldId == placeholderId && $0.newId == "racc:Drafts:42" && $0.newMessageId == "42"
+        }, """
+        the placeholder's indexed text was carried to the server address, so its FTS \
+        entry must MOVE there. Routed through neither channel it stays filed under a \
+        header id that no longer exists — an entry search can hit and never resolve — \
+        and `pruneFTSOrphans` provably cannot run again to clean it. \
+        Got ftsRekeys=\(result.ftsRekeys.map { "\($0.oldId)→\($0.newId)" })
+        """)
+        #expect(!result.staleIds.contains(placeholderId),
+                "and it must NOT ride the removal channel — deleting the entry would throw away the indexed body text and its embedding for content that still exists")
+    }
+
+    /// THE COLLISION LEG of the same block: the placeholder is DISCARDED (already
+    /// deleted, its deferred body never inserted), so the old id names content that no
+    /// longer exists anywhere and must ride the REMOVAL channel.
+    ///
+    /// This is the two-sided half (`MIS-026`): the two legs of one block need
+    /// OPPOSITE channels, so a fix that routed everything to `ftsRekeys` would be its
+    /// own defect — re-keying an entry onto a row whose content was never written.
+    @Test("A collided DraftDedup routes the discarded placeholder to the removal channel")
+    func draftDedupCollisionRoutesTheOldIdToStaleIds() async throws {
+        let (pool, dir) = try makePool()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+        let rfc = "draft-r16-8-collided@example.com"
+        let placeholderId = MessageIdentity.headerId(
+            accountId: "racc", folderPath: "Drafts", messageId: "draft-local-1")
+        try await pool.write { db in
+            var acc = Account(emailAddress: "d@example.com", displayName: "T", provider: .imap)
+            acc.id = "racc"
+            try acc.insert(db)
+            try Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "racc").insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "racc").insert(db)
+            _ = try Self.insertHeader(
+                db, messageId: "draft-local-1", folderPath: "Drafts",
+                folderId: "racc:Drafts", rfc822: rfc, isInInbox: false)
+            // A row already occupying the server-assigned PK, but whose folderId
+            // column points elsewhere — so the per-message existence lookup (which
+            // filters on folderId) does not see it and the dedup block's own
+            // `fetchOne(key:)` does. That is the reachable shape of the block's
+            // "already exists (post-snapshot)" guard.
+            _ = try Self.insertHeader(
+                db, messageId: "42", folderPath: "Drafts", folderId: "racc:INBOX",
+                rfc822: "someone-else@example.com", isInInbox: false)
+        }
+
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:Drafts")! }
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult([
+            makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: Self.syncDate)
+        ])
+
+        let result = try await SyncEngine.runSyncMessages(
+            for: folder, provider: mock, limit: 1, dbPool: PrioritizedDatabase(pool: pool))
+
+        #expect(try await pool.read { try MessageHeader.fetchOne($0, key: placeholderId) } == nil,
+                "setup: the collision leg deletes the placeholder before returning — got a surviving row")
+        #expect(result.staleIds.contains(placeholderId),
+                """
+                the placeholder was DISCARDED, not migrated: its row is deleted and its \
+                deferred body was never inserted, so its FTS entry names content that \
+                exists nowhere. Unrouted it is a permanent orphan. \
+                Got staleIds=\(result.staleIds)
+                """)
+        #expect(!result.ftsRekeys.contains { $0.oldId == placeholderId },
+                "and it must NOT ride the re-key channel — there is no carried content to move it onto")
+    }
+
+    /// THE PRE-SYNC RECLAIM, both legs at once: the FIRST drifted row is reclaimed
+    /// (its body is carried to the canonical address ⇒ re-key channel) and every TAIL
+    /// duplicate is deleted outright (⇒ removal channel). One fixture, two opposite
+    /// dispositions, which is what makes it non-vacuous in both directions.
+    @Test("Pre-sync reclaim re-keys the row it migrates and removes the duplicates it deletes")
+    func preSyncReclaimRoutesBothLegs() async throws {
+        let (pool, dir) = try makePool()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+        let rfc = "reclaim-r16-8@example.com"
+        let firstDriftedId = MessageIdentity.headerId(
+            accountId: "racc", folderPath: "NSE-A", messageId: "42")
+        let secondDriftedId = MessageIdentity.headerId(
+            accountId: "racc", folderPath: "NSE-B", messageId: "42")
+        let driftedIds = [firstDriftedId, secondDriftedId]
+        try await pool.write { db in
+            var acc = Account(emailAddress: "r@example.com", displayName: "T", provider: .imap)
+            acc.id = "racc"
+            try acc.insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "racc").insert(db)
+            try Folder(name: "NSE-A", path: "NSE-A", role: .custom, accountId: "racc").insert(db)
+            try Folder(name: "NSE-B", path: "NSE-B", role: .custom, accountId: "racc").insert(db)
+            _ = try Self.insertHeader(
+                db, messageId: "42", folderPath: "NSE-A", folderId: "racc:NSE-A",
+                rfc822: rfc, isInInbox: true)
+            try MessageBody(
+                contentKey: ContentKey(rawValue: firstDriftedId),
+                htmlContent: "<p>reclaimed</p>").insert(db)
+            _ = try Self.insertHeader(
+                db, messageId: "42", folderPath: "NSE-B", folderId: "racc:NSE-B",
+                rfc822: rfc, isInInbox: true)
+        }
+
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:INBOX")! }
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult([
+            makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: Self.syncDate)
+        ])
+
+        let result = try await SyncEngine.runSyncMessages(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
+
+        #expect(try await pool.read { try MessageHeader.fetchOne($0, key: "racc:INBOX:42") } != nil,
+                "setup: the reclaim must have produced the canonical inbox row")
+        let survivingDrifted = try await pool.read { db in
+            try driftedIds.filter { try MessageHeader.fetchOne(db, key: $0) != nil }
+        }
+        #expect(survivingDrifted.isEmpty,
+                "setup: both drifted rows are consumed by the reclaim — got \(survivingDrifted)")
+
+        let rekeyedOldIds = result.ftsRekeys.map(\.oldId).filter { driftedIds.contains($0) }
+        #expect(rekeyedOldIds.count == 1,
+                """
+                exactly one drifted row is RECLAIMED — its body is carried to the canonical \
+                address, so its indexed text must move with it rather than stay filed under \
+                a header id the reclaim just deleted. \
+                Got ftsRekeys=\(result.ftsRekeys.map { "\($0.oldId)→\($0.newId)" })
+                """)
+        guard rekeyedOldIds.count == 1 else { return }
+        let reclaimedId = rekeyedOldIds[0]
+        #expect(result.ftsRekeys.contains { $0.oldId == reclaimedId && $0.newId == "racc:INBOX:42" },
+                "and it must move to the canonical inbox address")
+
+        let droppedIds = driftedIds.filter { $0 != reclaimedId }
+        #expect(droppedIds.count == 1)
+        guard droppedIds.count == 1 else { return }
+        #expect(result.staleIds.contains(droppedIds[0]),
+                """
+                the TAIL duplicate is deleted outright, not migrated, so its FTS entry must \
+                go with it. This is the third member of the same class, enumerated by \
+                "a header row this block destroys or re-keys" rather than by \
+                "a block that re-keys". Got staleIds=\(result.staleIds)
+                """)
+        #expect(!result.ftsRekeys.contains { $0.oldId == droppedIds[0] },
+                "and the deleted duplicate must not be re-keyed onto the survivor's address")
+    }
+}
+
 // MARK: - FIX A: bounded newRemoteIds membership (SyncEngine.newRemoteIds)
 
 /// Direct coverage for `SyncEngine.newRemoteIds(in:folderId:remoteIds:cachedLocalIds:)`
