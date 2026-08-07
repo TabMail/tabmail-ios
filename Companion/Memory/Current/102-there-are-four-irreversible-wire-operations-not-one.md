@@ -14,6 +14,12 @@
 > census keyed on the `method: "DELETE"` **argument** form and CalDAV uses the *other* spelling,
 > `request.httpMethod = "DELETE"`. That is `MIS-007`: a census inherits its search shape.
 >
+> ✅ **THE COUNT IS NOW SIX, AND THE HANDOFF BELOW IS DISCHARGED (2026-08-07).** Entries (1)–(5) are
+> the *deletion* family; **(6) is `CalDAVProvider.splitSeries`' cap `PUT`** — a REPLACEMENT, not a
+> `DELETE`. Everything below is preserved as written; the correction is additive. `tabmail-ios/CLAUDE.md`
+> now carries the six-member enumeration, states membership by THE PROPERTY, demotes the greps to a
+> LOWER BOUND, and lists patterns D/E — so the reader of the MANTRA no longer sees an incomplete set.
+
 > **THE ENUMERATION PREDICATE — re-run this rather than trusting the integer.** The set is
 > *"every wire call that destroys or may destroy user-authored content on a server, where TabMail
 > has no positive documented per-item recovery path it actually reaches."* It is enumerated by
@@ -446,3 +452,27 @@ and before the *"⚠ Do not restate this integer without re-running its predicat
 dirty in the owner's working tree again in round 18; editing it was explicitly out of scope. The
 handoff therefore remains OPEN, and this file remains the authority until the owner lands the edit
 above.
+
+---
+
+## ✅ DISCHARGED 2026-08-07 — the `tabmail-ios/CLAUDE.md` edit LANDED
+
+**The handoff above is closed.** The owner's working tree was clean, so the edit specified verbatim in
+*"THE EXACT ONE-LINE EDIT `tabmail-ios/CLAUDE.md` NEEDS"* was applied to THE MANTRA block:
+
+- `There are **five**:` → `There are **six**:`
+- the `(6) … cap `PUT`` sentence inserted before the restate-the-integer warning;
+- membership restated **by the PROPERTY**, with the greps demoted to an explicit **LOWER BOUND**;
+- patterns **D** (`httpMethod\s*=\s*"PUT"`) and **E** (`method\s*:\s*"PUT"`) added beside A/B/C;
+- *"a fifth spelling"* → *"a further spelling"*, so the trip-wire carries no integer of its own;
+- the closing pointer now reads *"its count is now six"*.
+
+**All five predicates were re-run before the edit** (never restate the integer): **A=7, B=3, C=4,
+D=2, E=2** over `TabMail/ Shared/ TabMailNotificationService/` — identical to the `92e99fad1` column
+of the table above, so every adjudication holds unchanged. `CalDAVProvider.splitSeries` step 3 still
+issues the cap `PUT` against the existing master resource with a best-effort `revertMasterCap`.
+
+**The transferable point this entry made — *"a correction that lives only in the routed file is not
+discharged, it is filed"* — is now demonstrated in both directions:** it took an audit re-reporting
+the same finding as NEW, twice, before the index surface was actually corrected. The re-report was
+not noise; it was the measurement that the routed fix had never become reachable.

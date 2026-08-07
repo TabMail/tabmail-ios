@@ -1,3 +1,34 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **⚠️ CURRENT ROUTING NOTE (2026-08-07) — the `Currently applies to:` line below is STALE. It names
+> FOUR tools; the real set is TWELVE.** The body is preserved unedited because its bytes are pinned by
+> `Companion/Decisions/manifest.tsv` and reconstruct `v1.6.38:DECISIONS.md`; read this note in its
+> place. The correction was first written *inside* the body on 2026-08-06 (`7c143daa5`) and is moved
+> here unchanged — that inline edit is what broke `ruby Scripts/compact_companion_docs.rb verify` for
+> a day (`MIS-IOS-009`, recurrence 3).
+>
+> **Applies to every tool that calls the gate — re-derived by that property 2026-08-06 (round-15
+> FIX-9), not by editing names into a list.** The predicate is `rg -l 'awaitConfirmation'` over
+> `TabMail/Services/AI/Tools/`, mapped to each type's `let name = "…"`. **Twelve tools:**
+>
+> - mail — `email_archive`, `email_delete`
+> - contacts — `contacts_edit`, `contacts_delete`
+> - calendar — `calendar_event_create`, `calendar_event_edit`, `calendar_event_delete`
+> - templates — `template_create`, `template_edit`, `template_delete`, `template_share`,
+>   `template_download`
+>
+> ⚠️ **This list said four — `email_archive`, `email_delete`, `contacts_edit`, `contacts_delete` —
+> until 2026-08-06, and the calendar and template families had been confirming for a long time.** The
+> staleness predates the v3 range. Re-derive the property; do not append to the names, because a list
+> maintained by appending is stale from the first tool added without touching this file (`MIS-031`).
+>
+> ⚠️ **THE NEGATIVE CASE, so this is not misread as "every mutating tool confirms" — it is not.**
+> `contacts_add`, `task_add`/`task_edit`/`task_del`, `reminder_add`/`reminder_del`, `kb_add`/`kb_del`,
+> `template_toggle`, `change_setting` and the compose family (`email_compose`, `email_reply`,
+> `email_forward`) all mutate and **do not** call this gate. That is a product decision about which
+> actions are destructive or irreversible enough to interrupt the user for, and this ADR does not
+> adjudicate it — it defines the pattern a tool MUST follow **once** it needs confirmation. If you are
+> here to decide whether a NEW tool should confirm, this list is evidence of practice, not a rule.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ## ADR-IOS-024: Destructive Tool Confirmation with ToolDeclinedError
 
@@ -14,28 +45,7 @@
 
 **All tools requiring user confirmation MUST follow this exact pattern.**
 
-**Applies to every tool that calls the gate — re-derived by that property 2026-08-06 (round-15
-FIX-9), not by editing names into a list.** The predicate is `rg -l 'awaitConfirmation'` over
-`TabMail/Services/AI/Tools/`, mapped to each type's `let name = "…"`. **Twelve tools:**
-
-- mail — `email_archive`, `email_delete`
-- contacts — `contacts_edit`, `contacts_delete`
-- calendar — `calendar_event_create`, `calendar_event_edit`, `calendar_event_delete`
-- templates — `template_create`, `template_edit`, `template_delete`, `template_share`,
-  `template_download`
-
-⚠️ **This list said four — `email_archive`, `email_delete`, `contacts_edit`, `contacts_delete` —
-until 2026-08-06, and the calendar and template families had been confirming for a long time.** The
-staleness predates the v3 range. Re-derive the property; do not append to the names, because a list
-maintained by appending is stale from the first tool added without touching this file (`MIS-031`).
-
-⚠️ **THE NEGATIVE CASE, so this is not misread as "every mutating tool confirms" — it is not.**
-`contacts_add`, `task_add`/`task_edit`/`task_del`, `reminder_add`/`reminder_del`, `kb_add`/`kb_del`,
-`template_toggle`, `change_setting` and the compose family (`email_compose`, `email_reply`,
-`email_forward`) all mutate and **do not** call this gate. That is a product decision about which
-actions are destructive or irreversible enough to interrupt the user for, and this ADR does not
-adjudicate it — it defines the pattern a tool MUST follow **once** it needs confirmation. If you are
-here to decide whether a NEW tool should confirm, this list is evidence of practice, not a rule.
+Currently applies to: `email_archive`, `email_delete`, `contacts_edit`, `contacts_delete`.
 
 **Consequences:**
 - LLM receives structured feedback on decline — can retry with correct targets

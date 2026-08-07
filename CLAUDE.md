@@ -90,7 +90,7 @@ deletion.
 
 > **Stated negatively, because this absolute was wrong for two years and walked reviewers past two
 > live hazards.** "Never permanently deletes" is true of MAIL, **not of DRAFTS OR CALENDAR EVENTS**,
-> and the `COPYUID`-gated purge is **not** the only irreversible wire operation. There are **five**:
+> and the `COPYUID`-gated purge is **not** the only irreversible wire operation. There are **six**:
 > (1) the `COPYUID`-gated source expunge; (2) `IMAPProvider.deleteDraftStrong`; (3) `saveDraft`'s
 > old-copy replacement; (4) Gmail's `DELETE /drafts/{id}`, which Google documents as permanent rather
 > than a trash; (5) `CalDAVProvider.deleteEvent` — WebDAV `DELETE` on the event's `.ics` resource,
@@ -102,11 +102,17 @@ deletion.
 > `ExchangeProvider.deleteDraft`, `ExchangeCalendarProvider.deleteEvent` and
 > `GoogleCalendarProvider.deleteEvent` are excluded on **positive** documented per-item recovery
 > (Graph Recoverable Items; Google Calendar's 30-day event trash), not on the absence of evidence.
-> **⚠ Do not restate this integer without re-running its predicate.** The set is enumerated by three
-> `--multiline` searches over `TabMail/ Shared/ TabMailNotificationService/` — `method\s*:\s*"DELETE"`,
-> `httpMethod\s*=\s*"DELETE"`, `expunge\(` — because **both** HTTP spellings occur, and the count was
-> "four" for a day precisely because the earlier census saw only the first (`MIS-007`).
-> **It is wrong the moment** a fifth spelling appears (a computed/enum HTTP verb, or deletion
+> **(6) is not a DELETE at all: `CalDAVProvider.splitSeries`' cap `PUT`** replaces the master `.ics`
+> with an `UNTIL=`-capped `RRULE`, destroying every occurrence after the split point, under a
+> best-effort compensating rollback rather than a transaction.
+> **⚠ Membership is defined by a PROPERTY — content that existed on the server no longer does, with
+> no documented per-item recovery the call reaches — NOT by the verb `DELETE`. Do not restate this
+> integer without re-running its predicate.** The greps are a **LOWER BOUND**, not the definition:
+> five `--multiline` searches over `TabMail/ Shared/ TabMailNotificationService/` —
+> `method\s*:\s*"DELETE"`, `httpMethod\s*=\s*"DELETE"`, `expunge\(`, plus the REPLACEMENT axis
+> `httpMethod\s*=\s*"PUT"` and `method\s*:\s*"PUT"` — because **both** HTTP spellings occur, and the
+> count was "four" for a day precisely because the earlier census saw only the first (`MIS-007`).
+> **It is wrong the moment** a further spelling appears (a computed/enum HTTP verb, or deletion
 > tunnelled through `POST` like Gmail `batchDelete` or Graph `permanentDelete`), a non-HTTP/non-IMAP
 > destructive surface is added, an excluded call loses its documented recovery, or
 > `GoogleCalendarProvider` gains a *this-and-following* series delete.
@@ -114,7 +120,7 @@ deletion.
 > valid for mail and invalid for drafts and CalDAV events — for those paths, say why the specific
 > loss is acceptable.
 > Detail and evidence: [`Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md`](Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md)
-> (filename preserved; its count is now five).
+> (filename preserved; its count is now six).
 
 **Check "rare" before invoking this.** An edge that is actually the common path is not an edge.
 "Undo of an already-drained move" *sounds* rare, but the drain fires immediately after the gesture, so

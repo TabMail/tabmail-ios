@@ -240,72 +240,72 @@ remains the normative source — or preserved here. Nothing was summarised, merg
 ### Source line 131 — `(section preamble)`
 
 <!-- BEGIN VERBATIM ROW 131 (pass 3) -->
-These topics exist only on the mature pre-v3 line and are therefore not in `v1.6.38:PROJECT_MEMORY.md`. The bodies are preserved byte-for-byte with their provenance in [`Companion/Memory/ported-manifest.tsv`](Companion/Memory/ported-manifest.tsv). They are excluded from the source-document reconstruction manifest.
+These topics exist only on the mature pre-v3 line and are therefore not in `v1.6.38:PROJECT_MEMORY.md`. The bodies are preserved byte-for-byte with their provenance in [`Companion/Memory/ported-manifest.tsv`](../ported-manifest.tsv). They are excluded from the source-document reconstruction manifest.
 <!-- END VERBATIM ROW 131 (pass 3) -->
 
 ### Source line 143 — `(section preamble)`
 
 <!-- BEGIN VERBATIM ROW 143 (pass 3) -->
-Authored after `v1.6.38`, so the pinned compaction has no byte-identical twin. Deliberately **not** rows in [`manifest.tsv`](Companion/Memory/manifest.tsv), which reconstructs `v1.6.38:PROJECT_MEMORY.md` exactly; provenance, source line ranges and per-fragment `sha256` are in [`amendments-manifest.tsv`](Companion/Memory/amendments-manifest.tsv).
+Authored after `v1.6.38`, so the pinned compaction has no byte-identical twin. Deliberately **not** rows in [`manifest.tsv`](../manifest.tsv), which reconstructs `v1.6.38:PROJECT_MEMORY.md` exactly; provenance, source line ranges and per-fragment `sha256` are in [`amendments-manifest.tsv`](../amendments-manifest.tsv).
 <!-- END VERBATIM ROW 143 (pass 3) -->
 
 ### Source line 147 — `094-retained-inline-no-byte-identical-routed-twin.md`
 
 <!-- BEGIN VERBATIM ROW 147 (pass 3) -->
-| Historical | Compaction drift list — the retired *Retained inline — no byte-identical routed twin* preamble: why a post-`v1.6.38` amendment can differ from its `Companion/Memory/` twin, and the check-the-routed-twin-before-editing rule | [read in full](Companion/Memory/History/094-retained-inline-no-byte-identical-routed-twin.md) |
+| Historical | Compaction drift list — the retired *Retained inline — no byte-identical routed twin* preamble: why a post-`v1.6.38` amendment can differ from its `Companion/Memory/` twin, and the check-the-routed-twin-before-editing rule | [read in full](094-retained-inline-no-byte-identical-routed-twin.md) |
 <!-- END VERBATIM ROW 147 (pass 3) -->
 
 ### Source line 148 — `095-v3-provider-id-action-queue-forward-port-resume-state.md`
 
 <!-- BEGIN VERBATIM ROW 148 (pass 3) -->
-| Current | v3 provider-id action-queue forward-port — resume state: branch `v3`, HEAD `583de7a5d`, **PAUSED BY OWNER**, never pushed; `PLAN_IOS_REFACTOR_V3.md` routing index; T4.T2 landed, T5.9/T4.T1 next; rules R0–R4; `v2final` PORT/SUBTRACT/INVENTED census | [read in full](Companion/Memory/Current/095-v3-provider-id-action-queue-forward-port-resume-state.md) |
+| Current | v3 provider-id action-queue forward-port — resume state: branch `v3`, HEAD `583de7a5d`, **PAUSED BY OWNER**, never pushed; `PLAN_IOS_REFACTOR_V3.md` routing index; T4.T2 landed, T5.9/T4.T1 next; rules R0–R4; `v2final` PORT/SUBTRACT/INVENTED census | [read in full](../Current/095-v3-provider-id-action-queue-forward-port-resume-state.md) |
 <!-- END VERBATIM ROW 148 (pass 3) -->
 
 ### Source line 149 — `096-t1-3-new-gesture-fails-closed-on-unknown-uidvalidity-epoch.md`
 
 <!-- BEGIN VERBATIM ROW 149 (pass 3) -->
-| Current | T1.3 — a NEW gesture fails CLOSED on an unknown UIDVALIDITY epoch: `newGestureRefusedForUnknownEpoch` is a silent no-op (`IOS-EPOCH-001`, C3), never "fixed" back to fail-open; on a refused write RECONCILE FROM THE DATABASE | [read in full](Companion/Memory/Current/096-t1-3-new-gesture-fails-closed-on-unknown-uidvalidity-epoch.md) |
+| Current | T1.3 — a NEW gesture fails CLOSED on an unknown UIDVALIDITY epoch: `newGestureRefusedForUnknownEpoch` is a silent no-op (`IOS-EPOCH-001`, C3), never "fixed" back to fail-open; on a refused write RECONCILE FROM THE DATABASE | [read in full](../Current/096-t1-3-new-gesture-fails-closed-on-unknown-uidvalidity-epoch.md) |
 <!-- END VERBATIM ROW 149 (pass 3) -->
 
 ### Source line 150 — `097-t4-s6-follow-up-superseded-v3-intermediate-draft-epoch-stamp.md`
 
 <!-- BEGIN VERBATIM ROW 150 (pass 3) -->
-| Historical | T4.S6 — **SUPERSEDED v3 intermediate, never implement from it**: `v69` `observedUidValidity` draft stamp, `v72` draft queue epoch; ⛔ the RETRACTED bare mailbox-wide `EXPUNGE` — `expungeScopedToTargets` is UIDPLUS-conditional | [read in full](Companion/Memory/History/097-t4-s6-follow-up-superseded-v3-intermediate-draft-epoch-stamp.md) |
+| Historical | T4.S6 — **SUPERSEDED v3 intermediate, never implement from it**: `v69` `observedUidValidity` draft stamp, `v72` draft queue epoch; ⛔ the RETRACTED bare mailbox-wide `EXPUNGE` — `expungeScopedToTargets` is UIDPLUS-conditional | [read in full](097-t4-s6-follow-up-superseded-v3-intermediate-draft-epoch-stamp.md) |
 <!-- END VERBATIM ROW 150 (pass 3) -->
 
 ### Source line 151 — `098-imap-external-deletion-blind-spot-amended-adr-ios-051.md`
 
 <!-- BEGIN VERBATIM ROW 151 (pass 3) -->
-| Current | IMAP external-deletion blind spot — server-deleted messages linger forever; FIXED by **ADR-IOS-051** Ph1+2: `SyncEngineDeletionReconcile`, `handleVanishedUIDs`, the `deletionReconcileChunkSize` breaker; no CONDSTORE/QRESYNC | [read in full](Companion/Memory/Current/098-imap-external-deletion-blind-spot-amended-adr-ios-051.md) |
+| Current | IMAP external-deletion blind spot — server-deleted messages linger forever; FIXED by **ADR-IOS-051** Ph1+2: `SyncEngineDeletionReconcile`, `handleVanishedUIDs`, the `deletionReconcileChunkSize` breaker; no CONDSTORE/QRESYNC | [read in full](../Current/098-imap-external-deletion-blind-spot-amended-adr-ios-051.md) |
 <!-- END VERBATIM ROW 151 (pass 3) -->
 
 ### Source line 154 — `101-isdeletedonserver-has-four-materialisation-paths.md`
 
 <!-- BEGIN VERBATIM ROW 154 (pass 3) -->
-| Current | `isDeletedOnServer` — FOUR materialisation paths **plus a FIFTH PRESENTATION path the census missed** (`SearchView.searchAccount` sends no `NOT DELETED`), `IOS-IMAP-001` FIXED `afa7889ee` — state the census NOUN; ⚠️ ERRATUM `deepBackfillFolder` is DEAD CODE | [read in full](Companion/Memory/Current/101-isdeletedonserver-has-four-materialisation-paths.md) |
+| Current | `isDeletedOnServer` — FOUR materialisation paths **plus a FIFTH PRESENTATION path the census missed** (`SearchView.searchAccount` sends no `NOT DELETED`), `IOS-IMAP-001` FIXED `afa7889ee` — state the census NOUN; ⚠️ ERRATUM `deepBackfillFolder` is DEAD CODE | [read in full](../Current/101-isdeletedonserver-has-four-materialisation-paths.md) |
 <!-- END VERBATIM ROW 154 (pass 3) -->
 
 ### Source line 155 — `102-there-are-four-irreversible-wire-operations-not-one.md`
 
 <!-- BEGIN VERBATIM ROW 155 (pass 3) -->
-| Current | ⚠️ **FIVE irreversible wire operations, not one** (FOUR until 2026-08-05; the `…four…` filename is a frozen id, not the count) — `COPYUID`-gated source expunge, **the draft family which DESTROYS a draft** (`deleteDraftStrong`, `saveDraft`, `GmailProvider.deleteDraft`), **plus `CalDAVProvider.deleteEvent`** — `CalDAVClient` sets `httpMethod = "DELETE"`, invisible to a `method: "DELETE"` census, and CalDAV has no trash. Enumerate BOTH spellings. "Never permanently deletes" is FALSE for drafts **and calendar events**. ⚠️ TWO FAMILIES: the five are the **deletion family**; a verb search is blind to the **replacement family** — `CalDAVProvider.splitSeries`'s cap `PUT` destroys every post-split occurrence and IS in the set (not a sixth member); also run `httpMethod = "PUT"` / `method: "PUT"`; `GmailProvider.saveDraft`'s draft PUT is the excluded negative case | [read in full](Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md) |
+| Current | ⚠️ **FIVE irreversible wire operations, not one** (FOUR until 2026-08-05; the `…four…` filename is a frozen id, not the count) — `COPYUID`-gated source expunge, **the draft family which DESTROYS a draft** (`deleteDraftStrong`, `saveDraft`, `GmailProvider.deleteDraft`), **plus `CalDAVProvider.deleteEvent`** — `CalDAVClient` sets `httpMethod = "DELETE"`, invisible to a `method: "DELETE"` census, and CalDAV has no trash. Enumerate BOTH spellings. "Never permanently deletes" is FALSE for drafts **and calendar events**. ⚠️ TWO FAMILIES: the five are the **deletion family**; a verb search is blind to the **replacement family** — `CalDAVProvider.splitSeries`'s cap `PUT` destroys every post-split occurrence and IS in the set (not a sixth member); also run `httpMethod = "PUT"` / `method: "PUT"`; `GmailProvider.saveDraft`'s draft PUT is the excluded negative case | [read in full](../Current/102-there-are-four-irreversible-wire-operations-not-one.md) |
 <!-- END VERBATIM ROW 155 (pass 3) -->
 
 ### Source line 161 — `113-a-swift-string-comparison-does-not-reproduce-sqlite-binary-collation.md`
 
 <!-- BEGIN VERBATIM ROW 161 (pass 3) -->
-| Current | 🚨 a Swift `String` comparison does NOT reproduce SQLite **BINARY** collation and is not even a total order (NFC/NFD are equal in Swift, distinct primary keys in SQLite) — compare `utf8.lexicographicallyPrecedes`; `InboxOrdering`, keyset cursor, `IOS-SCROLL-002` | [read in full](Companion/Memory/Current/113-a-swift-string-comparison-does-not-reproduce-sqlite-binary-collation.md) |
+| Current | 🚨 a Swift `String` comparison does NOT reproduce SQLite **BINARY** collation and is not even a total order (NFC/NFD are equal in Swift, distinct primary keys in SQLite) — compare `utf8.lexicographicallyPrecedes`; `InboxOrdering`, keyset cursor, `IOS-SCROLL-002` | [read in full](../Current/113-a-swift-string-comparison-does-not-reproduce-sqlite-binary-collation.md) |
 <!-- END VERBATIM ROW 161 (pass 3) -->
 
 ### Source line 162 — `107-a-staging-key-that-names-an-address-must-re-prove-identity-before-reusing-payload.md`
 
 <!-- BEGIN VERBATIM ROW 162 (pass 3) -->
-| Current | 🚨 **THE SAME STAGING KEY HAS FOUR WRITERS, AND "SAFE" POINTS THE OPPOSITE WAY FOR THREE** (`IOS-NSE-006`) — all four now call `stagedIdentityPositivelyDiffers`; ⚠️ **THE FAIL DIRECTION INVERTS**: KEEP-payload RETAINS, ADD-payload WRITES | [read in full](Companion/Memory/Current/107-a-staging-key-that-names-an-address-must-re-prove-identity-before-reusing-payload.md) |
+| Current | 🚨 **THE SAME STAGING KEY HAS FOUR WRITERS, AND "SAFE" POINTS THE OPPOSITE WAY FOR THREE** (`IOS-NSE-006`) — all four now call `stagedIdentityPositivelyDiffers`; ⚠️ **THE FAIL DIRECTION INVERTS**: KEEP-payload RETAINS, ADD-payload WRITES | [read in full](../Current/107-a-staging-key-that-names-an-address-must-re-prove-identity-before-reusing-payload.md) |
 <!-- END VERBATIM ROW 162 (pass 3) -->
 
 ### Source line 163 — `109-an-enum-with-no-silent-case-does-not-prevent-a-silent-path.md`
 
 <!-- BEGIN VERBATIM ROW 163 (pass 3) -->
-| Current | 🚨 **AN ENUM WITH NO SILENT CASE DOES NOT PREVENT A SILENT PATH** — `ResultTapOutcome`'s "cannot reintroduce silence" comment was FALSE AND LOAD-BEARING (`case …: break` compiles); the old tap suite stayed GREEN under it (`438f632cf`) | [read in full](Companion/Memory/Current/109-an-enum-with-no-silent-case-does-not-prevent-a-silent-path.md) |
+| Current | 🚨 **AN ENUM WITH NO SILENT CASE DOES NOT PREVENT A SILENT PATH** — `ResultTapOutcome`'s "cannot reintroduce silence" comment was FALSE AND LOAD-BEARING (`case …: break` compiles); the old tap suite stayed GREEN under it (`438f632cf`) | [read in full](../Current/109-an-enum-with-no-silent-case-does-not-prevent-a-silent-path.md) |
 <!-- END VERBATIM ROW 163 (pass 3) -->
 

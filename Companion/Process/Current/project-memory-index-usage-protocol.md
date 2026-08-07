@@ -14,7 +14,7 @@ searchable. Nothing was summarised, merged, or dropped.
 
 <!-- BEGIN VERBATIM -->
 **This file is a router, not an archive.** Every topic below is preserved in full under
-[`Companion/Memory/`](Companion/Memory/manifest.tsv); the manifest carries a `sha256` per fragment.
+[`Companion/Memory/`](../../Memory/manifest.tsv); the manifest carries a `sha256` per fragment.
 Load only the topics your task mechanically matches.
 
 1. Build search terms from the request, named files/symbols, subsystem, provider, invariant, and likely defect class.

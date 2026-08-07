@@ -2,7 +2,7 @@
 
 **Class:** documentation / verification
 **Severity:** high
-**First seen:** 2026-08-04 · **Recurrences:** 2 · **Status:** Active
+**First seen:** 2026-08-04 · **Recurrences:** 3 · **Status:** Active
 **Related:** [MIS-IOS-006](MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md); **MIS-023** and
 **MIS-027** in the monorepo-root tree (`rg -n 'MIS-023|MIS-027' ../MISTAKES.md`) — both are the same
 shape: reading a number instead of reading how far the run got.
@@ -160,3 +160,43 @@ bad=0; Dir.glob("Companion/**/*manifest.tsv").sort.each{|m| h=File.readlines(m,c
   puts "MISMATCH #{m}: #{f[pi]}"; bad+=1}}
 puts "mismatched=#{bad}"'
 ```
+
+## Instance 3 (2026-08-07) — the SAME file class, twice more, one of them by the supervisor; and the cascade it had been hiding
+
+Two more in-body amendments to hash-pinned fragments, found by running the mechanical sweep in this
+entry rather than by `verify` naming them (it `abort`s on the first, so it named only one):
+
+- **`Companion/Decisions/Active/adr-ios-024.md`** (`7c143daa5`, 2026-08-06) — the four-tools→twelve-tools
+  correction, written inline exactly as instance 1 was. Correct content, correct convention, wrong location.
+- **memory fragment **111** (`the-address-problem`, `Companion/Memory/Current/`)** — **mine, this session**, while retiring
+  THE ADDRESS PROBLEM's alarm. I had read this entry earlier in the same session. Reading the rule is not
+  the countermeasure; running the sweep is.
+
+**What the abort had been hiding for a day is the point.** With `adr-ios-024` fixed, `verify` advanced and
+immediately failed on checks nobody had seen since 2026-08-06: **14 broken Markdown links** (13 in
+history fragment **110** (`pre-compaction-index-row-abstracts`), 1 in `Companion/Process/Current/project-memory-index-usage-protocol.md`)
+and **1 unresolvable repository pointer**. The links broke for a mechanical reason worth knowing: that text
+was cut **byte-for-byte out of `PROJECT_MEMORY.md`**, where `Companion/Memory/manifest.tsv` is a correct
+root-relative path. Routing it into a nested directory silently invalidated every such link, and the
+byte-for-byte fidelity rule is what preserved the breakage. **Compaction that moves a file deeper must
+re-resolve its relative links; the no-content-loss rule does not make a moved link correct.**
+
+## THE DISTINCTION THAT DECIDES WHETHER YOU RE-PIN — learned 2026-08-07, and it is invisible at the edit site
+
+There are **two** pinning conventions in this tree, and the required repair is opposite in each:
+
+| manifest | hashes | on amendment |
+|---|---|---|
+| `Companion/{Memory,Decisions}/manifest.tsv` | `exact_body` — wrapper **stripped** | **NEVER re-pin.** The row also asserts `preserved_body == source.lines[start..end]` and the concatenation must reproduce `v1.6.38:PROJECT_MEMORY.md` / `DECISIONS.md`. Re-pinning the sha just moves the abort to `source-range mismatch`. Prepend a wrapper — the only legal repair. |
+| `Companion/{Memory,Decisions}/ported-manifest.tsv`, `Companion/**/amendments-manifest.tsv`, `Companion/Decisions/V3/manifest.tsv` | the **raw** file, wrapper included | **Re-pin.** These pin provenance, not a reconstruction; six ported files already carry wrappers *inside* their hash. |
+
+⚠️ **I nearly "fixed" that as a bug.** `verify_ported_decisions` hashes the raw `body` while calling
+`exact_body(body)` on the very next line for its ADR-id scan — which reads exactly like an oversight. It is
+not: `adr-ios-058/060/061/067` and memory `090/092` already carry wrappers counted **inside** their pinned
+hash, so applying `exact_body` there would have broken six green rows. **The regression check —
+"does any row this change touches already depend on the current behaviour?" — is what caught it, and it
+cost one command.** A consistency argument about two lines of code is not evidence about the data.
+
+Also note `Companion/Decisions/V3/manifest.tsv` and `Companion/Memory/amendments-manifest.tsv` are
+**tracked, documented in `Companion/README.md`, and read by NO verifier.** Their drift is invisible to
+`verify` by construction; only this entry's sweep sees it.
