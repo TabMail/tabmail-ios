@@ -84,7 +84,16 @@ struct InboxListReaderStatementTests {
 
         let base = Date(timeIntervalSince1970: 1_700_000_000)
         // Every bucket the order can put a row in: 0/1/2/3 plus untagged (99).
-        let tags: [ActionTag?] = [nil, .reply, .none, .archive, .delete]
+        //
+        // ⚠️ `ActionTag.none` IS SPELLED IN FULL ON PURPOSE. In an `[ActionTag?]`
+        // literal a bare `.none` binds to `Optional<ActionTag>.none` — i.e. `nil`
+        // — not to `ActionTag.none`, and the compiler only *warns*
+        // (`assuming you mean 'Optional<ActionTag>.none'`). This array shipped
+        // with the bare form in `2e971a2d5`, so it seeded FOUR distinct values
+        // with `nil` duplicated while this comment claimed five, and bucket 1
+        // (`.none`, `sortOrder == 1`) was never exercised by either test below.
+        // `feedback_swift_actiontag_none_ambiguity`.
+        let tags: [ActionTag?] = [nil, .reply, ActionTag.none, .archive, .delete]
         var ids: [String] = []
         for i in 0..<40 {
             // Every fourth pair shares a date exactly — the tie-break's reason to exist.
@@ -118,6 +127,28 @@ struct InboxListReaderStatementTests {
                 if i % 3 == 1 { try MessageUserLabel(messageId: id, userLabelId: "acc1:personal").insert(dbConn) }
             }
         }
+
+        // 🚨 THE FIXTURE'S STATED PRECONDITION, ASSERTED RATHER THAN COMMENTED.
+        // INVARIANT: **the displayed folder contains a row in every bucket the
+        // triage `ORDER BY tagSortOrder ASC` can produce** — the property the
+        // comment above claims. Read back out of the DATABASE, not off `tags`,
+        // so it pins what was actually seeded rather than restating the literal.
+        //
+        // This is the check that was missing when `2e971a2d5` wrote a bare
+        // `.none` into an `[ActionTag?]` literal: bucket 1 silently vanished,
+        // every equality below stayed green, and nothing said the matrix had
+        // stopped covering the order it exists to compare. Same role as the
+        // `shapesChecked`/`nonEmptyShapes` counters (`MIS-030`) — a comparison
+        // over a degraded fixture is satisfiable without proving anything.
+        let buckets = try db.read { dbConn in
+            try Int.fetchAll(dbConn, sql: """
+                SELECT DISTINCT tagSortOrder FROM messageHeader
+                WHERE folderId = 'acc1:INBOX' ORDER BY tagSortOrder
+                """)
+        }
+        #expect(buckets == [0, 1, 2, 3, 99],
+                "the fixture no longer seeds every triage bucket, so the comparisons below cover a narrower order than they claim: \(buckets)")
+
         return db
     }
 
