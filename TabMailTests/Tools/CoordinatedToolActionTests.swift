@@ -39,6 +39,13 @@ struct CoordinatedToolActionTests {
         let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
             let prev = current; current = appDb; return prev
         }
+        // Pre-existing pins in this suite predate the "Mark as Read on Archive
+        // & Delete" feature and assert the pre-feature op SHAPE (`ops.count ==
+        // 1`, one op per account) against default-UNREAD fixtures — force the
+        // setting OFF so they keep exercising exactly that behaviour. Tests
+        // covering the new feature flip it back ON via the same key after
+        // calling this helper.
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
         try pool.writeWithoutTransaction { db in
             var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
             acc.id = "acc1"
@@ -82,6 +89,7 @@ struct CoordinatedToolActionTests {
     /// fixture until process exit in either case so escaped work never reaches a
     /// closed pool.
     private func restoreTestDB(pool: DatabasePool, previous: AppDatabase?, dir: URL) {
+        UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
         InstalledTestDatabaseLifetime.finish(
             previous: previous,
             pool: pool,
@@ -136,6 +144,121 @@ struct CoordinatedToolActionTests {
 
         #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil, "refcount stranded after performCoordinatedRoleMove completed")
         #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded after performCoordinatedRoleMove completed")
+    }
+
+    // MARK: - (1b) Mark-as-read on archive & delete — the coordinated path
+    //
+    // Settings → TabMail Settings → User Interface → "Mark as Read on Archive
+    // & Delete" (`AccountManager.markReadOnArchiveDeleteKey`, default ON).
+    // `performCoordinatedRoleMove` is the ONE choke point for all four of its
+    // non-gesture callers — `EmailArchiveTool`, `EmailDeleteTool`, and both
+    // `AppDelegate` notification action buttons — so these tests cover every
+    // one of them. `makeTestDB` forces the setting OFF for this suite's other
+    // tests (see its comment); these flip it back ON.
+
+    @Test("mark-read-on-archive ON, coordinated path: an unread message ends READ and archived, and the read op is queued BEFORE the move op")
+    func coordinatedArchiveComposesReadWhenSettingOn() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-coord-markread", isRead: false)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive, expectedIdentities: [:])
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.isRead == true, "an archive from the coordinated path marks the message read")
+        #expect(final?.folderId == archive.id)
+
+        // ORDERING: the read op must be RECORDED first, because a move changes
+        // the address the read op names (see markReadBeforeRoleMove).
+        let ops = try await pool.read { db in
+            try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
+        }
+        #expect(ops.map(\.type) == [.markRead, .move], "read intent must precede the move: \(ops.map(\.type.rawValue))")
+
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil, "refcount stranded")
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded")
+    }
+
+    @Test("mark-read-on-archive ON, coordinated path: an ALREADY-READ message records no read op at all — only the move")
+    func coordinatedArchiveOnAlreadyReadRecordsNoReadOp() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-coord-alreadyread", isRead: true)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive, expectedIdentities: [:])
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.isRead == true)
+        #expect(final?.folderId == archive.id)
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.map(\.type) == [.move], "no redundant read intent for a message that is already read")
+    }
+
+    @Test("mark-read-on-delete ON, coordinated path: an unread message ends READ and in Trash, read op before the move op")
+    func coordinatedDeleteComposesReadWhenSettingOn() async throws {
+        let (pool, inbox, _, trash, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-coord-markread-del", isRead: false)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .trash, expectedIdentities: [:])
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.isRead == true, "a delete from the coordinated path marks the message read")
+        #expect(final?.folderId == trash.id)
+
+        let ops = try await pool.read { db in
+            try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
+        }
+        #expect(ops.map(\.type) == [.markRead, .move], "read intent must precede the move: \(ops.map(\.type.rawValue))")
+    }
+
+    /// C3 — the composition must name the SAME message the move acts on. An id
+    /// whose row is provably a different message now is refused by BOTH content
+    /// witnesses, and that refusal must extend to the read intent: an admitted
+    /// read op on the impostor's address is exactly the wrong-message mutation
+    /// the witness exists to prevent.
+    @Test("mark-read-on-archive ON, coordinated path: an id the C3 content witness refuses gets NO read op and NO move op, and its row is untouched")
+    func coordinatedArchiveRefusedByIdentityComposesNoReadIntent() async throws {
+        let (pool, inbox, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        var header = makeDurableHeader(folder: inbox, messageId: "m-coord-impostor", isRead: false)
+        header.rfc822MessageId = "actually-here@example.com"
+        let seeded = header
+        try await pool.writeWithoutTransaction { db in try seeded.insert(db) }
+        let id = seeded.id
+
+        // The caller captured a DIFFERENT message at this address.
+        let witness = ExpectedMessageIdentity(capturedRfc822MessageId: "the-caller-captured@example.com")
+        #expect(witness != nil, "the fixture must produce a usable witness or this test is vacuous")
+        guard let witness else { return }
+        await AccountManager.shared.performCoordinatedRoleMove(
+            ids: [id], role: .archive, expectedIdentities: [id: witness])
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.isRead == false, "a refused id must not be marked read")
+        #expect(final?.folderId == inbox.id, "a refused id must not move")
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "a refused id produces neither a read op nor a move op: \(ops.map(\.type.rawValue))")
     }
 
     // MARK: - (2) Staleness pin (Trace-A regression)

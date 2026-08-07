@@ -2030,3 +2030,402 @@ struct InboxGestureActionTests {
         }
     }
 }
+
+/// Owner feature (`main` line `98bebba7c`, re-implemented against v3's
+/// architecture): **archiving or deleting a message marks it read**, uniformly
+/// across every entry point, governed by Settings → TabMail Settings → User
+/// Interface → "Mark as Read on Archive & Delete"
+/// (`AccountManager.markReadOnArchiveDeleteKey`, default ON).
+///
+/// Every test here asserts an END STATE — which rows are read, where they are,
+/// which durable operations exist and in which order, and what the folder
+/// unread counts say — never "the helper was called". A mechanism-pinning test
+/// inherits a wrong spec and stays green on a broken system (global testing
+/// rule 12).
+///
+/// 🚨 **THE ORDERING PROPERTY IS THE C3 GUARD, and it is asserted here on the
+/// DURABLE ops and in `FinishTheMoveLocallyTests` on the WIRE.** A
+/// `PendingOperation` addresses its members in the SOURCE folder, and on IMAP an
+/// address is `(folder, UID, UIDVALIDITY)` — a move changes the address, and
+/// `optimisticMoveToFolder` nulls the row's `observedUidValidity` as it lands.
+/// A read op recorded AFTER the move can therefore never be admitted again (a
+/// dropped intention) or, worse, names a UID the source folder has since given
+/// to a different message.
+///
+/// `.serialized`/`.processGlobalState`: these mutate the process-wide
+/// `UserDefaults.standard` key AND `AccountManager.shared`'s overlay + FIFO
+/// write queue — the same isolation the rest of this file needs, for the same
+/// reasons (see the suite doc comment).
+@Suite("Mark as read on archive & delete — inbox gestures", .serialized, .processGlobalState)
+@MainActor
+struct InboxMarkReadOnArchiveDeleteTests {
+
+    // MARK: - Harness (mirrors InboxGestureActionTests.swift)
+
+    private func makeTestDB() throws -> (pool: DatabasePool, inbox: Folder, archive: Folder, trash: Folder, dir: URL, previous: AppDatabase?) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
+        try pool.writeWithoutTransaction { db in
+            var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
+            acc.id = "acc1"
+            try acc.insert(db)
+        }
+        let inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+        let archive = Folder(name: "Archive", path: "Archive", role: .archive, accountId: "acc1")
+        let trash = Folder(name: "Trash", path: "Trash", role: .trash, accountId: "acc1")
+        try pool.writeWithoutTransaction { db in
+            let i = inbox; try i.insert(db)
+            let a = archive; try a.insert(db)
+            let t = trash; try t.insert(db)
+        }
+        return (pool, inbox, archive, trash, dir, previous)
+    }
+
+    private func makeDurableHeader(
+        folder: Folder, messageId: String, isRead: Bool = false
+    ) -> MessageHeader {
+        var h = MessageHeader(
+            messageId: messageId, subject: "Subj \(messageId)", from: "Sender",
+            fromAddress: "s@example.com", to: "me@example.com", date: Date(), snippet: "snip",
+            folderId: folder.id, accountId: folder.accountId, folderPath: folder.path,
+            isInInbox: folder.role == .inbox
+        )
+        h.headerComplete = true
+        h.isRead = isRead
+        return h
+    }
+
+    private func restoreTestDB(previous: AppDatabase?, pool: DatabasePool, dir: URL) {
+        UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
+        InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+    }
+
+    private func clearOverlay() {
+        let snapshot = AccountManager.shared.snapshotOverlay()
+        AccountManager.shared.removeOverlayEntries(ids: Array(snapshot.keys))
+    }
+
+    private func drainWriteQueue() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            Task { await AccountManager.shared.enqueueWrite { cont.resume() } }
+        }
+    }
+
+    /// ⚠️ `drainWriteQueue` ALONE IS NOT A BARRIER FOR A GESTURE. The gesture
+    /// entry points submit their write from a DETACHED `Task { await
+    /// manager.enqueueWrite { … } }`, so a barrier submitted from another
+    /// detached `Task` can be admitted to the FIFO queue FIRST and return
+    /// having waited for nothing — a race that reads as a flaky "the move never
+    /// landed". Settle on an orthogonal, observable end state (the row's
+    /// FOLDER — never the read state, which is what these tests assert) and
+    /// only then take the barrier, so anything queued behind the gesture has
+    /// also completed. Bounded, so a genuinely broken system still reaches its
+    /// assertions and fails on them.
+    private func settle(
+        _ pool: DatabasePool, until condition: @escaping @Sendable (Database) throws -> Bool
+    ) async throws {
+        for _ in 0..<400 {
+            if try await pool.read(condition) { break }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        await drainWriteQueue()
+    }
+
+    /// Settle until every one of `ids` sits in `folderId`.
+    private func settleMove(
+        _ pool: DatabasePool, ids: [String], to folderId: String
+    ) async throws {
+        try await settle(pool) { db in
+            try ids.allSatisfy { id in
+                try MessageHeader.fetchOne(db, key: id)?.folderId == folderId
+            }
+        }
+    }
+
+    /// Durable ops in the order the drain will claim them (`createdAt` asc —
+    /// `AccountManager.drainPendingQueue`'s own fetch order).
+    private func opsInDrainOrder(_ pool: DatabasePool) async throws -> [PendingOperation] {
+        try await pool.read { db in try PendingOperation.order(Column("createdAt").asc).fetchAll(db) }
+    }
+
+    private func unreadCount(_ pool: DatabasePool, _ folder: Folder) async throws -> Int? {
+        try await pool.read { db in try Folder.fetchOne(db, key: folder.id)?.unreadCount }
+    }
+
+    private func setSetting(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: AccountManager.markReadOnArchiveDeleteKey)
+    }
+
+    // MARK: - Swipe archive / delete
+
+    @Test("swipe archive on an unread message: the row ends READ and archived, the read op is recorded BEFORE the move op and names the SOURCE folder, and the inbox unread count drops by exactly one while the destination gains none")
+    func swipeArchiveComposesReadBeforeMove() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, pool: pool, dir: dir); clearOverlay() }
+        clearOverlay()
+        setSetting(true)
+
+        // TWO unread messages, one of which is archived — so the inbox count
+        // has somewhere to land other than the `MAX(0, …)` clamp, and a
+        // DOUBLE decrement is distinguishable from a single one.
+        let target = makeDurableHeader(folder: inbox, messageId: "m-archive-unread")
+        let bystander = makeDurableHeader(folder: inbox, messageId: "m-archive-bystander")
+        try await pool.writeWithoutTransaction { db in
+            try target.insert(db)
+            try bystander.insert(db)
+            try db.execute(sql: "UPDATE folder SET unreadCount = 2 WHERE id = ?", arguments: [inbox.id])
+        }
+        let id = target.id
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.archive(id)
+        try await settleMove(pool, ids: [id], to: archive.id)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.isRead == true, "archiving an unread message must mark it read")
+        #expect(final?.folderId == archive.id, "and must still archive it")
+
+        let ops = try await opsInDrainOrder(pool)
+        #expect(ops.map(\.type) == [.markRead, .move],
+                "the read intent must be recorded BEFORE the move — a move changes the address the read op names: \(ops.map(\.type.rawValue))")
+        guard ops.count == 2 else { return }
+        #expect(ops[0].messageIds == [target.messageId], "the read op names the message the user acted on")
+        #expect(ops[0].folderPath == inbox.path, "the read op is addressed in the SOURCE folder")
+        #expect(ops[0].destinationPath == nil)
+        #expect(ops[1].destinationPath == archive.path)
+
+        // Exactly ONE decrement: the move's own delta re-reads `isRead` from
+        // the DB (never the caller's snapshot) and sees nothing unread moving.
+        #expect(try await unreadCount(pool, inbox) == 1,
+                "the inbox unread count must drop by exactly one, not two")
+        #expect(try await unreadCount(pool, archive) == 0,
+                "the archived message is read by the time it lands, so the destination gains no unread")
+
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded")
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil, "refcount stranded")
+    }
+
+    @Test("swipe delete on an unread message: the row ends READ and in Trash, the read op is recorded BEFORE the move op, and Trash gains no unread")
+    func swipeDeleteComposesReadBeforeMove() async throws {
+        let (pool, inbox, _, trash, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, pool: pool, dir: dir); clearOverlay() }
+        clearOverlay()
+        setSetting(true)
+
+        let target = makeDurableHeader(folder: inbox, messageId: "m-delete-unread")
+        let bystander = makeDurableHeader(folder: inbox, messageId: "m-delete-bystander")
+        try await pool.writeWithoutTransaction { db in
+            try target.insert(db)
+            try bystander.insert(db)
+            try db.execute(sql: "UPDATE folder SET unreadCount = 2 WHERE id = ?", arguments: [inbox.id])
+        }
+        let id = target.id
+
+        let vm = InboxViewModel(folders: [inbox])
+        _ = await vm.delete(id)
+        try await settleMove(pool, ids: [id], to: trash.id)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.isRead == true, "deleting an unread message must mark it read")
+        #expect(final?.folderId == trash.id)
+
+        let ops = try await opsInDrainOrder(pool)
+        #expect(ops.map(\.type) == [.markRead, .move],
+                "the read intent must be recorded BEFORE the move: \(ops.map(\.type.rawValue))")
+        guard ops.count == 2 else { return }
+        #expect(ops[0].folderPath == inbox.path, "the read op is addressed in the SOURCE folder")
+
+        #expect(try await unreadCount(pool, inbox) == 1)
+        #expect(try await unreadCount(pool, trash) == 0)
+    }
+
+    // MARK: - The setting OFF is pre-feature parity
+
+    @Test("setting OFF: swipe archive leaves the message UNREAD, records ONLY the move op, and the unread moves with the message exactly as it did before the feature")
+    func settingOffIsPreFeatureParity() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, pool: pool, dir: dir); clearOverlay() }
+        clearOverlay()
+        setSetting(false)
+
+        let target = makeDurableHeader(folder: inbox, messageId: "m-archive-off")
+        let bystander = makeDurableHeader(folder: inbox, messageId: "m-archive-off-bystander")
+        try await pool.writeWithoutTransaction { db in
+            try target.insert(db)
+            try bystander.insert(db)
+            try db.execute(sql: "UPDATE folder SET unreadCount = 2 WHERE id = ?", arguments: [inbox.id])
+        }
+        let id = target.id
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.archive(id)
+        try await settleMove(pool, ids: [id], to: archive.id)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.isRead == false, "with the setting OFF the message stays unread")
+        #expect(final?.folderId == archive.id, "and is still archived")
+
+        let ops = try await opsInDrainOrder(pool)
+        #expect(ops.map(\.type) == [.move], "no read op may be enqueued at all: \(ops.map(\.type.rawValue))")
+
+        #expect(try await unreadCount(pool, inbox) == 1)
+        #expect(try await unreadCount(pool, archive) == 1,
+                "pre-feature behaviour: an unread message carries its unread into the destination")
+
+        // The optimistic overlay must not claim a read the user never asked
+        // for either — the display and the durable state agree.
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil)
+    }
+
+    @Test("setting ON, message ALREADY READ: no read op is enqueued — the composition only ever names the unread members")
+    func alreadyReadMessageRecordsNoReadIntent() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, pool: pool, dir: dir); clearOverlay() }
+        clearOverlay()
+        setSetting(true)
+
+        let target = makeDurableHeader(folder: inbox, messageId: "m-archive-alreadyread", isRead: true)
+        try await pool.writeWithoutTransaction { db in try target.insert(db) }
+        let id = target.id
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.archive(id)
+        try await settleMove(pool, ids: [id], to: archive.id)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.isRead == true)
+        #expect(final?.folderId == archive.id)
+
+        let ops = try await opsInDrainOrder(pool)
+        #expect(ops.map(\.type) == [.move],
+                "an already-read message must not produce a redundant read op (or a redundant wire STORE): \(ops.map(\.type.rawValue))")
+    }
+
+    // MARK: - Thread variants: only the UNREAD members get the read intent
+
+    @Test("archiveThread over a mixed read/unread thread: every member is archived, only the UNREAD member is named by the read op, and every member ends read")
+    func archiveThreadMarksOnlyUnreadMembers() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, pool: pool, dir: dir); clearOverlay() }
+        clearOverlay()
+        setSetting(true)
+
+        let unread = makeDurableHeader(folder: inbox, messageId: "m-thread-unread", isRead: false)
+        let alreadyRead = makeDurableHeader(folder: inbox, messageId: "m-thread-read", isRead: true)
+        try await pool.writeWithoutTransaction { db in
+            try unread.insert(db)
+            try alreadyRead.insert(db)
+            try db.execute(sql: "UPDATE folder SET unreadCount = 1 WHERE id = ?", arguments: [inbox.id])
+        }
+
+        let vm = InboxViewModel(folders: [inbox])
+        _ = vm.archiveThread([unread.id, alreadyRead.id])
+        try await settleMove(pool, ids: [unread.id, alreadyRead.id], to: archive.id)
+
+        let rows = try await pool.read { db in try MessageHeader.order(Column("id").asc).fetchAll(db) }
+        #expect(rows.count == 2)
+        #expect(rows.allSatisfy { $0.isRead }, "every thread member ends read")
+        #expect(rows.allSatisfy { $0.folderId == archive.id }, "every thread member ends archived")
+
+        let ops = try await opsInDrainOrder(pool)
+        #expect(ops.map(\.type) == [.markRead, .move], "read intent before the move: \(ops.map(\.type.rawValue))")
+        guard ops.count == 2 else { return }
+        #expect(ops[0].messageIds == [unread.messageId],
+                "ONLY the unread member may be named by the read op — the already-read sibling is not touched")
+        #expect(Set(ops[1].messageIds) == [unread.messageId, alreadyRead.messageId],
+                "the move still covers the whole thread")
+
+        #expect(try await unreadCount(pool, inbox) == 0)
+        #expect(try await unreadCount(pool, archive) == 0)
+    }
+
+    @Test("deleteThread over a mixed read/unread thread: only the UNREAD member is named by the read op, and every member ends read and in Trash")
+    func deleteThreadMarksOnlyUnreadMembers() async throws {
+        let (pool, inbox, _, trash, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, pool: pool, dir: dir); clearOverlay() }
+        clearOverlay()
+        setSetting(true)
+
+        let unread = makeDurableHeader(folder: inbox, messageId: "m-tdel-unread", isRead: false)
+        let alreadyRead = makeDurableHeader(folder: inbox, messageId: "m-tdel-read", isRead: true)
+        try await pool.writeWithoutTransaction { db in
+            try unread.insert(db)
+            try alreadyRead.insert(db)
+            try db.execute(sql: "UPDATE folder SET unreadCount = 1 WHERE id = ?", arguments: [inbox.id])
+        }
+
+        let vm = InboxViewModel(folders: [inbox])
+        _ = await vm.deleteThread([unread.id, alreadyRead.id])
+        try await settleMove(pool, ids: [unread.id, alreadyRead.id], to: trash.id)
+
+        let rows = try await pool.read { db in try MessageHeader.order(Column("id").asc).fetchAll(db) }
+        #expect(rows.count == 2)
+        #expect(rows.allSatisfy { $0.isRead }, "every thread member ends read")
+        #expect(rows.allSatisfy { $0.folderId == trash.id }, "every thread member ends in Trash")
+
+        let ops = try await opsInDrainOrder(pool)
+        #expect(ops.map(\.type) == [.markRead, .move], "read intent before the move: \(ops.map(\.type.rawValue))")
+        guard ops.count == 2 else { return }
+        #expect(ops[0].messageIds == [unread.messageId],
+                "ONLY the unread member may be named by the read op")
+    }
+
+    // MARK: - Undo restores the LOCATION only
+
+    /// The owner's spec, verbatim: *"Undoing such an archive restores the
+    /// location only; the message stays read, which is structural — undo
+    /// entries carry no read state at all."*
+    ///
+    /// It is structural in v3 too, and for the same reason: `UndoMember` has no
+    /// read field, and `AccountManager.undoMove`'s restore writes only
+    /// `folderId`/`folderPath`/`isInInbox`/`observedUidValidity`/`actionTag`/
+    /// `tagSortOrder`. This test is the anchor for that — if a future change
+    /// widens undo to carry read state, an archive-then-undo would silently
+    /// resurrect an unread badge the user already cleared.
+    @Test("undo after a mark-read archive restores the LOCATION only — the message stays read, and no unread reappears in the inbox count")
+    func undoAfterMarkReadArchiveKeepsTheMessageRead() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer {
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
+            clearOverlay(); UndoService.shared.dismissAll()
+        }
+        clearOverlay(); UndoService.shared.dismissAll()
+        setSetting(true)
+
+        let target = makeDurableHeader(folder: inbox, messageId: "m-undo-stays-read")
+        try await pool.writeWithoutTransaction { db in
+            try target.insert(db)
+            try db.execute(sql: "UPDATE folder SET unreadCount = 1 WHERE id = ?", arguments: [inbox.id])
+        }
+        let id = target.id
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.archive(id)
+        try await settleMove(pool, ids: [id], to: archive.id)
+
+        // NON-VACUITY: the archive really did both halves before the undo, so
+        // the assertions below are about undo and not about a no-op archive.
+        let afterArchive = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(afterArchive?.isRead == true)
+        #expect(afterArchive?.folderId == archive.id)
+        #expect(UndoService.shared.currentAction != nil, "the archive must have pushed an undo entry")
+
+        await UndoService.shared.undo()
+        try await settleMove(pool, ids: [id], to: inbox.id)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderId == inbox.id, "undo restores the location")
+        #expect(final?.folderPath == inbox.path)
+        #expect(final?.isRead == true,
+                "undo must NOT resurrect the unread state — undo entries carry no read state at all")
+        #expect(try await unreadCount(pool, inbox) == 0,
+                "and no unread may reappear in the inbox count")
+    }
+}

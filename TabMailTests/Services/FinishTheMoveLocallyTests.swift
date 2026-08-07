@@ -650,4 +650,99 @@ struct FinishTheMoveLocallyTests {
         try? await provider.disconnect()
         await finish(f)
     }
+
+    // MARK: - W — the ordering oracle for mark-as-read-on-archive
+
+    /// **THE PROPERTY: when "Mark as read on archive & delete" archives a
+    /// message, the read reaches the server AT THE ADDRESS THE MESSAGE STILL
+    /// HAS — before the move takes that address away.**
+    ///
+    /// This is THE ADDRESS PROBLEM applied to a composed pair. A
+    /// `PendingOperation` addresses its members in the SOURCE folder, and on
+    /// IMAP an address is `(folder, UID, UIDVALIDITY)`; a move changes all
+    /// three. So a read op recorded AFTER the move names a UID that, in the
+    /// source folder, is either gone or now somebody else's message — the
+    /// wrong-message mutation C3 exists to prevent — and in the best case is
+    /// simply refused, leaving the message archived but still unread.
+    ///
+    /// Asserted as END STATE ON THE SERVER, not as local row state and not as
+    /// the shape of the queue: the archived copy carries `\Seen`. That is only
+    /// reachable if the `UID STORE` ran in INBOX before the copy, because the
+    /// server propagates the source flags to the destination copy at copy time.
+    /// The explicit wire-order assertion below is the same fact stated
+    /// directly, kept so a failure says WHICH half broke.
+    ///
+    /// RED PROOF (recorded): with the setting forced OFF — i.e. the composition
+    /// removed, exactly the pre-feature behaviour — no `\Seen` `UID STORE` is
+    /// issued at all, the archived copy has no `\Seen`, and this fails at the
+    /// first assertion.
+    @Test("A mark-read-on-archive read reaches the server BEFORE the move takes the address away")
+    @MainActor
+    func markReadOnArchiveIsIssuedAtTheSourceAddressBeforeTheMove() async throws {
+        let target = "markread-before-move@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 55, id: target)],
+            "Archive": [],
+            "Trash": [],
+        ])
+        for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        defer { UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey) }
+
+        let f = try fixture(accountId: "address-markread-order")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let seeded = try seedHeader(f, uid: 55, rfc: target)
+        #expect(seeded.isRead == false, "premise: the archived message is unread")
+        #expect(
+            server.flags(in: "INBOX", uid: 55).contains("\\Seen") == false,
+            "premise: the server has no \\Seen on it either")
+
+        await AccountManager.shared.performCoordinatedRoleMove(
+            ids: [seeded.id], role: .archive, expectedIdentities: [:])
+        try await drainToQuiescence(f)
+
+        // NON-VACUITY: the archive itself happened, so the flag assertion below
+        // is about the copy the user will actually open.
+        #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
+
+        // THE PROPERTY.
+        #expect(
+            server.flags(in: "Archive", rfc822MessageId: target)?.contains("\\Seen") == true,
+            """
+            the archived copy is still UNREAD on the server. Either the read was never issued, or \
+            it was issued after the move — at which point it names an address the message no \
+            longer has. Archive flags: \
+            \(String(describing: server.flags(in: "Archive", rfc822MessageId: target)))
+            """)
+
+        // The same fact on the wire, so a failure names the broken half.
+        let commands = server.recordedCommands()
+        let seenStore = commands.firstIndex {
+            let upper = $0.uppercased()
+            return upper.contains("UID STORE") && upper.contains("\\SEEN")
+        }
+        let relocation = commands.firstIndex {
+            let upper = $0.uppercased()
+            return upper.contains("UID COPY") || upper.contains("UID MOVE")
+        }
+        #expect(seenStore != nil, "no \\Seen STORE reached the wire at all: \(commands)")
+        #expect(relocation != nil, "no COPY/MOVE reached the wire at all: \(commands)")
+        if let seenStore, let relocation {
+            #expect(
+                seenStore < relocation,
+                """
+                the read was issued AFTER the move — it names the source address the move already \
+                invalidated: \(commands)
+                """)
+        }
+
+        // C3: nothing was mutated that the gesture did not select.
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
 }

@@ -11,6 +11,7 @@ struct TabMailSettingsView: View {
     @AppStorage(ChatPillState.maxSessionsKey) private var maxChatSessions = ChatPillState.defaultMaxSessions
     @AppStorage(ChatPillState.maxMemoryTurnsKey) private var maxMemoryTurns = ChatPillState.defaultMaxMemoryTurns
     @AppStorage(ChatPillState.autoDictationKey) private var autoDictation = false
+    @AppStorage(AccountManager.markReadOnArchiveDeleteKey) private var markReadOnArchiveDelete = true
     @AppStorage(ProactiveNotifyService.enabledKey) private var proactiveEnabled = true
     @AppStorage(ProactiveNotifyService.windowDaysKey) private var windowDays = ProactiveNotifyService.defaultWindowDays
     @AppStorage(ProactiveNotifyService.advanceMinutesKey) private var advanceMinutes = ProactiveNotifyService.defaultAdvanceMinutes
@@ -250,6 +251,20 @@ struct TabMailSettingsView: View {
                         }
                     } icon: {
                         Image(systemName: "mic")
+                            .foregroundStyle(.primary)
+                    }
+                }
+
+                Toggle(isOn: $markReadOnArchiveDelete) {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Mark as Read on Archive & Delete")
+                            Text("Unread messages are marked read when archived or deleted")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "envelope.open")
                             .foregroundStyle(.primary)
                     }
                 }

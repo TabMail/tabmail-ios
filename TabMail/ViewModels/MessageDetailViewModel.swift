@@ -1576,10 +1576,31 @@ final class MessageDetailViewModel {
         // Archive's destination is never the inbox (guarded above), so
         // `msg.isInInbox` alone determines "leaving the inbox" (F6) — clears
         // the tag in the overlay so the mid-drain window doesn't flash it.
-        manager.registerMutation(id: msg.id, mutation: .init(folderId: archiveFolder.id, actionTag: msg.isInInbox ? .some(nil) : nil))
-        enqueueMove(msg, to: archiveFolder.path)
+        // `isRead` rides the same coalesced entry (mark-as-read-on-archive/
+        // delete, default ON) — see `InboxViewModel.archive(_:)`. `nil` when
+        // the setting is off ⇒ the field is skipped entirely.
+        manager.registerMutation(id: msg.id, mutation: .init(
+            isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
+            folderId: archiveFolder.id,
+            actionTag: msg.isInInbox ? .some(nil) : nil))
+        markReadOnArchiveDeleteInMemory(msg)
+        enqueueMove(msg, to: archiveFolder.path, markReadFirst: true)
         updateThreadMessageFolder(msg, newFolderPath: archiveFolder.path, newFolderId: archiveFolder.id)
         return true
+    }
+
+    /// Mirror the mark-as-read-on-archive/delete flip onto the in-memory rows
+    /// the detail view renders, so the on-screen read state doesn't lag the DB
+    /// write. Same dual-update shape as `toggleRead` / `applyManualTag`: the
+    /// primary `message` when it is the one being acted on, and the matching
+    /// thread card, which `updateThreadMessageFolder` deliberately KEEPS
+    /// VISIBLE after an archive/delete (it only relabels its location).
+    private func markReadOnArchiveDeleteInMemory(_ msg: MessageHeader) {
+        guard AccountManager.markReadOnArchiveDeleteEnabled, !msg.isRead else { return }
+        if msg.id == message?.id { message?.isRead = true }
+        if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
+            threadMessages[idx].isRead = true
+        }
     }
 
     /// Returns false when the delete was a no-op (no trash folder, or the
@@ -1607,8 +1628,13 @@ final class MessageDetailViewModel {
         manager.retainOverlayEntry(id: msg.id)
         // Delete's destination is never the inbox (guarded above), so
         // `msg.isInInbox` alone determines "leaving the inbox" (F6).
-        manager.registerMutation(id: msg.id, mutation: .init(folderId: trashFolder.id, actionTag: msg.isInInbox ? .some(nil) : nil))
-        enqueueMove(msg, to: trashFolder.path)
+        // `isRead` rides the same coalesced entry — see `archiveMessage(_:)`.
+        manager.registerMutation(id: msg.id, mutation: .init(
+            isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
+            folderId: trashFolder.id,
+            actionTag: msg.isInInbox ? .some(nil) : nil))
+        markReadOnArchiveDeleteInMemory(msg)
+        enqueueMove(msg, to: trashFolder.path, markReadFirst: true)
         updateThreadMessageFolder(msg, newFolderPath: trashFolder.path, newFolderId: trashFolder.id)
         return true
     }
@@ -1652,9 +1678,19 @@ final class MessageDetailViewModel {
     /// un-pin before the move has executed (zero-width pin window — the
     /// round-9 defect, which shipped in three hand-kept copies; one helper
     /// keeps the protocol in lockstep).
-    private func enqueueMove(_ msg: MessageHeader, to folderPath: String) {
+    /// `markReadFirst` has NO DEFAULT on purpose: it selects the
+    /// mark-as-read-on-archive/delete composition, which is ON for the two
+    /// role-move callers (archive, delete) and OFF for the user-chosen-folder
+    /// move. A default would let a future caller silently pick one without the
+    /// call site saying so — the same seam the `expectedIdentities` parameter
+    /// on `performCoordinatedRoleMove` had to give up.
+    private func enqueueMove(_ msg: MessageHeader, to folderPath: String, markReadFirst: Bool) {
         let manager = manager
         Task { await manager.enqueueWrite { [weak self, manager] in
+            // Read intent BEFORE the move, in this one closure — a move
+            // changes the address the read op would have to name. See
+            // `AccountManager.markReadBeforeRoleMove`.
+            if markReadFirst { await manager.markReadBeforeRoleMove(ids: [msg.id]) }
             await manager.move([msg], to: folderPath)
             manager.releaseOverlayEntry(id: msg.id)
             await self?.completeLocalMove(msg.id)
@@ -1720,7 +1756,10 @@ final class MessageDetailViewModel {
             originalFolderPath: msg.folderPath,
             accountId: msg.accountId, timestamp: Date()
         ))
-        enqueueMove(msg, to: toFolderPath)
+        // A move to a user-CHOSEN folder is deliberately NOT in the
+        // mark-as-read-on-archive/delete scope — see
+        // `AccountManager.markReadOnArchiveDeleteKey`.
+        enqueueMove(msg, to: toFolderPath, markReadFirst: false)
         updateThreadMessageFolder(
             msg, newFolderPath: toFolderPath, newFolderId: destFolderId,
             isInInbox: destIsInbox

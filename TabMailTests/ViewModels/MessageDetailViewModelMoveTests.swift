@@ -363,3 +363,220 @@ struct MessageDetailViewModelMoveTests {
                 """)
     }
 }
+
+/// Owner feature (`main` line `98bebba7c`, re-implemented against v3): the
+/// DETAIL-VIEW half of "archive/delete marks the message read", governed by
+/// `AccountManager.markReadOnArchiveDeleteKey` (default ON).
+///
+/// The detail view is the entry point where the read flip is most VISIBLE:
+/// `updateThreadMessageFolder` deliberately keeps an archived/deleted thread
+/// card ON SCREEN and only relabels its location, so a card left showing an
+/// unread dot after the user archived it is a lie the next reload silently
+/// corrects. Both halves are asserted — the in-memory rows the view renders,
+/// and the durable end state plus the operation ORDER (the read op must precede
+/// the move op, because a move changes the address the read op names).
+///
+/// A user-CHOSEN-folder move is deliberately OUT of scope and is pinned here
+/// too — the feature means "I have dealt with this", not "file it".
+@Suite("Mark as read on archive & delete — detail view", .serialized, .processGlobalState)
+struct MessageDetailMarkReadOnArchiveDeleteTests {
+    private static let inboxPath = "INBOX"
+    private static let archivePath = "Archive"
+    private static let trashPath = "Trash"
+
+    @MainActor
+    private func makeEnv() throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
+        try pool.writeWithoutTransaction { db in
+            var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
+            acc.id = "acc1"
+            try acc.insert(db)
+            try Folder(name: "INBOX", path: Self.inboxPath, role: .inbox, accountId: "acc1").insert(db)
+            try Folder(name: "Archive", path: Self.archivePath, role: .archive, accountId: "acc1").insert(db)
+            try Folder(name: "Trash", path: Self.trashPath, role: .trash, accountId: "acc1").insert(db)
+        }
+        return (pool, dir, previous)
+    }
+
+    @MainActor
+    private func insertUnreadHeader(_ pool: DatabasePool, messageId: String) throws -> MessageHeader {
+        var header = MessageHeader(
+            messageId: messageId, subject: "Test",
+            from: "sender@example.com", fromAddress: "sender@example.com",
+            to: "me@example.com", date: Date(timeIntervalSince1970: 1_800_000_000),
+            snippet: "body",
+            folderId: "acc1:\(Self.inboxPath)", accountId: "acc1",
+            folderPath: Self.inboxPath, isInInbox: true
+        )
+        header.isRead = false
+        header.headerComplete = true
+        let seeded = header
+        try pool.writeWithoutTransaction { try seeded.insert($0) }
+        return seeded
+    }
+
+    private func clearOverlay() {
+        let snapshot = AccountManager.shared.snapshotOverlay()
+        AccountManager.shared.removeOverlayEntries(ids: Array(snapshot.keys))
+    }
+
+    private func teardown(previous: AppDatabase?, pool: DatabasePool, dir: URL) {
+        UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
+        InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+    }
+
+    private func drainWriteQueue() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            Task { await AccountManager.shared.enqueueWrite { cont.resume() } }
+        }
+    }
+
+    /// ⚠️ `drainWriteQueue` ALONE IS NOT A BARRIER HERE. `enqueueMove` submits
+    /// the view model's write from a DETACHED `Task { await manager
+    /// .enqueueWrite { … } }`, so a barrier submitted from another detached
+    /// `Task` can be admitted to the FIFO queue FIRST and return having waited
+    /// for nothing — a race that reads as a flaky "the move never landed".
+    /// Settle on an orthogonal, observable end state (the row's FOLDER — never
+    /// the read state, which is what these tests assert) and only then take the
+    /// barrier. Bounded, so a genuinely broken system still reaches its
+    /// assertions and fails on them.
+    private func settleMove(_ pool: DatabasePool, id: String, to folderPath: String) async throws {
+        for _ in 0..<400 {
+            let landed = try await pool.read { db in
+                try MessageHeader.fetchOne(db, key: id)?.folderPath == folderPath
+            }
+            if landed { break }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        await drainWriteQueue()
+    }
+
+    private func opsInDrainOrder(_ pool: DatabasePool) async throws -> [PendingOperation] {
+        try await pool.read { db in try PendingOperation.order(Column("createdAt").asc).fetchAll(db) }
+    }
+
+    @Test("detail archive of an unread message: the on-screen focused row AND its thread card both show read immediately, and the durable end state is read + archived with the read op recorded before the move")
+    @MainActor
+    func detailArchiveMarksUnreadRead() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir); clearOverlay() }
+        clearOverlay()
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let focused = try insertUnreadHeader(pool, messageId: "detail-archive-unread")
+        let vm = MessageDetailViewModel(messageId: focused.id, dbPool: pool, fetchBodyOverride: { _ in })
+        vm._testSeedMessage(focused)
+        vm.threadMessages = [focused]
+
+        #expect(vm.message?.isRead == false, "fixture must start unread or this test is vacuous")
+        #expect(vm.archiveMessage(focused) == true)
+
+        // The VISIBLE state, immediately — the card stays on screen after an
+        // archive, so it must not keep showing an unread dot.
+        #expect(vm.message?.isRead == true, "the focused row must show read at once")
+        #expect(vm.threadMessages.first?.isRead == true, "the still-visible thread card must show read at once")
+
+        try await settleMove(pool, id: focused.id, to: Self.archivePath)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: focused.id) }
+        #expect(final?.isRead == true)
+        #expect(final?.folderPath == Self.archivePath)
+
+        let ops = try await opsInDrainOrder(pool)
+        #expect(ops.map(\.type) == [.markRead, .move],
+                "read intent before the move: \(ops.map(\.type.rawValue))")
+        guard ops.count == 2 else { return }
+        #expect(ops[0].folderPath == Self.inboxPath, "the read op is addressed in the SOURCE folder")
+    }
+
+    @Test("detail delete of an unread message: ends read and in Trash, read op recorded before the move")
+    @MainActor
+    func detailDeleteMarksUnreadRead() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir); clearOverlay() }
+        clearOverlay()
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let focused = try insertUnreadHeader(pool, messageId: "detail-delete-unread")
+        let vm = MessageDetailViewModel(messageId: focused.id, dbPool: pool, fetchBodyOverride: { _ in })
+        vm._testSeedMessage(focused)
+
+        #expect(vm.deleteMessage(focused) == true)
+        #expect(vm.message?.isRead == true)
+
+        try await settleMove(pool, id: focused.id, to: Self.trashPath)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: focused.id) }
+        #expect(final?.isRead == true)
+        #expect(final?.folderPath == Self.trashPath)
+
+        let ops = try await opsInDrainOrder(pool)
+        #expect(ops.map(\.type) == [.markRead, .move],
+                "read intent before the move: \(ops.map(\.type.rawValue))")
+    }
+
+    @Test("detail archive with the setting OFF: the message stays unread and only the move op is recorded — pre-feature parity")
+    @MainActor
+    func detailArchiveSettingOffIsPreFeatureParity() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir); clearOverlay() }
+        clearOverlay()
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let focused = try insertUnreadHeader(pool, messageId: "detail-archive-off")
+        let vm = MessageDetailViewModel(messageId: focused.id, dbPool: pool, fetchBodyOverride: { _ in })
+        vm._testSeedMessage(focused)
+        vm.threadMessages = [focused]
+
+        #expect(vm.archiveMessage(focused) == true)
+        #expect(vm.message?.isRead == false, "with the setting OFF nothing flips the on-screen read state")
+        #expect(vm.threadMessages.first?.isRead == false)
+
+        try await settleMove(pool, id: focused.id, to: Self.archivePath)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: focused.id) }
+        #expect(final?.isRead == false)
+        #expect(final?.folderPath == Self.archivePath)
+
+        let ops = try await opsInDrainOrder(pool)
+        #expect(ops.map(\.type) == [.move], "no read op at all: \(ops.map(\.type.rawValue))")
+    }
+
+    /// SCOPE ANCHOR. Filing a message into a folder the user picked is not
+    /// "I have dealt with this" — the owner's feature names archive and delete
+    /// only. If a future change routes the generic move through the same
+    /// composition, this goes red.
+    @Test("a move to a user-CHOSEN folder is OUT of scope even with the setting ON: the message stays unread and only the move op is recorded")
+    func chosenFolderMoveIsOutOfScope() async throws {
+        let (pool, dir, previous) = try await MainActor.run { try makeEnv() }
+        defer { teardown(previous: previous, pool: pool, dir: dir); clearOverlay() }
+        clearOverlay()
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let focused = try await MainActor.run { try insertUnreadHeader(pool, messageId: "detail-chosen-move") }
+        await MainActor.run {
+            let vm = MessageDetailViewModel(messageId: focused.id, dbPool: pool, fetchBodyOverride: { _ in })
+            vm._testSeedMessage(focused)
+            #expect(vm.moveMessage(focused, toFolderPath: Self.archivePath) == true)
+            #expect(vm.message?.isRead == false, "a chosen-folder move must not flip the read state")
+        }
+
+        try await settleMove(pool, id: focused.id, to: Self.archivePath)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: focused.id) }
+        #expect(final?.isRead == false, "a chosen-folder move must leave the message unread")
+        #expect(final?.folderPath == Self.archivePath)
+
+        let ops = try await opsInDrainOrder(pool)
+        #expect(ops.map(\.type) == [.move],
+                "a chosen-folder move records ONLY the move: \(ops.map(\.type.rawValue))")
+    }
+}

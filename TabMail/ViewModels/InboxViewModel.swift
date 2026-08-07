@@ -1687,7 +1687,19 @@ final class InboxViewModel {
         // `message.isInInbox` alone determines "leaving the inbox" — clear
         // the tag in the overlay (F6) so the mid-drain window doesn't flash
         // the stale tag in the destination folder's row.
-        manager.registerMutation(id: messageId, mutation: .init(folderId: destFolderId, actionTag: message.isInInbox ? .some(nil) : nil))
+        //
+        // `isRead` rides the SAME coalesced entry (mark-as-read-on-archive/
+        // delete, default ON): `NavigationStore.refreshFolders` reads exactly
+        // this pair to answer its two different questions — source decrement
+        // from RAW DB truth, destination increment from the overlay-projected
+        // value — so registering it here is what stops the sidebar flashing a
+        // phantom unread in the destination during the mid-drain window.
+        // `nil` when the setting is off ⇒ `registerMutation` skips the field
+        // entirely (pre-feature parity).
+        manager.registerMutation(id: messageId, mutation: .init(
+            isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
+            folderId: destFolderId,
+            actionTag: message.isInInbox ? .some(nil) : nil))
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: message.folderPath, toPath: archivePath), messages: [undoSnapshot],
             originalFolderId: message.folderId,
@@ -1695,6 +1707,10 @@ final class InboxViewModel {
             accountId: message.accountId, timestamp: Date()
         ))
         Task { await manager.enqueueWrite { [manager] in
+            // Read intent BEFORE the move, in this one closure — a move
+            // changes the address the read op would have to name. See
+            // `AccountManager.markReadBeforeRoleMove`.
+            await manager.markReadBeforeRoleMove(ids: [messageId])
             await manager.move([message], to: archivePath)
             manager.releaseOverlayEntry(id: messageId)
         }}
@@ -1730,9 +1746,13 @@ final class InboxViewModel {
         // member's own `isInInbox` determines "leaving the inbox" (F6) — a
         // thread can mix members already outside the inbox with ones still
         // in it.
+        // `isRead` rides the same coalesced entry — see `archive(_:)`.
         for msg in messages {
             manager.retainOverlayEntry(id: msg.id)
-            manager.registerMutation(id: msg.id, mutation: .init(folderId: destFolderId, actionTag: msg.isInInbox ? .some(nil) : nil))
+            manager.registerMutation(id: msg.id, mutation: .init(
+                isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
+                folderId: destFolderId,
+                actionTag: msg.isInInbox ? .some(nil) : nil))
         }
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: first.folderPath, toPath: archivePath), messages: undoMessages,
@@ -1741,6 +1761,9 @@ final class InboxViewModel {
             accountId: first.accountId, timestamp: Date()
         ))
         Task { await manager.enqueueWrite { [manager] in
+            // Read intent BEFORE the move — see `archive(_:)`. Only the
+            // members that are actually unread at execution time get it.
+            await manager.markReadBeforeRoleMove(ids: compositeIds)
             await manager.move(messages, to: archivePath)
             for id in compositeIds { manager.releaseOverlayEntry(id: id) }
         }}
@@ -1784,7 +1807,11 @@ final class InboxViewModel {
         manager.retainOverlayEntry(id: messageId)
         // Delete's destination is never the inbox (guarded above), so
         // `message.isInInbox` alone determines "leaving the inbox" (F6).
-        manager.registerMutation(id: messageId, mutation: .init(folderId: destFolderId, actionTag: message.isInInbox ? .some(nil) : nil))
+        // `isRead` rides the same coalesced entry — see `archive(_:)`.
+        manager.registerMutation(id: messageId, mutation: .init(
+            isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
+            folderId: destFolderId,
+            actionTag: message.isInInbox ? .some(nil) : nil))
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: message.folderPath, toPath: trashPath), messages: [undoSnapshot],
             originalFolderId: message.folderId,
@@ -1792,6 +1819,8 @@ final class InboxViewModel {
             accountId: message.accountId, timestamp: Date()
         ))
         Task { await manager.enqueueWrite { [manager] in
+            // Read intent BEFORE the move — see `archive(_:)`.
+            await manager.markReadBeforeRoleMove(ids: [messageId])
             await manager.move([message], to: trashPath)
             manager.releaseOverlayEntry(id: messageId)
         }}
@@ -1834,9 +1863,13 @@ final class InboxViewModel {
         let undoMessages = messages.map { overlayAdjustedForUndo($0) }
         // Delete's destination is never the inbox (guarded above), so each
         // member's own `isInInbox` determines "leaving the inbox" (F6).
+        // `isRead` rides the same coalesced entry — see `archive(_:)`.
         for msg in messages {
             manager.retainOverlayEntry(id: msg.id)
-            manager.registerMutation(id: msg.id, mutation: .init(folderId: destFolderId, actionTag: msg.isInInbox ? .some(nil) : nil))
+            manager.registerMutation(id: msg.id, mutation: .init(
+                isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
+                folderId: destFolderId,
+                actionTag: msg.isInInbox ? .some(nil) : nil))
         }
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: first.folderPath, toPath: trashPath), messages: undoMessages,
@@ -1845,6 +1878,8 @@ final class InboxViewModel {
             accountId: first.accountId, timestamp: Date()
         ))
         Task { await manager.enqueueWrite { [manager] in
+            // Read intent BEFORE the move — see `archive(_:)`.
+            await manager.markReadBeforeRoleMove(ids: compositeIds)
             await manager.move(messages, to: trashPath)
             for id in compositeIds { manager.releaseOverlayEntry(id: id) }
         }}

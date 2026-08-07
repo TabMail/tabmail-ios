@@ -1343,3 +1343,43 @@ struct AccountManagerActionsTagClearTests {
                 "with no overlay the row must pass through unchanged")
     }
 }
+
+/// Owner feature (`main` line `98bebba7c`, re-implemented on v3): the "Mark as
+/// Read on Archive & Delete" toggle (Settings → TabMail Settings → User
+/// Interface, `AccountManager.markReadOnArchiveDeleteKey`). Pins the
+/// UserDefaults contract in isolation from the composition behaviour (covered
+/// end-to-end in `InboxGestureActionTests`, `MessageDetailViewModelMoveTests`,
+/// `CoordinatedToolActionTests`, `NotificationActionRouterTests` and, on the
+/// wire, `FinishTheMoveLocallyTests`): default ON when the key has never been
+/// set — the same missing-key handling `ProactiveNotifyService.isEnabled` uses
+/// — and an explicit persisted change honoured on the next read.
+///
+/// The default matters more than it looks: `UserDefaults.bool(forKey:)` returns
+/// `false` for a never-set key, so reading the toggle that way would ship the
+/// feature silently OFF for every existing user.
+///
+/// `.serialized`/`.processGlobalState`: mutates the process-wide
+/// `UserDefaults.standard` key every archive/delete entry point reads.
+@Suite("AccountManager.markReadOnArchiveDeleteEnabled — setting contract", .serialized, .processGlobalState)
+struct MarkReadOnArchiveDeleteSettingTests {
+    @Test("key is the documented literal, default is ON when never set, and an explicit persisted change is honoured on the next read")
+    func settingRoundTrip() {
+        let key = AccountManager.markReadOnArchiveDeleteKey
+        #expect(key == "markReadOnArchiveDelete")
+
+        let defaults = UserDefaults.standard
+        let previous = defaults.object(forKey: key)
+        defer {
+            if let previous { defaults.set(previous, forKey: key) } else { defaults.removeObject(forKey: key) }
+        }
+
+        defaults.removeObject(forKey: key)
+        #expect(AccountManager.markReadOnArchiveDeleteEnabled == true, "a never-set key defaults to ON")
+
+        defaults.set(false, forKey: key)
+        #expect(AccountManager.markReadOnArchiveDeleteEnabled == false, "a persisted false is honoured on the next read")
+
+        defaults.set(true, forKey: key)
+        #expect(AccountManager.markReadOnArchiveDeleteEnabled == true, "a persisted true is honoured on the next read")
+    }
+}

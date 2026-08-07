@@ -64,6 +64,12 @@ private enum MovedInImpostorFixture {
         let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
             let prev = current; current = appDb; return prev
         }
+        // "Mark as read on archive & delete" (Settings → User Interface) ships
+        // default ON, which composes an extra `.markRead` op ahead of every
+        // archive/delete move. These tests pin WHICH ROW an action lands on and
+        // count the resulting ops; they predate that feature, so the fixture
+        // forces the setting OFF. `finish` removes the key again.
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
         try pool.writeWithoutTransaction { db in
             var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: provider)
             acc.id = accountId
@@ -87,6 +93,7 @@ private enum MovedInImpostorFixture {
     /// production paths driven here fire unstructured background Tasks, so the
     /// fixture is retained until process exit rather than unlinked immediately.
     static func finish(_ env: Env) {
+        UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
         InstalledTestDatabaseLifetime.finish(
             previous: env.previous,
             pool: env.pool,

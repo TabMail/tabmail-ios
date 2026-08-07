@@ -744,6 +744,80 @@ extension AccountManager {
         return result
     }
 
+    // MARK: - Mark-as-Read-on-Archive/Delete Setting (Settings → User Interface)
+
+    /// UserDefaults key for the "Mark as read on archive & delete" toggle.
+    /// Governs EVERY archive/delete-to-trash entry point (inbox swipe incl.
+    /// thread variants, detail-view, settings bulk archive, agent tools, AND
+    /// notification action buttons via `performCoordinatedRoleMove`). The
+    /// owner's request (feature round 2026-07-15, `main` line commit
+    /// `98bebba7c`) was uniform mark-read on these actions; an audit at the
+    /// time showed no path did it before, so all origins now compose the read
+    /// intent when this is ON. A move to a user-CHOSEN folder is deliberately
+    /// out of scope — this is "I have dealt with this", not "file it".
+    static let markReadOnArchiveDeleteKey = "markReadOnArchiveDelete"
+
+    /// Default true (missing key ⇒ ON) — `bool(forKey:)` returns `false` for a
+    /// never-set key, which would silently invert a default-ON setting; the
+    /// explicit `object(forKey:) == nil` check is the same pattern
+    /// `ProactiveNotifyService.isEnabled` uses for its own default-true toggle.
+    static var markReadOnArchiveDeleteEnabled: Bool {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: markReadOnArchiveDeleteKey) == nil { return true }
+        return defaults.bool(forKey: markReadOnArchiveDeleteKey)
+    }
+
+    /// Compose the mark-as-read-on-archive/delete intent for the UNREAD members
+    /// of `messages`.
+    ///
+    /// 🚨 **MUST be awaited IMMEDIATELY BEFORE the caller's own move, inside the
+    /// SAME queued closure. Never in a separate `enqueueWrite`, never in a
+    /// detached `Task`, and never reordered "for efficiency".**
+    ///
+    /// THE ADDRESS PROBLEM (`tabmail-ios/CLAUDE.md`): a `PendingOperation`
+    /// addresses its members in the SOURCE folder, and on IMAP an address is
+    /// `(folder, UID, UIDVALIDITY)` — a move changes the address. `markRead`
+    /// records an op naming the source folderPath and the source epoch, and
+    /// `optimisticMoveToFolder` nulls the row's `observedUidValidity` the
+    /// instant the move lands. Issue the move first and the read intent either
+    /// can never be admitted again (a dropped intention — forbidden) or, on the
+    /// wire, addresses whatever now occupies that UID in the source folder —
+    /// C3 wrong-message mutation, which nothing recovers.
+    ///
+    /// Ordering on the wire follows from ordering here: the read op's
+    /// `createdAt` precedes the move op's (separate, strictly sequential write
+    /// transactions), the drain claims ops in `createdAt` order, and both ops
+    /// name the same member ids so `buildLanes` puts them in ONE FIFO lane.
+    ///
+    /// The unread count decrements exactly ONCE: `markRead` decrements
+    /// `folder.unreadCount` by its own fresh in-transaction
+    /// `countCurrentlyUnread`, and `optimisticMoveToFolder` re-reads `isRead`
+    /// from the DB (never a caller snapshot) for its own source/dest delta, so
+    /// it sees zero unread moving and adjusts nothing.
+    func markReadBeforeRoleMove(_ messages: [MessageHeader]) async {
+        guard Self.markReadOnArchiveDeleteEnabled else { return }
+        let unread = messages.filter { !$0.isRead }
+        guard !unread.isEmpty else { return }
+        await markRead(unread)
+    }
+
+    /// Id-taking variant for the gesture entry points, which hold only a
+    /// tap-time `lookupMessage` snapshot (gesture paths are zero-DB on the main
+    /// actor). Re-resolves row truth INSIDE the queued closure first — the same
+    /// doctrine as `move(_:to:)`'s own re-resolve, and for the same reason: a
+    /// second gesture landing before this closure commits would otherwise let
+    /// the read op name a folder the message has already left. Ids that no
+    /// longer resolve are dropped by `resolveHeadersForAction`'s documented
+    /// contract, exactly as they are for the move.
+    ///
+    /// The setting is checked BEFORE the resolve so an OFF toggle costs no
+    /// extra read — pre-feature parity, byte for byte.
+    func markReadBeforeRoleMove(ids: [String]) async {
+        guard Self.markReadOnArchiveDeleteEnabled else { return }
+        let fresh = await resolveHeadersForAction(ids: ids)
+        await markReadBeforeRoleMove(fresh)
+    }
+
     func markRead(_ messages: [MessageHeader]) async {
         await ensureDurable(messages)
 
@@ -1418,6 +1492,16 @@ extension AccountManager {
                 for id in droppedByFreshResolve {
                     self.releaseOverlayEntry(id: id)
                 }
+
+                // Mark-as-read-on-archive/delete (Settings → User Interface,
+                // default ON). Composed against `freshMovable` — the SAME
+                // execution-time set the move below acts on, after BOTH C3
+                // content-witness passes and the role filter — so the read op
+                // and the move op can never name different messages. Awaited
+                // immediately before the move inside this one closure; see
+                // `markReadBeforeRoleMove` for why that ordering is the C3
+                // guard and not a stylistic choice.
+                await self.markReadBeforeRoleMove(freshMovable)
 
                 switch role {
                 case .archive:

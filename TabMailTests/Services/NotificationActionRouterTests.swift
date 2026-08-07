@@ -55,6 +55,14 @@ struct NotificationActionRouterTests {
         let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
             let prev = current; current = appDb; return prev
         }
+        // "Mark as read on archive & delete" (Settings → User Interface) ships
+        // default ON, which composes an extra `.markRead` op ahead of every
+        // archive/delete move. The op-count assertions below predate that
+        // feature and pin the MOVE dispatch itself, so this harness forces the
+        // setting OFF to keep exercising exactly that behaviour. The test that
+        // covers the new feature flips it back ON via the same key after
+        // calling this helper.
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
         try pool.writeWithoutTransaction { db in
             var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
             acc.id = "acc1"
@@ -90,6 +98,7 @@ struct NotificationActionRouterTests {
     /// fixture until process exit in either case so escaped work never reaches a
     /// closed pool.
     private func restoreTestDB(pool: DatabasePool, previous: AppDatabase?, dir: URL) {
+        UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
         InstalledTestDatabaseLifetime.finish(
             previous: previous,
             pool: pool,
@@ -134,6 +143,46 @@ struct NotificationActionRouterTests {
         // durable completion — by the time `execute` returns, its retain/release
         // must have fully drained (no stranded overlay entry).
         #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil, "overlay refcount must drain to zero once performCoordinatedRoleMove's queued closure completes")
+    }
+
+    // MARK: - (1b) Mark-as-read on archive & delete — the notification button
+    //
+    // The notification action buttons are one of the entry points the setting
+    // covers (Settings → User Interface → "Mark as Read on Archive & Delete",
+    // default ON). They reach it structurally: `NotificationActionRouter`
+    // dispatches ARCHIVE/DELETE through `performCoordinatedRoleMove`, which
+    // composes the read intent itself. This test pins that the button really
+    // does inherit it — a future refactor that routes the notification path
+    // around the coordinator would otherwise silently lose the behaviour with
+    // every other suite still green. `makeTestDB` forces the setting OFF for
+    // this suite's other tests (see its comment); this one flips it back ON.
+
+    @Test("mark-read-on-archive ON: a notification ARCHIVE button tap on an UNREAD message ends read AND archived, with the read op recorded BEFORE the move")
+    func notificationArchiveComposesReadWhenSettingOn() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-notif-markread")
+        #expect(header.isRead == false, "premise: the notification's message is unread")
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        await NotificationActionRouter.execute(actionId: "ARCHIVE", messageId: "m-notif-markread", accountId: "acc1")
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.isRead == true, "a notification-button archive marks the message read")
+        #expect(final?.folderId == archive.id)
+
+        // ORDERING: the read op must be RECORDED first — a move changes the
+        // address the read op would have to name (THE ADDRESS PROBLEM).
+        let ops = try await pool.read { db in
+            try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
+        }
+        #expect(ops.map(\.type) == [.markRead, .move], "read intent must precede the move: \(ops.map(\.type.rawValue))")
+        guard ops.count == 2 else { return }
+        #expect(ops[0].folderPath == inbox.path, "the read op names the SOURCE folder")
+        #expect(ops[1].destinationPath == archive.path)
     }
 
     // MARK: - (2) No header anywhere + ARCHIVE

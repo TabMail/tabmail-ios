@@ -690,6 +690,11 @@ struct SettingsView: View {
                     accountId: accountId, timestamp: Date()
                 ))
             }
+            // Mark-as-read-on-archive/delete (Settings → User Interface,
+            // default ON). Strictly before the move and in the same awaited
+            // sequence: a move changes the address the read op would have to
+            // name. See `AccountManager.markReadBeforeRoleMove`.
+            await AccountManager.shared.markReadBeforeRoleMove(ids: messages.map(\.id))
             await AccountManager.shared.move(messages, to: archivePath)
             totalArchived += messages.count
         }
