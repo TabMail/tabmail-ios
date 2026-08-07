@@ -2282,15 +2282,41 @@ final class AppDatabase: Sendable {
         //  1. ORPHANS ARE STRUCTURALLY PREVENTED, so the gate guards a state the
         //     schema already forbids. `AppDatabase.makeConfiguration` sets
         //     `config.foreignKeysEnabled = true`, and EVERY foreign key this schema
-        //     declares carries `ON DELETE CASCADE`. Censused over
-        //     `TabMail/ Shared/ TabMailNotificationService/`: `rg '\.references\("'`
-        //     returns 19 lines, 3 of which are prose in comments, leaving 16 DDL
-        //     declarations — and all 16 spell `onDelete: .cascade`, zero bare.
-        //     Four differently-shaped predicates for the same fact (a
-        //     `.references("x")` with no `onDelete`; raw-SQL `REFERENCES`;
-        //     `foreignKey(`; `t.belongsTo`) each return nothing, so the count is not
-        //     merely the shape of one grep (`MIS-007`). Deleting a parent takes its
-        //     children with it; no application path can strand one.
+        //     declares carries `ON DELETE CASCADE`. Measured two ways at
+        //     `271d13334`, over the chain through `v83`:
+        //     • LIVE SCHEMA — authoritative. `PRAGMA foreign_key_list` over every
+        //       table of a freshly migrated database (21 tables) returns 10 foreign
+        //       keys, and `on_delete` is `CASCADE` for all 10, zero otherwise:
+        //       `{folder, messageHeader, draft, outboxMessage, userLabel,
+        //       caldavConfig, pendingCalendarOperation} → account`;
+        //       `messageReference → messageHeader`; `messageUserLabel →
+        //       {messageHeader, userLabel}`. Pinned by
+        //       `MigrationForeignKeyModeTests.everyLiveForeignKeyCascades`, so this
+        //       paragraph is now checked by the suite rather than by re-grepping.
+        //     • SOURCE DDL — secondary. `rg '\.references\("'` over
+        //       `TabMail/ Shared/ TabMailNotificationService/` finds 16 DDL
+        //       declarations, all 16 spelling `onDelete: .cascade`, zero bare.
+        //     16 ≠ 10 because six declarations are DEAD SOURCE: `v1`'s
+        //     `messageHeader.folderId → folder` (dropped by `v2`), `messageBody →
+        //     messageHeader` spelled twice (`v1`, then `v2`'s rebuild — both dropped
+        //     by `v70`), and `v82`'s rebuild re-spelling the three label edges `v33`
+        //     first declared. THE GREP COUNTS DEAD DDL; THE PRAGMA DOES NOT.
+        //     ⚠️ `MIS-033` — this census read *"returns 19 lines, 3 of which are
+        //     prose, leaving 16"* and the truth was 20 and 4. The uncounted fourth
+        //     prose line was A LINE OF THIS BANNER: it quotes the search token, so
+        //     the grep matches the paragraph that reports it, and the total drifts by
+        //     one every time the wording changes. Never restate this as "N lines, M
+        //     of which are prose" — state the DDL count, which the banner cannot
+        //     contaminate. For the same reason the four corroborating predicates once
+        //     claimed here to "each return nothing" are gone: a bare
+        //     `.references("x")`, raw-SQL `REFERENCES` and `foreignKey(` now match
+        //     only this comment, and `t.belongsTo` matches this comment PLUS a real
+        //     hit. That hit is not a counterexample — GRDB record associations
+        //     (`rg 'belongsTo|hasMany\(|ForeignKey\(' TabMail/Models/` → 3 sites, a
+        //     path this banner cannot pollute) are QUERY-LAYER joins declaring no
+        //     schema constraint, and both columns they join on are already among the
+        //     10 cascading edges above. Deleting a parent takes its children with it;
+        //     no application path can strand one.
         //  2. IT IS REDUNDANT WITH THE REST OF THE CHAIN. The large majority of the
         //     83 migrations still end with their own whole-database check — the
         //     exact figure is re-derived in `v82`'s step-1 comment below, which is

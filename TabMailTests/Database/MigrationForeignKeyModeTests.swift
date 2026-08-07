@@ -36,6 +36,11 @@ import GRDB
 /// stays green. So the third test asserts the CONTENTS survive and are re-pointed
 /// per account — as a total mapping of the pre-migration set, not a row count.
 ///
+/// The fourth test pins the PREMISE the retirement rests on rather than its
+/// consequence: every foreign key in the migrated schema is `ON DELETE CASCADE`,
+/// read from `PRAGMA foreign_key_list` rather than from a grep of `AppDatabase.swift`
+/// (which counts dead DDL, and counted its own recording — `MIS-033`).
+///
 /// RED EVIDENCE (2026-08-06, `MIS-015`): pointing `v82` step 5 at the live
 /// `messageUserLabel` instead of its `_v82_legacy` snapshot fails this test with
 /// *"Expected 14, got 0"* while the FK-violation test above it still PASSES.
@@ -43,7 +48,8 @@ import GRDB
 /// ⚠️ WHAT THIS TEST IS **NOT** RED AGAINST, recorded because the comment it
 /// replaces claimed otherwise (`MIS-019`). Swapping `v82`'s two `db.drop` calls so
 /// the PARENT goes first — the classic implicit-`DELETE FROM` cascade hazard — was
-/// built and run: all three tests still pass and all 14 memberships survive. The
+/// built and run: all three tests then present still pass and all 14 memberships
+/// survive. The
 /// cascade is harmless there because step 2 snapshots both tables BEFORE either
 /// drop and nothing afterwards reads the live table. The drop order is the `v2`
 /// house pattern, not a safety mechanism; step 2 is the safety mechanism.
@@ -350,7 +356,7 @@ struct MigrationForeignKeyModeTests {
     /// while the FK-violation test passes. Measured 2026-08-06.
     ///
     /// ⚠️ It is NOT red against swapping the two `db.drop` calls — that was tried and
-    /// all three tests still pass, because step 2's snapshots make the cascade
+    /// all three tests then present still pass, because step 2's snapshots make the cascade
     /// harmless. See the suite doc; the previous version of this comment asserted the
     /// opposite on inherited reasoning and was never measured.
     ///
@@ -451,5 +457,92 @@ struct MigrationForeignKeyModeTests {
         // 4. And the end state is referentially clean, so 1–3 are not describing a
         //    database that merely happens to look right.
         #expect(try Self.foreignKeyViolations(db).isEmpty)
+    }
+
+    // MARK: - 4. The premise the retired gates rested on
+
+    /// 🚨 **THE ARGUMENT THAT RETIRED BOTH WHOLE-DATABASE GATES, measured over the
+    /// LIVE SCHEMA instead of over the source text.** `v71` and `v82` dropped their
+    /// `PRAGMA foreign_key_check` on the grounds that orphans are structurally
+    /// prevented: foreign keys are enforced live (`AppDatabase.makeConfiguration`
+    /// sets `foreignKeysEnabled = true`) and every declared edge cascades, so
+    /// deleting a parent takes its children with it and no application path can
+    /// strand one. That premise buys 19,311 ms of the owner's 27,601 ms device
+    /// upgrade, and until now it was only ever checked by grepping `AppDatabase.swift`.
+    ///
+    /// A grep cannot carry it, for two independent reasons. It counts **dead DDL** —
+    /// 16 `.references("` declarations for 10 live edges, because `v1`'s
+    /// `messageHeader → folder` was dropped by `v2`, `messageBody → messageHeader` is
+    /// spelled twice and dropped by `v70`, and `v82`'s rebuild re-spells the three
+    /// label edges `v33` created. And it counts **its own recording**: the `v71`
+    /// banner quotes the search token, so its "19 lines, 3 of which are prose"
+    /// arithmetic was wrong from the day it was written, when the file held 20 and 4
+    /// (`MIS-033`). `PRAGMA foreign_key_list` over a migrated database has neither
+    /// failure mode.
+    ///
+    /// The EDGE SET is a staleness tripwire for that banner; the CASCADE is the
+    /// invariant. If a migration adds or retargets an edge this fails on the set
+    /// first — re-derive the census in `AppDatabase.swift`'s `v71` retirement
+    /// comment, then update the roster here.
+    @Test("Every foreign key in the migrated schema is ON DELETE CASCADE")
+    func everyLiveForeignKeyCascades() throws {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        try Self.migrateToHead(db)
+
+        let edges: [(child: String, parent: String, onDelete: String)] = try db.read { db in
+            var found: [(child: String, parent: String, onDelete: String)] = []
+            let tables = try String.fetchAll(db, sql: """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                ORDER BY name
+                """)
+            for table in tables {
+                let rows = try Row.fetchAll(
+                    db, sql: "PRAGMA foreign_key_list(\(table.quotedDatabaseIdentifier))")
+                for row in rows {
+                    let parent: String = row["table"]
+                    let onDelete: String = row["on_delete"]
+                    found.append((child: table, parent: parent, onDelete: onDelete))
+                }
+            }
+            return found
+        }
+
+        // THE INVARIANT.
+        let uncascaded = edges.filter { $0.onDelete.uppercased() != "CASCADE" }
+        #expect(
+            uncascaded.isEmpty,
+            """
+            \(uncascaded.count) foreign key(s) do not cascade: \
+            \(uncascaded.map { "\($0.child) -> \($0.parent) ON DELETE \($0.onDelete)" }.sorted()). \
+            v71 and v82 retired their whole-database foreign-key gates on the argument \
+            that orphans are structurally impossible. A non-cascading edge makes that \
+            argument false: deleting a parent strands a child that nothing now checks for.
+            """)
+
+        // THE TRIPWIRE, which is also what makes the assertion above non-vacuous
+        // (`MIS-030`): an empty or mis-shaped query would satisfy `uncascaded.isEmpty`
+        // while proving nothing about the schema.
+        #expect(
+            Set(edges.map { "\($0.child) -> \($0.parent)" }) == [
+                "caldavConfig -> account",
+                "draft -> account",
+                "folder -> account",
+                "messageHeader -> account",
+                "messageReference -> messageHeader",
+                "messageUserLabel -> messageHeader",
+                "messageUserLabel -> userLabel",
+                "outboxMessage -> account",
+                "pendingCalendarOperation -> account",
+                "userLabel -> account",
+            ],
+            """
+            the live schema declares \(edges.count) foreign key(s), not the 10 the v71 \
+            retirement comment enumerates: \(edges.map { "\($0.child) -> \($0.parent)" }.sorted()). \
+            Re-derive that census with PRAGMA foreign_key_list, update the comment, then \
+            update this roster.
+            """)
     }
 }
