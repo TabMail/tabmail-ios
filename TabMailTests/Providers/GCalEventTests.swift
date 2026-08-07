@@ -534,4 +534,65 @@ struct FormatDetailedEventTests {
         let output = CalendarToolHelpers.formatDetailedEvent(event)
         #expect(output.contains("title: (No title)"))
     }
+
+    // MARK: - The timezone contract (round 18, item C clause 1)
+
+    /// **The invariant: `timezone:` names the zone `start_iso` / `end_iso` are
+    /// EXPRESSED IN.** Not the provider's stored zone, not "whichever we happen
+    /// to have" — the pair must denote one instant.
+    ///
+    /// Until round 18 this line was `storedTz.isEmpty ? tz.identifier : storedTz`,
+    /// so a Vancouver device reading a Tokyo event emitted a Vancouver wall clock
+    /// labelled `timezone: Asia/Tokyo`. That names an instant 16 hours away from
+    /// the real one, and the agent then feeds `start_iso` back as
+    /// `recurrence_id` (the edit tool's own error string calls it "the
+    /// `start_iso` of the target occurrence"), where the Google and Exchange
+    /// occurrence resolvers day-prefix-match it against instances rendered in the
+    /// EVENT's zone.
+    ///
+    /// Red evidence: at `b4de53ec6` this test fails on
+    /// `#expect(output.contains("timezone: America/Vancouver"))`, which reads
+    /// `timezone: Asia/Tokyo`. The `event_timezone:` assertion fails there too —
+    /// the key did not exist.
+    @Test("timezone: names the zone start_iso is expressed in, and the stored zone gets its own key")
+    func timezoneNamesTheZoneTheIsoValuesAreIn() throws {
+        let display = try #require(TimeZone(identifier: "America/Vancouver"))
+        let event = GCalEvent(
+            id: "e-tz", summary: "Tokyo standup", location: nil, description: nil,
+            // 2026-05-21T09:00 Asia/Tokyo == 2026-05-20T17:00 America/Vancouver.
+            start: GCalDateTime(dateTime: "2026-05-21T09:00:00+09:00", date: nil, timeZone: "Asia/Tokyo"),
+            end: GCalDateTime(dateTime: "2026-05-21T09:30:00+09:00", date: nil, timeZone: "Asia/Tokyo"),
+            attendees: nil, organizer: nil, recurrence: nil,
+            transparency: nil, status: nil, htmlLink: nil, created: nil, updated: nil
+        )
+        let output = CalendarToolHelpers.formatDetailedEvent(event, timeZone: display)
+
+        // Anchor what the naive values actually are, so the timezone assertion
+        // below is about a PAIR and not about a label in isolation (`MIS-030`).
+        #expect(output.contains("start_iso: 2026-05-20T17:00:00"),
+                "precondition: start_iso is formatted in the DISPLAY zone")
+        #expect(output.contains("timezone: America/Vancouver"),
+                "the timezone line must name the zone start_iso is expressed in — pairing a Vancouver wall clock with Asia/Tokyo denotes an instant 16 hours from the real one")
+        #expect(output.contains("event_timezone: Asia/Tokyo"),
+                "the provider's stored zone is still needed for provider-local wall times and DST — it moves to its own key, it is not dropped")
+    }
+
+    /// The other direction (`MIS-005`): an event with no stored zone must not
+    /// grow an `event_timezone:` line, and `timezone:` must still be the display
+    /// zone. Without this, "always emit the display zone" and "the stored zone is
+    /// preserved" are indistinguishable from "the stored zone was deleted".
+    @Test("An event with no stored zone emits timezone: only, and no event_timezone: line")
+    func noStoredZoneEmitsNoEventTimezoneLine() throws {
+        let display = try #require(TimeZone(identifier: "America/Vancouver"))
+        let event = GCalEvent(
+            id: "e-tz-none", summary: "Local", location: nil, description: nil,
+            start: GCalDateTime(dateTime: "2026-05-20T17:00:00Z", date: nil, timeZone: nil),
+            end: GCalDateTime(dateTime: "2026-05-20T17:30:00Z", date: nil, timeZone: nil),
+            attendees: nil, organizer: nil, recurrence: nil,
+            transparency: nil, status: nil, htmlLink: nil, created: nil, updated: nil
+        )
+        let output = CalendarToolHelpers.formatDetailedEvent(event, timeZone: display)
+        #expect(output.contains("timezone: America/Vancouver"))
+        #expect(!output.contains("event_timezone:"))
+    }
 }

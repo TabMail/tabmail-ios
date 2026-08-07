@@ -414,11 +414,34 @@ enum CalendarToolHelpers {
         if let end = event.endDate {
             lines.append("end_iso: \(EKEventStoreHelper.toNaiveISO(end, timeZone: tz))")
         }
-        // Report the stored event timezone explicitly when present; otherwise the
-        // datetimes above are formatted in the resolved display timezone, so
-        // surface that. Either way the agent gets an unambiguous IANA id.
+        // 🚨 `timezone:` NAMES THE ZONE `start_iso`/`end_iso` ARE EXPRESSED IN,
+        // AND NOTHING ELSE. It is `tz` — the resolved display zone — because that
+        // is what `toNaiveISO` was just handed.
+        //
+        // ⚠️ THIS LINE READ `storedTz.isEmpty ? tz.identifier : storedTz` UNTIL
+        // ROUND 18, i.e. it emitted the PROVIDER'S stored zone next to values
+        // formatted in the DISPLAY zone whenever the two differed. A Vancouver
+        // device reading a Tokyo event therefore produced a self-contradictory
+        // pair — a Vancouver wall clock labelled `timezone: Asia/Tokyo` — which
+        // names an instant 16 hours from the real one. The old comment
+        // ("Either way the agent gets an unambiguous IANA id") was true of the
+        // ID and false of the PAIR, which is the whole of the bug.
+        //
+        // The other three emitters of this key already meant the display zone —
+        // `formatGroupedSummary` (`timezone: \(tz.identifier)`),
+        // `CalendarEventCreateTool` and `CalendarEventEditTool` (both
+        // `timezone: \(resolvedTz.identifier)`) — so this was the odd one out,
+        // not the convention.
+        //
+        // The stored zone is NOT dropped: it is genuinely needed for
+        // provider-local wall times and DST reasoning, so it moves to its own
+        // key rather than being discarded. Byte-identical to shipped
+        // `07a4bb703` before this change; the defect ships today.
+        lines.append("timezone: \(tz.identifier)")
         let storedTz = (event.start?.timeZone?.isEmpty == false ? event.start?.timeZone : event.end?.timeZone) ?? ""
-        lines.append("timezone: \(storedTz.isEmpty ? tz.identifier : storedTz)")
+        if !storedTz.isEmpty {
+            lines.append("event_timezone: \(storedTz)")
+        }
         lines.append("all_day: \(event.isAllDay ? "yes" : "no")")
         lines.append("availability: \(event.transparency == "transparent" ? "free" : "busy")")
 
