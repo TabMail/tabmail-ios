@@ -357,8 +357,32 @@ extension AccountManager {
     /// in-flight slot publish and the ledger compare — it fails **OPEN**, and records
     /// that as an accepted residual: *"virgin-folder fail-open is bounded by
     /// seed-write latency"* (`v2final:Companion/Decisions/Active/adr-ios-061.md:38`).
-    /// That was only tenable because v2 carried an epoch ledger plus a purge-and-
-    /// resync reaction. v3 has neither, so v3 is deliberately stronger and refuses.
+    /// That was only tenable because v2 carried an ADMISSION-TIME epoch mechanism:
+    /// the claim-time stamp, the in-flight slot publish and the ledger compare above,
+    /// backed by the memory-side mirror (`uidValidityLedgerBox`,
+    /// `recordObservedUidValidity`, `stampUidValidityLedgerAfterReset`). v3
+    /// deliberately omits that mirror — every v3 consumer holds a `Database` and
+    /// reads `Folder.lastKnownUidValidity` directly, so there is no synchronous
+    /// compare needing a memory copy (see the DELIBERATE OMISSIONS list on
+    /// `AccountManager.runUidValidityResetReaction`) — so v3 is deliberately
+    /// stronger here and refuses.
+    ///
+    /// ⚠️ **THIS SAID "v3 has NEITHER" (an epoch ledger NOR a purge-and-resync
+    /// reaction) UNTIL R14-F6, AND THE SECOND HALF WAS FALSE.** v3 HAS the reaction:
+    /// `AccountManager.runUidValidityResetReaction`
+    /// (`AccountManagerUidValidityReset.swift`), driven from FIVE production call
+    /// sites — `AccountManager.scheduleUidValidityResetReaction`,
+    /// `SyncEngineFullSync`, `SyncEngineDeltaSync`, `SyncEngineEpochVerify`, and its
+    /// own in-file re-drive. A compound absolute is false when EITHER half is, and
+    /// this one sent readers looking for a reaction that has been there all along.
+    ///
+    /// **The refusal does not depend on the corrected half, which is why the
+    /// disposition is unchanged and must stay unchanged.** The reaction repairs
+    /// LOCAL rows after a turnover has been detected — it purges and resyncs. It
+    /// cannot un-send a STORE or a COPY that already addressed the wrong message on
+    /// the server, and that is the whole hazard here (C3, spelled out below). So the
+    /// refusal rests on C3 alone; "v3 lacks a reaction" was never load-bearing for
+    /// it and was merely wrong.
     ///
     /// **This deliberately drops one user intention, which this repo's core
     /// philosophy otherwise forbids. Do NOT "fix" it back to fail-open.** The owner

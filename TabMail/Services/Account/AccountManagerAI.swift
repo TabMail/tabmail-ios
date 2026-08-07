@@ -102,8 +102,20 @@ struct AIWriteTarget: Sendable, Equatable {
     /// .optimisticMoveToFolder`, `SyncEngineDeltaSync`, `SyncEngineFullSync`,
     /// `BackfillBodyQueue` all null it), and for any row predating the column.
     ///
-    /// ⚠ A nil here is an ORDINARY state, not a signal: it is what 15 production
-    /// sites write against only 4 that stamp the column. So it is neither evidence
+    /// ⚠ A nil here is an ORDINARY state, not a signal: far more production
+    /// statements write only `nil` to this column than write a proven epoch.
+    /// **That ratio is the ARGUMENT — invert it and this conclusion inverts — so it
+    /// has ONE owner and this is not it.** See `AIWriteTarget.resolveCurrentHeader`
+    /// below, whose own note routes to the doc comment on
+    /// `SearchView.resolveLocalResultHeaderId` ("THE COUNT, WITH ITS PREDICATE AND
+    /// ITS MEMBERS") for the predicate, the members by enclosing symbol, and the
+    /// exclusive/inclusive split. **Re-derive there and update there; do not
+    /// restate a bare integer here.** This sentence carried "15 … against only 4"
+    /// until R14-F5, which was the figure `e4751e438` introduced and the correcting
+    /// pass never reached — the same staleness `resolveCurrentHeader` had already
+    /// recorded for its own copy, in the same file, one screen down (`MIS-031`: a
+    /// fix's scope is every sentence that describes the thing, not the one the
+    /// finding named). So a nil is neither evidence
     /// of a turnover NOR, on its own, grounds to admit. It is simply the absence of
     /// a numbering proof, and `resolveCurrentHeader` treats it as exactly that: the
     /// numbering arm (8) needs a positive stamp, and a row that has none must be

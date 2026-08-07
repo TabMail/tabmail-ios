@@ -879,8 +879,17 @@ struct AIWriteIdentityGuardTests {
     }
 
     /// 🚨 AUDIT ROUND 2 / MUST FIX 1, invariant 2. The cost half of the same
-    /// conflation. An unstamped row is ORDINARY, not suspicious: 15 production
-    /// sites null `observedUidValidity` against 4 that set it. When such a row has
+    /// conflation. An unstamped row is ORDINARY, not suspicious: far more
+    /// production statements null `observedUidValidity` than set it. **That ratio is
+    /// the ARGUMENT — invert it and this test's premise inverts — so it has ONE
+    /// owner and this is not it.** The predicate, the members by enclosing symbol
+    /// and the exclusive/inclusive split live in the doc comment on
+    /// `SearchView.resolveLocalResultHeaderId` ("THE COUNT, WITH ITS PREDICATE AND
+    /// ITS MEMBERS"), routed to from `AIWriteTarget.resolveCurrentHeader`.
+    /// **Re-derive there and update there; do not restate a bare integer here.**
+    /// This sentence said "15 … against 4" until R14-F5 — the figure `e4751e438`
+    /// introduced, which the correcting pass landed in `SearchView.swift` only.
+    /// When such a row has
     /// NOT been replaced, refusing does not fail closed in any useful sense — it
     /// leaves `summaryBlurb` nil, so `needsSummary` stays true, so the next open
     /// re-runs the LLM and drops it again: a paid API call repeated forever for a

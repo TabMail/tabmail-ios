@@ -639,14 +639,27 @@ extension AccountManager {
     ///    `AccountManager.drainPendingQueue`'s claim transaction — a per-op record
     ///    of the epoch it was recorded under, which cannot be defeated by a future
     ///    op shape this classifier misreads.
-    ///    ⚑ UPDATE (2026-08-01): the EXECUTOR half is closed too —
-    ///    `IMAPProvider.deleteDraft` now resolves either by a wire-verified rfc822
-    ///    Message-ID or, when the op recorded the epoch its UID was MINTED under
-    ///    (`PendingOperation.draftServerUidValidity`, v72), by that UID inside a
-    ///    SELECT whose live UIDVALIDITY equals it. A bare UID with no recorded
-    ///    epoch is refused outright, so no numbering is ever assumed. The stamp
-    ///    stays: it is provider-agnostic and stops the op before it reaches any
-    ///    executor;
+    ///    ⚑ UPDATE (2026-08-01, CORRECTED R14-F7): the EXECUTOR half is closed too —
+    ///    `IMAPProvider.deleteDraft` resolves the draft by the UID carried in its
+    ///    typed identity, inside a SELECT whose live UIDVALIDITY equals the epoch
+    ///    the op recorded its UID as MINTED under
+    ///    (`PendingOperation.draftServerUidValidity`, v72). A bare UID with no
+    ///    recorded epoch is refused outright, so no numbering is ever assumed.
+    ///    ⚠ **THERE IS NO RFC LEG, and this sentence claimed one.** It read
+    ///    *"resolves EITHER by a wire-verified rfc822 Message-ID OR … by that UID"*.
+    ///    `IMAPProvider.deleteDraft` opens with
+    ///    `guard case .imap(let folder, let uidValidity, let uid) = identity` and
+    ///    throws `actionIdentityResolutionFailed` on anything else — that guard is
+    ///    the whole of its identity handling — and `DraftDeleteIdentity` has no
+    ///    RFC-bearing case at all (`gmail`, `gmailContainedMessage`, `outlook`,
+    ///    `imap`, `demo`). `deleteDraftStrong`'s own doc states the subtraction
+    ///    outright: it "omit[s] optional RFC corroboration because v3's typed
+    ///    identity has no RFC leg". A reader who trusted the old sentence would
+    ///    believe a second, CONTENT-named route exists beside the address-named one
+    ///    and would design the next guard around a fallback that is not there —
+    ///    which is the same failure mode as the corrected sentence two paragraphs
+    ///    up. The stamp stays: it is provider-agnostic and stops the op before it
+    ///    reaches any executor;
     ///  - an op every one of whose `messageIds` is a CANONICAL BARE UID **and whose
     ///    own recorded `observedUidValidity` is a positive epoch that DISAGREES
     ///    with the fresh one** has no identity beyond an ADDRESS in a numbering the

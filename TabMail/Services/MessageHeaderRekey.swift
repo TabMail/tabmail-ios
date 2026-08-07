@@ -143,6 +143,49 @@ enum MessageHeaderRekey {
     ///    ⚠ A caller of `apply` that does not route through `publishRekeys`
     ///    still owes that mirror; this function cannot do it (different pool,
     ///    and it must not run inside the GRDB write).
+    ///
+    ///    🚨 **AND ONE IN-TREE CALLER DOES NOT MEET IT — stated as the negative
+    ///    case, because the sentence above stated an obligation and left a
+    ///    reader to assume it was met (`MIS-019`: an absolute like "all other
+    ///    callers route through `publishRekeys`" is exactly the shape that
+    ///    produced this gap).** The caller is the **UID-remap block in
+    ///    `SyncEngineFullSync`** — the `guard try MessageHeaderRekey.apply(…)`
+    ///    inside the stale-message loop. It is named rather than counted, so
+    ///    the sentence cannot go stale as an integer (`MIS-007`). Leg by leg:
+    ///     * **FTS — DISCHARGED, by the caller itself, not by `publishRekeys`.**
+    ///       It appends to `ftsRekeys` and its callers run the same
+    ///       `SearchIndex.rekeyHeaders`, and it deliberately keeps the re-keyed
+    ///       old id OFF the `staleIds` channel (`uidMigratedSet` is filtered out
+    ///       of `staleFiltered`) because the FTS entry must MOVE, not be
+    ///       removed. So the obligation is not "all three legs" for every
+    ///       caller — assuming that is how a reader concludes the sync path is
+    ///       broken in a way it is not.
+    ///     * **`UndoService.applyRekeys` — NOT discharged.** An undo entry that
+    ///       names the old header id keeps naming it, so the undo resolves
+    ///       nothing and fails closed. Bounded by the undo stack's lifetime.
+    ///     * **`BodyAssetStore.rekeyContentKey` — NOT discharged, and the
+    ///       consequence is not merely a cache miss.** The old key's assets
+    ///       become orphans while the carried-forward `messageBody` row at the
+    ///       NEW key still references them through `tabmail-asset://` — the
+    ///       R12-T7 mechanism `publishRekeys` calls *"A REGRESSION, NOT MERELY
+    ///       AN EDGE"*. The old id rides neither the re-key channel nor the
+    ///       `staleIds` removal (which does clear `stores: [.searchIndex, .body]`).
+    ///
+    ///    **Why it is accepted under THE MANTRA rather than fixed, and the
+    ///    load-bearing half re-verified at `07a4bb703` rather than inherited.**
+    ///    `git show 07a4bb703:` that file: the UID-remap block already did
+    ///    collision-skip → `migrated.insert(db)` → `body.id = newId;
+    ///    body.insert(db)`, already fed `ftsRekeys`, and already kept the
+    ///    re-keyed id off `staleIds` — this `apply` is that sequence extracted
+    ///    verbatim. And `git ls-tree 07a4bb703` shows `BodyAssetStore` and
+    ///    `BodyAssetMaintenance.pruneOrphans` present while `publishRekeys`,
+    ///    `UndoService.applyRekeys` and `BodyAssetStore.rekeyContentKey` are
+    ///    **absent entirely**. So the sync path's exposure is byte-identical to
+    ///    shipped: v3 built the mirror for the DRAIN, whose re-key was a v3
+    ///    regression against an ordinary primary path, and did not extend it to
+    ///    a path v3 never changed. It self-heals at
+    ///    `SyncConfig.bodyCacheTTLHours`, so the recoverability test says fail
+    ///    closed and let it be. Registered, not mechanised.
     ///  - **`pendingRender` is a DEAD TABLE.** `v32` created it for durable
     ///    body staging; nothing has INSERTed, SELECTed or UPDATEd it since. The
     ///    only surviving statements are two DELETEs — `SettingsView`'s reset
