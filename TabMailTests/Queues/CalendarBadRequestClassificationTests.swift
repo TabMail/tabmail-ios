@@ -56,6 +56,15 @@ import Foundation
 //     clear a revoked grant, so that is a permanent starvation, i.e. a wedge.
 //     `isCalendarAuthError` now claims the raw 401 on both providers.
 //
+// ⚠️ **AND THE CENSUS THAT PRODUCED THE THREE BULLETS ABOVE WAS ITSELF THE WRONG
+// SHAPE (R14-F4, 2026-08-06).** It enumerated calendar auth failure BY HTTP STATUS.
+// A token that is never MINTED carries no status at all: both providers' `request`
+// call `accessToken(false)` and, on a 401, `accessToken(true)` — **uncaught** — and
+// that closure raises `ProviderError.authenticationFailed` and
+// `OAuthError.tokenExchangeFailed`, which no arm claimed and no status-shaped
+// census could see. See `reachableErrorRoster` below, which is derived from the
+// CALL GRAPH instead (`MIS-007`).
+//
 // CalDAV's 403 is deliberately retired by `isCalendarBadRequestError`, because
 // iCloud returns an opaque 403 for permanent policy refusals
 // (attendee-without-organizer, shared-calendar writes) that no retry fixes. That
@@ -322,6 +331,176 @@ struct CalendarBadRequestClassificationTests {
         #expect(reason.contains("400"), "the original create failure must survive into the reason: \(reason)")
         #expect(reason.lowercased().contains("timed out") || reason.contains("-1001"),
                 "the rollback failure must survive into the reason too, or the user is told only half the story: \(reason)")
+    }
+
+    // MARK: - R14-F4 — the credential failures that carried no HTTP status at all
+
+    /// 🚨 **THE CENSUS SHAPE, not the finding, is what this section fixes
+    /// (`MIS-007`).** R12-T1 enumerated calendar OAuth failure **by HTTP status**,
+    /// because statuses were what was on screen. A token that is never MINTED
+    /// carries no status. `GoogleCalendarProvider.request` opens with
+    /// `try await accessToken(false)` and its 401 branch calls `accessToken(true)`,
+    /// **both uncaught**, and that closure — `AccountManager.makeOAuthAccessor` →
+    /// `OAuthRefreshCoordinator.refresh` → `refreshGoogleToken` /
+    /// `refreshMicrosoftToken` — raises `ProviderError.authenticationFailed` and
+    /// `OAuthError.tokenExchangeFailed`, neither of which any status-shaped census
+    /// could see. `ExchangeCalendarProvider.request` has the identical shape.
+    ///
+    /// So this roster is derived from *"every error type that can propagate out of
+    /// `executeCalendarOperation`"*, walking the call graph, rather than from the
+    /// three calendar provider error enums. `CalDAVError.noWritableCalendar` and
+    /// `.discoveryFailed` are deliberately absent: `rg 'primaryCalendarId|listCalendars'
+    /// AccountManagerCalendarQueue.swift` returns nothing, so neither is reachable
+    /// from the drain.
+    ///
+    /// Each row states the disposition AND why, because a roster whose entries are
+    /// only `true`/`false` cannot be reviewed — a wrong entry looks exactly like a
+    /// right one.
+    private func reachableErrorRoster() -> [(label: String, error: Error, terminal: Bool)] {
+        [
+            // — Google: the provider's own enum, all four cases —
+            ("Google missing scope", GoogleCalendarError.missingScope, true),
+            ("Google post-refresh 401 (grant revoked)", GoogleCalendarError.httpError(401, nil), true),
+            ("Google 400 (malformed payload)", GoogleCalendarError.httpError(400, nil), true),
+            ("Google 500 (server could not answer)", GoogleCalendarError.httpError(500, nil), false),
+            ("Google event not found", GoogleCalendarError.eventNotFound, true),
+            ("Google unencodable path segment", GoogleCalendarError.invalidPathSegment("Google event id"), true),
+            // — Exchange: same enum shape, asserted separately so a fix to one
+            //   provider cannot be read as covering its sibling (`MIS-007`) —
+            ("Exchange missing scope", ExchangeCalendarError.missingScope, true),
+            ("Exchange post-refresh 401 (grant revoked)", ExchangeCalendarError.httpError(401, nil), true),
+            ("Exchange 400 (malformed payload)", ExchangeCalendarError.httpError(400, nil), true),
+            ("Exchange 503 (server could not answer)", ExchangeCalendarError.httpError(503, nil), false),
+            ("Exchange event not found", ExchangeCalendarError.eventNotFound, true),
+            ("Exchange unencodable path segment", ExchangeCalendarError.invalidPathSegment("Graph event id"), true),
+            // — CalDAV —
+            ("CalDAV credentials rejected", CalDAVError.authFailed, true),
+            ("CalDAV not found", CalDAVError.notFound, true),
+            ("CalDAV opaque 403 policy refusal", CalDAVError.httpError(403, nil), true),
+            ("CalDAV 503 (server could not answer)", CalDAVError.httpError(503, nil), false),
+            // 412 on an update means our ETag was stale — re-read and retry is
+            // exactly the remedy, so terminalizing it would discard a live edit.
+            ("CalDAV stale-ETag precondition", CalDAVError.preconditionFailed, false),
+            ("CalDAV unreadable response body", CalDAVError.parseError("Empty response for event evt-1"), false),
+            ("CalDAV half-landed split, rollback failed", CalDAVError.inconsistentState("capped, no successor"), true),
+            // — Cross-provider —
+            ("provider cannot perform this edit scope", CalendarProviderError.notSupported("this_and_following"), true),
+            // — THE R14-F4 CLASS: raised before any request is issued —
+            ("OAuth grant revoked (invalid_grant)", OAuthError.tokenExchangeFailed("invalid_grant"), true),
+            ("OAuth client rejected (invalid_client)", OAuthError.tokenExchangeFailed("invalid_client"), true),
+            ("OAuth client unauthorized", OAuthError.tokenExchangeFailed("unauthorized_client"), true),
+            ("OAuth endpoint temporarily unavailable", OAuthError.tokenExchangeFailed("temporarily_unavailable"), false),
+            ("OAuth endpoint 5xx", OAuthError.tokenExchangeFailed("server_error"), false),
+            ("OAuth body carried no error code at all", OAuthError.tokenExchangeFailed("unknown"), false),
+            ("OAuth wrong scope requested — our bug, not a dead grant", OAuthError.tokenExchangeFailed("invalid_scope"), false),
+            ("credential could not be read", ProviderError.authenticationFailed, false),
+            // — Transport / storage, on the same path —
+            ("connection lost", URLError(.networkConnectionLost), false),
+            ("keychain write failed", KeychainError.saveFailed(-25300), false),
+        ]
+    }
+
+    @Test("Every error type reachable from executeCalendarOperation has an adjudicated disposition")
+    func everyReachableErrorTypeIsAdjudicated() {
+        let roster = reachableErrorRoster()
+        // MIS-030: anchor the roster's own cardinality, so a future edit that
+        // silently empties or truncates it cannot make every assertion below
+        // pass over nothing.
+        #expect(roster.count == 30, "the roster lost or gained entries — re-derive it from the call graph")
+        for (label, error, terminal) in roster {
+            #expect(
+                claimedByATerminalArm(error) == terminal,
+                terminal
+                    ? "\(label): claimed by NO terminal arm, so the drain requeues it AND inserts the account into failedAccounts — every later calendar op on that account is skipped, on this drain and every subsequent one. A wedge sits in the same non-recoverable set as a dropped intention."
+                    : "\(label): a terminal arm claims it, so the durable PendingCalendarOperation row is DELETED. This error is indeterminate or transient — retiring on it drops the user's intention on 'we could not determine the answer' (never-drop clause 2).")
+        }
+    }
+
+    @Test("A revoked OAuth grant reaches a terminal arm instead of wedging the account's calendar lane")
+    func revokedGrantIsTerminal() {
+        // The exact values `refreshGoogleToken` / `refreshMicrosoftToken` raise:
+        //     throw OAuthError.tokenExchangeFailed(response.error ?? "unknown")
+        // where the payload is the token endpoint's own machine-readable code.
+        // These three say the GRANT is dead, so every future drain reproduces the
+        // failure identically and no retry can ever clear it.
+        for code in ["invalid_grant", "invalid_client", "unauthorized_client"] {
+            #expect(claimedByATerminalArm(OAuthError.tokenExchangeFailed(code)),
+                    "\(code) is claimed by NO terminal arm — the op is requeued forever at the head of a createdAt-ASC queue and head-of-line-blocks the account's whole calendar lane")
+        }
+        #expect(claimedByATerminalArm(OAuthError.tokenExchangeFailed(" INVALID_GRANT ")),
+                "case and surrounding whitespace come off the wire; failing to match on either is a wedge, so the classifier normalises before comparing")
+    }
+
+    @Test("A token endpoint that merely could not answer stays retryable")
+    func indeterminateTokenFailuresAreStillRetryable() {
+        // ⚠️ THE MIRROR IMAGE, pinned so it cannot be traded in. Blanket-
+        // terminalizing `tokenExchangeFailed` is the obvious "fix" and it is wrong:
+        // both endpoints raise the SAME case for reasons a retry resolves, and
+        // `"unknown"` is the fallback for a response body with no `error` key at
+        // all — the purest form of "we could not determine the answer".
+        for code in ["temporarily_unavailable", "server_error", "unknown", "invalid_scope", ""] {
+            #expect(claimedByATerminalArm(OAuthError.tokenExchangeFailed(code)) == false,
+                    "'\(code)' is indeterminate or is our own request bug — retiring the op on it deletes the user's queued calendar operation for a condition that clears itself")
+        }
+    }
+
+    @Test("The re-auth signal is raised for a strictly larger set than the terminal arm claims")
+    func reauthSignalCoversWhatTheTerminalArmDoesNot() {
+        // 🚨 THE SIGNAL AND THE DISPOSITION ARE DIFFERENT QUESTIONS. Before R14-F4
+        // this file's drain never touched `authFailedAccounts` at all
+        // (`rg -c authFailedAccounts AccountManagerCalendarQueue.swift` → 0), so an
+        // OAuth calendar account whose grant was revoked produced no persistent
+        // user-visible prompt — only CalDAV accounts did, via `caldavConfig.needsReauth`.
+        for (label, error) in [
+            ("Google post-refresh 401", GoogleCalendarError.httpError(401, nil) as Error),
+            ("Exchange post-refresh 401", ExchangeCalendarError.httpError(401, nil)),
+            ("revoked grant", OAuthError.tokenExchangeFailed("invalid_grant")),
+            ("credential could not be read", ProviderError.authenticationFailed),
+        ] {
+            #expect(AccountManager.isCalendarOAuthReauthRequired(error),
+                    "\(label): the user is never told to sign in again, so nothing they can do clears the failure — that is what turns a fail-closed stop into an unrecoverable wedge")
+        }
+
+        // 🚨 THE ASYMMETRY THIS FIX RESTS ON. `ProviderError.authenticationFailed`
+        // is SIGNALLED but NOT terminal. `OAuthRefreshCoordinator.refresh` raises it
+        // from `guard let refreshToken = KeychainHelper.loadString(…)`, and
+        // `KeychainHelper.load` returns nil for ANY SecItemCopyMatching failure —
+        // an absence of evidence, not a provider refusal. Terminalizing it would
+        // trade a wedge that one ordinary user gesture clears (re-authenticate,
+        // prompted by the signal asserted above) for a permanently dropped
+        // intention, which nothing recovers.
+        #expect(claimedByATerminalArm(ProviderError.authenticationFailed) == false,
+                "a credential we could not READ is not a credential the provider REFUSED; deleting the op on it drops the user's intention on 'we could not determine'")
+
+        // And the signal is not a catch-all: an ordinary malformed payload or a
+        // dropped connection must not tell the user their sign-in is broken.
+        for (label, error) in [
+            ("malformed payload", GoogleCalendarError.httpError(400, nil) as Error),
+            ("missing scope", ExchangeCalendarError.missingScope),
+            ("connection lost", URLError(.networkConnectionLost)),
+            ("indeterminate token endpoint", OAuthError.tokenExchangeFailed("temporarily_unavailable")),
+            ("CalDAV — has its own needsReauth column", CalDAVError.authFailed),
+        ] {
+            #expect(AccountManager.isCalendarOAuthReauthRequired(error) == false,
+                    "\(label) must not raise the OAuth re-auth prompt")
+        }
+    }
+
+    @Test("The terminal auth reason names the failure that actually happened")
+    func authFailureReasonMatchesTheCause() {
+        // `MIS-031` — the string is surfaced verbatim to the agent and through it to
+        // the user, and the pre-fix two-way ternary asserted "refused again after a
+        // token refresh" for a token that was never minted at all.
+        #expect(AccountManager.calendarAuthFailureReason(CalDAVError.authFailed).hasPrefix("CalDAV"))
+        let revoked = AccountManager.calendarAuthFailureReason(
+            OAuthError.tokenExchangeFailed("invalid_grant"))
+        #expect(revoked.contains("invalid_grant"),
+                "the provider's own reason must survive into the message: \(revoked)")
+        #expect(revoked.contains("after a token refresh") == false,
+                "a token that was never minted was not 'refused again after a token refresh': \(revoked)")
+        #expect(AccountManager.calendarAuthFailureReason(
+            GoogleCalendarError.httpError(401, nil)).contains("after a token refresh"),
+                "the post-refresh 401 message must keep describing what it is")
     }
 
     @Test("Non-4xx statuses and non-HTTP errors are never classified as malformed")

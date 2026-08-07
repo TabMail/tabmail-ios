@@ -265,6 +265,26 @@ extension AccountManager {
                 } catch {
                     let ageHours = Date().timeIntervalSince(currentOp.createdAt) / 3600
 
+                    // 🚨 R14-F4 — RAISE THE RE-AUTH SIGNAL BEFORE ANY DISPOSITION IS
+                    // CHOSEN. The signal is about the ACCOUNT; the arms below decide
+                    // about the OP. Those are different questions and conflating them
+                    // is how this went unnoticed: `rg -c authFailedAccounts` over this
+                    // file returned ZERO, so an OAuth calendar account whose grant had
+                    // been revoked produced no persistent, user-visible signal at all
+                    // — only CalDAV accounts did, through their `caldavConfig`
+                    // `needsReauth` column. `authFailedAccounts` is the OAuth
+                    // equivalent: `AccountManager`'s `didSet` mirrors it into
+                    // `AccountManagerState`, which `RootView`, `SettingsView` and
+                    // `AccountDetailView` all render as a "re-authenticate" prompt,
+                    // and a successful re-auth clears it (`AccountManagerSetup`).
+                    //
+                    // This is what makes the RETRYABLE half below recoverable rather
+                    // than a silent wedge: the op stays queued, the user is told to
+                    // re-authenticate, and one ordinary gesture drains it.
+                    if Self.isCalendarOAuthReauthRequired(error) {
+                        markAuthFailed(currentOp.accountId)
+                    }
+
                     // Permanent errors — drop immediately, no retry
                     if Self.isCalendarNotFoundError(error) {
                         print("[CalendarQueue] Event not found for \(opType) — dropping (server wins)")
@@ -294,10 +314,15 @@ extension AccountManager {
                         continue
                     }
                     // Auth failure — semi-permanent, needs re-authentication (L12).
-                    // Covers CalDAV's typed `authFailed` AND a POST-REFRESH raw 401
-                    // from Google/Exchange; see `isCalendarAuthError` for why the
-                    // second one is safe to treat as terminal (the providers force a
-                    // token refresh and only rethrow the SECOND 401).
+                    // Covers CalDAV's typed `authFailed`, a POST-REFRESH raw 401 from
+                    // Google/Exchange, and (R14-F4) a token-ACQUISITION failure whose
+                    // OAuth error code names a dead GRANT. See `isCalendarAuthError`
+                    // for why the second is safe to treat as terminal (the providers
+                    // force a token refresh and only rethrow the SECOND 401) and
+                    // `isGrantLevelOAuthFailure` for why only three codes qualify for
+                    // the third. The signal that the user must re-authenticate was
+                    // already raised above, for a strictly larger set of errors than
+                    // this arm claims.
                     if Self.isCalendarAuthError(error) {
                         let isCalDAV = Self.isCalDAVAuthError(error)
                         print("[CalendarQueue] Auth failed for \(opType) (\(isCalDAV ? "CalDAV" : "OAuth")) — stopping retries, user must re-authenticate")
@@ -321,10 +346,7 @@ extension AccountManager {
                         failedAccounts.insert(currentOp.accountId)
                         signalCalendarOpOutcome(
                             opId: currentOp.id,
-                            outcome: .permanentFailure(
-                                reason: isCalDAV
-                                    ? "CalDAV authentication failed — user must re-authenticate in Settings"
-                                    : "calendar authentication failed (the account's access was refused again after a token refresh) — user must re-authenticate in Settings"))
+                            outcome: .permanentFailure(reason: Self.calendarAuthFailureReason(error)))
                         continue
                     }
 
@@ -779,11 +801,104 @@ extension AccountManager {
     /// provider is added whose first 401 reaches the queue raw — this arm starts
     /// retiring ops that a token refresh would have fixed. Re-read both `request`
     /// implementations before changing this.
+    /// - **Google / Exchange, token ACQUISITION (R14-F4):** an
+    ///   `OAuthError.tokenExchangeFailed` whose payload is a GRANT-LEVEL OAuth 2.0
+    ///   error code. See `isGrantLevelOAuthFailure` — it is a positively parsed
+    ///   reason, never a bare failure, exactly as
+    ///   `GoogleCalendarProvider.isDuplicateIdConflict` reads Google's 409 body
+    ///   rather than trusting the status.
     static func isCalendarAuthError(_ error: Error) -> Bool {
         if case CalDAVError.authFailed = error { return true }
         if case GoogleCalendarError.httpError(401, _) = error { return true }
         if case ExchangeCalendarError.httpError(401, _) = error { return true }
+        if case OAuthError.tokenExchangeFailed(let reason) = error {
+            return isGrantLevelOAuthFailure(reason)
+        }
         return false
+    }
+
+    /// The OAuth 2.0 token-endpoint `error` codes (RFC 6749 §5.2) that describe a
+    /// GRANT the server has positively refused, as opposed to a token endpoint that
+    /// merely could not answer.
+    ///
+    /// `GoogleAuthService.refreshGoogleToken` and
+    /// `MicrosoftAuthService.refreshMicrosoftToken` both raise
+    /// `OAuthError.tokenExchangeFailed(response.error ?? "unknown")`, so the payload
+    /// is the server's own machine-readable code — the same evidence standard the
+    /// calendar queue already applies to Google's 409 bodies.
+    ///
+    /// 🚨 **DELIBERATELY EXACT-MATCH AND DELIBERATELY THREE.** This predicate is the
+    /// gate on a TERMINAL arm, and a terminal arm deletes the user's queued calendar
+    /// operation, so every value added here is an intention that can leave the queue.
+    /// `temporarily_unavailable`, `server_error`, a 5xx, a dropped connection and the
+    /// `"unknown"` fallback (a body with no `error` key at all) are all *"we could not
+    /// determine the answer"*, which never-drop clause 2 makes retryable forever —
+    /// blanket-terminalizing `tokenExchangeFailed` is the mirror image of this fix and
+    /// must not be shipped. `invalid_scope` and `unsupported_grant_type` are permanent
+    /// too but describe a REQUEST this client got wrong rather than a dead grant; they
+    /// are left retryable because a wrong request is our bug to fix in a release, not
+    /// the user's intention to discard.
+    static func isGrantLevelOAuthFailure(_ reason: String) -> Bool {
+        switch reason.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "invalid_grant", "invalid_client", "unauthorized_client": return true
+        default: return false
+        }
+    }
+
+    /// True when the error proves the account's OAuth credential can no longer be
+    /// obtained or used, so the user has to re-authenticate — **independent of
+    /// whether the queued operation is retired.**
+    ///
+    /// 🚨 **THE SIGNAL AND THE DISPOSITION ARE DIFFERENT QUESTIONS, and this
+    /// predicate exists because collapsing them is what made the R14-F4 wedge
+    /// invisible.** `isCalendarAuthError` answers *"may this op leave the queue?"*.
+    /// This answers *"must the user be told to sign in again?"*, which is true for a
+    /// strictly larger set — including
+    /// `ProviderError.authenticationFailed`, which stays RETRYABLE (below).
+    ///
+    /// ⚠️ **`ProviderError.authenticationFailed` IS DELIBERATELY NOT TERMINAL, and
+    /// the round-14 brief's claim that it "is unambiguous and can be claimed
+    /// directly" was refuted in the tree.** `OAuthRefreshCoordinator.refresh` raises
+    /// it from exactly two guards:
+    ///   1. `guard !invalidated` — the account was removed. Those ops cannot wedge
+    ///      anything: `pendingCalendarOperation.accountId` is declared
+    ///      `.references("account", onDelete: .cascade)`, one of the 10 live
+    ///      cascading foreign keys, so deleting the account already deleted them.
+    ///   2. `guard let refreshToken = KeychainHelper.loadString(…)` — and
+    ///      `KeychainHelper.load` returns `nil` for **any** `SecItemCopyMatching`
+    ///      failure, not only "the token is gone". That is an ABSENCE OF EVIDENCE,
+    ///      i.e. never-drop clause 2's *"we could not determine the answer"*, which
+    ///      is retryable forever and is never a provider-authoritative refusal.
+    /// Terminalizing it would trade a wedge that ONE ordinary user gesture clears —
+    /// re-authenticate, prompted by the very signal this predicate raises — for a
+    /// permanently dropped intention, which nothing recovers. The asymmetry is the
+    /// whole argument; see `THE MANTRA` in `CLAUDE.md`.
+    static func isCalendarOAuthReauthRequired(_ error: Error) -> Bool {
+        if case GoogleCalendarError.httpError(401, _) = error { return true }
+        if case ExchangeCalendarError.httpError(401, _) = error { return true }
+        if case ProviderError.authenticationFailed = error { return true }
+        if case OAuthError.tokenExchangeFailed(let reason) = error {
+            return isGrantLevelOAuthFailure(reason)
+        }
+        return false
+    }
+
+    /// The reason string the drain surfaces to the agent and, through it, to the
+    /// user when an auth failure retires a calendar operation.
+    ///
+    /// Each arm of `isCalendarAuthError` describes a DIFFERENT failure and this
+    /// string is shown verbatim, so they cannot share one sentence. The text used to
+    /// be a two-way ternary whose OAuth branch asserted *"the account's access was
+    /// refused again after a token refresh"* — true of a post-refresh 401 and false
+    /// of a token that was never minted at all, which is the case R14-F4 added.
+    static func calendarAuthFailureReason(_ error: Error) -> String {
+        if case CalDAVError.authFailed = error {
+            return "CalDAV authentication failed — user must re-authenticate in Settings"
+        }
+        if case OAuthError.tokenExchangeFailed(let reason) = error {
+            return "calendar authentication failed (the account's saved sign-in was rejected by the provider: \(reason)) — user must re-authenticate in Settings"
+        }
+        return "calendar authentication failed (the account's access was refused again after a token refresh) — user must re-authenticate in Settings"
     }
 
     /// True only for the CalDAV spelling of an auth failure. CalDAV accounts own a
