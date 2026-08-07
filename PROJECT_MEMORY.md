@@ -2,24 +2,20 @@
 
 > **iOS-specific knowledge.** Claude reads this before every task and updates it when discovering something new. For cross-cutting knowledge, see `../PROJECT_MEMORY.md`.
 
-**Last updated:** 2026-08-02
+**Last updated:** 2026-08-06
 
 ---
 
 ## How to use this index
 
 **This file is a router, not an archive.** Every topic below is preserved in full under
-[`Companion/Memory/`](Companion/Memory/manifest.tsv); the manifest carries a `sha256` per fragment.
-Load only the topics your task mechanically matches.
-
-1. Build search terms from the request, named files/symbols, subsystem, provider, invariant, and likely defect class.
-2. Run `rg -ni '<terms>' PROJECT_MEMORY.md DECISIONS.md MISTAKES.md Companion/` and a code census with `rg`.
-3. Read each matched detailed topic, ADR, process, rule, and mistake document completely before acting.
-4. Record every required routed path in any plan, implementation brief, or review prompt.
-5. Update the relevant detail file and its index row when durable knowledge changes; do not grow this file into an unconditional archive.
+[`Companion/Memory/`](Companion/Memory/manifest.tsv) (`sha256` per fragment); load only the topics
+your task mechanically matches. Routing protocol — derive terms → `rg -ni` → read in full → enumerate
+in the brief → update the detail — is **normative in root [`../CLAUDE.md`](../CLAUDE.md) § *Companion
+Routing***; this file's own wording is preserved in
+[`Companion/Process/Current/project-memory-index-usage-protocol.md`](Companion/Process/Current/project-memory-index-usage-protocol.md).
 
 Current entries govern. Historical entries preserve evidence but do not override current rules or active ADRs.
-Do not use Markdown imports as a context shortcut; imported text still consumes startup context.
 
 ## Current topics
 
@@ -128,7 +124,7 @@ These files preserve source history. Read them when a current topic, ADR, plan, 
 
 ## Forward-ported topics absent from the shipped source
 
-These topics exist only on the mature pre-v3 line and are therefore not in `v1.6.38:PROJECT_MEMORY.md`. The bodies are preserved byte-for-byte with their provenance in [`Companion/Memory/ported-manifest.tsv`](Companion/Memory/ported-manifest.tsv). They are excluded from the source-document reconstruction manifest.
+Pre-v3-line topics absent from `v1.6.38:PROJECT_MEMORY.md`; bodies preserved byte-for-byte, provenance in [`ported-manifest.tsv`](Companion/Memory/ported-manifest.tsv).
 
 | Status | Topic / search terms | Detail |
 |---|---|---|
@@ -140,26 +136,26 @@ These topics exist only on the mature pre-v3 line and are therefore not in `v1.6
 
 ## Post-`v1.6.38` topics — routed detail, no byte-identical `v1.6.38` twin
 
-Authored after `v1.6.38`, so the pinned compaction has no byte-identical twin. Deliberately **not** rows in [`manifest.tsv`](Companion/Memory/manifest.tsv), which reconstructs `v1.6.38:PROJECT_MEMORY.md` exactly; provenance, source line ranges and per-fragment `sha256` are in [`amendments-manifest.tsv`](Companion/Memory/amendments-manifest.tsv).
+Authored after `v1.6.38`, so deliberately **not** rows in [`manifest.tsv`](Companion/Memory/manifest.tsv); provenance, source line ranges and per-fragment `sha256` in [`amendments-manifest.tsv`](Companion/Memory/amendments-manifest.tsv).
 
 | Status | Topic / search terms | Detail |
 |---|---|---|
-| Historical | Compaction drift list — the retired *Retained inline — no byte-identical routed twin* preamble: why a post-`v1.6.38` amendment can differ from its `Companion/Memory/` twin, and the check-the-routed-twin-before-editing rule | [read in full](Companion/Memory/History/094-retained-inline-no-byte-identical-routed-twin.md) |
-| Current | v3 provider-id action-queue forward-port — resume state: branch `v3`, HEAD `583de7a5d`, **PAUSED BY OWNER**, never pushed; `PLAN_IOS_REFACTOR_V3.md` routing index; T4.T2 landed, T5.9/T4.T1 next; rules R0–R4; `v2final` PORT/SUBTRACT/INVENTED census | [read in full](Companion/Memory/Current/095-v3-provider-id-action-queue-forward-port-resume-state.md) |
-| Current | T1.3 — a NEW gesture fails CLOSED on an unknown UIDVALIDITY epoch: `newGestureRefusedForUnknownEpoch` is a silent no-op (`IOS-EPOCH-001`, C3), never "fixed" back to fail-open; on a refused write RECONCILE FROM THE DATABASE | [read in full](Companion/Memory/Current/096-t1-3-new-gesture-fails-closed-on-unknown-uidvalidity-epoch.md) |
-| Historical | T4.S6 — **SUPERSEDED v3 intermediate, never implement from it**: `v69` `observedUidValidity` draft stamp, `v72` draft queue epoch; ⛔ the RETRACTED bare mailbox-wide `EXPUNGE` — `expungeScopedToTargets` is UIDPLUS-conditional | [read in full](Companion/Memory/History/097-t4-s6-follow-up-superseded-v3-intermediate-draft-epoch-stamp.md) |
-| Current | IMAP external-deletion blind spot — server-deleted messages linger forever; FIXED by **ADR-IOS-051** Ph1+2: `SyncEngineDeletionReconcile`, `handleVanishedUIDs`, the `deletionReconcileChunkSize` breaker; no CONDSTORE/QRESYNC | [read in full](Companion/Memory/Current/098-imap-external-deletion-blind-spot-amended-adr-ios-051.md) |
+| Historical | Compaction drift list — why a post-`v1.6.38` amendment can differ from its `Companion/Memory/` twin, and the check-the-routed-twin-before-editing rule | [read in full](Companion/Memory/History/094-retained-inline-no-byte-identical-routed-twin.md) |
+| Current | v3 provider-id action-queue forward-port — resume state: branch `v3`, HEAD `583de7a5d`, **PAUSED BY OWNER**, never pushed; `PLAN_IOS_REFACTOR_V3.md`; rules R0–R4; `v2final` PORT/SUBTRACT/INVENTED census | [read in full](Companion/Memory/Current/095-v3-provider-id-action-queue-forward-port-resume-state.md) |
+| Current | T1.3 — a NEW gesture fails CLOSED on an unknown UIDVALIDITY epoch: `newGestureRefusedForUnknownEpoch` is a silent no-op (`IOS-EPOCH-001`, C3), never "fixed" back to fail-open | [read in full](Companion/Memory/Current/096-t1-3-new-gesture-fails-closed-on-unknown-uidvalidity-epoch.md) |
+| Historical | T4.S6 — **SUPERSEDED v3 intermediate, never implement from it**: `v69` `observedUidValidity` draft stamp, `v72` draft queue epoch; ⛔ the RETRACTED bare mailbox-wide `EXPUNGE` | [read in full](Companion/Memory/History/097-t4-s6-follow-up-superseded-v3-intermediate-draft-epoch-stamp.md) |
+| Current | IMAP external-deletion blind spot — server-deleted messages linger forever; FIXED by **ADR-IOS-051** Ph1+2: `SyncEngineDeletionReconcile`, `handleVanishedUIDs`, `deletionReconcileChunkSize` | [read in full](Companion/Memory/Current/098-imap-external-deletion-blind-spot-amended-adr-ios-051.md) |
 | Current | Persistent NSE log + watchdog partial-result delivery, audit rounds 1–7: `NSELogStore`/`nse.log`, `PartialSignalHolder`; **idle-timer-vs-SSE** root cause; zombie-resume `OneShotFlag.hasFired()` | [read in full](Companion/Memory/Current/099-persistent-nse-log-file-watchdog-partial-delivery-audit-rounds.md) |
 | Current | Two-instant wake handoff — deadline elapses between the query and the re-check ⇒ arm nothing; "elapsed" means DO IT NOW (`AccountManager.wakeUpDelay`, `holdUntil`, `IOS-OUTBOX-005`, `UInt64(negative)` traps) | [read in full](Companion/Memory/Current/100-two-instant-wake-handoff-elapsed-means-do-it-now.md) |
-| Current | `isDeletedOnServer` — FOUR materialisation paths **plus a FIFTH PRESENTATION path the census missed** (`SearchView.searchAccount` sends no `NOT DELETED`), `IOS-IMAP-001` FIXED `afa7889ee` — state the census NOUN; ⚠️ ERRATUM `deepBackfillFolder` is DEAD CODE | [read in full](Companion/Memory/Current/101-isdeletedonserver-has-four-materialisation-paths.md) |
-| Current | ⚠️ **FIVE irreversible wire operations, not one** (FOUR until 2026-08-05; the `…four…` filename is a frozen id, not the count) — `COPYUID`-gated source expunge, **the draft family which DESTROYS a draft** (`deleteDraftStrong`, `saveDraft`, `GmailProvider.deleteDraft`), **plus `CalDAVProvider.deleteEvent`** — `CalDAVClient` sets `httpMethod = "DELETE"`, invisible to a `method: "DELETE"` census, and CalDAV has no trash. Enumerate BOTH spellings. "Never permanently deletes" is FALSE for drafts **and calendar events**. ⚠️ TWO FAMILIES: the five are the **deletion family**; a verb search is blind to the **replacement family** — `CalDAVProvider.splitSeries`'s cap `PUT` destroys every post-split occurrence and IS in the set (not a sixth member); also run `httpMethod = "PUT"` / `method: "PUT"`; `GmailProvider.saveDraft`'s draft PUT is the excluded negative case | [read in full](Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md) |
+| Current | `isDeletedOnServer` — FOUR materialisation paths **plus a FIFTH PRESENTATION path the census missed** (`SearchView.searchAccount` sends no `NOT DELETED`), `IOS-IMAP-001`; ⚠️ ERRATUM `deepBackfillFolder` is DEAD CODE | [read in full](Companion/Memory/Current/101-isdeletedonserver-has-four-materialisation-paths.md) |
+| Current | ⚠️ **FIVE irreversible wire operations, not one** — `COPYUID`-gated source expunge, the **draft family** (`deleteDraftStrong`, `saveDraft`, `GmailProvider.deleteDraft`), `CalDAVProvider.deleteEvent`; plus the **replacement family** (`splitSeries`'s cap `PUT`). Enumerate BOTH spellings (`httpMethod =` / `method:`). Normative: `CLAUDE.md` § THE MANTRA | [read in full](Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md) |
 | Current | 🚨 `await dbPool.read` is NOT a short suspension — the ASYNC overload first `await`s `NSEDataBridge.mergeIfStagingPending()`, a measured 7.6 s cold-boot write; check-then-act across it is never BOUNDED | [read in full](Companion/Memory/Current/103-await-dbpool-read-is-not-a-short-suspension.md) |
 | Current | 🚨 a latch that AUTHORISES a transition must be HELD across the write — reading `isDrainingOutbox` then `await`ing proves nothing; ACQUIRE it (`IOS-OUTBOX-006`, `reconcileOutbox`, no Sent APPEND) | [read in full](Companion/Memory/Current/104-a-latch-that-authorises-a-transition-must-be-held-across-the-write.md) |
 | Current | 🚨 a bare `print` is NOT production observability on iOS — `stdout` is DISCARDED on device; use `BackgroundSyncLogger.logError`; a gate inside a BRANCH CONDITION picks the branch (`MIS-019`) | [read in full](Companion/Memory/Current/105-a-print-is-not-production-observability-on-ios.md) |
 | Current | 🚨 a filter applied AFTER a query's `LIMIT` narrows the page instead of selecting it — `InboxListReader.gather`, `hasMoreMessages` (`IOS-SCROLL-002`, `IOS-BACKFILL-001`, `6d460aa99`) | [read in full](Companion/Memory/Current/106-a-filter-after-the-limit-narrows-the-page-instead-of-selecting-it.md) |
 | Current | 🚨 a staging key that names an ADDRESS must re-prove identity before it reuses payload — `nse_processed_message`'s PK holds a UID, `stageHeader`'s `ON CONFLICT` (`IOS-NSE-005`, C3) | [read in full](Companion/Memory/Current/107-a-staging-key-that-names-an-address-must-re-prove-identity-before-reusing-payload.md) |
-| Current | 🚨 a Swift `String` comparison does NOT reproduce SQLite **BINARY** collation and is not even a total order (NFC/NFD are equal in Swift, distinct primary keys in SQLite) — compare `utf8.lexicographicallyPrecedes`; `InboxOrdering`, keyset cursor, `IOS-SCROLL-002` | [read in full](Companion/Memory/Current/113-a-swift-string-comparison-does-not-reproduce-sqlite-binary-collation.md) |
-| Current | 🚨 **THE SAME STAGING KEY HAS FOUR WRITERS, AND "SAFE" POINTS THE OPPOSITE WAY FOR THREE** (`IOS-NSE-006`) — all four now call `stagedIdentityPositivelyDiffers`; ⚠️ **THE FAIL DIRECTION INVERTS**: KEEP-payload RETAINS, ADD-payload WRITES | [read in full](Companion/Memory/Current/107-a-staging-key-that-names-an-address-must-re-prove-identity-before-reusing-payload.md) |
-| Current | 🚨 **AN ENUM WITH NO SILENT CASE DOES NOT PREVENT A SILENT PATH** — `ResultTapOutcome`'s "cannot reintroduce silence" comment was FALSE AND LOAD-BEARING (`case …: break` compiles); the old tap suite stayed GREEN under it (`438f632cf`) | [read in full](Companion/Memory/Current/109-an-enum-with-no-silent-case-does-not-prevent-a-silent-path.md) |
+| Current | 🚨 a Swift `String` comparison does NOT reproduce SQLite **BINARY** collation and is not even a total order — compare `utf8.lexicographicallyPrecedes`; `InboxOrdering`, keyset cursor, `IOS-SCROLL-002` | [read in full](Companion/Memory/Current/113-a-swift-string-comparison-does-not-reproduce-sqlite-binary-collation.md) |
+| Current | 🚨 **THE SAME STAGING KEY HAS FOUR WRITERS, AND "SAFE" POINTS THE OPPOSITE WAY FOR THREE** (`IOS-NSE-006`, `stagedIdentityPositivelyDiffers`) — ⚠️ **THE FAIL DIRECTION INVERTS** | [read in full](Companion/Memory/Current/107-a-staging-key-that-names-an-address-must-re-prove-identity-before-reusing-payload.md) |
+| Current | 🚨 **AN ENUM WITH NO SILENT CASE DOES NOT PREVENT A SILENT PATH** — `ResultTapOutcome`'s "cannot reintroduce silence" comment was FALSE AND LOAD-BEARING (`case …: break` compiles) | [read in full](Companion/Memory/Current/109-an-enum-with-no-silent-case-does-not-prevent-a-silent-path.md) |
 | Current | 🚨 THE ADDRESS PROBLEM HAS TWO ADDRESS SPACES — Graph's `/move` response IS the `COPYUID`; `ExchangeProvider.moveMessage` discarded the new `id` (`IOS-GRAPH-002`, `MIS-006`) | [read in full](Companion/Memory/Current/108-the-address-problem-has-two-address-spaces-graph-move-response-is-the-copyuid.md) |
 | Current | 🚨 `uidValidityResetPendingAt` STAYS ARMED ON PURPOSE — never demand proof of transience; `crawlWalkWriteAllowed` was the LAST consumer writing under an armed flag (`16ecafd93`) | [read in full](Companion/Memory/Current/112-uidvalidityresetpendingat-is-a-redrive-flag-that-stays-armed-on-purpose.md) |
