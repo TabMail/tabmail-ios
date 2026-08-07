@@ -1,8 +1,32 @@
 # THE ADDRESS PROBLEM — the root cause behind most action-queue complexity
 
-**Status:** Current. Routed out of `CLAUDE.md` (working tree, 2026-08-05 companion-compact pass),
-source lines 115–149, byte-for-byte — nothing below is reworded, merged, or truncated. `CLAUDE.md`
-keeps a one-line index row pointing here; where the index and this file differ, **this file wins**.
+**Status: SUPERSEDED / HISTORICAL as of v1.7.0 (2026-08-07). The problem described below is FIXED.**
+**`CLAUDE.md` now wins over this file — the precedence stated in the original header is REVERSED.**
+
+Routed out of `CLAUDE.md` (working tree, 2026-08-05 companion-compact pass), source lines 115–149,
+byte-for-byte — nothing below is reworded, merged, or truncated. It is kept because the reasoning is
+still the best account of *why* the design landed where it did, and because compaction never deletes
+superseded material. **Do not read it as live state.**
+
+What changed, and where to verify it in the tree (cited by SYMBOL — line citations go stale):
+
+- *"The destination address is never persisted anywhere"* — **no longer true.**
+  `IMAPProvider.copyProvenSourceUIDs` now returns `destinationProviderId` /
+  `destinationUidValidity`, and `MessageHeaderRekey.finishMove` re-keys the row to the destination
+  UID and epoch at drain time from the `COPYUID` already in hand. This is exactly the "finish the
+  move locally" answer the last paragraph below argues for; it was implemented.
+- *"Undo … cannot name the message in its new folder, so it refuses"* / *"Nothing replaced it"* —
+  **no longer true.** `AccountManager.undoMove` performs an ordinary reverse move against the
+  recorded durable identity.
+- The banned D4 direction — an RFC 822 Message-ID `SEARCH` selecting a **mutation** target
+  (ADR-IOS-068, `IOS-IMAP-002`) — is gone from the tree. The two surviving `searchByMessageId`
+  callers (`currentUIDs`, `appendToSentFolder`) are both **non-mutating**.
+
+**What survives as a live invariant** (and is stated in `CLAUDE.md`, which is normative): a move
+changes the address, so anything recorded against the source *after* a move has landed either can
+never be admitted again (a dropped intention) or names whatever now occupies that UID (**C3**).
+A composed read-then-move therefore records the read strictly before the move, in the same queued
+closure.
 
 ---
 

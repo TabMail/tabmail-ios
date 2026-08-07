@@ -51,7 +51,7 @@ Both follow the same contract:
 5. **Treat remote actions as user actions.** IMAP tag updates from other TabMail instances (TB addon) are equivalent to local user actions. When consolidating, the most recent action wins — a remote tag change that arrives after a local queue entry overrides it. The queue is not privileged over remote state; both represent user intention from different devices.
 6. **Never silently discard.** Failed sends stay visible in Outbox. Durable message actions retry transient failures without a retry cap. Automatic cleanup only happens for provably completed or provably stale operations. The user always has agency to retry or dismiss.
 
-   **A queued operation may leave the queue for exactly FOUR reasons — and no others:** (1) **provider success**; (2) **a provider-authoritative stale/no-op result** — the provider told us the work is already done or no longer applicable; *"we could not determine the answer" is NOT this*: a thrown read, an unresolvable identity, a failed durable write and an **unknown** epoch are all **retryable**, never authoritative, and conflating the two is the single most repeated defect in this codebase's history; (3) **annihilation by a newer inverse user action**, only when the earlier operation was **never attempted**, the members match **exactly**, and the new action is a true inverse; (4) **invalidation by an id reset in its own address space** — a **proven** UIDVALIDITY turnover or provider stable-id reset drops every queued op that named an address in that space, because v3 compares an op against its **durable** `PendingOperation.observedUidValidity`, so once the epoch provably moves every retry of that op fails identically and forever rather than executing under numbering it never observed (**C3**: no action may ever mutate the wrong message; failing closed is always acceptable — `KNOWN_ISSUES.md` `IOS-EPOCH-001` / `IOS-ACTION-002`).
+   **A queued operation may leave the queue for exactly FOUR reasons — and no others:** (1) **provider success**; (2) **a provider-authoritative stale/no-op result** — the provider told us the work is already done or no longer applicable; *"we could not determine the answer" is NOT this*: a thrown read, an unresolvable identity, a failed durable write and an **unknown** epoch are all **retryable**, never authoritative, and conflating the two is the single most repeated defect in this codebase's history; (3) **annihilation by a newer inverse user action**, only when the earlier operation was **never attempted**, the members match **exactly**, and the new action is a true inverse; (4) **invalidation by an id reset in its own address space** — a **proven** UIDVALIDITY turnover or provider stable-id reset drops every queued op that named an address in that space, because the drain compares an op against its **durable** `PendingOperation.observedUidValidity`, so once the epoch provably moves every retry of that op fails identically and forever rather than executing under numbering it never observed (**C3**: no action may ever mutate the wrong message; failing closed is always acceptable — `KNOWN_ISSUES.md` `IOS-EPOCH-001` / `IOS-ACTION-002`).
 
    **Exit 4 does not widen clause 2.** Exit 4 requires a **proven** epoch change — a *positive* fact. Clause 2's *unknown* epoch is an **absence of evidence** and stays retryable forever. The two are disjoint. Exit 4 is the only exit that is a failure, it is deliberately narrow, and **nothing else may use it**. A bounded, visible, retryable quarantine is **not** a discard, and a transient failure is **not** an exit.
 
@@ -122,9 +122,28 @@ for an online user it may be the majority case. Frequency first, then the mantra
 
 ---
 
-## THE ADDRESS PROBLEM — the root cause behind most action-queue complexity
+## THE ADDRESS PROBLEM — SOLVED in v1.7.0; keep the invariant, not the alarm
 
-**Read this whenever a task touches the action queue, moves, undo, or IMAP identity.** A `PendingOperation` addresses its members in the **source** folder, and on IMAP an address is `(folder, UID, UIDVALIDITY)` — so **a move changes the address**. `COPYUID` hands us the new one; `copyProvenSourceUIDs` reads `pair.destination.value` only to validate it and returns **source** UIDs, so the destination address is never persisted. Every downstream symptom is that one absence: undo of an already-drained move cannot name the message; a later gesture addresses the `\Deleted` source residue instead of the destination copy; `canonicalizeLocalRows` / the UID-remap path repairs the row later on weaker RFC 822 evidence than the wire already proved. **Undo is JUST A REVERSE MOVE, never a rollback** — `v1.6.38` named the message by RFC 822 Message-ID `SEARCH`, which is banned (ADR-IOS-068/D4, registered `IOS-IMAP-002`) and was never replaced. Before designing a receipt, alias table, two-door identity scheme or outcome enum, ask whether the answer is simply to finish the move locally, re-keying the row to the destination UID and epoch at drain time from the `COPYUID` already in hand. The failure this prevents: four audit rounds argued about *which evidence retires an operation* when the real defect was decision **granularity**.
+**Read this whenever a task touches the action queue, moves, undo, or IMAP identity.** The durable
+invariant, which has not changed: a `PendingOperation` addresses its members in the **source**
+folder, on IMAP an address is `(folder, UID, UIDVALIDITY)`, and therefore **a move changes the
+address**. Anything recorded against the source after a move has landed either can never be admitted
+again (a dropped intention) or names whatever now occupies that UID (**C3** wrong-message mutation).
+That is why a composed read-then-move records the read **strictly before** the move, inside the same
+queued closure.
+
+**The problem itself is fixed — do not re-derive it, and do not design around it as if it were still
+open.** `copyProvenSourceUIDs` now returns `destinationProviderId` / `destinationUidValidity`, and
+`MessageHeaderRekey.finishMove` re-keys the row to the destination UID and epoch at drain time from
+the `COPYUID` already in hand. Undo is an ordinary reverse move (`AccountManager.undoMove`), not a
+rollback and not a Message-ID `SEARCH`; the two surviving `searchByMessageId` callers (`currentUIDs`,
+`appendToSentFolder`) are both **non-mutating**, so the banned D4 direction — a SEARCH selecting a
+mutation target (ADR-IOS-068, `IOS-IMAP-002`) — no longer exists in the tree.
+
+**The lesson worth keeping:** four audit rounds argued about *which evidence retires an operation*
+when the real defect was decision **granularity** — the wire had already proved the destination
+address and the code threw it away. Before designing a receipt, alias table, two-door identity scheme
+or outcome enum, ask first whether the wire already handed you the answer.
 
 > Full text, byte-for-byte: [Companion/Memory/Current/111-the-address-problem-root-cause-behind-most-action-queue-complexity.md](Companion/Memory/Current/111-the-address-problem-root-cause-behind-most-action-queue-complexity.md).
 
