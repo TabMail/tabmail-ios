@@ -198,6 +198,21 @@ enum DemoError: Error, LocalizedError {
     case callBudgetExhausted
     case startFailed(String)
     case notInDemo
+    /// R15-FIX-4 — a PROVIDER-AUTHORITATIVE "the addressed demo record does not
+    /// exist": the store was read (or written) successfully and positively reported
+    /// no such row. It is deliberately its OWN case rather than a `.startFailed`
+    /// string, because the calendar drain has to tell it apart from every other
+    /// demo failure to choose a disposition.
+    ///
+    /// 🚨 THE COUNTERFACTUAL, and it is why this case exists at all. Blanket-claiming
+    /// `.startFailed` as terminal is the over-correction: that case also carries
+    /// indeterminate demo *initialization* failures (`DemoModeService.start`), and
+    /// `.notInDemo` is a third state meaning the database was not up — retiring
+    /// either would drop valid work on "we could not determine the answer", which
+    /// never-drop clause 2 forbids. Only this case is a positive fact about the
+    /// record, so only this case may be terminal. Same signal-vs-disposition split
+    /// `AccountManagerCalendarQueue.isGrantLevelOAuthFailure` uses for OAuth codes.
+    case eventNotFound
 
     var errorDescription: String? {
         switch self {
@@ -207,6 +222,8 @@ enum DemoError: Error, LocalizedError {
             return "Could not start demo: \(reason)"
         case .notInDemo:
             return "Not in demo mode."
+        case .eventNotFound:
+            return "That event no longer exists."
         }
     }
 }

@@ -738,12 +738,29 @@ extension AccountManager {
         return "operation not supported on this calendar provider"
     }
 
+    /// ⚠️ **THE DEMO PROVIDER IS A PROVIDER (R15-FIX-4).** `DemoCalendarProvider` is
+    /// registered into `calendarProviders` by `AccountManager.registerDemoProviders`
+    /// (from `DemoModeService`), so it reaches this drain exactly as Google,
+    /// Exchange and CalDAV do — and until R15-FIX-4 its "this event does not exist"
+    /// was spelled `DemoError.startFailed("event not found")`, which NO terminal arm
+    /// claimed. A stale edit therefore wedged the account's whole calendar lane, the
+    /// mirror-image shape R12-T8's banner on `executeCalendarOperation` already
+    /// names as a defect class.
+    ///
+    /// 🚨 **ONLY `.eventNotFound` IS CLAIMED, AND THAT NARROWNESS IS THE FIX.**
+    /// `DemoError.startFailed` also carries indeterminate demo *initialization*
+    /// failures and `.notInDemo` means the database was not up; both are *"we could
+    /// not determine the answer"* and stay retryable forever under never-drop clause
+    /// 2. Blanket-claiming `DemoError` is the over-correction and must not ship —
+    /// the same reasoning, and the same shape, as `isGrantLevelOAuthFailure`'s
+    /// deliberately exact three OAuth codes below.
     static func isCalendarNotFoundError(_ error: Error) -> Bool {
         if case GoogleCalendarError.httpError(404, _) = error { return true }
         if case GoogleCalendarError.eventNotFound = error { return true }
         if case ExchangeCalendarError.httpError(404, _) = error { return true }
         if case ExchangeCalendarError.eventNotFound = error { return true }
         if case CalDAVError.notFound = error { return true }
+        if case DemoError.eventNotFound = error { return true }
         return false
     }
 

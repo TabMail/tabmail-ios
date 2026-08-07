@@ -383,6 +383,17 @@ struct CalendarBadRequestClassificationTests {
             ("CalDAV stale-ETag precondition", CalDAVError.preconditionFailed, false),
             ("CalDAV unreadable response body", CalDAVError.parseError("Empty response for event evt-1"), false),
             ("CalDAV half-landed split, rollback failed", CalDAVError.inconsistentState("capped, no successor"), true),
+            // — Demo: a registered `CalendarProvider` like any other (R15-FIX-4).
+            //   `DemoModeService` calls `AccountManager.registerDemoProviders`, which
+            //   puts `DemoCalendarProvider` into `calendarProviders`, so this drain
+            //   executes its errors. The roster omitted the whole provider, and that
+            //   omission is why the classifier gap survived — the derivation rule
+            //   above says "every error type that can propagate out of
+            //   `executeCalendarOperation`", and it walked the three PROVIDER ENUMS
+            //   instead of the providers (`MIS-007`, a census inheriting its search
+            //   shape) —
+            ("Demo event not found (stale edit)", DemoError.eventNotFound, true),
+            ("Demo database not up", DemoError.notInDemo, false),
             // — Cross-provider —
             ("provider cannot perform this edit scope", CalendarProviderError.notSupported("this_and_following"), true),
             // — THE R14-F4 CLASS: raised before any request is issued —
@@ -406,7 +417,7 @@ struct CalendarBadRequestClassificationTests {
         // MIS-030: anchor the roster's own cardinality, so a future edit that
         // silently empties or truncates it cannot make every assertion below
         // pass over nothing.
-        #expect(roster.count == 30, "the roster lost or gained entries — re-derive it from the call graph")
+        #expect(roster.count == 32, "the roster lost or gained entries — re-derive it from the call graph")
         for (label, error, terminal) in roster {
             #expect(
                 claimedByATerminalArm(error) == terminal,
@@ -441,6 +452,86 @@ struct CalendarBadRequestClassificationTests {
         for code in ["temporarily_unavailable", "server_error", "unknown", "invalid_scope", ""] {
             #expect(claimedByATerminalArm(OAuthError.tokenExchangeFailed(code)) == false,
                     "'\(code)' is indeterminate or is our own request bug — retiring the op on it deletes the user's queued calendar operation for a condition that clears itself")
+        }
+    }
+
+    // MARK: - R15-FIX-4 — the demo provider's stale edit
+
+    /// 🚨 THE INVARIANT THIS PINS — the system property, not the mechanism
+    /// (`MIS-015`): **a provider-authoritative "this event does not exist" retires
+    /// the operation instead of wedging the lane.**
+    ///
+    /// The reachable sequence: an edit tool reads a Demo event and awaits user
+    /// confirmation, another chat deletes it, the user confirms. `updateEvent`'s
+    /// UPDATE matches zero rows and its confirming `getEvent` finds none — and for an
+    /// edit carrying attendee deltas, `resolveAttendeeDelta` reaches `getEvent`
+    /// before any update is attempted. Until R15-FIX-4 that was
+    /// `DemoError.startFailed("event not found")`, claimed by NO terminal arm, so it
+    /// fell to the transient arm: requeue, `retryCount += 1` (this file has no retry
+    /// cap — one increment, zero comparisons) and `failedAccounts.insert`. The next
+    /// drain's `if failedAccounts.contains(currentOp.accountId) { continue }` then
+    /// skipped every later calendar op on that account, forever, with the wedged op
+    /// reached first every time because ops are ordered `createdAt ASC`.
+    ///
+    /// `DemoCalendarProvider` reaches this drain like any other provider:
+    /// `DemoModeService` → `AccountManager.registerDemoProviders` →
+    /// `calendarProviders[accountId] = calendar`.
+    @Test("A stale demo calendar edit is retired instead of wedging the account's calendar lane")
+    func staleDemoEditIsTerminal() {
+        #expect(AccountManager.isCalendarNotFoundError(DemoError.eventNotFound),
+                "the demo store positively reported no such row — that is the same provider-authoritative fact Google's 404 and CalDAV's notFound carry")
+        #expect(claimedByATerminalArm(DemoError.eventNotFound),
+                "claimed by NO terminal arm, the op is requeued forever at the head of a createdAt-ASC queue and head-of-line-blocks the account's whole calendar lane — a wedge sits in the same non-recoverable set as a dropped intention")
+    }
+
+    /// END-TO-END, because the two assertions above are about the CLASSIFIER and a
+    /// classifier test alone would stay green if the provider went on raising the
+    /// unclassifiable spelling (`MIS-015`). This drives the REAL
+    /// `DemoCalendarProvider` against the real database and asserts the value it
+    /// actually throws is the one a terminal arm claims — the loop the wedge lived
+    /// in. Read-only: it addresses an id no row can carry, so it needs no fixture
+    /// and leaves nothing behind.
+    @Test("The demo provider raises the classifiable signal for an event that is gone")
+    func demoProviderRaisesTheClassifiableSignal() async {
+        let provider = DemoCalendarProvider(accountId: DemoSeed.demoAccountId)
+        do {
+            _ = try await provider.getEvent(
+                calendarId: "primary", eventId: "r15fix4-absent-\(UUID().uuidString)")
+            Issue.record("reading an event that does not exist must throw")
+        } catch {
+            #expect(claimedByATerminalArm(error),
+                    "the value the provider actually throws must reach a terminal arm — a classifier that claims a case nothing raises leaves the lane wedged exactly as before: \(error)")
+            #expect(AccountManager.isCalendarNotFoundError(error),
+                    "and it must be claimed as the provider-authoritative not-found, not by some unrelated terminal arm: \(error)")
+        }
+    }
+
+    /// TWO-SIDED ANCHOR — the over-correction, pinned so it cannot be traded in
+    /// (`MIS-026`). Blanket-terminalizing `DemoError` is the obvious "fix" and it is
+    /// wrong: `.startFailed` also carries indeterminate demo INITIALIZATION failures
+    /// (`DemoModeService.start` raises it twice), and `.notInDemo` means
+    /// `AppDatabase.shared` was nil — the database was not up. Both are *"we could
+    /// not determine the answer"*, which never-drop clause 2 keeps retryable forever.
+    /// Retiring either deletes the user's queued calendar operation for a condition
+    /// that clears itself.
+    ///
+    /// `.startFailed` is deliberately NOT in `reachableErrorRoster()`: giving the
+    /// authoritative fact its own spelling is exactly what removed `.startFailed`
+    /// from `DemoCalendarProvider`, so it is no longer reachable from
+    /// `executeCalendarOperation` and the roster's stated derivation excludes it.
+    /// It is anchored here instead, because "unreachable today" is a property of
+    /// today's callers rather than an invariant.
+    @Test("An indeterminate demo failure stays retryable")
+    func indeterminateDemoFailuresAreStillRetryable() {
+        for (label, error) in [
+            ("demo could not start", DemoError.startFailed("Demo not available right now.")),
+            ("demo record read failed for an unstated reason", DemoError.startFailed("event not found")),
+            ("database not up", DemoError.notInDemo),
+        ] {
+            #expect(claimedByATerminalArm(error) == false,
+                    "\(label): a terminal arm claims it, so the durable PendingCalendarOperation row is DELETED for a demo failure that says nothing about whether the event exists")
+            #expect(AccountManager.isCalendarNotFoundError(error) == false,
+                    "\(label): must not be read as the provider saying the event is gone")
         }
     }
 

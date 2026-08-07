@@ -87,7 +87,32 @@ actor DemoCalendarProvider: CalendarProvider {
                 .fetchOne(conn, sql: "SELECT * FROM demoCalendarEvent WHERE id = ?", arguments: [eventId])
         }
         guard let row else {
-            throw DemoError.startFailed("event not found")
+            // R15-FIX-4 — was `DemoError.startFailed("event not found")`, which no
+            // terminal arm of `AccountManagerCalendarQueue` claimed. A stale edit
+            // (the agent reads an event, awaits confirmation, another chat deletes
+            // it, the user confirms) therefore fell to the transient arm, which
+            // requeues the op AND inserts the account into `failedAccounts` — and
+            // that file has no retry cap, one `retryCount += 1` and zero
+            // comparisons. `drainCalendarQueue`'s `if failedAccounts.contains(...)
+            // { continue }` then skipped every later calendar op on that account,
+            // on every drain, forever; ops are ordered `createdAt ASC` so the
+            // wedged one is reached first every time. A wedge sits in the same
+            // non-recoverable set as a dropped intention.
+            //
+            // ⚠️ THIS READ IS THE AUTHORITY FOR BOTH STALE-EDIT PATHS, which is why
+            // the signal is raised here rather than from `updateEvent`'s affected-row
+            // count. An `.edit` op carrying `add_attendees`/`remove_attendees`
+            // reaches `resolveAttendeeDelta` → `getEvent` BEFORE any update is
+            // attempted; every other `.edit` reaches `updateEvent`, whose UPDATE
+            // matches zero rows and which then confirms through this same `getEvent`.
+            // An affected-row check alone would have covered only the second.
+            //
+            // `createEvent`'s trailing confirmation read shares this throw, and the
+            // disposition is right there too: reaching it means the row we just
+            // inserted was deleted underneath us, so the event genuinely does not
+            // exist and re-creating it on retry would resurrect something that was
+            // just deleted.
+            throw DemoError.eventNotFound
         }
         return Self.toGCalEvent(row)
     }
