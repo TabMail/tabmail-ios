@@ -896,6 +896,74 @@ struct ComposeDraftGuardTests {
         #expect(!toldTheUser, "an admitted durable auto-save must not warn the user")
     }
 
+    // MARK: R15-FIX-1 — the R14-F3 class, not just its instance
+
+    /// 🚨 THE INVARIANT THIS PINS — the system property, not the mechanism
+    /// (`MIS-015`): **a durable auto-save that fails for a reason other than losing a
+    /// generation CAS produces a user-visible warning.**
+    ///
+    /// R14-F3 closed exactly ONE exit of `DynamicIslandChat.autoSaveDraft` — the
+    /// refused durable admission, pinned by the two tests directly above. Every
+    /// EARLIER exit of the same function still returned silently, and those are the
+    /// *more likely* failure modes: a thrown predecessor read, a thrown save on
+    /// either branch, and an unresolvable owning account. On each of them the user's
+    /// typed text is stranded with no signal whatsoever — the compose sheet looks
+    /// identical to a successful turn, and on this surface there is no dismissal to
+    /// withhold. That is `MIS-006`: the instance fixed, the class left open.
+    ///
+    /// Asserted as a SET, not case-by-case, so a future exit added to the roster and
+    /// classified silent breaks this test instead of joining the silent majority.
+    @Test("Every determinable auto-save failure warns the user")
+    func everyDeterminableAutoSaveFailureWarnsTheUser() {
+        let warning = Set(ComposeDraftGuards.AutoSaveExit.allCases
+            .filter { ComposeDraftGuards.autoSaveExitWarnsUser($0) })
+        #expect(warning == [
+            .predecessorReadFailed,
+            .updateSaveFailed,
+            .noAccountForFirstSave,
+            .firstSaveFailed,
+            .durableAdmissionRefused,
+        ], "a thrown read, a thrown write on either branch, an unresolvable account and a refused durable admission are all 'we could not do it' — never provider-authoritative success — so each must reach the user")
+        // Non-vacuity: the hazard is real only if these exits exist at all.
+        #expect(warning.count == 5)
+    }
+
+    /// TWO-SIDED ANCHOR — the DELIBERATELY HELD direction (`MIS-026`). Without this,
+    /// `everyDeterminableAutoSaveFailureWarnsTheUser` would still pass against a
+    /// guard that warns on EVERY exit, which is the mirror image and its own defect:
+    ///
+    /// > Do not warn merely because `cursor.admit` returns a non-applied CAS result —
+    /// > a newer generation may already have durably won, and warning there would
+    /// > report a false failure. The correct opposite direction is to surface actual
+    /// > read/write/account-resolution failures while retaining the silent
+    /// > newer-generation no-op.
+    ///
+    /// A lost CAS is not a failure at all: a NEWER save of the same draft already
+    /// landed durably, so the user's text is safe and a warning there is a lie that
+    /// trains them to ignore the channel. `.composeUnavailable` is held silent for a
+    /// different reason — `autoSaveDraft`'s single caller, `sendComposeEdit`, already
+    /// returns early with its own dedicated warning on the same conditions, so
+    /// warning here would double-report one cause.
+    ///
+    /// This is the side that must stay GREEN when the fix is inverted toward
+    /// blanket-warning.
+    @Test("A lost-generation auto-save no-op warns nothing")
+    func aLostGenerationAutoSaveNoOpWarnsNothing() {
+        let silent = Set(ComposeDraftGuards.AutoSaveExit.allCases
+            .filter { !ComposeDraftGuards.autoSaveExitWarnsUser($0) })
+        #expect(silent == [
+            .updateLostGeneration,
+            .firstSaveLostGeneration,
+            .composeUnavailable,
+        ], "only a CAS no-op (a newer generation durably won) or an entry condition already warned upstream may pass silently")
+        #expect(silent.count == 3)
+        // The roster is exhaustive: every exit is classified exactly once, so a new
+        // one cannot be added without landing in one of the two asserted sets.
+        #expect(silent.count + ComposeDraftGuards.AutoSaveExit.allCases
+            .filter({ ComposeDraftGuards.autoSaveExitWarnsUser($0) }).count
+            == ComposeDraftGuards.AutoSaveExit.allCases.count)
+    }
+
     /// ORDER, not just outcome — the sibling `dismissRunsAfterTheDeleteLands` applied
     /// to this path: at the instant the UI acknowledges the save, the durable
     /// producer must already have returned its verdict.

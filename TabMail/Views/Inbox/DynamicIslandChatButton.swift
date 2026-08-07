@@ -1490,6 +1490,36 @@ struct DynamicIslandChat: View {
         }
     }
 
+    /// The ONE user-facing string for "this compose-edit turn's auto-save did not
+    /// land". Held in a single place so the five exits that surface it cannot drift
+    /// apart, and so a sixth cannot be added with a sixth wording.
+    private static let autoSaveDidNotLandWarning =
+        "This draft couldn't be saved to your Drafts folder. Your text is still here — tap Save to try again."
+
+    /// R15-FIX-1 — THE ONE PLACE `autoSaveDraft` DECIDES WHETHER THE USER HEARS
+    /// ABOUT AN EXIT. Every early return in `autoSaveDraft` goes through here, so
+    /// the roster in `ComposeDraftGuards.AutoSaveExit` is the LIVE decision rather
+    /// than a parallel description of it — a new exit cannot be added without
+    /// choosing a case, and choosing a case is choosing warn-or-silent.
+    ///
+    /// Surfaced as a chat `.warning`, which is this surface's own failure channel —
+    /// the same one `sendComposeEdit`'s two catch arms use — and which persists in
+    /// the transcript. `agentToast` is deliberately NOT used: it renders only while
+    /// the pill is collapsed (`!isExpanded`), and the compose sheet this message is
+    /// about is on screen precisely when it is expanded.
+    ///
+    /// ⚠️ NOT A ROLLBACK, and that is the mirror image (see
+    /// `ComposeDraftGuards.runCheckedDurableAutoSave`): whatever the local `Draft`
+    /// row already holds stays exactly as saved. Deleting it on a failed exit would
+    /// destroy the very text this signal exists to protect.
+    private func finishAutoSave(_ exit: ComposeDraftGuards.AutoSaveExit) {
+        guard ComposeDraftGuards.autoSaveExitWarnsUser(exit) else { return }
+        chatMessages.append(ChatMessage(
+            role: .warning,
+            content: Self.autoSaveDidNotLandWarning,
+            timestamp: Date()))
+    }
+
     /// Auto-save the current draft state to GRDB for resume on reopen.
     private func autoSaveDraft(draftKey: String, subject: String, body: String) async {
         let entryTime = Date()
@@ -1502,6 +1532,7 @@ struct DynamicIslandChat: View {
             if DebugModeManager.isLoggingEnabled() {
                 print("[DraftStore] autoSaveDraft: exit (no composeContext) draftKey=\(draftKey)")
             }
+            finishAutoSave(.composeUnavailable)
             return
         }
         let editHistJSON = Draft.encodeEditHistory(editHistory)
@@ -1518,6 +1549,7 @@ struct DynamicIslandChat: View {
             existingLoaded = try DraftStore.shared.load(id: draftKey)
         } catch {
             print("[DraftStore] Auto-save predecessor read failed: \(error)")
+            finishAutoSave(.predecessorReadFailed)
             return
         }
         if DebugModeManager.isLoggingEnabled() {
@@ -1539,13 +1571,20 @@ struct DynamicIslandChat: View {
                         epoch: newEpoch,
                         expectedPredecessor: predecessor)
                 }
-                guard result == .applied else { return }
+                guard result == .applied else {
+                    finishAutoSave(.updateLostGeneration)
+                    return
+                }
                 if DebugModeManager.isLoggingEnabled() {
                     let saveMs = Int(Date().timeIntervalSince(saveStart) * 1000)
                     print("[DraftStore] autoSaveDraft: save (existing) took \(saveMs)ms draftKey=\(draftKey)")
                 }
             }
-            catch { print("[DraftStore] Auto-save failed: \(error)"); return }
+            catch {
+                print("[DraftStore] Auto-save failed: \(error)")
+                finishAutoSave(.updateSaveFailed)
+                return
+            }
         } else {
             // First save — need accountId. Use sender email from context to find account.
             let accountId: String? = try? await AppDatabase.dbPool.read { db in
@@ -1555,6 +1594,7 @@ struct DynamicIslandChat: View {
                 if DebugModeManager.isLoggingEnabled() {
                     print("[DraftStore] autoSaveDraft: exit (no account for first save) draftKey=\(draftKey)")
                 }
+                finishAutoSave(.noAccountForFirstSave)
                 return
             }
             savedAccountId = aid
@@ -1590,13 +1630,20 @@ struct DynamicIslandChat: View {
                         epoch: newEpoch,
                         expectedPredecessor: predecessor)
                 }
-                guard result == .applied else { return }
+                guard result == .applied else {
+                    finishAutoSave(.firstSaveLostGeneration)
+                    return
+                }
                 if DebugModeManager.isLoggingEnabled() {
                     let saveMs = Int(Date().timeIntervalSince(saveStart) * 1000)
                     print("[DraftStore] autoSaveDraft: save (first) took \(saveMs)ms draftKey=\(draftKey)")
                 }
             }
-            catch { print("[DraftStore] Auto-save failed (first save): \(error)"); return }
+            catch {
+                print("[DraftStore] Auto-save failed (first save): \(error)")
+                finishAutoSave(.firstSaveFailed)
+                return
+            }
         }
 
         // Queue server push via PendingOperation (crash-safe, retried on failure/launch).
@@ -1612,23 +1659,18 @@ struct DynamicIslandChat: View {
         // see `ComposeDraftGuards.runCheckedDurableAutoSave` for the full argument
         // and for why NOT rolling the local row back is load-bearing.
         //
-        // Surfaced as a chat `.warning`, which is this surface's own failure
-        // channel — the same one `sendComposeEdit`'s two catch arms use — and which
-        // persists in the transcript. `agentToast` is deliberately NOT used: it
-        // renders only while the pill is collapsed (`!isExpanded`), and the compose
-        // sheet this message is about is on screen precisely when it is expanded.
+        // Surfaced through `finishAutoSave` above, which is this surface's own
+        // failure channel and now the SHARED one: R15-FIX-1 routed the four earlier
+        // failure exits of this function through the same signal, because leaving
+        // them silent while only this one warned was `MIS-006` — the instance fixed,
+        // the class left open.
         if let savedAccountId {
             await ComposeDraftGuards.runCheckedDurableAutoSave(
                 save: {
                     await AccountManager.shared.queueDraftSave(
                         draftId: draftKey, accountId: savedAccountId)
                 },
-                onAdmissionFailure: {
-                    chatMessages.append(ChatMessage(
-                        role: .warning,
-                        content: "This draft couldn't be saved to your Drafts folder. Your text is still here — tap Save to try again.",
-                        timestamp: Date()))
-                })
+                onAdmissionFailure: { finishAutoSave(.durableAdmissionRefused) })
         }
         if DebugModeManager.isLoggingEnabled() {
             let totalMs = Int(Date().timeIntervalSince(entryTime) * 1000)

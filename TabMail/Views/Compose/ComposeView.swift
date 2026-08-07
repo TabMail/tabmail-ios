@@ -275,6 +275,80 @@ enum ComposeDraftGuards {
         }
     }
 
+    /// ⚑ NO REFERENCE — INVENTED. R15-FIX-1.
+    ///
+    /// EXHAUSTIVE roster of the ways `DynamicIslandChat.autoSaveDraft` can return
+    /// **without** the compose-edit turn's authored text having reached the durable
+    /// Drafts route. R14-F3 wired `runCheckedDurableAutoSave` above at the LAST of
+    /// them (`.durableAdmissionRefused`) and left every earlier one returning
+    /// silently — so the *more likely* failure modes stranded the user's text with
+    /// no signal at all. That is `MIS-006`: the instance was fixed and the class was
+    /// not. This enum exists so the class is enumerated in one place and a new exit
+    /// cannot be added without classifying it.
+    ///
+    /// 🚨 THE COUNTERFACTUAL — this is the whole point, and it is why the roster is
+    /// split rather than blanket-warned:
+    /// > Do not warn merely because `cursor.admit` returns a non-applied CAS result —
+    /// > a newer generation may already have durably won, and warning there would
+    /// > report a false failure. The correct opposite direction is to surface actual
+    /// > read/write/account-resolution failures while retaining the silent
+    /// > newer-generation no-op.
+    ///
+    /// So the two `guard result == .applied` sites are **CAS no-ops and MUST stay
+    /// silent**: another, newer save of the same draft already landed, the user's
+    /// text is durable, and a warning there is a lie that trains the user to ignore
+    /// the channel. The mirror image of R14-F3's own bug is a warning after every
+    /// successful agent turn.
+    enum AutoSaveExit: String, CaseIterable, Sendable {
+        /// The entry guard — no `composeContext`, no `ComposeGenerationCursor`, or
+        /// `composeMutationAllowed == false`.
+        case composeUnavailable
+        /// `DraftStore.load` THREW reading the predecessor row.
+        case predecessorReadFailed
+        /// Update branch: `cursor.admit` returned a non-`.applied` CAS result.
+        case updateLostGeneration
+        /// Update branch: the admitted `saveAsync` THREW.
+        case updateSaveFailed
+        /// First-save branch: the row's owning account could not be resolved.
+        case noAccountForFirstSave
+        /// First-save branch: `cursor.admit` returned a non-`.applied` CAS result.
+        case firstSaveLostGeneration
+        /// First-save branch: the admitted `saveAsync` THREW.
+        case firstSaveFailed
+        /// `AccountManager.queueDraftSave` refused the durable admission (R14-F3).
+        case durableAdmissionRefused
+    }
+
+    /// Whether an `AutoSaveExit` must produce a user-visible warning.
+    ///
+    /// THE INVARIANT: *a durable auto-save that fails for a reason other than losing
+    /// a generation CAS produces a user-visible warning.* A thrown read, a thrown
+    /// write and an unresolvable account are all "we could not determine / could not
+    /// do it" — never provider-authoritative success — and on this surface nothing
+    /// else can tell the user, because there is no dismissal to withhold and the
+    /// compose sheet looks identical either way (the sibling argument recorded on
+    /// `runCheckedDurableAutoSave`).
+    ///
+    /// `.composeUnavailable` is SILENT and is not an oversight: `autoSaveDraft` has
+    /// exactly one caller, inside `sendComposeEdit`, which already returns early with
+    /// its own dedicated warning ("This draft did not finish loading. Close and
+    /// reopen it before editing.") on the same `composeMutationAllowed` /
+    /// `composeContext` conditions. Warning again would double-report one cause.
+    static func autoSaveExitWarnsUser(_ exit: AutoSaveExit) -> Bool {
+        switch exit {
+        case .composeUnavailable,
+             .updateLostGeneration,
+             .firstSaveLostGeneration:
+            return false
+        case .predecessorReadFailed,
+             .updateSaveFailed,
+             .noAccountForFirstSave,
+             .firstSaveFailed,
+             .durableAdmissionRefused:
+            return true
+        }
+    }
+
     /// PORT — `v2final:ServerDraftOpen.mayBindPersistedDraft` (commits `a8eb813b5`,
     /// `69a9bae88`), relocated here because this forward-port has no
     /// `ServerDraftOpen` enum.
