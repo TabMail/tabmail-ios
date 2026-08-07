@@ -725,15 +725,45 @@ final class MessageDetailViewModel {
     /// excluded because the detail view's body fetch + AI processing use those
     /// to address the IMAP folder, and an optimistic move's overlay points at
     /// the destination before the message has physically been moved there.
+    ///
+    /// 🚨 `tagSortOrder` IS MIRRORED HERE, AND "DISPLAY-ONLY" IS NOT A REASON
+    /// TO SKIP IT (R13-U13, sibling half). `actionTag` and `tagSortOrder` are
+    /// ONE fact stored twice. This view model is NOT like `InboxViewModel`,
+    /// whose display array is `[MessageSnapshot]` and whose undo snapshots come
+    /// from a DB-fresh `MessageHeader` via `AccountManager.overlayAdjustedSnapshot`:
+    /// here `message` / `threadMessages` are `MessageHeader`s and the SAME
+    /// values are handed straight to `UndoableAction(messages:)` by
+    /// `archiveMessage` / `deleteMessage` / `moveMessage`. `UndoMember.init(header:)`
+    /// records BOTH fields off them and `AccountManagerActions.undoMove` writes
+    /// BOTH durably, so a pair written apart on a "display" header becomes a
+    /// durably corrupt row — the chip says one thing and triage files it
+    /// somewhere else. That is the exact shape migration `v58` was written to
+    /// heal once, and a one-time heal does not re-run.
+    ///
+    /// The expression is `MessageHeader.setActionTag`'s, verbatim — that
+    /// function is the pairing's source of truth — and is inlined for the same
+    /// reason `overlayAdjustedSnapshot` inlines it: `setActionTag` also stamps
+    /// `actionTagSetAt`, which the overlay does not carry and `UndoMember` does
+    /// not record, so stamping it here would invent a fact rather than mirror
+    /// one.
+    ///
+    /// Mirroring cannot move a row under the user's finger (User Interaction
+    /// Freeze Rule): the detail view orders threads by `(date, id)` only —
+    /// `recomputeThreadSplit` — and nothing under `TabMail/Views/` reads
+    /// `tagSortOrder`.
     private func applyOverlay(to header: inout MessageHeader) {
         let overlay = manager.snapshotOverlay()
         guard let mutation = overlay[header.id] else { return }
         if let v = mutation.isRead { header.isRead = v }
         if let v = mutation.isFlagged { header.isFlagged = v }
-        if let v = mutation.actionTag { header.actionTag = v }
+        if let v = mutation.actionTag {
+            header.actionTag = v
+            header.tagSortOrder = v?.sortOrder ?? 99
+        }
         if let v = mutation.isInInbox { header.isInInbox = v }
     }
 
+    /// Array overload — same pairing rule as the single-header overload above.
     private func applyOverlay(to headers: inout [MessageHeader]) {
         let overlay = manager.snapshotOverlay()
         guard !overlay.isEmpty else { return }
@@ -741,7 +771,10 @@ final class MessageDetailViewModel {
             guard let mutation = overlay[headers[i].id] else { continue }
             if let v = mutation.isRead { headers[i].isRead = v }
             if let v = mutation.isFlagged { headers[i].isFlagged = v }
-            if let v = mutation.actionTag { headers[i].actionTag = v }
+            if let v = mutation.actionTag {
+                headers[i].actionTag = v
+                headers[i].tagSortOrder = v?.sortOrder ?? 99
+            }
             if let v = mutation.isInInbox { headers[i].isInInbox = v }
         }
     }
@@ -1586,12 +1619,29 @@ final class MessageDetailViewModel {
     /// the Inbox (true), which must re-enable inbox-only UI (tags, summary, triage).
     /// Internal (not `private`) so tests can drive the locally-moved-bubble
     /// preserve contract without a full archive/delete flow (folders + IMAP drain).
+    ///
+    /// The tag clear mirrors `tagSortOrder` — see `applyOverlay(to:)` for why a
+    /// pair written apart on a thread header reaches a durable write.
+    ///
+    /// This site runs AFTER its caller's `UndoService.push`, so it cannot
+    /// corrupt THAT action's member; it corrupts a LATER one. The card stays on
+    /// screen showing its new location, and the row it leaves behind is
+    /// `(actionTag: nil, tagSortOrder: <the old tag's bucket>)`. The next thread
+    /// reload carries that exact in-memory row forward verbatim while the move
+    /// is still pinned (`localMovePins` → the append-current-row branch of
+    /// `loadThreadMessagesAsync`), `recomputeThreadSplit` copies it into
+    /// `earlierMessages`/`laterMessages`, and `MessageDetailView.cardRow`'s
+    /// swipe Delete / Move buttons hand that copy to `deleteMessage` /
+    /// `moveMessage` — neither of which is guarded against a row already out of
+    /// the inbox. `executeTaggedAction` is NOT a route here (it early-returns on
+    /// a nil `actionTag`), which is exactly why this member is easy to miss.
     func updateThreadMessageFolder(_ msg: MessageHeader, newFolderPath: String, newFolderId: String, isInInbox newIsInInbox: Bool = false) {
         guard let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) else { return }
         threadMessages[idx].folderPath = newFolderPath
         threadMessages[idx].folderId = newFolderId
         threadMessages[idx].isInInbox = newIsInInbox
         threadMessages[idx].actionTag = nil
+        threadMessages[idx].tagSortOrder = 99
         localMovePins[msg.id, default: 0] += 1
     }
 
@@ -1678,6 +1728,16 @@ final class MessageDetailViewModel {
         return true
     }
 
+    /// The badge menu's retag (`MessageCardView.actionTagBadge`) — the only
+    /// route to this function.
+    ///
+    /// The optimistic writes mirror `tagSortOrder`: see `applyOverlay(to:)` for
+    /// why a pair written apart here is not display-local. `message` and
+    /// `threadMessages[idx]` are exactly the values `MessageCardView.message`
+    /// resolves and hands back through `executeTaggedAction` /
+    /// `handleArchive` / `handleDelete` / `handleMove` into
+    /// `archiveMessage` / `deleteMessage` / `moveMessage`, which push them into
+    /// `UndoableAction`. Retag → archive → undo is the reproduction.
     func applyManualTag(_ msg: MessageHeader, tag: ActionTag?) {
         // Baseline captured from the passed header BEFORE the optimistic
         // mutations below — `msg` is the render-time snapshot (visualized
@@ -1686,9 +1746,11 @@ final class MessageDetailViewModel {
         // Optimistic UI update
         if msg.id == message?.id {
             message?.actionTag = tag
+            message?.tagSortOrder = tag?.sortOrder ?? 99
         }
         if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
             threadMessages[idx].actionTag = tag
+            threadMessages[idx].tagSortOrder = tag?.sortOrder ?? 99
         }
         // Gesture intents on the same id coalesce to the NET target
         // (ADR-IOS-057) — see `InboxViewModel.toggleRead`'s doc comment.

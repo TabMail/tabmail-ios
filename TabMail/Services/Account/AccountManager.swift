@@ -616,6 +616,18 @@ actor AccountManager {
         // `setActionTag` also stamps `actionTagSetAt`, which the overlay does
         // not carry and `UndoMember` does not record; stamping it here would
         // invent a fact rather than mirror one.
+        //
+        // ⚠️ THIS FUNCTION IS NOT THE ONLY FEEDER OF `UndoMember`, and reading
+        // it as one is what left the sibling half open for a day. It covers the
+        // six `InboxViewModel` pushes (via `overlayAdjustedForUndo`) and
+        // `SettingsView`'s. The three `MessageDetailViewModel` pushes —
+        // `archiveMessage` / `deleteMessage` / `moveMessage` — do NOT call it:
+        // that view model holds `MessageHeader`s in `message` / `threadMessages`
+        // and hands those values straight to `UndoableAction(messages:)`, so the
+        // pairing there is enforced at ITS four writers instead (`applyOverlay`
+        // ×2, `updateThreadMessageFolder`, `applyManualTag`). Fixing one place
+        // does not close the class; the class is "every `actionTag` write on a
+        // value that can reach `UndoMember.init(header:)`".
         if let actionTag = m.actionTag {
             h.actionTag = actionTag
             h.tagSortOrder = actionTag?.sortOrder ?? 99

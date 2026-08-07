@@ -60,7 +60,8 @@ struct MessageDetailViewModelMoveTests {
     @MainActor
     @discardableResult
     private func insertHeader(
-        _ pool: DatabasePool, messageId: String, folderPath: String, isInInbox: Bool
+        _ pool: DatabasePool, messageId: String, folderPath: String, isInInbox: Bool,
+        actionTag: ActionTag? = nil
     ) throws -> MessageHeader {
         var header = MessageHeader(
             messageId: messageId, subject: "Test",
@@ -72,6 +73,10 @@ struct MessageDetailViewModelMoveTests {
         )
         header.isRead = true
         header.headerComplete = true
+        // `setActionTag` is the pairing's source of truth, so a seeded row is
+        // consistent by construction — the fixture can never supply the corrupt
+        // pair the test is looking for.
+        if let actionTag { header.setActionTag(actionTag) }
         try pool.writeWithoutTransaction { try header.insert($0) }
         return try pool.read { db in
             try MessageHeader
@@ -261,5 +266,100 @@ struct MessageDetailViewModelMoveTests {
 
         #expect(UndoService.shared.undoStack.isEmpty)
         #expect(AccountManager.shared.snapshotOverlay()[ghostId] == nil)
+    }
+
+    // MARK: - (actionTag, tagSortOrder) — the pair a durable write must never split
+
+    /// 🚨 INVARIANT: **no durable write ever lands an `(actionTag, tagSortOrder)`
+    /// pair that disagrees.** The two columns are ONE fact stored twice; the
+    /// triage list sorts by `ORDER BY tagSortOrder ASC, date DESC` while the
+    /// chip renders `actionTag`, so a split pair is a row whose chip says one
+    /// thing and whose position says another. It is the exact shape migration
+    /// `v58` was written to heal ONCE — and a one-time heal does not re-run, so
+    /// anything corrupted after v58 stays corrupted.
+    ///
+    /// This is the sibling half of R13-U13 (`d3a95d26f`), which closed the
+    /// inbox-gesture route by mirroring inside
+    /// `AccountManager.overlayAdjustedSnapshot`. That fix does not reach here:
+    /// `InboxViewModel`'s display array is `[MessageSnapshot]` and its six undo
+    /// pushes pass a DB-fresh `MessageHeader` through `overlayAdjustedForUndo`,
+    /// whereas `MessageDetailViewModel` holds `MessageHeader`s in `message` /
+    /// `threadMessages` and hands those very values to
+    /// `UndoableAction(messages:)`. Any display write that touched one field and
+    /// not the other therefore travelled into `UndoMember.init(header:)` — which
+    /// records BOTH — and out of `AccountManagerActions.undoMove`, which writes
+    /// BOTH durably.
+    ///
+    /// PINNED AS THE END STATE, NOT THE MECHANISM: the assertion is
+    /// `row.tagSortOrder == (row.actionTag?.sortOrder ?? 99)` on the row the
+    /// undo actually wrote — never "which expression computes the sort order",
+    /// and never the captured `UndoMember`'s fields. It stays honest if the
+    /// mapping changes, if the mirror moves to a helper, or if the capture path
+    /// is rewritten.
+    ///
+    /// NON-VACUITY (`MIS-030`, `MIS-027`): the fixture is anchored on both sides
+    /// — the seeded row is asserted consistent BEFORE the gesture, the
+    /// post-archive row is asserted to have actually left the inbox, and the
+    /// restored row is asserted to be back in INBOX. Without the last one a
+    /// refused `undoMove` (which returns without writing anything) would leave
+    /// the untouched `(nil, 99)` row passing the pairing assertion for free.
+    @Test("Retag in the detail view, archive, undo — the restored row's actionTag and tagSortOrder still agree")
+    @MainActor
+    func detailRetagThenArchiveThenUndoRestoresAConsistentTagPair() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay()
+        }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        // A tagged inbox row. `.reply` sorts at 0, `.delete` at 3 — so a
+        // retag that moves one field and not the other is visible as a gap.
+        let focused = try insertHeader(
+            pool, messageId: "u13b-focused", folderPath: Self.inboxPath, isInInbox: true,
+            actionTag: .reply)
+        #expect(focused.actionTag == .reply)
+        #expect(focused.tagSortOrder == ActionTag.reply.sortOrder,
+                "fixture anchor: the seeded row's pair agrees, so any disagreement below is the code's")
+
+        let vm = MessageDetailViewModel(messageId: focused.id, dbPool: pool, fetchBodyOverride: { _ in })
+        vm._testSeedMessage(focused)
+
+        // THE REPRODUCTION, as the user performs it: retag from the card's
+        // badge menu (`MessageCardView.actionTagBadge` → `applyManualTag`), then
+        // archive. Both are synchronous MainActor gestures with no suspension
+        // between them, exactly as two taps are — nothing can re-read the row
+        // and quietly repair the in-memory header in between.
+        let target = try #require(vm.message)
+        vm.applyManualTag(target, tag: .delete)
+        #expect(vm.message?.actionTag == .delete, "the retag took, so this is the header the undo capture sees")
+        #expect(vm.archive(), "archive must be recorded — otherwise no undo entry exists to assert on")
+
+        await settle()
+
+        // Anchor the mid-state: the forward move landed, so the undo below is
+        // reversing a real move rather than asserting on an untouched row.
+        let archived = try #require(
+            try await pool.read { db in try MessageHeader.fetchOne(db, key: focused.id) })
+        #expect(archived.folderPath == Self.archivePath)
+        #expect(archived.isInInbox == false)
+
+        #expect(UndoService.shared.undoStack.count == 1, "the detail archive pushed exactly one undoable action")
+        await UndoService.shared.undo()
+        await settle()
+
+        let restored = try #require(
+            try await pool.read { db in try MessageHeader.fetchOne(db, key: focused.id) })
+        #expect(restored.folderPath == Self.inboxPath,
+                "non-vacuity: the undo restore actually wrote — a refusal would leave the archived row untouched")
+        #expect(restored.tagSortOrder == (restored.actionTag?.sortOrder ?? 99),
+                """
+                durably restored a split pair: (actionTag: \
+                \(restored.actionTag?.rawValue ?? "nil"), tagSortOrder: \(restored.tagSortOrder)) \
+                — the chip and the triage bucket disagree, the shape migration v58 heals once and never again
+                """)
     }
 }

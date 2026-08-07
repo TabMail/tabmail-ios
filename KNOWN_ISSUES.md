@@ -1198,6 +1198,52 @@ members DO reach a durable write, so it is a live finding for the coordinator ra
 registrable residual.** It is described in that commit's follow-up report, not here, because writing
 a row would assert a cosmetic scope this register would then carry as settled.
 
+✅ **THAT LIVE FINDING IS NOW FIXED (2026-08-06). The paragraph above is superseded and is kept
+verbatim rather than edited, because it is the reason no row was ever written and because two of its
+sentences turned out to be wrong in ways worth seeing.**
+
+- **"`MessageSnapshot.actionTag` writers" names the wrong TYPE.** The members that reach a durable
+  write are `MessageHeader` writers in `MessageDetailViewModel`: `applyOverlay(to:)`,
+  `applyOverlay(to headers:)`, `updateThreadMessageFolder` and `applyManualTag`. The three
+  `MessageSnapshot` sites `d3a95d26f` enumerated (`InboxListComposer.applyOverlay`,
+  `InboxViewModel`'s background-change snapshot merge, `InboxViewModel.applyManualTag`) remain
+  correctly UNCHANGED — `InboxViewModel`'s display array is `[MessageSnapshot]` and all six of its
+  undo pushes pass a DB-fresh `MessageHeader` through `overlayAdjustedForUndo`, so nothing they
+  write can reach `UndoMember`. Mirroring them would move a row under the user's finger, which is a
+  different invariant (User Interaction Freeze Rule) with its own analysis.
+- **`d3a95d26f`'s own body says *"None of them reaches a durable write — `UndoMember` is fed only by
+  `overlayAdjustedSnapshot`"*. That sentence is false**, and a commit body cannot be amended
+  (`MIS-031`), so the correction lives here. `MessageDetailViewModel.archiveMessage` /
+  `deleteMessage` / `moveMessage` push `UndoableAction(messages: [msg])` carrying the very
+  `message` / `threadMessages` values those four functions mutate; `UndoMember.init(header:)`
+  records both `sourceActionTag` and `sourceTagSortOrder`; `AccountManagerActions.undoMove` writes
+  both durably. Those three are the ONLY undo-capture sites in the tree that do not call
+  `overlayAdjustedSnapshot` (`SettingsView` and all six `InboxViewModel` sites do).
+- **The durable-reaching set is FOUR functions, not three.** `MIS-007` instance 56 names
+  `applyManualTag` and both `applyOverlay` overloads. Re-derived by ASSIGNMENT rather than by the
+  functions the prior report listed, `updateThreadMessageFolder` is a fourth: it clears `actionTag`
+  without the mirror, and although it runs after its caller's `UndoService.push` it leaves the
+  thread row `(nil, <old bucket>)` for the NEXT gesture — a thread reload carries that in-memory row
+  forward verbatim while the move is pinned, and `cardRow`'s swipe Delete / Move hand it to
+  `deleteMessage` / `moveMessage`. Recorded as `MIS-007` instance 57.
+
+**What now holds.** All four writers mirror `tagSortOrder` with `MessageHeader.setActionTag`'s
+expression (inlined, as `overlayAdjustedSnapshot` inlines it, because `setActionTag` also stamps
+`actionTagSetAt` — a fact the overlay does not carry and `UndoMember` does not record). Pinned by
+`MessageDetailViewModelMoveTests.detailRetagThenArchiveThenUndoRestoresAConsistentTagPair`, which
+asserts `row.tagSortOrder == (row.actionTag?.sortOrder ?? 99)` on the row the undo actually wrote —
+the END STATE, never the expression. Red pre-fix: `(restored.tagSortOrder → 0) ==
+((restored.actionTag?.sortOrder ?? 99) → 3)`, i.e. `(actionTag: 'delete', tagSortOrder: 0)`. A
+blessing-test search was run first (`tagSortOrder ==` across `TabMailTests/`, 60 assertions) and
+found none: every existing assertion pairs a sort order with its own tag, or 99 with nil.
+
+**Still no register row, and now for a different reason:** the finding is closed, not deferred, so
+there is nothing outstanding to register. **Why mirroring is safe HERE and not at the `MessageSnapshot`
+display sites:** the detail view orders threads by `(date, id)` alone (`recomputeThreadSplit`) and
+nothing under `TabMail/Views/` reads `tagSortOrder` (the sole write there is `PreviewMocks`, already
+mirrored) — so no re-sort is possible, and the interaction-freeze objection that holds the inbox
+display sites cannot apply to a view that never orders on the field.
+
 **The census, re-derived rather than inherited (`MIS-006`, `MIS-007`).** `rg -ni --no-ignore
 'pendingrender'` over `TabMail/ Shared/ TabMailNotificationService/ TabMailTests/` returns **9
 occurrences, and there is no fourth spelling to miss**: the search was taken case-insensitively (so
