@@ -217,7 +217,16 @@ struct CalendarToolHelpersBuildInputTests {
     }
 }
 
-@Suite("CalendarToolHelpers formatDetailedEvent")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18c-F3). This suite and the type
+// `FormatDetailedEventTests` (in `TabMailTests/Providers/GCalEventTests.swift`
+// — a FILE name, not a type qualifier) both read
+// `@Suite("CalendarToolHelpers formatDetailedEvent")`, and the run log prints
+// the DISPLAY name — so the `MIS-013` countermeasure ("reconcile executed vs
+// expected PER SUITE by display name") could not tell the two apart, and a
+// suite that silently ran zero tests would have been covered by its twin's
+// line. `-only-testing:` is NOT affected: it selects by Swift TYPE name, and
+// the two types were always distinct.
+@Suite("CalendarToolHelpers formatDetailedEvent — field rendering")
 struct CalendarToolHelpersFormatTests {
 
     @Test("Format event with all fields")

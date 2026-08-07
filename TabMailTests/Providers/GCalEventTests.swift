@@ -441,7 +441,10 @@ struct BuildGCalEventInputTests {
 
 // MARK: - CalendarToolHelpers formatDetailedEvent
 
-@Suite("CalendarToolHelpers formatDetailedEvent")
+// ⚠️ DISPLAY NAME DISAMBIGUATED (R18c-F3) — see the matching note on the type
+// `CalendarToolHelpersFormatTests` (in
+// `TabMailTests/Tools/CalendarToolHelpersTests.swift`).
+@Suite("CalendarToolHelpers formatDetailedEvent — timezone and all-day shapes")
 struct FormatDetailedEventTests {
 
     @Test("Formats basic timed event")
