@@ -289,19 +289,19 @@ struct ExchangeCalendarRecurringTests {
     func graphEndDateBeforeDayBefore() {
         // MS Graph recurrenceRange.endDate is DATE-inclusive, so to EXCLUDE the
         // 2026-05-20 occurrence the cap endDate must be 2026-05-19.
-        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "2026-05-20T17:00:00", allDay: false) == "2026-05-19")
+        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "2026-05-20T17:00:00", allDay: false, zone: .current) == "2026-05-19")
         // Date-only recurrence_id form also parses.
-        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "2026-05-20", allDay: true) == "2026-05-19")
+        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "2026-05-20", allDay: true, zone: .current) == "2026-05-19")
         // Malformed input → nil (caller surfaces an error rather than guessing).
-        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "garbage", allDay: false) == nil)
+        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "garbage", allDay: false, zone: .current) == nil)
     }
 
     @Test("graphEndDateBefore rolls month/year boundaries (Calendar arithmetic, not flat 86400s)")
     func graphEndDateBeforeBoundaries() {
-        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "2026-03-01T09:00:00", allDay: false) == "2026-02-28")
-        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "2026-01-01T09:00:00", allDay: false) == "2025-12-31")
+        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "2026-03-01T09:00:00", allDay: false, zone: .current) == "2026-02-28")
+        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "2026-01-01T09:00:00", allDay: false, zone: .current) == "2025-12-31")
         // Leap year.
-        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "2028-03-01T09:00:00", allDay: false) == "2028-02-29")
+        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "2028-03-01T09:00:00", allDay: false, zone: .current) == "2028-02-29")
     }
 
     /// 2026-05-14 is a Thursday — used to verify DTSTART-implied fields.

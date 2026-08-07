@@ -341,6 +341,7 @@ actor CalDAVProvider: CalendarProvider {
         calendarId: String,
         eventId: String,
         recurrenceId: String,
+        recurrenceIdZone: TimeZone,
         event: GCalEventInput,
         sendUpdates: String
     ) async throws -> GCalEvent {
@@ -396,17 +397,34 @@ actor CalDAVProvider: CalendarProvider {
         //    iCloud's CalDAV enforces this strictly — without it, a PUT that
         //    adds an attendee to the override fails with HTTP 403 (empty body).
         let masterKind = Self.masterDTStartKind(from: masterICS)
+        // The caller's `recurrence_id` is a wall clock in `recurrenceIdZone` (the
+        // operation's declared timezone, device by default). RFC 5545 requires
+        // RECURRENCE-ID to be expressed in the master's own frame — convert
+        // through the absolute instant. See `recurrenceIdInMasterFrame`.
+        guard let masterFrameRecurrenceId = Self.recurrenceIdInMasterFrame(
+            recurrenceId, declaredZone: recurrenceIdZone, kind: masterKind
+        ) else {
+            throw CalendarProviderError.notSupported(
+                "Could not express recurrence_id '\(recurrenceId)' (\(recurrenceIdZone.identifier)) in this event's timezone — refusing to write an override that may name a different occurrence."
+            )
+        }
         let masterOrganizerLine = Self.masterVEventLines(from: masterICS)
             .first(where: { $0.uppercased().hasPrefix("ORGANIZER") })
         let overrideBlock = Self.buildOverrideVEvent(
-            patch: inheritedPatch, uid: masterUID, recurrenceId: recurrenceId,
+            patch: inheritedPatch, uid: masterUID, recurrenceId: masterFrameRecurrenceId,
             kind: masterKind, organizerLine: masterOrganizerLine
         )
 
         // 4. Splice it into the ICS — replace any pre-existing override with
         //    the same RECURRENCE-ID, otherwise append before END:VCALENDAR.
+        //    MUST use the SAME converted value the override block carries: the
+        //    splice decides whether an existing override is "the same
+        //    occurrence", so comparing against a differently-framed string
+        //    appends a duplicate VEVENT sharing UID+RECURRENCE-ID instead of
+        //    replacing it — a malformed resource servers resolve
+        //    nondeterministically.
         let updatedICS = Self.spliceOrReplaceOverride(
-            ics: masterICS, recurrenceId: recurrenceId, kind: masterKind, newOverrideBlock: overrideBlock
+            ics: masterICS, recurrenceId: masterFrameRecurrenceId, kind: masterKind, newOverrideBlock: overrideBlock
         )
 
         // 5. PUT back — atomic at the CalDAV resource level (one HTTP call).
@@ -434,6 +452,7 @@ actor CalDAVProvider: CalendarProvider {
         calendarId: String,
         eventId: String,
         recurrenceId: String,
+        recurrenceIdZone: TimeZone,
         patch: GCalEventInput,
         sendUpdates: String
     ) async throws -> GCalEvent {
@@ -454,8 +473,24 @@ actor CalDAVProvider: CalendarProvider {
         // RFC 5545 §3.3.10: the UNTIL value type must match DTSTART's. If the
         // master's DTSTART is a bare DATE (all-day), UNTIL must be a bare DATE.
         let masterIsAllDay = Self.icsIsAllDay(masterICS)
-        guard let untilValue = GoogleCalendarProvider.googleUntilString(beforeNaiveISO: recurrenceId, allDay: masterIsAllDay) else {
+        // The cap is an ABSOLUTE boundary (RFC 5545 UNTIL is UTC for a timed
+        // DTSTART), so it is computed from the declared frame directly — no
+        // conversion, the instant is the instant.
+        guard let untilValue = GoogleCalendarProvider.googleUntilString(beforeNaiveISO: recurrenceId, allDay: masterIsAllDay, zone: recurrenceIdZone) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
+        }
+        // The new series' DTSTART, by contrast, is a WALL CLOCK the successor
+        // resource carries in the master's frame — `buildNewSeriesInput` parses
+        // it in the master's zone, so it must be handed a master-frame value.
+        // Capping in one frame while starting the successor in another is how a
+        // split duplicates or drops the boundary occurrence.
+        let masterKindForSplit = Self.masterDTStartKind(from: masterICS)
+        guard let masterFrameRecurrenceId = Self.recurrenceIdInMasterFrame(
+            recurrenceId, declaredZone: recurrenceIdZone, kind: masterKindForSplit
+        ) else {
+            throw CalendarProviderError.notSupported(
+                "Could not express recurrence_id '\(recurrenceId)' (\(recurrenceIdZone.identifier)) in this event's timezone — refusing to split a series at an occurrence we cannot name."
+            )
         }
         let cappedRRule = GoogleCalendarProvider.replaceOrAppendUntil(in: originalRRule, untilValue: untilValue)
         let cappedICS = Self.replaceRRule(in: masterICS, newRRule: cappedRRule)
@@ -506,7 +541,7 @@ actor CalDAVProvider: CalendarProvider {
         do {
             newSeriesInput = try Self.buildNewSeriesInput(
                 masterICS: masterICS, patch: patch,
-                newStartNaiveISO: recurrenceId,
+                newStartNaiveISO: masterFrameRecurrenceId,
                 newRRule: rruleWithoutCap
             )
         } catch {
@@ -1156,6 +1191,57 @@ actor CalDAVProvider: CalendarProvider {
             .replacingOccurrences(of: "\r\n", with: "\\n")
             .replacingOccurrences(of: "\r", with: "\\n")
             .replacingOccurrences(of: "\n", with: "\\n")
+    }
+
+    /// Re-express the caller's naive `recurrence_id` in the frame the master's
+    /// DTSTART uses, so `RECURRENCE-ID` names the occurrence the caller meant.
+    ///
+    /// 🚨 **THE INPUT IS NOT IN THE MASTER'S ZONE — IT NEVER WAS.** Until
+    /// 2026-08-07 `buildOverrideVEvent` compacted the naive digits VERBATIM and
+    /// stapled the master's `TZID` onto them, and `buildNewSeriesInput` parsed the
+    /// same string in the master's zone, both on the documented premise that "the
+    /// naive recurrence_id is the occurrence's wall-clock time IN THE MASTER'S
+    /// ZONE". That premise is false at the mint site:
+    /// `CalendarToolHelpers.formatDetailedEvent` renders `start_iso` in
+    /// `timezone ?? .current` — the DEVICE zone by default — and round 18 added a
+    /// separate `event_timezone` field precisely because the two are different
+    /// things. So for any series whose master zone differs from the device zone,
+    /// CalDAV was writing an override keyed to a wall clock no occurrence has:
+    /// at best an orphan override the user never sees take effect, at worst one
+    /// that collides with a DIFFERENT real occurrence. Converting through the
+    /// absolute instant is what makes CalDAV agree with Google and Exchange about
+    /// what one `recurrence_id` means.
+    ///
+    /// Identity in the overwhelmingly common case (declared zone == master zone,
+    /// or the value carries no time), so this is not a behaviour change for the
+    /// single-timezone user.
+    ///
+    /// Returns nil when the value cannot be re-expressed; callers MUST fail closed
+    /// rather than fall back to the raw digits, which is the pre-fix behaviour and
+    /// the defect itself.
+    static func recurrenceIdInMasterFrame(
+        _ recurrenceId: String,
+        declaredZone: TimeZone,
+        kind: MasterDTStartKind
+    ) -> String? {
+        switch kind {
+        case .allDay:
+            // A calendar DATE has no zone. Shifting one by a UTC offset is how
+            // you land on the adjacent day's occurrence.
+            return recurrenceId
+        case .floating:
+            // RFC 5545 floating time is "local wherever the viewer is", so there
+            // is no target frame to convert INTO. The declared wall clock is the
+            // best available reading; inventing an offset would be worse.
+            return recurrenceId
+        case .utc:
+            return RecurrenceOccurrenceResolver.renderNaive(
+                recurrenceId, from: declaredZone, to: TimeZone(identifier: "UTC") ?? declaredZone
+            )
+        case .zoned(let tzid):
+            guard let masterZone = TimeZone(identifier: tzid) else { return nil }
+            return RecurrenceOccurrenceResolver.renderNaive(recurrenceId, from: declaredZone, to: masterZone)
+        }
     }
 
     /// Build a single VEVENT block (no VCALENDAR wrapper) for use as an

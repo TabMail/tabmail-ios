@@ -33,8 +33,8 @@ actor MockCalendarProvider: CalendarProvider {
     var createdEvents: [(calendarId: String, event: GCalEventInput, sendUpdates: String)] = []
     var updatedEvents: [(calendarId: String, eventId: String, event: GCalEventInput, sendUpdates: String)] = []
     var deletedEvents: [(calendarId: String, eventId: String, sendUpdates: String)] = []
-    var updatedOccurrences: [(calendarId: String, eventId: String, recurrenceId: String, event: GCalEventInput, sendUpdates: String)] = []
-    var splitSeriesCalls: [(calendarId: String, eventId: String, recurrenceId: String, patch: GCalEventInput, sendUpdates: String)] = []
+    var updatedOccurrences: [(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, event: GCalEventInput, sendUpdates: String)] = []
+    var splitSeriesCalls: [(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String)] = []
     var updateOccurrenceResult: GCalEvent?
     var updateOccurrenceThrows: Error?
     var splitSeriesResult: GCalEvent?
@@ -95,9 +95,9 @@ actor MockCalendarProvider: CalendarProvider {
         if let error = deleteEventThrows { throw error }
     }
 
-    func updateOccurrence(calendarId: String, eventId: String, recurrenceId: String, event: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
-        callLog.append("updateOccurrence(calendarId:\(calendarId),eventId:\(eventId),recurrenceId:\(recurrenceId),sendUpdates:\(sendUpdates))")
-        updatedOccurrences.append((calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId, event: event, sendUpdates: sendUpdates))
+    func updateOccurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, event: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
+        callLog.append("updateOccurrence(calendarId:\(calendarId),eventId:\(eventId),recurrenceId:\(recurrenceId),recurrenceIdZone:\(recurrenceIdZone.identifier),sendUpdates:\(sendUpdates))")
+        updatedOccurrences.append((calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone, event: event, sendUpdates: sendUpdates))
         if let error = updateOccurrenceThrows { throw error }
         guard let result = updateOccurrenceResult else {
             throw NSError(domain: "MockCalendarProvider", code: 500, userInfo: [NSLocalizedDescriptionKey: "No mock result configured"])
@@ -105,9 +105,9 @@ actor MockCalendarProvider: CalendarProvider {
         return result
     }
 
-    func splitSeries(calendarId: String, eventId: String, recurrenceId: String, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
-        callLog.append("splitSeries(calendarId:\(calendarId),eventId:\(eventId),recurrenceId:\(recurrenceId),sendUpdates:\(sendUpdates))")
-        splitSeriesCalls.append((calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId, patch: patch, sendUpdates: sendUpdates))
+    func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
+        callLog.append("splitSeries(calendarId:\(calendarId),eventId:\(eventId),recurrenceId:\(recurrenceId),recurrenceIdZone:\(recurrenceIdZone.identifier),sendUpdates:\(sendUpdates))")
+        splitSeriesCalls.append((calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone, patch: patch, sendUpdates: sendUpdates))
         if let error = splitSeriesThrows { throw error }
         guard let result = splitSeriesResult else {
             throw NSError(domain: "MockCalendarProvider", code: 500, userInfo: [NSLocalizedDescriptionKey: "No mock result configured"])

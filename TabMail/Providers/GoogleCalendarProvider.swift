@@ -22,7 +22,10 @@ protocol CalendarProvider: Sendable {
     /// occurrence as an override and applies `event` to it.
     /// Default implementation falls back to series-wide updateEvent so existing
     /// callers stay correct; recurring-aware providers (Google) override.
-    func updateOccurrence(calendarId: String, eventId: String, recurrenceId: String, event: GCalEventInput, sendUpdates: String) async throws -> GCalEvent
+    ///
+    /// 🚨 `recurrenceIdZone` IS NOT DECORATION — IT IS THE OTHER HALF OF THE ADDRESS.
+    /// See the invariant on `RecurrenceOccurrenceResolver`.
+    func updateOccurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, event: GCalEventInput, sendUpdates: String) async throws -> GCalEvent
 
     /// Split a recurring series at `recurrenceId` (this_and_following edit_scope):
     /// cap the original series with UNTIL = recurrenceId - 1, then create a new
@@ -32,7 +35,13 @@ protocol CalendarProvider: Sendable {
     /// Default implementation throws `CalendarProviderError.notSupported` —
     /// providers that don't natively expose split semantics surface this to the
     /// LLM so it can fall back to manual orchestration or ask the user.
-    func splitSeries(calendarId: String, eventId: String, recurrenceId: String, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent
+    ///
+    /// `recurrenceIdZone` carries the same meaning as on `updateOccurrence`, and
+    /// it is threaded here for the same reason: the two methods take the SAME
+    /// `recurrence_id` string off the SAME durable operation, so honouring the
+    /// declared frame in only one of them would make one argument mean two
+    /// different instants depending on `edit_scope`.
+    func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent
 }
 
 /// Errors common to calendar providers when an operation isn't supported.
@@ -46,11 +55,181 @@ enum CalendarProviderError: Error {
 // implemented the recurring-aware paths yet. These keep existing callers
 // compiling while letting newly-aware providers override.
 extension CalendarProvider {
-    func updateOccurrence(calendarId: String, eventId: String, recurrenceId: String, event: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
+    func updateOccurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, event: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
         throw CalendarProviderError.notSupported("Editing a single occurrence of a recurring event is not yet supported on this calendar provider. Edit the whole series or use the Thunderbird add-on for fine-grained occurrence edits.")
     }
-    func splitSeries(calendarId: String, eventId: String, recurrenceId: String, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
+    func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
         throw CalendarProviderError.notSupported("Splitting a recurring series at a given occurrence is not yet supported on this calendar provider. Edit the whole series or use the Thunderbird add-on for this-and-following edits.")
+    }
+}
+
+// MARK: - Addressing one occurrence of a recurring series
+
+/// A provider-neutral candidate occurrence, reduced to the only two things that
+/// can be compared without re-entering a timezone: the ABSOLUTE INSTANT its
+/// start names (timed occurrences), or the bare calendar DATE it names (all-day
+/// occurrences). Exactly one of the two is non-nil.
+struct OccurrenceCandidate: Sendable, Equatable {
+    /// The provider's id for this instance — the value the caller will address.
+    let id: String
+    /// Absolute instant of the occurrence's start. Non-nil for timed occurrences.
+    let instant: Date?
+    /// `yyyy-MM-dd` calendar date. Non-nil for all-day occurrences.
+    let dateOnly: String?
+}
+
+/// The result of trying to name ONE occurrence out of an enumerated window.
+enum OccurrenceMatch: Equatable {
+    /// Exactly one candidate answers to the address.
+    case resolved(String)
+    /// The provider enumerated the window and NO candidate answers to it.
+    /// This is a positive, provider-authoritative statement of absence.
+    case absent
+    /// More than one candidate answers to it. C3 — refuse rather than guess.
+    case ambiguous(Int)
+    /// The address itself is unusable (`recurrence_id` is not a naive ISO8601
+    /// date or date-time). Nothing was learned about the server.
+    case malformed
+}
+
+/// **THE OCCURRENCE ADDRESS INVARIANT.**
+///
+/// A recurring occurrence is addressed by `recurrence_id`: a NAIVE wall-clock
+/// string with no offset and no zone. A naive string alone is not an address —
+/// it only becomes one when paired with the frame it is to be read in. The tool
+/// schema already publishes that frame: `calendar_event_edit`'s `timezone`
+/// parameter says *"when provided, all naive ISO8601 datetime parameters are
+/// interpreted in this timezone instead of the user's device timezone"*, and the
+/// mint site (`CalendarToolHelpers.formatDetailedEvent`) renders `start_iso` in
+/// exactly that zone. So the frame is `CalendarToolHelpers.resolveTimeZone(arguments)`,
+/// it is carried on the durable operation already, and every provider must read
+/// the naive value in it. Nothing here is a new contract; this is the app finally
+/// honouring a published one.
+///
+/// 🚨 **WHAT WAS BROKEN, AND WHY IT WAS C3.** Both `resolveInstanceId`
+/// implementations selected an occurrence by comparing the FIRST TEN CHARACTERS
+/// of `recurrence_id` against the first ten characters of the provider's
+/// rendering of the instance start — a DAY-PREFIX string comparison across two
+/// different frames. Google returns `start.dateTime` as RFC 3339 in the EVENT's
+/// own zone, so for a series whose event zone crosses the device's date boundary
+/// the day prefixes belong to different days and the comparison could select the
+/// PRECEDING occurrence, which was then `PATCH`ed with `sendUpdates: "all"` —
+/// an outward-facing mutation with invitations to third parties that cannot be
+/// recalled. Worse, when no day matched, `items.count == 1` was accepted as a
+/// match: a guess, on an operation whose whole purpose is to name one occurrence
+/// out of many.
+///
+/// **The rules, in order:**
+/// 1. A TIMED address (`2026-05-20T17:00:00`) is resolved on the ABSOLUTE
+///    INSTANT it names when read in `zone`. Instants are frame-free, so no
+///    consumer can re-interpret them.
+/// 2. A DATE-ONLY address (`2026-05-20`, or any form too short to carry a time)
+///    is resolved on the calendar DAY it names, with each timed candidate
+///    rendered back into `zone` for the comparison. This preserves the
+///    date-only capability the pre-fix code had, in a single stated frame.
+/// 3. An ALL-DAY candidate is always compared on its bare DATE against the
+///    literal first ten characters of `recurrence_id`. A DATE has no zone, and
+///    shifting one by a UTC offset is how you land on the adjacent day's
+///    occurrence.
+/// 4. **Exactly one match, or nothing happens.** Zero ⇒ `.absent`; two or more
+///    ⇒ `.ambiguous`. There is no "well, there was only one instance" arm, and
+///    there must never be one again.
+///
+/// ⚠️ **WHAT BREAKS THE OTHER WAY (`MIS-026`).** Instant matching is STRICTER
+/// than day matching: an address whose frame is wrong now finds nothing instead
+/// of finding something. That is the entire point — every frame error is
+/// converted from a silent wrong-occurrence mutation into a refusal the user
+/// sees and can correct with one ordinary gesture. The deliberately-held
+/// direction is that we do NOT retry the match in a second frame, and do NOT
+/// accept a match under "any plausible offset": both would double the number of
+/// occurrences that answer to one address, which is the same C3 defect with a
+/// wider mouth (`MIS-005` — when the two candidate fixes are inverses of each
+/// other, neither is the fix).
+enum RecurrenceOccurrenceResolver {
+
+    /// Select the single occurrence named by `recurrenceId` read in `zone`.
+    static func select(
+        _ candidates: [OccurrenceCandidate],
+        recurrenceId: String,
+        zone: TimeZone
+    ) -> OccurrenceMatch {
+        let targetDay = String(recurrenceId.prefix(10))
+
+        let dayFmt = DateFormatter()
+        dayFmt.locale = Locale(identifier: "en_US_POSIX")
+        dayFmt.dateFormat = "yyyy-MM-dd"
+        dayFmt.timeZone = zone
+        guard dayFmt.date(from: targetDay) != nil else { return .malformed }
+
+        let dtFmt = DateFormatter()
+        dtFmt.locale = Locale(identifier: "en_US_POSIX")
+        dtFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        dtFmt.timeZone = zone
+
+        // A time component is only present when there are at least 19 characters
+        // (`yyyy-MM-ddTHH:mm:ss`). `prefix(19)` is the same normalization
+        // `ExchangeCalendarProvider.convertToRFC3339` already applies, so a
+        // trailing `Z` or fractional seconds do not defeat the parse.
+        var targetInstant: Date?
+        if recurrenceId.count >= 19 {
+            guard let parsed = dtFmt.date(from: String(recurrenceId.prefix(19))) else { return .malformed }
+            targetInstant = parsed
+        }
+
+        let matches = candidates.filter { candidate in
+            if let date = candidate.dateOnly {
+                // Rule 3 — an all-day occurrence answers only to its literal date.
+                return date == targetDay
+            }
+            guard let instant = candidate.instant else { return false }
+            if let target = targetInstant {
+                return instant == target                      // Rule 1
+            }
+            return dayFmt.string(from: instant) == targetDay   // Rule 2
+        }
+
+        if matches.count == 1 { return .resolved(matches[0].id) }
+        if matches.isEmpty { return .absent }
+        return .ambiguous(matches.count)
+    }
+
+    /// The centre of the enumeration window for `recurrenceId` read in `zone`.
+    /// Date-only addresses centre on midnight of that day in `zone`.
+    /// Returns nil when the address is unusable — callers MUST fail closed
+    /// rather than substituting `Date()`, which would enumerate the wrong week.
+    static func windowCenter(recurrenceId: String, zone: TimeZone) -> Date? {
+        let dtFmt = DateFormatter()
+        dtFmt.locale = Locale(identifier: "en_US_POSIX")
+        dtFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        dtFmt.timeZone = zone
+        if recurrenceId.count >= 19, let d = dtFmt.date(from: String(recurrenceId.prefix(19))) {
+            return d
+        }
+        let dayFmt = DateFormatter()
+        dayFmt.locale = Locale(identifier: "en_US_POSIX")
+        dayFmt.dateFormat = "yyyy-MM-dd"
+        dayFmt.timeZone = zone
+        return dayFmt.date(from: String(recurrenceId.prefix(10)))
+    }
+
+    /// Re-express a naive wall-clock value from `source` into `target`.
+    /// Date-only values are returned UNCHANGED — a calendar date has no zone,
+    /// and shifting one by a UTC offset moves it to the adjacent day.
+    /// Returns nil when the value cannot be parsed, so callers fail closed
+    /// instead of emitting a plausible-looking wrong time.
+    static func renderNaive(_ naive: String, from source: TimeZone, to target: TimeZone) -> String? {
+        guard naive.count >= 19 else { return naive }
+        if source == target { return naive }
+        let inFmt = DateFormatter()
+        inFmt.locale = Locale(identifier: "en_US_POSIX")
+        inFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        inFmt.timeZone = source
+        guard let instant = inFmt.date(from: String(naive.prefix(19))) else { return nil }
+        let outFmt = DateFormatter()
+        outFmt.locale = Locale(identifier: "en_US_POSIX")
+        outFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        outFmt.timeZone = target
+        return outFmt.string(from: instant)
     }
 }
 
@@ -313,6 +492,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         calendarId: String = "primary",
         eventId: String,
         recurrenceId: String,
+        recurrenceIdZone: TimeZone,
         event: GCalEventInput,
         sendUpdates: String = "all"
     ) async throws -> GCalEvent {
@@ -325,14 +505,23 @@ actor GoogleCalendarProvider: CalendarProvider {
         let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
         let encodedMasterId = try Self.encodedPathSegment(eventId, "Google master event id")
 
-        // Find the instance whose start matches recurrenceId. Google's instances
-        // endpoint accepts originalStart query (in RFC 3339) but parsing that
-        // requires the master's timezone; safer to fetch a small window around
-        // the recurrenceId and match by start.
+        // Find the instance whose start IS the instant `recurrenceId` names when
+        // read in `recurrenceIdZone`.
+        //
+        // Google's instances endpoint also exposes a server-side `originalStart`
+        // filter, and the round-18c brief asked whether to prefer it over
+        // client-side scanning. Deliberately NOT used: `originalStart` takes an
+        // RFC 3339 instant that must round-trip through the MASTER's zone, and a
+        // filter we formatted wrongly answers with an empty list — indistinguishable
+        // from "the occurrence does not exist", which is precisely the
+        // could-not-determine-laundered-as-authoritative failure this round exists
+        // to remove. Enumerating a bounded window and matching instants locally is
+        // verifiable in a unit test against a fixed payload; the filter is not.
         let instanceId = try await resolveInstanceId(
             calendarId: encodedCalId,
             masterId: encodedMasterId,
-            recurrenceId: recurrenceId
+            recurrenceId: recurrenceId,
+            zone: recurrenceIdZone
         )
         let encodedInstanceId = try Self.encodedPathSegment(instanceId, "Google occurrence id")
 
@@ -362,6 +551,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         calendarId: String = "primary",
         eventId: String,
         recurrenceId: String,
+        recurrenceIdZone: TimeZone,
         patch: GCalEventInput,
         sendUpdates: String = "all"
     ) async throws -> GCalEvent {
@@ -379,7 +569,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         guard let originalRRule = masterRecurrence.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else {
             throw CalendarProviderError.notSupported("Master event has no RRULE; can't split.")
         }
-        guard let untilValue = Self.googleUntilString(beforeNaiveISO: recurrenceId, allDay: master.isAllDay) else {
+        guard let untilValue = Self.googleUntilString(beforeNaiveISO: recurrenceId, allDay: master.isAllDay, zone: recurrenceIdZone) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
         let cappedRRule = Self.replaceOrAppendUntil(in: originalRRule, untilValue: untilValue)
@@ -420,6 +610,7 @@ actor GoogleCalendarProvider: CalendarProvider {
             master: master,
             patch: patch,
             newStartNaiveISO: recurrenceId,
+            newStartZone: recurrenceIdZone,
             newRecurrence: [rruleWithoutCap]
         )
         let newSeriesId = Self.deterministicSplitEventId(masterId: eventId, recurrenceId: recurrenceId)
@@ -645,34 +836,51 @@ actor GoogleCalendarProvider: CalendarProvider {
         return (eventId, fetched)
     }
 
-    /// Find the Google instance id for `recurrenceId` by hitting the instances
-    /// endpoint with a wide-enough window to tolerate DST transitions and
-    /// device/event timezone mismatches.
+    /// Find the Google instance id for the occurrence `recurrenceId` names when
+    /// read in `zone`, by enumerating the instances endpoint over a window
+    /// centred on that instant and matching on the instant itself.
+    ///
     /// Window rationale: ±25 hours covers (a) DST shifts of up to 1h either
-    /// way, (b) a worst-case device-vs-event timezone delta (e.g. UTC+14 vs
-    /// UTC-12 = 26h difference — close to the limit but covered by the
-    /// instances-endpoint's recurrence-aware filtering), and (c) all-day
+    /// way, (b) a worst-case device-vs-event timezone delta, and (c) all-day
     /// events where the instance start may be midnight in a different zone.
-    /// We narrow back to the correct instance via day-prefix matching below.
-    private func resolveInstanceId(calendarId: String, masterId: String, recurrenceId: String) async throws -> String {
-        // recurrenceId is naive ISO; treat as device-local for the window math.
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        fmt.timeZone = .current
-        guard let centerDate = fmt.date(from: String(recurrenceId)) else {
-            // Fall back to date-only form (e.g. "2026-05-20" for an all-day event)
-            // before declaring the recurrenceId malformed.
-            let dateFmt = DateFormatter()
-            dateFmt.dateFormat = "yyyy-MM-dd"
-            dateFmt.timeZone = TimeZone(identifier: "UTC")
-            guard dateFmt.date(from: String(recurrenceId.prefix(10))) != nil else {
-                throw GoogleCalendarError.eventNotFound
-            }
-            // Recurse with a normalized full-day form so the rest of the path
-            // can use a single code branch.
-            return try await resolveInstanceId(
-                calendarId: calendarId, masterId: masterId,
-                recurrenceId: "\(recurrenceId.prefix(10))T00:00:00"
+    /// The window only has to CONTAIN the occurrence; `RecurrenceOccurrenceResolver`
+    /// does the selecting, and it selects on instants, so a generous window
+    /// costs a few extra candidates and never costs correctness.
+    ///
+    /// 🚨 **THE THREE FAILURES ARE DIFFERENT FACTS AND MUST NOT SHARE AN ERROR.**
+    /// Until 2026-08-07 every failure here threw `GoogleCalendarError.eventNotFound`,
+    /// which `AccountManagerCalendarQueue.isCalendarNotFoundError` classifies as
+    /// provider-authoritative and retires the durable operation with
+    /// *"event not found on server"*. A malformed `recurrence_id` and an
+    /// undecodable payload are statements about US, not about the server:
+    /// laundering them as authoritative absence is never-drop exit 2 ("we could
+    /// not determine the answer" is NOT a provider-authoritative stale/no-op
+    /// result). So:
+    ///  * malformed / undecodable ⇒ `CalendarProviderError.notSupported`, which
+    ///    `isCalendarUnsupportedError` retires WITH ITS REASON shown to the user.
+    ///    This is the same disposition the sibling `splitSeries` has always given
+    ///    the same malformed input, so the two arms of one operation finally agree.
+    ///  * ambiguous ⇒ `notSupported` as well. C3: failing closed is always acceptable.
+    ///  * genuinely no match ⇒ `eventNotFound`, and NOW that claim is true: the
+    ///    provider enumerated every instance in a 50-hour window centred on the
+    ///    named instant, so the named occurrence demonstrably is not there.
+    ///
+    /// ⚠️ Do NOT "fix" the never-drop concern by making these retryable. That was
+    /// tried and refuted: a resolution failure is deterministic, so no terminal arm
+    /// claims it, it falls to `drainCalendarQueue`'s transient arm, which requeues
+    /// AND does `failedAccounts.insert(accountId)` — head-of-line-blocking every
+    /// later calendar op on that account forever. A wedge is in the same
+    /// non-recoverable set as a dropped intention. Both dispositions being wrong is
+    /// what proved the disposition was never the bug; the ADDRESS was.
+    private func resolveInstanceId(
+        calendarId: String,
+        masterId: String,
+        recurrenceId: String,
+        zone: TimeZone
+    ) async throws -> String {
+        guard let centerDate = RecurrenceOccurrenceResolver.windowCenter(recurrenceId: recurrenceId, zone: zone) else {
+            throw CalendarProviderError.notSupported(
+                "Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00') or a date (e.g. '2026-05-20')."
             )
         }
         let windowSeconds: TimeInterval = 25 * 60 * 60
@@ -690,21 +898,42 @@ actor GoogleCalendarProvider: CalendarProvider {
         )
         let resp = try JSONDecoder().decode(GCalEventListResponse.self, from: data)
         let items = resp.items ?? []
-        let dayPrefix = String(recurrenceId.prefix(10))
-        // First try strict day-prefix match against the instance's start (handles
-        // DST inside the window). Fall back to the first instance only if exactly
-        // ONE instance came back — multiple instances + no day-match means we
-        // can't pick safely, so throw.
-        if let dayMatch = items.first(where: { ev in
-            guard let start = ev.start?.dateTime ?? ev.start?.date else { return false }
-            return start.hasPrefix(dayPrefix)
-        }), let id = dayMatch.id {
-            return id
+
+        var candidates: [OccurrenceCandidate] = []
+        for ev in items {
+            guard let id = ev.id else { continue }
+            if let date = ev.start?.date {
+                candidates.append(OccurrenceCandidate(id: id, instant: nil, dateOnly: String(date.prefix(10))))
+                continue
+            }
+            guard let dt = ev.start?.dateTime else { continue }
+            // Google returns instance starts as RFC 3339 WITH an offset, so the
+            // instant is unambiguous. If one is not parseable we know nothing
+            // about that occurrence, and a candidate we cannot place could be
+            // the very one being addressed — refuse rather than resolve to a
+            // different instance that happened to decode (C3).
+            guard let instant = Date.fromISO8601(dt) else {
+                throw CalendarProviderError.notSupported(
+                    "Could not interpret the start time of an occurrence of \(masterId) returned by Google ('\(dt)') — refusing to edit an occurrence that may not be the one you named."
+                )
+            }
+            candidates.append(OccurrenceCandidate(id: id, instant: instant, dateOnly: nil))
         }
-        if items.count == 1, let id = items[0].id {
+
+        switch RecurrenceOccurrenceResolver.select(candidates, recurrenceId: recurrenceId, zone: zone) {
+        case .resolved(let id):
             return id
+        case .absent:
+            throw GoogleCalendarError.eventNotFound
+        case .ambiguous(let count):
+            throw CalendarProviderError.notSupported(
+                "recurrence_id '\(recurrenceId)' (\(zone.identifier)) matched \(count) occurrences of \(masterId) — refusing to guess which one you meant. Re-read the event and use the exact start_iso of the occurrence you want."
+            )
+        case .malformed:
+            throw CalendarProviderError.notSupported(
+                "Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00') or a date (e.g. '2026-05-20')."
+            )
         }
-        throw GoogleCalendarError.eventNotFound
     }
 
     /// Produce an RFC 5545 UNTIL value for capping a series just before the
@@ -717,20 +946,22 @@ actor GoogleCalendarProvider: CalendarProvider {
     ///     `YYYYMMDD`. We use (split − 1 day) so the split day's occurrence is
     ///     excluded (UNTIL is inclusive of the date for all-day rules).
     ///
-    /// `naive` is interpreted as device-local time. Accepts both the full
+    /// `naive` is interpreted in `zone` — the operation's declared timezone (see
+    /// the invariant on `RecurrenceOccurrenceResolver`), which is the device zone
+    /// unless the caller supplied `timezone`. Accepts both the full
     /// `2026-05-20T17:00:00` form and the date-only `2026-05-20` form (the
     /// latter is what an all-day occurrence's recurrence_id looks like).
     /// Returns nil if the input is unparseable — callers MUST handle this
     /// (silently emitting "now-1s" would cap the series in the past with
     /// nothing in the new series).
-    static func googleUntilString(beforeNaiveISO naive: String, allDay: Bool) -> String? {
+    static func googleUntilString(beforeNaiveISO naive: String, allDay: Bool, zone: TimeZone) -> String? {
         // Parse: try full date-time first, then fall back to date-only.
         let dtFmt = DateFormatter()
         dtFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        dtFmt.timeZone = .current
+        dtFmt.timeZone = zone
         let dateFmt = DateFormatter()
         dateFmt.dateFormat = "yyyy-MM-dd"
-        dateFmt.timeZone = .current
+        dateFmt.timeZone = zone
         let parsed = dtFmt.date(from: naive)
             ?? dateFmt.date(from: String(naive.prefix(10)))
         guard let date = parsed else { return nil }
@@ -741,11 +972,11 @@ actor GoogleCalendarProvider: CalendarProvider {
             // transition (a 23h or 25h local day), which would cap the series
             // a day early/late.
             var cal = Calendar(identifier: .gregorian)
-            cal.timeZone = .current
+            cal.timeZone = zone
             guard let dayBefore = cal.date(byAdding: .day, value: -1, to: date) else { return nil }
             let out = DateFormatter()
             out.dateFormat = "yyyyMMdd"
-            out.timeZone = .current
+            out.timeZone = zone
             return out.string(from: dayBefore)
         }
         // One second before, UTC date-time form.
@@ -915,10 +1146,15 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// Build a `GCalEventInput` for the NEW series of a split. Inherits the
     /// master's fields, applies the caller's `patch` on top, and rewrites
     /// start/end/recurrence to the split point.
+    /// `newStartZone` is the frame `newStartNaiveISO` is expressed in — the
+    /// operation's declared timezone (see `RecurrenceOccurrenceResolver`). It
+    /// applies ONLY to the naive `recurrence_id` fallback; `patch.startDateTime`
+    /// arrives as an offset-bearing ISO 8601 string and is already unambiguous.
     static func mergeMasterAndPatch(
         master: GCalEvent,
         patch: GCalEventInput,
         newStartNaiveISO: String,
+        newStartZone: TimeZone,
         newRecurrence: [String]
     ) -> GCalEventInput {
         var out = GCalEventInput()
@@ -942,13 +1178,13 @@ actor GoogleCalendarProvider: CalendarProvider {
             // All-day: emit date-only start/end. Google's all-day `end.date` is
             // EXCLUSIVE, so a 1-day event is start=D, end=D+1 (durationSec≈86400).
             var cal = Calendar(identifier: .gregorian)
-            cal.timeZone = .current
+            cal.timeZone = newStartZone
             let dateOnlyFmt = DateFormatter()
             dateOnlyFmt.dateFormat = "yyyy-MM-dd"
-            dateOnlyFmt.timeZone = .current
+            dateOnlyFmt.timeZone = newStartZone
             let parseFmt = DateFormatter()
             parseFmt.dateFormat = "yyyy-MM-dd"
-            parseFmt.timeZone = .current
+            parseFmt.timeZone = newStartZone
             // Prefer the patch's explicit new date when the LLM is moving the
             // series with the split. `recurrence_id` only identifies WHICH
             // occurrence the split anchors at — `start_iso` is the user's
@@ -970,7 +1206,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         } else {
             let fmt = DateFormatter()
             fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-            fmt.timeZone = .current
+            fmt.timeZone = newStartZone
             // Prefer the patch's explicit new datetime — same rationale as
             // above. The recurrence_id is the "WHICH occurrence" anchor; the
             // patch's start_iso/end_iso is the "WHAT TIME" the new series

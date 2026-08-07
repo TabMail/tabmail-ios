@@ -250,6 +250,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         calendarId: String = "primary",
         eventId: String,
         recurrenceId: String,
+        recurrenceIdZone: TimeZone,
         event: GCalEventInput,
         sendUpdates: String = "all"
     ) async throws -> GCalEvent {
@@ -258,7 +259,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // `/events/{id}/instances` endpoint requires the master id — resolve
         // via seriesMasterId before the instance lookup.
         let (eventId, _) = try await resolveToMaster(eventId: eventId)
-        let instanceId = try await resolveInstanceId(masterId: eventId, recurrenceId: recurrenceId)
+        let instanceId = try await resolveInstanceId(masterId: eventId, recurrenceId: recurrenceId, zone: recurrenceIdZone)
         let encodedInstanceId = try Self.encodedGraphPathSegment(instanceId, context: "Graph event instance id")
         // Same defensive full-payload approach as `updateEvent` — fetch the
         // instance, merge the patch onto it, send everything. Without this an
@@ -292,6 +293,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         calendarId: String = "primary",
         eventId: String,
         recurrenceId: String,
+        recurrenceIdZone: TimeZone,
         patch: GCalEventInput,
         sendUpdates: String = "all"
     ) async throws -> GCalEvent {
@@ -315,7 +317,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         //    Graph would keep on the master. So compute the cap directly:
         //    endDate = local date of (split occurrence − 1 day). Graph also
         //    REQUIRES `startDate` on the range — supply the master's start.
-        guard let capEndDate = Self.graphEndDateBefore(naiveISO: recurrenceId, allDay: master.isAllDay) else {
+        guard let capEndDate = Self.graphEndDateBefore(naiveISO: recurrenceId, allDay: master.isAllDay, zone: recurrenceIdZone) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
         guard let masterStartDate = master.startDate else {
@@ -376,6 +378,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             master: master,
             patch: patch,
             newStartNaiveISO: recurrenceId,
+            newStartZone: recurrenceIdZone,
             newRecurrence: [rruleWithoutCap]
         )
         // Stamp a DETERMINISTIC `transactionId` (derived from master id +
@@ -486,14 +489,17 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// DATE-inclusive, so this is the local date of (split occurrence − 1 day).
     /// `allDay` doesn't change the math here (the result is a date either way)
     /// but is accepted for signature symmetry with the Google helper.
+    /// `naiveISO` is read in `zone` — the operation's declared timezone (see the
+    /// invariant on `RecurrenceOccurrenceResolver`), which is the device zone
+    /// unless the caller supplied `timezone`.
     /// Returns nil if `naiveISO` can't be parsed.
-    static func graphEndDateBefore(naiveISO: String, allDay: Bool) -> String? {
+    static func graphEndDateBefore(naiveISO: String, allDay: Bool, zone: TimeZone) -> String? {
         let dtFmt = DateFormatter()
         dtFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        dtFmt.timeZone = .current
+        dtFmt.timeZone = zone
         let dateFmt = DateFormatter()
         dateFmt.dateFormat = "yyyy-MM-dd"
-        dateFmt.timeZone = .current
+        dateFmt.timeZone = zone
         let parsed = dtFmt.date(from: naiveISO)
             ?? dateFmt.date(from: String(naiveISO.prefix(10)))
         guard let date = parsed else { return nil }
@@ -501,11 +507,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // or 25h of local time, so `addingTimeInterval(-86400)` can land on the
         // wrong calendar day and cap the series a day early/late.
         var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = .current
+        cal.timeZone = zone
         guard let dayBefore = cal.date(byAdding: .day, value: -1, to: date) else { return nil }
         let out = DateFormatter()
         out.dateFormat = "yyyy-MM-dd"
-        out.timeZone = .current
+        out.timeZone = zone
         return out.string(from: dayBefore)
     }
 
@@ -526,29 +532,28 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return (eventId, fetched)
     }
 
-    /// Find the Graph instance id for the occurrence starting at `recurrenceId`
-    /// by querying a wide-enough window around that time to tolerate DST and
-    /// device/event timezone deltas. See `GoogleCalendarProvider.resolveInstanceId`
-    /// for the ±25h rationale; we use the same window for parity so a DST-
-    /// adjacent occurrence resolves the same way on both backends.
-    private func resolveInstanceId(masterId: String, recurrenceId: String) async throws -> String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        fmt.timeZone = .current
-        guard let centerDate = fmt.date(from: recurrenceId) else {
-            // Fall back to the date-only form (e.g. "2026-05-20" for an all-day
-            // recurring event) before declaring the recurrenceId malformed —
-            // parity with GoogleCalendarProvider.resolveInstanceId. Recurse with
-            // a normalized full-day form so the rest of the path is one branch.
-            let dateFmt = DateFormatter()
-            dateFmt.dateFormat = "yyyy-MM-dd"
-            dateFmt.timeZone = TimeZone(identifier: "UTC")
-            guard dateFmt.date(from: String(recurrenceId.prefix(10))) != nil else {
-                throw ExchangeCalendarError.eventNotFound
-            }
-            return try await resolveInstanceId(
-                masterId: masterId,
-                recurrenceId: "\(recurrenceId.prefix(10))T00:00:00"
+    /// Find the Graph instance id for the occurrence `recurrenceId` names when
+    /// read in `zone`, by enumerating a wide-enough window around that instant to
+    /// tolerate DST and device/event timezone deltas. See
+    /// `GoogleCalendarProvider.resolveInstanceId` for the ±25h rationale and for
+    /// the full statement of why each failure mode gets its OWN error; we use the
+    /// same window and the same shared `RecurrenceOccurrenceResolver` so the two
+    /// backends cannot drift apart again (A7 — both copies of the day-prefix
+    /// defect existed because the selection logic was duplicated, so the fix is
+    /// one implementation, not two).
+    ///
+    /// Graph-specific note: `request` sends `Prefer: outlook.timezone="<device zone>"`,
+    /// so instance starts come back as a naive `dateTime` plus the IANA `timeZone`
+    /// we asked for. That pairing is what makes the instant computable at all —
+    /// unlike Google, the wire value carries NO offset. If Graph ever answers with
+    /// a zone identifier Foundation cannot resolve (a Windows-style name such as
+    /// "Pacific Standard Time"), we do not guess: an unplaceable candidate could
+    /// be the one being addressed, and defaulting it to UTC would compute a wrong
+    /// instant, which is how a wrong occurrence gets PATCHed.
+    private func resolveInstanceId(masterId: String, recurrenceId: String, zone: TimeZone) async throws -> String {
+        guard let centerDate = RecurrenceOccurrenceResolver.windowCenter(recurrenceId: recurrenceId, zone: zone) else {
+            throw CalendarProviderError.notSupported(
+                "Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00') or a date (e.g. '2026-05-20')."
             )
         }
         let windowSeconds: TimeInterval = 25 * 60 * 60
@@ -567,18 +572,41 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
         struct InstancesResponse: Decodable { let value: [MSEvent] }
         let resp = try JSONDecoder().decode(InstancesResponse.self, from: data)
-        // Match by day prefix first — handles DST shifts inside the window. If
-        // multiple instances came back and none day-matches, refuse to guess
-        // (consistent with Google's behavior).
-        let dayPrefix = String(recurrenceId.prefix(10))
-        if let dayMatch = resp.value.first(where: { ($0.start?.dateTime ?? "").hasPrefix(dayPrefix) }),
-           let id = dayMatch.id {
-            return id
+
+        var candidates: [OccurrenceCandidate] = []
+        for ev in resp.value {
+            guard let id = ev.id, let start = ev.start, let dt = start.dateTime else { continue }
+            guard let startZone = TimeZone(identifier: start.timeZone ?? "UTC") else {
+                throw CalendarProviderError.notSupported(
+                    "Microsoft Graph returned an occurrence of \(masterId) in an unrecognized timezone ('\(start.timeZone ?? "")') — refusing to edit an occurrence that may not be the one you named."
+                )
+            }
+            let fmt = DateFormatter()
+            fmt.locale = Locale(identifier: "en_US_POSIX")
+            fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+            fmt.timeZone = startZone
+            guard let instant = fmt.date(from: String(dt.prefix(19))) else {
+                throw CalendarProviderError.notSupported(
+                    "Could not interpret the start time of an occurrence of \(masterId) returned by Microsoft Graph ('\(dt)') — refusing to edit an occurrence that may not be the one you named."
+                )
+            }
+            candidates.append(OccurrenceCandidate(id: id, instant: instant, dateOnly: nil))
         }
-        if resp.value.count == 1, let id = resp.value[0].id {
+
+        switch RecurrenceOccurrenceResolver.select(candidates, recurrenceId: recurrenceId, zone: zone) {
+        case .resolved(let id):
             return id
+        case .absent:
+            throw ExchangeCalendarError.eventNotFound
+        case .ambiguous(let count):
+            throw CalendarProviderError.notSupported(
+                "recurrence_id '\(recurrenceId)' (\(zone.identifier)) matched \(count) occurrences of \(masterId) — refusing to guess which one you meant. Re-read the event and use the exact start_iso of the occurrence you want."
+            )
+        case .malformed:
+            throw CalendarProviderError.notSupported(
+                "Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00') or a date (e.g. '2026-05-20')."
+            )
         }
-        throw ExchangeCalendarError.eventNotFound
     }
 
     // MARK: - HTTP

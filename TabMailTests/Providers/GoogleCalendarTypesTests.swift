@@ -408,7 +408,7 @@ struct GoogleCalendarSplitHelpersTests {
     func googleUntilStringTimedFormat() {
         // RFC 5545: timed master (DTSTART with tz) → UNTIL must be UTC date-time.
         // Naive ISO is interpreted in device-local time, then output in UTC.
-        let out = GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "2026-05-20T17:00:00", allDay: false)
+        let out = GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "2026-05-20T17:00:00", allDay: false, zone: .current)
         #expect(out != nil)
         guard let out else { return }
         // ICS basic UTC date-time form: yyyyMMddTHHmmssZ — 16 chars, Z-terminated.
@@ -422,10 +422,10 @@ struct GoogleCalendarSplitHelpersTests {
         // RFC 5545: when DTSTART is VALUE=DATE, UNTIL MUST also be a bare DATE
         // (no time, no Z). Capping an all-day series before its 2026-05-20
         // occurrence means UNTIL=20260519.
-        let out = GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "2026-05-20T00:00:00", allDay: true)
+        let out = GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "2026-05-20T00:00:00", allDay: true, zone: .current)
         #expect(out == "20260519", "all-day UNTIL must be YYYYMMDD day-before; got \(out ?? "nil")")
         // Date-only recurrence_id form must also parse.
-        let out2 = GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "2026-05-20", allDay: true)
+        let out2 = GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "2026-05-20", allDay: true, zone: .current)
         #expect(out2 == "20260519")
         // No 'T', no 'Z' — must NOT be the date-time form.
         if let out { #expect(!out.contains("T") && !out.contains("Z")) }
@@ -435,10 +435,10 @@ struct GoogleCalendarSplitHelpersTests {
     func googleUntilStringAllDayBoundaries() {
         // Calendar-based subtraction (not flat 86400s) must roll month/year
         // boundaries and is DST-correct by Foundation's contract.
-        #expect(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "2026-03-01", allDay: true) == "20260228")
-        #expect(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "2026-01-01", allDay: true) == "20251231")
+        #expect(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "2026-03-01", allDay: true, zone: .current) == "20260228")
+        #expect(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "2026-01-01", allDay: true, zone: .current) == "20251231")
         // Leap year: 2028 is a leap year, so day before Mar 1 is Feb 29.
-        #expect(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "2028-03-01", allDay: true) == "20280229")
+        #expect(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "2028-03-01", allDay: true, zone: .current) == "20280229")
     }
 
     @Test("mergeMasterAndPatch honors patch.recurrence when LLM wants to change the pattern")
@@ -461,6 +461,7 @@ struct GoogleCalendarSplitHelpersTests {
         let out = GoogleCalendarProvider.mergeMasterAndPatch(
             master: master, patch: patch,
             newStartNaiveISO: "2026-05-25T17:00:00",
+            newStartZone: .current,
             newRecurrence: ["RRULE:FREQ=DAILY"]  // default would be daily
         )
         #expect(out.recurrence == ["RRULE:FREQ=WEEKLY;BYDAY=MO"])
@@ -485,6 +486,7 @@ struct GoogleCalendarSplitHelpersTests {
         let out = GoogleCalendarProvider.mergeMasterAndPatch(
             master: master, patch: GCalEventInput(),
             newStartNaiveISO: "2026-05-27",   // all-day recurrence_id form
+            newStartZone: .current,
             newRecurrence: ["RRULE:FREQ=WEEKLY"]
         )
         // Must emit date-only fields, NOT date-time.
@@ -512,6 +514,7 @@ struct GoogleCalendarSplitHelpersTests {
         let out = GoogleCalendarProvider.mergeMasterAndPatch(
             master: master, patch: GCalEventInput(),
             newStartNaiveISO: "2026-05-21T22:00:00",
+            newStartZone: .current,
             newRecurrence: ["RRULE:FREQ=WEEKLY"]
         )
         #expect(out.startTimeZone == "America/Vancouver")
@@ -531,6 +534,7 @@ struct GoogleCalendarSplitHelpersTests {
         let out2 = GoogleCalendarProvider.mergeMasterAndPatch(
             master: noTzMaster, patch: GCalEventInput(),
             newStartNaiveISO: "2026-05-21T22:00:00",
+            newStartZone: .current,
             newRecurrence: ["RRULE:FREQ=WEEKLY"]
         )
         #expect(out2.startTimeZone == TimeZone.current.identifier)
@@ -550,6 +554,7 @@ struct GoogleCalendarSplitHelpersTests {
         let out = GoogleCalendarProvider.mergeMasterAndPatch(
             master: master, patch: GCalEventInput(),
             newStartNaiveISO: "2026-05-25T17:00:00",
+            newStartZone: .current,
             newRecurrence: ["RRULE:FREQ=DAILY"]
         )
         #expect(out.recurrence == ["RRULE:FREQ=DAILY"])
@@ -561,9 +566,9 @@ struct GoogleCalendarSplitHelpersTests {
         // producing a UNTIL value that capped the series at "now". Caller couldn't
         // tell parse-success from silent-default. Now we return nil so the caller
         // surfaces a clear error to the LLM/user.
-        #expect(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "garbage", allDay: false) == nil)
-        #expect(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "", allDay: false) == nil)
-        #expect(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "2026-13-99T99:99:99", allDay: true) == nil)
+        #expect(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "garbage", allDay: false, zone: .current) == nil)
+        #expect(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "", allDay: false, zone: .current) == nil)
+        #expect(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: "2026-13-99T99:99:99", allDay: true, zone: .current) == nil)
     }
 
     @Test("deterministicSplitEventId is stable across calls and varies with inputs")

@@ -31,6 +31,7 @@ struct MockCalendarProviderRecurringTests {
         _ = try await mock.updateOccurrence(
             calendarId: "cal-1", eventId: "evt-1",
             recurrenceId: "2026-05-20T17:00:00",
+            recurrenceIdZone: .current,
             event: input, sendUpdates: "all"
         )
         let calls = await mock.updatedOccurrences
@@ -58,6 +59,7 @@ struct MockCalendarProviderRecurringTests {
         _ = try await mock.splitSeries(
             calendarId: "cal-1", eventId: "evt-1",
             recurrenceId: "2026-05-20T17:00:00",
+            recurrenceIdZone: .current,
             patch: patch, sendUpdates: "all"
         )
         let calls = await mock.splitSeriesCalls
@@ -78,6 +80,7 @@ struct MockCalendarProviderRecurringTests {
         do {
             _ = try await mock.updateOccurrence(
                 calendarId: "c", eventId: "e", recurrenceId: "r",
+                recurrenceIdZone: .current,
                 event: GCalEventInput(), sendUpdates: "all"
             )
             Issue.record("expected throw")
@@ -115,6 +118,7 @@ struct CalendarProviderDefaultExtensionTests {
         do {
             _ = try await p.updateOccurrence(
                 calendarId: "c", eventId: "e", recurrenceId: "r",
+                recurrenceIdZone: .current,
                 event: GCalEventInput(), sendUpdates: "all"
             )
             Issue.record("expected throw")
@@ -131,6 +135,7 @@ struct CalendarProviderDefaultExtensionTests {
         do {
             _ = try await p.splitSeries(
                 calendarId: "c", eventId: "e", recurrenceId: "r",
+                recurrenceIdZone: .current,
                 patch: GCalEventInput(), sendUpdates: "all"
             )
             Issue.record("expected throw")

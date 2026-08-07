@@ -829,6 +829,17 @@ extension AccountManager {
             // implied single-occurrence override).
             let explicitScope = CalendarToolHelpers.stringArgOpt(resolvedArgs, "edit_scope")?.lowercased()
             let recurrenceId = CalendarToolHelpers.stringArgOpt(resolvedArgs, "recurrence_id")
+            // 🚨 THE OTHER HALF OF THE OCCURRENCE ADDRESS. `recurrence_id` is a
+            // naive wall clock with no offset; on its own it does not name an
+            // instant. `calendar_event_edit`'s schema already publishes the frame
+            // ("all naive ISO8601 datetime parameters are interpreted in this
+            // timezone", default: the device zone), the durable operation already
+            // persists the whole argument dictionary including `timezone`, and
+            // `formatDetailedEvent` already MINTS `start_iso` in that same zone.
+            // The frame was present on both ends the entire time and was simply
+            // never carried across — the calendar instance of THE ADDRESS PROBLEM.
+            // Resolving it here, once, is what lets every provider agree.
+            let recurrenceIdZone = CalendarToolHelpers.resolveTimeZone(resolvedArgs)
             let scope: String = explicitScope
                 ?? (recurrenceId != nil ? "this_only" : "all")
 
@@ -839,18 +850,20 @@ extension AccountManager {
                 }
                 _ = try await provider.updateOccurrence(
                     calendarId: calId, eventId: eventId, recurrenceId: rid,
+                    recurrenceIdZone: recurrenceIdZone,
                     event: input, sendUpdates: "all"
                 )
-                print("[CalendarQueue] Updated event id=\(eventId) scope=this_only at \(rid)")
+                print("[CalendarQueue] Updated event id=\(eventId) scope=this_only at \(rid) (\(recurrenceIdZone.identifier))")
             case "this_and_following":
                 guard let rid = recurrenceId else {
                     throw CalendarProviderError.notSupported("edit_scope='this_and_following' requires recurrence_id")
                 }
                 let created = try await provider.splitSeries(
                     calendarId: calId, eventId: eventId, recurrenceId: rid,
+                    recurrenceIdZone: recurrenceIdZone,
                     patch: input, sendUpdates: "all"
                 )
-                print("[CalendarQueue] Updated event id=\(eventId) scope=this_and_following at \(rid) — new series id=\(created.id ?? "?")")
+                print("[CalendarQueue] Updated event id=\(eventId) scope=this_and_following at \(rid) (\(recurrenceIdZone.identifier)) — new series id=\(created.id ?? "?")")
                 // Surface the new series id so `awaitCalendarOpOutcome` can hand
                 // it back to the tool — the LLM needs it to address occurrences
                 // in the split's second half. Without this, follow-up edits

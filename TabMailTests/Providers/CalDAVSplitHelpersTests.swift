@@ -1100,6 +1100,7 @@ struct CalDAVSplitRollbackTests {
                 calendarId: Self.calendarId,
                 eventId: Self.masterEventId,
                 recurrenceId: fixture.recurrenceId,
+                recurrenceIdZone: .current,
                 patch: GCalEventInput(),
                 sendUpdates: "none")
         }
@@ -1175,6 +1176,7 @@ struct CalDAVSplitRollbackTests {
                 calendarId: Self.calendarId,
                 eventId: Self.masterEventId,
                 recurrenceId: fixture.recurrenceId,
+                recurrenceIdZone: .current,
                 patch: GCalEventInput(),
                 sendUpdates: "none")
         }
@@ -1219,6 +1221,7 @@ struct CalDAVSplitRollbackTests {
             calendarId: Self.calendarId,
             eventId: Self.masterEventId,
             recurrenceId: fixture.recurrenceId,
+            recurrenceIdZone: .current,
             patch: GCalEventInput(),
             sendUpdates: "none")
 
@@ -1277,6 +1280,7 @@ struct CalDAVSplitRollbackTests {
                 calendarId: Self.calendarId,
                 eventId: Self.masterEventId,
                 recurrenceId: fixture.recurrenceId,
+                recurrenceIdZone: .current,
                 patch: GCalEventInput(),
                 sendUpdates: "none")
         }
@@ -1437,7 +1441,7 @@ struct CalDAVUpdatePreconditionTests {
         do {
             _ = try await provider.updateOccurrence(
                 calendarId: Self.calendarId, eventId: path,
-                recurrenceId: fixture.recurrenceId, event: patch, sendUpdates: "none")
+                recurrenceId: fixture.recurrenceId, recurrenceIdZone: .current, event: patch, sendUpdates: "none")
         } catch {
             Issue.record("the override must land against a server that returns no ETag — threw: \(error)")
         }
@@ -1475,6 +1479,7 @@ struct CalDAVUpdatePreconditionTests {
             _ = try await provider.splitSeries(
                 calendarId: Self.calendarId, eventId: masterPath,
                 recurrenceId: fixture.recurrenceId,
+                recurrenceIdZone: .current,
                 patch: GCalEventInput(), sendUpdates: "none")
         } catch {
             Issue.record("the split must land against a server that returns no ETag — threw: \(error)")
@@ -1532,10 +1537,11 @@ struct CalDAVUpdatePreconditionTests {
             calendarId: Self.calendarId, eventId: editPath, event: patch, sendUpdates: "none")
         _ = try await provider.updateOccurrence(
             calendarId: Self.calendarId, eventId: occurrencePath,
-            recurrenceId: fixture.recurrenceId, event: patch, sendUpdates: "none")
+            recurrenceId: fixture.recurrenceId, recurrenceIdZone: .current, event: patch, sendUpdates: "none")
         _ = try await provider.splitSeries(
             calendarId: Self.calendarId, eventId: splitPath,
             recurrenceId: fixture.recurrenceId,
+            recurrenceIdZone: .current,
             patch: GCalEventInput(), sendUpdates: "none")
 
         for path in [editPath, occurrencePath, splitPath] {
