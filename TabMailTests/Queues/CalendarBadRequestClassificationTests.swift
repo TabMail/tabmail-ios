@@ -43,8 +43,9 @@ import Foundation
 //     and `ExchangeCalendarProvider.request` map `statusCode == 403` to
 //     `.missingScope` before throwing. ⚠️ But they do that only on the FIRST
 //     response: after a 401 both force a token refresh, re-issue, and rethrow the
-//     retry's status RAW (`httpError(retry.statusCode, nil)`). A 401-then-403
-//     therefore arrived as `httpError(403, nil)`, which no arm claimed.
+//     retry's status RAW (`httpError(retry.statusCode, retry.errorBody)` — a
+//     literal `nil` payload until R14-F1). A 401-then-403 therefore arrived as
+//     `httpError(403, …)`, which no arm claimed.
 //     `isCalendarMissingScopeError` now matches the raw form too.
 //   * **401 — FALSE as originally written.** `isCalendarAuthError` was CalDAV-only
 //     (`CalDAVError.authFailed`), so a POST-REFRESH Google/Exchange 401 was not an
@@ -127,8 +128,10 @@ struct CalendarBadRequestClassificationTests {
         // These are the exact values `GoogleCalendarProvider.request` /
         // `ExchangeCalendarProvider.request` rethrow after they have ALREADY forced
         // a token refresh and re-issued the request:
-        //     throw GoogleCalendarError.httpError(retry.statusCode, nil)
-        // so the grant is revoked and no retry can ever clear it.
+        //     throw GoogleCalendarError.httpError(retry.statusCode, retry.errorBody)
+        // so the grant is revoked and no retry can ever clear it. (The payload was
+        // a literal `nil` until R14-F1; these arms match on the STATUS, so `nil` is
+        // still a legal value here — an empty error body produces it.)
         let postRefresh: [(label: String, error: Error)] = [
             ("Google 401", GoogleCalendarError.httpError(401, nil)),
             ("Exchange 401", ExchangeCalendarError.httpError(401, nil)),

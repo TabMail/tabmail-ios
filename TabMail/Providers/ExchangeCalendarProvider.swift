@@ -613,6 +613,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return encoded
     }
 
+    /// 🚨 **R14-F1 — THE ERROR PAYLOAD IS `errorBody`, NEVER `data`.** Identical
+    /// to `GoogleCalendarProvider.request`'s note, kept in step deliberately:
+    /// `performHTTPRequest` nils `data` on every non-2xx and puts the server's
+    /// bytes in `errorBody`, so `httpError(_, result.data)` could only ever carry
+    /// `nil`. Every reason string `badRequestReason` / `parseHttpReason` surfaced
+    /// to the user and to the LLM was therefore the code-only fallback.
     private func request(path: String, method: String = "GET", body: Data? = nil) async throws -> Data {
         let token = try await accessToken(false)
         // `Prefer: outlook.timezone` controls the timezone Graph uses in the
@@ -643,7 +649,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             if let data = retry.data {
                 return data
             }
-            throw ExchangeCalendarError.httpError(retry.statusCode, nil)
+            throw ExchangeCalendarError.httpError(retry.statusCode, retry.errorBody)
         }
 
         // 403 — missing scope
@@ -651,7 +657,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             throw ExchangeCalendarError.missingScope
         }
 
-        throw ExchangeCalendarError.httpError(result.statusCode, result.data)
+        throw ExchangeCalendarError.httpError(result.statusCode, result.errorBody)
     }
 
     // MARK: - Model Mapping (Graph → GCal)

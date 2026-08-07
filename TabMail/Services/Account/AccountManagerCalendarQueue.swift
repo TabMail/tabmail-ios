@@ -725,11 +725,22 @@ extension AccountManager {
     /// `GoogleCalendarProvider.request` / `ExchangeCalendarProvider.request` map a
     /// 403 to the typed case only on the FIRST response. When the first response
     /// was a 401, both force a token refresh and re-issue, and the retry's status
-    /// is rethrown RAW — `throw GoogleCalendarError.httpError(retry.statusCode, nil)`.
-    /// So a 401-then-403 arrives here as `httpError(403, nil)`, which the typed
+    /// is rethrown RAW — `throw GoogleCalendarError.httpError(retry.statusCode, retry.errorBody)`.
+    /// So a 401-then-403 arrives here as `httpError(403, …)`, which the typed
     /// match cannot see and which `isCalendarBadRequestError` deliberately excludes
     /// (403 is not a malformed payload). Before this arm covered the raw form, that
     /// error was claimed by NO terminal arm and wedged the account's calendar lane.
+    ///
+    /// ⚠️ **THE PAYLOAD USED TO BE A LITERAL `nil` ON BOTH REFRESH-RETRY ARMS, AND
+    /// IS NOT ANY MORE (R14-F1).** The arms match `_` on the payload, so the change
+    /// is inert HERE — but the sentence above named the `nil` explicitly, and every
+    /// classifier that DOES read the payload (`isGoogleDuplicateIdConflict`,
+    /// `badRequestReason`, `parseHttpReason`) was receiving `nil` on **every**
+    /// non-2xx, refresh-retry or not: `performHTTPRequest` returns `data: nil` for
+    /// any non-2xx and puts the server's bytes in `errorBody`, and both providers
+    /// threw `result.data`. Which arm carries what, stated so no future reader has
+    /// to re-derive it: **first response and refresh-retry both carry the server's
+    /// raw body now; neither carries `nil` unless the response body was empty.**
     static func isCalendarMissingScopeError(_ error: Error) -> Bool {
         if case GoogleCalendarError.missingScope = error { return true }
         if case ExchangeCalendarError.missingScope = error { return true }
@@ -753,9 +764,11 @@ extension AccountManager {
     /// `GoogleCalendarProvider.request` and `ExchangeCalendarProvider.request` both
     /// intercept it, call `accessToken(true)` to FORCE a refresh, re-issue the
     /// request with the fresh token, and only then rethrow — as
-    /// `httpError(retry.statusCode, nil)`. So a 401 arriving here is the SECOND
-    /// one, observed with a token minted seconds earlier: the grant itself is
-    /// revoked/expired, and every future drain reproduces it identically.
+    /// `httpError(retry.statusCode, retry.errorBody)` (a literal `nil` until
+    /// R14-F1; the payload is irrelevant to this arm, which matches `_`). So a 401
+    /// arriving here is the SECOND one, observed with a token minted seconds
+    /// earlier: the grant itself is revoked/expired, and every future drain
+    /// reproduces it identically.
     ///
     /// **This safety rests entirely on that provider behaviour.** If either
     /// `request` ever stops force-refreshing before rethrowing — or a new calendar

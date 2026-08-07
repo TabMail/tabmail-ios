@@ -192,9 +192,23 @@ struct CalendarPathContainmentTests {
     // Oracle: `GoogleCalendarProvider.request` calls `try await accessToken(false)`
     // as its FIRST statement, so no HTTP request can be formed without it. A
     // token closure that COUNTS and then THROWS therefore proves "the request was
-    // refused before it could be built" without adding a `URLSession` seam to the
-    // provider — and, deliberately, without any test in this file being able to
-    // reach the live internet (`feedback_nil_defaulted_seam_is_fail_dangerous`).
+    // refused before it could be built" using NO transport seam at all — and,
+    // deliberately, with no test in this file able to reach the live internet
+    // (`feedback_nil_defaulted_seam_is_fail_dangerous`).
+    //
+    // ⚠️ NARROWED (R14-F1): this used to read *"without adding a `URLSession` seam
+    // to the provider"*, which now reads as a prohibition the provider violates.
+    // `GoogleCalendarProvider` DOES have a transport seam today — a SEPARATE
+    // `init(accessToken:session:)` taking a NON-OPTIONAL session, so a dropped
+    // injection is a compile error rather than a silent live-internet fallback
+    // (the same shape as `CalDAVClient`'s pair, and deliberately *not*
+    // `GmailProvider`'s `session: URLSession? = nil`). It exists because
+    // `CalendarConflictDispositionTests` must prove a property OF THE TRANSPORT
+    // SEAM, which a mock `CalendarProvider` cannot reach. The claim that survives,
+    // and the only one this file needs, is the narrower one: **these path-
+    // containment proofs need no session, because the refusal happens before the
+    // token is even requested.** Do not "modernise" them onto the seam — the
+    // absence of a session is what makes `spy.calls == 0` mean what it says.
 
     private final class TokenSpy: @unchecked Sendable {
         private let lock = NSLock()

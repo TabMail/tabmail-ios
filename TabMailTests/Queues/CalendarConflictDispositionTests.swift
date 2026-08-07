@@ -189,6 +189,114 @@ struct CalendarConflictDispositionTests {
                 "with no client-supplied id the server minted its own, so a duplicate-identifier conflict cannot be evidence that OUR create landed")
     }
 
+    // MARK: - R14-F1 — the same invariant, driven through the TRANSPORT SEAM
+    //
+    // 🚨 EVERY TEST ABOVE IS VACUOUS WITH RESPECT TO PRODUCTION, and that is the
+    // defect this section closes rather than a criticism of them. They hand
+    // `MockCalendarProvider` a `GoogleCalendarError.httpError(409, body)` that the
+    // TEST authored, so they prove the classifier is correct given a body. In
+    // production no body ever arrived: `performHTTPRequest` returns `data: nil` for
+    // every non-2xx and puts the server's bytes in `errorBody`, while
+    // `GoogleCalendarProvider.request` threw `httpError(status, result.data)` — a
+    // line reachable ONLY when `result.data == nil`. So
+    // `isGoogleDuplicateIdConflict` returned `false` at its first `guard let body`
+    // on every real 409, the arm could never fire, and a Google create whose
+    // response was lost fell to the transient arm and head-of-line-blocked that
+    // account's calendar lane forever.
+    //
+    // These two tests therefore assert the same system property as their siblings
+    // — the durable row survives every outcome except a positively-proven one —
+    // but they let the REAL provider parse a REAL HTTP response. They are the only
+    // tests in this file that would notice `errorBody` being swapped back to
+    // `data`, and the only ones that can, because a mock provider cannot express
+    // the question.
+    //
+    // ⚠️ NON-VACUITY IS TWO-SIDED HERE TOO, and the wire half matters more than
+    // usual: `servedCallSequence()` proves the POST reached the fake. Without it a
+    // provider that never issued a request — or one that escaped to the live
+    // internet, which leaves no record at all — would satisfy "the row survives".
+
+    /// Google's `POST /calendar/v3/calendars/primary/events` path, as
+    /// `GoogleCalendarProvider.baseURL + createEvent`'s path build it.
+    private static let googleCreatePath = "/calendar/v3/calendars/primary/events"
+
+    private func drainOneCreateThroughRealGoogleProvider(
+        accountId: String,
+        pregenEventId: String,
+        conflictBody: Data
+    ) async throws -> (remaining: Int, outcome: CalendarOpOutcome, wire: [String]) {
+        let (pool, dir, previous) = try makeTestDB(accountId: accountId)
+        let http = FakeHTTP.Scenario()
+        http.register(
+            path: Self.googleCreatePath, method: "POST",
+            response: .raw(
+                statusCode: 409,
+                headers: ["Content-Type": "application/json"],
+                body: conflictBody))
+        // NON-OPTIONAL session — a dropped injection is a compile error here, not
+        // a silent fallback to `sharedEphemeralSession` and the live internet
+        // (`feedback_nil_defaulted_seam_is_fail_dangerous`).
+        let provider = GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: provider)
+        defer {
+            Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) }
+            http.close()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+        }
+
+        let op = PendingCalendarOperation(
+            operationType: .create,
+            accountId: accountId,
+            eventId: pregenEventId,
+            calendarId: "primary",
+            arguments: ["summary": .string("Quarterly review")]
+        )
+        try await pool.write { db in try op.insert(db) }
+
+        async let outcome = AccountManager.shared.awaitCalendarOpOutcome(opId: op.id, timeoutSeconds: 5.0)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        await AccountManager.shared.drainCalendarQueue()
+        let result = await outcome
+
+        let remaining = try await pool.read { db in try PendingCalendarOperation.fetchCount(db) }
+        return (remaining, result, http.servedCallSequence())
+    }
+
+    @Test("A REAL Google 409 whose body says `duplicate` retires the op — the error payload survives the transport seam")
+    func googleDuplicateSurvivesTheTransportSeam() async throws {
+        let result = try await drainOneCreateThroughRealGoogleProvider(
+            accountId: "cal-r14-f1-seam-dup",
+            pregenEventId: "pre-goog-seam-dup",
+            conflictBody: googleErrorBody(
+                reason: "duplicate", message: "The requested identifier already exists."))
+
+        #expect(result.wire == ["POST \(Self.googleCreatePath)"],
+                "the create never reached the stubbed transport, so nothing below is evidence about the seam — got \(result.wire)")
+        #expect(isSuccess(result.outcome), "got \(result.outcome)")
+        #expect(result.remaining == 0,
+                "Google positively told us OUR client-supplied id is already on the calendar, and the queue could not hear it: the provider threw `result.data` (always nil on a non-2xx) instead of `result.errorBody`, so the duplicate-id classifier returned false at its first `guard let body` and the op fell to the transient arm — which requeues it AND inserts the account into `failedAccounts`, head-of-line-blocking every later calendar op on that account on every subsequent drain. That is a wedge, and the wedge corollary sits in the same non-recoverable set as a dropped intention.")
+    }
+
+    @Test("A REAL Google 409 whose body says `conflict` still leaves the create queued — carrying the body did not widen what counts as proof")
+    func googleBatchConflictThroughTheTransportSeamStaysQueued() async throws {
+        // ⚠️ THE MIRROR IMAGE, pinned at the seam. Making the body reach the
+        // classifier must not make every 409 terminal: Google documents
+        // reason `conflict` as an `events.batch` operational conflict its own
+        // guidance says to retry, and retiring on it drops the user's create on
+        // "we could not determine the answer" (never-drop clause 2). This is the
+        // side that must stay GREEN when F1 is inverted.
+        let result = try await drainOneCreateThroughRealGoogleProvider(
+            accountId: "cal-r14-f1-seam-conflict",
+            pregenEventId: "pre-goog-seam-conflict",
+            conflictBody: googleErrorBody(reason: "conflict", message: "Conflict"))
+
+        #expect(result.wire == ["POST \(Self.googleCreatePath)"],
+                "the create never reached the stubbed transport — got \(result.wire)")
+        #expect(isStillQueued(result.outcome), "got \(result.outcome)")
+        #expect(result.remaining == 1,
+                "a batch-operational conflict is not a statement that OUR event exists; retiring it drops the user's intention")
+    }
+
     // MARK: Control
 
     @Test("CONTROL — an ordinary successful create still retires the op, so the four survivals above are not 'the drain never deletes'")

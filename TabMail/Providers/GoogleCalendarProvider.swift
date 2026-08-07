@@ -60,9 +60,38 @@ extension CalendarProvider {
 actor GoogleCalendarProvider: CalendarProvider {
     private let accessToken: @Sendable (_ forceRefresh: Bool) async throws -> String
     private let baseURL = "https://www.googleapis.com/calendar/v3"
+    /// Test-only transport override. `nil` on every production path, where
+    /// `performHTTPRequest` falls back to `sharedEphemeralSession`.
+    private let testSession: URLSession?
 
     init(accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String) {
         self.accessToken = accessToken
+        self.testSession = nil
+    }
+
+    /// Explicit-session initializer, used by tests to route this provider's HTTP
+    /// through `FakeHTTP`.
+    ///
+    /// ⚠️ Deliberately a SEPARATE initializer taking a NON-OPTIONAL session,
+    /// mirroring `CalDAVClient`'s pair rather than `GmailProvider`'s
+    /// `session: URLSession? = nil` parameter. A nil-defaulted seam is
+    /// fail-DANGEROUS: an injection that is silently dropped leaves the unit
+    /// suite talking to the live internet, and nothing in the run says so
+    /// (`feedback_nil_defaulted_seam_is_fail_dangerous`). Omitting *this*
+    /// initializer is a compile error instead.
+    ///
+    /// This seam exists because `CalendarConflictDispositionTests` has to prove a
+    /// property of the TRANSPORT SEAM — that the bytes Google sends with a 409
+    /// reach the queue's duplicate-id classifier — and that is unreachable from a
+    /// mock `CalendarProvider`, which by construction hands the classifier a body
+    /// the test itself authored. The neighbouring path-containment proofs still
+    /// need no session at all (see `CalendarPathContainmentTests` § Google).
+    init(
+        accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String,
+        session: URLSession
+    ) {
+        self.accessToken = accessToken
+        self.testSession = session
     }
 
     // MARK: - Calendars
@@ -896,9 +925,20 @@ actor GoogleCalendarProvider: CalendarProvider {
 
     // MARK: - HTTP
 
+    /// 🚨 **R14-F1 — THE ERROR PAYLOAD IS `errorBody`, NEVER `data`.**
+    /// `performHTTPRequest` returns `data: nil` on *every* non-2xx and puts the
+    /// bytes the server sent in `errorBody` (`HTTPRequestResult`'s own doc states
+    /// this). Both throws below reached this line only because `result.data` was
+    /// nil, so `httpError(_, result.data)` could never carry anything but `nil` —
+    /// which made `AccountManagerCalendarQueue.isGoogleDuplicateIdConflict`
+    /// VACUOUS in production (it returns `false` at its first `guard let body`)
+    /// and left `badRequestReason` / `parseHttpReason` permanently on their
+    /// code-only fallback. The classifier was provably correct and provably
+    /// unreachable: its tests construct `httpError(409, body)` directly and so
+    /// bypass this seam.
     private func request(path: String, method: String = "GET", body: Data? = nil) async throws -> Data {
         let token = try await accessToken(false)
-        let result = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: token, logLabel: "GoogleCalendar")
+        let result = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: token, session: testSession, logLabel: "GoogleCalendar")
 
         if let data = result.data {
             return data
@@ -908,11 +948,11 @@ actor GoogleCalendarProvider: CalendarProvider {
         if result.statusCode == 401 {
             print("[GoogleCalendar] Token expired, refreshing...")
             let freshToken = try await accessToken(true)
-            let retry = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: freshToken, logLabel: "GoogleCalendar")
+            let retry = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: freshToken, session: testSession, logLabel: "GoogleCalendar")
             if let data = retry.data {
                 return data
             }
-            throw GoogleCalendarError.httpError(retry.statusCode, nil)
+            throw GoogleCalendarError.httpError(retry.statusCode, retry.errorBody)
         }
 
         // 403 — missing calendar scope
@@ -920,7 +960,7 @@ actor GoogleCalendarProvider: CalendarProvider {
             throw GoogleCalendarError.missingScope
         }
 
-        throw GoogleCalendarError.httpError(result.statusCode, result.data)
+        throw GoogleCalendarError.httpError(result.statusCode, result.errorBody)
     }
 
     // MARK: - Helpers
