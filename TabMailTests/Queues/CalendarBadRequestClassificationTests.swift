@@ -16,9 +16,13 @@ import Foundation
 // the two is the single most repeated defect in this codebase's history.
 //
 // `isCalendarBadRequestError` is the predicate that decides retirement for the
-// malformed-payload arm: `true` deletes the `PendingCalendarOperation` outright,
-// `false` falls through to the transient arm that requeues with `retryCount + 1`.
-// So every `true` here is a user intention leaving the queue forever.
+// malformed-payload arm: `true` RETIRES the `PendingCalendarOperation` —
+// `status = 'failed'` with a reason, which since R16-1 is a durable write rather
+// than the `deleteOne` this comment asserted until R17-7 — and `false` falls
+// through to the transient arm that requeues with `retryCount + 1`. The retired
+// row survives for diagnostics; the WORK does not. So every `true` here is still
+// a user intention leaving the queue forever, which is the property this suite
+// guards; only the mechanism changed.
 //
 // ⚠️ TWO-SIDED, deliberately. The mirror-image fix — delete the classifier so
 // nothing is ever retired — would make a genuinely malformed 400/415/422 retry
@@ -289,9 +293,10 @@ struct CalendarBadRequestClassificationTests {
     func aFailedSplitRollbackDoesNotRetireAsABadRequest() {
         // SYSTEM PROPERTY: a series that has been CAPPED on the server, with no
         // successor created and no rollback, must not be retired by the arm that
-        // exists for "your payload is broken" — because that arm deletes the
-        // durable row silently, and the user is left with a recurring series that
-        // ends early, no queued work to fix it, and no way for sync to know.
+        // exists for "your payload is broken" — because that arm retires the
+        // durable row silently (`status = 'failed'`; it deleted it before R16-1),
+        // and the user is left with a recurring series that ends early, no queued
+        // work to fix it, and no way for sync to know.
         //
         // The pre-fix shape reported both rollback outcomes identically
         // (`_ = try? await updateEvent(… revertInput …)` then `throw error`), so
@@ -314,11 +319,11 @@ struct CalendarBadRequestClassificationTests {
 
         // ROLLBACK FAILED — the server is in a state no retry of this op can
         // repair (a retry re-caps an already-capped master), and no silent
-        // deletion may claim it.
+        // retirement may claim it.
         let stranded = GoogleCalendarProvider.splitRollbackError(
             original: original, revertFailure: URLError(.timedOut))
         #expect(AccountManager.isCalendarBadRequestError(stranded) == false,
-                "the half-landed split was retired as a malformed request — the durable row is deleted and the truncated master is left on the server with nothing queued to repair it")
+                "the half-landed split was retired as a malformed request — the durable row is retired unexecuted and the truncated master is left on the server with nothing queued to repair it")
         #expect(claimedByATerminalArm(stranded),
                 "it must still reach SOME terminal arm — falling into the transient arm would head-of-line-block every later calendar op on the account, which is the wedge this suite's other tests guard against")
 
@@ -423,7 +428,7 @@ struct CalendarBadRequestClassificationTests {
                 claimedByATerminalArm(error) == terminal,
                 terminal
                     ? "\(label): claimed by NO terminal arm, so the drain requeues it AND inserts the account into failedAccounts — every later calendar op on that account is skipped, on this drain and every subsequent one. A wedge sits in the same non-recoverable set as a dropped intention."
-                    : "\(label): a terminal arm claims it, so the durable PendingCalendarOperation row is DELETED. This error is indeterminate or transient — retiring on it drops the user's intention on 'we could not determine the answer' (never-drop clause 2).")
+                    : "\(label): a terminal arm claims it, so the durable PendingCalendarOperation row is RETIRED (status = 'failed') and its work never executes. This error is indeterminate or transient — retiring on it drops the user's intention on 'we could not determine the answer' (never-drop clause 2).")
         }
     }
 
@@ -451,7 +456,7 @@ struct CalendarBadRequestClassificationTests {
         // all — the purest form of "we could not determine the answer".
         for code in ["temporarily_unavailable", "server_error", "unknown", "invalid_scope", ""] {
             #expect(claimedByATerminalArm(OAuthError.tokenExchangeFailed(code)) == false,
-                    "'\(code)' is indeterminate or is our own request bug — retiring the op on it deletes the user's queued calendar operation for a condition that clears itself")
+                    "'\(code)' is indeterminate or is our own request bug — retiring the op on it ends the user's queued calendar operation unexecuted for a condition that clears itself")
         }
     }
 
@@ -512,8 +517,8 @@ struct CalendarBadRequestClassificationTests {
     /// (`DemoModeService.start` raises it twice), and `.notInDemo` means
     /// `AppDatabase.shared` was nil — the database was not up. Both are *"we could
     /// not determine the answer"*, which never-drop clause 2 keeps retryable forever.
-    /// Retiring either deletes the user's queued calendar operation for a condition
-    /// that clears itself.
+    /// Retiring either ends the user's queued calendar operation unexecuted for a
+    /// condition that clears itself.
     ///
     /// `.startFailed` is deliberately NOT in `reachableErrorRoster()`: giving the
     /// authoritative fact its own spelling is exactly what removed `.startFailed`
@@ -529,13 +534,26 @@ struct CalendarBadRequestClassificationTests {
             ("database not up", DemoError.notInDemo),
         ] {
             #expect(claimedByATerminalArm(error) == false,
-                    "\(label): a terminal arm claims it, so the durable PendingCalendarOperation row is DELETED for a demo failure that says nothing about whether the event exists")
+                    "\(label): a terminal arm claims it, so the durable PendingCalendarOperation row is RETIRED unexecuted for a demo failure that says nothing about whether the event exists")
             #expect(AccountManager.isCalendarNotFoundError(error) == false,
                     "\(label): must not be read as the provider saying the event is gone")
         }
     }
 
-    @Test("The re-auth signal is raised for a strictly larger set than the terminal arm claims")
+    /// ⚠️ **RETIRED DISPLAY NAME, RECORDED VERBATIM SO EXISTING CITATIONS STILL
+    /// GREP (R17-7, `b87804055`'s convention):**
+    /// *"The re-auth signal is raised for a strictly larger set than the terminal
+    /// arm claims"*. It was renamed, not re-scoped — **no assertion was added,
+    /// removed or weakened**. R16-10 corrected the same false claim in
+    /// `isCalendarOAuthReauthRequired`'s doc block (*"THE TWO SETS ARE
+    /// INCOMPARABLE, NOT NESTED"*) and left this copy standing, which is the copy
+    /// most likely to be re-propagated because test names get quoted into commit
+    /// bodies. The falsity is provable from this test's OWN body, in both
+    /// directions and without leaving the file: `ProviderError.authenticationFailed`
+    /// is asserted signal-yes / terminal-no (signal ∖ terminal ≠ ∅), and
+    /// `CalDAVError.authFailed` is asserted signal-no while the drain's auth arm
+    /// claims it (terminal ∖ signal ≠ ∅). Neither set contains the other.
+    @Test("The re-auth signal and the terminal auth arm claim incomparable error sets")
     func reauthSignalCoversWhatTheTerminalArmDoesNot() {
         // 🚨 THE SIGNAL AND THE DISPOSITION ARE DIFFERENT QUESTIONS. Before R14-F4
         // this file's drain never touched `authFailedAccounts` at all
@@ -561,7 +579,7 @@ struct CalendarBadRequestClassificationTests {
         // prompted by the signal asserted above) for a permanently dropped
         // intention, which nothing recovers.
         #expect(claimedByATerminalArm(ProviderError.authenticationFailed) == false,
-                "a credential we could not READ is not a credential the provider REFUSED; deleting the op on it drops the user's intention on 'we could not determine'")
+                "a credential we could not READ is not a credential the provider REFUSED; retiring the op on it drops the user's intention on 'we could not determine'")
 
         // And the signal is not a catch-all: an ordinary malformed payload or a
         // dropped connection must not tell the user their sign-in is broken.

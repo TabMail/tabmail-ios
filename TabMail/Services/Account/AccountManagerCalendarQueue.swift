@@ -587,8 +587,10 @@ extension AccountManager {
         // The log said one thing and the mechanism did the opposite.
         //
         // They now throw `CalendarProviderError.notSupported`, which
-        // `isCalendarUnsupportedError` claims → the drain deletes the row and
-        // signals `.permanentFailure(reason:)` with this string surfaced to the
+        // `isCalendarUnsupportedError` claims → the drain RETIRES the row
+        // (`status = 'failed'` with a reason, via `retireAndAnnounce`; it used to
+        // DELETE it, and this sentence said so until R17-7) and signals
+        // `.permanentFailure(reason:)` with this string surfaced to the
         // agent verbatim. Same disposition, honest outcome. This reuses the
         // classification three sibling guards in this very function already use
         // for a malformed persisted request (`edit_scope='…' is not
@@ -856,8 +858,10 @@ extension AccountManager {
 
     /// `CalendarProviderError.notSupported` is permanent for the chosen provider —
     /// no retry will help (Exchange / CalDAV / Demo simply don't implement the
-    /// recurring-occurrence + split paths yet). The drain loop drops the op and
-    /// surfaces the message to the LLM so it can either pivot (e.g. propose a
+    /// recurring-occurrence + split paths yet). The drain loop RETIRES the op —
+    /// `status = 'failed'` with a reason, not a delete (R16-1); either way the
+    /// user's queued work never executes — and surfaces the message to the LLM so
+    /// it can either pivot (e.g. propose a
     /// whole-series edit) or relay the limitation to the user.
     /// The **six** error classifiers below — predicate, so it can be re-derived
     /// rather than trusted: every `static func …(_ error: Error) -> Bool` between
@@ -870,8 +874,24 @@ extension AccountManager {
     /// delay). They are `static` (hence nonisolated) for the same
     /// reason `isCalendarBadRequestError` is: the drain's disposition can then be
     /// asserted in tests against real provider error values, rather than inferred
-    /// from the drain loop's side effects. Every one of them answers the same
-    /// system-level question — *does SOME terminal arm claim this error?* — and an
+    /// from the drain loop's side effects.
+    ///
+    /// ⚠️ **FOUR OF THE SIX ANSWER ONE QUESTION; TWO ANSWER A DIFFERENT ONE
+    /// (R17-7).** This read *"Every one of them answers the same system-level
+    /// question — does SOME terminal arm claim this error?"*, which R16-7 left
+    /// standing when it correctly widened the COUNT from four to six. The count was
+    /// right and the absolute was wrong, and the exception is not incidental:
+    /// `isCalendarOAuthReauthRequired` and `isCalDAVAuthError` answer *"must the
+    /// user be told to sign in again?"* — the SIGNAL question, not the DISPOSITION
+    /// question — and this same file says 150 lines below that collapsing those two
+    /// questions *"is what made the R14-F4 wedge invisible"*. Re-derive rather than
+    /// trust: a classifier belongs to the disposition set iff it appears in
+    /// `claimedByATerminalArm`'s roster in
+    /// `TabMailTests/Queues/CalendarBadRequestClassificationTests.swift`; the other
+    /// two are read only for `markAuthFailed` (:432) and for the
+    /// `caldavConfig.needsReauth` rider (:481).
+    ///
+    /// For the FOUR that do answer *does SOME terminal arm claim this error?*, an
     /// error no arm claims falls through to the transient arm, which requeues it
     /// and inserts the account into `failedAccounts`, head-of-line-blocking every
     /// later op on that account on every subsequent drain. That starvation is a
@@ -994,8 +1014,13 @@ extension AccountManager {
     /// calendar queue already applies to Google's 409 bodies.
     ///
     /// 🚨 **DELIBERATELY EXACT-MATCH AND DELIBERATELY THREE.** This predicate is the
-    /// gate on a TERMINAL arm, and a terminal arm deletes the user's queued calendar
-    /// operation, so every value added here is an intention that can leave the queue.
+    /// gate on a TERMINAL arm, and a terminal arm RETIRES the user's queued calendar
+    /// operation — `status = 'failed'` with a reason since R16-1, not the delete this
+    /// sentence asserted until R17-7. The row survives for diagnostics and is
+    /// reclaimed after `SyncConfig.retiredCalendarOpRetentionDays`; what does NOT
+    /// survive is the work, which never executes. So every value added here is still
+    /// an intention that leaves the queue unexecuted — the harm the sentence was
+    /// written to guard is unchanged, only its mechanism was.
     /// `temporarily_unavailable`, `server_error`, a 5xx, a dropped connection and the
     /// `"unknown"` fallback (a body with no `error` key at all) are all *"we could not
     /// determine the answer"*, which never-drop clause 2 makes retryable forever —
