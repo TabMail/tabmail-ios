@@ -349,6 +349,38 @@ enum ComposeDraftGuards {
         }
     }
 
+    /// Whether an `AutoSaveExit` leaves a DURABLE draft row that "tap to review" can
+    /// actually open (R16-3).
+    ///
+    /// 🚨 **A DIFFERENT QUESTION FROM `autoSaveExitWarnsUser`, and collapsing them
+    /// would be wrong in both directions.** That one asks *"must a warning appear in
+    /// this chat transcript?"*; this asks *"may a GLOBAL, cross-view signal claim a
+    /// reviewable draft exists?"*. The two disagree on the CAS exits below, which is
+    /// exactly why this is a second roster and not a reuse.
+    ///
+    /// The `false` set is the three exits that end with no row written by anyone:
+    /// a thrown predecessor read, a thrown save (either branch), an unresolvable
+    /// account, and a refused durable admission. The `true` set is the two
+    /// generation-CAS losses — a NEWER generation won the write, so a durable row
+    /// exists and that generation publishes its own signal; warning here would be a
+    /// false alarm about a draft that is fine. `.composeUnavailable` is `false`: the
+    /// turn's own state went away mid-flight, so this turn has no evidence either
+    /// way and must not assert one (`CLAUDE.md` never-drop clause 2 — an absence of
+    /// evidence is not a positive result).
+    static func autoSaveExitLeftDurableDraft(_ exit: AutoSaveExit) -> Bool {
+        switch exit {
+        case .updateLostGeneration, .firstSaveLostGeneration:
+            return true
+        case .composeUnavailable,
+             .predecessorReadFailed,
+             .updateSaveFailed,
+             .noAccountForFirstSave,
+             .firstSaveFailed,
+             .durableAdmissionRefused:
+            return false
+        }
+    }
+
     /// PORT — `v2final:ServerDraftOpen.mayBindPersistedDraft` (commits `a8eb813b5`,
     /// `69a9bae88`), relocated here because this forward-port has no
     /// `ServerDraftOpen` enum.

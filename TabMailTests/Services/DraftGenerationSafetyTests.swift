@@ -416,6 +416,107 @@ struct DraftGenerationSafetyTests {
         #expect(staleCalls.filter { $0.hasPrefix("saveDraft") }.isEmpty)
     }
 
+    // MARK: R16-2 — promoting the placeholder must carry the header's children
+
+    /// 🚨 THE INVARIANT, stated as the system property rather than the mechanism
+    /// (`MIS-015`): **after a draft placeholder is promoted to the server's real
+    /// identity, the message's user labels and its threading edges still exist
+    /// against the address the message now has.** No assertion here names
+    /// `MessageHeaderRekey.apply`; any carrier that keeps them reachable passes.
+    ///
+    /// `DraftStore.migrateExactPlaceholder` is a header PRIMARY-KEY change, so it is a
+    /// member of the class *"every code path that changes a header's primary key"* —
+    /// and it had exactly the gap `BackfillBodyQueue.rekeyRemappedHeader` did: it
+    /// carried the BODY by hand and let `placeholder.delete(db)` cascade
+    /// `messageUserLabel` and `messageReference` away. `messageReference` is the one
+    /// that bites here — a REPLY draft carries `In-Reply-To`, so its edge to the
+    /// message being replied to was destroyed at the exact moment the placeholder
+    /// became the real draft, dropping the user's own reply out of the conversation
+    /// it belongs to. That is `MIS-006`: the instance fixed, the class left open.
+    ///
+    /// Asserted at the STORE, as end state. The promoted id is the server address
+    /// (`accountId:draftsFolder:<graphId>`), so the assertion also proves the carry
+    /// landed on the NEW key and not merely that some row survived somewhere.
+    @Test("Promoting a draft placeholder carries its labels and threading edges to the real id")
+    func placeholderPromotionCarriesLabelsAndThreadEdges() async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let initial = draft(id: "reply-draft-1", epoch: "E1")
+        let parentRfc = "r16-2-parent@example.com"
+        let placeholderId = PendingOperation.draftPlaceholderHeaderPK(
+            accountId: "acc1", draftsFolderPath: "Drafts",
+            draftId: initial.id, instanceEpoch: "E1")
+        let promotedId = "acc1:Drafts:mock-graph-id"
+
+        try await fixture.0.writeWithoutTransaction { db in
+            try initial.insert(db)
+            try Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1").insert(db)
+            var placeholder = MessageHeader(
+                messageId: PendingOperation.draftPlaceholderMessageId(
+                    draftId: initial.id, instanceEpoch: "E1"),
+                subject: "Re: fixture", from: "Owner", fromAddress: "owner@example.com",
+                to: "peer@example.com", date: Date(), snippet: "",
+                folderId: "acc1:Drafts", accountId: "acc1", folderPath: "Drafts",
+                isInInbox: false)
+            placeholder.inReplyTo = parentRfc
+            try placeholder.insert(db)
+            try ThreadUtils.insertMessageReferences(for: placeholder, db: db)
+            let label = UserLabel(
+                accountId: "acc1", providerLabelId: "follow-up", name: "Follow up", isSystem: false)
+            try label.insert(db, onConflict: .ignore)
+            try MessageUserLabel(messageId: placeholder.id, userLabelId: label.id).insert(db)
+        }
+
+        // MIS-030 — anchor the fixture: the placeholder id this test computed really
+        // is the row the promotion will migrate, and it really does carry both children.
+        #expect(try await fixture.0.read { try MessageHeader.fetchOne($0, key: placeholderId) } != nil,
+                "precondition: the placeholder header exists at the id the promotion looks up")
+        #expect(try await fixture.0.read {
+            try MessageUserLabel.filter(Column("messageId") == placeholderId).fetchCount($0)
+        } == 1, "precondition: the user applied a label to the draft")
+        #expect(try await fixture.0.read {
+            try Int.fetchOne(
+                $0, sql: "SELECT COUNT(*) FROM messageReference WHERE messageHeaderId = ?",
+                arguments: [placeholderId])
+        } == 1, "precondition: the reply draft has a threading edge to its parent")
+
+        let provider = MockEmailProvider(
+            saveDraftResult: .created(.outlook(graphId: "mock-graph-id")))
+        let result = try await DraftStore.shared.pushDraftToServer(
+            draftId: initial.id, expectedInstanceEpoch: "E1", provider: provider,
+            runtimeKind: .outlook, draftsFolderPath: "Drafts")
+        #expect(result == .completed, "setup: the push must have completed for a promotion to occur")
+
+        #expect(try await fixture.0.read { try MessageHeader.fetchOne($0, key: promotedId) } != nil,
+                "setup: the placeholder must have been promoted to the server address")
+        let carriedLabels = try await fixture.0.read {
+            try MessageUserLabel.filter(Column("messageId") == promotedId).fetchAll($0)
+        }
+        #expect(carriedLabels.count == 1,
+                """
+                the user's label must follow the draft to the identity the server assigned — \
+                the placeholder delete cascades `messageUserLabel` and NOTHING in the \
+                database can rebuild it, so a promotion that does not carry it destroys the \
+                label silently and permanently. Got \(carriedLabels.count)
+                """)
+        guard carriedLabels.count == 1 else { return }
+        #expect(carriedLabels[0].userLabelId == "acc1:follow-up")
+
+        let edges = try await fixture.0.read {
+            try String.fetchAll(
+                $0, sql: "SELECT referencedRfc822Id FROM messageReference WHERE messageHeaderId = ?",
+                arguments: [promotedId])
+        }
+        #expect(edges == [parentRfc],
+                """
+                and the reply's threading edge must exist at the promoted id, or the user's \
+                own reply falls out of the conversation it answers. Got \(edges)
+                """)
+        #expect(try await fixture.0.read {
+            try MessageUserLabel.filter(Column("messageId") == placeholderId).fetchCount($0)
+        } == 0, "and nothing may be left filed under the retired placeholder id")
+    }
+
     /// **THE MIRROR IMAGE OF THE `"pushing"`-RESIDUE FIX, AND IT IS WORSE THAN THE
     /// BUG (`MIS-005`): a draft whose provider save is GENUINELY LIVE in this
     /// process must never be pushed a second time.**
@@ -962,6 +1063,74 @@ struct ComposeDraftGuardTests {
         #expect(silent.count + ComposeDraftGuards.AutoSaveExit.allCases
             .filter({ ComposeDraftGuards.autoSaveExitWarnsUser($0) }).count
             == ComposeDraftGuards.AutoSaveExit.allCases.count)
+    }
+
+    // MARK: R16-3 — the pill's claim must match the SAVE OUTCOME
+
+    /// 🚨 THE INVARIANT (the system property, `MIS-015`): **no exit that leaves no
+    /// durable draft may be reported as one that does** — i.e. the global
+    /// "Draft updated — tap to review" signal is reachable only from an exit after
+    /// which a durable draft actually exists.
+    ///
+    /// The defect: `DynamicIslandChatButton` published that pending response 41 lines
+    /// BEFORE the `await autoSaveDraft(…)` it announces, so a failed first save still
+    /// offered the Inbox a success pill. Tapping it reached
+    /// `DraftComposePresenter`'s `case .notFound: Color.clear.onAppear { dismiss() }`
+    /// — a success signal that opens NOTHING, for generated content that was never
+    /// committed and that no sync can recreate. `finishAutoSave`'s warning could not
+    /// cover it: that is a chat `.warning`, invisible once the compose sheet is gone,
+    /// which is precisely the situation the pill exists for.
+    ///
+    /// ⚠️ A DIFFERENT QUESTION FROM `autoSaveExitWarnsUser`, and the two disagree on
+    /// exactly the CAS exits — which is why this is a second roster and not a reuse.
+    /// That one asks *"must a warning appear in this transcript?"*; this asks
+    /// *"may a global, cross-view signal claim a reviewable draft exists?"*.
+    ///
+    /// Asserted as a SET over `allCases`, so an exit added to the roster and left
+    /// unclassified breaks this test instead of silently joining the claiming side.
+    @Test("Only a lost generation CAS leaves a durable draft the pill may claim")
+    func onlyALostGenerationLeavesADurableDraft() {
+        let claimable = Set(ComposeDraftGuards.AutoSaveExit.allCases
+            .filter { ComposeDraftGuards.autoSaveExitLeftDurableDraft($0) })
+        #expect(claimable == [
+            .updateLostGeneration,
+            .firstSaveLostGeneration,
+        ], "a NEWER generation durably won the write, so a reviewable draft does exist and that generation publishes its own signal — these are the only two exits after which 'Draft updated — tap to review' is true")
+        #expect(claimable.count == 2)
+    }
+
+    /// TWO-SIDED ANCHOR — the side that must go RED when the fix is inverted, and the
+    /// reason the roster above cannot be satisfied by returning `true` everywhere.
+    ///
+    /// The `false` set is every exit that ends with NO row written by anyone: a thrown
+    /// predecessor read, a thrown save on either branch, an unresolvable owning
+    /// account, and a refused durable admission. `.composeUnavailable` is `false` for
+    /// a different reason — the turn's own state went away mid-flight, so this turn
+    /// has no evidence either way and must not assert one (never-drop clause 2: an
+    /// absence of evidence is not a positive result).
+    ///
+    /// The exhaustiveness assertion at the end is what makes the pair a partition:
+    /// every one of the eight cases is classified exactly once, so a ninth cannot be
+    /// added without landing in one of the two asserted sets.
+    @Test("Every auto-save exit that wrote nothing must not be claimed as a saved draft")
+    func exitsThatWroteNothingAreNotClaimedAsSaved() {
+        let notClaimable = Set(ComposeDraftGuards.AutoSaveExit.allCases
+            .filter { !ComposeDraftGuards.autoSaveExitLeftDurableDraft($0) })
+        #expect(notClaimable == [
+            .composeUnavailable,
+            .predecessorReadFailed,
+            .updateSaveFailed,
+            .noAccountForFirstSave,
+            .firstSaveFailed,
+            .durableAdmissionRefused,
+        ], "after each of these the user's generated text is NOT in the Drafts route, so a global 'tap to review' pill would open nothing — the exact dead signal R16-3 removed")
+        #expect(notClaimable.count == 6)
+        // The roster is a PARTITION of the enum: eight cases, classified once each.
+        #expect(notClaimable.count + ComposeDraftGuards.AutoSaveExit.allCases
+            .filter({ ComposeDraftGuards.autoSaveExitLeftDurableDraft($0) }).count
+            == ComposeDraftGuards.AutoSaveExit.allCases.count)
+        #expect(ComposeDraftGuards.AutoSaveExit.allCases.count == 8,
+                "non-vacuity: the roster is the eight-exit class R14-F3 left open, not a subset of it")
     }
 
     /// ORDER, not just outcome — the sibling `dismissRunsAfterTheDeleteLands` applied

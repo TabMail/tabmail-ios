@@ -15,6 +15,25 @@ enum ScreenshotMode {
     /// Used by TabMailApp's `.preferredColorScheme()` modifier.
     static let isDarkMode: Bool = ProcessInfo.processInfo.arguments.contains("--screenshot-dark")
 
+    /// The instance epoch the seeded compose chat session is keyed under (R16-11).
+    /// A constant, because a fixture runs before any `ComposeGenerationCursor`
+    /// exists and therefore cannot know the epoch a live compose session will mint.
+    /// See the seeding site for why that means the session is not bindable today.
+    private static let screenshotComposeEpoch = "screenshot-epoch"
+
+    /// The draft id `ComposeView.onAppear` derives via `Draft.draftKey` for a reply
+    /// to the seeded `msg001`.
+    static let seededComposeDraftId = "reply:screenshot-account:msg001"
+
+    /// The EXACT `ChatPillState` key the compose fixture seeds under, minted through
+    /// `ActiveAgentTracker.composeSessionKey`. Hoisted out of the seeding site (not
+    /// private) so a test can decode it back through the real parser: the fixture
+    /// runs only under `--screenshot-mode`, so this constant is the only surface on
+    /// which the round-trip is checkable, and checking a key the test mints itself
+    /// would prove nothing about this producer.
+    static let seededComposeSessionKey = ActiveAgentTracker.composeSessionKey(
+        draftId: seededComposeDraftId, epoch: screenshotComposeEpoch)
+
     // MARK: - Mock data for AccountDashboardView
 
     static let mockAccountInfo: AccountInfo? = {
@@ -438,10 +457,36 @@ enum ScreenshotMode {
         ]
         detailSession.lastChatActivity = Date()
 
-        // Compose chat: inline edit conversation
-        // ComposeView.onAppear overrides draftId via Draft.draftKey — for a reply to msg001,
-        // the key becomes "compose:reply:screenshot-account:msg001"
-        let composeSession = ChatPillState.shared.session(for: "compose:reply:screenshot-account:msg001")
+        // Compose chat: inline edit conversation.
+        //
+        // 🚨 R16-11 — A THIRD UNPORTED CONSUMER OF THE COMPOSE SESSION-KEY FORMAT.
+        // This built the key by hand as `"compose:reply:screenshot-account:msg001"`,
+        // and the comment above it asserted that bare shape as current. PORT
+        // `3f2cc4c34` changed the format to `compose:<epochByteCount>:<epoch><draftId>`
+        // and moved it behind `ActiveAgentTracker.composeSessionKey`, whose namespace
+        // `ChatPillState.session(for:)` shares — `DynamicIslandChatButton.sessionKey`
+        // and `ComposeView` both mint their `ChatPillState` key through that symbol.
+        // R15-FIX-4b ported ONE of the two known consumers (`InboxView`'s
+        // `.composeDraft` decode); this is a third that neither that fix nor its
+        // review enumerated, because both greps were for the SYMBOL and this site
+        // spells only the FORMAT. `MIS-018`: the unit of a port is the CONTRACT — so
+        // the key is minted through the symbol here too, and cannot drift again.
+        //
+        // ⚠️ NEGATIVE CASE, stated because minting through the symbol makes this look
+        // solved and it is not: this fixture still cannot BIND to a live compose
+        // session. The epoch half of the key is minted at runtime by
+        // `ComposeGenerationCursor`, so no fixture can predict it, and no screenshot
+        // flow opens compose against a seeded epoch today. The seeded session is
+        // retained as the content source for that flow if it is ever added; what R16
+        // fixed is the false format claim and the hand-rolled key, not the binding.
+        // ⚠️ Do NOT "fix" the binding by weakening `composeSessionKey` to accept a
+        // fixture-supplied bare key — the length prefix is what makes the encoding
+        // injective when a draft id or an epoch contains a colon (both can), and both
+        // `DraftOptimisticSaveTests` round-trip suites anchor that.
+        //
+        // `ComposeView.onAppear` overrides draftId via `Draft.draftKey` — for a reply
+        // to msg001 the draft id is `reply:screenshot-account:msg001`.
+        let composeSession = ChatPillState.shared.session(for: Self.seededComposeSessionKey)
         composeSession.chatMessages = [
             ChatMessage(role: .user, content: "Make the tone more casual and suggest grabbing coffee Thursday to discuss", timestamp: now.addingTimeInterval(-120)),
             ChatMessage(role: .agent, content: "Done! I made the tone friendlier and suggested meeting over coffee Thursday afternoon.", timestamp: now.addingTimeInterval(-115)),

@@ -1401,10 +1401,22 @@ struct DynamicIslandChat: View {
                     animate: true
                 ))
                 if !isExpanded {
-                    // Always set pending response for compose — ComposeView may be
-                    // dismissed by the time this fires, so onAgentReply goes nowhere.
-                    // InboxView's observeAgentFinish picks it up as a toast.
-                    ActiveAgentTracker.shared.setPendingResponse(sessionKey, text: "Draft updated — tap to review")
+                    // 🚨 R16-3 — `setPendingResponse("Draft updated — tap to review")`
+                    // USED TO BE HERE, 41 lines ABOVE the `await autoSaveDraft(…)`
+                    // it announces. It is now published after that save, below.
+                    //
+                    // The conversational reply below stays here: it reports what the
+                    // AGENT did, which is true the moment the edit is applied to the
+                    // in-memory draft. The moved line is different in kind — it is a
+                    // GLOBAL, cross-view claim that a reviewable DURABLE draft exists,
+                    // and `finishAutoSave`'s warning is a chat `.warning` appended to
+                    // `chatMessages` only, invisible once the sheet is dismissed. So
+                    // when the first save failed the Inbox still offered "Draft
+                    // updated — tap to review", and tapping it reached
+                    // `DraftComposePresenter`'s `case .notFound: Color.clear.onAppear
+                    // { dismiss() }` — a success signal that opens nothing, for
+                    // generated content that was never committed and that no sync can
+                    // recreate.
                     onAgentReply?(responseText)
                     if onAgentReply == nil {
                         showAgentToast(responseText)
@@ -1439,14 +1451,42 @@ struct DynamicIslandChat: View {
                 sessionTurns.append(assistantTurn)
 
                 // Auto-save draft to GRDB (state after edit applied).
+                var autoSaveExit: ComposeDraftGuards.AutoSaveExit?
+                var autoSaveAttempted = false
                 if let did = draftId, !skipSave {
                     let updatedSubject = result.subject ?? currentSubject
                     let updatedBody = result.body ?? currentBody
                     if DebugModeManager.isLoggingEnabled() {
                         print("[DynamicIslandChat] sendComposeEdit: autoSaveDraft task fired draftKey=\(did) sessionKey=\(sessionKey)")
                     }
-                    await autoSaveDraft(
+                    autoSaveAttempted = true
+                    autoSaveExit = await autoSaveDraft(
                         draftKey: did, subject: updatedSubject, body: updatedBody)
+                }
+
+                // R16-3 — THE GLOBAL SIGNAL, PUBLISHED AFTER THE WRITE IT CLAIMS.
+                // `InboxView.observeAgentFinish` consumes this on the
+                // `agentSessionDidFinish` post that `clearWorking(sessionKey)` makes
+                // at the end of this task, so publishing here still reaches it.
+                //
+                // ⚠️ DELIBERATELY NOT GATED ON THE PROVIDER-SIDE UPLOAD, which is
+                // the mirror image (`MIS-005`): `autoSaveDraft` returns once the
+                // LOCAL durable row and the durable `.saveDraft` admission have
+                // landed, and the server push is a queued `PendingOperation` that
+                // drains later. Waiting for it would hide successful offline saves,
+                // which is the opposite error. The bar is "a durable draft exists
+                // that tapping this toast can open", and that is exactly what a nil
+                // exit means.
+                //
+                // `autoSaveAttempted == false` (no `draftId`, or `skipDraftAutoSave`)
+                // keeps the original text: this turn never claimed to save, and the
+                // caller that set `skipDraftAutoSave` owns the save.
+                if !isExpanded {
+                    let landed = !autoSaveAttempted
+                        || (autoSaveExit.map(ComposeDraftGuards.autoSaveExitLeftDurableDraft) ?? true)
+                    ActiveAgentTracker.shared.setPendingResponse(
+                        sessionKey,
+                        text: landed ? "Draft updated — tap to review" : Self.autoSaveDidNotLandWarning)
                 }
 
                 print("[DynamicIslandChat] Inline edit applied, editHistory=\(editHistory.count) turns")
@@ -1521,7 +1561,14 @@ struct DynamicIslandChat: View {
     }
 
     /// Auto-save the current draft state to GRDB for resume on reopen.
-    private func autoSaveDraft(draftKey: String, subject: String, body: String) async {
+    ///
+    /// R16-3 — RETURNS ITS EXIT (nil = the durable local save and the durable
+    /// `.saveDraft` admission both landed). `finishAutoSave` still owns the in-chat
+    /// warning; the return value exists because the caller publishes a GLOBAL
+    /// "Draft updated — tap to review" signal that must not outrun this write, and
+    /// a chat `.warning` cannot reach a user whose compose sheet is already gone.
+    @discardableResult
+    private func autoSaveDraft(draftKey: String, subject: String, body: String) async -> ComposeDraftGuards.AutoSaveExit? {
         let entryTime = Date()
         if DebugModeManager.isLoggingEnabled() {
             print("[DraftStore] autoSaveDraft: enter draftKey=\(draftKey)")
@@ -1533,7 +1580,7 @@ struct DynamicIslandChat: View {
                 print("[DraftStore] autoSaveDraft: exit (no composeContext) draftKey=\(draftKey)")
             }
             finishAutoSave(.composeUnavailable)
-            return
+            return .composeUnavailable
         }
         let editHistJSON = Draft.encodeEditHistory(editHistory)
         let now = Date().timeIntervalSince1970
@@ -1550,7 +1597,7 @@ struct DynamicIslandChat: View {
         } catch {
             print("[DraftStore] Auto-save predecessor read failed: \(error)")
             finishAutoSave(.predecessorReadFailed)
-            return
+            return .predecessorReadFailed
         }
         if DebugModeManager.isLoggingEnabled() {
             let loadMs = Int(Date().timeIntervalSince(loadStart) * 1000)
@@ -1573,7 +1620,7 @@ struct DynamicIslandChat: View {
                 }
                 guard result == .applied else {
                     finishAutoSave(.updateLostGeneration)
-                    return
+                    return .updateLostGeneration
                 }
                 if DebugModeManager.isLoggingEnabled() {
                     let saveMs = Int(Date().timeIntervalSince(saveStart) * 1000)
@@ -1583,7 +1630,7 @@ struct DynamicIslandChat: View {
             catch {
                 print("[DraftStore] Auto-save failed: \(error)")
                 finishAutoSave(.updateSaveFailed)
-                return
+                return .updateSaveFailed
             }
         } else {
             // First save — need accountId. Use sender email from context to find account.
@@ -1595,7 +1642,7 @@ struct DynamicIslandChat: View {
                     print("[DraftStore] autoSaveDraft: exit (no account for first save) draftKey=\(draftKey)")
                 }
                 finishAutoSave(.noAccountForFirstSave)
-                return
+                return .noAccountForFirstSave
             }
             savedAccountId = aid
             var draft = Draft(
@@ -1632,7 +1679,7 @@ struct DynamicIslandChat: View {
                 }
                 guard result == .applied else {
                     finishAutoSave(.firstSaveLostGeneration)
-                    return
+                    return .firstSaveLostGeneration
                 }
                 if DebugModeManager.isLoggingEnabled() {
                     let saveMs = Int(Date().timeIntervalSince(saveStart) * 1000)
@@ -1642,7 +1689,7 @@ struct DynamicIslandChat: View {
             catch {
                 print("[DraftStore] Auto-save failed (first save): \(error)")
                 finishAutoSave(.firstSaveFailed)
-                return
+                return .firstSaveFailed
             }
         }
 
@@ -1664,18 +1711,23 @@ struct DynamicIslandChat: View {
         // failure exits of this function through the same signal, because leaving
         // them silent while only this one warned was `MIS-006` — the instance fixed,
         // the class left open.
+        var admissionExit: ComposeDraftGuards.AutoSaveExit?
         if let savedAccountId {
             await ComposeDraftGuards.runCheckedDurableAutoSave(
                 save: {
                     await AccountManager.shared.queueDraftSave(
                         draftId: draftKey, accountId: savedAccountId)
                 },
-                onAdmissionFailure: { finishAutoSave(.durableAdmissionRefused) })
+                onAdmissionFailure: {
+                    admissionExit = .durableAdmissionRefused
+                    finishAutoSave(.durableAdmissionRefused)
+                })
         }
         if DebugModeManager.isLoggingEnabled() {
             let totalMs = Int(Date().timeIntervalSince(entryTime) * 1000)
             print("[DraftStore] autoSaveDraft: exit draftKey=\(draftKey) totalMs=\(totalMs)")
         }
+        return admissionExit
     }
 
     // MARK: - Agent chat (non-compose mode) — uses completions API matching TB's agentConverse

@@ -137,6 +137,54 @@ struct ActiveAgentTrackerTests {
         #expect(tracker.workingComposeDraftId == nil)
     }
 
+    // MARK: - R16-11 — every producer of a compose session key mints it
+
+    /// 🚨 THE INVARIANT (system property, not mechanism — `MIS-015`): **a compose
+    /// session key produced anywhere in the app decodes back to the draft id it was
+    /// made for.** Asserted here against `ScreenshotMode`'s fixture key, which built
+    /// itself by hand as `"compose:<draftId>"` — a format that stopped being current
+    /// at PORT `3f2cc4c34`, when the key became
+    /// `compose:<epochByteCount>:<epoch><draftId>` behind
+    /// `ActiveAgentTracker.composeSessionKey`. R15-FIX-4b ported one of the two known
+    /// consumers and this was a THIRD, missed because both greps were for the SYMBOL
+    /// while this site spelled only the FORMAT (`MIS-018` — the unit of a port is the
+    /// CONTRACT).
+    ///
+    /// The assertion is deliberately a DECODE of the producer's own constant rather
+    /// than a comparison against a key this test mints: minting it here would compare
+    /// `composeSessionKey` with itself and stay green no matter what `ScreenshotMode`
+    /// does. `ScreenshotMode.seededComposeSessionKey` is the exact value
+    /// `seedChatSessionsIfNeeded` passes to `ChatPillState.session(for:)`.
+    ///
+    /// ⚠️ TWO NAMESPACES SHARE THE `compose:` PREFIX and only one is governed here:
+    /// `ChatStore` session ids are the bare `compose:<draftId>`, while
+    /// `ActiveAgentTracker` / `ChatPillState` keys carry the length-prefixed epoch.
+    /// `composeSessionKey` must NOT be weakened to accept a bare key — the length
+    /// prefix is what keeps the encoding injective when a draft id or an epoch
+    /// contains a colon, and both can. The bare-key rejection below is that anchor.
+    @Test("ScreenshotMode's seeded compose key round-trips through the real parser")
+    func screenshotComposeSessionKeyRoundTrips() {
+        let key = ScreenshotMode.seededComposeSessionKey
+        let parsed = ActiveAgentTracker.parseComposeSession(key)
+        #expect(parsed?.draftId == ScreenshotMode.seededComposeDraftId,
+                """
+                the screenshot fixture's ChatPillState key must decode back to the draft id \
+                it names — a hand-rolled "compose:<draftId>" key binds to no live compose \
+                session, because every live producer mints the length-prefixed epoch form. \
+                Got \(parsed?.draftId ?? "nil") from key \(key)
+                """)
+        #expect(parsed?.epoch.isEmpty == false,
+                "and it must carry an epoch — the half of the key a bare format has no room for")
+
+        // NON-VACUITY / the held direction (`MIS-026`): the parser is not one that
+        // accepts anything with the prefix. A bare key is REFUSED, which is exactly
+        // why the hand-rolled fixture key bound to nothing.
+        #expect(
+            ActiveAgentTracker.parseComposeSession(
+                "compose:\(ScreenshotMode.seededComposeDraftId)") == nil,
+            "a bare `compose:<draftId>` key must stay unparseable — weakening the decoder is the mirror-image fix")
+    }
+
     @Test("workingComposeDraftId ignores non-compose sessions")
     func workingComposeDraftIdIgnoresOthers() {
         let tracker = ActiveAgentTracker()
