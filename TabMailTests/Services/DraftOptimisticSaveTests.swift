@@ -8,7 +8,14 @@ import GRDB
 @testable import TabMail
 
 /// Tests for optimistic draft header creation, FTS indexing, headerComplete visibility,
-/// and the handleAgentToastTap compose navigation path.
+/// and the `handleAgentToastTap` compose navigation path.
+///
+/// R15-FIX-4b — that last clause was FALSE from the day it was written until
+/// 2026-08-06: no `@Test` here touched the toast-tap path, and the regression it
+/// claimed to cover (the compose branch decoding session keys with a bare
+/// `dropFirst`, after `ActiveAgentTracker.composeSessionKey` had moved to the
+/// length-prefixed form) shipped underneath the claim. The claim is now true —
+/// see "Agent toast navigation" at the bottom of this suite.
 @Suite("Draft Optimistic Save Tests")
 struct DraftOptimisticSaveTests {
 
@@ -584,5 +591,78 @@ struct DraftOptimisticSaveTests {
         #expect(newHeader?.date == matchDate)
         #expect(newHeader?.isRead == true)
         #expect(newHeader?.isFlagged == true)
+    }
+
+    // MARK: - Agent toast navigation (R15-FIX-4b)
+
+    /// THE INVARIANT: a compose session key produced by the live producer resolves,
+    /// through the live toast-tap consumer, to the draft id the producer was given.
+    ///
+    /// Both ends are the real symbols — `ActiveAgentTracker.composeSessionKey` and
+    /// `AgentToastPayload.destination`, the function `handleAgentToastTap` now calls.
+    /// The format is never re-spelled here: a test that hand-built
+    /// `"compose:\(n):\(epoch)\(draftId)"` would have stayed green through exactly
+    /// the change that broke this path, because it would have been asserting the
+    /// consumer against a copy of the format instead of against the producer.
+    ///
+    /// The draft ids and epochs below contain colons on purpose — that is the whole
+    /// reason the key stopped being `compose:<draftId>` — and the second pair is the
+    /// adversarial one: the two keys differ only in where the boundary falls, so a
+    /// consumer that splits on the first (or last) colon returns a plausible-looking
+    /// wrong id rather than failing loudly.
+    @MainActor
+    @Test("Toast tap opens the draft the compose session key named")
+    func agentToastComposeKeyRoundTripsToTheProducersDraftId() {
+        let cases: [(draftId: String, epoch: String)] = [
+            ("draft-abc", "epoch-1"),
+            ("reply:acct:msg", "legacy:op:42"),
+            ("reply:acct:msg:legacy:op", "42"),
+            ("default", "0"),
+        ]
+        for (draftId, epoch) in cases {
+            let key = ActiveAgentTracker.composeSessionKey(draftId: draftId, epoch: epoch)
+            #expect(
+                AgentToastPayload.destination(forSessionKey: key) == .composeDraft(draftId: draftId),
+                "session key for draftId=\(draftId) epoch=\(epoch) must resolve to that draft id"
+            )
+        }
+    }
+
+    /// The mirror-image over-correction this must never become: a lenient fallback
+    /// that, when the length-prefixed parse fails, guesses with the old bare
+    /// `dropFirst("compose:".count)`. A key we cannot decode names NO draft, so it
+    /// must land on the pre-existing safe destination (expand the chat pill) rather
+    /// than open a presenter on a fabricated id that resolves `.notFound` and
+    /// dismisses in the user's face.
+    @MainActor
+    @Test("Undecodable compose keys route to the chat pill, never to a guessed draft")
+    func undecodableComposeKeysNeverFabricateADraftId() {
+        let undecodable = [
+            "compose:draft-abc",        // the pre-port bare format
+            "compose:",
+            "compose::epoch-1draft",    // zero-length epoch count
+            "compose:0:draft-abc",      // zero-length epoch
+            "compose:9:short",          // count longer than the remainder
+            "compose:notanumber:draft",
+        ]
+        for key in undecodable {
+            #expect(
+                AgentToastPayload.destination(forSessionKey: key) == .chatPill,
+                "\(key) must not resolve to a draft"
+            )
+        }
+    }
+
+    /// Non-vacuity for the extraction: the other two branches still route where they
+    /// did before the decision moved out of the view. Without this, a consumer that
+    /// returned `.chatPill` for everything would pass the test above.
+    @MainActor
+    @Test("Message and inbox toast keys still route to their own destinations")
+    func nonComposeToastKeysKeepTheirDestinations() {
+        #expect(
+            AgentToastPayload.destination(forSessionKey: "msg:acct1:stable:id:with:colons")
+                == .message(accountId: "acct1", stableId: "stable:id:with:colons")
+        )
+        #expect(AgentToastPayload.destination(forSessionKey: "inbox") == .chatPill)
     }
 }

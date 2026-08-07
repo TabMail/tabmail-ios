@@ -846,10 +846,11 @@ struct InboxView: View {
 
     private func handleAgentToastTap(_ payload: AgentToastPayload) {
         let sessionKey = payload.sessionKey ?? "inbox"
-        if let parsed = ActiveAgentTracker.messageStableId(from: sessionKey) {
+        switch AgentToastPayload.destination(forSessionKey: sessionKey) {
+        case .message(let accountId, let stableId):
             // Message-detail session — navigate to the message with chat open.
             Task {
-                guard let messageId = try? await lookupMessageId(accountId: parsed.accountId, stableId: parsed.stableId) else { return }
+                guard let messageId = try? await lookupMessageId(accountId: accountId, stableId: stableId) else { return }
                 // If already viewing this message, just reload + open chat.
                 // If different, navigate first (view creation triggers .task { loadBody() }).
                 if selectedMessageId != messageId {
@@ -864,11 +865,19 @@ struct InboxView: View {
                     userInfo: ["messageId": messageId]
                 )
             }
-        } else if sessionKey.hasPrefix("compose:") {
-            let draftId = String(sessionKey.dropFirst("compose:".count))
+        case .composeDraft(let draftId):
+            // R15-FIX-4b — the draft id now arrives already decoded by the tracker's
+            // own parser (see `AgentToastPayload.destination`). This site used to run
+            // `String(sessionKey.dropFirst("compose:".count))`, which after PORT
+            // 3f2cc4c34 handed `DraftComposePresenter` the whole
+            // `<epochByteCount>:<epoch><draftId>` blob: the presenter resolved
+            // `.notFound` and dismissed instantly, so the "Draft updated — tap to
+            // review" toast opened nothing, for EVERY compose agent session.
+            // `v1.6.38` was correct because both ends spelled the same bare format —
+            // this is a regression relative to shipped, not a latent edge.
             agentDraftIdToOpen = draftId
             showAgentDraft = true
-        } else {
+        case .chatPill:
             // Inbox session or unknown — open the chat pill
             withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
                 chatExpanded = true
@@ -1833,6 +1842,45 @@ private extension View {
 struct AgentToastPayload {
     let text: String
     let sessionKey: String?
+}
+
+/// Where a tapped agent completion toast sends the user.
+enum AgentToastDestination: Equatable {
+    case message(accountId: String, stableId: String)
+    case composeDraft(draftId: String)
+    /// Inbox session, or a key no live decoder recognises.
+    case chatPill
+}
+
+extension AgentToastPayload {
+    /// R15-FIX-4b — the toast's routing decision, as a pure function.
+    ///
+    /// This lives outside `InboxView.handleAgentToastTap` for exactly one reason:
+    /// the compose branch is a DECODER whose encoder lives in another file, and a
+    /// decoder no test can call is a decoder that silently rots when the encoder
+    /// moves — which is precisely what happened. PORT 3f2cc4c34 re-shaped
+    /// `ActiveAgentTracker.composeSessionKey` and ported the tracker's own consumer,
+    /// while the view's copy kept decoding the OLD bare format; the round-trip that
+    /// would have caught it could not be written because the only consumer was
+    /// private to a SwiftUI view. Same extraction rationale as `ComposeDraftGuards`.
+    ///
+    /// Every branch delegates to the symbol that OWNS the format — never to a
+    /// re-spelling of it here. A key neither decoder claims routes to `.chatPill`,
+    /// the pre-existing safe landing spot for unknown keys: an undecodable key names
+    /// no draft, and opening a presenter that instantly dismisses is worse than
+    /// expanding the chat pill.
+    /// `@MainActor` only because `ActiveAgentTracker.messageStableId` inherits the
+    /// tracker's actor isolation; the decision itself touches no mutable state.
+    @MainActor
+    static func destination(forSessionKey sessionKey: String) -> AgentToastDestination {
+        if let parsed = ActiveAgentTracker.messageStableId(from: sessionKey) {
+            return .message(accountId: parsed.accountId, stableId: parsed.stableId)
+        }
+        if let parsed = ActiveAgentTracker.parseComposeSession(sessionKey) {
+            return .composeDraft(draftId: parsed.draftId)
+        }
+        return .chatPill
+    }
 }
 
 /// Combined row background: agent glow (accent tint pulse) + thread expanded fill.
