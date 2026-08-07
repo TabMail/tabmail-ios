@@ -1996,7 +1996,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v83 RANGE ─────────────────────
+        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v84 RANGE ─────────────────────
         //
         // `registerTimedMigration`'s DEFAULT stays `.deferred` and is NOT
         // changed. v1…v67 have never been adjudicated for `.immediate` safety,
@@ -2054,8 +2054,11 @@ final class AppDatabase: Sendable {
         //     statement. Both halves of what it used to do — the `ANALYZE` and then
         //     the `CREATE INDEX` itself — moved to the background maintenance pass
         //     (ADR-IOS-029, 2026-08-05 amendment and its 2026-08-06 extension). The
-        //     mode is retained on an empty body so this range's census stays 16 of 16
+        //     mode is retained on an empty body so this range's census stays uniform
         //     and a future reader who fills the body in does not inherit `.deferred`.
+        //   • v84 — `ALTER TABLE … ADD COLUMN` only (`pendingCalendarOperation`
+        //     `failureReason`). Same argument as the `ADD COLUMN` bullet above:
+        //     adding a column writes no key of either kind.
         //
         //   • v82 — `DROP`/`CREATE` of `userLabel` + `messageUserLabel`. FK-clean
         //     per statement, verified statement by statement in that migration's own
@@ -2065,8 +2068,19 @@ final class AppDatabase: Sendable {
         //     house pattern, and the snapshots taken before either drop are what make
         //     the body safe.
         //
-        // ⚑ AMENDED 2026-08-06 — **EVERY MIGRATION IN v68…v83 NOW RUNS `.immediate`,
-        // so this range runs ZERO whole-database foreign-key checks.** The sentence
+        // ⚑ AMENDED 2026-08-06, RANGE RE-DERIVED AT R17-6 — **EVERY MIGRATION IN
+        // v68…v84 NOW RUNS `.immediate`, so this range runs ZERO whole-database
+        // foreign-key checks.** The range is an OPEN interval that moves with the
+        // top of the chain, so it is re-derived rather than restated (`MIS-031` — a
+        // sentence that enumerates is a cache, and this one had gone stale at `v84`
+        // in five places at once). Comments excluded so this paragraph cannot
+        // satisfy its own predicate (`MIS-033`, `IOS-DOC-002`):
+        //   rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' \
+        //      TabMail/Services/AppDatabase.swift                            → 17
+        //   rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' \
+        //      TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 17
+        // Equal counts are the invariant: every migration from v68 to the top runs
+        // `.immediate`, and none below v68 does. The sentence
         // that stood here said *"`v71` and `v82` stay `.deferred`, each for a
         // different reason — read their own comments before changing either"*, and
         // the `ADD COLUMN` bullet above listed `v71` among the migrations that
@@ -2347,8 +2361,11 @@ final class AppDatabase: Sendable {
         // the check was useless: it was one of the two things that would have found
         // a pre-existing orphan on an edge no range migration rebuilds (e.g.
         // `messageReference → messageHeader`). `v82`'s gate was the other, and it
-        // was retired in the very next commit, so **nothing in v68…v83 detects one
-        // any more.** Such a row now survives the chain, renders nothing, and is
+        // was retired in the very next commit, so **nothing from v68 to the top of
+        // the chain detects one any more** (the range was written as "v68…v83" and
+        // was already stale at `v84`; it is now stated as the open interval it has
+        // always been — see the range predicate in the section header above).
+        // Such a row now survives the chain, renders nothing, and is
         // swept by nothing. That residual is ACCEPTED and registered —
         // `KNOWN_ISSUES.md` `IOS-MIGRATION-002`, whose own text used to say
         // "Neither gate may be flipped to `.immediate`" and is corrected there.
@@ -2888,9 +2905,12 @@ final class AppDatabase: Sendable {
         // is ever revisited, measure that — do not re-argue it from `v71`'s figure, and
         // do not restore the gate as a cost instrument; it is a correctness one.
         //
-        // With this change the v68…v83 range runs ZERO whole-database foreign-key
-        // gates. `v2_dropMessageHeaderFolderFK` is the only explicitly `.deferred`
-        // migration left in the file, and it applied on every shipped device long ago.
+        // With this change the `.immediate` range — `v68` to the top of the chain,
+        // `v84` as of R17-6 — runs ZERO whole-database foreign-key gates.
+        // `v2_dropMessageHeaderFolderFK` is the only explicitly `.deferred` migration
+        // left in the file, and it applied on every shipped device long ago. (This
+        // said "the v68…v83 range"; the regime is an open interval and the endpoint
+        // was stale one migration later. Predicate: the section header above.)
         //
         // BEST-EFFORT `name`. A row reconstructed for account B in step 3a inherits
         // whatever `name`/`isSystem` the hijacked shared row was carrying, because that
@@ -2941,10 +2961,25 @@ final class AppDatabase: Sendable {
             //          **1** explicit `.deferred` (`v2` alone), **66** taking
             //          `registerTimedMigration`'s default, which IS `.deferred`. So
             //          **67 of 83 end with a whole-database `PRAGMA foreign_key_check`
-            //          and 16 do not** — and NONE of the 67 is in the v68…v83 range,
-            //          which now runs no whole-database gate at all. (It was 69/14 with
-            //          both gates, 68/15 with only `v82`'s.) ⚠️ THIS MIGRATION IS ONE OF
-            //          THE 16: reason (b) below is now a statement about migrations that
+            //          and 16 do not** — and NONE of the 67 is in the `.immediate`
+            //          range, which runs no whole-database gate at all. (It was 69/14
+            //          with both gates, 68/15 with only `v82`'s.)
+            //          ⚠️ RE-DERIVED AGAIN AT R17-6, because `v84` invalidated every
+            //          integer in the paragraph above and nobody came back for them —
+            //          which is the very lesson recorded at the bottom of this comment,
+            //          committed a third time. The figures are kept verbatim as the
+            //          2026-08-06 reading and superseded here rather than overwritten:
+            //          **84** registered, **17** explicit `.immediate` (v68…v84,
+            //          contiguous), **1** explicit `.deferred`, **66** default ⇒
+            //          **67 of 84 end with the whole-database check and 17 do not**.
+            //          The 67 is unchanged because `v84` joined the `.immediate` side.
+            //          Predicates, comments excluded so this paragraph cannot satisfy
+            //          them (`MIS-033`):
+            //            rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' <this file> | sort -n -u | wc -l
+            //            rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' <this file>
+            //            rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.deferred'  <this file>
+            //          ⚠️ THIS MIGRATION IS ONE OF THE 17: reason (b) below is now a
+            //          statement about migrations that
             //          ran on shipped devices long ago, not about this chain.
             //          Confirmed against GRDB's own
             //          `GRDB/Migration/Migration.swift`: `runWithDeferredForeignKeysChecks`
@@ -3328,10 +3363,12 @@ final class AppDatabase: Sendable {
         // is at the top of this block.
         //
         // `foreignKeyChecks: .immediate` is retained rather than removed: an empty
-        // body cannot violate a constraint, so the mode is moot, but leaving it makes
-        // the file's mode census uniform across v68…v83 (16 of 16) and means a future
-        // reader who fills this body in cannot inherit the default `.deferred` and its
-        // whole-database scan by accident.
+        // body cannot violate a constraint, so the mode is moot, but leaving it keeps
+        // the file's mode census uniform from `v68` to the top of the chain, and means
+        // a future reader who fills this body in cannot inherit the default
+        // `.deferred` and its whole-database scan by accident. (This said "uniform
+        // across v68…v83 (16 of 16)"; the count was correct when written and stale one
+        // migration later. The range predicate is in the section header above.)
         migrator.registerTimedMigration(
             "v83_markAllAsReadUnreadSweepIndex", foreignKeyChecks: .immediate
         ) { _ in
@@ -3356,9 +3393,23 @@ final class AppDatabase: Sendable {
         // value, so the body is one `ALTER TABLE` and adds nothing to the blocking
         // launch chain.
         //
-        // `foreignKeyChecks: .immediate` matches v68…v83 (17 of 17) — an
+        // `foreignKeyChecks: .immediate` matches every migration from `v68` up — an
         // `ALTER TABLE … ADD COLUMN` cannot violate a constraint, so the mode is
         // moot, but a uniform census is worth more than a considered exception.
+        //
+        // ⚠️ THIS READ "matches v68…v83 (17 of 17)" AND WAS WRONG BY ONE IN A
+        // SPECIFIC, INSTRUCTIVE WAY (R17-6): `v68…v83` has SIXTEEN members and 17 is
+        // the `v68…v84` count, so the author counted the row being ADDED and
+        // described the range EXCLUDING it. The same file said "16 of 16" for the
+        // identical range 27 lines above, written by the same commit. Per
+        // `IOS-DOC-002` the predicate ships with the sentence, comments excluded so
+        // it cannot count its own recording (`MIS-033`):
+        //   rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' TabMail/Services/AppDatabase.swift \
+        //     | sort -n -u | awk '$1>=68' | wc -l                                  → 17
+        //   rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' \
+        //      TabMail/Services/AppDatabase.swift                                  → 17
+        // The two must be EQUAL. A new migration keeps them equal by declaring
+        // `.immediate`; one that cannot must say why, here.
         migrator.registerTimedMigration(
             "v84_addPendingCalendarOperationFailureReason", foreignKeyChecks: .immediate
         ) { db in
