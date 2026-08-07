@@ -547,6 +547,173 @@ extension SyncEngine {
         }
     }
 
+    // MARK: - Deferred index builds (ADR-IOS-029 rule 5, deferred timing)
+
+    /// One index whose BUILD is deferred off the blocking launch path.
+    ///
+    /// The DDL and the name live in ONE value on purpose. Two parallel lists — a
+    /// `[String]` of statements and a `[String]` of names to probe — is a census
+    /// that drifts the first time somebody adds an index to one and not the other
+    /// (`MIS-006`), and the drift is silent: the pass would report "already
+    /// present" for an index it never built.
+    struct DeferredIndex: Sendable {
+        let name: String
+        let sql: String
+    }
+
+    /// What one call to `runBuildDeferredIndexesIfMissing` did. Returned so the
+    /// invariant — *a deferred index is built exactly once and the pass converges* —
+    /// is observable without reaching into `sqlite_master` from the caller.
+    enum DeferredIndexBuild: Equatable, Sendable {
+        /// Every deferred index already exists. Nothing was written.
+        case alreadyPresent
+        /// At least one was missing and the whole set has now been created.
+        case built
+        /// The probe could not read the schema, or the create failed / was cancelled
+        /// / hit a suspension. NOTHING is recorded, so the next pass retries.
+        case abandoned
+    }
+
+    /// Indexes moved OFF the blocking migration path (ADR-IOS-029, 2026-08-05
+    /// amendment; owner directive *"startup migrations should really have only
+    /// things that are absolutely necessary and blocking. Other things should happen
+    /// durably in the heal/sync/background queues."*).
+    ///
+    /// `messageHeader_unreadSweep` is `v83`'s index. On the owner's device upgrading
+    /// v67 → v83 (5 accounts / 78 folders) `MigrationTimingLedger` attributed
+    /// **5,050 ms** to `v83` — a single `CREATE INDEX` over the whole
+    /// `messageHeader` table, paid before any UI appears. Its `ANALYZE` had already
+    /// been moved here by the same amendment; this moves the build itself.
+    ///
+    /// ⚠️ WHY THIS ONE IS ELIGIBLE AND MOST ARE NOT — the test is stated as a rule
+    /// because the next reader will want to "finish the job". An index may move here
+    /// only if its absence degrades PERFORMANCE AND NOTHING ELSE. A column, a data
+    /// repair, a UNIQUE index a write depends on, or an index a query names with
+    /// `INDEXED BY` (which makes SQLite *error* when it is missing) all stay
+    /// blocking. `messageHeader_unreadSweep` qualifies exactly: every one of
+    /// `InboxViewModel.markAllAsRead`'s three statements returns the SAME ROWS
+    /// without it, just via a temp B-tree sort — the O(U²/50) shape `v83` exists to
+    /// remove. No result changes, no write depends on it, and nothing names it in an
+    /// `INDEXED BY` clause (`rg 'INDEXED BY messageHeader_unreadSweep'` over
+    /// `TabMail/ Shared/ TabMailNotificationService/` → zero).
+    ///
+    /// CONVERGENCE (Data Integrity rule 5). `v83`'s body is now empty, so the two
+    /// populations diverge for exactly as long as it takes this pass to run: a
+    /// database that ran `v83` BEFORE the body was emptied already has the index; a
+    /// fresh install or a device that upgrades after it does not. Both converge here,
+    /// because `CREATE INDEX IF NOT EXISTS` is a no-op on the first and a build on
+    /// the second, and this pass runs from both the foreground poll and the
+    /// BGProcessing drain. Registered as `IOS-PERF-005`.
+    nonisolated static let deferredIndexes: [DeferredIndex] = [
+        DeferredIndex(
+            name: "messageHeader_unreadSweep",
+            sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_unreadSweep
+                ON messageHeader(folderId, id)
+                WHERE isRead = 0
+                """)
+    ]
+
+    /// Creates every deferred index that does not already exist, inside the caller's
+    /// transaction.
+    ///
+    /// Separate from the `async` pass below so a test can reach the PRODUCTION DDL
+    /// through a plain `Database` instead of re-typing the `CREATE INDEX` — a
+    /// re-typed copy is a test that passes against a statement the app does not run.
+    nonisolated static func createDeferredIndexes(_ db: Database) throws {
+        for index in deferredIndexes {
+            try db.execute(sql: index.sql)
+        }
+    }
+
+    /// The deferred indexes `sqlite_master` does not have, or `nil` if the schema
+    /// could not be read at all (which is *unknown*, not *present*).
+    ///
+    /// ⚠️ NOT `async`, for the same reason as `plannerStatisticsSchemaVersion` below:
+    /// Swift binds the ASYNC overload from an async context, and
+    /// `PrioritizedDatabase.read`'s awaited overload runs the NSE read-through
+    /// staging merge before it reads. Inlining this into the async caller silently
+    /// drags a multi-second durable merge into a probe that exists to decide whether
+    /// to do any work at all.
+    private static func missingDeferredIndexes(_ dbPool: PrioritizedDatabase) -> [String]? {
+        try? dbPool.read { db in
+            try deferredIndexes.filter { index in
+                try Row.fetchOne(
+                    db,
+                    sql: "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                    arguments: [index.name]) == nil
+            }.map(\.name)
+        }
+    }
+
+    /// Builds any missing deferred index. Runs from the background WAL maintenance
+    /// pass, BEFORE the `ANALYZE` step.
+    ///
+    /// 🚨 THE ORDER IS LOAD-BEARING AND IT IS THE ONE THING TO PRESERVE HERE.
+    /// `CREATE INDEX` is DDL, so it bumps SQLite's `schema_version`, which is exactly
+    /// the marker `runRefreshPlannerStatisticsIfStale` latches on. Building the index
+    /// FIRST means the `ANALYZE` that follows in the same pass reads the
+    /// POST-index version and records it, so **one pass converges**: index built,
+    /// statistics computed over it, marker settled. Moving this AFTER the `ANALYZE`
+    /// would have the analysis record version N, the index bump it to N+1, and the
+    /// NEXT pass pay a second whole-database `ANALYZE` for nothing.
+    ///
+    /// ⚠️ NO SINGLE-FLIGHT LATCH, deliberately, and this is where it differs from its
+    /// `ANALYZE` sibling. The two maintenance callers (the foreground poll and the
+    /// BGProcessing drain) really can overlap, but `CREATE INDEX IF NOT EXISTS` is
+    /// idempotent and SQLite serializes writers, so the loser of the race waits for
+    /// the writer and then executes a no-op. The sibling needs a latch because
+    /// `ANALYZE` is NOT a no-op the second time — it re-pays up to 8.5 s. Adding a
+    /// latch here would buy nothing and add a failure mode.
+    ///
+    /// FAILS SAFE. If this is skipped, cancelled or aborted, `markAllAsRead` sorts
+    /// through a temp B-tree — slow, correct, and the ALREADY-SHIPPED behaviour up to
+    /// `v83`. Nothing is recorded on failure, so the next pass retries. Recovery is
+    /// automatic and needs no user gesture (THE MANTRA: recoverable ⇒ fail closed).
+    ///
+    /// COST WHILE IT RUNS: one write transaction; 119 ms measured at 360k rows,
+    /// 5,050 ms on the owner's 5-account device — which is the whole point of it
+    /// being here rather than on the launch path.
+    @discardableResult
+    nonisolated static func runBuildDeferredIndexesIfMissing(
+        dbPool: PrioritizedDatabase
+    ) async -> DeferredIndexBuild {
+        guard let missing = missingDeferredIndexes(dbPool) else {
+            // Could not read the schema ⇒ nothing is determined. Retry next pass.
+            return .abandoned
+        }
+        guard !missing.isEmpty else { return .alreadyPresent }
+
+        let t0 = CFAbsoluteTimeGetCurrent()
+        // Same cancellation shape as `runRefreshPlannerStatisticsIfStale`: the flag is
+        // a `Mutex` rather than `Task.isCancelled` because GRDB dispatches the write
+        // closure onto its own writer queue, where `Task.isCancelled` always reads
+        // `false`. Abandoning drops no user intention — this write carries none.
+        let cancelledWhileQueued = Mutex<Bool>(false)
+        do {
+            try await withTaskCancellationHandler {
+                try await dbPool.write(label: "BuildDeferredIndexes") { db in
+                    guard !cancelledWhileQueued.withLock({ $0 }),
+                          !DatabaseSuspension.isSuspended else {
+                        throw CancellationError()
+                    }
+                    try createDeferredIndexes(db)
+                }
+            } onCancel: {
+                cancelledWhileQueued.withLock { $0 = true }
+            }
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Maintenance] built deferred index(es) \(missing.joined(separator: ", ")) in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms")
+            }
+            return .built
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Maintenance] deferred index build abandoned after \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms — retrying next pass: \(error)")
+            }
+            return .abandoned
+        }
+    }
+
     // MARK: - Query-planner statistics (ADR-IOS-029 rule 5, deferred timing)
 
     /// What one call to `runRefreshPlannerStatisticsIfStale` did. Returned so the

@@ -80,9 +80,16 @@ struct DatabaseIndexTests {
     /// regression (the planner preferring a `date`-ordered index) this pins.
     /// The test database is tiny, so the sort-elimination assertion carries the
     /// weight; a `SCAN`-vs-`SEARCH` assertion alone would be size-dependent.
+    ///
+    /// ⚠️ THE INDEX NO LONGER EXISTS AFTER MIGRATION — it is built by the background
+    /// maintenance pass (2026-08-06), so this test runs the PRODUCTION DDL via
+    /// `SyncEngine.createDeferredIndexes` first. It is called rather than re-typed on
+    /// purpose: a re-typed `CREATE INDEX` would let this test keep passing against a
+    /// statement the app no longer runs.
     @Test("markAllAsRead's three statements sort from the v83 index, never a temp B-tree")
     func markAllAsReadSweepUsesUnreadSweepIndex() throws {
         let db = try TestDatabase.make()
+        try db.write { try SyncEngine.createDeferredIndexes($0) }
 
         // Verbatim from `InboxViewModel.markAllAsRead` — the frozen upper-bound
         // probe, the first page, and the cursor page.
@@ -131,6 +138,10 @@ struct DatabaseIndexTests {
     @Test("The v83 index is not chosen for the date-ordered inbox display query")
     func unreadSweepIndexIsNotChosenForDateOrderedReads() throws {
         let db = try TestDatabase.make()
+        // Build it, so "not chosen" means the planner REJECTED an index that was
+        // available — not that it was absent and could not have been chosen. Without
+        // this line the control passes vacuously.
+        try db.write { try SyncEngine.createDeferredIndexes($0) }
         let plan: String = try db.read { dbConn in
             try Row.fetchAll(dbConn, sql: """
                 EXPLAIN QUERY PLAN
@@ -380,5 +391,133 @@ struct DatabaseIndexTests {
         #expect(ordered.count == 3)
         #expect(ordered[0].date >= ordered[1].date)
         #expect(ordered[1].date >= ordered[2].date)
+    }
+}
+
+/// `v83`'s index build moved out of the blocking migration chain and into the
+/// background WAL maintenance pass (2026-08-06; ADR-IOS-029's 2026-08-05 deferred-
+/// timing amendment, extended from the `ANALYZE` to the `CREATE INDEX`). On the
+/// owner's device the migration cost **5,050 ms** before any UI appeared.
+///
+/// 🚨 THE PROPERTY PINNED HERE IS CONVERGENCE, NOT THE MOVE. Emptying an
+/// already-applied migration's body is normally forbidden (Data Integrity rule 5),
+/// and it is admissible ONLY because every population reaches the same schema
+/// anyway. So these tests assert, in order: the migration chain alone does NOT
+/// produce the index (otherwise the deferral is fiction and every other assertion
+/// here is vacuous); the pass DOES; the pass is idempotent; and a second pass over
+/// the converged state does nothing.
+///
+/// `.serialized` because `runRefreshPlannerStatisticsIfStale` carries a
+/// process-wide single-flight latch, and the ordering test drives it.
+@Suite("Deferred index builds — v83 moved off the launch path", .serialized)
+struct DeferredIndexBuildTests {
+
+    private struct Fixture {
+        let pool: DatabasePool
+        let directory: URL
+    }
+
+    /// On disk, not in memory: `PrioritizedDatabase` wraps a `DatabasePool`, and a
+    /// pool needs a file.
+    private func makeFixture() throws -> Fixture {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration)
+        try AppDatabase.runMigrations(on: pool)
+        return Fixture(pool: pool, directory: directory)
+    }
+
+    private func indexExists(_ pool: DatabasePool, _ name: String) throws -> Bool {
+        try pool.read { db in
+            try Row.fetchOne(
+                db,
+                sql: "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                arguments: [name]) != nil
+        }
+    }
+
+    /// 🚨 NON-VACUITY, and it is the first test on purpose. If the migration chain
+    /// still built the index, every "the pass builds it" assertion below would pass
+    /// without the pass doing anything at all — and the 5,050 ms would still be on
+    /// the launch path. This is the test that fails if somebody "restores" `v83`'s
+    /// body, which is exactly the change the migration's comment warns against.
+    @Test("The migration chain alone does not build the deferred index")
+    func migrationChainDoesNotBuildTheDeferredIndex() throws {
+        let fixture = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+
+        for index in SyncEngine.deferredIndexes {
+            #expect(try indexExists(fixture.pool, index.name) == false,
+                    """
+                    \(index.name) exists straight after the migration chain — the \
+                    deferral is not in effect and its cost is still paid before first \
+                    paint. Did v83's body get restored?
+                    """)
+        }
+        #expect(!SyncEngine.deferredIndexes.isEmpty,
+                "an empty deferred set would make the loop above assert nothing")
+    }
+
+    /// The other half: it must actually arrive, or `markAllAsRead` never gets its
+    /// index and the deferral is a silent regression rather than a deferral.
+    @Test("The background maintenance pass builds it, and is idempotent")
+    func maintenancePassBuildsTheDeferredIndexAndConverges() async throws {
+        let fixture = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+
+        #expect(await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool) == .built)
+        for index in SyncEngine.deferredIndexes {
+            #expect(try indexExists(fixture.pool, index.name),
+                    "\(index.name) missing after the pass reported .built")
+        }
+
+        // Idempotent, and it reports so. A pass that rebuilt every time would burn
+        // the 5,050 ms on every foreground poll — a worse defect than the one this
+        // change fixes, and invisible without this assertion.
+        #expect(await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool) == .alreadyPresent)
+        for index in SyncEngine.deferredIndexes {
+            #expect(try indexExists(fixture.pool, index.name))
+        }
+    }
+
+    /// 🚨 ONE PASS CONVERGES — the reason the index build runs BEFORE the `ANALYZE`
+    /// in `runWALMaintenance`. `CREATE INDEX` is DDL and bumps `schema_version`,
+    /// which is the marker the statistics refresh latches on. Built first, the
+    /// analysis records the POST-index version and the next pass is `.alreadyFresh`.
+    /// Built after, the analysis would record a version the index immediately
+    /// invalidates and the NEXT pass would pay a second whole-database `ANALYZE`.
+    ///
+    /// This asserts the SYSTEM PROPERTY (the second pass is a no-op on both steps),
+    /// not the call order, so it stays honest if the steps are ever restructured.
+    @Test("Index build then ANALYZE converges in a single maintenance pass")
+    func indexBuildBeforeAnalyzeConvergesInOnePass() async throws {
+        let fixture = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        let defaults = UserDefaults.standard
+        let key = "analyzeMarker-\(UUID().uuidString)"
+        defer { defaults.removeObject(forKey: key) }
+
+        // Pass 1, in production order.
+        #expect(await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool) == .built)
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: defaults, markerKey: key) == .refreshed)
+
+        // Pass 2 must do nothing at all. `.alreadyFresh` here is the whole claim: the
+        // marker settled ON the post-index schema version.
+        #expect(await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool) == .alreadyPresent)
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: defaults, markerKey: key) == .alreadyFresh,
+                """
+                a second maintenance pass re-ran the whole-database ANALYZE — the \
+                index build's schema_version bump landed after the marker settled, \
+                which is the two-pass shape the ordering exists to prevent
+                """)
     }
 }

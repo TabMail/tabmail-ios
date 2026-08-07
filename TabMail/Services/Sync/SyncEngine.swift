@@ -209,11 +209,15 @@ actor SyncEngine {
     /// want maintenance to happen whenever EITHER fires. Abandons on suspend at each
     /// step (ADR-IOS-046).
     ///
-    /// `async` ONLY because its last step is: the deferred `ANALYZE` has to reach
-    /// the priority write queue, and a non-async caller binds `PriorityGate`'s
-    /// pass-through synchronous `write` overload instead. Every other step here is
-    /// unchanged and still synchronous. Both callers already run inside detached
-    /// tasks, so this adds no new concurrency.
+    /// `async` because its last TWO steps are: the deferred index build and the
+    /// deferred `ANALYZE` both have to reach the priority write queue, and a
+    /// non-async caller binds `PriorityGate`'s pass-through synchronous `write`
+    /// overload instead — which has no tier at all and holds SQLite's single writer
+    /// ahead of every queued `.priority` write. (This sentence read *"ONLY because
+    /// its last step is"* while `ANALYZE` was the only deferred step;
+    /// `runBuildDeferredIndexesIfMissing` joined it on 2026-08-06.) Every other step
+    /// here is unchanged and still synchronous. Both callers already run inside
+    /// detached tasks, so this adds no new concurrency.
     nonisolated static func runWALMaintenance(
         dbPool: PrioritizedDatabase,
         includePrune: Bool,
@@ -237,20 +241,31 @@ actor SyncEngine {
             runEvictChatSessions(dbPool: dbPool)
         }
         let t4 = CFAbsoluteTimeGetCurrent()
-        // LAST on purpose. It is the only step here that can cost seconds, it runs at
-        // most once per schema change, and nothing above depends on it — so putting it
-        // last means a suspension mid-`ANALYZE` costs the cheap reclaim steps nothing.
-        // It is on THIS side of the maintenance split because `ANALYZE` is a main-DB
-        // WAL write (see `runRefreshPlannerStatisticsIfStale`, and ADR-IOS-046 for why
-        // the `runBodyAssetMaintenance` side would be a `0xdead10cc` bug).
+        // 🚨 BEFORE THE `ANALYZE`, NOT AFTER — the order is the convergence argument.
+        // `CREATE INDEX` is DDL and bumps SQLite's `schema_version`, which is the very
+        // marker `runRefreshPlannerStatisticsIfStale` latches on. Building first means
+        // the analysis below reads the POST-index version and settles it, so ONE pass
+        // converges. After it, the analysis would record version N, the index bump it
+        // to N+1, and the next pass would re-run a whole-database `ANALYZE` for
+        // nothing. See `runBuildDeferredIndexesIfMissing`.
+        if shouldRun() {
+            await runBuildDeferredIndexesIfMissing(dbPool: dbPool)
+        }
+        let t5 = CFAbsoluteTimeGetCurrent()
+        // LAST on purpose. It is the only step here that can cost seconds unconditionally,
+        // it runs at most once per schema change, and nothing above depends on it — so
+        // putting it last means a suspension mid-`ANALYZE` costs the cheap reclaim steps
+        // nothing. It is on THIS side of the maintenance split because `ANALYZE` is a
+        // main-DB WAL write (see `runRefreshPlannerStatisticsIfStale`, and ADR-IOS-046
+        // for why the `runBodyAssetMaintenance` side would be a `0xdead10cc` bug).
         if shouldRun() {
             await runRefreshPlannerStatisticsIfStale(dbPool: dbPool)
         }
-        let t5 = CFAbsoluteTimeGetCurrent()
+        let t6 = CFAbsoluteTimeGetCurrent()
         if includePrune {
-            print("[Sync] WAL maintenance: prune=\(Int((t1-t0)*1000))ms evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t4-t3)*1000))ms analyze=\(Int((t5-t4)*1000))ms")
+            print("[Sync] WAL maintenance: prune=\(Int((t1-t0)*1000))ms evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t4-t3)*1000))ms indexBuild=\(Int((t5-t4)*1000))ms analyze=\(Int((t6-t5)*1000))ms")
         } else {
-            print("[Sync] WAL maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t4-t3)*1000))ms analyze=\(Int((t5-t4)*1000))ms")
+            print("[Sync] WAL maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t4-t3)*1000))ms indexBuild=\(Int((t5-t4)*1000))ms analyze=\(Int((t6-t5)*1000))ms")
         }
     }
 

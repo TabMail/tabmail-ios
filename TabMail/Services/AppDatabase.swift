@@ -2014,13 +2014,20 @@ final class AppDatabase: Sendable {
         //     `UPDATE messageHeader SET actionTagSetAt = …` was removed (see that
         //     migration's own note). `messageHeader` IS a parent, but adding a
         //     column writes no key of either kind.
-        //   • v83 — `CREATE INDEX`; changes no row. (Its `ANALYZE` moved to the
-        //     background maintenance pass — ADR-IOS-029, 2026-08-05 amendment.)
+        //   • v83 — EMPTY BODY as of 2026-08-06; changes no row and issues no
+        //     statement. Both halves of what it used to do — the `ANALYZE` and then
+        //     the `CREATE INDEX` itself — moved to the background maintenance pass
+        //     (ADR-IOS-029, 2026-08-05 amendment and its 2026-08-06 extension). The
+        //     mode is retained on an empty body so this range's census stays 16 of 16
+        //     and a future reader who fills the body in does not inherit `.deferred`.
         //
         //   • v82 — `DROP`/`CREATE` of `userLabel` + `messageUserLabel`. FK-clean
-        //     per statement because the CHILD is dropped before the PARENT and
-        //     recreated after it is repopulated; verified statement by statement
-        //     in that migration's own comment, which is where the argument lives.
+        //     per statement, verified statement by statement in that migration's own
+        //     comment, which is where the argument lives. ⚠️ This bullet used to say
+        //     *"because the CHILD is dropped before the PARENT"*; that clause was
+        //     wrong and is corrected at the migration — the drop order is the `v2`
+        //     house pattern, and the snapshots taken before either drop are what make
+        //     the body safe.
         //
         // ⚑ AMENDED 2026-08-06 — **EVERY MIGRATION IN v68…v83 NOW RUNS `.immediate`,
         // so this range runs ZERO whole-database foreign-key checks.** The sentence
@@ -2985,6 +2992,58 @@ final class AppDatabase: Sendable {
 
         // v83: partial index for `InboxViewModel.markAllAsRead`'s keyset sweep.
         //
+        // 🚨🚨 THE BODY OF THIS MIGRATION IS EMPTY AS OF 2026-08-06. THE INDEX IS
+        // REAL AND STILL REQUIRED; ONLY ITS BUILD MOVED. It is created by
+        // `SyncEngine.runBuildDeferredIndexesIfMissing`, the background WAL
+        // maintenance pass, from the SAME `CREATE INDEX IF NOT EXISTS` statement —
+        // `SyncEngine.deferredIndexes` is the one place the DDL lives now. Everything
+        // below about WHY the index exists, WHY it is partial, and WHY it must be
+        // chosen by the planner is unchanged and still governs; only the sentences
+        // about WHEN it is built have moved, and they say so where they occur.
+        //
+        // WHY IT MOVED — cost, measured on hardware. On the owner's device upgrading
+        // v67 → v83 (5 accounts / 78 folders) `MigrationTimingLedger` attributed
+        // **5,050 ms** to `v83`, all of it this one `CREATE INDEX` over the whole
+        // `messageHeader` table, paid before any UI appears. Together with `v71`'s and
+        // `v82`'s retired foreign-key gates that is 24,360 ms of a 27,601 ms chain.
+        // Owner directive, 2026-08-05: *"startup migrations should really have only
+        // things that are absolutely necessary and blocking. Other things should
+        // happen durably in the heal/sync/background queues."* The `ANALYZE` half of
+        // this body moved for the same reason a day earlier; this is the other half.
+        //
+        // CONVERGENCE (Data Integrity rule 5) — THE ARGUMENT, IN FULL, BECAUSE THIS IS
+        // A BODY CHANGE TO AN ALREADY-APPLIED MIGRATION AND THAT IS NORMALLY BANNED.
+        // Rule 5's two prohibited shapes are APPENDING statements to an applied body
+        // (they never execute on a database that already ran it) and RENAMING it (GRDB
+        // re-runs the whole body and fails on the existing objects). This is neither:
+        // the identifier is frozen, and the body only ever SHRANK. The three
+        // populations and where each ends up:
+        //   • A database that ran `v83` BEFORE this change — has the index. The empty
+        //     body does not run again. Unchanged.
+        //   • A database that has not reached `v83` yet, and every fresh install — runs
+        //     the empty body, does NOT get the index from the migration, and gets it
+        //     from the first background maintenance pass.
+        //   • A database that never reaches the maintenance pass — see the accepted
+        //     window below.
+        // All three converge on the identical schema because
+        // `CREATE INDEX IF NOT EXISTS` is idempotent and the pass runs from BOTH the
+        // foreground poll and the BGProcessing drain, re-arming itself on every launch
+        // until it succeeds. Nothing reads or writes a row either way.
+        //
+        // ⚠️ THE ACCEPTED WINDOW, stated because this change creates it. Between an
+        // upgrade launch and the first maintenance pass, `markAllAsRead` sorts through
+        // a temp B-tree — the pre-`v83` behaviour, i.e. every shipped release up to
+        // and including `v1.6.38`. It is SLOW, not wrong: the same rows are returned
+        // in the same order. Recoverable without any user gesture, so it fails closed
+        // and is registered (`IOS-PERF-005`) rather than mechanised — THE MANTRA.
+        // ⚠️ NEGATIVE CASE, so this is not read as licence: an index whose absence
+        // changes a RESULT, or that a query names in an `INDEXED BY` clause (SQLite
+        // *errors* when such an index is missing), or that a write depends on for
+        // uniqueness, may NOT move. `messageHeader_unreadSweep` is named in no
+        // `INDEXED BY` clause anywhere in `TabMail/ Shared/ TabMailNotificationService/`
+        // — that is a checked fact, not an assumption, and it is the check to re-run
+        // before deferring the next one.
+        //
         // 🚨 THE DEFECT IS A PLAN, NOT A QUERY. `markAllAsRead` runs three statements
         // per folder — a frozen upper-bound probe (`ORDER BY id COLLATE BINARY DESC
         // LIMIT 1`), a first page, and a cursor page (`id > ? AND id <= ?`), all under
@@ -3051,6 +3110,11 @@ final class AppDatabase: Sendable {
         // things that are absolutely necessary and blocking. Other things should
         // happen durably in the heal/sync/background queues."* Recorded as the
         // 2026-08-05 amendment to ADR-IOS-029; read it before adding one back.
+        // ⚠️ As of 2026-08-06 there is no `CREATE INDEX` in this body either, for the
+        // same reason and by the same route — see the banner at the top of this
+        // block. The two deferrals are ordered inside one maintenance pass: index
+        // first (its DDL bumps `schema_version`), `ANALYZE` second, so a single pass
+        // converges instead of two.
         //
         // WHY THIS BODY IS WHERE IT MATTERED. Measured launch cost on a 360k-row
         // database: `CREATE INDEX` 119 ms + `ANALYZE` ~850 ms. Harness-measured at
@@ -3058,13 +3122,16 @@ final class AppDatabase: Sendable {
         // separate runs the whole migration was **8,522 ms** and **6,688 ms**, of
         // which the bare `ANALYZE` alone was **5,259.6 ms** in the second — the
         // single most expensive statement in the whole `v68…v83` chain, paid before
-        // any UI appears. With it removed the same migration measures **2,015 ms
-        // total / 296.5 ms body**. (The two totals differ because this is a
-        // timing-dependent measurement on a 3.4 GB file; read the SHAPE — one
-        // statement dominating the chain — not the integer.) It also buys THIS
-        // migration nothing: the plan quoted above is chosen identically with and
-        // without statistics, which is the whole reason the partial form was
-        // preferred.
+        // any UI appears. With it removed the same migration measured **2,015 ms
+        // total / 296.5 ms body** on that harness. ⚠️ THAT RESIDUAL WAS NOT SMALL ON
+        // REAL HARDWARE, which is why the `CREATE INDEX` followed it out: the owner's
+        // device (5 accounts / 78 folders) attributed **5,050 ms** to this migration
+        // with the `ANALYZE` already gone. A harness figure on a quiet Mac understates
+        // a device by 2–4×, and 296.5 ms × 4 is not 5,050 ms — read the SHAPE (one
+        // statement dominating), never the integer, and prefer the device number when
+        // the two disagree. The `ANALYZE` also bought THIS migration nothing: the plan
+        // quoted above is chosen identically with and without statistics, which is the
+        // whole reason the partial form was preferred.
         //
         // ⚠️ NEGATIVE CASE — STATISTICS THEMSELVES ARE NOT OPTIONAL, so "just delete
         // the `ANALYZE`" would have been the wrong change. Measured at profile H on
@@ -3135,17 +3202,32 @@ final class AppDatabase: Sendable {
         // `messageHeader_aiIncomplete` / `messageHeader_embeddingIncomplete` /
         // `messageHeader_reminderLookup` — all raw-SQL partials).
         //
-        // CONVERGENCE (Data Integrity rule 5): additive and idempotent. A fresh
-        // install creates the index over an empty table; an existing database creates
-        // it over real rows. Same schema either way. Nothing reads or writes a row.
+        // ⚠️ THE BODY IS EMPTY ON PURPOSE — do not "restore" the `CREATE INDEX`. It
+        // read, until 2026-08-06:
+        //
+        //     try db.execute(sql: """
+        //         CREATE INDEX IF NOT EXISTS messageHeader_unreadSweep
+        //         ON messageHeader(folderId, id)
+        //         WHERE isRead = 0
+        //     """)
+        //
+        // and that statement now lives in `SyncEngine.deferredIndexes`, executed by
+        // `SyncEngine.runBuildDeferredIndexesIfMissing` from the background WAL
+        // maintenance pass. The identifier and the registration stay because a
+        // registered migration's NAME is frozen once any database has run it (Data
+        // Integrity rule 5) — deleting the registration would make GRDB see an applied
+        // identifier it no longer knows. The convergence argument for the empty body
+        // is at the top of this block.
+        //
+        // `foreignKeyChecks: .immediate` is retained rather than removed: an empty
+        // body cannot violate a constraint, so the mode is moot, but leaving it makes
+        // the file's mode census uniform across v68…v83 (16 of 16) and means a future
+        // reader who fills this body in cannot inherit the default `.deferred` and its
+        // whole-database scan by accident.
         migrator.registerTimedMigration(
             "v83_markAllAsReadUnreadSweepIndex", foreignKeyChecks: .immediate
-        ) { db in
-            try db.execute(sql: """
-                CREATE INDEX IF NOT EXISTS messageHeader_unreadSweep
-                ON messageHeader(folderId, id)
-                WHERE isRead = 0
-            """)
+        ) { _ in
+            // Intentionally empty. See above.
         }
     }
 
