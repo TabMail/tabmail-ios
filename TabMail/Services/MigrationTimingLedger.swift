@@ -218,9 +218,18 @@ final class MigrationTimingLedger: Sendable {
         /// `v1` has run. `nil` and `0` are NOT the same fact ("no schema" vs "empty
         /// mailbox") and are rendered differently, because a calibration line that
         /// prints `0` for both would make a fresh install indistinguishable from a
-        /// user who deleted all their mail.
-        let messageHeaders: Int?
-        let messageBodies: Int?
+        /// user who deleted all their mail. This applies to all four figures below.
+        ///
+        /// ⚠️ **THE TWO UNBOUNDED TABLES REPORT A CEILING, NOT A COUNT** — `MAX(rowid)`,
+        /// which is `>=` the true row count and equals it only when no row has ever been
+        /// deleted. They are named and rendered as ceilings (`<=`) because a calibration
+        /// denominator tolerates an upper bound but a silent relabel of an estimate as a
+        /// count does not. `account` and `folder` remain EXACT counts: their cardinality
+        /// is bounded (the owner's device: 5 and 78), so `COUNT(*)` on them is ~2 pages
+        /// and there is nothing to buy by weakening them. See `measureChainScale` for
+        /// the measured reason the other two had to change.
+        let messageHeadersAtMost: Int?
+        let messageBodiesAtMost: Int?
         let accounts: Int?
         let folders: Int?
         /// `page_count × page_size`. **Not** a filesystem stat: `Database.path` is
@@ -252,14 +261,63 @@ final class MigrationTimingLedger: Sendable {
     /// not throw out of a diagnostic and take the migration chain — and the app's
     /// launch — with it. Failing to measure is a missing number; failing to launch is
     /// a brick.
+    ///
+    /// 🚨 **WHY THE TWO BIG TABLES USE `MAX(rowid)` AND NOT `COUNT(*)`.** This
+    /// measurement cost the owner's device **7,533 ms — 38.5% of a 19,558 ms migration
+    /// splash** — and all of it was in the two unbounded `COUNT(*)`s.
+    ///
+    /// ⚠️ **NOT for the reason it looks like, and the wrong reason was written down
+    /// twice before it was measured (`MIS-015` — pin the invariant, not the story).**
+    /// The plausible explanation is "`COUNT(*)` walks the table b-tree, so it drags all
+    /// 2.9 GB of `htmlContent` overflow pages through the pager". **That is false.**
+    /// SQLite serves both counts from a small covering index and never touches an
+    /// overflow page:
+    /// ```
+    /// SELECT COUNT(*) FROM messageHeader -> SCAN messageHeader USING COVERING INDEX messageHeader_date
+    /// SELECT COUNT(*) FROM messageBody   -> SCAN messageBody USING COVERING INDEX sqlite_autoindex_messageBody_1
+    /// ```
+    /// Measured on synthetic databases holding the owner's exact shape (252,216
+    /// headers; 160,000 bodies), counting pages the pager actually had to read
+    /// (`SQLITE_DBSTATUS_CACHE_MISS`) so the number is independent of any warm cache:
+    ///
+    /// | `messageBody` fixture        | `COUNT(*)` | `MAX(rowid)` |
+    /// |------------------------------|-----------:|-------------:|
+    /// | 160,000 rows /    19 MB html |      1,177 |            9 |
+    /// | 160,000 rows / 2,747 MB html |      1,177 |            9 |
+    /// |  16,000 rows /   274 MB html |        117 |            9 |
+    ///
+    /// **144x the bytes changes nothing; 10x the rows changes everything.** The cost is
+    /// the INDEX, and it scales with row count and key length — at a realistic 60-char
+    /// `accountId:folderPath:messageId` id the same 160,000 rows cost **3,019** pages
+    /// instead of 1,177. So the real bracket is ~3,019 + ~1,970 ≈ **5,000 pages ≈
+    /// 19.5 MB of cold random reads**, which at the ~1.5 ms/page a contended, encrypted,
+    /// fragmented flash read costs during a boot storm is the 7,533 ms observed.
+    /// `MAX(rowid)` is a single rightmost-descent (`SEARCH`, 9 pages), flat in every
+    /// dimension, so the bracket becomes ~22 pages ≈ 88 KB.
+    ///
+    /// **Consequence for anyone editing this function: keep it off the row axis.** A
+    /// future "improvement" such as `COUNT(*) FROM messageBody WHERE htmlContent IS NOT
+    /// NULL` would reinstate the cost AND finally make the overflow-page story true,
+    /// because a predicate on a non-indexed column is what forces the table b-tree.
+    /// `chainScaleMeasurementIsFlatInRowCount` is red against exactly that.
+    ///
+    /// `COALESCE` is load-bearing: `MAX(rowid)` of an EMPTY table is SQL `NULL`, which
+    /// would arrive as `nil` and collapse the "no schema" vs "empty mailbox" distinction
+    /// `ChainScale` documents and `preSchemaDatabaseReportsAbsentNotZero` pins.
     static func measureChainScale(_ db: Database, pendingMigrations: Int) -> ChainScale {
         let t0 = CFAbsoluteTimeGetCurrent()
+        /// Exact. Only for tables whose cardinality is bounded and small.
         func count(_ table: String) -> Int? {
             guard (try? db.tableExists(table)) == true else { return nil }
             return try? Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(table)")
         }
-        let headers = count("messageHeader")
-        let bodies = count("messageBody")
+        /// An upper bound in O(1) pages, for the tables that grow with the mailbox.
+        func rowidCeiling(_ table: String) -> Int? {
+            guard (try? db.tableExists(table)) == true else { return nil }
+            return try? Int.fetchOne(db, sql: "SELECT COALESCE(MAX(rowid), 0) FROM \(table)")
+        }
+        let headers = rowidCeiling("messageHeader")
+        let bodies = rowidCeiling("messageBody")
         let accounts = count("account")
         let folders = count("folder")
         let bytes: Int64? = {
@@ -268,8 +326,8 @@ final class MigrationTimingLedger: Sendable {
             return pages * pageSize
         }()
         return ChainScale(
-            messageHeaders: headers,
-            messageBodies: bodies,
+            messageHeadersAtMost: headers,
+            messageBodiesAtMost: bodies,
             accounts: accounts,
             folders: folders,
             databaseBytes: bytes,
@@ -285,8 +343,8 @@ final class MigrationTimingLedger: Sendable {
         let megabytes = scale.databaseBytes.map { String(format: "%.1fMB", Double($0) / 1_048_576) } ?? "n/a"
         BackgroundSyncLogger.log(
             "AppDatabase: migration chain scale — \(scale.pendingMigrations) pending migration(s) over "
-                + "messageHeader \(render(scale.messageHeaders)) rows, "
-                + "messageBody \(render(scale.messageBodies)) rows, "
+                + "messageHeader <=\(render(scale.messageHeadersAtMost)) rows, "
+                + "messageBody <=\(render(scale.messageBodiesAtMost)) rows, "
                 + "\(render(scale.accounts)) account(s), \(render(scale.folders)) folder(s), "
                 + "db \(megabytes) (main file, excl. WAL) "
                 + "[measured in \(scale.measurementMs)ms, included in the chain total]")

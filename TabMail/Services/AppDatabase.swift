@@ -451,13 +451,16 @@ final class AppDatabase: Sendable {
         // reported a 27,601 ms chain and nobody could say whether that meant "slow
         // migrations" or "a very large mailbox" — and those have OPPOSITE remedies.
         // This emits the denominator once, immediately before the first body runs:
-        // header count, body count, accounts, folders, and the database's page
-        // footprint. See `MigrationTimingLedger.measureChainScale`.
+        // a header ceiling, a body ceiling, exact account and folder counts, and the
+        // database's page footprint. See `MigrationTimingLedger.measureChainScale` —
+        // the two unbounded tables report `MAX(rowid)` rather than `COUNT(*)`, because
+        // counting them cost the owner's device 7,533 ms of a 19,558 ms splash.
         //
         // The `unapplied.isEmpty` guard is what keeps this off the ordinary launch
         // path. An already-migrated database pays ONE read of `grdb_migrations` — the
         // same read `migrator.migrate` is about to do anyway — and emits nothing. The
-        // four `COUNT(*)`s are paid at most once per app upgrade.
+        // four figures are paid at most once per app upgrade, and none of them is on
+        // the row axis any more.
         //
         // ⚠️ IT IS INSIDE THE WINDOW IT MEASURES. `AppDatabase.init` brackets this
         // whole function with the aggregate *"schema migrations completed in Nms"*
@@ -2248,9 +2251,14 @@ final class AppDatabase: Sendable {
             // "the FTS row carries non-empty indexed body TEXT" — which stays TRUE,
             // because the FTS text survives. Search keeps working over bodies whose
             // HTML cache this migration discarded.
+            // `MAX(rowid)`, not `COUNT(*)`: this is a diagnostic, and on the owner's
+            // device the `COUNT(*)` it replaces scanned ~3,000 index pages (~4.5 s of
+            // this migration's 11,993 ms body) to produce a number nothing branches on.
+            // A ceiling costs 9 pages. `COALESCE` keeps an empty table reading `0`
+            // rather than `-1`. Full measurement: `MigrationTimingLedger.measureChainScale`.
             if DebugModeManager.isLoggingEnabled() {
-                let discarded = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageBody") ?? -1
-                print("[Migration v70] discarding \(discarded) cached body row(s) to drop the header FK")
+                let discarded = try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(rowid), 0) FROM messageBody") ?? -1
+                print("[Migration v70] discarding <=\(discarded) cached body row(s) to drop the header FK")
             }
             try db.drop(table: "messageBody")
             // Recreated WITHOUT the `.references("messageHeader", onDelete: .cascade)`

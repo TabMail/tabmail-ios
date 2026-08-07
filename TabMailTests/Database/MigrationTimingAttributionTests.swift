@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import SQLite3
 @testable import TabMail
 
 /// THE INVARIANT: **the debug migration log accounts for the whole chain, and
@@ -335,8 +336,8 @@ struct MigrationChainScaleTests {
         let scale = try db.read { db in
             MigrationTimingLedger.measureChainScale(db, pendingMigrations: 83)
         }
-        #expect(scale.messageHeaders == nil)
-        #expect(scale.messageBodies == nil)
+        #expect(scale.messageHeadersAtMost == nil)
+        #expect(scale.messageBodiesAtMost == nil)
         #expect(scale.accounts == nil)
         #expect(scale.folders == nil)
         #expect(scale.pendingMigrations == 83)
@@ -359,21 +360,46 @@ struct MigrationChainScaleTests {
         let scale = try db.read { db in
             MigrationTimingLedger.measureChainScale(db, pendingMigrations: 0)
         }
-        #expect(scale.messageHeaders == 7,
-                "seeded 7 headers, measured \(String(describing: scale.messageHeaders))")
+        // A ceiling, but an exact one here: nothing has been deleted, so `MAX(rowid)`
+        // and `COUNT(*)` coincide. Asserting the number rather than merely its presence
+        // is what stops an O(1) rewrite from reporting a plausible-looking wrong scale.
+        #expect(scale.messageHeadersAtMost == 7,
+                "seeded 7 headers, measured \(String(describing: scale.messageHeadersAtMost))")
         #expect(scale.accounts == 1)
         #expect(scale.folders == 1)
-        #expect(scale.messageBodies != nil,
-                "messageBody exists in the migrated schema, so its count must not be absent")
+        // 🚨 THE `COALESCE` GUARD. `messageBody` exists in the migrated schema and is
+        // EMPTY in this fixture, which is the one case where `MAX(rowid)` returns SQL
+        // `NULL`. Without `COALESCE(..., 0)` that arrives as `nil` and renders `n/a` —
+        // collapsing "no schema" into "empty mailbox", the exact distinction
+        // `preSchemaDatabaseReportsAbsentNotZero` above exists to keep. `0`, not `nil`.
+        #expect(scale.messageBodiesAtMost == 0,
+                """
+                messageBody exists in the migrated schema and is empty, so its ceiling \
+                must be 0 — `nil` here means the COALESCE was dropped and an empty \
+                mailbox now reads as a fresh install
+                """)
         #expect((scale.databaseBytes ?? 0) > 0)
     }
 
-    /// 🚨 THE COST CONTAINMENT, asserted rather than assumed. This measurement runs
-    /// INSIDE the window the aggregate *"schema migrations completed in Nms"* line
-    /// covers, so it inflates the very number it calibrates. It is reported inline so
-    /// it is subtractable — and a value that is present but never plausible would mean
-    /// the four `COUNT(*)`s had quietly become the expensive part.
-    @Test("The measurement reports its own cost, and that cost is small")
+    /// THE SELF-REPORTING CONTRACT: `measurementMs` is present and finite, so the
+    /// calibration's own cost is subtractable from the aggregate line it inflates.
+    ///
+    /// ⚠️ **THIS TEST IS SCALE-BLIND AND CANNOT DETECT AN EXPENSIVE MEASUREMENT. It is
+    /// kept for the contract above and must NOT be read as cost containment.** Its
+    /// fixture is four EMPTY tables, so the property it appears to guard — "the
+    /// calibration has not become a cost of its own" — cannot fail here no matter how
+    /// bad the queries are: on an empty database even a full table scan is free. It was
+    /// green throughout the entire period in which this measurement cost the owner's
+    /// device **7,533 ms, 38.5% of a 19,558 ms migration splash**. That is the
+    /// blessing-test shape (`feedback_non_vacuity_must_be_two_sided`): a green test
+    /// that certifies nothing.
+    ///
+    /// **Tightening the millisecond bound here would not repair it** — the fixture, not
+    /// the threshold, is what makes it vacuous, and a wall-clock threshold is
+    /// machine-dependent anyway. Cost containment is now pinned by
+    /// `chainScaleMeasurementIsFlatInRowCount` below, on the axis that actually drives
+    /// the cost and in a machine-independent unit.
+    @Test("The measurement reports its own cost")
     func measurementReportsAndBoundsItsOwnCost() throws {
         let db = try TestDatabase.make()
         let scale = try db.read { db in
@@ -382,9 +408,149 @@ struct MigrationChainScaleTests {
         #expect(scale.measurementMs >= 0)
         #expect(scale.measurementMs < 1_000,
                 """
-                counting four empty tables took \(scale.measurementMs)ms — on this \
-                fixture it should be single-digit, and anything near a second means \
-                the calibration has become a cost of its own
+                measuring four EMPTY tables took \(scale.measurementMs)ms — this bound \
+                only catches a pathology so gross it shows up at zero rows; see \
+                chainScaleMeasurementIsFlatInRowCount for the real containment
                 """)
+    }
+
+    // MARK: - Cost containment, on the axis that actually drives it
+
+    /// 🚨 **THE INVARIANT: the chain-scale measurement's cost does not grow with the
+    /// mailbox.** It runs INSIDE the window the aggregate *"schema migrations completed
+    /// in Nms"* line covers, on the blocking launch path, in front of a splash screen —
+    /// so a calibration that scales with the thing it is calibrating is a startup
+    /// regression that grows with the user's mailbox.
+    ///
+    /// **Measured in pager cache misses (`SQLITE_DBSTATUS_CACHE_MISS`), not milliseconds.**
+    /// Pages-read is the quantity the device actually pays for (each is a random,
+    /// encrypted flash read) and it is identical on a fast Mac and a cold iPhone, so
+    /// this test cannot flake on a loaded CI machine the way a wall-clock threshold can.
+    ///
+    /// **THE RED AXIS IS ROW COUNT.** Reverting `measureChainScale` to `COUNT(*)` fails
+    /// the `manyRows` assertion below and nothing else.
+    ///
+    /// ⚠️ **THE BYTE AXIS IS ASSERTED BUT IS *NOT* RED AGAINST THE PRE-FIX CODE, and it
+    /// is recorded here because the pre-fix code was blamed on it twice in writing
+    /// before anyone measured it (`MIS-019`, `MIS-015`).** The story was "`COUNT(*)`
+    /// walks the table b-tree and drags 2.9 GB of `htmlContent` overflow pages through
+    /// the pager". SQLite serves both counts from a small covering index and never
+    /// touches an overflow page, so the pre-fix code was ALREADY flat in bytes — 160,000
+    /// bodies cost 1,177 pages at 19 MB of html and 1,177 pages at 2,747 MB. Seeding
+    /// byte volume alone would therefore have produced a red-looking test that was green
+    /// on the bug. The `fatBytes` assertion is kept as a REGRESSION guard with a
+    /// specific future defect in view: a predicate on a non-indexed column
+    /// (`... WHERE htmlContent IS NOT NULL`) would force the table b-tree and finally
+    /// make the overflow-page story true.
+    @Test("The chain-scale measurement is flat in row count and in byte volume")
+    func chainScaleMeasurementIsFlatInRowCount() throws {
+        let baseline = try Self.makeScaleFixture(rows: 200, htmlBytes: 2)
+        let manyRows = try Self.makeScaleFixture(rows: 20_000, htmlBytes: 2)
+        let fatBytes = try Self.makeScaleFixture(rows: 200, htmlBytes: 40_000)
+        defer { for url in [baseline, manyRows, fatBytes] { try? FileManager.default.removeItem(at: url) } }
+
+        // NON-VACUITY, stated as positive facts about the fixtures. Without these a
+        // silently-empty seed would make every comparison below trivially true — which
+        // is exactly how the scale-blind test above stayed green for so long.
+        let baseScale = try Self.chainScale(at: baseline)
+        let manyScale = try Self.chainScale(at: manyRows)
+        let fatScale = try Self.chainScale(at: fatBytes)
+        #expect(baseScale.messageHeadersAtMost == 200)
+        #expect(manyScale.messageHeadersAtMost == 20_000,
+                "the many-rows fixture must really carry 100x the rows, else this test proves nothing")
+        #expect(manyScale.messageBodiesAtMost == 20_000)
+        #expect(fatScale.messageHeadersAtMost == 200)
+        let baseBytes = try Self.fileSize(baseline)
+        let fatFileBytes = try Self.fileSize(fatBytes)
+        #expect(fatFileBytes > baseBytes * 10,
+                """
+                the fat-bytes fixture must really be much larger on disk \
+                (\(fatFileBytes) vs \(baseBytes) bytes), else its assertion proves nothing
+                """)
+
+        let basePages = try Self.pagesReadMeasuringChainScale(at: baseline)
+        let manyPages = try Self.pagesReadMeasuringChainScale(at: manyRows)
+        let fatPages = try Self.pagesReadMeasuringChainScale(at: fatBytes)
+        #expect(basePages > 0, "the page counter must be live, else every bound below is vacuous")
+
+        #expect(manyPages <= basePages * 2,
+                """
+                THE INVARIANT BROKE: 100x the rows cost \(manyPages) pages vs \
+                \(basePages) at baseline, so the calibration is back on the row axis. \
+                This is what charged the owner's device 7,533ms in front of the splash.
+                """)
+        #expect(fatPages <= basePages * 2,
+                """
+                the measurement now reads \(fatPages) pages vs \(basePages) at baseline \
+                on a fixture that differs only in htmlContent SIZE — something started \
+                touching the body b-tree instead of the covering index
+                """)
+    }
+
+    // MARK: - Fixtures for the cost-containment test
+
+    /// An ON-DISK migrated database. On disk is load-bearing: pager cache misses are
+    /// only meaningful against a real VFS, and an in-memory database would report a
+    /// constant and make the test vacuous.
+    private static func makeScaleFixture(rows: Int, htmlBytes: Int) throws -> URL {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("chain-scale-\(UUID().uuidString).sqlite")
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let queue = try DatabaseQueue(path: url.path, configuration: config)
+        try AppDatabase.runMigrations(on: queue)
+        try TestDatabase.insertAccount(queue, id: "acct-1")
+        try TestDatabase.insertFolder(queue, accountId: "acct-1")
+        try queue.write { db in
+            try db.execute(sql: """
+                INSERT INTO messageHeader
+                    (id, folderId, accountId, folderPath, messageId, subject,
+                     "from", fromAddress, "to", date)
+                WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < \(rows))
+                SELECT printf('acct-1:INBOX:%d', n), 'acct-1:INBOX', 'acct-1', 'INBOX',
+                       CAST(n AS TEXT), 'Subject', 'Sender <s@domain.com>',
+                       's@domain.com', 'me@domain.com',
+                       datetime(1700000000 + n * 60, 'unixepoch')
+                FROM s
+                """)
+            try db.execute(sql: """
+                INSERT INTO messageBody (id, htmlContent, fetchedAt)
+                WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < \(rows))
+                SELECT printf('acct-1:INBOX:%d', n), hex(zeroblob(\(max(1, htmlBytes / 2)))),
+                       datetime('now')
+                FROM s
+                """)
+        }
+        return url
+    }
+
+    private static func fileSize(_ url: URL) throws -> Int {
+        (try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+    }
+
+    private static func chainScale(at url: URL) throws -> MigrationTimingLedger.ChainScale {
+        try DatabaseQueue(path: url.path).read { db in
+            MigrationTimingLedger.measureChainScale(db, pendingMigrations: 1)
+        }
+    }
+
+    /// Pages the pager had to fetch through the VFS while running one whole
+    /// `measureChainScale`.
+    ///
+    /// A FRESH connection per call is load-bearing. GRDB keeps one connection per
+    /// `DatabaseQueue` and its pager cache survives between statements, so measuring
+    /// twice on one queue would report the second run as nearly free and make every
+    /// comparison in the test pass by construction.
+    private static func pagesReadMeasuringChainScale(at url: URL) throws -> Int {
+        try DatabaseQueue(path: url.path).read { db in
+            guard let handle = db.sqliteConnection else { return -1 }
+            var current: Int32 = 0
+            var highwater: Int32 = 0
+            // resetFlag 1 zeroes the counter, so what follows is measured from zero.
+            sqlite3_db_status(handle, SQLITE_DBSTATUS_CACHE_MISS, &current, &highwater, 1)
+            _ = MigrationTimingLedger.measureChainScale(db, pendingMigrations: 1)
+            sqlite3_db_status(handle, SQLITE_DBSTATUS_CACHE_MISS, &current, &highwater, 0)
+            return Int(current)
+        }
     }
 }
