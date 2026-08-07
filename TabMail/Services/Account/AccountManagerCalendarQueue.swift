@@ -133,9 +133,99 @@ extension AccountManager {
 
     /// Drain-side notification: resolve any pending awaiter for `opId` with
     /// `outcome`. No-op if no one is waiting.
-    func signalCalendarOpOutcome(opId: String, outcome: CalendarOpOutcome) {
-        guard let cont = calendarOpAwaiters.removeValue(forKey: opId) else { return }
+    ///
+    /// 🚨 **THE RETURN VALUE IS THE POINT (R16-1).** This used to return `Void` and
+    /// no caller could tell a delivered outcome from one that reached nobody — which
+    /// is why the silent case survived so long. Enumerate the drain's SIX production
+    /// triggers and only ONE of them (`queueCalendarOperation`'s
+    /// `Task { await drainCalendarQueue() }`) is causally paired with an awaiter
+    /// registration; `reconcileCalendarQueue`, both `NetworkMonitor` arms and both
+    /// `SyncScheduler` arms can never have one. So "the tool is told" is not a race
+    /// on a 10 s timeout, it is the MINORITY path. The durable retirement in
+    /// `retireCalendarOperation` is what makes the outcome survive that; this
+    /// boolean only decides how loudly the miss is recorded.
+    @discardableResult
+    func signalCalendarOpOutcome(opId: String, outcome: CalendarOpOutcome) -> Bool {
+        guard let cont = calendarOpAwaiters.removeValue(forKey: opId) else { return false }
         cont.resume(returning: outcome)
+        return true
+    }
+
+    /// Retire a queued calendar operation TERMINALLY, durably, in one write.
+    ///
+    /// 🚨 **THIS REPLACES `PendingCalendarOperation.deleteOne` ON EVERY TERMINAL
+    /// FAILURE ARM (R16-1).** The old shape deleted the durable row and reported the
+    /// failure only into an in-memory continuation, so on the five drain triggers
+    /// that can have no awaiter — and on the sixth once the tool's 10 s wait has
+    /// elapsed — the user's intention was destroyed with no record at all, *after*
+    /// `CalendarEventCreateTool`'s `case .stillQueued, .timedOut:` arm had already
+    /// answered "queued successfully … will appear on the calendar shortly". No sync
+    /// can recreate the event, reapply the edit or perform the delete: this is a
+    /// dropped user intention, which `THE MANTRA` puts in the non-recoverable set.
+    ///
+    /// ⚠️ **BOTH OBVIOUS REMEDIES ARE EACH OTHER'S MIRROR IMAGE AND THIS IS
+    /// NEITHER (`MIS-005`).** Not resuming on timeout restores the R12-T6 hang on
+    /// every offline calendar call. Leaving terminal failures QUEUED wedges the
+    /// account's calendar lane — the exact `MIS-006` defect R15-FIX-4 was fixing.
+    /// `PendingStatus.failed` is a THIRD state: durable, so the outcome outlives the
+    /// waiter, and outside `drainCalendarQueue`'s `status == queued` filter and
+    /// `reconcileCalendarQueue`'s `inFlight` reset, so it can never be re-executed
+    /// and can never starve a later op.
+    ///
+    /// The write is the SAME write that used to delete, so the retirement cannot
+    /// outrun its own record. If it throws, the row stays `inFlight`, launch
+    /// reconciliation returns it to `queued`, and the op is retried — a retry loop,
+    /// never a drop.
+    ///
+    /// Also the honest half of the "the user is told" claim: this is the only place
+    /// in this file that reaches `BackgroundSyncLogger`, whose Error Log is what
+    /// `DebugLogView` renders. Two doc comments in this file asserted terminal
+    /// failures were *"Logged at error level so the user sees this in DebugLog"* /
+    /// *"Logged loudly so the user can see"* while the file held raw `print`s and
+    /// no logger call at all (R16-10). ⚠️ That sentence carried a bare "39" until
+    /// R16-7; the integer was already stale by the time it was committed, because
+    /// R16-1's own conversion of the six terminal arms to `retireCalendarOperation`
+    /// removed some of them. Predicate instead of an integer, comments excluded so
+    /// this paragraph cannot satisfy it:
+    ///   `rg -c --pcre2 '^(?!\s*(///|//)).*\bprint\('
+    ///    TabMail/Services/Account/AccountManagerCalendarQueue.swift` → **34** at
+    ///   the R16 candidate. The number is expected to move; what must not move is
+    ///   that every TERMINAL outcome also reaches `BackgroundSyncLogger`.
+    ///
+    /// - Parameter caldavReauthAccountId: when non-nil, `caldavConfig.needsReauth`
+    ///   is set for that account IN THIS SAME TRANSACTION. It rides here rather
+    ///   than in its own write because the auth arm's delete and its `needsReauth`
+    ///   update were atomic before this change, and splitting them would let the
+    ///   retirement land without the persistent signal that makes it recoverable.
+    private func retireCalendarOperation(
+        _ op: PendingCalendarOperation,
+        reason: String,
+        caldavReauthAccountId: String? = nil
+    ) async {
+        BackgroundSyncLogger.logError(
+            "[CalendarQueue] TERMINAL \(op.operationType) op=\(op.id) account=\(op.accountId) event=\(op.eventId ?? "new"): \(reason)",
+            source: "CalendarQueue")
+        do {
+            try await retryWrite(dbPool, label: "CalendarQueue") { db in
+                if let caldavAccountId = caldavReauthAccountId {
+                    try db.execute(
+                        sql: "UPDATE caldavConfig SET needsReauth = 1 WHERE accountId = ?",
+                        arguments: [caldavAccountId]
+                    )
+                }
+                guard var row = try PendingCalendarOperation.fetchOne(db, key: op.id) else { return }
+                row.status = PendingStatus.failed.rawValue
+                row.failureReason = reason
+                try row.update(db)
+            }
+        } catch {
+            // The row stays `inFlight`; `reconcileCalendarQueue` returns it to
+            // `queued` at next launch and the op retries. Recorded, not silent.
+            BackgroundSyncLogger.logError(
+                "[CalendarQueue] FAILED to record terminal outcome for op \(op.id) — it will be retried: \(error)",
+                source: "CalendarQueue")
+            print("[CalendarQueue] Failed to record terminal outcome for op \(op.id): \(error)")
+        }
     }
 
     // MARK: - Calendar Operation Queue
@@ -285,32 +375,35 @@ extension AccountManager {
                         markAuthFailed(currentOp.accountId)
                     }
 
-                    // Permanent errors — drop immediately, no retry
+                    // Permanent errors — retire terminally, no retry.
                     if Self.isCalendarNotFoundError(error) {
-                        print("[CalendarQueue] Event not found for \(opType) — dropping (server wins)")
-                        do {
-                            try await dbPool.write { db in
-                                _ = try PendingCalendarOperation.deleteOne(db, key: currentOp.id)
-                            }
-                        } catch {
-                            print("[CalendarQueue] Failed to delete not-found op \(currentOp.id): \(error)")
-                        }
+                        print("[CalendarQueue] Event not found for \(opType) — retiring (server wins)")
+                        let reason = "event not found on server"
+                        await retireCalendarOperation(currentOp, reason: reason)
                         executedAny = true
-                        signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: "event not found on server"))
+                        signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: reason))
                         continue
                     }
                     if Self.isCalendarMissingScopeError(error) {
-                        print("[CalendarQueue] Calendar scope not granted for \(opType) — dropping. User must re-authenticate in Settings.")
-                        do {
-                            try await dbPool.write { db in
-                                _ = try PendingCalendarOperation.deleteOne(db, key: currentOp.id)
-                            }
-                        } catch {
-                            print("[CalendarQueue] Failed to delete missing-scope op \(currentOp.id): \(error)")
-                        }
+                        print("[CalendarQueue] Calendar scope not granted for \(opType) — retiring. User must re-authenticate in Settings.")
+                        // 🚨 R16-5 — RAISE THE PERSISTENT RE-AUTH SIGNAL HERE TOO.
+                        // This arm's own reason string ends *"user must
+                        // re-authenticate in Settings"*, i.e. its remedy is a USER
+                        // GESTURE — and until now nothing told the user to make it.
+                        // `isCalendarOAuthReauthRequired` is FALSE for both spellings
+                        // this arm claims (`missingScope` and a raw `httpError(403,…)`),
+                        // so the R14-F4 signal above does not fire, and unlike the
+                        // CalDAV auth arm there is no `caldavConfig.needsReauth` write
+                        // either. `IOS-CAL-003`'s stated discharge was therefore false
+                        // for its own namesake case — the same shape as R15's
+                        // `IOS-QUEUE-009` on the mail lane, one lane fixed and the
+                        // sibling left (`MIS-006`).
+                        markAuthFailed(currentOp.accountId)
+                        let reason = "calendar permission missing — user must re-authenticate in Settings"
+                        await retireCalendarOperation(currentOp, reason: reason)
                         executedAny = true
                         failedAccounts.insert(currentOp.accountId)
-                        signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: "calendar permission missing — user must re-authenticate in Settings"))
+                        signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: reason))
                         continue
                     }
                     // Auth failure — semi-permanent, needs re-authentication (L12).
@@ -320,33 +413,30 @@ extension AccountManager {
                     // for why the second is safe to treat as terminal (the providers
                     // force a token refresh and only rethrow the SECOND 401) and
                     // `isGrantLevelOAuthFailure` for why only three codes qualify for
-                    // the third. The signal that the user must re-authenticate was
-                    // already raised above, for a strictly larger set of errors than
-                    // this arm claims.
+                    // the third.
+                    //
+                    // ⚠️ THE SIGNAL IS RAISED FOR AN INCOMPARABLE SET, NOT A LARGER
+                    // ONE (R16-10). `isCalendarOAuthReauthRequired` above does NOT
+                    // claim `CalDAVError.authFailed`, which this arm does claim —
+                    // CalDAV's persistent signal is the `caldavConfig.needsReauth`
+                    // write below instead. See that predicate's doc for the exact
+                    // set difference in both directions.
                     if Self.isCalendarAuthError(error) {
                         let isCalDAV = Self.isCalDAVAuthError(error)
                         print("[CalendarQueue] Auth failed for \(opType) (\(isCalDAV ? "CalDAV" : "OAuth")) — stopping retries, user must re-authenticate")
-                        do {
-                            try await dbPool.write { db in
-                                _ = try PendingCalendarOperation.deleteOne(db, key: currentOp.id)
-                                // Only CalDAV accounts have a `caldavConfig` row —
-                                // running this for an OAuth account would match zero
-                                // rows and read as if we had marked something.
-                                if isCalDAV {
-                                    try db.execute(
-                                        sql: "UPDATE caldavConfig SET needsReauth = 1 WHERE accountId = ?",
-                                        arguments: [currentOp.accountId]
-                                    )
-                                }
-                            }
-                        } catch {
-                            print("[CalendarQueue] Failed to handle auth failure for op \(currentOp.id): \(error)")
-                        }
+                        let reason = Self.calendarAuthFailureReason(error)
+                        // Only CalDAV accounts have a `caldavConfig` row — running
+                        // the UPDATE for an OAuth account would match zero rows and
+                        // read as if we had marked something. It travels INSIDE the
+                        // retirement write so the two cannot come apart.
+                        await retireCalendarOperation(
+                            currentOp, reason: reason,
+                            caldavReauthAccountId: isCalDAV ? currentOp.accountId : nil)
                         executedAny = true
                         failedAccounts.insert(currentOp.accountId)
                         signalCalendarOpOutcome(
                             opId: currentOp.id,
-                            outcome: .permanentFailure(reason: Self.calendarAuthFailureReason(error)))
+                            outcome: .permanentFailure(reason: reason))
                         continue
                     }
 
@@ -356,14 +446,8 @@ extension AccountManager {
                     // and surface a clear reason — retrying won't help.
                     if Self.isCalendarUnsupportedError(error) {
                         let reason = unsupportedReason(error)
-                        print("[CalendarQueue] Unsupported \(opType) (\(reason)) — dropping (no retry)")
-                        do {
-                            try await dbPool.write { db in
-                                _ = try PendingCalendarOperation.deleteOne(db, key: currentOp.id)
-                            }
-                        } catch {
-                            print("[CalendarQueue] Failed to delete unsupported op \(currentOp.id): \(error)")
-                        }
+                        print("[CalendarQueue] Unsupported \(opType) (\(reason)) — retiring (no retry)")
+                        await retireCalendarOperation(currentOp, reason: reason)
                         executedAny = true
                         signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: reason))
                         continue
@@ -375,38 +459,35 @@ extension AccountManager {
                     // capped master and create duplicate successor series, so
                     // drop the op and surface the message for manual attention.
                     if case CalDAVError.inconsistentState(let reason) = error {
-                        print("[CalendarQueue] Inconsistent calendar state for \(opType) — dropping (no retry): \(reason)")
-                        do {
-                            try await dbPool.write { db in
-                                _ = try PendingCalendarOperation.deleteOne(db, key: currentOp.id)
-                            }
-                        } catch {
-                            print("[CalendarQueue] Failed to delete inconsistent-state op \(currentOp.id): \(error)")
-                        }
+                        print("[CalendarQueue] Inconsistent calendar state for \(opType) — retiring (no retry): \(reason)")
+                        await retireCalendarOperation(currentOp, reason: reason)
                         executedAny = true
                         signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: reason))
                         continue
                     }
 
-                    // Permanent malformed-request errors — drop. Retrying the
-                    // same broken payload never succeeds. Logged at error level
-                    // so the user sees this in DebugLog.
+                    // Permanent malformed-request errors — retire terminally.
+                    // Retrying the same broken payload never succeeds. The
+                    // retirement is recorded at error level through
+                    // `BackgroundSyncLogger`, which is what `DebugLogView` renders
+                    // (R16-10 — this sentence claimed that before it was true).
                     if Self.isCalendarBadRequestError(error) {
-                        print("[CalendarQueue] Bad request for \(opType) (\(error)) — dropping (will not retry)")
-                        do {
-                            try await dbPool.write { db in
-                                _ = try PendingCalendarOperation.deleteOne(db, key: currentOp.id)
-                            }
-                        } catch {
-                            print("[CalendarQueue] Failed to delete bad-request op \(currentOp.id): \(error)")
-                        }
+                        print("[CalendarQueue] Bad request for \(opType) (\(error)) — retiring (will not retry)")
+                        let reason = badRequestReason(error)
+                        await retireCalendarOperation(currentOp, reason: reason)
                         executedAny = true
-                        signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: badRequestReason(error)))
+                        signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: reason))
                         continue
                     }
 
                     // Transient errors — always retry. NEVER drop on age alone.
-                    // Only confirmed-stale paths above (notFound, missingScope, authError, badRequest) may delete.
+                    // Only confirmed-stale paths above (notFound, missingScope,
+                    // authError, unsupported, inconsistentState, badRequest — SIX
+                    // arms, re-derived 2026-08-06 by grepping
+                    // `retireCalendarOperation` in this function) may retire an op,
+                    // and none of them DELETES it: each moves the row to
+                    // `PendingStatus.failed` with a reason. See
+                    // `retireCalendarOperation`.
                     print("[CalendarQueue] Failed \(opType): \(error) (age \(String(format: "%.1f", ageHours))h) — will retry")
                     try? await retryWrite(dbPool, label: "CalendarQueue") { db in
                         var updated = currentOp
@@ -718,7 +799,15 @@ extension AccountManager {
     /// recurring-occurrence + split paths yet). The drain loop drops the op and
     /// surfaces the message to the LLM so it can either pivot (e.g. propose a
     /// whole-series edit) or relay the limitation to the user.
-    /// The four classifiers below are `static` (hence nonisolated) for the same
+    /// The **six** error classifiers below — predicate, so it can be re-derived
+    /// rather than trusted: every `static func …(_ error: Error) -> Bool` between
+    /// this line and `isCalendarBadRequestError`, i.e.
+    /// `rg -c 'static func is[A-Za-z]+\(_ error: Error\) -> Bool'` over this file
+    /// minus `isCalendarBadRequestError` itself, which the sentence names
+    /// separately. It read "four" until 2026-08-06, having been written when there
+    /// were four and never re-derived as arms were added (R16-7; a sentence that
+    /// enumerates is a cache, and a cache with no invalidation is a lie with a
+    /// delay). They are `static` (hence nonisolated) for the same
     /// reason `isCalendarBadRequestError` is: the drain's disposition can then be
     /// asserted in tests against real provider error values, rather than inferred
     /// from the drain loop's side effects. Every one of them answers the same
@@ -869,9 +958,22 @@ extension AccountManager {
     /// 🚨 **THE SIGNAL AND THE DISPOSITION ARE DIFFERENT QUESTIONS, and this
     /// predicate exists because collapsing them is what made the R14-F4 wedge
     /// invisible.** `isCalendarAuthError` answers *"may this op leave the queue?"*.
-    /// This answers *"must the user be told to sign in again?"*, which is true for a
-    /// strictly larger set — including
-    /// `ProviderError.authenticationFailed`, which stays RETRYABLE (below).
+    /// This answers *"must the user be told to sign in again?"*.
+    ///
+    /// ⚠️ **THE TWO SETS ARE INCOMPARABLE, NOT NESTED (R16-10).** This doc claimed
+    /// "a strictly larger set" and was wrong in both directions; re-derive it from
+    /// the two arm lists rather than trusting either sentence:
+    ///   * signal ∖ terminal = `ProviderError.authenticationFailed` — deliberately
+    ///     retryable (see below), so it raises the prompt without retiring the op.
+    ///   * terminal ∖ signal = `CalDAVError.authFailed` — retired without going
+    ///     through THIS predicate, because CalDAV's persistent signal is the
+    ///     `caldavConfig.needsReauth` write in the same arm rather than
+    ///     `authFailedAccounts`.
+    /// Both halves shared: the two raw 401s and the three grant-level OAuth codes.
+    /// The behaviour is correct; the SENTENCE was the problem, and it was copied
+    /// verbatim into `KNOWN_ISSUES.md`, where a reviewer read it as evidence that
+    /// signal coverage had been checked. It is what hid the missing-scope arm's
+    /// silence (R16-5) for a whole round.
     ///
     /// ⚠️ **`ProviderError.authenticationFailed` IS DELIBERATELY NOT TERMINAL, and
     /// the round-14 brief's claim that it "is unambiguous and can be claimed
@@ -929,9 +1031,22 @@ extension AccountManager {
     }
 
     /// HTTP 400 / 422 / 415 — the request itself is malformed. Retrying with
-    /// the same payload can never succeed, so we drop the op rather than
-    /// clogging the queue indefinitely. Logged loudly so the user can see what
-    /// happened (e.g. a "Missing end time" payload from a buggy create).
+    /// the same payload can never succeed, so we retire the op rather than
+    /// clogging the queue indefinitely.
+    ///
+    /// ⚠️ **THIS USED TO SAY "Logged loudly so the user can see what happened" AND
+    /// IT WAS FALSE (R16-10).** Until 2026-08-06 this file had 39 raw `print`s and
+    /// ZERO calls to `BackgroundSyncLogger` / `DebugLogView` / `DebugModeManager`
+    /// (`rg -c 'BackgroundSyncLogger|DebugLogView|DebugModeManager'` over the file:
+    /// rc=1, no match), so nothing here reached any surface a user can open. It
+    /// mattered beyond tidiness: this sentence and its twin on the bad-request arm
+    /// were the stated discharge of the "the user is told" half of the argument that
+    /// licensed every terminal drop in this file, and a reviewer who read them
+    /// concluded the user had a channel. `retireCalendarOperation` now writes the
+    /// retirement to `BackgroundSyncLogger.logError`, whose Error Log
+    /// `DebugLogView` renders, so the claim is true where it is made — and the
+    /// durable `PendingStatus.failed` row, not the log line, is what actually holds
+    /// the intention.
     ///
     /// ⚠️ INDETERMINATE 4xx CODES ARE NOT AUTHORITATIVE (R11-C, 2026-08-06).
     /// `CLAUDE.md`'s never-drop clause 2 retires an op only on a

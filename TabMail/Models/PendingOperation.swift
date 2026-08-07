@@ -27,6 +27,17 @@ enum PendingStatus: String, Codable, Sendable {
     case queued
     case inFlight
     case cancelled
+    /// TERMINAL, and used only by `pendingCalendarOperation` today (R16-1).
+    ///
+    /// A calendar operation that a terminal arm retires is moved HERE instead of
+    /// being deleted, so the failure survives the disappearance of the in-memory
+    /// awaiter that used to be its only report channel. It is not a queue state:
+    /// `drainCalendarQueue` fetches `status == queued` only, and
+    /// `reconcileCalendarQueue` resets `inFlight` only, so a `failed` row is never
+    /// re-executed and can never head-of-line-block an account's lane — which is
+    /// the mirror-image defect (`MIS-005`) that keeping terminal failures QUEUED
+    /// would have created.
+    case failed
 }
 
 struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiable, Sendable {

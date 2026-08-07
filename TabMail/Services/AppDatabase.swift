@@ -2812,15 +2812,28 @@ final class AppDatabase: Sendable {
         //    child only AFTER the parent is repopulated, so the parent's implicit
         //    delete finds no child to cascade to and no cascade fires at all.
         //    Verified per statement, all thirteen of them, against a census of the
-        //    referrers: `references("userLabel"` returns exactly TWO hits in
-        //    `TabMail/ Shared/ TabMailNotificationService/` (`v33`'s create and step 4
-        //    below), BOTH of them `messageUserLabel`, and `references("messageUserLabel"`
-        //    returns ZERO — nothing else can be cascaded into. The two
-        //    `CREATE TABLE … AS SELECT` snapshots carry no constraints (SQLite copies
-        //    none through CTAS), so they neither block a drop nor participate in a
-        //    cascade. There are no triggers anywhere in the tree
-        //    (`rg -i 'CREATE TRIGGER'` → zero), and SQLite's implicit delete does not
-        //    fire them in any case.
+        //    referrers. ⚠️ ALL THREE COUNTS BELOW WERE RE-DERIVED WITH AN INSTRUMENT
+        //    THIS COMMENT CANNOT ENTER (R16-7, 2026-08-06). As first written they were
+        //    bare `rg` invocations that MATCHED THEMSELVES: the naive greps return 3, 1
+        //    and 1 rather than the TWO / ZERO / zero claimed, because each sentence
+        //    quoting a pattern is a hit for it. `MIS-033` — and note the countermeasure
+        //    was already in this file about 530 lines above, with its own `MIS-033`
+        //    citation, and simply was not applied here. Predicates, all excluding `//`
+        //    and `///` lines by negative lookahead, all rooted at
+        //    `TabMail/ Shared/ TabMailNotificationService/`:
+        //      · `rg -c --pcre2 '^(?!\s*(///|//)).*references\("userLabel"'` → **2**,
+        //        both in this file (`v33`'s create and step 4 below) and BOTH of them
+        //        `messageUserLabel`. (Naive: 3.)
+        //      · `rg -c --pcre2 '^(?!\s*(///|//)).*references\("messageUserLabel"'` →
+        //        **no output, exit 1** — nothing can be cascaded into. (Naive: 1.)
+        //      · `rg -i -c --pcre2 '^(?!\s*(///|//)).*CREATE TRIGGER'` → **no output,
+        //        exit 1** — no triggers anywhere in the tree. (Naive: 1.)
+        //    Non-vacuity for the two claimed zeros, so a broken regex cannot pass as a
+        //    clean result: the FIRST predicate uses the identical lookahead and returns
+        //    a non-empty 2, so the lookahead demonstrably does not swallow live code.
+        //    The two `CREATE TABLE … AS SELECT` snapshots carry no constraints (SQLite
+        //    copies none through CTAS), so they neither block a drop nor participate in
+        //    a cascade, and SQLite's implicit delete does not fire triggers in any case.
         //  • THE TRAILING PROOF IS NOW A PER-STATEMENT PROOF. Step 5 writes the SAME
         //    expression over the SAME join that step 3a inserted from, so every parent
         //    it names provably exists; step 3a's `accountId` comes from
@@ -3094,10 +3107,34 @@ final class AppDatabase: Sendable {
         //
         // ⚠️ THE ACCEPTED WINDOW, stated because this change creates it. Between an
         // upgrade launch and the first maintenance pass, `markAllAsRead` sorts through
-        // a temp B-tree — the pre-`v83` behaviour, i.e. every shipped release up to
-        // and including `v1.6.38`. It is SLOW, not wrong: the same rows are returned
-        // in the same order. Recoverable without any user gesture, so it fails closed
-        // and is registered (`IOS-PERF-005`) rather than mechanised — THE MANTRA.
+        // a temp B-tree. It is SLOW, not wrong: the same rows are returned in the same
+        // order. Recoverable without any user gesture, so it fails closed and is
+        // registered (`IOS-PERF-005`) rather than mechanised — THE MANTRA.
+        //
+        // 🚨 THIS PARAGRAPH USED TO LICENSE THE WINDOW WITH *"the pre-`v83`
+        // behaviour, i.e. every shipped release up to and including `v1.6.38`"* — AND
+        // THAT WAS FALSE (R16-4, corrected 2026-08-06). Shipped's `markAllAsRead`
+        // (`07a4bb703:TabMail/ViewModels/InboxViewModel.swift`, quoted against an
+        // immutable tag) fetches `.filter(folderId == fid && isRead == false)
+        // .limit(batchSize)` with **NO `ORDER BY` at all**, so it never sorted and
+        // never had the O(U²/50) shape. The ordered keyset sweep was introduced
+        // IN-RANGE by `a790dd61d` (2026-08-03), which
+        // `git merge-base --is-ancestor a790dd61d 07a4bb703` reports is **not** an
+        // ancestor of the shipped tag (exit 1). The window is therefore a real
+        // in-range REGRESSION, not a restoration of shipped behaviour: 357,400 rows /
+        // 100,000 unread / fresh-install `sqlite_stat1` measures shipped's unordered
+        // sweep at **7,889 ms**, the current sweep WITH the index at **4,610 ms**, and
+        // the current sweep WITHOUT it at **43,296 ms** — **5.5× worse than shipped**,
+        // 86.6–173.2 s at this repo's 2–4× Mac-understates-device factor.
+        // ⚠️ THE ACCEPTANCE SURVIVES THE CORRECTION, ON A DIFFERENT BASIS, and the
+        // basis is the only thing that licenses it: the window is transient and
+        // self-healing (the pass re-arms on every foreground poll and BGProcessing
+        // drain until it succeeds), not a permanent state. It is NOT licensed by
+        // equivalence to shipped, and the two remedies that would restore
+        // equivalence are both worse — see the "Do NOT" pair on `IOS-PERF-005`:
+        // restoring `v83`'s body re-imposes 5,050 ms before first paint, and
+        // restoring shipped's UNORDERED fetch removes the `ORDER BY` that IS the
+        // sweep's loop variant.
         // ⚠️ NEGATIVE CASE, so this is not read as licence: an index whose absence
         // changes a RESULT, or that a query names in an `INDEXED BY` clause (SQLite
         // *errors* when such an index is missing), or that a write depends on for
@@ -3299,6 +3336,35 @@ final class AppDatabase: Sendable {
             "v83_markAllAsReadUnreadSweepIndex", foreignKeyChecks: .immediate
         ) { _ in
             // Intentionally empty. See above.
+        }
+
+        // v84 (R16-1) — the durable half of a terminal calendar outcome.
+        //
+        // A terminal arm of `drainCalendarQueue` used to `deleteOne` the row and
+        // report the failure ONLY through `signalCalendarOpOutcome`, an in-memory
+        // continuation. Five of the six drain triggers can never have a waiter
+        // registered at all (only `queueCalendarOperation`'s trigger is causally
+        // paired with one, and even it loses the waiter after the tool's 10 s
+        // budget), so on the majority of paths a permanent failure was delivered to
+        // nobody and the user's intention was destroyed with no record — after the
+        // agent had already answered *"queued … will appear on the calendar
+        // shortly"*. Terminal arms now write `status = 'failed'` plus this reason in
+        // the SAME write, so the retirement cannot outrun its own record.
+        //
+        // A nullable TEXT column with no index and no backfill: existing rows are
+        // all `queued`/`inFlight`/`cancelled`, for which `NULL` is the correct
+        // value, so the body is one `ALTER TABLE` and adds nothing to the blocking
+        // launch chain.
+        //
+        // `foreignKeyChecks: .immediate` matches v68…v83 (17 of 17) — an
+        // `ALTER TABLE … ADD COLUMN` cannot violate a constraint, so the mode is
+        // moot, but a uniform census is worth more than a considered exception.
+        migrator.registerTimedMigration(
+            "v84_addPendingCalendarOperationFailureReason", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "pendingCalendarOperation") { t in
+                t.add(column: "failureReason", .text)
+            }
         }
     }
 

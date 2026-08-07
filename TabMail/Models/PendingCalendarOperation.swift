@@ -26,6 +26,19 @@ struct PendingCalendarOperation: Codable, FetchableRecord, PersistableRecord, Id
     var status: String
     var createdAt: Date
     var retryCount: Int
+    /// Why a terminal arm retired this operation (R16-1). Non-nil exactly when
+    /// `status == PendingStatus.failed.rawValue`.
+    ///
+    /// 🚨 THIS COLUMN IS THE DURABLE HALF OF THE TERMINAL OUTCOME. The drain used
+    /// to report a permanent failure only through `signalCalendarOpOutcome`, an
+    /// in-memory continuation registered by the calendar tool that queued the op —
+    /// and five of the six drain triggers can never have one, while the sixth loses
+    /// it after the tool's 10 s wait. The row was deleted in the same breath, so an
+    /// op that failed after the agent had already told the user *"queued … will
+    /// appear on the calendar shortly"* left no record anywhere. Writing the reason
+    /// in the SAME write that retires the row is what makes the outcome outlive the
+    /// waiter.
+    var failureReason: String?
 
     /// Decoded arguments from JSON storage
     var arguments: [String: JSONValue] {
@@ -56,6 +69,7 @@ struct PendingCalendarOperation: Codable, FetchableRecord, PersistableRecord, Id
         self.status = PendingStatus.queued.rawValue
         self.createdAt = Date()
         self.retryCount = 0
+        self.failureReason = nil
     }
 
     /// Convert Foundation Any to JSONValue for argument replay.

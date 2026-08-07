@@ -119,10 +119,77 @@ struct CalendarQueueOutcomeTests {
         let wire = await mock.deletedEvents
         #expect(wire.isEmpty, "nothing should have reached the provider — got \(wire.count) delete(s)")
 
-        // DURABLE side: the row must not be left queued either, or the same
+        // DURABLE side: the row must not be left CLAIMABLE, or the same
         // unexecutable op re-enters every future drain and head-of-line-blocks
         // the account's calendar lane (the wedge, which never recovers via sync).
+        //
+        // 🚨 THIS ASSERTED `remaining.isEmpty` UNTIL R16-1, AND THAT WAS A
+        // BLESSING TEST (`MIS-014`). It pinned the MECHANISM the fix happened to
+        // use — `PendingCalendarOperation.deleteOne` — rather than the system
+        // property, so it would have gone red for the CORRECT fix (retire the op
+        // to a terminal `failed` status carrying its reason) and stayed green for
+        // the defect the row now records: a retirement that destroys its own
+        // evidence. The property is *the lane cannot be blocked*, and a `failed`
+        // row satisfies it exactly as a deleted one does, because the drain
+        // fetches `status == queued` only and the reconciler resets `inFlight`
+        // only. Assert THAT.
         let remaining = try await pool.read { db in try PendingCalendarOperation.fetchAll(db) }
-        #expect(remaining.isEmpty, "the unexecutable op is still queued — it will starve the lane forever")
+        #expect(!remaining.contains { $0.status == PendingStatus.queued.rawValue },
+                "an unexecutable op is still CLAIMABLE (status == queued) — it will starve the account's calendar lane forever")
+        #expect(!remaining.contains { $0.status == PendingStatus.inFlight.rawValue },
+                "an unexecutable op was left inFlight — the reconciler will reset it to queued and the wedge returns")
+    }
+
+    // MARK: - R16-1 — a terminal failure with no live awaiter
+
+    @Test("a terminal calendar failure leaves a DURABLE record even when nobody is waiting for it")
+    func terminalFailureWithNoAwaiterLeavesADurableRecord() async throws {
+        let accountId = "cal-r16-1"
+        let (pool, dir, previous) = try makeTestDB(accountId: accountId)
+        let mock = MockCalendarProvider()
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer {
+            Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+        }
+
+        // THE SHAPE THIS PINS, and why the awaiter's absence is the whole point.
+        // `awaitCalendarOpOutcome` is bounded at 10 s by every calendar tool, but
+        // the queue is durable across app kill, reboot and days offline. So the
+        // ordinary case for a queued calendar op is that by the time the drain
+        // reaches it the tool's wait has LONG since timed out and the chat turn
+        // is over — `signalCalendarOpOutcome` then resolves nobody. Before R16-1
+        // the terminal arms answered that by DELETING the row, so the failure
+        // existed only in the signal that reached no one: the user's calendar
+        // change silently never happened and nothing anywhere recorded why.
+        //
+        // The property asserted is the SYSTEM one — *after a terminal failure
+        // with no live awaiter, a durable record of that failure exists* — NOT
+        // the mechanism ("the continuation map was empty", "deleteOne was not
+        // called"), which is `MIS-015`.
+        let op = PendingCalendarOperation(
+            operationType: .delete, accountId: accountId, eventId: nil,
+            calendarId: "primary", arguments: [:])
+        try await pool.write { db in try op.insert(db) }
+
+        // NO awaiter is registered — this is the after-the-turn case.
+        await AccountManager.shared.drainCalendarQueue()
+
+        let rows = try await pool.read { db in try PendingCalendarOperation.fetchAll(db) }
+        guard rows.count == 1 else {
+            #expect(Bool(false),
+                    "expected the retired op to SURVIVE as a durable record of its own failure, found \(rows.count) row(s). A retirement that deletes the row leaves no trace of a calendar change that never happened, for a user who was not watching.")
+            return
+        }
+        let row = rows[0]
+        #expect(row.status == PendingStatus.failed.rawValue,
+                "the retired op must carry a TERMINAL status; got \(row.status)")
+        #expect(!(row.failureReason ?? "").isEmpty,
+                "the durable record must say WHY — a `failed` row with no reason is only marginally better than a deleted one")
+        // And the lane is still free: a terminal row must never be re-claimable.
+        #expect(row.status != PendingStatus.queued.rawValue && row.status != PendingStatus.inFlight.rawValue,
+                "a terminal failure must not be re-claimable, or the record becomes a wedge")
+        let wire = await mock.deletedEvents
+        #expect(wire.isEmpty, "nothing should have reached the provider — got \(wire.count) delete(s)")
     }
 }
