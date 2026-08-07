@@ -1211,9 +1211,15 @@ extension AccountManager {
     /// choice if it races (`newExists` ⇒ delete the old key), so the two agree.
     ///
     /// ⚠ COST (A6). This adds ONE bounded `UPDATE` per applied record on the
-    /// manifest queue — the same cardinality as the FTS mirror immediately
-    /// above, on a store whose primary key is `id` and whose `headerId` is the
-    /// column the sweep already scans. Both stores are separate SQLite pools;
+    /// manifest queue — the same cardinality IN ROWS as the FTS mirror
+    /// immediately above, but NOT in transactions: `SearchIndex.rekeyHeaders`
+    /// takes the whole array in ONE call, while this loop issues N separate
+    /// cross-process `queue.write`s on the manifest pool. Batching it would need
+    /// a manifest-side multi-key overload plus a per-key collision split, which
+    /// is more mechanism than the cost justifies — N is bounded by one drained
+    /// op's members and none of this is on the render path. The store's primary
+    /// key is `id` and `headerId` is the column the sweep already scans, so each
+    /// write is itself cheap. Both stores are separate SQLite pools;
     /// this one is synchronous because `BodyAssetStore` is a nonisolated `enum`
     /// serving the NSE and the main app identically. A missing App Group
     /// container makes `manifestQueue()` nil and every call a no-op returning 0,

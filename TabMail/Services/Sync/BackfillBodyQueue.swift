@@ -951,6 +951,51 @@ actor BackfillBodyQueue {
         try? await SearchIndex.shared.rekeyHeaders([(oldKey: ContentKey(rawValue: item.headerId),
                                                      newKey: ContentKey(rawValue: newHeaderId),
                                                      newMessageId: newUID)])
+        // R15-FIX-2 — THE BODY-ASSET MANIFEST IS A THIRD SQLITE POOL KEYED BY THE
+        // SAME HEADER ID, so it needs the same two-phase mirror the FTS index just
+        // took. This carrier had the FTS half and not this one: a half-port
+        // (`MIS-018`).
+        //
+        // WHY IT MATTERS HERE SPECIFICALLY. The `.migrated` leg carries `oldBody`
+        // forward under `newHeaderId`, and that HTML still embeds
+        // `tabmail-asset://<oldHeaderId-hash>/…` URLs. Without the mirror the
+        // manifest rows keep the OLD `headerId`, so the next `pruneOrphans` sweep
+        // sees a key with no `messageHeader` row, judges it dead, and deletes a LIVE
+        // message's cached inline images and attachments. `recoverMovedContentKey`
+        // cannot save it: that recovery leg is gated `provider == .gmail || .outlook`
+        // and returns nil for IMAP, which is the only family that reaches this
+        // function. Nor does the replacement body fetch overwrite the carried one —
+        // `BodyFetchProcessor` inserts with `onConflict: .ignore`, so the
+        // carried-forward body WINS and the stale URLs survive in a body that
+        // outlives its assets. `rekeyContentKey` preserves the row `id` (and so the
+        // embedded URL) and re-points only `headerId`, which is why this works at
+        // all.
+        //
+        // ⚠ THE SPLIT IS LOAD-BEARING, AND A BLANKET MIRROR IS THE MIRROR-IMAGE BUG.
+        // On `.duplicateDropped` the new UID was independently backfilled and owns
+        // its own assets; re-keying onto it would file two messages' attachment
+        // bytes under one content key, and every later lookup at that key could
+        // return the OTHER message's bytes — a content misattribution, C3-adjacent.
+        // So the dropped duplicate's assets are DELETED, exactly as the sibling
+        // `AccountManagerQueue.publishRekeys` disposes of its collided ids, and
+        // exactly as `pruneOrphans` would dispose of them later anyway (its `dead`
+        // set is "manifest key with no `messageHeader` row", which is precisely what
+        // the dropped duplicate's key becomes). `rekeyContentKey` independently makes
+        // the same choice if it races (`newExists` ⇒ delete the old key).
+        switch outcome {
+        case .migrated:
+            _ = BodyAssetStore.rekeyContentKey(
+                from: ContentKey(rawValue: item.headerId),
+                to: ContentKey(rawValue: newHeaderId))
+        case .duplicateDropped:
+            _ = BodyAssetStore.deleteAllAssets(
+                forContentKey: ContentKey(rawValue: item.headerId))
+        case .failed:
+            // Unreachable: the `catch` above returns `.failed` directly and never
+            // falls through to here. Enumerated rather than defaulted so a future
+            // non-throwing failure leg has to choose a disposition.
+            break
+        }
         return outcome
     }
 

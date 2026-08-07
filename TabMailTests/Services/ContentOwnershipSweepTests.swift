@@ -540,6 +540,201 @@ struct ContentOwnershipSweepTests {
         await cleanup(accountId: accountId, keys: [oldKey, newKey])
     }
 
+    // MARK: - R15-FIX-2: the SEVENTH carrier — the backfill body queue's UID remap
+
+    /// ⚠ THE TWO TESTS ABOVE CANNOT REACH THIS CARRIER. They drive
+    /// `AccountManagerQueue.publishRekeys`, the drain-time re-key. A UID remap
+    /// discovered by the BODY QUEUE takes a different function entirely —
+    /// `BackfillBodyQueue.rekeyRemappedHeader` — which had the FTS half of the
+    /// mirror (`SearchIndex.rekeyHeaders`) and not the asset half: a half-port
+    /// (`MIS-018`), and the one carrier `MessageContentStore.recoverMovedContentKey`
+    /// structurally cannot rescue, because that leg is gated
+    /// `provider == .gmail || .outlook` and IMAP is the only family that reaches
+    /// this path.
+    ///
+    /// The property asserted is the SYSTEM one — *after a UID remap carries a body
+    /// to a new key, that body's assets are reachable under the new key* — not the
+    /// mechanism ("`rekeyContentKey` was called"). It matters because the carried
+    /// body's HTML still embeds `tabmail-asset://` URLs, and
+    /// `BodyFetchProcessor` inserts the replacement body with `onConflict: .ignore`,
+    /// so the carried-forward body WINS and outlives its own assets.
+    @Test("A backfill UID remap carries the body's assets to the new address")
+    func backfillUidRemapCarriesAssetsToTheNewAddress() async throws {
+        let dir = try Self.makeAssetEnvironment()
+        defer { Self.teardownAssets(dir) }
+        let accountId = "r15fix2-migrated"
+        let stamp = "rfc:r15fix2-migrated@example.com"
+        try await seedScope(accountId: accountId, folderPath: "Archive", provider: .imap)
+        let old = try await seedHeader(
+            accountId: accountId, folderPath: "Archive", messageId: "77")
+        let newHeaderId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: "Archive", messageId: "78")
+        let oldKey = ContentKey(rawValue: old.id)
+        let newKey = ContentKey(rawValue: newHeaderId)
+        try await seedBody(
+            key: oldKey,
+            html: #"<img src="tabmail-asset://carried/inline">"#,
+            ageHours: 0)
+
+        let assetId = BodyAssetStore.writeAttachment(
+            contentKey: oldKey, section: "2", contentType: "application/pdf",
+            data: Data(repeating: 3, count: 128), identityStamp: stamp)
+        // MIS-030 — anchor the fixture before asserting anything about absence.
+        #expect(assetId != nil, "precondition: the remapped message has a cached attachment")
+        #expect(manifestKeys().contains(oldKey),
+                "precondition: that attachment is filed under the DEAD UID's address")
+
+        let outcome = await BackfillBodyQueue().rekeyRemappedHeader(
+            item: BackfillBodyQueue.Item(
+                headerId: old.id, accountId: accountId,
+                folderPath: "Archive", messageId: "77", isInInbox: false),
+            newUID: "78")
+        guard case .migrated = outcome else {
+            Issue.record("precondition: the remap must have MIGRATED, got \(outcome)")
+            await cleanup(accountId: accountId, keys: [oldKey, newKey])
+            return
+        }
+        // Non-vacuity of the hazard: the body really was carried, so there really is
+        // a live row whose HTML points at these assets.
+        #expect(await bodyHTML(newKey) != nil,
+                "precondition: the body was carried to the new address")
+
+        let keys = manifestKeys()
+        #expect(!keys.contains(oldKey),
+                "no asset may stay filed under a UID the message no longer has — the next sweep classifies it dead and deletes it")
+        #expect(keys.contains(newKey),
+                """
+                the remapped message's cached attachment must follow its body to the new \
+                address — the carried body still references it and IMAP has no recovery leg
+                """)
+        if let assetId {
+            #expect(BodyAssetStore.read(assetId: assetId) != nil,
+                    "the cached bytes must survive the re-key")
+            #expect(
+                BodyAssetStore.attachmentAssetId(
+                    contentKey: newKey, section: "2", identityStamp: stamp) == assetId,
+                "and must be REACHABLE by the address the message now has")
+        }
+        await cleanup(accountId: accountId, keys: [oldKey, newKey])
+    }
+
+    /// TWO-SIDED ANCHOR — the other half of the split, and the counterfactual to the
+    /// fix above (`MIS-026`). On the `.duplicateDropped` leg the new UID was
+    /// independently backfilled and owns its OWN assets; `rekeyRemappedHeader`
+    /// deletes the old header and body and carries nothing. A blanket unconditional
+    /// mirror would file two messages' attachment bytes under one content key, and a
+    /// later `attachmentAssetId` at that key could hand back the OTHER message's
+    /// bytes — content misattribution, C3-adjacent. This is the side that must stay
+    /// GREEN when the fix is inverted toward a blanket mirror.
+    @Test("A dropped-duplicate backfill remap never merges the loser's assets onto the survivor")
+    func backfillUidRemapDropNeverMergesAssetsOntoTheSurvivor() async throws {
+        let dir = try Self.makeAssetEnvironment()
+        defer { Self.teardownAssets(dir) }
+        let accountId = "r15fix2-dropped"
+        let loserStamp = "rfc:r15fix2-loser@example.com"
+        let survivorStamp = "rfc:r15fix2-survivor@example.com"
+        try await seedScope(accountId: accountId, folderPath: "Archive", provider: .imap)
+        let old = try await seedHeader(
+            accountId: accountId, folderPath: "Archive", messageId: "77")
+        let survivor = try await seedHeader(
+            accountId: accountId, folderPath: "Archive", messageId: "78")
+        let oldKey = ContentKey(rawValue: old.id)
+        let newKey = ContentKey(rawValue: survivor.id)
+
+        let loserAssetId = BodyAssetStore.writeAttachment(
+            contentKey: oldKey, section: "2", contentType: "application/pdf",
+            data: Data(repeating: 1, count: 64), identityStamp: loserStamp)
+        let survivorAssetId = BodyAssetStore.writeAttachment(
+            contentKey: newKey, section: "2", contentType: "application/pdf",
+            data: Data(repeating: 2, count: 64), identityStamp: survivorStamp)
+        #expect(loserAssetId != nil && survivorAssetId != nil,
+                "precondition: BOTH addresses carry their own cached attachment")
+        #expect(manifestKeys().isSuperset(of: [oldKey, newKey]),
+                "precondition: the collision is real — both keys are in the manifest")
+
+        let outcome = await BackfillBodyQueue().rekeyRemappedHeader(
+            item: BackfillBodyQueue.Item(
+                headerId: old.id, accountId: accountId,
+                folderPath: "Archive", messageId: "77", isInInbox: false),
+            newUID: "78")
+        guard case .duplicateDropped = outcome else {
+            Issue.record("precondition: the remap must have DROPPED the duplicate, got \(outcome)")
+            await cleanup(accountId: accountId, keys: [oldKey, newKey])
+            return
+        }
+
+        let keys = manifestKeys()
+        #expect(!keys.contains(oldKey),
+                "the dropped duplicate's row is gone, so nothing may still be filed under its address")
+        #expect(keys.contains(newKey), "the survivor keeps its own assets")
+        #expect(
+            BodyAssetStore.attachmentAssetId(
+                contentKey: newKey, section: "2", identityStamp: survivorStamp) == survivorAssetId,
+            "and the survivor's address must still resolve to the survivor's OWN bytes")
+        await cleanup(accountId: accountId, keys: [oldKey, newKey])
+    }
+
+    /// ⚠ THE ANCHOR ABOVE IS NOT SHARP ENOUGH ON ITS OWN, and this test exists
+    /// because of that. `BodyAssetStore.rekeyContentKey` carries its own collision
+    /// policy — `newExists` ⇒ delete the old key — so when the survivor already has
+    /// assets, a WRONG blanket mirror produces the same observable outcome as the
+    /// correct split and the anchor stays green on a broken system (`MIS-015`).
+    ///
+    /// The two only diverge when the survivor has NO assets of its own: the correct
+    /// split DELETES the dropped duplicate's bytes, while a blanket mirror MOVES
+    /// them onto the survivor's address, where the survivor's body — a different
+    /// message — would then resolve them as its own. That is the misattribution, and
+    /// this fixture is the only one that can see it.
+    @Test("A dropped-duplicate backfill remap deletes the loser's assets rather than moving them")
+    func backfillUidRemapDropDeletesTheLoserAssetsRatherThanMovingThem() async throws {
+        let dir = try Self.makeAssetEnvironment()
+        defer { Self.teardownAssets(dir) }
+        let accountId = "r15fix2-dropped-bare"
+        let loserStamp = "rfc:r15fix2-bare-loser@example.com"
+        try await seedScope(accountId: accountId, folderPath: "Archive", provider: .imap)
+        let old = try await seedHeader(
+            accountId: accountId, folderPath: "Archive", messageId: "77")
+        let survivor = try await seedHeader(
+            accountId: accountId, folderPath: "Archive", messageId: "78")
+        let oldKey = ContentKey(rawValue: old.id)
+        let newKey = ContentKey(rawValue: survivor.id)
+
+        let loserAssetId = BodyAssetStore.writeAttachment(
+            contentKey: oldKey, section: "2", contentType: "application/pdf",
+            data: Data(repeating: 1, count: 64), identityStamp: loserStamp)
+        #expect(loserAssetId != nil,
+                "precondition: the dropped duplicate has a cached attachment")
+        #expect(manifestKeys().contains(oldKey))
+        #expect(!manifestKeys().contains(newKey),
+                "precondition: the SURVIVOR has no assets of its own — the only fixture in which a blanket mirror is observable")
+
+        let outcome = await BackfillBodyQueue().rekeyRemappedHeader(
+            item: BackfillBodyQueue.Item(
+                headerId: old.id, accountId: accountId,
+                folderPath: "Archive", messageId: "77", isInInbox: false),
+            newUID: "78")
+        guard case .duplicateDropped = outcome else {
+            Issue.record("precondition: the remap must have DROPPED the duplicate, got \(outcome)")
+            await cleanup(accountId: accountId, keys: [oldKey, newKey])
+            return
+        }
+
+        let keys = manifestKeys()
+        #expect(!keys.contains(oldKey),
+                "the dropped duplicate's row is gone, so nothing may still be filed under its address")
+        #expect(!keys.contains(newKey),
+                """
+                and its bytes must NOT have been moved onto the survivor — the survivor is a \
+                DIFFERENT message that was independently backfilled, and an attachment lookup \
+                at its address must never return the dropped duplicate's bytes
+                """)
+        if let loserAssetId {
+            #expect(BodyAssetStore.read(assetId: loserAssetId) == nil,
+                    "the dropped duplicate's cached bytes are reclaimed, not orphaned")
+        }
+        await cleanup(accountId: accountId, keys: [oldKey, newKey])
+    }
+
     // MARK: - R3: the ordering contract
 
     /// The ordering contract, pinned DIRECTLY rather than by outcome: the SAME key
