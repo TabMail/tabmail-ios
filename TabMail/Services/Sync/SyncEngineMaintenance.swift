@@ -438,11 +438,20 @@ extension SyncEngine {
                 if batch == 0 { break }
                 reclaimed += batch
             } catch {
-                print("[CalendarQueue] Retired-op reclaim failed: \(error)")
+                // Debug-gated per global rule 12. This is a diagnostic, not a
+                // structured alert production observability consumes: the reclaim
+                // is a best-effort background sweep, the rows it failed to remove
+                // are inert (`status == failed` is outside `drainCalendarQueue`'s
+                // filter), and the next pass retries. Its two siblings in this
+                // file — `runBuildDeferredIndexesIfMissing`'s success and
+                // abandoned arms — are gated the same way, including the error arm.
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[CalendarQueue] Retired-op reclaim failed: \(error)")
+                }
                 break
             }
         }
-        if reclaimed > 0 {
+        if reclaimed > 0, DebugModeManager.isLoggingEnabled() {
             print("[CalendarQueue] Reclaimed \(reclaimed) retired calendar ops older than \(SyncConfig.retiredCalendarOpRetentionDays)d")
         }
     }

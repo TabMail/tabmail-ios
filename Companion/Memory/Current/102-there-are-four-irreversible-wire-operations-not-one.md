@@ -401,3 +401,48 @@ deferred. It needs: membership stated by THE PROPERTY, the three greps demoted t
 cross-check, patterns D and E added, `CalDAVProvider.splitSeries` adjudicated in, and the integer
 never restated without its revision. Until that edit lands, **this file is the authority** and
 `CLAUDE.md`'s MANTRA already says so (*"Detail and evidence: …102-…"*).
+
+⚠️ **THE SECOND HANDOFF IS STILL OPEN, RE-VERIFIED 2026-08-07 (round-18 D4) — and round 18 produced
+the evidence that it is not merely tidy-up.** The round-18 audit re-reported *"the enumeration lists
+five deletion-family operations but omits `CalDAVProvider.splitSeries`"* as a **new** finding. It is
+not new: the *"Adjudication — `CalDAVProvider.splitSeries` **IS IN THE SET**"* section above has said
+so since round 10. What the re-report actually measures is **reachability**: an auditor reading
+`tabmail-ios/CLAUDE.md`'s MANTRA block sees five DELETE/expunge-shaped members and three
+DELETE/expunge-shaped census patterns, finds no replacement axis, and correctly concludes the set is
+incomplete — because *from that file* it is. The routed detail is authoritative and was already
+right; it is simply not what the reader reads. **A correction that lives only in the routed file is
+not discharged, it is filed.** That is the transferable point, and it is why this handoff gets a
+dated re-verification rather than a second copy of the adjudication.
+
+**Re-derived at `92e99fad1` + this round's working tree, per the never-a-bare-integer rule above.**
+Bounded to `TabMail/ Shared/ TabMailNotificationService/`:
+
+| # | pattern | hits at `3974e4280` | hits at `92e99fad1` | delta |
+|---|---|---|---|---|
+| A | `method\s*:\s*"DELETE"` | — | 7 | (`AuthedHTTP` helper; Gmail drafts ×2 incl. retry; Exchange calendar; Google calendar; Exchange draft ×2 incl. retry) |
+| B | `httpMethod\s*=\s*"DELETE"` | — | 3 | (`PushClient` ×2 — TabMail's own backend, excluded; `CalDAVClient:103`) |
+| C | `expunge\(` | — | 4 | (2 calls in `IMAPProvider`, 2 comment lines) |
+| D | `httpMethod\s*=\s*"PUT"` | 2 | **2** | unchanged — `CalDAVClient.swift:82` (in the set, via `splitSeries`' cap), `TabMailAuthService.swift:273` (own backend, excluded) |
+| E | `method\s*:\s*"PUT"` | 2 | **2** | unchanged — `AuthedHTTP.swift:50` (generic helper), `GmailProvider.swift:655` (adjudicated OUT above) |
+
+So **the adjudications above hold unchanged at this revision**; nothing was added to the replacement
+axis and nothing left it. `CalDAVProvider.splitSeries` step 3 still issues
+`client.put(url: eventURL, body: cappedICS, precondition: etag.map(.ifMatch) ?? .unconditional)`
+against the existing master resource, and the compensating `revertMasterCap` is still best-effort
+rather than transactional.
+
+**THE EXACT ONE-LINE EDIT `tabmail-ios/CLAUDE.md` NEEDS — written out so the owner does not have to
+re-derive it.** In THE MANTRA's *"Stated negatively"* block, after the sentence enumerating the five
+and before the *"⚠ Do not restate this integer without re-running its predicate"* warning, insert:
+
+> **(6) is not a DELETE at all: `CalDAVProvider.splitSeries`' cap `PUT` replaces the master `.ics`
+> with an `UNTIL=`-capped `RRULE`, destroying every occurrence after the split point, under a
+> best-effort compensating rollback rather than a transaction. Membership in this set is defined by
+> a PROPERTY — content that existed on the server no longer does, with no documented per-item
+> recovery the call reaches — not by the verb `DELETE`; the three greps are a LOWER BOUND, and
+> patterns D (`httpMethod\s*=\s*"PUT"`) and E (`method\s*:\s*"PUT"`) belong beside them.**
+
+**This entry does NOT edit `tabmail-ios/CLAUDE.md`.** That file is a protected owner artifact and was
+dirty in the owner's working tree again in round 18; editing it was explicitly out of scope. The
+handoff therefore remains OPEN, and this file remains the authority until the owner lands the edit
+above.

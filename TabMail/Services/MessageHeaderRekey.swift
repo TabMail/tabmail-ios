@@ -157,8 +157,9 @@ enum MessageHeaderRekey {
     ///    rg -n --pcre2 '^(?!\s*(///|//)).*MessageHeaderRekey\.apply\(' \
     ///       TabMail/ Shared/ TabMailNotificationService/
     ///    ```
-    ///    → 5 at R17-1 (was 3). Check each hit against
-    ///    `AccountManagerQueue.publishRekeys`; the ones that do NOT reach it are:
+    ///    → 5 at R17-1 (was 3), and **still 5 at R18-D5**. Check each hit
+    ///    against `AccountManagerQueue.publishRekeys`; the ones that do NOT
+    ///    reach it are:
     ///     * the **UID-remap block in `SyncEngineFullSync`** — the
     ///       `guard try MessageHeaderRekey.apply(…)` inside the stale-message
     ///       loop;
@@ -167,7 +168,55 @@ enum MessageHeaderRekey {
     ///       delete+reinsert before that, destroying both children outright, so
     ///       adopting this carrier strictly reduced its loss);
     ///     * **`DemoProvider.move`**, also R17-1 — demo mode only, and demo has
-    ///       no `publishRekeys` path at all.
+    ///       no `publishRekeys` path at all;
+    ///     * 🚨 **`DraftStore.migrateExactPlaceholder` — ADDED R18-D5. The
+    ///       roster said THREE and the predicate returns FIVE, and the arithmetic
+    ///       is the whole point: this bullet list is the "does not reach
+    ///       `publishRekeys` AND still owes a leg" set, so it is NOT simply
+    ///       `5 − 2`.** `BackfillBodyQueue.rekeyRemappedHeader` also never
+    ///       reaches `publishRekeys` and is correctly absent, because it
+    ///       DISCHARGES BOTH MIRRORS INLINE — `SearchIndex.rekeyHeaders` and
+    ///       `BodyAssetStore.rekeyContentKey` / `deleteAllAssets` on the
+    ///       `.migrated` / `.duplicateDropped` split. `migrateExactPlaceholder`
+    ///       discharges only the FTS leg (its caller runs
+    ///       `SearchIndex.rekeyHeaders` on the `rekeyed == true` branch, and
+    ///       `MessageContentStore.releaseUnowned(stores: [.searchIndex, .body])`
+    ///       on the false branch), and does NOT call `rekeyContentKey`. ⚠ The
+    ///       false completeness claim being corrected is `f8a437125`'s commit
+    ///       body, which said it was "naming all three".
+    ///       **`bodyAsset` leg — NOT discharged, and the population it would
+    ///       carry is provably EMPTY, which is why this is a doc correction and
+    ///       not a fix.** Verified rather than assumed, by censusing the
+    ///       manifest's row-CREATING entry points (`prepare`/`publish` have no
+    ///       callers outside `BodyAssetStore.write`, so the class is exactly
+    ///       `writeInlineImage` / `writeAttachment` / `makeInlineImageWriter`):
+    ///       ```
+    ///       rg -n 'BodyAssetStore\.(writeInlineImage|writeAttachment|prepare|publish|makeInlineImageWriter)\(' \
+    ///          TabMail/ Shared/ TabMailNotificationService/
+    ///       ```
+    ///       → 5 non-comment sites at R18-D5: `GmailAPI`, `GraphAPI`,
+    ///       `IMAPFetchMapping`, `BodyFetchProcessor` (all four take their
+    ///       content key from a header being fetched FROM the provider) and
+    ///       `AttachmentListView` (reached only AFTER
+    ///       `manager.fetchAttachment(for:section:)` returns bytes). A draft
+    ///       placeholder's `messageId` is
+    ///       `PendingOperation.draftPlaceholderMessageId` — `draft-<draftId>…`,
+    ///       not an address any provider can fetch — so none of the five can
+    ///       ever produce a row under a placeholder content key. Independently:
+    ///       `AccountManagerActions` creates the placeholder header and its
+    ///       `MessageBody` in the SAME write, with
+    ///       `MessageBody.plainTextToHTML(draft.body)` — no `cid:` inline images
+    ///       and no attachment sections — so there is nothing for a render path
+    ///       to write even if one ran.
+    ///       **`UndoService` leg** — inherits the same disposition as the two
+    ///       `SyncEngineFullSync` callers below: an undo entry naming the old id
+    ///       resolves nothing and fails closed, bounded by the undo stack's
+    ///       lifetime.
+    ///       ⚠ **What would falsify this and make it a real loss path:** a draft
+    ///       placeholder gaining attachment sections or `cid:` inline images in
+    ///       its locally-composed body, or any new `BodyAssetStore` write site
+    ///       keyed by a header id that was not fetched from a provider. Re-run
+    ///       the predicate above before assuming the population is still empty.
     ///    Leg by leg, for the two `SyncEngineFullSync` callers:
     ///     * **FTS — DISCHARGED, by the caller itself, not by `publishRekeys`.**
     ///       The UID-remap block appends to `ftsRekeys` directly; the

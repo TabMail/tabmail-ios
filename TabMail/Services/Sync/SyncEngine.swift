@@ -240,6 +240,15 @@ actor SyncEngine {
         if shouldRun() {
             runEvictChatSessions(dbPool: dbPool)
         }
+        // R18-D3 — its OWN marker. `t4` used to be taken after the calendar reclaim
+        // below, so `chatEvict=` reported chat eviction PLUS the reclaim as one
+        // number, while the range's two other new steps (`indexBuild=`, `analyze=`)
+        // each got their own bucket. A timing line that silently aggregates two
+        // steps under one step's name is worse than no timing line: it attributes
+        // the cost to the wrong function, which is exactly the reading a reader
+        // uses to decide where to look. Numbered `t3b` rather than renumbering
+        // `t4`–`t6`, so the diff touches only what it measures.
+        let t3b = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
             // R17-3 — reclaim terminally-retired calendar ops. Same reclaim class
             // as the three steps above: bounded, chunked, dropping only rows no
@@ -272,9 +281,9 @@ actor SyncEngine {
         }
         let t6 = CFAbsoluteTimeGetCurrent()
         if includePrune {
-            print("[Sync] WAL maintenance: prune=\(Int((t1-t0)*1000))ms evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t4-t3)*1000))ms indexBuild=\(Int((t5-t4)*1000))ms analyze=\(Int((t6-t5)*1000))ms")
+            print("[Sync] WAL maintenance: prune=\(Int((t1-t0)*1000))ms evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuild=\(Int((t5-t4)*1000))ms analyze=\(Int((t6-t5)*1000))ms")
         } else {
-            print("[Sync] WAL maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t4-t3)*1000))ms indexBuild=\(Int((t5-t4)*1000))ms analyze=\(Int((t6-t5)*1000))ms")
+            print("[Sync] WAL maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuild=\(Int((t5-t4)*1000))ms analyze=\(Int((t6-t5)*1000))ms")
         }
     }
 
