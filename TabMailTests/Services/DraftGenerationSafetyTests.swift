@@ -1133,6 +1133,73 @@ struct ComposeDraftGuardTests {
                 "non-vacuity: the roster is the eight-exit class R14-F3 left open, not a subset of it")
     }
 
+    // MARK: R17-5 — "no save was attempted" is not "the save landed"
+
+    /// 🚨 THE INVARIANT (the system property, `MIS-015`): **the global
+    /// "Draft updated — tap to review" signal is published only when this turn has
+    /// POSITIVE evidence that a durable draft exists.** No assertion names the
+    /// call site or the branch shape; any decision procedure that withholds the
+    /// claim without evidence passes.
+    ///
+    /// R16-3 moved that publication below the save it announces, and R16 then
+    /// re-created the symptom through a different door: the call site read
+    /// `let landed = !autoSaveAttempted || (exit.map(…) ?? true)`, so the branch
+    /// where NO SAVE WAS ATTEMPTED — `draftId == nil`, or `skipDraftAutoSave` —
+    /// published the success text anyway. Tapping it reached
+    /// `DraftComposePresenter`'s `case .notFound:` arm and dismissed instantly.
+    ///
+    /// The comment licensing it said *"the caller that set `skipDraftAutoSave`
+    /// owns the save"*. It does not: `ComposeView.applyInlineEdit` calls
+    /// `persistCachedReply` only `if replyTo != nil && !isForward`, so new-message
+    /// and forward have no durable writer at all — and `persistCachedReply` writes
+    /// `messageHeader.cachedReply`, not the `Draft` row the tap resolves.
+    @Test("A compose-edit turn that attempted no save claims no durable draft")
+    func noAttemptedSaveClaimsNoDurableDraft() {
+        #expect(ComposeDraftGuards.composeEditGlobalSignal(
+            autoSaveAttempted: false, autoSaveExit: nil) == ComposeDraftGuards.ComposeEditSignal.none,
+                """
+                `skipDraftAutoSave` / no `draftId` wrote nothing, so the turn has no \
+                evidence a reviewable draft exists. Publishing the success text here \
+                is a global claim that opens nothing
+                """)
+        // And it is not the WARNING either — nothing failed, nothing was tried.
+        // Claiming "this draft couldn't be saved" would be the opposite falsehood.
+        #expect(ComposeDraftGuards.composeEditGlobalSignal(
+            autoSaveAttempted: false, autoSaveExit: nil) != .autoSaveDidNotLand)
+        // An exit value cannot smuggle a claim past the attempted gate either.
+        for exit in ComposeDraftGuards.AutoSaveExit.allCases {
+            #expect(ComposeDraftGuards.composeEditGlobalSignal(
+                autoSaveAttempted: false, autoSaveExit: exit) == ComposeDraftGuards.ComposeEditSignal.none,
+                    "no save was attempted, so \(exit.rawValue) cannot license any claim")
+        }
+    }
+
+    /// TWO-SIDED ANCHOR (`feedback_non_vacuity_must_be_two_sided`) — the side that
+    /// goes RED if the fix is over-applied into "never claim anything". A turn that
+    /// DID attempt the save and landed it must still publish the success text, and
+    /// one that attempted and provably failed must still publish the warning;
+    /// otherwise the R16-3 signal is silently deleted rather than made truthful.
+    @Test("An attempted compose-edit save still reports its real outcome")
+    func attemptedSaveStillReportsItsOutcome() {
+        #expect(ComposeDraftGuards.composeEditGlobalSignal(
+            autoSaveAttempted: true, autoSaveExit: nil) == .durableDraftAvailable,
+                "a nil exit is `autoSaveDraft`'s success path — the durable row landed")
+        for exit in ComposeDraftGuards.AutoSaveExit.allCases {
+            let expected: ComposeDraftGuards.ComposeEditSignal =
+                ComposeDraftGuards.autoSaveExitLeftDurableDraft(exit)
+                ? .durableDraftAvailable : .autoSaveDidNotLand
+            #expect(ComposeDraftGuards.composeEditGlobalSignal(
+                autoSaveAttempted: true, autoSaveExit: exit) == expected,
+                    "an ATTEMPTED save defers to the existing roster, unchanged, for \(exit.rawValue)")
+        }
+        // Non-vacuity: the loop above exercised BOTH signals, so it cannot pass by
+        // the roster having collapsed to one side.
+        let signals = Set(ComposeDraftGuards.AutoSaveExit.allCases.map {
+            ComposeDraftGuards.composeEditGlobalSignal(autoSaveAttempted: true, autoSaveExit: $0)
+        })
+        #expect(signals == [.durableDraftAvailable, .autoSaveDidNotLand])
+    }
+
     /// ORDER, not just outcome — the sibling `dismissRunsAfterTheDeleteLands` applied
     /// to this path: at the instant the UI acknowledges the save, the durable
     /// producer must already have returned its verdict.

@@ -381,6 +381,56 @@ enum ComposeDraftGuards {
         }
     }
 
+    /// What, if anything, a compose-edit turn may publish on the GLOBAL
+    /// cross-view channel (`ActiveAgentTracker.setPendingResponse`).
+    ///
+    /// Three outcomes, because two is what caused R17-5.
+    enum ComposeEditSignal: Equatable {
+        /// A durable draft exists that tapping the toast can open.
+        case durableDraftAvailable
+        /// A save was attempted and provably left no durable row — warn.
+        case autoSaveDidNotLand
+        /// No save was attempted, so this turn has NO EVIDENCE either way and
+        /// must assert neither.
+        case none
+    }
+
+    /// 🚨 **R17-5 — "NO SAVE WAS ATTEMPTED" IS NOT "THE SAVE LANDED".** The call
+    /// site read `let landed = !autoSaveAttempted || (exit.map(…) ?? true)`, so
+    /// the two collapsed into one and the turn published *"Draft updated — tap to
+    /// review"* on the branch that never wrote anything. Tapping it reached
+    /// `DraftComposePresenter`'s `case .notFound:` arm and dismissed instantly —
+    /// the same symptom R16-3 fixed, re-created through a different door.
+    ///
+    /// The comment that licensed the collapse claimed *"the caller that set
+    /// `skipDraftAutoSave` owns the save"*. There is exactly one such caller
+    /// (`ComposeView`, `skipDraftAutoSave: showingSuggestion`) and it owns the
+    /// save in NONE of its three modes for this purpose: `applyInlineEdit` calls
+    /// `persistCachedReply` only `if replyTo != nil && !isForward`, so new-message
+    /// and forward have no durable writer at all, and `persistCachedReply` writes
+    /// `messageHeader.cachedReply` — not the `Draft` row the toast's tap resolves.
+    /// The other half of `!autoSaveAttempted` is `draftId == nil`, where no
+    /// durable draft exists by construction.
+    ///
+    /// ⚠️ THE MIRROR IMAGE IS NOT TO AUTO-SAVE THE SUGGESTION (`MIS-005`). The
+    /// suggestion bubble is ephemeral by design and adopting it requires an
+    /// explicit user gesture; persisting it here to make the toast true would be
+    /// the inverse error. `.none` is the honest answer, and it is the same
+    /// never-drop clause-2 reasoning `autoSaveExitLeftDurableDraft` applies to
+    /// `.composeUnavailable`: an absence of evidence is not a positive result.
+    ///
+    /// A `nil` exit with `autoSaveAttempted == true` is the SUCCESS path —
+    /// `autoSaveDraft` returns nil only when every guard passed and the durable
+    /// row landed.
+    static func composeEditGlobalSignal(
+        autoSaveAttempted: Bool,
+        autoSaveExit: AutoSaveExit?
+    ) -> ComposeEditSignal {
+        guard autoSaveAttempted else { return .none }
+        guard let exit = autoSaveExit else { return .durableDraftAvailable }
+        return autoSaveExitLeftDurableDraft(exit) ? .durableDraftAvailable : .autoSaveDidNotLand
+    }
+
     /// PORT — `v2final:ServerDraftOpen.mayBindPersistedDraft` (commits `a8eb813b5`,
     /// `69a9bae88`), relocated here because this forward-port has no
     /// `ServerDraftOpen` enum.

@@ -1465,9 +1465,15 @@ struct DynamicIslandChat: View {
                 }
 
                 // R16-3 — THE GLOBAL SIGNAL, PUBLISHED AFTER THE WRITE IT CLAIMS.
-                // `InboxView.observeAgentFinish` consumes this on the
-                // `agentSessionDidFinish` post that `clearWorking(sessionKey)` makes
-                // at the end of this task, so publishing here still reaches it.
+                // The anonymous `.onReceive(… .agentSessionDidFinish)` closure in
+                // `InboxView` consumes this on the post that
+                // `clearWorking(sessionKey)` makes at the end of this task, so
+                // publishing here still reaches it. (⚠ This named
+                // `InboxView.observeAgentFinish` until R17-5 — a symbol that has
+                // never existed. `rg 'observeAgentFinish'` returned two hits, both
+                // comments citing each other. This repo cites symbols because line
+                // numbers rot, `MIS-009`; a symbol citation naming nothing is the
+                // same failure with better manners, `MIS-010`.)
                 //
                 // ⚠️ DELIBERATELY NOT GATED ON THE PROVIDER-SIDE UPLOAD, which is
                 // the mirror image (`MIS-005`): `autoSaveDraft` returns once the
@@ -1478,15 +1484,47 @@ struct DynamicIslandChat: View {
                 // that tapping this toast can open", and that is exactly what a nil
                 // exit means.
                 //
-                // `autoSaveAttempted == false` (no `draftId`, or `skipDraftAutoSave`)
-                // keeps the original text: this turn never claimed to save, and the
-                // caller that set `skipDraftAutoSave` owns the save.
+                // 🚨 **R17-5 — `autoSaveAttempted == false` PUBLISHES NOTHING, AND
+                // THE COMMENT THAT LICENSED THE BYPASS WAS THE LOAD-BEARING ERROR.**
+                // It read *"this turn never claimed to save, and the caller that set
+                // `skipDraftAutoSave` owns the save"*, and `!autoSaveAttempted` was
+                // OR-ed into `landed` — which makes "no save was attempted"
+                // indistinguishable from "the save landed" and republishes the exact
+                // R16-3 symptom through a different door.
+                //
+                // There is exactly ONE caller that sets `skipDraftAutoSave`
+                // (`ComposeView`, `skipDraftAutoSave: showingSuggestion`) and it does
+                // NOT own the save. `applyInlineEdit`'s suggestion branch calls
+                // `persistCachedReply` only `if replyTo != nil && !isForward`, so
+                // new-message and forward have no durable writer at all — and even in
+                // reply mode `persistCachedReply` writes `messageHeader.cachedReply`,
+                // which is not the `Draft` row this toast's tap resolves. The other
+                // half of `!autoSaveAttempted` is `draftId == nil`, where no durable
+                // draft exists by construction. In every one of those states the
+                // toast tapped through to `DraftComposePresenter`'s
+                // `case .notFound:` arm and dismissed instantly.
+                //
+                // ⚠️ AND THE MIRROR IMAGE IS NOT TO AUTO-SAVE THE SUGGESTION. The
+                // suggestion bubble is ephemeral BY DESIGN; adopting it requires an
+                // explicit user gesture, so persisting it here to make the toast true
+                // would be the inverse error (`MIS-005`). Publishing nothing is the
+                // honest option: the agent's own reply is already in `chatMessages`
+                // above, and a toast whose tap opens nothing is strictly worse than
+                // no toast. Nothing else reads this key — `InboxView`'s reappear
+                // path consumes the literal `"inbox"` key, not a compose one.
                 if !isExpanded {
-                    let landed = !autoSaveAttempted
-                        || (autoSaveExit.map(ComposeDraftGuards.autoSaveExitLeftDurableDraft) ?? true)
-                    ActiveAgentTracker.shared.setPendingResponse(
-                        sessionKey,
-                        text: landed ? "Draft updated — tap to review" : Self.autoSaveDidNotLandWarning)
+                    switch ComposeDraftGuards.composeEditGlobalSignal(
+                        autoSaveAttempted: autoSaveAttempted, autoSaveExit: autoSaveExit
+                    ) {
+                    case .durableDraftAvailable:
+                        ActiveAgentTracker.shared.setPendingResponse(
+                            sessionKey, text: "Draft updated — tap to review")
+                    case .autoSaveDidNotLand:
+                        ActiveAgentTracker.shared.setPendingResponse(
+                            sessionKey, text: Self.autoSaveDidNotLandWarning)
+                    case .none:
+                        break
+                    }
                 }
 
                 print("[DynamicIslandChat] Inline edit applied, editHistory=\(editHistory.count) turns")

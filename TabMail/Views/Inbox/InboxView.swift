@@ -782,9 +782,14 @@ struct InboxView: View {
                 }
             }
             // Check for agent responses that arrived while this view was offscreen.
-            // The .task { observeAgentFinish() } listener is cancelled on disappear,
-            // so notifications fired while offscreen are missed. Pending responses
-            // are stored in ActiveAgentTracker and consumed here on reappear.
+            // The `.onReceive(… .agentSessionDidFinish)` subscription above is torn
+            // down when this view leaves the hierarchy, so notifications fired while
+            // offscreen are missed. Pending responses are stored in
+            // `ActiveAgentTracker` and consumed here on reappear.
+            // (⚠ This cited `.task { observeAgentFinish() }` until R17-5. No such
+            // symbol has ever existed — `rg 'observeAgentFinish'` returned exactly
+            // two hits, this comment and the one in `DynamicIslandChatButton` that
+            // pointed back at it. `MIS-009` / `MIS-010`.)
             if let response = ActiveAgentTracker.shared.consumePendingResponse("inbox") {
                 showAgentToast(response, sessionKey: "inbox")
             }
