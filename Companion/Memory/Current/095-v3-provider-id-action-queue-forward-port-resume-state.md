@@ -1,3 +1,19 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> ✅ **THE v3 REFACTOR IS COMPLETE AND SHIPPED (v1.7.0, 2026-08-07). Everything below is the
+> 2026-08-02 resume state and is HISTORICAL — do not act on it.**
+>
+> - **The `v3` branch is DELETED; `main` IS that line.** Any "branch `v3`" below means `main`.
+>   The body says HEAD `583de7a5d`, **PAUSED BY OWNER**, never pushed — all three are now false.
+> - **RULES R0 and R3 are RETIRED** (owner directive 2026-08-07). There is **no mandatory
+>   `v2final` consult**, no `⚑ R0 REFERENCE BLOCK` obligation, and their absence is not a defect.
+> - ⛔ **`v2final` IS NOT A REFERENCE.** It is a **sibling** of `v1.6.38`, not an ancestor, and it
+>   **never shipped to a user device**. It survives only as preserved history — readable at
+>   `archive/main-v2final-20260807` for provenance comments that cite it — and must not be
+>   consulted as a source of truth, ported from by default, or cited as authority for a design.
+>   In-code `PORT — v2final:…` comments are kept as PROVENANCE: they record why existing code is
+>   shaped as it is, not an instruction to go read that branch.
+> - The `PORT/SUBTRACT/INVENTED` census below was an artefact of R0/R3 and is retired with them.
+<!-- COMPANION-CURRENT-NOTE-END -->
 ## v3 provider-id action-queue forward-port — authoritative resume state (2026-08-02)
 
 **The plan is now hierarchical. Load only what your task needs.**
