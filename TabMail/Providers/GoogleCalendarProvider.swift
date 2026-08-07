@@ -432,12 +432,65 @@ actor GoogleCalendarProvider: CalendarProvider {
                 event: newSeriesInput,
                 sendUpdates: sendUpdates
             )
-        } catch GoogleCalendarError.httpError(409, _) {
-            // 409 Conflict — the new series with this deterministic id already
-            // exists from a prior (lost-ACK) attempt. The split already
-            // completed; do NOT revert the master cap. Return the existing
-            // series so the retry settles as success.
-            return try await getEvent(calendarId: calendarId, eventId: newSeriesId)
+        } catch GoogleCalendarError.httpError(409, let conflictBody)
+                    where Self.isDuplicateIdConflict(conflictBody) {
+            // 🚨 R14-F2 — POSITIVELY IDENTIFIED, and the proof-GET's failure may
+            // not masquerade as anything else.
+            //
+            // Until 2026-08-06 this arm was `catch GoogleCalendarError.httpError(409, _)`
+            // and DISCARDED the body. End to end: step 4 caps the master, step 6's
+            // create returns a NON-duplicate 409, this arm assumes lost-ACK
+            // success, `getEvent(newSeriesId)` answers 404 because nothing was
+            // created, the sibling rollback `catch` below is skipped — a throw
+            // inside a `catch` clause is not claimed by a sibling `catch` of the
+            // same `do` — and that 404 reaches `isCalendarNotFoundError`, which
+            // deletes the `PendingCalendarOperation` and signals
+            // `.permanentFailure`. The recurring master stays truncated, the
+            // successor never exists, and the only durable intention that could
+            // repair it is gone. Later sync imports the truncated master and
+            // cannot reconstruct the recurrence.
+            //
+            // The `where` clause is the whole fix's first half: an unproven,
+            // empty or unparseable 409 now falls into the rollback `catch`, which
+            // restores the master's recurrence and rethrows through
+            // `splitRollbackError`. The siblings already did this — `CalDAVProvider`
+            // verifies the successor exists AND is ours before treating a
+            // collision as completion, and `ExchangeCalendarProvider` carries an
+            // explicit "THERE IS DELIBERATELY NO `catch …httpError(409, _)`" so
+            // every create failure routes through rollback accounting. Google was
+            // the only one accepting any 409 as proof.
+            //
+            // ⚠️ WHAT BREAKS THE OTHER WAY (`MIS-026`). A genuine duplicate whose
+            // body Google failed to send now rolls the cap back and retries the
+            // whole split instead of returning the existing successor. That
+            // converges (the cap is recomputed from the master's own RRULE and is
+            // idempotent) and is the same disposition the `.create` path already
+            // gives a body-less 409, which `googleBodylessConflictKeepsTheIntentionQueued`
+            // pins. Failing closed on absent evidence is always acceptable;
+            // deleting the durable row on it is never-drop clause 2.
+            do {
+                return try await getEvent(calendarId: calendarId, eventId: newSeriesId)
+            } catch {
+                // The successor EXISTS — Google just said so — we merely could not
+                // read it back. Two dispositions are forbidden here and both are
+                // reachable-looking:
+                //  * letting this error escape, because a 404/`eventNotFound` from
+                //    the proof-GET is claimed by `isCalendarNotFoundError` and
+                //    deletes the durable row on "the original event is gone",
+                //    which is exactly the defect above;
+                //  * falling into the rollback `catch`, because UNCAPPING a master
+                //    whose successor exists duplicates every future occurrence —
+                //    F2's own mirror image.
+                // Rethrowing the ORIGINAL 409 is the only honest answer: it says
+                // "we could not determine the outcome", no terminal arm claims a
+                // 409 (`isCalendarBadRequestError` excludes it as indeterminate),
+                // so the op stays queued and the next drain re-runs the split
+                // against the already-capped master — which re-conflicts, re-proves
+                // the duplicate, and retries the read. The server state is stable
+                // across that retry, so it terminates as soon as the GET succeeds.
+                print("[GoogleCalendar] splitSeries proof-GET for \(newSeriesId) FAILED after a proven duplicate: \(error) — keeping the operation queued")
+                throw GoogleCalendarError.httpError(409, conflictBody)
+            }
         } catch {
             // Best-effort revert of step 1 so we don't leave the master truncated
             // with no replacement series. Same defensive include-start/end as
@@ -520,6 +573,46 @@ actor GoogleCalendarProvider: CalendarProvider {
         guard let revertFailure else { return original }
         return CalDAVError.inconsistentState(
             "the recurring series was capped but its replacement series could not be created (\(original)), and restoring the original recurrence also failed (\(revertFailure)). The series now ends early on the server and needs its recurrence fixed by hand.")
+    }
+
+    /// Does this Google Calendar 409 body positively say *"the identifier you
+    /// supplied already exists"* (R13-U3)?
+    ///
+    /// Google documents exactly two 409 reasons on `events.insert`:
+    ///   * `"duplicate"` — *"The requested identifier already exists."* The event
+    ///     is there. This is the only one that is proof of anything.
+    ///   * `"conflict"` — *"a batched item inside an `events.batch` operation
+    ///     can't be executed due to an operational conflict."* Transient, and
+    ///     retryable per Google's own guidance.
+    /// Source: developers.google.com/workspace/calendar/api/guides/errors.
+    ///
+    /// ⚠️ FAIL-CLOSED, and the direction is load-bearing. Unparseable, empty and
+    /// unrecognised bodies all return `false`, which routes the error to the
+    /// drain's indeterminate/retry path — the SAFE side, because the retry is
+    /// duplicate-safe (Google rejects a second insert of the same client-supplied
+    /// id) while a wrong `true` would delete the user's intention on a conflict
+    /// that never created anything. A nil-defaulted or optimistic reading here
+    /// would be fail-DANGEROUS.
+    ///
+    /// ⚠️ **IT LIVES HERE, NOT ON THE QUEUE (R14-F2).** It was
+    /// `AccountManagerCalendarQueue`'s `isGoogleDuplicateIdConflict` until
+    /// 2026-08-06, and `splitSeries` — in THIS file — needs the identical
+    /// question answered before it may treat a 409 as proof the successor series
+    /// exists. Copying it in would have produced two spellings of one invariant,
+    /// which is precisely the drift `splitRollbackError` above was created to
+    /// prevent. Parsing a Google error payload is the Google provider's job, and
+    /// `deterministicSplitEventId` / `splitRollbackError` already establish that
+    /// a cross-provider helper lives on this type. Still `static` (hence
+    /// nonisolated), so the discrimination stays table-testable against real
+    /// Google error payloads exactly as before.
+    static func isDuplicateIdConflict(_ body: Data?) -> Bool {
+        guard let body, !body.isEmpty,
+              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let err = json["error"] as? [String: Any] else { return false }
+        // Google puts the machine-readable reason on the per-error entries; the
+        // top-level object carries only `code` and `message`.
+        guard let errors = err["errors"] as? [[String: Any]] else { return false }
+        return errors.contains { ($0["reason"] as? String) == "duplicate" }
     }
 
     // MARK: - Recurring helpers

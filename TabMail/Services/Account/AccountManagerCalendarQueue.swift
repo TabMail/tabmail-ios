@@ -472,8 +472,12 @@ extension AccountManager {
             // its own idempotency currency, which is why `op.eventId` is set
             // unconditionally rather than per-provider:
             //  - Google — sent as the resource `id` on `events.insert`; a
-            //    replay answers 409 `duplicate`, which `isGoogleDuplicateIdConflict`
-            //    reads as "already created" (R13-U3).
+            //    replay answers 409 `duplicate`, which
+            //    `GoogleCalendarProvider.isDuplicateIdConflict` reads as
+            //    "already created" (R13-U3; it lived here as
+            //    `isGoogleDuplicateIdConflict` until R14-F2 moved it beside the
+            //    other cross-provider split helper, because `splitSeries` needs
+            //    the same question answered and two spellings drift).
             //  - Exchange — `ExchangeCalendarProvider.createEventJSON` maps it to
             //    Graph's `transactionId` (skipped past 256 chars, which is Graph's
             //    documented cap; over-long simply degrades to non-idempotent).
@@ -502,7 +506,7 @@ extension AccountManager {
                     createdRealId = realId
                 }
             } catch GoogleCalendarError.httpError(409, let body)
-                        where op.eventId != nil && Self.isGoogleDuplicateIdConflict(body) {
+                        where op.eventId != nil && GoogleCalendarProvider.isDuplicateIdConflict(body) {
                 // 🚨 R13-U3 — POSITIVELY IDENTIFIED, not assumed.
                 // Google documents exactly two 409s on `events.insert`
                 // (developers.google.com/workspace/calendar/api/guides/errors):
@@ -734,7 +738,7 @@ extension AccountManager {
     /// ⚠️ **THE PAYLOAD USED TO BE A LITERAL `nil` ON BOTH REFRESH-RETRY ARMS, AND
     /// IS NOT ANY MORE (R14-F1).** The arms match `_` on the payload, so the change
     /// is inert HERE — but the sentence above named the `nil` explicitly, and every
-    /// classifier that DOES read the payload (`isGoogleDuplicateIdConflict`,
+    /// classifier that DOES read the payload (`GoogleCalendarProvider.isDuplicateIdConflict`,
     /// `badRequestReason`, `parseHttpReason`) was receiving `nil` on **every**
     /// non-2xx, refresh-retry or not: `performHTTPRequest` returns `data: nil` for
     /// any non-2xx and puts the server's bytes in `errorBody`, and both providers
@@ -860,37 +864,6 @@ extension AccountManager {
         // already claimed by `isCalendarUnsupportedError` at the arm above.
         if case GoogleCalendarError.invalidPathSegment = error { return true }
         return false
-    }
-
-    /// Does this Google Calendar 409 body positively say *"the identifier you
-    /// supplied already exists"* (R13-U3)?
-    ///
-    /// Google documents exactly two 409 reasons on `events.insert`:
-    ///   * `"duplicate"` — *"The requested identifier already exists."* The event
-    ///     is there. This is the only one that is proof of anything.
-    ///   * `"conflict"` — *"a batched item inside an `events.batch` operation
-    ///     can't be executed due to an operational conflict."* Transient, and
-    ///     retryable per Google's own guidance.
-    /// Source: developers.google.com/workspace/calendar/api/guides/errors.
-    ///
-    /// ⚠️ FAIL-CLOSED, and the direction is load-bearing. Unparseable, empty and
-    /// unrecognised bodies all return `false`, which routes the error to the
-    /// drain's indeterminate/retry path — the SAFE side, because the retry is
-    /// duplicate-safe (Google rejects a second insert of the same client-supplied
-    /// id) while a wrong `true` would delete the user's intention on a conflict
-    /// that never created anything. A nil-defaulted or optimistic reading here
-    /// would be fail-DANGEROUS.
-    ///
-    /// `static` (hence nonisolated) so the discrimination is table-testable
-    /// against real Google error payloads, exactly like `isCalendarBadRequestError`.
-    static func isGoogleDuplicateIdConflict(_ body: Data?) -> Bool {
-        guard let body, !body.isEmpty,
-              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-              let err = json["error"] as? [String: Any] else { return false }
-        // Google puts the machine-readable reason on the per-error entries; the
-        // top-level object carries only `code` and `message`.
-        guard let errors = err["errors"] as? [[String: Any]] else { return false }
-        return errors.contains { ($0["reason"] as? String) == "duplicate" }
     }
 
     /// Best-effort extract of the server's reason string from a 4xx so the LLM
