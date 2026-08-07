@@ -487,3 +487,147 @@ struct CalendarQueueRecurrenceFrameTests {
                 "splitSeries takes the SAME recurrence_id off the SAME durable row as updateOccurrence; honouring the declared frame in only one of them would make one argument mean two instants depending on edit_scope")
     }
 }
+
+// MARK: - R18d — the MINT site of an ALL-DAY occurrence address
+//
+// The suites above pin what the RESOLVER does with an address. This one pins the
+// address the app HANDS the agent in the first place, for the one event shape
+// whose address is frame-free by definition.
+//
+// **INVARIANT.** *An all-day event's rendered `start_iso` names the provider's
+// own calendar date, whatever display timezone the output is rendered in.*
+//
+// RFC 5545 §3.3.4's `DATE` value type carries no zone, and Google/Graph both hand
+// it over as a bare `yyyy-MM-dd`. Until round 18d the all-day path nonetheless
+// went through a zone conversion twice: `GCalEvent.parseDateOnly` fixed the date
+// to midnight in `.current` (the DEVICE zone) and
+// `EKEventStoreHelper.toNaiveISO` re-rendered that instant in the resolved
+// DISPLAY zone. Any display zone west of the device zone pushes the wall clock
+// back past midnight, so `start_iso` names the PREVIOUS DAY.
+//
+// **Why that is C3 and not cosmetic.** `CalendarEventEditTool` documents
+// `recurrence_id` as "the `start_iso` of the target occurrence", and
+// `RecurrenceOccurrenceResolver`'s rule 3 matches an all-day candidate on its
+// literal `dateOnly` against `recurrenceId.prefix(10)`. On an all-day DAILY
+// series the shifted date answers to the PRECEDING occurrence, and
+// `updateOccurrence` `PATCH`es it with `sendUpdates: "all"`. On `splitSeries`
+// the same shift caps the master a day early through an irreversible-family PUT.
+// `allDayShiftedAddressResolvesThePrecedingOccurrence` below is the machine-
+// checkable statement of that consequence — it is what makes this a C3 test and
+// not a formatting test.
+//
+// ⚠️ **TWO-SIDED (`MIS-030`).** "The date never moves" is satisfiable by a
+// formatter that emits nothing, so `allDayStartIsoStillCarriesTheDate` asserts
+// the key is present and carries the right digits, and
+// `timedStartIsoStillFollowsTheDisplayZone` is the negative control proving the
+// fix did not flatten the TIMED path into the same frame-free treatment.
+//
+// ⚠️ **Every zone here is NAMED and the spread spans the whole offset range
+// (−12 … +14).** The pre-fix error is `displayOffset − deviceOffset`, so a test
+// that used one fixed display zone would be red or green depending on the
+// machine the suite runs on. With both extremes in the list at least one entry
+// shifts for every possible device zone, which is what makes the red proof
+// independent of the simulator's locale.
+
+private let allDayProbeZones: [String] = [
+    "Etc/GMT+12",          // UTC−12, the western extreme
+    "Pacific/Honolulu",    // UTC−10
+    "America/Vancouver",   // UTC−7 (PDT)
+    "UTC",
+    "Asia/Tokyo",          // UTC+9
+    "Pacific/Kiritimati",  // UTC+14, the eastern extreme
+]
+
+@Suite("All-day occurrence address — the date is frame-free at the mint site")
+struct AllDayOccurrenceAddressMintTests {
+
+    private func allDayEvent(id: String = "allday-1", start: String, end: String) -> GCalEvent {
+        GCalEvent(
+            id: id, summary: "Company holiday", location: nil, description: nil,
+            start: GCalDateTime(dateTime: nil, date: start, timeZone: nil),
+            end: GCalDateTime(dateTime: nil, date: end, timeZone: nil),
+            attendees: nil, organizer: nil, recurrence: ["RRULE:FREQ=DAILY"],
+            transparency: nil, status: nil, htmlLink: nil, created: nil, updated: nil
+        )
+    }
+
+    private func line(_ output: String, _ key: String) -> String? {
+        output.split(separator: "\n", omittingEmptySubsequences: false)
+            .first { $0.hasPrefix("\(key): ") }
+            .map { String($0.dropFirst(key.count + 2)) }
+    }
+
+    @Test("an all-day event's start_iso names the provider's calendar date in EVERY display timezone")
+    func allDayDateNeverMovesWithTheDisplayZone() {
+        let event = allDayEvent(start: "2026-05-20", end: "2026-05-21")
+        for id in allDayProbeZones {
+            let tz = TimeZone(identifier: id)!
+            let output = CalendarToolHelpers.formatDetailedEvent(event, timeZone: tz)
+            let start = line(output, "start_iso")
+            #expect(start?.hasPrefix("2026-05-20") == true,
+                    "display zone \(id) (device \(TimeZone.current.identifier)): start_iso is \(start ?? "<absent>"), not the provider's date 2026-05-20. A calendar DATE has no zone; shifting one by a UTC offset is how an all-day recurrence_id names the adjacent day's occurrence.")
+            let end = line(output, "end_iso")
+            #expect(end?.hasPrefix("2026-05-21") == true,
+                    "display zone \(id): end_iso is \(end ?? "<absent>"), not the provider's date 2026-05-21")
+        }
+    }
+
+    @Test("the shifted address resolves the PRECEDING occurrence — why the frame error is C3, not cosmetic")
+    func allDayShiftedAddressResolvesThePrecedingOccurrence() {
+        // A daily all-day series. These are the candidates Google's `instances`
+        // call returns, keyed on their literal DATE.
+        let candidates = [
+            OccurrenceCandidate(id: "occ-05-19", instant: nil, dateOnly: "2026-05-19"),
+            OccurrenceCandidate(id: "occ-05-20", instant: nil, dateOnly: "2026-05-20"),
+            OccurrenceCandidate(id: "occ-05-21", instant: nil, dateOnly: "2026-05-21"),
+        ]
+        // The address the agent copies out of `start_iso`. This is the whole
+        // point: the resolver is CORRECT — it faithfully resolves whatever date
+        // it is handed — so a mint site that hands it the previous day gets a
+        // confident, well-formed mutation of the wrong occurrence.
+        #expect(RecurrenceOccurrenceResolver.select(candidates, recurrenceId: "2026-05-19T00:00:00", zone: .current)
+                == .resolved("occ-05-19"))
+        #expect(RecurrenceOccurrenceResolver.select(candidates, recurrenceId: "2026-05-20T00:00:00", zone: .current)
+                == .resolved("occ-05-20"))
+
+        // And the mint site must never produce the first of those two for an
+        // event whose provider date is 2026-05-20 — in any display zone.
+        let event = allDayEvent(start: "2026-05-20", end: "2026-05-21")
+        for id in allDayProbeZones {
+            let tz = TimeZone(identifier: id)!
+            let minted = line(CalendarToolHelpers.formatDetailedEvent(event, timeZone: tz), "start_iso") ?? ""
+            let match = RecurrenceOccurrenceResolver.select(candidates, recurrenceId: minted, zone: tz)
+            #expect(match == .resolved("occ-05-20"),
+                    "display zone \(id): the minted address '\(minted)' resolved \(match). Anything other than occ-05-20 is a wrong-target PATCH with sendUpdates=all.")
+        }
+    }
+
+    @Test("start_iso is still emitted and still carries the date — the non-vacuity control")
+    func allDayStartIsoStillCarriesTheDate() {
+        let output = CalendarToolHelpers.formatDetailedEvent(
+            allDayEvent(start: "2026-05-20", end: "2026-05-21"),
+            timeZone: TimeZone(identifier: "Etc/GMT+12")!)
+        #expect(line(output, "start_iso") == "2026-05-20T00:00:00")
+        #expect(line(output, "end_iso") == "2026-05-21T00:00:00")
+        #expect(output.contains("all_day: yes"))
+    }
+
+    @Test("a TIMED event's start_iso still follows the display zone — the fix did not flatten the timed path")
+    func timedStartIsoStillFollowsTheDisplayZone() {
+        // 2026-05-20 17:00 Vancouver == 2026-05-21 09:00 Tokyo. A timed value IS
+        // frame-bearing, so it MUST move with the display zone; only the DATE
+        // type is frame-free.
+        let event = GCalEvent(
+            id: "timed-1", summary: "Standup", location: nil, description: nil,
+            start: GCalDateTime(dateTime: "2026-05-21T00:00:00Z", date: nil, timeZone: nil),
+            end: GCalDateTime(dateTime: "2026-05-21T01:00:00Z", date: nil, timeZone: nil),
+            attendees: nil, organizer: nil, recurrence: nil,
+            transparency: nil, status: nil, htmlLink: nil, created: nil, updated: nil
+        )
+        #expect(line(CalendarToolHelpers.formatDetailedEvent(event, timeZone: vancouver), "start_iso")
+                == "2026-05-20T17:00:00")
+        #expect(line(CalendarToolHelpers.formatDetailedEvent(event, timeZone: tokyo), "start_iso")
+                == "2026-05-21T09:00:00")
+        #expect(CalendarToolHelpers.formatDetailedEvent(event, timeZone: tokyo).contains("all_day: no"))
+    }
+}

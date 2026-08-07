@@ -389,6 +389,19 @@ enum CalendarToolHelpers {
         return formatGroupedSummary(tuples, timeZone: timeZone)
     }
 
+    /// Render a provider `DATE` value (`yyyy-MM-dd`, RFC 5545 §3.3.4) as the
+    /// naive ISO shape the tool output uses, **without any zone conversion**.
+    ///
+    /// A calendar DATE has no timezone. Parsing one into a `Date` fixes it to
+    /// midnight in whatever zone the parser was configured with, and rendering
+    /// that instant in any other zone moves it onto an adjacent day — which is
+    /// how an all-day `recurrence_id` comes to name the wrong occurrence. The
+    /// provider's own digits are the whole of the value; this only appends the
+    /// `T00:00:00` the output shape expects.
+    static func allDayNaiveISO(_ providerDate: String) -> String {
+        "\(String(providerDate.prefix(10)))T00:00:00"
+    }
+
     /// Format a single GCalEvent with full details (same output as EKEvent version).
     /// `accountId` is used to build compound event_id for translator mapping.
     /// `accessRole` (when "freeBusyReader") swaps the title for "Busy — …" and
@@ -408,15 +421,71 @@ enum CalendarToolHelpers {
             lines.append("title: \((event.summary ?? "").isEmpty ? "(No title)" : event.summary!)")
         }
 
-        if let start = event.startDate {
-            lines.append("start_iso: \(EKEventStoreHelper.toNaiveISO(start, timeZone: tz))")
-        }
-        if let end = event.endDate {
-            lines.append("end_iso: \(EKEventStoreHelper.toNaiveISO(end, timeZone: tz))")
+        // 🚨 AN ALL-DAY DATE IS FRAME-FREE, SO IT IS NEVER RUN THROUGH A ZONE
+        // CONVERSION. RFC 5545's `DATE` value type carries no zone at all, and
+        // Google/Graph both hand it to us as a bare `yyyy-MM-dd` in `start.date`.
+        //
+        // ⚠️ UNTIL ROUND 18d THIS BRANCH DID NOT EXIST, and the all-day path ran
+        // the same route as the timed one: `GCalEvent.parseDateOnly` parses
+        // `start.date` in `.current` — the DEVICE zone — and `toNaiveISO` then
+        // re-rendered that instant in `tz`, the resolved DISPLAY zone. Whenever
+        // the display zone is west of the device zone the rendered wall clock
+        // falls back past midnight and **`start_iso` names the PREVIOUS DAY**.
+        // (East shifts the same way once the gap reaches 24 h.)
+        //
+        // That was not cosmetic. `CalendarEventEditTool` documents `recurrence_id`
+        // as "the `start_iso` of the target occurrence", and
+        // `RecurrenceOccurrenceResolver`'s rule 3 matches an all-day candidate on
+        // its literal `dateOnly` against `recurrenceId.prefix(10)`. So on an
+        // all-day DAILY series the shifted date answers to the PRECEDING
+        // occurrence, which `updateOccurrence` then `PATCH`es with
+        // `sendUpdates: "all"` — a C3 wrong-target mutation whose invitations
+        // cannot be recalled. On `splitSeries` it caps the master a day early,
+        // and that cap `PUT` is an irreversible-family write with only a
+        // compensating rollback.
+        //
+        // ⚠️ WHAT BREAKS THE OTHER WAY (`MIS-026`). The alternative was to emit a
+        // bare `2026-05-20` for an all-day event. It is arguably more honest —
+        // there is no time — but it changes the SHAPE of `start_iso` for every
+        // all-day event for every user, at the end of an audit train, on a key
+        // the tool schemas describe as a naive ISO8601 date-time. Appending
+        // `T00:00:00` to the provider's own date is byte-identical to today's
+        // output whenever the display zone equals the device zone (the
+        // overwhelmingly common case), so only the frame error changes hands.
+        // Both forms resolve identically downstream — `prefix(10)` is what every
+        // consumer reads (`RecurrenceOccurrenceResolver.select`/`.windowCenter`,
+        // `GoogleCalendarProvider.googleUntilString`,
+        // `CalDAVProvider.buildNewSeriesInput`) — so the narrower change is the
+        // right one.
+        if event.isAllDay, let startDay = event.start?.date {
+            lines.append("start_iso: \(Self.allDayNaiveISO(startDay))")
+            if let endDay = event.end?.date {
+                lines.append("end_iso: \(Self.allDayNaiveISO(endDay))")
+            } else if let end = event.endDate {
+                // Mixed shape (all-day start, timed end). Nothing frame-free to
+                // preserve on the end side, so it keeps the display rendering.
+                lines.append("end_iso: \(EKEventStoreHelper.toNaiveISO(end, timeZone: tz))")
+            }
+        } else {
+            if let start = event.startDate {
+                lines.append("start_iso: \(EKEventStoreHelper.toNaiveISO(start, timeZone: tz))")
+            }
+            if let end = event.endDate {
+                lines.append("end_iso: \(EKEventStoreHelper.toNaiveISO(end, timeZone: tz))")
+            }
         }
         // 🚨 `timezone:` NAMES THE ZONE `start_iso`/`end_iso` ARE EXPRESSED IN,
         // AND NOTHING ELSE. It is `tz` — the resolved display zone — because that
         // is what `toNaiveISO` was just handed.
+        //
+        // ⚠️ ONE STATED EXCEPTION, added with the all-day branch above: for an
+        // ALL-DAY event the ISO values are expressed in NO zone, because a
+        // calendar DATE has none. `timezone:` then names only the display zone
+        // the rest of the output uses, and `all_day: yes` two lines below is what
+        // tells the agent the date is absolute. It is deliberately still emitted
+        // rather than suppressed: dropping a key for one event shape is a wider
+        // output change than the frame fix needs, and the value is harmless
+        // because the date it labels is the same in every zone.
         //
         // ⚠️ THIS LINE READ `storedTz.isEmpty ? tz.identifier : storedTz` UNTIL
         // ROUND 18, i.e. it emitted the PROVIDER'S stored zone next to values
@@ -608,7 +677,7 @@ enum CalendarToolHelpers {
     // MARK: - Error Classification
 
     /// Check if an error indicates "event not found" (404 or equivalent).
-    /// Same pattern as AccountManagerCalendarQueue.isCalendarNotFoundError.
+    /// Same pattern as AccountManager.isCalendarNotFoundError.
     static func isEventNotFoundError(_ error: Error) -> Bool {
         if case GoogleCalendarError.httpError(404, _) = error { return true }
         if case GoogleCalendarError.eventNotFound = error { return true }
