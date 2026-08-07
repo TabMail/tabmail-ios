@@ -177,6 +177,33 @@ extension AccountManager {
     /// reconciliation returns it to `queued`, and the op is retried — a retry loop,
     /// never a drop.
     ///
+    /// 🚨 **AND THAT IS WHY THIS RETURNS A `Bool` (R17-2). PRODUCER AND CONSUMER
+    /// MUST AGREE ON WHETHER THE OP IS OVER.** This was `-> Void`, so all six
+    /// terminal arms ran `signalCalendarOpOutcome(… .permanentFailure(reason:))`
+    /// unconditionally — three lines after a catch arm whose own comment says the
+    /// op *retries*. The producer said RETRYABLE and the consumer announced
+    /// TERMINAL, and the consumer is what the user sees: `CalendarEventEditTool`
+    /// turns the confirmation card red and instructs the LLM *"call
+    /// calendar_event_edit again"*. The user re-issues, the original row drains
+    /// at next launch too, and **two events exist with two sets of invitations
+    /// already delivered to other people.** No sync converges them — both are
+    /// authoritative server objects and the recipients have both mails.
+    ///
+    /// So `.permanentFailure` may be signalled ONLY on a committed retirement.
+    /// On a failed write the honest outcome is `.stillQueued`, which is what the
+    /// transient arm already signals and which every tool renders as "in flight,
+    /// will appear shortly" — true, because reconciliation requeues it.
+    ///
+    /// ⚠️ THE MIRROR IMAGE, stated because it is the obvious alternative
+    /// (`MIS-005`): signalling NOTHING on a failed write leaves the awaiter to
+    /// its 10 s timeout and `.timedOut`, which the tools treat identically to
+    /// `.stillQueued` — so it is not wrong, merely slower and less legible. What
+    /// would be wrong in the other direction is deleting the row or leaving it
+    /// `queued`-but-announced-terminal; neither is done here.
+    ///
+    /// - Returns: `true` when the terminal status was durably committed, `false`
+    ///   when the write failed and the operation therefore remains retryable.
+    ///
     /// Also the honest half of the "the user is told" claim: this is the only place
     /// in this file that reaches `BackgroundSyncLogger`, whose Error Log is what
     /// `DebugLogView` renders. Two doc comments in this file asserted terminal
@@ -201,7 +228,7 @@ extension AccountManager {
         _ op: PendingCalendarOperation,
         reason: String,
         caldavReauthAccountId: String? = nil
-    ) async {
+    ) async -> Bool {
         BackgroundSyncLogger.logError(
             "[CalendarQueue] TERMINAL \(op.operationType) op=\(op.id) account=\(op.accountId) event=\(op.eventId ?? "new"): \(reason)",
             source: "CalendarQueue")
@@ -218,14 +245,45 @@ extension AccountManager {
                 row.failureReason = reason
                 try row.update(db)
             }
+            return true
         } catch {
             // The row stays `inFlight`; `reconcileCalendarQueue` returns it to
-            // `queued` at next launch and the op retries. Recorded, not silent.
+            // `queued` at next launch and the op retries. Recorded, not silent —
+            // and reported, so no caller announces `.permanentFailure` over it.
             BackgroundSyncLogger.logError(
                 "[CalendarQueue] FAILED to record terminal outcome for op \(op.id) — it will be retried: \(error)",
                 source: "CalendarQueue")
             print("[CalendarQueue] Failed to record terminal outcome for op \(op.id): \(error)")
+            return false
         }
+    }
+
+    /// The single terminal-announcement gate: signal `.permanentFailure` when the
+    /// retirement committed, and the truthful `.stillQueued` when it did not.
+    ///
+    /// 🚨 R17-2 — ALL SIX TERMINAL ARMS ROUTE THROUGH THIS, so the producer's
+    /// verdict and the consumer's announcement cannot come apart again. The census
+    /// property is *"every call site that announces a terminal calendar outcome"*;
+    /// re-derive it with a predicate this comment cannot satisfy (`MIS-033`):
+    /// ```
+    /// rg -n --pcre2 '^(?!\s*(///|//)).*\.permanentFailure\(' \
+    ///    TabMail/Services/Account/AccountManagerCalendarQueue.swift
+    /// ```
+    /// → exactly one hit, inside this function. The two remaining
+    /// `signalCalendarOpOutcome` calls in `drainCalendarQueue` are deliberately
+    /// NOT members: `.success` follows a completed provider write (true whatever
+    /// the local delete did) and `.stillQueued` is the transient arm, which is
+    /// already non-terminal.
+    private func retireAndAnnounce(
+        _ op: PendingCalendarOperation,
+        reason: String,
+        caldavReauthAccountId: String? = nil
+    ) async {
+        let retired = await retireCalendarOperation(
+            op, reason: reason, caldavReauthAccountId: caldavReauthAccountId)
+        signalCalendarOpOutcome(
+            opId: op.id,
+            outcome: retired ? .permanentFailure(reason: reason) : .stillQueued)
     }
 
     // MARK: - Calendar Operation Queue
@@ -379,9 +437,8 @@ extension AccountManager {
                     if Self.isCalendarNotFoundError(error) {
                         print("[CalendarQueue] Event not found for \(opType) — retiring (server wins)")
                         let reason = "event not found on server"
-                        await retireCalendarOperation(currentOp, reason: reason)
+                        await retireAndAnnounce(currentOp, reason: reason)
                         executedAny = true
-                        signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: reason))
                         continue
                     }
                     if Self.isCalendarMissingScopeError(error) {
@@ -400,10 +457,9 @@ extension AccountManager {
                         // sibling left (`MIS-006`).
                         markAuthFailed(currentOp.accountId)
                         let reason = "calendar permission missing — user must re-authenticate in Settings"
-                        await retireCalendarOperation(currentOp, reason: reason)
+                        await retireAndAnnounce(currentOp, reason: reason)
                         executedAny = true
                         failedAccounts.insert(currentOp.accountId)
-                        signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: reason))
                         continue
                     }
                     // Auth failure — semi-permanent, needs re-authentication (L12).
@@ -429,14 +485,11 @@ extension AccountManager {
                         // the UPDATE for an OAuth account would match zero rows and
                         // read as if we had marked something. It travels INSIDE the
                         // retirement write so the two cannot come apart.
-                        await retireCalendarOperation(
+                        await retireAndAnnounce(
                             currentOp, reason: reason,
                             caldavReauthAccountId: isCalDAV ? currentOp.accountId : nil)
                         executedAny = true
                         failedAccounts.insert(currentOp.accountId)
-                        signalCalendarOpOutcome(
-                            opId: currentOp.id,
-                            outcome: .permanentFailure(reason: reason))
                         continue
                     }
 
@@ -447,9 +500,8 @@ extension AccountManager {
                     if Self.isCalendarUnsupportedError(error) {
                         let reason = unsupportedReason(error)
                         print("[CalendarQueue] Unsupported \(opType) (\(reason)) — retiring (no retry)")
-                        await retireCalendarOperation(currentOp, reason: reason)
+                        await retireAndAnnounce(currentOp, reason: reason)
                         executedAny = true
-                        signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: reason))
                         continue
                     }
 
@@ -460,9 +512,8 @@ extension AccountManager {
                     // drop the op and surface the message for manual attention.
                     if case CalDAVError.inconsistentState(let reason) = error {
                         print("[CalendarQueue] Inconsistent calendar state for \(opType) — retiring (no retry): \(reason)")
-                        await retireCalendarOperation(currentOp, reason: reason)
+                        await retireAndAnnounce(currentOp, reason: reason)
                         executedAny = true
-                        signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: reason))
                         continue
                     }
 
@@ -474,20 +525,29 @@ extension AccountManager {
                     if Self.isCalendarBadRequestError(error) {
                         print("[CalendarQueue] Bad request for \(opType) (\(error)) — retiring (will not retry)")
                         let reason = badRequestReason(error)
-                        await retireCalendarOperation(currentOp, reason: reason)
+                        await retireAndAnnounce(currentOp, reason: reason)
                         executedAny = true
-                        signalCalendarOpOutcome(opId: currentOp.id, outcome: .permanentFailure(reason: reason))
                         continue
                     }
 
                     // Transient errors — always retry. NEVER drop on age alone.
                     // Only confirmed-stale paths above (notFound, missingScope,
-                    // authError, unsupported, inconsistentState, badRequest — SIX
-                    // arms, re-derived 2026-08-06 by grepping
-                    // `retireCalendarOperation` in this function) may retire an op,
-                    // and none of them DELETES it: each moves the row to
-                    // `PendingStatus.failed` with a reason. See
-                    // `retireCalendarOperation`.
+                    // authError, unsupported, inconsistentState, badRequest) may
+                    // retire an op, and none of them DELETES it: each moves the row
+                    // to `PendingStatus.failed` with a reason.
+                    //
+                    // ⚠ The names above are the members; the COUNT is re-derived,
+                    // not carried (`MIS-031` — this sentence said "SIX arms,
+                    // re-derived by grepping `retireCalendarOperation`", and R17-2
+                    // moved the arms onto `retireAndAnnounce`, so the stated
+                    // predicate stopped returning what the sentence claimed while
+                    // the sentence stayed put). Comments excluded so this paragraph
+                    // cannot satisfy it (`MIS-033`):
+                    //   rg -c --pcre2 '^(?!\s*(///|//)).*retireAndAnnounce\('
+                    //      TabMail/Services/Account/AccountManagerCalendarQueue.swift
+                    // → 7 at R17-2: the six arms plus the function's own definition.
+                    // See `retireAndAnnounce`, which is now the single terminal
+                    // announcement gate, and `retireCalendarOperation` beneath it.
                     print("[CalendarQueue] Failed \(opType): \(error) (age \(String(format: "%.1f", ageHours))h) — will retry")
                     try? await retryWrite(dbPool, label: "CalendarQueue") { db in
                         var updated = currentOp

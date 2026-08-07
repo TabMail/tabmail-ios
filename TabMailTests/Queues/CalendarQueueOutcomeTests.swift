@@ -192,4 +192,116 @@ struct CalendarQueueOutcomeTests {
         let wire = await mock.deletedEvents
         #expect(wire.isEmpty, "nothing should have reached the provider — got \(wire.count) delete(s)")
     }
+
+    // MARK: - R17-2 — a failed retirement WRITE is not a permanent failure
+
+    /// 🚨 THE INVARIANT (the system property, `MIS-015`): **a terminal calendar
+    /// outcome is announced only when the retirement that makes it terminal
+    /// durably committed.** Nothing below names `retireCalendarOperation`,
+    /// `retireAndAnnounce` or a boolean — any implementation in which the
+    /// producer's verdict and the consumer's announcement agree will pass.
+    ///
+    /// The defect: `retireCalendarOperation` was `async -> Void` and swallowed its
+    /// write failure, with a catch-arm comment stating that the row stays
+    /// `inFlight`, `reconcileCalendarQueue` returns it to `queued`, and **the op
+    /// retries**. All six terminal arms then ran
+    /// `signalCalendarOpOutcome(… .permanentFailure(reason:))` unconditionally,
+    /// three lines later. Producer says RETRYABLE, consumer announces TERMINAL.
+    ///
+    /// The consumer is what the user sees. `CalendarEventEditTool` flips the
+    /// confirmation card red and returns *"Do not tell the user the edit
+    /// succeeded … call calendar_event_edit again"*. The user re-issues, the
+    /// original row drains at the next launch too, and **two events exist with two
+    /// sets of invitations already delivered to other people** — not recoverable
+    /// by sync, because both are authoritative server objects and the recipients
+    /// already have both mails.
+    ///
+    /// The failure is injected as a real SQLite `ABORT` on the retirement's own
+    /// UPDATE rather than through a production seam, so the write genuinely fails
+    /// exactly where production's would (`feedback_nil_defaulted_seam_is_fail_dangerous`
+    /// — a seam defaulted to "no failure" proves nothing when it is dropped).
+    ///
+    /// TWO-SIDED (`feedback_non_vacuity_must_be_two_sided`): the committed side is
+    /// pinned by `unexecutableOpIsNotReportedAsSuccess` above, which asserts the
+    /// SAME drain on the SAME unexecutable op DOES report `.permanentFailure` when
+    /// the write is allowed to land. Deleting this fix's gate turns that test
+    /// green and this one red, and vice versa.
+    @Test("A retirement whose durable write fails is never announced as a permanent failure")
+    func failedRetirementWriteIsNotAnnouncedAsPermanent() async throws {
+        let accountId = "cal-r17-2"
+        let (pool, dir, previous) = try makeTestDB(accountId: accountId)
+        let mock = MockCalendarProvider()
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer {
+            Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+        }
+
+        // Same unexecutable op the sibling test uses — a delete with no event id,
+        // which every terminal arm agrees is not retryable ON ITS MERITS. The only
+        // thing that differs here is that the RETIREMENT ITSELF cannot be written.
+        let op = PendingCalendarOperation(
+            operationType: .delete, accountId: accountId, eventId: nil,
+            calendarId: "primary", arguments: [:])
+        try await pool.write { db in
+            try op.insert(db)
+            // Injected write failure, at the exact statement the retirement makes.
+            try db.execute(sql: """
+                CREATE TRIGGER r17_2_block_retirement
+                BEFORE UPDATE ON pendingCalendarOperation
+                WHEN NEW.status = 'failed'
+                BEGIN SELECT RAISE(ABORT, 'injected retirement write failure'); END;
+                """)
+        }
+
+        async let outcome = AccountManager.shared.awaitCalendarOpOutcome(
+            opId: op.id, timeoutSeconds: 5.0)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        await AccountManager.shared.drainCalendarQueue()
+        let result = await outcome
+
+        if case .permanentFailure(let reason) = result {
+            #expect(Bool(false), """
+                the drain announced a PERMANENT failure ("\(reason)") over a retirement \
+                that never committed. Its own catch arm says the op retries — so the \
+                user is told the calendar action failed for good, re-issues it, and the \
+                original row drains too: two events, and two sets of invitations already \
+                sent to other people. Nothing converges them
+                """)
+        }
+        // NON-VACUITY, and the proof that the injection actually fired: if the
+        // retirement HAD committed, `.permanentFailure` would be correct and this
+        // test would be asserting nothing.
+        let rows = try await pool.read { db in try PendingCalendarOperation.fetchAll(db) }
+        guard rows.count == 1 else {
+            #expect(Bool(false), "expected the op to survive its failed retirement, found \(rows.count) row(s)")
+            return
+        }
+        #expect(rows[0].status != PendingStatus.failed.rawValue,
+                "fixture check: the injected ABORT must have prevented the terminal write, or this test proves nothing")
+
+        // And the op is genuinely still claimable — the half that makes
+        // `.permanentFailure` a lie. `reconcileCalendarQueue`'s recovery filter is
+        // `status == inFlight`, so a row in that state IS one the next launch
+        // returns to `queued` and retries.
+        #expect(rows[0].status == PendingStatus.inFlight.rawValue,
+                """
+                a retirement that could not be written must leave the op in the state \
+                launch reconciliation reclaims; got \(rows[0].status)
+                """)
+
+        // End to end: with the injected failure removed, the ordinary recovery path
+        // does exactly what the catch arm promised — the op is retried and THEN
+        // retired for real. The intention was never dropped and never duplicated.
+        try await pool.write { db in try db.execute(sql: "DROP TRIGGER r17_2_block_retirement") }
+        await AccountManager.shared.reconcileCalendarQueue()
+        let recovered = try await pool.read { db in try PendingCalendarOperation.fetchAll(db) }
+        #expect(recovered.count == 1)
+        guard recovered.count == 1 else { return }
+        #expect(recovered[0].status == PendingStatus.failed.rawValue,
+                "after recovery the op reaches its real terminal state, so nothing is wedged either")
+        #expect(!(recovered[0].failureReason ?? "").isEmpty)
+        let wire = await mock.deletedEvents
+        #expect(wire.isEmpty, "nothing should have reached the provider — got \(wire.count) delete(s)")
+    }
 }
