@@ -86,7 +86,15 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// states it omits the reference's optional RFC corroboration "because v3's
     /// typed identity has no RFC leg". There is no weaker arm to degrade TO — the
     /// alternative to a usable epoch is REFUSAL (`actionIdentityResolutionFailed`),
-    /// which is a retryable throw, not a delete. An RFC 822 Message-ID never selects
+    /// not a delete. ⚠️ **THAT REFUSAL IS TERMINAL, NOT RETRYABLE — this sentence
+    /// said "which is a retryable throw" until 2026-08-06 and it was the wrong
+    /// disposition.** `ProviderError.actionIdentityResolutionFailed`'s own
+    /// declaration states it is *"DETERMINISTIC and PRE-WIRE: it cannot change on
+    /// retry. The drain terminalizes it instead"*, and `drainPendingQueue`'s arm
+    /// does exactly that — `PendingOperation.deleteOne`, an adjudicated drop
+    /// (`IOS-QUEUE-003` item 4). Do not re-litigate the disposition here: what a
+    /// dropped `.deleteDraft` costs, and why the arm must never be split per-id, are
+    /// argued at that arm. An RFC 822 Message-ID never selects
     /// or authorizes a mutation target (ADR-IOS-068/D4), so a comment describing one
     /// is not merely stale: it reads as an instruction to restore the banned path.
     ///

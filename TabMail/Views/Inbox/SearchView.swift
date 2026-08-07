@@ -401,9 +401,28 @@ struct SearchView: View {
     ///     `SyncEngine.fetchOlderMessages` ·
     ///     `SyncEngineBackfillDeep.insertBackfillBatchGuardable` ·
     ///     `SyncEngineFullSync.runSyncMessages` ×2 (the proven merge and the
-    ///     insert). `NSEDataBridge.insertNewHeaderFromStaging` is in NEITHER
-    ///     class: it copies whatever the NSE staged, so the value's provenance is
-    ///     the staging row rather than this pass.
+    ///     insert). **TWO statements are in NEITHER class** — they copy whatever
+    ///     the NSE staged, so the value's provenance is the staging row rather
+    ///     than this pass: `NSEDataBridge.insertNewHeaderFromStaging` and
+    ///     `StagedInboxRow.toMessageHeader`. Classified total: 18 + 2 + 5 + 2 = **27**.
+    ///
+    ///     ⚠️ **`StagedInboxRow.toMessageHeader` WAS MISSING FROM THIS CENSUS UNTIL
+    ///     2026-08-06, AND THE EXCLUSION CLAUSE ABOVE IS WHY** — it lists
+    ///     `StagedInboxRow` among the types carrying a *same-named field*, which is
+    ///     correct as far as it goes and is not the shape of that statement.
+    ///     `h.observedUidValidity = observedUidValidity` has a **`MessageHeader` on
+    ///     the LEFT** and `StagedInboxRow`'s field only on the right, so it assigns
+    ///     to `MessageHeader.observedUidValidity` and the predicate claims it.
+    ///     **THE INVARIANT, so the next reader does not need this instance:** this
+    ///     census is about the type of the ASSIGNMENT TARGET. A same-named field on
+    ///     another type excludes a statement only when it is the target; as a
+    ///     source it is irrelevant, and a name-shaped exclusion cannot tell those
+    ///     apart (`feedback_filename_is_not_a_type_qualifier`). All 25 previous
+    ///     attributions were CORRECT — only completeness failed. Re-derived with a
+    ///     deliberately different instrument from the `.set(to:)` one that built the
+    ///     list above (a direct `\.observedUidValidity\s*=\s*[^=]` sweep over
+    ///     `TabMail/ Shared/ TabMailNotificationService/`), because a census re-run
+    ///     with its own shape returns its own answer.
     ///
     ///     Some nil-writers write onto a row being re-keyed or adopted under a
     ///     new primary key rather than onto a row updated in place — **that

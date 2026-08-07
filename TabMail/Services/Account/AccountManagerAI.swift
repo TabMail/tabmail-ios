@@ -271,11 +271,11 @@ struct AIWriteTarget: Sendable, Equatable {
     ///     a replacement bearing a `nil` stamp while the folder stayed on the
     ///     captured epoch — arms 6a, 6b and 7 all passed on a row that was not the
     ///     captured message, binding X's summary onto Y (a C3 hole). And it refused
-    ///     an UNREPLACED row whose stamp was merely absent — **18 production
-    ///     statements write only `nil` to that column (20 counting the two that
-    ///     write nil-or-epoch by a branch) against 5 that write only a proven
-    ///     epoch**, so absence is the ORDINARY state, not evidence of a turnover
-    ///     — which left `summaryBlurb`/`actionTag`
+    ///     an UNREPLACED row whose stamp was merely absent — **production writes of
+    ///     `nil` to that column outnumber writes of a proven epoch by a wide margin
+    ///     (the enumeration, with its predicate and its members, is owned by
+    ///     `SearchView.resolveLocalResultHeaderId`)**, so absence is the ORDINARY
+    ///     state, not evidence of a turnover — which left `summaryBlurb`/`actionTag`
     ///     nil, so `needsSummary`/`needsAction` stayed true, so the next open
     ///     re-ran the LLM and dropped it again: a paid API call repeated forever
     ///     for a summary that could never land.
@@ -288,7 +288,14 @@ struct AIWriteTarget: Sendable, Equatable {
     ///     enclosing symbol, and the exclusive/inclusive split live in the
     ///     doc comment on `SearchView.resolveLocalResultHeaderId`
     ///     ("THE COUNT, WITH ITS PREDICATE AND ITS MEMBERS"). **Re-derive there
-    ///     and update there; do not restate a bare integer here.**
+    ///     and update there; do not restate a bare integer here.** ⚠️ **This
+    ///     paragraph DID restate them — "18 … (20 …) against 5" — two paragraphs
+    ///     below its own prohibition, and the restatement was removed 2026-08-06
+    ///     when the owning census grew a member.** The DIRECTION is what this arm
+    ///     depends on and it is stated above; the integers are not, and a second
+    ///     copy of them is a second thing to keep true. That is the whole reason
+    ///     the prohibition exists — the "15 against 4" instance it was written
+    ///     about failed exactly this way.
     ///
     ///     Reading the row's own stamp closes the first half. It does NOT close the
     ///     second, and must not be mistaken for doing so: captured-nil against

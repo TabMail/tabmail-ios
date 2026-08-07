@@ -594,8 +594,27 @@ extension SyncEngine {
     /// `InboxViewModel.markAllAsRead`'s three statements returns the SAME ROWS
     /// without it, just via a temp B-tree sort — the O(U²/50) shape `v83` exists to
     /// remove. No result changes, no write depends on it, and nothing names it in an
-    /// `INDEXED BY` clause (`rg 'INDEXED BY messageHeader_unreadSweep'` over
-    /// `TabMail/ Shared/ TabMailNotificationService/` → zero).
+    /// `INDEXED BY` clause.
+    ///
+    /// ⚠️ **THE CHECK IS STATED AS AN INSTRUMENT THIS SENTENCE CANNOT ENTER, and
+    /// that is the entire point.** It used to read *"`rg 'INDEXED BY
+    /// messageHeader_unreadSweep'` … → zero"*, which was FALSE THE MOMENT IT WAS
+    /// WRITTEN: the grep returned exactly one hit — this comment. A check whose
+    /// quoted command matches the prose quoting it can never be re-run to a clean
+    /// result, and it fails silently, because the reader who re-runs it sees a hit
+    /// and cannot tell a real `INDEXED BY` from the sentence claiming there is none
+    /// (`MIS-033`). Re-run these two instead; both skip `//` and `///` lines with a
+    /// negative lookahead, so no comment — including this one — can satisfy them:
+    ///   1. **Absence, the claim itself.** `rg --pcre2 '^(?!\s*(///|//)).*INDEXED
+    ///      BY\s+messageHeader_unreadSweep' TabMail/ Shared/
+    ///      TabMailNotificationService/` → **no output, exit 1**.
+    ///   2. **Non-vacuity, so a broken regex cannot pass as a clean result.**
+    ///      The same command without the index name returns exactly the **four**
+    ///      live hints — `messageHeader_folderId_messageId` (`MessageContentStore`),
+    ///      `messageHeader_rfc822MessageId` (`MessageContentStore`, `ChatStore`) and
+    ///      `messageHeader_triage_display` (`InboxListReader`) — every one built by
+    ///      a SHIPPED migration (`v64`, `v1` ×2, `v38`), none deferred. Check 1 is
+    ///      meaningful only when check 2 is non-empty.
     ///
     /// CONVERGENCE (Data Integrity rule 5). `v83`'s body is now empty, so the two
     /// populations diverge for exactly as long as it takes this pass to run: a

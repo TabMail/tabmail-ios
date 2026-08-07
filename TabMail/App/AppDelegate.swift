@@ -564,10 +564,26 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 
         // MARK_READ wires through AccountManager.markRead so the local
         // MessageHeader.isRead + folder.unreadCount flip optimistically, the
-        // optimistic overlay registers, sibling rfc822 rows expand, the
-        // delivered notification clears, and drainPendingQueue auto-kicks.
+        // optimistic overlay registers, the addressed row is ADMITTED (or
+        // refused) by `admittedOrdinaryActionTargets`, the delivered
+        // notification clears, and drainPendingQueue auto-kicks.
         // Direct PendingOperation INSERT bypasses all of that and leaves the
         // local row stale for up to 30s past drain (recentlyCompleted guard).
+        //
+        // ⚠️ THIS SAID "sibling rfc822 rows expand" UNTIL 2026-08-06. That
+        // behaviour is GONE — `AccountManager.expandWithSiblingsByRfc822`
+        // survives only as a removal note in `SyncEngineEpochVerify` — and the
+        // sentence was worse than merely stale: it advertised the remedy
+        // ADR-IOS-068/D4 PROHIBITS (selecting mutation targets by RFC 822
+        // Message-ID), so a reader repairing this path would have reached for
+        // it. `IOS-IMAP-011` owns the removal. What runs today does the
+        // OPPOSITE of expanding: `admittedOrdinaryActionTargets` NARROWS the
+        // gesture to the rows whose address it can prove — on IMAP, a folder
+        // with no pending epoch reset, a live `lastKnownUidValidity`, and per
+        // row `observedUidValidity == liveEpoch` with a `messageId` that is
+        // exactly its own UID — dropping the unproven members and returning nil
+        // if none survive, so the op carries one coherent epoch. Non-IMAP
+        // providers admit any non-empty stable id and record no epoch.
         if actionId == "MARK_READ" {
             guard let messageId = userInfo["messageId"] as? String,
                   let accountId = userInfo["accountId"] as? String else {

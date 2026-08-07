@@ -3106,6 +3106,15 @@ final class AppDatabase: Sendable {
         // — that is a checked fact, not an assumption, and it is the check to re-run
         // before deferring the next one.
         //
+        // ⚠️ RE-RUN IT WITH THE PAIR OF COMMANDS ON `SyncEngineMaintenance
+        // .deferredIndexes`, NOT WITH A BARE GREP FOR THE INDEX NAME. This banner
+        // used to send the next author to a check that matched the sentence
+        // describing it — one hit, from prose — so the re-run could never come back
+        // clean and the reader could not tell prose from SQL (`MIS-033`). Those two
+        // commands exclude `//` and `///` lines by construction, and the second one
+        // is the non-vacuity half: it must return the four live hints, or the first
+        // one's silence proves nothing.
+        //
         // 🚨 THE DEFECT IS A PLAN, NOT A QUERY. `markAllAsRead` runs three statements
         // per folder — a frozen upper-bound probe (`ORDER BY id COLLATE BINARY DESC
         // LIMIT 1`), a first page, and a cursor page (`id > ? AND id <= ?`), all under

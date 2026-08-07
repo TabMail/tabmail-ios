@@ -88,9 +88,16 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
     ///
     /// nil for non-IMAP providers, for a draft that was never pushed, and for
     /// any row written before v72. For an IMAP row a nil epoch means the delete
-    /// cannot be addressed at all and REFUSES (`actionIdentityResolutionFailed`,
-    /// a retryable throw); for Gmail/Graph the address is a stable epoch-free
-    /// resource id and nothing is missing.
+    /// cannot be addressed at all and REFUSES (`actionIdentityResolutionFailed`);
+    /// for Gmail/Graph the address is a stable epoch-free resource id and nothing
+    /// is missing.
+    ///
+    /// ⚠️ **THAT REFUSAL IS TERMINAL, NOT RETRYABLE — this said "a retryable
+    /// throw" until 2026-08-06.** The error's own declaration says it is
+    /// *"DETERMINISTIC and PRE-WIRE: it cannot change on retry. The drain
+    /// terminalizes it instead"*, and `drainPendingQueue` runs
+    /// `PendingOperation.deleteOne` on it: an adjudicated drop, `IOS-QUEUE-003`
+    /// item 4. The disposition is settled there, not here.
     ///
     /// ⚠️ CORRECTED 2026-08-06. This used to say the recorded UID "is FETCHed and
     /// corroborated" after the epoch check, and that a nil epoch kept the row "on

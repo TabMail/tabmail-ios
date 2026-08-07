@@ -5546,9 +5546,24 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// removes EVERY message flagged `\Deleted` in the selected mailbox — another
     /// client's soft-deleted mail, or a copy a crashed prior attempt left marked
     /// but unexpunged. On the draft path the blast radius lands in Drafts, which is
-    /// precisely where `saveDraft` leaves `\Deleted`-but-unexpunged messages behind
-    /// on its `try?`-swallowed legs. That is a wrong-message deletion — C3 — with
-    /// or without any UIDVALIDITY change.
+    /// precisely where `saveDraft` leaves `\Deleted`-but-unexpunged messages behind.
+    /// That is a wrong-message deletion — C3 — with or without any UIDVALIDITY
+    /// change.
+    ///
+    /// ⚠️ **THIS SENTENCE SAID "on its `try?`-swallowed legs" UNTIL 2026-08-06 AND
+    /// THAT MECHANISM DOES NOT EXIST.** `saveDraft`'s old-copy replacement issues
+    /// `try await server.store(flags: [.deleted], …)` and `try await
+    /// self.expungeScopedToTargets(…)` — both propagate, neither swallows, and the
+    /// current polarity is CORRECT (do not "restore" `try?` to make a comment
+    /// true). The conclusion is unchanged, because Drafts accumulates
+    /// marked-but-unexpunged messages by **two live mechanisms** instead:
+    ///   1. **This function's own non-UIDPLUS arm deliberately issues nothing.** The
+    ///      caller has already sent the `\Deleted` STORE, so on every server without
+    ///      UIDPLUS the message stays marked and present, by design, forever.
+    ///   2. **A crash, kill or connection drop between the STORE `await` and the
+    ///      expunge `await`** leaves the same residue, on any server.
+    /// Both are recoverable soft deletes and both are exactly the population a bare
+    /// mailbox-wide `EXPUNGE` would destroy.
     ///
     /// UID EXPUNGE (RFC 4315) when the server advertises UIDPLUS, and NOTHING
     /// otherwise. `target` must already name exactly the verified UID(s) to
@@ -5581,9 +5596,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // No UIDPLUS: a mailbox-wide EXPUNGE is the ONLY server-side purge
             // available, and it removes EVERY `\Deleted` message in the selected
             // mailbox (RFC 3501 §6.4.3) — another client's soft-deleted mail, or a
-            // copy a crashed `saveDraft` left marked-but-unexpunged on one of its
-            // `try?`-swallowed legs. That is a wrong-message deletion, with or
-            // without any UIDVALIDITY change. FAIL CLOSED: the `\Deleted` STORE the
+            // copy left marked-but-unexpunged by a `saveDraft` that was killed
+            // between its STORE `await` and its expunge `await`, or by an EARLIER
+            // TRIP THROUGH THIS VERY BRANCH. That is a wrong-message deletion, with
+            // or without any UIDVALIDITY change. (This said "on one of its
+            // `try?`-swallowed legs" until 2026-08-06; `saveDraft` has no `try?` on
+            // that path and never did in this revision — see the doc comment above.
+            // Note the self-reference: on a non-UIDPLUS server this arm is itself
+            // the main producer of the residue, so the population grows with every
+            // draft replacement and a bare EXPUNGE gets more dangerous over time,
+            // not less.) FAIL CLOSED: the `\Deleted` STORE the
             // caller already issued records the deletion intent (soft delete), and a
             // UIDPLUS-capable client or the server's own policy completes the purge.
             // NEVER a mailbox-wide EXPUNGE.
