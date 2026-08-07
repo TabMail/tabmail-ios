@@ -217,27 +217,59 @@ actor DemoProvider: EmailProvider {
         let serverId = existingDraftId ?? "demo-draft-\(UUID().uuidString.prefix(8))"
         try await db.dbPool.write { conn in
             let folderId = "\(self.accountId):\(draftsFolderPath)"
-            let oldHeaderId = MessageIdentity.headerId(accountId: self.accountId, folderPath: draftsFolderPath, messageId: serverId)
-            if let existing = try MessageHeader.filter(Column("id") == oldHeaderId).fetchOne(conn) {
-                try existing.delete(conn)
-            }
-            var header = MessageHeader(
-                messageId: serverId,
-                subject: draft.subject,
-                from: DemoSeed.demoDisplayName,
-                fromAddress: DemoSeed.demoEmail,
-                to: draft.to.joined(separator: ", "),
-                date: Date(),
-                snippet: String(Self.stripHTML(draft.body).prefix(160)),
-                folderId: folderId,
-                accountId: self.accountId,
-                folderPath: draftsFolderPath,
-                isInInbox: false
-            )
+            let headerId = MessageIdentity.headerId(accountId: self.accountId, folderPath: draftsFolderPath, messageId: serverId)
+            // 🚨 R17b-B1 — RE-MATERIALISE IN PLACE, NEVER DELETE + RE-INSERT.
+            //
+            // Re-saving a demo draft addresses the SAME primary key: `serverId` is
+            // the prior `.demo(localId:)` identity, and the account, folder path and
+            // message id that mint `headerId` are all unchanged. So there is no
+            // re-key here and nothing to carry — but the old shape still ran
+            // `existing.delete(conn)` first, and a `messageHeader` delete fires
+            // `ON DELETE CASCADE` on BOTH of that table's surviving children
+            // whether or not the key moves:
+            //   * `messageUserLabel` (`AppDatabase` `v82`, cascade on `messageId`) —
+            //     every label the user applied, with NO rebuild source anywhere in
+            //     the database, and demo mode has no server to re-fetch it from;
+            //   * `messageReference` (`AppDatabase` `v27`, cascade on
+            //     `messageHeaderId`) — the draft's threading edges. A REPLY draft
+            //     carries `In-Reply-To`, so the edge to the message being replied to
+            //     was destroyed on every autosave.
+            // The re-insert restored neither. `MessageHeaderRekey.apply` is the
+            // carrier for the case where the key genuinely MOVES; here the smaller
+            // and strictly safer answer is not to delete at all, which is the shape
+            // `AccountManagerActions`' real (non-demo) draft-placeholder write
+            // already uses — fetch-or-create, assign the fields the save changes,
+            // then `save`.
+            //
+            // ⚠️ AND THE DELETE HAD A SECOND CONSEQUENCE THAT ONLY APPEARED AFTER
+            // `v70_dropMessageBodyHeaderFK`: `messageBody` is no longer cascaded, so
+            // the old body row SURVIVED the header delete and the unconditional
+            // `MessageBody(…).insert(conn)` below it hit `UNIQUE constraint failed:
+            // messageBody.id` on the second save of any demo draft — the whole write
+            // rolled back and the save reported failure. `save` is an upsert, so the
+            // body is replaced rather than re-inserted.
+            var header = try MessageHeader.fetchOne(conn, key: headerId)
+                ?? MessageHeader(
+                    messageId: serverId,
+                    subject: draft.subject,
+                    from: DemoSeed.demoDisplayName,
+                    fromAddress: DemoSeed.demoEmail,
+                    to: draft.to.joined(separator: ", "),
+                    date: Date(),
+                    snippet: String(Self.stripHTML(draft.body).prefix(160)),
+                    folderId: folderId,
+                    accountId: self.accountId,
+                    folderPath: draftsFolderPath,
+                    isInInbox: false
+                )
+            header.subject = draft.subject
+            header.to = draft.to.joined(separator: ", ")
+            header.date = Date()
+            header.snippet = String(Self.stripHTML(draft.body).prefix(160))
             header.rfc822MessageId = serverId
             header.headerComplete = true
-            try header.insert(conn)
-            try MessageBody(contentKey: ContentKey(rawValue: header.id), htmlContent: draft.body).insert(conn)
+            try header.save(conn)
+            try MessageBody(contentKey: ContentKey(rawValue: header.id), htmlContent: draft.body).save(conn)
         }
         return .created(.demo(localId: serverId))
     }

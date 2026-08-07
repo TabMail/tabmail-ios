@@ -468,3 +468,228 @@ struct DemoMoveRekeyChildrenTests {
         #expect(after.4 == false, "and nothing may be left stranded under the retired id")
     }
 }
+
+// MARK: - R17b-B1 — a demo draft re-save is a DELETE + RE-INSERT of the same message
+
+/// `DemoProvider.saveDraft` re-materialised the draft's `messageHeader` row by
+/// deleting it and inserting a replacement under the **same** primary key.
+///
+/// That makes it a member of the class *"every code path that DELETEs a
+/// `messageHeader` row and re-inserts a row for the same message"* — which is
+/// strictly wider than the key-change class R17-1 enumerated, because the harm
+/// was never that the key moved. `ON DELETE CASCADE` on `messageUserLabel`
+/// (`v82`) and `messageReference` (`v27`) fires on **any** header delete, and an
+/// insert restores neither.
+///
+/// Separated from `DemoIsolationTests` for the same reason
+/// `DemoMoveRekeyChildrenTests` is: it drives the real provider against an
+/// installed `AppDatabase.shared`, so it mutates global state and must be
+/// `.serialized`.
+@Suite("Demo draft save — re-materialising in place keeps the header's FK children", .serialized)
+struct DemoDraftSaveChildrenTests {
+
+    private func install() throws -> (DatabasePool, URL, AppDatabase?) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("demo-draft-save-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration)
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let saved = current
+            current = appDatabase
+            return saved
+        }
+        return (pool, directory, previous)
+    }
+
+    private func finish(_ fixture: (DatabasePool, URL, AppDatabase?)) {
+        InstalledTestDatabaseLifetime.finish(
+            previous: fixture.2, pool: fixture.0, directory: fixture.1)
+    }
+
+    /// Seed the demo account, a Drafts folder, and one draft header carrying the
+    /// two pieces of state a header delete destroys.
+    private func seed(
+        pool: DatabasePool, accountId: String, draftId: String, parentRfc: String
+    ) async throws -> String {
+        let headerId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: "DRAFTS", messageId: draftId)
+        try await pool.write { db in
+            var account = Account(
+                emailAddress: "demo@example.com", displayName: "Demo", provider: .imap)
+            account.id = accountId
+            try account.insert(db)
+            try Folder(
+                name: "Drafts", path: "DRAFTS", role: .drafts, accountId: accountId).insert(db)
+            var header = MessageHeader(
+                messageId: draftId, subject: "old subject", from: "Demo",
+                fromAddress: "demo@example.com", to: "peer@example.com", date: Date(),
+                snippet: "", folderId: "\(accountId):DRAFTS", accountId: accountId,
+                folderPath: "DRAFTS", isInInbox: false)
+            header.rfc822MessageId = draftId
+            header.inReplyTo = parentRfc
+            try header.insert(db)
+            try ThreadUtils.insertMessageReferences(for: header, db: db)
+            let label = UserLabel(
+                accountId: accountId, providerLabelId: "keep", name: "Keep", isSystem: false)
+            try label.insert(db, onConflict: .ignore)
+            try MessageUserLabel(messageId: header.id, userLabelId: label.id).insert(db)
+        }
+        return headerId
+    }
+
+    /// 🚨 THE INVARIANT, stated as the system property rather than the mechanism
+    /// (`MIS-015`): **a message re-materialised in place keeps its labels and its
+    /// threading edges.** No assertion names `delete`, `insert`, `update` or
+    /// `MessageHeaderRekey`.
+    ///
+    /// A reply draft is the case that bites: it carries `In-Reply-To`, so its
+    /// edge to the message being replied to was destroyed on every autosave, and
+    /// demo mode has no server from which any of it could be re-fetched.
+    @Test("A demo draft re-save keeps the draft's labels and threading edges")
+    func demoDraftResaveKeepsHeaderChildren() async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let pool = fixture.0
+        let accountId = DemoSeed.demoAccountId
+        let draftId = "demo-draft-r17b"
+        let parentRfc = "r17b-demo-parent@example.com"
+        let headerId = try await seed(
+            pool: pool, accountId: accountId, draftId: draftId, parentRfc: parentRfc)
+
+        // MIS-030 — anchor the fixture BEFORE the act, so a post-save assertion
+        // cannot pass vacuously against rows that never existed.
+        let before = try await pool.read { db -> (Int, Int) in
+            (try MessageUserLabel.filter(Column("messageId") == headerId).fetchCount(db),
+             try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM messageReference WHERE messageHeaderId = ?",
+                arguments: [headerId]) ?? 0)
+        }
+        #expect(before.0 == 1, "precondition: the user applied a label to this draft")
+        #expect(before.1 == 1, "precondition: the reply draft has a threading edge to its parent")
+
+        let provider = DemoProvider(accountId: accountId)
+        let draft = DraftMessage(
+            to: ["peer@example.com"], subject: "new subject", body: "edited body",
+            inReplyTo: parentRfc)
+        _ = try await provider.saveDraft(
+            draft, existingIdentity: .demo(localId: draftId), draftsFolderPath: "DRAFTS")
+
+        let after = try await pool.read { db -> (String?, [String], [String]) in
+            (try MessageHeader.fetchOne(db, key: headerId)?.subject,
+             try MessageUserLabel.filter(Column("messageId") == headerId)
+                .fetchAll(db).map(\.userLabelId),
+             try String.fetchAll(
+                db,
+                sql: "SELECT referencedRfc822Id FROM messageReference WHERE messageHeaderId = ?",
+                arguments: [headerId]))
+        }
+        #expect(after.0 == "new subject", "setup: the save must have applied the edit")
+        #expect(after.1 == ["\(accountId):keep"],
+                """
+                the user's label must survive a re-save of the same draft — nothing in \
+                the database can rebuild it, and demo has no server to re-fetch it from
+                """)
+        #expect(after.2 == [parentRfc],
+                "and the threading edge, or the reply falls out of its own conversation")
+    }
+
+    /// The same invariant read from the durability end: a draft the user edits
+    /// twice must still be there, with the second edit's content.
+    ///
+    /// This is a distinct end state, not a restatement: since
+    /// `v70_dropMessageBodyHeaderFK` the `messageBody` row is NOT cascaded by a
+    /// header delete, so it outlived the delete and collided with the
+    /// unconditional body insert that followed.
+    @Test("A demo draft edited twice keeps the second edit")
+    func demoDraftSurvivesASecondSave() async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let pool = fixture.0
+        let accountId = DemoSeed.demoAccountId
+        try await pool.write { db in
+            var account = Account(
+                emailAddress: "demo@example.com", displayName: "Demo", provider: .imap)
+            account.id = accountId
+            try account.insert(db)
+            try Folder(
+                name: "Drafts", path: "DRAFTS", role: .drafts, accountId: accountId).insert(db)
+        }
+
+        let provider = DemoProvider(accountId: accountId)
+        let first = try await provider.saveDraft(
+            DraftMessage(to: ["peer@example.com"], subject: "v1", body: "first body"),
+            existingIdentity: nil, draftsFolderPath: "DRAFTS")
+        guard case .created(let identity) = first, case .demo(let localId) = identity else {
+            Issue.record("setup: the first save must mint a demo draft identity")
+            return
+        }
+        // MIS-030 — the second save is only meaningful if the first one landed.
+        let seeded = try await pool.read { db in
+            try MessageHeader.filter(Column("accountId") == accountId).fetchCount(db)
+        }
+        #expect(seeded == 1, "precondition: the first save created exactly one draft header")
+
+        _ = try await provider.saveDraft(
+            DraftMessage(to: ["peer@example.com"], subject: "v2", body: "second body"),
+            existingIdentity: .demo(localId: localId), draftsFolderPath: "DRAFTS")
+
+        let headerId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: "DRAFTS", messageId: localId)
+        let after = try await pool.read { db -> (Int, String?, String?) in
+            (try MessageHeader.filter(Column("accountId") == accountId).fetchCount(db),
+             try MessageHeader.fetchOne(db, key: headerId)?.subject,
+             try MessageBody.fetchOne(db, key: ContentKey(rawValue: headerId))?.htmlContent)
+        }
+        #expect(after.0 == 1, "the draft is still exactly one row")
+        #expect(after.1 == "v2", "and it carries the second edit's subject")
+        #expect(after.2 == "second body", "and the second edit's body")
+    }
+
+    /// ⚠️ THE ASYMMETRY GUARD, and it must hold in BOTH directions (`MIS-005`,
+    /// `MIS-026`). A delete that genuinely DISCARDS a draft — the user threw it
+    /// away — must keep cascading its children away; only a delete that
+    /// re-materialises the *same* message is a member of the class above.
+    ///
+    /// This test is deliberately GREEN before and after the fix: it is the anchor
+    /// that proves the fix did not over-reach into the discard path. If it ever
+    /// goes red, a carrier has been added where a cascade belongs.
+    @Test("Discarding a demo draft still cascades its labels and threading edges away")
+    func demoDraftDeleteStillCascades() async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let pool = fixture.0
+        let accountId = DemoSeed.demoAccountId
+        let draftId = "demo-draft-discarded"
+        let parentRfc = "r17b-demo-discard-parent@example.com"
+        let headerId = try await seed(
+            pool: pool, accountId: accountId, draftId: draftId, parentRfc: parentRfc)
+
+        let before = try await pool.read { db -> (Int, Int) in
+            (try MessageUserLabel.filter(Column("messageId") == headerId).fetchCount(db),
+             try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM messageReference WHERE messageHeaderId = ?",
+                arguments: [headerId]) ?? 0)
+        }
+        #expect(before.0 == 1, "precondition: the discarded draft carried a label")
+        #expect(before.1 == 1, "precondition: the discarded draft carried a threading edge")
+
+        let provider = DemoProvider(accountId: accountId)
+        try await provider.deleteDraft(identity: .demo(localId: draftId))
+
+        let after = try await pool.read { db -> (Bool, Int, Int) in
+            (try MessageHeader.fetchOne(db, key: headerId) != nil,
+             try MessageUserLabel.filter(Column("messageId") == headerId).fetchCount(db),
+             try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM messageReference WHERE messageHeaderId = ?",
+                arguments: [headerId]) ?? 0)
+        }
+        #expect(after.0 == false, "the discarded draft is gone")
+        #expect(after.1 == 0, "and its label association went with it")
+        #expect(after.2 == 0, "and so did its threading edges — a discard must still cascade")
+    }
+}
