@@ -145,7 +145,18 @@ struct MigrationTimingAttributionTests {
 
     // MARK: - 1. The arithmetic reconciles
 
-    @Test("Bodies plus post-body intervals account for the whole v68…v83 chain")
+    /// ⚠️ RETIRED DISPLAY NAME, recorded verbatim (`b87804055`): this test was
+    /// **"Bodies plus post-body intervals account for the whole v68…v83 chain"**
+    /// until R17b-B3. The range it names is the `.immediate` regime, which is an
+    /// OPEN interval that moves with the top of the chain (`MIS-031`), and the
+    /// old name was stale from `v84`. The body is unchanged — it migrates a
+    /// `v67` database to HEAD and reconciles every entry the ledger produced.
+    ///
+    /// This file was NOT in R17-6's scope and NOT in the R17b brief's, which
+    /// named `MigrationForeignKeyModeTests` alone. It is here because the census
+    /// was run over `TabMailTests/` rather than over the file already in hand
+    /// (`MIS-007`).
+    @Test("Bodies plus post-body intervals account for the whole v67-to-HEAD chain")
     func chainAttributionReconciles() throws {
         let db = try Self.makeSeededV67Database(headers: 400, refs: 4_000)
 
@@ -175,8 +186,12 @@ struct MigrationTimingAttributionTests {
                 """)
 
         // Each entry truncates DOWN to whole milliseconds twice (body and gap),
-        // so a 16-migration chain can shed ~32 ms to rounding alone; the rest is
-        // GRDB's own pre-first-body setup.
+        // so a chain sheds up to 2 ms per migration to rounding alone; the rest is
+        // GRDB's own pre-first-body setup. The tolerance is computed from
+        // `report.entries.count` rather than from a written-down chain length,
+        // which is why this sentence no longer states one: it read *"a
+        // 16-migration chain can shed ~32 ms"* until R17b-B3 and the chain has
+        // been 17 (v68…v84) since `v84` landed (`MIS-031`).
         let tolerance = report.entries.count * 2 + 60
         #expect(abs(report.unattributedMs) <= tolerance,
                 """
@@ -192,7 +207,7 @@ struct MigrationTimingAttributionTests {
         let deferred = Set(report.entries.filter { $0.mode == "deferred" }.map(\.identifier))
         #expect(deferred.isEmpty,
                 """
-                every migration in the v68…v83 range runs `foreignKeyChecks: .immediate` \
+                every migration from v68 up runs `foreignKeyChecks: .immediate` \
                 as of 2026-08-06, so the range runs no whole-database \
                 `PRAGMA foreign_key_check` at all — \(deferred.sorted()) is/are still \
                 deferred. This is an ANCHOR, not a style rule: on the owner's device the \

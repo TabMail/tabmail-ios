@@ -9,15 +9,36 @@ import GRDB
 
 /// The invariant `foreignKeyChecks: .immediate` must not break.
 ///
-/// `v68…v83` used to run on the wrapper's `.deferred` default, which made GRDB
-/// append a whole-database `PRAGMA foreign_key_check` to EVERY one of the 16
-/// migrations — measured at 69–74% of the entire upgrade's wall clock, and at
-/// 70% of it (19,312 ms of 27,601 ms) on the owner's real device. ALL SIXTEEN now
-/// declare `.immediate` instead, which enforces foreign keys LIVE on the writes
-/// the body actually makes and runs no trailing scan. (This sentence read
-/// *"Fifteen of them"* between the two flips — `v82`'s gate outlived `v71`'s by one
-/// commit — and it is spelled out here because a count in a doc comment is a census
-/// claim, `MIS-006`.)
+/// The range from `v68` **to the top of the chain** used to run on the wrapper's
+/// `.deferred` default, which made GRDB append a whole-database
+/// `PRAGMA foreign_key_check` to EVERY migration in it — measured at 69–74% of
+/// the entire upgrade's wall clock, and at 70% of it (19,312 ms of 27,601 ms) on
+/// the owner's real device. They ALL declare `.immediate` instead now, which
+/// enforces foreign keys LIVE on the writes the body actually makes and runs no
+/// trailing scan.
+///
+/// ⚠️ **THE RANGE IS AN OPEN INTERVAL AND IS RE-DERIVED, NEVER RESTATED
+/// (`MIS-031`, `IOS-DOC-002`).** This paragraph read *"`v68…v83` … EVERY one of
+/// the 16 migrations … ALL SIXTEEN now declare `.immediate`"* until R17b-B3, and
+/// before that *"Fifteen of them"* between the two flips (`v82`'s gate outlived
+/// `v71`'s by one commit). Both were exact when written and both went stale the
+/// moment a migration was appended — R17-6 corrected the same sentence in five
+/// places in `AppDatabase.swift` and left this file's copies plus three test
+/// display names standing, which is the whole reason a display name counts as a
+/// describing sentence. Re-derive with predicates this comment cannot satisfy
+/// (`MIS-033`), rather than trusting any integer here:
+/// ```
+/// rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' \
+///    TabMail/Services/AppDatabase.swift                                    → 17
+/// rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' \
+///    TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 17
+/// ```
+/// Equal counts are the invariant: every migration from `v68` up runs
+/// `.immediate`, none below `v68` does, and `everyLiveForeignKeyCascades` below
+/// checks the premise that licenses it. At R17b the top of the chain is `v84`
+/// and the two counts are 17; at 84 registered migrations that leaves 67 still
+/// running the whole-database check (66 on the GRDB default plus `v2`, the only
+/// explicit `.deferred` left).
 ///
 /// 🚨 **THE PROPERTY PINNED HERE IS THE END STATE, NOT THE MODE TABLE.** A test
 /// that asserted "v72 is `.immediate`" would pass on a chain that leaves the
@@ -66,7 +87,12 @@ import GRDB
 /// bodies that measured 1 ms and 7 ms; the orphan class they ran early to catch
 /// is the one `v82` repairs itself. Read the two registration comments in
 /// `AppDatabase.swift` for the full argument.
-@Suite("Migration foreign-key modes (v68…v83)")
+///
+/// ⚠️ RETIRED DISPLAY NAME, recorded verbatim so existing citations still grep
+/// (`b87804055`'s convention): this suite was
+/// **"Migration foreign-key modes (v68…v83)"** until R17b-B3. Only the name
+/// changed — no assertion was added, removed or weakened.
+@Suite("Migration foreign-key modes (v68 to the top of the chain)")
 struct MigrationForeignKeyModeTests {
 
     // MARK: - Fixture
@@ -241,7 +267,12 @@ struct MigrationForeignKeyModeTests {
 
     // MARK: - 1. The invariant
 
-    @Test("v68…v83 leave a populated database foreign-key clean")
+    /// ⚠️ RETIRED DISPLAY NAME, recorded verbatim (`b87804055`): this test was
+    /// **"v68…v83 leave a populated database foreign-key clean"** until R17b-B3.
+    /// The body is unchanged — the fixture migrates from `v67` to the top of the
+    /// chain, which is what the new name says and what the old name stopped
+    /// saying at `v84`.
+    @Test("v68 to the top of the chain leaves a populated database foreign-key clean")
     func chainLeavesDatabaseForeignKeyClean() throws {
         let db = try Self.makeV67Database()
         try Self.seed(db)
@@ -270,8 +301,8 @@ struct MigrationForeignKeyModeTests {
     /// from opposite sides, and the way to tell them apart is to ask what breaks if
     /// it goes the other way.** If this ever starts failing because the chain aborts
     /// again, something has re-added a whole-database `PRAGMA foreign_key_check` to
-    /// the v68…v83 range — which on the owner's device cost 19,311 ms of a 27,601 ms
-    /// upgrade. That is the failure this pins. It does NOT bless orphans: the second
+    /// the `.immediate` range — which on the owner's device cost 19,311 ms of a
+    /// 27,601 ms upgrade. That is the failure this pins. It does NOT bless orphans: the second
     /// half asserts the orphan is still there afterwards, i.e. the chain walked past
     /// it rather than silently deleting the user's row.
     @Test("A pre-existing orphan no longer aborts the chain, and is left exactly as found")
@@ -280,9 +311,12 @@ struct MigrationForeignKeyModeTests {
         try Self.seed(db)
 
         // `messageReference → messageHeader` is the edge to break: it is declared
-        // at v27 and NO migration in v68…v83 rebuilds that table, so nothing in the
+        // at v27 and NO migration from v68 up rebuilds that table, so nothing in the
         // range repairs it either. (An orphan in `messageBody` would prove nothing —
-        // v70 drops the table outright.)
+        // v70 drops the table outright.) Re-derive rather than trust the range:
+        //   rg -n 'messageReference' TabMail/Services/AppDatabase.swift
+        // → every DDL hit is v27's create; `v84` only adds a column to
+        //   `pendingCalendarOperation`.
         //
         // Foreign keys have to be off to CREATE the orphan, which is the whole
         // point: a real one arrives the same way — written under a schema or a
@@ -307,7 +341,7 @@ struct MigrationForeignKeyModeTests {
             thrown == nil,
             """
             the chain aborted on a pre-existing dangling messageReference row: \
-            \(String(describing: thrown)). As of 2026-08-06 no migration in v68…v83 \
+            \(String(describing: thrown)). As of 2026-08-06 no migration from v68 up \
             runs a whole-database foreign-key check — both gates were retired because \
             they cost 19,311 ms of the owner's 27,601 ms device upgrade to guard \
             bodies of 1 ms and 7 ms, and their remedy on firing was a launch brick for \
