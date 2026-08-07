@@ -337,3 +337,134 @@ struct DemoIsolationTests {
         #expect(whileInactive == ["real-1:INBOX"])  // demo inbox NOT aggregated
     }
 }
+
+// MARK: - R17-1 — a demo move is a header PRIMARY-KEY change
+
+/// `DemoProvider.move` deletes the header row and re-inserts it under the
+/// destination-folder primary key, so it is a member of the class *"every code
+/// path that changes a header's primary key"* — the same class as
+/// `BackfillBodyQueue.rekeyRemappedHeader`, `DraftStore.migrateExactPlaceholder`
+/// and `SyncEngineFullSync.canonicalizeLocalRows`.
+///
+/// It is separated from `DemoIsolationTests` because it drives the real provider
+/// against an installed `AppDatabase.shared`, so unlike that suite it does mutate
+/// global state and must be `.serialized`.
+@Suite("Demo move — the re-key carries the header's FK children", .serialized)
+struct DemoMoveRekeyChildrenTests {
+
+    private func install() throws -> (DatabasePool, URL, AppDatabase?) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("demo-move-rekey-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration)
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let saved = current
+            current = appDatabase
+            return saved
+        }
+        return (pool, directory, previous)
+    }
+
+    private func finish(_ fixture: (DatabasePool, URL, AppDatabase?)) {
+        InstalledTestDatabaseLifetime.finish(
+            previous: fixture.2, pool: fixture.0, directory: fixture.1)
+    }
+
+    /// 🚨 THE INVARIANT, as the system property and not the mechanism
+    /// (`MIS-015`): **a header that changes its primary key keeps its labels and
+    /// its threading edges.** No assertion names `MessageHeaderRekey.apply`.
+    ///
+    /// `messageHeader` has exactly two surviving cascading children —
+    /// `messageUserLabel.messageId` (`v82`) and `messageReference.messageHeaderId`
+    /// (`v27`) — and this path's hand-rolled `delete` → reassign `id` → `insert`
+    /// restored neither. It also stranded the `messageBody` row: since
+    /// `v70_dropMessageBodyHeaderFK` the body is no longer cascaded away, so it
+    /// was left ORPHANED under the id the message no longer has, and the moved
+    /// message rendered blank. Demo mode has no server, so nothing re-fetches any
+    /// of it and every loss is permanent for the life of the demo account.
+    @Test("A demo move carries the message's labels, threading edges and body to the new id")
+    func demoMoveCarriesHeaderChildren() async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let pool = fixture.0
+        let accountId = DemoSeed.demoAccountId
+        let parentRfc = "r17-1-demo-parent@example.com"
+        let oldId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: "INBOX", messageId: "d1")
+        let newId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: "ARCHIVE", messageId: "d1")
+
+        try await pool.write { db in
+            var account = Account(
+                emailAddress: "demo@example.com", displayName: "Demo", provider: .imap)
+            account.id = accountId
+            try account.insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId).insert(db)
+            try Folder(
+                name: "Archive", path: "ARCHIVE", role: .archive, accountId: accountId).insert(db)
+            var header = MessageHeader(
+                messageId: "d1", subject: "Re: demo", from: "Peer",
+                fromAddress: "peer@example.com", to: "demo@example.com", date: Date(),
+                snippet: "", folderId: "\(accountId):INBOX", accountId: accountId,
+                folderPath: "INBOX", isInInbox: true)
+            header.inReplyTo = parentRfc
+            try header.insert(db)
+            try ThreadUtils.insertMessageReferences(for: header, db: db)
+            let label = UserLabel(
+                accountId: accountId, providerLabelId: "keep", name: "Keep", isSystem: false)
+            try label.insert(db, onConflict: .ignore)
+            try MessageUserLabel(messageId: header.id, userLabelId: label.id).insert(db)
+            try MessageBody(
+                contentKey: ContentKey(rawValue: header.id),
+                htmlContent: "<p>demo body</p>").insert(db)
+        }
+
+        // MIS-030 — anchor the fixture BEFORE the act, so the post-move
+        // assertions cannot pass against rows that never existed.
+        let before = try await pool.read { db -> (Int, Int, Bool) in
+            (try MessageUserLabel.filter(Column("messageId") == oldId).fetchCount(db),
+             try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM messageReference WHERE messageHeaderId = ?",
+                arguments: [oldId]) ?? 0,
+             try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) != nil)
+        }
+        #expect(before.0 == 1, "precondition: the user applied a label to the message")
+        #expect(before.1 == 1, "precondition: the message has a threading edge to its parent")
+        #expect(before.2, "precondition: the message has a cached body")
+
+        let provider = DemoProvider(accountId: accountId)
+        try await provider.move(ids: ["d1"], from: "INBOX", to: "ARCHIVE")
+
+        let after = try await pool.read { db -> (Bool, [String], [String], String?, Bool) in
+            (try MessageHeader.fetchOne(db, key: newId) != nil,
+             try MessageUserLabel.filter(Column("messageId") == newId)
+                .fetchAll(db).map(\.userLabelId),
+             try String.fetchAll(
+                db,
+                sql: "SELECT referencedRfc822Id FROM messageReference WHERE messageHeaderId = ?",
+                arguments: [newId]),
+             try MessageBody.fetchOne(db, key: ContentKey(rawValue: newId))?.htmlContent,
+             try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) != nil)
+        }
+        #expect(after.0, "setup: the move must have re-keyed the header to the destination")
+        #expect(after.1 == ["\(accountId):keep"],
+                """
+                the user's label must follow the message to the folder it was moved to — \
+                the re-key's delete cascades `messageUserLabel` and NOTHING can rebuild \
+                it, and demo has no server to re-fetch it from
+                """)
+        #expect(after.2 == [parentRfc],
+                "and the threading edge, or the message falls out of its own conversation")
+        #expect(after.3 == "<p>demo body</p>",
+                """
+                and the cached body, which since `v70_dropMessageBodyHeaderFK` is not \
+                cascaded but ORPHANED under the old id — leaving the moved message blank
+                """)
+        #expect(after.4 == false, "and nothing may be left stranded under the retired id")
+    }
+}

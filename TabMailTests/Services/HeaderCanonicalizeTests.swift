@@ -248,6 +248,167 @@ struct HeaderCanonicalizeTests {
         let result = try canonicalize(db, messageId: "g4")
         #expect(result.row?.actionTag == .archive)
     }
+
+    // MARK: - R17-1 — a header primary-key change must carry its FK children
+
+    /// Give a header a user label and a threading edge to `parentRfc`, the two
+    /// child tables that declare `.references("messageHeader", onDelete: .cascade)`
+    /// and are therefore destroyed by any delete of the parent row.
+    private func attachChildren(
+        _ db: DatabaseQueue,
+        headerId: String,
+        labelId: String,
+        parentRfc: String
+    ) throws {
+        try db.write { dbConn in
+            var header = try MessageHeader.fetchOne(dbConn, key: headerId)!
+            header.inReplyTo = parentRfc
+            try header.update(dbConn)
+            let label = UserLabel(
+                accountId: "acc1", providerLabelId: labelId, name: labelId, isSystem: false)
+            try label.insert(dbConn, onConflict: .ignore)
+            try MessageUserLabel(messageId: headerId, userLabelId: label.id).insert(dbConn)
+            try ThreadUtils.insertMessageReferences(for: header, db: dbConn)
+        }
+    }
+
+    private func labelIds(_ db: DatabaseQueue, headerId: String) throws -> [String] {
+        try db.read {
+            try MessageUserLabel
+                .filter(Column("messageId") == headerId)
+                .fetchAll($0)
+                .map(\.userLabelId)
+                .sorted()
+        }
+    }
+
+    private func threadEdges(_ db: DatabaseQueue, headerId: String) throws -> [String] {
+        try db.read {
+            try String.fetchAll(
+                $0,
+                sql: "SELECT referencedRfc822Id FROM messageReference WHERE messageHeaderId = ? ORDER BY 1",
+                arguments: [headerId])
+        }
+    }
+
+    /// 🚨 THE INVARIANT, stated as the system property rather than the mechanism
+    /// (`MIS-015`): **a header that changes its primary key keeps its labels and
+    /// its threading edges.** No assertion below names `MessageHeaderRekey.apply`
+    /// — any carrier that leaves both children reachable at the address the
+    /// message now has will pass.
+    ///
+    /// `canonicalizeLocalRows`' `willRekey` leg is a member of the class *"every
+    /// code path that changes a header's primary key"*, and it hand-rolled
+    /// `delete` → reassign `id` → `insert`. `messageHeader` has exactly two
+    /// surviving cascading children — `messageUserLabel.messageId` (`v82`) and
+    /// `messageReference.messageHeaderId` (`v27`) — and the re-insert restored
+    /// NEITHER. The label loss is permanent: nothing else in the database knows
+    /// which labels the user applied. The edge loss drops the message out of its
+    /// own conversation, and the existing-row merge branch in `runSyncMessages`
+    /// updates `referencesJSON` without ever calling
+    /// `ThreadUtils.insertMessageReferences`, so nothing rebuilt it either.
+    ///
+    /// Asserted at the STORE, as end state, against the NEW key — which also
+    /// proves the carry landed on the re-keyed address rather than merely that
+    /// some row survived somewhere.
+    @Test("A canonicalizing re-key carries the message's labels and threading edges")
+    func rekeyCarriesLabelsAndThreadEdges() throws {
+        let db = try makeDB()
+        let remnant = try insertRemnant(db, messageId: "g20")
+        let parentRfc = "r17-1-parent@example.com"
+        try attachChildren(db, headerId: remnant.id, labelId: "follow-up", parentRfc: parentRfc)
+
+        // MIS-030 — anchor the fixture BEFORE the act: the precondition really
+        // holds, so a later `== 0`/`isEmpty` cannot pass on a row that never had
+        // children in the first place.
+        #expect(remnant.id == "acc1:INBOX:g20")
+        #expect(try labelIds(db, headerId: remnant.id) == ["acc1:follow-up"],
+                "precondition: the user applied a label to the remnant")
+        #expect(try threadEdges(db, headerId: remnant.id) == [parentRfc],
+                "precondition: the remnant has a threading edge to its parent")
+
+        let result = try canonicalize(db, messageId: "g20")
+
+        #expect(result.ftsRekey?.oldId == "acc1:INBOX:g20")
+        #expect(result.ftsRekey?.newId == "acc1:TRASH:g20")
+        #expect(result.row?.id == "acc1:TRASH:g20")
+
+        #expect(try labelIds(db, headerId: "acc1:TRASH:g20") == ["acc1:follow-up"],
+                """
+                the user's label must follow the message to its canonical address — \
+                the re-key's delete cascades `messageUserLabel` and NOTHING in the \
+                database can rebuild it, so a re-key that does not carry it destroys \
+                the label silently and permanently
+                """)
+        #expect(try threadEdges(db, headerId: "acc1:TRASH:g20") == [parentRfc],
+                """
+                and the threading edge must exist at the canonical address, or the \
+                message falls out of the conversation it belongs to
+                """)
+        #expect(try labelIds(db, headerId: "acc1:INBOX:g20").isEmpty,
+                "and nothing may be left filed under the retired id")
+        #expect(try threadEdges(db, headerId: "acc1:INBOX:g20").isEmpty)
+    }
+
+    /// 🚨 **THE MIRROR IMAGE, AND IT WOULD BE STRICTLY WORSE THAN THE BUG
+    /// (`MIS-005`).** The merge loop above the re-key deletes duplicate LOSERS,
+    /// and **their** cascade loss is INTENDED — they are being discarded, not
+    /// re-addressed. Only the survivor's `delete → reassign id → insert` is an
+    /// address change wearing a deletion's clothes.
+    ///
+    /// A "restore the cascaded children" fix applied across the whole function
+    /// would let distinct duplicates donate unrelated labels to the survivor:
+    /// label misattribution across messages, which no sync repairs because both
+    /// the junction row and the label are locally authoritative. This test is the
+    /// other side of `rekeyCarriesLabelsAndThreadEdges` and the pair is
+    /// two-sided by construction (`feedback_non_vacuity_must_be_two_sided`) —
+    /// the survivor's own label must arrive, the loser's must not.
+    @Test("A merge loser's labels are never grafted onto the re-keyed survivor")
+    func loserLabelsAreNotGraftedOntoSurvivor() throws {
+        let db = try makeDB()
+        // Two non-canonical rows for the same (messageId, folderId): the first
+        // inserted is the survivor, the second is a merge loser. Neither holds
+        // the canonical PK, so the survivor's leg re-keys.
+        let survivorRemnant = try insertRemnant(db, messageId: "g21")
+        let loser = try TestDatabase.insertMessageHeader(
+            db, messageId: "g21",
+            folderId: "acc1:ARCHIVE", accountId: "acc1", folderPath: "ARCHIVE",
+            isInInbox: false
+        )
+        try db.write { dbConn in
+            try dbConn.execute(
+                sql: "UPDATE messageHeader SET folderId = ?, folderPath = ?, isInInbox = 0 WHERE id = ?",
+                arguments: [trashFolderId, trashPath, loser.id]
+            )
+        }
+        try attachChildren(
+            db, headerId: survivorRemnant.id, labelId: "mine", parentRfc: "r17-1-mine@example.com")
+        try attachChildren(
+            db, headerId: loser.id, labelId: "not-mine", parentRfc: "r17-1-not-mine@example.com")
+
+        // MIS-030 — anchor both fixtures, and anchor that they are DISTINCT rows.
+        #expect(survivorRemnant.id == "acc1:INBOX:g21")
+        #expect(loser.id == "acc1:ARCHIVE:g21")
+        #expect(try labelIds(db, headerId: survivorRemnant.id) == ["acc1:mine"])
+        #expect(try labelIds(db, headerId: loser.id) == ["acc1:not-mine"])
+
+        let result = try canonicalize(db, messageId: "g21")
+
+        #expect(result.row?.id == "acc1:TRASH:g21")
+        #expect(result.removedIds == ["acc1:ARCHIVE:g21"])
+        #expect(try labelIds(db, headerId: "acc1:TRASH:g21") == ["acc1:mine"],
+                """
+                the survivor keeps EXACTLY its own label. `acc1:not-mine` appearing \
+                here is the mirror-image failure: a discarded duplicate donating a \
+                label to a message the user never applied it to — misattribution, and \
+                nothing in sync repairs it because both the junction row and the label \
+                are locally authoritative
+                """)
+        #expect(try threadEdges(db, headerId: "acc1:TRASH:g21") == ["r17-1-mine@example.com"],
+                "and the survivor's own threading edge, not the loser's")
+        #expect(try labelIds(db, headerId: "acc1:ARCHIVE:g21").isEmpty,
+                "the loser's junction rows go with the loser — its cascade loss is INTENDED")
+    }
 }
 
 // MARK: - SearchIndex.rekeyHeaders

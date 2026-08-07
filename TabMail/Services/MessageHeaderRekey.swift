@@ -144,22 +144,42 @@ enum MessageHeaderRekey {
     ///    still owes that mirror; this function cannot do it (different pool,
     ///    and it must not run inside the GRDB write).
     ///
-    ///    🚨 **AND ONE IN-TREE CALLER DOES NOT MEET IT — stated as the negative
+    ///    🚨 **AND SOME IN-TREE CALLERS DO NOT MEET IT — stated as the negative
     ///    case, because the sentence above stated an obligation and left a
     ///    reader to assume it was met (`MIS-019`: an absolute like "all other
     ///    callers route through `publishRekeys`" is exactly the shape that
-    ///    produced this gap).** The caller is the **UID-remap block in
-    ///    `SyncEngineFullSync`** — the `guard try MessageHeaderRekey.apply(…)`
-    ///    inside the stale-message loop. It is named rather than counted, so
-    ///    the sentence cannot go stale as an integer (`MIS-007`). Leg by leg:
+    ///    produced this gap).** They are NAMED rather than counted, so the
+    ///    sentence cannot go stale as an integer (`MIS-007`). ⚠ Re-derive the
+    ///    roster with an instrument this doc block cannot itself enter — a bare
+    ///    `rg 'MessageHeaderRekey.apply'` matches the bullets below and counts
+    ///    its own recording (`MIS-033`; `IOS-DOC-002` requires the predicate):
+    ///    ```
+    ///    rg -n --pcre2 '^(?!\s*(///|//)).*MessageHeaderRekey\.apply\(' \
+    ///       TabMail/ Shared/ TabMailNotificationService/
+    ///    ```
+    ///    → 5 at R17-1 (was 3). Check each hit against
+    ///    `AccountManagerQueue.publishRekeys`; the ones that do NOT reach it are:
+    ///     * the **UID-remap block in `SyncEngineFullSync`** — the
+    ///       `guard try MessageHeaderRekey.apply(…)` inside the stale-message
+    ///       loop;
+    ///     * **`SyncEngineFullSync.canonicalizeLocalRows`** — the `willRekey`
+    ///       leg, which became a caller in R17-1 (it hand-rolled the identical
+    ///       delete+reinsert before that, destroying both children outright, so
+    ///       adopting this carrier strictly reduced its loss);
+    ///     * **`DemoProvider.move`**, also R17-1 — demo mode only, and demo has
+    ///       no `publishRekeys` path at all.
+    ///    Leg by leg, for the two `SyncEngineFullSync` callers:
     ///     * **FTS — DISCHARGED, by the caller itself, not by `publishRekeys`.**
-    ///       It appends to `ftsRekeys` and its callers run the same
-    ///       `SearchIndex.rekeyHeaders`, and it deliberately keeps the re-keyed
-    ///       old id OFF the `staleIds` channel (`uidMigratedSet` is filtered out
-    ///       of `staleFiltered`) because the FTS entry must MOVE, not be
-    ///       removed. So the obligation is not "all three legs" for every
+    ///       The UID-remap block appends to `ftsRekeys` directly; the
+    ///       canonicalizer returns its pair in the `ftsRekey` tuple, which
+    ///       `runSyncMessages` folds into the same `ftsRekeys`. Both end at the
+    ///       same `SearchIndex.rekeyHeaders`, and both deliberately keep the
+    ///       re-keyed old id OFF the `staleIds` channel (`uidMigratedSet` is
+    ///       filtered out of `staleFiltered`) because the FTS entry must MOVE,
+    ///       not be removed. So the obligation is not "all three legs" for every
     ///       caller — assuming that is how a reader concludes the sync path is
-    ///       broken in a way it is not.
+    ///       broken in a way it is not. `DemoProvider.move` has no FTS mirror at
+    ///       all, which is a demo-only cost and is not this function's to close.
     ///     * **`UndoService.applyRekeys` — NOT discharged.** An undo entry that
     ///       names the old header id keeps naming it, so the undo resolves
     ///       nothing and fails closed. Bounded by the undo stack's lifetime.

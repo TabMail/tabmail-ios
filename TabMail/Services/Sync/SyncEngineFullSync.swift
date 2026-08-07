@@ -745,20 +745,67 @@ extension SyncEngine {
                 if !removedIds.isEmpty || survivorHadObservedEpoch { try survivor.update(db) }
                 return (survivor, removedIds, nil, true)
             }
-            // Re-key the optimistic-move remnant to the canonical PK, by delete +
-            // reinsert with the body reattached below. (The FK that used to FORBID a
-            // PK `UPDATE` here is gone as of Stage D, but converting these legs is
-            // deliberately NOT part of that change — it is a behaviour change riding
-            // a schema commit, and Stage E1 reshapes them again.) The old body row
-            // is now deleted EXPLICITLY: without it the row would survive the re-key
-            // AND a copy would be inserted under the canonical id — a duplicate plus
-            // a leak, where the cascade used to leave exactly one row.
+            // Re-key the optimistic-move remnant to the canonical PK. (The FK that
+            // used to FORBID a PK `UPDATE` here is gone as of Stage D, but converting
+            // this leg to an `UPDATE` is deliberately NOT part of that change — it is
+            // a behaviour change riding a schema commit.)
+            //
+            // 🚨 R17-1 — THE CARRIER IS SHARED, NOT HAND-ROLLED. This block used to
+            // run its own `delete` → reassign `id` → `insert`, which is a header
+            // PRIMARY-KEY change, so it is a member of the class *"every code path
+            // that changes a header's primary key"* — and it had the same gap
+            // `BackfillBodyQueue.rekeyRemappedHeader` and
+            // `DraftStore.migrateExactPlaceholder` had. `survivor.delete(db)` fires
+            // `ON DELETE CASCADE` on BOTH surviving children of `messageHeader`, and
+            // the re-insert restored NEITHER:
+            //   * `messageUserLabel` (`AppDatabase` `v82`'s create, cascade on the
+            //     `messageId` FK) — every label the user applied, destroyed with NO
+            //     rebuild source. Nothing else in the database knows which labels the
+            //     user chose.
+            //   * `messageReference` (`AppDatabase` `v27`'s create, cascade on the
+            //     `messageHeaderId` FK) — the message's threading edges. The
+            //     existing-row merge branch in `runSyncMessages` updates
+            //     `referencesJSON` but never calls
+            //     `ThreadUtils.insertMessageReferences`, so nothing rebuilt them
+            //     either, and the message fell out of its own conversation.
+            // `MessageHeaderRekey.apply` is the sibling carrier — the very sequence
+            // this file's own UID-remap block runs — which carries the labels and
+            // rebuilds the references from the migrated header's own content.
+            //
+            // ⚠️ THE SURVIVOR ONLY, AND THAT BOUND IS LOAD-BEARING (`MIS-005`). The
+            // merge loop ABOVE deletes duplicate LOSERS, and their cascade loss is
+            // INTENDED — they are being discarded, not re-addressed. Only the
+            // survivor's delete+reinsert is an address change wearing a deletion's
+            // clothes. Carrying every loser's children onto the survivor would let
+            // distinct duplicates donate unrelated labels to it: misattribution, and
+            // strictly worse than the bug this closes.
+            //
+            // The BODY is deliberately left for the `bestBody` reattachment below
+            // rather than carried by `apply`: that reattachment picks the RICHEST
+            // body across every merged row, which is strictly more than the
+            // survivor's own. Deleting the survivor's body row FIRST leaves `apply`'s
+            // carry-forward nothing to find, so the selection below stays the sole
+            // body writer and the pre-existing behaviour is preserved exactly.
             let oldId = survivor.id
-            try survivor.delete(db)
             _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
-            survivor.id = canonicalId
-            survivor.folderPath = folderPath
-            try survivor.insert(db)
+            var migrated = survivor
+            migrated.id = canonicalId
+            migrated.folderPath = folderPath
+            guard try MessageHeaderRekey.apply(from: survivor, to: migrated, db: db) else {
+                // UNREACHABLE at this revision, and kept as a live arm rather than
+                // discarded so a future reordering degrades instead of corrupting.
+                // `apply` returns false only when `canonicalId` is already occupied,
+                // which the guard above refused inside THIS write transaction, and
+                // GRDB serializes writers. `apply` deletes before its own collision
+                // return, so `oldId` now names no header at all — it rides
+                // `removedIds`, the caller's "this id is gone, drop its FTS entry"
+                // channel, and must NOT ride `ftsRekey`, which would file the index
+                // under a row that was never inserted.
+                print("[Sync] Canonicalize: re-key \(oldId) → \(canonicalId) COLLIDED — old row is gone")
+                removedIds.append(oldId)
+                return (try MessageHeader.fetchOne(db, key: canonicalId), removedIds, nil, true)
+            }
+            survivor = migrated
             ftsRekey = (oldId: oldId, newId: canonicalId)
             print("[Sync] Canonicalize: re-keyed remnant \(oldId) → \(canonicalId)")
         } else if !removedIds.isEmpty {

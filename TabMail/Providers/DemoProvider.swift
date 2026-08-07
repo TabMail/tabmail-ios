@@ -134,14 +134,32 @@ actor DemoProvider: EmailProvider {
             let toIsInbox = to.uppercased() == "INBOX"
             for id in ids {
                 let oldHeaderId = MessageIdentity.headerId(accountId: self.accountId, folderPath: from, messageId: id)
-                guard var h = try MessageHeader.filter(Column("id") == oldHeaderId).fetchOne(conn) else { continue }
+                guard let existing = try MessageHeader.filter(Column("id") == oldHeaderId).fetchOne(conn) else { continue }
                 let newHeaderId = MessageIdentity.headerId(accountId: self.accountId, folderPath: to, messageId: id)
-                try h.delete(conn)
-                h.id = newHeaderId
-                h.folderId = toFolderId
-                h.folderPath = to
-                h.isInInbox = toIsInbox
-                try h.insert(conn)
+                var migrated = existing
+                migrated.id = newHeaderId
+                migrated.folderId = toFolderId
+                migrated.folderPath = to
+                migrated.isInInbox = toIsInbox
+                // 🚨 R17-1 — THE CARRIER IS SHARED, NOT HAND-ROLLED. A demo move is a
+                // header PRIMARY-KEY change, so it is a member of the class *"every
+                // code path that changes a header's primary key"*. This block used to
+                // run its own `delete` → reassign `id` → `insert`, which fires
+                // `ON DELETE CASCADE` on both surviving children of `messageHeader`
+                // (`messageUserLabel`, `messageReference`) and restored neither, and
+                // since `v70_dropMessageBodyHeaderFK` left the `messageBody` row
+                // ORPHANED under the old id rather than cascaded away.
+                //
+                // Demo mode has no server, so nothing re-fetches any of it: the loss
+                // is permanent for the life of the demo account, which is why the
+                // shared carrier matters here even though the data is synthetic.
+                // `apply` carries the body and the labels and rebuilds the references.
+                //
+                // Its `false` return (the new id is already occupied) leaves the old
+                // row deleted and inserts nothing. That is a strict improvement on the
+                // previous behaviour, which threw a UNIQUE violation and rolled the
+                // whole demo move back.
+                try MessageHeaderRekey.apply(from: existing, to: migrated, db: conn)
             }
         }
     }
