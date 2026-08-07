@@ -443,6 +443,191 @@ struct PendingSendServiceLifecycleTests {
         // (c) and the tap is not a dead one: the user is told it did not take.
         #expect(svc.undoFailureMessage != nil)
     }
+
+    // MARK: - R16-9 — every exit of undo() speaks
+
+    /// Whether this `undo()` return left the user with ANYTHING to observe.
+    /// The three channels are the only ones the surface has: a reopen snapshot
+    /// (compose comes back), a cleared toast (the send is visibly gone), or an
+    /// `undoFailureMessage` (the user is told it did not take). A `nil` return
+    /// with the toast still up and no message is a dead tap.
+    private func leftAnObservableEndState(
+        _ service: PendingSendService, snapshot: PendingSendService.ReopenSnapshot?
+    ) -> Bool {
+        snapshot != nil || service.current == nil || service.undoFailureMessage != nil
+    }
+
+    /// 🚨 THE INVARIANT, asserted as the SYSTEM PROPERTY rather than the fix's
+    /// mechanism (`MIS-015`): **every exit of `PendingSendService.undo()` leaves an
+    /// observable end state** — a reopen snapshot, a cleared toast, or a non-nil
+    /// `undoFailureMessage`. Never a `nil` return with the toast still up and
+    /// nothing said.
+    ///
+    /// The defect this pins: `undo()`'s doc claimed exactly this property, and it
+    /// was FALSE for two of its six exits. `RetainedAuthorityOutcome`'s three cases
+    /// are a roster of ANSWERS, not of exits — two of those cases each contain a
+    /// `guard AccountManager.shared.discardOutboxMessageConfirmed(…) else { return nil }`,
+    /// and both inner returns left no snapshot, no cleared toast and no message. The
+    /// sibling `.readFailed` arm eight lines above set one for the SAME user
+    /// experience: under a suspended GRDB one root cause routed two ways, one spoke,
+    /// one was silent, and the message went out while the user believed they had
+    /// stopped it. That the invariant was WRITTEN DOWN is exactly how it went
+    /// unaudited (`MIS-018`'s tell — a thorough doc comment reads as evidence the
+    /// work was done), so it is now machine-checked instead.
+    ///
+    /// ⚠️ THE REFUSAL ITSELF IS DELIBERATELY HELD AND IS **NOT** UNDER TEST HERE
+    /// (`MIS-026`, Outbox Rules 3/10). `discardOutboxMessageConfirmed` returning
+    /// `false` means the row was not provably cancelled — a `sending` row may
+    /// already have left the server — and making the cancellation unconditional
+    /// would be a double-send or a lost message. What R16-9 changed is the SILENCE,
+    /// not the refusal, so every refusal case below still asserts that the Outbox
+    /// row and the toast SURVIVE.
+    ///
+    /// Enumerated by counting `return` statements inside `undo()` — six — rather
+    /// than by the enum, so a seventh exit cannot join the silent set unnoticed.
+    @Test("Every exit of undo() leaves an observable end state")
+    func everyUndoExitLeavesAnObservableEndState() throws {
+        // EXIT 1 — `guard let p = current`. Nothing to observe because there was no
+        // toast to begin with; the cleared-toast channel is satisfied trivially.
+        do {
+            let service = makeFreshService()
+            service.dismiss()
+            let snapshot = service.undo()
+            #expect(leftAnObservableEndState(service, snapshot: snapshot),
+                    "no toast: an undo with nothing pending must still be an observable no-op")
+            #expect(service.current == nil)
+        }
+
+        // EXIT 2 — `.readFailed`. The read threw, so nothing is decided and the user
+        // is told. (Also covered by `thrownAuthorityReadLeavesTheSendCancellable`;
+        // repeated here so the roster below is exhaustive rather than partial.)
+        do {
+            let fixture = try install()
+            defer { finish(fixture) }
+            let retained = draft(id: "draft-exit-read-failed", epoch: "E1")
+            let pending = outbox(draftId: retained.id, epoch: "E1")
+            try fixture.0.writeWithoutTransaction { db in
+                try retained.insert(db)
+                try pending.insert(db)
+            }
+            let service = makeFreshService()
+            service.present(
+                outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
+                toSummary: "To: to@example.com")
+            try fixture.0.writeWithoutTransaction { db in
+                try db.execute(sql: "DROP TABLE draft")
+            }
+
+            let snapshot = service.undo()
+            #expect(leftAnObservableEndState(service, snapshot: snapshot),
+                    "readFailed: an undecidable read must still tell the user")
+            #expect(service.undoFailureMessage != nil)
+            #expect(service.current?.id == pending.id,
+                    "and the send stays cancellable — the refusal direction is held")
+        }
+
+        // EXIT 3 — `.mismatchOrAbsent`, cancellation CONFIRMED. The toast clears,
+        // which is the observable end state; no message is needed and none is set.
+        do {
+            let fixture = try install()
+            defer { finish(fixture) }
+            let replacement = draft(id: "draft-exit-mismatch-ok", epoch: "E2")
+            let pending = outbox(draftId: replacement.id, epoch: "E1")
+            try fixture.0.writeWithoutTransaction { db in
+                try replacement.insert(db)
+                try pending.insert(db)
+            }
+            let service = makeFreshService()
+            service.present(
+                outboxId: pending.id, draftId: replacement.id, instanceEpoch: "E1",
+                toSummary: "To: to@example.com")
+
+            let snapshot = service.undo()
+            #expect(leftAnObservableEndState(service, snapshot: snapshot))
+            #expect(service.current == nil)
+            #expect(service.undoFailureMessage == nil,
+                    "a confirmed cancellation is not a failure — warning here would be the mirror image")
+        }
+
+        // EXIT 4 — `.mismatchOrAbsent`, cancellation REFUSED (R16-9 leg A).
+        // A `sending` row cannot be provably cancelled, so the refusal stands; what
+        // must not stand is the silence.
+        do {
+            let fixture = try install()
+            defer { finish(fixture) }
+            let replacement = draft(id: "draft-exit-mismatch-refused", epoch: "E2")
+            let pending = outbox(draftId: replacement.id, epoch: "E1", status: .sending)
+            try fixture.0.writeWithoutTransaction { db in
+                try replacement.insert(db)
+                try pending.insert(db)
+            }
+            let service = makeFreshService()
+            service.present(
+                outboxId: pending.id, draftId: replacement.id, instanceEpoch: "E1",
+                toSummary: "To: to@example.com")
+
+            let snapshot = service.undo()
+            #expect(leftAnObservableEndState(service, snapshot: snapshot),
+                    "mismatch + refused discard: the user tapped Undo, nothing was cancelled, nothing reopened, and the toast stayed up — so this exit MUST say so or the tap is dead")
+            #expect(service.undoFailureMessage != nil,
+                    "the sibling `.readFailed` arm sets one for the same user experience; this arm returned nil in silence")
+            // The held direction: the refusal itself is preserved.
+            #expect(try fixture.0.read { try OutboxMessage.fetchOne($0, key: pending.id) } != nil,
+                    "a `sending` row may already have left the server — it must NOT be cancelled")
+            #expect(service.current?.id == pending.id)
+        }
+
+        // EXIT 5 — `.verified`, cancellation REFUSED (R16-9 leg B). The arm where
+        // the user had a reopenable draft in hand, so a silent nil reads as
+        // "Undo did nothing at all".
+        do {
+            let fixture = try install()
+            defer { finish(fixture) }
+            let retained = draft(id: "draft-exit-verified-refused", epoch: "E1")
+            let pending = outbox(draftId: retained.id, epoch: "E1", status: .sending)
+            try fixture.0.writeWithoutTransaction { db in
+                try retained.insert(db)
+                try pending.insert(db)
+            }
+            let service = makeFreshService()
+            service.present(
+                outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
+                toSummary: "To: to@example.com")
+
+            let snapshot = service.undo()
+            #expect(leftAnObservableEndState(service, snapshot: snapshot),
+                    "verified + refused discard: nothing cancelled, nothing reopened, toast still up — this exit MUST say so")
+            #expect(service.undoFailureMessage != nil)
+            #expect(try fixture.0.read { try OutboxMessage.fetchOne($0, key: pending.id) } != nil,
+                    "the refusal is deliberately held (Outbox Rules 3/10)")
+            #expect(service.current?.id == pending.id)
+        }
+
+        // EXIT 6 — `.verified`, cancellation CONFIRMED. The snapshot IS the
+        // observable end state. This is the NON-VACUITY anchor for the whole test
+        // (`MIS-030`): it proves the harness can reach a successful undo at all, so
+        // the five absences above are meaningful.
+        do {
+            let fixture = try install()
+            defer { finish(fixture) }
+            let retained = draft(id: "draft-exit-verified-ok", epoch: "E1")
+            let pending = outbox(draftId: retained.id, epoch: "E1")
+            try fixture.0.writeWithoutTransaction { db in
+                try retained.insert(db)
+                try pending.insert(db)
+            }
+            let service = makeFreshService()
+            service.present(
+                outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
+                toSummary: "To: to@example.com")
+
+            let snapshot = service.undo()
+            #expect(leftAnObservableEndState(service, snapshot: snapshot))
+            #expect(snapshot != nil, "non-vacuity: a confirmed undo must still reopen")
+            #expect(service.current == nil)
+            #expect(service.undoFailureMessage == nil)
+        }
+    }
 }
 
 // MARK: - Recipient cap logic

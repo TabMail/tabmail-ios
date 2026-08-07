@@ -110,12 +110,24 @@ final class PendingSendService {
             // and the toast are left exactly as they were, and the user is told.
             // Do NOT reach for `discardOutboxMessageConfirmed` here — cancelling on
             // an unknown is the direction that loses the content (see the enum).
-            undoFailureMessage = "Try again."
+            undoFailureMessage = Self.undoNotConfirmedMessage
             return nil
         case .mismatchOrAbsent:
             // PROVEN not to be the generation this toast is holding. Cancel the send
             // — the user asked for that and we know it is safe — but reopen nothing.
             guard AccountManager.shared.discardOutboxMessageConfirmed(p.id) else {
+                // 🚨 R16-9 — THE REFUSAL STAYS; ONLY THE SILENCE GOES.
+                // `discardOutboxMessageConfirmed` returning `false` means the row was
+                // not provably cancelled (Outbox Rules 3/10 — a `sending` row may
+                // already have left the server, and the confirmed read is what keeps
+                // this from becoming a double-send or a lost message). That direction
+                // is DELIBERATELY HELD and must not become unconditional (`MIS-026`).
+                // What was wrong is that this arm returned `nil` with no snapshot, no
+                // cleared toast and no `undoFailureMessage` — while the sibling
+                // `.readFailed` arm eight lines above sets one for the SAME user
+                // experience. Under a suspended GRDB one root cause routed two ways:
+                // one spoke, one was silent, and the message went out.
+                undoFailureMessage = Self.undoNotConfirmedMessage
                 return nil
             }
             dismissTask?.cancel()
@@ -123,6 +135,10 @@ final class PendingSendService {
             return nil
         case .verified(let authority):
             guard AccountManager.shared.discardOutboxMessageConfirmed(p.id) else {
+                // R16-9 — same arm, same reason as `.mismatchOrAbsent` above. This is
+                // the arm where the user had a reopenable draft in hand, so a silent
+                // `nil` here reads as "Undo did nothing at all".
+                undoFailureMessage = Self.undoNotConfirmedMessage
                 return nil
             }
             dismissTask?.cancel()
@@ -130,6 +146,22 @@ final class PendingSendService {
             return ReopenSnapshot(id: p.id, authority: authority)
         }
     }
+
+    /// The ONE string for "the cancellation was not confirmed, so nothing was
+    /// changed" (R16-9). Held in one place for the same reason
+    /// `DynamicIslandChatButton.autoSaveDidNotLandWarning` is: **three** exits
+    /// surface it and a fourth must not arrive with a fourth wording.
+    ///
+    /// Predicate, and note the SHAPE — it excludes comment lines
+    /// (`--pcre2 '^(?!\s*(///|//))'`) because a naive `rg -c` for the assignment
+    /// matches THIS SENTENCE quoting it and returns four. `MIS-033`: a census that
+    /// counts its own recording is off by one at the commit that writes it, and
+    /// predicate-plus-number cannot catch an observer effect — only an instrument the
+    /// sentence cannot enter can:
+    ///   `rg --pcre2 -c '^(?!\s*(///|//)).*undoFailureMessage = Self\.undoNotConfirmedMessage'` It says only what was
+    /// observed — like `undoFailureMessage`'s own contract, it claims nothing about
+    /// what happened to the message, because at this point we do not know.
+    private static let undoNotConfirmedMessage = "Try again."
 
     /// The three answers a retained-authority read can give, kept apart because two
     /// of them used to arrive as the same `nil`.
@@ -155,6 +187,18 @@ final class PendingSendService {
     /// silent path, so what actually holds the invariant here is that every arm of
     /// `undo()` leaves an observable end state (a snapshot, a cleared toast, or
     /// `undoFailureMessage`), which is what the tests assert.
+    ///
+    /// ⚠️ **THAT SENTENCE WAS FALSE WHERE IT WAS WRITTEN, FOR TWO OF THE FIVE EXITS
+    /// (R16-9, fixed 2026-08-06).** The enum's three cases are not the exits: two of
+    /// them contain a `guard discardOutboxMessageConfirmed(…) else { return nil }`,
+    /// and BOTH of those inner returns left no snapshot, no cleared toast and no
+    /// `undoFailureMessage`. Predicate to re-derive the exit count rather than trust
+    /// it: count `return` statements inside `undo()` — **six**. One per enum case
+    /// (3), plus the two discard-refusal guards, plus the `guard let p = current`
+    /// early return, which is the one exit with nothing to observe because there was
+    /// no toast to begin with. The enum is a roster of ANSWERS, never of exits, which
+    /// is precisely how a documented invariant went on reading as evidence that the
+    /// work was done (`MIS-018`'s tell).
     private enum RetainedAuthorityOutcome {
         /// Both rows read, and this toast's generation matches them exactly.
         case verified(RetainedDraftAuthority)
