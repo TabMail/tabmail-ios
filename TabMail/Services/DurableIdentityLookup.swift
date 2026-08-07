@@ -80,8 +80,27 @@ enum DurableIdentityLookup {
     /// rfc822 fallback to catch).
     ///
     /// At most 3 SELECTs, fetching all five columns each time — no second
-    /// round-trip to pick up folder/inbox/rfc822 state after a hit. The
-    /// common case (step 1 or step 2, no rejection) is 1 SELECT.
+    /// round-trip to pick up folder/inbox/rfc822 state after a hit.
+    ///
+    /// COST PER OUTCOME, stated per-step because the steps are SEQUENTIAL and a
+    /// later step only runs because the earlier ones MISSED. ⚠️ This paragraph read
+    /// *"The common case (step 1 or step 2, no rejection) is 1 SELECT"* until R16-7
+    /// (corrected 2026-08-06) — false for step 2, which by construction costs the
+    /// step-1 miss plus its own hit:
+    ///   • step-1 hit (exact folder) — **1** SELECT. This is the true common case.
+    ///   • step-2 hit (folder-blind, not rejected) — **2**.
+    ///   • step-2 rejection then a step-3 hit, or step-3 hit outright — **3**.
+    ///   • no row at all — **2** with no usable `rfc822MessageId` (step 3 is
+    ///     short-circuited by its `let rfc822 …, !rfc822.isEmpty` guard), **3** with
+    ///     one.
+    /// Predicate for the upper bound, skipping comments so this text cannot satisfy
+    /// it: `rg -c --pcre2 '^(?!\s*(///|//)).*Row\.fetchOne\(db, sql:'
+    /// TabMail/Services/DurableIdentityLookup.swift` → **3**.
+    ///
+    /// ⚠️ DO NOT "FIX" THIS BY COLLAPSING THE THREE SELECTS INTO ONE. Preserving
+    /// exact-folder PRECEDENCE and step 2's conditional rfc822-disagreement
+    /// REJECTION in a single statement risks changing identity semantics, which is
+    /// C3 territory. The count is the thing that was wrong, not the query.
     static func find(
         db: Database,
         accountId: String,

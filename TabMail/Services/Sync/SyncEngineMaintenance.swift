@@ -686,9 +686,30 @@ extension SyncEngine {
     /// latch here would buy nothing and add a failure mode.
     ///
     /// FAILS SAFE. If this is skipped, cancelled or aborted, `markAllAsRead` sorts
-    /// through a temp B-tree — slow, correct, and the ALREADY-SHIPPED behaviour up to
-    /// `v83`. Nothing is recorded on failure, so the next pass retries. Recovery is
-    /// automatic and needs no user gesture (THE MANTRA: recoverable ⇒ fail closed).
+    /// through a temp B-tree — slow, and correct in the sense that matters (identical
+    /// rows, identical order). Nothing is recorded on failure, so the next pass
+    /// retries. Recovery is automatic and needs no user gesture (THE MANTRA:
+    /// recoverable ⇒ fail closed).
+    ///
+    /// 🚨 IT IS **NOT** "THE ALREADY-SHIPPED BEHAVIOUR UP TO `v83`", WHICH IS WHAT
+    /// THIS SENTENCE SAID UNTIL R16-4 (corrected 2026-08-06) — and the wording
+    /// mattered, because that clause was the entire licence for deferring the build.
+    /// Shipped `markAllAsRead` (`07a4bb703:TabMail/ViewModels/InboxViewModel.swift`,
+    /// an immutable tag) fetched `.filter(folderId == fid && isRead == false)
+    /// .limit(batchSize)` with **no `ORDER BY`**, so it never sorted at all. The
+    /// ordered keyset sweep arrived IN-RANGE with `a790dd61d` (2026-08-03), which
+    /// `git merge-base --is-ancestor a790dd61d 07a4bb703` reports is NOT an ancestor
+    /// of the shipped tag (exit 1). Measured at 357,400 rows / 100,000 unread /
+    /// fresh-install `sqlite_stat1`: shipped **7,889 ms**, current with the index
+    /// **4,610 ms**, current WITHOUT it **43,296 ms** — **5.5× worse than shipped**.
+    /// The deferral is accepted because the window is TRANSIENT and SELF-HEALING,
+    /// never because it equals a shipped baseline. Full argument: `IOS-PERF-005`.
+    ///
+    /// ⚠️ Contrast the sibling below: `runRefreshPlannerStatisticsIfStale`'s
+    /// "ALREADY-SHIPPED regime" claim about stale statistics is TRUE and stays —
+    /// `ANALYZE` really has only ever run inside migration bodies. Two adjacent
+    /// functions, the same argument shape, opposite truth values; that is why each
+    /// one has to be checked against the tag rather than against its neighbour.
     ///
     /// COST WHILE IT RUNS: one write transaction; 119 ms measured at 360k rows,
     /// 5,050 ms on the owner's 5-account device — which is the whole point of it

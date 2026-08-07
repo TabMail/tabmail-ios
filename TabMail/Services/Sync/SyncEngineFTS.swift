@@ -619,7 +619,13 @@ extension SyncEngine {
     /// At `.utility` this became a QoS-17 reader/writer contending with MainActor
     /// reads at `.userInitiated` (25): the 8-level inversion ADR-IOS-031 forbids, on
     /// an ordinary primary path (six callers — every delta sync, full sync, and
-    /// deletion-reconcile pass). Scheduling priority is the only thing that changes;
+    /// deletion-reconcile pass). Predicate for the count, comments excluded so this
+    /// sentence cannot satisfy it (R16-7):
+    ///   `rg -n --pcre2 '^(?!\s*(///|//)).*removeHeadersFromFTS\('
+    ///    TabMail/ Shared/ TabMailNotificationService/` → **7** lines = this
+    ///   definition plus **6** call sites (`SyncEngineDeltaSync` ×4,
+    ///   `SyncEngineDeletionReconcile`, `SyncEngineFullSync`).
+    /// Scheduling priority is the only thing that changes;
     /// the work performed, its ordering, and its failure handling are untouched.
     func removeHeadersFromFTS(_ headerIds: [String]) {
         guard !headerIds.isEmpty else { return }

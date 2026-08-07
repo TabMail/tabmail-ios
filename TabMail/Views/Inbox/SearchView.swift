@@ -488,7 +488,10 @@ struct SearchView: View {
     ///     `07a4bb703` NEITHER file had any such guard (`normalizedIncomingRfc822`
     ///     does not exist at that revision, and all five delta-sync assignments are
     ///     already bare there), so the range NARROWS this exposure rather than
-    ///     regressing it, and guarding those three sites would be an unrequested
+    ///     regressing it, and guarding those five sites (⚠️ this said "three"
+    ///     until R16-7, 2026-08-06 — the pre-R11-I number surviving *inside the
+    ///     very block that retracts it*, twenty lines below its own correction)
+    ///     would be an unrequested
     ///     behaviour change in a release-audit fix round. The residual is bounded
     ///     and recoverable: a delta sync that nulls a stored id makes arm 3 read an
     ///     ordinary absence as disagreement and return `nil` — a SPURIOUS REFUSAL,

@@ -4370,9 +4370,29 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         case unknownAdmittedEpoch(folder: String, live: UInt32)
     }
 
-    /// The single epoch comparison in this file. `live` is what the server just
-    /// reported for `folder`; `expected` is the epoch the operation is
-    /// authorized under.
+    /// The epoch comparison for every ADMITTED MUTATION in this file. `live` is
+    /// what the server just reported for `folder`; `expected` is the epoch the
+    /// operation is authorized under.
+    ///
+    /// ⚠️ IT IS NOT "THE SINGLE EPOCH COMPARISON IN THIS FILE", WHICH IS WHAT THIS
+    /// SENTENCE CLAIMED UNTIL R16-7 (corrected 2026-08-06). There are **two**, and
+    /// the second one — `saveDraft`'s old-copy delete guard, which compares
+    /// `selection.uidValidity.value == UInt32(exactly: recordedEpoch)` — is LIVE.
+    /// A reader who trusted "single" and changed the epoch contract here would have
+    /// left it untouched. Re-derive rather than trust; the predicate skips `//` and
+    /// `///` lines so this paragraph cannot satisfy it:
+    ///   `rg -n --pcre2 '^(?!\s*(///|//)).*(live == expected|uidValidity\.value ==)'
+    ///    TabMail/Providers/IMAPProvider.swift` → **2** (this guard, and the
+    ///   `saveDraft` one). Non-vacuity control, so a broken regex cannot read as a
+    ///   clean two: the same command with the alternation replaced by `uidValidity`
+    ///   returns **29**.
+    ///
+    /// THE TWO ARE NOT INTERCHANGEABLE AND MUST NOT BE MERGED. This one is a
+    /// MUTATION ADMISSION guard: a mismatch is a PROVEN turnover and throws
+    /// `ProviderError.uidValidityChanged`, which the drain treats as exit 4 and
+    /// retires. `saveDraft`'s is a fail-closed SKIP: a mismatch means the recorded
+    /// coordinates are stale, so it declines the old-copy delete and continues to
+    /// APPEND, dropping no intention. Same fact, opposite dispositions.
     ///
     /// THREE outcomes, not two, and the split is the whole point:
     ///  - both epochs real and EQUAL ⇒ proceed;

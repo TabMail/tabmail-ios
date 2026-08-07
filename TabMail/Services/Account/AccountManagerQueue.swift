@@ -1013,9 +1013,15 @@ extension AccountManager {
                 // `ComposeView`'s discard/send paths). ⚑ `v2final` demotes this case to
                 // its queue tail instead of dropping it, via
                 // `ProviderError.persistentActionFailure` — machinery this tree does not
-                // have (F2b L4). Terminal drop is the disposition v3 already shipped and
-                // keeps; the intention loss is bounded and visible, and adding a demote
-                // path is a separate change.
+                // have (F2b L4). Terminal drop is the disposition **this tree already
+                // has** and keeps; the intention loss is bounded and visible, and adding
+                // a demote path is a separate change. ⚠️ This read *"the disposition v3
+                // already shipped"* until R16-4's class census; **v3 has never shipped**
+                // — neither v3 nor its `v2final` sibling has ever been on a user device,
+                // both branch from `v1.6.38` (`07a4bb703`) — so the phrase asserted a
+                // shipped baseline that does not exist. Nothing about the acceptance
+                // rests on it: the licence is `IOS-QUEUE-003` item 4's bounded-and-
+                // VISIBLE argument, which is stated on its own terms below.
                 // 🚨 UNGATED BY DECISION (rule 12's production-observability
                 // exception). This is the F2b L4 TERMINAL DROP of a durable user
                 // intention. `KNOWN_ISSUES.md` `IOS-QUEUE-003` item 4 accepts
@@ -1142,10 +1148,21 @@ extension AccountManager {
         }
     }
 
-    /// Mirror a COMMITTED re-key into the two stores that key by
+    /// Mirror a COMMITTED re-key into the **three** stores that key by
     /// `messageHeader.id` but do not live in the GRDB database — the in-memory
-    /// undo stack and the FTS index. Shared by the whole-op success path and by
-    /// the narrowing pass, so the two cannot drift.
+    /// undo stack, the FTS index, and the body-asset manifest. Shared by the
+    /// whole-op success path and by the narrowing pass, so the three cannot drift.
+    ///
+    /// ⚠️ THIS LEDE SAID "**two** … the in-memory undo stack and the FTS index"
+    /// until R16-7 (corrected 2026-08-06), while the block 30 lines below it
+    /// shouted that the manifest is *"THE **THIRD** STORE KEYED BY
+    /// `messageHeader.id` OUTSIDE GRDB"* and the body has mirrored into it since
+    /// R12-T7. A stale count in the lede is worse than no count: a reader
+    /// enumerating out-of-GRDB stores stops at the first sentence that answers
+    /// the question. Re-derive rather than trust — the predicate skips comments,
+    /// so nothing here can satisfy it:
+    ///   `rg -n --pcre2 '^(?!\s*(///|//)).*(UndoService\.shared\.applyRekeys|SearchIndex\.shared\.rekeyHeaders|BodyAssetStore\.rekeyContentKey)'
+    ///    TabMail/Services/Account/AccountManagerQueue.swift` → **3**.
     ///
     /// 🚨 THE UNDO STACK IS PUBLISHED FIRST, AND THE ORDER IS THE FIX
     /// (`IOS-UNDO-002`). `SearchIndex` is a SEPARATE SQLite pool, so its re-key

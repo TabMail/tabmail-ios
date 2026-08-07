@@ -96,6 +96,11 @@ final class UserLabelMenuModel {
     /// `AccountProvider.contentKeySpace`: a sixth provider must be a compile error
     /// here, not a silent "labels work on it".
     ///
+    /// Predicate for the "four call sites" both this comment and the numbered note
+    /// above rely on, comments excluded so neither sentence can satisfy it (R16-7):
+    ///   `rg -n --pcre2 '^(?!\s*(///|//)).*Self\.supportsRemoteUserLabels\('
+    ///    TabMail/ Shared/ TabMailNotificationService/` → **4**.
+    ///
     /// `nonisolated` because three of its four call sites run inside a GRDB
     /// database-queue closure, off the MainActor this type is isolated to — the
     /// same treatment `AccountManager.newGestureRefusedForUnknownEpoch` gets.

@@ -785,8 +785,16 @@ enum BodyAssetStore {
     // This is the single source of the writer — both main-app
     // `BodyFetchProcessor.renderBody` and the NSE clients
     // (`IMAPFetchMapping.renderBody`, `GmailAPI.messageFull`,
-    // `GraphAPI.messageFull`) call this. Two callers, identical behavior,
+    // `GraphAPI.messageFull`) call this. FOUR callers, identical behavior,
     // impossible to drift.
+    // ⚠️ This read "Two callers" until R16-7 (2026-08-06) — while the SAME
+    // SENTENCE named four sites. A count that contradicts the enumeration beside
+    // it is the cheapest possible instance of the class: no census was needed to
+    // falsify it, only reading to the end of the sentence. Predicate, comments
+    // excluded so this paragraph cannot satisfy it:
+    //   `rg -n --pcre2 '^(?!\s*(///|//)).*makeInlineImageWriter'
+    //    TabMail/ Shared/ TabMailNotificationService/` → **5** lines = the
+    //   definition below plus the four call sites named above.
 
     /// Returns an `InlineImageWriter` closure bound to a given headerId.
     /// Used by both NSE and main-app render paths. By design, no caller
@@ -877,7 +885,18 @@ enum BodyAssetStore {
         }
     }
 
-    // MARK: - Public: LRU bump (the only bump site is user tap)
+    // MARK: - Public: LRU bump (every bump site is a user tap)
+    //
+    // ⚠️ This MARK read "the only bump site is user tap" until R16-7
+    // (2026-08-06). There are **three**, not one — what is true is the PROPERTY
+    // (every bump is a user gesture, never a sweep or a background pass), and
+    // that property is what the LRU depends on; the singular was never load-
+    // bearing and was simply wrong. Predicate, comments excluded:
+    //   `rg -n --pcre2 '^(?!\s*(///|//)).*BodyAssetStore\.bumpMessageAccess'
+    //    TabMail/ Shared/ TabMailNotificationService/` → **3**
+    //   (`AttachmentListView` ×2 — attachment taps; `MessageDetailViewModel` — the
+    //   opened-message bump). `MessageDetailViewModel`'s own "SOLE bump site"
+    //   comment is correctly QUALIFIED ("for opened-message access") and stays.
 
     /// Bump every asset of a given message to "now". Single UPDATE; touches all
     /// rows for that headerId. Fire-and-forget.

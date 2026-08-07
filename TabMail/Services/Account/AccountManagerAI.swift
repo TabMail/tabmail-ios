@@ -24,7 +24,12 @@ import UserNotifications
 // `AIWriteTarget` is captured ONCE at job start and every downstream header write
 // re-resolves through it, dropping cleanly (no mutation, no success side effect)
 // when the captured identity no longer holds. Dropping is safe here in a way it
-// is NOT for user gestures: these nine sites write DERIVED AI METADATA, which is
+// is NOT for user gestures: these nine sites — predicate, comments excluded so
+// this sentence cannot satisfy it:
+//   `rg -n --pcre2 '^(?!\s*(///|//)).*aiGuardedHeaderWrite\(db, target:'
+//    TabMail/ Shared/ TabMailNotificationService/` → **9**
+//   (`AccountManagerAI` ×5, `ActiveAIQueue` ×4)
+// — write DERIVED AI METADATA, which is
 // recomputable — the queue's own GRDB arbiter (`ActiveAIQueue.readJobOutcome`)
 // sees the field still empty and re-drives the job. This leniency does NOT
 // generalize to any user-intention path (see `Core Philosophy: Never Drop User

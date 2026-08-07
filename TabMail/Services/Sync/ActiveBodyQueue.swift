@@ -181,7 +181,16 @@ actor ActiveBodyQueue {
     // MARK: - Public API
 
     /// Guarded admission — the SINGLE gate every enqueue site in this actor routes
-    /// through: skip a headerId already deferred as oversized so a deferred item is
+    /// through. Predicate, comments excluded so this sentence cannot satisfy it
+    /// (R16-7): `rg -n --pcre2 '^(?!\s*(///|//)).*(func admit|admit\()'
+    /// TabMail/Services/Sync/ActiveBodyQueue.swift` → **6** lines = this definition
+    /// plus **5** enqueue sites, and there is no insertion into
+    /// `oversizedDeferredThisSession` / the pending set outside them. A NEW enqueue
+    /// path that does not call `admit` silently re-admits a deferred oversized item
+    /// for the rest of the process lifetime, which is exactly what this gate exists
+    /// to prevent — so re-run the predicate rather than trusting the word SINGLE.
+    ///
+    /// The gate itself: skip a headerId already deferred as oversized so a deferred item is
     /// never re-admitted this process lifetime. The repopulate/drain SELECTs still
     /// return the row (`bodyComplete = 0 / bodyEmptyConfirmed = 0` is truthfully
     /// retryable — the row is NOT lied about), but this gate keeps it out of the
@@ -203,7 +212,20 @@ actor ActiveBodyQueue {
     /// re-inserts fresh-epoch rows that MAY reuse a deferred header's UID; a stale
     /// key would make `admit()` reject a message that was never oversized, starving
     /// it of its body until relaunch. The purge-and-resync is the correct
-    /// invalidation point (ADR-IOS-061/062). Colon-hierarchy safe via
+    /// invalidation point — ADR-IOS-061, specifically the **purge-and-resync
+    /// carve-out**, which is one of the two clauses of 061 that ADR-IOS-070 leaves
+    /// STANDING rather than withdrawing. ⚠️ This cited `ADR-IOS-061/062` until R16-7
+    /// (corrected 2026-08-06): **`ADR-IOS-062` has never existed.** `DECISIONS.md`
+    /// §ADR-IOS-070 states it outright — it appears in no `DECISIONS.md` at either
+    /// tag, has no detail file, and exists only in an untracked draft; the number is
+    /// unused and must not be cited. The principle a reader reaches for when they
+    /// cite it is **ADR-IOS-068** (native provider id is the durable action key),
+    /// which is NOT what licenses this function — the licence here is 061's
+    /// carve-out. Predicate: `rg -n 'ADR-IOS-062|061/062' TabMail/ Shared/
+    /// TabMailNotificationService/ TabMailTests/` → **no output, exit 1**; the only
+    /// surviving mentions anywhere are the two that exist to say the number is
+    /// void (`DECISIONS.md`, `Companion/Decisions/V3/Active/adr-ios-070.md` §5).
+    /// Colon-hierarchy safe via
     /// `MessageIdentity.headerIdBelongsToFolder` — a nested `:`-delimited sibling
     /// folder is not matched.
     func clearOversizedDeferred(accountId: String, folderPath: String) {

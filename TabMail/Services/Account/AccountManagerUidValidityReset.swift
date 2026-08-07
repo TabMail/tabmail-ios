@@ -714,10 +714,34 @@ extension AccountManager {
     /// the op carries no durable identity that could be re-resolved under a new
     /// epoch.
     ///
-    /// The discriminator mirrors `MessageHeader.stableId`, which is what the
-    /// admission sites store: an rfc822 Message-ID when one exists, the raw UID
-    /// otherwise. An op with NO ids at all is not address-only — there is nothing
-    /// to be wrong about, and deleting it would drop intention for free.
+    /// An op with NO ids at all is not address-only — there is nothing to be wrong
+    /// about, and deleting it would drop intention for free.
+    ///
+    /// ⚠️ THIS PARAGRAPH USED TO READ *"The discriminator mirrors
+    /// `MessageHeader.stableId`, which is what the admission sites store: an rfc822
+    /// Message-ID when one exists, the raw UID otherwise"* — **describing a regime
+    /// that was WITHDRAWN** (R16-7, corrected 2026-08-06). It is dangerous
+    /// specifically because `stableId` the property still has that RFC-first shape,
+    /// so the sentence reads as verifiable while the thing it describes — RFC as a
+    /// live durable action key — is gone. ADR-IOS-068/D4 removed RFC as mutation
+    /// authority; the drain's Checkpoint A refuses to CLAIM any IMAP non-draft op
+    /// unless `idsAreCanonicalUIDs` holds, i.e. every id is a canonical non-zero
+    /// bare UID. So the ops this predicate can ever see on IMAP already carry bare
+    /// UIDs, and the discriminator's real job is to separate an ADDRESS from
+    /// everything that is not one — draft UUIDs, encoded composite ids, `"0"`,
+    /// `"001"` — not to pick the raw-UID branch of a two-branch admission format.
+    ///
+    /// THE ONE PLACE AN rfc822 id STILL REACHES `PendingOperation`, named so this
+    /// correction does not read as "RFC ids no longer exist": the ReplyDetect
+    /// `reply→none` producers, all of type `.setTag`. Predicate, comments excluded:
+    ///   `rg -n --pcre2 '^(?!\s*(///|//)).*messageIds: \[\w+\.stableId\]'
+    ///    TabMail/ Shared/ TabMailNotificationService/` → **7**
+    ///   (`SyncEngine`, `SyncEngineFullSync` ×2, `SyncEngineDeltaSync` ×2,
+    ///   `SyncEngineBackfillDeep`, `AccountManagerOutbox`).
+    /// `.setTag` is DELIBERATELY absent from Checkpoint A's `nonDraftTypes` for
+    /// exactly this reason — see the comment above that set: adding it would make
+    /// all seven a deterministic IMAP drop, and leaving them in while the exit-4 arm
+    /// stopped deleting would accumulate unclaimable rows forever. Neither happens.
     ///
     /// ⚠ SHAPE ONLY — NOT AUTHORITY TO RETIRE. This answers "could these ids mean
     /// anything under a different numbering?", which is a necessary condition and

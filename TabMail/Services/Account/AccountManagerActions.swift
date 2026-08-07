@@ -203,8 +203,8 @@ struct ExpectedMessageIdentity: Sendable, Equatable {
     /// `MessageMetadata.rfc822MessageId` is `String?` by construction (nil
     /// whenever the provider payload omits the header) and three production
     /// statements assign that Optional straight onto an EXISTING row with no nil
-    /// check — `SyncEngine.gmailDeltaSync` ×1 and `SyncEngine.exchangeDeltaSync`
-    /// ×2 — so a stored identity can go from present to absent by PROPAGATION
+    /// check — `SyncEngine.gmailDeltaSync` ×2 and `SyncEngine.exchangeDeltaSync`
+    /// ×3, i.e. FIVE — so a stored identity can go from present to absent by PROPAGATION
     /// even though nothing nulls it literally. **The failure direction is why
     /// this stays as-is rather than being tightened:** this type is a VETO only,
     /// so a propagated nil causes a spurious refusal, which one ordinary gesture
@@ -214,7 +214,26 @@ struct ExpectedMessageIdentity: Sendable, Equatable {
     /// `if normalizedIncomingRfc822 != nil` merge guard): the ⚠️ CORRECTED
     /// 2026-08-05 block in the doc comment on
     /// `SearchView.resolveLocalResultHeaderId`, which also records why no guard
-    /// is being added at those three sites.
+    /// is being added at those five sites.
+    ///
+    /// ⚠️ THIS COMMENT SAID "×1 … ×2 … those THREE sites" UNTIL R16-7
+    /// (2026-08-06) — the PRE-re-census number, left behind when round 11 (R11-I)
+    /// re-derived the same census and found FIVE. It is the worst shape in the
+    /// class: it points the reader at the corrected block in
+    /// `SearchView.resolveLocalResultHeaderId` while itself carrying the number
+    /// that block exists to retract, so following the pointer produced a
+    /// contradiction and trusting the pointer-holder produced a wrong count.
+    /// A cache is not invalidated by citing the thing that invalidates it.
+    /// Predicate, comments excluded so this paragraph cannot satisfy it:
+    ///   `rg -c --pcre2 '^(?!\s*(///|//)).*\.rfc822MessageId\s*=' \
+    ///    TabMail/Services/Sync/SyncEngineDeltaSync.swift` → **7**, of which the
+    ///   two that build a freshly-parsed `header` for INSERT cannot null a stored
+    ///   value and are not counted; the remaining **five** write onto a row that is
+    ///   subsequently `update`d. Census by PROPERTY (assignment to
+    ///   `rfc822MessageId` on an UPDATED row), never by receiver name — the
+    ///   original miss was a `existing.rfc822MessageId =` search that was
+    ///   structurally blind to the orphan-reclaim arm's `orphaned.` receiver
+    ///   (`MIS-007`).
     func matches(_ header: MessageHeader) -> Bool {
         rfc822MessageId == MessageIdentity.comparableRfc822Identity(header.rfc822MessageId)
     }
