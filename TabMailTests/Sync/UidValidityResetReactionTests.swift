@@ -510,8 +510,8 @@ struct UidValidityResetReactionTests {
         #expect(events[0].2 == UInt32(Self.oldEpoch) && events[0].3 == UInt32(Self.newEpoch))
     }
 
-    /// 🚨 The QUARANTINE half of the §5.5 in-txn guard, exercised through the OTHER
-    /// door into `runSyncMessages`: `SyncEngine.syncFolderMessages`.
+    /// 🚨 NOTHING MERGES INTO A QUARANTINED FOLDER, asserted at the OTHER door:
+    /// `SyncEngine.syncFolderMessages`.
     ///
     /// The full-sync and delta-sync loops branch into the reaction before they reach
     /// the merge pass, so a guard living only in those loops would LOOK complete —
@@ -520,6 +520,19 @@ struct UidValidityResetReactionTests {
     /// none of which read the flag. A user merely OPENING a quarantined folder would
     /// then insert NEW-epoch headers under the OLD stamp, which is exactly the state
     /// a bare-UID durable op mutates the wrong message from (C3).
+    ///
+    /// ⚠ WHERE the refusal happens moved in v1.7.1 and this test's assertions did
+    /// not, which is the point of stating them as an end state. `syncFolderMessages`
+    /// now branches into the reaction for a quarantined folder and RETURNS, so this
+    /// case no longer reaches `runSyncMessages` at all — its non-IMAP `MockEmailProvider`
+    /// is never registered, so the reaction cannot obtain one and aborts with the flag
+    /// still set. The in-transaction quarantine term inside `runSyncMessages` is NOT
+    /// thereby dead: `syncMessages` has a second caller in the delta-sync path, and
+    /// the term is the one that holds inside the write transaction rather than across
+    /// a suspension. See `EpochRebuildArmMigrationTests
+    /// .onDemandNavigationRedrivesAQuarantinedCustomFolder` for the complementary
+    /// case, where a REAL IMAP provider is registered and the same door rebuilds the
+    /// folder instead of stranding it.
     ///
     /// The epochs AGREE here on purpose, so the epoch half of the guard cannot be
     /// what produces the green.

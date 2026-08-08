@@ -461,6 +461,79 @@ extension AccountManager {
         }
     }
 
+    /// **v1.7.1 one-shot: rebuild every IMAP/iCloud folder's epoch through the
+    /// reaction.** The 1.6.38 → 1.7.0 upgrade left inherited rows with a nil
+    /// `MessageHeader.observedUidValidity` and no path that fills it: admission
+    /// (`admittedOrdinaryActionTargets`) needs the row epoch and the folder epoch
+    /// both non-nil and EQUAL, so every gesture below the newest ~50 UIDs per
+    /// folder is silently refused, permanently. Nothing recovers it — it is a
+    /// dropped intention on the whole inherited corpus, not a fail-closed edge the
+    /// mantra lets stand.
+    ///
+    /// The repair-pass approach (prove each inherited row's address in place, then
+    /// stamp it) was killed across five vet rounds. This ships the reaction we
+    /// already have instead: purge the folder's local rows and resync from the
+    /// server, so every row is stamped by its OWN fetch. It is the same code that
+    /// runs on a real UIDVALIDITY turnover — already ported, tested and driven by
+    /// three owners — so no mitigation-only machinery is introduced or retired.
+    ///
+    /// **Why this is an ARM and not a bespoke migration.** `uidValidityResetArmFlag`
+    /// is the SINGLE WRITER of `uidValidityResetPendingAt`; a batched
+    /// `UPDATE folder SET …` here would be a second writer of a column whose
+    /// safety property is that exactly one path raises it and exactly one clears
+    /// it (`Folder.uidValidityResetPendingAt`). Arming also short-circuits the
+    /// reaction's own trigger validation, which REFUSES to start on a folder whose
+    /// stored epoch is nil — the state 26 of this corpus's 41 IMAP folders are
+    /// actually in — exactly as `verifyAndBootstrapPrePopulatedFolderEpoch`
+    /// documents for its own entry.
+    ///
+    /// **Scope: every non-empty-path folder on an `.imap`/`.icloud` account.**
+    /// Gmail and Outlook never populate `lastKnownUidValidity`, and the reaction
+    /// re-checks the provider itself. Custom non-favourite folders ARE included and
+    /// are only safe to include because `SyncEngine.syncFolderMessages` now
+    /// re-drives on quarantine; without that they would be armed with no owner. They
+    /// pay the purge lazily, when the user first opens them.
+    ///
+    /// The flag is set ONLY when every folder armed. A partial arm leaves it clear
+    /// so the next launch retries — re-arming an already-quarantined folder is a
+    /// no-op write, so the retry is idempotent. Zero folders trivially satisfies
+    /// this: an account with no folder rows yet has no inherited mail to repair,
+    /// and whatever it syncs later is stamped by its own fetch.
+    func armImapUidValidityResetForEpochRebuildIfNeeded() async {
+        let flagKey = "didArmImapUidValidityResetForEpochRebuild_v1"
+        guard !UserDefaults.standard.bool(forKey: flagKey) else { return }
+
+        let folderIds: [String]
+        do {
+            folderIds = try await dbPool.read { db in
+                let accountIds = try String.fetchAll(db, Account
+                    .select(Column("id"))
+                    .filter([AccountProvider.imap.rawValue, AccountProvider.icloud.rawValue]
+                        .contains(Column("provider"))))
+                guard !accountIds.isEmpty else { return [] }
+                return try String.fetchAll(db, Folder
+                    .select(Column("id"))
+                    .filter(accountIds.contains(Column("accountId")))
+                    .filter(Column("path") != ""))
+            }
+        } catch {
+            BackgroundSyncLogger.log("[EpochRebuild] folder enumeration failed: \(error) — flag NOT set, retrying next launch")
+            return
+        }
+
+        var armed = 0
+        for folderId in folderIds {
+            if await uidValidityResetArmFlag(folderId: folderId) { armed += 1 }
+        }
+
+        guard armed == folderIds.count else {
+            BackgroundSyncLogger.log("[EpochRebuild] armed \(armed)/\(folderIds.count) IMAP/iCloud folders — flag NOT set, retrying next launch")
+            return
+        }
+        UserDefaults.standard.set(true, forKey: flagKey)
+        BackgroundSyncLogger.log("[EpochRebuild] armed UIDVALIDITY reset on \(armed) IMAP/iCloud folder(s) — each purges and resyncs on its next sync pass")
+    }
+
     /// Step 2.5 — the FIFO write barrier, looped until the local write queue and
     /// the durable-op drain are both quiescent. UNLIKE
     /// `awaitWriteQueueDrainOrTimeout` (which races a wall clock and is ALLOWED to

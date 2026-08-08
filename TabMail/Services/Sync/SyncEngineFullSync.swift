@@ -466,6 +466,34 @@ extension SyncEngine {
     /// On-demand sync for a single folder (called when user navigates to it).
     /// Publishes `.checking` phase for the folder's account.
     func syncFolderMessages(folder: Folder, provider: any EmailProvider) async throws {
+        // T4.S6 re-drive — the THIRD owner, and the ONLY one that reaches a custom
+        // non-favourite folder. `fullSync`'s per-folder loop and `imapDeltaSync`
+        // both branch into the reaction for a quarantined folder, but both iterate
+        // `syncableFolders` (primary ∪ secondary ∪ favourite), so a quarantined
+        // custom folder previously had NO re-drive at all: `runSyncMessages`'s
+        // in-transaction quarantine term correctly SKIPS the merge pass and
+        // `isFolderWalkComplete` refuses the crawl, which together left the folder
+        // quarantined and unsynced FOREVER — the reaction's own abort legs
+        // deliberately leave the flag set precisely because a re-drive is assumed
+        // to exist. On-demand navigation is that folder's only door
+        // (`AccountManager.syncFolders(_:)` → here → `runSyncMessages`, whose
+        // filter is `!folder.path.isEmpty` and nothing else), so the branch belongs
+        // here. Re-read the flag rather than trusting the caller's snapshot — the
+        // caller's `Folder` may predate an arm by an arbitrary interval.
+        //
+        // No recursion through step 6: the reaction releases and resyncs only AFTER
+        // step 5 cleared the flag in the same write that stamped the fresh epoch, so
+        // the re-read below is nil by then. An abort leg returns before step 6 runs
+        // at all, and `runUidValidityResetReaction` is single-flight regardless.
+        let quarantined = (try? await dbPool.read { [folderId = folder.id] db in
+            try Folder.fetchOne(db, key: folderId)?.uidValidityResetPendingAt != nil
+        }) ?? false
+        if quarantined {
+            await AccountManager.shared.runUidValidityResetReaction(
+                accountId: folder.accountId, folderPath: folder.path
+            )
+            return
+        }
         Task { @MainActor in AccountManagerState.shared.setSyncPhase(.checking, forAccount: folder.accountId) }
         try await syncMessages(for: folder, provider: provider, limit: SyncConfig.syncMessageLimit)
         // Unread recount is now handled inside syncMessages, immediately after header commit.

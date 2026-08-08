@@ -605,6 +605,17 @@ final class AppStartup {
         resumeDBWaiters()
         BootProfiler.mark("dbReady=true (push / NSE-merge / BGTask waiters unblocked)")
 
+        // v1.7.1 one-shot epoch rebuild — OFF the launch gate, and it CANNOT sit in
+        // `StartupMigrations` (which runs synchronously inside `AppDatabase.init`,
+        // before `AppDatabase.shared` is published): the arm goes through
+        // `uidValidityResetArmFlag`, the single writer of that column, which is
+        // `async` and lives on `AccountManager`. The one-cycle delay costs nothing —
+        // the flag is durable, the arm is idempotent, and a folder that syncs once
+        // before being armed is simply purged and resynced on its next pass.
+        Task.detached(priority: .utility) {
+            await AccountManager.shared.armImapUidValidityResetForEpochRebuildIfNeeded()
+        }
+
         // NSE staging-DB schema upkeep + state mirror — OFF the launch gate.
         // Neither is needed to show the inbox: `mergeNSEStagingData` tolerates a
         // missing staging file, and `mirror*` only feeds the NSE's NEXT push.
