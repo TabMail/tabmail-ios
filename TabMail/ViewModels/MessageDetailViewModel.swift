@@ -1476,8 +1476,13 @@ final class MessageDetailViewModel {
         // ⚠️ CHECK BEFORE THE DESTRUCTIVE STEP. This function deletes the durable body FIRST and
         // fetches second. If the row's address is mid-move, `fetchBody` now refuses (it must — the
         // UID names a different message), so the delete would land and the fetch would not,
-        // leaving the user staring at a blank message they could previously read, with no path
-        // back until some unrelated sync or queue drain happens. Skipping the whole refresh keeps
+        // leaving the user staring at a blank message they could previously read. ⚠️ **This said
+        // "with no path back until some unrelated sync or queue drain happens" — the same sentence
+        // an audit round had already corrected in this row's registry twin, `IOS-BODY-002`, and
+        // missed here.** A drain does restore the DURABLE body (the delete leaves
+        // `bodyComplete = 0`, so the queues re-fetch once the address settles); it does not restore
+        // THIS VIEW, which is still polling the stale key. The user sits in front of a blank message
+        // until they back out and reopen. Skipping the whole refresh keeps
         // the body they already have, which is strictly better than destroying it to prove a point.
         // (Found by audit — the refusal was added to the funnel without checking what each caller
         // had already thrown away by the time it fires.)
@@ -2016,8 +2021,14 @@ final class MessageDetailViewModel {
     /// messageNotFound: IMAP actor may be mid-sync with a different mailbox selected.
     /// Connection errors: fetchBody reconnects on failure internally, retry uses the fresh connection.
     /// Delays: 200ms, 500ms — fast first retry since priority lock resolves most contention quickly.
-    /// After exhausting retries, re-resolves the message (it may have been re-synced with a new
-    /// composite ID during the delay window) and retries body fetch once with the new header.
+    /// ⚠️ **The post-loop re-resolve below is UNREACHABLE, and this comment promised it for as
+    /// long as it has existed** (found by audit). Both `catch` clauses carry
+    /// `where attempt < maxAttempts`, so on the final attempt nothing matches and the error
+    /// propagates straight out of this `throws` function; the loop can only exit by `return` or by
+    /// throwing. Nothing after it runs. The promise is left described rather than silently deleted
+    /// because it is the same false self-heal this file is being corrected for elsewhere — and
+    /// because removing the dead tail is a control-flow edit that does not belong in a
+    /// documentation-only release candidate. Treat it as a follow-up cleanup, not as behaviour.
     private func fetchBodyWithRetry(for msg: MessageHeader) async throws {
         let maxAttempts = 3
         let retryDelays = [200, 500] // ms — indexed by (attempt - 1)

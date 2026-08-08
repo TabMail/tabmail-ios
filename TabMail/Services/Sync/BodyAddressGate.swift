@@ -75,23 +75,44 @@ import GRDB
 /// and `AccountManagerQueue.publishRekeys` mirrors the mapping to Undo, `SearchIndex` and
 /// `BodyAssetStore` — **never into a live `MessageDetailViewModel`**. So every screen that holds a
 /// captured header — the detail body poll, pull-to-refresh, the three attachment surfaces, a forward
-/// launched from that view — keeps testing the pre-move `(destination folder, SOURCE UID)` pair and
-/// stays refused **after the database has settled**. Waiting does not help; repeating the same
-/// gesture in the same view does not help; a later sync does not help.
+/// launched from that view — keeps testing the pre-move `(destination folder, SOURCE UID)` pair
+/// **on every path that needs a NEW fetch**, and stays refused there even after the database has
+/// settled. Waiting does not help; repeating a fetch-requiring gesture in the same view does not
+/// help; a later sync does not help.
 ///
 /// **The guaranteed recovery is always the same: back out to the message list and reopen**, which
 /// rebuilds the view model against the current row. Any narrower claim ("it will load once the move
 /// completes", "pull again", "tap it again", "forward it again") is false for this class, and one
 /// was found live in a different file in each of rounds 9, 10 and 11.
 ///
-/// **Two things this closure does NOT say**, because overcorrecting is its own defect:
+/// ⚠️ **"On every path that needs a NEW fetch" is a load-bearing qualifier, added after an audit
+/// round rejected the blanket version of this paragraph.** A blanket closure is false in one
+/// direction and, worse, licenses deleting the true exceptions. The boundary, stated exactly:
+/// - **A file already materialized into the view's own state still opens.** `AttachmentListView`
+///   hands a `downloadedFiles[section]` hit straight to `AttachmentQuickLook.present`, and
+///   `EmlAttachmentPreview` assigns its `previewURL` the same way — neither calls
+///   `AccountManager.fetchAttachment`, so neither reaches the guard. Those taps keep working in the
+///   stale view for as long as it lives.
+/// - **A durable-cache hit does NOT survive the re-key.** `publishRekeys` also calls
+///   `BodyAssetStore.rekeyContentKey`, which moves the manifest row from the old content key to the
+///   destination one. A stale view still asks `attachmentAssetId` for the OLD key, so after the
+///   re-key it MISSES a cache that is sitting right there under the new key — and then falls
+///   through to the refusing guard. So the durable cache is an exception BEFORE the re-key and not
+///   after it, which is the opposite of what "cached attachments still open" suggests on its own.
+///
+/// **Two further things this closure does NOT say**, because overcorrecting is its own defect:
 /// - The poll still heals SAME-KEY failures — a connection error, a lock timeout, or a body that
 ///   later lands under this row's existing key. It is only the re-key branch that it cannot see.
 /// - A repeat gesture is not guaranteed, but it is not useless either: a fresh `ComposeView`
 ///   re-resolves through `Draft.resolveReplyToHeader`, whose Strategy 2 (account + UNIQUE
 ///   `rfc822MessageId`) usually finds the re-keyed row. It fails closed on a message with no
-///   Message-ID and on duplicate RFC matches — which is exactly why reopening, which restores
-///   Strategy 1's direct primary-key hit, is the instruction to give the user.
+///   Message-ID and on duplicate RFC matches — which is why reopening, which restores Strategy 1's
+///   direct primary-key hit, is the instruction to give the user. ⚠️ **With one caveat that cost a
+///   blocking finding: reopening only restores Strategy 1 if no DRAFT was saved under the
+///   deterministic `forward:<accountId>:<stableId>` key.** If one was, `loadDraftOrPrepopulate`
+///   takes its existing-draft branch, resolves from the persisted `draft.replyToId`, restores the
+///   saved attachment set and never re-runs `carryForwardAttachments` (`IOS-COMPOSE-001`). That is
+///   why the carry-forward alert tells the user to DISCARD rather than merely close.
 enum BodyAddressGate {
 
     /// Why a fetch/write was refused. `nil` means "proceed".

@@ -662,10 +662,11 @@ struct ComposeView: View {
     @State private var carryForwardCollected: [String] = []
     @State private var carryForwardOutstanding = 0
     /// True when at least one of those failures was `ProviderError.addressPendingMove` — the
-    /// message's address is mid-move, so the advice names the guaranteed recovery (go back to the
-    /// message list, reopen, forward again) rather than "attach them manually". It said "try the
-    /// forward again shortly" until an audit round showed a bare retry is not guaranteed; see the
-    /// `message` builder below for why.
+    /// message's address is mid-move, so the advice names the recovery that actually works
+    /// (discard this draft, reopen the message from the list, forward again) rather than "attach
+    /// them manually". Two audit rounds corrected this: "try the forward again shortly" ignored the
+    /// stale captured header, and "close this draft and forward it again" ignored that Close OFFERS
+    /// TO SAVE. See the `message` builder below.
     @State private var carryForwardBlockedByMove = false
     @State private var contactSearch = ContactSearchService()
     @State private var activeField: ComposeField?
@@ -3365,8 +3366,8 @@ private struct CarryForwardFailureAlert: ViewModifier {
         }
     }
 
-    /// The mid-move case gets different advice because it is transient — but the advice must name
-    /// the GUARANTEED gesture, not the probable one.
+    /// The mid-move case gets different advice because it is transient — but the advice must name a
+    /// gesture that actually completes, not merely a plausible one. It took two rounds to get here.
     ///
     /// Closing this draft does not rebuild the underlying `MessageDetailView`, so its
     /// `activeMessage` can still be the pre-move `(destination folder, SOURCE UID)` header
@@ -3380,15 +3381,27 @@ private struct CarryForwardFailureAlert: ViewModifier {
     /// from the message list restores Strategy 1's direct primary-key hit, so it is the instruction
     /// worth giving. (This string promised a bare "forward the message again" until an audit round
     /// traced the resolver.)
+    ///
+    /// ⚠️ **And it must say DISCARD, not "close" — the second round caught that too.** A forward
+    /// key is deterministic (`forward:<accountId>:<stableId>`), and `snapshotInitialState()` runs
+    /// synchronously at the end of `prepopulate()`, BEFORE any carry task lands. So in the mixed
+    /// case this alert is most likely to describe — some attachments carried, others refused — the
+    /// arrived ones make `hasChanges` true and Close prompts Save. Saving persists the INCOMPLETE
+    /// set under that same deterministic key, and the next Forward then takes
+    /// `loadDraftOrPrepopulate`'s existing-draft branch: it restores the saved attachments,
+    /// resolves from the persisted `draft.replyToId`, and never calls `carryForwardAttachments`
+    /// again (`IOS-COMPOSE-001`). The advice would have routed the user straight back into the
+    /// missing set it was warning them about. Discarding deletes the row, so the reopened Forward
+    /// re-runs `prepopulate` and carries cleanly.
     private var message: String {
         let names = failures.joined(separator: ", ")
         let subject = failures.count == 1
             ? "This attachment could not be carried over"
             : "These attachments could not be carried over"
         if blockedByMove {
-            return "\(subject) because the original message is still being moved: \(names).\n\nClose this draft, go back to the message list and open the message again, then forward it — or attach the files manually before sending."
+            return "\(subject) because the original message is still being moved: \(names).\n\nDiscard this draft (choose Discard if you're asked to save), then open the message again from the message list and forward it. Or attach the files manually before sending."
         }
-        return "\(subject): \(names).\n\nAttach them manually before sending, or close this draft and forward the message again."
+        return "\(subject): \(names).\n\nAttach them manually before sending, or discard this draft (choose Discard if you're asked to save) and forward the message again."
     }
 }
 
