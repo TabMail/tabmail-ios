@@ -195,6 +195,25 @@ struct ComposeAttachmentCarryTests {
         }
     }
 
+    @Test("Close and Discard arbitrate with a running compose-agent edit")
+    func terminalComposeActionsClaimAgentDisposition() throws {
+        let source = try composeSource()
+        let close = try functionBody(
+            "private func closeCompose() async {",
+            before: "private func deleteClearedDraftAndDismiss() async {",
+            in: source)
+        let discard = try functionBody(
+            "private func discardDraftAndDismiss() async {",
+            before: "private func typedDeleteIdentity(for draft: Draft) async",
+            in: source)
+        for (name, body) in [("close", close), ("discard", discard)] {
+            #expect(body.contains("agentSendFence.claimExclusiveDisposition()"),
+                    "a running agent edit must exclude the competing \(name) action")
+            #expect(body.contains("agentSendFence.releaseExclusiveDisposition()"),
+                    "a failed or completed \(name) must restore agent admission")
+        }
+    }
+
     @Test("Photos-picker work joins the same attachment completion boundary")
     func photoPickerPreparationCannotBeSnapshottedMidImport() throws {
         let body = try functionBody(
