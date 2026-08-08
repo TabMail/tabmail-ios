@@ -2022,14 +2022,8 @@ final class MessageDetailViewModel {
     /// messageNotFound: IMAP actor may be mid-sync with a different mailbox selected.
     /// Connection errors: fetchBody reconnects on failure internally, retry uses the fresh connection.
     /// Delays: 200ms, 500ms — fast first retry since priority lock resolves most contention quickly.
-    /// ⚠️ **The post-loop re-resolve below is UNREACHABLE, and this comment promised it for as
-    /// long as it has existed** (found by audit). Both `catch` clauses carry
-    /// `where attempt < maxAttempts`, so on the final attempt nothing matches and the error
-    /// propagates straight out of this `throws` function; the loop can only exit by `return` or by
-    /// throwing. Nothing after it runs. The promise is left described rather than silently deleted
-    /// because it is the same false self-heal this file is being corrected for elsewhere — and
-    /// because removing the dead tail is a control-flow edit that does not belong in a
-    /// documentation-only release candidate. Treat it as a follow-up cleanup, not as behaviour.
+    /// The final attempt either succeeds or propagates its error: the filtered catch clauses match
+    /// only attempts one and two, so there is deliberately no post-loop guessed-row recovery.
     private func fetchBodyWithRetry(for msg: MessageHeader) async throws {
         let maxAttempts = 3
         let retryDelays = [200, 500] // ms — indexed by (attempt - 1)
@@ -2045,17 +2039,6 @@ final class MessageDetailViewModel {
                 try await Task.sleep(for: .milliseconds(retryDelays[attempt - 1]))
             }
         }
-        // All retries exhausted — re-resolve (message may have been re-synced with new ID)
-        print("[MoveTrace] fetchBodyWithRetry — retries exhausted, re-resolving \(msg.id)")
-        if var resolved = await resolveMessageAsync(compositeId: messageId), resolved.id != msg.id {
-            print("[MoveTrace] fetchBodyWithRetry — re-resolved to \(resolved.id), retrying body fetch")
-            applyOverlay(to: &resolved)
-            message = resolved
-            try await manager.fetchBody(for: resolved)
-            return
-        }
-        // Re-resolve didn't help — throw to trigger error state
-        throw ProviderError.messageNotFound
     }
 
     // MARK: - Message Resolution
