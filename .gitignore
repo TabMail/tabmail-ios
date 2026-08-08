@@ -48,6 +48,10 @@ Secrets.xcconfig.bak
 # backend internals) and are not part of the public client. One slipped in
 # once (PLAN_NSE_ENHANCE.md); this rule prevents a recurrence.
 PLAN_*.md
+# ...and their companion evidence DIRECTORIES (`PLAN_<NAME>/` — vet briefs, agent
+# reports, measurement dumps). `PLAN_*.md` does NOT match a directory, so
+# `PLAN_FOLDER_EPOCH_BOOTSTRAP/` sat untracked-but-publishable until 2026-08-07.
+PLAN_*/
 
 # Agent/automation tooling is private infrastructure — never in the public repo.
 AGENTS.md
