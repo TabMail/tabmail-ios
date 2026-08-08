@@ -127,7 +127,7 @@ These records were authored after `v1.6.38`, so the pinned compaction has no byt
 - **[ADR-IOS-026B — the v3 supersession record](Companion/Decisions/V3/Superseded/adr-ios-026b-v3-superseded-by-068.md)** — *PendingOperation Uses Stable IDs (rfc822MessageId)*, **SUPERSEDED 2026-08-02 by ADR-IOS-068** and retained verbatim as evidence: `MessageHeader.stableId`, `IMAPProvider.resolveUID`'s Message-ID `SEARCH`, dual-match pending-op filtering, the UIDVALIDITY rationale. **Only its durable-mutation-authority layer is superseded** — fetch, normalize, dedup, stage, the AI cross-device cache probe, threading/`References`, and Outbox send de-duplication all SURVIVE; ADR-IOS-068's exempt list is normative. Authored under the colliding number `ADR-IOS-026`, so both search terms find it. The byte-identical `v1.6.38` twin, without the supersession banner, is [`Companion/Decisions/Superseded/adr-ios-026b.md`](Companion/Decisions/Superseded/adr-ios-026b.md).
 - **[Compaction drift list](Companion/Decisions/V3/retained-inline-no-byte-identical-routed-twin.md)** — the retired *Retained inline — no byte-identical routed twin* preamble: check the routed twin before editing a post-`v1.6.38` amendment.
 
-# v3 records (ADR-IOS-068 … 074)
+# v3 records (ADR-IOS-068 … 075)
 
 > **Numbering note.** This file jumps from ADR-IOS-057 to ADR-IOS-068. That gap is deliberate and is
 > itself a record: **ADR-IOS-058, 059, 060, 061, 062, 063, 064, 065, 066 and 067 were authored on a
@@ -143,4 +143,5 @@ These records were authored after `v1.6.38`, so the pinned compaction has no byt
 - **[ADR-IOS-071](Companion/Decisions/V3/Active/adr-ios-071.md)** — Active. No backward compatibility for the legacy action queue: migration v74 purges it predicate-free; authored drafts/outbox/content remain never-drop.
 - **[ADR-IOS-072](Companion/Decisions/V3/Active/adr-ios-072.md)** — Active. Content belongs to message identity, not a mutable slot. A NULL identity stamp means re-fetch, never destroy; positive mismatch and two-phase publish gates own cleanup.
 - **[ADR-IOS-073](Companion/Decisions/V3/Active/adr-ios-073.md)** — Active. Atomic `UID MOVE` is a distinct no-fallback route; `UIDPLUS` governs evidence, not eligibility. Missing evidence never authorizes guessing, replay, or stale undo.
-- **[ADR-IOS-074](Companion/Decisions/V3/Active/adr-ios-074.md)** — Active. Send, explicit Save and agent autosave share one complete forward-attachment snapshot boundary; autosave persists it copy-on-write.
+- **[ADR-IOS-074](Companion/Decisions/V3/Active/adr-ios-074.md)** — Active. Every attachment ingress joins one snapshot/failure boundary, and compose-agent edits are mutually exclusive with Save, Send, Close and Discard.
+- **[ADR-IOS-075](Companion/Decisions/V3/Active/adr-ios-075.md)** — Active. Body processing reports success or confirmed-empty only when the corresponding cache transaction committed; write aborts stay retryable.
