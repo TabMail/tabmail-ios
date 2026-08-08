@@ -646,10 +646,21 @@ struct ComposeView: View {
     @State private var showCc = false
     @State private var isSending = false
     @State private var sendError: String?
-    /// Filenames `carryForwardAttachments` could not download. Non-empty means the user is about
-    /// to forward a message WITHOUT attachments they have every reason to think are attached, so
-    /// this must be surfaced, not logged. See the alert below and that function's own comment.
+    /// Filenames `carryForwardAttachments` could not download, published ONLY once every fetch in
+    /// the batch has settled. Non-empty means the user is about to forward a message WITHOUT
+    /// attachments they have every reason to think are attached, so this must be surfaced, not
+    /// logged. See the alert below and that function's own comment.
     @State private var carryForwardFailures: [String] = []
+    /// Failures collected so far, and how many fetches are still outstanding. These exist because
+    /// the batch needs a real COMPLETION BOUNDARY: publishing straight into
+    /// `carryForwardFailures` as each failure lands presents the alert on the FIRST one, and
+    /// `AccountManager.fetchAttachment`'s address guard awaits a `dbPool.read`, so the fetches
+    /// genuinely interleave rather than all failing within one run loop turn. Without this counter
+    /// the alert could list one file out of five, or present with `blockedByMove` advice derived
+    /// from a different file's cause. (Found by audit — an earlier version of this repair claimed
+    /// same-turn accumulation, and the suspending read disproves it.)
+    @State private var carryForwardCollected: [String] = []
+    @State private var carryForwardOutstanding = 0
     /// True when at least one of those failures was `ProviderError.addressPendingMove` — the
     /// message's address is mid-move, so the right advice is "try the forward again shortly"
     /// rather than "attach them manually".
@@ -2827,6 +2838,7 @@ struct ComposeView: View {
     private func clearCarryForwardFailures() {
         carryForwardFailures = []
         carryForwardBlockedByMove = false
+        carryForwardCollected = []
     }
 
     /// One task per attachment, matching the concurrency this function has always had. An audit
@@ -2838,14 +2850,17 @@ struct ComposeView: View {
     /// slower instead of ~N/10. Only IMAP converges later, on the single reserved action
     /// connection. Concurrency restored.
     ///
-    /// Failures accumulate into `carryForwardFailures` as they land rather than being aggregated at
-    /// a single completion point. In the case this exists for — an address refusal — every fetch
-    /// fails on a local read with no network round trip, so all of them land within the same run
-    /// loop turn and the alert presents once with the full list. A mixed batch where a later
-    /// network failure arrives after the alert is already on screen may under-list that one file;
-    /// that is accepted rather than paid for with the slowdown above.
+    /// Failures are collected into `carryForwardCollected` and published to the alert-driving
+    /// `carryForwardFailures` only when `carryForwardOutstanding` reaches zero — a real completion
+    /// boundary. A second audit round killed the version that published on each failure: the
+    /// address guard inside `AccountManager.fetchAttachment` awaits a `dbPool.read`, so the fetches
+    /// interleave and the "they all fail in the same run loop turn" reasoning that version relied
+    /// on was simply untrue. Concurrency and one complete, correctly-attributed alert are not in
+    /// tension; they just need the counter.
     private func carryForwardAttachments(from reply: MessageHeader, attachments atts: [AttachmentInfo]) {
         print("[ComposeForward] Carrying over \(atts.count) attachment(s) from \(reply.id)")
+        guard !atts.isEmpty else { return }
+        carryForwardOutstanding += atts.count
         for att in atts {
             Task { @MainActor in
                 do {
@@ -2864,7 +2879,12 @@ struct ComposeView: View {
                     if case ProviderError.addressPendingMove = error {
                         self.carryForwardBlockedByMove = true
                     }
-                    self.carryForwardFailures.append(att.filename)
+                    self.carryForwardCollected.append(att.filename)
+                }
+                self.carryForwardOutstanding -= 1
+                // Last fetch in the batch: publish whatever failed, once, in full.
+                if self.carryForwardOutstanding == 0, !self.carryForwardCollected.isEmpty {
+                    self.carryForwardFailures = self.carryForwardCollected
                 }
             }
         }

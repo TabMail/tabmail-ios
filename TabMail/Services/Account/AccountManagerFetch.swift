@@ -170,7 +170,10 @@ extension AccountManager {
         // attachment. Unlike the body path there is nothing downstream to catch it: the
         // bytes are previewed to the user and cached under this row's content key with this
         // row's identity stamp, after which every read check accepts them. Refuse instead;
-        // the refusal clears when `finishMove` re-keys the row, so tapping again works.
+        // the refusal clears in the DATABASE when `finishMove` re-keys the row — but NOT in an
+        // already-open view, which keeps the pre-move header that `publishRekeys` never refreshes,
+        // so the recovery is going back to the message list and reopening, not tapping again.
+        // See `ProviderError.addressPendingMove` and `IOS-BODY-005`.
         guard await !attachmentFetchIsBlockedByPendingAddress(for: message) else {
             throw ProviderError.addressPendingMove(message.id)
         }
