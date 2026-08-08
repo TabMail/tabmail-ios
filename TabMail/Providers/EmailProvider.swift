@@ -725,6 +725,12 @@ enum ProviderError: LocalizedError {
     /// the request boundary so the bug surfaces at its source, not as an opaque
     /// network error.
     case syntheticFolderPath(String)
+    /// The row's provider address is not corroborated — a move is in flight, so
+    /// `(folderPath, messageId)` may name a DIFFERENT message on the wire. Thrown by
+    /// `AccountManager.fetchAttachment`; see `BodyAddressGate`. TRANSIENT by construction:
+    /// it clears the moment `MessageHeaderRekey.finishMove` re-keys the row, so the
+    /// recovering gesture is simply tapping the attachment again.
+    case addressPendingMove(String)
 
     var errorDescription: String? {
         switch self {
@@ -738,6 +744,7 @@ enum ProviderError: LocalizedError {
             return "UIDVALIDITY changed for \(folderPath): stored=\(stored) live=\(live)"
         case .syntheticPlaceholderId(let ids): return "Synthetic placeholder id(s) leaked into provider fetch: \(ids.prefix(3))"
         case .syntheticFolderPath(let path): return "Synthetic folder path leaked into provider request: \(path)"
+        case .addressPendingMove: return "This message is still being moved. Try again in a moment."
         }
     }
 }

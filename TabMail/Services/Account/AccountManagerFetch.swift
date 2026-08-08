@@ -66,6 +66,36 @@ extension AccountManager {
         return !BodyAddressGate.isFetchable(header: message, provider: provider)
     }
 
+    /// The ATTACHMENT counterpart — and it FAILS CLOSED, the opposite direction from the
+    /// body pre-filter above. That asymmetry is deliberate and load-bearing.
+    ///
+    /// The body path can afford a fail-OPEN pre-filter because a dropped pre-filter costs
+    /// only a wasted round trip: `BodyFetchProcessor.process` still refuses authoritatively
+    /// before anything is written. **The attachment path has no such downstream refusal.**
+    /// `fetchAttachment` hands raw bytes back to `AttachmentListView.downloadAndPreview`,
+    /// which previews them AND caches them via `BodyAssetStore.writeAttachment` under
+    /// `ContentKey(message.id)` — the MOVED row's key — stamped with that row's own
+    /// identity from `AttachmentCacheIdentity.stamp(for:)`. So a stranger's attachment
+    /// bytes land under the victim's key carrying the victim's identity proof, and every
+    /// later read check accepts them: the wrong attachment is served as this message's
+    /// attachment indefinitely.
+    ///
+    /// This function IS the guard, not a pre-filter, so an unreadable account must REFUSE.
+    /// Reusing the fail-open version here would be a fail-open seam feeding a guard, which
+    /// is fail-dangerous (`feedback_port_safe_only_if_consumer_direction_same`).
+    func attachmentFetchIsBlockedByPendingAddress(for message: MessageHeader) async -> Bool {
+        let provider: AccountProvider?
+        do {
+            provider = try await dbPool.read { db in
+                try Account.fetchOne(db, key: message.accountId)?.provider
+            }
+        } catch {
+            return true
+        }
+        guard let provider else { return true }
+        return !BodyAddressGate.isFetchable(header: message, provider: provider)
+    }
+
     func fetchBody(for message: MessageHeader) async throws {
         print("[FetchBody] Opening: id=\(message.id.prefix(40)) msgId=\(message.messageId.prefix(30)) folder=\(message.folderPath)")
 
@@ -132,6 +162,18 @@ extension AccountManager {
     /// Download a single attachment's data.
     /// On connection error, reconnects the provider and retries once (handles stale IMAP after device sleep).
     func fetchAttachment(for message: MessageHeader, section: String, encoding: String?) async throws -> Data {
+        // 🚨 C3 — THE SAME ADDRESS HAZARD THE BODY GATE CLOSES, IN THE SIBLING READER.
+        // The fetch below addresses the wire by `(message.folderPath, message.messageId)`.
+        // `optimisticMoveToFolder` rewrites `folderPath` to the destination while leaving
+        // the SOURCE UID in `messageId`, and on IMAP every folder has its own UID space —
+        // so mid-move that pair names a DIFFERENT message and this returns a stranger's
+        // attachment. Unlike the body path there is nothing downstream to catch it: the
+        // bytes are previewed to the user and cached under this row's content key with this
+        // row's identity stamp, after which every read check accepts them. Refuse instead;
+        // the refusal clears when `finishMove` re-keys the row, so tapping again works.
+        guard await !attachmentFetchIsBlockedByPendingAddress(for: message) else {
+            throw ProviderError.addressPendingMove(message.id)
+        }
         // Ensure provider exists
         if providers[message.accountId] == nil {
             guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: message.accountId) }) else {

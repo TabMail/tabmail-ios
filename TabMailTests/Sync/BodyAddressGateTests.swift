@@ -681,4 +681,69 @@ struct BodyAddressGateTests {
         #expect(!BodyAddressGate.identityContradicts(
             stored: "a@example.com", fetched: "<a@example.com>"))
     }
+
+    // MARK: - The sibling reader: attachments
+
+    /// 🚨 **The SAME defect class, in the reader next door.** `AccountManager.fetchAttachment`
+    /// addresses the wire by `(message.folderPath, message.messageId)` — the exact pair
+    /// `optimisticMoveToFolder` leaves inconsistent — so mid-move it returns a STRANGER's
+    /// attachment. `AttachmentListView.downloadAndPreview` then previews those bytes AND caches
+    /// them via `BodyAssetStore.writeAttachment` under `ContentKey(message.id)`, stamped with the
+    /// victim row's own identity from `AttachmentCacheIdentity.stamp(for:)` — so the wrong bytes
+    /// carry the right proof and every later read accepts them. Unlike the body path there is no
+    /// authoritative downstream refusal to catch it.
+    ///
+    /// **Why this asserts the BLOCK DECISION rather than a wire outcome.** `fetchAttachment` is
+    /// coupled to the singleton's `providers`/`workQueues` dictionaries and is not reachable in a
+    /// unit test (see the note atop `AccountManagerFetchTests`). The decision function is the whole
+    /// of the guard, and the property that matters is its DIRECTION.
+    ///
+    /// ⚠️ **The third case is the one that must never silently flip.** The body sibling,
+    /// `bodyFetchIsBlockedByPendingAddress`, deliberately fails OPEN — correct there, because
+    /// `BodyFetchProcessor.process` refuses again at write time. Copying that direction here would
+    /// be a fail-open seam feeding a guard, which is fail-dangerous
+    /// (`feedback_port_safe_only_if_consumer_direction_same`). An unverifiable identity must REFUSE.
+    @Test("An attachment fetch is refused mid-move, and refused when identity cannot be verified")
+    @MainActor
+    func attachmentFetchIsBlockedForInFlightAddress() async throws {
+        let accountId = "gate-attach"
+        let (pool, dir, previous) = try Self.fixture(accountId: accountId, provider: .imap)
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let manager = AccountManager.shared
+
+        // (1) IN FLIGHT — the row still carries the SOURCE UID at the destination folder.
+        let moved = try Self.insertOptimisticallyMovedHeader(
+            accountId: accountId, sourcePath: "INBOX", destinationPath: "Archive",
+            uid: "41", rfc822: "victim@example.com", pool: pool)
+        let movedHeader = try await pool.read { db in try MessageHeader.fetchOne(db, key: moved) }
+        #expect(movedHeader != nil)
+        guard let movedHeader else { return }
+        let inFlightBlocked = await manager.attachmentFetchIsBlockedByPendingAddress(for: movedHeader)
+        #expect(
+            inFlightBlocked,
+            "an in-flight address must never reach the wire — it names a different message")
+
+        // (2) SETTLED — the non-vacuity control. Without this a guard that refuses everything
+        //     would pass, and the user could never open any attachment.
+        let settled = try Self.makeHeader(
+            accountId: accountId, folderPath: "Archive", uid: "77",
+            rfc822: "settled@example.com", observedUidValidity: 202, pool: pool)
+        let settledBlocked = await manager.attachmentFetchIsBlockedByPendingAddress(for: settled)
+        #expect(
+            !settledBlocked,
+            "a settled address must fetch normally — refusing it drops a user intention")
+
+        // (3) UNVERIFIABLE — the account row is gone, so the provider cannot be determined.
+        //     This is the direction that distinguishes a guard from a pre-filter.
+        try await pool.write { db in
+            try db.execute(sql: "DELETE FROM account WHERE id = ?", arguments: [accountId])
+        }
+        let unverifiableBlocked = await manager.attachmentFetchIsBlockedByPendingAddress(for: settled)
+        #expect(
+            unverifiableBlocked,
+            "an identity that cannot be verified must FAIL CLOSED — this guard has no backstop")
+    }
 }
