@@ -1390,10 +1390,18 @@ final class MessageDetailViewModel {
         // Address-corroboration pre-gate (`BodyAddressGate`). `optimisticMoveToFolder`
         // leaves the row at (destination folder, SOURCE UID) with a nil epoch until the
         // drain's `finishMove` re-keys it — and on IMAP that address names a DIFFERENT
-        // message. Poll instead of fetching: the body lands once the move completes, or
-        // once the next sync of that folder re-stamps the epoch. The authoritative
-        // refusal is in `BodyFetchProcessor.process`; this branch exists so the user sees
-        // the same pending state as any other in-flight body rather than a blank one.
+        // message. Poll instead of fetching, so the user sees the same pending state as any
+        // other in-flight body rather than a blank one. The authoritative refusal is in
+        // `BodyFetchProcessor.process`.
+        //
+        // ⚠️ **The poll does NOT self-heal once the move lands.** It keeps the stale
+        // `resolvedId` and in-memory header, `publishRekeys` never refreshes them, and the
+        // catch below deliberately refuses to guess a replacement row (two audit rounds found
+        // a wrong-message hole in every version that tried). So neither the drain's
+        // `finishMove` nor a later sync makes the body appear HERE — the guaranteed recovery
+        // is backing out to the message list and reopening. Registered as `IOS-BODY-004`.
+        // (This comment claimed "the body lands once the move completes, or once the next sync
+        // re-stamps the epoch" until an audit round showed the poll cannot observe either.)
         if await manager.bodyFetchIsBlockedByPendingAddress(for: msg) {
             print("[MoveTrace] loadBody — address not corroborated (move in flight), polling for \(rid.prefix(40))")
             isLoading = true

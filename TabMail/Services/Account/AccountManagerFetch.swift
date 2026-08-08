@@ -117,7 +117,7 @@ extension AccountManager {
             print("[MoveTrace] fetchBody — address not corroborated (move in flight), skipping fetch for \(message.id.prefix(40))")
             throw ProviderError.networkError(
                 underlying: NSError(domain: "TabMail", code: -3,
-                    userInfo: [NSLocalizedDescriptionKey: "This message is still being moved. It will load once the move completes."])
+                    userInfo: [NSLocalizedDescriptionKey: "This message is still being moved. Go back to the message list and open it again in a moment."])
             )
         }
 
