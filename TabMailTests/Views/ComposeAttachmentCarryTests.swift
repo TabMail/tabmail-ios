@@ -178,6 +178,23 @@ struct ComposeAttachmentCarryTests {
                 "a failed or completed Save must release agent admission")
     }
 
+    @Test("An in-flight Send rejects competing close and discard entries")
+    func sendExcludesCompetingTerminalComposeActions() throws {
+        let source = try composeSource()
+        let close = try functionBody(
+            "private func closeCompose() async {",
+            before: "private func deleteClearedDraftAndDismiss() async {",
+            in: source)
+        let discard = try functionBody(
+            "private func discardDraftAndDismiss() async {",
+            before: "private func typedDeleteIdentity(for draft: Draft) async",
+            in: source)
+        for (name, body) in [("close", close), ("discard", discard)] {
+            #expect(body.contains("guard !isSending else { return }"),
+                    "an admitted send must exclude the competing \(name) action")
+        }
+    }
+
     @Test("Photos-picker work joins the same attachment completion boundary")
     func photoPickerPreparationCannotBeSnapshottedMidImport() throws {
         let body = try functionBody(
