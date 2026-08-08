@@ -72,7 +72,7 @@ import GRDB
 /// > **No event that leaves a view model's in-memory `MessageHeader` stale can heal that view.**
 ///
 /// The re-key is a DELETE at the old key plus an INSERT at the new one (`MessageHeaderRekey.apply`),
-/// and `AccountManagerQueue.publishRekeys` mirrors the mapping to Undo, `SearchIndex` and
+/// and `AccountManagerQueue.publishMoveFinish` mirrors the mapping to Undo, `SearchIndex` and
 /// `BodyAssetStore` — **never into a live `MessageDetailViewModel`**. So every screen that holds a
 /// captured header — the detail body poll, pull-to-refresh, the three attachment surfaces, a forward
 /// launched from that view — keeps testing the pre-move `(destination folder, SOURCE UID)` pair
@@ -93,7 +93,7 @@ import GRDB
 ///   `EmlAttachmentPreview` assigns its `previewURL` the same way — neither calls
 ///   `AccountManager.fetchAttachment`, so neither reaches the guard. Those taps keep working in the
 ///   stale view for as long as it lives.
-/// - **A durable-cache hit does NOT survive the re-key.** `publishRekeys` also calls
+/// - **A durable-cache hit does NOT survive the re-key.** `publishMoveFinish` also calls
 ///   `BodyAssetStore.rekeyContentKey`, which moves the manifest row from the old content key to the
 ///   destination one. A stale view still asks `attachmentAssetId` for the OLD key, so after the
 ///   re-key it MISSES a cache that is sitting right there under the new key — and then falls

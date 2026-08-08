@@ -198,6 +198,17 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// but whose description of it cannot be parsed. `false` for every
         /// pre-existing test.
         var copyUidCardinalityMismatch = false
+        /// Atomic MOVE equivalent of `copyUidWithheldSourceUIDs`. The server
+        /// completes UID MOVE but omits these members from the optional
+        /// COPYUID response. Empty means ordinary conforming evidence.
+        var moveUidWithheldSourceUIDs: Set<Int> = []
+        /// Atomic MOVE equivalent of `copyUidCardinalityMismatch`: the move is
+        /// committed and tagged OK, but its COPYUID mapping cannot be parsed.
+        var moveUidCardinalityMismatch = false
+        /// Close the client socket after the next UID MOVE has mutated server
+        /// state but before its tagged response is sent. This is the exact
+        /// ambiguous-success boundary atomic retry is meant to survive.
+        var disconnectAfterUIDMoveCommitCount = 0
         /// Whether UID SEARCH honours the RFC 3501 §6.4.4 `SINCE` / `BEFORE` date
         /// keys. `false` for every pre-existing test: this fake has always answered
         /// UID SEARCH with the WHOLE mailbox regardless of the window asked for, and
@@ -848,6 +859,26 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// 1,000,000 UIDs, neither of which a mailbox fixture can produce naturally.
     func reportCopyUIDWithCardinalityMismatch() {
         withState { $0.copyUidCardinalityMismatch = true }
+    }
+
+    /// UID MOVE still commits these source UIDs, but its optional COPYUID
+    /// response omits them. Withholding all moved members removes the response
+    /// code entirely.
+    func withholdMoveCOPYUID(forSourceUIDs uids: Set<Int>) {
+        withState { $0.moveUidWithheldSourceUIDs = uids }
+    }
+
+    /// UID MOVE commits and returns tagged OK with an unparseable COPYUID whose
+    /// destination side has one extra UID.
+    func reportMoveCOPYUIDWithCardinalityMismatch() {
+        withState { $0.moveUidCardinalityMismatch = true }
+    }
+
+    /// Commit the next UID MOVE, then close its transport before the tagged
+    /// response is written. Unlike `killConnectionOnNextCommand`, this fires
+    /// after mutation and therefore models an ambiguous success.
+    func disconnectAfterNextUIDMoveCommit() {
+        withState { $0.disconnectAfterUIDMoveCommitCount += 1 }
     }
 
     /// Test seam (B1, ADR-IOS-068/D4): APPEND into `mailbox` still stores the
@@ -1522,6 +1553,15 @@ final class FakeIMAPServer: @unchecked Sendable {
                     tag: tag, command: command, args: args, fd: fd,
                     authenticated: &authenticated, selectedMailbox: &selectedMailbox
                 )
+                let disconnectAfterCommit = withState { state -> Bool in
+                    guard recordedCommand.uppercased().hasPrefix("UID MOVE "),
+                          state.disconnectAfterUIDMoveCommitCount > 0 else { return false }
+                    state.disconnectAfterUIDMoveCommitCount -= 1
+                    _ = state.loggedInFds.remove(fd)
+                    _ = state.testInitiatedCloseFds.insert(fd)
+                    return true
+                }
+                if disconnectAfterCommit { break clientLoop }
                 sendLine(fd: fd, response)
                 if response.uppercased().contains("\(tag.uppercased()) OK") {
                     withState { state in
@@ -1907,7 +1947,11 @@ final class FakeIMAPServer: @unchecked Sendable {
             guard components.count == 2 else { return "\(tag) BAD Invalid UID MOVE\r\n" }
             let uids = Set(parseUIDSet(components[0], in: mailbox))
             let destination = components[1].trimmingCharacters(in: .init(charactersIn: "\""))
-            withState { state in
+            if withState({ $0.deletedMailboxes[destination] != nil }) {
+                return "\(tag) NO [TRYCREATE] UID MOVE destination does not exist\r\n"
+            }
+            let (moved, destinationUidValidity, withheld, mismatched) = withState {
+                state -> ([(source: Int, destination: Int)], Int, Set<Int>, Bool) in
                 recordOracleCheck(command: "UID MOVE", mailbox: mailbox, uids: uids, state: &state)
                 let sourceMessages = state.messagesByMailbox[mailbox] ?? []
                 let moving = sourceMessages.filter { uids.contains($0.uid) }
@@ -1917,16 +1961,33 @@ final class FakeIMAPServer: @unchecked Sendable {
                 var nextUID = (destinationMessages.map(\.uid).max() ?? 0) + 1
                 var sourceFlags = state.flagsByMailbox[mailbox] ?? [:]
                 var destinationFlags = state.flagsByMailbox[destination] ?? [:]
+                var pairs: [(source: Int, destination: Int)] = []
                 for message in moving {
                     destinationMessages.append(message.replacingUID(nextUID))
                     destinationFlags[nextUID] = sourceFlags.removeValue(forKey: message.uid) ?? []
+                    pairs.append((source: message.uid, destination: nextUID))
                     nextUID += 1
                 }
                 state.messagesByMailbox[destination] = destinationMessages
                 state.flagsByMailbox[mailbox] = sourceFlags
                 state.flagsByMailbox[destination] = destinationFlags
+                return (
+                    pairs,
+                    state.uidValidityByMailbox[destination] ?? 1,
+                    state.moveUidWithheldSourceUIDs,
+                    state.moveUidCardinalityMismatch)
             }
-            return "\(tag) OK UID MOVE completed\r\n"
+            let reported = moved.filter { !withheld.contains($0.source) }
+            guard capabilities.contains("UIDPLUS"), !reported.isEmpty else {
+                return "\(tag) OK UID MOVE completed\r\n"
+            }
+            let sourceSet = reported.map { String($0.source) }.joined(separator: ",")
+            let destinations = reported.map(\.destination)
+            let advertisedDestinations = mismatched
+                ? destinations + [(destinations.max() ?? 0) + 1]
+                : destinations
+            let destinationSet = advertisedDestinations.map(String.init).joined(separator: ",")
+            return "\(tag) OK [COPYUID \(destinationUidValidity) \(sourceSet) \(destinationSet)] UID MOVE completed\r\n"
         case "EXPUNGE":
             // ⚠ A PREVIOUS REVISION `trimmingCharacters(in: .whitespaces)`-ED THIS
             // ARGUMENT AND THAT WAS WRONG — it is restored to the raw value, with a

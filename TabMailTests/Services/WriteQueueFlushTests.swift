@@ -9,7 +9,7 @@ import Testing
 
 /// Pins `AccountManager.awaitWriteQueueDrain()` / `awaitWriteQueueDrainOrTimeout`
 /// (F3, PLAN_OVERLAY_CALLSITE_AUDIT.md §6 follow-ups) — the production-grade
-/// promotion of the `drainWriteQueue` FIFO-barrier pattern already proven in
+/// promotion of the `drainWriteQueue` quiescence-barrier pattern proven in
 /// `InboxGestureActionTests`/`MessageDetailStagedFallbackTests`, now used by
 /// `AppDelegate`'s `didEnterBackground` "wal-durability-checkpoint" bracket to
 /// flush `AccountManager.writeQueue` (including queued ADR-IOS-057 intent-cycle
@@ -43,7 +43,29 @@ struct WriteQueueFlushTests {
         #expect(result == [0, 1, 2, 3, 4], "closures must have drained in FIFO submission order by the time the barrier returns")
     }
 
-    // MARK: - 2. Multiple concurrent awaiters
+    // MARK: - 2. Synchronous admission precedes the actor hop
+
+    @Test("awaitWriteQueueDrain includes every synchronous admission that predates the call, even when its unstructured actor hop has not appended yet")
+    func awaitDrainIncludesSynchronousAdmissions() async throws {
+        let ran = Mutex<Set<Int>>([])
+
+        // A burst makes the original one-pass-barrier race reproducible: each
+        // admission exists synchronously, while each actual FIFO append still
+        // has to win an independent actor hop.
+        for i in 0..<100 {
+            AccountManager.shared.enqueueWriteFromSynchronousContext {
+                ran.withLock { values in
+                    _ = values.insert(i)
+                }
+            }
+        }
+
+        await AccountManager.shared.awaitWriteQueueDrain()
+
+        #expect(ran.withLock { $0 } == Set(0..<100), "the barrier returned before every pre-existing admission reached and drained from the FIFO")
+    }
+
+    // MARK: - 3. Multiple concurrent awaiters
 
     @Test("multiple concurrent awaitWriteQueueDrain callers all resume")
     func concurrentAwaitersAllResume() async throws {
@@ -75,7 +97,7 @@ struct WriteQueueFlushTests {
         #expect(workRan.withLock { $0 } == true, "the antecedent queued write must have run before any awaiter resumed")
     }
 
-    // MARK: - 3. Timeout race shape (the exact code AppDelegate uses)
+    // MARK: - 4. Timeout race shape (the exact code AppDelegate uses)
 
     /// Verified empirically (probe script, not committed) before writing this:
     /// a naive `withTaskGroup` race of `awaitWriteQueueDrain()` vs a timer

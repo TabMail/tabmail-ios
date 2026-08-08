@@ -1003,7 +1003,7 @@ actor BackfillBodyQueue {
         // bytes under one content key, and every later lookup at that key could
         // return the OTHER message's bytes — a content misattribution, C3-adjacent.
         // So the dropped duplicate's assets are DELETED, exactly as the sibling
-        // `AccountManager.publishRekeys` disposes of its collided ids, and
+        // `AccountManager.publishMoveFinish` disposes of its removed old ids, and
         // exactly as `pruneOrphans` would dispose of them later anyway (its `dead`
         // set is "manifest key with no `messageHeader` row", which is precisely what
         // the dropped duplicate's key becomes). `rekeyContentKey` independently makes

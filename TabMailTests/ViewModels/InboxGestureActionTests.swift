@@ -136,15 +136,14 @@ struct InboxGestureActionTests {
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
     }
 
-    /// Enqueue a barrier onto `AccountManager.shared`'s FIFO write queue and
-    /// await it — since the queue is strictly FIFO, every write enqueued
-    /// BEFORE this call is guaranteed to have drained by the time this
-    /// returns. Mirrors `MessageDetailStagedFallbackTests.pinSurvivesWhileMoveQueued`'s
-    /// closing barrier.
+    /// Await the production user-action quiescence barrier. A bare FIFO marker
+    /// is insufficient here: `registerGestureIntent` creates its cycle
+    /// synchronously, then reaches `enqueueWrite` through an unstructured
+    /// `Task`, so the marker can overtake that hop. The production barrier
+    /// repeats only while such an admitted cycle still exists; it does not use
+    /// a sleep, retry budget, or weakened assertion.
     private func drainWriteQueue() async {
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            Task { await AccountManager.shared.enqueueWrite { cont.resume() } }
-        }
+        await AccountManager.shared.awaitWriteQueueDrain()
     }
 
     // MARK: - (a) Rapid double-toggle correctness
@@ -1274,8 +1273,9 @@ struct InboxGestureActionTests {
     // test-only seam to production code purely for this test, out of scope
     // for this fix batch. Driven instead via the spec's own documented
     // fallback: a fully-drained first cycle, then a second cycle registered
-    // strictly afterward. Every `drainWriteQueue()` call is a FIFO barrier,
-    // so this is fully deterministic — no sleep-based race.
+    // strictly afterward. Every `drainWriteQueue()` call waits for both the
+    // FIFO and the synchronously admitted intent-cycle register, so this is
+    // fully deterministic — no sleep-based race.
     @Test("a gesture cycle registered strictly after a prior cycle for the same id has fully drained starts a SECOND, independent cycle whose own write is semantically necessary — final DB state matches the LAST registered intent and every register drains to empty (ADR-IOS-057 accepted residual)")
     func sequentialCyclesEachExecuteIndependently() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
@@ -2113,40 +2113,25 @@ struct InboxMarkReadOnArchiveDeleteTests {
     }
 
     private func drainWriteQueue() async {
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            Task { await AccountManager.shared.enqueueWrite { cont.resume() } }
-        }
+        await AccountManager.shared.awaitWriteQueueDrain()
     }
 
-    /// ⚠️ `drainWriteQueue` ALONE IS NOT A BARRIER FOR A GESTURE. The gesture
-    /// entry points submit their write from a DETACHED `Task { await
-    /// manager.enqueueWrite { … } }`, so a barrier submitted from another
-    /// detached `Task` can be admitted to the FIFO queue FIRST and return
-    /// having waited for nothing — a race that reads as a flaky "the move never
-    /// landed". Settle on an orthogonal, observable end state (the row's
-    /// FOLDER — never the read state, which is what these tests assert) and
-    /// only then take the barrier, so anything queued behind the gesture has
-    /// also completed. Bounded, so a genuinely broken system still reaches its
-    /// assertions and fails on them.
-    private func settle(
-        _ pool: DatabasePool, until condition: @escaping @Sendable (Database) throws -> Bool
-    ) async throws {
-        for _ in 0..<400 {
-            if try await pool.read(condition) { break }
-            try? await Task.sleep(for: .milliseconds(5))
-        }
-        await drainWriteQueue()
-    }
-
-    /// Settle until every one of `ids` sits in `folderId`.
+    /// Await the admission-aware production barrier, then assert that every
+    /// requested row reached the destination. The old helper had to poll with
+    /// 5 ms sleeps because a bare FIFO marker could overtake the gesture's
+    /// unstructured enqueue hop. `enqueueWriteFromSynchronousContext` now
+    /// publishes that hop before spawning it, so the production barrier is
+    /// deterministic and the timing loop is neither needed nor permitted.
     private func settleMove(
         _ pool: DatabasePool, ids: [String], to folderId: String
     ) async throws {
-        try await settle(pool) { db in
+        await drainWriteQueue()
+        let landed = try await pool.read { db in
             try ids.allSatisfy { id in
                 try MessageHeader.fetchOne(db, key: id)?.folderId == folderId
             }
         }
+        #expect(landed, "admitted move must land before the write-queue barrier returns")
     }
 
     /// Durable ops in the order the drain will claim them (`createdAt` asc —

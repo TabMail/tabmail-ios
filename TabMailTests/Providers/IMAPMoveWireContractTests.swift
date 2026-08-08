@@ -62,6 +62,11 @@ struct IMAPMoveWireContractTests {
     private static let epoch: UInt32 = 92_101
     /// The epoch a mailbox turns over to mid-sequence. Must differ from `epoch`.
     private static let nextEpoch: UInt32 = 92_102
+    /// Force the shipped, app-owned COPY/STORE/UID-EXPUNGE arm. Tests that
+    /// exercise atomic MOVE use the fake's default capabilities instead.
+    private static let ownedCapabilities = FakeIMAPServer.defaultCapabilities.filter {
+        $0 != "MOVE"
+    }
 
     private static func message(_ uid: Int, _ id: String) -> FakeIMAPServer.Message {
         FakeIMAPServer.makeMessage(uid: uid, rfc822Text: """
@@ -146,13 +151,206 @@ struct IMAPMoveWireContractTests {
         }
     }
 
+    // MARK: - RFC 6851 atomic route
+
+    @Test("A MOVE plus UIDPLUS server uses one UID MOVE and no owned fallback command")
+    func atomicMoveWithUIDPlusUsesOneCommand() async throws {
+        let target = "atomic-uidplus@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "Work": [Self.message(7, target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(Int(Self.epoch), for: "Work")
+        server.setUidValidity(Int(Self.nextEpoch), for: "Archive")
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let outcome = try await provider.move(
+            ids: ["7"], from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
+
+        #expect(outcome.provenIds == ["7"])
+        let destination = try #require(outcome.provenDestinations.first)
+        #expect(destination.sourceProviderId == "7")
+        #expect(destination.destinationProviderId == "1")
+        #expect(destination.destinationUidValidity == Self.nextEpoch)
+        #expect(Self.commands(server, containing: "UID MOVE").count == 1)
+        #expect(Self.commands(server, containing: "UID COPY").isEmpty)
+        #expect(Self.deletedStores(server).isEmpty)
+        #expect(Self.anyExpunges(server).isEmpty)
+        #expect(server.messageIDs(in: "Work").isEmpty)
+        #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
+        #expect(server.wrongMessageViolations().isEmpty)
+    }
+
+    @Test("A MOVE server without UIDPLUS still uses UID MOVE and safely returns no address evidence")
+    func atomicMoveWithoutUIDPlusStillUsesMove() async throws {
+        let target = "atomic-no-uidplus@example.com"
+        let server = FakeIMAPServer(
+            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" },
+            mailboxes: ["Work": [Self.message(8, target)], "Archive": []])
+        server.setUidValidity(Int(Self.epoch), for: "Work")
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let outcome = try await provider.move(
+            ids: ["8"], from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
+
+        #expect(outcome.provenIds == ["8"])
+        #expect(outcome.provenDestinations.isEmpty)
+        #expect(Self.commands(server, containing: "UID MOVE").count == 1)
+        #expect(Self.commands(server, containing: "UID COPY").isEmpty)
+        #expect(Self.deletedStores(server).isEmpty)
+        #expect(Self.anyExpunges(server).isEmpty)
+        #expect(server.messageIDs(in: "Work").isEmpty)
+        #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
+        #expect(server.wrongMessageViolations().isEmpty)
+    }
+
+    @Test("Retry after UID MOVE commits and loses its response creates exactly one destination copy")
+    func atomicRetryAfterPostCommitDisconnectDoesNotDuplicate() async throws {
+        let target = "atomic-post-commit-loss@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "Work": [Self.message(9, target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(Int(Self.epoch), for: "Work")
+        server.setUidValidity(Int(Self.nextEpoch), for: "Archive")
+        server.disconnectAfterNextUIDMoveCommit()
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.move(
+                ids: ["9"], from: "Work", to: "Archive",
+                admittedUidValidity: Self.epoch)
+        }
+        let retry = try await provider.move(
+            ids: ["9"], from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
+
+        #expect(retry.provenIds == ["9"])
+        #expect(Self.commands(server, containing: "UID MOVE").count == 2)
+        #expect(Self.commands(server, containing: "UID COPY").isEmpty)
+        #expect(Self.deletedStores(server).isEmpty)
+        #expect(Self.anyExpunges(server).isEmpty)
+        #expect(server.messageIDs(in: "Work").isEmpty)
+        #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
+        #expect(server.wrongMessageViolations().isEmpty)
+    }
+
+    @Test("A committed UID MOVE with malformed COPYUID retires without reissuing the move")
+    func atomicMalformedCopyUIDIsSuccessWithoutEvidence() async throws {
+        let target = "atomic-malformed-copyuid@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "Work": [Self.message(10, target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(Int(Self.epoch), for: "Work")
+        server.reportMoveCOPYUIDWithCardinalityMismatch()
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let outcome = try await provider.move(
+            ids: ["10"], from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
+
+        #expect(outcome.provenIds == ["10"])
+        #expect(outcome.provenDestinations.isEmpty)
+        #expect(Self.commands(server, containing: "UID MOVE").count == 1)
+        #expect(Self.commands(server, containing: "UID COPY").isEmpty)
+        #expect(server.messageIDs(in: "Work").isEmpty)
+        #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
+        #expect(server.wrongMessageViolations().isEmpty)
+    }
+
+    @Test("An INBOX epoch turnover after legacy flag stripping refuses before UID MOVE")
+    func atomicMoveReassertsEpochAfterLegacyStrip() async throws {
+        let target = "atomic-strip-turnover@example.com"
+        let decoy = "atomic-strip-decoy@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(13, target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(Int(Self.epoch), for: "INBOX")
+        server.resetMailboxAfterNextSuccessfulResponse(
+            containing: "UID STORE", mailbox: "INBOX",
+            uidValidity: Int(Self.nextEpoch), messages: [Self.message(13, decoy)])
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        await #expect(throws: ProviderError.self) {
+            _ = try await provider.move(
+                ids: ["13"], from: "INBOX", to: "Archive",
+                admittedUidValidity: Self.epoch)
+        }
+
+        #expect(Self.commands(server, containing: "UID MOVE").isEmpty)
+        #expect(Self.commands(server, containing: "UID COPY").isEmpty)
+        #expect(Self.anyExpunges(server).isEmpty)
+        #expect(server.messageIDs(in: "INBOX") == ["<\(decoy)>"])
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+        #expect(server.wrongMessageViolations().isEmpty)
+    }
+
+    @Test("An INBOX turnover after checkout refuses before legacy flag stripping")
+    func atomicMoveReassertsEpochBeforeLegacyStrip() async throws {
+        let target = "atomic-pre-strip-turnover@example.com"
+        let decoy = "atomic-pre-strip-decoy@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(14, target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(Int(Self.epoch), for: "INBOX")
+        server.resetMailboxAfterNextSuccessfulResponse(
+            containing: "SELECT", mailbox: "INBOX",
+            uidValidity: Int(Self.nextEpoch), messages: [Self.message(14, decoy)])
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        await #expect(throws: ProviderError.self) {
+            _ = try await provider.move(
+                ids: ["14"], from: "INBOX", to: "Archive",
+                admittedUidValidity: Self.epoch)
+        }
+
+        #expect(Self.commands(server, containing: "UID STORE").isEmpty)
+        #expect(Self.commands(server, containing: "UID MOVE").isEmpty)
+        #expect(Self.commands(server, containing: "UID COPY").isEmpty)
+        #expect(Self.anyExpunges(server).isEmpty)
+        #expect(server.messageIDs(in: "INBOX") == ["<\(decoy)>"])
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+        #expect(server.wrongMessageViolations().isEmpty)
+    }
+
     // MARK: - T3.2 / T3.15 — the purge is UID-scoped or absent, never mailbox-wide
 
     @Test("A UIDPLUS move purges only the named source UID and spares a co-resident deleted message")
     func uidPlusMovePurgesOnlyTheNamedUID() async throws {
         let target = "move-target@example.com"
         let bystander = "move-bystander@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedCapabilities, mailboxes: [
             "INBOX": [Self.message(11, bystander), Self.message(12, target)],
             "Archive": [],
         ])
@@ -222,7 +420,7 @@ struct IMAPMoveWireContractTests {
         let target = "soft-target@example.com"
         let bystander = "soft-bystander@example.com"
         let server = FakeIMAPServer(
-            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" },
+            capabilities: Self.ownedCapabilities.filter { $0 != "UIDPLUS" },
             mailboxes: [
                 "INBOX": [Self.message(21, bystander), Self.message(22, target)],
                 "Archive": [],
@@ -320,7 +518,7 @@ struct IMAPMoveWireContractTests {
         // UIDPLUS IS advertised here: this server CAN name what it copied and
         // declined to, which RFC 4315 §3 permits and which — for a UIDNOTSTICKY
         // store or a COPY-but-not-SELECT mailbox — it will decline forever.
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedCapabilities, mailboxes: [
             "Work": [Self.message(91, bystander), Self.message(92, target)],
             "Archive": [],
         ])
@@ -384,7 +582,7 @@ struct IMAPMoveWireContractTests {
     func copyUidAuthorizesThePurgeOnlyForTheMembersItNames() async throws {
         let named = "per-member-named@example.com"
         let unnamed = "per-member-unnamed@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedCapabilities, mailboxes: [
             "Work": [Self.message(101, named), Self.message(102, unnamed)],
             "Archive": [],
         ])
@@ -457,7 +655,7 @@ struct IMAPMoveWireContractTests {
     func sourceCleanupSkipsAMemberTheSourceNoLongerHolds() async throws {
         let present = "absent-member-present@example.com"
         let server = FakeIMAPServer(
-            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" },
+            capabilities: Self.ownedCapabilities.filter { $0 != "UIDPLUS" },
             mailboxes: [
                 "INBOX": [Self.message(22, present)],
                 "Archive": [],
@@ -517,7 +715,7 @@ struct IMAPMoveWireContractTests {
     func aWhollyAbsentSourceSetIsATerminalNoOp() async throws {
         let bystander = "wholly-absent-bystander@example.com"
         let server = FakeIMAPServer(
-            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" },
+            capabilities: Self.ownedCapabilities.filter { $0 != "UIDPLUS" },
             mailboxes: [
                 "INBOX": [Self.message(21, bystander)],
                 "Archive": [],
@@ -551,7 +749,7 @@ struct IMAPMoveWireContractTests {
         // the withheld evidence and not by anything else about the fixture.
         let first = "per-member-control-first@example.com"
         let second = "per-member-control-second@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedCapabilities, mailboxes: [
             "Work": [Self.message(101, first), Self.message(102, second)],
             "Archive": [],
         ])
@@ -603,7 +801,7 @@ struct IMAPMoveWireContractTests {
         // unnamed and the liveness probe runs over the WHOLE requested set —
         // which is the arm the unbounded FETCH lived on.
         FakeIMAPServer(
-            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" },
+            capabilities: Self.ownedCapabilities.filter { $0 != "UIDPLUS" },
             mailboxes: [
                 "Work": Self.oversizedLiveUIDs.map { Self.message($0, "oversized-\($0)@example.com") },
                 "Archive": [],
@@ -791,7 +989,7 @@ struct IMAPMoveWireContractTests {
         let unreadable = "unparsed-unreadable@example.com"
         // No UIDPLUS, so no `COPYUID` and the probe runs over both members.
         let server = FakeIMAPServer(
-            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" },
+            capabilities: Self.ownedCapabilities.filter { $0 != "UIDPLUS" },
             mailboxes: [
                 "Work": [Self.message(201, readable), Self.message(202, unreadable)],
                 "Archive": [],
@@ -859,7 +1057,7 @@ struct IMAPMoveWireContractTests {
     func epochTurnoverAfterCopyRefusesTheDelete() async throws {
         let target = "epoch-copy-target@example.com"
         let decoy = "epoch-copy-decoy@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedCapabilities, mailboxes: [
             "INBOX": [Self.message(31, target)],
             "Archive": [],
         ])
@@ -898,7 +1096,7 @@ struct IMAPMoveWireContractTests {
         // Source is deliberately NOT "INBOX": the legacy `tm_*` strip is also a
         // `UID STORE`, and it would consume the post-response reset below before
         // the soft-delete ever ran.
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedCapabilities, mailboxes: [
             "Work": [Self.message(41, target)],
             "Archive": [],
         ])
@@ -932,7 +1130,7 @@ struct IMAPMoveWireContractTests {
     @Test("A destination mailbox LIST proves is gone makes the whole move a terminal no-op")
     func absentDestinationIsATerminalNoOp() async throws {
         let target = "absent-dest-target@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedCapabilities, mailboxes: [
             "INBOX": [Self.message(51, target)],
             "Archive": [],
         ])
@@ -965,7 +1163,7 @@ struct IMAPMoveWireContractTests {
     @Test("A SELECT failure on a mailbox LIST still reports keeps the move retryable")
     func transientSelectFailureStaysRetryable() async throws {
         let target = "transient-target@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedCapabilities, mailboxes: [
             "INBOX": [Self.message(61, target)],
             "Archive": [],
         ])
@@ -1008,7 +1206,7 @@ struct IMAPMoveWireContractTests {
     @Test("A move cancelled during its checkout stops at a step boundary and never soft-deletes the source")
     func cancelledMoveNeverCompletesTheSecondMutation() async throws {
         let target = "cancel-target@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedCapabilities, mailboxes: [
             "Work": [Self.message(71, target)],
             "Archive": [],
         ])
@@ -1082,7 +1280,7 @@ struct IMAPMoveWireContractTests {
     @Test("A destination UIDVALIDITY turnover between the probe and the COPY refuses all source cleanup")
     func destinationEpochTurnoverAcrossTheCopyRefusesSourceCleanup() async throws {
         let target = "dest-epoch-target@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedCapabilities, mailboxes: [
             "Work": [Self.message(111, target)],
             "Archive": [],
         ])
@@ -1159,7 +1357,7 @@ struct IMAPMoveWireContractTests {
     @Test("A destination SELECT that reports no UIDVALIDITY refuses the move before anything reaches the wire")
     func unknownDestinationEpochRefusesBeforeAnyWireMutation() async throws {
         let target = "dest-unknown-target@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedCapabilities, mailboxes: [
             "Work": [Self.message(111, target)],
             "Archive": [],
         ])
@@ -1232,7 +1430,7 @@ struct IMAPMoveWireContractTests {
         // in `Work` becomes UID 1 in `Archive`, a UID this operation has never
         // seen, and the move completes because the destination UIDVALIDITY held.
         let target = "dest-stable-target@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedCapabilities, mailboxes: [
             "Work": [Self.message(111, target)],
             "Archive": [],
         ])
@@ -1265,7 +1463,7 @@ struct IMAPMoveWireContractTests {
         // cancels it, so the assertions there are about the cancel and not
         // about a fixture that never mutates.
         let target = "control-target@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedCapabilities, mailboxes: [
             "Work": [Self.message(81, target)],
             "Archive": [],
         ])

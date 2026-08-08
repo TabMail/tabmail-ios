@@ -729,7 +729,7 @@ enum ProviderError: LocalizedError {
     /// `(folderPath, messageId)` may name a DIFFERENT message on the wire. Thrown by
     /// `AccountManager.fetchAttachment`; see `BodyAddressGate`. TRANSIENT in the DATABASE — it
     /// clears the moment `MessageHeaderRekey.finishMove` re-keys the row — but **NOT transient in
-    /// an already-open view**, which keeps the pre-move header in memory that `publishRekeys` never
+    /// an already-open view**, which keeps the pre-move header in memory that `publishMoveFinish` never
     /// refreshes. So the recovering gesture is going back to the message list and opening the
     /// message again, NOT tapping the attachment again; see `errorDescription` below and
     /// `IOS-BODY-005`. (This comment said "simply tapping the attachment again" until an audit
@@ -749,7 +749,7 @@ enum ProviderError: LocalizedError {
         case .syntheticPlaceholderId(let ids): return "Synthetic placeholder id(s) leaked into provider fetch: \(ids.prefix(3))"
         case .syntheticFolderPath(let path): return "Synthetic folder path leaked into provider request: \(path)"
         // ⚠️ Deliberately names GOING BACK TO THE LIST, not "try again" and not "close it".
-        // An already-open view holds the pre-move `MessageHeader` in memory and `publishRekeys`
+        // An already-open view holds the pre-move `MessageHeader` in memory and `publishMoveFinish`
         // does not push the re-keyed row into it, so repeated taps re-submit the same stale value
         // and stay refused even after the move has settled (the same stale-open-view condition as
         // `IOS-BODY-004`) — so "try again" is wrong. And "close it" is AMBIGUOUS: one of the three

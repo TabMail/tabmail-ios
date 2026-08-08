@@ -3371,7 +3371,7 @@ private struct CarryForwardFailureAlert: ViewModifier {
     ///
     /// Closing this draft does not rebuild the underlying `MessageDetailView`, so its
     /// `activeMessage` can still be the pre-move `(destination folder, SOURCE UID)` header
-    /// (`BodyAddressGate`'s stale-open-view closure: `publishRekeys` never pushes the re-keyed row
+    /// (`BodyAddressGate`'s stale-open-view closure: `publishMoveFinish` never pushes the re-keyed row
     /// into a live view model). A fresh `ComposeView` does re-resolve through
     /// `Draft.resolveReplyToHeader`, so a repeat Forward is not useless: after the drain, Strategy 1
     /// misses on the deleted old key and Strategy 2 finds the re-keyed row by

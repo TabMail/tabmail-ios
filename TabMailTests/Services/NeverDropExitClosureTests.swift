@@ -103,6 +103,12 @@ struct NeverDropExitClosureTests {
         FakeIMAPServer.makeMessage(uid: uid, rfc822Text: rfc822(messageId: id))
     }
 
+    /// Force the app-owned COPY/STORE/UID-EXPUNGE route for tests whose
+    /// contract is specifically about COPYUID or reversible soft deletion.
+    private static let ownedMoveCapabilities = FakeIMAPServer.defaultCapabilities.filter {
+        $0 != "MOVE"
+    }
+
     @MainActor
     private func registeredIMAPProvider(
         server: FakeIMAPServer, fixture: Fixture
@@ -393,7 +399,7 @@ struct NeverDropExitClosureTests {
     ///     complete on any future drain and its `.haltLane` disposition starved
     ///     every later gesture on that message forever. Round 3 deleted the
     ///     capability refusal; the two-sided partner is now
-    ///     `aNonUidPlusMoveCompletesAndReleasesItsLane`.
+    ///     `aNonUidPlusNonMoveServerCompletesAndReleasesItsLane`.
     ///  2. Round 3: a UIDPLUS server that WITHHOLDS `COPYUID`, on the theory
     ///     that such a server "may prove it next time" (RFC 4315 §3 makes the
     ///     response code a MAY). **Audit round 4 found that theory false** — §3
@@ -426,7 +432,7 @@ struct NeverDropExitClosureTests {
     @MainActor
     func unprovableMoveKeepsTheOpQueued() async throws {
         let target = "unprovable-move@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedMoveCapabilities, mailboxes: [
             "INBOX": [Self.message(uid: 77, id: target)],
             "Archive": [],
         ])
@@ -525,7 +531,7 @@ struct NeverDropExitClosureTests {
     /// UIDPLUS fixture (round 3; audit round 4 showed RFC 4315 §3 names servers
     /// for which that response code never arrives). Both of those now COMPLETE,
     /// and their lane-mates MUST execute — see
-    /// `aNonUidPlusMoveCompletesAndReleasesItsLane` and
+    /// `aNonUidPlusNonMoveServerCompletesAndReleasesItsLane` and
     /// `aWithheldCopyUidMoveCompletesAndReleasesItsLane`.
     ///
     /// The fixture is therefore a destination whose SELECT omits the REQUIRED
@@ -539,7 +545,7 @@ struct NeverDropExitClosureTests {
     func unprovableOpDoesNotWedgeTheAccountsOtherGestures() async throws {
         let unprovable = "wedge-unprovable@example.com"
         let bystander = "wedge-bystander@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedMoveCapabilities, mailboxes: [
             "INBOX": [Self.message(uid: 77, id: unprovable), Self.message(uid: 88, id: bystander)],
             "Archive": [],
         ])
@@ -658,7 +664,7 @@ struct NeverDropExitClosureTests {
     ///
     /// The source copy is `\Deleted` but still present, which is deliberate and
     /// is the accepted cost recorded in `KNOWN_ISSUES.md` `IOS-IMAP-001`: a
-    /// server without UIDPLUS has no narrower purge than a mailbox-wide
+    /// server without UIDPLUS or MOVE has no narrower purge than a mailbox-wide
     /// `EXPUNGE`, which would irreversibly destroy unrelated mail that already
     /// carries `\Deleted`. Incomplete VISIBLE cleanup is preferred over both
     /// that and the permanent wedge. Asserting the `\Deleted` mark (rather than
@@ -666,13 +672,13 @@ struct NeverDropExitClosureTests {
     ///
     /// RED PROOF (recorded): with the `supportsUIDPlus` refusal restored, this
     /// fails at property 1 — `Archive` is empty — and at properties 2 and 3.
-    @Test("A move on a server without UIDPLUS completes and releases its lane")
+    @Test("A move on a server without UIDPLUS or MOVE completes and releases its lane")
     @MainActor
-    func aNonUidPlusMoveCompletesAndReleasesItsLane() async throws {
+    func aNonUidPlusNonMoveServerCompletesAndReleasesItsLane() async throws {
         let target = "nouidplus-target@example.com"
         let bystander = "nouidplus-bystander@example.com"
         let server = FakeIMAPServer(
-            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" },
+            capabilities: Self.ownedMoveCapabilities.filter { $0 != "UIDPLUS" },
             mailboxes: [
                 "INBOX": [Self.message(uid: 77, id: target), Self.message(uid: 88, id: bystander)],
                 "Archive": [],
@@ -775,7 +781,7 @@ struct NeverDropExitClosureTests {
     func partialCopyUidRetiresPerMember() async throws {
         let proven = "partial-proven@example.com"
         let withheld = "partial-withheld@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedMoveCapabilities, mailboxes: [
             "INBOX": [Self.message(uid: 81, id: proven), Self.message(uid: 82, id: withheld)],
             "Archive": [],
         ])
@@ -864,7 +870,7 @@ struct NeverDropExitClosureTests {
     func aSourceAbsentMemberRetiresWithoutWedgingItsLane() async throws {
         let present = "absent-member-present@example.com"
         let bystander = "absent-member-bystander@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedMoveCapabilities, mailboxes: [
             "INBOX": [Self.message(uid: 77, id: present), Self.message(uid: 88, id: bystander)],
             "Archive": [],
         ])
@@ -969,7 +975,7 @@ struct NeverDropExitClosureTests {
     func aWithheldCopyUidMoveCompletesAndReleasesItsLane() async throws {
         let target = "withheld-completes@example.com"
         let bystander = "withheld-completes-bystander@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedMoveCapabilities, mailboxes: [
             "INBOX": [Self.message(uid: 77, id: target), Self.message(uid: 88, id: bystander)],
             "Archive": [],
         ])
@@ -1086,7 +1092,7 @@ struct NeverDropExitClosureTests {
     func anUnparseableCopyUidMoveIsNeverReCopied() async throws {
         let target = "unparseable-copyuid@example.com"
         let bystander = "unparseable-copyuid-bystander@example.com"
-        let server = FakeIMAPServer(mailboxes: [
+        let server = FakeIMAPServer(capabilities: Self.ownedMoveCapabilities, mailboxes: [
             "INBOX": [Self.message(uid: 77, id: target), Self.message(uid: 88, id: bystander)],
             "Archive": [],
         ])

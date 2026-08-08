@@ -1706,14 +1706,14 @@ final class InboxViewModel {
             originalFolderPath: message.folderPath,
             accountId: message.accountId, timestamp: Date()
         ))
-        Task { await manager.enqueueWrite { [manager] in
+        manager.enqueueWriteFromSynchronousContext { [manager] in
             // Read intent BEFORE the move, in this one closure — a move
             // changes the address the read op would have to name. See
             // `AccountManager.markReadBeforeRoleMove`.
             await manager.markReadBeforeRoleMove(ids: [messageId])
             await manager.move([message], to: archivePath)
             manager.releaseOverlayEntry(id: messageId)
-        }}
+        }
         return true
     }
 
@@ -1760,13 +1760,13 @@ final class InboxViewModel {
             originalFolderPath: first.folderPath,
             accountId: first.accountId, timestamp: Date()
         ))
-        Task { await manager.enqueueWrite { [manager] in
+        manager.enqueueWriteFromSynchronousContext { [manager] in
             // Read intent BEFORE the move — see `archive(_:)`. Only the
             // members that are actually unread at execution time get it.
             await manager.markReadBeforeRoleMove(ids: compositeIds)
             await manager.move(messages, to: archivePath)
             for id in compositeIds { manager.releaseOverlayEntry(id: id) }
-        }}
+        }
         // Members that never resolved were never acted upon — report them
         // skipped so the caller un-hides exactly those rows.
         let recorded = Set(compositeIds)
@@ -1818,12 +1818,12 @@ final class InboxViewModel {
             originalFolderPath: message.folderPath,
             accountId: message.accountId, timestamp: Date()
         ))
-        Task { await manager.enqueueWrite { [manager] in
+        manager.enqueueWriteFromSynchronousContext { [manager] in
             // Read intent BEFORE the move — see `archive(_:)`.
             await manager.markReadBeforeRoleMove(ids: [messageId])
             await manager.move([message], to: trashPath)
             manager.releaseOverlayEntry(id: messageId)
-        }}
+        }
         return true
     }
 
@@ -1877,12 +1877,12 @@ final class InboxViewModel {
             originalFolderPath: first.folderPath,
             accountId: first.accountId, timestamp: Date()
         ))
-        Task { await manager.enqueueWrite { [manager] in
+        manager.enqueueWriteFromSynchronousContext { [manager] in
             // Read intent BEFORE the move — see `archive(_:)`.
             await manager.markReadBeforeRoleMove(ids: compositeIds)
             await manager.move(messages, to: trashPath)
             for id in compositeIds { manager.releaseOverlayEntry(id: id) }
-        }}
+        }
         // Members that never resolved were never acted upon — report them
         // skipped so the caller un-hides exactly those rows.
         let recorded = Set(compositeIds)
@@ -2106,7 +2106,7 @@ final class InboxViewModel {
         }
 
         // FIFO write queue — ensures ordering with other actions
-        Task { await manager.enqueueWrite { [manager] in
+        manager.enqueueWriteFromSynchronousContext { [manager] in
             // On-screen ids: intent already established by the visualized
             // state — resolve headers and write unconditionally (writing
             // isRead=true to a row that's already true, or still lags to
@@ -2141,7 +2141,7 @@ final class InboxViewModel {
             // needs releasing even though `onScreenHeaders` dropped them.
             for id in unreadOnScreenIds { manager.releaseOverlayEntry(id: id) }
             for header in offScreenHeaders { manager.releaseOverlayEntry(id: header.id) }
-        }}
+        }
     }
 
     /// Sweep every currently-unread message in every loaded folder to read.
@@ -2441,10 +2441,10 @@ final class InboxViewModel {
             originalFolderPath: message.folderPath,
             accountId: message.accountId, timestamp: Date()
         ))
-        Task { await manager.enqueueWrite { [manager] in
+        manager.enqueueWriteFromSynchronousContext { [manager] in
             await manager.move([message], to: toFolderPath)
             manager.releaseOverlayEntry(id: messageId)
-        }}
+        }
         return true
     }
 
@@ -2489,10 +2489,10 @@ final class InboxViewModel {
             originalFolderPath: first.folderPath,
             accountId: first.accountId, timestamp: Date()
         ))
-        Task { await manager.enqueueWrite { [manager] in
+        manager.enqueueWriteFromSynchronousContext { [manager] in
             await manager.move(messages, to: toFolderPath)
             for id in compositeIds { manager.releaseOverlayEntry(id: id) }
-        }}
+        }
         // Members that never resolved were never acted upon — report them
         // skipped so the caller un-hides exactly those rows.
         let recorded = Set(compositeIds)

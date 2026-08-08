@@ -171,7 +171,7 @@ extension AccountManager {
         // bytes are previewed to the user and cached under this row's content key with this
         // row's identity stamp, after which every read check accepts them. Refuse instead;
         // the refusal clears in the DATABASE when `finishMove` re-keys the row — but NOT in an
-        // already-open view, which keeps the pre-move header that `publishRekeys` never refreshes,
+        // already-open view, which keeps the pre-move header that `publishMoveFinish` never refreshes,
         // so the recovery is going back to the message list and reopening, not tapping again.
         // See `ProviderError.addressPendingMove` and `IOS-BODY-005`.
         guard await !attachmentFetchIsBlockedByPendingAddress(for: message) else {

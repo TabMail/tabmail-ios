@@ -412,12 +412,44 @@ actor AccountManager {
     private var writeQueue: [@Sendable () async -> Void] = []
     private var isDrainingLocalWrites = false
 
+    /// Synchronous admission ledger for callers that cannot `await` the actor
+    /// hop into `enqueueWrite`. The token exists before their unstructured
+    /// `Task` is spawned and is retired only after that task has appended its
+    /// closure to the actor-owned FIFO. `awaitWriteQueueDrain` snapshots this
+    /// ledger so its barrier cannot overtake a pre-existing enqueue hop.
+    private struct WriteAdmissions: Sendable {
+        var nextToken: UInt64 = 0
+        var notYetEnqueued: Set<UInt64> = []
+    }
+    private let writeAdmissions = Mutex(WriteAdmissions())
+
     /// Enqueue a local DB write. Executes FIFO. Never blocks caller.
     func enqueueWrite(_ work: @escaping @Sendable () async -> Void) {
         writeQueue.append(work)
         if !isDrainingLocalWrites {
             isDrainingLocalWrites = true
             Task { await drainLocalWrites() }
+        }
+    }
+
+    /// Admit a FIFO write from a synchronous caller. Unlike an open-coded
+    /// `Task { await enqueueWrite(...) }`, this publishes a token before the
+    /// actor hop, allowing the production durability barrier and deterministic
+    /// tests to wait for work that was requested but not appended yet.
+    nonisolated func enqueueWriteFromSynchronousContext(
+        _ work: @escaping @Sendable () async -> Void
+    ) {
+        let token = writeAdmissions.withLock { admissions -> UInt64 in
+            admissions.nextToken &+= 1
+            let token = admissions.nextToken
+            admissions.notYetEnqueued.insert(token)
+            return token
+        }
+        Task {
+            await self.enqueueWrite(work)
+            writeAdmissions.withLock { admissions in
+                admissions.notYetEnqueued.remove(token)
+            }
         }
     }
 
@@ -429,10 +461,20 @@ actor AccountManager {
         isDrainingLocalWrites = false
     }
 
-    /// FIFO barrier — returns once every closure enqueued before this call
-    /// has run. Appends a continuation-resuming closure to the back of
-    /// `writeQueue`; because the queue is strictly FIFO, every write enqueued
-    /// earlier is guaranteed to have drained by the time this returns.
+    /// User-action quiescence barrier — returns once every closure enqueued
+    /// before this call has run, including a gesture intent registered before
+    /// the call whose unstructured enqueue hop has not reached this actor yet.
+    ///
+    /// Each pass appends a continuation-resuming closure to the back of
+    /// `writeQueue`; because the queue is strictly FIFO, every write already
+    /// enqueued is guaranteed to have drained when that continuation resumes.
+    /// Synchronous callers use `enqueueWriteFromSynchronousContext`, which
+    /// publishes an admission token before its unstructured actor hop. This
+    /// method snapshots the highest token that existed at entry, waits until
+    /// every such token has reached the FIFO, then appends one final barrier
+    /// behind those closures. Later admissions are outside this call's
+    /// contract. This is a condition wait, not a timing retry: no sleep or
+    /// widened deadline is involved.
     /// `AccountManager` is an actor and `enqueueWrite` is a same-actor call,
     /// so no `Task` hop is needed here (contrast the test-only mirror of this
     /// pattern, which hops via `Task` because it's called from `@MainActor`
@@ -440,6 +482,17 @@ actor AccountManager {
     /// to flush queued writes (including ADR-IOS-057 intent-cycle executors)
     /// before the WAL fsync.
     func awaitWriteQueueDrain() async {
+        let admissionCeiling = writeAdmissions.withLock { $0.nextToken }
+        while writeAdmissions.withLock({ admissions in
+            admissions.notYetEnqueued.contains { $0 <= admissionCeiling }
+        }) {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                enqueueWrite { cont.resume() }
+            }
+        }
+        // A targeted admission may have reached the FIFO immediately after
+        // the preceding barrier and immediately before the ledger check. This
+        // final pass is therefore mandatory even when the loop ran.
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             enqueueWrite { cont.resume() }
         }
@@ -796,7 +849,7 @@ actor AccountManager {
         if isNewCycle { retainOverlayEntry(id: id) }
         registerMutation(id: id, mutation: mutation)
         guard isNewCycle else { return }
-        Task { await self.enqueueWrite { await self.executeIntentCycle(id: id) } }
+        enqueueWriteFromSynchronousContext { await self.executeIntentCycle(id: id) }
     }
 
     /// Executes the NET per-field intent accumulated in `id`'s coalesced

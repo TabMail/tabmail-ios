@@ -9,7 +9,7 @@ import GRDB
 
 /// `IOS-IMAP-001`, decision **D3** — *a message the server reports with
 /// `\Deleted` is not presented in any folder listing, and a move on a server
-/// without UIDPLUS does not relist its source copy after the protection TTL
+/// without UIDPLUS or MOVE does not relist its source copy after the protection TTL
 /// expires.*
 ///
 /// ## What D3 was blocked on, and what the code answered
@@ -24,7 +24,7 @@ import GRDB
 ///
 /// ## The defect is worse than "incomplete visible cleanup"
 ///
-/// On a server without UIDPLUS a move leaves the source copy `\Deleted`-but-
+/// On a server without UIDPLUS or MOVE, the app-owned move leaves the source copy `\Deleted`-but-
 /// present, and the purge stays gated on `COPYUID`, which such a server can never
 /// supply. `finishMove` cannot re-key the local row without it, so the row keeps
 /// its source primary key while its `folderPath` names the destination — i.e. the
@@ -102,14 +102,12 @@ struct DeletedFlagMergeVisibilityTests {
     /// so every fixture must report a real UIDVALIDITY.
     private static let epoch: UInt32 = 94_301
 
-    /// `FakeIMAPServer.defaultCapabilities` minus `UIDPLUS` — the server class
-    /// this row is about. Such a server can never furnish `COPYUID`, so the
-    /// `COPYUID`-gated purge never fires and the source copy is always left
-    /// `\Deleted`-but-present. `MOVE` is kept so nothing else about the fixture
-    /// changes shape (`IMAPProvider.move` issues its own sequence and never calls
-    /// `server.move`, so the capability is inert here either way).
+    /// `FakeIMAPServer.defaultCapabilities` minus `UIDPLUS` and `MOVE` — the
+    /// app-owned COPY/soft-delete server class this row is about. A MOVE-capable
+    /// server now takes RFC 6851's atomic route and removes the source outright,
+    /// so retaining MOVE here would bypass the `\Deleted` state under test.
     private static let nonUidplusCapabilities =
-        ["IMAP4rev1", "AUTH=PLAIN", "LITERAL+", "ID", "NAMESPACE", "MOVE", "IDLE"]
+        ["IMAP4rev1", "AUTH=PLAIN", "LITERAL+", "ID", "NAMESPACE", "IDLE"]
 
     private static func message(_ uid: Int, _ id: String) -> FakeIMAPServer.Message {
         FakeIMAPServer.makeMessage(uid: uid, rfc822Text: """
@@ -222,7 +220,7 @@ struct DeletedFlagMergeVisibilityTests {
 
     // MARK: - The headline: no relist after the protections expire
 
-    /// THE property this row closes. A completed move on a server without UIDPLUS
+    /// THE property this row closes. A completed move on a server without UIDPLUS or MOVE
     /// leaves the source copy on the server, `\Deleted`; the merge that follows —
     /// with every protection expired — must not put it back in the Inbox.
     ///
@@ -276,7 +274,7 @@ struct DeletedFlagMergeVisibilityTests {
         #expect(server.messageIDs(in: "Archive") == ["<\(target)>"],
                 "precondition: the move landed")
         #expect(server.messageIDs(in: "INBOX").count == 2,
-                "precondition: the source copy was NOT expunged — no UIDPLUS, no COPYUID, no purge")
+                "precondition: the source copy was NOT expunged — no MOVE, UIDPLUS, COPYUID, or purge")
         #expect(server.flags(in: "INBOX", uid: 42).contains("\\Deleted"),
                 "precondition: the source copy is soft-deleted, which is the whole state under test")
         #expect(Self.bareExpunges(server).isEmpty,
@@ -491,10 +489,12 @@ struct DeletedFlagMergeVisibilityTests {
     func aUidPlusMoveStillPurgesOnlyTheNamedUID() async throws {
         let target = "d3-uidplus-target@example.com"
         let bystander = "d3-uidplus-bystander@example.com"
-        let server = FakeIMAPServer(mailboxes: [
-            "INBOX": [Self.message(81, bystander), Self.message(82, target)],
-            "Archive": [],
-        ])
+        let server = FakeIMAPServer(
+            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "MOVE" },
+            mailboxes: [
+                "INBOX": [Self.message(81, bystander), Self.message(82, target)],
+                "Archive": [],
+            ])
         server.setFlags(["\\Deleted"], in: "INBOX", uid: 81)
         server.setUidValidity(Int(Self.epoch), for: "INBOX")
         server.setUidValidity(Int(Self.epoch), for: "Archive")
@@ -542,7 +542,7 @@ struct DeletedFlagMergeVisibilityTests {
     /// for this file's assertions (which are all at the local store).
     ///
     /// The reachable scenario is the one this whole file is about: on a server
-    /// without UIDPLUS a move soft-deletes the source, `runSyncMessages` hides it
+    /// without UIDPLUS or MOVE a move soft-deletes the source, `runSyncMessages` hides it
     /// and the stale channel removes the local row, so `existingIds` no longer
     /// contains that UID — and the next crawl window or paging pull covering it
     /// re-materialises it as an ordinary visible row. The user archives, it comes
@@ -669,7 +669,7 @@ struct DeletedFlagMergeVisibilityTests {
     /// unreachable by scrolling. One such record in one full page was enough —
     /// and `IMAPProvider.searchDateRange` issues its `SINCE`/`BEFORE` search with
     /// no `NOT DELETED` term, so the filter is live on exactly the mail paging
-    /// walks into: on a server without UIDPLUS, soft-deleted move sources
+    /// walks into: on a server without UIDPLUS or MOVE, soft-deleted move sources
     /// accumulate in older mail.
     ///
     /// The fixture is the smallest one that can show it: a page of exactly

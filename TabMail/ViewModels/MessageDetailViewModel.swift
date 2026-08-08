@@ -1355,9 +1355,9 @@ final class MessageDetailViewModel {
                 BootProfiler.mark("detail body CACHE HIT \(rid.prefix(24))")
                 messageBody = existingBody
                 isLoading = false
-                Task { await manager.enqueueWrite { [manager] in
+                manager.enqueueWriteFromSynchronousContext { [manager] in
                     await manager.processOpenedMessage(msg)
-                }}
+                }
                 loadThreadMessagesAsync()
                 return
             }
@@ -1381,9 +1381,9 @@ final class MessageDetailViewModel {
             BootProfiler.mark("detail body from STAGED snapshot (phase-2 not durable yet) \(rid.prefix(24))")
             messageBody = stagedBody
             isLoading = false
-            Task { await manager.enqueueWrite { [manager] in
+            manager.enqueueWriteFromSynchronousContext { [manager] in
                 await manager.processOpenedMessage(msg)
-            }}
+            }
             loadThreadMessagesAsync()
             return
         }
@@ -1395,7 +1395,7 @@ final class MessageDetailViewModel {
         // `BodyFetchProcessor.process`.
         //
         // ⚠️ **The poll does NOT self-heal once the move lands.** It keeps the stale
-        // `resolvedId` and in-memory header, `publishRekeys` never refreshes them, and the
+        // `resolvedId` and in-memory header, `publishMoveFinish` never refreshes them, and the
         // catch below deliberately refuses to guess a replacement row (two audit rounds found
         // a wrong-message hole in every version that tried). So neither the drain's
         // `finishMove` nor a later sync makes the body appear HERE — the guaranteed recovery
@@ -1755,9 +1755,10 @@ final class MessageDetailViewModel {
 
     /// The single queued-move protocol shared by archive/delete/move: execute
     /// the move, drop the (coalesced) overlay entry, then end THIS op's pin
-    /// window — all INSIDE the queued closure. `enqueueWrite` returns at
-    /// ENQUEUE time ("Never blocks caller"), so a continuation after it would
-    /// un-pin before the move has executed (zero-width pin window — the
+    /// window — all INSIDE the queued closure.
+    /// `enqueueWriteFromSynchronousContext` returns at ADMISSION time (before
+    /// the actor hop may even append the closure), so a continuation after it
+    /// would un-pin before the move has executed (zero-width pin window — the
     /// round-9 defect, which shipped in three hand-kept copies; one helper
     /// keeps the protocol in lockstep).
     /// `markReadFirst` has NO DEFAULT on purpose: it selects the
@@ -1768,7 +1769,7 @@ final class MessageDetailViewModel {
     /// on `performCoordinatedRoleMove` had to give up.
     private func enqueueMove(_ msg: MessageHeader, to folderPath: String, markReadFirst: Bool) {
         let manager = manager
-        Task { await manager.enqueueWrite { [weak self, manager] in
+        manager.enqueueWriteFromSynchronousContext { [weak self, manager] in
             // Read intent BEFORE the move, in this one closure — a move
             // changes the address the read op would have to name. See
             // `AccountManager.markReadBeforeRoleMove`.
@@ -1776,7 +1777,7 @@ final class MessageDetailViewModel {
             await manager.move([msg], to: folderPath)
             manager.releaseOverlayEntry(id: msg.id)
             await self?.completeLocalMove(msg.id)
-        }}
+        }
     }
 
     /// Ends a bubble move's pin window — called INSIDE the archive/delete/move

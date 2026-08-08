@@ -228,7 +228,7 @@ final class UndoService {
                         newHeaderId: record.newHeaderId,
                         newProviderMessageId: record.newProviderMessageId)
                     // Debug-gated: this witnesses the ordinary drain SUCCESS path
-                    // (`AccountManager.publishRekeys`), so it fires once per
+                    // (`AccountManager.publishMoveFinish`), so it fires once per
                     // re-keyed member on every drained move an undo entry names.
                     // `../CLAUDE.md` rule 12 — a new diagnostic must be a no-op in
                     // production. It claims no observability exception: the three
@@ -240,6 +240,26 @@ final class UndoService {
                 }
             }
         }
+    }
+
+    /// Remove only undo members whose successful forward move changed their
+    /// provider address without leaving a safe destination address to target.
+    /// Other members in the same command and other actions remain undoable.
+    func discardMembers(namedByOldHeaderIds oldHeaderIds: [String]) {
+        let discarded = Set(oldHeaderIds)
+        guard !discarded.isEmpty, !undoStack.isEmpty else { return }
+
+        for actionIndex in undoStack.indices {
+            undoStack[actionIndex].messages.removeAll { discarded.contains($0.id) }
+            for commandIndex in undoStack[actionIndex].commands.indices {
+                undoStack[actionIndex].commands[commandIndex].members.removeAll {
+                    discarded.contains($0.originalHeaderId)
+                }
+            }
+            undoStack[actionIndex].commands.removeAll { $0.members.isEmpty }
+        }
+        undoStack.removeAll { $0.commands.isEmpty }
+        if undoStack.isEmpty { hideToast() }
     }
 
     func undo() async {

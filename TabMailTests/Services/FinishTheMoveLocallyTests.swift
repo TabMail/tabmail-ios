@@ -299,8 +299,10 @@ struct FinishTheMoveLocallyTests {
     // MARK: - G2 — fresher than the folder is worse than unknown
 
     /// **THE PROPERTY: when the destination epoch the drain proved is not one
-    /// this app has recorded for that folder, the user's next gesture on the
-    /// re-keyed row is RETAINED FOR RETRY — never terminally dropped.**
+    /// this app has recorded for that folder, local finish refuses to bind that
+    /// destination address.** The optimistic source-address row survives with
+    /// its epoch unread, so every later provider mutation remains closed until
+    /// sync supplies a corroborated address.
     ///
     /// This is the mirror-image guard. `Folder.lastKnownUidValidity` is written
     /// by sync paths alone and the drain runs ahead of them, so a drain-time
@@ -340,9 +342,9 @@ struct FinishTheMoveLocallyTests {
     ///
     /// RED PROOF (recorded): stamping unconditionally (dropping the
     /// `folderEpoch == …` comparison in `MessageHeaderRekey.finishMove`) fails
-    /// this at the property assertion — the gesture comes back `.terminalStale`,
-    /// so its id lands in `failedIds`.
-    @Test("A destination epoch the folder does not share leaves the next gesture retryable")
+    /// this at the property assertion — the gesture is admitted against the
+    /// wrong destination address instead of remaining retryable.
+    @Test("A destination epoch the folder does not share refuses the local re-key")
     @MainActor
     func aDisagreeingDestinationEpochKeepsTheNextGestureRetryable() async throws {
         let target = "epoch-disagreement@example.com"
@@ -360,41 +362,43 @@ struct FinishTheMoveLocallyTests {
         // The drain's own step 3, verbatim — `finishMove` and the retirement of
         // the operation in ONE write — with a destination epoch the `Folder` row
         // (still 10, as the fixture seeded it) has never observed.
-        let applied = try await f.pool.write { db -> [HeaderRekeyRecord] in
+        let finishResult = try await f.pool.write { db -> MoveFinishResult in
             guard let op = try PendingOperation.fetchAll(db).first(where: { $0.type == .move })
-            else { return [] }
-            let records = try MessageHeaderRekey.finishMove(
+            else { return .empty }
+            let result = try MessageHeaderRekey.finishMove(
                 op,
                 destinations: [ProvenDestinationAddress(
                     sourceProviderId: "77", destinationProviderId: "1",
                     destinationUidValidity: 20_260_803)],
+                addressChangesOnMove: true,
                 db: db)
             _ = try PendingOperation.deleteOne(db, key: op.id)
-            return records
+            return result
         }
 
-        // NON-VACUITY: the re-key itself DID happen, so the only thing the guard
-        // under test changed is the stamp. Without this the property below would
-        // hold vacuously for a `finishMove` that did nothing at all.
-        #expect(applied.count == 1)
+        #expect(finishResult.applied.isEmpty)
+        #expect(finishResult.retainedUnaddressedOldHeaderIds == [seeded.id])
         let afterArchive = try rows(f)
         #expect(afterArchive.count == 1)
         guard afterArchive.count == 1 else { return }
         #expect(
-            afterArchive[0].messageId == "1",
-            "the row was never re-keyed, so the stamp under test was never reached")
+            afterArchive[0].id == seeded.id && afterArchive[0].messageId == "77",
+            "positive epoch disagreement must not bind an uncorroborated destination address")
+        #expect(afterArchive[0].observedUidValidity == nil)
+        #expect(BodyAddressGate.addressIsInFlight(
+            id: afterArchive[0].id,
+            accountId: afterArchive[0].accountId,
+            folderPath: afterArchive[0].folderPath,
+            messageId: afterArchive[0].messageId))
 
         let outcome = await AccountManager.shared.move([afterArchive[0]], to: "Trash")
 
-        // THE PROPERTY — the gesture is preserved, not destroyed. Either it was
-        // durably admitted (the epoch agreed after all) or it is retained for
-        // retry; what it must NEVER be is terminally stale.
+        // The surviving uncorroborated row is fail-closed: no wrong-address
+        // provider operation is admitted. An unread epoch is UNKNOWN, so the
+        // gesture remains retryable rather than being reported terminally stale.
         #expect(
-            outcome.failedIds.isEmpty,
-            """
-            the next gesture was TERMINALLY dropped because the row was stamped fresher than the \
-            folder it lives in — the exact inverse of the bug this change fixes: \(outcome.failedIds)
-            """)
+            outcome.pendingIds == [seeded.id] && outcome.failedIds.isEmpty,
+            "the next gesture must remain pending while the destination address is uncorroborated")
         await finish(f)
     }
 
@@ -600,7 +604,7 @@ struct FinishTheMoveLocallyTests {
     /// (`messageIds: providerIds`, `observedUidValidity: sourceEpoch`) fails
     /// this — the bystander lands in `INBOX` and the wire oracle records the
     /// mutation against a message the gesture never selected.
-    @Test("Undo does nothing for a member COPYUID never named")
+    @Test("An address-changing move with no COPYUID evidence removes its unsafe undo member")
     @MainActor
     func undoDoesNothingForAMemberCopyUidNeverNamed() async throws {
         let target = "undo-unnamed@example.com"
@@ -614,6 +618,7 @@ struct FinishTheMoveLocallyTests {
         ])
         for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
         server.withholdCopyUID(forSourceUIDs: [88])
+        server.withholdMoveCOPYUID(forSourceUIDs: [88])
         server.expectMutation(rfc822MessageId: target)
         try server.start()
         defer { server.stop() }
@@ -623,6 +628,7 @@ struct FinishTheMoveLocallyTests {
         let seeded = try seedHeader(f, uid: 88, rfc: target)
 
         pushUndo(seeded, to: "Archive")
+        defer { UndoService.shared.dismissAll() }
         await AccountManager.shared.move([seeded], to: "Archive")
         try await drainToQuiescence(f)
 
@@ -630,13 +636,12 @@ struct FinishTheMoveLocallyTests {
         // not say where — this is an evidence gap, not a failed move.
         #expect(Set(server.messageIDs(in: "Archive")) == ["<\(target)>", "<\(bystander)>"])
 
-        await UndoService.shared.undo()
-        try await settleUndo(f)
+        #expect(
+            UndoService.shared.undoStack.isEmpty,
+            "an undo member with no safe destination address must not remain executable")
 
         // THE PROPERTY: nothing was reversed, and — the part that matters —
-        // nothing was reversed WRONGLY. The unpurged source copy is still
-        // `\Deleted`-but-present, which is the documented reversible outcome of
-        // a move with no COPYUID.
+        // nothing can later be reversed WRONGLY with the stale source UID.
         #expect(
             Set(server.messageIDs(in: "Archive")) == ["<\(target)>", "<\(bystander)>"],
             "undo mutated in a folder where it could not name its own message")

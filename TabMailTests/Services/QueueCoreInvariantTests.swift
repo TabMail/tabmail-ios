@@ -380,6 +380,7 @@ struct QueueCoreInvariantTests {
             op, provenMembers: ["77"], remaining: ["88"],
             provenDestinations: [ProvenDestinationAddress(
                 sourceProviderId: "77", destinationProviderId: "5", destinationUidValidity: 42)],
+            addressChangesOnMove: true,
             context: AccountManager.DrainContext())
 
         let destinationId = MessageIdentity.headerId(
@@ -421,7 +422,8 @@ struct QueueCoreInvariantTests {
 
         await AccountManager.shared.retirePartiallyCompletedOp(
             op, provenMembers: ["77"], remaining: ["88"],
-            provenDestinations: [], context: AccountManager.DrainContext())
+            provenDestinations: [], addressChangesOnMove: true,
+            context: AccountManager.DrainContext())
 
         // THE CONTROL: the re-key is authorized by the server's own `COPYUID`
         // and by nothing else. With no destination proved, the address must not
@@ -459,7 +461,7 @@ struct QueueCoreInvariantTests {
     /// fixed ordering the answer is "nothing", because the FTS call sits after
     /// a hop that cannot complete.
     ///
-    /// RED PROOF (recorded): with `publishRekeys`' two calls swapped back, the
+    /// RED PROOF (recorded): with `publishMoveFinish`'s two calls swapped back, the
     /// probe observes the FTS entry ALREADY re-keyed while the MainActor is
     /// still held, and `ftsUntouchedWhileUndoPublicationIsBlocked` fails.
     @Test("the undo stack is published BEFORE the cross-database FTS round trip")
@@ -509,7 +511,7 @@ struct QueueCoreInvariantTests {
             return missing.isEmpty
         }
         let publish = Task.detached {
-            await AccountManager.shared.publishRekeys([record], collidedOldHeaderIds: [])
+            await AccountManager.shared.publishMoveFinish(MoveFinishResult(applied: [record]))
         }
         // Hold the MainActor SYNCHRONOUSLY — an `await` here would release it
         // and let the undo publication through, which is exactly what must not
@@ -544,7 +546,7 @@ struct QueueCoreInvariantTests {
     /// at a composite id a later message can re-occupy.
     ///
     /// RED PROOF (recorded): with the `removeMessages` call deleted from
-    /// `publishRekeys`, `collidedRekeyLeavesNoFtsEntryWithoutAHeader` fails —
+    /// `publishMoveFinish`, `collidedRekeyLeavesNoFtsEntryWithoutAHeader` fails —
     /// `contentKeysMissingFromFTS` reports the old key present while no
     /// `messageHeader` row carries it.
     @Test("a collided drain-time re-key leaves no FTS entry whose header is gone")
@@ -577,20 +579,17 @@ struct QueueCoreInvariantTests {
 
         // The drain's own step 3, verbatim — the re-key and the retirement of
         // the operation in ONE write, then the publication outside it.
-        let outcome = try await fixture.pool.write { db -> (applied: [HeaderRekeyRecord], collided: [String]) in
-            var collided: [String] = []
-            let applied = try MessageHeaderRekey.finishMove(
+        let outcome = try await fixture.pool.write { db -> MoveFinishResult in
+            try MessageHeaderRekey.finishMove(
                 op, destinations: [ProvenDestinationAddress(
                     sourceProviderId: "77", destinationProviderId: "5", destinationUidValidity: 42)],
-                db: db, onCollidedRekey: { collided.append($0) })
-            return (applied, collided)
+                addressChangesOnMove: true, db: db)
         }
-        await AccountManager.shared.publishRekeys(
-            outcome.applied, collidedOldHeaderIds: outcome.collided)
+        await AccountManager.shared.publishMoveFinish(outcome)
 
         // NON-VACUITY: the collision leg is the one that actually ran.
         #expect(outcome.applied.isEmpty)
-        #expect(outcome.collided == [oldHeaderId])
+        #expect(outcome.removedOldHeaderIds == [oldHeaderId])
 
         // THE PROPERTY, stated as the invariant rather than the mechanism: no
         // FTS entry names a header id with no `messageHeader` row behind it.
@@ -602,6 +601,109 @@ struct QueueCoreInvariantTests {
         #expect(
             missing == [oldKey],
             "an FTS entry outlived its header — a search hit with nothing behind it, at an address a later message can re-occupy")
+    }
+
+    @Test("an epochless Graph move still adopts the destination id the server returned")
+    func epochlessGraphMoveStillRekeys() async throws {
+        let fixture = try fixture(
+            accountId: "acc-graph-rekey", provider: .outlook,
+            folders: [("INBOX", .inbox, nil), ("Archive", .archive, nil)])
+        defer { finish(fixture) }
+
+        let old = try seedHeader(
+            fixture, messageId: "graph-old", folderPath: "Archive",
+            keyedFromFolderPath: "INBOX", epoch: nil)
+        let op = PendingOperation(
+            type: .move, messageIds: ["graph-old"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: nil)
+
+        let result = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                op,
+                destinations: [ProvenDestinationAddress(
+                    sourceProviderId: "graph-old",
+                    destinationProviderId: "graph-new",
+                    destinationUidValidity: nil)],
+                addressChangesOnMove: true,
+                db: db)
+        }
+
+        let newId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "Archive", messageId: "graph-new")
+        let moved = try await fixture.pool.read { db in
+            try MessageHeader.fetchOne(db, key: newId)
+        }
+        #expect(result.applied == [HeaderRekeyRecord(
+            oldHeaderId: old.id, newHeaderId: newId, newProviderMessageId: "graph-new")])
+        #expect(moved?.messageId == "graph-new" && moved?.observedUidValidity == nil)
+    }
+
+    @Test("an address-stable Gmail move does not require destination-address evidence")
+    func addressStableGmailMoveDoesNotEnterAddressRepair() async throws {
+        let fixture = try fixture(accountId: "acc-gmail-stable", provider: .gmail)
+        defer { finish(fixture) }
+
+        let old = try seedHeader(
+            fixture, messageId: "gmail-stable", folderPath: "Archive",
+            keyedFromFolderPath: "INBOX", epoch: nil)
+        let op = PendingOperation(
+            type: .move, messageIds: ["gmail-stable"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: nil)
+
+        let result = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                op, destinations: [], addressChangesOnMove: false, db: db)
+        }
+
+        #expect(result == .empty)
+        let survivor = try await fixture.pool.read { db in
+            try MessageHeader.fetchOne(db, key: old.id)
+        }
+        #expect(survivor?.messageId == "gmail-stable" && survivor?.folderPath == "Archive")
+    }
+
+    @Test("a retired move whose old row is already gone releases its old external mirrors")
+    func missingOldRowIsClassifiedForMirrorRemoval() async throws {
+        let fixture = try fixture(accountId: "acc-missing-old-row")
+        defer { finish(fixture) }
+
+        let op = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
+        let result = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                op, destinations: [], addressChangesOnMove: true, db: db)
+        }
+        let oldId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "INBOX", messageId: "77")
+
+        #expect(result.applied.isEmpty)
+        #expect(result.retainedUnaddressedOldHeaderIds.isEmpty)
+        #expect(result.removedOldHeaderIds == [oldId])
+    }
+
+    @Test("discarding one unsafe undo member preserves its safe sibling")
+    @MainActor
+    func unsafeUndoDiscardIsMemberScoped() throws {
+        let fixture = try fixture(accountId: "acc-undo-member-scope")
+        defer { finish(fixture) }
+
+        let unsafe = try seedHeader(fixture, messageId: "77", folderPath: "INBOX")
+        let safe = try seedHeader(fixture, messageId: "88", folderPath: "INBOX")
+        UndoService.shared.push(UndoableAction(
+            type: .move(fromPath: "INBOX", toPath: "Archive"),
+            messages: [unsafe, safe],
+            originalFolderId: unsafe.folderId,
+            originalFolderPath: "INBOX",
+            accountId: fixture.accountId,
+            timestamp: Date()))
+        defer { UndoService.shared.dismissAll() }
+
+        UndoService.shared.discardMembers(namedByOldHeaderIds: [unsafe.id])
+
+        let action = UndoService.shared.undoStack.last
+        #expect(action?.messages.map(\.id) == [safe.id])
+        #expect(action?.commands.flatMap(\.members).map(\.originalHeaderId) == [safe.id])
     }
 
     // MARK: - Test-local timings

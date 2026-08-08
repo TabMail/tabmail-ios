@@ -19,9 +19,24 @@ struct ExecutedOperation: Sendable {
     /// address at all (Gmail's `messages.modify` only adds/removes labels), and
     /// whenever the server furnished no usable evidence.
     let provenDestinations: [ProvenDestinationAddress]
+    /// True only when a successful move invalidates the source provider
+    /// address (IMAP and Microsoft Graph). Empty destination evidence cannot
+    /// distinguish that state from Gmail's address-stable label mutation.
+    let addressChangesOnMove: Bool
+
+    init(
+        provenMembers: [String]?,
+        provenDestinations: [ProvenDestinationAddress],
+        addressChangesOnMove: Bool = false
+    ) {
+        self.provenMembers = provenMembers
+        self.provenDestinations = provenDestinations
+        self.addressChangesOnMove = addressChangesOnMove
+    }
 
     /// Every member dispositioned, nothing re-keyable.
-    static let allMembers = ExecutedOperation(provenMembers: nil, provenDestinations: [])
+    static let allMembers = ExecutedOperation(
+        provenMembers: nil, provenDestinations: [], addressChangesOnMove: false)
 }
 
 /// Debug-gated diagnostic log for this file (global `CLAUDE.md` development
@@ -703,7 +718,9 @@ extension AccountManager {
                 let remaining = currentOp.messageIds.filter { !provenMembers.contains($0) }
                 await retirePartiallyCompletedOp(
                     currentOp, provenMembers: provenMembers, remaining: remaining,
-                    provenDestinations: executed.provenDestinations, context: context)
+                    provenDestinations: executed.provenDestinations,
+                    addressChangesOnMove: executed.addressChangesOnMove,
+                    context: context)
                 return .haltLane
             }
             // TOCTOU fix: record recentActions BEFORE deleting PendingOp.
@@ -769,16 +786,16 @@ extension AccountManager {
             // for the four guards) closes that, and makes undo-after-drain an
             // ordinary reverse move. Sharing this transaction with the op's
             // deletion keeps the crash window exactly where it already was.
-            let rekeyOutcome: (applied: [HeaderRekeyRecord], collided: [String])
+            let finishResult: MoveFinishResult
             do {
-                rekeyOutcome = try await retryWrite(dbPool, label: "Queue") {
-                    db -> (applied: [HeaderRekeyRecord], collided: [String]) in
-                    var collided: [String] = []
-                    let rekeys = try MessageHeaderRekey.finishMove(
-                        currentOp, destinations: executed.provenDestinations, db: db,
-                        onCollidedRekey: { collided.append($0) })
+                finishResult = try await retryWrite(dbPool, label: "Queue") { db in
+                    let result = try MessageHeaderRekey.finishMove(
+                        currentOp,
+                        destinations: executed.provenDestinations,
+                        addressChangesOnMove: executed.addressChangesOnMove,
+                        db: db)
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                    return (rekeys, collided)
+                    return result
                 }
             } catch {
                 // 🚨 UNGATED BY DECISION (rule 12's production-observability
@@ -798,9 +815,9 @@ extension AccountManager {
                 BackgroundSyncLogger.logError(
                     "CRITICAL: failed to delete completed PendingOperation \(currentOp.id) (type \(opType)) after retries — it stays queued and WILL re-execute, so a wire effect already applied may be applied twice: \(error)",
                     source: "actionQueue")
-                rekeyOutcome = ([], [])
+                finishResult = .empty
             }
-            await publishRekeys(rekeyOutcome.applied, collidedOldHeaderIds: rekeyOutcome.collided)
+            await publishMoveFinish(finishResult)
             if [.archive, .delete, .move].contains(currentOp.type), let dest = currentOp.destinationPath {
                 context.foldersToSync.insert("\(currentOp.accountId)|\(dest)")
             }
@@ -1148,10 +1165,13 @@ extension AccountManager {
         }
     }
 
-    /// Mirror a COMMITTED re-key into the **three** stores that key by
-    /// `messageHeader.id` but do not live in the GRDB database — the in-memory
-    /// undo stack, the FTS index, and the body-asset manifest. Shared by the
-    /// whole-op success path and by the narrowing pass, so the three cannot drift.
+    /// Publish a COMMITTED local move finish into the **three** stores that key
+    /// by `messageHeader.id` but do not live in the GRDB database — the
+    /// in-memory undo stack, the FTS index, and the body-asset manifest. Applied
+    /// re-keys move all three. Retained-unaddressed members lose only their
+    /// unsafe stale-address undo entries. Removed old ids lose undo entries and
+    /// external mirrors. Shared by the whole-op success path and the narrowing
+    /// pass so the dispositions cannot drift.
     ///
     /// ⚠️ THIS LEDE SAID "**two** … the in-memory undo stack and the FTS index"
     /// until R16-7 (corrected 2026-08-06), while the block 30 lines below it
@@ -1241,12 +1261,11 @@ extension AccountManager {
     /// serving the NSE and the main app identically. A missing App Group
     /// container makes `manifestQueue()` nil and every call a no-op returning 0,
     /// which is the correct fail-safe: no assets means nothing to orphan.
-    func publishRekeys(
-        _ applied: [HeaderRekeyRecord],
-        collidedOldHeaderIds: [String]
-    ) async {
+    func publishMoveFinish(_ result: MoveFinishResult) async {
+        let applied = result.applied
+        let removedOldHeaderIds = result.removedOldHeaderIds
         if !applied.isEmpty {
-            queueLog("[MoveTrace] executeSingleOp — re-keyed \(applied.count) moved row(s) to their COPYUID-proven destination address")
+            queueLog("[MoveTrace] executeSingleOp — re-keyed \(applied.count) moved row(s) to their provider-proven destination address")
             // The undo stack names its members by the SAME primary key and UID
             // this re-key just changed, so it has to follow — otherwise
             // finishing the move would break undo rather than enable it.
@@ -1276,14 +1295,18 @@ extension AccountManager {
                 queueLog("[MoveTrace] executeSingleOp — re-keyed \(rekeyedAssetKeys) moved row(s)' cached body assets")
             }
         }
-        if !collidedOldHeaderIds.isEmpty {
-            queueLog("[MoveTrace] executeSingleOp — dropped \(collidedOldHeaderIds.count) FTS entry(s) whose re-key collided; the destination row is the survivor")
+        let unsafeUndoIds = result.retainedUnaddressedOldHeaderIds + removedOldHeaderIds
+        if !unsafeUndoIds.isEmpty {
+            await UndoService.shared.discardMembers(namedByOldHeaderIds: unsafeUndoIds)
+        }
+        if !removedOldHeaderIds.isEmpty {
+            queueLog("[MoveTrace] executeSingleOp — dropped \(removedOldHeaderIds.count) external mirror(s) whose old header no longer exists")
             try? await SearchIndex.shared.removeMessages(
-                contentKeys: collidedOldHeaderIds.map { ContentKey(rawValue: $0) })
+                contentKeys: removedOldHeaderIds.map { ContentKey(rawValue: $0) })
             // Same disposition for the assets, and for a stronger reason —
             // merging them onto the survivor's key would misattribute one
             // message's attachment bytes to another.
-            for oldId in collidedOldHeaderIds {
+            for oldId in removedOldHeaderIds {
                 _ = BodyAssetStore.deleteAllAssets(forContentKey: ContentKey(rawValue: oldId))
             }
         }
@@ -1350,6 +1373,7 @@ extension AccountManager {
         provenMembers: [String],
         remaining: [String],
         provenDestinations: [ProvenDestinationAddress],
+        addressChangesOnMove: Bool,
         context: DrainContext
     ) async {
         queueLog("[Queue] Partial \(currentOp.type.rawValue): provider proved \(provenMembers.count) of \(currentOp.messageIds.count) member(s) — retiring those and keeping \(remaining.count) queued")
@@ -1385,21 +1409,21 @@ extension AccountManager {
             return op
         }()
         do {
-            let rekeyOutcome = try await retryWrite(dbPool, label: "Queue") {
-                db -> (applied: [HeaderRekeyRecord], collided: [String]) in
-                var collided: [String] = []
-                let rekeys = try MessageHeaderRekey.finishMove(
-                    frozenRetiredOp, destinations: provenDestinations, db: db,
-                    onCollidedRekey: { collided.append($0) })
+            let finishResult = try await retryWrite(dbPool, label: "Queue") { db in
+                let result = try MessageHeaderRekey.finishMove(
+                    frozenRetiredOp,
+                    destinations: provenDestinations,
+                    addressChangesOnMove: addressChangesOnMove,
+                    db: db)
                 guard var fresh = try PendingOperation.fetchOne(db, key: currentOp.id) else {
-                    return (rekeys, collided)
+                    return result
                 }
                 fresh.messageIds = remaining
                 fresh.status = PendingStatus.queued.rawValue
                 try fresh.save(db)
-                return (rekeys, collided)
+                return result
             }
-            await publishRekeys(rekeyOutcome.applied, collidedOldHeaderIds: rekeyOutcome.collided)
+            await publishMoveFinish(finishResult)
         } catch {
             // The narrowing write failed. NEVER leave the row `inFlight` (it
             // would only unstick at the next launch's crash recovery) and never
@@ -1710,7 +1734,8 @@ extension AccountManager {
                 queueLog("[MoveTrace] executeOperation.move — completed for \(outcome.provenIds.count)/\(op.messageIds.count) member(s), \(outcome.provenDestinations.count) with a server-named destination address")
                 return ExecutedOperation(
                     provenMembers: outcome.provenIds,
-                    provenDestinations: outcome.provenDestinations)
+                    provenDestinations: outcome.provenDestinations,
+                    addressChangesOnMove: true)
             }
             // 🚨 THE SIBLING ARM THE `COPYUID` CENSUS NEVER REACHED
             // (`IOS-GRAPH-002`, `MIS-006` instance 5). Graph reallocates a
@@ -1734,7 +1759,8 @@ extension AccountManager {
                 queueLog("[MoveTrace] executeOperation.move — completed for \(outcome.provenIds.count)/\(op.messageIds.count) member(s), \(outcome.provenDestinations.count) with a server-named destination address")
                 return ExecutedOperation(
                     provenMembers: outcome.provenIds,
-                    provenDestinations: outcome.provenDestinations)
+                    provenDestinations: outcome.provenDestinations,
+                    addressChangesOnMove: true)
             }
             try await provider.move(ids: op.messageIds, from: op.folderPath, to: dest)
             queueLog("[MoveTrace] executeOperation.move — completed successfully")

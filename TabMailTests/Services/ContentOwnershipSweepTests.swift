@@ -512,10 +512,10 @@ struct ContentOwnershipSweepTests {
         #expect(manifestKeys().contains(oldKey),
                 "precondition: that attachment is filed under the SOURCE address")
 
-        await AccountManager.shared.publishRekeys(
-            [HeaderRekeyRecord(
-                oldHeaderId: oldHeaderId, newHeaderId: newHeaderId, newProviderMessageId: "5")],
-            collidedOldHeaderIds: [])
+        await AccountManager.shared.publishMoveFinish(MoveFinishResult(
+            applied: [HeaderRekeyRecord(
+                oldHeaderId: oldHeaderId, newHeaderId: newHeaderId,
+                newProviderMessageId: "5")]))
 
         let keys = manifestKeys()
         #expect(!keys.contains(oldKey),
@@ -571,7 +571,8 @@ struct ContentOwnershipSweepTests {
         #expect(manifestKeys().isSuperset(of: [oldKey, newKey]),
                 "precondition: the collision is real — both keys are in the manifest")
 
-        await AccountManager.shared.publishRekeys([], collidedOldHeaderIds: [oldHeaderId])
+        await AccountManager.shared.publishMoveFinish(MoveFinishResult(
+            removedOldHeaderIds: [oldHeaderId]))
 
         let keys = manifestKeys()
         #expect(!keys.contains(oldKey),
@@ -587,7 +588,7 @@ struct ContentOwnershipSweepTests {
     // MARK: - R15-FIX-2: the SEVENTH carrier — the backfill body queue's UID remap
 
     /// ⚠ THE TWO TESTS ABOVE CANNOT REACH THIS CARRIER. They drive
-    /// `AccountManager.publishRekeys`, the drain-time re-key. A UID remap
+    /// `AccountManager.publishMoveFinish`, the drain-time re-key. A UID remap
     /// discovered by the BODY QUEUE takes a different function entirely —
     /// `BackfillBodyQueue.rekeyRemappedHeader` — which had the FTS half of the
     /// mirror (`SearchIndex.rekeyHeaders`) and not the asset half: a half-port
@@ -599,7 +600,7 @@ struct ContentOwnershipSweepTests {
     /// WHICH IS WHAT THIS COMMENT CLAIMED UNTIL R16-7 (corrected 2026-08-06) — and
     /// the refutation was sitting 100 lines ABOVE it in this same file: the
     /// `drainTimeRekeyCarriesAssetsToTheNewAddress` header says the drain-time
-    /// re-key (`MessageHeaderRekey.finishMove` → `AccountManager.publishRekeys`)
+    /// re-key (`MessageHeaderRekey.finishMove` → `AccountManager.publishMoveFinish`)
     /// is *"structurally blind"* to the same recovery leg for the same reason. Two
     /// tests, one file, contradicting each other on a uniqueness absolute. R16-8
     /// then added two more — `SyncEngineFullSync`'s DraftDedup and pre-sync-reclaim
