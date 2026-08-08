@@ -250,10 +250,12 @@ enum BodyFetchProcessor {
                 }
             } catch {
                 // ADR-IOS-046: suspension aborts are expected + retryable (bodyComplete
-                // stays 0 → re-fetched next wake); only log genuine failures.
+                // stays 0 → re-fetched next wake); only log genuine failures. Never
+                // mint an FTS candidate for bytes that did not reach the body cache.
                 if !error.isDatabaseSuspensionAbort {
                     print("[BodyFetch] MessageBody insert failed for \(item.headerId.prefix(30)): \(error)")
                 }
+                return (.retry, nil)
             }
             let snippet = EmailFilter.snippetFromPlainText(plainText)
             let processed = ProcessedItem(
@@ -289,6 +291,7 @@ enum BodyFetchProcessor {
                 if !error.isDatabaseSuspensionAbort {
                     print("[BodyFetch] Attachment-only MessageBody insert failed for \(item.headerId.prefix(30)): \(error)")
                 }
+                return (.retry, nil)
             }
             let placeholder = "[attachment]"
             let processed = ProcessedItem(
@@ -342,6 +345,9 @@ enum BodyFetchProcessor {
                     if !error.isDatabaseSuspensionAbort {
                         print("[BodyFetch] Confirmed-empty flag write failed for \(item.headerId.prefix(30)): \(error)")
                     }
+                    // Confirmation is an acknowledgement of the combined body+flag
+                    // transaction. A suspension abort leaves the message retryable.
+                    return (.retry, nil)
                 }
                 return (.confirmedEmpty, nil)
             } else {
