@@ -2431,14 +2431,23 @@ struct ComposeView: View {
         // genuinely HAS attachments; we merely could not read them, so report
         // `hasAttachments: true` and let the unchanged-content branch dismiss with
         // the row intact.
+        // Attachment preparation is also authored content even before it becomes
+        // a realized chip. Do not let Close take the unchanged / empty dismissal
+        // path while a selected forward, Photos, Files, or Camera attachment is
+        // still being prepared. Prompting leaves the user an explicit choice:
+        // Save waits at the attachment boundary, Discard drops the work, and
+        // Cancel keeps the compose open without wedging Close on a slow provider.
+        let attachmentPreparationIsUnsettled = attachmentCarryGate.outstanding > 0
+            || attachmentCarryGate.hasUnacknowledgedFailure
         let hasContent = ComposeDraftGuards.hasContent(
             subject: subject, body: messageBody,
             to: toTokens, cc: ccTokens, bcc: bccTokens,
             toInput: toInput, ccInput: ccInput, bccInput: bccInput,
-            hasAttachments: !attachments.isEmpty || attachmentLoadFailed)
+            hasAttachments: !attachments.isEmpty || attachmentLoadFailed || attachmentPreparationIsUnsettled)
         let hasChanges = subject != initialSubject || messageBody != initialBody
             || toTokens != initialToTokens || ccTokens != initialCcTokens || bccTokens != initialBccTokens
             || attachmentsFingerprint(attachments) != initialAttachmentsFingerprint
+            || attachmentPreparationIsUnsettled
         switch ComposeDraftGuards.closeAction(
             readState: draftReadState, hasContent: hasContent, hasChanges: hasChanges
         ) {
