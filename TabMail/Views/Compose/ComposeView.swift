@@ -646,6 +646,14 @@ struct ComposeView: View {
     @State private var showCc = false
     @State private var isSending = false
     @State private var sendError: String?
+    /// Filenames `carryForwardAttachments` could not download. Non-empty means the user is about
+    /// to forward a message WITHOUT attachments they have every reason to think are attached, so
+    /// this must be surfaced, not logged. See the alert below and that function's own comment.
+    @State private var carryForwardFailures: [String] = []
+    /// True when at least one of those failures was `ProviderError.addressPendingMove` — the
+    /// message's address is mid-move, so the right advice is "try the forward again shortly"
+    /// rather than "attach them manually".
+    @State private var carryForwardBlockedByMove = false
     @State private var contactSearch = ContactSearchService()
     @State private var activeField: ComposeField?
     @State private var chatExpanded = false
@@ -1341,6 +1349,17 @@ struct ComposeView: View {
             } message: {
                 Text(sendError ?? "An unknown error occurred.")
             }
+            // The forward carried fewer attachments than the original had — surfaced, never
+            // silent. In a `ViewModifier` for the reason `DiscardUnsavedEditsAlert` documents:
+            // this body's alert chain is at the type-checker's budget, and adding one more inline
+            // `.alert` here fails with "unable to type-check this expression in reasonable time"
+            // (it did — and the compiler blamed the PRE-EXISTING `sendError` binding, not the new
+            // alert, which is why the budget has to be respected rather than rediscovered).
+            .modifier(CarryForwardFailureAlert(
+                failures: carryForwardFailures,
+                blockedByMove: carryForwardBlockedByMove,
+                onDismiss: clearCarryForwardFailures
+            ))
             .alert("Save Draft?", isPresented: $showDiscardPrompt) {
                 Button("Save") { Task { await saveDraftAndDismiss() } }
                 Button("Discard", role: .destructive) { Task { await discardDraftAndDismiss() } }
@@ -2788,14 +2807,32 @@ struct ComposeView: View {
         }
     }
 
-    /// Download and re-attach the original message's attachments. Runs asynchronously;
-    /// chips appear in the attachment list as downloads complete. Failures are logged
-    /// and skipped — they do not block composing or surface errors to the user (the
-    /// user can still manually attach files if needed).
+    /// Download and re-attach the original message's attachments. Runs asynchronously; chips
+    /// appear in the attachment list as downloads complete.
+    ///
+    /// 🚨 **A FAILURE HERE IS REPORTED, NOT SWALLOWED.** This function used to log every failure
+    /// and skip it, on the reasoning that the user could always attach files manually. That
+    /// reasoning fails in exactly the case it matters: the user does not KNOW an attachment is
+    /// missing, so "they can attach it manually" is not a recovery — it is a silent, permanent
+    /// omission from an outbound message the user believes is complete. Nothing re-runs this
+    /// function, so there is no later gesture that repairs it either. That makes it a dropped
+    /// user intention, which is never acceptable.
+    ///
+    /// The trigger that exposed it: `AccountManager.fetchAttachment` now refuses while the source
+    /// message's address is mid-move (`ProviderError.addressPendingMove`, see `BodyAddressGate`),
+    /// which turned an occasional network flake into a deterministic refusal. But the defect was
+    /// never specific to that cause — a dropped connection did the same thing — so every failure
+    /// is surfaced, not just the address refusal. (Found by audit.)
+    ///
+    /// Sequential rather than one task per attachment: the fetches serialize inside the account's
+    /// work queue regardless, and a single loop gives one place to aggregate failures and report
+    /// them once instead of an alert per file.
     private func carryForwardAttachments(from reply: MessageHeader, attachments atts: [AttachmentInfo]) {
         print("[ComposeForward] Carrying over \(atts.count) attachment(s) from \(reply.id)")
-        for att in atts {
-            Task { @MainActor in
+        Task { @MainActor in
+            var failed: [String] = []
+            var blockedByMove = false
+            for att in atts {
                 do {
                     let data = try await AccountManager.shared.fetchAttachment(
                         for: reply, section: att.section, encoding: att.encoding
@@ -2809,9 +2846,19 @@ struct ComposeView: View {
                     print("[ComposeForward] Attached \(att.filename) (\(data.count) bytes)")
                 } catch {
                     print("[ComposeForward] Failed to carry \(att.filename): \(error)")
+                    failed.append(att.filename)
+                    if case ProviderError.addressPendingMove = error { blockedByMove = true }
                 }
             }
+            guard !failed.isEmpty else { return }
+            self.carryForwardBlockedByMove = blockedByMove
+            self.carryForwardFailures = failed
         }
+    }
+
+    private func clearCarryForwardFailures() {
+        carryForwardFailures = []
+        carryForwardBlockedByMove = false
     }
 
     /// Resolve contact display names for all current recipient tokens.
@@ -3257,6 +3304,47 @@ private struct DiscardUnsavedEditsAlert: ViewModifier {
         } message: {
             Text("This draft didn't finish loading, so your changes can't be saved to it. Closing now discards them.")
         }
+    }
+}
+
+/// Tells the user that a forward could not carry some of the original's attachments.
+///
+/// Its own `ViewModifier` for the reason `DiscardUnsavedEditsAlert` above documents: the compose
+/// body's alert chain is at the type-checker's budget.
+///
+/// 🚨 **Why this alert exists at all.** `carryForwardAttachments` used to log failures and skip
+/// them. The user is then one tap away from sending a forward missing documents they believe are
+/// attached, with nothing on screen saying so and no later gesture that re-runs the carry — a
+/// silent, permanent dropped intention. The mid-move refusal made that deterministic; the defect
+/// predated it. (Found by audit.)
+private struct CarryForwardFailureAlert: ViewModifier {
+    let failures: [String]
+    let blockedByMove: Bool
+    let onDismiss: () -> Void
+
+    func body(content: Content) -> some View {
+        let presented = Binding(
+            get: { !failures.isEmpty },
+            set: { if !$0 { onDismiss() } }
+        )
+        return content.alert("Attachments Not Carried Over", isPresented: presented) {
+            Button("OK") { onDismiss() }
+        } message: {
+            Text(message)
+        }
+    }
+
+    /// The mid-move case gets different advice because it is transient: forwarding again once the
+    /// move settles carries the attachments normally, whereas a genuine fetch failure does not.
+    private var message: String {
+        let names = failures.joined(separator: ", ")
+        let subject = failures.count == 1
+            ? "This attachment could not be carried over"
+            : "These attachments could not be carried over"
+        if blockedByMove {
+            return "\(subject) because the original message is still being moved: \(names).\n\nClose this draft and forward the message again in a moment, or attach the files manually before sending."
+        }
+        return "\(subject): \(names).\n\nAttach them manually before sending, or close this draft and forward the message again."
     }
 }
 

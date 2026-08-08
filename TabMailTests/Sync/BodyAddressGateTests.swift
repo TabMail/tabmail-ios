@@ -746,4 +746,28 @@ struct BodyAddressGateTests {
             unverifiableBlocked,
             "an identity that cannot be verified must FAIL CLOSED — this guard has no backstop")
     }
+
+    /// 🚨 **Pins the CLASSIFICATION that two callers depend on.** `ProviderError.addressPendingMove`
+    /// is deterministic and pre-wire: retrying the same stale value cannot succeed, and the
+    /// connection is fine. Two consequences ride on that:
+    ///   - `AccountManager.fetchAttachment`'s own `for attempt in 1...2` loop retries only when
+    ///     `SyncEngine.isConnectionError` is true, so misclassifying this would spend a pointless
+    ///     second attempt on a refusal that cannot change.
+    ///   - `AttachmentListView` renders "Download failed. Check your connection and try again." for
+    ///     connection errors, which would send the user to diagnose their network for a refusal
+    ///     that has nothing to do with it, and would bury the actual instruction (reopen the
+    ///     message) that does recover.
+    ///
+    /// The `notConnected` case is the two-sided control: it proves the predicate is live and that a
+    /// `false` here means something, rather than the predicate simply never firing. (Found by audit.)
+    @Test("A pending-move refusal is not a connection error")
+    func addressPendingMoveIsNotAConnectionError() {
+        #expect(!SyncEngine.isConnectionError(ProviderError.addressPendingMove("acct:INBOX:41")))
+        #expect(SyncEngine.isConnectionError(ProviderError.notConnected))
+        // The user-facing text must name the gesture that actually recovers. A bare "try again"
+        // is wrong here: an open view keeps the pre-move header in memory, so re-tapping resubmits
+        // the same stale address. See `IOS-BODY-005`.
+        let text = ProviderError.addressPendingMove("acct:INBOX:41").errorDescription ?? ""
+        #expect(text.localizedCaseInsensitiveContains("open it again"))
+    }
 }

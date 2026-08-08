@@ -744,7 +744,12 @@ enum ProviderError: LocalizedError {
             return "UIDVALIDITY changed for \(folderPath): stored=\(stored) live=\(live)"
         case .syntheticPlaceholderId(let ids): return "Synthetic placeholder id(s) leaked into provider fetch: \(ids.prefix(3))"
         case .syntheticFolderPath(let path): return "Synthetic folder path leaked into provider request: \(path)"
-        case .addressPendingMove: return "This message is still being moved. Try again in a moment."
+        // ⚠️ Deliberately says REOPEN, not just "try again". An already-open view holds the
+        // pre-move `MessageHeader` in memory and `publishRekeys` does not push the re-keyed row
+        // into it, so repeated taps re-submit the same stale value and stay refused even after
+        // the move has settled (the same stale-open-view condition as `IOS-BODY-004`). Leaving
+        // and reopening resolves against the current row, which is the reliable recovery.
+        case .addressPendingMove: return "This message is still being moved. Close it and open it again in a moment."
         }
     }
 }
