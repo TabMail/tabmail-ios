@@ -220,7 +220,11 @@ struct OversizedBodyQuarantineDatabaseTests {
             renderedBody: MessageBody.create(contentKey: ContentKey(rawValue: header.id), htmlBody: nil),
             plainText: nil,
             hasAttachments: false,
-            hasUnresolvedICS: false
+            hasUnresolvedICS: false,
+            // This fixture's row was never moved (its key encodes its own folder) and its
+            // rfc822 id is nil, so `BodyAddressGate` has nothing to refuse and the
+            // confirmed-empty path runs exactly as before.
+            fetchedRfc822MessageId: nil
         )
         let (outcome, processed) = await BodyFetchProcessor.process(fetchResult: fetchResult, enableAI: false)
         #expect(outcome == .confirmedEmpty)

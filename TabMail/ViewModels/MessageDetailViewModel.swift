@@ -1123,6 +1123,29 @@ final class MessageDetailViewModel {
                     }
                 } catch {
                     print("[MessageDetail] Poll fetch failed (attempt \(fetchAttempt)): \(error)")
+                    // ⚠️ **NO REKEY RECOVERY HERE — REMOVED DELIBERATELY, DO NOT RE-ADD.**
+                    //
+                    // Rounds 3 and 4 of the audit each found a WRONG-MESSAGE (C3) hole in an
+                    // attempt to self-heal this case, and the second was found in the fix for the
+                    // first. Both had the same root: after `MessageHeaderRekey.finishMove` deletes
+                    // and re-inserts the row, this view holds a key that no longer exists, and
+                    // every candidate for "find the row it became" is a GUESS.
+                    //   - Matching account-wide on `rfc822MessageId` can return a different copy of
+                    //     the message (the Sent copy of a thread), silently swapping what the user
+                    //     is reading.
+                    //   - Scoping to (account, folder, RFC id) and requiring a unique match still
+                    //     adopts the wrong row when the primary key vanished for a reason OTHER
+                    //     than a move: `MessageHeaderRekey.apply`'s collision path deletes the
+                    //     losing row, so the "sole remaining RFC match" is a DIFFERENT message.
+                    // Post-deletion cardinality is not evidence that a rekey is what happened.
+                    //
+                    // The recovery was only ever a convenience: without it the body simply does not
+                    // appear until the user leaves and reopens the message, at which point
+                    // resolution runs fresh against the re-keyed row and works. That is ONE
+                    // ordinary gesture, which is THE MANTRA's fail-closed-and-let-it-be case — and
+                    // it is what shipped `v1.6.38` does. Trading a guaranteed-correct one-gesture
+                    // recovery for an automatic one that can show someone else's mail is a bad
+                    // trade at any probability. Registered as `IOS-BODY-004`.
                 }
             }
         }
@@ -1364,6 +1387,19 @@ final class MessageDetailViewModel {
             loadThreadMessagesAsync()
             return
         }
+        // Address-corroboration pre-gate (`BodyAddressGate`). `optimisticMoveToFolder`
+        // leaves the row at (destination folder, SOURCE UID) with a nil epoch until the
+        // drain's `finishMove` re-keys it — and on IMAP that address names a DIFFERENT
+        // message. Poll instead of fetching: the body lands once the move completes, or
+        // once the next sync of that folder re-stamps the epoch. The authoritative
+        // refusal is in `BodyFetchProcessor.process`; this branch exists so the user sees
+        // the same pending state as any other in-flight body rather than a blank one.
+        if await manager.bodyFetchIsBlockedByPendingAddress(for: msg) {
+            print("[MoveTrace] loadBody — address not corroborated (move in flight), polling for \(rid.prefix(40))")
+            isLoading = true
+            startBodyPoll()
+            return
+        }
         // If the body queue is already fetching this message, don't compete for the
         // IMAP connection — just poll until the background fetch completes. Competing
         // causes "cannot connect" errors because the folder connection is locked.
@@ -1429,6 +1465,19 @@ final class MessageDetailViewModel {
         isRefetchingBody = true
         defer { isRefetchingBody = false }
         let rid = resolvedId
+        // ⚠️ CHECK BEFORE THE DESTRUCTIVE STEP. This function deletes the durable body FIRST and
+        // fetches second. If the row's address is mid-move, `fetchBody` now refuses (it must — the
+        // UID names a different message), so the delete would land and the fetch would not,
+        // leaving the user staring at a blank message they could previously read, with no path
+        // back until some unrelated sync or queue drain happens. Skipping the whole refresh keeps
+        // the body they already have, which is strictly better than destroying it to prove a point.
+        // (Found by audit — the refusal was added to the funnel without checking what each caller
+        // had already thrown away by the time it fires.)
+        if let msg = message, await manager.bodyFetchIsBlockedByPendingAddress(for: msg) {
+            print("[Refetch] Skipped — address not corroborated (move in flight) for \(rid.prefix(40))")
+            startBodyPoll()
+            return
+        }
         print("[Refetch] Starting refetchBody for rid=\(rid.prefix(40))")
         // Delete existing body and reset body-fetch state. Pull-to-refresh is the
         // user's explicit "retry from scratch" signal — give the empty-fetch chain
@@ -1518,6 +1567,18 @@ final class MessageDetailViewModel {
                 let htmlPreview = String(self.messageBody?.htmlContent?.prefix(200) ?? "nil")
                 print("[Refetch] Body loaded: htmlLen=\(htmlLen) preview=\(htmlPreview)")
                 self.isLoading = false
+                // The destructive half of this refresh ALWAYS lands (the body row is deleted before
+                // the fetch), so if we end with no body the user is looking at a message they could
+                // read a moment ago. The pre-gate above prevents the common cause, but it reads a
+                // snapshot and a move can land between that check and the delete — a TOCTOU window
+                // no check on this side can close. Leaving the poll running is what makes that
+                // window recoverable rather than terminal: it adopts the body as soon as one exists.
+                // (Found by audit; before this, the refusal path ended with a blank view and nothing
+                // scheduled to fill it.)
+                if self.messageBody == nil {
+                    print("[Refetch] Ended with no body — leaving the poll running to recover")
+                    self.startBodyPoll()
+                }
                 self.loadThreadMessagesAsync()
             }
         }

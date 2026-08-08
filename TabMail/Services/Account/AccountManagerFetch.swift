@@ -43,12 +43,53 @@ extension AccountManager {
 
     // MARK: - Body & Attachment Fetching
 
+    /// True when this row's provider address is not corroborated, so a body fetch would
+    /// name a DIFFERENT message on the wire. See `BodyAddressGate`.
+    ///
+    /// ⚠️ **This is a PRE-FILTER, not the guard.** It exists to avoid a round trip that
+    /// `BodyFetchProcessor.process` would refuse anyway, and to let the UI show a pending
+    /// state instead of a blank body. It therefore FAILS OPEN (returns false) when the
+    /// account cannot be read: a dropped pre-filter costs one wasted fetch, while the
+    /// authoritative refusal still runs at the write. Do not promote this to a guard
+    /// without flipping that direction — a fail-open seam feeding a guard is
+    /// fail-dangerous (`feedback_port_safe_only_if_consumer_direction_same`).
+    func bodyFetchIsBlockedByPendingAddress(for message: MessageHeader) async -> Bool {
+        let provider: AccountProvider?
+        do {
+            provider = try await dbPool.read { db in
+                try Account.fetchOne(db, key: message.accountId)?.provider
+            }
+        } catch {
+            return false
+        }
+        guard let provider else { return false }
+        return !BodyAddressGate.isFetchable(header: message, provider: provider)
+    }
+
     func fetchBody(for message: MessageHeader) async throws {
         print("[FetchBody] Opening: id=\(message.id.prefix(40)) msgId=\(message.messageId.prefix(30)) folder=\(message.folderPath)")
 
         // Body already loaded — nothing to do
         let hasBody = (try? await dbPool.read { db in try MessageBody.fetchOne(db, key: message.id) != nil }) ?? false
         guard !hasBody else { return }
+
+        // Address not corroborated: this UID names a DIFFERENT message on the wire right now,
+        // and `BodyFetchProcessor.process` would refuse the write anyway. Skip the round trip.
+        //
+        // ⚠️ **The check belongs HERE, at the funnel — not only in the callers.** It was first
+        // placed in `MessageDetailViewModel.loadBody` alone, but `startBodyPoll` calls this
+        // function directly on a 2s cadence and never re-runs the caller-side check, so a move
+        // parked offline produced an IMAP round trip every two seconds for as long as the detail
+        // view stayed open, each one guaranteed to be refused at the write. Every body path
+        // converges here; the caller-side check now only decides which UI state to show.
+        // (Found by audit.)
+        if await bodyFetchIsBlockedByPendingAddress(for: message) {
+            print("[MoveTrace] fetchBody — address not corroborated (move in flight), skipping fetch for \(message.id.prefix(40))")
+            throw ProviderError.networkError(
+                underlying: NSError(domain: "TabMail", code: -3,
+                    userInfo: [NSLocalizedDescriptionKey: "This message is still being moved. It will load once the move completes."])
+            )
+        }
 
         // Ensure provider exists
         if providers[message.accountId] == nil {

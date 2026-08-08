@@ -245,6 +245,11 @@ actor MockEmailProvider: EmailProvider {
     /// it can observe/act while the claimed row is genuinely in flight. Never
     /// held while any gate is held: this fires entirely outside the queue's
     /// mutation gate, mirroring production.
+    /// Awaited from INSIDE `fetchMessage(id:folder:)`, AFTER the call is logged and BEFORE the
+    /// result is returned — i.e. while the fetch is genuinely "on the wire". Lets a test mutate the
+    /// database mid-fetch, which is the only way to exercise a guard that must run AFTER the
+    /// network returns but BEFORE the result is rendered or written.
+    var fetchMessageHook: (@Sendable () async -> Void)?
     var moveHook: (@Sendable () async -> Void)?
     /// Awaited from INSIDE `send(draft:)`, AFTER the draft is recorded, so a
     /// test can act while the SMTP transaction is genuinely on the wire: the
@@ -290,6 +295,7 @@ actor MockEmailProvider: EmailProvider {
 
     func fetchMessage(id: String, folder: String) async throws -> FullMessageInfo {
         callLog.append("fetchMessage(id:\(id),folder:\(folder))")
+        if let fetchMessageHook { await fetchMessageHook() }
         if let error = fetchMessageThrows { throw error }
         guard let result = fetchMessageResult else {
             throw ProviderError.messageNotFound
@@ -413,6 +419,10 @@ actor MockEmailProvider: EmailProvider {
 
     func setSaveDraftHook(_ hook: (@Sendable () async -> Void)?) {
         saveDraftHook = hook
+    }
+
+    func setFetchMessageHook(_ hook: (@Sendable () async -> Void)?) {
+        fetchMessageHook = hook
     }
 
     func setMoveHook(_ hook: (@Sendable () async -> Void)?) {

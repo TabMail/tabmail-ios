@@ -43,6 +43,13 @@ enum BodyFetchProcessor {
         /// (transient). `process` routes this to retry instead of caching an empty
         /// attachment-only body. See `RenderedBody.hasUnresolvedICS`.
         let hasUnresolvedICS: Bool
+        /// RFC 2822 Message-ID of the message the server ACTUALLY returned, carried so
+        /// `process` can compare it against the row's before writing
+        /// (`BodyAddressGate.identityContradicts`). Both producers hold `fullMessage`;
+        /// `process` is the sole consumer and therefore the sole enforcement point — a
+        /// check spread across producers can be forgotten by the next producer added.
+        /// Optional because RFC 5322 makes `Message-ID` a SHOULD, not a MUST.
+        let fetchedRfc822MessageId: String?
     }
 
     /// Fetch + render a single message. Provider gates concurrency.
@@ -51,6 +58,21 @@ enum BodyFetchProcessor {
         item: Item,
         provider: any EmailProvider
     ) async -> Swift.Result<FetchResult, Result> {
+        // PRE-FETCH REFUSAL — before the network round trip, not after it.
+        //
+        // A refused row deliberately keeps `bodyComplete = 0`, so the queues' `repopulateOnDrain`
+        // re-admits it every cycle. Without this check each of those cycles issued a full
+        // `provider.fetchMessage` that was then guaranteed to be refused — an unbounded fetch loop
+        // for as long as a move stays undrained, at the queue's cycle rate. Refusing here makes a
+        // retry cycle cost one indexed point read instead of an IMAP round trip. (Found by audit.)
+        //
+        // This does NOT replace the write-time refusal: it runs before the fetch, so it cannot see
+        // a move that lands while the fetch is in flight.
+        if let refusal = await addressRefusal(for: item, fetchedRfc822MessageId: nil) {
+            BackgroundSyncLogger.log(
+                "[BodyFetch] REFUSED before fetch for \(item.headerId.prefix(30)) folder=\(item.folderPath) uid=\(item.messageId) — \(refusal.logDescription); left bodyComplete=0 for retry")
+            return .failure(.retry)
+        }
         let t0 = CFAbsoluteTimeGetCurrent()
         do {
             let fullMessage = try await provider.fetchMessage(id: item.messageId, folder: item.folderPath)
@@ -67,6 +89,15 @@ enum BodyFetchProcessor {
             let rawTextLen = fullMessage.textBody?.count ?? 0
             if rawHtmlLen == 0 && rawTextLen == 0 {
                 print("[BodyFetch] RAW empty \(item.messageId) folder=\(item.folderPath) attachments=\(fullMessage.attachments.count) inline=\(fullMessage.inlineImages.count) ics=\(fullMessage.icsData != nil) tookMs=\(fetchMs)")
+            }
+
+            // PRE-RENDER REFUSAL — see `addressRefusal`. Rendering persists inline images to disk
+            // under this row's content key, so it must not run for a message we are going to refuse.
+            if let refusal = await addressRefusal(
+                for: item, fetchedRfc822MessageId: fullMessage.header.rfc822MessageId) {
+                BackgroundSyncLogger.log(
+                    "[BodyFetch] REFUSED before render for \(item.headerId.prefix(30)) folder=\(item.folderPath) uid=\(item.messageId) — \(refusal.logDescription); left bodyComplete=0 for retry")
+                return .failure(.retry)
             }
 
             let fetchAttachment = buildAttachmentFetcher(
@@ -94,7 +125,8 @@ enum BodyFetchProcessor {
                 renderedBody: renderedBody,
                 plainText: plainText,
                 hasAttachments: !fullMessage.attachments.isEmpty,
-                hasUnresolvedICS: hasUnresolvedICS
+                hasUnresolvedICS: hasUnresolvedICS,
+                fetchedRfc822MessageId: fullMessage.header.rfc822MessageId
             ))
         } catch {
             let desc = "\(error)"
@@ -176,6 +208,28 @@ enum BodyFetchProcessor {
         let item = fetchResult.item
         let dbPool = AppDatabase.dbPool
         let bodyToInsert = fetchResult.renderedBody
+
+        // ── ADDRESS-CORROBORATION GATE (BodyAddressGate) ────────────────────────────
+        // THE single enforcement point for every body write. All four callers converge
+        // here: `fetch` → `process` (interactive single fetch) and `renderFetched` →
+        // `process` (both body queues' batch fetch). Enforcing at the sole CONSUMER
+        // rather than at each producer is deliberate — a producer added later cannot
+        // forget a check it never has to make.
+        //
+        // Disposition is ALWAYS `.retry`, never `.confirmedEmpty`: the row keeps
+        // `bodyComplete = 0` so it is re-attempted once `finishMove`'s COPYUID proof or
+        // an ordinary folder sync re-stamps the epoch (Data Integrity Rule 1 — never
+        // mark unfetched content as fetched; Rule 2 — retries must not mask failures).
+        // THE AUTHORITATIVE REFUSAL. Both render paths run this same probe pre-render, but that
+        // pass cannot see a move that lands DURING the fetch — this one re-reads the row after the
+        // bytes are in hand, so it is the one the invariant rests on. (The pre-render pass exists
+        // to stop `renderBody` persisting inline images under this row's content key; it is an
+        // optimisation, never the guard.)
+        if let refusal = await addressRefusal(for: item, fetchedRfc822MessageId: fetchResult.fetchedRfc822MessageId) {
+            BackgroundSyncLogger.log(
+                "[BodyFetch] REFUSED body write for \(item.headerId.prefix(30)) folder=\(item.folderPath) uid=\(item.messageId) — \(refusal.logDescription); left bodyComplete=0 for retry")
+            return (.retry, nil)
+        }
 
         // Branch on content — only write MessageBody when we have actual content.
         if let plainText = fetchResult.plainText, !plainText.isEmpty {
@@ -379,10 +433,106 @@ enum BodyFetchProcessor {
     /// Render a pre-fetched FullMessageInfo into a FetchResult.
     /// Used by batch fetch path — the provider fetch already happened in bulk.
     /// Handles CID resolution, ICS calendar parsing, plain text extraction.
+    /// One read for the `process` gate, on a path that is already DB-bound.
+    ///
+    /// Reads the row's CURRENT epoch rather than trusting anything carried on `Item`: the
+    /// window this closes is precisely one in which the row changes underneath an
+    /// in-flight fetch, so a snapshot taken at enqueue time would classify stale state.
+    /// (That admission-vs-execution skew is a recorded trap —
+    /// `feedback_admission_execution_classification_skew`.)
+    /// The gate's probe. Runs at TWO points, deliberately:
+    ///   - **pre-render**, with `fetchedRfc822MessageId: nil` — so a refused message never reaches
+    ///     `renderBody`, which would otherwise persist its inline images to disk under this row's
+    ///     content key via `BodyAssetStore.makeInlineImageWriter` before anything could refuse the
+    ///     write. Those files outlive the refusal, and a later legitimate fetch that references a
+    ///     colliding CID but fails to re-fetch that one attachment would render the STRANGER's
+    ///     image inside this message — a wrong-content display that no sync undoes. Preventing the
+    ///     write is cheaper than reasoning about the collision. (Found by audit.)
+    ///   - **at write time**, with the real fetched Message-ID — the AUTHORITATIVE refusal. The
+    ///     pre-render call is an optimisation and cannot be relied on: it runs before the row is
+    ///     re-read at write time, so it cannot see a move that lands during the fetch.
+    ///
+    /// A `nil` fetched id disarms only the identity half (absence of evidence, by design), so the
+    /// pre-render pass still enforces both address halves.
+    private static func addressRefusal(
+        for item: Item, fetchedRfc822MessageId: String?
+    ) async -> BodyAddressGate.Refusal? {
+        struct Probe {
+            let id: String
+            let folderPath: String
+            let messageId: String
+            let storedRfc: String?
+            let provider: AccountProvider
+        }
+        let probe: Probe?
+        do {
+            // `dbPool.pool` (RAW), not `dbPool.read`: `PrioritizedDatabase.read` awaits
+            // `NSEDataBridge.mergeIfStagingPending()` first, which would put a potentially
+            // multi-second NSE merge in front of EVERY body write — a hot path that runs once per
+            // fetched message. The gate wants the DURABLE row state anyway: the fields it reads
+            // (`folderPath`, `messageId`, `rfc822MessageId`) are written by the move path, and the
+            // NSE never moves messages, so a pending merge cannot change this answer. A row that
+            // exists only in staging reads as missing here ⇒ `.verificationUnavailable` ⇒ `.retry`,
+            // which is the fail-closed direction and clears once the merge commits. (Found by audit.)
+            probe = try await AppDatabase.dbPool.pool.read { db -> Probe? in
+                guard let header = try MessageHeader.fetchOne(db, key: item.headerId),
+                      let account = try Account.fetchOne(db, key: item.accountId)
+                else { return nil }
+                // `header.folderPath`, NOT `item.folderPath`: the Item is a snapshot taken
+                // at enqueue time, and the window this closes is precisely one in which the
+                // row moves underneath an in-flight fetch.
+                return Probe(
+                    id: header.id,
+                    folderPath: header.folderPath,
+                    messageId: header.messageId,
+                    storedRfc: header.rfc822MessageId,
+                    provider: account.provider)
+            }
+        } catch {
+            // Suspension aborts and transient read failures land here. An unknown answer
+            // is retryable, never authoritative — refuse rather than write blind.
+            return .verificationUnavailable
+        }
+        // Header or account gone mid-fetch: nothing left to corroborate against, and the
+        // body would be orphaned anyway. Refuse; the queue's scans no longer select a
+        // deleted header, so this does not spin.
+        guard let probe else { return .verificationUnavailable }
+        // PROVENANCE. These bytes were fetched against `item.folderPath` / `item.messageId`.
+        // The key test below compares the row's key to the row's CURRENT folder, which is blind
+        // to a row that moved and moved BACK while this fetch was in flight: an undo annihilating
+        // an unattempted move restores the source `folderPath`, so the key agrees again — yet the
+        // bytes in hand were fetched from the destination address and belong to a stranger.
+        // Comparing what we fetched against what the row now is closes that independently.
+        // Scoped to the same hazard as the rest of the gate: where a stale address MISSES rather
+        // than resolving, bytes fetched under the old address are still this message's bytes
+        // (Gmail/Graph fetch by opaque id, not by folder+UID), so refusing would only cost a
+        // needless retry on every label move that overlaps a body fetch — a common pair.
+        if BodyAddressGate.addressCanResolveToAnotherMessage(
+            provider: probe.provider, accountId: item.accountId),
+           probe.folderPath != item.folderPath || probe.messageId != item.messageId {
+            return .fetchProvenanceMismatch
+        }
+        return BodyAddressGate.refusal(
+            id: probe.id,
+            accountId: item.accountId,
+            folderPath: probe.folderPath,
+            messageId: probe.messageId,
+            provider: probe.provider,
+            storedRfc822MessageId: probe.storedRfc,
+            fetchedRfc822MessageId: fetchedRfc822MessageId)
+    }
+
     static func renderFetched(
         item: Item,
         fullMessage: FullMessageInfo
     ) async -> Swift.Result<FetchResult, Result> {
+        // PRE-RENDER REFUSAL — see `addressRefusal`. Rendering persists inline images to disk
+        // under this row's content key, so it must not run for a message we are going to refuse.
+        if let refusal = await addressRefusal(for: item, fetchedRfc822MessageId: fullMessage.header.rfc822MessageId) {
+            BackgroundSyncLogger.log(
+                "[BodyFetch] REFUSED before render for \(item.headerId.prefix(30)) folder=\(item.folderPath) uid=\(item.messageId) — \(refusal.logDescription); left bodyComplete=0 for retry")
+            return .failure(.retry)
+        }
         let t0 = CFAbsoluteTimeGetCurrent()
 
         let fetchAttachment = buildAttachmentFetcher(
@@ -404,7 +554,8 @@ enum BodyFetchProcessor {
             renderedBody: renderedBody,
             plainText: plainText,
             hasAttachments: !fullMessage.attachments.isEmpty,
-            hasUnresolvedICS: hasUnresolvedICS
+            hasUnresolvedICS: hasUnresolvedICS,
+            fetchedRfc822MessageId: fullMessage.header.rfc822MessageId
         ))
     }
 

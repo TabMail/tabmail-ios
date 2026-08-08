@@ -193,7 +193,10 @@ struct PayloadTooLargeRetryabilityTests {
             renderedBody: MessageBody.create(contentKey: ContentKey(rawValue: header.id), htmlBody: nil),
             plainText: nil,
             hasAttachments: false,
-            hasUnresolvedICS: false
+            hasUnresolvedICS: false,
+            // Row was never moved (its key encodes its own folder) and carries no rfc822
+            // id, so `BodyAddressGate` has nothing to refuse here.
+            fetchedRfc822MessageId: nil
         )
         let (outcome, processed) = await BodyFetchProcessor.process(fetchResult: fetchResult, enableAI: false)
         #expect(outcome == .confirmedEmpty)

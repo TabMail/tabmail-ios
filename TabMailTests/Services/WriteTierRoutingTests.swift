@@ -101,7 +101,11 @@ struct WriteTierRoutingTests {
         let body = MessageBody.create( contentKey: ContentKey(rawValue: headerId), htmlBody: "<p>Tier test body</p>")
         return BodyFetchProcessor.FetchResult(
             item: item, renderedBody: body, plainText: "Tier test body plain text",
-            hasAttachments: false, hasUnresolvedICS: false
+            hasAttachments: false, hasUnresolvedICS: false,
+            // This fixture is about write-tier routing, not identity: the account is
+            // `.gmail` (no reused UID space) and the header carries no rfc822 id, so
+            // `BodyAddressGate` has nothing to contradict and `process` proceeds.
+            fetchedRfc822MessageId: nil
         )
     }
 
