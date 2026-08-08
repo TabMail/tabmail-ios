@@ -214,6 +214,23 @@ struct ComposeAttachmentCarryTests {
         }
     }
 
+    @Test("Close treats unsettled attachment preparation as unsaved content")
+    func closeCannotSilentlyDropPendingAttachmentIntention() throws {
+        let body = try functionBody(
+            "private func closeCompose() async {",
+            before: "private func deleteClearedDraftAndDismiss() async {",
+            in: composeSource())
+        #expect(body.contains(
+            "let attachmentPreparationIsUnsettled = attachmentCarryGate.outstanding > 0"),
+            "Close must account for selected attachment work before it becomes a realized chip")
+        #expect(body.contains(
+            "hasAttachments: !attachments.isEmpty || attachmentLoadFailed || attachmentPreparationIsUnsettled"),
+            "pending attachment work is content and must not take the empty-delete path")
+        #expect(body.contains(
+            "|| attachmentPreparationIsUnsettled"),
+            "pending attachment work is an unsaved change and must prompt before dismissal")
+    }
+
     @Test("Photos-picker work joins the same attachment completion boundary")
     func photoPickerPreparationCannotBeSnapshottedMidImport() throws {
         let body = try functionBody(

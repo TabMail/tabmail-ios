@@ -190,6 +190,38 @@ struct WriteTierRoutingTests {
         #expect(body == nil)
     }
 
+    @Test("A failed attachment-only body-cache write stays retryable")
+    func attachmentOnlyWriteAbortDoesNotReportSuccess() async throws {
+        let (header, restore) = try makeTestDB(suspendable: true)
+        defer {
+            postResume()
+            restore()
+        }
+        let item = BodyFetchProcessor.Item(
+            headerId: header.id, accountId: header.accountId,
+            folderPath: header.folderPath, messageId: header.messageId,
+            isInInbox: true)
+        let fetchResult = BodyFetchProcessor.FetchResult(
+            item: item,
+            renderedBody: MessageBody.create(
+                contentKey: ContentKey(rawValue: header.id), htmlBody: ""),
+            plainText: nil, hasAttachments: true,
+            hasUnresolvedICS: false, fetchedRfc822MessageId: nil)
+
+        postSuspend()
+        let (outcome, processed) = await BodyFetchProcessor.process(
+            fetchResult: fetchResult, enableAI: false)
+        postResume()
+
+        #expect(outcome == .retry)
+        #expect(processed == nil,
+                "an FTS placeholder must not outrun the failed attachment cache write")
+        let body = try await AppDatabase.rawPool.read {
+            try MessageBody.fetchOne($0, key: ContentKey(rawValue: header.id))
+        }
+        #expect(body == nil)
+    }
+
     @Test("A failed confirmed-empty transaction is retryable, never acknowledged")
     func confirmedEmptyWriteAbortDoesNotReportConfirmation() async throws {
         let (header, restore) = try makeTestDB(suspendable: true)
