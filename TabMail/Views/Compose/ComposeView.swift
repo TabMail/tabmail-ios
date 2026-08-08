@@ -10,23 +10,39 @@ import TipKit
 import UniformTypeIdentifiers
 
 /// Completion boundary for the original attachments carried into a forward.
-/// The first red-test checkpoint deliberately leaves the wait behavior inert;
-/// the deferred IOS-COMPOSE-001 implementation wires the real boundary next.
+/// Send, explicit Save and agent autosave all wait here before they snapshot the
+/// compose attachment list, so no producer can persist an in-flight prefix.
 @MainActor @Observable
 final class ComposeAttachmentCarryGate {
     private(set) var outstanding = 0
+    private(set) var hasUnacknowledgedFailure = false
+    @ObservationIgnored
+    private var waiters: [CheckedContinuation<Void, Never>] = []
 
     func begin(_ count: Int) {
         outstanding += count
     }
 
-    func completeOne() {
+    func completeOne(succeeded: Bool) {
         guard outstanding > 0 else { return }
+        if !succeeded { hasUnacknowledgedFailure = true }
         outstanding -= 1
+        guard outstanding == 0 else { return }
+        let settled = waiters
+        waiters.removeAll()
+        for waiter in settled { waiter.resume() }
     }
 
     func waitUntilSettled() async {
-        // RED scaffold: current shipped behavior does not wait.
+        guard outstanding > 0 else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func acknowledgeFailures() {
+        guard outstanding == 0 else { return }
+        hasUnacknowledgedFailure = false
     }
 }
 
@@ -47,24 +63,32 @@ enum ComposeDraftGuards {
     enum AttachmentSnapshotGate: Equatable {
         case ready
         case wait
+        case blockedByFailure
     }
 
-    /// RED scaffold for IOS-COMPOSE-001: shipped code snapshots immediately for
-    /// all three producers even while an attachment carry remains outstanding.
+    /// One decision shared by every attachment snapshot producer. Keeping the
+    /// producer in the API makes the caller census explicit and testable even
+    /// though all three intentionally take the same result.
     static func attachmentSnapshotGate(
         producer: AttachmentSnapshotProducer,
-        outstandingCarryCount: Int
+        outstandingCarryCount: Int,
+        hasUnacknowledgedFailure: Bool = false
     ) -> AttachmentSnapshotGate {
-        .ready
+        switch producer {
+        case .send, .explicitSave, .autoSave:
+            if outstandingCarryCount > 0 { return .wait }
+            return hasUnacknowledgedFailure ? .blockedByFailure : .ready
+        }
     }
 
-    /// RED scaffold for the autosave half of IOS-COMPOSE-001. The shipped
-    /// first-save branch constructs a Draft without adopting the completed
-    /// in-memory attachment snapshot, so reopen sees an attachment-less row.
+    /// Adopt the copy-on-write attachment snapshot without changing any authored
+    /// or provider-linkage field on the draft. Used by both autosave branches.
     static func applyingAttachmentSnapshotDirectory(
         _ dirName: String?, to draft: Draft
     ) -> Draft {
-        draft
+        var updated = draft
+        updated.attachmentsDirName = dirName
+        return updated
     }
 
     /// PORT — `v2final:ComposeDraftGuards.ReadState`.
@@ -365,6 +389,9 @@ enum ComposeDraftGuards {
         case firstSaveLostGeneration
         /// First-save branch: the admitted `saveAsync` THREW.
         case firstSaveFailed
+        /// The original forward carry settled with at least one missing file, so
+        /// no attachment-bearing draft snapshot was attempted.
+        case attachmentCarryIncomplete
         /// `AccountManager.queueDraftSave` refused the durable admission (R14-F3).
         case durableAdmissionRefused
     }
@@ -394,6 +421,7 @@ enum ComposeDraftGuards {
              .updateSaveFailed,
              .noAccountForFirstSave,
              .firstSaveFailed,
+             .attachmentCarryIncomplete,
              .durableAdmissionRefused:
             return true
         }
@@ -408,7 +436,7 @@ enum ComposeDraftGuards {
     /// reviewable draft exists?"*. The two disagree on the CAS exits below, which is
     /// exactly why this is a second roster and not a reuse.
     ///
-    /// The `false` set is the three exits that end with no row written by anyone:
+    /// The `false` set is the exits that end with no row written by anyone:
     /// a thrown predecessor read, a thrown save (either branch), an unresolvable
     /// account, and a refused durable admission. The `true` set is the two
     /// generation-CAS losses — a NEWER generation won the write, so a durable row
@@ -426,6 +454,7 @@ enum ComposeDraftGuards {
              .updateSaveFailed,
              .noAccountForFirstSave,
              .firstSaveFailed,
+             .attachmentCarryIncomplete,
              .durableAdmissionRefused:
             return false
         }
@@ -710,7 +739,7 @@ struct ComposeView: View {
     /// from a different file's cause. (Found by audit — an earlier version of this repair claimed
     /// same-turn accumulation, and the suspending read disproves it.)
     @State private var carryForwardCollected: [String] = []
-    @State private var carryForwardOutstanding = 0
+    @State private var attachmentCarryGate = ComposeAttachmentCarryGate()
     /// True when at least one of those failures was `ProviderError.addressPendingMove` — the
     /// message's address is mid-move, so the advice names the recovery that actually works
     /// (discard this draft, reopen the message from the list, forward again) rather than "attach
@@ -1229,7 +1258,15 @@ struct ComposeView: View {
                     Button("Close") { Task { await closeCompose() } }
                         .font(.subheadline)
                     Spacer()
-                    if isSending {
+                    if attachmentCarryGate.outstanding > 0 {
+                        HStack(spacing: 7) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Preparing attachments…")
+                                .font(.subheadline)
+                        }
+                        .accessibilityIdentifier("composePreparingAttachments")
+                    } else if isSending {
                         ProgressView()
                     } else {
                         Button("Send") { trySend() }
@@ -1243,7 +1280,12 @@ struct ComposeView: View {
                             // replied that we have not identified.
                             .disabled(
                                 toTokens.isEmpty || subject.isEmpty || attachmentLoadFailed
-                                || replyTargetBlocksSend)
+                                || replyTargetBlocksSend
+                                || ComposeDraftGuards.attachmentSnapshotGate(
+                                    producer: .send,
+                                    outstandingCarryCount: attachmentCarryGate.outstanding,
+                                    hasUnacknowledgedFailure:
+                                        attachmentCarryGate.hasUnacknowledgedFailure) != .ready)
                     }
                 }
                 .padding(.horizontal, 16)
@@ -1310,6 +1352,8 @@ struct ComposeView: View {
                         draftReplyToUidValidity: replyTo?.observedUidValidity,
                         composeGenerationCursor: admissionCursor,
                         composeAgentSendFence: agentSendFence,
+                        composeAttachments: $attachments,
+                        composeAttachmentCarryGate: attachmentCarryGate,
                         composeMutationAllowed: draftReadState != .error,
                         // Bubble showing → suggestion is ephemeral; no Draft row.
                         // Reply mode additionally persists edits to cachedReply.
@@ -2431,6 +2475,14 @@ struct ComposeView: View {
         // dropped) by this save. Reached directly from the close prompt's "Save",
         // which does not go back through `closeCompose`.
         commitPendingRecipientInput()
+        // IOS-COMPOSE-001: a close can race the unstructured carry tasks even
+        // though the header replaces Send with a progress label. Wait before
+        // capturing ANY field so this save is one coherent MainActor snapshot.
+        // A carry failure publishes its dedicated alert and blocks this attempt;
+        // after the user acknowledges it they may attach the file manually and
+        // retry Save, or discard and restart the forward.
+        guard let capAttachments = await settledAttachmentSnapshot(
+            for: .explicitSave) else { return }
         let now = Date().timeIntervalSince1970
         // Capture MainActor-isolated properties before entering Sendable closure
         let capDraftId = draftId
@@ -2439,7 +2491,6 @@ struct ComposeView: View {
         let capBcc = bccTokens
         let capSubject = subject
         let capBody = messageBody
-        let capAttachments = attachments
 
         // PORT — v2final `saveDraftAndDismiss`'s "N2: ONE throwing draft read at
         // the TOP, BEFORE any disk or DB mutation". This replaces the TWO separate
@@ -2892,6 +2943,7 @@ struct ComposeView: View {
         carryForwardFailures = []
         carryForwardBlockedByMove = false
         carryForwardCollected = []
+        attachmentCarryGate.acknowledgeFailures()
     }
 
     /// One task per attachment, matching the concurrency this function has always had. An audit
@@ -2904,7 +2956,7 @@ struct ComposeView: View {
     /// connection. Concurrency restored.
     ///
     /// Failures are collected into `carryForwardCollected` and published to the alert-driving
-    /// `carryForwardFailures` only when `carryForwardOutstanding` reaches zero — a real completion
+    /// `carryForwardFailures` only when `attachmentCarryGate.outstanding` reaches zero — a real completion
     /// boundary. A second audit round killed the version that published on each failure: the
     /// address guard inside `AccountManager.fetchAttachment` awaits a `dbPool.read`, so the fetches
     /// interleave and the "they all fail in the same run loop turn" reasoning that version relied
@@ -2913,9 +2965,10 @@ struct ComposeView: View {
     private func carryForwardAttachments(from reply: MessageHeader, attachments atts: [AttachmentInfo]) {
         print("[ComposeForward] Carrying over \(atts.count) attachment(s) from \(reply.id)")
         guard !atts.isEmpty else { return }
-        carryForwardOutstanding += atts.count
+        attachmentCarryGate.begin(atts.count)
         for att in atts {
             Task { @MainActor in
+                var succeeded = false
                 do {
                     let data = try await AccountManager.shared.fetchAttachment(
                         for: reply, section: att.section, encoding: att.encoding
@@ -2926,6 +2979,7 @@ struct ComposeView: View {
                         data: data
                     )
                     self.attachments.append(draftAtt)
+                    succeeded = true
                     print("[ComposeForward] Attached \(att.filename) (\(data.count) bytes)")
                 } catch {
                     print("[ComposeForward] Failed to carry \(att.filename): \(error)")
@@ -2934,13 +2988,34 @@ struct ComposeView: View {
                     }
                     self.carryForwardCollected.append(att.filename)
                 }
-                self.carryForwardOutstanding -= 1
+                self.attachmentCarryGate.completeOne(succeeded: succeeded)
                 // Last fetch in the batch: publish whatever failed, once, in full.
-                if self.carryForwardOutstanding == 0, !self.carryForwardCollected.isEmpty {
+                if self.attachmentCarryGate.outstanding == 0,
+                   !self.carryForwardCollected.isEmpty {
                     self.carryForwardFailures = self.carryForwardCollected
                 }
             }
         }
+    }
+
+    /// The single capture boundary shared by send and explicit save. The agent
+    /// autosave calls the same gate through `DynamicIslandChat` before reading its
+    /// binding to this attachment array.
+    private func settledAttachmentSnapshot(
+        for producer: ComposeDraftGuards.AttachmentSnapshotProducer
+    ) async -> [DraftAttachment]? {
+        var decision = ComposeDraftGuards.attachmentSnapshotGate(
+            producer: producer,
+            outstandingCarryCount: attachmentCarryGate.outstanding,
+            hasUnacknowledgedFailure: attachmentCarryGate.hasUnacknowledgedFailure)
+        if decision == .wait {
+            await attachmentCarryGate.waitUntilSettled()
+            decision = ComposeDraftGuards.attachmentSnapshotGate(
+                producer: producer,
+                outstandingCarryCount: attachmentCarryGate.outstanding,
+                hasUnacknowledgedFailure: attachmentCarryGate.hasUnacknowledgedFailure)
+        }
+        return decision == .ready ? attachments : nil
     }
 
     /// Resolve contact display names for all current recipient tokens.
@@ -3087,6 +3162,12 @@ struct ComposeView: View {
             sendError = "No account available to send from."
             return
         }
+        // Defense-in-depth for every alternate send entry (including the empty-
+        // body alert): do not capture an in-flight prefix. A failed carry blocks
+        // this attempt until its alert is acknowledged and the user chooses how
+        // to replace/retry the missing file.
+        guard let settledAttachments = await settledAttachmentSnapshot(
+            for: .send) else { return }
 
         // Commit any pending input
         var finalTo = toTokens
@@ -3129,7 +3210,7 @@ struct ComposeView: View {
             isHTML: isHTML,
             inReplyTo: threadHeaders.inReplyTo,
             references: threadHeaders.references,
-            attachments: attachments,
+            attachments: settledAttachments,
             threadId: threadHeaders.threadId
         )
         let snapshot = AuthoredSendSnapshot(
@@ -3141,7 +3222,7 @@ struct ComposeView: View {
             bcc: finalBcc,
             subject: subject,
             authoredBody: messageBody,
-            attachments: attachments,
+            attachments: settledAttachments,
             replyToHeaderId: replyTo?.id,
             replyToProviderMessageId: replyTo?.messageId,
             replyToUidValidity: replyTo?.observedUidValidity,

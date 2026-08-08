@@ -56,12 +56,36 @@ struct ComposeAttachmentCarryTests {
 
         await Task.yield()
         #expect(!released)
-        gate.completeOne()
+        gate.completeOne(succeeded: true)
         await Task.yield()
         #expect(!released)
-        gate.completeOne()
+        gate.completeOne(succeeded: true)
         await waiter.value
         #expect(released)
+    }
+
+    @Test("A failed carry blocks every snapshot until the user acknowledges it")
+    func failedCarryBlocksEveryProducer() async {
+        let gate = ComposeAttachmentCarryGate()
+        gate.begin(1)
+        gate.completeOne(succeeded: false)
+
+        for producer in ComposeDraftGuards.AttachmentSnapshotProducer.allCases {
+            #expect(ComposeDraftGuards.attachmentSnapshotGate(
+                producer: producer,
+                outstandingCarryCount: gate.outstanding,
+                hasUnacknowledgedFailure: gate.hasUnacknowledgedFailure
+            ) == .blockedByFailure)
+        }
+
+        gate.acknowledgeFailures()
+        for producer in ComposeDraftGuards.AttachmentSnapshotProducer.allCases {
+            #expect(ComposeDraftGuards.attachmentSnapshotGate(
+                producer: producer,
+                outstandingCarryCount: gate.outstanding,
+                hasUnacknowledgedFailure: gate.hasUnacknowledgedFailure
+            ) == .ready)
+        }
     }
 
     @Test("Autosave adopts the completed carry's staged attachment directory")

@@ -28,6 +28,10 @@ struct DynamicIslandChat: View {
     let draftReplyToUidValidity: Int?
     let composeGenerationCursor: ComposeGenerationCursor?
     let composeAgentSendFence: ComposeAgentSendFence?
+    /// Live attachment state and the original-forward carry boundary owned by
+    /// ComposeView. Autosave waits, then copy-on-write persists this exact set.
+    let composeAttachments: Binding<[DraftAttachment]>?
+    let composeAttachmentCarryGate: ComposeAttachmentCarryGate?
     let composeMutationAllowed: Bool
     /// Skip writing LLM results to the `Draft` table — caller persists elsewhere.
     let skipDraftAutoSave: Bool
@@ -195,6 +199,8 @@ struct DynamicIslandChat: View {
         draftReplyToUidValidity: Int? = nil,
         composeGenerationCursor: ComposeGenerationCursor? = nil,
         composeAgentSendFence: ComposeAgentSendFence? = nil,
+        composeAttachments: Binding<[DraftAttachment]>? = nil,
+        composeAttachmentCarryGate: ComposeAttachmentCarryGate? = nil,
         composeMutationAllowed: Bool = true,
         skipDraftAutoSave: Bool = false,
         isExpanded: Binding<Bool>,
@@ -213,6 +219,8 @@ struct DynamicIslandChat: View {
         self.draftReplyToUidValidity = draftReplyToUidValidity
         self.composeGenerationCursor = composeGenerationCursor
         self.composeAgentSendFence = composeAgentSendFence
+        self.composeAttachments = composeAttachments
+        self.composeAttachmentCarryGate = composeAttachmentCarryGate
         self.composeMutationAllowed = composeMutationAllowed
         self.skipDraftAutoSave = skipDraftAutoSave
         self._isExpanded = isExpanded
@@ -1232,11 +1240,19 @@ struct DynamicIslandChat: View {
 
     // MARK: - Logic
 
+    private var composeAttachmentSnapshotReady: Bool {
+        guard let gate = composeAttachmentCarryGate else { return true }
+        return ComposeDraftGuards.attachmentSnapshotGate(
+            producer: .autoSave,
+            outstandingCarryCount: gate.outstanding,
+            hasUnacknowledgedFailure: gate.hasUnacknowledgedFailure) == .ready
+    }
+
     private var canSend: Bool {
         hasTabMailSession
             && !inputText.trimmingCharacters(in: .whitespaces).isEmpty
             && !isWorking
-            && (!isComposeMode || composeMutationAllowed)
+            && (!isComposeMode || (composeMutationAllowed && composeAttachmentSnapshotReady))
     }
 
     private func sendMessage() {
@@ -1286,6 +1302,13 @@ struct DynamicIslandChat: View {
                 timestamp: Date()))
             return false
         }
+        guard composeAttachmentSnapshotReady else {
+            chatMessages.append(ChatMessage(
+                role: .warning,
+                content: "Wait for the forward's attachments to finish preparing before editing.",
+                timestamp: Date()))
+            return false
+        }
         guard let ctx = composeContext else {
             print("[DynamicIslandChat] sendComposeEdit: NO composeContext — aborting")
             return false
@@ -1307,6 +1330,14 @@ struct DynamicIslandChat: View {
             chatMessages.append(ChatMessage(
                 role: .warning,
                 content: "This draft did not finish loading. Close and reopen it before editing.",
+                timestamp: Date()))
+            return
+        }
+        guard composeAttachmentSnapshotReady else {
+            if agentAdmissionAcquired { composeAgentSendFence?.finishAgent() }
+            chatMessages.append(ChatMessage(
+                role: .warning,
+                content: "Wait for the forward's attachments to finish preparing before editing.",
                 timestamp: Date()))
             return
         }
@@ -1569,7 +1600,7 @@ struct DynamicIslandChat: View {
     }
 
     /// The ONE user-facing string for "this compose-edit turn's auto-save did not
-    /// land". Held in a single place so the five exits that surface it cannot drift
+    /// land". Held in a single place so the six exits that surface it cannot drift
     /// apart, and so a sixth cannot be added with a sixth wording.
     private static let autoSaveDidNotLandWarning =
         "This draft couldn't be saved to your Drafts folder. Your text is still here — tap Save to try again."
@@ -1620,6 +1651,28 @@ struct DynamicIslandChat: View {
             finishAutoSave(.composeUnavailable)
             return .composeUnavailable
         }
+
+        // IOS-COMPOSE-001: the inline editor is normally disabled while the
+        // original forward carry is unsettled, but an already-admitted agent turn
+        // can cross that boundary. Wait here as the authoritative producer gate,
+        // then read the live Binding so autosave persists the complete attachment
+        // set rather than the prefix captured when the turn began.
+        if let gate = composeAttachmentCarryGate {
+            if ComposeDraftGuards.attachmentSnapshotGate(
+                producer: .autoSave,
+                outstandingCarryCount: gate.outstanding,
+                hasUnacknowledgedFailure: gate.hasUnacknowledgedFailure) == .wait {
+                await gate.waitUntilSettled()
+            }
+            guard ComposeDraftGuards.attachmentSnapshotGate(
+                producer: .autoSave,
+                outstandingCarryCount: gate.outstanding,
+                hasUnacknowledgedFailure: gate.hasUnacknowledgedFailure) == .ready else {
+                finishAutoSave(.attachmentCarryIncomplete)
+                return .attachmentCarryIncomplete
+            }
+        }
+        let attachmentSnapshot = composeAttachments?.wrappedValue
         let editHistJSON = Draft.encodeEditHistory(editHistory)
         let now = Date().timeIntervalSince1970
 
@@ -1641,13 +1694,60 @@ struct DynamicIslandChat: View {
             let loadMs = Int(Date().timeIntervalSince(loadStart) * 1000)
             print("[DraftStore] autoSaveDraft: load took \(loadMs)ms found=\(existingLoaded != nil) draftKey=\(draftKey)")
         }
+
+        // Copy-on-write the exact post-boundary attachment snapshot before the DB
+        // save. A nil Binding means a non-Compose caller and preserves the row's
+        // directory; an empty Compose snapshot intentionally adopts nil. Cleanup
+        // always follows `attachmentDisposition`, so a losing generation can
+        // destroy only its own staging directory and never the winner's live one.
+        let previousDirName = existingLoaded?.attachmentsDirName
+        let stagingDirName: String?
+        if let attachmentSnapshot {
+            if attachmentSnapshot.isEmpty {
+                stagingDirName = nil
+            } else {
+                let staging = DraftAttachmentStorage.newStagingDirName()
+                do {
+                    try DraftAttachmentStorage.saveAttachments(
+                        attachmentSnapshot, dirName: staging)
+                } catch {
+                    DraftAttachmentStorage.deleteAttachments(dirName: staging)
+                    let exit: ComposeDraftGuards.AutoSaveExit = existingLoaded == nil
+                        ? .firstSaveFailed : .updateSaveFailed
+                    print("[DraftStore] Auto-save attachment staging failed: \(error)")
+                    finishAutoSave(exit)
+                    return exit
+                }
+                stagingDirName = staging
+            }
+        } else {
+            stagingDirName = nil
+        }
+
+        func finishAttachmentSnapshot(saveApplied: Bool) {
+            guard attachmentSnapshot != nil else { return }
+            switch ComposeDraftGuards.attachmentDisposition(
+                saveApplied: saveApplied,
+                stagingDir: stagingDirName,
+                previousDir: previousDirName
+            ) {
+            case .deleteSuperseded(let dir), .deleteStaging(let dir):
+                DraftAttachmentStorage.deleteAttachments(dirName: dir)
+            case .noCleanup:
+                break
+            }
+        }
+
         if var existing = existingLoaded {
             existing.subject = subject
             existing.body = body
             existing.editHistoryJSON = editHistJSON
             existing.updatedAt = now
             savedAccountId = existing.accountId
-            let existingToSave = existing
+            let existingToSave = attachmentSnapshot == nil
+                ? existing
+                : ComposeDraftGuards.applyingAttachmentSnapshotDirectory(
+                    stagingDirName, to: existing)
             let saveStart = Date()
             do {
                 let result = try await cursor.admit { newEpoch, predecessor in
@@ -1657,15 +1757,18 @@ struct DynamicIslandChat: View {
                         expectedPredecessor: predecessor)
                 }
                 guard result == .applied else {
+                    finishAttachmentSnapshot(saveApplied: false)
                     finishAutoSave(.updateLostGeneration)
                     return .updateLostGeneration
                 }
+                finishAttachmentSnapshot(saveApplied: true)
                 if DebugModeManager.isLoggingEnabled() {
                     let saveMs = Int(Date().timeIntervalSince(saveStart) * 1000)
                     print("[DraftStore] autoSaveDraft: save (existing) took \(saveMs)ms draftKey=\(draftKey)")
                 }
             }
             catch {
+                finishAttachmentSnapshot(saveApplied: false)
                 print("[DraftStore] Auto-save failed: \(error)")
                 finishAutoSave(.updateSaveFailed)
                 return .updateSaveFailed
@@ -1676,6 +1779,7 @@ struct DynamicIslandChat: View {
                 try Account.filter(sql: "emailAddress = ?", arguments: [ctx.senderEmail]).fetchOne(db)?.id
             }
             guard let aid = accountId else {
+                finishAttachmentSnapshot(saveApplied: false)
                 if DebugModeManager.isLoggingEnabled() {
                     print("[DraftStore] autoSaveDraft: exit (no account for first save) draftKey=\(draftKey)")
                 }
@@ -1706,7 +1810,10 @@ struct DynamicIslandChat: View {
             // Immutable copy for the escaping admission closure, mirroring the
             // `existingToSave` binding in the update branch above (a captured `var`
             // is a concurrency hazard, not merely a style point).
-            let draftToSave = draft
+            let draftToSave = attachmentSnapshot == nil
+                ? draft
+                : ComposeDraftGuards.applyingAttachmentSnapshotDirectory(
+                    stagingDirName, to: draft)
             let saveStart = Date()
             do {
                 let result = try await cursor.admit { newEpoch, predecessor in
@@ -1716,15 +1823,18 @@ struct DynamicIslandChat: View {
                         expectedPredecessor: predecessor)
                 }
                 guard result == .applied else {
+                    finishAttachmentSnapshot(saveApplied: false)
                     finishAutoSave(.firstSaveLostGeneration)
                     return .firstSaveLostGeneration
                 }
+                finishAttachmentSnapshot(saveApplied: true)
                 if DebugModeManager.isLoggingEnabled() {
                     let saveMs = Int(Date().timeIntervalSince(saveStart) * 1000)
                     print("[DraftStore] autoSaveDraft: save (first) took \(saveMs)ms draftKey=\(draftKey)")
                 }
             }
             catch {
+                finishAttachmentSnapshot(saveApplied: false)
                 print("[DraftStore] Auto-save failed (first save): \(error)")
                 finishAutoSave(.firstSaveFailed)
                 return .firstSaveFailed

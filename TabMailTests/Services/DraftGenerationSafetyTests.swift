@@ -1023,10 +1023,11 @@ struct ComposeDraftGuardTests {
             .updateSaveFailed,
             .noAccountForFirstSave,
             .firstSaveFailed,
+            .attachmentCarryIncomplete,
             .durableAdmissionRefused,
         ], "a thrown read, a thrown write on either branch, an unresolvable account and a refused durable admission are all 'we could not do it' — never provider-authoritative success — so each must reach the user")
         // Non-vacuity: the hazard is real only if these exits exist at all.
-        #expect(warning.count == 5)
+        #expect(warning.count == 6)
     }
 
     /// TWO-SIDED ANCHOR — the DELIBERATELY HELD direction (`MIS-026`). Without this,
@@ -1110,7 +1111,7 @@ struct ComposeDraftGuardTests {
     /// absence of evidence is not a positive result).
     ///
     /// The exhaustiveness assertion at the end is what makes the pair a partition:
-    /// every one of the eight cases is classified exactly once, so a ninth cannot be
+    /// every one of the nine cases is classified exactly once, so a tenth cannot be
     /// added without landing in one of the two asserted sets.
     @Test("Every auto-save exit that wrote nothing must not be claimed as a saved draft")
     func exitsThatWroteNothingAreNotClaimedAsSaved() {
@@ -1122,15 +1123,16 @@ struct ComposeDraftGuardTests {
             .updateSaveFailed,
             .noAccountForFirstSave,
             .firstSaveFailed,
+            .attachmentCarryIncomplete,
             .durableAdmissionRefused,
         ], "after each of these the user's generated text is NOT in the Drafts route, so a global 'tap to review' pill would open nothing — the exact dead signal R16-3 removed")
-        #expect(notClaimable.count == 6)
-        // The roster is a PARTITION of the enum: eight cases, classified once each.
+        #expect(notClaimable.count == 7)
+        // The roster is a PARTITION of the enum: nine cases, classified once each.
         #expect(notClaimable.count + ComposeDraftGuards.AutoSaveExit.allCases
             .filter({ ComposeDraftGuards.autoSaveExitLeftDurableDraft($0) }).count
             == ComposeDraftGuards.AutoSaveExit.allCases.count)
-        #expect(ComposeDraftGuards.AutoSaveExit.allCases.count == 8,
-                "non-vacuity: the roster is the eight-exit class R14-F3 left open, not a subset of it")
+        #expect(ComposeDraftGuards.AutoSaveExit.allCases.count == 9,
+                "non-vacuity: the original eight-exit class plus the attachment carry refusal are all classified")
     }
 
     // MARK: R17-5 — "no save was attempted" is not "the save landed"
