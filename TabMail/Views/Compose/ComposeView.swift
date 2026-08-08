@@ -9,6 +9,27 @@ import PhotosUI
 import TipKit
 import UniformTypeIdentifiers
 
+/// Completion boundary for the original attachments carried into a forward.
+/// The first red-test checkpoint deliberately leaves the wait behavior inert;
+/// the deferred IOS-COMPOSE-001 implementation wires the real boundary next.
+@MainActor @Observable
+final class ComposeAttachmentCarryGate {
+    private(set) var outstanding = 0
+
+    func begin(_ count: Int) {
+        outstanding += count
+    }
+
+    func completeOne() {
+        guard outstanding > 0 else { return }
+        outstanding -= 1
+    }
+
+    func waitUntilSettled() async {
+        // RED scaffold: current shipped behavior does not wait.
+    }
+}
+
 /// PORT — the v2final `ComposeDraftGuards` fail-closed family
 /// (`v2final:TabMail/Views/Compose/ComposeView.swift`), carrying the decisions
 /// this forward-port's compose load / save / send / close paths exercise.
@@ -17,6 +38,35 @@ import UniformTypeIdentifiers
 /// dependency so the reopen / save / send / close fail-closed invariants can be
 /// pinned without the live compose UI (Testing Rule 12).
 enum ComposeDraftGuards {
+    enum AttachmentSnapshotProducer: CaseIterable, Sendable {
+        case send
+        case explicitSave
+        case autoSave
+    }
+
+    enum AttachmentSnapshotGate: Equatable {
+        case ready
+        case wait
+    }
+
+    /// RED scaffold for IOS-COMPOSE-001: shipped code snapshots immediately for
+    /// all three producers even while an attachment carry remains outstanding.
+    static func attachmentSnapshotGate(
+        producer: AttachmentSnapshotProducer,
+        outstandingCarryCount: Int
+    ) -> AttachmentSnapshotGate {
+        .ready
+    }
+
+    /// RED scaffold for the autosave half of IOS-COMPOSE-001. The shipped
+    /// first-save branch constructs a Draft without adopting the completed
+    /// in-memory attachment snapshot, so reopen sees an attachment-less row.
+    static func applyingAttachmentSnapshotDirectory(
+        _ dirName: String?, to draft: Draft
+    ) -> Draft {
+        draft
+    }
+
     /// PORT — `v2final:ComposeDraftGuards.ReadState`.
     ///
     /// Outcome of a `Draft.fetchOne` on a compose path. A THROWN read (DB
