@@ -40,7 +40,11 @@ existed in shipped v1.6.38; the broader ingress and disposition census closed th
    refuse either admitted operation and claim the same fence before their own suspending work. Failed
    or completed non-send dispositions release admission; an outbox-admitted Send retains ownership
    through dismissal.
-6. The boundary does not widen message identity, provider address, body fetch or attachment fetch
+6. Close treats outstanding preparation or an unacknowledged attachment failure as authored content
+   and an unsaved change even before a chip is realized. It prompts Save/Discard/Cancel instead of
+   taking an unchanged or empty dismissal path. Close does not itself await the provider: Save joins
+   the completion boundary, Discard explicitly drops the work and Cancel keeps the compose open.
+7. The boundary does not widen message identity, provider address, body fetch or attachment fetch
    authority. IOS-BODY-001 through IOS-BODY-005 remain accepted/forward-fix-only as registered.
 
 **Rationale.** Completeness cannot be inferred from the current array length because the original
@@ -54,6 +58,8 @@ bounded-concurrent fetch behavior.
   completed attachment set.
 - A selected Photos, Files or Camera item cannot disappear without an on-screen failure; an admitted
   terminal action cannot race a running agent edit or another Save/Send disposition.
+- Closing while attachment preparation is unsettled cannot silently discard the selected intention,
+  and a slow or hung provider does not remove the user's explicit Discard/Cancel escape paths.
 - Save or autosave can wait for the slowest provider fetch (including its existing timeout ceiling).
   This is visible/retained work, not a dropped intention.
 - An acknowledged fetch failure can still lead to a deliberately incomplete draft if the user ignores
@@ -62,10 +68,10 @@ bounded-concurrent fetch behavior.
   usage during an in-flight save but preserving the live directory across failures and CAS losses.
 
 **Tests / evidence.** Red checkpoint `4a1f45073` fails all three producer gates, early completion and
-autosave first-save adoption; `cb338d1d8`, `b325c368d` and `a41298e8b` pin the related ingress and
-disposition defects. Implementations `ec9682dec` and `f7bc2315c` pass the focused compose, generation
-and write-tier gates (34 tests in the final focused receipt at
-`Test-TabMail-2026.08.08_11-03-10--0700.xcresult`). `ComposeAttachmentCarryTests` pins
+autosave first-save adoption; `cb338d1d8`, `b325c368d`, `a41298e8b` and `bb75ecf06` pin the related
+ingress, disposition and pending-Close defects. Implementations `ec9682dec`, `f7bc2315c` and
+`967e5b3c5` pass the focused compose, generation and write-tier gates (36 tests in the final focused
+receipt at `Test-TabMail-2026.08.08_11-15-11--0700.xcresult`). `ComposeAttachmentCarryTests` pins
 wait/ready/failure directions, all-members completion, Photos admission, synchronous failure
 surfacing and disposition ordering; the existing draft attachment fail-closed/COW suites remain green.
 

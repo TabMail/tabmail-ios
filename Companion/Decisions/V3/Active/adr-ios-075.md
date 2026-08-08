@@ -31,9 +31,10 @@ whose transaction never committed. No schema, provider authority or retry budget
 
 **Tests / evidence.** Red checkpoint `cb338d1d8` uses real GRDB suspension notifications to prove the
 old text-body and confirmed-empty outcomes were false acknowledgements. Implementation `0ff56514f`
-makes both tests green; the complete focused receipt contains 34 passing tests across
-`WriteTierRoutingTests`, `ComposeAttachmentCarryTests` and `DraftGenerationSafetyTests` at
-`Test-TabMail-2026.08.08_11-03-10--0700.xcresult`.
+makes both tests green; `bb75ecf06` extends the same real-suspension census to the attachment-only
+branch. The complete focused receipt contains 36 passing tests across `WriteTierRoutingTests`,
+`ComposeAttachmentCarryTests` and `DraftGenerationSafetyTests` at
+`Test-TabMail-2026.08.08_11-15-11--0700.xcresult`.
 
 **Relates:** ADR-IOS-046 (abandon-on-suspend), ADR-IOS-056 (body-queue write tiers),
 ADR-IOS-072 (content ownership), never-mark-unfetched-as-fetched.
