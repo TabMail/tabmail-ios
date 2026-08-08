@@ -727,9 +727,13 @@ enum ProviderError: LocalizedError {
     case syntheticFolderPath(String)
     /// The row's provider address is not corroborated — a move is in flight, so
     /// `(folderPath, messageId)` may name a DIFFERENT message on the wire. Thrown by
-    /// `AccountManager.fetchAttachment`; see `BodyAddressGate`. TRANSIENT by construction:
-    /// it clears the moment `MessageHeaderRekey.finishMove` re-keys the row, so the
-    /// recovering gesture is simply tapping the attachment again.
+    /// `AccountManager.fetchAttachment`; see `BodyAddressGate`. TRANSIENT in the DATABASE — it
+    /// clears the moment `MessageHeaderRekey.finishMove` re-keys the row — but **NOT transient in
+    /// an already-open view**, which keeps the pre-move header in memory that `publishRekeys` never
+    /// refreshes. So the recovering gesture is going back to the message list and opening the
+    /// message again, NOT tapping the attachment again; see `errorDescription` below and
+    /// `IOS-BODY-005`. (This comment said "simply tapping the attachment again" until an audit
+    /// round showed that does not recover.)
     case addressPendingMove(String)
 
     var errorDescription: String? {
@@ -744,12 +748,18 @@ enum ProviderError: LocalizedError {
             return "UIDVALIDITY changed for \(folderPath): stored=\(stored) live=\(live)"
         case .syntheticPlaceholderId(let ids): return "Synthetic placeholder id(s) leaked into provider fetch: \(ids.prefix(3))"
         case .syntheticFolderPath(let path): return "Synthetic folder path leaked into provider request: \(path)"
-        // ⚠️ Deliberately says REOPEN, not just "try again". An already-open view holds the
-        // pre-move `MessageHeader` in memory and `publishRekeys` does not push the re-keyed row
-        // into it, so repeated taps re-submit the same stale value and stay refused even after
-        // the move has settled (the same stale-open-view condition as `IOS-BODY-004`). Leaving
-        // and reopening resolves against the current row, which is the reliable recovery.
-        case .addressPendingMove: return "This message is still being moved. Close it and open it again in a moment."
+        // ⚠️ Deliberately names GOING BACK TO THE LIST, not "try again" and not "close it".
+        // An already-open view holds the pre-move `MessageHeader` in memory and `publishRekeys`
+        // does not push the re-keyed row into it, so repeated taps re-submit the same stale value
+        // and stay refused even after the move has settled (the same stale-open-view condition as
+        // `IOS-BODY-004`) — so "try again" is wrong. And "close it" is AMBIGUOUS: one of the three
+        // catches that renders this string is `EmlAttachmentPreview`, a sheet showing a nested
+        // `.eml`, where the nearest referent for "it" is that sheet — but the stale header is the
+        // PARENT message, so dismissing only the sheet recovers nothing. Naming the message list
+        // is unambiguous from every one of the three surfaces. (Both earlier wordings were caught
+        // by audit rounds; an inaccurate recovery instruction is worse than none, because the user
+        // repeats a gesture that cannot work.)
+        case .addressPendingMove: return "This message is still being moved. Go back to the message list and open it again in a moment."
         }
     }
 }

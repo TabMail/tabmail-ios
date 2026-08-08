@@ -2824,15 +2824,30 @@ struct ComposeView: View {
     /// never specific to that cause — a dropped connection did the same thing — so every failure
     /// is surfaced, not just the address refusal. (Found by audit.)
     ///
-    /// Sequential rather than one task per attachment: the fetches serialize inside the account's
-    /// work queue regardless, and a single loop gives one place to aggregate failures and report
-    /// them once instead of an alert per file.
+    private func clearCarryForwardFailures() {
+        carryForwardFailures = []
+        carryForwardBlockedByMove = false
+    }
+
+    /// One task per attachment, matching the concurrency this function has always had. An audit
+    /// round corrected an earlier version of this repair that serialized the loop "because the
+    /// fetches serialize in the account work queue anyway" — **that premise is false.**
+    /// `ProviderWorkQueue` is bounded-concurrent, not serial (10 slots for Gmail, 10 for Outlook,
+    /// 20 for IMAP/iCloud), and Gmail/Graph attachment fetches are independent HTTP requests with
+    /// no further gate, so serializing made an N-attachment forward on those providers roughly N×
+    /// slower instead of ~N/10. Only IMAP converges later, on the single reserved action
+    /// connection. Concurrency restored.
+    ///
+    /// Failures accumulate into `carryForwardFailures` as they land rather than being aggregated at
+    /// a single completion point. In the case this exists for — an address refusal — every fetch
+    /// fails on a local read with no network round trip, so all of them land within the same run
+    /// loop turn and the alert presents once with the full list. A mixed batch where a later
+    /// network failure arrives after the alert is already on screen may under-list that one file;
+    /// that is accepted rather than paid for with the slowdown above.
     private func carryForwardAttachments(from reply: MessageHeader, attachments atts: [AttachmentInfo]) {
         print("[ComposeForward] Carrying over \(atts.count) attachment(s) from \(reply.id)")
-        Task { @MainActor in
-            var failed: [String] = []
-            var blockedByMove = false
-            for att in atts {
+        for att in atts {
+            Task { @MainActor in
                 do {
                     let data = try await AccountManager.shared.fetchAttachment(
                         for: reply, section: att.section, encoding: att.encoding
@@ -2846,19 +2861,13 @@ struct ComposeView: View {
                     print("[ComposeForward] Attached \(att.filename) (\(data.count) bytes)")
                 } catch {
                     print("[ComposeForward] Failed to carry \(att.filename): \(error)")
-                    failed.append(att.filename)
-                    if case ProviderError.addressPendingMove = error { blockedByMove = true }
+                    if case ProviderError.addressPendingMove = error {
+                        self.carryForwardBlockedByMove = true
+                    }
+                    self.carryForwardFailures.append(att.filename)
                 }
             }
-            guard !failed.isEmpty else { return }
-            self.carryForwardBlockedByMove = blockedByMove
-            self.carryForwardFailures = failed
         }
-    }
-
-    private func clearCarryForwardFailures() {
-        carryForwardFailures = []
-        carryForwardBlockedByMove = false
     }
 
     /// Resolve contact display names for all current recipient tokens.
