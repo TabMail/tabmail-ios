@@ -2377,6 +2377,10 @@ struct ComposeView: View {
     /// Handle close button: prompt Save/Discard/Cancel when there are actual
     /// changes. Draft is saved BEFORE dismiss (persist before acknowledge).
     private func closeCompose() async {
+        // An explicit Save owns the compose across its attachment-carry and DB
+        // suspensions. Do not let a later Close enter a competing disposition
+        // while that durable user intention is still landing.
+        guard !isSavingDraft else { return }
         // F3: commit any pending in-progress recipient BEFORE the emptiness /
         // changes checks, so it is seen (hasChanges) and later persisted (save).
         commitPendingRecipientInput()
@@ -2471,6 +2475,13 @@ struct ComposeView: View {
         case .save(let resolved):
             account = resolved
         }
+        // Claim the compose BEFORE the first suspension introduced by attachment
+        // carry settlement. Otherwise a second Close can choose Discard while this
+        // Save waits, then this task can resume and recreate the discarded draft.
+        // The defer covers every failure/early-return after ownership is claimed.
+        guard !isSavingDraft else { return }
+        withAnimation(.easeIn(duration: 0.15)) { isSavingDraft = true }
+        defer { isSavingDraft = false }
         // F3: commit any pending in-progress recipient so it is PERSISTED (not
         // dropped) by this save. Reached directly from the close prompt's "Save",
         // which does not go back through `closeCompose`.
@@ -2523,8 +2534,6 @@ struct ComposeView: View {
         if case .success(let value) = readResult { existing = value } else { existing = nil }
         let previousDirName = existing?.attachmentsDirName
 
-        withAnimation(.easeIn(duration: 0.15)) { isSavingDraft = true }
-
         // PORT — v2final `saveDraftAndDismiss`'s F0d COPY-ON-WRITE attachment
         // staging. Persist attachments to disk BEFORE the DB write (file I/O
         // outside GRDB transactions), but into a FRESH, opaque-UUID staging dir —
@@ -2553,7 +2562,6 @@ struct ComposeView: View {
                 // Staging write failed — nothing durable changed. Best-effort clean
                 // the partial staging dir; the live dir is UNTOUCHED.
                 DraftAttachmentStorage.deleteAttachments(dirName: staging)
-                isSavingDraft = false
                 sendError = "Failed to save attachments: \(error.localizedDescription)"
                 return
             }
@@ -2621,7 +2629,6 @@ struct ComposeView: View {
                 saveApplied: false, stagingDir: stagingDirName, previousDir: previousDirName) {
                 DraftAttachmentStorage.deleteAttachments(dirName: dir)
             }
-            isSavingDraft = false
             sendError = "Failed to save draft: \(error.localizedDescription)"
             return
         }
@@ -2639,7 +2646,6 @@ struct ComposeView: View {
         guard saveResult == .applied else {
             // A newer snapshot already won on disk — our snapshot was NOT adopted.
             // Its staging dir was destroyed above; the live dir is intact.
-            isSavingDraft = false
             sendError = "Failed to save draft: \(DraftStore.DraftEpochAdmissionError.staleOrReserved.localizedDescription)"
             return
         }
@@ -2664,16 +2670,17 @@ struct ComposeView: View {
                     draftId: draftId, accountId: account.id)
             },
             dismiss: {
-                isSavingDraft = false
                 dismiss()
             },
             onAdmissionFailure: {
-                isSavingDraft = false
                 sendError = "This draft couldn't be saved to your Drafts folder. Your message is still here — tap Save to try again."
             })
     }
 
     private func discardDraftAndDismiss() async {
+        // See `saveDraftAndDismiss`: never let Discard overtake an explicit Save
+        // that already owns this compose across a suspension.
+        guard !isSavingDraft else { return }
         guard draftReadState != .error else {
             sendError = "This draft did not finish loading. Close and reopen it before discarding."
             return
@@ -3122,6 +3129,9 @@ struct ComposeView: View {
     }
 
     private func send() async {
+        // An explicit Save may be suspended while settling forwarded attachments.
+        // Sending concurrently would race two durable dispositions of one compose.
+        guard !isSavingDraft else { return }
         // Reentrancy / double-send guard. Once we commit to sending we flip
         // `isSending` (swaps the Send button for a spinner), so a second tap
         // cannot fire a second send during the now-SUSPENDING async persistence.
