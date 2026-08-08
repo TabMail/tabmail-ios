@@ -64,6 +64,34 @@ import GRDB
 /// symptom of it, not a new failure introduced here — and the pre-fix behaviour in that same state
 /// was to durably store another message's body under this row's key. Refusing is strictly better,
 /// and it is reversible the moment the move resolves.
+///
+/// 🚨 **THE STALE-OPEN-VIEW CLOSURE — everything above is about the DURABLE ROW; an already-open
+/// view is a separate question, and answering it one site at a time cost three audit rounds.**
+/// State the closure instead of its instances:
+///
+/// > **No event that leaves a view model's in-memory `MessageHeader` stale can heal that view.**
+///
+/// The re-key is a DELETE at the old key plus an INSERT at the new one (`MessageHeaderRekey.apply`),
+/// and `AccountManagerQueue.publishRekeys` mirrors the mapping to Undo, `SearchIndex` and
+/// `BodyAssetStore` — **never into a live `MessageDetailViewModel`**. So every screen that holds a
+/// captured header — the detail body poll, pull-to-refresh, the three attachment surfaces, a forward
+/// launched from that view — keeps testing the pre-move `(destination folder, SOURCE UID)` pair and
+/// stays refused **after the database has settled**. Waiting does not help; repeating the same
+/// gesture in the same view does not help; a later sync does not help.
+///
+/// **The guaranteed recovery is always the same: back out to the message list and reopen**, which
+/// rebuilds the view model against the current row. Any narrower claim ("it will load once the move
+/// completes", "pull again", "tap it again", "forward it again") is false for this class, and one
+/// was found live in a different file in each of rounds 9, 10 and 11.
+///
+/// **Two things this closure does NOT say**, because overcorrecting is its own defect:
+/// - The poll still heals SAME-KEY failures — a connection error, a lock timeout, or a body that
+///   later lands under this row's existing key. It is only the re-key branch that it cannot see.
+/// - A repeat gesture is not guaranteed, but it is not useless either: a fresh `ComposeView`
+///   re-resolves through `Draft.resolveReplyToHeader`, whose Strategy 2 (account + UNIQUE
+///   `rfc822MessageId`) usually finds the re-keyed row. It fails closed on a message with no
+///   Message-ID and on duplicate RFC matches — which is exactly why reopening, which restores
+///   Strategy 1's direct primary-key hit, is the instruction to give the user.
 enum BodyAddressGate {
 
     /// Why a fetch/write was refused. `nil` means "proceed".

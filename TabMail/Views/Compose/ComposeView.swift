@@ -662,8 +662,10 @@ struct ComposeView: View {
     @State private var carryForwardCollected: [String] = []
     @State private var carryForwardOutstanding = 0
     /// True when at least one of those failures was `ProviderError.addressPendingMove` — the
-    /// message's address is mid-move, so the right advice is "try the forward again shortly"
-    /// rather than "attach them manually".
+    /// message's address is mid-move, so the advice names the guaranteed recovery (go back to the
+    /// message list, reopen, forward again) rather than "attach them manually". It said "try the
+    /// forward again shortly" until an audit round showed a bare retry is not guaranteed; see the
+    /// `message` builder below for why.
     @State private var carryForwardBlockedByMove = false
     @State private var contactSearch = ContactSearchService()
     @State private var activeField: ComposeField?
@@ -3363,15 +3365,28 @@ private struct CarryForwardFailureAlert: ViewModifier {
         }
     }
 
-    /// The mid-move case gets different advice because it is transient: forwarding again once the
-    /// move settles carries the attachments normally, whereas a genuine fetch failure does not.
+    /// The mid-move case gets different advice because it is transient — but the advice must name
+    /// the GUARANTEED gesture, not the probable one.
+    ///
+    /// Closing this draft does not rebuild the underlying `MessageDetailView`, so its
+    /// `activeMessage` can still be the pre-move `(destination folder, SOURCE UID)` header
+    /// (`BodyAddressGate`'s stale-open-view closure: `publishRekeys` never pushes the re-keyed row
+    /// into a live view model). A fresh `ComposeView` does re-resolve through
+    /// `Draft.resolveReplyToHeader`, so a repeat Forward is not useless: after the drain, Strategy 1
+    /// misses on the deleted old key and Strategy 2 finds the re-keyed row by
+    /// `(accountId, rfc822MessageId)` — which is why this usually works. It is not GUARANTEED,
+    /// because Strategy 2 fails closed on a message with no Message-ID and on duplicate RFC matches,
+    /// and a failed resolve produces a forward with no quote and no attachments at all. Reopening
+    /// from the message list restores Strategy 1's direct primary-key hit, so it is the instruction
+    /// worth giving. (This string promised a bare "forward the message again" until an audit round
+    /// traced the resolver.)
     private var message: String {
         let names = failures.joined(separator: ", ")
         let subject = failures.count == 1
             ? "This attachment could not be carried over"
             : "These attachments could not be carried over"
         if blockedByMove {
-            return "\(subject) because the original message is still being moved: \(names).\n\nClose this draft and forward the message again in a moment, or attach the files manually before sending."
+            return "\(subject) because the original message is still being moved: \(names).\n\nClose this draft, go back to the message list and open the message again, then forward it — or attach the files manually before sending."
         }
         return "\(subject): \(names).\n\nAttach them manually before sending, or close this draft and forward the message again."
     }

@@ -1579,12 +1579,20 @@ final class MessageDetailViewModel {
                 // the fetch), so if we end with no body the user is looking at a message they could
                 // read a moment ago. The pre-gate above prevents the common cause, but it reads a
                 // snapshot and a move can land between that check and the delete — a TOCTOU window
-                // no check on this side can close. Leaving the poll running is what makes that
-                // window recoverable rather than terminal: it adopts the body as soon as one exists.
+                // no check on this side can close. Leaving the poll running is what covers the
+                // SAME-KEY failures: a connection error, a lock timeout, or a body that lands later
+                // under this row's existing key are all adopted as soon as one exists.
                 // (Found by audit; before this, the refusal path ended with a blank view and nothing
                 // scheduled to fill it.)
+                //
+                // ⚠️ **It does NOT cover the branch this paragraph names.** If the move that raced
+                // the delete then DRAINS, `finishMove` re-keys the row and any replacement body is
+                // written under the DESTINATION key, while the poll keeps reading `resolvedId` —
+                // the stale-open-view closure on `BodyAddressGate`. This comment claimed the poll
+                // made "that window" recoverable for a day; it makes the same-key window
+                // recoverable, and the re-key window still needs a back-out and reopen.
                 if self.messageBody == nil {
-                    print("[Refetch] Ended with no body — leaving the poll running to recover")
+                    print("[Refetch] Ended with no body — poll stays up for a same-key arrival; a re-key needs a reopen")
                     self.startBodyPoll()
                 }
                 self.loadThreadMessagesAsync()

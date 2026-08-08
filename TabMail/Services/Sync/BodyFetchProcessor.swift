@@ -217,9 +217,19 @@ enum BodyFetchProcessor {
         // forget a check it never has to make.
         //
         // Disposition is ALWAYS `.retry`, never `.confirmedEmpty`: the row keeps
-        // `bodyComplete = 0` so it is re-attempted once `finishMove`'s COPYUID proof or
-        // an ordinary folder sync re-stamps the epoch (Data Integrity Rule 1 — never
-        // mark unfetched content as fetched; Rule 2 — retries must not mask failures).
+        // `bodyComplete = 0` so it is re-attempted once the address is corroborated again
+        // (Data Integrity Rule 1 — never mark unfetched content as fetched; Rule 2 —
+        // retries must not mask failures).
+        //
+        // ⚠️ **What clears the refusal is the row being RE-KEYED, not the epoch being
+        // re-stamped.** This comment said "or an ordinary folder sync re-stamps the epoch"
+        // until an audit round checked it against the predicate: `addressIsInFlight`
+        // compares the stored primary key against one re-minted from
+        // `(accountId, folderPath, messageId)`, and the epoch appears in neither side —
+        // so stamping it on the still-mismatched old-key row changes this answer by
+        // exactly nothing. The clearing events are `finishMove` re-keying on COPYUID
+        // proof, or a sync that RE-INSERTS the row at its destination address (which is
+        // what `BodyAddressGate`'s own banner says, and it was right while this was not).
         // THE AUTHORITATIVE REFUSAL. Both render paths run this same probe pre-render, but that
         // pass cannot see a move that lands DURING the fetch — this one re-reads the row after the
         // bytes are in hand, so it is the one the invariant rests on. (The pre-render pass exists
