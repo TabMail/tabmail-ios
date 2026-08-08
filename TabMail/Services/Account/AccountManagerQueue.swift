@@ -1295,7 +1295,7 @@ extension AccountManager {
                 queueLog("[MoveTrace] executeSingleOp — re-keyed \(rekeyedAssetKeys) moved row(s)' cached body assets")
             }
         }
-        let unsafeUndoIds = result.retainedUnaddressedOldHeaderIds + removedOldHeaderIds
+        let unsafeUndoIds = result.unsafeUndoOldHeaderIds + removedOldHeaderIds
         if !unsafeUndoIds.isEmpty {
             await UndoService.shared.discardMembers(namedByOldHeaderIds: unsafeUndoIds)
         }

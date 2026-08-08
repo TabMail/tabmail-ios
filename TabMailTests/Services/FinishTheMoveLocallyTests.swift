@@ -377,7 +377,7 @@ struct FinishTheMoveLocallyTests {
         }
 
         #expect(finishResult.applied.isEmpty)
-        #expect(finishResult.retainedUnaddressedOldHeaderIds == [seeded.id])
+        #expect(finishResult.unsafeUndoOldHeaderIds == [seeded.id])
         let afterArchive = try rows(f)
         #expect(afterArchive.count == 1)
         guard afterArchive.count == 1 else { return }

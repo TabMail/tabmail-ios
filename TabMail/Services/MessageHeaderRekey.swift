@@ -97,12 +97,14 @@ struct HeaderRekeyRecord: Sendable, Equatable {
 }
 
 /// Every local disposition produced while retiring an address-changing move.
-/// The three sets are disjoint: an old address was re-keyed, survived because
-/// no destination address was safe to bind, or no longer owns a header and its
-/// external mirrors must be removed.
+/// Applied and removed old ids are disjoint. `unsafeUndoOldHeaderIds` is an
+/// authority disposition rather than a row disposition: it includes both an
+/// exact optimistic row retained without a safe destination address and an old
+/// key now occupied by a row this operation no longer owns. Neither case may
+/// retain undo authority for the completed source-address move.
 struct MoveFinishResult: Sendable, Equatable {
     var applied: [HeaderRekeyRecord] = []
-    var retainedUnaddressedOldHeaderIds: [String] = []
+    var unsafeUndoOldHeaderIds: [String] = []
     var removedOldHeaderIds: [String] = []
 
     static let empty = MoveFinishResult()
@@ -380,8 +382,9 @@ enum MessageHeaderRekey {
     /// mutate a bystander. Gmail's label-based move keeps a stable provider id,
     /// so `addressChangesOnMove == false` bypasses address repair entirely.
     ///
-    /// - Returns: the disjoint applied, retained-unaddressed, and removed-old-id
-    ///   dispositions that callers must publish to undo, FTS, and body assets.
+    /// - Returns: applied re-keys, old ids whose completed source-address undo
+    ///   authority is unsafe, and removed old ids. Callers publish those
+    ///   dispositions to undo, FTS, and body assets.
     static func finishMove(
         _ op: PendingOperation,
         destinations: [ProvenDestinationAddress],
@@ -430,10 +433,17 @@ enum MessageHeaderRekey {
                   row.messageId == sourceProviderId,
                   row.folderPath == destinationPath,
                   row.folderId == destinationFolderId
-            else { continue }
+            else {
+                // The remote move succeeded, so the source-address undo member
+                // is invalid even though this local row is outside the op's
+                // authority. Retain the row and every external mirror, but
+                // explicitly revoke the stale undo target.
+                result.unsafeUndoOldHeaderIds.append(oldId)
+                continue
+            }
 
             guard let destination = safeDestinations[sourceProviderId] else {
-                result.retainedUnaddressedOldHeaderIds.append(oldId)
+                result.unsafeUndoOldHeaderIds.append(oldId)
                 continue
             }
 
@@ -444,7 +454,7 @@ enum MessageHeaderRekey {
             if let provenEpoch = destination.destinationUidValidity,
                let folderEpoch, folderEpoch > 0,
                folderEpoch != Int(provenEpoch) {
-                result.retainedUnaddressedOldHeaderIds.append(oldId)
+                result.unsafeUndoOldHeaderIds.append(oldId)
                 continue
             }
 
@@ -453,7 +463,7 @@ enum MessageHeaderRekey {
                 accountId: op.accountId, folderPath: destinationPath,
                 messageId: newMessageId)
             guard newId != oldId else {
-                result.retainedUnaddressedOldHeaderIds.append(oldId)
+                result.unsafeUndoOldHeaderIds.append(oldId)
                 continue
             }
 

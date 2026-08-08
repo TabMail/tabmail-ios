@@ -678,8 +678,82 @@ struct QueueCoreInvariantTests {
             accountId: fixture.accountId, folderPath: "INBOX", messageId: "77")
 
         #expect(result.applied.isEmpty)
-        #expect(result.retainedUnaddressedOldHeaderIds.isEmpty)
+        #expect(result.unsafeUndoOldHeaderIds.isEmpty)
         #expect(result.removedOldHeaderIds == [oldId])
+    }
+
+    /// A successful address-changing move invalidates the source-address undo
+    /// member even when the old primary key has since been occupied by a row
+    /// outside this operation's exact optimistic shape. The row itself must be
+    /// left untouched, and its FTS entry must remain because it still exists;
+    /// only the stale undo authority is unsafe.
+    ///
+    /// RED PROOF (recorded): before the first atomic-MOVE implementation audit
+    /// classified G3 mismatches for undo pruning, `finishMove` returned no
+    /// disposition for this member. `publishMoveFinish` therefore retained an
+    /// undo command whose source address now names the unrelated survivor.
+    @Test("a successful move prunes stale undo when its old key now names a non-optimistic row")
+    @MainActor
+    func nonOptimisticOldRowPrunesOnlyItsStaleUndoMember() async throws {
+        let fixture = try fixture(accountId: "acc-mismatched-old-row")
+        defer { finish(fixture) }
+
+        let original = try seedHeader(
+            fixture, messageId: "77", folderPath: "INBOX", epoch: 42)
+        UndoService.shared.push(UndoableAction(
+            type: .move(fromPath: "INBOX", toPath: "Archive"),
+            messages: [original],
+            originalFolderId: original.folderId,
+            originalFolderPath: "INBOX",
+            accountId: fixture.accountId,
+            timestamp: Date()))
+        defer { UndoService.shared.dismissAll() }
+
+        // Simulate a later local owner at the same primary key. Its folder
+        // fields deliberately do not match this operation's optimistic
+        // Archive row, so G3 must not re-key or delete it.
+        try await fixture.pool.write { db in
+            let fetched = try MessageHeader.fetchOne(db, key: original.id)
+            var survivor = try #require(fetched)
+            survivor.folderPath = "Trash"
+            survivor.folderId = MessageIdentity.folderId(
+                accountId: fixture.accountId, folderPath: "Trash")
+            survivor.observedUidValidity = 42
+            try survivor.update(db)
+        }
+
+        let oldKey = ContentKey(rawValue: original.id)
+        _ = try await SearchIndex.shared.indexHeaders([FTSHeaderRecord(
+            contentKey: oldKey, headerId: original.id, messageId: "77",
+            subject: "mismatched old-row survivor", from: "Sender",
+            to: "queue-core@example.com",
+            dateMs: Int64(Date().timeIntervalSince1970 * 1000),
+            folderId: MessageIdentity.folderId(
+                accountId: fixture.accountId, folderPath: "Trash"))])
+        defer { Task { try? await SearchIndex.shared.removeMessages(contentKeys: [oldKey]) } }
+
+        let op = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
+        let result = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                op, destinations: [ProvenDestinationAddress(
+                    sourceProviderId: "77", destinationProviderId: "5",
+                    destinationUidValidity: 42)],
+                addressChangesOnMove: true, db: db)
+        }
+        await AccountManager.shared.publishMoveFinish(result)
+
+        #expect(result.applied.isEmpty)
+        #expect(result.unsafeUndoOldHeaderIds == [original.id])
+        #expect(result.removedOldHeaderIds.isEmpty)
+        let survivor = try await fixture.pool.read { db in
+            try MessageHeader.fetchOne(db, key: original.id)
+        }
+        #expect(survivor?.folderPath == "Trash")
+        #expect(UndoService.shared.undoStack.isEmpty)
+        let missing = try await SearchIndex.shared.contentKeysMissingFromFTS([oldKey])
+        #expect(missing.isEmpty, "the surviving row's external mirror must not be deleted")
     }
 
     @Test("discarding one unsafe undo member preserves its safe sibling")
