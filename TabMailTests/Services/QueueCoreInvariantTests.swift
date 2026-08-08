@@ -442,9 +442,9 @@ struct QueueCoreInvariantTests {
 
     // MARK: - IOS-UNDO-002 / IOS-SEARCH-002 — publishing a committed re-key
     //
-    // Both rows are about the window AFTER the GRDB write commits, when the two
-    // stores that key by `messageHeader.id` but do not live in that database —
-    // the in-memory undo stack and the FTS index — are brought up to date.
+    // Both rows are about the window AFTER the GRDB write commits, when stores
+    // that key by `messageHeader.id` — undo, chat-pill identity, FTS and body
+    // assets — are brought up to date.
 
     /// `IOS-UNDO-002`. The FTS index is a SEPARATE SQLite pool, so its re-key is
     /// a real cross-database round trip. Running it BEFORE the undo publication
@@ -536,6 +536,37 @@ struct QueueCoreInvariantTests {
         #expect(stackMember?.providerMessageId == "5")
         let missingAfter = try await SearchIndex.shared.contentKeysMissingFromFTS([oldKey])
         #expect(missingAfter == [oldKey], "the FTS entry moved off the old key")
+    }
+
+    @Test("a committed message re-key preserves cached chat-pill identity")
+    func committedRekeyPreservesCachedChatPillIdentity() async throws {
+        let fixture = try fixture(accountId: "acc-chat-pill-rekey")
+        defer { finish(fixture) }
+        await ChatIdTranslator.shared.clearAll()
+
+        let oldHeaderId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "INBOX", messageId: "77")
+        let newHeaderId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "Archive", messageId: "5")
+        let numericId = await ChatIdTranslator.shared.toNumericId(oldHeaderId)
+
+        await AccountManager.shared.publishMoveFinish(MoveFinishResult(applied: [
+            HeaderRekeyRecord(
+                oldHeaderId: oldHeaderId,
+                newHeaderId: newHeaderId,
+                newProviderMessageId: "5")
+        ]))
+
+        #expect(await ChatIdTranslator.shared.toRealId(numericId) == newHeaderId)
+        let persistedRealId = try await fixture.pool.read { db in
+            try String.fetchOne(
+                db,
+                sql: "SELECT realId FROM chatIdMapping WHERE numericId = ?",
+                arguments: [numericId])
+        }
+        #expect(persistedRealId == newHeaderId)
+
+        await ChatIdTranslator.shared.clearAll()
     }
 
     /// `IOS-SEARCH-002`. `MessageHeaderRekey.apply` deletes the old header and

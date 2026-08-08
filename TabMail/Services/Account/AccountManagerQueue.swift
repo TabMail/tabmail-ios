@@ -1270,6 +1270,15 @@ extension AccountManager {
             // this re-key just changed, so it has to follow — otherwise
             // finishing the move would break undo rather than enable it.
             await UndoService.shared.applyRekeys(applied)
+            // Persisted chat pills name messages by that same mutable primary key.
+            // Keep their numeric identity stable across the move; otherwise a
+            // cached discussion still renders its baked subject but tapping it
+            // resolves the now-deleted source address and appears inert.
+            for record in applied {
+                _ = await ChatIdTranslator.shared.remapRealId(
+                    from: record.oldHeaderId,
+                    to: record.newHeaderId)
+            }
             // The FTS index is a SEPARATE database, so its re-key is two-phase —
             // outside the GRDB write — exactly as the sync path does it. The
             // entry MOVES; it is never removed.

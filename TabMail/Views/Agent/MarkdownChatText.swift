@@ -20,10 +20,6 @@ struct MarkdownChatText: View {
 
     @State private var lines: [ContentLine] = []
     @State private var pills: [PillRef] = []
-    @State private var pillDetail: EmailPillDetail?
-    @State private var contactDetail: ContactPillDetail?
-    @State private var eventDetail: EventPillDetail?
-    @State private var templateDetail: TemplatePillDetail?
     @State private var dismissedHashes: Set<String> = []
     @State private var revealedLineCount: Int = 0
 
@@ -165,7 +161,11 @@ struct MarkdownChatText: View {
                                 return .handled
                             })
                     case .pill(let ref):
-                        pillChip(numericId: ref.numericId, type: ref.type, label: ref.label)
+                        ChatPillChip(
+                            numericId: ref.numericId,
+                            type: ref.type,
+                            label: ref.label,
+                            isHistory: isHistory)
                     }
                 }
             }
@@ -284,130 +284,6 @@ struct MarkdownChatText: View {
             }
         }
         .padding(.leading, CGFloat(indent / 2) * 12)
-    }
-
-    // MARK: - Pill Chip (styled like TB's pill)
-
-    @ViewBuilder
-    private func pillChip(numericId: Int, type: String, label: String) -> some View {
-        Button {
-            guard !isHistory else { return }
-            Task {
-                switch type {
-                case "contact":
-                    if let detail = await ChatIdTranslator.shared.resolveContactDetail(numericId) {
-                        print("[AIChatDebug] Contact pill tapped: numericId=\(numericId) name=\(detail.name)")
-                        contactDetail = detail
-                    } else {
-                        print("[AIChatDebug] Contact pill tapped but could not resolve detail for numericId=\(numericId)")
-                    }
-                case "event":
-                    if let detail = await ChatIdTranslator.shared.resolveEventDetail(numericId) {
-                        print("[AIChatDebug] Event pill tapped: numericId=\(numericId) title=\(detail.title.prefix(40))")
-                        eventDetail = detail
-                    } else {
-                        print("[AIChatDebug] Event pill tapped but could not resolve detail for numericId=\(numericId)")
-                    }
-                case "template":
-                    if let detail = await ChatIdTranslator.shared.resolveTemplateDetail(numericId) {
-                        print("[AIChatDebug] Template pill tapped: numericId=\(numericId) name=\(detail.name)")
-                        templateDetail = detail
-                    } else {
-                        print("[AIChatDebug] Template pill tapped but could not resolve detail for numericId=\(numericId)")
-                    }
-                default:
-                    if let detail = await ChatIdTranslator.shared.resolveEmailDetail(numericId) {
-                        print("[AIChatDebug] Pill tapped: numericId=\(numericId) subject=\(detail.subject.prefix(40))")
-                        pillDetail = detail
-                    } else {
-                        print("[AIChatDebug] Pill tapped but could not resolve detail for numericId=\(numericId)")
-                    }
-                }
-            }
-        } label: {
-            Text(label)
-                .font(.caption)
-                .fontWeight(.medium)
-                .lineLimit(1)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(Theme.accent.opacity(isHistory ? 0.06 : 0.12))
-                .foregroundStyle(isHistory ? Theme.textSecondary : Theme.accent)
-                .clipShape(Capsule())
-                .overlay(
-                    Capsule().stroke(
-                        (isHistory ? Theme.textSecondary : Theme.accent).opacity(0.3),
-                        lineWidth: 0.5
-                    )
-                )
-        }
-        .buttonStyle(.plain)
-        .disabled(isHistory)
-        .popover(
-            isPresented: Binding(
-                get: { pillDetail?.id == numericId },
-                set: { if !$0 { pillDetail = nil } }
-            )
-        ) {
-            if let detail = pillDetail {
-                EmailPillPopover(detail: detail) {
-                    pillDetail = nil
-                    NotificationCenter.default.post(
-                        name: .emailPillTapped,
-                        object: nil,
-                        userInfo: ["numericId": detail.id, "realId": detail.realId]
-                    )
-                }
-                .presentationCompactAdaptation(.popover)
-            }
-        }
-        .popover(
-            isPresented: Binding(
-                get: { contactDetail?.id == numericId },
-                set: { if !$0 { contactDetail = nil } }
-            )
-        ) {
-            if let detail = contactDetail {
-                ContactPillPopover(detail: detail) { email in
-                    contactDetail = nil
-                    NotificationCenter.default.post(
-                        name: .contactPillComposeTapped,
-                        object: nil,
-                        userInfo: ["email": email, "name": detail.name]
-                    )
-                }
-                .presentationCompactAdaptation(.popover)
-            }
-        }
-        .popover(
-            isPresented: Binding(
-                get: { eventDetail?.id == numericId },
-                set: { if !$0 { eventDetail = nil } }
-            )
-        ) {
-            if let detail = eventDetail {
-                EventPillPopover(detail: detail)
-                    .presentationCompactAdaptation(.popover)
-            }
-        }
-        .popover(
-            isPresented: Binding(
-                get: { templateDetail?.id == numericId },
-                set: { if !$0 { templateDetail = nil } }
-            )
-        ) {
-            if let detail = templateDetail {
-                TemplatePillPopover(detail: detail) {
-                    templateDetail = nil
-                    NotificationCenter.default.post(
-                        name: .templatePillOpenTapped,
-                        object: nil,
-                        userInfo: ["templateId": detail.realId, "numericId": detail.id]
-                    )
-                }
-                .presentationCompactAdaptation(.popover)
-            }
-        }
     }
 
     // MARK: - Reminder Card (matches TB's .tm-reminder-card)
@@ -777,6 +653,136 @@ struct MarkdownChatText: View {
         }
         guard url.scheme == "http" || url.scheme == "https" else { return }
         UIApplication.shared.open(url)
+    }
+}
+
+// MARK: - Pill Chip (styled like TB's pill)
+
+/// One chip owns one presentation slot. The previous implementation kept four
+/// detail values on the containing MarkdownChatText and attached four independent
+/// `.popover` modifiers to every rendered occurrence. After an asynchronous
+/// resolution all occurrences with the same numeric ID could simultaneously claim
+/// presentation, while the four modifier hosts also competed on each occurrence.
+/// SwiftUI would accept the state write (and the tap log would print) but could
+/// decline to mount any popover. Local state plus one item-driven host makes the
+/// tapped occurrence the only possible presenter.
+private enum ChatPillPresentation: Identifiable {
+    case email(EmailPillDetail)
+    case contact(ContactPillDetail)
+    case event(EventPillDetail)
+    case template(TemplatePillDetail)
+
+    var id: String {
+        switch self {
+        case .email(let detail): "email:\(detail.id)"
+        case .contact(let detail): "contact:\(detail.id)"
+        case .event(let detail): "event:\(detail.id)"
+        case .template(let detail): "template:\(detail.id)"
+        }
+    }
+}
+
+private struct ChatPillChip: View {
+    let numericId: Int
+    let type: String
+    let label: String
+    let isHistory: Bool
+
+    @State private var presentation: ChatPillPresentation?
+
+    var body: some View {
+        Button {
+            Task { await resolveForPresentation() }
+        } label: {
+            Text(label)
+                .font(.caption)
+                .fontWeight(.medium)
+                .lineLimit(1)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Theme.accent.opacity(isHistory ? 0.06 : 0.12))
+                .foregroundStyle(isHistory ? Theme.textSecondary : Theme.accent)
+                .clipShape(Capsule())
+                .overlay(
+                    Capsule().stroke(
+                        (isHistory ? Theme.textSecondary : Theme.accent).opacity(0.3),
+                        lineWidth: 0.5
+                    )
+                )
+        }
+        .buttonStyle(.plain)
+        .disabled(isHistory)
+        .popover(item: $presentation) { item in
+            Group {
+                switch item {
+                case .email(let detail):
+                    EmailPillPopover(detail: detail) {
+                        presentation = nil
+                        NotificationCenter.default.post(
+                            name: .emailPillTapped,
+                            object: nil,
+                            userInfo: ["numericId": detail.id, "realId": detail.realId]
+                        )
+                    }
+                case .contact(let detail):
+                    ContactPillPopover(detail: detail) { email in
+                        presentation = nil
+                        NotificationCenter.default.post(
+                            name: .contactPillComposeTapped,
+                            object: nil,
+                            userInfo: ["email": email, "name": detail.name]
+                        )
+                    }
+                case .event(let detail):
+                    EventPillPopover(detail: detail)
+                case .template(let detail):
+                    TemplatePillPopover(detail: detail) {
+                        presentation = nil
+                        NotificationCenter.default.post(
+                            name: .templatePillOpenTapped,
+                            object: nil,
+                            userInfo: ["templateId": detail.realId, "numericId": detail.id]
+                        )
+                    }
+                }
+            }
+            .presentationCompactAdaptation(.popover)
+        }
+    }
+
+    @MainActor
+    private func resolveForPresentation() async {
+        guard !isHistory else { return }
+        switch type {
+        case "contact":
+            if let detail = await ChatIdTranslator.shared.resolveContactDetail(numericId) {
+                print("[AIChatDebug] Contact pill tapped: numericId=\(numericId) name=\(detail.name)")
+                presentation = .contact(detail)
+            } else {
+                print("[AIChatDebug] Contact pill tapped but could not resolve detail for numericId=\(numericId)")
+            }
+        case "event":
+            if let detail = await ChatIdTranslator.shared.resolveEventDetail(numericId) {
+                print("[AIChatDebug] Event pill tapped: numericId=\(numericId) title=\(detail.title.prefix(40))")
+                presentation = .event(detail)
+            } else {
+                print("[AIChatDebug] Event pill tapped but could not resolve detail for numericId=\(numericId)")
+            }
+        case "template":
+            if let detail = await ChatIdTranslator.shared.resolveTemplateDetail(numericId) {
+                print("[AIChatDebug] Template pill tapped: numericId=\(numericId) name=\(detail.name)")
+                presentation = .template(detail)
+            } else {
+                print("[AIChatDebug] Template pill tapped but could not resolve detail for numericId=\(numericId)")
+            }
+        default:
+            if let detail = await ChatIdTranslator.shared.resolveEmailDetail(numericId) {
+                print("[AIChatDebug] Pill tapped: numericId=\(numericId) subject=\(detail.subject.prefix(40))")
+                presentation = .email(detail)
+            } else {
+                print("[AIChatDebug] Pill tapped but could not resolve detail for numericId=\(numericId)")
+            }
+        }
     }
 }
 

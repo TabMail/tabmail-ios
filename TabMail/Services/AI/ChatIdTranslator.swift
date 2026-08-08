@@ -551,6 +551,12 @@ actor ChatIdTranslator {
     /// Used when a message's real ID changes (e.g., folder move changes the key).
     /// Matches TB's `remapUniqueId()`.
     func remapRealId(from oldRealId: String, to newRealId: String) -> Int {
+        // A move can finish before any chat surface has asked the actor to resolve
+        // a pill during this process. In that cold state the authoritative mapping
+        // exists only in GRDB; consulting the empty in-memory reverseMap would turn
+        // the remap into a false no-op and strand every persisted historical pill
+        // at the old message address.
+        ensureLoadedFromDB()
         guard let numericId = reverseMap.removeValue(forKey: oldRealId) else { return 0 }
         idMap[numericId] = newRealId
         reverseMap[newRealId] = numericId

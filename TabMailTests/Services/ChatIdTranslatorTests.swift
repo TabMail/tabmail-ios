@@ -473,6 +473,24 @@ struct RemapRealIdTests {
         let count = await translator.remapRealId(from: "nonexistent", to: "new-id")
         #expect(count == 0)
     }
+
+    @Test("remap cold-loads a persisted mapping before consulting the reverse map")
+    func remapColdLoadsPersistedMapping() async {
+        let token = UUID().uuidString
+        let oldRealId = "cold-old-\(token)"
+        let newRealId = "cold-new-\(token)"
+
+        // A prior process/session persisted the mapping. A fresh actor has empty
+        // in-memory maps and has never called toNumericId/toRealId.
+        let writer = ChatIdTranslator.createIsolated()
+        let numericId = await writer.toNumericId(oldRealId)
+        let cold = ChatIdTranslator.createIsolated()
+
+        let count = await cold.remapRealId(from: oldRealId, to: newRealId)
+
+        #expect(count == 1)
+        #expect(await cold.toRealId(numericId) == newRealId)
+    }
 }
 
 // MARK: - cleanupEvictedIds Tests
