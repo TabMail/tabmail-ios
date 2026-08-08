@@ -476,3 +476,34 @@ issues the cap `PUT` against the existing master resource with a best-effort `re
 discharged, it is filed"* — is now demonstrated in both directions:** it took an audit re-reporting
 the same finding as NEW, twice, before the index surface was actually corrected. The re-report was
 not noise; it was the measurement that the routed fix had never become reachable.
+
+---
+
+## Re-derived for atomic UID MOVE at `ec9682dec` (2026-08-08)
+
+The property predicate and all five lower-bound searches were re-run over `TabMail/`, `Shared/` and
+`TabMailNotificationService/` at the production candidate `ec9682dec`:
+
+| pattern | hits | disposition |
+|---|---:|---|
+| A — `method\s*:\s*"DELETE"` | 7 | unchanged adjudications |
+| B — `httpMethod\s*=\s*"DELETE"` | 3 | unchanged adjudications |
+| C — `expunge\s*\(` | 5 | 2 live UID-scoped calls and 3 comments; the +1 from the prior census is comment-only |
+| D — `httpMethod\s*=\s*"PUT"` | 2 | unchanged adjudications |
+| E — `method\s*:\s*"PUT"` | 2 | unchanged adjudications |
+
+A direct transport census adds exactly one app call to `server.moveAtomically`. It is **outside the
+set on positive evidence**: successful RFC 6851 `UID MOVE` retains each affected message in the
+destination mailbox, and the fork entry point has no COPY/STORE/EXPUNGE fallback. It changes the
+message's location, not whether its authored content exists on the server. The no-`MOVE` owned route
+and its two live UID-scoped expunge calls remain unchanged.
+
+Therefore the six-member property set is unchanged at `ec9682dec`; only reachability narrows. On a
+`MOVE` server the app no longer reaches its own `STORE \\Deleted` / scoped-expunge tail. The soft-
+deleted residue and explicit source-expunge surfaces remain reachable only on the no-`MOVE` route,
+as narrowed in `IOS-IMAP-001` and `IOS-IMAP-006`.
+
+**Negative case.** Re-adjudicate atomic MOVE if the fork ever gains a fallback, if a call can report
+success without retaining each member in at least one mailbox, or if a future provider implements a
+"move" as destructive replacement without a reached per-item recovery path. The symbol name is not
+the exclusion; retained server-side content is.
