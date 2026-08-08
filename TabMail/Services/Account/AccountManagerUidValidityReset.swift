@@ -503,18 +503,20 @@ extension AccountManager {
         let flagKey = "didArmImapUidValidityResetForEpochRebuild_v1"
         guard !UserDefaults.standard.bool(forKey: flagKey) else { return }
 
+        let accounts: [Account]
         let folderIds: [String]
         do {
-            folderIds = try await dbPool.read { db in
-                let accountIds = try String.fetchAll(db, Account
-                    .select(Column("id"))
+            (accounts, folderIds) = try await dbPool.read { db -> ([Account], [String]) in
+                let accounts = try Account
                     .filter([AccountProvider.imap.rawValue, AccountProvider.icloud.rawValue]
-                        .contains(Column("provider"))))
-                guard !accountIds.isEmpty else { return [] }
-                return try String.fetchAll(db, Folder
+                        .contains(Column("provider")))
+                    .fetchAll(db)
+                guard !accounts.isEmpty else { return ([], []) }
+                let folders = try String.fetchAll(db, Folder
                     .select(Column("id"))
-                    .filter(accountIds.contains(Column("accountId")))
+                    .filter(accounts.map(\.id).contains(Column("accountId")))
                     .filter(Column("path") != ""))
+                return (accounts, folders)
             }
         } catch {
             BackgroundSyncLogger.log("[EpochRebuild] folder enumeration failed: \(error) — flag NOT set, retrying next launch")
@@ -530,8 +532,63 @@ extension AccountManager {
             BackgroundSyncLogger.log("[EpochRebuild] armed \(armed)/\(folderIds.count) IMAP/iCloud folders — flag NOT set, retrying next launch")
             return
         }
+
+        // MAKE THE REBUILD DUE NOW. Arming alone only sets durable flags; the
+        // reaction runs when a re-drive owner next reaches the folder, and
+        // `SyncEngine.sync(account:)` gates full sync on `lastFullSyncAt` +
+        // `fullSyncInterval` (900s). A launch that has just full-synced therefore
+        // leaves every armed folder quarantined for up to 15 minutes — and a
+        // quarantined folder's merge pass is SKIPPED, so the user watches a mailbox
+        // that has silently stopped showing new mail and has no way to know why.
+        // Shipped as 1.7.1 and observed on TestFlight: mail reappeared only after a
+        // manual quit-and-relaunch forced the sync. Nulling the cursor is the
+        // established "full sync is due" write (`StartupMigrations` uses it twice;
+        // it is also what Settings' force-resync does).
+        //
+        // ORDER IS LOAD-BEARING: null AFTER arming, never before. A full sync
+        // landing between a null and the arm would consume the due state, re-stamp
+        // `lastFullSyncAt = now`, and restore the 15-minute wait this exists to
+        // remove.
+        do {
+            try await dbPool.write { [ids = accounts.map(\.id)] db in
+                _ = try Account.filter(ids.contains(Column("id")))
+                    .updateAll(db, Column("lastFullSyncAt").set(to: nil as Date?))
+            }
+        } catch {
+            // Non-fatal: the flags are already durable and every re-drive owner
+            // still reaches them. This only costs the immediacy, so it must not
+            // hold back the one-shot flag and re-arm the whole corpus next launch.
+            BackgroundSyncLogger.log("[EpochRebuild] could not clear lastFullSyncAt: \(error) — rebuild still armed, but waits for the ordinary full-sync interval")
+        }
+
+        // The one-shot is DONE once the flags and the due-marker are durable. Set it
+        // BEFORE the sync kick below: the kick is an optimisation, it can take
+        // minutes, and a crash partway through it must not re-arm the entire corpus
+        // (every folder is already quarantined and every re-drive owner still
+        // reaches them).
         UserDefaults.standard.set(true, forKey: flagKey)
-        BackgroundSyncLogger.log("[EpochRebuild] armed UIDVALIDITY reset on \(armed) IMAP/iCloud folder(s) — each purges and resyncs on its next sync pass")
+        BackgroundSyncLogger.log("[EpochRebuild] armed UIDVALIDITY reset on \(armed) IMAP/iCloud folder(s) across \(accounts.count) account(s); full sync marked due")
+
+        // KICK IT NOW rather than waiting for the next scheduled pass. Marking full
+        // sync due only decides what the NEXT sync does; without this the folders sit
+        // quarantined — merge pass skipped, no new mail visible — until foreground
+        // polling comes round (`SyncConfig.foregroundPollIntervalSeconds`, 300s) or
+        // the user relaunches. `syncAccount` is the same entry Settings' force-resync
+        // uses, and it drives BOTH re-drive owners: `imapDeltaSync`'s per-folder loop
+        // and, because `lastFullSyncAt` is now nil, `fullSync`'s.
+        //
+        // Sequential and best-effort: each account's reaction disconnects its
+        // provider between folders, so overlapping accounts would fight over
+        // reconnects, and a throwing account must not stop the others. A failure here
+        // costs only immediacy — the durable flags survive and the next ordinary pass
+        // re-drives.
+        for account in accounts {
+            do {
+                _ = try await syncAccount(account)
+            } catch {
+                BackgroundSyncLogger.log("[EpochRebuild] immediate resync failed for \(account.id.prefix(8)): \(error) — folders stay armed; the next ordinary pass re-drives")
+            }
+        }
     }
 
     /// Step 2.5 — the FIFO write barrier, looped until the local write queue and

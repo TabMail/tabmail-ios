@@ -100,17 +100,25 @@ struct EpochRebuildArmMigrationTests {
         }
     }
 
-    /// Every column of every folder row for the given accounts, as an opaque
-    /// comparable snapshot. Used to assert Gmail/Outlook come through the migration
-    /// BYTE-IDENTICAL — a weaker "the quarantine column is still nil" would pass on
-    /// a migration that clobbered cursors or epochs on the way past.
-    private static func folderSnapshot(_ pool: DatabasePool, accountIds: [String]) throws -> [String] {
-        try pool.read { db in
-            try Row.fetchAll(db, sql: """
-                SELECT * FROM folder WHERE accountId IN (\(accountIds.map { _ in "?" }.joined(separator: ",")))
-                ORDER BY id
-                """, arguments: StatementArguments(accountIds))
-                .map { $0.description }
+    /// Every column of every `folder` AND `account` row for the given accounts, as
+    /// an opaque comparable snapshot. Used to assert Gmail/Outlook come through the
+    /// migration BYTE-IDENTICAL — a weaker "the quarantine column is still nil"
+    /// would pass on a migration that clobbered cursors or epochs on the way past.
+    ///
+    /// `account` is in scope deliberately: the migration writes `lastFullSyncAt`
+    /// there to make the rebuild due, and that write must be scoped to IMAP/iCloud
+    /// exactly as tightly as the folder arming is. A snapshot covering only `folder`
+    /// would not have caught a mis-scoped forced resync of every Gmail account.
+    private static func rowSnapshot(_ pool: DatabasePool, accountIds: [String]) throws -> [String] {
+        let placeholders = accountIds.map { _ in "?" }.joined(separator: ",")
+        return try pool.read { db in
+            let folders = try Row.fetchAll(db, sql: """
+                SELECT * FROM folder WHERE accountId IN (\(placeholders)) ORDER BY id
+                """, arguments: StatementArguments(accountIds)).map { "folder:" + $0.description }
+            let accounts = try Row.fetchAll(db, sql: """
+                SELECT * FROM account WHERE id IN (\(placeholders)) ORDER BY id
+                """, arguments: StatementArguments(accountIds)).map { "account:" + $0.description }
+            return folders + accounts
         }
     }
 
@@ -192,6 +200,67 @@ struct EpochRebuildArmMigrationTests {
         }
     }
 
+    // MARK: - 1b — the rebuild must be DUE, not parked behind the sync interval
+
+    /// 🚨 THE 1.7.1 REGRESSION, pinned. Arming alone only sets durable flags; the
+    /// reaction runs when a re-drive owner next reaches the folder, and
+    /// `SyncEngine.sync(account:)` gates full sync on `lastFullSyncAt` +
+    /// `fullSyncInterval` (900s). A launch that has just full-synced therefore left
+    /// every armed folder quarantined for up to 15 minutes — and a quarantined
+    /// folder's merge pass is SKIPPED, so the mailbox silently stops showing new
+    /// mail with nothing to explain it. Observed on the 1.7.1 TestFlight build:
+    /// mail returned only after a manual quit-and-relaunch forced a sync.
+    ///
+    /// The invariant is about the SYSTEM being ready to rebuild, not about which
+    /// call performs it: no account owning an armed folder may still be holding a
+    /// full-sync cursor that defers the rebuild. Asserted on the durable end state
+    /// so it survives any future change to how the kick is issued.
+    @Test("No account owning an armed folder is left waiting on the full-sync interval")
+    @MainActor
+    func armLeavesNoAccountWaitingOnTheFullSyncInterval() async throws {
+        try await Self.withClearedOneShot {
+            let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+            defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+            let imapId = "rebuild-due-imap"
+            _ = try FolderEpochTestFixture.makeAccount(id: imapId, provider: .imap, pool: pool)
+            try FolderEpochTestFixture.insertFolder(
+                accountId: imapId, path: "INBOX", role: .inbox, pool: pool,
+                lastKnownUidValidity: Self.oldEpoch)
+            try FolderEpochTestFixture.insertHeaders(
+                accountId: imapId, path: "INBOX", uids: [101], pool: pool)
+
+            // The state that produced the regression: a full sync JUST completed, so
+            // the next one is not due for `fullSyncInterval`. Without the fix the
+            // armed folder waits that long with its merge pass skipped.
+            try await pool.write { db in
+                _ = try Account.filter(Column("id") == imapId)
+                    .updateAll(db, Column("lastFullSyncAt").set(to: Date()))
+            }
+
+            await AccountManager.shared.armImapUidValidityResetForEpochRebuildIfNeeded()
+
+            let stillDeferred = try await pool.read { db in
+                try String.fetchAll(db, sql: """
+                    SELECT DISTINCT a.id
+                    FROM account a
+                    JOIN folder f ON f.accountId = a.id
+                    WHERE f.uidValidityResetPendingAt IS NOT NULL
+                      AND a.lastFullSyncAt IS NOT NULL
+                    ORDER BY a.id
+                    """)
+            }
+            #expect(stillDeferred.isEmpty,
+                    """
+                    \(stillDeferred.count) account(s) own an armed folder but still carry a \
+                    full-sync cursor: \(stillDeferred). Their folders are quarantined, so every \
+                    merge pass is skipped, and the reaction that would rebuild them does not run \
+                    until the 900s full-sync interval elapses — the mailbox shows no new mail and \
+                    gives the user no way to know why. This is the 1.7.1 regression.
+                    """)
+        }
+    }
+
     // MARK: - 2/4 — blast radius
 
     /// Gmail and Outlook never populate `lastKnownUidValidity`; the reaction refuses
@@ -226,11 +295,11 @@ struct EpochRebuildArmMigrationTests {
                 lastKnownUidValidity: Self.oldEpoch)
 
             let untouchedIds = [gmailId, outlookId]
-            let before = try Self.folderSnapshot(pool, accountIds: untouchedIds)
+            let before = try Self.rowSnapshot(pool, accountIds: untouchedIds)
 
             await AccountManager.shared.armImapUidValidityResetForEpochRebuildIfNeeded()
 
-            let after = try Self.folderSnapshot(pool, accountIds: untouchedIds)
+            let after = try Self.rowSnapshot(pool, accountIds: untouchedIds)
             #expect(after == before,
                     """
                     a Gmail/Outlook folder row changed across the migration. Those providers have \
