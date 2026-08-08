@@ -9,6 +9,27 @@ import Testing
 @Suite("Compose attachment carry boundary")
 @MainActor
 struct ComposeAttachmentCarryTests {
+    private func composeSource() throws -> String {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        return try String(contentsOf: projectRoot
+            .appendingPathComponent("TabMail/Views/Compose/ComposeView.swift"),
+            encoding: .utf8)
+    }
+
+    private func functionBody(
+        _ signature: String,
+        before nextSignature: String,
+        in source: String
+    ) throws -> Substring {
+        let start = try #require(source.range(of: signature))
+        let tail = source[start.lowerBound...]
+        let end = try #require(tail.range(of: nextSignature))
+        return tail[..<end.lowerBound]
+    }
+
     private func draft() -> Draft {
         Draft(
             id: "forward:source", accountId: "acc1",
@@ -95,5 +116,40 @@ struct ComposeAttachmentCarryTests {
         #expect(updated.attachmentsDirName == "complete-carry")
         #expect(updated.subject == "Fwd: report",
                 "adopting attachments must not alter authored fields")
+    }
+
+    @Test("Explicit Save claims the compose before waiting for attachment carry")
+    func explicitSaveClaimsBeforeCarryWait() throws {
+        let body = try functionBody(
+            "private func saveDraftAndDismiss() async {",
+            before: "private func discardDraftAndDismiss() async {",
+            in: composeSource())
+        let claim = try #require(body.range(of: "isSavingDraft = true"))
+        let wait = try #require(body.range(of: "await settledAttachmentSnapshot"))
+        #expect(claim.lowerBound < wait.lowerBound,
+                "the compose must become non-reentrant before the new carry suspension")
+        #expect(body.contains("defer"),
+                "every early return after the pre-wait claim must release it")
+    }
+
+    @Test("An in-flight explicit Save rejects competing close, discard, and send entries")
+    func explicitSaveExcludesCompetingComposeActions() throws {
+        let source = try composeSource()
+        let close = try functionBody(
+            "private func closeCompose() async {",
+            before: "private func deleteClearedDraftAndDismiss() async {",
+            in: source)
+        let discard = try functionBody(
+            "private func discardDraftAndDismiss() async {",
+            before: "private func typedDeleteIdentity(for draft: Draft) async",
+            in: source)
+        let send = try functionBody(
+            "private func send() async {",
+            before: "// MARK: - Discard-unsaved-edits confirmation",
+            in: source)
+        for (name, body) in [("close", close), ("discard", discard), ("send", send)] {
+            #expect(body.contains("guard !isSavingDraft else { return }"),
+                    "a save waiting on attachment carry must exclude the competing \(name) action")
+        }
     }
 }
