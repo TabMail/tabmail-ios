@@ -28,12 +28,13 @@ struct WriteTierRoutingTests {
     /// Temp file-backed DatabasePool with all migrations applied (DatabasePool
     /// requires WAL, not available with `:memory:`) — same recipe as
     /// `InboxListReaderIntegrationTests`/`OnDemandBodyFetchIntegrationTests`.
-    private func makeTestPool() throws -> (pool: DatabasePool, dir: URL) {
+    private func makeTestPool(suspendable: Bool = false) throws -> (pool: DatabasePool, dir: URL) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let path = dir.appendingPathComponent("test.sqlite").path
         var config = Configuration()
         config.foreignKeysEnabled = true
+        config.observesSuspensionNotifications = suspendable
         let pool = try DatabasePool(path: path, configuration: config)
         try AppDatabase.runMigrations(on: pool)
         return (pool, dir)
@@ -43,8 +44,8 @@ struct WriteTierRoutingTests {
     /// header fixture inserted. Returns the header and a restore closure (swaps
     /// `AppDatabase.shared` back AND removes the temp dir) the caller MUST run in
     /// `defer` — `defer { restore() }`, nothing else needed.
-    private func makeTestDB() throws -> (header: MessageHeader, restore: () -> Void) {
-        let (pool, dir) = try makeTestPool()
+    private func makeTestDB(suspendable: Bool = false) throws -> (header: MessageHeader, restore: () -> Void) {
+        let (pool, dir) = try makeTestPool(suspendable: suspendable)
         let appDb = try AppDatabase(dbPool: pool)
         let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
             let prev = current; current = appDb; return prev
@@ -109,6 +110,14 @@ struct WriteTierRoutingTests {
         )
     }
 
+    private func postSuspend() {
+        NotificationCenter.default.post(name: Database.suspendNotification, object: nil)
+    }
+
+    private func postResume() {
+        NotificationCenter.default.post(name: Database.resumeNotification, object: nil)
+    }
+
     // MARK: - BodyFetchProcessor.process — the ActiveBodyQueue wrap
 
     @Test("process() wrapped in PriorityGate.normal (ActiveBodyQueue's wrap) executes at .normal, NOT .priority")
@@ -153,6 +162,70 @@ struct WriteTierRoutingTests {
         let snapshot = recorded.withLock { $0 }
         #expect(!snapshot.isEmpty)
         #expect(snapshot.allSatisfy { $0.0 == .priority }, "on-demand path must stay .priority, got \(snapshot.map(\.0))")
+    }
+
+    @Test("A failed body-cache write stays retryable and produces no FTS candidate")
+    func bodyWriteAbortDoesNotReportSuccess() async throws {
+        let (header, restore) = try makeTestDB(suspendable: true)
+        defer {
+            postResume()
+            restore()
+        }
+        let fetchResult = makeFetchResult(
+            headerId: header.id, accountId: header.accountId,
+            folderPath: header.folderPath, messageId: header.messageId)
+
+        postSuspend()
+        let (outcome, processed) = await BodyFetchProcessor.process(
+            fetchResult: fetchResult, enableAI: false)
+        postResume()
+
+        #expect(outcome == .retry,
+                "bytes not committed to the body cache remain retryable")
+        #expect(processed == nil,
+                "FTS/bodyComplete must not outrun the failed body-cache write")
+        let body = try await AppDatabase.rawPool.read {
+            try MessageBody.fetchOne($0, key: ContentKey(rawValue: header.id))
+        }
+        #expect(body == nil)
+    }
+
+    @Test("A failed confirmed-empty transaction is retryable, never acknowledged")
+    func confirmedEmptyWriteAbortDoesNotReportConfirmation() async throws {
+        let (header, restore) = try makeTestDB(suspendable: true)
+        defer {
+            postResume()
+            restore()
+        }
+        try await AppDatabase.rawPool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET emptyFetchCount = 2 WHERE id = ?",
+                arguments: [header.id])
+        }
+        let item = BodyFetchProcessor.Item(
+            headerId: header.id, accountId: header.accountId,
+            folderPath: header.folderPath, messageId: header.messageId,
+            isInInbox: true)
+        let fetchResult = BodyFetchProcessor.FetchResult(
+            item: item,
+            renderedBody: MessageBody.create(
+                contentKey: ContentKey(rawValue: header.id), htmlBody: ""),
+            plainText: nil, hasAttachments: false,
+            hasUnresolvedICS: false, fetchedRfc822MessageId: nil)
+
+        postSuspend()
+        let (outcome, processed) = await BodyFetchProcessor.process(
+            fetchResult: fetchResult, enableAI: false)
+        postResume()
+
+        #expect(outcome == .retry,
+                "an empty body is confirmed only when its body+flag transaction commits")
+        #expect(processed == nil)
+        let updated = try await AppDatabase.rawPool.read {
+            try MessageHeader.fetchOne($0, key: header.id)
+        }
+        #expect(updated?.bodyComplete == false)
+        #expect(updated?.bodyEmptyConfirmed == false)
     }
 
     @Test("A privileged merge context wins over the .normal wrap — PrioritizedDatabase.effectivePriority checks inPrivilegedContext first")

@@ -30,6 +30,17 @@ struct ComposeAttachmentCarryTests {
         return tail[..<end.lowerBound]
     }
 
+    private func sourceSlice(
+        _ startMarker: String,
+        before endMarker: String,
+        in source: String
+    ) throws -> Substring {
+        let start = try #require(source.range(of: startMarker))
+        let tail = source[start.lowerBound...]
+        let end = try #require(tail.range(of: endMarker))
+        return tail[..<end.lowerBound]
+    }
+
     private func draft() -> Draft {
         Draft(
             id: "forward:source", accountId: "acc1",
@@ -151,5 +162,53 @@ struct ComposeAttachmentCarryTests {
             #expect(body.contains("guard !isSavingDraft else { return }"),
                     "a save waiting on attachment carry must exclude the competing \(name) action")
         }
+    }
+
+    @Test("Explicit Save arbitrates with an already-running compose-agent edit")
+    func explicitSaveClaimsAgentDispositionBeforeSnapshot() throws {
+        let body = try functionBody(
+            "private func saveDraftAndDismiss() async {",
+            before: "private func discardDraftAndDismiss() async {",
+            in: composeSource())
+        let claim = try #require(body.range(of: "agentSendFence.claimExclusiveDisposition()"))
+        let snapshot = try #require(body.range(of: "await settledAttachmentSnapshot"))
+        #expect(claim.lowerBound < snapshot.lowerBound,
+                "an older Save snapshot must not race and overwrite an admitted agent edit")
+        #expect(body.contains("agentSendFence.releaseExclusiveDisposition()"),
+                "a failed or completed Save must release agent admission")
+    }
+
+    @Test("Photos-picker work joins the same attachment completion boundary")
+    func photoPickerPreparationCannotBeSnapshottedMidImport() throws {
+        let body = try functionBody(
+            "private func handlePhotoPickerItemsChange(_ items: [PhotosPickerItem]) {",
+            before: "private func performLifecycleAppear()",
+            in: composeSource())
+        let begin = try #require(body.range(of: "attachmentCarryGate.begin"))
+        let load = try #require(body.range(of: "await item.loadTransferable"))
+        let complete = try #require(body.range(of: "attachmentCarryGate.completeOne"))
+        #expect(begin.lowerBound < load.lowerBound && load.lowerBound < complete.lowerBound,
+                "every selected item must be counted before its async load and settled afterward")
+        #expect(!body.contains("try? await item.loadTransferable"),
+                "a selected attachment that fails to load must be surfaced, not silently omitted")
+    }
+
+    @Test("File and camera attachment preparation failures are surfaced")
+    func synchronousAttachmentPreparationFailuresAreNotSilent() throws {
+        let source = try composeSource()
+        let fileImport = try functionBody(
+            "private func handleFileImport(_ result: Result<[URL], Error>) {",
+            before: "// MARK: - Send",
+            in: source)
+        #expect(!fileImport.contains("try? Data(contentsOf:"),
+                "a selected file read failure must not disappear")
+        #expect(fileImport.contains("recordAttachmentPreparationFailure"))
+
+        let camera = try sourceSlice(
+            ".fullScreenCover(isPresented: $showCamera)",
+            before: ".dismissKeyboardOnTap()",
+            in: source)
+        #expect(camera.contains("recordAttachmentPreparationFailure"),
+                "a failed camera-image conversion must be surfaced")
     }
 }
