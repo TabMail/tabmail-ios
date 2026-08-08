@@ -9,7 +9,7 @@ import PhotosUI
 import TipKit
 import UniformTypeIdentifiers
 
-/// Completion boundary for the original attachments carried into a forward.
+/// Completion boundary for every asynchronous attachment preparation path.
 /// Send, explicit Save and agent autosave all wait here before they snapshot the
 /// compose attachment list, so no producer can persist an in-flight prefix.
 @MainActor @Observable
@@ -31,6 +31,12 @@ final class ComposeAttachmentCarryGate {
         let settled = waiters
         waiters.removeAll()
         for waiter in settled { waiter.resume() }
+    }
+
+    /// Record a synchronous or already-settled preparation failure. Unlike
+    /// `completeOne`, this does not consume an outstanding async operation.
+    func recordSettledFailure() {
+        hasUnacknowledgedFailure = true
     }
 
     func waitUntilSettled() async {
@@ -739,6 +745,11 @@ struct ComposeView: View {
     /// from a different file's cause. (Found by audit — an earlier version of this repair claimed
     /// same-turn accumulation, and the suspending read disproves it.)
     @State private var carryForwardCollected: [String] = []
+    /// User-selected Photos, Files or Camera items that could not be converted
+    /// into a `DraftAttachment`. Kept separate from forward-carry failures so the
+    /// alert can give recovery advice appropriate to each source.
+    @State private var attachmentImportFailures: [String] = []
+    @State private var attachmentImportCollected: [String] = []
     @State private var attachmentCarryGate = ComposeAttachmentCarryGate()
     /// True when at least one of those failures was `ProviderError.addressPendingMove` — the
     /// message's address is mid-move, so the advice names the recovery that actually works
@@ -1463,10 +1474,11 @@ struct ComposeView: View {
             // `.alert` here fails with "unable to type-check this expression in reasonable time"
             // (it did — and the compiler blamed the PRE-EXISTING `sendError` binding, not the new
             // alert, which is why the budget has to be respected rather than rediscovered).
-            .modifier(CarryForwardFailureAlert(
-                failures: carryForwardFailures,
+            .modifier(AttachmentPreparationFailureAlert(
+                carryFailures: carryForwardFailures,
+                importFailures: attachmentImportFailures,
                 blockedByMove: carryForwardBlockedByMove,
-                onDismiss: clearCarryForwardFailures
+                onDismiss: clearAttachmentPreparationFailures
             ))
             .alert("Save Draft?", isPresented: $showDiscardPrompt) {
                 Button("Save") { Task { await saveDraftAndDismiss() } }
@@ -1520,13 +1532,16 @@ struct ComposeView: View {
             }
             .fullScreenCover(isPresented: $showCamera) {
                 CameraPickerView { image in
-                    if let data = image.jpegData(compressionQuality: 0.85) {
-                        attachments.append(DraftAttachment(
-                            filename: "photo_\(attachments.count + 1).jpg",
-                            mimeType: "image/jpeg",
-                            data: data
-                        ))
+                    guard let data = image.jpegData(compressionQuality: 0.85) else {
+                        recordAttachmentPreparationFailure("Camera photo")
+                        publishAttachmentPreparationFailuresIfSettled()
+                        return
                     }
+                    attachments.append(DraftAttachment(
+                        filename: "photo_\(attachments.count + 1).jpg",
+                        mimeType: "image/jpeg",
+                        data: data
+                    ))
                 }
             }
             .dismissKeyboardOnTap()
@@ -1596,14 +1611,34 @@ struct ComposeView: View {
     }
 
     private func handlePhotoPickerItemsChange(_ items: [PhotosPickerItem]) {
-        Task {
-            for item in items {
-                if let data = try? await item.loadTransferable(type: Data.self) {
-                    let mimeType = item.supportedContentTypes.first?.preferredMIMEType ?? "application/octet-stream"
-                    let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "dat"
-                    let filename = "photo_\(attachments.count + 1).\(ext)"
-                    attachments.append(DraftAttachment(filename: filename, mimeType: mimeType, data: data))
+        guard !items.isEmpty else { return }
+        attachmentCarryGate.begin(items.count)
+        Task { @MainActor in
+            for (index, item) in items.enumerated() {
+                var succeeded = false
+                do {
+                    if let data = try await item.loadTransferable(type: Data.self) {
+                        let mimeType = item.supportedContentTypes.first?.preferredMIMEType
+                            ?? "application/octet-stream"
+                        let ext = item.supportedContentTypes.first?.preferredFilenameExtension
+                            ?? "dat"
+                        let filename = "photo_\(attachments.count + 1).\(ext)"
+                        attachments.append(DraftAttachment(
+                            filename: filename, mimeType: mimeType, data: data))
+                        succeeded = true
+                    } else {
+                        recordAttachmentPreparationFailure(
+                            "Selected photo or video \(index + 1)")
+                    }
+                } catch {
+                    recordAttachmentPreparationFailure(
+                        "Selected photo or video \(index + 1)")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[ComposeView] Photo picker import failed: \(error)")
+                    }
                 }
+                attachmentCarryGate.completeOne(succeeded: succeeded)
+                publishAttachmentPreparationFailuresIfSettled()
             }
             photoPickerItems = []
         }
@@ -2377,10 +2412,16 @@ struct ComposeView: View {
     /// Handle close button: prompt Save/Discard/Cancel when there are actual
     /// changes. Draft is saved BEFORE dismiss (persist before acknowledge).
     private func closeCompose() async {
-        // An explicit Save owns the compose across its attachment-carry and DB
-        // suspensions. Do not let a later Close enter a competing disposition
-        // while that durable user intention is still landing.
+        // A durable disposition owns the compose across its suspensions. Do not
+        // let Close race Save/Send, or dismiss while an agent edit is still
+        // computing an authored replacement.
         guard !isSavingDraft else { return }
+        guard !isSending else { return }
+        guard agentSendFence.claimExclusiveDisposition() else {
+            sendError = "Wait for the draft edit to finish before closing."
+            return
+        }
+        defer { agentSendFence.releaseExclusiveDisposition() }
         // F3: commit any pending in-progress recipient BEFORE the emptiness /
         // changes checks, so it is seen (hasChanges) and later persisted (save).
         commitPendingRecipientInput()
@@ -2475,11 +2516,16 @@ struct ComposeView: View {
         case .save(let resolved):
             account = resolved
         }
-        // Claim the compose BEFORE the first suspension introduced by attachment
-        // carry settlement. Otherwise a second Close can choose Discard while this
-        // Save waits, then this task can resume and recreate the discarded draft.
-        // The defer covers every failure/early-return after ownership is claimed.
+        // Claim the compose and its shared agent/disposition fence BEFORE the first
+        // attachment settlement suspension. Otherwise an agent edit or terminal
+        // action can overtake this older Save snapshot.
         guard !isSavingDraft else { return }
+        guard !isSending else { return }
+        guard agentSendFence.claimExclusiveDisposition() else {
+            sendError = "Wait for the draft edit or send to finish before saving."
+            return
+        }
+        defer { agentSendFence.releaseExclusiveDisposition() }
         withAnimation(.easeIn(duration: 0.15)) { isSavingDraft = true }
         defer { isSavingDraft = false }
         // F3: commit any pending in-progress recipient so it is PERSISTED (not
@@ -2678,9 +2724,15 @@ struct ComposeView: View {
     }
 
     private func discardDraftAndDismiss() async {
-        // See `saveDraftAndDismiss`: never let Discard overtake an explicit Save
-        // that already owns this compose across a suspension.
+        // See `saveDraftAndDismiss`: never let Discard overtake another durable
+        // disposition or a running agent edit.
         guard !isSavingDraft else { return }
+        guard !isSending else { return }
+        guard agentSendFence.claimExclusiveDisposition() else {
+            sendError = "Wait for the draft edit to finish before discarding."
+            return
+        }
+        defer { agentSendFence.releaseExclusiveDisposition() }
         guard draftReadState != .error else {
             sendError = "This draft did not finish loading. Close and reopen it before discarding."
             return
@@ -2946,11 +2998,31 @@ struct ComposeView: View {
     /// never specific to that cause — a dropped connection did the same thing — so every failure
     /// is surfaced, not just the address refusal. (Found by audit.)
     ///
-    private func clearCarryForwardFailures() {
+    private func clearAttachmentPreparationFailures() {
         carryForwardFailures = []
         carryForwardBlockedByMove = false
         carryForwardCollected = []
+        attachmentImportFailures = []
+        attachmentImportCollected = []
         attachmentCarryGate.acknowledgeFailures()
+    }
+
+    private func recordAttachmentPreparationFailure(_ label: String) {
+        attachmentImportCollected.append(label)
+        attachmentCarryGate.recordSettledFailure()
+    }
+
+    /// Publish only after every overlapping forward/picker batch has settled, so
+    /// the user sees one complete failure census and every attachment snapshot
+    /// producer remains blocked until that census is acknowledged.
+    private func publishAttachmentPreparationFailuresIfSettled() {
+        guard attachmentCarryGate.outstanding == 0 else { return }
+        if !carryForwardCollected.isEmpty {
+            carryForwardFailures = carryForwardCollected
+        }
+        if !attachmentImportCollected.isEmpty {
+            attachmentImportFailures = attachmentImportCollected
+        }
     }
 
     /// One task per attachment, matching the concurrency this function has always had. An audit
@@ -2996,11 +3068,7 @@ struct ComposeView: View {
                     self.carryForwardCollected.append(att.filename)
                 }
                 self.attachmentCarryGate.completeOne(succeeded: succeeded)
-                // Last fetch in the batch: publish whatever failed, once, in full.
-                if self.attachmentCarryGate.outstanding == 0,
-                   !self.carryForwardCollected.isEmpty {
-                    self.carryForwardFailures = self.carryForwardCollected
-                }
+                self.publishAttachmentPreparationFailuresIfSettled()
             }
         }
     }
@@ -3105,13 +3173,23 @@ struct ComposeView: View {
         switch result {
         case .success(let urls):
             for url in urls {
-                guard url.startAccessingSecurityScopedResource() else { continue }
+                guard url.startAccessingSecurityScopedResource() else {
+                    recordAttachmentPreparationFailure(url.lastPathComponent)
+                    continue
+                }
                 defer { url.stopAccessingSecurityScopedResource() }
-                if let data = try? Data(contentsOf: url) {
+                do {
+                    let data = try Data(contentsOf: url)
                     let mimeType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
                     attachments.append(DraftAttachment(filename: url.lastPathComponent, mimeType: mimeType, data: data))
+                } catch {
+                    recordAttachmentPreparationFailure(url.lastPathComponent)
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[ComposeView] File import failed for \(url.lastPathComponent): \(error)")
+                    }
                 }
             }
+            publishAttachmentPreparationFailuresIfSettled()
         case .failure(let error):
             sendError = "Failed to import files: \(error.localizedDescription)"
         }
@@ -3171,6 +3249,21 @@ struct ComposeView: View {
         guard let account = resolvedAccount else {
             sendError = "No account available to send from."
             return
+        }
+        // Claim before attachment settlement, not after snapshot construction:
+        // otherwise an agent edit or another terminal action can overtake the
+        // suspended Send and leave its older snapshot to win later.
+        guard agentSendFence.claimExclusiveDisposition() else {
+            sendError = "Wait for the draft edit or other draft action to finish before sending."
+            return
+        }
+        var sendWasAdmitted = false
+        isSending = true
+        defer {
+            if !sendWasAdmitted {
+                isSending = false
+                agentSendFence.releaseExclusiveDisposition()
+            }
         }
         // Defense-in-depth for every alternate send entry (including the empty-
         // body alert): do not capture an in-flight prefix. A failed carry blocks
@@ -3239,16 +3332,6 @@ struct ComposeView: View {
             resolvedReplyTarget: sendTarget,
             isForward: isForward,
             outbound: outbound)
-
-        guard agentSendFence.claimSend() else {
-            sendError = "Wait for the draft edit to finish before sending."
-            return
-        }
-        var sendWasAdmitted = false
-        defer {
-            if !sendWasAdmitted { agentSendFence.releaseFailedSend() }
-        }
-        isSending = true
 
         // Capture existing draft (server-side metadata preserved through save-before-send).
         // Async read so the main actor isn't blocked behind a busy writer. `draftId`
@@ -3490,21 +3573,28 @@ private struct DiscardUnsavedEditsAlert: ViewModifier {
 /// attached, with nothing on screen saying so and no later gesture that re-runs the carry — a
 /// silent, permanent dropped intention. The mid-move refusal made that deterministic; the defect
 /// predated it. (Found by audit.)
-private struct CarryForwardFailureAlert: ViewModifier {
-    let failures: [String]
+private struct AttachmentPreparationFailureAlert: ViewModifier {
+    let carryFailures: [String]
+    let importFailures: [String]
     let blockedByMove: Bool
     let onDismiss: () -> Void
 
     func body(content: Content) -> some View {
         let presented = Binding(
-            get: { !failures.isEmpty },
+            get: { !carryFailures.isEmpty || !importFailures.isEmpty },
             set: { if !$0 { onDismiss() } }
         )
-        return content.alert("Attachments Not Carried Over", isPresented: presented) {
+        return content.alert(title, isPresented: presented) {
             Button("OK") { onDismiss() }
         } message: {
             Text(message)
         }
+    }
+
+    private var title: String {
+        if importFailures.isEmpty { return "Attachments Not Carried Over" }
+        if carryFailures.isEmpty { return "Attachments Not Added" }
+        return "Attachments Incomplete"
     }
 
     /// The mid-move case gets different advice because it is transient — but the advice must name a
@@ -3535,14 +3625,28 @@ private struct CarryForwardFailureAlert: ViewModifier {
     /// missing set it was warning them about. Discarding deletes the row, so the reopened Forward
     /// re-runs `prepopulate` and carries cleanly.
     private var message: String {
-        let names = failures.joined(separator: ", ")
-        let subject = failures.count == 1
+        if carryFailures.isEmpty { return importFailureMessage }
+        if importFailures.isEmpty { return carryFailureMessage }
+        return "\(carryFailureMessage)\n\nAlso, \(importFailureMessage)"
+    }
+
+    private var carryFailureMessage: String {
+        let names = carryFailures.joined(separator: ", ")
+        let subject = carryFailures.count == 1
             ? "This attachment could not be carried over"
             : "These attachments could not be carried over"
         if blockedByMove {
             return "\(subject) because the original message is still being moved: \(names).\n\nDiscard this draft (choose Discard if you're asked to save), then open the message again from the message list and forward it. Or attach the files manually before sending."
         }
         return "\(subject): \(names).\n\nAttach them manually before sending, or discard this draft (choose Discard if you're asked to save) and forward the message again."
+    }
+
+    private var importFailureMessage: String {
+        let names = importFailures.joined(separator: ", ")
+        let subject = importFailures.count == 1
+            ? "This selected attachment could not be added"
+            : "These selected attachments could not be added"
+        return "\(subject): \(names).\n\nSelect the item again or attach it another way before saving or sending."
     }
 }
 

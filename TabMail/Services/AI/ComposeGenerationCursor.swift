@@ -67,19 +67,20 @@ final class ComposeGenerationCursor: @unchecked Sendable {
     }
 }
 
-/// ⚑ NO REFERENCE — INVENTED minimum arbitration between the only two
-/// asynchronous compose owners that may race: an inline-agent edit and Send.
+/// ⚑ NO REFERENCE — INVENTED minimum arbitration between an inline-agent edit
+/// and a durable or terminal compose disposition (Save, Send, Close, Discard).
 /// Ordinary user edits remain unrestricted; this fence owns no lifecycle state.
 final class ComposeAgentSendFence: @unchecked Sendable {
     private struct State {
         var agentInFlight = false
-        var sendClaimed = false
+        var exclusiveDispositionClaimed = false
     }
     private let state = Mutex(State())
 
     func beginAgent() -> Bool {
         state.withLock { value in
-            guard !value.agentInFlight, !value.sendClaimed else { return false }
+            guard !value.agentInFlight,
+                  !value.exclusiveDispositionClaimed else { return false }
             value.agentInFlight = true
             return true
         }
@@ -89,15 +90,16 @@ final class ComposeAgentSendFence: @unchecked Sendable {
         state.withLock { $0.agentInFlight = false }
     }
 
-    func claimSend() -> Bool {
+    func claimExclusiveDisposition() -> Bool {
         state.withLock { value in
-            guard !value.agentInFlight, !value.sendClaimed else { return false }
-            value.sendClaimed = true
+            guard !value.agentInFlight,
+                  !value.exclusiveDispositionClaimed else { return false }
+            value.exclusiveDispositionClaimed = true
             return true
         }
     }
 
-    func releaseFailedSend() {
-        state.withLock { $0.sendClaimed = false }
+    func releaseExclusiveDisposition() {
+        state.withLock { $0.exclusiveDispositionClaimed = false }
     }
 }

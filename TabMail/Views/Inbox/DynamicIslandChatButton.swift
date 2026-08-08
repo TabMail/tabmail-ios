@@ -1317,7 +1317,7 @@ struct DynamicIslandChat: View {
         guard composeAgentSendFence?.beginAgent() ?? true else {
             chatMessages.append(ChatMessage(
                 role: .warning,
-                content: "Send is already in progress.",
+                content: "Saving, sending, or another draft action is already in progress.",
                 timestamp: Date()))
             return false
         }

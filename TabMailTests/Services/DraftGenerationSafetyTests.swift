@@ -631,16 +631,17 @@ struct DraftGenerationSafetyTests {
     }
 
     /// ⚑ NO REFERENCE — INVENTED: the approved minimum local arbitration proof for
-    /// the observed suspended Agent-versus-Send race; it adds no lifecycle machinery.
-    @Test("Agent and Send claims are mutually exclusive and release restores admission")
+    /// suspended Agent-versus-disposition races; it adds no lifecycle machinery.
+    @Test("Agent and exclusive disposition claims are mutually exclusive and releasable")
     func agentSendFence() {
         let fence = ComposeAgentSendFence()
         #expect(fence.beginAgent())
-        #expect(!fence.claimSend())
+        #expect(!fence.claimExclusiveDisposition())
         fence.finishAgent()
-        #expect(fence.claimSend())
+        #expect(fence.claimExclusiveDisposition())
         #expect(!fence.beginAgent())
-        fence.releaseFailedSend()
+        #expect(!fence.claimExclusiveDisposition())
+        fence.releaseExclusiveDisposition()
         #expect(fence.beginAgent())
         fence.finishAgent()
     }
