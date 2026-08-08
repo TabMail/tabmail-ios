@@ -2,7 +2,7 @@
 
 **Class:** documentation / verification
 **Severity:** high
-**First seen:** 2026-08-04 · **Recurrences:** 3 · **Status:** Active
+**First seen:** 2026-08-04 · **Recurrences:** 4 · **Status:** Active
 **Related:** [MIS-IOS-006](MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md); **MIS-023** and
 **MIS-027** in the monorepo-root tree (`rg -n 'MIS-023|MIS-027' ../MISTAKES.md`) — both are the same
 shape: reading a number instead of reading how far the run got.
@@ -200,3 +200,25 @@ cost one command.** A consistency argument about two lines of code is not eviden
 Also note `Companion/Decisions/V3/manifest.tsv` and `Companion/Memory/amendments-manifest.tsv` are
 **tracked, documented in `Companion/README.md`, and read by NO verifier.** Their drift is invisible to
 `verify` by construction; only this entry's sweep sees it.
+
+## Instance 4 (2026-08-08) — byte-faithful routing preserved a broken root-relative link
+
+During `MISTAKES.md` compaction, I moved the old `MIS-IOS-009` index line byte-for-byte into this
+nested detail file. Its Markdown target still began with `Companion/Mistakes/Active/`, which was
+correct from the repository-root index and wrong from inside that directory. The post-edit
+`compact_companion_docs.rb verify` caught it as a broken link before completion.
+
+This is the exact recurrence already documented by instance 3: byte fidelity preserves relative-link
+syntax, not the link's meaning after a move. The repair normalizes only the moved target to this
+file's basename; the pre-pass line remains mechanically reconstructable by restoring the original
+root-relative target during the round-trip check. The root-only link check then found five older
+copies of the same defect in the two mistake-detail files touched by this pass; those historical
+self-links were normalized mechanically to their local basenames as well.
+
+## Index-line detail (routed 2026-08-08 by `companion-compact`, pass 12)
+
+The prior iOS-index prose is preserved verbatim below; only its Markdown self-link target is
+normalized to the local basename so it resolves after routing. The round-trip check restores the
+original target before hashing. Nothing was summarised, merged, or dropped.
+
+> - **[MIS-IOS-009](MIS-IOS-009-amended-a-hash-pinned-fragment-and-killed-the-verifier.md)** — wrote a correct amendment **inside** a hash-pinned routed fragment (`adr-ios-031.md`, `9430ef418`), so `compact_companion_docs.rb verify` aborted at `hash mismatch:` on manifest row 33 and **every later check silently stopped running for a day** — the ADR census, 91-fragment memory routing, 212-file link check, 279 pointer check, and the budget report that was holding a live 38%-over `CLAUDE.md` finding. The tree has a designed amendment surface (`<!-- COMPANION-CURRENT-NOTE-BEGIN/END -->`, stripped by `exact_body` before hashing) but the marker is invisible at the edit site. **A file whose path appears in a `manifest.tsv` with a `sha256` column has immutable bytes: prepend the wrapper, never edit the body — not even to append a pointer.** An `abort`-on-first-failure verifier is fail-open for everything after the abort; read its LAST line, not its first. **Instance 2 is the same failure with a different grammar:** four unescaped `|` quoted from shell commands into `KNOWN_ISSUES.md` table cells silently SPLIT those rows' fields (`\|` is the file's own convention). Generalised: **before amending any file, ask what MACHINE reads it besides a human — a manifest verifier, a GFM table parser, a census script — and verify STRUCTURALLY (per-row field count vs `HEAD`), not visually.** ⚠️ **TWO pinning conventions decide the repair:** `{Memory,Decisions}/manifest.tsv` hashes the **stripped** body and must NEVER be re-pinned (it also asserts a source-line range + full-document reconstruction); `ported-manifest.tsv` / `amendments-manifest.tsv` / `Decisions/V3/manifest.tsv` hash the **raw** file and MUST be re-pinned. Fixing the first abort revealed 14 broken links + 1 dead pointer hidden behind it since 2026-08-06 — **routing a file deeper silently breaks its root-relative links, and byte-for-byte fidelity preserves the breakage.** (×3)
