@@ -1970,8 +1970,10 @@ extension AccountManager {
     }
 
     /// On app launch, recover from any crash during the previous session.
-    /// Resets inFlight ops back to queued (they were mid-execution when app died),
-    /// then drains the entire queue. All operations are idempotent, so re-execution is safe.
+    /// Ordinary operations return to queued. An attempted MOVE is deliberately
+    /// dropped instead: after a process death we cannot know whether the server
+    /// committed it, and resending can duplicate the move. The normal foreground
+    /// sync that follows launch restores whichever state the server actually has.
     func reconcilePendingOperations() async {
         // Crash recovery MUST succeed — inFlight ops from the previous session are stuck
         // and will never drain unless reset to queued.
@@ -1980,8 +1982,15 @@ extension AccountManager {
                 .filter(Column("status") == PendingStatus.inFlight.rawValue)
                 .fetchAll(db)
             if !staleOps.isEmpty {
-                queueLog("[Queue] Crash recovery: resetting \(staleOps.count) inFlight ops to queued")
+                queueLog("[Queue] Crash recovery: reconciling \(staleOps.count) inFlight ops")
                 for op in staleOps {
+                    if op.type == .move, op.everAttempted {
+                        _ = try PendingOperation.deleteOne(db, key: op.id)
+                        queueLog(
+                            "[Queue] Dropped interrupted MOVE \(op.id.prefix(8)) " +
+                            "instead of risking a duplicate; foreground sync will reconcile")
+                        continue
+                    }
                     var updated = op
                     updated.status = PendingStatus.queued.rawValue
                     try updated.save(db)

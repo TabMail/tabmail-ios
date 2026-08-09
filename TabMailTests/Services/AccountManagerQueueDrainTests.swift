@@ -142,7 +142,7 @@ struct AccountManagerQueueDrainTests {
 
     // MARK: - 8. GAP1: reconcilePendingOperations (real function) — launch-time crash recovery
 
-    @Test("reconcilePendingOperations (real function): inFlight→queued, cancelled deleted, queued untouched, count==2 — accountId has no registered provider so the triggered drain no-ops safely")
+    @Test("reconcilePendingOperations: ordinary inFlight retries, attempted MOVE is dropped, cancelled deletes")
     func reconcilePendingOperationsResetsInFlightDeletesCancelledLeavesQueued() async throws {
         let (pool, dir, previous) = try makeTestDB()
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
@@ -160,9 +160,27 @@ struct AccountManagerQueueDrainTests {
         inFlightOp.status = PendingStatus.inFlight.rawValue
         var cancelledOp = PendingOperation(type: .markUnread, messageIds: ["msg-cancelled"], accountId: "acc-gap1", folderPath: "INBOX")
         cancelledOp.status = PendingStatus.cancelled.rawValue
+        var uncertainMove = PendingOperation(
+            type: .move,
+            messageIds: ["msg-move"],
+            accountId: "acc-gap1",
+            folderPath: "INBOX",
+            destinationPath: "Archive")
+        uncertainMove.status = PendingStatus.inFlight.rawValue
+        uncertainMove.everAttempted = true
+        var preEmissionMove = PendingOperation(
+            type: .move,
+            messageIds: ["msg-prewire"],
+            accountId: "acc-gap1",
+            folderPath: "INBOX",
+            destinationPath: "Archive")
+        preEmissionMove.status = PendingStatus.inFlight.rawValue
+        preEmissionMove.everAttempted = false
         let queuedOp = PendingOperation(type: .markFlagged, messageIds: ["msg-queued"], accountId: "acc-gap1", folderPath: "INBOX")
         try insertOp(inFlightOp, pool: pool)
         try insertOp(cancelledOp, pool: pool)
+        try insertOp(uncertainMove, pool: pool)
+        try insertOp(preEmissionMove, pool: pool)
         try insertOp(queuedOp, pool: pool)
 
         await AccountManager.shared.reconcilePendingOperations()
@@ -170,7 +188,7 @@ struct AccountManagerQueueDrainTests {
         let remaining = try await pool.read { db in
             try PendingOperation.filter(Column("accountId") == "acc-gap1").fetchAll(db)
         }
-        #expect(remaining.count == 2)
+        #expect(remaining.count == 3)
 
         let inFlightAfter = try fetchOp(inFlightOp.id, pool: pool)
         #expect(inFlightAfter != nil, "inFlight op must survive (reset, not dropped)")
@@ -178,6 +196,13 @@ struct AccountManagerQueueDrainTests {
 
         let cancelledAfter = try fetchOp(cancelledOp.id, pool: pool)
         #expect(cancelledAfter == nil, "cancelled op deleted by crash recovery")
+
+        let uncertainMoveAfter = try fetchOp(uncertainMove.id, pool: pool)
+        #expect(uncertainMoveAfter == nil, "an attempted MOVE with an unknown provider outcome must never be replayed")
+
+        let preEmissionMoveAfter = try fetchOp(preEmissionMove.id, pool: pool)
+        #expect(preEmissionMoveAfter?.status == PendingStatus.queued.rawValue,
+                "a MOVE with no persisted attempt evidence remains retryable")
 
         let queuedAfter = try fetchOp(queuedOp.id, pool: pool)
         #expect(queuedAfter != nil, "already-queued op must survive untouched")
