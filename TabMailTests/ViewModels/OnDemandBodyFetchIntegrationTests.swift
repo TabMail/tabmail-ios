@@ -609,7 +609,22 @@ struct RefetchBodyConfirmedEmptyResetTests {
             dbPool: pool,
             fetchBodyOverride: { msg in
                 let body = MessageBody( contentKey: ContentKey(rawValue: msg.id), htmlContent: "<p>real content</p>")
-                try await pool.write { try body.insert($0) }
+                try await pool.write { db in
+                    try body.save(db)
+                    try db.execute(
+                        sql: """
+                            UPDATE messageHeader
+                            SET bodyComplete = 0,
+                                bodyEmptyConfirmed = 0,
+                                emptyFetchCount = 0,
+                                embeddingComplete = 0,
+                                summaryBlurb = NULL,
+                                actionTag = NULL,
+                                tagSortOrder = 99
+                            WHERE id = ?
+                        """,
+                        arguments: [msg.id])
+                }
             }
         )
 
@@ -659,7 +674,7 @@ struct RefetchBodyConfirmedEmptyResetTests {
             dbPool: pool,
             fetchBodyOverride: { msg in
                 let body = MessageBody( contentKey: ContentKey(rawValue: msg.id), htmlContent: "<p>fresh body</p>")
-                try await pool.write { try body.insert($0) }
+                try await pool.write { try body.save($0) }
             }
         )
 
@@ -705,7 +720,7 @@ struct RefetchBodyConfirmedEmptyResetTests {
             dbPool: pool,
             fetchBodyOverride: { msg in
                 let body = MessageBody( contentKey: ContentKey(rawValue: msg.id), htmlContent: "<p>refetched</p>")
-                try await pool.write { try body.insert($0) }
+                try await pool.write { try body.save($0) }
             }
         )
 

@@ -96,12 +96,15 @@ extension AccountManager {
         return !BodyAddressGate.isFetchable(header: message, provider: provider)
     }
 
-    func fetchBody(for message: MessageHeader) async throws {
+    func fetchBody(
+        for message: MessageHeader,
+        replaceExistingBody: Bool = false
+    ) async throws {
         print("[FetchBody] Opening: id=\(message.id.prefix(40)) msgId=\(message.messageId.prefix(30)) folder=\(message.folderPath)")
 
         // Body already loaded — nothing to do
         let hasBody = (try? await dbPool.read { db in try MessageBody.fetchOne(db, key: message.id) != nil }) ?? false
-        guard !hasBody else { return }
+        guard replaceExistingBody || !hasBody else { return }
 
         // Address not corroborated: this UID names a DIFFERENT message on the wire right now,
         // and `BodyFetchProcessor.process` would refuse the write anyway. Skip the round trip.
@@ -140,7 +143,10 @@ extension AccountManager {
             isInInbox: message.isInInbox
         )
         let result = await BodyFetchProcessor.fetchAndProcess(
-            item: item, provider: queue.provider, enableAI: true
+            item: item,
+            provider: queue.provider,
+            enableAI: true,
+            replaceExistingBody: replaceExistingBody
         )
 
         switch result {

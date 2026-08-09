@@ -17,6 +17,8 @@ struct AutoSizingHTMLView: View {
     let html: String
     let previewFilename: String?
     let headerId: String?
+    /// Explicit same-bytes reload trigger used by pull-to-refresh.
+    let reloadToken: Int
     @State private var height: CGFloat
     /// True once the WKWebView has actually revealed its content (the JS
     /// `reveal()` flips opacity 0→1 and posts `{revealed:true}`). Until then a
@@ -34,10 +36,16 @@ struct AutoSizingHTMLView: View {
     @State private var leadingPad: CGFloat = 16
     @State private var trailingPad: CGFloat = 16
 
-    init(html: String, previewFilename: String? = nil, headerId: String? = nil) {
+    init(
+        html: String,
+        previewFilename: String? = nil,
+        headerId: String? = nil,
+        reloadToken: Int = 0
+    ) {
         self.html = html
         self.previewFilename = previewFilename
         self.headerId = headerId
+        self.reloadToken = reloadToken
         // Seed the initial frame height from the last applied measurement for
         // this message. SwiftUI List dismantles far-offscreen rows — when an
         // expanded card scrolls back toward the viewport, the whole view
@@ -97,7 +105,7 @@ struct AutoSizingHTMLView: View {
     private var showsLoadingPlaceholder: Bool { headerId != nil && !hasRevealed }
 
     var body: some View {
-        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad)
+        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, reloadToken: reloadToken, height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad)
             // While a real body is still rendering, reserve room for the
             // placeholder so it's visible even before the web view reports a
             // height. Once revealed (or for non-body previews) size strictly to
@@ -272,6 +280,7 @@ private struct HTMLWebView: UIViewRepresentable {
     let html: String
     let previewFilename: String?
     let headerId: String?
+    let reloadToken: Int
     @Binding var height: CGFloat
     @Binding var hasRevealed: Bool
     // Dynamic horizontal gutter: starts at the 16pt minimum and is REDUCED by the
@@ -380,9 +389,11 @@ private struct HTMLWebView: UIViewRepresentable {
         context.coordinator.webView = webView
         let currentWidth = webView.bounds.width
         let htmlChanged = html != context.coordinator.loadedHTML
+        let reloadChanged = reloadToken != context.coordinator.loadedReloadToken
 
-        if htmlChanged {
+        if htmlChanged || reloadChanged {
             context.coordinator.loadedHTML = html
+            context.coordinator.loadedReloadToken = reloadToken
             context.coordinator.loadedPreviewFilename = previewFilename
             context.coordinator.loadedHeaderId = headerId
             context.coordinator.lastMeasuredWidth = currentWidth
@@ -470,6 +481,7 @@ private struct HTMLWebView: UIViewRepresentable {
         var loadedHTML: String?
         var loadedPreviewFilename: String?
         var loadedHeaderId: String?
+        var loadedReloadToken: Int?
         /// Appearance the current document was rendered under. fixDarkModeColorsJS
         /// bakes inline color overrides for ONE appearance at load; when this no
         /// longer matches the SwiftUI environment, updateUIView reloads so the
@@ -3744,4 +3756,3 @@ private let fitViewportJS: String = {
 /// and applyContentSize above. No polling, no JS height measurement, no
 /// +Npt overshoot bandaid — one observer, fires when WebKit has a genuine
 /// layout change to report.
-

@@ -203,7 +203,8 @@ enum BodyFetchProcessor {
     /// cancellation, server delay) and must not permanently mark a message as empty.
     static func process(
         fetchResult: FetchResult,
-        enableAI: Bool
+        enableAI: Bool,
+        replaceExistingBody: Bool = false
     ) async -> (Result, ProcessedItem?) {
         let item = fetchResult.item
         let dbPool = AppDatabase.dbPool
@@ -246,7 +247,11 @@ enum BodyFetchProcessor {
             // Has text content — write body and return data for FTS batching.
             do {
                 try await dbPool.write { db in
-                    try bodyToInsert.insert(db, onConflict: .ignore)
+                    try persistDisplayableBody(
+                        bodyToInsert,
+                        item: item,
+                        replaceExistingBody: replaceExistingBody,
+                        db: db)
                 }
             } catch {
                 // ADR-IOS-046: suspension aborts are expected + retryable (bodyComplete
@@ -285,7 +290,11 @@ enum BodyFetchProcessor {
             // plainText and were already handled by the first branch.)
             do {
                 try await dbPool.write { db in
-                    try bodyToInsert.insert(db, onConflict: .ignore)
+                    try persistDisplayableBody(
+                        bodyToInsert,
+                        item: item,
+                        replaceExistingBody: replaceExistingBody,
+                        db: db)
                 }
             } catch {
                 if !error.isDatabaseSuspensionAbort {
@@ -325,7 +334,11 @@ enum BodyFetchProcessor {
                 // Third+ empty fetch — confirmed empty. Write empty body for UI and set flags.
                 do {
                     try await dbPool.write { db in
-                        try bodyToInsert.insert(db, onConflict: .ignore)
+                        if replaceExistingBody {
+                            try bodyToInsert.save(db)
+                        } else {
+                            try bodyToInsert.insert(db, onConflict: .ignore)
+                        }
                         try db.execute(
                             sql: """
                                 UPDATE messageHeader
@@ -370,6 +383,50 @@ enum BodyFetchProcessor {
                 return (.retry, nil)
             }
         }
+    }
+
+    private static func persistDisplayableBody(
+        _ body: MessageBody,
+        item: Item,
+        replaceExistingBody: Bool,
+        db: Database
+    ) throws {
+        guard replaceExistingBody else {
+            try body.insert(db, onConflict: .ignore)
+            return
+        }
+
+        try body.save(db)
+        // Keep the old body visible until the complete replacement is durable.
+        // The existing FTS tail reconfirms bodyComplete after indexing succeeds.
+        try db.execute(
+            sql: """
+                UPDATE messageHeader
+                SET summaryBlurb = CASE
+                        WHEN bodyEmptyConfirmed = 1 AND summaryBlurb = 'This message has no content.'
+                            THEN NULL
+                        ELSE summaryBlurb
+                    END,
+                    actionTag = CASE
+                        WHEN bodyEmptyConfirmed = 1 AND actionTag = ? THEN NULL
+                        ELSE actionTag
+                    END,
+                    tagSortOrder = CASE
+                        WHEN bodyEmptyConfirmed = 1 AND actionTag = ? THEN 99
+                        ELSE tagSortOrder
+                    END,
+                    bodyComplete = 0,
+                    bodyEmptyConfirmed = 0,
+                    emptyFetchCount = 0,
+                    embeddingComplete = 0
+                WHERE id = ?
+            """,
+            arguments: [
+                ActionTag.delete.rawValue,
+                ActionTag.delete.rawValue,
+                item.headerId,
+            ]
+        )
     }
 
     /// Flush a batch of processed items to FTS + GRDB flags in one go.
@@ -580,12 +637,16 @@ enum BodyFetchProcessor {
     static func fetchAndProcess(
         item: Item,
         provider: any EmailProvider,
-        enableAI: Bool
+        enableAI: Bool,
+        replaceExistingBody: Bool = false
     ) async -> Result {
         let fetchResult = await fetch(item: item, provider: provider)
         switch fetchResult {
         case .success(let result):
-            let (outcome, processed) = await process(fetchResult: result, enableAI: enableAI)
+            let (outcome, processed) = await process(
+                fetchResult: result,
+                enableAI: enableAI,
+                replaceExistingBody: replaceExistingBody)
             if let processed {
                 await flushBatch([processed], enableAI: enableAI)
             }

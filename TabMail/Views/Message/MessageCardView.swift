@@ -617,7 +617,10 @@ struct MessageCardView: View {
             // Focused card reads from viewModel.messageBody (loaded by loadBody)
             if let body = viewModel.messageBody {
                 if let html = body.htmlContent, !html.isEmpty {
-                    AutoSizingHTMLView(html: html, headerId: message.id)
+                    AutoSizingHTMLView(
+                        html: html,
+                        headerId: message.id,
+                        reloadToken: viewModel.bodyReloadToken)
                 } else {
                     Text("This message has no content.")
                         .foregroundStyle(.secondary)
@@ -719,4 +722,3 @@ struct MessageCardView: View {
         }
     }
 }
-

@@ -164,6 +164,67 @@ struct WriteTierRoutingTests {
         #expect(snapshot.allSatisfy { $0.0 == .priority }, "on-demand path must stay .priority, got \(snapshot.map(\.0))")
     }
 
+    @Test("replaceExistingBody swaps only after a complete body is ready")
+    func replaceExistingBodyUsesCurrentRowAsFallback() async throws {
+        let (header, restore) = try makeTestDB()
+        defer { restore() }
+        try await AppDatabase.rawPool.write { db in
+            try MessageBody(
+                contentKey: ContentKey(rawValue: header.id),
+                htmlContent: "<p>old readable body</p>").insert(db)
+            try db.execute(
+                sql: """
+                    UPDATE messageHeader
+                    SET bodyComplete = 1,
+                        bodyEmptyConfirmed = 1,
+                        emptyFetchCount = 3,
+                        embeddingComplete = 1,
+                        summaryBlurb = 'This message has no content.',
+                        actionTag = ?,
+                        tagSortOrder = ?
+                    WHERE id = ?
+                """,
+                arguments: [
+                    ActionTag.delete.rawValue,
+                    ActionTag.delete.sortOrder,
+                    header.id,
+                ])
+        }
+
+        let result = makeFetchResult(
+            headerId: header.id,
+            accountId: header.accountId,
+            folderPath: header.folderPath,
+            messageId: header.messageId)
+        let (outcome, processed) = await BodyFetchProcessor.process(
+            fetchResult: result,
+            enableAI: false,
+            replaceExistingBody: true)
+
+        #expect(outcome == .success)
+        #expect(processed != nil)
+        let state = try await AppDatabase.rawPool.read { db -> (MessageBody?, Row?) in
+            let body = try MessageBody.fetchOne(db, key: header.id)
+            let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT bodyComplete, bodyEmptyConfirmed, emptyFetchCount,
+                           embeddingComplete, summaryBlurb, actionTag, tagSortOrder
+                    FROM messageHeader WHERE id = ?
+                """,
+                arguments: [header.id])
+            return (body, row)
+        }
+        #expect(state.0?.htmlContent == "<p>Tier test body</p>")
+        #expect((state.1?["bodyComplete"] as Int?) == 0)
+        #expect((state.1?["bodyEmptyConfirmed"] as Int?) == 0)
+        #expect((state.1?["emptyFetchCount"] as Int?) == 0)
+        #expect((state.1?["embeddingComplete"] as Int?) == 0)
+        #expect((state.1?["summaryBlurb"] as String?) == nil)
+        #expect((state.1?["actionTag"] as String?) == nil)
+        #expect((state.1?["tagSortOrder"] as Int?) == 99)
+    }
+
     @Test("A failed body-cache write stays retryable and produces no FTS candidate")
     func bodyWriteAbortDoesNotReportSuccess() async throws {
         let (header, restore) = try makeTestDB(suspendable: true)

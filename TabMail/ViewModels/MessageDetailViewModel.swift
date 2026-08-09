@@ -24,6 +24,7 @@ final class MessageDetailViewModel {
     private(set) var messageId: String
     private(set) var message: MessageHeader?
     private(set) var messageBody: MessageBody?
+    private(set) var bodyReloadToken = 0
     var isLoading = true
     var error: String?
     var messageNotFound = false
@@ -107,13 +108,9 @@ final class MessageDetailViewModel {
     /// (e.g., lock contention caused a timeout, but a later retry wrote the body).
     	@ObservationIgnored nonisolated(unsafe) private var bodyPollTask: Task<Void, Never>?
 
-    /// True while `refetchBody` (pull-to-refresh) is in flight: it deliberately
-    /// deletes the durable body + sets `messageBody = nil` to show "Loading…"
-    /// until its own fresh server fetch lands. Any OTHER `messageBody == nil`
-    /// consumer (`adoptReadyBody`, driven by `.nseMergeDidCommit` or the poll
-    /// entry) MUST NOT re-adopt a durable/staged body during that window — doing
-    /// so flashes the stale body back and clears the spinner mid-refresh,
-    /// defeating the user's explicit refresh. Internal for the guard's unit test.
+    /// True while pull-to-refresh is fetching a replacement. The previous body
+    /// remains readable; concurrent adoption waits so the refresh has one stable
+    /// visible baseline.
     @ObservationIgnored var isRefetchingBody = false
 
     /// Message IDs whose `.messageDataDidChange` notifications arrived while the
@@ -1464,76 +1461,24 @@ final class MessageDetailViewModel {
     }
 
     func refetchBody() async {
-        // Guard the whole refresh window: from the durable-row delete + in-memory
-        // `messageBody = nil` below until the fresh fetch lands, a concurrent
-        // `.nseMergeDidCommit` catch-up must NOT re-adopt a body (`adopt`), and a
-        // running `startBodyPoll` skips its ticks (loop-top `!isRefetchingBody`
-        // guard) — so the poll stays alive and resumes after, no cancel/restart
-        // needed (rounds 2-5). `defer` covers every exit, incl. the not-found path.
         isRefetchingBody = true
         defer { isRefetchingBody = false }
         let rid = resolvedId
-        // ⚠️ CHECK BEFORE THE DESTRUCTIVE STEP. This function deletes the durable body FIRST and
-        // fetches second. If the row's address is mid-move, `fetchBody` now refuses (it must — the
-        // UID names a different message), so the delete would land and the fetch would not,
-        // leaving the user staring at a blank message they could previously read. ⚠️ **This said
-        // "with no path back until some unrelated sync or queue drain happens" — the same sentence
-        // an audit round had already corrected in this row's registry twin, `IOS-BODY-002`, and
-        // missed here.** A drain does restore the DURABLE body (the delete leaves
-        // `bodyComplete = 0`, so the queues re-fetch once the address settles); it does not restore
-        // THIS VIEW, which is still polling the stale key. The user sits in front of a blank message
-        // until they back out and reopen. Skipping the whole refresh keeps
-        // the body they already have, which is strictly better than destroying it to prove a point.
-        // (Found by audit — the refusal was added to the funnel without checking what each caller
-        // had already thrown away by the time it fires.)
+        let previousBody: MessageBody?
+        if let messageBody {
+            previousBody = messageBody
+        } else {
+            previousBody = try? await dbPool.read { db in
+                try MessageBody.fetchOne(db, key: rid)
+            }
+        }
+        if messageBody == nil { messageBody = previousBody }
+
         if let msg = message, await manager.bodyFetchIsBlockedByPendingAddress(for: msg) {
             print("[Refetch] Skipped — address not corroborated (move in flight) for \(rid.prefix(40))")
-            startBodyPoll()
             return
         }
         print("[Refetch] Starting refetchBody for rid=\(rid.prefix(40))")
-        // Delete existing body and reset body-fetch state. Pull-to-refresh is the
-        // user's explicit "retry from scratch" signal — give the empty-fetch chain
-        // a fresh start (otherwise a previously-confirmedEmpty message is locked
-        // into the "This message has no content." stub forever, even after the
-        // underlying server/parser issue is resolved). When the message was
-        // previously auto-classified as empty, also clear the auto-generated
-        // summary/tag so the user doesn't see stale stub text after a successful
-        // re-fetch. The AI queue will repopulate summaryBlurb/actionTag from the
-        // refreshed body content.
-        try? await dbPool.write { db in
-            _ = try MessageBody.deleteOne(db, key: rid)
-            try db.execute(
-                sql: """
-                    UPDATE messageHeader
-                    SET summaryBlurb = CASE
-                            WHEN bodyEmptyConfirmed = 1 AND summaryBlurb = 'This message has no content.'
-                                THEN NULL
-                            ELSE summaryBlurb
-                        END,
-                        actionTag = CASE
-                            WHEN bodyEmptyConfirmed = 1 AND actionTag = ?
-                                THEN NULL
-                            ELSE actionTag
-                        END,
-                        tagSortOrder = CASE
-                            WHEN bodyEmptyConfirmed = 1 AND actionTag = ?
-                                THEN 99
-                            ELSE tagSortOrder
-                        END,
-                        bodyComplete = 0,
-                        bodyEmptyConfirmed = 0,
-                        emptyFetchCount = 0,
-                        embeddingComplete = 0
-                    WHERE id = ?
-                """,
-                arguments: [ActionTag.delete.rawValue, ActionTag.delete.rawValue, rid]
-            )
-        }
-        print("[Refetch] Deleted body from DB and reset empty-fetch state")
-        // Clear in-memory body immediately — forces SwiftUI to drop the stale
-        // WKWebView and show "Loading..." until the fresh body arrives.
-        messageBody = nil
 
         // Refetch message (with fallback)
         var msg = try? await dbPool.read({ db in try MessageHeader.fetchOne(db, key: rid) })
@@ -1549,7 +1494,7 @@ final class MessageDetailViewModel {
         applyOverlay(to: &msg)
         message = msg
 
-        isLoading = true
+        isLoading = messageBody == nil
         error = nil
         messageNotFound = false
 
@@ -1565,7 +1510,9 @@ final class MessageDetailViewModel {
                     if let override = self._fetchBodyOverride {
                         try await override(fetchMsg)
                     } else {
-                        try await self.fetchBodyWithRetry(for: fetchMsg)
+                        try await self.fetchBodyWithRetry(
+                            for: fetchMsg,
+                            replaceExistingBody: true)
                     }
                     print("[Refetch] fetchBodyWithRetry succeeded")
                 } catch {
@@ -1575,29 +1522,16 @@ final class MessageDetailViewModel {
                     }
                 }
                 let postRefetchId = self.resolvedId
-                self.messageBody = try? await self.dbPool.read { db in try MessageBody.fetchOne(db, key: postRefetchId) }
+                let refreshedBody = try? await self.dbPool.read { db in
+                    try MessageBody.fetchOne(db, key: postRefetchId)
+                }
+                self.messageBody = refreshedBody ?? previousBody
+                if refreshedBody != nil { self.bodyReloadToken &+= 1 }
                 let htmlLen = self.messageBody?.htmlContent?.count ?? 0
                 let htmlPreview = String(self.messageBody?.htmlContent?.prefix(200) ?? "nil")
                 print("[Refetch] Body loaded: htmlLen=\(htmlLen) preview=\(htmlPreview)")
                 self.isLoading = false
-                // The destructive half of this refresh ALWAYS lands (the body row is deleted before
-                // the fetch), so if we end with no body the user is looking at a message they could
-                // read a moment ago. The pre-gate above prevents the common cause, but it reads a
-                // snapshot and a move can land between that check and the delete — a TOCTOU window
-                // no check on this side can close. Leaving the poll running is what covers the
-                // SAME-KEY failures: a connection error, a lock timeout, or a body that lands later
-                // under this row's existing key are all adopted as soon as one exists.
-                // (Found by audit; before this, the refusal path ended with a blank view and nothing
-                // scheduled to fill it.)
-                //
-                // ⚠️ **It does NOT cover the branch this paragraph names.** If the move that raced
-                // the delete then DRAINS, `finishMove` re-keys the row and any replacement body is
-                // written under the DESTINATION key, while the poll keeps reading `resolvedId` —
-                // the stale-open-view closure on `BodyAddressGate`. This comment claimed the poll
-                // made "that window" recoverable for a day; it makes the same-key window
-                // recoverable, and the re-key window still needs a back-out and reopen.
                 if self.messageBody == nil {
-                    print("[Refetch] Ended with no body — poll stays up for a same-key arrival; a re-key needs a reopen")
                     self.startBodyPoll()
                 }
                 self.loadThreadMessagesAsync()
@@ -2024,12 +1958,17 @@ final class MessageDetailViewModel {
     /// Delays: 200ms, 500ms — fast first retry since priority lock resolves most contention quickly.
     /// The final attempt either succeeds or propagates its error: the filtered catch clauses match
     /// only attempts one and two, so there is deliberately no post-loop guessed-row recovery.
-    private func fetchBodyWithRetry(for msg: MessageHeader) async throws {
+    private func fetchBodyWithRetry(
+        for msg: MessageHeader,
+        replaceExistingBody: Bool = false
+    ) async throws {
         let maxAttempts = 3
         let retryDelays = [200, 500] // ms — indexed by (attempt - 1)
         for attempt in 1...maxAttempts {
             do {
-                try await manager.fetchBody(for: msg)
+                try await manager.fetchBody(
+                    for: msg,
+                    replaceExistingBody: replaceExistingBody)
                 return
             } catch ProviderError.messageNotFound where attempt < maxAttempts {
                 print("[MessageDetail] messageNotFound (attempt \(attempt)/\(maxAttempts)), retrying...")

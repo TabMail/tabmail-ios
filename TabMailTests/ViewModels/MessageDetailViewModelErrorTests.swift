@@ -165,6 +165,60 @@ struct MessageDetailViewModelErrorTests {
         #expect(vm.error != nil, "Non-connection errors must surface to the user on refetch")
     }
 
+    @Test("refetchBody keeps the last readable body when refresh fails")
+    @MainActor
+    func refetchBodyPreservesPreviousBodyOnFailure() async throws {
+        let (vm, pool, dir) = try makeVM { _ in
+            throw TestConnectionError(description: "Connection reset by peer")
+        }
+        defer { cleanup(pool, dir) }
+        let messageId = vm.messageId
+
+        let oldBody = MessageBody(
+            contentKey: ContentKey(rawValue: messageId),
+            htmlContent: "<p>still readable</p>")
+        try await pool.write { db in try oldBody.insert(db) }
+        await vm.loadBody()
+
+        await vm.refetchBody()
+
+        let durable = try await pool.read { db in
+            try MessageBody.fetchOne(db, key: messageId)
+        }
+        #expect(durable?.htmlContent == "<p>still readable</p>")
+        #expect(vm.messageBody?.htmlContent == "<p>still readable</p>")
+        #expect(vm.error == nil)
+    }
+
+    @Test("successful same-HTML refresh advances the WebView reload token")
+    @MainActor
+    func refetchBodyReloadsSameHTML() async throws {
+        let (vm, pool, dir) = try makeVM { _ in }
+        defer { cleanup(pool, dir) }
+        let messageId = vm.messageId
+
+        let html = "<p>same bytes</p>"
+        try await pool.write { db in
+            try MessageBody(
+                contentKey: ContentKey(rawValue: messageId),
+                htmlContent: html).insert(db)
+        }
+        await vm.loadBody()
+        let previousToken = vm.bodyReloadToken
+        vm._fetchBodyOverride = { message in
+            try await pool.write { db in
+                try MessageBody(
+                    contentKey: ContentKey(rawValue: message.id),
+                    htmlContent: html).save(db)
+            }
+        }
+
+        await vm.refetchBody()
+
+        #expect(vm.messageBody?.htmlContent == html)
+        #expect(vm.bodyReloadToken == previousToken + 1)
+    }
+
     // MARK: - isLoading default and lifecycle
 
     @Test("isLoading defaults to true — spinner shows from first frame")
