@@ -129,6 +129,63 @@ struct SameFolderNoOpTests {
         #expect(vm.deleteIsNoOp("nonexistent") == false)
     }
 
+    @Test("delete no-op follows the visual Undo location while the durable row catches up")
+    @MainActor func deleteIsNoOpFollowsVisualUndoLocation() async throws {
+        let (pool, inbox, _, trash, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let id = try insertMessage(pool, messageId: "t1", folder: trash, date: baseDate)
+        defer { AccountManager.shared.removeOverlayEntries(ids: [id]) }
+
+        let vm = InboxViewModel(folders: [inbox, trash])
+        AccountManager.shared.registerMutation(
+            id: id,
+            mutation: .init(
+                folderId: inbox.id,
+                folderPath: inbox.path,
+                isInInbox: true
+            )
+        )
+
+        // Slow IMAP case from logmain.log: Undo has restored the row on screen,
+        // while the provider/DB move still names Trash. A new Delete is a valid
+        // opposite intent and must reach the existing move coalescer.
+        #expect(vm.deleteIsNoOp(id) == false)
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+        #expect(await vm.delete(id) == true)
+        #expect(UndoService.shared.undoStack.last?.originalFolderPath == inbox.path)
+        #expect(AccountManager.shared.snapshotOverlay()[id]?.folderPath == trash.path)
+    }
+
+    @Test("delete no-op rejects the visual trash location before the durable row catches up")
+    @MainActor func deleteIsNoOpRejectsVisualTrashLocation() async throws {
+        let (pool, inbox, _, trash, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let id = try insertMessage(pool, messageId: "i1", folder: inbox, date: baseDate)
+        defer { AccountManager.shared.removeOverlayEntries(ids: [id]) }
+
+        let vm = InboxViewModel(folders: [inbox, trash])
+        AccountManager.shared.registerMutation(
+            id: id,
+            mutation: .init(
+                folderId: trash.id,
+                folderPath: trash.path,
+                isInInbox: false
+            )
+        )
+
+        #expect(vm.deleteIsNoOp(id) == true)
+    }
+
     // MARK: - InboxViewModel.archive / archiveThread guards
 
     @Test("archive() from the archive folder is a no-op — no undo, no overlay")

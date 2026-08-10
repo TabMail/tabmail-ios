@@ -392,6 +392,20 @@ final class InboxViewModel {
         manager.overlayAdjustedSnapshot(header)
     }
 
+    /// Resolve the location the user is acting on. During a slow provider move,
+    /// Undo restores the source folder in the optimistic overlay immediately,
+    /// while the durable row can still name the forward destination. Role-move
+    /// guards and admissions must use that visible location or a valid second
+    /// gesture is mistaken for a same-folder no-op.
+    private func overlayAdjustedForAction(_ header: MessageHeader) -> MessageHeader {
+        guard let mutation = manager.snapshotOverlay()[header.id] else { return header }
+        var adjusted = header
+        if let folderId = mutation.folderId { adjusted.folderId = folderId }
+        if let folderPath = mutation.folderPath { adjusted.folderPath = folderPath }
+        if let isInInbox = mutation.isInInbox { adjusted.isInInbox = isInInbox }
+        return adjusted
+    }
+
     /// Synchronous folder role lookup — no suspension points.
     private func lookupFolderRole(_ folderId: String) -> FolderRole? {
         try? dbPool.read { db in try Folder.fetchOne(db, key: folderId)?.role }
@@ -1676,7 +1690,8 @@ final class InboxViewModel {
     /// path-only comparison can miss the folder the user is actually viewing.
     /// Being IN any folder of the destination role makes the action a no-op.
     func archiveIsNoOp(_ messageId: String) -> Bool {
-        guard let message = lookupMessage(messageId) else { return false }
+        guard let stored = lookupMessage(messageId) else { return false }
+        let message = overlayAdjustedForAction(stored)
         if lookupFolderRole(message.folderId) == .archive { return true }
         guard let archivePath = lookupFolderPath(accountId: message.accountId, role: .archive) else { return false }
         return message.folderPath == archivePath
@@ -1688,7 +1703,8 @@ final class InboxViewModel {
     /// affected: they delete via the draft-specific path, not move-to-trash.
     /// See `archiveIsNoOp` for why the role check comes first.
     func deleteIsNoOp(_ messageId: String) -> Bool {
-        guard let message = lookupMessage(messageId) else { return false }
+        guard let stored = lookupMessage(messageId) else { return false }
+        let message = overlayAdjustedForAction(stored)
         if lookupFolderRole(message.folderId) == .trash { return true }
         guard let trashPath = lookupFolderPath(accountId: message.accountId, role: .trash) else { return false }
         return message.folderPath == trashPath
@@ -1722,7 +1738,8 @@ final class InboxViewModel {
     /// defect class `archiveThread`'s skipped-ids contract guards against).
     @discardableResult
     func archive(_ messageId: String) -> Bool {
-        guard let message = lookupMessage(messageId) else { return false }
+        guard let stored = lookupMessage(messageId) else { return false }
+        let message = overlayAdjustedForAction(stored)
         // Archive-from-Archive is a no-op: no undo entry, no overlay, no queued
         // move. Role check first — see archiveIsNoOp.
         guard lookupFolderRole(message.folderId) != .archive else { return false }
@@ -1752,6 +1769,8 @@ final class InboxViewModel {
         manager.registerMutation(id: messageId, mutation: .init(
             isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
             folderId: destFolderId,
+            folderPath: archivePath,
+            isInInbox: false,
             actionTag: message.isInInbox ? .some(nil) : nil))
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: message.folderPath, toPath: archivePath), messages: [undoSnapshot],
@@ -1777,7 +1796,9 @@ final class InboxViewModel {
     /// those rows vanish forever with no undo entry.
     @discardableResult
     func archiveThread(_ messageIds: [String]) -> [String] {
-        let messages = messageIds.compactMap { lookupMessage($0) }
+        let messages = messageIds.compactMap { id in
+            lookupMessage(id).map(overlayAdjustedForAction)
+        }
         // Nothing resolved — every id reported skipped so the caller un-hides.
         guard let first = messages.first else { return messageIds }
         // Archive-from-Archive is a no-op: no undo entry, no overlay, no queued
@@ -1805,6 +1826,8 @@ final class InboxViewModel {
             manager.registerMutation(id: msg.id, mutation: .init(
                 isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
                 folderId: destFolderId,
+                folderPath: archivePath,
+                isInInbox: false,
                 actionTag: msg.isInInbox ? .some(nil) : nil))
         }
         UndoService.shared.push(UndoableAction(
@@ -1833,7 +1856,8 @@ final class InboxViewModel {
     /// draft-specific path's own success.
     @discardableResult
     func delete(_ messageId: String) async -> Bool {
-        guard let message = lookupMessage(messageId) else { return false }
+        guard let stored = lookupMessage(messageId) else { return false }
+        let message = overlayAdjustedForAction(stored)
         // Drafts folder: use draft-specific deletion (DELETE /drafts or STORE+EXPUNGE)
         // instead of move-to-trash, which doesn't work for Gmail drafts.
         let folderRole = lookupFolderRole(message.folderId)
@@ -1864,6 +1888,8 @@ final class InboxViewModel {
         manager.registerMutation(id: messageId, mutation: .init(
             isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
             folderId: destFolderId,
+            folderPath: trashPath,
+            isInInbox: false,
             actionTag: message.isInInbox ? .some(nil) : nil))
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: message.folderPath, toPath: trashPath), messages: [undoSnapshot],
@@ -1884,7 +1910,9 @@ final class InboxViewModel {
     /// `archiveThread`'s doc comment for the un-hide contract this satisfies.
     @discardableResult
     func deleteThread(_ messageIds: [String]) async -> [String] {
-        let messages = messageIds.compactMap { lookupMessage($0) }
+        let messages = messageIds.compactMap { id in
+            lookupMessage(id).map(overlayAdjustedForAction)
+        }
         // Nothing resolved — every id reported skipped so the caller un-hides.
         guard let first = messages.first else { return messageIds }
         // Drafts folder: delete each draft individually
@@ -1922,6 +1950,8 @@ final class InboxViewModel {
             manager.registerMutation(id: msg.id, mutation: .init(
                 isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
                 folderId: destFolderId,
+                folderPath: trashPath,
+                isInInbox: false,
                 actionTag: msg.isInInbox ? .some(nil) : nil))
         }
         UndoService.shared.push(UndoableAction(
