@@ -12,6 +12,12 @@ enum UndoableActionType {
     case move(fromPath: String, toPath: String)
 }
 
+enum UndoInvocationSource: String, Sendable {
+    case compactToast
+    case shakeAlert
+    case programmatic
+}
+
 /// PORT — the reference's command/member Undo shape, adapted from hybrid
 /// identity to the one native provider address plus its source epoch.
 struct UndoMember: Sendable, Equatable {
@@ -292,10 +298,25 @@ final class UndoService {
         }
     }
 
-    func undo(expectedActionID: UUID? = nil) async {
+    func undo(
+        expectedActionID: UUID? = nil,
+        source: UndoInvocationSource = .programmatic
+    ) async {
         guard let top = undoStack.last else {
             print("[UndoStack] UNDO called but stack is empty")
             return
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            let ageMilliseconds = max(
+                0,
+                Int(Date().timeIntervalSince(top.timestamp) * 1_000)
+            )
+            let expectedDescription = expectedActionID?.uuidString ?? "nil"
+            print(
+                "[UndoStack] UNDO invoked source=\(source.rawValue) "
+                    + "expected=\(expectedDescription) "
+                    + "top=\(top.id.uuidString) ageMs=\(ageMilliseconds)"
+            )
         }
         if let expectedActionID, top.id != expectedActionID {
             if DebugModeManager.isLoggingEnabled() {

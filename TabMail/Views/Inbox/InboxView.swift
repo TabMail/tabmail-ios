@@ -464,7 +464,11 @@ struct InboxView: View {
                         .lineLimit(1)
                     Button("Undo") {
                         let actionID = action.id
-                        Task { await undoService.undo(expectedActionID: actionID) }
+                        Task {
+                            await undoService.undo(
+                                expectedActionID: actionID,
+                                source: .compactToast)
+                        }
                     }
                     .font(.caption)
                     .fontWeight(.semibold)
@@ -484,6 +488,11 @@ struct InboxView: View {
                         .fill(Color(hex: 0x323232))
                         .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
                 )
+                // A new action is a new undo offer, not an update to the old
+                // button. Without explicit identity SwiftUI can reuse the
+                // transitioning control and retarget an already-recognized
+                // touch to the newly pushed action.
+                .id(action.id)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
                 .ignoresSafeArea(.container, edges: .bottom)
                 .padding(.bottom, -12)
@@ -828,7 +837,11 @@ struct InboxView: View {
             Button("Undo") {
                 guard let actionID = undoAlertActionID else { return }
                 undoAlertActionID = nil
-                Task { await undoService.undo(expectedActionID: actionID) }
+                Task {
+                    await undoService.undo(
+                        expectedActionID: actionID,
+                        source: .shakeAlert)
+                }
             }
             Button("Cancel", role: .cancel) {
                 undoAlertActionID = nil

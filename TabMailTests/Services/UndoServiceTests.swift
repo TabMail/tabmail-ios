@@ -507,6 +507,45 @@ struct UndoServiceEmptyStackTests {
     }
 }
 
+// MARK: - Undo UI offer identity
+
+@Suite("Undo UI offer identity")
+struct UndoUIOfferIdentityTests {
+    private func inboxViewSource() throws -> String {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        return try String(
+            contentsOf: projectRoot.appendingPathComponent(
+                "TabMail/Views/Inbox/InboxView.swift"),
+            encoding: .utf8)
+    }
+
+    @Test("Each compact Undo offer has the action identity and an explicit invocation source")
+    func compactUndoOfferCannotBeRetargetedInPlace() throws {
+        let source = try inboxViewSource()
+        let start = try #require(source.range(of: "// Compact undo chip"))
+        let tail = source[start.lowerBound...]
+        let end = try #require(tail.range(of: "// Agent reply toast"))
+        let compactUndo = tail[..<end.lowerBound]
+
+        #expect(compactUndo.contains(".id(action.id)"))
+        #expect(compactUndo.contains("source: .compactToast"))
+    }
+
+    @Test("Shake Undo names its distinct invocation source")
+    func shakeUndoHasExplicitSource() throws {
+        let source = try inboxViewSource()
+        let start = try #require(source.range(of: ".onShake {"))
+        let tail = source[start.lowerBound...]
+        let end = try #require(tail.range(of: "private func collapseChat"))
+        let shakeUndo = tail[..<end.lowerBound]
+
+        #expect(shakeUndo.contains("source: .shakeAlert"))
+    }
+}
+
 // MARK: - UndoableAction Timestamp Ordering
 
 @Suite("UndoableAction Timestamps")
