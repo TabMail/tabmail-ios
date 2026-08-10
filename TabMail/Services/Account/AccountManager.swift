@@ -404,6 +404,19 @@ actor AccountManager {
     /// Set when drainPendingQueue() is called while isDraining — triggers re-drain on completion.
     var needsRedrain = false
 
+    /// An in-flight IMAP MOVE cannot name its opposite until COPYUID returns
+    /// the destination UID. Keep that short-lived opposite in memory; if the
+    /// process dies, sync simply exposes the completed forward move.
+    struct DeferredMoveSuccessor: Sendable, Equatable {
+        let predecessorOperationId: String
+        let predecessorDestinationPath: String
+        let oldHeaderId: String
+        var desiredDestinationPath: String
+    }
+
+    /// Old source-address header id -> latest successor.
+    var deferredMoveSuccessors: [String: DeferredMoveSuccessor] = [:]
+
     // MARK: - FIFO Local Write Queue
 
     /// Serial queue for ALL local DB writes from user actions.
@@ -447,7 +460,7 @@ actor AccountManager {
         }
         Task {
             await self.enqueueWrite(work)
-            writeAdmissions.withLock { admissions in
+            _ = writeAdmissions.withLock { admissions in
                 admissions.notYetEnqueued.remove(token)
             }
         }
@@ -496,6 +509,22 @@ actor AccountManager {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             enqueueWrite { cont.resume() }
         }
+    }
+
+    /// Append work after every synchronous admission that already existed at
+    /// entry, but do not wait for any queued closure to execute. Undo uses this
+    /// to preserve gesture order while returning immediately behind a gated or
+    /// slow forward move.
+    func enqueueWriteAfterPriorAdmissions(
+        _ work: @escaping @Sendable () async -> Void
+    ) async {
+        let admissionCeiling = writeAdmissions.withLock { $0.nextToken }
+        while writeAdmissions.withLock({ admissions in
+            admissions.notYetEnqueued.contains { $0 <= admissionCeiling }
+        }) {
+            await Task.yield()
+        }
+        enqueueWrite(work)
     }
 
     /// Races `awaitWriteQueueDrain()` against a deadline: returns as soon as

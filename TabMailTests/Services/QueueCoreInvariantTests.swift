@@ -855,6 +855,74 @@ struct QueueCoreInvariantTests {
         #expect(UndoService.shared.currentAction?.messages.map(\.id) == [older.id])
     }
 
+    @Test("Undo consumes the displayed newest action before its queued restore can run")
+    @MainActor
+    func newestUndoDoesNotRetargetWhileForwardWriteIsQueued() async throws {
+        let fixture = try fixture(accountId: "acc-undo-newest-first")
+        defer { finish(fixture) }
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        let older = try seedHeader(fixture, messageId: "77", folderPath: "INBOX")
+        let latest = try seedHeader(fixture, messageId: "88", folderPath: "INBOX")
+        try await fixture.pool.writeWithoutTransaction { db in
+            try MessageHeader.filter(Column("id") == latest.id).updateAll(
+                db,
+                Column("folderId").set(to: MessageIdentity.folderId(
+                    accountId: fixture.accountId, folderPath: "Archive")),
+                Column("folderPath").set(to: "Archive"),
+                Column("isInInbox").set(to: false),
+                Column("observedUidValidity").set(to: nil as Int?))
+            try PendingOperation(
+                type: .move,
+                messageIds: [latest.messageId],
+                accountId: fixture.accountId,
+                folderPath: "INBOX",
+                destinationPath: "Archive",
+                observedUidValidity: 42).insert(db)
+        }
+
+        let olderAction = UndoableAction(
+            type: .move(fromPath: "INBOX", toPath: "Trash"),
+            messages: [older], originalFolderId: older.folderId,
+            originalFolderPath: "INBOX", accountId: fixture.accountId,
+            timestamp: Date())
+        let latestAction = UndoableAction(
+            type: .move(fromPath: "INBOX", toPath: "Archive"),
+            messages: [latest], originalFolderId: latest.folderId,
+            originalFolderPath: "INBOX", accountId: fixture.accountId,
+            timestamp: Date())
+        UndoService.shared.push(olderAction)
+        UndoService.shared.push(latestAction)
+
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            var iterator = gateStream.makeAsyncIterator()
+            _ = await iterator.next()
+        }
+
+        await UndoService.shared.undo(expectedActionID: latestAction.id)
+
+        #expect(UndoService.shared.undoStack.map(\.id) == [olderAction.id])
+        #expect(AccountManager.shared.snapshotOverlay()[latest.id]?.folderPath == "INBOX")
+        let beforeRelease = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: latest.id), try PendingOperation.fetchAll(db))
+        }
+        #expect(beforeRelease.0?.folderPath == "Archive")
+        #expect(beforeRelease.1.count == 1)
+
+        gate.finish()
+        await AccountManager.shared.awaitWriteQueueDrain()
+
+        let afterRestore = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: latest.id), try PendingOperation.fetchAll(db))
+        }
+        #expect(afterRestore.0?.folderPath == "INBOX")
+        #expect(afterRestore.1.isEmpty)
+        #expect(UndoService.shared.undoStack.map(\.id) == [olderAction.id])
+        #expect(AccountManager.shared.snapshotOverlay()[latest.id] == nil)
+    }
+
     // MARK: - Test-local timings
     //
     // Only the RED direction depends on these being generous enough for a small

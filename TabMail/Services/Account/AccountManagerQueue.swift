@@ -818,6 +818,7 @@ extension AccountManager {
                 finishResult = .empty
             }
             await publishMoveFinish(finishResult)
+            await materializeDeferredMoveSuccessors(after: currentOp, result: finishResult)
             if [.archive, .delete, .move].contains(currentOp.type), let dest = currentOp.destinationPath {
                 context.foldersToSync.insert("\(currentOp.accountId)|\(dest)")
             }
@@ -840,6 +841,7 @@ extension AccountManager {
                     try await retryWrite(dbPool, label: "Queue") { db in
                         _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                     }
+                    dropDeferredMoveSuccessors(for: currentOp.id)
                     context.executedAny = true
                     return .proceed
                 } catch {
@@ -901,6 +903,7 @@ extension AccountManager {
                             }
                             _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                         }
+                        dropDeferredMoveSuccessors(for: currentOp.id)
                     } catch {
                         queueLog("[Queue] Failed to split batch op \(currentOp.id): \(error) — batch will retry as-is")
                     }
@@ -920,6 +923,7 @@ extension AccountManager {
                 try? await retryWrite(dbPool, label: "Queue") { db in
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                 }
+                dropDeferredMoveSuccessors(for: currentOp.id)
                 // If the error was a structurally-confirmed permanent gone (HTTP 404/410
                 // or ProviderError.messageNotFound), also delete the local header. The
                 // message is verified gone on the server; retaining a ghost row causes
@@ -943,6 +947,7 @@ extension AccountManager {
                 try? await retryWrite(dbPool, label: "Queue") { db in
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                 }
+                dropDeferredMoveSuccessors(for: currentOp.id)
                 context.executedAny = true
                 return .proceed
             }
@@ -1061,6 +1066,7 @@ extension AccountManager {
                 try? await retryWrite(dbPool, label: "Queue") { db in
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                 }
+                dropDeferredMoveSuccessors(for: currentOp.id)
                 context.executedAny = true
                 return .proceed
             }
@@ -1433,6 +1439,7 @@ extension AccountManager {
                 return result
             }
             await publishMoveFinish(finishResult)
+            await materializeDeferredMoveSuccessors(after: frozenRetiredOp, result: finishResult)
         } catch {
             // The narrowing write failed. NEVER leave the row `inFlight` (it
             // would only unstick at the next launch's crash recovery) and never

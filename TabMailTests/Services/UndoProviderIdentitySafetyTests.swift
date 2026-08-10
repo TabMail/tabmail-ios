@@ -49,6 +49,9 @@ struct UndoProviderIdentitySafetyTests {
             var other = Folder(name: "Other", path: "Other", role: .custom, accountId: accountId)
             other.lastKnownUidValidity = 63
             try other.insert(db)
+            var trash = Folder(name: "Trash", path: "Trash", role: .trash, accountId: accountId)
+            trash.lastKnownUidValidity = 74
+            try trash.insert(db)
         }
         return Fixture(pool: pool, directory: directory, previous: previous, accountId: accountId)
     }
@@ -112,6 +115,316 @@ struct UndoProviderIdentitySafetyTests {
                 Column("tagSortOrder").set(to: 99)
             )
         }
+    }
+
+    @MainActor
+    private func insertInFlightMove(
+        _ fixture: Fixture,
+        messageIds: [String],
+        from sourcePath: String,
+        to destinationPath: String,
+        epoch: Int
+    ) async throws -> PendingOperation {
+        var operation = PendingOperation(
+            type: .move,
+            messageIds: messageIds,
+            accountId: fixture.accountId,
+            folderPath: sourcePath,
+            destinationPath: destinationPath,
+            observedUidValidity: epoch)
+        operation.status = PendingStatus.inFlight.rawValue
+        operation.everAttempted = true
+        let insertedOperation = operation
+        try await fixture.pool.write { db in try insertedOperation.insert(db) }
+        return insertedOperation
+    }
+
+    @MainActor
+    private func finishMove(
+        _ fixture: Fixture,
+        operation: PendingOperation,
+        sourceId: String,
+        destinationId: String,
+        destinationEpoch: UInt32
+    ) async throws -> MoveFinishResult {
+        try await fixture.pool.write { db in
+            let result = try MessageHeaderRekey.finishMove(
+                operation,
+                destinations: [ProvenDestinationAddress(
+                    sourceProviderId: sourceId,
+                    destinationProviderId: destinationId,
+                    destinationUidValidity: destinationEpoch)],
+                addressChangesOnMove: true,
+                db: db)
+            _ = try PendingOperation.deleteOne(db, key: operation.id)
+            return result
+        }
+    }
+
+    @Test("Undo is immediate while an IMAP move is in flight and waits only for its destination UID")
+    @MainActor
+    func inFlightImapUndoIsImmediateAndUidSafe() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
+
+        let original = sourceHeader(fixture, providerId: "101", rfc: "move@example.com")
+        try installOptimisticallyMoved(original, pool: fixture.pool)
+        _ = try await insertInFlightMove(
+            fixture, messageIds: ["101"], from: "INBOX", to: "Archive", epoch: 41)
+
+        let manager = AccountManager.shared
+        manager.retainOverlayEntry(id: original.id)
+        manager.registerMutation(
+            id: original.id,
+            mutation: .init(
+                folderId: original.folderId,
+                folderPath: original.folderPath,
+                isInInbox: true,
+                actionTag: .some(original.actionTag)))
+        let restored = await manager.undoMove(
+            accountId: fixture.accountId,
+            forwardDestinationPath: "Archive",
+            members: [UndoMember(header: original)])
+        manager.releaseOverlayEntry(id: original.id)
+
+        #expect(restored == [original.id])
+        #expect(await manager.deferredMoveSuccessorCountForTesting() == 1)
+        #expect(manager.snapshotOverlay()[original.id]?.folderPath == "INBOX")
+        let state = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: original.id), try PendingOperation.fetchAll(db))
+        }
+        #expect(state.0?.folderPath == "Archive", "the durable row remains eligible for the forward COPYUID re-key")
+        #expect(state.0?.observedUidValidity == nil)
+        #expect(state.1.count == 1)
+        #expect(state.1.first?.status == PendingStatus.inFlight.rawValue)
+
+        await manager.clearDeferredMoveSuccessorsForTesting()
+    }
+
+    @Test("COPYUID turns a deferred Undo into one ordinary inverse with the proven destination address")
+    @MainActor
+    func copyUidMaterializesDeferredInverse() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
+
+        let original = sourceHeader(fixture, providerId: "101", rfc: "move@example.com")
+        try installOptimisticallyMoved(original, pool: fixture.pool)
+        let forward = try await insertInFlightMove(
+            fixture, messageIds: ["101"], from: "INBOX", to: "Archive", epoch: 41)
+        let restored = await AccountManager.shared.undoMove(
+            accountId: fixture.accountId,
+            forwardDestinationPath: "Archive",
+            members: [UndoMember(header: original)])
+        #expect(restored == [original.id])
+
+        let result = try await finishMove(
+            fixture, operation: forward, sourceId: "101",
+            destinationId: "901", destinationEpoch: 52)
+        await AccountManager.shared.materializeDeferredMoveSuccessors(
+            after: forward, result: result)
+        await AccountManager.shared.awaitWriteQueueDrain()
+
+        let newHeaderId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "Archive", messageId: "901")
+        let state = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: newHeaderId), try PendingOperation.fetchAll(db))
+        }
+        #expect(state.0?.folderPath == "INBOX", "Undo stays optimistic after the forward re-key")
+        #expect(state.0?.observedUidValidity == nil, "destination UID must not be paired with the INBOX epoch")
+        #expect(state.1.count == 1)
+        guard state.1.count == 1 else { return }
+        #expect(state.1[0].messageIds == ["901"])
+        #expect(state.1[0].folderPath == "Archive")
+        #expect(state.1[0].destinationPath == "INBOX")
+        #expect(state.1[0].observedUidValidity == 52)
+        #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 0)
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[original.id] == nil)
+    }
+
+    @Test("Delete after an in-flight Delete Undo cancels the deferred move back")
+    @MainActor
+    func deleteUndoDeleteCancelsDeferredMoveBack() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
+
+        let original = sourceHeader(fixture, providerId: "101", rfc: "move@example.com")
+        try installOptimisticallyMoved(original, destinationPath: "Trash", pool: fixture.pool)
+        let forward = try await insertInFlightMove(
+            fixture, messageIds: ["101"], from: "INBOX", to: "Trash", epoch: 41)
+        _ = await AccountManager.shared.undoMove(
+            accountId: fixture.accountId,
+            forwardDestinationPath: "Trash",
+            members: [UndoMember(header: original)])
+
+        let outcome = await AccountManager.shared.move([original], to: "Trash")
+
+        #expect(outcome.admittedIds == [original.id])
+        #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 0)
+        let state = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: original.id), try PendingOperation.fetchAll(db))
+        }
+        #expect(state.0?.folderPath == "Trash")
+        #expect(state.1.count == 1)
+        guard state.1.count == 1 else { return }
+        #expect(state.1[0].id == forward.id)
+        #expect(state.1[0].status == PendingStatus.inFlight.rawValue)
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[original.id] == nil)
+    }
+
+    @Test("Delete retargets an in-flight Undo and skips the obsolete move back")
+    @MainActor
+    func deleteRetargetsDeferredUndoBeforeCopyUid() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
+
+        let original = sourceHeader(fixture, providerId: "101", rfc: "move@example.com")
+        try installOptimisticallyMoved(original, pool: fixture.pool)
+        let forward = try await insertInFlightMove(
+            fixture, messageIds: ["101"], from: "INBOX", to: "Archive", epoch: 41)
+        _ = await AccountManager.shared.undoMove(
+            accountId: fixture.accountId,
+            forwardDestinationPath: "Archive",
+            members: [UndoMember(header: original)])
+
+        let delete = await AccountManager.shared.move([original], to: "Trash")
+        #expect(delete.pendingIds == [original.id])
+        #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 1)
+
+        let result = try await finishMove(
+            fixture, operation: forward, sourceId: "101",
+            destinationId: "901", destinationEpoch: 52)
+        await AccountManager.shared.materializeDeferredMoveSuccessors(
+            after: forward, result: result)
+        await AccountManager.shared.awaitWriteQueueDrain()
+
+        let archiveHeaderId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "Archive", messageId: "901")
+        let state = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: archiveHeaderId), try PendingOperation.fetchAll(db))
+        }
+        #expect(state.0?.folderPath == "Trash")
+        #expect(state.1.count == 1)
+        guard state.1.count == 1 else { return }
+        #expect(state.1[0].messageIds == ["901"])
+        #expect(state.1[0].folderPath == "Archive")
+        #expect(state.1[0].destinationPath == "Trash")
+        #expect(state.1[0].observedUidValidity == 52)
+        #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 0)
+    }
+
+    @Test("A terminal predecessor drops its deferred Undo overlay and leaves reconciliation to sync")
+    @MainActor
+    func terminalPredecessorDropsDeferredSuccessor() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
+
+        let original = sourceHeader(fixture, providerId: "101", rfc: "move@example.com")
+        try installOptimisticallyMoved(original, pool: fixture.pool)
+        let forward = try await insertInFlightMove(
+            fixture, messageIds: ["101"], from: "INBOX", to: "Archive", epoch: 41)
+        _ = await AccountManager.shared.undoMove(
+            accountId: fixture.accountId,
+            forwardDestinationPath: "Archive",
+            members: [UndoMember(header: original)])
+
+        #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 1)
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[original.id] == 1)
+
+        await AccountManager.shared.dropDeferredMoveSuccessors(for: forward.id)
+
+        #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 0)
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[original.id] == nil)
+        let state = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: original.id), try PendingOperation.fetchAll(db))
+        }
+        #expect(state.0?.folderPath == "Archive")
+        #expect(state.1.first?.id == forward.id)
+    }
+
+    @Test("A queued inverse and an immediate opposite gesture annihilate to the provider address")
+    @MainActor
+    func queuedInverseAndOppositeGestureAnnihilate() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
+
+        var row = sourceHeader(
+            fixture, providerId: "901", rfc: "move@example.com",
+            sourcePath: "Trash", sourceEpoch: nil)
+        row.folderId = MessageIdentity.folderId(accountId: fixture.accountId, folderPath: "INBOX")
+        row.folderPath = "INBOX"
+        row.isInInbox = true
+        let insertedRow = row
+        try await fixture.pool.write { db in
+            try insertedRow.insert(db)
+            try PendingOperation(
+                type: .move,
+                messageIds: ["901"],
+                accountId: fixture.accountId,
+                folderPath: "Trash",
+                destinationPath: "INBOX",
+                observedUidValidity: 74).insert(db)
+        }
+
+        let outcome = await AccountManager.shared.move([insertedRow], to: "Trash")
+
+        #expect(outcome.admittedIds == [insertedRow.id])
+        let state = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: insertedRow.id), try PendingOperation.fetchAll(db))
+        }
+        #expect(state.0?.folderPath == "Trash")
+        #expect(state.0?.observedUidValidity == 74)
+        #expect(state.1.isEmpty, "the two opposite never-sent moves reduce to no provider work")
+    }
+
+    @Test("Delete after a completed Delete Undo waits for the in-flight move-back UID")
+    @MainActor
+    func deleteAfterCompletedDeleteUndoChainsSafely() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
+
+        var row = sourceHeader(
+            fixture, providerId: "901", rfc: "move@example.com",
+            sourcePath: "Trash", sourceEpoch: nil)
+        row.folderId = MessageIdentity.folderId(accountId: fixture.accountId, folderPath: "INBOX")
+        row.folderPath = "INBOX"
+        row.isInInbox = true
+        let insertedRow = row
+        try await fixture.pool.write { db in try insertedRow.insert(db) }
+        let inverse = try await insertInFlightMove(
+            fixture, messageIds: ["901"], from: "Trash", to: "INBOX", epoch: 74)
+
+        let admission = await AccountManager.shared.move([insertedRow], to: "Trash")
+        #expect(admission.pendingIds == [insertedRow.id])
+        #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 1)
+
+        let result = try await finishMove(
+            fixture, operation: inverse, sourceId: "901",
+            destinationId: "102", destinationEpoch: 41)
+        await AccountManager.shared.materializeDeferredMoveSuccessors(
+            after: inverse, result: result)
+        await AccountManager.shared.awaitWriteQueueDrain()
+
+        let inboxHeaderId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "INBOX", messageId: "102")
+        let state = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: inboxHeaderId), try PendingOperation.fetchAll(db))
+        }
+        #expect(state.0?.folderPath == "Trash")
+        #expect(state.0?.observedUidValidity == nil)
+        #expect(state.1.count == 1)
+        guard state.1.count == 1 else { return }
+        #expect(state.1[0].messageIds == ["102"])
+        #expect(state.1[0].folderPath == "INBOX")
+        #expect(state.1[0].destinationPath == "Trash")
+        #expect(state.1[0].observedUidValidity == 41)
+        #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 0)
     }
 
     @Test("Undo annihilates only an exact never-attempted provider-ID move and restores the exact local member")

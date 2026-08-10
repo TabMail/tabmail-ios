@@ -929,6 +929,139 @@ extension AccountManager {
 
     // MARK: - Optimistic Move (shared by archive, delete, move)
 
+    /// Retain the already-visible optimistic overlay while an in-flight IMAP
+    /// predecessor is still producing the UID needed by the opposite move.
+    /// Re-registering the same exact member is idempotent and does not take a
+    /// second retain.
+    private func registerDeferredMoveSuccessors(_ successors: [DeferredMoveSuccessor]) {
+        for successor in successors {
+            let isNew = deferredMoveSuccessors[successor.oldHeaderId] == nil
+            deferredMoveSuccessors[successor.oldHeaderId] = successor
+            if isNew { retainOverlayEntry(id: successor.oldHeaderId) }
+        }
+    }
+
+    /// Apply latest-move-wins to an opposite waiting behind in-flight IMAP
+    /// work. Returning to the predecessor destination cancels the opposite;
+    /// any other destination retargets it. Neither case waits for the provider.
+    private func coalesceDeferredMoves(
+        headerIds: Set<String>, destinationPath: String
+    ) -> (ids: Set<String>, admission: RoleMoveAdmission) {
+        var ids: Set<String> = []
+        var admission = RoleMoveAdmission()
+        for headerId in headerIds {
+            guard var successor = deferredMoveSuccessors[headerId] else { continue }
+            ids.insert(headerId)
+            if destinationPath == successor.predecessorDestinationPath {
+                deferredMoveSuccessors.removeValue(forKey: headerId)
+                releaseOverlayEntry(id: headerId)
+                admission.set(.durablyAdmitted, id: headerId)
+            } else {
+                successor.desiredDestinationPath = destinationPath
+                deferredMoveSuccessors[headerId] = successor
+                admission.set(.retainedForRetry, id: headerId)
+            }
+        }
+        return (ids, admission)
+    }
+
+    #if DEBUG
+    func deferredMoveSuccessorCountForTesting() -> Int {
+        deferredMoveSuccessors.count
+    }
+
+    func clearDeferredMoveSuccessorsForTesting() {
+        let retainedIds = Array(deferredMoveSuccessors.keys)
+        deferredMoveSuccessors.removeAll()
+        for id in retainedIds { releaseOverlayEntry(id: id) }
+    }
+    #endif
+
+    /// A terminal predecessor without destination evidence cannot safely run
+    /// its deferred inverse. Drop that process-local convenience and its
+    /// overlay; the normal sync path remains the source of truth.
+    func dropDeferredMoveSuccessors(for predecessorOperationId: String) {
+        let oldHeaderIds = deferredMoveSuccessors.values.compactMap { successor in
+            successor.predecessorOperationId == predecessorOperationId
+                ? successor.oldHeaderId
+                : nil
+        }
+        guard !oldHeaderIds.isEmpty else { return }
+        for oldHeaderId in oldHeaderIds {
+            deferredMoveSuccessors.removeValue(forKey: oldHeaderId)
+            releaseOverlayEntry(id: oldHeaderId)
+        }
+        Task { @MainActor in
+            NotificationCenter.default.post(
+                name: .inboxDataDidChange, object: oldHeaderIds)
+        }
+    }
+
+    /// Turn an opposite gesture recorded during an in-flight IMAP MOVE into an
+    /// ordinary queued move only after the provider has named the destination
+    /// UID. The predecessor has already been retired in the same transaction
+    /// that produced `result`, so this reuses the normal optimistic-move path;
+    /// there is no second queue, guessed UID, Message-ID search or migration.
+    func materializeDeferredMoveSuccessors(
+        after predecessor: PendingOperation,
+        result: MoveFinishResult
+    ) async {
+        await enqueueWriteAfterPriorAdmissions { [self, predecessor, result] in
+            await materializeDeferredMoveSuccessorsInFIFO(
+                after: predecessor, result: result)
+        }
+    }
+
+    private func materializeDeferredMoveSuccessorsInFIFO(
+        after predecessor: PendingOperation,
+        result: MoveFinishResult
+    ) async {
+        let waiting = deferredMoveSuccessors.values.filter {
+            $0.predecessorOperationId == predecessor.id
+        }
+        guard !waiting.isEmpty else { return }
+        for successor in waiting {
+            deferredMoveSuccessors.removeValue(forKey: successor.oldHeaderId)
+        }
+
+        let appliedByOldId = Dictionary(
+            result.applied.map { ($0.oldHeaderId, $0) },
+            uniquingKeysWith: { first, _ in first })
+        let rowsByOldId: [String: MessageHeader] = (try? await dbPool.read { db in
+            var rows: [String: MessageHeader] = [:]
+            for successor in waiting {
+                guard let record = appliedByOldId[successor.oldHeaderId],
+                      let row = try MessageHeader.fetchOne(db, key: record.newHeaderId),
+                      row.accountId == predecessor.accountId,
+                      row.folderPath == predecessor.destinationPath,
+                      row.messageId == record.newProviderMessageId
+                else { continue }
+                rows[successor.oldHeaderId] = row
+            }
+            return rows
+        }) ?? [:]
+
+        for (destinationPath, successors) in Dictionary(
+            grouping: waiting, by: \.desiredDestinationPath
+        ) {
+            let rows = successors.compactMap { rowsByOldId[$0.oldHeaderId] }
+            guard rows.count == successors.count else { continue }
+            _ = await move(rows, to: destinationPath)
+        }
+
+        // The forward is already retired. Any inverse that could not be
+        // admitted is deliberately dropped; the next sync exposes server truth.
+        let completedOldIds = waiting.map(\.oldHeaderId)
+        for oldId in completedOldIds {
+            releaseOverlayEntry(id: oldId)
+        }
+
+        Task { @MainActor in
+            NotificationCenter.default.post(
+                name: .inboxDataDidChange, object: completedOldIds)
+        }
+    }
+
     /// Core optimistic move: reassigns messages to the destination folder in GRDB,
     /// queues tag removal if leaving inbox, and queues the PendingOperation.
     /// Unread counts are adjusted inline (same transaction) for immediate UI feedback.
@@ -954,7 +1087,10 @@ extension AccountManager {
         opType: OperationType,
         removeTagsIfLeavingInbox: Bool,
         db: Database
-    ) throws -> (folderIds: Set<String>, admission: RoleMoveAdmission) {
+    ) throws -> (
+        folderIds: Set<String>, admission: RoleMoveAdmission,
+        deferredSuccessors: [DeferredMoveSuccessor]
+    ) {
         var outcome = RoleMoveAdmission()
         // Self-move is a no-op — don't create PendingOperation or touch local state.
         // Happens when archiving from All Mail on Gmail (source=dest=__GMAIL_ALL_MAIL__).
@@ -963,8 +1099,97 @@ extension AccountManager {
             // PROVEN: the row already sits at the requested destination, so the
             // requested end state is already true. Terminal, never retried.
             outcome.set(.terminalStale, ids: msgs.map(\.id))
-            return ([], outcome)
+            return ([], outcome, [])
         }
+
+        // 1.6.38 GUARD, PORTED TO PROVIDER-NATIVE ADDRESSING.
+        //
+        // A queued opposite move has not reached the provider, so the latest
+        // gesture may annihilate it and restore the exact source address it
+        // already carries. If it is in flight, the source UID will change and
+        // cannot be guessed; retain an in-memory successor until COPYUID proves
+        // the new address. The strict whole-bundle match prevents a partial or
+        // unrelated operation sharing one UID from being folded.
+        if opType == .move, !msgs.isEmpty {
+            let ids = msgs.map(\.messageId)
+            let idSet = Set(ids)
+            let activeMoves = try PendingOperation
+                .filter(Column("accountId") == accountId)
+                .filter(Column("type") == OperationType.move.rawValue)
+                .filter(Column("status") != PendingStatus.cancelled.rawValue)
+                .fetchAll(db)
+            let related = activeMoves.filter {
+                !Set($0.messageIds).isDisjoint(with: idSet)
+            }
+            let exactOpposites = related.filter { op in
+                op.messageIds.count == ids.count
+                    && Set(op.messageIds) == idSet
+                    && op.destinationPath == folderPath
+                    && op.folderPath == destinationPath
+                    && msgs.allSatisfy { message in
+                        message.id == MessageIdentity.headerId(
+                            accountId: accountId, folderPath: op.folderPath,
+                            messageId: message.messageId)
+                    }
+            }
+            if related.count == 1, exactOpposites.count == 1 {
+                let predecessor = exactOpposites[0]
+                if predecessor.status == PendingStatus.queued.rawValue,
+                   !predecessor.everAttempted {
+                    let sourceFolderId = msgs[0].folderId
+                    let destinationFolderId = MessageIdentity.folderId(
+                        accountId: accountId, folderPath: destinationPath)
+                    let destinationFolder = try Folder.fetchOne(db, key: destinationFolderId)
+                    let destinationIsInbox = destinationFolder?.role == .inbox
+                    let unreadMoving = try Self.countCurrentlyUnread(
+                        msgIds: msgs.map(\.id), db: db)
+
+                    var assignments: [ColumnAssignment] = [
+                        Column("folderId").set(to: destinationFolderId),
+                        Column("folderPath").set(to: destinationPath),
+                        Column("isInInbox").set(to: destinationIsInbox),
+                        Column("observedUidValidity").set(to: predecessor.observedUidValidity),
+                    ]
+                    if removeTagsIfLeavingInbox && msgs[0].isInInbox {
+                        assignments.append(Column("actionTag").set(to: nil as String?))
+                        assignments.append(Column("tagSortOrder").set(to: 99))
+                    }
+                    try MessageHeader
+                        .filter(msgs.map(\.id).contains(Column("id")))
+                        .updateAll(db, assignments)
+                    _ = try PendingOperation.deleteOne(db, key: predecessor.id)
+
+                    try Self.restoreInboxAICacheAfterOptimisticMove(
+                        headerIds: msgs.map(\.id), accountId: accountId,
+                        destinationPath: destinationPath,
+                        destinationIsInbox: destinationIsInbox == true, db: db)
+                    if unreadMoving > 0 {
+                        try db.execute(
+                            sql: "UPDATE folder SET unreadCount = MAX(0, unreadCount - ?) WHERE id = ?",
+                            arguments: [unreadMoving, sourceFolderId])
+                        try db.execute(
+                            sql: "UPDATE folder SET unreadCount = unreadCount + ? WHERE id = ?",
+                            arguments: [unreadMoving, destinationFolderId])
+                    }
+                    outcome.set(.durablyAdmitted, ids: msgs.map(\.id))
+                    return ([sourceFolderId, destinationFolderId], outcome, [])
+                }
+
+                if predecessor.status == PendingStatus.inFlight.rawValue,
+                   predecessor.observedUidValidity != nil {
+                    let successors = msgs.map { message in
+                        DeferredMoveSuccessor(
+                            predecessorOperationId: predecessor.id,
+                            predecessorDestinationPath: folderPath,
+                            oldHeaderId: message.id,
+                            desiredDestinationPath: destinationPath)
+                    }
+                    outcome.set(.retainedForRetry, ids: msgs.map(\.id))
+                    return ([], outcome, successors)
+                }
+            }
+        }
+
         // Capture the source-native ids and epoch before the optimistic move
         // clears `observedUidValidity` on the destination row.
         let admissionResult = try Self.admittedOrdinaryActionTargets(
@@ -974,7 +1199,7 @@ extension AccountManager {
             msgs.filter { !admittedIds.contains($0.id) },
             accountId: accountId, folderPath: folderPath, db: db)
         for (id, disposition) in rejectDispositions { outcome.set(disposition, id: id) }
-        guard let admission = admissionResult else { return ([], outcome) }
+        guard let admission = admissionResult else { return ([], outcome, []) }
         let admitted = admission.messages
         let leavingInbox = admitted[0].isInInbox
 
@@ -1042,7 +1267,7 @@ extension AccountManager {
         // The local mutation and the durable op are now in the SAME open
         // transaction — that is exactly what `durablyAdmitted` asserts.
         outcome.set(.durablyAdmitted, ids: admittedIds)
-        return ([admitted[0].folderId, destFolderId], outcome)
+        return ([admitted[0].folderId, destFolderId], outcome, [])
     }
 
     /// Restore missing AI fields only for rows that the enclosing optimistic
@@ -1078,6 +1303,19 @@ extension AccountManager {
     /// never reached the provider.
     @discardableResult
     func move(_ messages: [MessageHeader], to destinationPath: String) async -> RoleMoveAdmission {
+        var outcome = RoleMoveAdmission()
+
+        // If Undo already recorded the exact opposite behind an in-flight
+        // predecessor, a new gesture back to the predecessor's destination is
+        // the net cancel-out. Fold it before re-resolving the deliberately
+        // optimistic row (whose durable folder still reflects the predecessor).
+        let requestedIds = Set(messages.map(\.id))
+        let coalesced = coalesceDeferredMoves(
+            headerIds: requestedIds, destinationPath: destinationPath)
+        outcome.merge(coalesced.admission)
+        let remainingMessages = messages.filter { !coalesced.ids.contains($0.id) }
+        guard !remainingMessages.isEmpty else { return outcome }
+
         // Re-resolve fresh headers by id — the single choke point for every
         // surface (swipe, detail view, agent tools, settings bulk-archive).
         // Gesture paths capture `lookupMessage` snapshots at tap time and pass
@@ -1090,9 +1328,8 @@ extension AccountManager {
         // as-is (its double resolve is harmless). Ids that no longer resolve
         // (vanished rows) are dropped from the batch — correct, per
         // `resolveHeadersForAction`'s documented contract.
-        var outcome = RoleMoveAdmission()
-        let requestedIds = messages.map(\.id)
-        let fresh = await resolveHeadersForAction(ids: requestedIds)
+        let unresolvedIds = remainingMessages.map(\.id)
+        let fresh = await resolveHeadersForAction(ids: unresolvedIds)
         // Observability (audit round 5): resolveHeadersForAction swallows read
         // errors (`try?` → []), so an empty result for a NON-empty input is
         // either all-rows-vanished (legit) or a genuine read failure — in the
@@ -1106,9 +1343,9 @@ extension AccountManager {
         // (zero-extra-DB contract), so the probe that CAN prove absence lives
         // in `performCoordinatedRoleMove` instead, which is a non-gesture path.
         let freshIds = Set(fresh.map(\.id))
-        outcome.set(.retainedForRetry, ids: requestedIds.filter { !freshIds.contains($0) })
-        if fresh.isEmpty, !messages.isEmpty {
-            print("[Queue] WARNING: move(to: \(destinationPath)) resolved 0 of \(messages.count) ids — vanished rows or read failure; nothing queued")
+        outcome.set(.retainedForRetry, ids: unresolvedIds.filter { !freshIds.contains($0) })
+        if fresh.isEmpty, !remainingMessages.isEmpty {
+            print("[Queue] WARNING: move(to: \(destinationPath)) resolved 0 of \(remainingMessages.count) ids — vanished rows or read failure; nothing queued")
         }
         // Same-folder move is a no-op. Drop those messages here — using FRESH
         // data so a stale caller snapshot whose row already sits at the
@@ -1124,24 +1361,32 @@ extension AccountManager {
 
         let grouped = Dictionary(grouping: movable) { "\($0.accountId)|\($0.folderPath)" }
         let affectedFolderIds: Set<String>
+        let deferredSuccessors: [DeferredMoveSuccessor]
         do {
-            let written = try await dbPool.write { db -> (folderIds: Set<String>, admission: RoleMoveAdmission) in
+            let written = try await dbPool.write { db -> (
+                folderIds: Set<String>, admission: RoleMoveAdmission,
+                deferredSuccessors: [DeferredMoveSuccessor]
+            ) in
                 var folderIds: Set<String> = []
                 var admission = RoleMoveAdmission()
+                var deferredSuccessors: [DeferredMoveSuccessor] = []
                 for (_, msgs) in grouped {
                     let accountId = msgs[0].accountId
                     let folderPath = msgs[0].folderPath
                     let moved = try Self.optimisticMoveToFolder(msgs: msgs, accountId: accountId, folderPath: folderPath, destinationPath: destinationPath, opType: .move, removeTagsIfLeavingInbox: true, db: db)
                     folderIds.formUnion(moved.folderIds)
                     admission.merge(moved.admission)
+                    deferredSuccessors.append(contentsOf: moved.deferredSuccessors)
                 }
-                return (folderIds, admission)
+                return (folderIds, admission, deferredSuccessors)
             }
             affectedFolderIds = written.folderIds
+            deferredSuccessors = written.deferredSuccessors
             outcome.merge(written.admission)
         } catch {
             print("[Queue] ERROR: move write failed: \(error)")
             affectedFolderIds = []
+            deferredSuccessors = []
             // The transaction rolled back, so NOTHING landed for ANY member —
             // including groups that had already produced a `durablyAdmitted`
             // classification inside the closure (whose return value is
@@ -1150,6 +1395,7 @@ extension AccountManager {
             // (core philosophy §6, exit 2).
             outcome.set(.retainedForRetry, ids: movable.map(\.id))
         }
+        registerDeferredMoveSuccessors(deferredSuccessors)
         Task { @MainActor in
             NotificationCenter.default.post(name: .unreadCountsDidChange, object: nil)
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
@@ -1599,6 +1845,7 @@ extension AccountManager {
         var restoredOriginalHeaderIds: [String] = []
         var affectedFolderIds: Set<String> = []
         var queuedInverse = false
+        var deferredSuccessors: [DeferredMoveSuccessor] = []
     }
 
     /// Compatibility entry point for the existing UI/test call shape. Execution
@@ -1625,22 +1872,10 @@ extension AccountManager {
         )
     }
 
-    /// PORT — v2final's ordinary inverse plus exact whole-bundle
-    /// annihilation, narrowed to provider-native identity. No RFC lookup,
-    /// full-row resurrection, receipt, alias, or recovery lifecycle exists.
-    ///
-    /// An IMAP move that has already reached the provider is reversed as an
-    /// ordinary forward move from the destination, because by the time this
-    /// runs the drain has re-keyed each row to the destination address
-    /// `COPYUID` proved (`MessageHeaderRekey.finishMove`) and
-    /// `UndoService.applyRekeys` has pointed the stacked members at it. The
-    /// inverse is therefore admitted through `admittedOrdinaryActionTargets`
-    /// like any other gesture — a destination UID and positive UIDVALIDITY are
-    /// still independently required, they are simply no longer missing. A
-    /// member `COPYUID` never named is not re-keyed, so its row still carries
-    /// the source address, admission refuses it, and the whole command fails
-    /// closed with no local or durable mutation; sync/delta-sync reconciles
-    /// server truth.
+    /// Restore immediately, as in 1.6.38. A queued forward is annihilated; a
+    /// completed forward gets one ordinary inverse; an in-flight IMAP forward
+    /// records a process-local successor until COPYUID supplies its new UID.
+    /// There is no Message-ID mutation lookup or full-row resurrection.
     @discardableResult
     func undoMove(
         accountId: String,
@@ -1739,6 +1974,27 @@ extension AccountManager {
                 }
                 let annihilate = related.count == 1 && annihilable.count == 1
 
+                // The optimistic row still names the SOURCE UID while the
+                // exact IMAP forward is on the wire. Record the opposite now,
+                // but let the drain's COPYUID result name it. This preserves
+                // 1.6.38's immediate Undo without restoring its Message-ID
+                // search mutation target.
+                if isIMAP,
+                   related.count == 1,
+                   exactPayload(related[0]),
+                   related[0].status == PendingStatus.inFlight.rawValue {
+                    let predecessor = related[0]
+                    return UndoMoveWriteResult(
+                        restoredOriginalHeaderIds: members.map(\.originalHeaderId),
+                        deferredSuccessors: members.map { member in
+                            DeferredMoveSuccessor(
+                                predecessorOperationId: predecessor.id,
+                                predecessorDestinationPath: forwardDestinationPath,
+                                oldHeaderId: member.originalHeaderId,
+                                desiredDestinationPath: sourcePath)
+                        })
+                }
+
                 if annihilate {
                     if isIMAP {
                         guard let epoch = sourceEpoch,
@@ -1785,26 +2041,12 @@ extension AccountManager {
                     ).insert(db)
                 }
 
-                // 🚨 C3 — WHICH EPOCH THE OPTIMISTIC RESTORE MAY WRITE.
-                //
-                // Annihilated, or a stable-id provider: the message never left
-                // its source address (or has one address everywhere), so the
-                // captured source epoch still describes the row and restoring
-                // it is correct.
-                //
-                // A QUEUED IMAP INVERSE is the opposite case, and stamping the
-                // source epoch there would be a wrong-message mutation. That
-                // row now carries the DESTINATION address — the drain re-keyed
-                // its primary key and its `messageId` to the UID `COPYUID`
-                // proved in the destination folder — and this loop only moves
-                // the row's FOLDER back for display. Pairing a destination-space
-                // UID with the source folder's epoch is exactly the shape
-                // `admittedOrdinaryActionTargets` admits, so the user's next
-                // gesture would be issued against whatever message currently
-                // holds that UID in the source folder. Leaving the epoch unread
-                // fails closed instead: an absence of evidence is retryable, and
-                // the inverse move re-keys the row for real when it drains.
-                let restoreSourceEpoch = annihilate || !isIMAP
+                // Undo remains instant, as it was in 1.6.38. For a queued IMAP
+                // inverse the row temporarily carries destination UID + source
+                // folder, so its epoch MUST be nil. The exact queued-opposite
+                // guard above can safely cancel it; every other provider action
+                // remains fail-closed until the inverse re-keys it for real.
+                let restoredEpoch = annihilate || !isIMAP ? sourceEpoch : nil
                 // ⚑ NO REFERENCE — INVENTED: smallest field-level restoration
                 // for v3's exact authenticated row. Preserve every unrelated
                 // field (notably current read/flag state); never `save` a stale
@@ -1815,17 +2057,16 @@ extension AccountManager {
                         Column("folderId").set(to: member.sourceFolderId),
                         Column("folderPath").set(to: member.sourceFolderPath),
                         Column("isInInbox").set(to: member.sourceIsInInbox),
-                        Column("observedUidValidity").set(
-                            to: restoreSourceEpoch ? member.sourceObservedUidValidity : nil),
+                        Column("observedUidValidity").set(to: restoredEpoch),
                         Column("actionTag").set(to: member.sourceActionTag?.rawValue),
                         Column("tagSortOrder").set(to: member.sourceTagSortOrder)
                     )
                 }
 
                 let restoredIds = members.map(\.originalHeaderId)
-                let unreadRestored = currentRows.filter { !$0.isRead }.count
                 let destinationFolderId = MessageIdentity.folderId(
                     accountId: accountId, folderPath: forwardDestinationPath)
+                let unreadRestored = currentRows.filter { !$0.isRead }.count
                 if unreadRestored > 0 {
                     try db.execute(
                         sql: "UPDATE folder SET unreadCount = MAX(0, unreadCount - ?) WHERE id = ?",
@@ -1844,12 +2085,17 @@ extension AccountManager {
             print("[UndoStack] ERROR: undoMove write failed: \(error)")
             return []
         }
-        guard !result.restoredOriginalHeaderIds.isEmpty else { return [] }
-        Task { @MainActor in
-            NotificationCenter.default.post(name: .unreadCountsDidChange, object: nil)
-            NotificationCenter.default.post(name: .inboxDataDidChange, object: result.restoredOriginalHeaderIds)
+        registerDeferredMoveSuccessors(result.deferredSuccessors)
+        if result.deferredSuccessors.isEmpty,
+           !result.restoredOriginalHeaderIds.isEmpty {
+            Task { @MainActor in
+                NotificationCenter.default.post(name: .unreadCountsDidChange, object: nil)
+                NotificationCenter.default.post(
+                    name: .inboxDataDidChange,
+                    object: result.restoredOriginalHeaderIds)
+            }
+            Task { await UnreadCountManager.shared.requestRecount(folderIds: result.affectedFolderIds) }
         }
-        Task { await UnreadCountManager.shared.requestRecount(folderIds: result.affectedFolderIds) }
         if result.queuedInverse { Task { await drainPendingQueue() } }
         return result.restoredOriginalHeaderIds
     }

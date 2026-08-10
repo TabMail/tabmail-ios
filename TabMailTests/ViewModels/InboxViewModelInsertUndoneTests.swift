@@ -196,6 +196,47 @@ struct InboxViewModelInsertUndoneTests {
         #expect(!vm.loadedMessages.contains(where: { $0.id == id }))
     }
 
+    @Test("Undo insertion projects the restored action tag immediately instead of an AI spinner")
+    @MainActor func overlayProjectsRestoredActionTag() async throws {
+        let (pool, inbox, archive, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay()
+        }
+        clearOverlay()
+
+        let id = try insertHeader(
+            pool,
+            messageId: "m-undone-action-tag",
+            folderId: archive.id,
+            folderPath: archive.path,
+            isInInbox: false
+        )
+        let vm = InboxViewModel(folders: [inbox])
+        #expect(!vm.loadedMessages.contains(where: { $0.id == id }))
+
+        // Exact state installed synchronously by UndoService before it posts
+        // `.messagesUndone`: durable row still lives outside Inbox and has no
+        // tag, while the optimistic row belongs in Inbox with its old tag.
+        AccountManager.shared.registerMutation(
+            id: id,
+            mutation: .init(
+                folderId: inbox.id,
+                folderPath: inbox.path,
+                isInInbox: true,
+                actionTag: .some(.delete)
+            )
+        )
+
+        vm.insertUndoneMessages([id])
+
+        let restored = vm.loadedMessages.first { $0.id == id }
+        #expect(restored?.actionTag == .delete)
+        #expect(restored?.tagSortOrder == ActionTag.delete.sortOrder)
+        #expect(restored.flatMap(ActionTagDisplay.displayedTag(for:)) == .delete)
+    }
+
     @Test("Overlay without folderId change → still gated by real folderId")
     @MainActor func overlayWithoutFolderIdChange() async throws {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()

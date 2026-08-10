@@ -202,8 +202,10 @@ struct WriteTierRoutingTests {
             replaceExistingBody: true)
 
         #expect(outcome == .success)
-        #expect(processed != nil)
-        let state = try await AppDatabase.rawPool.read { db -> (MessageBody?, Row?) in
+        if processed == nil {
+            Issue.record("a successful body publication must return its processed row")
+        }
+        let state = try AppDatabase.rawPool.read { db -> (MessageBody?, Row?) in
             let body = try MessageBody.fetchOne(db, key: header.id)
             let row = try Row.fetchOne(
                 db,

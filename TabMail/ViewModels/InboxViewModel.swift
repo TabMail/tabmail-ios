@@ -704,6 +704,15 @@ final class InboxViewModel {
             if let overlayIsRead = overlay[id]?.isRead {
                 header.isRead = overlayIsRead
             }
+            // UndoService restores the pre-move action tag into this same
+            // overlay before posting `.messagesUndone`. Carry it onto the
+            // immediately reinserted row just like the unified reader does;
+            // otherwise the row briefly renders the AI spinner (and has no
+            // tappable action chip) until the deferred DB restore/cache read.
+            if let overlayActionTag = overlay[id]?.actionTag {
+                header.actionTag = overlayActionTag
+                header.tagSortOrder = overlayActionTag?.sortOrder ?? 99
+            }
             // Only insert if the message belongs to a currently displayed folder
             guard folderIds.contains(header.folderId) else { continue }
             // Respect unread filter

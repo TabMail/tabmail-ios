@@ -163,6 +163,9 @@ final class UndoService {
     private(set) var showToast = false
 
     private var dismissTask: Task<Void, Never>?
+    /// Prevents two controls from consuming the same exact top-of-stack offer
+    /// during the short local admission pass. Provider work is never awaited.
+    private var undoInProgressActionID: UUID?
     private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     private init() {}
@@ -301,34 +304,21 @@ final class UndoService {
             hideToast()
             return
         }
-        guard let action = undoStack.popLast() else { return }
+        guard undoInProgressActionID == nil else { return }
+        let actionID = top.id
+        undoInProgressActionID = actionID
+        defer { undoInProgressActionID = nil }
+
+        // Pop the exact action the control displayed BEFORE any suspension.
+        // This is the 1.6.38 behaviour: Undo is an immediate latest-stack
+        // gesture, never a provider-drain waiter that can fall through to an
+        // older action while the newest move is still on the wire.
+        guard let action = undoStack.popLast(), action.id == actionID else {
+            hideToast()
+            return
+        }
 
         let manager = AccountManager.shared
-        let msgIds = action.commands.flatMap { $0.members.map(\.providerMessageId) }
-        let compositeIds = action.commands.flatMap { $0.members.map(\.originalHeaderId) }
-        print("[UndoStack] UNDO type=\(action.type) msgIds=\(msgIds) compositeIds=\(compositeIds) originalFolderId=\(action.originalFolderId) originalFolderPath=\(action.originalFolderPath) stackSize=\(undoStack.count + 1)→\(undoStack.count)")
-        // Dump DB state BEFORE undo
-        for msgId in msgIds {
-            let rows = try? await dbPool.read { db in
-                try MessageHeader
-                    .filter(Column("messageId") == msgId && Column("accountId") == action.accountId)
-                    .fetchAll(db)
-            }
-            let rowSummary = rows?.map { "id=\($0.id) folderId=\($0.folderId) folderPath=\($0.folderPath)" } ?? ["<fetch failed>"]
-            print("[UndoStack] DB state BEFORE undo — msgId=\(msgId) rows=[\(rowSummary.joined(separator: ", "))]")
-        }
-        let pendingBefore = try? await dbPool.read { db in
-            try PendingOperation
-                .filter(Column("accountId") == action.accountId)
-                .fetchAll(db)
-        }
-        let pendingBeforeSummary = pendingBefore?.map { "id=\($0.id.prefix(8)) type=\($0.type.rawValue) status=\($0.status) msgIds=\($0.messageIds) dest=\($0.destinationPath ?? "nil")" } ?? ["<fetch failed>"]
-        print("[UndoStack] PendingOps BEFORE undo — [\(pendingBeforeSummary.joined(separator: ", "))]")
-
-        // PORT — as in v2final's ordinary inverse flow, Undo joins the same
-        // FIFO as the forward gesture instead of racing its not-yet-durable
-        // optimistic write. Register the inverse display immediately, then
-        // authenticate and commit it when its FIFO turn arrives.
         let originalIds = action.commands.flatMap { $0.members.map(\.originalHeaderId) }
         for command in action.commands {
             for member in command.members {
@@ -349,45 +339,35 @@ final class UndoService {
         }
 
         for command in action.commands {
-            await manager.enqueueWrite { [manager, command] in
-                let restoredOriginalIds = await manager.undoMove(
+            // Append behind the gesture's already-admitted local write, but do
+            // not wait for that write or any provider operation to finish.
+            await manager.enqueueWriteAfterPriorAdmissions { [manager, command] in
+                let restoredIds = await manager.undoMove(
                     accountId: command.accountId,
                     forwardDestinationPath: command.forwardDestinationPath,
-                    members: command.members
-                )
+                    members: command.members)
                 for member in command.members {
+                    // An in-flight IMAP outcome took its own extra retain
+                    // before returning. Every other outcome has committed or
+                    // refused, so this release exposes durable state.
                     manager.releaseOverlayEntry(id: member.originalHeaderId)
                 }
-                if restoredOriginalIds.isEmpty {
+                if restoredIds.isEmpty {
                     await MainActor.run {
                         NotificationCenter.default.post(
                             name: .inboxDataDidChange,
-                            object: command.members.map(\.originalHeaderId)
-                        )
+                            object: command.members.map(\.originalHeaderId))
                     }
+                }
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[UndoStack] UNDO admitted action=\(actionID) restored=\(restoredIds.count)")
                 }
             }
         }
 
-        // Dump DB state AFTER undo dispatch
-        for msgId in msgIds {
-            let rows = try? await dbPool.read { db in
-                try MessageHeader
-                    .filter(Column("messageId") == msgId && Column("accountId") == action.accountId)
-                    .fetchAll(db)
-            }
-            let rowSummary = rows?.map { "id=\($0.id) folderId=\($0.folderId) folderPath=\($0.folderPath)" } ?? ["<fetch failed>"]
-            print("[UndoStack] DB state AFTER undo — msgId=\(msgId) rows=[\(rowSummary.joined(separator: ", "))]")
+        if DebugModeManager.isLoggingEnabled() {
+            print("[UndoStack] UNDO displayed action=\(actionID) remainingStack=\(undoStack.count)")
         }
-        let pendingAfter = try? await dbPool.read { db in
-            try PendingOperation
-                .filter(Column("accountId") == action.accountId)
-                .fetchAll(db)
-        }
-        let pendingAfterSummary = pendingAfter?.map { "id=\($0.id.prefix(8)) type=\($0.type.rawValue) status=\($0.status) msgIds=\($0.messageIds) dest=\($0.destinationPath ?? "nil")" } ?? ["<fetch failed>"]
-        print("[UndoStack] PendingOps AFTER undo — [\(pendingAfterSummary.joined(separator: ", "))]")
-
-        print("[UndoStack] posted .messagesUndone for originalIds=\(originalIds) remainingStack=\(undoStack.count)")
 
         // If more items on the stack, refresh the toast timer
         if !undoStack.isEmpty {
