@@ -904,6 +904,10 @@ extension Notification.Name {
     /// Posted when undo restores dismissed messages.
     /// Object is [String] array of message IDs to un-dismiss.
     static let messagesUndone = Notification.Name("messagesUndone")
+    /// Posted after an address-changing provider move has atomically re-keyed
+    /// local rows. Object is `[HeaderRekeyRecord]`; active lists follow the new
+    /// primary key immediately instead of waiting for their debounced reload.
+    static let messageHeadersRekeyed = Notification.Name("messageHeadersRekeyed")
     /// Posted by the NSE merge with just-read staged mail so the inbox can render
     /// it IN-MEMORY without waiting for the durable header write (ADR-IOS-049).
     /// Object is `[StagedInboxRow]`.

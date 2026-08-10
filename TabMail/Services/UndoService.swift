@@ -27,7 +27,7 @@ struct UndoMember: Sendable, Equatable {
     private(set) var providerMessageId: String
     let sourceFolderId: String
     let sourceFolderPath: String
-    let sourceObservedUidValidity: Int?
+    private(set) var sourceObservedUidValidity: Int?
     let sourceIsInInbox: Bool
     let sourceActionTag: ActionTag?
     let sourceTagSortOrder: Int
@@ -84,9 +84,30 @@ struct UndoMember: Sendable, Equatable {
     /// its identity. The whole point of the witness is that it is invariant
     /// across exactly the re-addressing this method performs — re-keying it would
     /// make it agree with whatever now sits at the new address, i.e. destroy it.
-    mutating func rekey(newHeaderId: String, newProviderMessageId: String) {
+    mutating func rekey(
+        accountId: String,
+        newHeaderId: String,
+        newProviderMessageId: String,
+        newObservedUidValidity: Int?
+    ) {
         originalHeaderId = newHeaderId
         providerMessageId = newProviderMessageId
+        // An optimistic inverse deliberately clears the row epoch while it
+        // waits for the provider to assign its source-folder UID. When that
+        // exact inverse later re-keys back into the command's original source,
+        // adopt the corroborated epoch so a subsequent Undo can authenticate
+        // the newly-addressed row. A forward re-key into any other folder must
+        // never rewrite the source witness.
+        let sourceHeaderId = MessageIdentity.headerId(
+            accountId: accountId,
+            folderPath: sourceFolderPath,
+            messageId: newProviderMessageId)
+        if sourceObservedUidValidity == nil,
+           newHeaderId == sourceHeaderId,
+           let newObservedUidValidity,
+           newObservedUidValidity > 0 {
+            sourceObservedUidValidity = newObservedUidValidity
+        }
     }
 }
 
@@ -171,7 +192,12 @@ final class UndoService {
     private var dismissTask: Task<Void, Never>?
     /// Prevents two controls from consuming the same exact top-of-stack offer
     /// during the short local admission pass. Provider work is never awaited.
-    private var undoInProgressActionID: UUID?
+    /// The popped action remains reachable until every local inverse admission
+    /// finishes. A provider re-key can land in that short window; keeping the
+    /// command here lets `applyRekeys` update the exact in-progress address
+    /// instead of leaving the queued closure with a deleted primary key.
+    private var undoInProgressAction: UndoableAction?
+    private var undoInProgressRemainingCommands = 0
     private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     private init() {}
@@ -226,7 +252,7 @@ final class UndoService {
     /// authority for a mutation — `undoMove` re-authenticates the row against
     /// the database before touching anything.
     func applyRekeys(_ records: [HeaderRekeyRecord]) {
-        guard !records.isEmpty, !undoStack.isEmpty else { return }
+        guard !records.isEmpty else { return }
         let byOldId = Dictionary(
             records.map { ($0.oldHeaderId, $0) }, uniquingKeysWith: { first, _ in first })
         for actionIndex in undoStack.indices {
@@ -241,8 +267,10 @@ final class UndoService {
                     let member = undoStack[actionIndex].commands[commandIndex].members[memberIndex]
                     guard let record = byOldId[member.originalHeaderId] else { continue }
                     undoStack[actionIndex].commands[commandIndex].members[memberIndex].rekey(
+                        accountId: undoStack[actionIndex].commands[commandIndex].accountId,
                         newHeaderId: record.newHeaderId,
-                        newProviderMessageId: record.newProviderMessageId)
+                        newProviderMessageId: record.newProviderMessageId,
+                        newObservedUidValidity: record.newObservedUidValidity)
                     // Debug-gated: this witnesses the ordinary drain SUCCESS path
                     // (`AccountManager.publishMoveFinish`), so it fires once per
                     // re-keyed member on every drained move an undo entry names.
@@ -255,6 +283,26 @@ final class UndoService {
                     }
                 }
             }
+        }
+        if var action = undoInProgressAction {
+            for messageIndex in action.messages.indices {
+                guard let record = byOldId[action.messages[messageIndex].id]
+                else { continue }
+                action.messages[messageIndex].id = record.newHeaderId
+                action.messages[messageIndex].messageId = record.newProviderMessageId
+            }
+            for commandIndex in action.commands.indices {
+                for memberIndex in action.commands[commandIndex].members.indices {
+                    let member = action.commands[commandIndex].members[memberIndex]
+                    guard let record = byOldId[member.originalHeaderId] else { continue }
+                    action.commands[commandIndex].members[memberIndex].rekey(
+                        accountId: action.commands[commandIndex].accountId,
+                        newHeaderId: record.newHeaderId,
+                        newProviderMessageId: record.newProviderMessageId,
+                        newObservedUidValidity: record.newObservedUidValidity)
+                }
+            }
+            undoInProgressAction = action
         }
     }
 
@@ -325,10 +373,8 @@ final class UndoService {
             hideToast()
             return
         }
-        guard undoInProgressActionID == nil else { return }
+        guard undoInProgressAction == nil else { return }
         let actionID = top.id
-        undoInProgressActionID = actionID
-        defer { undoInProgressActionID = nil }
 
         // Pop the exact action the control displayed BEFORE any suspension.
         // This is the 1.6.38 behaviour: Undo is an immediate latest-stack
@@ -336,6 +382,12 @@ final class UndoService {
         // older action while the newest move is still on the wire.
         guard let action = undoStack.popLast(), action.id == actionID else {
             hideToast()
+            return
+        }
+        undoInProgressAction = action
+        undoInProgressRemainingCommands = action.commands.count
+        if action.commands.isEmpty {
+            undoInProgressAction = nil
             return
         }
 
@@ -359,15 +411,25 @@ final class UndoService {
             NotificationCenter.default.post(name: .messagesUndone, object: originalIds)
         }
 
-        for command in action.commands {
+        for (commandIndex, initialCommand) in action.commands.enumerated() {
             // Append behind the gesture's already-admitted local write, but do
             // not wait for that write or any provider operation to finish.
-            await manager.enqueueWriteAfterPriorAdmissions { [manager, command] in
+            await manager.enqueueWriteAfterPriorAdmissions { [manager] in
+                guard let command = await MainActor.run(body: {
+                    UndoService.shared.inProgressCommand(
+                        actionID: actionID,
+                        commandIndex: commandIndex)
+                }) else {
+                    await MainActor.run {
+                        UndoService.shared.finishInProgressCommand(actionID: actionID)
+                    }
+                    return
+                }
                 let restoredIds = await manager.undoMove(
                     accountId: command.accountId,
                     forwardDestinationPath: command.forwardDestinationPath,
                     members: command.members)
-                for member in command.members {
+                for member in initialCommand.members {
                     // An in-flight IMAP outcome took its own extra retain
                     // before returning. Every other outcome has committed or
                     // refused, so this release exposes durable state.
@@ -379,6 +441,9 @@ final class UndoService {
                             name: .inboxDataDidChange,
                             object: command.members.map(\.originalHeaderId))
                     }
+                }
+                await MainActor.run {
+                    UndoService.shared.finishInProgressCommand(actionID: actionID)
                 }
                 if DebugModeManager.isLoggingEnabled() {
                     print("[UndoStack] UNDO admitted action=\(actionID) restored=\(restoredIds.count)")
@@ -395,6 +460,26 @@ final class UndoService {
             showToastWithTimer()
         } else {
             hideToast()
+        }
+    }
+
+    private func inProgressCommand(
+        actionID: UUID,
+        commandIndex: Int
+    ) -> UndoAccountCommand? {
+        guard let action = undoInProgressAction,
+              action.id == actionID,
+              action.commands.indices.contains(commandIndex)
+        else { return nil }
+        return action.commands[commandIndex]
+    }
+
+    private func finishInProgressCommand(actionID: UUID) {
+        guard undoInProgressAction?.id == actionID else { return }
+        undoInProgressRemainingCommands -= 1
+        if undoInProgressRemainingCommands <= 0 {
+            undoInProgressRemainingCommands = 0
+            undoInProgressAction = nil
         }
     }
 

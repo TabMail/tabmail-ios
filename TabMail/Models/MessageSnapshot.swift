@@ -9,10 +9,10 @@ import Foundation
 /// useful for the inbox list: they hold only the fields the list row needs
 /// and support in-place mutation (optimistic UI) without touching the database.
 struct MessageSnapshot: Identifiable, Hashable, Sendable {
-    let id: String
+    var id: String
     let accountId: String
-    let messageId: String
-    let observedUidValidity: Int?
+    var messageId: String
+    var observedUidValidity: Int?
     let threadId: String?
     // var (not let): reloadMessages' Pass-1 retains an existing NON-EMPTY
     // computedThreadId when a same-identity fresh row arrives with an EMPTY

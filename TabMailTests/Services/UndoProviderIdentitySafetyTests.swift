@@ -427,6 +427,68 @@ struct UndoProviderIdentitySafetyTests {
         #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 0)
     }
 
+    @Test("Undo of a Delete waiting behind move-back cancels that deferred Delete")
+    @MainActor
+    func undoCancelsDeleteDeferredBehindMoveBack() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        let manager = AccountManager.shared
+        await manager.clearDeferredMoveSuccessorsForTesting()
+
+        // Exact slow-iCloud shape from logmain.log: the first Undo has already
+        // restored the row optimistically to Inbox, while its Trash → Inbox
+        // provider move is still in flight and the row still carries Trash's
+        // UID/address. A new Delete therefore becomes a deferred successor.
+        var row = sourceHeader(
+            fixture, providerId: "901", rfc: "move@example.com",
+            sourcePath: "Trash", sourceEpoch: nil)
+        row.folderId = MessageIdentity.folderId(
+            accountId: fixture.accountId, folderPath: "INBOX")
+        row.folderPath = "INBOX"
+        row.isInInbox = true
+        let insertedRow = row
+        try await fixture.pool.write { db in try insertedRow.insert(db) }
+        let moveBack = try await insertInFlightMove(
+            fixture, messageIds: ["901"], from: "Trash", to: "INBOX", epoch: 74)
+
+        let deletion = await manager.move([insertedRow], to: "Trash")
+        #expect(deletion.pendingIds == [insertedRow.id])
+        #expect(await manager.deferredMoveSuccessorCountForTesting() == 1)
+
+        let restored = await manager.undoMove(
+            accountId: fixture.accountId,
+            forwardDestinationPath: "Trash",
+            members: [UndoMember(header: insertedRow)])
+
+        #expect(restored == [insertedRow.id])
+        #expect(await manager.deferredMoveSuccessorCountForTesting() == 0)
+        let beforeProviderFinishes = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: insertedRow.id),
+             try PendingOperation.fetchAll(db))
+        }
+        #expect(beforeProviderFinishes.0?.folderPath == "INBOX")
+        #expect(beforeProviderFinishes.1.map(\.id) == [moveBack.id],
+                "Undo cancels the waiting Delete; it must not queue a third move")
+
+        // When the already-sent move-back later completes, there is no deferred
+        // Delete left to materialize, so the restored message stays restored.
+        let result = try await finishMove(
+            fixture, operation: moveBack, sourceId: "901",
+            destinationId: "102", destinationEpoch: 41)
+        await manager.materializeDeferredMoveSuccessors(
+            after: moveBack, result: result)
+        await manager.awaitWriteQueueDrain()
+
+        let inboxHeaderId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "INBOX", messageId: "102")
+        let settled = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: inboxHeaderId),
+             try PendingOperation.fetchAll(db))
+        }
+        #expect(settled.0?.folderPath == "INBOX")
+        #expect(settled.1.isEmpty)
+    }
+
     @Test("Undo annihilates only an exact never-attempted provider-ID move and restores the exact local member")
     @MainActor
     func exactNeverAttemptedAnnihilation() async throws {

@@ -923,6 +923,74 @@ struct QueueCoreInvariantTests {
         #expect(AccountManager.shared.snapshotOverlay()[latest.id] == nil)
     }
 
+    @Test("a provider re-key after Undo pops its action updates the queued inverse")
+    @MainActor
+    func providerRekeyUpdatesPoppedUndoBeforeInverseAdmission() async throws {
+        let fixture = try fixture(accountId: "acc-undo-rekey-in-progress")
+        defer { finish(fixture) }
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        let source = try seedHeader(
+            fixture, messageId: "77", folderPath: "INBOX", epoch: 42)
+        UndoService.shared.push(UndoableAction(
+            type: .move(fromPath: "INBOX", toPath: "Archive"),
+            messages: [source], originalFolderId: source.folderId,
+            originalFolderPath: "INBOX", accountId: fixture.accountId,
+            timestamp: Date()))
+
+        // The forward gesture has committed its optimistic local address, but
+        // the provider has not yet published the destination UID.
+        _ = try await fixture.pool.writeWithoutTransaction { db in
+            try MessageHeader.filter(Column("id") == source.id).updateAll(
+                db,
+                Column("folderId").set(to: MessageIdentity.folderId(
+                    accountId: fixture.accountId, folderPath: "Archive")),
+                Column("folderPath").set(to: "Archive"),
+                Column("isInInbox").set(to: false),
+                Column("observedUidValidity").set(to: nil as Int?))
+        }
+
+        // Hold the local-write FIFO after Undo pops the action but before its
+        // inverse admission reads the command.
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        defer { gate.finish() }
+        await AccountManager.shared.enqueueWrite {
+            var iterator = gateStream.makeAsyncIterator()
+            _ = await iterator.next()
+        }
+        await UndoService.shared.undo()
+        #expect(UndoService.shared.undoStack.isEmpty)
+
+        let forward = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive",
+            observedUidValidity: 42)
+        let finishResult = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                forward,
+                destinations: [ProvenDestinationAddress(
+                    sourceProviderId: "77",
+                    destinationProviderId: "5",
+                    destinationUidValidity: 42)],
+                addressChangesOnMove: true,
+                db: db)
+        }
+        #expect(finishResult.applied.count == 1)
+        UndoService.shared.applyRekeys(finishResult.applied)
+
+        gate.finish()
+        await AccountManager.shared.awaitWriteQueueDrain()
+
+        let inverse = try await fixture.pool.read { db in
+            try PendingOperation.fetchAll(db)
+        }
+        #expect(inverse.count == 1)
+        #expect(inverse.first?.messageIds == ["5"])
+        #expect(inverse.first?.folderPath == "Archive")
+        #expect(inverse.first?.destinationPath == "INBOX")
+    }
+
     // MARK: - Test-local timings
     //
     // Only the RED direction depends on these being generous enough for a small

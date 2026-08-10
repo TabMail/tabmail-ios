@@ -1276,6 +1276,11 @@ extension AccountManager {
             // this re-key just changed, so it has to follow — otherwise
             // finishing the move would break undo rather than enable it.
             await UndoService.shared.applyRekeys(applied)
+            await MainActor.run {
+                NotificationCenter.default.post(
+                    name: .messageHeadersRekeyed,
+                    object: applied)
+            }
             // Persisted chat pills name messages by that same mutable primary key.
             // Keep their numeric identity stable across the move; otherwise a
             // cached discussion still renders its baked subject but tapping it

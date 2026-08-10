@@ -48,6 +48,45 @@ enum InboxErrorBanner {
     }
 }
 
+/// Keeps the already-large InboxView modifier chain below Swift's type-check
+/// limit while applying provider-proven primary-key changes atomically to the
+/// list and its view-local identity sets.
+private struct HeaderRekeyReceiver: ViewModifier {
+    let viewModel: InboxViewModel
+    @Binding var dismissedMessages: Set<String>
+    @Binding var swipeFadingMessages: Set<String>
+    @Binding var selectedMessageId: String?
+    @Binding var pushedMessageId: String?
+
+    func body(content: Content) -> some View {
+        content.onReceive(
+            NotificationCenter.default.publisher(for: .messageHeadersRekeyed)
+                .receive(on: DispatchQueue.main)
+        ) { notification in
+            handle(notification)
+        }
+    }
+
+    private func handle(_ notification: Notification) {
+        guard let records = notification.object as? [HeaderRekeyRecord],
+              !records.isEmpty else { return }
+        dismissedMessages = InboxViewModel.rekeyedHeaderIDs(
+            dismissedMessages, using: records)
+        swipeFadingMessages = InboxViewModel.rekeyedHeaderIDs(
+            swipeFadingMessages, using: records)
+        let byOldId = Dictionary(
+            records.map { ($0.oldHeaderId, $0.newHeaderId) },
+            uniquingKeysWith: { first, _ in first })
+        if let selectedMessageId, let newId = byOldId[selectedMessageId] {
+            self.selectedMessageId = newId
+        }
+        if let pushedMessageId, let newId = byOldId[pushedMessageId] {
+            self.pushedMessageId = newId
+        }
+        viewModel.applyHeaderRekeys(records)
+    }
+}
+
 struct InboxView: View {
     let title: String
     let folders: [Folder]
@@ -743,6 +782,12 @@ struct InboxView: View {
                 }
             }
         }
+        .modifier(HeaderRekeyReceiver(
+            viewModel: viewModel,
+            dismissedMessages: $dismissedMessages,
+            swipeFadingMessages: $swipeFadingMessages,
+            selectedMessageId: $selectedMessageId,
+            pushedMessageId: $pushedMessageId))
         .onDisappear {
             let detailPushed: Bool = selectedMessageId != nil || pushedMessageId != nil
             BackgroundSyncLogger.logInbox("[\(viewModel.instanceTag)] InboxView.onDisappear sideButtonsReady=\(sideButtonsReady) chatExpanded=\(chatExpanded) selection=\(String(describing: selection)) detailPushed=\(detailPushed)")

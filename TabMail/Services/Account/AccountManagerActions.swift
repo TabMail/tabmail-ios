@@ -1903,6 +1903,29 @@ extension AccountManager {
             return []
         }
         let sourceEpoch = members[0].sourceObservedUidValidity
+        // The forward gesture can itself be a process-local successor waiting
+        // behind an in-flight opposite move. Undoing that newest gesture means
+        // cancelling the successor, not trying to move the still-source row
+        // from a destination address it has not received yet. The synchronous
+        // admission ledger guarantees the gesture's move closure has already
+        // registered this successor before the inverse closure reaches here.
+        // This is exact and whole-command: every member must name a successor
+        // whose current desired destination is the forward destination and
+        // whose predecessor already leaves the message in the undo source.
+        let memberHeaderIds = Set(members.map(\.originalHeaderId))
+        if memberHeaderIds.count == members.count,
+           members.allSatisfy({ member in
+               guard let successor = deferredMoveSuccessors[member.originalHeaderId]
+               else { return false }
+               return successor.desiredDestinationPath == forwardDestinationPath
+                   && successor.predecessorDestinationPath == sourcePath
+           }) {
+            let cancelled = coalesceDeferredMoves(
+                headerIds: memberHeaderIds,
+                destinationPath: sourcePath)
+            guard cancelled.ids == memberHeaderIds else { return [] }
+            return members.map(\.originalHeaderId)
+        }
 
         let result: UndoMoveWriteResult
         do {

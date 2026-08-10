@@ -94,6 +94,21 @@ struct HeaderRekeyRecord: Sendable, Equatable {
     let oldHeaderId: String
     let newHeaderId: String
     let newProviderMessageId: String
+    /// Destination-folder epoch proven by the provider and corroborated by
+    /// the local folder row. `nil` means no safe epoch was available.
+    let newObservedUidValidity: Int?
+
+    init(
+        oldHeaderId: String,
+        newHeaderId: String,
+        newProviderMessageId: String,
+        newObservedUidValidity: Int? = nil
+    ) {
+        self.oldHeaderId = oldHeaderId
+        self.newHeaderId = newHeaderId
+        self.newProviderMessageId = newProviderMessageId
+        self.newObservedUidValidity = newObservedUidValidity
+    }
 }
 
 /// Every local disposition produced while retiring an address-changing move.
@@ -490,7 +505,8 @@ enum MessageHeaderRekey {
             }
             result.applied.append(HeaderRekeyRecord(
                 oldHeaderId: oldId, newHeaderId: newId,
-                newProviderMessageId: newMessageId))
+                newProviderMessageId: newMessageId,
+                newObservedUidValidity: migrated.observedUidValidity))
         }
         return result
     }

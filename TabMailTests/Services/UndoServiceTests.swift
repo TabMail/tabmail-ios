@@ -54,6 +54,45 @@ private func makeMoveAction(
     )
 }
 
+@Suite("Undo member provider re-key")
+struct UndoMemberProviderRekeyTests {
+    @Test("A proven return to the original source promotes its previously unknown epoch")
+    func returnToSourcePromotesEpoch() {
+        var optimistic = makeHeader(
+            messageId: "901", accountId: "acc1", folderPath: "INBOX")
+        optimistic.id = MessageIdentity.headerId(
+            accountId: "acc1", folderPath: "Trash", messageId: "901")
+        optimistic.observedUidValidity = nil
+        var member = UndoMember(header: optimistic)
+
+        member.rekey(
+            accountId: "acc1",
+            newHeaderId: MessageIdentity.headerId(
+                accountId: "acc1", folderPath: "INBOX", messageId: "102"),
+            newProviderMessageId: "102",
+            newObservedUidValidity: 41)
+
+        #expect(member.originalHeaderId == "acc1:INBOX:102")
+        #expect(member.providerMessageId == "102")
+        #expect(member.sourceObservedUidValidity == 41)
+    }
+
+    @Test("A forward re-key into another folder never rewrites the source epoch")
+    func forwardRekeyDoesNotPromoteSourceEpoch() {
+        var member = UndoMember(header: makeHeader(
+            messageId: "101", accountId: "acc1", folderPath: "INBOX"))
+
+        member.rekey(
+            accountId: "acc1",
+            newHeaderId: MessageIdentity.headerId(
+                accountId: "acc1", folderPath: "Trash", messageId: "901"),
+            newProviderMessageId: "901",
+            newObservedUidValidity: 74)
+
+        #expect(member.sourceObservedUidValidity == nil)
+    }
+}
+
 // MARK: - Undo Stack Logic Tests (Test Double)
 
 /// Tests the push/pop/eviction stack logic by replicating UndoService's algorithm

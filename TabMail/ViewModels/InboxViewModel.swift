@@ -332,6 +332,50 @@ final class InboxViewModel {
         }?.toMessageHeader()
     }
 
+    /// Follow a provider-proven address change immediately in the active list.
+    /// The durable row has already moved to `newHeaderId`; waiting for the
+    /// ordinary 500ms reload leaves the visible snapshot naming the deleted old
+    /// primary key, so a second gesture during that window resolves nothing and
+    /// appears to be ignored. This changes identity fields only; all visual
+    /// content remains the snapshot the user is already looking at until the
+    /// normal reload reconciles it.
+    func applyHeaderRekeys(_ records: [HeaderRekeyRecord]) {
+        guard !records.isEmpty else { return }
+        let byOldId = Dictionary(
+            records.map { ($0.oldHeaderId, $0) },
+            uniquingKeysWith: { first, _ in first })
+        var changed = false
+        for index in loadedMessages.indices {
+            guard let record = byOldId[loadedMessages[index].id] else { continue }
+            loadedMessages[index].id = record.newHeaderId
+            loadedMessages[index].messageId = record.newProviderMessageId
+            loadedMessages[index].observedUidValidity = record.newObservedUidValidity
+            changed = true
+        }
+        guard changed else { return }
+
+        loadedIds = Self.rekeyedHeaderIDs(loadedIds, using: records)
+        snippetQueue = Self.rekeyedHeaderIDs(snippetQueue, using: records)
+        snippetInFlight = Self.rekeyedHeaderIDs(snippetInFlight, using: records)
+        snippetFailed = Self.rekeyedHeaderIDs(snippetFailed, using: records)
+        pendingAIBatch = Self.rekeyedHeaderIDs(pendingAIBatch, using: records)
+        rebuildDisplayGroups()
+    }
+
+    /// Rekey view-local identity sets with the same provider-proven mapping as
+    /// the snapshots. Used by `InboxView` for dismissed/fading rows too, so a
+    /// forward move stays hidden after its primary key changes while an undone
+    /// visible row remains actionable under the new key.
+    nonisolated static func rekeyedHeaderIDs(
+        _ ids: Set<String>,
+        using records: [HeaderRekeyRecord]
+    ) -> Set<String> {
+        let byOldId = Dictionary(
+            records.map { ($0.oldHeaderId, $0.newHeaderId) },
+            uniquingKeysWith: { first, _ in first })
+        return Set(ids.map { byOldId[$0] ?? $0 })
+    }
+
     /// Undo snapshots must capture the VISUALIZED state (act-on-visualized-state
     /// rule): a queued intent cycle's isRead/isFlagged/actionTag exist only in the
     /// overlay until the FIFO drains, and a DB-fresh row predates them — an undo

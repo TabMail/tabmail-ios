@@ -273,4 +273,52 @@ struct InboxViewModelInsertUndoneTests {
 
         #expect(!vm.loadedMessages.contains(where: { $0.id == id }))
     }
+
+    @Test("Provider re-key immediately updates the visible row and dismissed identity")
+    @MainActor func providerRekeyKeepsVisibleRowActionable() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay()
+        }
+        clearOverlay()
+
+        let oldId = try insertHeader(
+            pool,
+            messageId: "101",
+            folderId: inbox.id,
+            folderPath: inbox.path,
+            isInInbox: true)
+        let vm = InboxViewModel(folders: [inbox])
+        #expect(vm.loadedMessages.contains { $0.id == oldId })
+
+        let newId = MessageIdentity.headerId(
+            accountId: "acc1", folderPath: inbox.path, messageId: "102")
+        try await pool.write { db in
+            var row = try MessageHeader.fetchOne(db, key: oldId)!
+            _ = try row.delete(db)
+            row.id = newId
+            row.messageId = "102"
+            row.observedUidValidity = 41
+            try row.insert(db)
+        }
+        let record = HeaderRekeyRecord(
+            oldHeaderId: oldId,
+            newHeaderId: newId,
+            newProviderMessageId: "102",
+            newObservedUidValidity: 41)
+
+        vm.applyHeaderRekeys([record])
+
+        #expect(!vm.loadedMessages.contains { $0.id == oldId })
+        #expect(vm.loadedMessages.contains {
+            $0.id == newId && $0.messageId == "102" && $0.observedUidValidity == 41
+        })
+        #expect(vm.lookupMessage(newId)?.id == newId,
+                "a second Delete now resolves the provider-proven row immediately")
+        #expect(InboxViewModel.rekeyedHeaderIDs([oldId, "unrelated"], using: [record])
+            == [newId, "unrelated"],
+            "dismissed/fading sets must follow the same key so hidden moves stay hidden")
+    }
 }
