@@ -281,8 +281,10 @@ struct InboxViewModelInsertUndoneTests {
             AppDatabase.shared.withLock { $0 = previous }
             TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay()
+            MessageHeaderRekey.clearAddressHandoffsForTesting()
         }
         clearOverlay()
+        MessageHeaderRekey.clearAddressHandoffsForTesting()
 
         let oldId = try insertHeader(
             pool,
@@ -295,6 +297,11 @@ struct InboxViewModelInsertUndoneTests {
 
         let newId = MessageIdentity.headerId(
             accountId: "acc1", folderPath: inbox.path, messageId: "102")
+        let record = HeaderRekeyRecord(
+            oldHeaderId: oldId,
+            newHeaderId: newId,
+            newProviderMessageId: "102",
+            newObservedUidValidity: 41)
         try await pool.write { db in
             var row = try MessageHeader.fetchOne(db, key: oldId)!
             _ = try row.delete(db)
@@ -302,13 +309,11 @@ struct InboxViewModelInsertUndoneTests {
             row.messageId = "102"
             row.observedUidValidity = 41
             try row.insert(db)
+            MessageHeaderRekey.publishAddressHandoffsAfterCommit([record], in: db)
         }
-        let record = HeaderRekeyRecord(
-            oldHeaderId: oldId,
-            newHeaderId: newId,
-            newProviderMessageId: "102",
-            newObservedUidValidity: 41)
 
+        #expect(vm.lookupMessage(oldId)?.id == newId,
+                "the provider handoff must be visible before slower mirror publication")
         vm.applyHeaderRekeys([record])
 
         #expect(!vm.loadedMessages.contains { $0.id == oldId })

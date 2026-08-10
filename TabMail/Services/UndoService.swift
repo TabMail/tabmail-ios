@@ -251,7 +251,15 @@ final class UndoService {
     /// thing that consumes it. Nothing here is persisted, and nothing here is
     /// authority for a mutation — `undoMove` re-authenticates the row against
     /// the database before touching anything.
-    func applyRekeys(_ records: [HeaderRekeyRecord]) {
+    ///
+    /// `preservedIds` is the one ordering exception: an Undo that has already
+    /// entered the local FIFO may need its old key long enough to cancel a
+    /// deferred successor still stored under that key. Only the in-progress
+    /// action is preserved; every stacked action follows the rekey normally.
+    func applyRekeys(
+        _ records: [HeaderRekeyRecord],
+        preservingInProgressMemberIds preservedIds: Set<String> = []
+    ) {
         guard !records.isEmpty else { return }
         let byOldId = Dictionary(
             records.map { ($0.oldHeaderId, $0) }, uniquingKeysWith: { first, _ in first })
@@ -286,6 +294,7 @@ final class UndoService {
         }
         if var action = undoInProgressAction {
             for messageIndex in action.messages.indices {
+                guard !preservedIds.contains(action.messages[messageIndex].id) else { continue }
                 guard let record = byOldId[action.messages[messageIndex].id]
                 else { continue }
                 action.messages[messageIndex].id = record.newHeaderId
@@ -294,6 +303,7 @@ final class UndoService {
             for commandIndex in action.commands.indices {
                 for memberIndex in action.commands[commandIndex].members.indices {
                     let member = action.commands[commandIndex].members[memberIndex]
+                    guard !preservedIds.contains(member.originalHeaderId) else { continue }
                     guard let record = byOldId[member.originalHeaderId] else { continue }
                     action.commands[commandIndex].members[memberIndex].rekey(
                         accountId: action.commands[commandIndex].accountId,
@@ -405,6 +415,13 @@ final class UndoService {
                         actionTag: .some(member.sourceActionTag)
                     )
                 )
+                BackgroundSyncLogger.logInbox(
+                    "[RoleActionTrace] undo phase=overlayRecorded "
+                        + "action=\(actionID.uuidString) "
+                        + "id=\(member.originalHeaderId) "
+                        + "source=\(member.sourceFolderPath) "
+                        + manager.roleActionOverlayDiagnostic(
+                            id: member.originalHeaderId))
             }
         }
         if !originalIds.isEmpty {
@@ -425,15 +442,39 @@ final class UndoService {
                     }
                     return
                 }
+                for member in command.members {
+                    BackgroundSyncLogger.logInbox(
+                        "[RoleActionTrace] undo phase=queuedClosure.begin "
+                            + "action=\(actionID.uuidString) "
+                            + "id=\(member.originalHeaderId) "
+                            + "forwardDestination=\(command.forwardDestinationPath) "
+                            + manager.roleActionOverlayDiagnostic(
+                                id: member.originalHeaderId))
+                }
                 let restoredIds = await manager.undoMove(
                     accountId: command.accountId,
                     forwardDestinationPath: command.forwardDestinationPath,
                     members: command.members)
+                for member in command.members {
+                    BackgroundSyncLogger.logInbox(
+                        "[RoleActionTrace] undo phase=undoMove.returned "
+                            + "action=\(actionID.uuidString) "
+                            + "id=\(member.originalHeaderId) "
+                            + "restored=\(restoredIds.contains(member.originalHeaderId)) "
+                            + manager.roleActionOverlayDiagnostic(
+                                id: member.originalHeaderId))
+                }
                 for member in initialCommand.members {
                     // An in-flight IMAP outcome took its own extra retain
                     // before returning. Every other outcome has committed or
                     // refused, so this release exposes durable state.
                     manager.releaseOverlayEntry(id: member.originalHeaderId)
+                    BackgroundSyncLogger.logInbox(
+                        "[RoleActionTrace] undo phase=initialRetainReleased "
+                            + "action=\(actionID.uuidString) "
+                            + "id=\(member.originalHeaderId) "
+                            + manager.roleActionOverlayDiagnostic(
+                                id: member.originalHeaderId))
                 }
                 if restoredIds.isEmpty {
                     await MainActor.run {

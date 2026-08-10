@@ -59,9 +59,11 @@ private struct HeaderRekeyReceiver: ViewModifier {
     @Binding var pushedMessageId: String?
 
     func body(content: Content) -> some View {
+        // `publishMoveFinish` posts this notification from MainActor. Keep
+        // delivery synchronous: hopping back onto the same queue lets an
+        // already-enqueued gesture run against the deleted pre-COPYUID key.
         content.onReceive(
             NotificationCenter.default.publisher(for: .messageHeadersRekeyed)
-                .receive(on: DispatchQueue.main)
         ) { notification in
             handle(notification)
         }
@@ -1431,6 +1433,25 @@ struct InboxView: View {
 
     // MARK: - Dismiss animation helpers
 
+    private func logDeleteGestureReceived(
+        _ snapshot: MessageSnapshot,
+        surface: String,
+        fadingBefore: Bool? = nil
+    ) {
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] view action=delete surface=\(surface) "
+                + "phase=received id=\(snapshot.id)")
+        let fading = fadingBefore.map { String($0) } ?? "n/a"
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] view action=delete phase=receivedState "
+                + "id=\(snapshot.id) isInInbox=\(snapshot.isInInbox)")
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] view action=delete phase=receivedState "
+                + "id=\(snapshot.id) "
+                + "dismissedBefore=\(dismissedMessages.contains(snapshot.id)) "
+                + "fadingBefore=\(fading)")
+    }
+
     private func dismissAndArchive(_ snapshot: MessageSnapshot, markRead: Bool = false, expandedGroup: ThreadGroup? = nil) {
         // Archive-from-Archive is a no-op — never hide the row.
         guard !viewModel.archiveIsNoOp(snapshot.id) else {
@@ -1463,18 +1484,28 @@ struct InboxView: View {
     }
 
     private func dismissAndDelete(_ snapshot: MessageSnapshot, markRead: Bool = false, expandedGroup: ThreadGroup? = nil) {
+        logDeleteGestureReceived(snapshot, surface: "tap")
         // Delete-from-Trash is a no-op — never hide the row.
         guard !viewModel.deleteIsNoOp(snapshot.id) else {
             BackgroundSyncLogger.logInbox("[NoOpGuard] dismissAndDelete suppressed — already in trash: \(snapshot.id)")
             return
         }
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] view action=delete surface=tap phase=guardPassed "
+                + "id=\(snapshot.id)")
         withAnimation(.easeIn(duration: 0.25)) {
             _ = dismissedMessages.insert(snapshot.id)
         }
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] view action=delete surface=tap phase=hidden "
+                + "id=\(snapshot.id) dismissedNow=\(dismissedMessages.contains(snapshot.id))")
         // Defer model mutations to next run-loop tick so the DB write doesn't
         // trigger a non-animated view invalidation that swallows the dismiss
         // animation of a consecutively-tapped message.
         Task { @MainActor in
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] view action=delete surface=tap phase=taskBegin "
+                    + "id=\(snapshot.id)")
             if let group = expandedGroup {
                 withAnimation(.easeInOut(duration: 0.25)) {
                     viewModel.evictAndRebuild(snapshot.id, collapseThread: group.id)
@@ -1485,10 +1516,17 @@ struct InboxView: View {
             // folder for this account, or a draft whose provider-addressed
             // cleanup failed closed) — un-hide the row rather than let it
             // vanish forever with no undo entry.
-            if !(await viewModel.delete(snapshot.id)) {
+            let recorded = await viewModel.delete(snapshot.id)
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] view action=delete surface=tap phase=vmReturned "
+                    + "id=\(snapshot.id) recorded=\(recorded)")
+            if !recorded {
                 withAnimation(.easeOut(duration: 0.35)) {
                     _ = dismissedMessages.remove(snapshot.id)
                 }
+                BackgroundSyncLogger.logInbox(
+                    "[RoleActionTrace] view action=delete surface=tap phase=unhidden "
+                        + "id=\(snapshot.id) reason=admissionRefused")
             }
         }
     }
@@ -1709,11 +1747,17 @@ struct InboxView: View {
     }
 
     private func swipeAndDelete(_ snapshot: MessageSnapshot, expandedGroup: ThreadGroup? = nil) {
+        logDeleteGestureReceived(
+            snapshot, surface: "swipe",
+            fadingBefore: swipeFadingMessages.contains(snapshot.id))
         // Delete-from-Trash is a no-op — never hide the row.
         guard !viewModel.deleteIsNoOp(snapshot.id) else {
             BackgroundSyncLogger.logInbox("[NoOpGuard] swipeAndDelete suppressed — already in trash: \(snapshot.id)")
             return
         }
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] view action=delete surface=swipe phase=guardPassed "
+                + "id=\(snapshot.id)")
 
         viewModel.beginInteraction()
         swipeFadingMessages.insert(snapshot.id)
@@ -1729,11 +1773,18 @@ struct InboxView: View {
             // delete() returns false when nothing was recorded — un-hide the
             // row (both dismissedMessages and swipeFadingMessages) rather
             // than let it vanish forever with no undo entry.
-            if !(await viewModel.delete(snapshot.id)) {
+            let recorded = await viewModel.delete(snapshot.id)
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] view action=delete surface=swipe phase=vmReturned "
+                    + "id=\(snapshot.id) recorded=\(recorded)")
+            if !recorded {
                 withAnimation(.easeOut(duration: 0.35)) {
                     dismissedMessages.remove(snapshot.id)
                     swipeFadingMessages.remove(snapshot.id)
                 }
+                BackgroundSyncLogger.logInbox(
+                    "[RoleActionTrace] view action=delete surface=swipe phase=unhidden "
+                        + "id=\(snapshot.id) reason=admissionRefused")
             }
             viewModel.endInteraction()
         }

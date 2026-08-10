@@ -1623,10 +1623,27 @@ final class MessageDetailViewModel {
     /// message is already in it) — callers must not dismiss/flash in that case.
     @discardableResult
     func deleteMessage(_ msg: MessageHeader) -> Bool {
+        if DebugModeManager.isLoggingEnabled() {
+            var effective = msg
+            applyOverlay(to: &effective)
+            let rawRole = lookupFolderRole(msg.folderId)?.rawValue ?? "<unknown>"
+            let effectiveRole = lookupFolderRole(effective.folderId)?.rawValue
+                ?? "<unknown>"
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] detail action=delete phase=received id=\(msg.id) "
+                    + "raw={folderId=\(msg.folderId) folderPath=\(msg.folderPath) role=\(rawRole)} "
+                    + "effective={folderId=\(effective.folderId) "
+                    + "folderPath=\(effective.folderPath) role=\(effectiveRole)} "
+                    + manager.roleActionOverlayDiagnostic(id: msg.id))
+        }
         AccountManager.logDeleteTrace(accountId: msg.accountId, messages: [msg], callSite: "MessageDetailViewModel.deleteMessage")
         // Delete-from-Trash is a no-op: no undo entry, no overlay, no queued
         // move. Role check first — see archiveMessage for why.
         guard lookupFolderRole(msg.folderId) != .trash else {
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] detail action=delete phase=refused "
+                    + "id=\(msg.id) reason=rawRole "
+                    + manager.roleActionOverlayDiagnostic(id: msg.id))
             BackgroundSyncLogger.logInbox("[NoOpGuard] detail deleteMessage suppressed — already in trash: \(msg.id)")
             return false
         }
@@ -1635,6 +1652,10 @@ final class MessageDetailViewModel {
             return false
         }
         guard msg.folderPath != trashFolder.path else { return false }
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] detail action=delete phase=record "
+                + "id=\(msg.id) source=\(msg.folderPath) "
+                + "destination=\(trashFolder.path)")
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: msg.folderPath, toPath: trashFolder.path), messages: [msg],
             originalFolderId: msg.folderId,
@@ -1649,6 +1670,10 @@ final class MessageDetailViewModel {
             isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
             folderId: trashFolder.id,
             actionTag: msg.isInInbox ? .some(nil) : nil))
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] detail action=delete phase=overlayRecorded "
+                + "id=\(msg.id) "
+                + manager.roleActionOverlayDiagnostic(id: msg.id))
         markReadOnArchiveDeleteInMemory(msg)
         enqueueMove(msg, to: trashFolder.path, markReadFirst: true)
         updateThreadMessageFolder(msg, newFolderPath: trashFolder.path, newFolderId: trashFolder.id)

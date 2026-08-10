@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 
 // MARK: - The destination address the wire already gave us
 
@@ -128,6 +129,93 @@ struct MoveFinishResult: Sendable, Equatable {
 // MARK: - The re-key itself
 
 enum MessageHeaderRekey {
+    private struct AddressHandoffState: Sendable {
+        var aliases: [String: String] = [:]
+        var insertionOrder: [String] = []
+    }
+
+    /// A process-local bridge across the only gap where the durable row has
+    /// its provider-proven destination key but slower in-memory mirrors have
+    /// not caught up yet. A gesture Task admitted under the old key can run in
+    /// that gap. Process death also kills that Task, so this is intentionally
+    /// not durable state.
+    private static let addressHandoffs = Mutex(AddressHandoffState())
+    private static let addressHandoffLimit = 512
+
+    /// Register from inside the transaction that performs the re-key. GRDB runs
+    /// the commit callback on its serialized writer queue, after a successful
+    /// commit and before the async write continuation resumes. A rollback
+    /// publishes nothing.
+    static func publishAddressHandoffsAfterCommit(
+        _ records: [HeaderRekeyRecord],
+        in db: Database
+    ) {
+        guard !records.isEmpty else { return }
+        db.afterNextTransaction { _ in
+            publishAddressHandoffs(records)
+        }
+    }
+
+    private static func publishAddressHandoffs(_ records: [HeaderRekeyRecord]) {
+        guard !records.isEmpty else { return }
+        addressHandoffs.withLock { state in
+            for record in records {
+                if state.aliases.updateValue(
+                    record.newHeaderId, forKey: record.oldHeaderId) == nil {
+                    state.insertionOrder.append(record.oldHeaderId)
+                }
+            }
+            let overflow = state.insertionOrder.count - addressHandoffLimit
+            guard overflow > 0 else { return }
+            for oldId in state.insertionOrder.prefix(overflow) {
+                state.aliases.removeValue(forKey: oldId)
+            }
+            state.insertionOrder.removeFirst(overflow)
+        }
+    }
+
+    /// Resolve only a chain the provider itself proved. Exact durable lookup
+    /// still wins at the call site, so a later address reuse is never replaced
+    /// by stale process-local history.
+    static func currentHeaderId(afterHandoffFrom id: String) -> String {
+        addressHandoffs.withLock { state in
+            var current = id
+            var visited: Set<String> = [id]
+            while let next = state.aliases[current],
+                  visited.insert(next).inserted {
+                current = next
+            }
+            return current
+        }
+    }
+
+    /// Old provider-proven addresses that now lead to `id`, nearest handoff
+    /// first. This lets short-lived optimistic state follow the same exact
+    /// move as the durable row during the commit-to-mirror gap. The set is
+    /// bounded with `addressHandoffs`; it is never a database lookup key or a
+    /// durable identity claim.
+    static func predecessorHeaderIds(leadingTo id: String) -> [String] {
+        addressHandoffs.withLock { state in
+            state.insertionOrder.reversed().filter { candidate in
+                var current = candidate
+                var visited: Set<String> = [candidate]
+                while let next = state.aliases[current],
+                      visited.insert(next).inserted {
+                    current = next
+                }
+                return current == id
+            }
+        }
+    }
+
+    #if DEBUG
+    static func clearAddressHandoffsForTesting() {
+        addressHandoffs.withLock { state in
+            state.aliases.removeAll()
+            state.insertionOrder.removeAll()
+        }
+    }
+    #endif
 
     /// Re-key ONE local header row to a new primary key, carrying every child
     /// row the delete would otherwise destroy.

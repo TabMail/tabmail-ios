@@ -7,6 +7,37 @@ import GRDB
 import Testing
 @testable import TabMail
 
+private actor UndoWriteGate {
+    private var didEnter = false
+    private var didOpen = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var openWaiter: CheckedContinuation<Void, Never>?
+
+    func hold() async {
+        didEnter = true
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        guard !didOpen else { return }
+        await withCheckedContinuation { continuation in
+            openWaiter = continuation
+        }
+    }
+
+    func waitUntilEntered() async {
+        guard !didEnter else { return }
+        await withCheckedContinuation { continuation in
+            entryWaiters.append(continuation)
+        }
+    }
+
+    func open() {
+        didOpen = true
+        openWaiter?.resume()
+        openWaiter = nil
+    }
+}
+
 @Suite("Undo provider identity safety", .processGlobalState)
 struct UndoProviderIdentitySafetyTests {
     private struct Fixture {
@@ -18,6 +49,7 @@ struct UndoProviderIdentitySafetyTests {
 
     @MainActor
     private func install(provider: AccountProvider, accountId: String = "undo-provider") throws -> Fixture {
+        MessageHeaderRekey.clearAddressHandoffsForTesting()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var configuration = Configuration()
@@ -58,6 +90,7 @@ struct UndoProviderIdentitySafetyTests {
 
     @MainActor
     private func uninstall(_ fixture: Fixture) {
+        MessageHeaderRekey.clearAddressHandoffsForTesting()
         // See `UndoDestructiveActionTests.uninstall` for the full reasoning.
         // Short version: the old comment named a real hazard (unlinking
         // SQLite/WAL under an open descriptor) and discharged it by leaking —
@@ -157,6 +190,8 @@ struct UndoProviderIdentitySafetyTests {
                 addressChangesOnMove: true,
                 db: db)
             _ = try PendingOperation.deleteOne(db, key: operation.id)
+            MessageHeaderRekey.publishAddressHandoffsAfterCommit(
+                result.applied, in: db)
             return result
         }
     }
@@ -272,6 +307,70 @@ struct UndoProviderIdentitySafetyTests {
         #expect(state.1[0].id == forward.id)
         #expect(state.1[0].status == PendingStatus.inFlight.rawValue)
         #expect(AccountManager.shared.overlayOpRefCountForTesting()[original.id] == nil)
+    }
+
+    @Test("Delete still cancels an in-flight Undo after COPYUID rekeys first")
+    @MainActor
+    func deleteUndoDeleteCancelsDeferredMoveBackAfterRekey() async throws {
+        let fixture = try install(provider: .imap)
+        defer {
+            UndoService.shared.dismissAll()
+            uninstall(fixture)
+        }
+        let manager = AccountManager.shared
+        await manager.clearDeferredMoveSuccessorsForTesting()
+        UndoService.shared.dismissAll()
+
+        let original = sourceHeader(
+            fixture, providerId: "111", rfc: "move-after-rekey@example.com")
+        try installOptimisticallyMoved(
+            original, destinationPath: "Trash", pool: fixture.pool)
+        let forward = try await insertInFlightMove(
+            fixture, messageIds: ["111"], from: "INBOX", to: "Trash", epoch: 41)
+        // UndoService publishes the visible source location before asking the
+        // manager to cancel/defer provider work. Reproduce that same UI order;
+        // the deferred successor takes its own retain below.
+        manager.retainOverlayEntry(id: original.id)
+        manager.registerMutation(
+            id: original.id,
+            mutation: .init(
+                folderId: original.folderId,
+                folderPath: original.folderPath,
+                isInInbox: original.isInInbox,
+                actionTag: .some(original.actionTag)))
+        _ = await manager.undoMove(
+            accountId: fixture.accountId,
+            forwardDestinationPath: "Trash",
+            members: [UndoMember(header: original)])
+        manager.releaseOverlayEntry(id: original.id)
+        #expect(await manager.deferredMoveSuccessorCountForTesting() == 1)
+
+        let result = try await finishMove(
+            fixture, operation: forward, sourceId: "111",
+            destinationId: "911", destinationEpoch: 74)
+        let folders = try await fixture.pool.read { db in try Folder.fetchAll(db) }
+        let viewModel = InboxViewModel(folders: folders)
+
+        #expect(!viewModel.deleteIsNoOp(original.id),
+                "the still-visible Undo overlay must win over the newly re-keyed Trash row")
+        #expect(await viewModel.delete(original.id),
+                "the second Delete must be recorded rather than ignored")
+        await manager.awaitWriteQueueDrain()
+
+        #expect(await manager.deferredMoveSuccessorCountForTesting() == 0,
+                "the second Delete must cancel the deferred move-back under its old key")
+        await manager.materializeDeferredMoveSuccessors(after: forward, result: result)
+        await manager.awaitWriteQueueDrain()
+
+        let trashHeaderId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "Trash", messageId: "911")
+        let settled = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: trashHeaderId),
+             try PendingOperation.fetchAll(db))
+        }
+        #expect(settled.0?.folderPath == "Trash")
+        #expect(settled.1.filter { $0.type == .move }.isEmpty,
+                "the obsolete move-back must never be materialized after the second Delete")
     }
 
     @Test("Delete retargets an in-flight Undo and skips the obsolete move back")
@@ -487,6 +586,136 @@ struct UndoProviderIdentitySafetyTests {
         }
         #expect(settled.0?.folderPath == "INBOX")
         #expect(settled.1.isEmpty)
+    }
+
+    @Test("Undo after Delete cancels then reinstates an in-flight move-back")
+    @MainActor
+    func undoAfterDeleteCancelsThenReinstatesMoveBack() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        let manager = AccountManager.shared
+        await manager.clearDeferredMoveSuccessorsForTesting()
+
+        let original = sourceHeader(
+            fixture, providerId: "101", rfc: "move@example.com")
+        try installOptimisticallyMoved(
+            original, destinationPath: "Trash", pool: fixture.pool)
+        let forward = try await insertInFlightMove(
+            fixture, messageIds: ["101"], from: "INBOX", to: "Trash", epoch: 41)
+
+        let firstUndo = await manager.undoMove(
+            accountId: fixture.accountId,
+            forwardDestinationPath: "Trash",
+            members: [UndoMember(header: original)])
+        #expect(firstUndo == [original.id])
+        #expect(await manager.deferredMoveSuccessorCountForTesting() == 1)
+
+        // Exact slow-iCloud shape: the durable optimistic row is already in
+        // Trash and therefore has no Inbox UIDVALIDITY, while the still-live
+        // Undo overlay makes the next gesture look like Inbox -> Trash.
+        var secondDeleteSnapshot = try #require(await fixture.pool.read { db in
+            try MessageHeader.fetchOne(db, key: original.id)
+        })
+        secondDeleteSnapshot.folderId = original.folderId
+        secondDeleteSnapshot.folderPath = original.folderPath
+        secondDeleteSnapshot.isInInbox = original.isInInbox
+        secondDeleteSnapshot.actionTag = original.actionTag
+        secondDeleteSnapshot.tagSortOrder = original.tagSortOrder
+        #expect(secondDeleteSnapshot.observedUidValidity == nil)
+
+        let secondDelete = await manager.move([secondDeleteSnapshot], to: "Trash")
+        #expect(secondDelete.admittedIds == [original.id])
+        #expect(await manager.deferredMoveSuccessorCountForTesting() == 0)
+
+        let secondUndo = await manager.undoMove(
+            accountId: fixture.accountId,
+            forwardDestinationPath: "Trash",
+            members: [UndoMember(header: secondDeleteSnapshot)])
+
+        #expect(secondUndo == [original.id],
+                "Undoing the coalesced Delete must reinstate the deferred move-back")
+        #expect(await manager.deferredMoveSuccessorCountForTesting() == 1)
+
+        let result = try await finishMove(
+            fixture, operation: forward, sourceId: "101",
+            destinationId: "901", destinationEpoch: 74)
+        await manager.materializeDeferredMoveSuccessors(after: forward, result: result)
+        await manager.awaitWriteQueueDrain()
+
+        let trashHeaderId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "Trash", messageId: "901")
+        let settled = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: trashHeaderId),
+             try PendingOperation.fetchAll(db))
+        }
+        #expect(settled.0?.folderPath == "INBOX")
+        #expect(settled.1.count == 1)
+        #expect(settled.1.first?.folderPath == "Trash")
+        #expect(settled.1.first?.destinationPath == "INBOX")
+    }
+
+    @Test("Queued Undo cancels its deferred Delete even when COPYUID rekeys first")
+    @MainActor
+    func queuedUndoCancellationSurvivesPredecessorRekey() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        let manager = AccountManager.shared
+        await manager.clearDeferredMoveSuccessorsForTesting()
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        var row = sourceHeader(
+            fixture, providerId: "901", rfc: "move@example.com",
+            sourcePath: "Trash", sourceEpoch: nil)
+        row.folderId = MessageIdentity.folderId(
+            accountId: fixture.accountId, folderPath: "INBOX")
+        row.folderPath = "INBOX"
+        row.isInInbox = true
+        let insertedRow = row
+        try await fixture.pool.write { db in try insertedRow.insert(db) }
+        let moveBack = try await insertInFlightMove(
+            fixture, messageIds: ["901"], from: "Trash", to: "INBOX", epoch: 74)
+
+        let action = UndoableAction(
+            type: .move(fromPath: "INBOX", toPath: "Trash"),
+            messages: [insertedRow],
+            originalFolderId: insertedRow.folderId,
+            originalFolderPath: insertedRow.folderPath,
+            accountId: fixture.accountId,
+            timestamp: Date())
+        UndoService.shared.push(action)
+        let deletion = await manager.move([insertedRow], to: "Trash")
+        #expect(deletion.pendingIds == [insertedRow.id])
+        #expect(await manager.deferredMoveSuccessorCountForTesting() == 1)
+
+        // Hold the local FIFO after Undo has popped the action but before its
+        // cancellation closure runs. The provider then finishes and rekeys the
+        // row, reproducing the ordering captured in logmain.log.
+        let gate = UndoWriteGate()
+        await manager.enqueueWriteAfterPriorAdmissions { await gate.hold() }
+        await gate.waitUntilEntered()
+        await UndoService.shared.undo(
+            expectedActionID: action.id, source: .programmatic)
+
+        let result = try await finishMove(
+            fixture, operation: moveBack, sourceId: "901",
+            destinationId: "102", destinationEpoch: 41)
+        await manager.publishMoveFinish(result)
+        await manager.materializeDeferredMoveSuccessors(
+            after: moveBack, result: result)
+        await gate.open()
+        await manager.awaitWriteQueueDrain()
+
+        let inboxHeaderId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "INBOX", messageId: "102")
+        let settled = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: inboxHeaderId),
+             try PendingOperation.fetchAll(db))
+        }
+        #expect(settled.0?.folderPath == "INBOX")
+        #expect(settled.1.isEmpty,
+                "the undone deferred Delete must not materialize after the rekey")
+        #expect(await manager.deferredMoveSuccessorCountForTesting() == 0)
     }
 
     @Test("Undo annihilates only an exact never-attempted provider-ID move and restores the exact local member")

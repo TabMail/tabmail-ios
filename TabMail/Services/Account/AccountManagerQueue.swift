@@ -794,6 +794,8 @@ extension AccountManager {
                         destinations: executed.provenDestinations,
                         addressChangesOnMove: executed.addressChangesOnMove,
                         db: db)
+                    MessageHeaderRekey.publishAddressHandoffsAfterCommit(
+                        result.applied, in: db)
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                     return result
                 }
@@ -1275,7 +1277,16 @@ extension AccountManager {
             // The undo stack names its members by the SAME primary key and UID
             // this re-key just changed, so it has to follow — otherwise
             // finishing the move would break undo rather than enable it.
-            await UndoService.shared.applyRekeys(applied)
+            // An Undo already admitted to the local FIFO may still need to
+            // cancel a deferred successor keyed by the predecessor's OLD
+            // address. COPYUID publication happens outside that FIFO. Keep
+            // only those in-progress members on the old key until their
+            // already-queued cancellation runs; stacked actions and ordinary
+            // in-progress Undo members still follow the provider rekey.
+            let deferredCancellationIds = Set(deferredMoveSuccessors.keys)
+            await UndoService.shared.applyRekeys(
+                applied,
+                preservingInProgressMemberIds: deferredCancellationIds)
             await MainActor.run {
                 NotificationCenter.default.post(
                     name: .messageHeadersRekeyed,
@@ -1435,6 +1446,8 @@ extension AccountManager {
                     destinations: provenDestinations,
                     addressChangesOnMove: addressChangesOnMove,
                     db: db)
+                MessageHeaderRekey.publishAddressHandoffsAfterCommit(
+                    result.applied, in: db)
                 guard var fresh = try PendingOperation.fetchOne(db, key: currentOp.id) else {
                     return result
                 }

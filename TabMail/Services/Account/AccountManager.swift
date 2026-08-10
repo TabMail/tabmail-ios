@@ -644,7 +644,8 @@ actor AccountManager {
 
     /// Register an optimistic mutation. Callable synchronously from any isolation domain.
     nonisolated func registerMutation(id: String, mutation: PendingMutation) {
-        optimisticOverlay.withLock { overlay in
+        let locationTrace = optimisticOverlay.withLock { overlay -> String? in
+            let before = overlay[id]
             var existing = overlay[id] ?? PendingMutation()
             if let v = mutation.isRead { existing.isRead = v }
             if let v = mutation.folderId { existing.folderId = v }
@@ -653,6 +654,18 @@ actor AccountManager {
             if let v = mutation.isFlagged { existing.isFlagged = v }
             if let v = mutation.actionTag { existing.actionTag = v }
             overlay[id] = existing
+
+            guard mutation.folderId != nil || mutation.folderPath != nil
+                    || mutation.isInInbox != nil
+            else { return nil }
+            return "before={\(Self.locationDescription(before))} "
+                + "incoming={\(Self.locationDescription(mutation))} "
+                + "after={\(Self.locationDescription(existing))}"
+        }
+        if let locationTrace {
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] overlay.register id=\(id) \(locationTrace) "
+                    + "retainCount=\(overlayRetainCount(id: id))")
         }
     }
 
@@ -668,6 +681,22 @@ actor AccountManager {
         optimisticOverlay.withLock { $0 }
     }
 
+    /// Find optimistic state under the durable row's current key, or under a
+    /// provider-proven predecessor key while the in-memory mirrors are still
+    /// catching up to a committed MOVE re-key. Exact current-key state wins.
+    nonisolated func snapshotOverlayMutation(
+        forCurrentHeaderId id: String
+    ) -> (id: String, mutation: PendingMutation)? {
+        let snapshot = snapshotOverlay()
+        if let mutation = snapshot[id] { return (id, mutation) }
+        for predecessorId in MessageHeaderRekey.predecessorHeaderIds(leadingTo: id) {
+            if let mutation = snapshot[predecessorId] {
+                return (predecessorId, mutation)
+            }
+        }
+        return nil
+    }
+
     /// Undo snapshots must capture the VISUALIZED state (act-on-visualized-state
     /// rule): a queued intent cycle's isRead/isFlagged/actionTag exist only in the
     /// overlay until the FIFO drains, and a DB-fresh row predates them — an undo
@@ -681,7 +710,9 @@ actor AccountManager {
     /// the SAME coalesced entry this reads. Calling it after would capture this
     /// action's own not-yet-committed mutation as if it were pre-existing state.
     nonisolated func overlayAdjustedSnapshot(_ header: MessageHeader) -> MessageHeader {
-        guard let m = snapshotOverlay()[header.id] else { return header }
+        guard let m = snapshotOverlayMutation(
+            forCurrentHeaderId: header.id)?.mutation
+        else { return header }
         var h = header
         if let isRead = m.isRead { h.isRead = isRead }
         if let isFlagged = m.isFlagged { h.isFlagged = isFlagged }
@@ -753,12 +784,42 @@ actor AccountManager {
     /// from this overlay refcount.)
     private let overlayOpRefCount = Mutex<[String: Int]>([:])
 
+    private nonisolated static func locationDescription(
+        _ mutation: PendingMutation?
+    ) -> String {
+        guard let mutation else { return "absent" }
+        let folderId = mutation.folderId ?? "<nil>"
+        let folderPath = mutation.folderPath ?? "<nil>"
+        let isInInbox = mutation.isInInbox.map { String($0) } ?? "<nil>"
+        return "folderId=\(folderId) folderPath=\(folderPath) "
+            + "isInInbox=\(isInInbox)"
+    }
+
+    /// DEBUG diagnostics for the folder-location overlay and its independent
+    /// retain lifecycle. This is deliberately a synchronous snapshot so tap,
+    /// guard, Undo, and queued-action logs can compare the same two stores.
+    nonisolated func roleActionOverlayDiagnostic(id: String) -> String {
+        let mutation = optimisticOverlay.withLock { $0[id] }
+        return "overlay={\(Self.locationDescription(mutation))} "
+            + "retainCount=\(overlayRetainCount(id: id))"
+    }
+
+    private nonisolated func overlayRetainCount(id: String) -> Int {
+        overlayOpRefCount.withLock { $0[id] ?? 0 }
+    }
+
     /// Mark one more in-flight gesture op for `id`. Call synchronously at
     /// gesture time, alongside `registerMutation`.
     nonisolated func retainOverlayEntry(id: String) {
-        overlayOpRefCount.withLock { counts in
+        let transition = overlayOpRefCount.withLock { counts -> (Int, Int) in
+            let before = counts[id] ?? 0
             counts[id, default: 0] += 1
+            return (before, counts[id] ?? 0)
         }
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] overlay.retain id=\(id) "
+                + "count=\(transition.0)->\(transition.1) "
+                + roleActionOverlayDiagnostic(id: id))
     }
 
     /// Release one in-flight gesture op for `id`. When the refcount reaches
@@ -767,23 +828,31 @@ actor AccountManager {
     /// itself. Call exactly once per `retainOverlayEntry` call, on every exit
     /// path of the owning queued closure.
     nonisolated func releaseOverlayEntry(id: String) {
-        let shouldRemoveOverlay = overlayOpRefCount.withLock { counts -> Bool in
+        let transition = overlayOpRefCount.withLock { counts -> (Int, Int, Bool) in
             guard let count = counts[id] else {
                 // Defensive: unmatched release (no retain on record). Treat as
                 // the terminal release so the overlay never strands, but this
                 // indicates a retain/release imbalance at a call site.
                 BackgroundSyncLogger.logInbox("[AccountManager] releaseOverlayEntry — unmatched release for \(id), no retain on record")
-                return true
+                return (0, 0, true)
             }
             if count <= 1 {
                 counts.removeValue(forKey: id)
-                return true
+                return (count, 0, true)
             }
             counts[id] = count - 1
-            return false
+            return (count, count - 1, false)
         }
-        guard shouldRemoveOverlay else { return }
+        let beforeRemoval = roleActionOverlayDiagnostic(id: id)
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] overlay.release id=\(id) "
+                + "count=\(transition.0)->\(transition.1) "
+                + "remove=\(transition.2) \(beforeRemoval)")
+        guard transition.2 else { return }
         removeOverlayEntries(ids: [id])
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] overlay.removed id=\(id) "
+                + roleActionOverlayDiagnostic(id: id))
     }
 
     /// Test seam: snapshot the retain/release refcount map (hygiene checks —

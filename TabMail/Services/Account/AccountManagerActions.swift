@@ -131,6 +131,14 @@ struct RoleMoveAdmission: Sendable, Equatable {
     var pendingIds: Set<String> { ids(with: .retainedForRetry) }
     /// Provably not applicable. Safe to surface as a failure.
     var failedIds: Set<String> { ids(with: .terminalStale) }
+
+    /// Stable, compact representation for DEBUG-gated end-to-end action logs.
+    /// The disposition is the useful fact; no message content is included.
+    var diagnosticSummary: String {
+        perID.sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value.rawValue)" }
+            .joined(separator: ",")
+    }
 }
 
 // MARK: - Expected message identity — the producer's content witness
@@ -938,6 +946,14 @@ extension AccountManager {
             let isNew = deferredMoveSuccessors[successor.oldHeaderId] == nil
             deferredMoveSuccessors[successor.oldHeaderId] = successor
             if isNew { retainOverlayEntry(id: successor.oldHeaderId) }
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] manager deferred.register "
+                    + "id=\(successor.oldHeaderId) "
+                    + "predecessor=\(successor.predecessorOperationId.prefix(8)) "
+                    + "predecessorDestination=\(successor.predecessorDestinationPath) "
+                    + "desiredDestination=\(successor.desiredDestinationPath) "
+                    + "newRetain=\(isNew) "
+                    + roleActionOverlayDiagnostic(id: successor.oldHeaderId))
         }
     }
 
@@ -950,16 +966,32 @@ extension AccountManager {
         var ids: Set<String> = []
         var admission = RoleMoveAdmission()
         for headerId in headerIds {
-            guard var successor = deferredMoveSuccessors[headerId] else { continue }
+            let candidateIds = [headerId]
+                + MessageHeaderRekey.predecessorHeaderIds(leadingTo: headerId)
+            guard let successorHeaderId = candidateIds.first(where: {
+                deferredMoveSuccessors[$0] != nil
+            }),
+                  var successor = deferredMoveSuccessors[successorHeaderId]
+            else { continue }
             ids.insert(headerId)
             if destinationPath == successor.predecessorDestinationPath {
-                deferredMoveSuccessors.removeValue(forKey: headerId)
-                releaseOverlayEntry(id: headerId)
+                deferredMoveSuccessors.removeValue(forKey: successorHeaderId)
+                releaseOverlayEntry(id: successorHeaderId)
                 admission.set(.durablyAdmitted, id: headerId)
+                BackgroundSyncLogger.logInbox(
+                    "[RoleActionTrace] manager deferred.coalesce id=\(headerId) "
+                        + "successorKey=\(successorHeaderId) "
+                        + "decision=cancelSuccessor destination=\(destinationPath) "
+                        + roleActionOverlayDiagnostic(id: successorHeaderId))
             } else {
                 successor.desiredDestinationPath = destinationPath
-                deferredMoveSuccessors[headerId] = successor
+                deferredMoveSuccessors[successorHeaderId] = successor
                 admission.set(.retainedForRetry, id: headerId)
+                BackgroundSyncLogger.logInbox(
+                    "[RoleActionTrace] manager deferred.coalesce id=\(headerId) "
+                        + "successorKey=\(successorHeaderId) "
+                        + "decision=retarget destination=\(destinationPath) "
+                        + roleActionOverlayDiagnostic(id: successorHeaderId))
             }
         }
         return (ids, admission)
@@ -988,6 +1020,10 @@ extension AccountManager {
         }
         guard !oldHeaderIds.isEmpty else { return }
         for oldHeaderId in oldHeaderIds {
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] manager deferred.drop id=\(oldHeaderId) "
+                    + "predecessor=\(predecessorOperationId.prefix(8)) "
+                    + roleActionOverlayDiagnostic(id: oldHeaderId))
             deferredMoveSuccessors.removeValue(forKey: oldHeaderId)
             releaseOverlayEntry(id: oldHeaderId)
         }
@@ -1020,6 +1056,10 @@ extension AccountManager {
             $0.predecessorOperationId == predecessor.id
         }
         guard !waiting.isEmpty else { return }
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] manager deferred.materialize.begin "
+                + "predecessor=\(predecessor.id.prefix(8)) "
+                + "waiting=[\(waiting.map(\.oldHeaderId).joined(separator: ","))]")
         for successor in waiting {
             deferredMoveSuccessors.removeValue(forKey: successor.oldHeaderId)
         }
@@ -1045,8 +1085,20 @@ extension AccountManager {
             grouping: waiting, by: \.desiredDestinationPath
         ) {
             let rows = successors.compactMap { rowsByOldId[$0.oldHeaderId] }
-            guard rows.count == successors.count else { continue }
-            _ = await move(rows, to: destinationPath)
+            guard rows.count == successors.count else {
+                BackgroundSyncLogger.logInbox(
+                    "[RoleActionTrace] manager deferred.materialize.refused "
+                        + "predecessor=\(predecessor.id.prefix(8)) "
+                        + "destination=\(destinationPath) "
+                        + "resolved=\(rows.count)/\(successors.count)")
+                continue
+            }
+            let admission = await move(rows, to: destinationPath)
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] manager deferred.materialize.admission "
+                    + "predecessor=\(predecessor.id.prefix(8)) "
+                    + "destination=\(destinationPath) "
+                    + "outcome=\(admission.diagnosticSummary)")
         }
 
         // The forward is already retired. Any inverse that could not be
@@ -1055,6 +1107,10 @@ extension AccountManager {
         for oldId in completedOldIds {
             releaseOverlayEntry(id: oldId)
         }
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] manager deferred.materialize.end "
+                + "predecessor=\(predecessor.id.prefix(8)) "
+                + "released=[\(completedOldIds.joined(separator: ","))]")
 
         Task { @MainActor in
             NotificationCenter.default.post(
@@ -1304,6 +1360,10 @@ extension AccountManager {
     @discardableResult
     func move(_ messages: [MessageHeader], to destinationPath: String) async -> RoleMoveAdmission {
         var outcome = RoleMoveAdmission()
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] manager.move phase=begin destination=\(destinationPath) "
+                + "members=[\(messages.map { "\($0.id){\($0.folderPath)}" }.joined(separator: ","))] "
+                + "deferredCount=\(deferredMoveSuccessors.count)")
 
         // If Undo already recorded the exact opposite behind an in-flight
         // predecessor, a new gesture back to the predecessor's destination is
@@ -1314,7 +1374,12 @@ extension AccountManager {
             headerIds: requestedIds, destinationPath: destinationPath)
         outcome.merge(coalesced.admission)
         let remainingMessages = messages.filter { !coalesced.ids.contains($0.id) }
-        guard !remainingMessages.isEmpty else { return outcome }
+        guard !remainingMessages.isEmpty else {
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] manager.move phase=coalescedAll "
+                    + "destination=\(destinationPath) outcome=\(outcome.diagnosticSummary)")
+            return outcome
+        }
 
         // Re-resolve fresh headers by id — the single choke point for every
         // surface (swipe, detail view, agent tools, settings bulk-archive).
@@ -1343,6 +1408,10 @@ extension AccountManager {
         // (zero-extra-DB contract), so the probe that CAN prove absence lives
         // in `performCoordinatedRoleMove` instead, which is a non-gesture path.
         let freshIds = Set(fresh.map(\.id))
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] manager.move phase=resolved destination=\(destinationPath) "
+                + "requested=[\(unresolvedIds.joined(separator: ","))] "
+                + "fresh=[\(fresh.map { "\($0.id){\($0.folderPath)}" }.joined(separator: ","))]")
         outcome.set(.retainedForRetry, ids: unresolvedIds.filter { !freshIds.contains($0) })
         if fresh.isEmpty, !remainingMessages.isEmpty {
             print("[Queue] WARNING: move(to: \(destinationPath)) resolved 0 of \(remainingMessages.count) ids — vanished rows or read failure; nothing queued")
@@ -1356,7 +1425,12 @@ extension AccountManager {
         let movable = fresh.filter { $0.folderPath != destinationPath }
         // PROVEN: already at the destination, so the requested end state holds.
         outcome.set(.terminalStale, ids: fresh.filter { $0.folderPath == destinationPath }.map(\.id))
-        guard !movable.isEmpty else { return outcome }
+        guard !movable.isEmpty else {
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] manager.move phase=noMovable destination=\(destinationPath) "
+                    + "outcome=\(outcome.diagnosticSummary)")
+            return outcome
+        }
         await ensureDurable(movable)
 
         let grouped = Dictionary(grouping: movable) { "\($0.accountId)|\($0.folderPath)" }
@@ -1396,6 +1470,10 @@ extension AccountManager {
             outcome.set(.retainedForRetry, ids: movable.map(\.id))
         }
         registerDeferredMoveSuccessors(deferredSuccessors)
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] manager.move phase=recorded destination=\(destinationPath) "
+                + "outcome=\(outcome.diagnosticSummary) "
+                + "deferredRegistered=\(deferredSuccessors.count)")
         Task { @MainActor in
             NotificationCenter.default.post(name: .unreadCountsDidChange, object: nil)
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
@@ -1882,6 +1960,11 @@ extension AccountManager {
         forwardDestinationPath: String,
         members: [UndoMember]
     ) async -> [String] {
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] manager.undoMove phase=begin "
+                + "forwardDestination=\(forwardDestinationPath) "
+                + "members=[\(members.map { "\($0.originalHeaderId){source=\($0.sourceFolderPath),provider=\($0.providerMessageId)}" }.joined(separator: ","))] "
+                + "deferredCount=\(deferredMoveSuccessors.count)")
         guard !members.isEmpty,
               !forwardDestinationPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return [] }
@@ -1900,6 +1983,9 @@ extension AccountManager {
               let sourceFolderId = sourceFolderIds.first
         else {
             print("[UndoStack] undoMove refused heterogeneous/duplicate command for account \(accountId)")
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] manager.undoMove phase=refused "
+                    + "reason=heterogeneousOrDuplicate account=\(accountId)")
             return []
         }
         let sourceEpoch = members[0].sourceObservedUidValidity
@@ -1924,6 +2010,9 @@ extension AccountManager {
                 headerIds: memberHeaderIds,
                 destinationPath: sourcePath)
             guard cancelled.ids == memberHeaderIds else { return [] }
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] manager.undoMove phase=cancelledDeferred "
+                    + "ids=[\(memberHeaderIds.sorted().joined(separator: ","))]")
             return members.map(\.originalHeaderId)
         }
 
@@ -1981,13 +2070,40 @@ extension AccountManager {
                 let related = activeMoves.filter {
                     !Set($0.messageIds).isDisjoint(with: providerIdSet)
                 }
-                func exactPayload(_ op: PendingOperation) -> Bool {
+                let relatedSummary = related.map { operation in
+                    let operationId = String(operation.id.prefix(8))
+                    let destination = operation.destinationPath ?? "<nil>"
+                    let summary: String = "\(operationId){status=\(operation.status),"
+                        + "attempted=\(operation.everAttempted),"
+                        + "from=\(operation.folderPath),to=\(destination)}"
+                    return summary
+                }.joined(separator: ",")
+                BackgroundSyncLogger.logInbox(
+                    "[RoleActionTrace] manager.undoMove phase=relatedOps "
+                        + "members=[\(members.map(\.originalHeaderId).joined(separator: ","))] "
+                        + "ops=[\(relatedSummary)]")
+                func exactAddressPayload(_ op: PendingOperation) -> Bool {
                     let ids = op.messageIds
                     return ids.count == providerIds.count
                         && Set(ids) == providerIdSet
                         && op.folderPath == sourcePath
                         && op.destinationPath == forwardDestinationPath
+                }
+                func exactPayload(_ op: PendingOperation) -> Bool {
+                    exactAddressPayload(op)
                         && op.observedUidValidity == sourceEpoch
+                }
+                func exactInFlightPayload(_ op: PendingOperation) -> Bool {
+                    guard exactAddressPayload(op) else { return false }
+                    if op.observedUidValidity == sourceEpoch { return true }
+                    // A second optimistic gesture can be built from the
+                    // destination row while the first IMAP command is still on
+                    // the wire. That row deliberately has no SOURCE epoch.
+                    // In this one exact in-flight case, inherit the epoch from
+                    // the already-admitted command instead of dropping Undo.
+                    // A non-nil mismatch still fails closed.
+                    return sourceEpoch == nil
+                        && (op.observedUidValidity.map { $0 > 0 } ?? false)
                 }
 
                 let annihilable = related.filter {
@@ -2004,9 +2120,13 @@ extension AccountManager {
                 // search mutation target.
                 if isIMAP,
                    related.count == 1,
-                   exactPayload(related[0]),
+                   exactInFlightPayload(related[0]),
                    related[0].status == PendingStatus.inFlight.rawValue {
                     let predecessor = related[0]
+                    BackgroundSyncLogger.logInbox(
+                        "[RoleActionTrace] manager.undoMove phase=deferBehindInFlight "
+                            + "predecessor=\(predecessor.id.prefix(8)) "
+                            + "ids=[\(members.map(\.originalHeaderId).joined(separator: ","))]")
                     return UndoMoveWriteResult(
                         restoredOriginalHeaderIds: members.map(\.originalHeaderId),
                         deferredSuccessors: members.map { member in
@@ -2019,6 +2139,10 @@ extension AccountManager {
                 }
 
                 if annihilate {
+                    BackgroundSyncLogger.logInbox(
+                        "[RoleActionTrace] manager.undoMove phase=annihilateQueued "
+                            + "op=\(annihilable[0].id.prefix(8)) "
+                            + "ids=[\(members.map(\.originalHeaderId).joined(separator: ","))]")
                     if isIMAP {
                         guard let epoch = sourceEpoch,
                               let positive = UInt32(exactly: epoch), positive > 0,
@@ -2062,6 +2186,10 @@ extension AccountManager {
                         destinationPath: sourcePath,
                         observedUidValidity: admission.observedUidValidity
                     ).insert(db)
+                    BackgroundSyncLogger.logInbox(
+                        "[RoleActionTrace] manager.undoMove phase=queuedInverse "
+                            + "from=\(forwardDestinationPath) to=\(sourcePath) "
+                            + "providerIds=[\(admission.providerIds.joined(separator: ","))]")
                 }
 
                 // Undo remains instant, as it was in 1.6.38. For a queued IMAP
@@ -2109,6 +2237,16 @@ extension AccountManager {
             return []
         }
         registerDeferredMoveSuccessors(result.deferredSuccessors)
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] manager.undoMove phase=result "
+                + "restored=[\(result.restoredOriginalHeaderIds.joined(separator: ","))] "
+                + "queuedInverse=\(result.queuedInverse) "
+                + "deferred=\(result.deferredSuccessors.count)")
+        for id in result.restoredOriginalHeaderIds {
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] manager.undoMove phase=resultOverlay id=\(id) "
+                    + roleActionOverlayDiagnostic(id: id))
+        }
         if result.deferredSuccessors.isEmpty,
            !result.restoredOriginalHeaderIds.isEmpty {
             Task { @MainActor in
