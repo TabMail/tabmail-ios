@@ -1,0 +1,20 @@
+# IOS-UNDO-001
+
+> Routed from `KNOWN_ISSUES.md` line 107 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).
+
+- Register classification: `closed-decision`
+- Original row SHA-256: `5425f61e9c585ee1b494aedb6497bd877f83631c189b03c84cb9ac17b61a53db`
+
+## Status
+
+✅ **CLOSED AS A DECISION (2026-08-04)** — tail 1 closed as a decision; **tail 2 RETRACTED** — its premise is FALSE at the tip
+
+## Subsystem and search terms
+
+Archive/delete; mark-read; Undo; rapid read-unread-archive; notification read; event ordering
+
+## Full detail
+
+Two rare tails stay deliberately simple. First, a rapid explicit read→unread→archive burst within one fold/retry window can let the older fold completion clear the newer archive ownership, so Undo may return the message read; avoiding that for Inbox, Detail, Settings bulk, and mark-all as one class requires a new per-identity event ledger. Second, warm/cold notification read actions do not participate in the UI-local Undo invalidation protocol, so a rare notification-action/read race may retain parent behavior — **tail 2 is carried forward UNVERIFIED against the v3 base and needs fresh investigation; no plan row owns it.** Neither tail can mutate a different message, lose message content, or wedge durable work; the user can correct read state manually. Do not broaden notification or durable queue identity merely to guarantee these rare tap/order cases.
+
+✅ **CLOSED AS A DECISION (2026-08-04). TAIL 2 IS RETRACTED — the fresh investigation this row asked for is what falsified it.** The retracted claim — *"warm/cold notification read actions do not participate in the UI-local Undo invalidation protocol, so a rare notification-action/read race may retain parent behavior"* — is kept above rather than deleted, so the error stays searchable. **There is no such protocol and nothing for a read action to fail to participate in:** `UndoService.UndoableActionType` has exactly ONE case, `move(fromPath:toPath:)`, so read state is never undoable, and the only `UndoService.shared` call sites are ten `push` sites, every one a destructive-move gesture. A row whose owning mechanism does not exist is not a deferral. **TAIL 1 IS CLOSED AS A DECISION, not deferred.** The decision: the read→unread→archive coalescing window (`AccountManager.registerGestureIntent` / `executeIntentCycle`, ADR-IOS-057) stays simple. **The basis is this row's own stated price** — *"a new per-identity event ledger"* covering Inbox, Detail, Settings bulk and mark-all as one class — which is exactly the "new mechanism for a minor rare edge" THE MANTRA forbids, and on which audit rule A3's tell fires (a mechanism whose purpose is to re-derive ownership a sibling path already cleared). **Accepted cost:** after an undo the message can be back in the Inbox showing as read. **Recoverability:** one ordinary gesture — swipe or tap unread. **A state where that gesture is itself blocked was searched for:** the candidates are `IOS-EPOCH-001`'s admission refusals, and they block the *durable* op rather than the local read flip, and they block the archive gesture that created the situation equally — so "the archive succeeded but the unread gesture cannot even be attempted" does not arise. **None found.** **One thing a future reader must not misread as a defect:** v3 deliberately does not restore read state on undo at all — `UndoMember` captures no `isRead`, and `AccountManagerActions.undoMove`'s restore loop is a field-level `updateAll` whose own comment says *"Preserve every unrelated field (notably current read/flag state); never `save` a stale snapshot or recreate a missing row."* Shipped `07a4bb703`'s `undoDestructiveAction` did the opposite, writing the whole gesture-time snapshot back and clobbering every concurrent change made since the gesture. **Do not "restore shipped" here** — per A1 corollary 3 the release is a floor, not a ceiling, and this divergence is the improvement.

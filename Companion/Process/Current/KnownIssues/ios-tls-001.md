@@ -1,0 +1,20 @@
+# IOS-TLS-001
+
+> Routed from `KNOWN_ISSUES.md` line 110 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).
+
+- Register classification: `closed-decision`
+- Original row SHA-256: `1d5f5ca0db349d8c5e2534ace8e838428d09536cebdfa45a63107eb6e9d4ac6a`
+
+## Status
+
+✅ **CLOSED AS A DECISION (2026-08-04)** — v3 does not restrict the offered cipher list; revisit condition made concrete
+
+## Subsystem and search terms
+
+TLS; cipher suites; IMAP; SMTP; NIOSSL; CBC-SHA1; 3DES; forward secrecy; legacy servers
+
+## Full detail
+
+The SwiftMail sync raises the IMAP/SMTP floor from TLS 1.0 to **TLS 1.2** (accepted by the owner 2026-07-30). That closes the broken protocol *versions*, but at 1.2 the cipher suite does the real work and NIOSSL's default list still offers CBC-SHA1 groups — which is precisely why TLS 1.0 was negotiating before. Restricting the offered ciphers (AEAD-only: AES-GCM / ChaCha20-Poly1305, ECDHE for forward secrecy) is a separate, smaller lever with its own compatibility risk. Owner's stated reservation (2026-07-30): *"Not sure if we want it though given servers may be broken configs."* TabMail connects to arbitrary user-configured servers, and a badly-configured or elderly one may offer only a weak suite, so tightening the list would silently disconnect those users exactly as a version-floor bump would. **Do NOT tighten the cipher list as part of the v3 refactor** — it is unrelated to the action-queue defect and needs its own compatibility testing against real servers. Revisit only with evidence about which suites TabMail's actual account population negotiates.
+
+✅ **CLOSED AS A DECISION (2026-08-04) — v3 does not restrict the offered cipher list; NIOSSL's defaults stand at the TLS 1.2 floor.** **Verified at the tip:** there is no TLS configuration in `TabMail/` or `Shared/` at all — the floor lives in the pinned SwiftMail fork (`project.yml` pins `github.com/TabMail/SwiftMail` by `branch: main`). The app's only TLS-adjacent code is `IMAPProvider.useTLS` (a test-only override, nil in production, so SwiftMail infers from the port) and the `.tlsFailed` arm of `AccountManagerOutbox.isTransientSendError`. So this is a decision about a dependency's defaults, not an unfixed TabMail defect. **Basis:** the owner already answered it for this release, with the reasoning stated — *"Not sure if we want it though given servers may be broken configs."* TabMail connects to arbitrary user-configured servers, and a badly-configured or elderly one may offer only a weak suite, so tightening the offered list would silently disconnect those users exactly as a version-floor bump does — while, **unlike** the version floor, buying no clear security boundary: TLS 1.2 with a CBC-SHA1 suite is weak, not broken. **Accepted cost:** sessions that negotiate CBC-SHA1 or a non-forward-secret suite at TLS 1.2 continue to do so. **Recoverability is not the relevant test here** and saying so is the honest answer: nothing is refused or deferred by this decision, so there is no fail-closed edge to recover from — the cost is a weaker-than-ideal session, never a lost or misdirected message. **The revisit condition, made concrete because a vague one is how a row like this survives forever:** the evidence gate this row names — *which suites TabMail's actual account population negotiates* — **cannot be discharged inside this repo.** It requires telemetry from real user connections, which the zero-retention policy (ADR-004) makes a separate product decision in its own right. So: revisit only with negotiated-suite evidence from the real account population, **and if the list is ever tightened, `IOS-TLS-002`'s clear-actionable-error requirement applies to the new failure mode too** — a user disconnected by a cipher restriction must be told that, not shown a generic connection failure.

@@ -1,0 +1,20 @@
+# IOS-OUTBOX-003
+
+> Routed from `KNOWN_ISSUES.md` line 156 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).
+
+- Register classification: `closed-decision`
+- Original row SHA-256: `9ec0e89366c239ae03844fac7b02c660ab30c394acb279594c825ef6aa2da91d`
+
+## Status
+
+✅ **CLOSED AS A DECISION (2026-08-04)** — pre-existing **product behaviour**, shipped verbatim in v1.6.38; the queue-time write stays optimistic by design
+
+## Subsystem and search terms
+
+Outbox; reply; forward; `isReplied`; `isForwarded`; `persistQueuedSend`; `deleteCompletedSendAtomic`; optimistic UI; `\Answered`; unaddressable parent
+
+## Full detail
+
+**The end-to-end gap, stated whole because each half alone is misleading.** For a parent the app cannot positively address — the `IOS-EPOCH-001` fail-closed window — the UI can still show "replied" while the server's `\Answered` is never set. There are **two producers** of that local flag and only one of them is gated. `AccountManagerOutbox.persistQueuedSend` writes `UPDATE messageHeader SET isReplied = 1` (and the `isForwarded` sibling) **optimistically at queue time with no admission gate at all**; `AccountManagerOutbox.deleteCompletedSendAtomic` writes it again at completion, and audit round 2 moved *that* write inside its `if let flagAdmission` guard so the local flag and the durable op now share one fate **at the completion producer**. The queue-time write is unchanged: it is verbatim in `07a4bb703`, it is correct optimistic-UI behaviour per ADR-IOS-001, and changing when a reply shows as replied is a product decision rather than a bug fix. **Consequence to hold onto:** the completion path no longer re-asserts a server-side claim it did not queue, but the queue-time claim still outlives an unaddressable parent, so the invariant *"local reply state never claims a server-side flag that was never queued"* does **not** hold end-to-end. Sync restores truth on the next pass that can address the folder.
+
+✅ **CLOSED AS A DECISION (2026-08-04) — the queue-time write stays optimistic and ungated, and that is a product decision the owner has already made by shipping it.** **The decision:** `AccountManagerOutbox.persistQueuedSend` continues to write `isReplied`/`isForwarded` at queue time with no admission gate. Three grounds, in order of weight. **(1)** It is **verbatim in `07a4bb703`** and is correct ADR-IOS-001 optimistic-UI behaviour; changing WHEN a reply shows as replied is a product change, not a bug fix. **(2)** Gating it would mean the user replies and the "replied" indicator does not appear, on an account whose folder epoch has not settled — a visible regression traded for an invariant no user can observe. **(3)** The invariant this row wanted — *"local reply state never claims a server-side flag that was never queued"* — is the **wrong invariant for an optimistic-UI field**. The right one is *"the completion path never re-asserts a server-side claim it did not queue"*, which round 2 established and which **holds**: `deleteCompletedSendAtomic` writes both flags inside its `if let flagAdmission` guard, so the completion producer and the durable op share one fate. **Accepted cost:** the "Consequence to hold onto" sentence above, which survives this closure verbatim and is the honest statement of the residual. **Recoverability:** a sync pass — `SyncEngineDeltaSync`/`SyncEngineFullSync` assign `header.isReplied = info.isReplied` from server flags, so the next pass that can address the folder restores truth. **The state where that does not fire** is a folder whose epoch is never established (the `IOS-AI-003` population) — but note that in that state the flag itself was never queued either, so the divergence is *"UI optimistically ahead of a server the app cannot address"*, which is precisely what optimistic UI means. **There is no state in which the local flag contradicts a KNOWN server truth.**

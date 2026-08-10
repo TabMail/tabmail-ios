@@ -1,0 +1,20 @@
+# IOS-NSE-002
+
+> Routed from `KNOWN_ISSUES.md` line 191 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).
+
+- Register classification: `closed-decision`
+- Original row SHA-256: `6d7ae63428150f45aa855a71de5dab72fa2bcb6a89a09f894a6a2d59c315c072`
+
+## Status
+
+✅ **CLOSED AS A DECISION (2026-08-04)** — the epoch comparison IS the fence; **NOT in the shipped release**; introduced PRE-candidate by `6e9840ed4`
+
+## Subsystem and search terms
+
+NSE; purge; cross-process; App Group; committed DELETE; fence; stale epoch
+
+## Full detail
+
+The staged-state purge is **not a cross-process fence**. A committed `DELETE` proves only that the rows visible *inside that transaction* are gone; the notification-service extension may still be running and can commit a row afterwards, carrying an old or unknown epoch, into a store the main app believes it has just cleaned. Nothing coordinates the two processes at that boundary.
+
+✅ **CLOSED AS A DECISION (2026-08-04) — the claim above stays literally true, but the FENCE is not what protects the invariant; the epoch comparison is, and it does.** **The decision:** no cross-process fence is built — no advisory lock, no App Group generation counter, no two-phase handshake. **Why the invariant holds without one, read from the guards rather than assumed:** `NSEDataBridge.uidValidityStagingRowStatus` reports `isOldEpoch` only on a **positive** disagreement with a **settled** folder epoch, and such rows are skipped **and deleted**; while the folder is quarantined the keep arm wins and rows are **kept, never deleted**, because a mismatch cannot yet distinguish "permanently stale" from "correctly observed the new epoch ahead of our stamp"; a row landing on an existing durable row must pass `nseMergeIdentityConfirmed`, which demands positive evidence (RFC equality unconditionally — with a positive RFC *disagreement* winning even when epochs agree — or epoch equality with a non-quarantined folder); and a folder read FAILURE is treated as QUARANTINED, so *"we could not look"* keeps the row rather than merging it. A late-committing NSE row carrying an old epoch is therefore **caught** once the reaction stamps E2 and **held** — not merged, not deleted — in the interval. **Answering the hazard with a fact about the DATA rather than with a lock is strictly more robust across a process boundary the OS may kill at any point**, which is the substantive reason this is a decision and not a deferral. **The residual is NAMED rather than claimed absent:** `NSEIMAPConnection` maps a reported `UIDVALIDITY` of `0` to nil; a nil epoch is fail-open in `uidValidityStagingRowStatus` (both signals false), and `insertNewHeaderFromStaging` does not consult `nseMergeIdentityConfirmed` (that guard serves the existing-durable-row arm). So a stale, RFC-less, epoch-less staged row inserted as a **new** header at an E2-recycled UID would seat wrong content — which **would be C3**. It requires ALL of: a server that omits `UIDVALIDITY` on SELECT (RFC 3501 §6.3.1 makes it REQUIRED, and `IOS-EPOCH-001` round 12 establishes that such a server *"is declaring it has no UIDs, which is an account this app cannot serve at all"*), **and** a UIDVALIDITY turnover on that same server, **and** an RFC-less message, **and** a concurrently-running NSE. Every component is already outside what this app supports. **The trade is stated so the chosen side is visible:** the narrow alternative — refuse to insert a NEW header from a staged IMAP row with a nil epoch — is tempting and should be *considered* by anyone who reopens this, but it would silently drop push-delivered mail on any server with a momentary SELECT hiccup, i.e. trade a C3 edge on an **unsupported** server for a data-visibility loss on **supported** ones. **v3 takes the current side.** Reopen only on the owner's call, and only with that trade restated.
