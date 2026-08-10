@@ -231,16 +231,8 @@ actor ActiveAIQueue {
             // Single indexed SQL query — no per-message FTS probes.
             // bodyComplete flag is set when body is written to FTS, so we know
             // which messages have body text ready for AI processing.
-            let items: [(headerId: String, accountId: String)] = try await dbPool.read { db in
-                let rows = try Row.fetchAll(db, sql: """
-                    SELECT id, accountId FROM messageHeader
-                    WHERE isInInbox = 1 AND bodyComplete = 1
-                    AND (summaryBlurb IS NULL OR summaryBlurb = ''
-                         OR actionTag IS NULL OR cachedReply IS NULL)
-                    ORDER BY date DESC
-                    LIMIT ?
-                """, arguments: [SyncConfig.maxRecentEmails])
-                return rows.map { ($0["id"] as String, $0["accountId"] as String) }
+            let items = try await dbPool.read { db in
+                try Self.repopulationCandidates(db: db)
             }
 
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
@@ -254,6 +246,23 @@ actor ActiveAIQueue {
         } catch {
             activeAILog("[ActiveAI] Repopulate failed: \(error)")
         }
+    }
+
+    /// The durable arbiter behind every direct-path redrive. Internal so the
+    /// UID-rekey regression can prove that a guarded drop is rediscovered by
+    /// the same production query, without launching an LLM in the test.
+    nonisolated static func repopulationCandidates(
+        db: Database
+    ) throws -> [(headerId: String, accountId: String)] {
+        let rows = try Row.fetchAll(db, sql: """
+            SELECT id, accountId FROM messageHeader
+            WHERE isInInbox = 1 AND bodyComplete = 1
+            AND (summaryBlurb IS NULL OR summaryBlurb = ''
+                 OR actionTag IS NULL OR cachedReply IS NULL)
+            ORDER BY date DESC
+            LIMIT ?
+        """, arguments: [SyncConfig.maxRecentEmails])
+        return rows.map { ($0["id"] as String, $0["accountId"] as String) }
     }
 
     /// Cancel all in-flight processing tasks and reset queue state.

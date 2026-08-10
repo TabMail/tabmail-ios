@@ -1011,6 +1011,19 @@ extension AccountManager {
             )
         }
 
+        // Returning to Inbox should reuse the durable AI result already keyed
+        // to the Inbox content identity. The old implementation waited for a
+        // later queue sweep, leaving actionTag nil (and the UI spinning) even
+        // when the cache was warm. This stays inside the same transaction as
+        // the optimistic move, so the row is never briefly published as an
+        // uncached Inbox message.
+        try Self.restoreInboxAICacheAfterOptimisticMove(
+            headerIds: msgIds,
+            accountId: accountId,
+            destinationPath: destinationPath,
+            destinationIsInbox: destIsInbox == true,
+            db: db)
+
         // Inline unread count update — fresh DB read, not stale snapshot.
         // Re-read isRead from DB to avoid double-decrement when markRead + move race.
         let unreadMoving = try Self.countCurrentlyUnread(msgIds: msgIds, db: db)
@@ -1030,6 +1043,32 @@ extension AccountManager {
         // transaction — that is exactly what `durablyAdmitted` asserts.
         outcome.set(.durablyAdmitted, ids: admittedIds)
         return ([admitted[0].folderId, destFolderId], outcome)
+    }
+
+    /// Restore missing AI fields only for rows that the enclosing optimistic
+    /// transaction has actually moved into Inbox. Internal for executable
+    /// regression coverage; it is not a second move path.
+    nonisolated static func restoreInboxAICacheAfterOptimisticMove(
+        headerIds: [String],
+        accountId: String,
+        destinationPath: String,
+        destinationIsInbox: Bool,
+        db: Database
+    ) throws {
+        guard destinationIsInbox else { return }
+        for headerId in headerIds {
+            guard var header = try MessageHeader.fetchOne(db, key: headerId),
+                  header.accountId == accountId,
+                  header.folderPath == destinationPath,
+                  header.isInInbox
+            else { continue }
+            try MessageAICache.restoreIfCached(
+                into: &header,
+                accountId: accountId,
+                folderPath: destinationPath,
+                db: db)
+            try header.update(db)
+        }
     }
 
     /// T4.V8: returns the per-id `(admitted, pending, failed)` triple. Existing

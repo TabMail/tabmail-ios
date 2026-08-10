@@ -91,6 +91,11 @@ struct UndoAccountCommand: Sendable, Equatable {
 }
 
 struct UndoableAction {
+    /// Stable identity for the exact undo state presented to the user. A safe
+    /// provider re-key keeps this id; pruning an unsafe member replaces it so a
+    /// button captured before the prune can never fall through to altered or
+    /// older work.
+    var id: UUID
     let type: UndoableActionType
     /// The captured snapshot. Not the undo path's identity — `commands` is —
     /// but `SyncEngine.scheduleMaintenanceInBackground` and
@@ -105,6 +110,7 @@ struct UndoableAction {
     var commands: [UndoAccountCommand]
 
     init(
+        id: UUID = UUID(),
         type: UndoableActionType,
         messages: [MessageHeader],
         originalFolderId: String,
@@ -112,6 +118,7 @@ struct UndoableAction {
         accountId: String,
         timestamp: Date
     ) {
+        self.id = id
         self.type = type
         self.messages = messages
         self.originalFolderId = originalFolderId
@@ -249,7 +256,15 @@ final class UndoService {
         let discarded = Set(oldHeaderIds)
         guard !discarded.isEmpty, !undoStack.isEmpty else { return }
 
+        // The toast is an offer to undo one exact action state. If pruning
+        // changes that state (or removes it), hide the offer instead of letting
+        // SwiftUI transparently retarget the same button to an older action.
+        let displayedActionID = showToast ? currentAction?.id : nil
+
         for actionIndex in undoStack.indices {
+            let memberCountBefore = undoStack[actionIndex].commands.reduce(0) {
+                $0 + $1.members.count
+            }
             undoStack[actionIndex].messages.removeAll { discarded.contains($0.id) }
             for commandIndex in undoStack[actionIndex].commands.indices {
                 undoStack[actionIndex].commands[commandIndex].members.removeAll {
@@ -257,16 +272,36 @@ final class UndoService {
                 }
             }
             undoStack[actionIndex].commands.removeAll { $0.members.isEmpty }
+            let memberCountAfter = undoStack[actionIndex].commands.reduce(0) {
+                $0 + $1.members.count
+            }
+            if memberCountAfter != memberCountBefore, memberCountAfter > 0 {
+                // This is now a different, smaller undo offer. Keep it in the
+                // stack for a later shake, but invalidate any captured button.
+                undoStack[actionIndex].id = UUID()
+            }
         }
         undoStack.removeAll { $0.commands.isEmpty }
-        if undoStack.isEmpty { hideToast() }
+        if let displayedActionID, currentAction?.id != displayedActionID {
+            hideToast()
+        } else if undoStack.isEmpty {
+            hideToast()
+        }
     }
 
-    func undo() async {
-        guard let action = undoStack.popLast() else {
+    func undo(expectedActionID: UUID? = nil) async {
+        guard let top = undoStack.last else {
             print("[UndoStack] UNDO called but stack is empty")
             return
         }
+        if let expectedActionID, top.id != expectedActionID {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[UndoStack] Refusing stale Undo control — displayed action changed")
+            }
+            hideToast()
+            return
+        }
+        guard let action = undoStack.popLast() else { return }
 
         let manager = AccountManager.shared
         let msgIds = action.commands.flatMap { $0.members.map(\.providerMessageId) }

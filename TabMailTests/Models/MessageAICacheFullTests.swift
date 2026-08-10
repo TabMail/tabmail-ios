@@ -278,6 +278,7 @@ struct MessageAICacheFullTests {
         #expect(header.reminderTime == "10:00")
         #expect(header.reminderContent == "Submit quarterly report")
         #expect(header.actionTag == .reply)
+        #expect(header.actionTagSetAt != nil)
         #expect(header.cachedReply == "I will submit by Friday.")
     }
 

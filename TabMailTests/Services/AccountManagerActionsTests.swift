@@ -529,6 +529,89 @@ struct AccountManagerActionsTests {
         #expect(moved?.isInInbox == true)
     }
 
+    @Test("optimistic move back to Inbox restores its existing AI cache immediately")
+    func moveToInboxRestoresWarmAICache() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
+        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+        let message = try TestDatabase.insertMessageHeader(
+            db,
+            messageId: "44",
+            folderId: "acc1:Archive",
+            folderPath: "Archive",
+            isInInbox: false,
+            rfc822MessageId: "<move-back@test.com>")
+
+        try db.write { db in
+            try MessageAICache.writeThrough(
+                accountId: "acc1",
+                folderPath: "INBOX",
+                rfc822MessageId: message.rfc822MessageId,
+                summaryBlurb: "Already computed",
+                actionTag: .archive,
+                cachedReply: "Already drafted",
+                db: db)
+            try MessageHeader.filter(Column("id") == message.id).updateAll(
+                db,
+                Column("folderId").set(to: "acc1:INBOX"),
+                Column("folderPath").set(to: "INBOX"),
+                Column("isInInbox").set(to: true),
+                Column("observedUidValidity").set(to: nil as Int?))
+            try AccountManager.restoreInboxAICacheAfterOptimisticMove(
+                headerIds: [message.id],
+                accountId: "acc1",
+                destinationPath: "INBOX",
+                destinationIsInbox: true,
+                db: db)
+        }
+
+        let moved = try db.read { try MessageHeader.fetchOne($0, key: message.id) }
+        #expect(moved?.summaryBlurb == "Already computed")
+        #expect(moved?.actionTag == .archive)
+        #expect(moved?.actionTagSetAt != nil)
+        #expect(moved?.cachedReply == "Already drafted")
+    }
+
+    @Test("optimistic move to a non-Inbox folder does not apply the Inbox AI cache")
+    func moveOutsideInboxDoesNotRestoreInboxCache() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
+        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+        let message = try TestDatabase.insertMessageHeader(
+            db,
+            messageId: "45",
+            rfc822MessageId: "<leave-inbox@test.com>")
+
+        try db.write { db in
+            try MessageAICache.writeThrough(
+                accountId: "acc1",
+                folderPath: "INBOX",
+                rfc822MessageId: message.rfc822MessageId,
+                actionTag: .reply,
+                db: db)
+            try MessageHeader.filter(Column("id") == message.id).updateAll(
+                db,
+                Column("folderId").set(to: "acc1:Archive"),
+                Column("folderPath").set(to: "Archive"),
+                Column("isInInbox").set(to: false),
+                Column("actionTag").set(to: nil as String?),
+                Column("actionTagSetAt").set(to: nil as Date?),
+                Column("tagSortOrder").set(to: 99))
+            try AccountManager.restoreInboxAICacheAfterOptimisticMove(
+                headerIds: [message.id],
+                accountId: "acc1",
+                destinationPath: "Archive",
+                destinationIsInbox: false,
+                db: db)
+        }
+
+        let moved = try db.read { try MessageHeader.fetchOne($0, key: message.id) }
+        #expect(moved?.actionTag == nil)
+        #expect(moved?.actionTagSetAt == nil)
+    }
+
     // MARK: - Self-move guard
 
     @Test("Self-move is a no-op: no PendingOperation created, no local state changed")

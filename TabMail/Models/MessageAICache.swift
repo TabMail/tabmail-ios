@@ -53,7 +53,7 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
         MessageIdentity.aiCacheKey(accountId: accountId, folderPath: folderPath, rfc822MessageId: rfc822MessageId)
     }
 
-    /// Restore cached AI state into a newly created MessageHeader.
+    /// Restore cached AI state into a newly created or re-addressed MessageHeader.
     /// Preserves first-compute-wins: doesn't overwrite actionTag if already set from server.
     static func restoreIfCached(
         into header: inout MessageHeader,
@@ -88,8 +88,7 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
             // (matches TB's messageProcessor.js ReplyDetect logic)
             // AI cache keeps the original LLM value (like TB's action:orig: key)
             let effectiveTag = (cachedTag == .reply && header.isReplied) ? ActionTag.none : cachedTag
-            header.actionTag = effectiveTag
-            header.tagSortOrder = effectiveTag.sortOrder
+            header.setActionTag(effectiveTag)
             if effectiveTag != cachedTag {
                 print("[ReplyDetect] Cache restore: reply→none for \(header.messageId) (already replied)")
             }

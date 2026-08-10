@@ -493,13 +493,15 @@ struct QueueCoreInvariantTests {
 
         // The undo stack names the member by the address the re-key changes.
         let moved = try seedHeader(fixture, messageId: "77", folderPath: "INBOX")
-        UndoService.shared.push(UndoableAction(
+        let undoAction = UndoableAction(
             type: .move(fromPath: "INBOX", toPath: "Archive"),
             messages: [moved],
             originalFolderId: moved.folderId,
             originalFolderPath: "INBOX",
             accountId: fixture.accountId,
-            timestamp: Date()))
+            timestamp: Date())
+        let actionID = undoAction.id
+        UndoService.shared.push(undoAction)
         defer { UndoService.shared.dismissAll() }
 
         // Samples the FTS index from OUTSIDE the MainActor, at a point where
@@ -532,6 +534,7 @@ struct QueueCoreInvariantTests {
         // publication did nothing at all.
         await publish.value
         let stackMember = UndoService.shared.undoStack.last?.commands.first?.members.first
+        #expect(UndoService.shared.undoStack.last?.id == actionID)
         #expect(stackMember?.originalHeaderId == newHeaderId)
         #expect(stackMember?.providerMessageId == "5")
         let missingAfter = try await SearchIndex.shared.contentKeysMissingFromFTS([oldKey])
@@ -795,13 +798,14 @@ struct QueueCoreInvariantTests {
 
         let unsafe = try seedHeader(fixture, messageId: "77", folderPath: "INBOX")
         let safe = try seedHeader(fixture, messageId: "88", folderPath: "INBOX")
-        UndoService.shared.push(UndoableAction(
+        let offered = UndoableAction(
             type: .move(fromPath: "INBOX", toPath: "Archive"),
             messages: [unsafe, safe],
             originalFolderId: unsafe.folderId,
             originalFolderPath: "INBOX",
             accountId: fixture.accountId,
-            timestamp: Date()))
+            timestamp: Date())
+        UndoService.shared.push(offered)
         defer { UndoService.shared.dismissAll() }
 
         UndoService.shared.discardMembers(namedByOldHeaderIds: [unsafe.id])
@@ -809,6 +813,46 @@ struct QueueCoreInvariantTests {
         let action = UndoService.shared.undoStack.last
         #expect(action?.messages.map(\.id) == [safe.id])
         #expect(action?.commands.flatMap(\.members).map(\.originalHeaderId) == [safe.id])
+        #expect(action?.id != offered.id, "the altered offer must invalidate a captured Undo button")
+        #expect(UndoService.shared.showToast == false)
+    }
+
+    @Test("discarding the visible latest action never retargets Undo to its predecessor")
+    @MainActor
+    func unsafeLatestUndoDoesNotFallThrough() async throws {
+        let fixture = try fixture(accountId: "acc-undo-no-fallthrough")
+        defer { finish(fixture) }
+
+        let older = try seedHeader(fixture, messageId: "77", folderPath: "INBOX")
+        let unsafeLatest = try seedHeader(fixture, messageId: "88", folderPath: "INBOX")
+        UndoService.shared.push(UndoableAction(
+            type: .move(fromPath: "INBOX", toPath: "Trash"),
+            messages: [older],
+            originalFolderId: older.folderId,
+            originalFolderPath: "INBOX",
+            accountId: fixture.accountId,
+            timestamp: Date()))
+        let offeredLatest = UndoableAction(
+            type: .move(fromPath: "INBOX", toPath: "Archive"),
+            messages: [unsafeLatest],
+            originalFolderId: unsafeLatest.folderId,
+            originalFolderPath: "INBOX",
+            accountId: fixture.accountId,
+            timestamp: Date())
+        UndoService.shared.push(offeredLatest)
+        defer { UndoService.shared.dismissAll() }
+
+        UndoService.shared.discardMembers(namedByOldHeaderIds: [unsafeLatest.id])
+
+        #expect(UndoService.shared.undoStack.count == 1)
+        #expect(UndoService.shared.currentAction?.messages.map(\.id) == [older.id])
+        #expect(UndoService.shared.showToast == false)
+
+        // This is the exact stale button closure captured before the drain
+        // learned that the latest MOVE had no safe destination address.
+        await UndoService.shared.undo(expectedActionID: offeredLatest.id)
+        #expect(UndoService.shared.undoStack.count == 1)
+        #expect(UndoService.shared.currentAction?.messages.map(\.id) == [older.id])
     }
 
     // MARK: - Test-local timings

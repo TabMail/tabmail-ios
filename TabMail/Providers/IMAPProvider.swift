@@ -4647,12 +4647,24 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     try Task.checkCancellation()
 
                     do {
-                        let moveEvidence = try await server.moveAtomically(
-                            messages: sourceUIDs, to: destination)
+                        let moveEvidence = try await server.move(
+                            messages: sourceUIDs, to: destination, fallback: .disabled)
                         return MoveOutcome(
                             provenIds: ids,
                             provenDestinations: Self.copyProvenDestinations(
                                 moveEvidence, requested: sourceUIDs))
+                    } catch IMAPError.malformedCopyUIDAfterTaggedOK {
+                        // SwiftMail has already observed the MOVE's tagged OK:
+                        // the provider mutation completed, but its destination
+                        // address evidence is unusable. Retire the forward
+                        // intention and let the ordinary source/destination
+                        // sync converge; publishing no destination mapping also
+                        // removes only this move's unsafe Undo member. Retrying
+                        // here could move a later UID occupant or duplicate work.
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[IMAP] Atomic MOVE completed with malformed COPYUID; converging by sync")
+                        }
+                        return MoveOutcome(provenIds: ids, provenDestinations: [])
                     } catch {
                         // A tagged failure is terminal only when an exact LIST
                         // proves the destination disappeared. Transport loss,

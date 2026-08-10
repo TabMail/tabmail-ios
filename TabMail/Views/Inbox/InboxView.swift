@@ -227,6 +227,9 @@ struct InboxView: View {
     }
 
     @State private var showUndoAlert = false
+    @State private var undoAlertActionID: UUID?
+    @State private var undoAlertLabel = "Undo last action?"
+    @State private var undoAlertStackCount = 0
     /// Reply-all compose target. Holds a VALUE copy of the header captured at
     /// action time (same rule as `draftHeaderToOpen`): the row can be deleted
     /// or UID-rekeyed by sync while the reply compose is open, so the cover
@@ -460,7 +463,8 @@ struct InboxView: View {
                         .foregroundStyle(.white.opacity(0.85))
                         .lineLimit(1)
                     Button("Undo") {
-                        Task { await undoService.undo() }
+                        let actionID = action.id
+                        Task { await undoService.undo(expectedActionID: actionID) }
                     }
                     .font(.caption)
                     .fontWeight(.semibold)
@@ -813,19 +817,26 @@ struct InboxView: View {
             }
         }
         .onShake {
-            if undoService.currentAction != nil {
+            if let action = undoService.currentAction {
+                undoAlertActionID = action.id
+                undoAlertLabel = action.label
+                undoAlertStackCount = undoService.undoStack.count
                 showUndoAlert = true
             }
         }
         .alert("Undo", isPresented: $showUndoAlert) {
             Button("Undo") {
-                Task { await undoService.undo() }
+                guard let actionID = undoAlertActionID else { return }
+                undoAlertActionID = nil
+                Task { await undoService.undo(expectedActionID: actionID) }
             }
-            Button("Cancel", role: .cancel) {}
+            Button("Cancel", role: .cancel) {
+                undoAlertActionID = nil
+            }
         } message: {
-            let label = undoService.currentAction?.label ?? "Undo last action?"
-            let stackCount = undoService.undoStack.count
-            Text(stackCount > 1 ? "\(label)\n\(stackCount) actions remaining" : label)
+            Text(undoAlertStackCount > 1
+                 ? "\(undoAlertLabel)\n\(undoAlertStackCount) actions remaining"
+                 : undoAlertLabel)
         }
     }
 

@@ -339,6 +339,23 @@ struct AIWriteTarget: Sendable, Equatable {
     }
 }
 
+/// One database-snapshot input for the user-opened AI path. Keeping the body,
+/// current header, and write authority together prevents a UID re-key between
+/// separate reads from turning a recoverable identity change into missing work.
+struct OpenedAIProcessingSnapshot: Sendable {
+    let body: MessageBody
+    let current: MessageHeader
+    let target: AIWriteTarget
+
+    static func capture(headerId: String, db: Database) throws -> Self? {
+        guard let body = try MessageBody.fetchOne(db, key: headerId),
+              let current = try MessageHeader.fetchOne(db, key: headerId),
+              let target = try AIWriteTarget.capture(message: current, db: db)
+        else { return nil }
+        return Self(body: body, current: current, target: target)
+    }
+}
+
 extension AccountManager {
 
     /// The ONE central guarded AI header write. Call INSIDE a `dbPool.write`.
@@ -382,29 +399,25 @@ extension AccountManager {
     /// and processes AI immediately, mirroring how TB processes the displayed email
     /// inline rather than through the background drain loop.
     func processOpenedMessage(_ message: MessageHeader) async {
-        guard message.isInInbox else { return }
         // T4.V7: co-read the body AND capture the AI-write identity in ONE read.
         // The target is captured from the CURRENT row at `message.id`, never from
         // the caller's (possibly stale) snapshot — the caller's `observedUidValidity`
         // could predate a resync. Zero extra round trips: the body read was already
         // here.
-        let opened: (body: MessageBody, target: AIWriteTarget)? =
-            (try? await dbPool.read { db -> (body: MessageBody, target: AIWriteTarget)? in
-            guard let body = try MessageBody.fetchOne(db, key: message.id),
-                  let current = try MessageHeader.fetchOne(db, key: message.id),
-                  let target = try AIWriteTarget.capture(message: current, db: db) else { return nil }
-            return (body, target)
+        let opened = (try? await dbPool.read { db in
+            try OpenedAIProcessingSnapshot.capture(headerId: message.id, db: db)
         }) ?? nil
         // body not yet fetched — fetchBody will trigger processMessage
-        guard let opened else { return }
+        guard let opened, opened.current.isInInbox else { return }
         let body = opened.body
         let target = opened.target
+        let current = opened.current
 
         // No-content message: set action=delete, summary directly (no AI needed)
         let bodyEmpty = body.htmlContent == nil || body.htmlContent?.isEmpty == true
         let hasAttachments = !body.attachments.isEmpty
-        let needsSummary = message.summaryBlurb == nil || message.summaryBlurb?.isEmpty == true
-        let needsAction = message.actionTag == nil
+        let needsSummary = current.summaryBlurb == nil || current.summaryBlurb?.isEmpty == true
+        let needsAction = current.actionTag == nil
         if bodyEmpty && !hasAttachments && (needsSummary || needsAction) {
             // T4.V7 site 8. A thrown DB error maps to `.dropped` here (the local
             // no-content shortcut has no failure-signal path) — either way NO
@@ -418,11 +431,18 @@ extension AccountManager {
             }) ?? .dropped
             if outcome == .written {
                 NotificationCenter.default.post(name: .messageDataDidChange, object: message.id)
+            } else {
+                // A move can safely re-key the row while this direct task is
+                // running. The guarded write must still refuse its stale
+                // address, but immediately let the ordinary queue rediscover
+                // the current Inbox row instead of leaving the UI spinning
+                // until an unrelated later maintenance pass.
+                await ActiveAIQueue.shared.repopulateFromDatabase()
             }
             return
         }
 
-        let needsReply = message.cachedReply == nil
+        let needsReply = current.cachedReply == nil
         guard needsSummary || needsAction || needsReply else { return } // already fully processed
 
         let aiDisabled = AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey)
@@ -430,21 +450,29 @@ extension AccountManager {
         let hasSession = KeychainHelper.load(key: "tabmail_session") != nil
         guard hasSession && (!aiDisabled || deviceSyncEnabled) else { return }
 
-        guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: message.accountId) }) else {
-            NotificationCenter.default.post(name: .aiDidFailForMessage, object: message.id)
+        guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: current.accountId) }) else {
+            NotificationCenter.default.post(name: .aiDidFailForMessage, object: current.id)
             return
         }
-        print("[AI] Priority direct path for opened message \(message.messageId)")
-        await processMessage(message, account: account, target: target)
+        print("[AI] Priority direct path for opened message \(current.messageId)")
+        await processMessage(current, body: body, account: account, target: target)
     }
 
     /// Process a single message after its body is fetched (priority path for user-opened messages).
     /// Handles AI summary + action classification, matching TB's processMessage().
     /// `target` is the T4.V7 identity captured at the direct-path entry; every
     /// header write below re-resolves through it.
-    func processMessage(_ message: MessageHeader, account: Account, target: AIWriteTarget) async {
-        let body = try? await dbPool.read { db in try MessageBody.fetchOne(db, key: message.id) }
-        guard let body, let bodyHtml = body.htmlContent, !bodyHtml.isEmpty else {
+    func processMessage(
+        _ message: MessageHeader,
+        body: MessageBody,
+        account: Account,
+        target: AIWriteTarget
+    ) async {
+        // `processOpenedMessage` captured this body, header and write target in
+        // one database snapshot. Re-reading by `message.id` here opened a
+        // needless race where an ordinary UID re-key made the body appear
+        // missing before the guarded-write/redrive path could run.
+        guard let bodyHtml = body.htmlContent, !bodyHtml.isEmpty else {
             NotificationCenter.default.post(name: .aiDidFailForMessage, object: message.id)
             return
         }
@@ -598,6 +626,7 @@ extension AccountManager {
                             if DebugModeManager.isLoggingEnabled() {
                                 print("[AI] T4.V7 direct combined write dropped for \(messageId)")
                             }
+                            await ActiveAIQueue.shared.repopulateFromDatabase()
                             return
                         }
 
@@ -619,13 +648,16 @@ extension AccountManager {
                 } else if !hasExistingAction {
                     // Action-only: summary exists but action missing
                     do {
-                        let msg = try? await dbPool.read({ db in try MessageHeader.fetchOne(db, key: headerId) })
+                        // Use the summary captured with the body and write
+                        // target. Re-reading by the pre-move header id is not
+                        // authoritative and can disappear during a UID re-key;
+                        // the guarded write below owns current-row validation.
                         let existingSummary = SummaryResult(
-                            blurb: msg?.summaryBlurb,
-                            todos: msg?.summaryTodos,
-                            reminderDate: msg?.reminderDate,
-                            reminderTime: msg?.reminderTime,
-                            reminderContent: msg?.reminderContent
+                            blurb: message.summaryBlurb,
+                            todos: message.summaryTodos,
+                            reminderDate: message.reminderDate,
+                            reminderTime: message.reminderTime,
+                            reminderContent: message.reminderContent
                         )
                         let action = try await aiService.classifyAction(
                             subject: subject,
@@ -664,6 +696,7 @@ extension AccountManager {
                                 if DebugModeManager.isLoggingEnabled() {
                                     print("[AI] T4.V7 direct action-only write dropped for \(messageId)")
                                 }
+                                await ActiveAIQueue.shared.repopulateFromDatabase()
                                 return
                             }
                             let effectiveAction = written.effective
@@ -682,61 +715,61 @@ extension AccountManager {
             async let rTask: Void = {
                 guard !hasReply else { return }
 
-                // Re-read model to check if another path populated the reply
-                let msg = try? await dbPool.read({ db in try MessageHeader.fetchOne(db, key: headerId) })
-                if let msg, msg.cachedReply == nil {
-                    do {
-                        let reply = try await aiService.processReply(
-                            messageId: messageId,
-                            rfc822MessageId: rfc822MessageId,
-                            accountEmail: accountEmail,
-                            subject: subject,
-                            from: from,
-                            fromAddress: fromAddress,
-                            to: toRecipients,
-                            date: date,
-                            bodyText: plainText,
-                            htmlContent: htmlContent,
-                            userName: userName,
-                            kbText: kbText,
-                            compositionPrompt: compositionPrompt
-                        )
-                        if let reply {
-                            // T4.V7 site 7.
-                            let outcome = (try? await dbPool.write { db in
-                                try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
-                                    msg.cachedReply = reply
-                                    try msg.save(db)
-                                    if !reply.isEmpty {
-                                        try MessageAICache.writeThrough(
-                                            accountId: accountId,
-                                            folderPath: msg.folderPath,
-                                            rfc822MessageId: msg.rfc822MessageId,
-                                            cachedReply: reply,
-                                            replyGeneratedAt: Date(),
-                                            db: db
-                                        )
-                                        if DebugModeManager.isLoggingEnabled() {
-                                            print("[AI] Reply precomputed for direct path \(messageId)")
-                                        }
-                                    } else {
-                                        if DebugModeManager.isLoggingEnabled() {
-                                            print("[AI] Reply filtered (sentinel) for direct path \(messageId)")
-                                        }
+                // `hasReply` came from the same captured header/body/target
+                // snapshot. A second lookup by the old header id could vanish
+                // after an ordinary UID re-key and skip both the guarded write
+                // and its redrive. Let the identity guard make the one
+                // authoritative decision instead.
+                do {
+                    let reply = try await aiService.processReply(
+                        messageId: messageId,
+                        rfc822MessageId: rfc822MessageId,
+                        accountEmail: accountEmail,
+                        subject: subject,
+                        from: from,
+                        fromAddress: fromAddress,
+                        to: toRecipients,
+                        date: date,
+                        bodyText: plainText,
+                        htmlContent: htmlContent,
+                        userName: userName,
+                        kbText: kbText,
+                        compositionPrompt: compositionPrompt
+                    )
+                    if let reply {
+                        // T4.V7 site 7.
+                        let outcome = (try? await dbPool.write { db in
+                            try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
+                                msg.cachedReply = reply
+                                try msg.save(db)
+                                if !reply.isEmpty {
+                                    try MessageAICache.writeThrough(
+                                        accountId: accountId,
+                                        folderPath: msg.folderPath,
+                                        rfc822MessageId: msg.rfc822MessageId,
+                                        cachedReply: reply,
+                                        replyGeneratedAt: Date(),
+                                        db: db
+                                    )
+                                    if DebugModeManager.isLoggingEnabled() {
+                                        print("[AI] Reply precomputed for direct path \(messageId)")
                                     }
+                                } else if DebugModeManager.isLoggingEnabled() {
+                                    print("[AI] Reply filtered (sentinel) for direct path \(messageId)")
                                 }
-                            }) ?? .dropped
-                            guard outcome == .written else {
-                                if DebugModeManager.isLoggingEnabled() {
-                                    print("[AI] T4.V7 direct reply write dropped for \(messageId)")
-                                }
-                                return
                             }
-                            NotificationCenter.default.post(name: .messageDataDidChange, object: headerId)
+                        }) ?? .dropped
+                        guard outcome == .written else {
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[AI] T4.V7 direct reply write dropped for \(messageId)")
+                            }
+                            await ActiveAIQueue.shared.repopulateFromDatabase()
+                            return
                         }
-                    } catch {
-                        print("[AI] Reply precompute failed for direct path \(messageId): \(error)")
+                        NotificationCenter.default.post(name: .messageDataDidChange, object: headerId)
                     }
+                } catch {
+                    print("[AI] Reply precompute failed for direct path \(messageId): \(error)")
                 }
             }()
 

@@ -599,6 +599,60 @@ struct AIWriteIdentityGuardTests {
         #expect(after == nil, "a guarded write must never re-create a purged row")
     }
 
+    @Test("opened AI snapshot survives a UID rekey and the current reply job is rediscovered")
+    func openedSnapshotRekeyRedrivesCurrentRow() throws {
+        let db = try makeFixture(folderEpoch: 111)
+        var original = makeHeader(
+            subject: "Rekey while open",
+            rfc822: "<rekey-open@example.com>",
+            observedEpoch: 111)
+        original.summaryBlurb = "Already summarized"
+        original.setActionTag(.archive)
+        original.bodyComplete = true
+        try db.write { db in
+            try original.insert(db)
+            try MessageBody(
+                contentKey: ContentKey(rawValue: original.id),
+                htmlContent: "<p>Captured body survives the address change</p>"
+            ).insert(db)
+        }
+
+        let snapshot = try db.read {
+            try OpenedAIProcessingSnapshot.capture(headerId: original.id, db: $0)
+        }
+        let captured = try #require(snapshot)
+
+        // The move drain re-addresses the same content after the direct path
+        // has captured its immutable input. The old address and body row are
+        // gone; only the new Inbox address remains eligible for AI work.
+        var rekeyed = original
+        rekeyed.id = MessageIdentity.headerId(
+            accountId: Self.accountId, folderPath: Self.folderPath, messageId: "99")
+        rekeyed.messageId = "99"
+        try db.write { db in
+            _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: original.id))
+            _ = try MessageHeader.deleteOne(db, key: original.id)
+            try rekeyed.insert(db)
+            try MessageBody(
+                contentKey: ContentKey(rawValue: rekeyed.id),
+                htmlContent: captured.body.htmlContent
+            ).insert(db)
+        }
+
+        #expect(captured.body.htmlContent == "<p>Captured body survives the address change</p>")
+        #expect(captured.current.summaryBlurb == "Already summarized")
+        #expect(captured.current.actionTag == .archive)
+        #expect(captured.current.cachedReply == nil)
+
+        let staleOutcome = try attemptSummaryWrite(
+            db, target: captured.target, blurb: "must not land at an obsolete address")
+        #expect(staleOutcome == .dropped)
+
+        let candidates = try db.read { try ActiveAIQueue.repopulationCandidates(db: $0) }
+        #expect(candidates.map(\.headerId) == [rekeyed.id])
+        #expect(candidates.map(\.accountId) == [Self.accountId])
+    }
+
     @Test("A folder mid UIDVALIDITY reset drops the AI write")
     func midResetDropsTheWrite() throws {
         let db = try makeFixture(folderEpoch: 111)
