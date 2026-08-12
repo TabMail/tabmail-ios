@@ -1058,9 +1058,9 @@ struct NeverDropExitClosureTests {
     /// mapping to work from. Handling them differently is the defect.
     ///
     /// Before the fix, `let copyEvidence = try await server.copy(...)` had no
-    /// `catch`, so the `IMAPError.commandFailed` that `CopyUID.init(nio:)` throws
-    /// on a cardinality mismatch propagated out of `IMAPProvider.move` to the
-    /// generic arm in `AccountManager.executeSingleOp`, which requeues the op
+    /// `catch`, so the error raised on a cardinality mismatch propagated out of
+    /// `IMAPProvider.move` to the generic arm in `AccountManager.executeSingleOp`,
+    /// which requeues the op
     /// and halts the lane. The throw happens BEFORE the `STORE \Deleted`, so the
     /// source is untouched and the next drain re-runs the whole sequence and
     /// issues ANOTHER `UID COPY`. One more duplicate at the destination per drain,
@@ -1068,6 +1068,24 @@ struct NeverDropExitClosureTests {
     /// cap. Sync cannot settle it, retrying makes it strictly worse, and no
     /// ordinary user gesture clears it: the wedge corollary, which is in the
     /// non-recoverable set, so this is a defect and not an accepted edge.
+    ///
+    /// ⚠️ **NAME THE ERROR THE APP ACTUALLY SEES, and do not restore a catch from
+    /// the raw thrower.** `CopyUID.init(nio:)` does throw
+    /// `IMAPError.commandFailed` on the cardinality mismatch — true of that
+    /// initializer IN ISOLATION and nothing else. It is not what reaches
+    /// `IMAPProvider.move`: `CopyHandler.handleTaggedOKResponse` wraps
+    /// `extractCopyUID` in a `do/catch` and re-raises
+    /// `IMAPError.malformedCopyUIDAfterTaggedOK(String(describing: error))`, so
+    /// that is the case the provider's `catch` must key on. This distinction is
+    /// not pedantry — it IS the defect `f8eb8acb9` fixed. SwiftMail PR #208
+    /// introduced the re-typing, only the atomic `server.move` arm was updated,
+    /// and the `server.copy` fallback arm was left catching a case the error no
+    /// longer was. A typed `catch` keyed on the wrong case does not fail to
+    /// compile, does not warn, and does not fire — it silently stops matching, and
+    /// the wedge described above came straight back. This comment said
+    /// "`IMAPError.commandFailed`" unqualified until 2026-08-12; a reader
+    /// restoring `catch IMAPError.commandFailed` from that sentence re-opens the
+    /// bug.
     ///
     /// **ASSERTED ON THE WIRE, deliberately.** The load-bearing assertion is the
     /// COUNT OF `UID COPY` COMMANDS ACROSS TWO DRAINS, not a flag, not the queue
@@ -1097,8 +1115,12 @@ struct NeverDropExitClosureTests {
             "Archive": [],
         ])
         // UIDPLUS advertised and a `COPYUID` sent — but with one more destination
-        // UID than source UID, which is exactly what `CopyUID.init(nio:)` rejects
-        // with `IMAPError.commandFailed`.
+        // UID than source UID. `CopyUID.init(nio:)` rejects that with
+        // `IMAPError.commandFailed`, but the app never sees that case:
+        // `CopyHandler.handleTaggedOKResponse` catches it and re-raises
+        // `IMAPError.malformedCopyUIDAfterTaggedOK`, which is what
+        // `IMAPProvider.move` must catch. See the doc comment above for why the
+        // distinction is the defect `f8eb8acb9` fixed.
         server.reportCopyUIDWithCardinalityMismatch()
         server.setUidValidity(10, for: "INBOX")
         server.setUidValidity(10, for: "Archive")

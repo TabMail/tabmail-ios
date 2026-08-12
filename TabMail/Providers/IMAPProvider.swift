@@ -4812,15 +4812,53 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 let preCopy = try await self.selectMailboxTracked(server, folder: source)
                 try self.requireUidValidity(
                     preCopy, expected: admittedUidValidity, folder: source)
-                // The pinned SwiftMail fork classifies tagged-OK malformed
-                // COPYUID as a successful COPY with nil evidence. That avoids
-                // retrying a copy the server already committed while preserving
-                // the no-evidence safety path below: at most reversible
-                // `\Deleted` is authorized, never UID EXPUNGE. Genuine tagged
-                // errors and transport failures still throw; the app therefore
-                // must not catch broad `.commandFailed` here.
-                let copyEvidence = try await server.copy(
-                    messages: sourceUIDs, to: destination)
+                // ⚠ THE FORK DOES NOT HAND BACK NIL EVIDENCE HERE — IT THROWS.
+                // This comment used to assert that "the pinned SwiftMail fork
+                // classifies tagged-OK malformed COPYUID as a successful COPY
+                // with nil evidence", and that is false: `CopyHandler`
+                // (`Sources/SwiftMail/IMAP/IMAP/Handler/ServerHandlers.swift` —
+                // there is no `CopyHandler.swift`) overrides
+                // `handleTaggedOKResponse` to call `extractCopyUID(from:)` →
+                // `CopyUID(nio:)` and, when that parse fails, calls
+                // `failWithError(IMAPError.malformedCopyUIDAfterTaggedOK(...))`.
+                // The false comment is what let the missing catch survive
+                // review, so it is corrected rather than deleted.
+                //
+                // WHAT THAT ERROR MEANS: the tagged OK was already observed, so
+                // under RFC 3501 §6.4.7 (an unsuccessful COPY MUST restore the
+                // destination to its prior state) the server COMMITTED this
+                // copy; only the address evidence describing it is unusable.
+                // Mapping that ONE case to `copyEvidence = nil` routes it into
+                // the no-evidence path below — the same path a server that
+                // withholds `COPYUID` entirely takes — where `copyProvenUIDs` is
+                // empty, so `purgeAuthorizedUIDs` is empty and the irreversible
+                // `UID EXPUNGE` is structurally UNREACHABLE; at most the
+                // REVERSIBLE `\Deleted` STORE is authorized, and only for
+                // members `liveSourceUIDs` proves the source still holds.
+                // Letting it propagate instead re-runs A1/A2/A3 next drain and
+                // issues ANOTHER `UID COPY` for a copy the server already made —
+                // one more duplicate at the destination per drain, on an op that
+                // never retires and a lane that stays halted: the never-drop
+                // WEDGE corollary (`IOS-IMAP-005`).
+                //
+                // ⚠ DELIBERATELY NARROW — DO NOT WIDEN THIS CATCH. A bare
+                // `catch`, a bare `IMAPError`, or `.commandFailed` would also
+                // swallow `.copyFailed` (a genuine tagged NO/BAD, which
+                // `CopyHandler.handleTaggedErrorResponse` raises), `.timeout`
+                // and `.connectionFailed` — copies that provably did NOT
+                // happen — and would soft-delete their sources anyway. That is a
+                // wrong-message mutation (C3); those must keep throwing and stay
+                // retryable.
+                let copyEvidence: CopyUID?
+                do {
+                    copyEvidence = try await server.copy(
+                        messages: sourceUIDs, to: destination)
+                } catch IMAPError.malformedCopyUIDAfterTaggedOK {
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[IMAP] move \(source)→\(destination): the COPY's tagged OK carried a COPYUID that could not be parsed — the server COMMITTED the copy, so this is NO EVIDENCE about a copy that DID happen, never a failed copy: no re-copy, no UID EXPUNGE (purge authorization is empty), at most a reversible \\Deleted on members the source still holds")
+                    }
+                    copyEvidence = nil
+                }
 
                 // T3.12 PORT (`a75196398`) — mutation-step checkpoint. The
                 // reference also carried checkpoints inside its per-member
