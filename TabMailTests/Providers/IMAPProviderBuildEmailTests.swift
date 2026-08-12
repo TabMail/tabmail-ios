@@ -10,6 +10,61 @@ import SwiftMail
 @Suite("IMAPProvider.buildEmail")
 struct IMAPProviderBuildEmailTests {
 
+    // MARK: - Control characters reaching an outbound header line
+
+    /// **The IMAP path is vulnerable through the LIBRARY, not through our code, and
+    /// "we hand SwiftMail a structured field" is not a defence.** SwiftMail's
+    /// `Email+Content` emits `"Subject: \(subject.rfc2047EncodedHeader())\r\n"`, and
+    /// `String+RFC2047Encode` opens with the same `guard contains(where: { !$0.isASCII })`
+    /// our own helper had — CR and LF are ASCII, so a CRLF-bearing subject is passed
+    /// through untouched and ends the header field. The duplication was predictable:
+    /// `RFC2047.swift`'s doc comment says it is kept byte-for-byte in step with that
+    /// function, so the bug was copied along with the helper.
+    ///
+    /// We therefore encode at OUR boundary. Upstream still needs its own fix (a
+    /// library must not emit an unencoded control character in a header regardless of
+    /// caller) — `IOS-IMAP-016`, and that PR goes to Cocoanetics, not the fork.
+    @Test("A control-bearing subject is encoded before SwiftMail sees it")
+    func controlBearingSubjectEncodedAtBoundary() {
+        let injected = "Fwd: Hi\r\nBcc: attacker@evil.example"
+        let email = IMAPProvider.buildEmail(
+            from: DraftMessage(to: ["alice@example.com"], subject: injected, body: "body"),
+            senderEmail: "sender@example.com"
+        )
+
+        #expect(!email.subject.unicodeScalars.contains { $0 == "\r" || $0 == "\n" },
+                "a raw CRLF reached SwiftMail's header emitter")
+        #expect(email.subject.hasPrefix("=?UTF-8?B?"))
+        // Nothing lost: the recipient still reads the sender's text.
+        #expect(RFC5322Parse.decodeRFC2047(email.subject) == injected)
+        // Composes with the library rather than fighting it — our output is pure
+        // ASCII, so SwiftMail's own encoder is a NO-OP on it and cannot double-encode.
+        #expect(email.subject.rfc2047EncodedHeader() == email.subject)
+    }
+
+    /// Non-vacuity: pre-encoding must not change the common paths. A benign ASCII
+    /// subject stays literal, and a non-ASCII one produces exactly what SwiftMail
+    /// would have produced on its own — so this fix is invisible to normal mail.
+    @Test("Pre-encoding leaves benign and non-ASCII subjects behaving as before")
+    func preEncodingDoesNotChangeNormalMail() {
+        let ascii = IMAPProvider.buildEmail(
+            from: DraftMessage(to: ["alice@example.com"], subject: "Q3 numbers (final)", body: "b"),
+            senderEmail: "sender@example.com"
+        )
+        #expect(ascii.subject == "Q3 numbers (final)")
+
+        let korean = "회의 일정 안내"
+        let nonASCII = IMAPProvider.buildEmail(
+            from: DraftMessage(to: ["alice@example.com"], subject: korean, body: "b"),
+            senderEmail: "sender@example.com"
+        )
+        // Untouched on purpose: SwiftMail already encodes non-ASCII at emit time, so
+        // this fix leaves the common non-ASCII path byte-identical rather than moving
+        // the encoding earlier for no wire-visible gain.
+        #expect(nonASCII.subject == korean)
+        #expect(nonASCII.subject.rfc2047EncodedHeader() == korean.rfc2047EncodedHeader())
+    }
+
     // MARK: - Basic construction
 
     @Test("Builds email with basic to-only draft")

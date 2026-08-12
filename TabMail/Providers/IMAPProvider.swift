@@ -5694,7 +5694,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             sender: SwiftMail.EmailAddress(address: senderEmail),
             recipients: draft.to.map { SwiftMail.EmailAddress(address: $0) },
             ccRecipients: draft.cc.map { SwiftMail.EmailAddress(address: $0) },
-            subject: draft.subject,
+            // SwiftMail emits `Subject: \(subject.rfc2047EncodedHeader())` and that
+            // encoder's trigger is `!$0.isASCII` — CR and LF are ASCII, so a
+            // control-bearing subject would cross into the header raw and end the
+            // field. Encode that case here; non-ASCII stays SwiftMail's job, so
+            // ordinary mail (including Korean subjects) is byte-identical on the wire.
+            subject: RFC2047.encodeIfNotEmittableLiterally(draft.subject),
             textBody: draft.isHTML ? EmailFilter.htmlToPlainText(draft.body) : draft.body,
             htmlBody: draft.isHTML ? draft.body : nil,
             attachments: smtpAttachments

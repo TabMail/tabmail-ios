@@ -26,16 +26,78 @@ enum RFC2047 {
     /// per-encoded-word ceiling.
     private static let maxBytesPerWord = 45
 
+    /// A control character can never appear literally in a header field body
+    /// (RFC 5322 §2.2 restricts it to printable US-ASCII plus SP and HTAB), and a
+    /// CR or LF among them *ends the field* — everything after it is read as a new
+    /// header. C0, DEL, and C1.
+    ///
+    /// Membership is on the SCALAR, not on `Character.isASCII`: a `Character` is a
+    /// grapheme cluster, and CR-LF is a single one, so a `\r\n` pair must be
+    /// recognised through its scalars.
+    private static func isForbiddenLiteralInHeader(_ scalar: Unicode.Scalar) -> Bool {
+        // HTAB is WSP, and RFC 5322 §3.2.5 permits WSP in an unstructured field
+        // body, so it is legal literal text and must NOT trigger encoding — the
+        // non-vacuity test `benignSubjectsStillPassThrough` caught an earlier
+        // version of this predicate encoding "a b\tc" for no reason.
+        if scalar.value == 0x09 { return false }
+        return scalar.value <= 0x1F || scalar.value == 0x7F || (0x80...0x9F).contains(scalar.value)
+    }
+
     /// Encode `value` as one or more RFC 2047 Base64 encoded-words when it
-    /// contains any non-ASCII character; pure-ASCII input is returned unchanged
+    /// contains any non-ASCII character **or any character that cannot appear
+    /// literally in a header field body**; otherwise it is returned unchanged
     /// (already a valid header value).
+    ///
+    /// ⚠️ **The control-character half of that trigger is load-bearing, and the
+    /// obvious-looking `!$0.isASCII` test is not sufficient — CR and LF ARE
+    /// ASCII.** With the narrower trigger this function returned a CRLF-bearing
+    /// subject *unchanged* while dutifully encoding a Korean one, so the only
+    /// input that could break a header was the one input it passed through. A
+    /// sender reaches this: `RFC5322Parse.decodeRFC2047` applies no control
+    /// filtering, so a legal `=?UTF-8?B?…?=` Subject decodes to arbitrary octets,
+    /// `ThreadUtils.normalizeSubject` trims `.whitespaces` (which contains neither
+    /// CR nor LF), and reply/forward carries the result into `draft.subject`. The
+    /// emitted `Subject:` then gained a second line — an attacker-chosen `Bcc:`
+    /// on the user's own outgoing mail. Pinned by
+    /// `GmailSubjectEncodingTests.bothBuildersRefuseInjectedHeader`.
+    ///
+    /// Encoding rather than rejecting is deliberate: an encoded-word is the
+    /// standard carrier for octets a header cannot hold literally, so the value is
+    /// neutralised structurally with nothing dropped and no send refused — the
+    /// recipient still sees exactly what the sender wrote.
     ///
     /// Multiple words are folded with `CRLF SPACE` so each stays within the
     /// 75-octet limit; a character's UTF-8 bytes are never split across words, so
     /// each word decodes independently. Round-trips through
     /// `RFC5322Parse.decodeRFC2047`.
     static func encodeHeaderValue(_ value: String) -> String {
-        guard value.contains(where: { !$0.isASCII }) else { return value }
+        let needsEncoding = value.contains { character in
+            !character.isASCII || character.unicodeScalars.contains(where: isForbiddenLiteralInHeader)
+        }
+        guard needsEncoding else { return value }
+        return encodeAsWords(value)
+    }
+
+    /// Encode ONLY when `value` cannot be emitted literally in a header body —
+    /// non-ASCII text is returned unchanged.
+    ///
+    /// For the IMAP/SMTP path, where **SwiftMail is the emitter**: it already
+    /// applies `String.rfc2047EncodedHeader()` to the subject, so non-ASCII is its
+    /// job and re-encoding here would change nothing on the wire while enlarging
+    /// the diff. What it does *not* do is catch a control character — its guard is
+    /// the same `!$0.isASCII` this file's used to be — so that half, and only that
+    /// half, has to happen before the value crosses the boundary. Deliberately
+    /// narrower than `encodeHeaderValue`, which the Gmail builders need because
+    /// there we are the emitter.
+    static func encodeIfNotEmittableLiterally(_ value: String) -> String {
+        // Not named `unsafe`: that is a contextual keyword for Swift's strict
+        // memory-safety expression marker and the parser rejects it here.
+        let hasForbiddenLiteral = value.unicodeScalars.contains(where: isForbiddenLiteralInHeader)
+        guard hasForbiddenLiteral else { return value }
+        return encodeAsWords(value)
+    }
+
+    private static func encodeAsWords(_ value: String) -> String {
 
         var words: [String] = []
         var chunk: [UInt8] = []
