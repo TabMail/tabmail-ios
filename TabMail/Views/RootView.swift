@@ -544,8 +544,19 @@ struct RootView: View {
                 // Non-fatal — user will see the consent gate and can consent natively
                 print("[RootView] /whoami consent check failed: \(error) — showing consent gate")
             }
-
-            // Check for pending account deletion (non-fatal)
+        }
+        // Pending-deletion check, deliberately its OWN task rather than a tail
+        // of the consent task above: that one returns early once
+        // `hasCompletedConsentGate` is true (it is `@AppStorage`, so true for
+        // every returning user), which skipped this check on every cold launch
+        // and left `DeletionBanner` — the only way to cancel a scheduled
+        // deletion — unreachable for the bulk of the 30-day grace window.
+        .task(id: hasTabMailSession) {
+            guard hasTabMailSession, !ScreenshotMode.isActive else {
+                pendingDeletionDate = nil
+                return
+            }
+            // Non-fatal: a failed check just leaves the banner hidden.
             do {
                 let status = try await BillingClient().checkDeletionStatus()
                 pendingDeletionDate = status.pending ? status.deletion_date : nil
@@ -806,7 +817,7 @@ private struct DeletionBanner: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Account deletion scheduled")
                     .font(.subheadline.bold())
-                Text("Your account will be deleted on \(formattedDate).")
+                Text("Permanently deleted on \(formattedDate). Tap Keep Account to call it off.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -829,7 +840,9 @@ private struct DeletionBanner: View {
                     Text("Retry")
                         .font(.subheadline.bold())
                 } else {
-                    Text("Cancel")
+                    // "Keep Account", not "Cancel" — next to a deletion banner
+                    // "Cancel" reads as "dismiss this banner".
+                    Text("Keep Account")
                         .font(.subheadline.bold())
                 }
             }
