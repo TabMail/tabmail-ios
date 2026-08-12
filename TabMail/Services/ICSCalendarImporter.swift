@@ -29,11 +29,21 @@ enum ICSCalendarImporter {
             do {
                 let params = NWParameters.tcp
                 let port: NWEndpoint.Port = 18942
+
+                // Bind to LOOPBACK ONLY — do not relax this to an all-interfaces bind.
+                //
+                // `NWListener(using: .tcp, on: port)` binds every interface by default. The only
+                // consumer is the in-process SFSafariViewController below, which fetches
+                // `http://127.0.0.1:<port>/invite.ics`, so a loopback-scoped bind is sufficient by
+                // construction and keeps a local-only server off the network it has no reason to be on.
+                params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: port)
                 do {
-                    listener = try NWListener(using: params, on: port)
+                    listener = try NWListener(using: params)
                 } catch {
                     print("[ICSImport] Port \(port) in use, trying random port")
-                    listener = try NWListener(using: params, on: .any)
+                    // Still loopback — the fallback must not widen the bind.
+                    params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
+                    listener = try NWListener(using: params)
                 }
             } catch {
                 print("[ICSImport] Failed to create listener: \(error)")
