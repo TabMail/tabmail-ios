@@ -140,6 +140,60 @@ struct AttachmentPreviewStagingTests {
         )
     }
 
+    /// The invariant: **no stager failure path deletes anything outside the
+    /// attempt directory it created.**
+    ///
+    /// This is deliberately NOT an assertion about what `displayFilename`
+    /// returns. The damage does not happen at the naming step — it happens when
+    /// a name that resolves back to the attempt DIRECTORY makes the write fail
+    /// and sends `stage`'s error path into `discardAttempt`, whose
+    /// `deletingLastPathComponent()` then removes the per-message NAMESPACE
+    /// rather than the attempt. Both preview call sites
+    /// (`AttachmentListView.downloadAndPreview` and
+    /// `EmlAttachmentPreview.downloadAndPreview`) stage under the same
+    /// `messageId`, so a nested `.eml` part could take out a top-level
+    /// attachment that a live QuickLook preview and its `ShareLink` are still
+    /// reading. Pinning the naming would leave that reachable through any other
+    /// name with the same shape.
+    @Test("A failed attempt never deletes a sibling attempt's staged bytes")
+    func aFailedAttemptNeverDeletesASiblingAttempt() throws {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let good = try AttachmentPreviewStager.stage(
+            data: Data("FIRST".utf8),
+            messageId: Self.messageId,
+            originalFilename: "invoice.pdf",
+            rootDirectory: root
+        )
+        // `<root>/TabMailAttachmentPreviews/<message hash>` — shared by every
+        // attempt for this message, which is exactly what must survive.
+        let namespace = good.deletingLastPathComponent().deletingLastPathComponent()
+
+        // A hostile name staged under the SAME messageId. Whether it succeeds or
+        // fails is not the point and is not asserted; the point is that its
+        // outcome is confined to its own attempt.
+        _ = try? AttachmentPreviewStager.stage(
+            data: Data("HOSTILE".utf8),
+            messageId: Self.messageId,
+            originalFilename: "/",
+            rootDirectory: root
+        )
+
+        #expect(
+            (try? Data(contentsOf: good)) == Data("FIRST".utf8),
+            "a second attempt's failure must not destroy the bytes a live preview and its ShareLink are reading"
+        )
+        var isDirectory: ObjCBool = false
+        let namespaceExists = FileManager.default.fileExists(
+            atPath: namespace.path, isDirectory: &isDirectory
+        )
+        #expect(
+            namespaceExists && isDirectory.boolValue,
+            "the per-message namespace directory must outlive any single failed attempt"
+        )
+    }
+
     // MARK: - Attempt lifetime (no unbounded tmp/ growth)
 
     @Test("A refused presentation removes the attempt directory it staged")

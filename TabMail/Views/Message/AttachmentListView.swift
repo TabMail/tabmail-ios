@@ -457,10 +457,40 @@ enum AttachmentPreviewStager {
     }
 
     /// Reduces an attachment filename to a single safe path component, so a
-    /// crafted name containing separators cannot escape the attempt directory.
+    /// crafted name containing separators cannot escape the attempt directory —
+    /// and, just as importantly, so no name can resolve BACK to the attempt
+    /// directory itself.
+    ///
+    /// The reduction splits textually on `/`. It deliberately does NOT go through
+    /// `URL(fileURLWithPath:).lastPathComponent`, which was wrong in two separate
+    /// directions:
+    ///
+    /// 1. It resolves a RELATIVE path against the process working directory
+    ///    before taking the last component, so `""`, `"."` and `".."` came back
+    ///    as a component of the CWD (measured: `"tabmail-ios"`, `"tabmail-ios"`,
+    ///    `"tabmail"`). The `.`/`..`/empty guard below could therefore never fire
+    ///    — it was dead code and its `"Attachment"` fallback was unreachable.
+    /// 2. For the root path it returns `"/"` itself, which passed that guard.
+    ///    `appendingPathComponent("/")` then collapses to the ATTEMPT DIRECTORY,
+    ///    so the atomic write fails `EISDIR` and `stage`'s error path calls
+    ///    `discardAttempt`, whose `deletingLastPathComponent()` removes the
+    ///    per-message NAMESPACE rather than the attempt — contradicting
+    ///    `discardAttempt`'s own contract and destroying a sibling attempt whose
+    ///    bytes a live QuickLook preview and its `ShareLink` are still reading.
+    ///    Both preview call sites stage under the same `messageId`
+    ///    (`AttachmentListView.downloadAndPreview` passes `message.id`,
+    ///    `EmlAttachmentPreview.downloadAndPreview` passes `parentMessage.id`),
+    ///    so a nested `.eml` part could reach a top-level attachment.
+    ///
+    /// `split(separator:)` omits empty subsequences, so its last element is
+    /// always exactly one non-empty component containing no `/` — which IS the
+    /// safety property — or there is no element at all (`""`, `"/"`, `"///"`).
+    /// `.` and `..` survive the split as single components and are refused
+    /// explicitly: neither names a file inside the attempt directory.
     private static func displayFilename(_ originalFilename: String) -> String {
-        let candidate = URL(fileURLWithPath: originalFilename).lastPathComponent
-        guard !candidate.isEmpty, candidate != ".", candidate != ".." else {
+        guard let candidate = originalFilename.split(separator: "/").last.map(String.init),
+              candidate != ".", candidate != ".."
+        else {
             return "Attachment"
         }
         return candidate
