@@ -186,22 +186,53 @@ struct EmlAttachmentPreview: View {
         downloadingSection = attachment.section
         error = nil
         Task {
-            do {
-                let data = try await manager.fetchAttachment(
-                    for: parentMessage, section: attachment.section, encoding: attachment.encoding
+            await downloadAndPreview(attachment) { part in
+                try await manager.fetchAttachment(
+                    for: parentMessage, section: part.section, encoding: part.encoding
                 )
-                let tempDir = FileManager.default.temporaryDirectory
-                let fileURL = tempDir.appendingPathComponent(attachment.filename)
-                try data.write(to: fileURL)
-                downloadedFiles[attachment.section] = fileURL
-                previewURL = fileURL
-            } catch {
-                self.error = SyncEngine.isConnectionError(error)
-                    ? "Download failed. Check your connection and try again."
-                    : "Download failed: \(error.localizedDescription)"
-                print("[EmlNestedAttachment] Download failed: \(error)")
             }
             downloadingSection = nil
+        }
+    }
+
+    /// Fetch → disk → preview, with the fetch supplied by the caller.
+    ///
+    /// `fetch` is required rather than defaulted: this is the only place a nested
+    /// `.eml` attachment reaches the filesystem, and a seam that could be omitted
+    /// would let a test silently exercise the live account instead of the write
+    /// path it means to pin.
+    func downloadAndPreview(
+        _ attachment: AttachmentInfo,
+        fetch: (AttachmentInfo) async throws -> Data
+    ) async {
+        do {
+            let data = try await fetch(attachment)
+            // `attachment.filename` is a raw MIME parameter authored by whoever
+            // sent the `.eml`, so it may carry path separators — joining it onto
+            // a directory lets it escape (`../Library/Application Support/TabMail/
+            // tabmail.sqlite` overwrites the live GRDB store). The stager reduces
+            // it to a single path component under a fresh per-attempt directory,
+            // the same guard `AttachmentListView` already applies to top-level
+            // attachments, and the per-attempt UUID also keeps repeated downloads
+            // of one attachment from overwriting the bytes a live preview reads.
+            //
+            // `messageId:` is `parentMessage.id` because that is the identity
+            // these bytes were fetched under — `fetchAttachment(for: parentMessage,
+            // section:)` — so the staging namespace is the same content key the
+            // sibling call site uses. The nested part is distinguished by
+            // `section`, which the stager deliberately keeps out of the namespace.
+            let fileURL = try AttachmentPreviewStager.stage(
+                data: data,
+                messageId: parentMessage.id,
+                originalFilename: attachment.filename
+            )
+            downloadedFiles[attachment.section] = fileURL
+            previewURL = fileURL
+        } catch {
+            self.error = SyncEngine.isConnectionError(error)
+                ? "Download failed. Check your connection and try again."
+                : "Download failed: \(error.localizedDescription)"
+            print("[EmlNestedAttachment] Download failed: \(error)")
         }
     }
 
