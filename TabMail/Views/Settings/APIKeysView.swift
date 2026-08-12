@@ -35,9 +35,11 @@ struct APIKeysView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                APIKeyProviderSection(provider: "openai", catalog: catalog)
-                APIKeyProviderSection(provider: "anthropic", catalog: catalog)
-                APIKeyProviderSection(provider: "google", catalog: catalog)
+                // Driven by BYOKProviderInfo.allProviders so this list cannot drift from the one
+                // AppDataWiper uses to DELETE keys. Order is the declaration order.
+                ForEach(BYOKProviderInfo.allProviders, id: \.self) { provider in
+                    APIKeyProviderSection(provider: provider, catalog: catalog)
+                }
             }
         }
         .navigationTitle("API Keys")

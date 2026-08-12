@@ -231,6 +231,14 @@ struct BYOKTierRows: View {
 // MARK: - Per-provider metadata
 
 enum BYOKProviderInfo {
+    /// Every provider a BYOK key can be stored for.
+    ///
+    /// Single source of truth on purpose: BYOK Keychain items are keyed by this raw string, so any
+    /// list that enumerates providers for DELETION (see `AppDataWiper`) must not be able to drift from
+    /// the list that offers them for ENTRY. A provider present in one list and absent from the other
+    /// is a key that can be saved but never wiped.
+    static let allProviders = ["openai", "anthropic", "google"]
+
     static func displayName(_ raw: String) -> String {
         switch raw {
         case "openai": return "OpenAI"
