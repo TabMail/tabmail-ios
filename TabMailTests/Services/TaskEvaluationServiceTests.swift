@@ -180,3 +180,30 @@ struct TaskExecutionCacheTests {
         #expect(all["\(hash)_2026-04-06"]?.content == "Entry")
     }
 }
+
+// MARK: - Unattended prompt-token boundary
+
+@Suite("TaskEvaluationService — unattended prompt token")
+struct TaskEvaluationPromptTokenTests {
+
+    @Test("Unattended evaluation names the task-eval prompt, never the interactive one")
+    func unattendedTokenIsDistinct() {
+        // The backend keys per-prompt `allowed_tools` off this exact string, so the constant IS the
+        // security boundary: swapping it back to the interactive token silently widens the tool set an
+        // unattended run can reach.
+        #expect(TaskEvaluationService.taskEvalSystemPrompt == "system_prompt_task_eval")
+        // Non-vacuity, and the actual property worth pinning: it must not be the interactive token.
+        // Asserting the literal alone would still pass if someone set both constants to the same value.
+        #expect(TaskEvaluationService.taskEvalSystemPrompt != "system_prompt_agent")
+        #expect(!TaskEvaluationService.taskEvalSystemPrompt.isEmpty)
+    }
+
+    // ⚠️ STATED COVERAGE GAP, not an oversight. What matters is the SYSTEM property — "the unattended
+    // path never sends the interactive token" — and that is NOT pinned here. `evaluateAll` builds its
+    // `CompletionsMessage` inline and calls `AIService` directly, so there is no seam a test can
+    // observe the outgoing token through, and a test asserting only the constant would keep passing if
+    // the call site stopped using it. Closing this properly means injecting the request builder, which
+    // is a refactor of a live AI path rather than part of this security fix. The Thunderbird half of
+    // this change pins its call site by reading its own source; Swift tests have no equivalent that
+    // works from the simulator sandbox without a fragile absolute host path.
+}

@@ -30,6 +30,12 @@ actor TaskEvaluationService {
     /// Evaluation interval (matches TB's TASK_EVAL_INTERVAL_MINUTES = 5)
     private static let evalIntervalSeconds: UInt64 = 5 * 60
 
+    /// Backend prompt token for UNATTENDED task evaluation — a security boundary, not an alias for
+    /// convenience. The backend keys per-prompt `allowed_tools` off this string, so this constant is
+    /// what decides which tools an unattended run can reach. Named so the invariant is testable and so
+    /// the interactive token cannot be substituted silently. See the use site.
+    static let taskEvalSystemPrompt = "system_prompt_task_eval"
+
     // MARK: - Lifecycle
 
     /// Start the periodic task evaluation loop. Call on app foreground.
@@ -219,9 +225,19 @@ actor TaskEvaluationService {
         let reminders = await ReminderBuilder.buildReminderList()
         let remindersJSON = reminders.isEmpty ? "" : await ReminderBuilder.formatRemindersJSON(reminders)
 
+        // Unattended scheduled-task evaluation. The backend expands this token into the SAME agent
+        // system prompt (it aliases the agent expander and shares its template, so they cannot drift)
+        // but resolves it to a narrower allowed_tools list than interactive chat gets.
+        //
+        // ⚠️ SECURITY BOUNDARY — do not substitute the interactive token here. This path is unattended,
+        // so it is scoped deliberately; widening it is a backend decision (systemPromptTiers.json),
+        // never a token swap at this call site.
+        //
+        // This named token is a versioned client/backend contract. Coordinate any future token
+        // change across both sides; do not substitute another prompt token locally.
         let systemMessage = CompletionsMessage(
             role: "system",
-            content: "system_prompt_agent",
+            content: Self.taskEvalSystemPrompt,
             vars: [
                 "user_name": .string(userName),
                 "user_kb_content": .string(kbText),
