@@ -141,9 +141,22 @@ final class DebugModeManager {
     /// Escaped rather than stripped, so the line still shows what the sender
     /// actually sent. The escaped set is the C0 range, `DEL` + the C1 range, and
     /// U+2028/U+2029 — deliberately the same class `imageLoadDiagnosticJS`'s
-    /// `sanitize` closes on the webview's `postMessage` channel, which this
-    /// channel is NOT covered by. U+0085 (NEL) needs no separate case: it is
-    /// inside the C1 range.
+    /// `sanitize` closes, which this `print` channel is NOT covered by.
+    /// U+0085 (NEL) needs no separate case: it is inside the C1 range.
+    ///
+    /// ⚠️ **This sentence said `sanitize` closes that class "on the webview's
+    /// `postMessage` channel" until 2026-08-12. It does not, and the overclaim
+    /// mattered in the direction that made the webview look protected.**
+    /// `sanitize` runs inside `imageLoadDiagnosticJS`'s own `log()` wrapper, one
+    /// line before that wrapper posts to `consoleLog`. It sanitises the values
+    /// OUR script interpolates. It cannot sanitise the channel: every
+    /// `WKUserScript` in `AutoSizingHTMLView.makeUIView` is installed with no
+    /// content world, so sender script shares our `window` and can call
+    /// `window.webkit.messageHandlers.consoleLog.postMessage(…)` directly with
+    /// embedded newlines, bypassing `log()` entirely. That remains open while
+    /// `allowsContentJavaScript` is `true` (ADR-IOS-076 decision 1 is what closes
+    /// it) and is out of scope for this helper, which owns only the Swift-side
+    /// `print` interpolations.
     ///
     /// ⚠️ This is NOT a reversible encoding and NOT injective. A backslash in the
     /// input is passed through unchanged, so a sender who writes the six literal

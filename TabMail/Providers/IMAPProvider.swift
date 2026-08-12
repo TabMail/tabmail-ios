@@ -3632,16 +3632,32 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             $0.contentType.lowercased().contains("text/calendar")
         })?.decodedData()
 
-        // Log body part structure for debugging embedded .eml rendering
+        // Log body part structure for debugging embedded .eml rendering.
+        //
+        // Debug-gated per global rule 12 — this block was ungated and so ran in
+        // release for every message carrying a `message/rfc822` part — and every
+        // sender-authored MIME value in it is escaped. `filename` and
+        // `contentType` are header text the SENDER chose, and `print` is a
+        // line-oriented sink, so a CR/LF/U+2028 in either does not corrupt a line,
+        // it forges a plausible extra one: see `DebugModeManager.escapedForLogLine`.
+        //
+        // The gate is in the BODY, not folded into the `if` condition. A gate in a
+        // branch condition lets a debug unlock decide which branch runs, so debug
+        // and release stop sharing one control-flow graph;
+        // `Companion/Memory/Current/105-a-print-is-not-production-observability-on-ios.md`
+        // §3 records the sibling where that happened. Keeping it inside also means
+        // a non-logging statement added here later still runs in production.
         let bodyParts = message.bodies
         let rfc822Parts = message.parts.filter { $0.contentType.lowercased().hasPrefix("message/rfc822") }
         if !rfc822Parts.isEmpty {
-            print("[EmlRender] Message has \(rfc822Parts.count) rfc822 part(s), \(bodyParts.count) body parts:")
-            for part in bodyParts {
-                print("[EmlRender]   section=\(part.section.description) type=\(part.contentType) len=\(part.textContent?.count ?? 0)")
-            }
-            for part in rfc822Parts {
-                print("[EmlRender]   rfc822: section=\(part.section.description) filename=\(part.filename ?? "nil")")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[EmlRender] Message has \(rfc822Parts.count) rfc822 part(s), \(bodyParts.count) body parts:")
+                for part in bodyParts {
+                    print("[EmlRender]   section=\(part.section.description) type=\(DebugModeManager.escapedForLogLine(part.contentType)) len=\(part.textContent?.count ?? 0)")
+                }
+                for part in rfc822Parts {
+                    print("[EmlRender]   rfc822: section=\(part.section.description) filename=\(DebugModeManager.escapedForLogLine(part.filename ?? "nil"))")
+                }
             }
         }
 
@@ -3649,8 +3665,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let htmlBody = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")
         let textBody = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/plain")
 
+        // Same gate, same reason. Nothing sender-authored is interpolated here —
+        // only two lengths — so there is nothing to escape; rule 12 still applies.
         if !rfc822Parts.isEmpty {
-            print("[EmlRender] htmlBody len=\(htmlBody?.count ?? 0), textBody len=\(textBody?.count ?? 0)")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[EmlRender] htmlBody len=\(htmlBody?.count ?? 0), textBody len=\(textBody?.count ?? 0)")
+            }
         }
 
         return FullMessageInfo(

@@ -1693,10 +1693,24 @@ actor GmailProvider: EmailProvider {
                             bodyHtml: parsed.bodyHtml
                         )
                     } else {
-                        print("[Gmail] Failed to parse \(part.filename ?? "?.eml") as RFC 822 — rendering as plain attachment")
+                        // Gated in the BODY, not in the `else` condition: a gate in
+                        // a branch condition lets a debug unlock decide which branch
+                        // runs, so debug and release stop sharing one control-flow
+                        // graph. `Companion/Memory/Current/105-a-print-is-not-production-observability-on-ios.md`
+                        // §3 records the sibling where that happened.
+                        //
+                        // `part.filename` is the sender's raw MIME `filename`
+                        // parameter and `print` is a line-oriented sink, so it is
+                        // escaped: see `DebugModeManager.escapedForLogLine`.
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[Gmail] Failed to parse \(DebugModeManager.escapedForLogLine(part.filename ?? "?.eml")) as RFC 822 — rendering as plain attachment")
+                        }
                     }
                 } catch {
-                    print("[Gmail] Failed to fetch bytes for \(part.filename ?? "?"): \(error)")
+                    if DebugModeManager.isLoggingEnabled() {
+                        // `error` can carry a server-supplied string as well.
+                        print("[Gmail] Failed to fetch bytes for \(DebugModeManager.escapedForLogLine(part.filename ?? "?")): \(DebugModeManager.escapedForLogLine(String(describing: error)))")
+                    }
                 }
                 continue
             }
@@ -1828,7 +1842,12 @@ actor GmailProvider: EmailProvider {
                         }
                     }
                 } catch {
-                    print("[Gmail] Failed to list nested attachments in \(part.filename ?? "?.eml"): \(error)")
+                    // Same class as the two sites in `extractBodyAndEmlMarkers`:
+                    // debug-gated per rule 12, sender-authored `filename` and the
+                    // error description both escaped for a line-oriented sink.
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Gmail] Failed to list nested attachments in \(DebugModeManager.escapedForLogLine(part.filename ?? "?.eml")): \(DebugModeManager.escapedForLogLine(String(describing: error)))")
+                    }
                 }
             }
             if let nested = part.parts {
@@ -1921,7 +1940,13 @@ actor GmailProvider: EmailProvider {
                 let data = try await fetchAttachment(messageId: messageId, attachmentId: attachmentId)
                 images.append(InlineImage(contentId: item.contentId, contentType: item.mimeType, data: data))
             } catch {
-                print("[Gmail] Failed to fetch inline image \(item.contentId): \(error)")
+                // `item.contentId` is the sender's `Content-ID` header value —
+                // the same sender-authored MIME-header class as `filename`, and
+                // NOT in the brief this fix came from; found by the source scan
+                // in `RenderPathLogSinkTests`, which is the point of having it.
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Gmail] Failed to fetch inline image \(DebugModeManager.escapedForLogLine(item.contentId)): \(DebugModeManager.escapedForLogLine(String(describing: error)))")
+                }
             }
         }
         return images

@@ -414,7 +414,16 @@ enum IMAPFetchMapping {
             for textPart in topLevelText {
                 if let content = textPart.textContent, !content.isEmpty {
                     topLevelContent += EmailFilter.plainTextToHTML(content)
+                    // Debug-gated per global rule 12. `#if DEBUG` rather than
+                    // `DebugModeManager.isLoggingEnabled()` because `Shared/` also
+                    // compiles into the notification-service extension, where
+                    // `DebugModeManager` does not exist — the same constraint
+                    // `Shared/Persistence/BodyAssetStore.swift` documents at the
+                    // `#if DEBUG` prints in its `catch` arms. Nothing
+                    // sender-authored is interpolated here.
+                    #if DEBUG
                     print("[EmlRender] Prepending main message text/plain (len=\(content.count)) as HTML for .eml-only HTML message")
+                    #endif
                 }
             }
         }
@@ -461,7 +470,24 @@ enum IMAPFetchMapping {
         for part in emlFileParts {
             guard let raw = part.decodedData() ?? part.data,
                   let parsed = EmlParsing.parse(rawBytes: raw) else {
+                // Debug-gated per global rule 12, by `#if DEBUG` for the reason
+                // above — this file compiles into the NSE target too.
+                //
+                // ⚠️ KNOWN RESIDUAL, recorded rather than fixed: `part.filename` is
+                // the sender's raw MIME `filename` parameter and it is NOT escaped
+                // here, so in a DEBUG build a CR/LF/U+2028 in it still forges an
+                // extra diagnostic line. The escaper is
+                // `DebugModeManager.escapedForLogLine`, which lives in the app
+                // target and is not visible from `Shared/`. Closing it means moving
+                // the escaper into `Shared/` — a wider change than this fix, and not
+                // taken here. Release builds no longer emit the line at all, which
+                // is the half that was reaching users.
+                //
+                // `RenderPathLogSinkTests` does NOT cover this file, for the same
+                // visibility reason; its doc comment says so.
+                #if DEBUG
                 print("[EmlRender] IMAP: could not parse \(part.filename ?? "?.eml") as RFC 822 — rendering as plain attachment")
+                #endif
                 continue
             }
             let filename = part.filename ?? "attached-email.eml"
