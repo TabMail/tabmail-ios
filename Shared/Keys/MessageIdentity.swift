@@ -287,6 +287,43 @@ public enum MessageIdentity {
     ///
     /// Use this ONLY to compare identities. Anything that MINTS a stored key must
     /// keep using `usableRfc822Tail`.
+    ///
+    /// ⚑ THE REJECTION SET BELOW IS 254 SCALARS — NOT `controlCharacters`' 24,970,
+    /// AND NOT THE 24,989 SET ALGEBRA PREDICTS. `whitespacesAndNewlines.union(.controlCharacters)`
+    /// does not compose the way its name reads. Measured on this platform across all
+    /// 17 planes, `.contains` per scalar: the bare constant is **24,970**
+    /// (`unassigned=24638 format=170 nonspacingMark=97 control=65`); this expression
+    /// is **254**; the difference is 24,735 scalars, every one of them in plane 14.
+    /// The cause is that a set OPERATION may materialise a built-in `CharacterSet`
+    /// down to Cc ∪ Cf (65 + 170 = 235) — and which operations do is not visible in
+    /// the source: `.subtracting(CharacterSet())` collapses it while
+    /// `.union(CharacterSet())`, equally an identity, does not. So the constant's
+    /// NAME predicts neither number, and neither does the expression's shape.
+    /// The bare set is additionally INCOHERENT in plane 14 — it contains U+E0101 but
+    /// not U+E0100 and not U+E0102–U+E011F — so it corresponds to no Unicode
+    /// category and must never be reasoned about from the identifier alone. Re-measure
+    /// rather than restate this number if the expression changes.
+    ///
+    /// What the 254 still rejects is what this guard actually needs, verified
+    /// scalar-by-scalar: NUL, TAB, LF, CR, DEL U+007F, NEL U+0085, ZWSP U+200B,
+    /// ZWJ U+200D, RLO U+202E, LRI U+2066, BOM U+FEFF, and the tag characters
+    /// U+E0001 / U+E0020–U+E007F. It loses only the plane-14 variation selectors,
+    /// which cannot make two distinct ids compare equal. No printable ASCII except
+    /// SPACE is a member, so no RFC 5322-conforming id is refused by this clause.
+    ///
+    /// ⛔ DO NOT WIDEN THIS SET — the failure direction is the opposite of the
+    /// intuitive one. A refused id returns `nil`, so `ExpectedMessageIdentity.init?`
+    /// fails, the header is absent from the witness map, and
+    /// `AccountManagerActions.partition(against:)` reaches
+    /// `guard let expected = expectedIdentities[header.id] else { return true }` —
+    /// `return true` KEEPS the header, so the action proceeds authenticated by the
+    /// durable composite address alone. Nothing is dropped and no intention is lost;
+    /// the cost is a silently LARGER witness-less population and correspondingly less
+    /// C3 wrong-message protection. That is exactly the direction `IOS-IDENTITY-001`
+    /// forbids (`Companion/Process/Current/KnownIssues/ios-identity-001.md`, closed as
+    /// a decision, substitute witness authored and reverted twice): the lever is to
+    /// make the witness-less population SMALLER by capturing an RFC id at more ingest
+    /// points — never to make the refusal BROADER.
     public static func comparableRfc822Identity(_ rawValue: String?) -> String? {
         guard let rawValue,
               !rawValue.utf8.contains(0x0D),
