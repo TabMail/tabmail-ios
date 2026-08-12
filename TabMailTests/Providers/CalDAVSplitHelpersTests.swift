@@ -1728,3 +1728,145 @@ struct CalDAVSplitBoundaryInstantTests {
         }
     }
 }
+
+// MARK: - ICS injection on the UPDATE paths
+
+/// `GCalEventInput.toICS` is not the only place ICS property lines are assembled, and guarding it
+/// alone left this class open: `toICS` covers create and split-series, while `updateOccurrence`
+/// builds its VEVENT in `CalDAVProvider.buildOverrideVEvent` and `updateEvent` builds it in
+/// `CalDAVProvider.mergePatchIntoICS` (via `replaceOrAppendInMasterVEvent`, `replaceRRule` and
+/// `replaceAttendeesInMasterVEvent`). Every one of those interpolates model-supplied tool arguments,
+/// so each is asserted here directly rather than through the create path.
+///
+/// The oracle is LINE-level and splits on ANY newline: sanitizing strips the separators rather than
+/// rejecting the value, so the payload text legitimately survives as inert value text — what must
+/// never happen is that it starts a line, because that is what makes it an ICS property.
+@Suite("CalDAVProvider — ICS injection on update paths")
+struct CalDAVICSInjectionTests {
+
+    /// CRLF, bare LF, and the Unicode separators `Character.isNewline` also recognises.
+    private static let payloadBreaks = ["\r\n", "\n", "\r", "\u{2028}", "\u{2029}", "\u{0085}"]
+
+    private func propertyLines(_ ics: String) -> [String] {
+        ics.split(whereSeparator: \.isNewline).map(String.init)
+    }
+
+    private let masterICS = """
+    BEGIN:VCALENDAR
+    VERSION:2.0
+    BEGIN:VEVENT
+    UID:abc-123
+    DTSTAMP:20260513T120000Z
+    DTSTART;TZID=America/Los_Angeles:20260513T170000
+    SUMMARY:Original title
+    ATTENDEE;CN="Alice";ROLE=REQ-PARTICIPANT:mailto:alice@example.com
+    END:VEVENT
+    END:VCALENDAR
+    """.replacingOccurrences(of: "\n", with: "\r\n")
+
+    @Test("buildOverrideVEvent: a poisoned SUMMARY cannot become a second property")
+    func overrideSummaryCannotInject() {
+        for brk in Self.payloadBreaks {
+            var patch = GCalEventInput()
+            patch.summary = "Standup\(brk)ATTENDEE;ROLE=REQ-PARTICIPANT:mailto:attacker@evil.example"
+            let block = CalDAVProvider.buildOverrideVEvent(
+                patch: patch, uid: "u", recurrenceId: "20260513T170000Z", kind: .utc
+            )
+            let lines = propertyLines(block)
+            #expect(!lines.contains { $0.hasPrefix("ATTENDEE") },
+                    "break \(brk.unicodeScalars.map { String($0.value, radix: 16) }) injected ATTENDEE:\n\(block)")
+            // Non-vacuity: the override itself is still produced.
+            #expect(lines.contains("BEGIN:VEVENT"))
+            #expect(lines.contains { $0.hasPrefix("SUMMARY:") }, "no SUMMARY emitted:\n\(block)")
+        }
+    }
+
+    @Test("buildOverrideVEvent: a poisoned attendee name cannot forge an occurrence")
+    func overrideAttendeeCannotForgeOccurrence() {
+        var patch = GCalEventInput()
+        patch.attendees = [(email: "real@example.com",
+                            name: "Bob\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nRECURRENCE-ID:20260520T170000Z\r\nSTATUS:CANCELLED")]
+        let block = CalDAVProvider.buildOverrideVEvent(
+            patch: patch, uid: "u", recurrenceId: "20260513T170000Z", kind: .utc
+        )
+        let lines = propertyLines(block)
+        // Exactly one VEVENT, and no forged cancellation of a DIFFERENT occurrence — that would be a
+        // mutation of a message the gesture never named, on a wire operation with no per-item recovery.
+        #expect(lines.filter { $0 == "BEGIN:VEVENT" }.count == 1, "forged VEVENT:\n\(block)")
+        #expect(!lines.contains { $0.hasPrefix("STATUS:CANCELLED") }, "forged cancellation:\n\(block)")
+        #expect(!lines.contains { $0.hasPrefix("RECURRENCE-ID:20260520") }, "forged RECURRENCE-ID:\n\(block)")
+        // Non-vacuity: the attendee we asked for is present.
+        #expect(lines.contains { $0.hasPrefix("ATTENDEE") && $0.contains("real@example.com") })
+    }
+
+    @Test("replaceAttendeesInMasterVEvent: a poisoned attendee name cannot add a property")
+    func replaceAttendeesCannotInject() {
+        let out = CalDAVProvider.replaceAttendeesInMasterVEvent(
+            in: masterICS,
+            attendees: [(email: "real@example.com",
+                         name: "Bob\r\nATTENDEE;ROLE=REQ-PARTICIPANT:mailto:attacker@evil.example")]
+        )
+        let lines = propertyLines(out)
+        let attendeeLines = lines.filter { $0.hasPrefix("ATTENDEE") }
+        #expect(attendeeLines.count == 1, "expected exactly the one attendee we set:\n\(out)")
+
+        // Self-calibrating property-line count, replacing an assertion that could not fire in either
+        // direction. That one read `!out.contains("mailto:attacker@evil.example\r\n")`, but the address
+        // sits inside the CN parameter and is always followed by `";ROLE=` — so it held pre-fix too and
+        // merely LOOKED like coverage. Comparing against a clean run of the same helper catches an
+        // injected property of ANY name, not just ATTENDEE, and needs no hardcoded baseline.
+        let clean = CalDAVProvider.replaceAttendeesInMasterVEvent(
+            in: masterICS,
+            attendees: [(email: "real@example.com", name: "Bob")]
+        )
+        #expect(lines.count == propertyLines(clean).count,
+                "the poisoned name changed the number of property lines:\n\(out)")
+        #expect(attendeeLines.first?.contains("real@example.com") == true, "non-vacuity: real attendee missing:\n\(out)")
+    }
+
+    @Test("mergePatchIntoICS: end to end, a poisoned attendee name cannot add a property")
+    func mergePatchAttendeeCannotInject() {
+        var patch = GCalEventInput()
+        patch.attendees = [(email: "real@example.com",
+                            name: "Bob\u{2028}ORGANIZER:mailto:attacker@evil.example")]
+        let merged = CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
+        let lines = propertyLines(merged)
+        #expect(!lines.contains { $0.hasPrefix("ORGANIZER:mailto:attacker") }, "injected ORGANIZER:\n\(merged)")
+        #expect(lines.filter { $0 == "BEGIN:VEVENT" }.count == 1, "extra VEVENT:\n\(merged)")
+        // Non-vacuity: the merge still did its job.
+        #expect(lines.contains("SUMMARY:Original title"), "merge dropped untouched properties:\n\(merged)")
+    }
+
+    @Test("replaceOrAppendInMasterVEvent guards the line at the point of insertion")
+    func replaceOrAppendSanitizesItsInput() {
+        // Asserted on the helper directly, because the guard belongs to the helper rather than to
+        // today's callers: every current caller happens to be safe, so a test driven only through
+        // them would pass with the guard removed and the next caller would inherit nothing.
+        let out = CalDAVProvider.replaceOrAppendInMasterVEvent(
+            in: masterICS,
+            propertyKey: "TRANSP",
+            newLine: "TRANSP:OPAQUE\r\nATTENDEE;ROLE=REQ-PARTICIPANT:mailto:attacker@evil.example"
+        )
+        let lines = propertyLines(out)
+        #expect(!lines.contains { $0.hasPrefix("ATTENDEE") && $0.contains("attacker") }, "injected ATTENDEE:\n\(out)")
+        #expect(lines.contains { $0.hasPrefix("TRANSP:OPAQUE") }, "non-vacuity: TRANSP not written:\n\(out)")
+    }
+
+    @Test("replaceRRule guards the line at the point of insertion")
+    func replaceRRuleSanitizesItsInput() {
+        // `replaceRRule` REPLACES an existing rule (the master-has-no-RRULE case is handled by
+        // `mergePatchIntoICS`'s fallback, not here), so the fixture must already carry one or the
+        // non-vacuity assertion below would fail for a reason unrelated to sanitizing.
+        let withRRule = masterICS.replacingOccurrences(
+            of: "SUMMARY:Original title",
+            with: "RRULE:FREQ=DAILY\r\nSUMMARY:Original title"
+        )
+        let out = CalDAVProvider.replaceRRule(
+            in: withRRule,
+            newRRule: "RRULE:FREQ=WEEKLY\r\nATTENDEE;ROLE=REQ-PARTICIPANT:mailto:attacker@evil.example"
+        )
+        let lines = propertyLines(out)
+        #expect(!lines.contains { $0.hasPrefix("ATTENDEE") && $0.contains("attacker") }, "injected ATTENDEE:\n\(out)")
+        #expect(lines.contains { $0.hasPrefix("RRULE:FREQ=WEEKLY") }, "non-vacuity: RRULE not written:\n\(out)")
+    }
+}

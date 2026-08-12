@@ -47,8 +47,13 @@ extension GCalEventInput {
         // pass through `escapeICSText` without corrupting `;` and `,`), and others are simply not
         // escaped today — attendee email, transparency, TZID, all-day date strings. Guarding the one
         // reported field would have left the rest, so the class is closed at the single point every
-        // line passes through. RFC 5545 forbids control characters in values other than HTAB, so
-        // removing them cannot damage a legitimate event.
+        // line passes through.
+        //
+        // RFC 5545's CONTROL production (`%x00-08 / %x0A-1F / %x7F`) forbids every C0 control except
+        // HTAB, plus DEL, in a property value — so stripping THOSE cannot damage a legitimate event.
+        // `isForbiddenICSScalar` also strips U+0085, U+2028 and U+2029, which the RFC does NOT forbid;
+        // that part is defence in depth against downstream line-splitters, justified where it is
+        // defined rather than by the RFC. Do not restate this as "the RFC forbids all of them".
         let sanitized = lines.map { Self.sanitizeICSLine($0) }
         let folded = sanitized.map { foldICSLine($0) }
         return folded.joined(separator: "\r\n") + "\r\n"
@@ -59,10 +64,28 @@ extension GCalEventInput {
     /// Stripping rather than rejecting: a mangled value yields a malformed property that the server
     /// refuses, which is recoverable and visible. Silently emitting an extra property is not.
     static func sanitizeICSLine(_ line: String) -> String {
-        guard line.unicodeScalars.contains(where: { $0.value < 0x20 && $0 != "\t" }) else { return line }
+        guard line.unicodeScalars.contains(where: Self.isForbiddenICSScalar) else { return line }
         return String(String.UnicodeScalarView(
-            line.unicodeScalars.filter { $0.value >= 0x20 || $0 == "\t" }
+            line.unicodeScalars.filter { !Self.isForbiddenICSScalar($0) }
         ))
+    }
+
+    /// Scalars that may not appear inside an ICS property value.
+    ///
+    /// C0 controls except HTAB, plus DEL — RFC 5545's CONTROL production excludes `%x7F`, so the
+    /// earlier `< 0x20` test was narrower than the spec it cited.
+    ///
+    /// It was also narrower than this guard's own test oracle, which is the part that mattered. The
+    /// injection tests split the result with `Character.isNewline`, and that treats U+0085 NEL,
+    /// U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR as line breaks while a `< 0x20` filter
+    /// passes all three through untouched — so a payload using them would have been reported as an
+    /// injected property by the very test meant to prove it could not happen. A guard must be at
+    /// least as strict as the notion of "line" used to judge it, and at least as strict as the most
+    /// lenient line-splitter downstream (Python's `str.splitlines()`, for one, splits on all three).
+    static func isForbiddenICSScalar(_ scalar: Unicode.Scalar) -> Bool {
+        if scalar == "\t" { return false }
+        if scalar.value < 0x20 || scalar.value == 0x7F { return true }
+        return scalar.value == 0x85 || scalar.value == 0x2028 || scalar.value == 0x2029
     }
 
     /// Build the VEVENT block and the set of `VTIMEZONE` components it requires.

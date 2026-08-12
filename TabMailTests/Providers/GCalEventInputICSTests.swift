@@ -313,6 +313,25 @@ struct GCalEventInputJSONTests {
         #expect(GCalEventInput.sanitizeICSLine("café") == "café", "non-ASCII must survive")
     }
 
+    @Test("sanitizeICSLine strips every scalar the test oracles treat as a line break, plus DEL")
+    func sanitizeCoversUnicodeLineBreaksAndDEL() {
+        // The guard was `< 0x20`, which is narrower than `Character.isNewline` — the notion of "line"
+        // every injection oracle in this file uses. U+0085, U+2028 and U+2029 are newlines to Swift
+        // (and to Python's str.splitlines(), so to a plausible server) but passed a `< 0x20` filter
+        // untouched, meaning a payload using them would have been reported as an injected property by
+        // the very tests meant to prove it could not happen. RFC 5545 also excludes DEL.
+        for scalar: Unicode.Scalar in ["\u{0085}", "\u{2028}", "\u{2029}", "\u{7F}"] {
+            let line = "RRULE:FREQ=DAILY\(Character(scalar))ATTENDEE:mailto:x@y.z"
+            let out = GCalEventInput.sanitizeICSLine(line)
+            #expect(!out.unicodeScalars.contains(scalar),
+                    "U+\(String(scalar.value, radix: 16, uppercase: true)) survived sanitizing: \(out)")
+            #expect(out.split(whereSeparator: \.isNewline).count == 1,
+                    "sanitized value still splits into multiple lines: \(out)")
+        }
+        // Two-sided: ordinary text, HTAB and non-ASCII must all survive untouched.
+        #expect(GCalEventInput.sanitizeICSLine("SUMMARY:a\tb café 会議") == "SUMMARY:a\tb café 会議")
+    }
+
     // MARK: - RRULE field validation (the reachable entry point)
 
     @Test("Only RFC 5545 FREQ tokens are accepted")

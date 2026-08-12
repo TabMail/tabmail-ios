@@ -866,6 +866,9 @@ actor CalDAVProvider: CalendarProvider {
     /// untouched. CalDAV resources almost always lead with a VTIMEZONE, so the
     /// old whole-resource scan was reliably wrong on real servers.
     static func replaceRRule(in ics: String, newRRule: String) -> String {
+        // Sanitized for the same reason as `replaceOrAppendInMasterVEvent`: this inserts a
+        // caller-supplied property line into a resource we PUT, and CRLF is the property separator.
+        let newRRule = GCalEventInput.sanitizeICSLine(newRRule)
         let lines = Self.physicalICSLines(ics)
         var output: [String] = []
         var replaced = false
@@ -995,6 +998,14 @@ actor CalDAVProvider: CalendarProvider {
     /// lines being dropped along with it. If no match exists, insert `newLine`
     /// just before `END:VEVENT`. Scoped to the master block (no RECURRENCE-ID).
     static func replaceOrAppendInMasterVEvent(in ics: String, propertyKey: String, newLine: String) -> String {
+        // Sanitized HERE rather than at each caller, because this is the single point every
+        // caller-supplied property line enters an ICS resource we then PUT. A value carrying CRLF
+        // would otherwise become an extra property (see `GCalEventInput.sanitizeICSLine`). Today's
+        // callers happen to be safe — SUMMARY/LOCATION/DESCRIPTION pass through `escapeICSText`,
+        // TRANSP is normalized at the tool boundary, and RRULE is validated there — but that is a
+        // property of the current call sites, not of this function, and the next caller inherits the
+        // guard for free.
+        let newLine = GCalEventInput.sanitizeICSLine(newLine)
         let prefix1 = "\(propertyKey):"
         let prefix2 = "\(propertyKey);"
         let lines = physicalICSLines(ics)
@@ -1137,9 +1148,21 @@ actor CalDAVProvider: CalendarProvider {
                     rewritten.append(line)
                     j += 1
                 }
+                // Sanitized for the same reason as `GCalEventInput.toICS`: `cn` and `a.email` are
+                // model-supplied (an attendee name or address from tool arguments) and are
+                // interpolated with only a quote swap, so a CRLF in either would split this into an
+                // extra ICS property the CalDAV server honours — an injected ATTENDEE has the server
+                // mail the invitation to an address the user never typed.
+                //
+                // Only the lines generated HERE are sanitized. The surrounding lines came from the
+                // server's own ICS via `physicalICSLines`, which has already split on real line
+                // breaks, so there is nothing left in them to strip and rewriting them would risk
+                // altering a value the server round-trips.
                 let attendeeLines = attendees.map { a -> String in
                     let cn = (a.name ?? a.email).replacingOccurrences(of: "\"", with: "'")
-                    return "ATTENDEE;CN=\"\(cn)\";ROLE=REQ-PARTICIPANT:mailto:\(a.email)"
+                    return GCalEventInput.sanitizeICSLine(
+                        "ATTENDEE;CN=\"\(cn)\";ROLE=REQ-PARTICIPANT:mailto:\(a.email)"
+                    )
                 }
                 if let endIdx = rewritten.firstIndex(of: "END:VEVENT") {
                     rewritten.insert(contentsOf: attendeeLines, at: endIdx)
@@ -1432,7 +1455,19 @@ actor CalDAVProvider: CalendarProvider {
             }
         }
         lines.append("END:VEVENT")
-        return lines.joined(separator: "\r\n")
+        // Same ICS-injection boundary as `GCalEventInput.toICS`, for the same reason: SUMMARY,
+        // LOCATION, DESCRIPTION, TRANSP and the ATTENDEE CN/mailto above are interpolated from
+        // model-supplied tool arguments without escaping, and CRLF is the ICS property separator, so
+        // a value carrying one would split into an extra property this override PUTs on the user's
+        // behalf. This block is spliced into a full-resource PUT, so an injected
+        // `END:VEVENT`/`BEGIN:VEVENT`/`RECURRENCE-ID` pair could also reach an occurrence the
+        // gesture never named — and a CalDAV event write has no documented per-item recovery.
+        //
+        // ⚠️ Guarding `toICS` alone left this path open: `toICS` covers create and split-series,
+        // while `updateOccurrence` builds its VEVENT here and `updateEvent` builds it in
+        // `mergePatchIntoICS`. Enumerate by "what emits an ICS property line", not by "what calls
+        // toICS".
+        return lines.map { GCalEventInput.sanitizeICSLine($0) }.joined(separator: "\r\n")
     }
 
     /// Insert an override VEVENT into a CalDAV ICS resource. If the resource
