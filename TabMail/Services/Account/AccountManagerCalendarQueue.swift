@@ -813,7 +813,7 @@ extension AccountManager {
                 throw CalendarProviderError.notSupported(
                     "the queued calendar edit carries no event id and can never be executed")
             }
-            let allDay = CalendarToolHelpers.boolArg(args, "all_day")
+            var resolvedAllDay = CalendarToolHelpers.boolArg(args, "all_day")
             // calendar_event_edit-v1.5.21+: attendees are delta-based. If args carries
             // add_attendees or remove_attendees, fetch the current event and resolve the
             // delta against its attendee list before building the update input — so the
@@ -821,7 +821,66 @@ extension AccountManager {
             let resolvedArgs = try await resolveAttendeeDelta(
                 args: args, eventId: eventId, calendarId: calId, provider: provider
             )
-            let input = CalendarToolHelpers.buildGCalEventInput(resolvedArgs, isAllDay: allDay)
+            // 🚨 AN RRULE `UNTIL`'S VALUE TYPE BELONGS TO THE DTSTART, AND ON AN EDIT THE DTSTART
+            // BELONGS TO THE RESOURCE. RFC 5545 §3.3.10: "The value of the UNTIL rule part MUST have
+            // the same value type as the DTSTART property." `buildGCalEventInput` renders the UNTIL
+            // from the `isAllDay` it is handed, so passing the model's `all_day` verbatim made the
+            // value type a property of the TOOL CALL. An edit that changes only the recurrence does
+            // not restate `all_day`, so `nil` became `false`, and a UTC DATE-TIME `UNTIL` landed
+            // against the server's `DTSTART;VALUE=DATE:` — `mergePatchIntoICS` leaves the start
+            // exactly as the server had it when the patch carries none, so nothing downstream can
+            // notice the disagreement. On `edit_scope: "this_and_following"` it is worse: CalDAV's
+            // `buildNewSeriesInput` prefers `patch.recurrence` over its own stripped rule while
+            // forcing the successor's DTSTART to the master's all-day form, so the mismatched pair is
+            // written AFTER the irreversible cap PUT, whose rollback is best effort.
+            //
+            // So resolve it from the resource — the only source of the landing DTSTART's value type
+            // available before the write. An explicitly stated `all_day` is still taken at its word —
+            // stating it is how the agent converts a timed event to all-day and back, and overriding
+            // that would break the conversion.
+            //
+            // ⚠️ **THIS FLAG ALSO RENDERS START/END, AND THE PROVIDERS DIVERGE.**
+            // `buildGCalEventInput` picks `startDate`/`endDate` over `startDateTime`/`endDateTime`
+            // from it, so a timed `start_iso` on an all-day resource now emits a bare date. On CalDAV
+            // that is a GAIN, not a loss: `mergePatchIntoICS` takes the value type from
+            // `masterDTStartKind` and `formatDTLine`'s `.allDay` arm reads only `patch.startDate`, so
+            // a timed patch left DTSTART untouched while the RRULE was replaced — that pair WAS the
+            // §3.3.10 mismatch. On Google and Exchange `mergeExistingEventWithPatch` passes the
+            // patch's start through, so there the cost is a conversion the timed `start_iso` used to
+            // perform implicitly — which CalDAV cannot express here at all.
+            //
+            // ⚠️ **TYPE-OF-CHECK / TYPE-OF-USE, accepted.** This GET is not the GET the write merges
+            // against, so a conversion between the two reads mismatches the pair in EITHER direction
+            // — a race in the mirror direction traded for the pre-fix all-day-resource case, not a
+            // subset. A rejected write is classified by `isCalendarBadRequestError` and retired by
+            // `retireAndAnnounce` rather than retried, so recovery is a fresh user request; read those
+            // two symbols for the codes and for what happens when the retire itself cannot persist.
+            // Case table and why it stays unfixed: memory 115, residual 4.
+            //
+            // Bounded on purpose: gated on `recurrenceUntilIsAtStake`, so no edit that does not emit
+            // an UNTIL pays a round trip. An edit that changes attendees AND sets an UNTIL fetches
+            // twice, because `resolveAttendeeDelta` fetches independently above; that is two GETs on
+            // one narrow combination, and it is accepted rather than refactoring that function's
+            // signature to thread the event back out.
+            //
+            // A failed fetch does NOT guess: the throw propagates and the drain classifies it —
+            // transient ⇒ retried, permanent ⇒ retired with a reason. Fail closed, per THE MANTRA; a
+            // defaulted value here would be the same wrong-value-type write, chosen by us instead of
+            // the model.
+            if resolvedAllDay == nil,
+               CalendarToolHelpers.recurrenceUntilIsAtStake(resolvedArgs) {
+                let current = try await provider.getEvent(calendarId: calId, eventId: eventId)
+                // `GCalDateTime.date` is populated only for an all-day event, on every provider:
+                // `ICSParser.makeGCalDateTime` (CalDAV), `ExchangeCalendarProvider.toGCalDateTime`,
+                // `DemoCalendarProvider`, and Google's own JSON all put the timed form in `dateTime`.
+                resolvedAllDay = (current.start?.date != nil)
+                // Gated per global rule 12 — this is a new diagnostic, and the surrounding ungated
+                // `print`s are the pre-existing corpus registered as `IOS-LOG-003`, not a licence.
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[CalendarQueue] Edit sets an RRULE UNTIL with no all_day argument — resolved allDay=\(resolvedAllDay == true) from the resource")
+                }
+            }
+            let input = CalendarToolHelpers.buildGCalEventInput(resolvedArgs, isAllDay: resolvedAllDay)
 
             // Route by edit_scope (calendar_event_edit-v1.5.21+). Default: 'all'
             // when no recurrence_id, 'this_only' when recurrence_id is present

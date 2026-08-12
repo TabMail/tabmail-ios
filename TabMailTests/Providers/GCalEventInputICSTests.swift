@@ -371,13 +371,131 @@ struct GCalEventInputJSONTests {
 
     @Test("UNTIL must be a DATE or UTC DATE-TIME shape")
     func untilIsValidated() {
-        #expect(CalendarToolHelpers.validatedRRuleUntil("2026-12-31") == "20261231")
-        #expect(CalendarToolHelpers.validatedRRuleUntil("20261231") == "20261231")
-        #expect(CalendarToolHelpers.validatedRRuleUntil("2026-12-31T23:59:59") == "20261231T235959Z")
-        #expect(CalendarToolHelpers.validatedRRuleUntil("2026-12-31T23:59:59Z") == "20261231T235959Z")
-        // Injection and junk are dropped.
-        #expect(CalendarToolHelpers.validatedRRuleUntil("20261231\r\nATTENDEE:mailto:x@y.z") == nil)
-        #expect(CalendarToolHelpers.validatedRRuleUntil("tomorrow") == nil)
-        #expect(CalendarToolHelpers.validatedRRuleUntil("") == nil)
+        // UNTIL's value type is dictated by DTSTART (RFC 5545 §3.3.10), so the two halves of this
+        // invariant must BOTH hold: the emitted value names the instant the user meant, AND it is the
+        // value type the event's own DTSTART requires. Two shipped versions each satisfied one half by
+        // violating the other — appending `Z` to a naive value kept the type legal and moved the instant;
+        // preserving the naive form fixed the instant and emitted a floating UNTIL against a zoned
+        // DTSTART. Assert both, or the next fix moves the bug again instead of closing it.
+        // ⚠️ FIXED-OFFSET zones, not named ones, for the conversion arithmetic. The first version of
+        // this test used `America/Vancouver` and hardcoded a UTC−8 winter offset from general knowledge.
+        // It failed — because the tzdata on this machine has BC on UTC−7 ALL YEAR (2026-12-31 reports
+        // `MST`, July reports `PDT`), so the expectation, not the code, was wrong. A named zone's offset
+        // is a political fact that changes under you, which makes it the same hazard as a hardcoded date
+        // in a test: it goes stale silently and the failure looks like a code regression. A fixed offset
+        // pins the arithmetic and cannot drift.
+        let minus8 = TimeZone(secondsFromGMT: -8 * 3600)!
+        let utc = TimeZone(identifier: "UTC")!
+
+        // ALL-DAY ⇒ bare DATE, because the all-day arm emits `DTSTART;VALUE=DATE:`.
+        #expect(CalendarToolHelpers.validatedRRuleUntil("2026-12-31", allDay: true, zone: minus8) == "20261231")
+        #expect(CalendarToolHelpers.validatedRRuleUntil("20261231", allDay: true, zone: minus8) == "20261231")
+        // A time on an all-day event is dropped, not rejected — the date is what the user meant.
+        #expect(CalendarToolHelpers.validatedRRuleUntil("2026-12-31T23:59:59", allDay: true, zone: minus8) == "20261231")
+
+        // TIMED ⇒ UTC DATE-TIME, because the timed arms emit `DTSTART;TZID=…` or `DTSTART:…Z`.
+        // THE INSTANT HALF: 23:59:59 on Dec 31 at UTC−8 is 07:59:59 UTC on Jan 1. Appending
+        // `Z` would have said 23:59:59Z — eight hours early, dropping that evening's occurrence.
+        #expect(CalendarToolHelpers.validatedRRuleUntil("2026-12-31T23:59:59", allDay: false, zone: minus8) == "20270101T075959Z")
+        // THE VALUE-TYPE HALF, stated separately so a regression to the floating form is unmistakable.
+        let timed = CalendarToolHelpers.validatedRRuleUntil("2026-12-31T23:59:59", allDay: false, zone: minus8)
+        #expect(timed?.hasSuffix("Z") == true, "a timed event's UNTIL must be UTC, got \(timed ?? "nil")")
+        // An input already in UTC is emitted unchanged — no double conversion.
+        #expect(CalendarToolHelpers.validatedRRuleUntil("2026-12-31T23:59:59Z", allDay: false, zone: minus8) == "20261231T235959Z")
+        // In UTC the wall clock and the instant coincide, which pins the conversion as zone-driven
+        // rather than a constant offset.
+        #expect(CalendarToolHelpers.validatedRRuleUntil("2026-12-31T23:59:59", allDay: false, zone: utc) == "20261231T235959Z")
+        // A date-only input on a timed event means the END of that day in the event's zone. Midnight
+        // would drop every occurrence on the day the user named.
+        #expect(CalendarToolHelpers.validatedRRuleUntil("2026-12-31", allDay: false, zone: minus8) == "20270101T075959Z")
+
+        // A NAMED zone still gets covered, but with the expectation DERIVED from the zone's own rules
+        // rather than asserted from memory — so it holds whatever tzdata this machine ships.
+        let named = TimeZone(identifier: "America/Vancouver")!
+        let inFmt = DateFormatter()
+        inFmt.locale = Locale(identifier: "en_US_POSIX")
+        inFmt.calendar = Calendar(identifier: .gregorian)
+        inFmt.dateFormat = "yyyyMMdd'T'HHmmss"
+        inFmt.timeZone = named
+        let outFmt = DateFormatter()
+        outFmt.locale = Locale(identifier: "en_US_POSIX")
+        outFmt.calendar = Calendar(identifier: .gregorian)
+        outFmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        outFmt.timeZone = TimeZone(identifier: "UTC")
+        let expectedNamed = inFmt.date(from: "20261231T235959").map { outFmt.string(from: $0) }
+        // Non-vacuity: a nil expectation would compare equal to a nil result and prove nothing.
+        #expect(expectedNamed != nil, "the derived named-zone expectation itself failed to compute")
+        #expect(CalendarToolHelpers.validatedRRuleUntil("2026-12-31T23:59:59", allDay: false, zone: named) == expectedNamed,
+                "named-zone conversion disagreed with the zone's own offset")
+
+        // Injection and junk are dropped, on both arms — the shape check runs before any conversion.
+        #expect(CalendarToolHelpers.validatedRRuleUntil("20261231\r\nATTENDEE:mailto:x@y.z", allDay: false, zone: minus8) == nil)
+        #expect(CalendarToolHelpers.validatedRRuleUntil("20261231\r\nATTENDEE:mailto:x@y.z", allDay: true, zone: minus8) == nil)
+        #expect(CalendarToolHelpers.validatedRRuleUntil("tomorrow", allDay: false, zone: minus8) == nil)
+        #expect(CalendarToolHelpers.validatedRRuleUntil("", allDay: false, zone: minus8) == nil)
+    }
+
+    /// INVARIANT (the property of the emitted value, not of the mechanism that checks it):
+    /// **`validatedRRuleUntil` never returns a value that does not name a real instant.** Its doc
+    /// comment promised *"anything unparseable returns nil"*; the check was SHAPE-only, so every arm
+    /// emitted impossible values, and one arm silently CHANGED the instant instead of rejecting it.
+    ///
+    /// Written as a table over all three arms because the shape check is shared and the return paths
+    /// are not — a defect in one arm is invisible from the others. Each row states what the arm
+    /// returned before the range guards existed, so a regression cannot be mistaken for a new case.
+    ///
+    /// ⚠️ TWO-SIDED (`MIS-030`, `MIS-014`). `nil` for everything satisfies the whole rejection half,
+    /// so the second table is the non-vacuity control: a real leap day in a real leap year, a
+    /// month-end, and an RFC 5545 leap second must all still come through. The leap second is the
+    /// reason this validator is hand-written instead of delegating to `DateFormatter`, which rejects
+    /// it — so if it stops passing, the fix has been replaced by a formatter parse.
+    @Test("An UNTIL whose numeric fields are out of range is dropped, on every arm — and legitimate edge values are not")
+    func untilFieldsAreRangeValidated() {
+        let minus8 = TimeZone(secondsFromGMT: -8 * 3600)!
+
+        // ── Arm 1: all-day (returns the bare date). Every value below was returned VERBATIM.
+        for impossible in ["20261340", "00000000", "99999999", "20261232", "20260229", "20260230", "20260231"] {
+            #expect(CalendarToolHelpers.validatedRRuleUntil(impossible, allDay: true, zone: minus8) == nil,
+                    "all-day arm emitted the impossible date \(impossible) into the RRULE")
+        }
+
+        // ── Arm 2: already-UTC (emits its input unchanged). Same shape, different return path.
+        for impossible in ["20261231T999999Z", "20261231T246000Z", "20261340T120000Z", "00000000T000000Z"] {
+            #expect(CalendarToolHelpers.validatedRRuleUntil(impossible, allDay: false, zone: minus8) == nil,
+                    "already-UTC arm emitted \(impossible) into the RRULE")
+        }
+
+        // ── Arm 3: naive → UTC. THE REGRESSION ARM, and the one that is not merely invalid output:
+        // `DateFormatter` rejects month 13 and day 32 but ROLLS an out-of-range day inside a real
+        // month, so these returned a WRONG INSTANT up to three days past what the user wrote.
+        #expect(CalendarToolHelpers.validatedRRuleUntil("20260230", allDay: false, zone: minus8) == nil,
+                "Feb 30 rolled forward instead of being rejected (it returned 20260303T075959Z)")
+        #expect(CalendarToolHelpers.validatedRRuleUntil("20260231", allDay: false, zone: minus8) == nil,
+                "Feb 31 rolled forward instead of being rejected (it returned 20260304T075959Z)")
+        #expect(CalendarToolHelpers.validatedRRuleUntil("20260229T120000", allDay: false, zone: minus8) == nil,
+                "Feb 29 of a non-leap year rolled forward (it returned 20260301T200000Z)")
+        #expect(CalendarToolHelpers.validatedRRuleUntil("20261340T120000", allDay: false, zone: minus8) == nil)
+
+        // ── Non-vacuity, both value types. These are the values a correct validator must NOT reject.
+        #expect(CalendarToolHelpers.validatedRRuleUntil("2028-02-29", allDay: true, zone: minus8) == "20280229",
+                "2028 IS a leap year — the leap-year rule was inverted or the check is rejecting everything")
+        #expect(CalendarToolHelpers.validatedRRuleUntil("2026-01-31", allDay: true, zone: minus8) == "20260131",
+                "a 31-day month's last day must pass")
+        #expect(CalendarToolHelpers.validatedRRuleUntil("2026-02-28", allDay: true, zone: minus8) == "20260228")
+        #expect(CalendarToolHelpers.validatedRRuleUntil("2028-02-29T12:00:00Z", allDay: false, zone: minus8) == "20280229T120000Z")
+        #expect(CalendarToolHelpers.validatedRRuleUntil("20261231T235960Z", allDay: false, zone: minus8) == "20261231T235960Z",
+                "RFC 5545 §3.3.12 allows second 60 (a positive leap second); rejecting it means the range check was delegated to DateFormatter, which does not")
+        #expect(CalendarToolHelpers.validatedRRuleUntil("20261231T235959Z", allDay: false, zone: minus8) == "20261231T235959Z")
+        #expect(CalendarToolHelpers.validatedRRuleUntil("20261231T000000Z", allDay: false, zone: minus8) == "20261231T000000Z",
+                "hour/minute/second 00 are the lower bounds, not falsy")
+        // 1900 is NOT a leap year (÷100 and not ÷400); 2000 IS. Pins the century rule both ways.
+        #expect(CalendarToolHelpers.validatedRRuleUntil("19000229", allDay: true, zone: minus8) == nil)
+        #expect(CalendarToolHelpers.validatedRRuleUntil("20000229", allDay: true, zone: minus8) == "20000229")
+
+        // The all-day arm's documented behaviour is UNCHANGED: it drops a supplied time rather than
+        // rejecting the date, so only the DATE is range-checked there. Stated as a test because it is
+        // the one place the two guards deliberately disagree.
+        #expect(CalendarToolHelpers.validatedRRuleUntil("20261231T999999Z", allDay: true, zone: minus8) == "20261231",
+                "the all-day arm must still keep the date the user meant when it discards the time")
     }
 }

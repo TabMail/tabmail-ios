@@ -631,3 +631,320 @@ struct AllDayOccurrenceAddressMintTests {
         #expect(CalendarToolHelpers.formatDetailedEvent(event, timeZone: tokyo).contains("all_day: no"))
     }
 }
+
+// MARK: - An RRULE UNTIL's value type belongs to the resource's DTSTART, not to the tool call
+//
+// **INVARIANT (a property of the bytes that reach the wire, not of any variable):** *the `UNTIL` an
+// edit emits has the same VALUE TYPE as the `DTSTART` the same edit leaves on the resource.*
+// RFC 5545 §3.3.10 — "The value of the UNTIL rule part MUST have the same value type as the DTSTART
+// property."
+//
+// The defect this pins was not in `validatedRRuleUntil`, which renders whichever type it is asked
+// for and is unit-tested both ways in `GCalEventInputICSTests.untilIsValidated`. It was in WHO
+// decides: `AccountManagerCalendarQueue`'s `.edit` case read `all_day` off the tool arguments, so an
+// edit that changes only the recurrence — the ordinary "make it end on Jan 1" turn, which has no
+// reason to restate `all_day` — passed `nil`, `buildGCalEventInput` read that as `false`, and a UTC
+// DATE-TIME `UNTIL` was written against a `DTSTART;VALUE=DATE:`. `mergePatchIntoICS` carries no start
+// of its own, so the mismatch is invisible from every line of the patch.
+//
+// ⚠️ **THE ASSERTIONS RUN ON THE EMITTED RRULE, AND FOR THE UPDATE PATH ON THE MERGED ICS DOCUMENT.**
+// A test on `validatedRRuleUntil`'s return is what let this through (`MIS-015`): the function was
+// already correct for the argument it was given. `mergedICSValueTypesAgree` is the strongest form
+// available without a network — it runs the captured patch through the same `mergePatchIntoICS` the
+// CalDAV provider uses and asserts the DTSTART and UNTIL in ONE document agree, which is the property
+// a strict server checks.
+//
+// ⚠️ **TWO-SIDED (`MIS-030`).** "The UNTIL is a bare DATE" is satisfiable by hardcoding the all-day
+// form, so `untilValueTypeFollowsTimedResource` is the mirror: the same absent `all_day` against a
+// TIMED resource must still produce a UTC DATE-TIME. And `explicitAllDayIsStillHonoured` /
+// `noExtraFetchWhenNoUntilIsAtStake` are the bounds — the fix must not start overriding a model that
+// DID state the type, and must not put a `getEvent` on edits that emit no UNTIL at all.
+
+@Suite("RRULE UNTIL value type — decided by the resource, not by the tool call", .serialized, .processGlobalState)
+struct CalendarQueueUntilValueTypeTests {
+
+    private func makeTestDB(accountId: String) throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
+        try pool.writeWithoutTransaction { db in
+            var acc = Account(emailAddress: "cal@example.com", displayName: "Cal", provider: .gmail)
+            acc.id = accountId
+            try acc.insert(db)
+        }
+        return (pool, dir, previous)
+    }
+
+    /// The resource as the SERVER has it. `GCalDateTime.date` is populated only for an all-day event
+    /// on every provider, so this is exactly what `getEvent` hands the queue.
+    private func allDayResource() -> GCalEvent {
+        GCalEvent(
+            id: "master-1", summary: "Company holiday", location: nil, description: nil,
+            start: GCalDateTime(dateTime: nil, date: "2026-06-01", timeZone: nil),
+            end: GCalDateTime(dateTime: nil, date: "2026-06-02", timeZone: nil),
+            attendees: nil, organizer: nil, recurrence: ["RRULE:FREQ=DAILY"],
+            transparency: nil, status: nil, htmlLink: nil, created: nil, updated: nil)
+    }
+
+    private func timedResource() -> GCalEvent {
+        GCalEvent(
+            id: "master-1", summary: "Standup", location: nil, description: nil,
+            start: GCalDateTime(dateTime: "2026-06-01T09:00:00-07:00", date: nil, timeZone: "America/Vancouver"),
+            end: GCalDateTime(dateTime: "2026-06-01T09:30:00-07:00", date: nil, timeZone: "America/Vancouver"),
+            attendees: nil, organizer: nil, recurrence: ["RRULE:FREQ=DAILY"],
+            transparency: nil, status: nil, htmlLink: nil, created: nil, updated: nil)
+    }
+
+    private func anyEvent() -> GCalEvent {
+        GCalEvent(
+            id: "master-1", summary: "Standup", location: nil, description: nil,
+            start: nil, end: nil, attendees: nil, organizer: nil, recurrence: nil,
+            transparency: nil, status: nil, htmlLink: nil, created: nil, updated: nil)
+    }
+
+    /// Drain one `.edit` against a mock whose `getEvent` returns `resource`, and report everything the
+    /// wire saw plus whether the durable row survived.
+    private func drainOneEdit(
+        accountId: String,
+        arguments: [String: JSONValue],
+        resource: GCalEvent?,
+        getEventThrows: Error? = nil
+    ) async throws -> (updates: [(calendarId: String, eventId: String, event: GCalEventInput, sendUpdates: String)],
+                       splits: [(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String)],
+                       getEventCalls: Int,
+                       remaining: Int,
+                       rows: [PendingCalendarOperation]) {
+        let (pool, dir, previous) = try makeTestDB(accountId: accountId)
+        let mock = MockCalendarProvider()
+        if let resource { await mock.setGetEventResult(resource) }
+        if let getEventThrows { await mock.setGetEventThrows(getEventThrows) }
+        await mock.setUpdateEventResult(anyEvent())
+        await mock.setSplitSeriesResult(anyEvent())
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer {
+            Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+        }
+
+        let op = PendingCalendarOperation(
+            operationType: .edit, accountId: accountId, eventId: "master-1",
+            calendarId: "primary", arguments: arguments)
+        try await pool.write { db in try op.insert(db) }
+
+        await AccountManager.shared.drainCalendarQueue()
+
+        let log = await mock.callLog
+        let rows = try await pool.read { db in try PendingCalendarOperation.fetchAll(db) }
+        return (await mock.updatedEvents,
+                await mock.splitSeriesCalls,
+                log.filter { $0.hasPrefix("getEvent(") }.count,
+                rows.count,
+                rows)
+    }
+
+    /// The UNTIL parameter of the single emitted RRULE, or nil.
+    private func untilOf(_ input: GCalEventInput?) -> String? {
+        guard let rule = input?.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else { return nil }
+        return rule.split(separator: ";").first { $0.uppercased().hasPrefix("UNTIL=") }
+            .map { String($0.dropFirst("UNTIL=".count)) }
+    }
+
+    /// An edit that only moves the end of the series — no `all_day`, no `start_iso`. This is the
+    /// argument set the defect needed, and it is the ordinary one.
+    private func untilOnlyArgs(scope: String? = nil) -> [String: JSONValue] {
+        var args: [String: JSONValue] = [
+            "recurrence": .dictionary([
+                "freq": .string("DAILY"),
+                "until": .string("2027-01-01"),
+            ]),
+            "timezone": .string("America/Vancouver"),
+        ]
+        if let scope {
+            args["edit_scope"] = .string(scope)
+            args["recurrence_id"] = .string("2026-06-10T00:00:00")
+        }
+        return args
+    }
+
+    @Test("an all-day resource gets a bare-DATE UNTIL when the edit does not restate all_day")
+    func untilValueTypeFollowsAllDayResource() async throws {
+        let r = try await drainOneEdit(
+            accountId: "cal-until-allday", arguments: untilOnlyArgs(), resource: allDayResource())
+        #expect(r.updates.count == 1, "setup: the drain never reached updateEvent (got \(r.updates.count))")
+        guard r.updates.count == 1 else { return }
+        let until = untilOf(r.updates[0].event)
+        #expect(until == "20270101",
+                "got UNTIL=\(until ?? "<absent>"). The resource's DTSTART is VALUE=DATE, so RFC 5545 §3.3.10 requires a bare DATE; a UTC DATE-TIME here is the value-type mismatch a strict server rejects, and it is invisible in the patch because mergePatchIntoICS leaves the server's DTSTART alone.")
+        #expect(r.getEventCalls == 1, "the value type must be LEARNED from the resource, not assumed")
+    }
+
+    @Test("the merged ICS document's DTSTART and UNTIL agree on their value type")
+    func mergedICSValueTypesAgree() async throws {
+        let r = try await drainOneEdit(
+            accountId: "cal-until-ics", arguments: untilOnlyArgs(), resource: allDayResource())
+        #expect(r.updates.count == 1, "setup: the drain never reached updateEvent")
+        guard r.updates.count == 1 else { return }
+        // The master exactly as a CalDAV server stores an all-day daily series.
+        let masterICS = """
+        BEGIN:VCALENDAR\r
+        VERSION:2.0\r
+        BEGIN:VEVENT\r
+        UID:master-1\r
+        DTSTART;VALUE=DATE:20260601\r
+        DTEND;VALUE=DATE:20260602\r
+        RRULE:FREQ=DAILY\r
+        SUMMARY:Company holiday\r
+        END:VEVENT\r
+        END:VCALENDAR\r
+        """
+        let merged = CalDAVProvider.mergePatchIntoICS(masterICS, patch: r.updates[0].event)
+        let lines = merged.split(whereSeparator: \.isNewline).map(String.init)
+        let dtstart = lines.first { $0.hasPrefix("DTSTART") }
+        let rrule = lines.first { $0.hasPrefix("RRULE:") }
+        #expect(dtstart?.contains("VALUE=DATE") == true,
+                "setup: the merge changed the master's DTSTART value type (\(dtstart ?? "<absent>")), so this document proves nothing")
+        #expect(rrule?.contains("UNTIL=20270101") == true,
+                "the resource carries a DATE DTSTART and the rule carries \(rrule ?? "<absent>"). One document, two value types — this is the exact byte sequence §3.3.10 forbids.")
+        // The UNTIL is compared as an EXTRACTED VALUE, never as a substring of the line. Both naive
+        // substring forms are wrong in opposite directions: `contains("T") == false` can never hold
+        // because the keyword `UNTIL` itself contains a T, and `contains("UNTIL=20270101") == true`
+        // holds just as well for `UNTIL=20270101T000000Z`. Pull the value out and compare it whole.
+        let untilValue = (rrule?.hasPrefix("RRULE:") == true ? String(rrule!.dropFirst("RRULE:".count)) : (rrule ?? ""))
+            .split(separator: ";").map(String.init)
+            .first { $0.hasPrefix("UNTIL=") }
+            .map { String($0.dropFirst("UNTIL=".count)) }
+        #expect(untilValue == "20270101",
+                "the UNTIL value is \(untilValue ?? "<absent>") in \(rrule ?? "<absent>") — a DATE-TIME against this document's VALUE=DATE DTSTART.")
+    }
+
+    @Test("a TIMED resource still gets a UTC DATE-TIME UNTIL — the fix did not flatten every event to all-day")
+    func untilValueTypeFollowsTimedResource() async throws {
+        let r = try await drainOneEdit(
+            accountId: "cal-until-timed", arguments: untilOnlyArgs(), resource: timedResource())
+        #expect(r.updates.count == 1, "setup: the drain never reached updateEvent")
+        guard r.updates.count == 1 else { return }
+        let until = untilOf(r.updates[0].event)
+        #expect(until?.hasSuffix("Z") == true,
+                "got UNTIL=\(until ?? "<absent>"). A zoned DTSTART requires a UTC DATE-TIME UNTIL; a bare DATE here is the mirror-image defect, not the fix.")
+        #expect(until?.contains("T") == true, "got UNTIL=\(until ?? "<absent>")")
+        #expect(r.getEventCalls == 1)
+    }
+
+    @Test("a this_and_following split writes the master's value type into the successor's rule")
+    func splitSuccessorUntilMatchesTheAllDayMaster() async throws {
+        let r = try await drainOneEdit(
+            accountId: "cal-until-split",
+            arguments: untilOnlyArgs(scope: "this_and_following"),
+            resource: allDayResource())
+        #expect(r.splits.count == 1, "setup: the drain never reached splitSeries (got \(r.splits.count))")
+        guard r.splits.count == 1 else { return }
+        let until = untilOf(r.splits[0].patch)
+        #expect(until == "20270101",
+                "got UNTIL=\(until ?? "<absent>"). CalDAV's buildNewSeriesInput prefers patch.recurrence over its own stripped rule while forcing the successor's DTSTART to the master's all-day form, so a mismatched pair here lands AFTER the irreversible cap PUT and its rollback is best-effort.")
+    }
+
+    @Test("no extra fetch on an edit that emits no UNTIL")
+    func noExtraFetchWhenNoUntilIsAtStake() async throws {
+        // A title change: no recurrence at all.
+        let title = try await drainOneEdit(
+            accountId: "cal-until-none",
+            arguments: ["title": .string("Renamed")],
+            resource: allDayResource())
+        #expect(title.getEventCalls == 0, "an edit with no recurrence paid a round trip")
+        #expect(title.updates.count == 1)
+
+        // A recurrence whose COUNT wins over UNTIL in buildGCalEventInput — the rule emits no UNTIL,
+        // so its value type is not at stake and nothing needs to be learned.
+        let counted = try await drainOneEdit(
+            accountId: "cal-until-count",
+            arguments: ["recurrence": .dictionary([
+                "freq": .string("WEEKLY"),
+                "count": .int(10),
+                "until": .string("2027-01-01"),
+            ])],
+            resource: allDayResource())
+        #expect(counted.getEventCalls == 0, "COUNT suppresses the UNTIL, so no fetch is warranted")
+        #expect(untilOf(counted.updates.first?.event) == nil,
+                "setup: the producer emitted an UNTIL alongside COUNT, so the predicate's COUNT case is wrong")
+    }
+
+    @Test("an explicitly stated all_day is still honoured, and costs no fetch")
+    func explicitAllDayIsStillHonoured() async throws {
+        // The agent converting a timed series to all-day states `all_day` AND a date. Overriding it
+        // from the (still timed) resource would break the conversion.
+        let r = try await drainOneEdit(
+            accountId: "cal-until-explicit",
+            arguments: [
+                "all_day": .bool(true),
+                "start_iso": .string("2026-06-01"),
+                "recurrence": .dictionary([
+                    "freq": .string("DAILY"),
+                    "until": .string("2027-01-01"),
+                ]),
+            ],
+            resource: timedResource())
+        #expect(r.getEventCalls == 0, "the model stated the type; asking the server is both wasteful and wrong")
+        #expect(r.updates.count == 1)
+        guard r.updates.count == 1 else { return }
+        #expect(untilOf(r.updates[0].event) == "20270101")
+        #expect(r.updates[0].event.startDate == "2026-06-01", "the declared conversion to all-day was dropped")
+    }
+
+    @Test("a failed resource read keeps the edit queued rather than guessing a value type")
+    func failedResourceReadKeepsTheEditQueued() async throws {
+        let r = try await drainOneEdit(
+            accountId: "cal-until-throws",
+            arguments: untilOnlyArgs(),
+            resource: nil,
+            getEventThrows: URLError(.notConnectedToInternet))
+        #expect(r.updates.isEmpty,
+                "an edit whose value type could not be established still reached the wire — a guessed type is the same wrong write, chosen by us instead of the model")
+        #expect(r.remaining == 1,
+                "the durable row was deleted on a transient read failure; never-drop clause 2 makes 'we could not determine the answer' retryable")
+        // `remaining == 1` alone is not enough: a terminal arm RETIRES the row in place
+        // (`status = failed`, R16-1) instead of deleting it, which would still count as one row while
+        // meaning the user's edit will never run again.
+        #expect(r.rows.first?.status == PendingStatus.queued.rawValue,
+                "the row survived but was retired: status=\(r.rows.first?.status ?? "<none>") reason=\(r.rows.first?.failureReason ?? "<none>")")
+        #expect(r.rows.first?.failureReason == nil)
+    }
+
+    @Test("recurrenceUntilIsAtStake mirrors the producer's own UNTIL branch")
+    func recurrenceUntilAtStakePredicate() {
+        let until: JSONValue = .string("2027-01-01")
+        // At stake: a legal FREQ plus an UNTIL string.
+        #expect(CalendarToolHelpers.recurrenceUntilIsAtStake(
+            ["recurrence": .dictionary(["freq": .string("daily"), "until": until])]))
+        // Not at stake — each for a reason the producer shares.
+        #expect(!CalendarToolHelpers.recurrenceUntilIsAtStake(["title": .string("x")]),
+                "no recurrence at all")
+        #expect(!CalendarToolHelpers.recurrenceUntilIsAtStake(
+            ["recurrence": .dictionary(["freq": .string("NOTAFREQ"), "until": until])]),
+                "an unvalidated FREQ drops the whole RRULE, so there is no UNTIL")
+        #expect(!CalendarToolHelpers.recurrenceUntilIsAtStake(
+            ["recurrence": .dictionary(["freq": .string("DAILY")])]),
+                "no until key")
+        #expect(!CalendarToolHelpers.recurrenceUntilIsAtStake(
+            ["recurrence": .dictionary(["freq": .string("DAILY"), "count": .int(5), "until": until])]),
+                "an integer COUNT wins over UNTIL in buildGCalEventInput")
+        #expect(!CalendarToolHelpers.recurrenceUntilIsAtStake(
+            ["recurrence": .dictionary(["freq": .string("DAILY"), "count": .double(5), "until": until])]),
+                "a double COUNT is the producer's second case and wins too")
+        // A STRING count is NOT one of the producer's two COUNT cases, so it does not suppress the
+        // UNTIL there and must not suppress the fetch here. This is the asymmetry a predicate written
+        // from the schema instead of from the producer would get wrong.
+        #expect(CalendarToolHelpers.recurrenceUntilIsAtStake(
+            ["recurrence": .dictionary(["freq": .string("DAILY"), "count": .string("5"), "until": until])]),
+                "a string count does not reach the producer's COUNT branch, so the UNTIL is still emitted")
+    }
+}
+
+extension MockCalendarProvider {
+    func setUpdateEventResult(_ ev: GCalEvent) { updateEventResult = ev }
+}

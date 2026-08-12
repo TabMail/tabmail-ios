@@ -755,11 +755,59 @@ enum CalendarToolHelpers {
             if case .int(let count) = rec["count"] { rrule += ";COUNT=\(count)" }
             else if case .double(let count) = rec["count"] { rrule += ";COUNT=\(Int(count))" }
             else if case .string(let until) = rec["until"],
-                    let normalizedUntil = Self.validatedRRuleUntil(until) { rrule += ";UNTIL=\(normalizedUntil)" }
+                    // `allDay:`/`zone:` are not decoration — UNTIL's value type is dictated by the
+                    // DTSTART this same builder emits (RFC 5545 §3.3.10), and the naive→UTC conversion
+                    // needs the event's zone to name an instant at all. Both are already resolved above
+                    // for start/end.
+                    let normalizedUntil = Self.validatedRRuleUntil(until, allDay: isAllDay == true, zone: resolvedTz) {
+                rrule += ";UNTIL=\(normalizedUntil)"
+            }
             input.recurrence = [rrule]
         }
 
         return input
+    }
+
+    /// Could `buildGCalEventInput(arguments:isAllDay:)` emit an `UNTIL` for these arguments?
+    ///
+    /// **COULD, not WOULD — deliberately WIDER than the producer.** It mirrors the producer's branch
+    /// conditions but never asks whether `validatedRRuleUntil` will accept the value, so
+    /// `recurrence: {freq: "DAILY", until: "tomorrow"}` answers true while the producer emits no UNTIL
+    /// at all — one wasted `getEvent`. Matching the producer EXACTLY needs `isAllDay`, because only its
+    /// all-day arm tolerates an invalid TIME portion, and `isAllDay` is what the guarded fetch exists to
+    /// discover. Narrowing PARTWAY does not: `validatedRRuleUntil` runs its shape parse and
+    /// `rruleUntilDateIsInRange` BEFORE `if allDay`. Nobody has. "Cannot be narrowed" (2026-08-12) was
+    /// too strong.
+    ///
+    /// The `isAllDay` a caller passes decides the UNTIL's VALUE TYPE (RFC 5545 §3.3.10), so an edit
+    /// that does not restate `all_day` has to learn it from the event before it can build a legal
+    /// rule — and learning it costs a `getEvent`. This predicate is what keeps that fetch off every
+    /// other edit: it answers "is an UNTIL actually at stake here?" and nothing else.
+    ///
+    /// It MIRRORS the recurrence branch of `buildGCalEventInput` deliberately, in the same order and
+    /// on the same cases, because a predicate that disagrees with the producer it guards is worse
+    /// than no predicate: too narrow and the fetch is skipped on an edit that does emit an UNTIL
+    /// (the defect returns, silently); too wide and edits pay a round trip for nothing. The three
+    /// conditions are therefore not independent choices — each one is a line of that branch:
+    ///
+    ///   1. a `recurrence` dictionary with a `freq` `validatedRRuleFreq` accepts — without it the
+    ///      producer emits no `RRULE` at all, so there is no UNTIL and no value type to match;
+    ///   2. **no numeric `count`** — the producer's `if/else if/else if` chain gives COUNT priority,
+    ///      so a rule carrying COUNT never reaches its UNTIL branch. A `count` that is a STRING is
+    ///      not one of those cases and does NOT suppress the UNTIL, here or there;
+    ///   3. an `until` STRING — the only input the UNTIL branch reads.
+    ///
+    /// Whether that string survives `validatedRRuleUntil` is not asked (see the headline). A dropped
+    /// clause is harmless on the update path and NOT on the split path — see `validatedRRuleUntil` on
+    /// what an omitted UNTIL costs a `this_and_following` successor.
+    static func recurrenceUntilIsAtStake(_ arguments: [String: JSONValue]) -> Bool {
+        guard case .dictionary(let rec) = arguments["recurrence"],
+              case .string(let rawFreq) = rec["freq"],
+              Self.validatedRRuleFreq(rawFreq) != nil else { return false }
+        if case .int = rec["count"] { return false }
+        if case .double = rec["count"] { return false }
+        if case .string = rec["until"] { return true }
+        return false
     }
 
     /// RFC 5545 `FREQ` is a closed token set. Returns the canonical token, or nil if unrecognised.
@@ -774,32 +822,209 @@ enum CalendarToolHelpers {
         return legal.contains(token) ? token : nil
     }
 
-    /// RFC 5545 `UNTIL` is a DATE (`YYYYMMDD`) or UTC DATE-TIME (`YYYYMMDDTHHMMSSZ`).
+    /// Normalise a model-supplied RRULE `UNTIL` to the value type RFC 5545 §3.3.10 requires.
     ///
-    /// Accepts the ISO-ish spellings the model tends to emit, normalises separators away, then checks
-    /// the SHAPE. Anything else returns nil and the UNTIL clause is omitted, which leaves an
-    /// unbounded recurrence — deliberately preferred over emitting arbitrary text into the rule.
-    static func validatedRRuleUntil(_ raw: String) -> String? {
+    /// **UNTIL's value type is not free — it is dictated by DTSTART.** §3.3.10: `UNTIL` MUST have the
+    /// same value type as `DTSTART`; if `DTSTART` is a date with local time AND A TIME ZONE REFERENCE,
+    /// or a date with UTC time, then `UNTIL` MUST be a date with UTC time. A floating `UNTIL` is legal
+    /// only against a floating `DTSTART`.
+    ///
+    /// This function can emit exactly two of the three forms §3.3.10 recognises, selected by `allDay`:
+    ///
+    ///   - all-day  → bare DATE `YYYYMMDD`
+    ///   - timed    → UTC DATE-TIME `YYYYMMDDTHHMMSSZ`
+    ///
+    /// ⚠️ **`allDay` IS THE CALLER'S CLAIM ABOUT THE DTSTART THIS UPDATE WILL LAND, AND THIS COMMENT
+    /// USED TO DESCRIBE THE WRONG PRODUCER.** It said the value type is *"decided by the EVENT, not by
+    /// how the model spelled its input"*, and justified that by enumerating what
+    /// `GCalEventInputICS.veventLines` emits. That is a claim about the CREATE path, where the same
+    /// arguments produce both the DTSTART and the UNTIL, so the two cannot disagree. On the EDIT path
+    /// they can and did: `mergePatchIntoICS` leaves the server's `DTSTART` alone when the patch carries
+    /// no start, so the value type came from the tool argument while the DTSTART came from the
+    /// resource. `AccountManagerCalendarQueue`'s `.edit` case now resolves an absent `all_day` from the
+    /// resource itself before calling this, which is what makes the sentence true again — but only for
+    /// an ABSENT `all_day`. An `all_day` the model states explicitly is taken at its word, because
+    /// stating it is how a timed event is converted to all-day and vice versa; a model that states it
+    /// while changing nothing else can still produce a mismatched pair.
+    ///
+    /// ⚠️ **WHAT `nil` COSTS ON THE SPLIT PATH.** Returning nil drops the `UNTIL` clause while
+    /// `buildGCalEventInput` still assigns a non-empty `input.recurrence` (`RRULE:FREQ=…`, plus any
+    /// INTERVAL — a numeric COUNT takes an earlier `else if` and cannot coexist with an UNTIL). On
+    /// `edit_scope: "this_and_following"`, `CalDAVProvider.buildNewSeriesInput` PREFERS a non-empty
+    /// `patch.recurrence` over `stripUntilAndCount(originalRRule)`, so the successor series is written
+    /// **unbounded**, carrying only the patch's rule parts — and AFTER the cap `PUT`, which is
+    /// irreversible wire operation #6. The 2026-08-12 range check did not create that path but moved
+    /// out-of-range dates onto it, from emitted-verbatim (all-day and already-UTC arms) or
+    /// silently-rolled (naive arm) to nil. So a NEW rejection here is not free: weigh it against an
+    /// unbounded successor, which one further edit can re-cap.
+    ///
+    /// The third form is the one this function cannot emit at all: `CalDAVProvider.MasterDTStartKind`
+    /// models `.floating` (`DTSTART:20260520T170000`, no TZID and no `Z`), and §3.3.10 wants a
+    /// FLOATING `UNTIL` against a floating DTSTART. Both outputs above are wrong for that master —
+    /// the timed one emits UTC against a floating DTSTART. Not handled, and not claimed to be
+    /// impossible: `allDay` is a `Bool`, so there is no value a caller could pass to ask for it.
+    ///
+    /// ⚠️ TWO WRONG ANSWERS, and this function shipped each of them in turn. Appending `Z` to a naive
+    /// value (the original) keeps the value type legal but REINTERPRETS the instant, moving the end of
+    /// the series by the user's offset — eight hours early at UTC−8, enough to drop the final
+    /// occurrence. Preserving the naive form instead (commit 82a0eda8b, this file's previous version)
+    /// fixes the instant and breaks the VALUE TYPE, emitting a floating `UNTIL` against a zoned or UTC
+    /// `DTSTART` — which a strict server may reject outright. The invariant has two halves and a fix
+    /// that satisfies one by violating the other has not converged; it has moved. Both halves are
+    /// checked in `untilIsValidated`.
+    ///
+    /// The naive → UTC conversion is deliberately NOT
+    /// `GoogleCalendarProvider.googleUntilString(beforeNaiveISO:allDay:zone:)` despite the obvious
+    /// resemblance: that function subtracts one second (one day for all-day) because it caps a series
+    /// STRICTLY BEFORE a split point. `UNTIL` here is the user's own INCLUSIVE end ("repeat until Dec
+    /// 31"), so borrowing it would silently shorten every series by a second.
+    ///
+    /// A date-only input on a timed event is read as the END OF THAT DAY in the event's zone. Reading
+    /// it as midnight would drop every occurrence on the day the user named, and returning nil would
+    /// leave the series unbounded, which is worse than either.
+    ///
+    /// Anything unparseable returns nil and the UNTIL clause is omitted — an unbounded recurrence,
+    /// deliberately preferred over emitting arbitrary text into a structured rule, and visible and
+    /// editable by the user. **"Unparseable" means both halves**: the SHAPE check below, and the
+    /// numeric field RANGES in `rruleUntilDateIsInRange` / `rruleUntilTimeIsInRange`. This sentence
+    /// claimed both while the function checked only the shape; those two helpers carry the measured
+    /// list of out-of-range values every arm used to emit, and one of them was a silent three-day
+    /// roll rather than a visible rejection.
+    static func validatedRRuleUntil(_ raw: String, allDay: Bool, zone: TimeZone) -> String? {
         let compact = raw
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "-", with: "")
             .replacingOccurrences(of: ":", with: "")
             .uppercased()
-        let isDate = compact.count == 8 && compact.allSatisfy { $0.isASCII && $0.isNumber }
-        if isDate { return compact }
-        // YYYYMMDDTHHMMSS with an optional trailing Z; always emitted as UTC.
-        let scalars = Array(compact)
-        if (scalars.count == 15 || scalars.count == 16),
-           scalars[8] == "T",
-           scalars.count == 15 || scalars[15] == "Z" {
-            let datePart = String(scalars[0..<8])
-            let timePart = String(scalars[9..<15])
-            if datePart.allSatisfy({ $0.isASCII && $0.isNumber }),
-               timePart.allSatisfy({ $0.isASCII && $0.isNumber }) {
-                return "\(datePart)T\(timePart)Z"
-            }
+        let isNumeric: (String) -> Bool = { $0.allSatisfy { $0.isASCII && $0.isNumber } }
+
+        // Parse the input into (date, optional time, whether it declared UTC). Shape check first, so no
+        // arbitrary text can reach the rule regardless of what the conversion below does.
+        var datePart = ""
+        var timePart: String?
+        var inputIsUTC = false
+        if compact.count == 8, isNumeric(compact) {
+            datePart = compact
+        } else {
+            let scalars = Array(compact)
+            guard scalars.count == 15 || scalars.count == 16,
+                  scalars[8] == "T",
+                  scalars.count == 15 || scalars[15] == "Z" else { return nil }
+            let d = String(scalars[0..<8])
+            let t = String(scalars[9..<15])
+            guard isNumeric(d), isNumeric(t) else { return nil }
+            datePart = d
+            timePart = t
+            inputIsUTC = scalars.count == 16
         }
-        return nil
+
+        // VALUE-RANGE CHECK. The block above proves the SHAPE (8 or 6 ASCII digits in the right
+        // slots); it says nothing about whether those digits name a real instant, and until this
+        // guard existed all three arms below returned out-of-range values. Each arm validates
+        // exactly the fields it emits, which is why this is two guards rather than one: the all-day
+        // arm keeps its documented behaviour of dropping a supplied time rather than rejecting the
+        // date the user meant.
+        guard Self.rruleUntilDateIsInRange(datePart) else { return nil }
+
+        // All-day: DTSTART is `VALUE=DATE`, so UNTIL must be a bare DATE. A supplied time is dropped
+        // rather than rejected — the date is the part the user meant.
+        if allDay { return datePart }
+
+        if let timePart, !Self.rruleUntilTimeIsInRange(timePart) { return nil }
+
+        // Timed: UNTIL must be UTC. Already UTC ⇒ emit as-is.
+        if inputIsUTC, let timePart { return "\(datePart)T\(timePart)Z" }
+
+        // Naive (or date-only) ⇒ read it in the event's zone and render the same instant in UTC.
+        //
+        // `locale` is `en_US_POSIX` and `calendar` is explicitly Gregorian because the parse must be
+        // frame-independent: a device on a non-Gregorian calendar or a locale with non-ASCII digits
+        // would otherwise fail to read a wire-format string it produced itself.
+        //
+        // ⚠️ The assignment ORDER of `calendar` and `timeZone` is NOT load-bearing, and an earlier
+        // version of this comment claimed it was. The theory was that setting `DateFormatter.calendar`
+        // also adopts that calendar's time zone (a fresh `Calendar(identifier: .gregorian)` carries the
+        // DEVICE zone), silently discarding the event's zone. That is false for `DateFormatter`: it
+        // keeps its own `timeZone` override, and a standalone check produced the identical instant with
+        // `timeZone` assigned first and last. The theory was invented to explain a failing assertion
+        // whose real cause was on the TEST side — a hardcoded UTC−8 offset for a named zone whose
+        // tzdata on the build host sits at UTC−7 year-round (see `untilIsValidated`). Do not reinstate
+        // the ordering claim, and do not treat this ordering as a guard.
+        let naive = timePart.map { "\(datePart)T\($0)" } ?? "\(datePart)T235959"
+        let inFmt = DateFormatter()
+        inFmt.locale = Locale(identifier: "en_US_POSIX")
+        inFmt.calendar = Calendar(identifier: .gregorian)
+        inFmt.dateFormat = "yyyyMMdd'T'HHmmss"
+        inFmt.timeZone = zone
+        guard let instant = inFmt.date(from: naive) else { return nil }
+        let outFmt = DateFormatter()
+        outFmt.locale = Locale(identifier: "en_US_POSIX")
+        outFmt.calendar = Calendar(identifier: .gregorian)
+        outFmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        outFmt.timeZone = TimeZone(identifier: "UTC")
+        return outFmt.string(from: instant)
+    }
+
+    /// Is a compact `YYYYMMDD` a date that exists? Callers have already proved eight ASCII digits.
+    ///
+    /// ⚠️ **This is the check the doc comment's *"anything unparseable returns nil"* promised and did
+    /// not do**, and every case below is measured, not supposed:
+    ///
+    ///   - **All-day arm** — returned `20261340`, `00000000`, `99999999`, `20261232` and `20260229`
+    ///     (2026 is not a leap year) verbatim, straight into the emitted `RRULE`.
+    ///   - **Already-UTC arm** — returned `20261340T120000Z` and `00000000T000000Z`.
+    ///   - **Naive arm** — the worse one, and a regression introduced when the naive→UTC conversion
+    ///     was added: `DateFormatter` REJECTS month 13 and day 32 but silently ROLLS an out-of-range
+    ///     day within a real month, so `20260230` became `20260303T075959Z` and `20260231` became
+    ///     `20260304T075959Z`. A wrong instant up to three days out, accepted silently, where the
+    ///     previous version returned the value verbatim and a strict server rejected it VISIBLY.
+    ///
+    /// Written out here rather than delegated to `DateFormatter` because the formatter is wrong in
+    /// both directions for this job: too lenient on the day (it rolls), and too strict on the second
+    /// (see `rruleUntilTimeIsInRange`).
+    private static func rruleUntilDateIsInRange(_ date: String) -> Bool {
+        guard date.count == 8,
+              let year = Int(date.prefix(4)),
+              let month = Int(date.dropFirst(4).prefix(2)),
+              let day = Int(date.suffix(2)),
+              (1...12).contains(month) else { return false }
+        return day >= 1 && day <= Self.gregorianDaysInMonth(month: month, year: year)
+    }
+
+    /// Is a compact `HHMMSS` a time RFC 5545 permits? Callers have already proved six ASCII digits.
+    ///
+    /// **Second `60` is deliberately legal.** RFC 5545 §3.3.12's `time` production is
+    /// `time-hour time-minute time-second [Z]` with `time-second = 2DIGIT ;00-60`, i.e. a positive
+    /// leap second is a valid wire value. `DateFormatter` refuses it, which is the second reason this
+    /// range check is hand-written: delegating would reject a value the spec permits.
+    ///
+    /// Only the already-UTC arm can carry a leap second through, because that arm emits its input
+    /// unchanged. The naive arm still returns nil for `T235960` — measured — because it must parse
+    /// the value into an instant before it can re-render it in UTC, and that parse is the
+    /// `DateFormatter` one. That is pre-existing behaviour this guard neither creates nor widens.
+    ///
+    /// The reachable input: `until: "2016-12-31T15:59:60"` with `allDay: false` in a UTC−8 zone is the
+    /// LOCAL spelling of the real 2016 positive leap second (`1483228800`), a legal RFC 5545 value this
+    /// range check accepts and the naive arm then drops — omitting the `UNTIL`, leaving it unbounded.
+    private static func rruleUntilTimeIsInRange(_ time: String) -> Bool {
+        guard time.count == 6,
+              let hour = Int(time.prefix(2)),
+              let minute = Int(time.dropFirst(2).prefix(2)),
+              let second = Int(time.suffix(2)) else { return false }
+        return (0...23).contains(hour) && (0...59).contains(minute) && (0...60).contains(second)
+    }
+
+    /// Days in `month` (1–12) of `year` in the proleptic Gregorian calendar, leap-year-correct.
+    /// Deliberately arithmetic rather than `Calendar.range(of:in:for:)`: this runs inside a wire-format
+    /// validator that must not depend on the device's current calendar or locale.
+    private static func gregorianDaysInMonth(month: Int, year: Int) -> Int {
+        switch month {
+        case 1, 3, 5, 7, 8, 10, 12: return 31
+        case 4, 6, 9, 11: return 30
+        default:
+            let isLeap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+            return isLeap ? 29 : 28
+        }
     }
 
     /// Convert a naive ISO string (yyyy-MM-dd'T'HH:mm:ss) to RFC 3339 with timezone offset.
