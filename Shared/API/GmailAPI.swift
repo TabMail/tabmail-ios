@@ -197,7 +197,33 @@ enum GmailAPI {
                 let bytes = try await attachment(http: http, messageId: messageId, attachmentId: attId)
                 out.append(InlineImageRef(contentId: item.contentId, contentType: item.contentType, data: bytes))
             } catch {
+                // `item.contentId` is the sender's raw `Content-ID` header value.
+                // `GmailParse.extractInlineImageRefs` only trims at the ENDS
+                // (whitespace/newlines, then `<>`, then whitespace/newlines again),
+                // so an INTERIOR CR/LF/U+2028 survives into this line-oriented sink
+                // and forges a plausible extra diagnostic line. Twin of the
+                // `GmailProvider.fetchInlineImages` sink this function mirrors.
+                //
+                // Debug-gated per global rule 12 by `#if DEBUG` rather than
+                // `DebugModeManager.isLoggingEnabled()`, because `Shared/` also
+                // compiles into the notification-service extension, where
+                // `DebugModeManager` does not exist — the same constraint
+                // `Shared/Parse/IMAPFetchMapping.swift` and
+                // `Shared/Persistence/BodyAssetStore.swift` document at their
+                // `#if DEBUG` prints.
+                //
+                // ⚠️ KNOWN RESIDUAL, recorded rather than fixed: `item.contentId`
+                // is still UNESCAPED here, so in a DEBUG build the forged line is
+                // still possible. The escaper — `DebugModeManager.escapedForLogLine`
+                // — lives in the app target and is not visible from `Shared/`;
+                // closing this means moving the escaper into `Shared/`, a wider
+                // change than this fix. Release builds no longer emit the line at
+                // all, which is the half that was reaching users — in BOTH targets,
+                // since `project.yml` puts `Shared/` in `TabMail` and
+                // `TabMailNotificationService`.
+                #if DEBUG
                 print("[GmailAPI] Inline image fetch failed for \(item.contentId): \(error)")
+                #endif
             }
         }
         return out
