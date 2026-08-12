@@ -8,23 +8,53 @@ import GRDB
 /// Comprehensive local data wipe — reusable by both SettingsView "Reset Everything"
 /// and account deletion flow.
 enum AppDataWiper {
+    /// A precondition of the wipe could not be read, so nothing was deleted.
+    ///
+    /// Deliberately a thrown error rather than a silent no-op: the identifiers this reads are the only
+    /// way to name the Keychain items belonging to the rows the wipe is about to destroy, so
+    /// continuing without them would delete the rows and permanently orphan the secrets.
+    enum WipeError: Error {
+        case couldNotEnumerateKeychainOwners(underlying: Error)
+    }
+
+    /// ⚠️ NOT WIRED TO ANY UI. `wipeAll` has no callers in the app — verified by searching every
+    /// target's sources; the only other mentions of `AppDataWiper` are comments and a metatype test.
+    /// The user-reachable "delete account" flow is `AccountDeletionView.scopedTabMailCleanup`, which
+    /// deliberately preserves email accounts, local messages, and therefore the BYOK and CalDAV
+    /// secrets that belong to them. So this function is a factory-reset utility kept correct for a
+    /// future caller, not a live code path — do not cite it as evidence that a reset happens.
     @MainActor
-    static func wipeAll() async {
+    static func wipeAll() async throws {
         let manager = AccountManager.shared
         let dbPool = AppDatabase.dbPool
-        // Read accounts directly from GRDB (not tied to NavigationStore/UI)
-        let accounts = (try? await dbPool.read { db in try Account.fetchAll(db) }) ?? []
 
-        // Read the CalDAV config ids NOW, before step 5 wipes the tables.
+        // Read the ids of every row whose Keychain items this wipe must delete, BEFORE step 5 wipes
+        // the tables.
         //
         // ⚠️ ORDERING IS LOAD-BEARING, not stylistic. `caldavConfig.accountId` is
-        // `.references("account", onDelete: .cascade)`, so `DELETE FROM account` destroys these rows —
+        // `.references("account", onDelete: .cascade)`, so `DELETE FROM account` destroys those rows —
         // and each row's id is the ONLY way to name its `caldav_password_<id>` Keychain item. Read
         // them after the wipe and the passwords become unenumerable orphans that survive app deletion
-        // with no code path left that can name them. That is exactly why they leak today.
-        let caldavConfigIds = (try? await dbPool.read { db in
-            try CalDAVConfig.fetchAll(db).map(\.id)
-        }) ?? []
+        // with no code path left that can name them.
+        //
+        // ⚠️ These reads FAIL CLOSED and must stay that way. They were `(try? …) ?? []`, which turned
+        // any read failure — GRDB suspension (0xdead10cc), corruption, a migration failure — into an
+        // empty id list: the wipe would delete the rows, iterate nothing, log "true factory reset" and
+        // post `.tabMailDidSignOut`, having produced exactly the unenumerable orphans described above
+        // while reporting success. Unlike most edges in this codebase that failure is NOT recoverable
+        // by a sync pass, a retry, or any number of user gestures — once the rows are gone no code can
+        // name the items again — so per THE MANTRA it is a defect, not a registrable edge.
+        let accounts: [Account]
+        let caldavConfigIds: [String]
+        do {
+            accounts = try await dbPool.read { db in try Account.fetchAll(db) }
+            caldavConfigIds = try await dbPool.read { db in
+                try CalDAVConfig.fetchAll(db).map(\.id)
+            }
+        } catch {
+            print("[AppDataWiper] ABORTED before deleting anything — could not enumerate Keychain owners: \(error)")
+            throw WipeError.couldNotEnumerateKeychainOwners(underlying: error)
+        }
 
         // 1. Unsubscribe all accounts from push (needs access tokens still in Keychain)
         for account in accounts {
