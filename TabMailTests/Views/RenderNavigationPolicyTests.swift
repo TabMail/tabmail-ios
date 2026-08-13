@@ -327,7 +327,7 @@ struct RenderLinkPolicyTests {
     }
 }
 
-@Suite("P1c bridge input validation — the three page-world channels")
+@Suite("P1c bridge input validation — the three bridge channels")
 struct RenderBridgeInputTests {
 
     @Test("A well-formed height payload survives validation unchanged")

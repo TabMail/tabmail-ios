@@ -149,14 +149,20 @@ final class DebugModeManager {
     /// mattered in the direction that made the webview look protected.**
     /// `sanitize` runs inside `imageLoadDiagnosticJS`'s own `log()` wrapper, one
     /// line before that wrapper posts to `consoleLog`. It sanitises the values
-    /// OUR script interpolates. It cannot sanitise the channel: every
-    /// `WKUserScript` in `AutoSizingHTMLView.makeUIView` is installed with no
-    /// content world, so sender script shares our `window` and can call
+    /// OUR script interpolates. It cannot sanitise the channel — and the reason it
+    /// could be bypassed has since been closed twice, by configuration rather than
+    /// by this helper. It read, correctly when written: *"every `WKUserScript` in
+    /// `AutoSizingHTMLView.makeUIView` is installed with no content world, so
+    /// sender script shares our `window` and can call
     /// `window.webkit.messageHandlers.consoleLog.postMessage(…)` directly with
-    /// embedded newlines, bypassing `log()` entirely. That remains open while
-    /// `allowsContentJavaScript` is `true` (ADR-IOS-076 decision 1 is what closes
-    /// it) and is out of scope for this helper, which owns only the Swift-side
-    /// `print` interpolations.
+    /// embedded newlines, bypassing `log()` entirely."* Both halves of that are now
+    /// false: P1b set `allowsContentJavaScript = false` (ADR-IOS-076 decision 1) so
+    /// no sender script runs, and P3 registered the three channels in
+    /// `RenderContentWorld.isolated` so the page world has no `messageHandlers`
+    /// object at all. Either alone would close it; both are single settings, and
+    /// four P1b settings in that file were reversed by owner directive within a day
+    /// of shipping, which is why neither is treated as permanent. Out of scope for
+    /// this helper regardless — it owns only the Swift-side `print` interpolations.
     ///
     /// ⚠️ This is NOT a reversible encoding and NOT injective. A backslash in the
     /// input is passed through unchanged, so a sender who writes the six literal

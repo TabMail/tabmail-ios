@@ -349,6 +349,15 @@ private struct HTMLWebView: UIViewRepresentable {
     // for the new appearance).
     @Environment(\.colorScheme) private var colorScheme
 
+    /// The `WKScriptMessageHandler` channel names, in ONE place so the registration
+    /// loop in `makeUIView`, the P3 diagnostic beside it, and the dispatch in
+    /// `Coordinator.userContentController(_:didReceive:)` cannot drift apart.
+    ///
+    /// Order is the historical registration order and is not load-bearing; WebKit keys
+    /// delivery by name. `heightChanged` is the only one whose loss would break the
+    /// render — see the `consoleLog` gating note in the coordinator.
+    static let bridgeChannels = ["heightChanged", "consoleLog", "gutterAdjust"]
+
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         // ── P1b render hardening (ADR-IOS-076 decision 1; PLAN_EMAIL_RENDER_SECURITY.md §11) ──
@@ -462,21 +471,33 @@ private struct HTMLWebView: UIViewRepresentable {
         let idStampJS = DebugModeManager.isLoggingEnabled()
             ? "window.__tmDiagId='\(context.coordinator.webViewId)';"
             : ""
-        let idStamp = WKUserScript(source: idStampJS, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+        // ── P3: every script below is built `in: RenderContentWorld.isolated` ──
+        // Read `RenderContentWorld` before touching any of the 17 constructions in this
+        // block, the 3 `add(…)` registrations, or the 3 `evaluateJavaScript` call sites.
+        // A world is a NAMESPACE: our scripts still share ONE DOM with the document, but
+        // they get their own `window`, so `__tmLayoutVp` / `__tmFitDone` /
+        // `__tmReportHeight` are no longer readable or forgeable by author content. The
+        // migration is ALL-OR-NOTHING and fails SILENTLY — one script left in the page
+        // world writes to a `window` nobody else in this pipeline can see, and the render
+        // dies whole (no height, no dark mode, no quote collapse, no deferred images) in a
+        // way no non-`WKWebView` test can observe. This is defense-in-depth; it did NOT
+        // enable the CSP, which shipped in P1b with every script still in the page world.
+        let idStamp = WKUserScript(source: idStampJS, injectionTime: .atDocumentStart, forMainFrameOnly: true, in: RenderContentWorld.isolated)
         // Install before parsing reaches any author image/background resources so
         // debug logs can distinguish an actual WebKit load error from a deferred
         // URL that simply has not been assigned yet. Production source is empty.
         let imageLoadDiag = WKUserScript(
             source: imageLoadDiagnosticJS(enabled: DebugModeManager.isLoggingEnabled()),
             injectionTime: .atDocumentStart,
-            forMainFrameOnly: true
+            forMainFrameOnly: true,
+            in: RenderContentWorld.isolated
         )
-        let mediaFix = WKUserScript(source: enforceMediaDisplayJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
-        let widthFix = WKUserScript(source: constrainWidthsJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
-        let darkMode = WKUserScript(source: fixDarkModeColorsJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
-        let emlCleanup = WKUserScript(source: cleanupEmlBodyJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
-        let quoteCollapse = WKUserScript(source: collapseQuotesJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
-        let icsCollapse = WKUserScript(source: collapseICSJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        let mediaFix = WKUserScript(source: enforceMediaDisplayJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
+        let widthFix = WKUserScript(source: constrainWidthsJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
+        let darkMode = WKUserScript(source: fixDarkModeColorsJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
+        let emlCleanup = WKUserScript(source: cleanupEmlBodyJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
+        let quoteCollapse = WKUserScript(source: collapseQuotesJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
+        let icsCollapse = WKUserScript(source: collapseICSJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
         // Production render path — always injected. Only its diagnostic hook is
         // gated, and it is gated by the SAME flag that decides whether
         // imageLoadDiagnosticJS above installs the hook at all, so an ungated
@@ -484,28 +505,29 @@ private struct HTMLWebView: UIViewRepresentable {
         let deferImages = WKUserScript(
             source: deferredImageLoadJS(diagnosticsEnabled: DebugModeManager.isLoggingEnabled()),
             injectionTime: .atDocumentEnd,
-            forMainFrameOnly: true
+            forMainFrameOnly: true,
+            in: RenderContentWorld.isolated
         )
         // After the layout-affecting transforms (quote/ics collapse, eml cleanup)
         // and before height monitoring/fit, so it measures the settled layout.
-        let leftFix = WKUserScript(source: constrainLeftOverflowJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        let leftFix = WKUserScript(source: constrainLeftOverflowJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
         // Crops a WHOLESALE per-region indent (e.g. OWA's margin:0 0 16px 40px on
         // every content block) BEFORE eatGutterMarginsJS/fitViewportJS measure, so
         // both see the post-crop layout. See normalizeIndentJS's doc comment.
-        let indentCrop = WKUserScript(source: normalizeIndentJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
-        let eatMargins = WKUserScript(source: eatGutterMarginsJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
-        let heightMonitor = WKUserScript(source: monitorHeightJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        let indentCrop = WKUserScript(source: normalizeIndentJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
+        let eatMargins = WKUserScript(source: eatGutterMarginsJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
+        let heightMonitor = WKUserScript(source: monitorHeightJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
         // After heightMonitor so window.__tmReportHeight is defined when a
         // correction fires; its own load listeners coexist with the height
         // monitor's (a single <img> can carry multiple load listeners).
-        let aspectFix = WKUserScript(source: fixImageAspectRatioJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        let aspectFix = WKUserScript(source: fixImageAspectRatioJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
         // After heightMonitor: re-checks horizontal overflow once the deferred
         // images have all settled — fit() measures with them hidden, so an
         // image-driven width overflow is invisible to it (see the doc comment
         // on postImageWidthRecheckJS).
-        let widthRefit = WKUserScript(source: postImageWidthRecheckJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
-        let debugReport = WKUserScript(source: htmlDebugReportJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
-        let heightDiag = WKUserScript(source: heightDiagnosticJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        let widthRefit = WKUserScript(source: postImageWidthRecheckJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
+        let debugReport = WKUserScript(source: htmlDebugReportJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
+        let heightDiag = WKUserScript(source: heightDiagnosticJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
         config.userContentController.addUserScript(idStamp)
         config.userContentController.addUserScript(imageLoadDiag)
         config.userContentController.addUserScript(mediaFix)
@@ -523,9 +545,35 @@ private struct HTMLWebView: UIViewRepresentable {
         config.userContentController.addUserScript(widthRefit)
         config.userContentController.addUserScript(debugReport)
         config.userContentController.addUserScript(heightDiag)
-        config.userContentController.add(context.coordinator, name: "heightChanged")
-        config.userContentController.add(context.coordinator, name: "consoleLog")
-        config.userContentController.add(context.coordinator, name: "gutterAdjust")
+        // P3 — the three bridge channels, registered INTO THE ISOLATED WORLD. This is the
+        // half of the isolation that changes what the DOCUMENT can do, rather than what it
+        // can see: `add(_:contentWorld:name:)` publishes
+        // `window.webkit.messageHandlers.<name>` only in the world it names, so the page
+        // world has no bridge object to post to at all. The registration is driven from
+        // `bridgeChannels` so the list, the debug line below and
+        // `Coordinator.userContentController(_:didReceive:)` cannot drift apart.
+        for channel in HTMLWebView.bridgeChannels {
+            config.userContentController.add(context.coordinator,
+                                             contentWorld: RenderContentWorld.isolated,
+                                             name: channel)
+        }
+
+        // P3 diagnostics (owner requirement). A botched world migration is otherwise
+        // invisible until the render dies, so say out loud which world the pipeline was
+        // wired into, how many scripts landed there, and which channels were registered.
+        // The script count is read back off the live `WKUserContentController` rather than
+        // from a literal, so it reports what was actually installed. Debug-gated per
+        // development rule 12 — a no-op in production.
+        if DebugModeManager.isLoggingEnabled() {
+            let world = RenderContentWorld.isolated
+            print("[RenderSec id=\(context.coordinator.webViewId)] "
+                  + "contentWorld=\(world.name ?? "<pageWorld>") "
+                  + "userScripts=\(config.userContentController.userScripts.count)")
+            for channel in HTMLWebView.bridgeChannels {
+                print("[RenderSec id=\(context.coordinator.webViewId)] "
+                      + "handler registered channel=\(channel) world=\(world.name ?? "<pageWorld>")")
+            }
+        }
 
         let webView = WKWebView(frame: .zero, configuration: config)
         // `allowsLinkPreview` is deliberately UNSET, so WebKit's default (ON) applies — the
@@ -644,7 +692,14 @@ private struct HTMLWebView: UIViewRepresentable {
             // heights against the stale widened viewport.
             context.coordinator.lastMeasuredWidth = currentWidth
             let resetJS = viewportResetJS(deviceWidth: Int(currentWidth.rounded()))
-            webView.evaluateJavaScript(resetJS) { _, _ in
+            // P3: `in: RenderContentWorld.isolated`. `viewportResetJS` CLEARS
+            // `window.__tmLayoutVp`, which `monitorHeightJS` (a user script) reads — so
+            // this call must land in the same world those scripts live in or it would
+            // clear a global nobody reads and leave the real one set, permanently bailing
+            // `fitViewportJS`'s idempotency guard. `in: nil` targets the main frame.
+            // The world-aware overload is `NS_REFINED_FOR_SWIFT`, so the completion handler
+            // takes a single `Result` rather than the `(value, error)` pair.
+            webView.evaluateJavaScript(resetJS, in: nil, in: RenderContentWorld.isolated) { _ in
                 context.coordinator.fit()
             }
         }
@@ -899,7 +954,12 @@ private struct HTMLWebView: UIViewRepresentable {
             // (WebKit bug 170595) — the same reason monitorHeightJS reads
             // __tmLayoutVp instead of innerWidth after a widen.
             let stampJS = "window.__tmDeviceWidth = \(Int(webView.bounds.width.rounded()));"
-            webView.evaluateJavaScript(stampJS + fitViewportJS) { _, _ in
+            // P3: `in: RenderContentWorld.isolated`. `__tmDeviceWidth` is stamped here and
+            // read by `monitorHeightJS`'s `__tmLayoutVp || __tmDeviceWidth || innerWidth`
+            // fallback chain, and `fitViewportJS` sets `__tmFitDone` / `__tmLayoutVp` that
+            // the same user scripts read — all one world, or the chain silently falls
+            // through to the untrustworthy `innerWidth` (WebKit bug 170595).
+            webView.evaluateJavaScript(stampJS + fitViewportJS, in: nil, in: RenderContentWorld.isolated) { _ in
                 // That's it. monitorHeightJS's ResizeObserver will fire
                 // after the viewport change settles, and
                 // handleHeightMessage will apply the result.
@@ -918,7 +978,9 @@ private struct HTMLWebView: UIViewRepresentable {
         func resetAndFit(_ webView: WKWebView? = nil) {
             guard let webView = webView ?? self.webView, webView.bounds.width > 50 else { return }
             let resetJS = viewportResetJS(deviceWidth: Int(webView.bounds.width.rounded()))
-            webView.evaluateJavaScript(resetJS + ";" + fitViewportJS) { _, _ in }
+            // P3: `in: RenderContentWorld.isolated` — same reason as `fit()` above, and
+            // still ONE evaluate call so WebKit commits a single layout/scale change.
+            webView.evaluateJavaScript(resetJS + ";" + fitViewportJS, in: nil, in: RenderContentWorld.isolated) { _ in }
         }
 
         /// Wrap `rawHTML` OFF the main thread, then load it into the web view.
@@ -1282,6 +1344,20 @@ private struct HTMLWebView: UIViewRepresentable {
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            // ── P3: SUBFRAME REJECTION, before anything else reads this message ──
+            // All 17 user scripts are `forMainFrameOnly: true`, so no script of OURS ever
+            // runs in a subframe and a legitimate bridge message is always main-frame.
+            // A post from a subframe therefore cannot be ours, and the ORDER here is the
+            // point: this guard sits ABOVE the liveness beacon, because a non-app message
+            // that reached the beacon would forge a LIVE verdict for a load where none of
+            // our scripts ran — exactly the spoof the beacon's own comment warns about.
+            // Fails closed, and says so under the debug gate. `message.name` is safe to
+            // interpolate: WebKit only delivers names we registered, so it is one of
+            // `bridgeChannels`, never sender-authored.
+            guard RenderBridgeInput.acceptsMessage(fromMainFrame: message.frameInfo.isMainFrame) else {
+                bridgeLog("rejected channel=\(message.name) reason=not-main-frame")
+                return
+            }
             // Bridge-liveness beacon (see `lastBridgeMessageGeneration`). Recorded
             // for EVERY channel and BEFORE any dispatch, because the question this
             // answers is "did app JavaScript run at all", not "did the height
@@ -1289,19 +1365,25 @@ private struct HTMLWebView: UIViewRepresentable {
             // open. Ungated on purpose: one integer store, no I/O; only the
             // verdict in `scheduleBridgeLivenessCheck` prints, and that is gated.
             //
-            // Sound as an APP-script signal only because `allowsContentJavaScript`
-            // is false: before P1b, sender script shared this `window` and could
-            // post to `consoleLog` itself, which would have let a message forge a
-            // LIVE verdict for a load where none of our scripts ran. Re-enabling
-            // author JS re-opens that, and this beacon would have to move to a
-            // channel author script cannot reach (a separate `WKContentWorld`).
+            // Sound as an APP-script signal for TWO independent reasons now, and the
+            // second is the durable one. (1) `allowsContentJavaScript` is false, so no
+            // sender script runs at all — before P1b it shared this `window` and could
+            // post to `consoleLog` itself. (2) P3 registered these channels in
+            // `RenderContentWorld.isolated`, so `webkit.messageHandlers` does not exist
+            // in the page world: re-enabling author JS would no longer re-open the
+            // forgery, because there is nothing there to post to. The old note said this
+            // beacon "would have to move to a separate `WKContentWorld`" if author JS came
+            // back — it has now moved, so that migration is DONE, not pending.
             lastBridgeMessageGeneration = loadGeneration
             // P1c — every payload below is validated in SWIFT before it is used.
-            // The three channels are registered in the PAGE world, so any clamp
-            // that lives in our injected JS is advisory: whatever runs in that
-            // world can post directly and simply not call it. Each rejection
-            // fails closed (the message is dropped) and says so under the debug
-            // gate; nothing substitutes a default a sender could aim.
+            // A clamp that lives in our injected JS is advisory: whatever runs in the
+            // world the channels are registered in can post directly and simply not call
+            // it. P3 narrowed WHO that is — only our own scripts share
+            // `RenderContentWorld.isolated` — but it did not make the Swift-side
+            // validation redundant, because a clamp WE wrote wrong produces the same
+            // `NaN` height as a hostile one. Each rejection fails closed (the message is
+            // dropped) and says so under the debug gate; nothing substitutes a default a
+            // sender could aim.
             if message.name == "heightChanged" {
                 guard let validated = RenderBridgeInput.validatedHeightBody(message.body) else {
                     bridgeLog("rejected channel=heightChanged reason=malformed-payload")
@@ -1397,9 +1479,10 @@ private struct HTMLWebView: UIViewRepresentable {
                 // sets __tmFitDone and re-posts the final height through here.
                 if dict["requestFit"] as? Bool == true {
                     // One-shot PER LOAD, enforced in Swift. `__tmFitRequested`
-                    // in monitorHeightJS is the page-world copy and is only
-                    // advisory; this is the authoritative guard, so a document
-                    // cannot drive an unbounded re-fit loop.
+                    // in monitorHeightJS is the JS-side copy (since P3 it lives
+                    // in `RenderContentWorld.isolated`, not the page world) and
+                    // is only advisory; this is the authoritative guard, so a
+                    // document cannot drive an unbounded re-fit loop.
                     guard fitRequestGeneration != loadGeneration else {
                         bridgeLog("rejected channel=heightChanged reason=duplicate-requestFit")
                         return
@@ -1416,7 +1499,8 @@ private struct HTMLWebView: UIViewRepresentable {
                 // before posting, so this cannot loop.
                 if dict["requestWidthRefit"] as? Bool == true {
                     // Same one-shot-per-load rule as `requestFit`;
-                    // `__tmWidthRefitRequested` is the advisory page-world copy.
+                    // `__tmWidthRefitRequested` is the advisory JS-side copy
+                    // (isolated world since P3), not the authority.
                     guard widthRefitRequestGeneration != loadGeneration else {
                         bridgeLog("rejected channel=heightChanged reason=duplicate-requestWidthRefit")
                         return
@@ -2998,28 +3082,42 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
 ///    …})` runs sender code on assignment, from inside our hook, on a path the
 ///    ungated build does not even reach. A sender who wants to be invoked simply
 ///    returns a falsy id.
-/// 5. CONTENT-WORLD PARITY between our scripts and the sender's. Every
+/// 5. CONTENT-WORLD PARITY between our scripts and the sender's. **⚠️ THIS CLAUSE
+///    WAS INVERTED BY P3 (2026-08-13) AND IS KEPT, NOT DELETED, BECAUSE ITS
+///    DEPENDENCY DIRECTION IS THE POINT.** It read, correctly until P3: *"every
 ///    `WKUserScript` in `makeUIView` is created with the
 ///    `init(source:injectionTime:forMainFrameOnly:)` initialiser — the one that
 ///    takes no content world — so every one of them runs in the PAGE world,
-///    alongside author script, sharing ONE `window`.
-///    ⚠️ Re-checking this needs care, because writing it down made the obvious
-///    search self-matching: `rg WKContentWorld` on this file now returns THIS
-///    COMMENT, where before it returned nothing. The invariant is *"no
-///    `WKUserScript` here is constructed with a content-world argument"* — read
+///    alongside author script, sharing ONE `window`."*
+///    That is now FALSE. All 17 are built `in: RenderContentWorld.isolated`, the
+///    three bridge channels are registered with `add(_:contentWorld:name:)`, and
+///    all three `evaluateJavaScript` call sites name the same world.
+///    ⚠️ Re-checking this STILL needs care, and P3 made the trap worse rather than
+///    better: `rg WKContentWorld` on this file already returned this comment
+///    instead of nothing, and now `rg RenderContentWorld` matches the prose in
+///    `makeUIView`'s own block comment too. The invariant is *"every
+///    `WKUserScript` here is constructed WITH the isolated content world"* — read
 ///    the `WKUserScript(` call sites in `makeUIView`, do not count identifier
 ///    hits. (Same trap as
 ///    `Companion/Memory/Current/105-a-print-is-not-production-observability-on-ios.md`,
 ///    where a correction mentioning `freopen`/`dup2` turned a zero-hit grep into
 ///    a four-hit one.)
-///    Page-world sharing is precisely what makes the non-replaceable
-///    install in 2 load-bearing rather than belt-and-braces: in a separate world
-///    the sender could not see, shadow or replace `__tmImageDiagWillAssign` at
-///    all, and 2 would be redundant. It is listed because it is a silent
-///    dependency — nothing in the code says "page world", it is the default — so
-///    a future change that moves our scripts into `.defaultClient` would make 2
-///    unnecessary, while a change that moves only SOME of them would break the
-///    pairing that 3 describes.
+///    **What this does to clause 2, stated exactly: 2 is now REDUNDANT, and it
+///    stays anyway.** Page-world sharing was precisely what made the
+///    non-replaceable install load-bearing — in a separate world the sender cannot
+///    see, shadow or replace `__tmImageDiagWillAssign` at all. So the
+///    `writable: false, configurable: false` install now defends against nothing
+///    reachable. **Do not remove it on that reasoning.** It costs one call at
+///    `.atDocumentStart` in debug builds only, and it is the sole surviving
+///    mitigation if this world is ever reverted — which is a live possibility, not
+///    a hypothetical: four P1b settings in this same file were reversed by owner
+///    directive within a day of shipping. Redundant-while-the-world-holds is the
+///    correct state for a belt-and-braces guard, not a cleanup opportunity.
+///    Clause 3's warning is unchanged and still applies for the same reason: a
+///    change that moved only SOME scripts — of worlds OR of frame scope — breaks
+///    the pairing, and P3 did not make that safer, it just moved which pairing
+///    is at stake. See `RenderContentWorld` for why a partial migration fails
+///    silently and totally.
 ///
 /// Relax any of these — `writable: false` in particular — and the sender chooses,
 /// or shares, what our render path does, at which point "cannot generate duplicate
@@ -3032,6 +3130,19 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
 /// is low for the same reason the Amplification bullet gives — while
 /// `allowsContentJavaScript` is `true` the sender can issue the request directly —
 /// but it must not survive into the phase where content JS is disabled.
+///
+/// ⚠️ **That last clause came due, and it is now discharged — by P3, not by a test.**
+/// Content JS *was* disabled at P1b (2026-08-12) and item 4 survived it, exactly as
+/// the sentence above feared; it stayed reachable in principle because our hook and
+/// the sender shared one set of DOM wrappers. P3 (2026-08-13) closes the mechanism:
+/// DOM wrapper objects and their expando properties are **per-world**, so an
+/// accessor a sender installs on `img.__tmImageDiagId` lives on the page world's
+/// wrapper and our hook — reading the same element through
+/// `RenderContentWorld.isolated`'s wrapper — never touches it. Item 4 is therefore
+/// unreachable for the same structural reason clause 2 is redundant, and it is
+/// still NOT covered by a test. **Do not restate it as "fixed"**: it is closed by a
+/// configuration property that an owner directive could reverse, which is precisely
+/// how four P1b settings in this file were undone within a day.
 ///
 /// **What each log line actually omits.** `safeURL`'s `return` statements do not
 /// all guarantee the same thing, and the ones that produce a URL-derived string

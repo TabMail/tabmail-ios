@@ -349,18 +349,82 @@ internal struct BridgeLivenessBeacon: Equatable {
     }
 }
 
+// MARK: - Content-world isolation
+
+/// The `WKContentWorld` that EVERY app-injected render script, EVERY bridge message
+/// handler and EVERY `evaluateJavaScript` call on the message web view runs in
+/// (P3; ADR-IOS-076, defense-in-depth).
+///
+/// **What this buys, stated exactly.** A `WKContentWorld` is a JavaScript *namespace*:
+/// scripts in different worlds manipulate ONE shared DOM but get separate global
+/// objects and separate DOM-wrapper prototypes. Moving our scripts off
+/// `WKContentWorld.pageWorld` therefore puts `window.__tmLayoutVp`, `__tmFitDone`,
+/// `__tmReportHeight`, `__tmDeviceWidth`, `__tmImageDiagWillAssign` and the rest of the
+/// render state out of the document's reach: author content can no longer READ our
+/// render state, FORGE it, or SHADOW a function our own scripts go on to call. That is
+/// a real partial mitigation for T3 (bridge spoofing).
+///
+/// It also moves the bridge itself. `add(_:contentWorld:name:)` publishes
+/// `window.webkit.messageHandlers.<name>` only in the world it names, so the page world
+/// has no `heightChanged` / `consoleLog` / `gutterAdjust` object to post to at all.
+///
+/// **⚠️ THIS IS DEFENSE-IN-DEPTH. It is NOT what makes the CSP work, and it never was.**
+/// The claim that page-world user scripts would be subject to `script-src 'none'` — which
+/// would have made this world a prerequisite for the CSP — was refuted (plan §8.1,
+/// superseding §3) and is now settled empirically as well: P1b shipped `script-src 'none'`
+/// together with `allowsContentJavaScript = false` while all 17 scripts were still in the
+/// page world, and every one of them ran. Do not describe this world as enabling the CSP,
+/// and do not re-derive the ordering argument.
+///
+/// **⚠️ ALL-OR-NOTHING — the failure mode is total, and it is SILENT.** Because a world is
+/// a namespace, a script that writes `window.__tmReportHeight` in this world while a caller
+/// reads it from the page world is not "mostly working": it sees a different global object
+/// and finds `undefined`. There is no partial-credit state. A half-migrated pipeline loses
+/// height reporting, dark mode, quote collapse and deferred images *at once*, and no test
+/// that does not drive a real `WKWebView` can observe it — which is precisely why the
+/// invariant here is a CENSUS rather than a style rule:
+///
+/// > every `WKUserScript` built in `HTMLWebView.makeUIView`, every
+/// > `WKUserContentController.add`, and every `evaluateJavaScript` on the render web view
+/// > names this world.
+///
+/// At P3 implementation time that census was **17 user scripts, 3 handler registrations,
+/// 3 `evaluateJavaScript` call sites**. Those numbers are a tripwire, not a budget: if you
+/// add a script or a call site, the requirement is that it names this world, not that the
+/// count stays 17. **Re-derive the counts rather than trusting this sentence** — and note
+/// that writing them down made the obvious search self-matching, exactly as the
+/// content-world note in `AutoSizingHTMLView.swift` warns. Count `WKUserScript(` CALL
+/// SITES in `makeUIView`; do not count identifier hits, which now include this paragraph.
+@MainActor
+internal enum RenderContentWorld {
+    /// A NAMED world rather than `.defaultClientWorld`: the name is what the Web Inspector
+    /// surfaces and what the debug-gated `[RenderSec]` line prints, and it keeps this
+    /// pipeline distinct from any other client-world consumer a later feature might add.
+    /// Repeated `world(name:)` calls return the same instance, so this is a stable identity
+    /// and not a per-call allocation.
+    static let isolated = WKContentWorld.world(name: "TabMailRender")
+}
+
 // MARK: - Bridge input validation
 
 /// Swift-side validation for the three `WKScriptMessageHandler` channels
 /// (`heightChanged`, `consoleLog`, `gutterAdjust`).
 ///
-/// **Why in Swift, when the page-side JS already clamps.** The handlers are registered in
-/// the page world, so every clamp that lives in our injected JS is *advisory* — anything
-/// running in that world can post whatever it likes and simply not call our clamps.
-/// `connect-src 'none'` does not close this: `webkit.messageHandlers` is not a fetch
-/// surface. P1b's `allowsContentJavaScript = false` removes today's reachable attacker,
-/// but the validation belongs on the trusted side regardless, and the failure modes
-/// (a `NaN` frame height, a 10⁹-point gutter) are cheap to make impossible.
+/// **Why in Swift, when the page-side JS already clamps.** Because a clamp that lives in
+/// our injected JS is *advisory*: whatever runs in the world the handlers are registered in
+/// can post directly and simply not call it. `connect-src 'none'` does not close that —
+/// `webkit.messageHandlers` is not a fetch surface — so the validation belongs on the
+/// trusted side, where the failure modes (a `NaN` frame height, a 10⁹-point gutter) are
+/// cheap to make impossible.
+///
+/// ⚠️ **The reachable attacker has been removed TWICE, and this validation is still not
+/// redundant.** P1b's `allowsContentJavaScript = false` stopped author script running at
+/// all; P3 then registered these channels in `RenderContentWorld.isolated`, so the page
+/// world has no `webkit.messageHandlers` object to reach even if author script ran again.
+/// Both are configuration, one setting each, revertible by an owner directive of the kind
+/// that already reversed four P1b settings — and neither makes OUR OWN injected JS correct.
+/// A clamp we wrote wrong in the isolated world produces the same `NaN` height as a hostile
+/// one. This is the authoritative copy; do not delete it as "already covered".
 ///
 /// Every rejection **fails closed**: the message is dropped and, when logging is enabled,
 /// says so. Nothing substitutes a default a sender could aim.
@@ -389,6 +453,26 @@ internal enum RenderBridgeInput {
     /// Boolean command keys. Present-but-not-a-`Bool` is a malformed payload, not a
     /// falsey one.
     private static let flagKeys = ["revealed", "requestFit", "requestWidthRefit"]
+
+    /// P3 — the FRAME gate, applied to every channel before any payload is read and before
+    /// the bridge-liveness beacon records anything.
+    ///
+    /// It lives here, rather than inline in the coordinator, for the reason this whole type
+    /// exists (see the header of this file): `Coordinator` is nested inside a `private
+    /// struct` and no test can reach it, so a decision left inline is a decision nothing
+    /// pins. The production call site is `Coordinator.userContentController(_:didReceive:)`.
+    ///
+    /// **Why main-frame-only is the correct rule and not merely a tighter one.** Every one
+    /// of the 17 user scripts is built `forMainFrameOnly: true`, so no script of ours ever
+    /// runs in a subframe and no legitimate bridge message can originate in one. The gate
+    /// therefore refuses only messages that are, by construction, not ours — it cannot cost
+    /// a real measurement. `EmailRenderSecurityCanaryTests` pins the production side of that
+    /// premise directly (`isForMainFrameOnly` on every installed script); if a future change
+    /// ever needs a subframe script, this gate and that premise must change together.
+    ///
+    /// Two-sided on purpose: the failure that matters is someone inverting the sense, and an
+    /// always-`true` gate is exactly as broken as an always-`false` one.
+    static func acceptsMessage(fromMainFrame isMainFrame: Bool) -> Bool { isMainFrame }
 
     /// Validate a `heightChanged` payload, returning the body to process or `nil` to drop
     /// it. A dictionary payload is returned with its `source` tag bounded and escaped, so

@@ -2551,22 +2551,27 @@ struct ImageAspectRatioFixTests {
 /// ⚠️ **It does NOT close "the webview's `postMessage` path", which is what this
 /// comment claimed until 2026-08-12.** `sanitize` is applied inside
 /// `imageLoadDiagnosticJS`'s `log()` wrapper, immediately before that wrapper
-/// calls `window.webkit.messageHandlers.consoleLog.postMessage`. Every
-/// `WKUserScript` in `AutoSizingHTMLView.makeUIView` is installed WITHOUT a
-/// content world, so our script and author script share one `window` — which
-/// means sender script can call `window.webkit.messageHandlers.consoleLog
-/// .postMessage('anything\nit likes')` itself, reaching the same Swift handler
-/// and the same `print`, without going through `log()` or `sanitize` at all.
+/// calls `window.webkit.messageHandlers.consoleLog.postMessage`. The bypass it
+/// leaves open was described, correctly at the time, as: *"every `WKUserScript` in
+/// `AutoSizingHTMLView.makeUIView` is installed WITHOUT a content world, so our
+/// script and author script share one `window` — which means sender script can call
+/// `window.webkit.messageHandlers.consoleLog.postMessage('anything\nit likes')`
+/// itself, reaching the same Swift handler and the same `print`, without going
+/// through `log()` or `sanitize` at all."*
 /// What `sanitize` actually closes is a sender-authored VALUE (a URL, an
 /// attribute) forging an extra line inside a diagnostic WE emit. What stayed open
 /// while `allowsContentJavaScript` was `true` is the sender posting arbitrary
 /// forged lines directly; that closed with ADR-IOS-076 decision 1, not here —
-/// **shipped at P1b (2026-08-12)**: `makeUIView` now sets
+/// **shipped at P1b (2026-08-12)**: `makeUIView` sets
 /// `allowsContentJavaScript = false`, so author script cannot reach
-/// `messageHandlers` at all. The shared-`window` shape it describes is unchanged
-/// (our user scripts still run in the page world); what changed is that no
-/// sender-authored script runs there to exploit it. Everything below still holds
-/// regardless — the paths it tests reach `print` from Swift, not from JS.
+/// `messageHandlers` at all.
+/// ⚠️ **The shared-`window` shape is no longer accurate either, as of P3
+/// (2026-08-13).** All 17 user scripts now run in `RenderContentWorld.isolated` and
+/// the three channels are registered there with `add(_:contentWorld:name:)`, so the
+/// page world has no `webkit.messageHandlers` object to post to even if author
+/// script were re-enabled. Two independent closures now, neither of them this
+/// helper. Everything below still holds regardless — the paths it tests reach
+/// `print` from Swift, not from JS.
 ///
 /// The attachment download / staging / preview / carry-forward
 /// paths reach `print` DIRECTLY, with sender-authored values interpolated in —

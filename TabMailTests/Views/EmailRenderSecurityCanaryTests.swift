@@ -325,6 +325,14 @@ enum CanaryKit {
         await waitUntil(timeout) { probe.events.contains { $0.callback == "didFinish" } }
     }
 
+    /// Evaluate in the **page world** — the document's own world.
+    ///
+    /// ⚠️ Since P3 this is the ATTACKER's vantage point, not the app's. The render pipeline
+    /// runs in `RenderContentWorld.isolated`, so a probe for one of our own globals through
+    /// this function asks *"can the document see it?"* and the answer must be no. To ask
+    /// *"did our script run?"* use `eval(_:_:in:)` with `RenderContentWorld.isolated`.
+    /// Probing app state here and reading `undefined` as "the script did not run" is the
+    /// single easiest way to misread this suite.
     static func eval(_ webView: WKWebView, _ js: String) async -> String {
         await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
             webView.evaluateJavaScript(js) { value, error in
@@ -334,6 +342,30 @@ enum CanaryKit {
                     cont.resume(returning: String(describing: value))
                 } else {
                     cont.resume(returning: "null")
+                }
+            }
+        }
+    }
+
+    /// Evaluate in an explicit `WKContentWorld`.
+    ///
+    /// P3 split one question into two: *"did our script run"* is asked of
+    /// `RenderContentWorld.isolated`, and *"can the document read our state"* is asked of
+    /// `WKContentWorld.pageWorld`. Both are needed — a one-sided probe cannot distinguish
+    /// a working isolated pipeline from a pipeline that did not run at all.
+    ///
+    /// `nil` is normalised to `"null"` so the two spellings agree with `eval(_:_:)` above;
+    /// WebKit hands back `NSNull` here where the older overload hands back `nil`, and a
+    /// silent `"<null>"` vs `"null"` mismatch would make an assertion fail for a reason
+    /// that has nothing to do with what it is testing.
+    static func eval(_ webView: WKWebView, _ js: String, in world: WKContentWorld) async -> String {
+        await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
+            webView.evaluateJavaScript(js, in: nil, in: world) { result in
+                switch result {
+                case .failure(let error):
+                    cont.resume(returning: "JSERR:\((error as NSError).domain)/\((error as NSError).code)")
+                case .success(let value):
+                    cont.resume(returning: value is NSNull ? "null" : String(describing: value))
                 }
             }
         }
@@ -568,8 +600,17 @@ struct EmailRenderSecurityCanaryTests {
 
         let authorRan = await CanaryKit.eval(wv, "String(window.__tmCanaryAuthorRan)")
         let authorDOM = await CanaryKit.eval(wv, "String(document.documentElement.getAttribute('data-author'))")
-        let appScript = await CanaryKit.eval(wv, "typeof window.__tmReportHeight")
-        print("[P1A] authorRan=\(authorRan) authorDOM=\(authorDOM) appScript=\(appScript)")
+        // ⚠️ P3 CHANGED WHICH WORLD THIS QUESTION IS ASKED OF, and the change is the point.
+        // Until P3 this read `CanaryKit.eval(wv, "typeof window.__tmReportHeight")` — the
+        // PAGE world — and expected `"function"`. That probe is now the exact opposite
+        // measurement: our scripts live in `RenderContentWorld.isolated`, so a page-world
+        // `"undefined"` is the SECURITY PROPERTY P3 buys, not a regression. The
+        // "did the app's script run" oracle moved to the isolated world. Read both.
+        let appScript = await CanaryKit.eval(wv, "typeof window.__tmReportHeight",
+                                             in: RenderContentWorld.isolated)
+        let appScriptFromPageWorld = await CanaryKit.eval(wv, "typeof window.__tmReportHeight")
+        print("[P1A] authorRan=\(authorRan) authorDOM=\(authorDOM) appScript=\(appScript) "
+              + "appScriptFromPageWorld=\(appScriptFromPageWorld)")
 
         // INVERTED AT P1b (was `== "true"` / `== "yes"`).
         #expect(authorRan == "undefined",
@@ -590,9 +631,16 @@ struct EmailRenderSecurityCanaryTests {
 
         // MUST NOT invert: the hardening depends on app user scripts still running.
         // This is the HARD-STOP oracle named in the P1b brief — if it fails, the phase is
-        // wrong, not the test.
+        // wrong, not the test. P3 re-aimed it at the isolated world; what it asserts is
+        // unchanged, because the question is unchanged.
         #expect(appScript == "function",
-                "the app's WKUserScript must execute (height reporting); P1b must not break this")
+                "the app's WKUserScript must execute (height reporting); P1b must not break this, and P3's world migration must not either")
+        // P3, the other side of the same fact — and the one that makes the phase worth
+        // shipping. `__tmReportHeight` is our bridge into Swift; a document that can read
+        // it can read our render state, and a document that can WRITE it can forge heights.
+        // It must not exist in the document's world at all.
+        #expect(appScriptFromPageWorld == "undefined",
+                "P3: the DOCUMENT's world must NOT see the app's render state — __tmReportHeight is defined only in RenderContentWorld.isolated")
         #expect(await CanaryKit.eval(wv, "1 + 1") == "2",
                 "app-side evaluateJavaScript still works with the gate closed")
 
@@ -1609,5 +1657,255 @@ struct RenderViewIdentityTests {
         }
         #expect(recreated,
                 "a body ContentKey change must recreate the WKWebView — the scheme handler is installed once in makeUIView and updateUIView cannot replace it")
+    }
+}
+
+// =====================================================================================
+// 13. P3 — `WKContentWorld` isolation and the `frameInfo.isMainFrame` frame gate.
+//
+// WHAT P3 IS: defense-in-depth, and nothing else. It did NOT enable the CSP — `script-src
+// 'none'` shipped in P1b while all 17 user scripts were still in the page world, and every
+// one of them ran (§2 measured it). The ordering claim that made this world a prerequisite
+// was refuted in the plan and is not re-derived here. What isolation buys is that author
+// content can no longer READ or FORGE `__tmReportHeight` and friends, and cannot reach
+// `webkit.messageHandlers` at all: a partial mitigation for bridge spoofing (T3).
+//
+// WHY THESE TESTS ARE BEHAVIOURAL RATHER THAN A CONFIG CENSUS. The obvious test — "assert
+// every installed `WKUserScript` names the isolated world" — CANNOT BE WRITTEN: `WKUserScript`
+// exposes `source`, `injectionTime` and `isForMainFrameOnly`, but **not** `contentWorld`
+// (verified against the SDK header). So the census is proven by consequence instead, on a
+// real `WKWebView` running the production configuration. That is the stronger test anyway:
+// it fails for a script left behind in the page world AND for a handler or an
+// `evaluateJavaScript` call left behind, which a property check would miss.
+//
+// THE FAILURE MODE THESE GUARD. A world is a NAMESPACE. A half-migrated pipeline is not
+// degraded, it is dead: a script writing `window.__tmReportHeight` in one world while the
+// caller reads it from another sees a different global object and finds `undefined` — no
+// height reporting, no dark mode, no quote collapse, no deferred images. Nothing except a
+// real `WKWebView` can observe that, which is exactly why these live here and not in a unit
+// suite.
+// =====================================================================================
+
+/// Collects `WKScriptMessage`s together with the frame each arrived from.
+///
+/// Exists because the production `Coordinator` is nested in a `private struct` and no test
+/// can reach it (the same constraint that put `RenderBridgeInput` in its own file). This
+/// handler is NOT a copy of the production dispatch and does not assert anything about it —
+/// its single job is to establish the PLATFORM fact the production gate rests on: that
+/// `WKScriptMessage.frameInfo.isMainFrame` actually discriminates main frame from subframe.
+/// Without that fact pinned, the production guard could be vacuously always-true and no
+/// test would notice.
+@MainActor
+final class FrameProbeHandler: NSObject, WKScriptMessageHandler {
+    private(set) var received: [(body: String, isMainFrame: Bool)] = []
+
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        received.append((String(describing: message.body), message.frameInfo.isMainFrame))
+    }
+}
+
+@MainActor
+@Suite("P3 content-world isolation — the render pipeline is out of the document's reach", .serialized)
+struct RenderContentWorldIsolationTests {
+
+    /// Ungated render-state globals. The debug-only ones (`__tmDiagId`,
+    /// `__tmImageDiagWillAssign`, `__tmImageDiagInstalled`) are deliberately EXCLUDED: they
+    /// are injected only when `DebugModeManager.isLoggingEnabled()`, so asserting they are
+    /// absent from the page world would pass for the wrong reason in a build where they were
+    /// never injected anywhere. Everything listed here is installed unconditionally.
+    static let renderStateGlobals = [
+        "__tmReportHeight", "__tmFixImgAspect", "__tmLayoutVp",
+        "__tmDeviceWidth", "__tmFitDone", "__tmFitRequested",
+    ]
+
+    /// `'reachable'` only where the bridge channel actually exists. Every failure mode
+    /// (no `webkit`, no `messageHandlers`, no channel, or a WebKit throw on touching an
+    /// unregistered handler) returns its own token rather than throwing, so a page-world
+    /// result is diagnosable instead of just "not reachable".
+    static let bridgeProbe = """
+    (function () {
+      try {
+        var w = window.webkit;
+        if (!w) { return 'no-webkit'; }
+        var m = w.messageHandlers;
+        if (!m) { return 'no-messageHandlers'; }
+        return m.heightChanged ? 'reachable' : 'no-channel';
+      } catch (e) { return 'threw'; }
+    })()
+    """
+
+    // -------------------------------------------------------------------------------
+    @Test("P3: the document's world can neither read the app's render state nor reach the bridge, while the pipeline still works end to end")
+    func renderStateIsUnreachableFromTheDocumentWorld() async {
+        let headerId = "canary-p3-world-\(CanaryKit.nonce())"
+        // A quoted body, so the same render that proves isolation also proves the DOM
+        // transforms still ran — quote collapse is one of the behaviours a botched world
+        // migration would silently kill.
+        let body = """
+        <div>P3 isolation probe</div>
+        <div>-----Original Message-----</div>
+        <div>From: Someone &lt;someone@example.com&gt;</div>
+        <div>Quoted text that should end up inside the collapsed quote.</div>
+        """
+        guard let host = await HostedRenderView(html: body, headerId: headerId) else {
+            #expect(Bool(false), "could not host AutoSizingHTMLView"); return
+        }
+        defer { host.tearDown() }
+        let wv = host.webView
+        try? await Task.sleep(for: .seconds(4))
+
+        // ── Side A: our scripts DID run, and they ran in the isolated world. ──
+        // This is the hard-stop half. If it fails, the migration is broken and the phase
+        // must be reverted rather than the test relaxed.
+        let isolatedReport = await CanaryKit.eval(wv, "typeof window.__tmReportHeight",
+                                                  in: RenderContentWorld.isolated)
+        let isolatedAspect = await CanaryKit.eval(wv, "typeof window.__tmFixImgAspect",
+                                                  in: RenderContentWorld.isolated)
+        #expect(isolatedReport == "function",
+                "monitorHeightJS must have run IN RenderContentWorld.isolated — if this is undefined the world migration is broken, not the test")
+        #expect(isolatedAspect == "function",
+                "fixImageAspectRatioJS must have run in the same world as monitorHeightJS — a split world is the P3 failure mode")
+
+        // ── Side B: the document cannot see ANY of it. ──
+        // Enumerated rather than sampled: one global left reachable is one the sender can
+        // read or forge, and `__tmReportHeight` in particular is the height bridge itself.
+        for global in Self.renderStateGlobals {
+            let pageWorld = await CanaryKit.eval(wv, "typeof window.\(global)")
+            #expect(pageWorld == "undefined",
+                    "P3: window.\(global) must NOT exist in the document's world — it is app render state and a sender that can read it can read our layout, while one that can write it can forge a height")
+        }
+
+        // ── Side C: the bridge itself. This is what P3 buys beyond hiding globals — ──
+        // `add(_:contentWorld:name:)` publishes `webkit.messageHandlers.<name>` ONLY in the
+        // named world, so the page world has nothing to post to even if author script ran.
+        let bridgeIsolated = await CanaryKit.eval(wv, Self.bridgeProbe, in: RenderContentWorld.isolated)
+        let bridgePage = await CanaryKit.eval(wv, Self.bridgeProbe)
+        print("[P3] bridge isolated=\(bridgeIsolated) pageWorld=\(bridgePage) "
+              + "appScriptIsolated=\(isolatedReport)")
+        #expect(bridgeIsolated == "reachable",
+                "the heightChanged channel must be reachable from the world our scripts run in")
+        #expect(bridgePage != "reachable",
+                "P3: the DOCUMENT's world must have no heightChanged channel to post to — that is the half of isolation that removes capability rather than visibility")
+
+        // ── Side D: the DOM transforms still ran. Isolation shares one DOM; only the ──
+        // globals are separate. If this regressed, isolation broke behaviour and the owner
+        // directive ("no behaviour changes, just security") is violated.
+        #expect(await CanaryKit.eval(wv, "String(document.querySelectorAll('.tm-quote-wrapper').length)") == "1",
+                "collapseQuotesJS still transforms the shared DOM from the isolated world — a world separates globals, not documents")
+
+        // ── Side E: the FULL round trip, without trusting a JS self-report. ──
+        // A HeightSeedCache entry is only ever written from the numeric branch of
+        // `Coordinator.handleHeightMessage`, so its presence proves user script →
+        // ResizeObserver → postMessage → isolated-world handler → main-frame gate →
+        // validation → applied height. This is the same shape §11 uses, and it is the one
+        // assertion here that would catch a handler registered into the WRONG world.
+        let seeded = await CanaryKit.waitUntil(10) {
+            (AutoSizingHTMLView.seededHeight(headerId: headerId) ?? 0) > 1
+        }
+        #expect(seeded,
+                "the bridge must still round-trip end to end with the handlers registered in the isolated world")
+        print("[P3] seededHeight=\(String(describing: AutoSizingHTMLView.seededHeight(headerId: headerId)))")
+    }
+
+    // -------------------------------------------------------------------------------
+    @Test("P3: every production user script is main-frame-only, which is what makes the frame gate free")
+    func everyProductionUserScriptIsMainFrameOnly() async {
+        guard let host = await HostedRenderView(html: "<p>frame scope probe</p>",
+                                                headerId: "canary-p3-frames") else {
+            #expect(Bool(false), "could not host AutoSizingHTMLView"); return
+        }
+        defer { host.tearDown() }
+        let scripts = host.webView.configuration.userContentController.userScripts
+
+        // The PREMISE of `RenderBridgeInput.acceptsMessage(fromMainFrame:)`: because no
+        // script of ours runs in a subframe, the gate can never refuse a legitimate
+        // measurement. If a future change needs a subframe script, the gate and this
+        // assertion have to move together — which is the point of pinning it.
+        // ⚠️ HOISTED OUT OF `#expect` ON PURPOSE — do not inline it back.
+        // `#expect(scripts.allSatisfy(\.isForMainFrameOnly), …)` does not compile:
+        // `allSatisfy` is `rethrows`, and the macro re-emits the call as
+        // `$0.allSatisfy($1)` with the predicate crossing a generic-parameter boundary,
+        // so the compiler can no longer see a non-throwing closure and `rethrows`
+        // degrades to `throws` → "call can throw, but it is not marked with 'try'".
+        // ⚠️ THE DISCRIMINATOR IS NARROW — measured 2026-08-13, and stated too broadly twice
+        // before this wording stuck. It breaks only when the `rethrows` call takes a KEY PATH
+        // *and* is the OUTERMOST expression `#expect` decomposes. Both conditions are needed:
+        //   • fails    — `#expect(scripts.allSatisfy(\.isForMainFrameOnly), …)`: the `rethrows`
+        //     call IS the top-level expression, so the macro re-emits it as `$0.allSatisfy($1)`
+        //     and the non-throwing proof is lost across that generic-parameter boundary.
+        //   • survives — a trailing closure at top level, e.g. the four `probe.events` /
+        //     `forgedEvents` sites elsewhere in this file, which are correct and untouched.
+        //   • survives — a key path NESTED inside a larger expression, because the macro
+        //     decomposes around the outer operator and the call stays an opaque operand:
+        //     `#expect(outcomes.filter(\.outcome.isFailure).count == 2)` in IntentionLedgerTests
+        //     compiles green, as do ~150 `map(\.…) == […]` sites across TabMailTests.
+        // So do NOT read this note as "key paths in `#expect` are broken" and go "fix" those —
+        // they are fine, and at the time of writing this hoist is the ONLY top-level key-path
+        // site in the whole test tree. Do NOT "fix" it by adding `try` either: nothing here can
+        // throw, and asserting a throwing possibility that cannot occur is worse than the hoist.
+        // The hoist also names the boolean, so a failure prints something legible, and the
+        // `print` below reuses it instead of evaluating the same predicate twice.
+        let allMainFrameOnly = scripts.allSatisfy(\.isForMainFrameOnly)
+        #expect(!scripts.isEmpty, "the production config must install user scripts")
+        #expect(allMainFrameOnly,
+                "every production user script must be forMainFrameOnly — the main-frame bridge gate assumes no legitimate message can originate in a subframe")
+        print("[P3] production userScripts=\(scripts.count) allMainFrameOnly=\(allMainFrameOnly)")
+    }
+
+    // -------------------------------------------------------------------------------
+    @Test("P3: frameInfo.isMainFrame really discriminates, and the gate drops the subframe")
+    func subframeMessagesAreDistinguishedAndRejected() async {
+        // A world of this test's own, so nothing here can perturb the production pipeline.
+        let probeWorld = WKContentWorld.world(name: "P3FrameProbe")
+        let handler = FrameProbeHandler()
+        let cfg = WKWebViewConfiguration()
+        let ucc = WKUserContentController()
+        // forMainFrameOnly: FALSE — the whole point. This is the one script in the codebase
+        // deliberately injected into subframes, and it exists only to make the subframe case
+        // observable at all.
+        ucc.addUserScript(WKUserScript(source: """
+        try { window.webkit.messageHandlers.frameProbe.postMessage(String(window === window.top)); } catch (e) {}
+        """, injectionTime: .atDocumentEnd, forMainFrameOnly: false, in: probeWorld))
+        ucc.add(handler, contentWorld: probeWorld, name: "frameProbe")
+        cfg.userContentController = ucc
+
+        let wv = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 600), configuration: cfg)
+        wv.loadHTMLString("""
+        <html><body><p>main frame</p>
+        <iframe srcdoc="<p>sub frame</p>" width="100" height="100"></iframe>
+        </body></html>
+        """, baseURL: nil)
+
+        let sawBoth = await CanaryKit.waitUntil(12) { handler.received.count >= 2 }
+        print("[P3] frame probe received=\(handler.received.map { "\($0.body)/main=\($0.isMainFrame)" })")
+        guard sawBoth else {
+            #expect(Bool(false),
+                    "expected a post from BOTH the main frame and the subframe; got \(handler.received.count). Without both, the frame gate is untested rather than passing")
+            return
+        }
+
+        // The PLATFORM fact: WebKit reports the originating frame, and the two differ.
+        // Two-sided on purpose — an `isMainFrame` that were always true (or always false)
+        // would make the production guard vacuous, and a one-sided assertion could not tell.
+        let mainFrameMessages = handler.received.filter(\.isMainFrame)
+        let subFrameMessages = handler.received.filter { !$0.isMainFrame }
+        #expect(!mainFrameMessages.isEmpty, "the main frame's post must arrive with isMainFrame == true")
+        #expect(!subFrameMessages.isEmpty,
+                "the subframe's post must arrive with isMainFrame == false — if WebKit reported every message as main-frame, the production gate would be silently vacuous")
+        // Cross-check the Swift-side signal against the JS-side one, so a mislabelling in
+        // either direction shows up rather than agreeing with itself.
+        #expect(mainFrameMessages.allSatisfy { $0.body == "true" },
+                "the frame WebKit calls main must be the one where window === window.top")
+        #expect(subFrameMessages.allSatisfy { $0.body == "false" },
+                "the frame WebKit calls a subframe must be the one where window !== window.top")
+
+        // THE DECISION the production coordinator makes on exactly this input. Fail-closed
+        // direction, both ways: the subframe message is DROPPED, not defaulted and not
+        // merely logged.
+        #expect(mainFrameMessages.allSatisfy { RenderBridgeInput.acceptsMessage(fromMainFrame: $0.isMainFrame) },
+                "a main-frame message must be admitted — a gate that drops real measurements would blank the render")
+        #expect(subFrameMessages.allSatisfy { !RenderBridgeInput.acceptsMessage(fromMainFrame: $0.isMainFrame) },
+                "a subframe message must be REFUSED before the liveness beacon records it, or a non-app post could forge a LIVE bridge verdict")
     }
 }
