@@ -905,6 +905,133 @@ extension AccountManager {
         return out
     }
 
+    // MARK: - Queued-member identity lookup
+
+    /// The `messageHeader` identity columns a drain needs for one queued member.
+    struct QueuedMemberIdentity {
+        let rfc822MessageId: String?
+        let messageId: String
+    }
+
+    /// Resolves the identity columns for EVERY member of a queued operation in two
+    /// set-based statements, replacing one `fetchOne` per member.
+    ///
+    /// ## Why this is not an N+1 tidy-up
+    ///
+    /// The per-member statement was
+    /// `WHERE (messageId = ? OR rfc822MessageId = ?) AND accountId = ?`, and with no
+    /// `sqlite_stat1` row for a full index on `messageHeader` — the regime a device
+    /// holds until `SyncEngineMaintenance.runRefreshPlannerStatisticsIfStale` runs,
+    /// see ADR-IOS-029 — SQLite cannot use a two-index `MULTI-INDEX OR` for it and
+    /// falls back to `SEARCH messageHeader USING INDEX messageHeader_accountId_messageId
+    /// (accountId=?)`: a walk of the whole account that stops at the first matching row.
+    /// Measured on a 260k-row fixture, 189,800 rows in the account, SQLite 3.51.0 (Mac;
+    /// a device is 2–4× slower), 200 members:
+    ///
+    /// ```
+    ///                                        stale stats      ANALYZEd
+    ///   per-member fetchOne (before)          12,229 ms          11 ms
+    ///   IN-list arm A + hinted arm B (after)      <1 ms          <1 ms
+    /// ```
+    ///
+    /// ⚠️ The cost depends on WHERE the member sits in the walk, not merely on whether
+    /// it exists — the ADR's "probe with a value that EXISTS" warning has this sibling.
+    /// The same 200 lookups against members at the HEAD of `(accountId, messageId)`
+    /// order measured 0.105 ms each and made the defect look absent. The figures above
+    /// draw from the tail, which is where a bulk archive of recent mail lands.
+    ///
+    /// ## Ordering of the two arms, and what changed
+    ///
+    /// Arm A matches `messageId` exactly, arm B matches the normalized
+    /// `rfc822MessageId`; a member resolved by both takes arm A. That is the same
+    /// precedence the `MULTI-INDEX OR` plan already applied whenever statistics
+    /// existed. Within one arm several rows can match — `messageId` is a per-folder
+    /// UID and repeats across the folders of one account (the fixture has 8 rows for
+    /// `messageId = '1'` in one account) — so the pick is made deterministic with
+    /// `ORDER BY isInInbox DESC, id ASC`, the same inbox-preferred tie-break
+    /// `ChatStore.findByStableIdSQL` uses. **This is a deliberate narrowing:** the
+    /// previous `fetchOne` over an `OR` returned whichever row its plan reached first,
+    /// so which sibling won already differed between statistics regimes. The consumers
+    /// feed `recordRecentlyCompleted`, so the change is which sibling's ids enter a 30s
+    /// sync-protection set, never which message is mutated.
+    ///
+    /// ## `INDEXED BY` on arm B is load-bearing
+    ///
+    /// Without it, arm B plans as `messageHeader_accountId_messageId (accountId=?)` in
+    /// the stale regime — one account walk for the whole op (69 ms measured) instead of
+    /// one per member. With it, both regimes seek: `messageHeader_rfc822MessageId
+    /// (rfc822MessageId=?)`, 0 ms. Same reasoning and same fail-safe as
+    /// `ChatStore.findByStableIdSQL`: a migration that drops or renames the index makes
+    /// this statement THROW rather than silently walk, and both callers already treat a
+    /// throw as "no identity columns collected".
+    nonisolated static func headerIdentitiesForQueuedMembers(
+        _ memberIds: [String], accountId: String, db: Database
+    ) throws -> [String: QueuedMemberIdentity] {
+        guard !memberIds.isEmpty else { return [:] }
+
+        var normalizedByRaw: [String: String] = [:]
+        for id in memberIds { normalizedByRaw[id] = EmailFilter.normalizeMessageId(id) }
+
+        // Keyed by the value each arm matches on. `pick` keeps the inbox-preferred,
+        // lowest-`id` row so a member resolves to the same sibling every time.
+        var byMessageId: [String: (sortKey: (Int, String), identity: QueuedMemberIdentity)] = [:]
+        var byRfc822: [String: (sortKey: (Int, String), identity: QueuedMemberIdentity)] = [:]
+
+        func absorb(_ rows: [Row], into table: inout [String: (sortKey: (Int, String), identity: QueuedMemberIdentity)],
+                    keyedBy key: (Row) -> String?) {
+            for row in rows {
+                guard let bucket = key(row) else { continue }
+                let rowId: String = row["id"]
+                let isInInbox: Bool = row["isInInbox"]
+                // isInInbox DESC → inbox rows sort first, hence `0` for inbox.
+                let sortKey = (isInInbox ? 0 : 1, rowId)
+                let identity = QueuedMemberIdentity(
+                    rfc822MessageId: row["rfc822MessageId"], messageId: row["messageId"])
+                if let existing = table[bucket], existing.sortKey <= sortKey { continue }
+                table[bucket] = (sortKey, identity)
+            }
+        }
+
+        for chunk in Array(normalizedByRaw.keys).chunked(into: SyncConfig.sqlChunkSize) {
+            let rows = try Row.fetchAll(
+                db, sql: Self.queuedMemberIdentitySQL(matching: "messageId", count: chunk.count),
+                arguments: StatementArguments([accountId] + chunk))
+            absorb(rows, into: &byMessageId, keyedBy: { (row: Row) -> String? in row["messageId"] })
+        }
+        for chunk in Array(Set(normalizedByRaw.values)).chunked(into: SyncConfig.sqlChunkSize) {
+            let rows = try Row.fetchAll(
+                db, sql: Self.queuedMemberIdentitySQL(matching: "rfc822MessageId", count: chunk.count),
+                arguments: StatementArguments([accountId] + chunk))
+            absorb(rows, into: &byRfc822, keyedBy: { (row: Row) -> String? in row["rfc822MessageId"] })
+        }
+
+        var out: [String: QueuedMemberIdentity] = [:]
+        for (raw, normalized) in normalizedByRaw {
+            if let hit = byMessageId[raw] {
+                out[raw] = hit.identity
+            } else if let hit = byRfc822[normalized] {
+                out[raw] = hit.identity
+            }
+        }
+        return out
+    }
+
+    /// The statements `headerIdentitiesForQueuedMembers` runs, exposed so a plan test
+    /// asserts against production's own SQL rather than a copy that could drift
+    /// (`ChatStore.findByStableIdSQL` / `MessageContentStore.ownersSQL` precedent).
+    nonisolated static func queuedMemberIdentitySQL(matching column: String, count: Int) -> String {
+        let placeholders = Array(repeating: "?", count: count).joined(separator: ", ")
+        // Arm B needs the hint; arm A's plan is already a two-column seek in both
+        // regimes, and an unnecessary hint would only add a way for a future migration
+        // to break the statement.
+        let hint = column == "rfc822MessageId" ? " INDEXED BY messageHeader_rfc822MessageId" : ""
+        return """
+            SELECT id, messageId, rfc822MessageId, isInInbox
+            FROM messageHeader\(hint)
+            WHERE accountId = ? AND \(column) IN (\(placeholders))
+            """
+    }
+
     // MARK: - Drain-barrier Test Seam (T0.8)
     //
     // `ProviderIdQueueFuzzTests` needs a drain barrier, and per the plan's T0.5
@@ -989,18 +1116,16 @@ extension AccountManager {
             if trackedTypes.contains(currentOp.type) {
                 do {
                     actionInfos = try await dbPool.read { db -> [(String, String?, String?)] in
-                        var infos: [(String, String?, String?)] = []
-                        for msgId in currentOp.messageIds {
-                            let normalizedMsgId = EmailFilter.normalizeMessageId(msgId)
-                            let header = try MessageHeader
-                                .filter(
-                                    (Column("messageId") == msgId || Column("rfc822MessageId") == normalizedMsgId) &&
-                                    Column("accountId") == currentOp.accountId
-                                )
-                                .fetchOne(db)
-                            infos.append((msgId, header?.rfc822MessageId, header?.messageId))
+                        // Two set-based statements for the whole op, not one walk per
+                        // member — see `headerIdentitiesForQueuedMembers`. One tuple per
+                        // member, in member order, `nil` columns when no row resolves,
+                        // exactly as the per-member `fetchOne` produced.
+                        let identities = try Self.headerIdentitiesForQueuedMembers(
+                            currentOp.messageIds, accountId: currentOp.accountId, db: db)
+                        return currentOp.messageIds.map { msgId in
+                            let header = identities[msgId]
+                            return (msgId, header?.rfc822MessageId, header?.messageId)
                         }
-                        return infos
                     }
                 } catch {
                     queueLog("[Queue] WARNING: Failed to collect rfc822 info for \(currentOp.id): \(error)")
@@ -1665,18 +1790,14 @@ extension AccountManager {
         // entry for a retired member is recorded BEFORE its id leaves the row.
         var completedIds: [String] = provenMembers
         if let infos = try? await dbPool.read({ db -> [(String?, String?)] in
-            var out: [(String?, String?)] = []
-            for msgId in provenMembers {
-                let normalized = EmailFilter.normalizeMessageId(msgId)
-                let header = try MessageHeader
-                    .filter(
-                        (Column("messageId") == msgId || Column("rfc822MessageId") == normalized) &&
-                        Column("accountId") == currentOp.accountId
-                    )
-                    .fetchOne(db)
-                out.append((header?.rfc822MessageId, header?.messageId))
+            // Same set-based lookup as the whole-op success path; one entry per proven
+            // member, in order, `nil` columns when no row resolves.
+            let identities = try Self.headerIdentitiesForQueuedMembers(
+                provenMembers, accountId: currentOp.accountId, db: db)
+            return provenMembers.map { msgId in
+                let header = identities[msgId]
+                return (header?.rfc822MessageId, header?.messageId)
             }
-            return out
         }) {
             for (rfc822, numericId) in infos {
                 if let rfc822 { completedIds.append(rfc822) }
