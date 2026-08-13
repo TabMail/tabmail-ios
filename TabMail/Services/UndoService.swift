@@ -203,10 +203,16 @@ final class UndoService {
     private init() {}
 
     func push(_ action: UndoableAction) {
-        let msgIds = action.messages.map(\.messageId)
-        let msgFolderIds = action.messages.map(\.folderId)
-        let msgCompositeIds = action.messages.map(\.id)
-        print("[UndoStack] PUSH type=\(action.type) msgIds=\(msgIds) folderId=\(msgFolderIds) compositeIds=\(msgCompositeIds) originalFolderId=\(action.originalFolderId) originalFolderPath=\(action.originalFolderPath) accountId=\(action.accountId) stackSize=\(undoStack.count)→\(undoStack.count + 1)")
+        // Development rule 12 — the three `map`s are EAGER, so gating only the
+        // `print` would still walk `action.messages` three times and build the
+        // interpolated line on every archive, delete and move in a shipping build
+        // where the output goes nowhere. The gate has to enclose the arguments.
+        if DebugModeManager.isLoggingEnabled() {
+            let msgIds = action.messages.map(\.messageId)
+            let msgFolderIds = action.messages.map(\.folderId)
+            let msgCompositeIds = action.messages.map(\.id)
+            print("[UndoStack] PUSH type=\(action.type) msgIds=\(msgIds) folderId=\(msgFolderIds) compositeIds=\(msgCompositeIds) originalFolderId=\(action.originalFolderId) originalFolderPath=\(action.originalFolderPath) accountId=\(action.accountId) stackSize=\(undoStack.count)→\(undoStack.count + 1)")
+        }
         undoStack.append(action)
         // Evict oldest if over limit
         if undoStack.count > SyncConfig.undoStackMaxSize {
@@ -216,7 +222,21 @@ final class UndoService {
         }
         // Show toast with auto-dismiss timer
         showToastWithTimer()
-        // Dump current DB state for the affected messages
+        // Dump current DB state for the affected messages.
+        //
+        // Log-only helper: gate the WHOLE body, not just the emission — the same
+        // principle `AccountManagerQueue.logStuckOpDiagnostic` records. What this
+        // guard skips is not a `print`, it is one main-actor `dbPool.read` PER
+        // MEMBER (200 of them on a bulk archive) plus an unbounded `fetchAll` over
+        // every `PendingOperation` row for the account, all of it performed to
+        // render output a shipping build cannot show. Gating only the `print`s
+        // would leave every one of those reads in place.
+        //
+        // Nothing below feeds control flow, state or UI: `rows` and `pendingOps`
+        // each terminate in a `print`, and the `Task` is discarded. So skipping the
+        // whole block is observably identical in production.
+        guard DebugModeManager.isLoggingEnabled() else { return }
+        let msgIds = action.messages.map(\.messageId)
         Task { @MainActor in
             for msgId in msgIds {
                 let rows = try? dbPool.read { db in
