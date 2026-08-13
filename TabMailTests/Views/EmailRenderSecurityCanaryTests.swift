@@ -38,6 +38,16 @@ import UIKit
 //     `appScriptsSurviveTheJavaScriptGate` both still pass: a `<meta http-equiv="refresh">`
 //     navigates with JavaScript disabled. Only P1c's per-load nonce closes it.
 //
+// P1c LANDED. Section 12 adds the permit's end-to-end half. Read this before "fixing" the
+// two tests just named: they run against ALLOW-EVERYTHING probe delegates on synthetic
+// configurations, and they still pass BY DESIGN — they measure that WebKit delivers the
+// forged navigation and that its shape is indistinguishable from an app load, which is the
+// premise the permit is built on. `metaRefreshIsRefusedByTheProductionCoordinator` is the
+// one that points the same document at the REAL delegate and asserts refusal. Deleting
+// either half loses the pair. One assertion in `terminationRecoveryAndAppearanceReload`
+// inverts here (the recovery load's base URL), and one that LOOKS like it should invert
+// deliberately does not — see the note there.
+//
 // FIDELITY. Where possible the measurements run against the REAL production surface:
 // `HostedRenderView` hosts `AutoSizingHTMLView` in a live `UIWindow`, so
 // `HTMLWebView.makeUIView` builds the actual `WKWebViewConfiguration` (the JS gate, the
@@ -1062,10 +1072,26 @@ struct EmailRenderSecurityCanaryTests {
         #expect(probe.order == ["decidePolicyFor", "didStartProvisionalNavigation", "didCommit", "didFinish"],
                 "the recovery reload produces the ordinary 4-callback app-load sequence")
         #expect(probe.policyEvents.first?.navType == .other)
-        #expect(probe.policyEvents.first?.url == BodyAssetConfig.baseURL.absoluteString,
-                "recovery re-derives the base URL from the retained headerId")
+        // INVERTED AT P1c (was `== BodyAssetConfig.baseURL.absoluteString`, "recovery
+        // re-derives the base URL from the retained headerId"). The recovery load is now
+        // an ordinary load: it mints a FRESH per-load nonce base URL like every other one,
+        // and the fixed base URL it used to re-derive is exactly the forgeable shape C1
+        // replaced.
+        #expect(probe.policyEvents.first?.url?
+                    .hasPrefix("\(BodyAssetConfig.urlScheme)://asset/\(RenderDocumentURL.pathPrefix)/") == true,
+                "P1c: the recovery reload carries its own nonce base URL")
+        #expect(probe.policyEvents.first?.url != BodyAssetConfig.baseURL.absoluteString,
+                "P1c: and it is NOT the fixed base URL a message document could name")
+        // ⚠️ NOT INVERTED AT P1c, and the reason matters. This assertion never observed
+        // the app at all: `NavProbe.labels` is the TEST's map, populated only by
+        // `probe.label(nav, …)` on a navigation the test itself started. An app-initiated
+        // load is unlabelled from here whether or not `Coordinator.wrapAndLoad` keeps the
+        // `WKNavigation` it returns — which it now does (P1c), so the old failure message
+        // would have been a false statement about shipped code. What the probe can still
+        // say is that the recovery load produced exactly one navigation's worth of
+        // callbacks, asserted by the `order` expectation above.
         #expect(probe.events.allSatisfy { $0.navLabel == nil || $0.navLabel == "UNLABELLED" },
-                "Coordinator.wrapAndLoad DISCARDS the returned WKNavigation, so the recovery load cannot be correlated today; C2's correlation requires capturing it")
+                "an app-initiated load carries no TEST-side label; this says nothing about the app's own correlation")
         #expect(await CanaryKit.eval(wv, "String(window.__tmCanaryMark)") == "undefined",
                 "the JS context is fresh after recovery")
 
@@ -1343,5 +1369,145 @@ struct EmailRenderSecurityCanaryTests {
         }
         #expect(seeded, "the app's height bridge delivered a real measurement for this message")
         print("[P1B] benign render seededHeight=\(String(describing: AutoSizingHTMLView.seededHeight(headerId: headerId)))")
+    }
+
+    // -------------------------------------------------------------------------------
+    // 12. P1c — the navigation permit, measured end to end against the REAL Coordinator.
+    //
+    // The unit-level enumeration of action shapes lives in `RenderNavigationPolicyTests`
+    // (the `Coordinator` is nested in a `private struct` and cannot be reached from a
+    // test). What only this harness can do is fire a real `<meta http-equiv="refresh">`
+    // from a real message body at the real delegate, which is the vector the permit
+    // exists for and the one P1b explicitly did NOT close.
+    // -------------------------------------------------------------------------------
+
+    @Test("P1c: a meta refresh no longer navigates the main frame — the forged .other action is REFUSED")
+    func metaRefreshIsRefusedByTheProductionCoordinator() async {
+        // Same document as `metaRefreshForgesAnAppLoadShape`, but pointed at the
+        // PRODUCTION coordinator instead of an allow-everything probe. That test still
+        // passes and still asserts the forged action is delivered and shape-identical to
+        // an app load; this one asserts the app now REFUSES it. Both halves are needed:
+        // the threat is only interesting because the shape is indistinguishable.
+        //
+        // ⚠️ THE DECISION IS ASSERTED, NOT ITS SIDE EFFECT — and that distinction was
+        // caught by running this test against a deliberately inverted gate. Asserting only
+        // that `location.href` did not become the forged URL BLESSES THE BUG: the forged
+        // target is a `tabmail-asset://` URL, `BodyAssetSchemeHandler` fails it (its host
+        // is not a 16-char hash), and a navigation that is ALLOWED and then fails to load
+        // leaves `location.href` exactly where a refused one does. The inverted build
+        // passed that version of the test. So the probe records the coordinator's own
+        // `.allow`/`.cancel` and the refusal is read off that.
+        let forged = "\(BodyAssetConfig.urlScheme)://asset/forged-target-p1c.html"
+        // 3 seconds, so the probe can be installed on the REAL coordinator before the
+        // refresh fires — a 0-second refresh races the initial load.
+        let body = """
+        <meta http-equiv="refresh" content="3;url=\(forged)">
+        <p id="p1c">meta refresh probe</p>
+        """
+        guard let host = await HostedRenderView(html: body, headerId: "canary-p1c-metarefresh") else {
+            #expect(Bool(false), "could not host AutoSizingHTMLView"); return
+        }
+        defer { host.tearDown() }
+        let wv = host.webView
+        try? await Task.sleep(for: .milliseconds(800))
+
+        let coordinator = wv.navigationDelegate
+        #expect(coordinator != nil, "the production view installs a navigation delegate")
+        let probe = NavProbe()
+        probe.forward = coordinator          // observe the REAL coordinator, do not replace it
+        wv.navigationDelegate = probe
+        defer { wv.navigationDelegate = coordinator }
+
+        try? await Task.sleep(for: .seconds(6))
+        print("[P1C] META-REFRESH trace:\n\(probe.trace)")
+
+        // NON-VACUITY: the forged action must actually have been DELIVERED. Without this
+        // leg, "no allowed forged navigation" would hold just as well on a build where the
+        // meta refresh never fired at all.
+        let forgedEvents = probe.policyEvents.filter { $0.url == forged }
+        #expect(!forgedEvents.isEmpty,
+                "the meta refresh still fires with JavaScript disabled — P1b did not close this")
+        #expect(forgedEvents.allSatisfy { $0.navType == .other && $0.target == .main },
+                "and it is still SHAPE-IDENTICAL to an app load: .other on the main frame")
+        #expect(forgedEvents.allSatisfy { $0.detail.hasSuffix("→ cancel") },
+                "THE INVARIANT: no unapproved new main-frame document is admitted — the production coordinator refuses it")
+
+        let href = await CanaryKit.eval(wv, "location.href")
+        print("[P1C] META-REFRESH href=\(href)")
+        #expect(href.hasPrefix("\(BodyAssetConfig.urlScheme)://asset/\(RenderDocumentURL.pathPrefix)/"),
+                "the document on screen is still the one the app loaded, under its own per-load nonce")
+
+        // NEGATIVE CONTROL, and it is the load-bearing half: default-deny must not deny
+        // the app's own load. If this fails the phase is wrong, not the test.
+        #expect(await CanaryKit.eval(wv, "String((document.getElementById('p1c')||{}).textContent)")
+                == "meta refresh probe",
+                "the legitimate app load WAS admitted and its body rendered")
+    }
+
+    @Test("P1c: every call site loads under a per-load nonce base URL, including headerId == nil")
+    func everyCallSiteLoadsUnderANonceBaseURL() async {
+        // C1 as AMENDED by P1a case D: unconditional, at every call site, whether or not a
+        // scheme handler is registered. Under `baseURL: nil` the action arrived as
+        // `about:blank` with a `null` origin, so the permit was not weak there — it was
+        // inexpressible. This also discharges the phase's HARD STOP: the `headerId == nil`
+        // sites (compose quote, `.eml` preview, tooltip) must still RENDER.
+        var seenNonceURLs: [String] = []
+        for (label, headerId) in [("persisted", "canary-p1c-base"), ("nil-header", nil)] as [(String, String?)] {
+            guard let host = await HostedRenderView(html: "<p id=\"m\">\(label) marker</p>",
+                                                    headerId: headerId) else {
+                #expect(Bool(false), "could not host the \(label) variant"); continue
+            }
+            defer { host.tearDown() }
+            let wv = host.webView
+            try? await Task.sleep(for: .seconds(3))
+
+            let baseURI = await CanaryKit.eval(wv, "document.baseURI")
+            let origin = await CanaryKit.eval(wv, "String(window.origin)")
+            print("[P1C] \(label) baseURI=\(baseURI) origin=\(origin)")
+            #expect(baseURI.hasPrefix("\(BodyAssetConfig.urlScheme)://asset/\(RenderDocumentURL.pathPrefix)/"),
+                    "\(label): loaded under a nonce base URL")
+            #expect(baseURI != BodyAssetConfig.baseURL.absoluteString,
+                    "\(label): NOT the fixed base URL a document can name")
+            #expect(origin == "\(BodyAssetConfig.urlScheme)://asset",
+                    "\(label): the nonce is in the PATH, so the origin is unchanged")
+            #expect(await CanaryKit.eval(wv, "String((document.getElementById('m')||{}).textContent)")
+                    == "\(label) marker",
+                    "\(label): the message still renders — the nonce base URL breaks no call site")
+            seenNonceURLs.append(baseURI)
+        }
+        #expect(seenNonceURLs.count == 2)
+        guard seenNonceURLs.count == 2 else { return }
+        #expect(seenNonceURLs[0] != seenNonceURLs[1], "each load mints its own nonce")
+    }
+
+    @Test("P1c: an in-document fragment click still works and does not replace the document")
+    func inDocumentFragmentStillWorks() async {
+        // The non-security defect P1a found alongside the allowlist: every `.linkActivated`
+        // was cancelled and handed to `UIApplication.shared.open`, so an in-document
+        // `#anchor` reached the SYSTEM OPENER as a `tabmail-asset://` URL. The allowlist
+        // half is enumerated in `RenderLinkPolicyTests`; what is asserted here is the
+        // user-visible half — the anchor still behaves like an anchor.
+        let body = """
+        <a id="lnk" href="#target">jump</a>
+        <div style="height:2000px"></div>
+        <div id="target">target</div>
+        """
+        guard let host = await HostedRenderView(html: body, headerId: "canary-p1c-fragment") else {
+            #expect(Bool(false), "could not host AutoSizingHTMLView"); return
+        }
+        defer { host.tearDown() }
+        let wv = host.webView
+        try? await Task.sleep(for: .seconds(3))
+
+        let before = await CanaryKit.eval(wv, "location.href")
+        _ = await CanaryKit.eval(wv, "document.getElementById('lnk').click(); 'clicked'")
+        try? await Task.sleep(for: .seconds(1))
+        let after = await CanaryKit.eval(wv, "location.href")
+        print("[P1C] FRAGMENT before=\(before) after=\(after)")
+
+        #expect(after == before + "#target",
+                "the same-document jump still happens — P1a measured that .cancel does not prevent it")
+        #expect(await CanaryKit.eval(wv, "String((document.getElementById('lnk')||{}).id)") == "lnk",
+                "and the document was NOT replaced")
     }
 }

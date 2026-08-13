@@ -531,19 +531,20 @@ private struct HTMLWebView: UIViewRepresentable {
                 let msoCount = html.components(separatedBy: "MsoNormal").count - 1
                 print("[HTMLDebug] INPUT HTML stats: <style>=\(styleCount) <p>=\(pCount) <span>=\(spanCount) <br>=\(brCount) font-size=\(fontSizeCount) MsoNormal=\(msoCount)")
             }
-            // baseURL: nil is fine for compose/Eml/tooltip (no scheme handler).
-            // For real bodies (headerId != nil) we hand a non-nil baseURL purely
-            // so the document has a non-nil origin — required by some CORS /
-            // mixed-content policies for scheme-handled subresources to load.
-            // BodyAssetConfig.baseURL is a fixed `tabmail-asset://asset/`; HTML
-            // `src` refs are absolute and resolve via the registered handler
-            // regardless of which origin the document is loaded under.
-            let base: URL? = (headerId != nil) ? BodyAssetConfig.baseURL : nil
+            // P1c: the base URL is no longer chosen here. `wrapAndLoad` mints a
+            // per-load synthetic nonce base URL for EVERY load, at every call
+            // site, whether or not a scheme handler is registered — see
+            // `RenderDocumentURL`. The previous `headerId != nil ? … : nil`
+            // conditional is deliberately GONE: under `baseURL: nil` the
+            // navigation action arrives as `about:blank` with a `null` origin,
+            // so a per-load permit is not merely weak there, it is
+            // inexpressible.
+            //
             // wrapHTML is regex-heavy (esp. full-document / large emails) — run
             // it OFF the main thread so it no longer freezes the UI at the render
             // moment. See Coordinator.wrapAndLoad; the wrapped-html fingerprint
             // logging moved there (it now exists only after the off-main wrap).
-            context.coordinator.wrapAndLoad(rawHTML: html, previewFilename: previewFilename, base: base)
+            context.coordinator.wrapAndLoad(rawHTML: html, previewFilename: previewFilename)
         } else if context.coordinator.loadedColorScheme != colorScheme {
             // Appearance flipped (light <-> dark) while the body is on screen. The
             // CSS @media (prefers-color-scheme) rules re-evaluate automatically,
@@ -557,8 +558,7 @@ private struct HTMLWebView: UIViewRepresentable {
             // "Loading…" placeholder — the opacity:0→reveal fade covers the brief
             // re-render.
             context.coordinator.loadedColorScheme = colorScheme
-            let base: URL? = (headerId != nil) ? BodyAssetConfig.baseURL : nil
-            context.coordinator.wrapAndLoad(rawHTML: html, previewFilename: previewFilename, base: base)
+            context.coordinator.wrapAndLoad(rawHTML: html, previewFilename: previewFilename)
         } else if currentWidth > 100 && abs(currentWidth - context.coordinator.lastMeasuredWidth) > 10 {
             // Frame width changed significantly (e.g. sheet animation settled) —
             // reset viewport to device-width and re-fit. ResizeObserver picks
@@ -633,6 +633,38 @@ private struct HTMLWebView: UIViewRepresentable {
         /// correct in release too); only the *reporting* is debug-gated, per
         /// development rule 12.
         var lastBridgeMessageGeneration: Int?
+        /// P1c — the permit half of the two-state navigation machine
+        /// (ADR-IOS-076 decisions 2 and 4; plan §10.1 C1 + C2).
+        ///
+        /// Armed immediately before each app-owned `loadHTMLString` with the
+        /// per-load nonce URL, and CONSUMED AT POLICY TIME — immediately before
+        /// `decidePolicyFor` returns `.allow`, not at commit. That ordering is
+        /// what makes a failure after commit unable to leak it.
+        private var permit = NavigationPermitState()
+        /// The `WKNavigation` returned by the load that consumed the permit —
+        /// the OTHER half of the machine. `decidePolicyFor` never receives a
+        /// `WKNavigation`, so a permit alone cannot be correlated to the
+        /// callbacks that follow.
+        ///
+        /// ⚠️ P1a measured that this return value was being DISCARDED, which
+        /// left the process-termination reload and the appearance reload
+        /// arriving unlabelled and uncorrelatable.
+        private var trackedNavigation: WKNavigation?
+        /// `loadGeneration` of `trackedNavigation`.
+        private var trackedGeneration: Int?
+        /// The document URL of the load that was actually admitted — i.e. the
+        /// identity of the document currently on screen, as WE supplied it.
+        ///
+        /// NEVER read `location.href` for this: P1a measured that `pushState`
+        /// changes it with no delegate callback at all, so it is a value the
+        /// document controls and the app cannot observe changing.
+        private var loadedDocumentURL: String?
+        /// Load generation whose one-shot `requestFit` has already been honoured.
+        /// The JS guard (`__tmFitRequested`) is ADVISORY — it lives in the page
+        /// world — so the authoritative one-shot lives here.
+        private var fitRequestGeneration: Int?
+        /// Same, for `requestWidthRefit` / `__tmWidthRefitRequested`.
+        private var widthRefitRequestGeneration: Int?
         /// Grace period between `didFinish` and the bridge-liveness verdict.
         /// `monitorHeightJS`'s ResizeObserver and the double-`rAF` reveal both
         /// post well inside this window on a normal render; it is long enough
@@ -722,6 +754,12 @@ private struct HTMLWebView: UIViewRepresentable {
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             self.webView = webView
             lastMeasuredWidth = webView.bounds.width
+            navLog("didFinish tracked=\(isTracked(navigation))")
+            // Idempotent, identity-matched. Deliberately does NOT gate the
+            // rendering work below: a load whose `WKNavigation` we failed to
+            // capture must still be fitted and revealed, or a nil return value
+            // from `loadHTMLString` would blank the message.
+            clearTrackedNavigation(matching: navigation)
             // Owner requirement (P1b): say out loud whether app JavaScript ran.
             scheduleBridgeLivenessCheck(generation: loadGeneration)
             // Wire up scrollView.contentSize KVO for diagnosis only (NOT for
@@ -815,16 +853,22 @@ private struct HTMLWebView: UIViewRepresentable {
         /// by `fit()` after `didFinish`, so the slightly-later load shows no
         /// flash. Behaviour is otherwise identical to the previous synchronous
         /// wrap + load.
-        func wrapAndLoad(rawHTML: String, previewFilename: String?, base: URL?) {
+        ///
+        /// P1c: this is also the ONE place a main-frame document permit is
+        /// armed. The base URL is minted here rather than passed in, because
+        /// every call site must get one — see `RenderDocumentURL`.
+        func wrapAndLoad(rawHTML: String, previewFilename: String?) {
             loadGeneration &+= 1
             let gen = loadGeneration
-            let hasHeader = base != nil
+            let hasHeader = loadedHeaderId != nil
             Task { @MainActor in
                 let wrapped = await Task.detached(priority: .userInitiated) {
                     EmailHTMLWrapper.wrapHTML(rawHTML, previewFilename: previewFilename)
                 }.value
                 // A newer load superseded this one (card rebound mid-wrap), or
-                // the web view went away — drop this stale result.
+                // the web view went away — drop this stale result. Note this
+                // returns BEFORE arming: a wrap that loses the race never arms a
+                // permit, so it cannot leak one.
                 guard self.loadGeneration == gen, let webView = self.webView else { return }
                 if DebugModeManager.isLoggingEnabled() {
                     // Privacy-safe per-email fingerprint: SHA256 of the wrapped
@@ -839,7 +883,29 @@ private struct HTMLWebView: UIViewRepresentable {
                     print("[Load id=\(self.webViewId)] bytes=\(wrapped.count) fp=\(fp) hasHeader=\(hasHeader)")
                 }
                 self.logRenderSecurityPosture(webView: webView, generation: gen, schemeHandlerRegistered: hasHeader)
-                webView.loadHTMLString(wrapped, baseURL: base)
+
+                // ── P1c: arm the permit, then load, then capture the navigation ──
+                // Arming supersedes any permit still pending. That IS the only
+                // retirement path for a superseded permit: P1a measured that a
+                // superseded load receives NO callback at all — not even
+                // `didFailProvisionalNavigation` — so a design that retired
+                // permits on a failure callback would leak them forever.
+                let nonce = RenderDocumentURL.nonce()
+                let base = RenderDocumentURL.url(nonce: nonce)
+                if let superseded = self.permit.arm(generation: gen, url: base.absoluteString) {
+                    self.navLog("superseded gen=\(superseded.generation) "
+                                + "nonce=\(RenderDocumentURL.logPrefix(forDocumentURL: superseded.url)) "
+                                + "by gen=\(gen)")
+                }
+                self.navLog("issued gen=\(gen) nonce=\(RenderDocumentURL.logPrefix(nonce)) "
+                            + "schemeHandler=\(hasHeader)")
+                let navigation = webView.loadHTMLString(wrapped, baseURL: base)
+                self.trackedNavigation = navigation
+                self.trackedGeneration = gen
+                if navigation == nil {
+                    self.navLog("gen=\(gen) WARNING loadHTMLString returned no WKNavigation — "
+                                + "this load's callbacks cannot be correlated")
+                }
             }
         }
 
@@ -904,26 +970,78 @@ private struct HTMLWebView: UIViewRepresentable {
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
             // iOS killed the WKWebView content process (memory pressure).
-            // Reload the content to restore rendering. Mirror the original
-            // baseURL choice: nil for compose/Eml, BodyAssetConfig.baseURL when
-            // a headerId is present (so scheme-handler-served images still load).
+            // Reload the content to restore rendering. The base URL is no longer
+            // re-derived from `loadedHeaderId` — `wrapAndLoad` mints a fresh
+            // nonce base URL for this load like any other.
             if DebugModeManager.isLoggingEnabled() {
                 print("[ImageLoadDiag id=\(webViewId)] web-content-process-terminated persistedBody=\(loadedHeaderId != nil)")
             }
+            // P1c: invalidate BOTH states before the recovery load. The dead
+            // content process cannot deliver the callbacks the old navigation
+            // was waiting on, and the recovery load then arms a fresh
+            // generation + nonce + permit + WKNavigation of its own.
+            invalidateNavigationState(reason: "web-content-process-terminated")
             if let html = loadedHTML {
-                let base: URL? = (loadedHeaderId != nil) ? BodyAssetConfig.baseURL : nil
                 // Off-main wrap + reload, same path as updateUIView.
-                wrapAndLoad(rawHTML: html, previewFilename: loadedPreviewFilename, base: base)
+                wrapAndLoad(rawHTML: html, previewFilename: loadedPreviewFilename)
             }
         }
 
+        /// The message-render navigation boundary (ADR-IOS-076 decisions 2, 3 and 6).
+        ///
+        /// **The guarantee: no unapproved new main-frame document is admitted.**
+        /// It deliberately does NOT claim that same-document fragment or
+        /// history-state mutations are prevented — P1a measured that
+        /// `pushState`/`history.back` surface no callback at all and that
+        /// returning `.cancel` on a fragment click does not stop it. A
+        /// same-document mutation does not replace the trusted document.
+        ///
+        /// What this closes that P1b did not: `<meta http-equiv="refresh">` in a
+        /// sender's body navigates the main frame and STILL fires with
+        /// `allowsContentJavaScript = false`. Its action is `.other` on the main
+        /// frame with `sourceFrame` main — **shape-identical to a legitimate app
+        /// load** — so only the per-load nonce distinguishes them.
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
-            if navigationAction.navigationType == .linkActivated,
-               let url = navigationAction.request.url {
+            let url = navigationAction.request.url
+            let navigationType = navigationAction.navigationType
+            let isMainFrame = navigationAction.targetFrame?.isMainFrame == true
+            let isNewWindow = navigationAction.targetFrame == nil
+            let matchesPermit = url != nil && url?.absoluteString == permit.pending?.url
+            navLog("decidePolicyFor type=\(Coordinator.typeName(navigationType)) "
+                   + "mainFrame=\(isMainFrame) newWindow=\(isNewWindow) "
+                   + "permitMatch=\(matchesPermit) url=\(Coordinator.loggableURL(url))")
+
+            // 1. The app's own document load — the ONLY way a new main-frame
+            //    document is admitted. Consumed here, at POLICY time.
+            switch permit.evaluate(url: url?.absoluteString,
+                                   navigationType: navigationType,
+                                   isMainFrame: isMainFrame) {
+            case .admit(let admitted):
+                loadedDocumentURL = admitted.url
+                navLog("consumed gen=\(admitted.generation) "
+                       + "nonce=\(RenderDocumentURL.logPrefix(forDocumentURL: admitted.url))")
+                return .allow
+            case .refuseAndInvalidate(let refusal):
+                // It named our per-load nonce but was not a main-frame `.other`
+                // action, so the permit is no longer trustworthy.
+                navLog("invalidated reason=\(refusal.rawValue) gen=\(loadGeneration)")
+                return .cancel
+            case .refuse(let refusal):
+                // Unrelated to the pending permit — which is left ARMED, so an
+                // old/subframe/user action can never cancel a legitimate app load.
+                navLog("refused reason=\(refusal.rawValue)")
+            }
+
+            // 2. `.linkActivated` — never a document admission (a scripted
+            //    `anchor.click()` is reported identically to a real tap, so this
+            //    type proves nothing about a user gesture). It is dispatched or
+            //    refused, and its WebKit navigation is cancelled either way.
+            if navigationType == .linkActivated, let url {
                 // Short-circuit mailto: so the user composes in TabMail rather
                 // than handing off to whichever app iOS currently considers
                 // the default mail client (we don't hold the entitlement yet).
                 if let request = MailtoRequest.parse(url) {
+                    navLog("open internal=compose scheme=mailto")
                     NotificationCenter.default.post(
                         name: .contactPillComposeTapped,
                         object: nil,
@@ -931,10 +1049,120 @@ private struct HTMLWebView: UIViewRepresentable {
                     )
                     return .cancel
                 }
-                await UIApplication.shared.open(url)
-                return .cancel
+                switch RenderLinkPolicy.dispatch(for: url, documentURL: loadedDocumentURL) {
+                case .sameDocumentFragment:
+                    // The defect P1a demonstrated on shipped code: every
+                    // `.linkActivated` was handed to `UIApplication.shared.open`,
+                    // so an in-document `#anchor` reached the SYSTEM OPENER as a
+                    // `tabmail-asset://` URL. It is handled internally now —
+                    // and the anchor still works, because the measured behaviour
+                    // is that `.cancel` does not prevent the same-document jump.
+                    navLog("open internal=same-document-fragment")
+                    return .cancel
+                case .openExternally:
+                    navLog("open allowed scheme=\(RenderLinkPolicy.loggableScheme(url))")
+                    await UIApplication.shared.open(url)
+                    return .cancel
+                case .refuse(let refusal):
+                    navLog("open refused reason=\(refusal.rawValue) "
+                           + "scheme=\(RenderLinkPolicy.loggableScheme(url))")
+                    return .cancel
+                }
             }
-            return .allow
+
+            // 3. Default-deny. Subframe loads, `target="_blank"`, form
+            //    submissions, `.backForward`, and any main-frame `.other` action
+            //    that could not present the per-load nonce (the meta-refresh
+            //    vector) all land here.
+            return .cancel
+        }
+
+        /// Never normal for a substitute-data load: nothing on the wire can
+        /// redirect `loadHTMLString`. If it fires on the tracked navigation the
+        /// document is not the one we admitted, so both states are invalidated
+        /// and the load is stopped — a following `.other` must not be treated as
+        /// a continuation of it.
+        func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
+            guard let navigation, navigation === trackedNavigation else {
+                navLog("server-redirect on an UNTRACKED navigation — ignored")
+                return
+            }
+            invalidateNavigationState(reason: "server-redirect")
+            webView.stopLoading()
+        }
+
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            navLog("didStartProvisionalNavigation tracked=\(isTracked(navigation)) gen=\(trackedGeneration.map(String.init) ?? "-")")
+        }
+
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            navLog("didCommit tracked=\(isTracked(navigation))")
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            navLog("didFail tracked=\(isTracked(navigation)) err=\((error as NSError).domain)/\((error as NSError).code)")
+            clearTrackedNavigation(matching: navigation)
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            navLog("didFailProvisionalNavigation tracked=\(isTracked(navigation)) err=\((error as NSError).domain)/\((error as NSError).code)")
+            clearTrackedNavigation(matching: navigation)
+        }
+
+        /// Idempotent, identity-matched cleanup. The permit is NOT touched here —
+        /// it was already consumed at policy time, and a late callback from an
+        /// older load must never clear newer state.
+        private func clearTrackedNavigation(matching navigation: WKNavigation?) {
+            guard let navigation, navigation === trackedNavigation else { return }
+            trackedNavigation = nil
+            trackedGeneration = nil
+        }
+
+        private func isTracked(_ navigation: WKNavigation?) -> Bool {
+            navigation != nil && navigation === trackedNavigation
+        }
+
+        /// Drop both halves of the navigation state.
+        private func invalidateNavigationState(reason: String) {
+            if let dropped = permit.invalidate() {
+                navLog("invalidated reason=\(reason) gen=\(dropped.generation) "
+                       + "nonce=\(RenderDocumentURL.logPrefix(forDocumentURL: dropped.url))")
+            } else {
+                navLog("invalidated reason=\(reason) (no permit was armed)")
+            }
+            trackedNavigation = nil
+            trackedGeneration = nil
+        }
+
+        /// Debug-gated navigation diagnostic. Production must not eat the noise
+        /// (development rule 12), and a failed smoke test must be diagnosable
+        /// from the log alone without a rebuild.
+        private func navLog(_ line: @autoclosure () -> String) {
+            guard DebugModeManager.isLoggingEnabled() else { return }
+            print("[NavPermit id=\(webViewId)] \(line())")
+        }
+
+        /// A navigation action's URL is SENDER-CONTROLLED. `print` is a
+        /// line-oriented sink, so it is truncated and control-character-escaped
+        /// before it reaches one — the same class `imageLoadDiagnosticJS`'s
+        /// `sanitize` closes on the JS side.
+        private static func loggableURL(_ url: URL?) -> String {
+            guard let url else { return "(nil)" }
+            let raw = url.absoluteString
+            let capped = raw.count > 120 ? String(raw.prefix(117)) + "..." : raw
+            return DebugModeManager.escapedForLogLine(capped)
+        }
+
+        private static func typeName(_ type: WKNavigationType) -> String {
+            switch type {
+            case .linkActivated: return "linkActivated"
+            case .formSubmitted: return "formSubmitted"
+            case .backForward: return "backForward"
+            case .reload: return "reload"
+            case .formResubmitted: return "formResubmitted"
+            case .other: return "other"
+            @unknown default: return "unknown(\(type.rawValue))"
+            }
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -952,18 +1180,34 @@ private struct HTMLWebView: UIViewRepresentable {
             // author JS re-opens that, and this beacon would have to move to a
             // channel author script cannot reach (a separate `WKContentWorld`).
             lastBridgeMessageGeneration = loadGeneration
+            // P1c — every payload below is validated in SWIFT before it is used.
+            // The three channels are registered in the PAGE world, so any clamp
+            // that lives in our injected JS is advisory: whatever runs in that
+            // world can post directly and simply not call it. Each rejection
+            // fails closed (the message is dropped) and says so under the debug
+            // gate; nothing substitutes a default a sender could aim.
             if message.name == "heightChanged" {
-                handleHeightMessage(message.body)
-            } else if message.name == "gutterAdjust", let d = message.body as? [String: Any] {
+                guard let validated = RenderBridgeInput.validatedHeightBody(message.body) else {
+                    bridgeLog("rejected channel=heightChanged reason=malformed-payload")
+                    return
+                }
+                handleHeightMessage(validated)
+            } else if message.name == "gutterAdjust" {
                 // eatGutterMarginsJS measured the email's own content inset and sent
                 // the SwiftUI padding to apply (= 16 − inset, clamped). Only ever
                 // ≤ the 16pt default, so the gutter stays a minimum. Guard equality
                 // to avoid a redundant frame resize (which would re-fit needlessly).
-                let l = (d["l"] as? NSNumber).map { CGFloat(truncating: $0) } ?? leadingPad
-                let r = (d["r"] as? NSNumber).map { CGFloat(truncating: $0) } ?? trailingPad
-                if leadingPad != l { leadingPad = l }
-                if trailingPad != r { trailingPad = r }
-            } else if message.name == "consoleLog", let msg = message.body as? String {
+                // The `[0, 16]` clamp is re-applied here because the JS one cannot
+                // be trusted, and a missing side keeps the current value.
+                guard let padding = RenderBridgeInput.gutterPadding(message.body,
+                                                                    leading: leadingPad,
+                                                                    trailing: trailingPad) else {
+                    bridgeLog("rejected channel=gutterAdjust reason=malformed-payload")
+                    return
+                }
+                if leadingPad != padding.leading { leadingPad = padding.leading }
+                if trailingPad != padding.trailing { trailingPad = padding.trailing }
+            } else if message.name == "consoleLog" {
                 // Defense-in-depth gate: most JS-side log sites already
                 // substitute an empty string when DebugModeManager is off (see
                 // `htmlDebugReportJS`, `heightDiagnosticJS`, `fitViewportJS`'s
@@ -977,8 +1221,26 @@ private struct HTMLWebView: UIViewRepresentable {
                 // script gaps. The message handler itself stays registered
                 // because gating its registration would skip `heightChanged`,
                 // which is load-bearing.
-                if DebugModeManager.isLoggingEnabled() { print(msg) }
+                //
+                // P1c adds the bound + escape: the line is app-authored but
+                // interpolates sender-influenced values (URLs, tag names, class
+                // names, error messages), and only `imageLoadDiagnosticJS`
+                // sanitizes its own emissions. This is the choke point for the
+                // channel itself.
+                guard DebugModeManager.isLoggingEnabled() else { return }
+                guard let line = RenderBridgeInput.consoleLine(message.body) else {
+                    bridgeLog("rejected channel=consoleLog reason=not-a-string")
+                    return
+                }
+                print(line)
             }
+        }
+
+        /// Debug-gated bridge diagnostic — the rejection half of the three
+        /// channels' validation. Same production-silence rule as `navLog`.
+        private func bridgeLog(_ line: @autoclosure () -> String) {
+            guard DebugModeManager.isLoggingEnabled() else { return }
+            print("[RenderBridge id=\(webViewId) gen=\(loadGeneration)] \(line())")
         }
 
         /// Consume the `{ h, vp }` payload from `monitorHeightJS` (ResizeObserver-
@@ -1018,6 +1280,15 @@ private struct HTMLWebView: UIViewRepresentable {
                 // frame is sized + revealed as soon as the width is known. fit()
                 // sets __tmFitDone and re-posts the final height through here.
                 if dict["requestFit"] as? Bool == true {
+                    // One-shot PER LOAD, enforced in Swift. `__tmFitRequested`
+                    // in monitorHeightJS is the page-world copy and is only
+                    // advisory; this is the authoritative guard, so a document
+                    // cannot drive an unbounded re-fit loop.
+                    guard fitRequestGeneration != loadGeneration else {
+                        bridgeLog("rejected channel=heightChanged reason=duplicate-requestFit")
+                        return
+                    }
+                    fitRequestGeneration = loadGeneration
                     fit(webView)
                     return
                 }
@@ -1028,6 +1299,13 @@ private struct HTMLWebView: UIViewRepresentable {
                 // path. One-shot: the JS side sets __tmWidthRefitRequested
                 // before posting, so this cannot loop.
                 if dict["requestWidthRefit"] as? Bool == true {
+                    // Same one-shot-per-load rule as `requestFit`;
+                    // `__tmWidthRefitRequested` is the advisory page-world copy.
+                    guard widthRefitRequestGeneration != loadGeneration else {
+                        bridgeLog("rejected channel=heightChanged reason=duplicate-requestWidthRefit")
+                        return
+                    }
+                    widthRefitRequestGeneration = loadGeneration
                     resetAndFit(webView)
                     return
                 }

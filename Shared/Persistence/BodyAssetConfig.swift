@@ -34,9 +34,17 @@ enum BodyAssetConfig {
     /// Simulator and silently fails on device.
     static let urlScheme = "tabmail-asset"
 
-    /// Fixed baseURL passed to `loadHTMLString` so the document has a non-nil origin.
-    /// NOT used for URL resolution — HTML `src` refs are absolute `tabmail-asset://`
-    /// URLs that resolve via the registered scheme handler.
+    /// The fixed baseURL that `loadHTMLString` used **before P1c**, so the document had a
+    /// non-nil origin. Never used for URL resolution — HTML `src` refs are absolute
+    /// `tabmail-asset://` URLs that resolve via the registered scheme handler.
+    ///
+    /// ⚠️ **No production code loads under this URL any more.** Being FIXED is exactly what
+    /// made it forgeable: a message document can simply name `tabmail-asset://asset/` in a
+    /// `<meta http-equiv="refresh">`, producing a navigation action shape-identical to an
+    /// app load. `RenderDocumentURL.url(nonce:)` replaced it with a per-load synthetic URL
+    /// carrying 128 random bits in its path (ADR-IOS-076 decision 2). It is kept because
+    /// the P1a/P1c canary measures the new behaviour AGAINST it — several assertions read
+    /// "…and it is NOT this" — and because it still names the origin the nonce preserves.
     static let baseURL = URL(string: "\(urlScheme)://asset/")!
 
     /// UserDefaults key (in the App Group suite) backing the user-visible
