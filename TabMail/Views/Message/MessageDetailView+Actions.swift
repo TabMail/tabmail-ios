@@ -19,7 +19,8 @@ extension MessageDetailView {
             // archive() returns false for a no-op (already in the archive
             // folder) — don't dismiss the row/detail then.
             if viewModel.archive() {
-                dismissMessage()
+                // Fixed archive-role destination — never a rendered inbox.
+                dismissMessage(destinationFolderId: nil)
             }
         case .archiveInPlace:
             if viewModel.archiveMessage(message) {
@@ -29,7 +30,8 @@ extension MessageDetailView {
             // delete() returns false for a no-op (already in the trash
             // folder) — don't dismiss the row/detail then.
             if viewModel.delete() {
-                dismissMessage()
+                // Fixed trash-role destination — never a rendered inbox.
+                dismissMessage(destinationFolderId: nil)
             }
         case .deleteInPlace:
             if viewModel.deleteMessage(message) {
@@ -41,10 +43,25 @@ extension MessageDetailView {
     }
 
     /// Notify the list to dismiss this message with animation, then pop the detail view.
-    func dismissMessage() {
-        NotificationCenter.default.post(name: .messageDismissedFromDetail, object: viewModel.messageId)
+    ///
+    /// `destinationFolderId` names the folder the action puts the message INTO, when the
+    /// caller knows it. The list receiving this notification hides the row on the premise
+    /// that the action took the message out of the folders it renders; that premise is
+    /// false for a move whose destination is one of those folders (Archive → Inbox), and
+    /// the wrong hide is permanent because there is no un-dismiss path for a row that
+    /// simply came back. Callers with a FIXED destination that can never be a rendered
+    /// inbox — archive, delete — pass `nil`. **Deliberately not defaulted:** a new dismiss
+    /// caller must state which of the two it is rather than silently inheriting `nil`.
+    func dismissMessage(destinationFolderId: String?) {
+        NotificationCenter.default.post(
+            name: .messageDismissedFromDetail,
+            object: viewModel.messageId,
+            userInfo: destinationFolderId.map { [Self.dismissDestinationFolderIdKey: $0] })
         dismiss()
     }
+
+    /// `userInfo` key carrying `dismissMessage`'s `destinationFolderId`.
+    static let dismissDestinationFolderIdKey = "destinationFolderId"
 
     // MARK: - Agent Tool Compose
 

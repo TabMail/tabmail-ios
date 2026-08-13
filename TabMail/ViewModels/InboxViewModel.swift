@@ -1732,6 +1732,48 @@ final class InboxViewModel {
 
     // MARK: - Message Actions
 
+    /// True when `folderId` is one of the folders THIS list renders — so a message
+    /// landing there must stay VISIBLE and MUST NOT be inserted into `InboxView`'s
+    /// `dismissedMessages`.
+    ///
+    /// Every `dismissedMessages` insert asserts *"the action moved this message OUT
+    /// of the folders this list renders"*. Archive/delete make that true structurally:
+    /// their destination is a fixed archive/trash-role folder, never an inbox this list
+    /// renders, and their role no-op guards (`archiveIsNoOp`/`deleteIsNoOp`) cover the
+    /// case where the message is already there. A MOVE has a user-chosen destination and
+    /// no such guarantee — Archive → Inbox from a search-opened detail view lands the
+    /// message right back in the displayed set, `InboxListComposer` keeps composing it,
+    /// and because there is no un-dismiss path for a row that simply came back it stays
+    /// invisible for the life of the view's `@State`. Exiting and re-entering the list
+    /// was the only recovery.
+    ///
+    /// The authority on displayed-set membership is `InboxListComposer`, whose
+    /// `applyOverlay` drops a row only when `!displayedFolderIds.contains(newFolderId)`
+    /// (ADR-IOS-055). `displayedFolderIds` is built from `folders`, so this asks the
+    /// composer's own question against the composer's own source. ZERO DB
+    /// (`Companion/Memory/Current/088` — gesture paths are zero-DB).
+    func displaysFolder(_ folderId: String) -> Bool {
+        folders.contains { $0.id == folderId }
+    }
+
+    /// True when moving `messageId` to `toFolderPath` would land it in a folder THIS
+    /// list renders. The move-sheet form of `displaysFolder`, which resolves the
+    /// destination folder id from the on-screen row's account.
+    ///
+    /// `MoveFolderPicker` excludes the message's DURABLE folder, not its overlay-adjusted
+    /// one, so an ADR-IOS-055 P row (durable elsewhere, pinned into the displayed set) is
+    /// offered the folder it is already showing in; duplicate-role folders reach the same
+    /// state with no overlay at all. Neither exclusion is a guard on this invariant.
+    ///
+    /// ZERO DB: the account comes from the on-screen snapshot, which is also the row the
+    /// dismissal would hide.
+    func moveDestinationIsDisplayed(_ messageId: String, toFolderPath: String) -> Bool {
+        guard let accountId = loadedMessages.first(where: { $0.id == messageId })?.accountId
+        else { return false }
+        return displaysFolder(
+            MessageIdentity.folderId(accountId: accountId, folderPath: toFolderPath))
+    }
+
     /// True when archiving `messageId` would be a same-folder move — the message
     /// already lives in an archive-role folder. Callers MUST treat the
     /// archive as a no-op and must NOT dismiss/hide the row.

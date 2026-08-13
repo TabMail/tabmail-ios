@@ -624,7 +624,8 @@ struct MessageDetailView: View {
         // is already in the archive folder) — don't dismiss or flash then.
         if msg.id == viewModel.message?.id {
             if viewModel.archive() {
-                dismissMessage()
+                // Fixed archive-role destination — never a rendered inbox.
+                dismissMessage(destinationFolderId: nil)
             }
         } else if viewModel.archiveMessage(msg) {
             flashedCardId = msg.id
@@ -636,7 +637,8 @@ struct MessageDetailView: View {
         // is already in the trash folder) — don't dismiss or flash then.
         if msg.id == viewModel.message?.id {
             if viewModel.delete() {
-                dismissMessage()
+                // Fixed trash-role destination — never a rendered inbox.
+                dismissMessage(destinationFolderId: nil)
             }
         } else if viewModel.deleteMessage(msg) {
             flashedCardId = msg.id
@@ -649,7 +651,12 @@ struct MessageDetailView: View {
         // no undo entry (same contract as handleArchive/handleDelete).
         if msg.id == viewModel.message?.id {
             if viewModel.move(toFolderPath: toFolderPath) {
-                dismissMessage()
+                // USER-CHOSEN destination: it can be a folder the list behind us is
+                // rendering (Archive → Inbox from a search-opened detail view). Name it
+                // so that list can decline to hide a row that is still one of its own.
+                dismissMessage(
+                    destinationFolderId: MessageIdentity.folderId(
+                        accountId: msg.accountId, folderPath: toFolderPath))
             }
         } else if viewModel.moveMessage(msg, toFolderPath: toFolderPath) {
             flashedCardId = msg.id

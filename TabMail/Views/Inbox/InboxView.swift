@@ -757,6 +757,19 @@ struct InboxView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .messageDismissedFromDetail).receive(on: DispatchQueue.main)) { notification in
             if let messageId = notification.object as? String {
+                // `dismissMessage()`'s MOVE caller (`MessageDetailView.handleMove`) can
+                // name a destination THIS list renders — Archive → Inbox from a
+                // search-opened detail view — and a dismissal then hides a row that is
+                // still a legitimate member of the list. There is no un-dismiss path for
+                // a row that simply came back, so it stayed invisible for the life of
+                // this `@State`; exit-and-re-enter was the only recovery.
+                let destinationFolderId = notification.userInfo?[
+                    MessageDetailView.dismissDestinationFolderIdKey] as? String
+                if let destinationFolderId, viewModel.displaysFolder(destinationFolderId) {
+                    BackgroundSyncLogger.logInbox(
+                        "[NoOpGuard] messageDismissedFromDetail suppressed — destination \(destinationFolderId) is a displayed folder: \(messageId)")
+                    return
+                }
                 withAnimation(.easeIn(duration: 0.25)) {
                     _ = dismissedMessages.insert(messageId)
                 }
@@ -1553,8 +1566,16 @@ struct InboxView: View {
     private func performSingleMove(_ id: String, to destinationPath: String) {
         print("[MoveTrace] MoveFolderPicker.onMove — id=\(id) dest=\(destinationPath) dismissedMessages.count=\(dismissedMessages.count)")
         viewModel.beginInteraction()
-        withAnimation(.easeIn(duration: 0.25)) {
-            _ = dismissedMessages.insert(id)
+        // Hide the row only when the move takes it OUT of the folders this list
+        // renders. `MoveFolderPicker` excludes the message's DURABLE folder, not its
+        // overlay-adjusted one, so an ADR-IOS-055 P row (durable elsewhere, pinned into
+        // the displayed set) is offered the folder it is already showing in — and a
+        // dismissal there is permanent. The move itself is unaffected; only the hide is
+        // skipped. See `InboxViewModel.displaysFolder`.
+        if !viewModel.moveDestinationIsDisplayed(id, toFolderPath: destinationPath) {
+            withAnimation(.easeIn(duration: 0.25)) {
+                _ = dismissedMessages.insert(id)
+            }
         }
         // move() returns false when nothing was recorded (e.g. the message
         // vanished between the picker opening and this tap) — un-hide the row
@@ -1572,8 +1593,14 @@ struct InboxView: View {
     private func performThreadMove(_ group: ThreadGroup, to destinationPath: String) {
         let allIds = group.members.map(\.id)
         viewModel.beginInteraction()
-        withAnimation(.easeIn(duration: 0.25)) {
-            dismissedMessages.formUnion(allIds)
+        // Same guard as `performSingleMove`. Asked once for the representative because
+        // `moveThread` itself derives ONE `destFolderId` from the first resolved
+        // member's account — the members of a thread move share a destination folder.
+        if !viewModel.moveDestinationIsDisplayed(
+            group.representative.id, toFolderPath: destinationPath) {
+            withAnimation(.easeIn(duration: 0.25)) {
+                dismissedMessages.formUnion(allIds)
+            }
         }
         // moveThread reports back any ids it did NOT act on — un-hide exactly
         // those; they were never queued, so they'd otherwise vanish forever
