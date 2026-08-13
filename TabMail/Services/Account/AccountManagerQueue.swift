@@ -97,6 +97,40 @@ extension AccountManager {
         /// `ProviderEvidenceUnavailable` and `evidenceRefused`.
         var failedAccounts = Set<String>()
         var foldersToSync: Set<String> = []
+
+        /// One member a completed `.move` landed in a folder the account treats
+        /// as its INBOX, recorded by DURABLE IDENTITY rather than by address.
+        ///
+        /// `messageId` alone is NOT enough and using it alone would be a C3
+        /// hazard, not merely a miss: on IMAP a UID is mailbox-local, so
+        /// resolving a bare source UID against the destination folder can land
+        /// on an unrelated message that happens to share that number
+        /// (`DurableIdentityLookup`'s G3 rejection exists for exactly this).
+        /// The rfc822 identity is what survives BOTH re-key paths, so it is
+        /// captured beside the address and both are handed to
+        /// `DurableIdentityLookup.find` later.
+        struct InboxEntry: Hashable, Sendable {
+            let accountId: String
+            let messageId: String
+            let rfc822MessageId: String?
+        }
+
+        /// Members that ENTERED an inbox during this drain, keyed by the same
+        /// `"accountId|destinationPath"` string as `foldersToSync` so the
+        /// post-drain phase can enqueue them immediately after that folder's
+        /// sync — the moment both the durable row and its FTS entry are under
+        /// their final ids (ADR-IOS-008 decision 3; see `recordMembersThatEnteredInbox`).
+        ///
+        /// ⚠️ `Mutex`-protected while its siblings above are not, and that is
+        /// deliberate rather than inconsistent. The per-lane drain tasks run
+        /// CONCURRENTLY (`drainPendingQueue` appends a `Task` per lane and only
+        /// then awaits them), so every field here is written from several tasks
+        /// at once — which is what `@unchecked Sendable` on this class is
+        /// currently papering over. That exposure is pre-existing for
+        /// `foldersToSync`/`failedAccounts` and is reported separately rather
+        /// than widened here: a new racy field is not excused by the old ones
+        /// (`Companion/Rules/Active/resilience.md` mandates `Mutex`, SE-0433).
+        let enteredInbox = Mutex<[String: [InboxEntry]]>([:])
         /// `PendingOperation.id`s whose provider could not obtain the evidence its
         /// own safety gate requires (`ProviderEvidenceUnavailable`). Per-op, not
         /// per-account: the op stays durably queued and retries on a LATER drain,
@@ -656,8 +690,219 @@ extension AccountManager {
                 } catch {
                     queueLog("[MoveTrace] post-drain sync — failed for \(folder.name): \(error)")
                 }
+                // ADR-IOS-008 decision 3. Deliberately AFTER the sync attempt and
+                // OUTSIDE its do/catch — see `enqueueAIForMembersThatEnteredInbox`
+                // for why either branch is a safe place to resolve an id, and why
+                // no earlier one is.
+                await enqueueAIForMembersThatEnteredInbox(key: key, folderPath: folderPath, context: ctx)
             }
         }
+    }
+
+    /// Record which members of a just-completed `.move` are now sitting in an
+    /// INBOX, so the post-drain phase can enqueue AI for them.
+    ///
+    /// **THIS RESTORES ADR-IOS-008 PARITY; it does not invent a pattern.** The
+    /// reference implementation is the TB addon's `onMoved.js`, whose
+    /// `!wasInInbox && nowInInbox` arm states the rationale in its own comment:
+    /// *"inbox scans may not process this message (e.g., sender filter or
+    /// maxEmails cap). When a message ENTERS inbox, proactively run the unified
+    /// pipeline on just this message so action tags are applied **without
+    /// requiring a user click**."* iOS had the other two decision-3 events
+    /// (new-mail-arrival via `BodyFetchProcessor`, startup scan via
+    /// `ActiveAIQueue.repopulateFromDatabase`) and was missing this one, so a
+    /// message moved into the inbox got AI only if the user opened it — i.e.
+    /// only by performing the click the action tag exists to make unnecessary.
+    ///
+    /// **`nowInInbox` is read from the DURABLE ROW, never inferred.** The guard
+    /// chain below (`accountId`, `folderPath == destinationPath`, `isInInbox`) is
+    /// deliberately the SAME chain as
+    /// `AccountManagerActions.restoreInboxAICacheAfterOptimisticMove`, the other
+    /// place that asks "did this row actually land in the inbox" — the two are
+    /// meant to stay recognisably paired.
+    ///
+    /// **`wasInInbox` is approximated by `dest != op.folderPath` at the call
+    /// site, and that is a deliberate, benign deviation from TB.** The source row
+    /// is gone by now, so a true `!wasInInbox` would cost another lookup. The
+    /// only case it admits that TB would skip is inbox→inbox across two
+    /// inbox-flagged folders, and the cost there is one DEDUPED job whose summary
+    /// is already cached (`executeSummaryJob` returns on a cache hit and still
+    /// chains the action job), never a wrong or duplicated write.
+    private func recordMembersThatEnteredInbox(
+        _ op: PendingOperation, destinationPath: String, context: DrainContext
+    ) async {
+        let accountId = op.accountId
+        // Follow the provider-proven handoff first: when `COPYUID` landed,
+        // `finishMove` has already re-keyed this row to its destination address,
+        // so the source-shaped id no longer names it. When it did not, the alias
+        // map is empty and this returns the id unchanged — which is still the
+        // right key, because the row then keeps its source PK.
+        let candidateIds = op.messageIds.map { messageId in
+            MessageHeaderRekey.currentHeaderId(
+                afterHandoffFrom: MessageIdentity.headerId(
+                    accountId: accountId, folderPath: op.folderPath, messageId: messageId))
+        }
+        let entries: [DrainContext.InboxEntry] = (try? await dbPool.read { db in
+            var found: [DrainContext.InboxEntry] = []
+            for headerId in candidateIds {
+                guard let header = try MessageHeader.fetchOne(db, key: headerId),
+                      header.accountId == accountId,
+                      header.folderPath == destinationPath,
+                      header.isInInbox
+                else { continue }
+                found.append(DrainContext.InboxEntry(
+                    accountId: accountId,
+                    messageId: header.messageId,
+                    rfc822MessageId: header.rfc822MessageId))
+            }
+            return found
+        }) ?? []
+        guard !entries.isEmpty else { return }
+        let key = "\(accountId)|\(destinationPath)"
+        context.enteredInbox.withLock { $0[key, default: []].append(contentsOf: entries) }
+        queueLog("[MoveTrace] entered inbox — \(entries.count) member(s) of op \(op.id) landed in \(destinationPath), AI enqueue deferred to post-drain")
+    }
+
+    /// Enqueue AI for the members this drain moved into `folderPath`'s inbox.
+    ///
+    /// **WHY THIS RUNS HERE AND NOWHERE EARLIER — constraint: the id must be the
+    /// POST-RE-KEY id.** `ActiveAIQueue.executeJob` resolves the body with
+    /// `ContentKey(rawValue: job.headerId)`, so a job carrying a superseded
+    /// address finds no FTS body and is dropped. A move can change that address
+    /// twice over, by two different paths:
+    ///  - the drain's own `COPYUID` re-key (`MessageHeaderRekey.finishMove`, with
+    ///    the FTS/bodyAsset mirror in `publishMoveFinish`), and
+    ///  - the sync's UID remap (`SyncEngine.runSyncMessages`, with its FTS mirror
+    ///    in `SyncEngineFullSync.syncMessages`) when no `COPYUID` was available.
+    ///
+    /// Both mirrors have completed by the time the post-drain sync call above
+    /// returns, so **at this point the durable id and the FTS key agree by
+    /// construction** — which is a stronger guarantee than "the sync succeeded",
+    /// and why this sits outside that do/catch. If `runSyncMessages` threw, its
+    /// transaction rolled back and NEITHER was re-keyed; if it committed, the FTS
+    /// mirror runs behind a `try?` that cannot propagate. There is no torn state
+    /// to land in.
+    ///
+    /// Enqueueing from a gesture, from `optimisticMoveToFolder`, or at
+    /// `finishMove` time would all race one of those re-keys — that race is
+    /// `IOS-AI-005`'s shape and is exactly what this placement avoids.
+    ///
+    /// No AI-enabled gate: `dispatchPending` already refuses on `canProcessAI`
+    /// and clears the queue, with `repopulateFromDatabase` re-discovering when
+    /// conditions change. `repopulateFromDatabase` enqueues ungated for the same
+    /// reason.
+    private func enqueueAIForMembersThatEnteredInbox(
+        key: String, folderPath: String, context: DrainContext
+    ) async {
+        let entries = context.enteredInbox.withLock { $0.removeValue(forKey: key) } ?? []
+        guard !entries.isEmpty else { return }
+        // `DurableIdentityLookup` is the SHARED identity resolver (NSE merge +
+        // unified inbox reader). Its step 1 catches the `COPYUID` case (already
+        // re-keyed, exact folder+UID hit) and its step 3 catches the sync-remap
+        // case (rfc822 fallback — the doc comment names "IMAP UID remaps after a
+        // server-side MOVE" as its purpose). Re-checking `isInInbox` closes the
+        // window where a later gesture moved the message straight back out again.
+        let resolved: [(headerId: String, accountId: String)] = (try? await dbPool.read { db in
+            try Self.resolveInboxEntryAITargets(
+                entries: entries, folderPath: folderPath, db: db)
+        }) ?? []
+        guard !resolved.isEmpty else {
+            queueLog("[MoveTrace] entered inbox — \(entries.count) member(s) in \(folderPath) resolved to no live inbox row, nothing enqueued")
+            return
+        }
+        // Per-item `enqueue` (S + R, with A chained by the summary job) mirrors
+        // the sibling event-driven site, `BodyFetchProcessor.flushBatch`'s
+        // `enableAI && item.isInInbox` arm.
+        for item in resolved {
+            await ActiveAIQueue.shared.enqueue(headerId: item.headerId, accountId: item.accountId)
+        }
+        queueLog("[MoveTrace] entered inbox — enqueued AI for \(resolved.count) member(s) in \(folderPath)")
+    }
+
+    /// The id each recorded member is CURRENTLY addressable by, for the AI
+    /// enqueue above. `internal static` for executable regression coverage — the
+    /// same reason `AccountManagerActions
+    /// .restoreInboxAICacheAfterOptimisticMove` is internal; it is not a second
+    /// enqueue path.
+    ///
+    /// ⚠️ **DO NOT "simplify" this to `MessageIdentity.headerId(accountId:
+    /// folderPath: messageId:)` on the recorded `messageId`.** That reconstructs
+    /// the address the member had when it was recorded, which the sync's UID
+    /// remap can already have superseded — the job would then miss its FTS body
+    /// and be dropped. Worse, resolving a bare source UID against a different
+    /// folder can land on an UNRELATED message that shares that number, because
+    /// IMAP UIDs are mailbox-local.
+    ///
+    /// 🚨 **AND DO NOT ROUTE THIS BACK THROUGH `DurableIdentityLookup.find` —
+    /// IT WAS WRITTEN THAT WAY, AND IT RESOLVED THE WRONG MESSAGE.** That
+    /// helper's header lists six consumers that must stay "in lockstep", so a
+    /// reader who finds a seventh identity resolution sitting outside it will
+    /// try to restore consistency by routing this through `find` again. That
+    /// reintroduces a wrong-message defect, for a reason that is a PREMISE of
+    /// the helper rather than a bug in it:
+    ///
+    ///  - `find`'s **step 1** matches `(accountId, folderPath, messageId)` and
+    ///    returns immediately with **no rfc822 check** — the only unguarded step
+    ///    of its three. Its stated justification is *"Unambiguous: IMAP UIDs are
+    ///    scoped per folder, so a hit here is provably the same message."* The G3
+    ///    audit that added rejection logic added it to step **2**, the
+    ///    folder-BLIND case; step 1 was deliberately left bare.
+    ///  - That is sound **only if the `(folderPath, messageId)` pair you pass is
+    ///    the message's CURRENT address.** All six lockstep consumers pass a
+    ///    STAGED row's address, which the NSE has just observed on the server —
+    ///    current by construction.
+    ///  - **This caller cannot honour that.** It deliberately passes the
+    ///    PRE-REMAP UID against the folder the message has only just moved INTO.
+    ///    An unrelated message can legitimately occupy that exact address, and
+    ///    step 1 returns it. Verified: `MoveIntoInboxAIEnqueueTests
+    ///    .aiTargetIsNeverAUidCollisionVictim` failed on this code, resolving the
+    ///    decoy's body instead of the moved message's.
+    ///
+    /// The distinction that keeps the two apart: the lockstep list is about
+    /// **dedup identity** for the merge and the reader. This is **AI-target
+    /// selection after a known move**, whose input address is stale on purpose.
+    /// Same shape as `IOS-QUEUE-010`'s deliberate asymmetry — consistency here
+    /// must not be bought by reintroducing the defect.
+    ///
+    /// So the priority is INVERTED relative to `find`: the rfc822 identity is
+    /// the only thing that survives both re-key paths, so it is required rather
+    /// than used as a fallback.
+    nonisolated static func resolveInboxEntryAITargets(
+        entries: [DrainContext.InboxEntry], folderPath: String, db: Database
+    ) throws -> [(headerId: String, accountId: String)] {
+        var out: [(headerId: String, accountId: String)] = []
+        for entry in entries {
+            // FAIL CLOSED, and OBSERVABLY. A member with no usable rfc822
+            // identity cannot be re-identified across a UID remap by anything
+            // this function has, and guessing from the stale address is the
+            // wrong-message bug above. Refusing costs only that this message
+            // waits for the ordinary foreground repopulate or an open — but a
+            // SILENT refusal would be indistinguishable from "AI has not run
+            // yet", which is exactly `IOS-AI-005`'s unobservable-drop shape.
+            // Debug-gated per development rule 12.
+            guard let rfc822 = entry.rfc822MessageId, !rfc822.isEmpty else {
+                queueLog("[MoveTrace] entered inbox — REFUSED AI enqueue for \(entry.accountId) uid=\(entry.messageId) in \(folderPath): no rfc822 Message-ID, cannot re-identify across a UID remap")
+                continue
+            }
+            // Scoped to the destination FOLDER, so the row this lands on is the
+            // one that entered THIS inbox. `isInInbox = 1` is deliberately NOT a
+            // conjunct here: `folderPath` already pins the folder, the capture in
+            // `recordMembersThatEnteredInbox` only records rows that were
+            // `isInInbox`, and `ActiveAIQueue.readJobOutcome` independently
+            // refuses a job whose row is no longer in an inbox (`.scopeExited`).
+            // A redundant conjunct in a correctness guard can mask the failure of
+            // the one that matters.
+            guard let id = try String.fetchOne(db, sql: """
+                SELECT id FROM messageHeader
+                WHERE accountId = ? AND folderPath = ? AND rfc822MessageId = ?
+                """, arguments: [entry.accountId, folderPath, rfc822])
+            else {
+                queueLog("[MoveTrace] entered inbox — no live row in \(folderPath) for rfc822 identity of uid=\(entry.messageId), nothing enqueued")
+                continue
+            }
+            out.append((headerId: id, accountId: entry.accountId))
+        }
+        return out
     }
 
     // MARK: - Drain-barrier Test Seam (T0.8)
@@ -823,6 +1068,14 @@ extension AccountManager {
             await materializeDeferredMoveSuccessors(after: currentOp, result: finishResult)
             if [.archive, .delete, .move].contains(currentOp.type), let dest = currentOp.destinationPath {
                 context.foldersToSync.insert("\(currentOp.accountId)|\(dest)")
+                // ADR-IOS-008 decision 3's third event — "message moved to
+                // inbox" — restored. Only `.move` can name an inbox: `.archive`
+                // and `.delete` resolve their destination from the archive and
+                // trash ROLES, and a same-folder move is a no-op.
+                if currentOp.type == .move, dest != currentOp.folderPath {
+                    await recordMembersThatEnteredInbox(
+                        currentOp, destinationPath: dest, context: context)
+                }
             }
             // Sync Drafts folder after draft save/delete so MessageHeaders reflect server state.
             // After saveDraft: the sync's UID remap detection matches our optimistic header
