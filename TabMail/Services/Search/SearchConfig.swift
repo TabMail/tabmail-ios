@@ -31,6 +31,11 @@ enum SearchConfig {
     static let searchDefaultLimit = 50
     static let snippetTokens = 16
 
+    /// Row budget for `SearchView.legacyLocalSearch`'s substring scan — the size of the
+    /// most-recent page the in-memory `localizedCaseInsensitiveContains` filter runs over.
+    /// Was an inline literal at three sites after the scoped query was split per folder.
+    static let legacySubstringScanRows = 200
+
     // MARK: - Hybrid Search
 
     static let vectorWeight: Double = 0.7

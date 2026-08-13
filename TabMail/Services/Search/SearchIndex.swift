@@ -2010,10 +2010,21 @@ actor SearchIndex {
             let sql = subqueries.joined(separator: " UNION ALL ") +
                 " ORDER BY rank ASC LIMIT ?\(limitParam)"
 
-            print("[SearchIndex] FTS candidates args: \(args)")
+            // Gated. This arm is the HYBRID path (`search()` ← `EmailSearchTool`), not the
+            // per-keystroke typing path — that one is `keywordSearch` → `searchFTSOnly`
+            // below. Same defect either way: `\(args)` interpolates the WHOLE
+            // bind-argument array — every scoped folder id, some of them long provider
+            // ids — so ungated it built and discarded that string on every search in
+            // production. Kept, not deleted (debug code is preserved here); the gate is
+            // the fix.
+            if DebugModeManager.isLoggingEnabled() {
+                print("[SearchIndex] FTS candidates args: \(args)")
+            }
 
             let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
-            print("[SearchIndex] FTS candidates returned \(rows.count) rows")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[SearchIndex] FTS candidates returned \(rows.count) rows")
+            }
             return rows.map { row in
                 FTSCandidate(
                     rowid: row["rowid"], contentKey: row["headerId"],
@@ -2066,10 +2077,18 @@ actor SearchIndex {
             let sql = subqueries.joined(separator: " UNION ALL ") +
                 " ORDER BY dateMs DESC, rank ASC LIMIT ?\(limitParam)"
 
-            print("[SearchIndex] FTS-only SQL: \(sql.prefix(300))")
-            print("[SearchIndex] FTS-only args: \(args)")
+            // Gated for the same reason as `searchFTSCandidates` above: this is THE
+            // per-keystroke path (it is the query the Archive-search stall episode was
+            // logged from), and ungated it interpolated a 300-char SQL prefix plus the
+            // whole bind-argument array on every search in production. Kept, not deleted.
+            if DebugModeManager.isLoggingEnabled() {
+                print("[SearchIndex] FTS-only SQL: \(sql.prefix(300))")
+                print("[SearchIndex] FTS-only args: \(args)")
+            }
             let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
-            print("[SearchIndex] FTS-only returned \(rows.count) rows")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[SearchIndex] FTS-only returned \(rows.count) rows")
+            }
             return rows.map { row in
                 FTSSearchResult(
                     contentKey: row["headerId"], messageId: row["msgId"],

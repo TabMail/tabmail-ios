@@ -1097,16 +1097,76 @@ struct SearchView: View {
         return results
     }
 
+    /// The most-recent page `legacyLocalSearch` scans, with optional folder scope.
+    ///
+    /// ⚠️ **The scope is applied as ONE QUERY PER FOLDER, never as a single
+    /// `folderId IN (…)`.** SQLite cannot satisfy `ORDER BY date DESC` from any index
+    /// across an `IN`-list — an `IN`-list yields *k separate date-ordered runs* and there
+    /// is no merge operator to interleave them — so the `IN` form plans as
+    /// `SEARCH … (folderId=?)` **+ `USE TEMP B-TREE FOR ORDER BY`**. Verified with
+    /// `EXPLAIN QUERY PLAN` on the v84 schema at 250k rows: **no** index avoids that
+    /// sorter, not `messageHeader_folderId`, not `messageHeader_inbox_display`, and not
+    /// even the exact `messageHeader_folderId_date` composite. This is therefore NOT a
+    /// missing-index bug and no migration can fix it — only the query shape can.
+    ///
+    /// The sorter **defeats the `LIMIT`**: every row in the scoped folders is materialised
+    /// and sorted before `budget` are taken, so cost is O(rows in scope), not O(budget).
+    /// Scoped to the INBOX folders that is a few thousand rows and invisible (24ms);
+    /// scoped to Archive / Gmail All Mail it is the whole mailbox (~215k rows, 833ms on a
+    /// warm Mac ⇒ 1.4–1.9s measured on device) — and because `legacyLocalSearch` is called
+    /// **synchronously on the main actor, once per keystroke** from `onQueryChanged`, that
+    /// landed directly on the typing thread. The *unscoped* query has no `WHERE` clause at
+    /// all, so it walks `messageHeader_date` and stops after `budget` rows; that is why
+    /// searching with the "all" flag on stayed fast while Archive-scoped search did not.
+    ///
+    /// Per-folder `folderId = ?` fixes the composite's leading column, so each arm plans as
+    /// a bare `SEARCH … USING INDEX messageHeader_folderId_date` with **no sorter** and
+    /// early-terminates at its own `LIMIT`.
+    ///
+    /// **The merged page is identical to the `IN`-list form.** The global `budget`
+    /// most-recent rows can draw at most `budget` from any single folder, so each folder's
+    /// own top-`budget` is a superset of its contribution; re-sorting the union and cutting
+    /// to `budget` reproduces the same page. (Verified position-for-position, 200/200, on a
+    /// 250k-row fixture, for both an inbox-sized and an archive-sized scope.) Among rows
+    /// with an *equal* `date` neither form specifies which wins — that indeterminacy is
+    /// pre-existing and unchanged.
+    ///
+    /// All arms run inside ONE `dbPool.read`, so this is k statements per **one** pool
+    /// acquisition — it does not add a round-trip, and k is bounded by `folders.count`.
+    ///
+    /// `nonisolated static` for the same reason as the other helpers in this file: it
+    /// touches no `@State` and needs no view, so a test can call it with a bare `Database`.
+    nonisolated static func recentHeaders(
+        _ db: Database, folderIds: [String]?, budget: Int
+    ) throws -> [MessageHeader] {
+        guard let ids = folderIds, !ids.isEmpty else {
+            return try MessageHeader.order(Column("date").desc).limit(budget).fetchAll(db)
+        }
+        // `seen` keeps `IN` semantics exactly: a row matches an `IN`-list once however
+        // many times its folder id appears in the list, so a duplicated id must not
+        // duplicate the row here either.
+        var merged: [MessageHeader] = []
+        var seen = Set<String>()
+        for id in ids where seen.insert(id).inserted {
+            merged += try MessageHeader
+                .filter(Column("folderId") == id)
+                .order(Column("date").desc)
+                .limit(budget)
+                .fetchAll(db)
+        }
+        merged.sort { $0.date > $1.date }
+        return merged.count > budget ? Array(merged.prefix(budget)) : merged
+    }
+
     private func legacyLocalSearch(_ query: String) -> [SearchResult] {
         let folderIds = activeFolderIds
 
-        // Bounded fetch — 200 most recent messages, with optional folder scope.
+        // Bounded fetch — most recent page, with optional folder scope. See
+        // `recentHeaders` for why the scope is NOT expressed as `folderId IN (…)`.
         guard let messages: [MessageHeader] = try? dbPool.read({ db in
-            var request = MessageHeader.order(Column("date").desc).limit(200)
-            if let ids = folderIds, !ids.isEmpty {
-                request = request.filter(ids.contains(Column("folderId")))
-            }
-            return try request.fetchAll(db)
+            try Self.recentHeaders(
+                db, folderIds: folderIds, budget: SearchConfig.legacySubstringScanRows
+            )
         }) else { return [] }
 
         let accountEmails: [String: String] = {
