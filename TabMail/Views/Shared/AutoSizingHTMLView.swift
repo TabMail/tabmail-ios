@@ -807,33 +807,17 @@ private struct HTMLWebView: UIViewRepresentable {
         /// `loadHTMLString` if a newer load superseded it — so a slow wrap of an
         /// OLD body can't clobber a newer one when the card is rebound mid-wrap.
         var loadGeneration: Int = 0
-        /// `loadGeneration` of the most recent `WKScriptMessage` this coordinator
-        /// received on any bridge channel (`HTMLWebView.bridgeChannels`) — i.e. the
-        /// last load for which app JavaScript provably executed and provably reached
-        /// Swift. P4 added a fourth, `imageLoadFailure`; the beacon is deliberately
-        /// channel-agnostic, so a new channel widens what can prove liveness and
-        /// changes nothing else.
+        /// Arming state AND liveness evidence for the bridge-liveness verdict (P1d).
+        /// See `BridgeLivenessBeacon` for the device evidence that moved the arm
+        /// from `didFinish` to `didCommit`, and for why every generation it handles
+        /// is a COMMITTED one.
         ///
-        /// **Why this exists at all (P1b, owner requirement 2026-08-12).** Every
-        /// render behaviour in this file is a `WKUserScript`, and so is every
-        /// JS-side diagnostic. If WebKit ever stopped executing app-injected
-        /// script — the exact hazard `allowsContentJavaScript = false` and
-        /// `script-src 'none'` raise — the render would break AND the
-        /// instrumentation that would report it would go silent in the same
-        /// instant. The owner would see a blank or mangled message and an empty
-        /// log, which is the least diagnosable possible outcome, because SILENCE
-        /// IS CURRENTLY INDISTINGUISHABLE FROM SUCCESS.
-        ///
-        /// So this one signal deliberately does **not** depend on page JavaScript:
-        /// it is written from the Swift side of the bridge, and
-        /// `scheduleBridgeLivenessCheck()` says out loud when nothing arrived.
-        /// The *recording* is ungated (a single assignment, no I/O, so it is
-        /// correct in release too); only the *reporting* is debug-gated, per
-        /// development rule 12.
-        var lastBridgeMessageGeneration: Int?
-        /// One-shot arming state for the bridge-liveness verdict (P1d). See
-        /// `BridgeLivenessBeacon` for the device evidence that moved the arm from
-        /// `didFinish` to `didCommit`.
+        /// ⚠️ Both halves are keyed on `documentGate.committedGeneration`, never on
+        /// `loadGeneration` — the field this coordinator used to stamp bridge
+        /// messages with. `wrapAndLoad` bumps `loadGeneration` before the new
+        /// document exists, so the OLD document's late messages were recorded as
+        /// evidence that the NEW document's scripts had run, and a document that
+        /// executed zero JavaScript could be reported `bridge=LIVE`.
         private var bridgeBeacon = BridgeLivenessBeacon()
         /// P1c — the permit half of the two-state navigation machine
         /// (ADR-IOS-076 decisions 2 and 4; plan §10.1 C1 + C2).
@@ -861,14 +845,20 @@ private struct HTMLWebView: UIViewRepresentable {
         /// changes it with no delegate callback at all, so it is a value the
         /// document controls and the app cannot observe changing.
         private var loadedDocumentURL: String?
-        /// Load generation whose one-shot `requestFit` has already been honoured.
-        /// The JS guard (`__tmFitRequested`) is ADVISORY — it lives in the page
-        /// world — so the authoritative one-shot lives here.
-        private var fitRequestGeneration: Int?
-        /// Same, for `requestWidthRefit` / `__tmWidthRefitRequested`.
-        private var widthRefitRequestGeneration: Int?
-        /// Same, for P4's `imageLoadFailure` census / `__tmImageFailureReported`.
-        private var imageFailureReportGeneration: Int?
+        /// Which document a bridge message belongs to, and which of its one-shot
+        /// requests (`requestFit`, `requestWidthRefit`, P4's `imageLoadFailure`
+        /// census) it has already spent. The JS-side guards (`__tmFitRequested`,
+        /// `__tmWidthRefitRequested`, `__tmImageFailureReported`) live in the
+        /// isolated world and are ADVISORY; this is the authority.
+        ///
+        /// ⚠️ Keyed on the COMMITTED generation, never on `loadGeneration`. See
+        /// `CommittedDocumentGate` for the measured defect: `loadGeneration` is
+        /// bumped by `wrapAndLoad`'s first statement, a whole off-main wrap and a
+        /// provisional load before the new document exists, so the OLD document —
+        /// still committed, still running its timers — was having its late
+        /// messages stamped with the NEW document's generation, and the new
+        /// document's own request refused as a duplicate.
+        private var documentGate = CommittedDocumentGate()
         /// Grace period between `didCommit` (P1d — it was `didFinish` until then)
         /// and the bridge-liveness verdict.
         /// `monitorHeightJS`'s ResizeObserver and the double-`rAF` reveal both
@@ -1114,6 +1104,10 @@ private struct HTMLWebView: UIViewRepresentable {
                 }
                 self.navLog("issued gen=\(gen) nonce=\(RenderDocumentURL.logPrefix(nonce)) "
                             + "schemeHandler=\(hasHeader)")
+                // Issuing is NOT committing: the document already on screen keeps
+                // running, keeps posting, and keeps its own one-shot slots until
+                // this load actually commits. See `CommittedDocumentGate`.
+                self.documentGate.issue(generation: gen)
                 let navigation = webView.loadHTMLString(wrapped, baseURL: base)
                 self.trackedNavigation = navigation
                 self.trackedGeneration = gen
@@ -1155,8 +1149,8 @@ private struct HTMLWebView: UIViewRepresentable {
             print("[RenderSec id=\(webViewId) gen=\(generation)] csp=\(EmailHTMLWrapper.contentSecurityPolicy)")
         }
 
-        /// Schedule the bridge-liveness verdict for `generation`, a short grace
-        /// period after that load COMMITTED.
+        /// Schedule the bridge-liveness verdict for the document that just
+        /// COMMITTED, a short grace period after the commit.
         ///
         /// This is the one diagnostic in this file that survives a total loss of
         /// page JavaScript, and it exists because every other one does not: if
@@ -1179,8 +1173,13 @@ private struct HTMLWebView: UIViewRepresentable {
         /// The arming is ungated (one integer store, no I/O), so the one-shot is a
         /// property of the state machine rather than of the log gate; only the
         /// verdict itself is debug-gated, per development rule 12.
-        private func scheduleBridgeLivenessCheck(generation: Int) {
-            guard bridgeBeacon.arm(generation: generation) else { return }
+        ///
+        /// ⚠️ The generation comes from `documentGate`, not from `loadGeneration`.
+        /// Passing it in was how the fourth consumer of the issued-generation
+        /// keying survived `4213cb3a9`; taking it from the gate leaves no argument
+        /// for a caller to get wrong.
+        private func scheduleBridgeLivenessCheck() {
+            guard let generation = bridgeBeacon.arm(in: documentGate) else { return }
             guard DebugModeManager.isLoggingEnabled() else { return }
             let id = webViewId
             // 3s measured from COMMIT is comfortably enough: the `.atDocumentEnd`
@@ -1196,11 +1195,13 @@ private struct HTMLWebView: UIViewRepresentable {
                     // longer on screen — and supersession is itself logged
                     // (`issued gen=…` / `superseded gen=…`), so the silence is
                     // explained rather than mysterious. Pre-existing behaviour; P1d
-                    // does not change it.
-                    guard let verdict = BridgeLivenessBeacon.settle(
+                    // does not change it. "Superseded" is now asked of the COMMITTED
+                    // document rather than of `loadGeneration`, so a load that has
+                    // merely been ISSUED no longer silences the verdict of the
+                    // document still on screen.
+                    guard let verdict = self.bridgeBeacon.settle(
                         generation: generation,
-                        currentGeneration: self.loadGeneration,
-                        lastBridgeMessageGeneration: self.lastBridgeMessageGeneration
+                        in: self.documentGate
                     ) else { return }
                     switch verdict {
                     case .live:
@@ -1340,12 +1341,40 @@ private struct HTMLWebView: UIViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-            navLog("didCommit tracked=\(isTracked(navigation))")
+            // THE document identity a `WKScriptMessage` does not carry. Committing is
+            // the moment the issued load actually replaced the document on screen, so
+            // it is the moment its one-shot slots become the live ones — see
+            // `CommittedDocumentGate`. WebKit runs this before document parsing, hence
+            // before every `.atDocumentStart`/`.atDocumentEnd` user script, so no
+            // bridge message of the new document can outrun it.
+            //
+            // ⚠️ IDENTITY-MATCHED, per ADR-IOS-076 decision 4 — which already required
+            // it of this callback, and which the generation adoption did not honour: the
+            // discriminator was computed for the log line below and then ignored, so a
+            // `didCommit` belonging to a load a newer `issue` had already superseded
+            // adopted the NEWER generation and labelled the OLD document with it.
+            //
+            // `trackedNavigation == nil` adopts, deliberately. It means there is no
+            // identity to match against — `loadHTMLString` may legitimately return no
+            // `WKNavigation` (this file logs a WARNING when it does) — and the same
+            // reasoning already governs `didFinish`, which does its fit-and-reveal work
+            // ungated for exactly that reason. Refusing there would strand a real
+            // document with no committed generation and refuse all three of its
+            // one-shots.
+            let tracked = isTracked(navigation)
+            let isIssuedLoad = tracked || trackedNavigation == nil
+            let committed = documentGate.commit(isIssuedLoad: isIssuedLoad)
+            navLog("didCommit tracked=\(tracked) adoptedIssued=\(isIssuedLoad) "
+                   + "committedGen=\(committed.map(String.init) ?? "-")")
             // Owner requirement (P1b), re-sequenced by P1d: say out loud whether app
             // JavaScript ran — for EVERY committed load, including one that never
             // finishes. Committing is the property every rendered document has;
             // finishing is one a live page may never reach.
-            scheduleBridgeLivenessCheck(generation: loadGeneration)
+            //
+            // The generation is read back out of `documentGate` by the beacon itself.
+            // It used to be `loadGeneration` — the ISSUED generation — which named the
+            // wrong load whenever a rebind had already bumped it.
+            scheduleBridgeLivenessCheck()
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -1381,6 +1410,11 @@ private struct HTMLWebView: UIViewRepresentable {
             }
             trackedNavigation = nil
             trackedGeneration = nil
+            // No document is on screen any more, so nothing can legitimately post on a
+            // one-shot channel until a fresh load issues AND commits. Refusing until
+            // then is the fail-closed direction: the alternative leaves a dead
+            // document's generation adopted by whatever posts next.
+            documentGate.invalidate()
         }
 
         /// Debug-gated navigation diagnostic. Production must not eat the noise
@@ -1429,12 +1463,18 @@ private struct HTMLWebView: UIViewRepresentable {
                 bridgeLog("rejected channel=\(message.name) reason=not-main-frame")
                 return
             }
-            // Bridge-liveness beacon (see `lastBridgeMessageGeneration`). Recorded
-            // for EVERY channel and BEFORE any dispatch, because the question this
+            // Bridge-liveness beacon (see `BridgeLivenessBeacon`). Recorded for
+            // EVERY channel and BEFORE any dispatch, because the question this
             // answers is "did app JavaScript run at all", not "did the height
             // arrive" — a script that ran and then threw still proves the gate is
-            // open. Ungated on purpose: one integer store, no I/O; only the
-            // verdict in `scheduleBridgeLivenessCheck` prints, and that is gated.
+            // open. Ungated on purpose: one store, no I/O; only the verdict in
+            // `scheduleBridgeLivenessCheck` prints, and that is gated.
+            //
+            // ⚠️ Attributed to the COMMITTED document, not to `loadGeneration`.
+            // Being upstream of every dispatch is exactly why the one-shot gate
+            // below cannot shield this line: it runs for every channel, before any
+            // of them, so keying it on the issued generation let document A's late
+            // `heightChanged` stand as proof that document B's scripts had run.
             //
             // Sound as an APP-script signal for TWO independent reasons now, and the
             // second is the durable one. (1) `allowsContentJavaScript` is false, so no
@@ -1445,7 +1485,7 @@ private struct HTMLWebView: UIViewRepresentable {
             // forgery, because there is nothing there to post to. The old note said this
             // beacon "would have to move to a separate `WKContentWorld`" if author JS came
             // back — it has now moved, so that migration is DONE, not pending.
-            lastBridgeMessageGeneration = loadGeneration
+            bridgeBeacon.recordBridgeMessage(in: documentGate)
             // P1c — every payload below is validated in SWIFT before it is used.
             // A clamp that lives in our injected JS is advisory: whatever runs in the
             // world the channels are registered in can post directly and simply not call
@@ -1511,18 +1551,33 @@ private struct HTMLWebView: UIViewRepresentable {
                     bridgeLog("rejected channel=imageLoadFailure reason=malformed-payload")
                     return
                 }
-                // One-shot PER LOAD, enforced in Swift for the same reason
-                // `requestFit` and `requestWidthRefit` are: `__tmImageFailureReported`
-                // lives in the isolated world and is only advisory, so the
-                // authoritative guard is here. A second report for the same
-                // document cannot re-raise a banner the user dismissed.
-                guard imageFailureReportGeneration != loadGeneration else {
-                    bridgeLog("rejected channel=imageLoadFailure reason=duplicate-report")
-                    return
-                }
-                imageFailureReportGeneration = loadGeneration
+                // One-shot PER COMMITTED DOCUMENT, enforced in Swift for the same
+                // reason `requestFit` and `requestWidthRefit` are:
+                // `__tmImageFailureReported` lives in the isolated world and is only
+                // advisory, so the authoritative guard is here. A second report for
+                // the same document cannot re-raise a banner the user dismissed —
+                // and a report from the document being REPLACED is attributed to the
+                // document it came from, never to the one about to arrive.
+                guard honourOneShot(.imageFailureReport, channel: "imageLoadFailure") else { return }
                 bridgeLog("imageLoadFailure failed=\(report.failed) deferred=\(report.deferred)")
                 if failedImageCount != report.failed { failedImageCount = report.failed }
+            }
+        }
+
+        /// Spend `oneShot` for the document currently on screen, or log why not.
+        ///
+        /// The whole decision lives in `CommittedDocumentGate`; this is only the
+        /// log-line half, kept here because `bridgeLog` is a coordinator method.
+        /// The refusal token composes as `<reason>-<request>` so the existing
+        /// `duplicate-requestFit` / `duplicate-requestWidthRefit` log strings are
+        /// unchanged and the new `no-committed-document-…` reason is greppable.
+        private func honourOneShot(_ oneShot: RenderOneShot, channel: String) -> Bool {
+            switch documentGate.evaluate(oneShot) {
+            case .honour:
+                return true
+            case .refuse(let refusal):
+                bridgeLog("rejected channel=\(channel) reason=\(refusal.rawValue)-\(oneShot.rawValue)")
+                return false
             }
         }
 
@@ -1570,16 +1625,16 @@ private struct HTMLWebView: UIViewRepresentable {
                 // frame is sized + revealed as soon as the width is known. fit()
                 // sets __tmFitDone and re-posts the final height through here.
                 if dict["requestFit"] as? Bool == true {
-                    // One-shot PER LOAD, enforced in Swift. `__tmFitRequested`
-                    // in monitorHeightJS is the JS-side copy (since P3 it lives
-                    // in `RenderContentWorld.isolated`, not the page world) and
-                    // is only advisory; this is the authoritative guard, so a
-                    // document cannot drive an unbounded re-fit loop.
-                    guard fitRequestGeneration != loadGeneration else {
-                        bridgeLog("rejected channel=heightChanged reason=duplicate-requestFit")
-                        return
-                    }
-                    fitRequestGeneration = loadGeneration
+                    // One-shot PER COMMITTED DOCUMENT, enforced in Swift.
+                    // `__tmFitRequested` in monitorHeightJS is the JS-side copy
+                    // (since P3 it lives in `RenderContentWorld.isolated`, not the
+                    // page world) and is only advisory; this is the authoritative
+                    // guard, so a document cannot drive an unbounded re-fit loop.
+                    // Losing this request is the one of the three that self-heals —
+                    // `didFinish` calls `fit()` directly — so it costs timing, not
+                    // correctness. That is a reason it is LOW impact, not a reason
+                    // to leave it keyed on the issued generation.
+                    guard honourOneShot(.fit, channel: "heightChanged") else { return }
                     fit(webView)
                     return
                 }
@@ -1590,14 +1645,18 @@ private struct HTMLWebView: UIViewRepresentable {
                 // path. One-shot: the JS side sets __tmWidthRefitRequested
                 // before posting, so this cannot loop.
                 if dict["requestWidthRefit"] as? Bool == true {
-                    // Same one-shot-per-load rule as `requestFit`;
+                    // Same one-shot-per-COMMITTED-DOCUMENT rule as `requestFit`;
                     // `__tmWidthRefitRequested` is the advisory JS-side copy
                     // (isolated world since P3), not the authority.
-                    guard widthRefitRequestGeneration != loadGeneration else {
-                        bridgeLog("rejected channel=heightChanged reason=duplicate-requestWidthRefit")
-                        return
-                    }
-                    widthRefitRequestGeneration = loadGeneration
+                    //
+                    // ⚠️ This is the arm where mis-attribution is VISIBLE. If the
+                    // outgoing document's late request consumed the incoming
+                    // document's slot, the incoming one's real request is refused
+                    // and `fitViewportJS`'s idempotency guard (`__tmLayoutVp`
+                    // already set) blocks every other re-fit path — so the message
+                    // renders with the uncorrected horizontal overflow `758fac32f`
+                    // restored, recoverable only by rotating the device.
+                    guard honourOneShot(.widthRefit, channel: "heightChanged") else { return }
                     resetAndFit(webView)
                     return
                 }

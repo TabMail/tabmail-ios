@@ -604,33 +604,54 @@ struct RenderBridgeInputTests {
 // =====================================================================================
 // P1d — the bridge-liveness beacon.
 //
-// THE INVARIANT: *every committed load emits exactly one bridge verdict.*
+// THE INVARIANT: *every committed load emits exactly one bridge verdict, and that verdict
+// is a statement about the document that committed.*
 //
 // Pinned at the sequence level, not at the text of the log line. The device evidence
 // that forced this (`KH4CLK`, 2026-08-12) is a load that COMMITTED, ran its user scripts,
 // never FINISHED, and therefore reported nothing at all — an alarm whose absence was
 // indistinguishable from the alarm not existing.
+//
+// The second half of the invariant is the 2026-08-13 finding: a `WKScriptMessage` carries
+// no document identity, so evidence keyed on the ISSUED generation let the OUTGOING
+// document's late timers vouch for the INCOMING one. That direction is the expensive one —
+// it makes the alarm fail OPEN — so these drive the beacon against a real
+// `CommittedDocumentGate` rather than handing it generations directly.
 // =====================================================================================
 
 @Suite("P1d bridge-liveness beacon — every committed load emits exactly one verdict")
 struct BridgeLivenessBeaconTests {
 
+    /// One load's production sequence: `wrapAndLoad` hands it to WebKit, `didCommit`
+    /// promotes it. Spelled out as two events because running them together is the bug
+    /// `CommittedDocumentGate` exists to prevent.
+    private func issueAndCommit(_ gate: inout CommittedDocumentGate, generation: Int) {
+        gate.issue(generation: generation)
+        gate.commit(isIssuedLoad: true)
+    }
+
     /// Drives the real arm/settle sequence and returns every verdict a load produced.
+    ///
+    /// `bridgeMessageDuring` is the generation that was the COMMITTED document when a
+    /// bridge message arrived (`nil` = none ever did); `settlesUnder` is the document
+    /// committed by the time the grace periods expire.
     private func verdicts(
         commits: [Int],
-        currentGeneration: Int,
-        lastBridgeMessageGeneration: Int?
+        bridgeMessageDuring: Int?,
+        settlesUnder: Int
     ) -> [BridgeLivenessVerdict] {
+        var gate = CommittedDocumentGate()
         var beacon = BridgeLivenessBeacon()
-        var out: [BridgeLivenessVerdict] = []
-        for generation in commits where beacon.arm(generation: generation) {
-            if let v = BridgeLivenessBeacon.settle(
-                generation: generation,
-                currentGeneration: currentGeneration,
-                lastBridgeMessageGeneration: lastBridgeMessageGeneration
-            ) { out.append(v) }
+        var armed: [Int] = []
+        for generation in commits {
+            issueAndCommit(&gate, generation: generation)
+            if let armedGeneration = beacon.arm(in: gate) { armed.append(armedGeneration) }
+            if bridgeMessageDuring == generation { beacon.recordBridgeMessage(in: gate) }
         }
-        return out
+        if gate.committedGeneration != settlesUnder {
+            issueAndCommit(&gate, generation: settlesUnder)
+        }
+        return armed.compactMap { beacon.settle(generation: $0, in: gate) }
     }
 
     @Test("A load that COMMITS but never FINISHES still reports — the KH4CLK blind spot")
@@ -638,43 +659,111 @@ struct BridgeLivenessBeaconTests {
         // The whole sequence for this load is: didCommit, then nothing. `didFinish` is
         // never called — KH4CLK's images never settled — so a verdict armed there would
         // never fire. Armed at commit, it does.
-        let out = verdicts(commits: [1], currentGeneration: 1, lastBridgeMessageGeneration: 1)
+        let out = verdicts(commits: [1], bridgeMessageDuring: 1, settlesUnder: 1)
         #expect(out == [.live],
                 "KH4CLK's user scripts provably ran ([ImageLoadDiag id=KH4CLK +1ms] inventory images=5, the line right after its didCommit), so the verdict for a committed-but-unfinished load is LIVE — and there must BE one")
     }
 
     @Test("Silence is reported, not omitted")
     func silenceIsReported() {
-        let out = verdicts(commits: [4], currentGeneration: 4, lastBridgeMessageGeneration: nil)
+        let out = verdicts(commits: [4], bridgeMessageDuring: nil, settlesUnder: 4)
         #expect(out == [.silent],
                 "SILENT is the designated alarm for the catastrophic-quiet failure mode; it must be a sentence, not an absence")
-        // A bridge message from an OLDER load proves nothing about this one.
-        let stale = verdicts(commits: [4], currentGeneration: 4, lastBridgeMessageGeneration: 3)
+        // A bridge message from an OLDER document proves nothing about this one.
+        let stale = verdicts(commits: [3, 4], bridgeMessageDuring: 3, settlesUnder: 4)
         #expect(stale == [.silent])
+    }
+
+    @Test("A bridge message from the OUTGOING document must not report the INCOMING one as LIVE")
+    func aSupersededDocumentsMessageDoesNotForgeLivenessForTheNextLoad() {
+        // THE INVARIANT, and the direction that matters: an alarm may fail closed and may
+        // not fail open. `Coordinator.userContentController(_:didReceive:)` records the
+        // evidence for EVERY channel and BEFORE any dispatch, so it sits upstream of the
+        // one-shot gate and the gate cannot shield it — the attribution has to be right
+        // where it is written.
+        var gate = CommittedDocumentGate()
+        var beacon = BridgeLivenessBeacon()
+
+        // Document A commits and is the document on screen.
+        issueAndCommit(&gate, generation: 1)
+        #expect(beacon.arm(in: gate) == 1)
+
+        // A rebind calls `wrapAndLoad`, whose FIRST statement bumps `loadGeneration`; the
+        // detached `EmailHTMLWrapper.wrapHTML` (100 ms–1 s+ of CPU) and WebKit's
+        // provisional load all happen after it. A is still committed for all of it.
+        gate.issue(generation: 2)
+
+        // A's ResizeObserver / 60 ms settle timers fire inside that window and post.
+        beacon.recordBridgeMessage(in: gate)
+
+        // B commits. Its user scripts never execute — the catastrophic-quiet failure mode
+        // this beacon is the designated alarm for.
+        gate.commit(isIssuedLoad: true)
+        #expect(beacon.arm(in: gate) == 2)
+
+        #expect(beacon.settle(generation: 2, in: gate) == .silent,
+                "document B ran zero JavaScript; document A's late message must not report it LIVE")
+
+        // NON-VACUITY, the other side: once B's OWN scripts reach Swift it reads LIVE, so
+        // this is not satisfied by a beacon that never says LIVE at all.
+        beacon.recordBridgeMessage(in: gate)
+        #expect(beacon.settle(generation: 2, in: gate) == .live)
+    }
+
+    @Test("Nothing on screen means nothing to vouch for — and no evidence is erased")
+    func aMessageWithNoCommittedDocumentIsNotRecorded() {
+        // After `invalidateNavigationState` (content-process death, server redirect) there
+        // is no document a message could have come from. Recording one would attribute it
+        // to whatever loads next; erasing the existing evidence would turn a LIVE document
+        // silent. Neither happens.
+        var gate = CommittedDocumentGate()
+        var beacon = BridgeLivenessBeacon()
+        issueAndCommit(&gate, generation: 1)
+        beacon.recordBridgeMessage(in: gate)
+        #expect(beacon.settle(generation: 1, in: gate) == .live)
+
+        gate.invalidate()
+        beacon.recordBridgeMessage(in: gate)
+
+        // The recovery load commits; it has posted nothing of its own.
+        issueAndCommit(&gate, generation: 2)
+        #expect(beacon.settle(generation: 2, in: gate) == .silent,
+                "a message received while nothing was committed must not vouch for the recovery load")
+        // And there is no verdict at all while nothing is committed.
+        var dead = CommittedDocumentGate()
+        dead.issue(generation: 3)
+        #expect(beacon.settle(generation: 3, in: dead) == nil)
     }
 
     @Test("EXACTLY one — a second commit for the same load cannot produce a second verdict")
     func exactlyOneVerdictPerLoad() {
         // This is the structural half of the invariant: it must be impossible to double-
         // report, including via a future edit that re-adds an arm from `didFinish`.
-        let out = verdicts(commits: [9, 9, 9], currentGeneration: 9, lastBridgeMessageGeneration: 9)
+        let out = verdicts(commits: [9, 9, 9], bridgeMessageDuring: 9, settlesUnder: 9)
         #expect(out == [.live], "three arms of one generation, one verdict")
 
+        var gate = CommittedDocumentGate()
         var beacon = BridgeLivenessBeacon()
-        #expect(beacon.arm(generation: 2) == true)
-        #expect(beacon.arm(generation: 2) == false, "re-arming the same generation is refused")
-        #expect(beacon.arm(generation: 3) == true, "a genuinely new load arms again")
+        #expect(beacon.arm(in: gate) == nil, "nothing is committed, so there is nothing to arm")
+        issueAndCommit(&gate, generation: 2)
+        #expect(beacon.arm(in: gate) == 2)
+        #expect(beacon.arm(in: gate) == nil, "re-arming the same committed document is refused")
+        issueAndCommit(&gate, generation: 3)
+        #expect(beacon.arm(in: gate) == 3, "a genuinely new document arms again")
     }
 
     @Test("Two distinct committed loads each get their own verdict")
     func twoLoadsTwoVerdicts() {
+        var gate = CommittedDocumentGate()
         var beacon = BridgeLivenessBeacon()
-        #expect(beacon.arm(generation: 1) == true)
-        #expect(BridgeLivenessBeacon.settle(generation: 1, currentGeneration: 1,
-                                            lastBridgeMessageGeneration: 1) == .live)
-        #expect(beacon.arm(generation: 2) == true)
-        #expect(BridgeLivenessBeacon.settle(generation: 2, currentGeneration: 2,
-                                            lastBridgeMessageGeneration: nil) == .silent)
+        issueAndCommit(&gate, generation: 1)
+        #expect(beacon.arm(in: gate) == 1)
+        beacon.recordBridgeMessage(in: gate)
+        #expect(beacon.settle(generation: 1, in: gate) == .live)
+
+        issueAndCommit(&gate, generation: 2)
+        #expect(beacon.arm(in: gate) == 2)
+        #expect(beacon.settle(generation: 2, in: gate) == .silent)
     }
 
     @Test("A SUPERSEDED load is silent about itself — the one documented exception")
@@ -684,9 +773,206 @@ struct BridgeLivenessBeaconTests {
         // screen, and supersession is separately logged (`issued gen=…` / `superseded
         // gen=…`), so its silence is explained rather than mysterious. Pre-existing
         // behaviour; P1d re-sequenced the arm and deliberately did not change this.
-        #expect(BridgeLivenessBeacon.settle(generation: 5, currentGeneration: 6,
-                                            lastBridgeMessageGeneration: 5) == nil)
-        #expect(BridgeLivenessBeacon.settle(generation: 5, currentGeneration: 6,
-                                            lastBridgeMessageGeneration: nil) == nil)
+        //
+        // "Superseded" now means a newer document COMMITTED — replacing what is on
+        // screen — rather than a newer load merely having been issued.
+        var gate = CommittedDocumentGate()
+        var spoke = BridgeLivenessBeacon()
+        issueAndCommit(&gate, generation: 5)
+        spoke.recordBridgeMessage(in: gate)
+        issueAndCommit(&gate, generation: 6)
+        // Load 5 had proven itself live, and still reports nothing once 6 replaced it.
+        #expect(spoke.settle(generation: 5, in: gate) == nil)
+        // …and so does a load that never posted at all: supersession outranks both verdicts.
+        let quiet = BridgeLivenessBeacon()
+        #expect(quiet.settle(generation: 5, in: gate) == nil)
+    }
+}
+
+// =====================================================================================
+// The committed-document gate — WHICH DOCUMENT a one-shot bridge request belongs to.
+//
+// THE INVARIANT THESE PIN, and it is two-sided:
+//   • a one-shot request that arrives after the next load was ISSUED but before that
+//     load COMMITTED is attributed to the OLD document — it spends the old document's
+//     slot, not the new one's;
+//   • and the new document, once committed, still gets its own request honoured.
+//
+// One direction alone is worthless here. A gate that refused everything would satisfy
+// the first; a gate that honoured everything would satisfy the second; only the pair
+// distinguishes "the right document" from "some document".
+//
+// Why the sequence rather than a field comparison: the defect and the fix differ ONLY in
+// when a generation is adopted. `#expect(gate.committedGeneration == …)` would restate
+// the mechanism and stay green through the bug, which is exactly the class of test
+// (MIS-015) that let the P4 candidate ship with it.
+// =====================================================================================
+
+@Suite("Committed-document gate — a one-shot belongs to the document that committed")
+struct CommittedDocumentGateTests {
+
+    /// The production sequence for one load: `wrapAndLoad` hands it to WebKit, then
+    /// `didCommit` promotes it. Kept as a helper so every test spells the two events out
+    /// separately — running them together is the bug.
+    private func issueAndCommit(_ gate: inout CommittedDocumentGate, generation: Int) {
+        gate.issue(generation: generation)
+        gate.commit(isIssuedLoad: true)
+    }
+
+    @Test("A late request from the OUTGOING document does not consume the INCOMING document's slot")
+    func aLateRequestFromTheOldDocumentIsAttributedToIt() {
+        // The measured window: `wrapAndLoad`'s FIRST statement bumps `loadGeneration`,
+        // and only then does the detached `wrapHTML` (100 ms–1 s+ of CPU), the main-actor
+        // hop and WebKit's provisional load happen. Document A is committed and posting
+        // throughout, and `WKScriptMessage` carries no document identity.
+        var gate = CommittedDocumentGate()
+        issueAndCommit(&gate, generation: 1)                      // document A on screen
+        #expect(gate.evaluate(.widthRefit) == .honour,
+                "A's own request must be honoured — the gate is not merely a suppressor")
+
+        // Document B is ISSUED. Note what does NOT happen: nothing commits, because the
+        // wrap has not finished and WebKit has not replaced anything. A is still the
+        // document on screen.
+        gate.issue(generation: 2)
+
+        // A's timers fire again inside that window. This is A's second request, so it is
+        // refused as A's DUPLICATE — the fact that a newer generation exists is not
+        // allowed to make it look like B's first.
+        #expect(gate.evaluate(.widthRefit) == .refuse(.duplicate))
+
+        // B commits and posts its own, genuine request.
+        gate.commit(isIssuedLoad: true)
+        #expect(gate.evaluate(.widthRefit) == .honour,
+                "keyed on the ISSUED generation, A's late message spent B's slot and B rendered with the uncorrected horizontal overflow 758fac32f restored — recoverable only by rotating the device")
+    }
+
+    @Test("Every one-shot channel gets the same attribution, not just the one that hurt most")
+    func everyOneShotIsAttributedToTheCommittedDocument() {
+        // Enumerated from `CaseIterable` rather than listed, so a fourth channel added to
+        // the gate is covered here the day it appears instead of the day someone
+        // remembers to widen a hand-written list.
+        for oneShot in RenderOneShot.allCases {
+            var gate = CommittedDocumentGate()
+            issueAndCommit(&gate, generation: 10)
+            #expect(gate.evaluate(oneShot) == .honour, "\(oneShot.rawValue): document A's own request")
+            gate.issue(generation: 11)
+            #expect(gate.evaluate(oneShot) == .refuse(.duplicate), "\(oneShot.rawValue): A's late repeat")
+            gate.commit(isIssuedLoad: true)
+            #expect(gate.evaluate(oneShot) == .honour, "\(oneShot.rawValue): B's own request")
+        }
+    }
+
+    @Test("The channels are independent — spending one does not spend the others")
+    func theChannelsDoNotShareASlot() {
+        // A message that both loses images AND needs a width re-fit must do both, which
+        // is the same reason the JS census keeps its own `__tmImageFailureReported`
+        // rather than inheriting `check()`'s guards.
+        var gate = CommittedDocumentGate()
+        issueAndCommit(&gate, generation: 3)
+        #expect(gate.evaluate(.imageFailureReport) == .honour)
+        #expect(gate.evaluate(.widthRefit) == .honour)
+        #expect(gate.evaluate(.fit) == .honour)
+        #expect(gate.evaluate(.imageFailureReport) == .refuse(.duplicate))
+    }
+
+    @Test("Nothing is honoured before a document commits, or after one is invalidated")
+    func nothingIsHonouredWithoutACommittedDocument() {
+        // Fail-closed, both at the start and after the content process died or a
+        // redirect made the document not the one we admitted. Refusing costs at most a
+        // timing detail — `didFinish` calls `fit()` directly regardless — while
+        // honouring would attribute a dead document's message to whatever loads next.
+        var gate = CommittedDocumentGate()
+        #expect(gate.evaluate(.fit) == .refuse(.noCommittedDocument))
+
+        // Issued but not yet committed: the provisional load has not replaced anything,
+        // so there is still no document that could have posted this.
+        gate.issue(generation: 1)
+        #expect(gate.evaluate(.fit) == .refuse(.noCommittedDocument))
+
+        gate.commit(isIssuedLoad: true)
+        #expect(gate.evaluate(.fit) == .honour)
+
+        gate.invalidate()
+        #expect(gate.evaluate(.fit) == .refuse(.noCommittedDocument))
+        #expect(gate.evaluate(.widthRefit) == .refuse(.noCommittedDocument))
+
+        // And recovery works: the termination path invalidates and then loads again.
+        issueAndCommit(&gate, generation: 2)
+        #expect(gate.evaluate(.fit) == .honour, "the recovery load must not inherit the refusal")
+    }
+
+    @Test("A repeated didCommit for one navigation is idempotent; a load that never commits never promotes itself")
+    func commitIsIdempotentAndNonCommittingLoadsNeverPromote() {
+        var gate = CommittedDocumentGate()
+        issueAndCommit(&gate, generation: 1)
+        #expect(gate.evaluate(.fit) == .honour)
+        // A second commit callback for the same navigation must not hand the document a
+        // fresh slot — that would be a second banner for one document.
+        gate.commit(isIssuedLoad: true)
+        #expect(gate.evaluate(.fit) == .refuse(.duplicate))
+
+        // A load that is issued and then fails provisionally (WebKit gives a superseded
+        // load no callback at all) must leave the committed document exactly as it was.
+        gate.issue(generation: 2)
+        #expect(gate.evaluate(.widthRefit) == .honour, "still document 1's slot")
+        #expect(gate.evaluate(.widthRefit) == .refuse(.duplicate),
+                "and it was document 1 that spent it, so document 1 cannot spend it twice")
+    }
+
+    @Test("A SUPERSEDED commit callback does not consume the newer load's one-shot")
+    func aSupersededCommitDoesNotConsumeTheNewerLoadsOneShot() {
+        // THE INVARIANT: a `didCommit` that belongs to a load a newer `issue` has already
+        // superseded must not adopt the newer generation. `Coordinator.webView(_:didCommit:)`
+        // computed `isTracked(navigation)` for its log line and then committed
+        // unconditionally, so document A's late commit callback labelled A with B's
+        // identity — A spent B's `widthRefit` slot and B's own request was refused as a
+        // duplicate, which is the user-visible defect this workstream exists to prevent
+        // (`fitViewportJS`'s `__tmLayoutVp` guard blocks every other re-fit path, so B
+        // renders with uncorrected horizontal overflow until the device is rotated).
+        //
+        // ADR-IOS-076 decision 4 already required this callback to be idempotent AND
+        // identity-matched; the generation adoption was the one part that was neither.
+        var gate = CommittedDocumentGate()
+        issueAndCommit(&gate, generation: 1)                   // document A on screen
+
+        // Load B is issued. `trackedNavigation` is now B's, so A's commit callback —
+        // delivered late — is no longer the issued load.
+        gate.issue(generation: 2)
+        #expect(gate.commit(isIssuedLoad: false) == 1,
+                "A's late commit reports the document that is actually on screen, not B")
+
+        // A's own one-shot is still A's, and spending it must not touch B's.
+        #expect(gate.evaluate(.widthRefit) == .honour, "still document A's slot")
+        #expect(gate.evaluate(.widthRefit) == .refuse(.duplicate))
+
+        // B commits for real and gets its OWN slot.
+        #expect(gate.commit(isIssuedLoad: true) == 2)
+        #expect(gate.evaluate(.widthRefit) == .honour,
+                "B's genuine width re-fit request must be honoured — it was refused as a duplicate while A's superseded commit was allowed to adopt B's generation")
+    }
+
+    @Test("Every one-shot channel survives a superseded commit, and a refused commit changes nothing")
+    func aSupersededCommitIsInertOnEveryChannel() {
+        // The class, not the instance (A7): `widthRefit` is the arm with the visible cost,
+        // but all three are attributed the same way.
+        for oneShot in RenderOneShot.allCases {
+            var gate = CommittedDocumentGate()
+            issueAndCommit(&gate, generation: 4)
+            #expect(gate.evaluate(oneShot) == .honour, "\(oneShot.rawValue): A's own request")
+            gate.issue(generation: 5)
+            gate.commit(isIssuedLoad: false)
+            #expect(gate.evaluate(oneShot) == .refuse(.duplicate),
+                    "\(oneShot.rawValue): a superseded commit must not hand A a fresh slot either")
+            gate.commit(isIssuedLoad: true)
+            #expect(gate.evaluate(oneShot) == .honour, "\(oneShot.rawValue): B's own request")
+        }
+
+        // A refused commit before anything has committed leaves the gate closed rather
+        // than promoting the issued load — the fail-closed direction, and the negative
+        // case that stops `isIssuedLoad: false` being read as "commit anyway".
+        var fresh = CommittedDocumentGate()
+        fresh.issue(generation: 1)
+        #expect(fresh.commit(isIssuedLoad: false) == nil)
+        #expect(fresh.evaluate(.fit) == .refuse(.noCommittedDocument))
     }
 }

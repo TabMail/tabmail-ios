@@ -316,36 +316,227 @@ internal enum BridgeLivenessVerdict: String, Equatable {
 /// silence is explained rather than mysterious. That exception is the pre-existing,
 /// deliberate behaviour — a superseded load's verdict describes a document that is no
 /// longer on screen — and P1d does not change it.
+///
+/// ⚠️ **EVERY generation this type handles is a COMMITTED one, and that is the whole of
+/// the 2026-08-13 fix.** `4213cb3a9` re-keyed the three render one-shots from
+/// `loadGeneration` onto the committed document and left this fourth consumer of the same
+/// keying, on the same code path, behind. `loadGeneration` is bumped by
+/// `Coordinator.wrapAndLoad`'s FIRST statement — a whole off-main wrap (100 ms–1 s+ of CPU)
+/// and a provisional load before the new document exists — so throughout that window the
+/// OLD document is still committed, still running its `ResizeObserver` and its 60 ms settle
+/// timers, and still posting. Stamping those messages with `loadGeneration` recorded the
+/// INCOMING load's identity as evidence that the incoming load's scripts had run. The
+/// incoming document could then execute zero JavaScript and still be reported `bridge=LIVE`
+/// — an alarm failing OPEN, in the one direction an alarm must not.
+///
+/// So both halves are asked of `CommittedDocumentGate`: `recordBridgeMessage(in:)` attributes
+/// the evidence to the document that was on screen when it arrived, and `arm(in:)` /
+/// `settle(generation:in:)` ask the same source which document that is. Nothing here reads
+/// `loadGeneration`, and nothing should: a bridge message can only have originated in the
+/// document that is currently committed, which is exactly the identity `WKScriptMessage`
+/// withholds.
 internal struct BridgeLivenessBeacon: Equatable {
     /// The most recent generation that has been armed. A generation is armed AT MOST
     /// ONCE, so a second `didCommit` for the same load — or a future edit that re-adds
     /// an arm from `didFinish` — cannot produce a second verdict.
     private(set) var armedGeneration: Int?
 
-    init(armedGeneration: Int? = nil) {
+    /// The COMMITTED generation that was on screen when the last `WKScriptMessage` arrived
+    /// on any bridge channel (`HTMLWebView.bridgeChannels`) — i.e. the last document for
+    /// which app JavaScript provably executed and provably reached Swift. P4 added a
+    /// fourth channel, `imageLoadFailure`; this is deliberately channel-agnostic, so a new
+    /// channel widens what can prove liveness and changes nothing else.
+    ///
+    /// **Why this signal exists at all (P1b, owner requirement 2026-08-12).** Every render
+    /// behaviour in `AutoSizingHTMLView` is a `WKUserScript`, and so is every JS-side
+    /// diagnostic. If WebKit ever stopped executing app-injected script — the exact hazard
+    /// `allowsContentJavaScript = false` and `script-src 'none'` raise — the render would
+    /// break AND the instrumentation that would report it would go silent in the same
+    /// instant. The owner would see a blank or mangled message and an empty log, which is
+    /// the least diagnosable possible outcome, because SILENCE IS OTHERWISE
+    /// INDISTINGUISHABLE FROM SUCCESS.
+    ///
+    /// So this one signal deliberately does **not** depend on page JavaScript: it is
+    /// written from the Swift side of the bridge, and the coordinator's
+    /// `scheduleBridgeLivenessCheck()` says out loud when nothing arrived. The *recording*
+    /// is ungated (a single store, no I/O, so it is correct in release too); only the
+    /// *reporting* is debug-gated, per development rule 12.
+    private(set) var lastBridgeMessageGeneration: Int?
+
+    init(armedGeneration: Int? = nil, lastBridgeMessageGeneration: Int? = nil) {
         self.armedGeneration = armedGeneration
+        self.lastBridgeMessageGeneration = lastBridgeMessageGeneration
     }
 
-    /// Arm the verdict timer for a committed load. Returns `true` when the caller should
-    /// actually schedule one, `false` when this generation is already armed.
-    mutating func arm(generation: Int) -> Bool {
-        guard armedGeneration != generation else { return false }
-        armedGeneration = generation
-        return true
+    /// Arm the verdict timer for the document `gate` says is committed, returning the
+    /// generation the caller should schedule a verdict for — or `nil` when there is
+    /// nothing to arm (no committed document, or this document is already armed).
+    ///
+    /// The generation is taken FROM the gate rather than passed in, because "which
+    /// document just committed" is the question this whole file exists to answer once.
+    /// A caller that supplied its own would be free to supply `loadGeneration`, which is
+    /// the defect.
+    mutating func arm(in gate: CommittedDocumentGate) -> Int? {
+        guard let committed = gate.committedGeneration else { return nil }
+        guard armedGeneration != committed else { return nil }
+        armedGeneration = committed
+        return committed
+    }
+
+    /// Record that a bridge message arrived — attributed to the document that is on
+    /// screen NOW, never to a load that has merely been issued.
+    ///
+    /// With nothing committed there is no document the message could have come from, so
+    /// nothing is recorded and nothing already recorded is erased. That fails closed
+    /// (toward `SILENT`), which is the correct direction for an alarm.
+    mutating func recordBridgeMessage(in gate: CommittedDocumentGate) {
+        guard let committed = gate.committedGeneration else { return }
+        lastBridgeMessageGeneration = committed
     }
 
     /// The verdict for `generation` when its grace period expires, or `nil` when a newer
-    /// load has superseded it.
+    /// load has committed and superseded it.
     ///
-    /// Pure: the caller supplies the state, so a test drives every branch without a
-    /// timer.
-    static func settle(
-        generation: Int,
-        currentGeneration: Int,
-        lastBridgeMessageGeneration: Int?
-    ) -> BridgeLivenessVerdict? {
-        guard currentGeneration == generation else { return nil }
+    /// Pure: the caller supplies the state, so a test drives every branch without a timer.
+    func settle(generation: Int, in gate: CommittedDocumentGate) -> BridgeLivenessVerdict? {
+        guard gate.committedGeneration == generation else { return nil }
         return lastBridgeMessageGeneration == generation ? .live : .silent
+    }
+}
+
+// MARK: - The committed-document gate
+
+/// The bridge requests that may be honoured AT MOST ONCE per document. Raw values are the
+/// tokens the coordinator's debug log already used.
+internal enum RenderOneShot: String, Equatable, CaseIterable {
+    /// `monitorHeightJS`'s first-layout `{requestFit:true}`.
+    case fit = "requestFit"
+    /// `postImageWidthRecheckJS`'s `{requestWidthRefit:true}`.
+    case widthRefit = "requestWidthRefit"
+    /// P4's `imageLoadFailure` census.
+    case imageFailureReport = "imageLoadFailure"
+}
+
+/// Why a one-shot request was not honoured. Raw values are log tokens.
+internal enum OneShotRefusal: String, Equatable {
+    /// No document is committed, so nothing on screen could have produced this message.
+    case noCommittedDocument = "no-committed-document"
+    /// The committed document has already had this request honoured.
+    case duplicate = "duplicate"
+}
+
+internal enum OneShotDecision: Equatable {
+    case honour
+    case refuse(OneShotRefusal)
+}
+
+/// Which document a bridge message belongs to, and whether that document has already spent
+/// each of its one-shot requests.
+///
+/// **The defect this closes.** `Coordinator.wrapAndLoad`'s FIRST statement is
+/// `loadGeneration &+= 1`, and everything expensive happens after it: the detached
+/// `EmailHTMLWrapper.wrapHTML` (priced in its own doc comment at 100 ms–1 s+ of CPU), the
+/// main-actor hop, and WebKit's provisional load. Throughout that window the OLD document is
+/// still committed, still running its timers, and still posting. A `WKScriptMessage` carries
+/// no document identity — `RenderBridgeInput.acceptsMessage(fromMainFrame:)` tests the FRAME,
+/// and the old document's main frame is still the main frame — so a one-shot keyed on
+/// `loadGeneration` is a DUPLICATE SUPPRESSOR, not a staleness gate: it stamps the old
+/// document's late message with the NEW document's generation and then refuses the new
+/// document's own.
+///
+/// Measured consequence, and it is not symmetric across the three:
+///   * `widthRefit` is the one with a visible cost. Document A's late `requestWidthRefit`
+///     consumes B's slot, B's real request is refused, and `fitViewportJS`'s idempotency
+///     guard (`window.__tmLayoutVp` already set) blocks every other re-fit path — so B
+///     renders with the uncorrected horizontal overflow that `758fac32f` was written to
+///     restore, recoverable only by rotating the device.
+///   * `fit` is genuinely self-healing: `didFinish` calls `fit()` directly, so losing the
+///     early request costs timing, not correctness.
+///   * `imageFailureReport` shows document A's accusation over document B — a claim about a
+///     stranger's mail server, on a message that may have lost nothing.
+///
+/// **The fix is to key on a COMMITTED generation.** `loadGeneration` keeps its meaning
+/// unchanged — `wrapAndLoad`'s own supersession check `guard self.loadGeneration == gen`
+/// depends on the early increment — and this type carries the second, later fact. A bridge
+/// message can only have originated in the document that is currently committed, which is
+/// exactly the identity `WKScriptMessage` withholds.
+///
+/// **Why it models BOTH events rather than taking a generation at commit time.** The
+/// difference between the defect and the fix is entirely in WHEN the generation is adopted,
+/// so a type that is merely told "generation N is current" cannot tell the two designs
+/// apart, and neither can any test of it. Modelling `issue` (a load was handed to WebKit;
+/// the old document is still on screen) separately from `commit` (that load replaced it)
+/// puts the whole sequence inside one testable value — which is the same reason
+/// `NavigationPermitState` and `BridgeLivenessBeacon` live in this file.
+///
+/// Ordering is guaranteed by WebKit, not assumed: `didCommit` precedes document parsing, so
+/// it precedes every `.atDocumentStart` / `.atDocumentEnd` user script and therefore every
+/// bridge message the new document can post.
+internal struct CommittedDocumentGate: Equatable {
+    /// The generation of the most recent load handed to `loadHTMLString`. Deliberately does
+    /// NOT decide attribution: issuing a load does not replace the document on screen.
+    private(set) var issuedGeneration: Int?
+    /// The generation of the document currently committed — the only document a bridge
+    /// message can have come from.
+    private(set) var committedGeneration: Int?
+    private var honoured: [RenderOneShot: Int] = [:]
+
+    init() {}
+
+    /// A load was handed to WebKit. The previously committed document keeps posting until
+    /// this one commits, and keeps its own one-shot slots until then.
+    mutating func issue(generation: Int) {
+        issuedGeneration = generation
+    }
+
+    /// The issued load committed and is now the document on screen. Returns the newly
+    /// committed generation for logging, or `nil` when nothing was issued — which fails
+    /// closed rather than leaving a dead document's generation adopted.
+    ///
+    /// `issuedGeneration` is deliberately NOT cleared, so a repeated `didCommit` for one
+    /// navigation is idempotent, and a load that never commits cannot promote itself.
+    ///
+    /// **`isIssuedLoad` is the caller's answer to "is the navigation that just committed
+    /// the one `issue(generation:)` described?"** — the coordinator answers it by
+    /// `WKNavigation` identity, the same discriminator it already prints on this line.
+    /// ADR-IOS-076 decision 4 requires every post-policy callback to be *idempotent and
+    /// identity-matched*, and adopting a generation is the one thing this callback does
+    /// that is neither unless the answer is consulted.
+    ///
+    /// Pass `false` for a `didCommit` belonging to a load that a newer `issue` has already
+    /// superseded. Adopting there would label the OLD document with the NEW document's
+    /// identity: the old document would spend the new one's `widthRefit` slot, the new
+    /// document's own request would be refused as a duplicate, and `fitViewportJS`'s
+    /// idempotency guard (`window.__tmLayoutVp` already set) blocks every other re-fit
+    /// path — i.e. exactly the user-visible defect `4213cb3a9` removed, reintroduced
+    /// through a different door. Refusing instead costs at most a one-shot the outgoing
+    /// document was about to lose anyway, which is the fail-closed direction this gate
+    /// already takes when nothing is committed.
+    ///
+    /// The identity question is deliberately NOT answered by comparing generations here.
+    /// `4213cb3a9` rejected a `trackedGeneration ?? loadGeneration` field for the reason
+    /// that made this type model two events in the first place: a generation cannot say
+    /// WHICH navigation carried it.
+    @discardableResult
+    mutating func commit(isIssuedLoad: Bool) -> Int? {
+        guard isIssuedLoad else { return committedGeneration }
+        committedGeneration = issuedGeneration
+        return committedGeneration
+    }
+
+    /// Drop both halves — the content process died, or a redirect made the document not the
+    /// one we admitted. Everything is refused until a fresh load issues and commits.
+    mutating func invalidate() {
+        issuedGeneration = nil
+        committedGeneration = nil
+    }
+
+    /// Honour `oneShot` for the currently committed document, or say why not.
+    mutating func evaluate(_ oneShot: RenderOneShot) -> OneShotDecision {
+        guard let committed = committedGeneration else { return .refuse(.noCommittedDocument) }
+        guard honoured[oneShot] != committed else { return .refuse(.duplicate) }
+        honoured[oneShot] = committed
+        return .honour
     }
 }
 
