@@ -246,11 +246,39 @@ enum ICSCalendarImporter {
     /// invite, so logging them would be cost without diagnostic value. `UID` is shown as a
     /// display-side prefix plus its length — enough to compare across two taps, which is all
     /// the update question needs.
-    private static func itipFingerprint(_ data: Data, label: String) -> String {
+    ///
+    /// ⚠️ **Unfolds first (RFC 5545 §3.1), and the ORDER is the whole point.** A value
+    /// longer than the physical-line limit continues on the next line, and the marker
+    /// for a continuation is that the line BEGINS WITH SPACE OR HTAB. Splitting into
+    /// physical lines and trimming each one — which is what this did until 2026-08-13 —
+    /// destroys that marker before anything can read it, so every long value was
+    /// reported at its FOLD WIDTH rather than its length, silently and with no sign
+    /// that anything had been cut.
+    ///
+    /// That is not a hypothetical: a device log read one event's `UID` as `(len 71)`
+    /// raw and `(len 70)` sanitized, which reads exactly like the sanitizer corrupting
+    /// iTIP identity. It is not. `ICSSanitizerConfig.physicalLineOctetLimit` is 75 and
+    /// `foldWidthOctets` is 74, so 75 - `"UID:".count` = 71 is the SENDER's fold width
+    /// and 74 - `"UID:".count` = 70 is ours. Both numbers were fold widths; the UID's
+    /// true length was never measured and never changed — the byte counts were
+    /// identical on both lines. The instrument manufactured a false corruption signal
+    /// in the one place it exists to rule one out.
+    ///
+    /// Internal rather than private so the unfold invariant is testable; the only
+    /// production caller is still the debug-gated pair in `presentCalendarImport`.
+    static func itipFingerprint(_ data: Data, label: String) -> String {
         guard let text = String(data: data, encoding: .utf8) else {
             return "[ICSImport][diag] \(label): NOT valid UTF-8, \(data.count) B"
         }
-        let lines = text.components(separatedBy: .newlines).map {
+        // Join continuation lines onto their predecessor BEFORE any trimming. Same four
+        // replacements as `ICSBuilder.parseIncoming` / `ICSParser.unfold`, written out
+        // here rather than reached for across the CalDAV boundary.
+        let unfolded = text
+            .replacingOccurrences(of: "\r\n ", with: "")
+            .replacingOccurrences(of: "\r\n\t", with: "")
+            .replacingOccurrences(of: "\n ", with: "")
+            .replacingOccurrences(of: "\n\t", with: "")
+        let lines = unfolded.components(separatedBy: .newlines).map {
             $0.trimmingCharacters(in: .whitespaces)
         }
         func value(of key: String) -> String {

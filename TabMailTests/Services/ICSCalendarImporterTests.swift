@@ -160,6 +160,119 @@ struct ICSCalendarImporterStateTests {
     }
 }
 
+@Suite("ICSCalendarImporter iTIP fingerprint")
+struct ICSCalendarImporterFingerprintTests {
+
+    // THE INVARIANT THESE PIN: *a folded value's parsed length equals its unfolded TRUE
+    // length.* The fingerprint exists to compare one event's identity across two taps and
+    // across the sanitizer, so a number that is really a fold width is worse than no
+    // number — it is a corruption signal the payload never carried. RFC 5545 §3.1.
+
+    /// Fold `logicalLine` so no physical line exceeds `width` octets, per RFC 5545 §3.1:
+    /// continuation lines begin with a single SPACE, which counts toward the width.
+    private static func fold(_ logicalLine: String, width: Int) -> String {
+        var remaining = Substring(logicalLine)
+        var physical: [String] = []
+        var take = width
+        while remaining.count > take {
+            physical.append(String(remaining.prefix(take)))
+            remaining = remaining.dropFirst(take)
+            take = width - 1 // the leading fold SPACE occupies one octet
+        }
+        physical.append(String(remaining))
+        return physical.joined(separator: "\r\n ")
+    }
+
+    private static func calendar(uid: String, foldWidth: Int) -> Data {
+        let body = [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "METHOD:REQUEST",
+            "BEGIN:VEVENT",
+            fold("UID:\(uid)", width: foldWidth),
+            "SEQUENCE:1",
+            "END:VEVENT",
+            "END:VCALENDAR"
+        ].joined(separator: "\r\n") + "\r\n"
+        return Data(body.utf8)
+    }
+
+    @Test("itipFingerprint reports a folded UID's TRUE length, not the fold width")
+    func fingerprintUnfoldsBeforeMeasuringLength() {
+        // Reproduces the device-log shape that made a byte-for-byte no-op sanitize look
+        // like iTIP corruption: ONE uid, folded by the sender at 75 octets and re-folded
+        // by us at 74, reported as `(len 71)` and `(len 70)`. Both were fold widths minus
+        // `"UID:".count`; the uid itself never changed.
+        let uid = String(repeating: "u", count: 120)
+
+        // Non-vacuity: if the fixture were not actually folded, both halves below would
+        // pass against the pre-fix code and the test would assert nothing.
+        let senderPayload = Self.calendar(uid: uid, foldWidth: 75)
+        #expect(String(data: senderPayload, encoding: .utf8)?.contains("\r\n u") == true,
+                "fixture is not folded — this test cannot see the defect")
+
+        let atSenderWidth = ICSCalendarImporter.itipFingerprint(senderPayload, label: "raw")
+        let atOurWidth = ICSCalendarImporter.itipFingerprint(
+            Self.calendar(uid: uid, foldWidth: 74), label: "sanitized")
+
+        #expect(atSenderWidth.contains("(len 120)"),
+                "pre-fix this read (len 71) — 75 minus \"UID:\", the SENDER's fold width")
+        #expect(atOurWidth.contains("(len 120)"),
+                "pre-fix this read (len 70) — 74 minus \"UID:\", OUR fold width")
+        // Said the other way round too, naming the exact two numbers the device log
+        // produced: neither fold width may ever be reported as a length.
+        #expect(!atSenderWidth.contains("(len 71)"))
+        #expect(!atOurWidth.contains("(len 70)"))
+    }
+
+    @Test("itipFingerprint unfolds before counting, so a continuation cannot forge a property")
+    func fingerprintUnfoldsBeforeCounting() {
+        // The same ordering defect on the COUNT axis. Trimming each physical line strips
+        // the fold SPACE, after which a continuation that happens to begin with a
+        // property name is indistinguishable from that property.
+        let ics = [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "METHOD:REQUEST",
+            "BEGIN:VEVENT",
+            "UID:folded-continuation-probe",
+            "ATTENDEE;CN=One:mailto:one@example.com",
+            "DESCRIPTION:agenda continues on the next physical line —",
+            " ATTENDEE:this is description text, not a fourth attendee",
+            "END:VEVENT",
+            "END:VCALENDAR"
+        ].joined(separator: "\r\n") + "\r\n"
+
+        // Non-vacuity: the continuation must actually be a continuation.
+        #expect(ics.contains("\r\n ATTENDEE:"), "fixture carries no folded continuation")
+
+        let out = ICSCalendarImporter.itipFingerprint(Data(ics.utf8), label: "probe")
+        #expect(out.contains(" ATTENDEE=1"), "pre-fix this counted the continuation and read 2")
+        #expect(!out.contains(" ATTENDEE=2"))
+    }
+
+    @Test("itipFingerprint leaves an unfolded payload's values untouched")
+    func fingerprintIsANoOpWithoutFolding() {
+        // Negative control: unfolding must not perturb the ordinary case, or the two
+        // tests above could pass through a change that mangles every payload equally.
+        let ics = [
+            "BEGIN:VCALENDAR",
+            "METHOD:REPLY",
+            "BEGIN:VEVENT",
+            "UID:short-uid-1234",
+            "SEQUENCE:19",
+            "END:VEVENT",
+            "END:VCALENDAR"
+        ].joined(separator: "\r\n") + "\r\n"
+
+        let out = ICSCalendarImporter.itipFingerprint(Data(ics.utf8), label: "plain")
+        #expect(out.contains("METHOD=REPLY"))
+        #expect(out.contains("SEQUENCE=19"))
+        #expect(out.contains("(len 14)"))
+        #expect(out.contains("VEVENT=1"))
+    }
+}
+
 @Suite("ICSCalendarImporter Teardown Cleanup")
 struct ICSCalendarImporterTeardownTests {
 
