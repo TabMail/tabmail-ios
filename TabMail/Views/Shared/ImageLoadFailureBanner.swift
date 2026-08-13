@@ -4,6 +4,40 @@
 
 import SwiftUI
 
+/// Which DOCUMENT a banner state is a statement about.
+///
+/// The banner says "the images THIS message asked for did not arrive", so its
+/// scope is the rendered CONTENT — not "the web view reloaded", and not "this
+/// SwiftUI view was re-evaluated". Membership is therefore exactly the inputs
+/// that decide WHICH content is on screen, and deliberately excludes the ones
+/// that decide only HOW it is drawn:
+///
+///   * `html` — the body bytes.
+///   * `reloadToken` — the caller saying "same view, freshly fetched body".
+///     `MessageDetailViewModel` bumps it only after a body REFETCH landed, and
+///     `updateUIView` reloads on `html || reloadToken`, so a refetch that
+///     returned identical bytes still replaces the document and still re-posts a
+///     census. A banner surviving that would be a stale claim about a census
+///     that has since been retaken.
+///   * `bodyContentKey` — which persisted body this view is bound to. A row
+///     re-keyed by a move rebinds the view to a different message; the `.id(…)`
+///     on the web view dismantles the platform view, but `@State` on the
+///     enclosing `AutoSizingHTMLView` survives it, so nothing else would clear
+///     the count. This is the wrong-message direction and the expensive one.
+///
+/// EXCLUDED, on purpose: the colour scheme. `updateUIView` reloads the document
+/// on a light↔dark flip (so `fixDarkModeColorsJS` re-runs), which is a genuine
+/// reload of the SAME content. Scoping the banner to reloads rather than to
+/// content would re-raise a notice the user had dismissed on the message they
+/// are still looking at, every time the appearance changed. Also excluded:
+/// `previewFilename`, which does not itself trigger a reload — see the
+/// `.eml`-sheet note in `deferredImageLoadJS`'s doc comment.
+struct RenderedDocumentIdentity: Equatable {
+    let html: String
+    let reloadToken: Int
+    let bodyContentKey: ContentKey?
+}
+
 /// Everything `AutoSizingHTMLView` knows about the image-failure banner, in one
 /// value so the DOCUMENT-scoped reset is a single named operation with a single
 /// test — rather than two loose `@State` writes a later edit can clear by halves.
@@ -26,15 +60,34 @@ struct ImageFailureBannerState: Equatable {
     /// then and no "have we finished loading?" term is needed here.
     var isVisible: Bool { failedCount > 0 && !dismissed }
 
-    /// Reset for a new document.
+    /// What a view showing `old` should publish now that it is showing `new`.
     ///
     /// ⚠️ Both fields are document-scoped and MUST clear together. Carrying
     /// `dismissed` across a document change would silently suppress the banner on
     /// the NEXT message the user opens — the one failure mode a purely
     /// observational notice cannot absorb, because it has no second channel to
     /// tell the user anything. Carrying `failedCount` across would be worse
-    /// still: a message that lost nothing would accuse its sender's server.
-    mutating func documentChanged() { self = ImageFailureBannerState() }
+    /// still: a message that lost nothing would accuse its sender's server. That
+    /// is why this returns a whole value rather than clearing fields: there is no
+    /// way to write "clear one half" through it.
+    ///
+    /// TOTAL on purpose — it answers for `old == new` as well — so the call site
+    /// is one unconditional assignment with no branch of its own to get wrong.
+    ///
+    /// ⚠️ This replaced `mutating func documentChanged()`, which took no
+    /// argument and so could not express WHICH change it was reacting to. The
+    /// caller supplied that, as `.onChange(of: html)`, and `html` is only one of
+    /// the three inputs that select a document — so a body refetch that returned
+    /// identical bytes, and a row re-keyed onto a different message, both left
+    /// the previous document's count and dismissal in place. Making the identity
+    /// an argument is what moves that decision somewhere a test can reach it.
+    static func carried(
+        _ state: ImageFailureBannerState,
+        describing old: RenderedDocumentIdentity,
+        into new: RenderedDocumentIdentity
+    ) -> ImageFailureBannerState {
+        old == new ? state : ImageFailureBannerState()
+    }
 }
 
 /// Dismiss-only notice shown above a rendered message when at least one of the

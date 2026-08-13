@@ -134,6 +134,13 @@ struct AutoSizingHTMLView: View {
     /// previews pass headerId == nil) and only until the first reveal.
     private var showsLoadingPlaceholder: Bool { headerId != nil && !hasRevealed }
 
+    /// Which document this view is currently showing, for the P4 banner's scope.
+    /// See `RenderedDocumentIdentity` for why membership is these three inputs
+    /// and not "whatever makes `updateUIView` reload".
+    private var documentIdentity: RenderedDocumentIdentity {
+        RenderedDocumentIdentity(html: html, reloadToken: reloadToken, bodyContentKey: bodyContentKey)
+    }
+
     var body: some View {
         // P4 — the failure banner sits ABOVE the web view, in SwiftUI, outside the
         // rendered document entirely. It therefore cannot perturb the measure →
@@ -224,28 +231,43 @@ struct AutoSizingHTMLView: View {
             // exact symptom the init seeding exists to prevent. `.onChange`
             // fires only on actual value changes, never on initial appearance.
             .onChange(of: html) { _, _ in
-                // P4 — the banner is a statement about the document currently on
-                // screen, so it dies with that document. `html` is what
-                // `updateUIView` compares to decide a reload, so this fires
-                // exactly when a new document is about to be loaded, and it is
-                // outside the `headerId != nil` guard below because the compose
-                // quote preview and the `.eml` sheet render documents too.
-                //
-                // This is the `HeightSeedCache` keying hazard applied to a
-                // different value: SwiftUI reuses this view across a rebind, so
-                // without an explicit clear the previous message's failure count
-                // would be inherited and a message that lost nothing would accuse
-                // the sender's server. The dismissal is cleared with it — a fresh
-                // document has not been dismissed — which is why the reset is one
-                // named operation (`ImageFailureBannerState.documentChanged`)
-                // rather than two loose writes an edit can clear by halves.
-                //
-                // Guarded by an equality check because `@State` does not diff for
-                // you: an unconditional assignment would invalidate this view on
-                // every content change even when nothing about the banner moved.
-                if imageFailure != ImageFailureBannerState() { imageFailure.documentChanged() }
                 guard headerId != nil else { return }
                 if hasRevealed { hasRevealed = false }
+            }
+            // P4 — the banner is a statement about the document currently on
+            // screen, so it dies with that document.
+            //
+            // ⚠️ This used to hang off `.onChange(of: html)` with the comment
+            // "`html` is what `updateUIView` compares to decide a reload, so this
+            // fires exactly when a new document is about to be loaded". That was
+            // FALSE in both directions and the false half was the bug:
+            // `updateUIView` reloads on `html || reloadToken`, so a body refetch
+            // returning identical bytes loaded a new document without firing it;
+            // and it reloads again on a colour-scheme flip, which is a reload
+            // that must NOT clear a dismissal because the message has not
+            // changed. `RenderedDocumentIdentity` names the three inputs that
+            // select CONTENT, which is the banner's actual scope; see its doc
+            // comment for why the colour scheme is excluded.
+            //
+            // It is outside the `headerId != nil` guard above because the compose
+            // quote preview and the `.eml` sheet render documents too.
+            //
+            // This is the `HeightSeedCache` keying hazard applied to a different
+            // value: SwiftUI reuses this view across a rebind — the `.id(…)`
+            // above dismantles the WEB VIEW, not the `@State` on the enclosing
+            // `AutoSizingHTMLView` — so without an explicit clear the previous
+            // message's failure count would be inherited and a message that lost
+            // nothing would accuse the sender's server. The dismissal is cleared
+            // with it, because a fresh document has not been dismissed, which is
+            // why this is one named operation returning a whole value rather than
+            // two loose writes an edit can clear by halves.
+            //
+            // Guarded by an equality check because `@State` does not diff for
+            // you: an unconditional assignment would invalidate this view on
+            // every content change even when nothing about the banner moved.
+            .onChange(of: documentIdentity) { old, new in
+                let next = ImageFailureBannerState.carried(imageFailure, describing: old, into: new)
+                if imageFailure != next { imageFailure = next }
             }
             // P1d diagnostics: the ONE place a ContentKey-driven view recreate is
             // observable from Swift. `.id(…)` above dismantles and rebuilds the

@@ -85,35 +85,108 @@ struct ImageFailureBannerStateTests {
                 "dismissal is a property of the DOCUMENT, not of a particular count")
     }
 
-    @Test("Switching messages carries NOTHING across — neither the accusation nor the dismissal")
-    func aDocumentChangeClearsBothHalves() {
-        // The failure direction: a previous message's count leaking into a message
-        // that rendered perfectly would accuse an innocent sender's server.
-        var accusing = ImageFailureBannerState(failedCount: 4, dismissed: false)
-        accusing.documentChanged()
-        #expect(accusing == ImageFailureBannerState())
-        #expect(accusing.isVisible == false)
+    /// A document identity with every field defaulted, so each test varies exactly
+    /// the one field it is about and the others cannot silently differ.
+    private static func identity(
+        html: String = "<p>hello</p>", reloadToken: Int = 0, key: String? = nil
+    ) -> RenderedDocumentIdentity {
+        RenderedDocumentIdentity(
+            html: html, reloadToken: reloadToken,
+            bodyContentKey: key.map { ContentKey(rawValue: $0) })
+    }
 
-        // The suppression direction, which is the one a plausible future edit gets
-        // wrong ("don't nag the user twice"): a dismissal leaking into the NEXT
-        // message silently withholds the banner from a message that really did lose
-        // images — and an observational notice has no second channel to fall back on.
-        var dismissed = ImageFailureBannerState(failedCount: 4, dismissed: true)
-        dismissed.documentChanged()
-        #expect(dismissed.dismissed == false,
-                "a reset that clears the count but keeps the dismissal blinds the next message")
+    /// A state with BOTH halves set, so "cleared" and "carried" are distinguishable
+    /// outcomes. A default-valued state makes them identical, which is how the
+    /// predecessor of these tests managed to assert nothing.
+    private static let accusingAndDismissed = ImageFailureBannerState(failedCount: 4, dismissed: true)
+
+    @Test("Every input that selects the CONTENT is part of the document's identity")
+    func everyContentInputParticipatesInTheIdentity() {
+        // Membership asserted directly, one field at a time, because the wiring
+        // reads this type's `==` and nothing else. Dropping a field here is exactly
+        // the shape of the defect being fixed: the reset then does not fire for a
+        // change that really did put a different document on screen.
+        let base = Self.identity()
+        #expect(base == Self.identity(), "same content ⇒ same document")
+
+        #expect(base != Self.identity(html: "<p>different</p>"),
+                "the body bytes are the document")
+        #expect(base != Self.identity(reloadToken: 1),
+                "a body refetch replaces the document even when the bytes match — updateUIView reloads on html || reloadToken")
+        #expect(base != Self.identity(key: "acct:INBOX:7"),
+                "a row re-keyed onto a different message rebinds this view; @State survives the .id(…) remount")
+        #expect(Self.identity(key: "acct:INBOX:7") != Self.identity(key: "acct:INBOX:8"),
+                "two different bodies are two different documents")
+    }
+
+    @Test("A change to ANY content input carries NOTHING across — neither the accusation nor the dismissal")
+    func aContentIdentityChangeClearsBothHalves() {
+        // MIS-IOS-016 — the setup has to be observably non-default, or "cleared" and
+        // "unchanged" are the same value and every assertion below is satisfied by
+        // an implementation that does nothing.
+        let dirty = Self.accusingAndDismissed
+        #expect(dirty != ImageFailureBannerState(),
+                "the fixture must differ from the reset value or this test proves nothing")
+        #expect(dirty.dismissed && dirty.failedCount > 0,
+                "both halves must be set, so a reset that clears only one is visible")
+
+        let base = Self.identity()
+        for changed in [Self.identity(html: "<p>next</p>"),
+                        Self.identity(reloadToken: 1),
+                        Self.identity(key: "acct:INBOX:7")] {
+            let next = ImageFailureBannerState.carried(dirty, describing: base, into: changed)
+            // The failure direction: a previous message's count leaking into a
+            // message that rendered perfectly accuses an innocent sender's server.
+            #expect(next.failedCount == 0)
+            #expect(next.isVisible == false)
+            // The suppression direction, which is the one a plausible future edit
+            // gets wrong ("don't nag the user twice"): a dismissal leaking into the
+            // NEXT message silently withholds the banner from a message that really
+            // did lose images — and an observational notice has no second channel.
+            #expect(next.dismissed == false,
+                    "a reset that clears the count but keeps the dismissal blinds the next message")
+        }
 
         // Cleared BOTH halves means the next document starts from the initial value,
         // so a real failure on it is visible again.
-        var next = dismissed
+        var next = ImageFailureBannerState.carried(dirty, describing: base, into: Self.identity(html: "<p>next</p>"))
         next.failedCount = 1
         #expect(next.isVisible)
+    }
 
-        // Idempotent: resetting an already-fresh state is a no-op, which is what
-        // lets the call site guard on inequality without changing behaviour.
-        var fresh = ImageFailureBannerState()
-        fresh.documentChanged()
-        #expect(fresh == ImageFailureBannerState())
+    @Test("A reload that does NOT change the content keeps the banner — a dark-mode flip must not resurrect a dismissal")
+    func anUnchangedIdentityCarriesBothHalves() {
+        // The reachable negative control, and the reason the identity is scoped to
+        // CONTENT rather than to "the web view reloaded": `updateUIView` reloads the
+        // document on a light↔dark flip so `fixDarkModeColorsJS` re-runs for the new
+        // appearance. That is a real reload of the SAME message. Scoping the reset to
+        // reloads would re-raise a notice the user just dismissed, on the message
+        // they are still reading, every time the appearance changed.
+        let dirty = Self.accusingAndDismissed
+        // MIS-IOS-016 again, in the other direction: if the fixture were the default
+        // value, "carried" would be indistinguishable from "reset".
+        #expect(dirty != ImageFailureBannerState())
+
+        let same = Self.identity()
+        let carried = ImageFailureBannerState.carried(dirty, describing: same, into: Self.identity())
+        #expect(carried == dirty, "an unchanged content identity changes nothing about the banner")
+        #expect(carried.dismissed, "the dismissal is the half a reload-scoped reset would lose")
+
+        // And the visible half survives too: a user who has NOT dismissed still sees
+        // the banner after an appearance change.
+        let undismissed = ImageFailureBannerState(failedCount: 2, dismissed: false)
+        #expect(undismissed.isVisible)
+        #expect(ImageFailureBannerState.carried(undismissed, describing: same, into: Self.identity()).isVisible)
+    }
+
+    @Test("Carrying a fresh state across a document change is a no-op — the call site's equality guard changes nothing")
+    func carryingAFreshStateIsANoOp() {
+        // `AutoSizingHTMLView` assigns only when the result differs, to avoid
+        // invalidating the view on every content change. That guard is only safe
+        // because the result for an already-fresh state IS the fresh state.
+        let fresh = ImageFailureBannerState()
+        #expect(ImageFailureBannerState.carried(
+            fresh, describing: Self.identity(), into: Self.identity(html: "<p>next</p>")) == fresh)
     }
 
     @Test("The user-visible sentence stays hedged, name-free and count-free")
