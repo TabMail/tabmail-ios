@@ -211,6 +211,23 @@ struct ImageFailureBannerStateTests {
             fresh, describing: Self.identity(), into: Self.identity(html: "<p>next</p>")) == fresh)
     }
 
+    /// A gate holding one committed document — the state every census actually
+    /// arrives in, since `evaluate` refuses outright when nothing is committed.
+    private func committedGate(generation: Int = 1) -> CommittedDocumentGate {
+        var gate = CommittedDocumentGate()
+        gate.issue(generation: generation)
+        gate.commit(isIssuedLoad: true)
+        return gate
+    }
+
+    /// The count a census publishes, or 0 when it publishes nothing.
+    private func publishedCount(_ census: ImageFailureBannerState.Census) -> Int {
+        switch census {
+        case .publish(let count): return count
+        case .suppressedOffline, .refused: return 0
+        }
+    }
+
     @Test("An offline device publishes no failures — the banner must not blame a server the device never reached")
     func anOfflineCensusIsSuppressed() {
         // On a device with no network EVERY remote image errors, so an unfiltered
@@ -226,25 +243,83 @@ struct ImageFailureBannerStateTests {
         #expect(ImageFailureBannerState(failedCount: reported).isVisible,
                 "the fixture must raise a banner when online, or suppression is unobservable")
 
-        #expect(ImageFailureBannerState.publishedFailureCount(reported: reported, isConnected: false) == 0)
-        let offline = ImageFailureBannerState(
-            failedCount: ImageFailureBannerState.publishedFailureCount(
-                reported: reported, isConnected: false))
+        var offlineGate = committedGate()
+        #expect(ImageFailureBannerState.census(
+            reported: reported, isConnected: false, in: &offlineGate) == .suppressedOffline)
+        let offline = ImageFailureBannerState(failedCount: publishedCount(.suppressedOffline))
         #expect(offline.isVisible == false, "no banner while offline")
 
         // The negative control, and it is the half that matters most: online, the
         // census is published untouched. A suppression that swallowed the online
         // case too would delete the feature outright while leaving the assertion
         // above green.
-        #expect(ImageFailureBannerState.publishedFailureCount(reported: reported, isConnected: true) == reported)
-        #expect(ImageFailureBannerState(
-            failedCount: ImageFailureBannerState.publishedFailureCount(
-                reported: reported, isConnected: true)).isVisible,
+        var onlineGate = committedGate()
+        let published = ImageFailureBannerState.census(
+            reported: reported, isConnected: true, in: &onlineGate)
+        #expect(published == .publish(reported))
+        #expect(ImageFailureBannerState(failedCount: publishedCount(published)).isVisible,
                 "a real failure on a connected device must still raise the banner")
 
         // And suppression cannot manufacture a banner in either direction.
-        #expect(ImageFailureBannerState.publishedFailureCount(reported: 0, isConnected: true) == 0)
-        #expect(ImageFailureBannerState.publishedFailureCount(reported: 0, isConnected: false) == 0)
+        var emptyOnline = committedGate()
+        var emptyOffline = committedGate()
+        #expect(ImageFailureBannerState.census(
+            reported: 0, isConnected: true, in: &emptyOnline) == .publish(0))
+        #expect(ImageFailureBannerState.census(
+            reported: 0, isConnected: false, in: &emptyOffline) == .suppressedOffline)
+    }
+
+    @Test("Suppressing a census for offline does not consume the document's one-shot")
+    func anOfflineCensusDoesNotSpendTheOneShot() {
+        // THE INVARIANT. A census suppressed for offline published nothing, so it
+        // must leave the document able to publish an honest one later. Spending the
+        // slot on a report that said nothing is unrecoverable in practice: the page's
+        // own `__tmImageFailureReported` also stops it re-posting, so the only way
+        // back is re-opening the message.
+        var gate = committedGate()
+
+        #expect(ImageFailureBannerState.census(
+            reported: 4, isConnected: false, in: &gate) == .suppressedOffline)
+
+        // Same document, network back. This is the assertion that fails when the
+        // one-shot is spent before connectivity is read.
+        #expect(ImageFailureBannerState.census(
+            reported: 4, isConnected: true, in: &gate) == .publish(4),
+                "the offline census must not have burned the slot the honest one needs")
+
+        // Non-vacuity, both sides. The slot IS a one-shot — otherwise the assertion
+        // above would hold against a gate that never refuses anything...
+        #expect(ImageFailureBannerState.census(
+            reported: 4, isConnected: true, in: &gate) == .refused(.duplicate),
+                "the second published census for one document must still be refused")
+
+        // ...and offline suppression is not simply "the gate refuses everything":
+        // with nothing committed, the online path refuses rather than publishing.
+        var uncommitted = CommittedDocumentGate()
+        #expect(ImageFailureBannerState.census(
+            reported: 4, isConnected: true, in: &uncommitted) == .refused(.noCommittedDocument))
+    }
+
+    @Test("Offline is read before the one-shot, so an offline census cannot be refused as a duplicate")
+    func offlineIsResolvedBeforeTheGate() {
+        // Order, stated as a property rather than as a statement sequence. Whatever
+        // the gate's state, an offline census reports suppression — it never reports
+        // a gate verdict, because it never reaches the gate.
+        var gate = committedGate()
+        #expect(ImageFailureBannerState.census(
+            reported: 3, isConnected: true, in: &gate) == .publish(3))
+        #expect(ImageFailureBannerState.census(
+            reported: 3, isConnected: true, in: &gate) == .refused(.duplicate),
+                "precondition: this document's slot is now spent")
+
+        #expect(ImageFailureBannerState.census(
+            reported: 3, isConnected: false, in: &gate) == .suppressedOffline,
+                "offline is answered without consulting the gate at all")
+
+        // And with no document committed — the other refusal — offline still wins.
+        var uncommitted = CommittedDocumentGate()
+        #expect(ImageFailureBannerState.census(
+            reported: 3, isConnected: false, in: &uncommitted) == .suppressedOffline)
     }
 
     @Test("The user-visible sentence stays hedged, name-free and count-free")

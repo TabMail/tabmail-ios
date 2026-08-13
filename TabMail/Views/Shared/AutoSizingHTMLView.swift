@@ -1573,6 +1573,20 @@ private struct HTMLWebView: UIViewRepresentable {
                     bridgeLog("rejected channel=imageLoadFailure reason=malformed-payload")
                     return
                 }
+                // A device with no network fails EVERY remote image, so an
+                // unfiltered census there accuses the sender's server of something
+                // the user's own connectivity did. The page cannot tell the two
+                // apart — WebKit gives it no reason code — but the app can. See
+                // `ImageFailureBannerState.census` for why the check lives here and
+                // not in JS as `navigator.onLine`.
+                //
+                // ⚠️ Connectivity is read BEFORE the one-shot is consulted, and the
+                // suppressed-offline arm leaves the one-shot UNSPENT — that ORDER is
+                // the invariant, and it is expressed inside `census` rather than as a
+                // statement sequence here because `Coordinator` is unreachable from a
+                // test. Spending it first burned the document's only census slot on a
+                // report that published nothing.
+                //
                 // One-shot PER COMMITTED DOCUMENT, enforced in Swift for the same
                 // reason `requestFit` and `requestWidthRefit` are:
                 // `__tmImageFailureReported` lives in the isolated world and is only
@@ -1580,19 +1594,21 @@ private struct HTMLWebView: UIViewRepresentable {
                 // the same document cannot re-raise a banner the user dismissed —
                 // and a report from the document being REPLACED is attributed to the
                 // document it came from, never to the one about to arrive.
-                guard honourOneShot(.imageFailureReport, channel: "imageLoadFailure") else { return }
-                // A device with no network fails EVERY remote image, so an
-                // unfiltered census there accuses the sender's server of something
-                // the user's own connectivity did. The page cannot tell the two
-                // apart — WebKit gives it no reason code — but the app can. See
-                // `publishedFailureCount` for why the check lives here and not in
-                // JS as `navigator.onLine`.
                 let connected = NetworkMonitor.checkConnected()
-                let published = ImageFailureBannerState.publishedFailureCount(
-                    reported: report.failed, isConnected: connected)
-                bridgeLog("imageLoadFailure failed=\(report.failed) deferred=\(report.deferred) "
-                          + "connected=\(connected) published=\(published)")
-                if failedImageCount != published { failedImageCount = published }
+                switch ImageFailureBannerState.census(reported: report.failed,
+                                                      isConnected: connected,
+                                                      in: &documentGate) {
+                case .suppressedOffline:
+                    bridgeLog("imageLoadFailure failed=\(report.failed) deferred=\(report.deferred) "
+                              + "connected=false suppressed=offline one-shot=unspent")
+                case .refused(let refusal):
+                    logOneShotRefusal(refusal, oneShot: .imageFailureReport,
+                                      channel: "imageLoadFailure")
+                case .publish(let published):
+                    bridgeLog("imageLoadFailure failed=\(report.failed) deferred=\(report.deferred) "
+                              + "connected=true published=\(published)")
+                    if failedImageCount != published { failedImageCount = published }
+                }
             }
         }
 
@@ -1608,9 +1624,21 @@ private struct HTMLWebView: UIViewRepresentable {
             case .honour:
                 return true
             case .refuse(let refusal):
-                bridgeLog("rejected channel=\(channel) reason=\(refusal.rawValue)-\(oneShot.rawValue)")
+                logOneShotRefusal(refusal, oneShot: oneShot, channel: channel)
                 return false
             }
+        }
+
+        /// The refusal log line, in ONE place.
+        ///
+        /// P4's census resolves its own gate call through
+        /// `ImageFailureBannerState.census` — connectivity has to be read first, which
+        /// `honourOneShot`'s Bool cannot express — so without this the token format
+        /// would be spelled twice and the two spellings would drift.
+        private func logOneShotRefusal(_ refusal: OneShotRefusal,
+                                       oneShot: RenderOneShot,
+                                       channel: String) {
+            bridgeLog("rejected channel=\(channel) reason=\(refusal.rawValue)-\(oneShot.rawValue)")
         }
 
         /// Debug-gated bridge diagnostic — the rejection half of the three

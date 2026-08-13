@@ -89,8 +89,22 @@ struct ImageFailureBannerState: Equatable {
         old == new ? state : ImageFailureBannerState()
     }
 
-    /// The count to publish for a census of `reported` failures taken while the
-    /// device was (or was not) on a network.
+    /// What one `imageLoadFailure` census does — to the banner, AND to the rendered
+    /// document's single census slot.
+    enum Census: Equatable {
+        /// The device had no network, so the census says nothing about the sender's
+        /// server. Nothing is published, **and the document's one-shot is left
+        /// UNSPENT** so a later, honest census for the same document can still use it.
+        case suppressedOffline
+        /// `CommittedDocumentGate` refused: no document is committed, or this document
+        /// has already published a census.
+        case refused(OneShotRefusal)
+        /// Publish this count. The document's one-shot is now spent.
+        case publish(Int)
+    }
+
+    /// Resolve a census of `reported` failures against the device's connectivity and
+    /// the rendered document's one-shot — **in that order**.
     ///
     /// **Offline is the one cause the page cannot distinguish but WE can.** The
     /// banner names the sender's image server. `onerror` fires identically for an
@@ -101,19 +115,50 @@ struct ImageFailureBannerState: Equatable {
     /// single cause we can rule out without guessing, and ruling it out is what
     /// keeps a hedged sentence from becoming a false accusation on a plane.
     ///
-    /// Suppression, not correction: it publishes 0 rather than rewriting the copy.
-    /// An offline user already knows why nothing loaded, and a second sentence
+    /// Suppression, not correction: it publishes nothing rather than rewriting the
+    /// copy. An offline user already knows why nothing loaded, and a second sentence
     /// telling them so is noise; there is nothing for a banner to explain. The
     /// count is not persisted anywhere, so re-rendering the message once the
     /// device is back on a network re-runs the census and reports honestly.
+    ///
+    /// ⚠️ **THE ORDER IS THE POINT, and it is why this is one function over the gate
+    /// rather than three statements in the coordinator.** The census path used to spend
+    /// `RenderOneShot.imageFailureReport` BEFORE reading `NetworkMonitor.checkConnected()`,
+    /// so a path flip to unsatisfied in that instant burned the document's only census
+    /// slot on a report that published nothing — permanently, because the page's own
+    /// `__tmImageFailureReported` also stops it re-posting, leaving re-opening the
+    /// message as the only recovery. `Coordinator` is nested in a `private struct` and
+    /// unreachable from a test (see the header of `RenderNavigationPolicy.swift`), so an
+    /// order expressed as a statement sequence there is one nothing can assert; this is
+    /// one that can be.
+    ///
+    /// It also cannot publish twice. Every `.publish` goes through
+    /// `CommittedDocumentGate.evaluate`, which is the same single authority as before —
+    /// the reorder only removes calls to it, never adds one — and the branch that skips
+    /// it publishes nothing at all.
+    ///
+    /// Suppression is stated in exactly ONE place, the `guard` below. Do not add a second
+    /// "is this census suppressed?" predicate anywhere: a second spelling of one key
+    /// drifts silently, which is the lockstep hazard `IOS-UI-004`'s *what NOT to do* list
+    /// names.
     ///
     /// ⚠️ Deliberately NOT `navigator.onLine` inside the page. That is
     /// sender-observable, sender-spoofable (author script can define the
     /// property), and answers about the WebView's view of the world rather than
     /// the app's. The connectivity fact belongs on the Swift side of the bridge,
     /// where the sender cannot reach it.
-    static func publishedFailureCount(reported: Int, isConnected: Bool) -> Int {
-        isConnected ? reported : 0
+    static func census(
+        reported: Int,
+        isConnected: Bool,
+        in gate: inout CommittedDocumentGate
+    ) -> Census {
+        guard isConnected else { return .suppressedOffline }
+        switch gate.evaluate(.imageFailureReport) {
+        case .refuse(let refusal):
+            return .refused(refusal)
+        case .honour:
+            return .publish(reported)
+        }
     }
 }
 
