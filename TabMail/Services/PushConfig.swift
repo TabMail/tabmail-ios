@@ -43,12 +43,27 @@ enum PushConfig {
     /// nil when there's no profile (App Store builds) or it can't be parsed.
     private static func apsEnvironmentFromEmbeddedProfile() -> String? {
         guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
-              let data = try? Data(contentsOf: url),
-              // isoLatin1 is byte-preserving, so the binary CMS wrapper doesn't
-              // corrupt the ASCII plist region we slice out below.
-              let raw = String(data: data, encoding: .isoLatin1),
+              let data = try? Data(contentsOf: url) else { return nil }
+        return apsEnvironment(fromProfileBytes: data)
+    }
+
+    /// Slice the plaintext plist region out of a CMS-signed provisioning profile
+    /// and read `Entitlements.aps-environment` from it. Split out of
+    /// `apsEnvironmentFromEmbeddedProfile` so the slicing is reachable from tests
+    /// without a bundle; the bundle read stays in the caller and is not injectable.
+    static func apsEnvironment(fromProfileBytes data: Data) -> String? {
+        // isoLatin1 is byte-preserving, so the binary CMS wrapper doesn't
+        // corrupt the ASCII plist region we slice out below.
+        guard let raw = String(data: data, encoding: .isoLatin1),
               let lo = raw.range(of: "<plist"),
-              let hi = raw.range(of: "</plist>") else { return nil }
+              // Bounded to start after the opening tag. Unbounded, the two
+              // searches are independent and a `</plist>` that ENDS before
+              // `<plist` begins yields a reversed Range, which `String`
+              // subscripting TRAPS on — an uncatchable precondition failure.
+              // `<plist` cannot match inside `</plist>` (the `/` blocks it), so
+              // the two can cross. Falling through to `nil` here is the existing
+              // "no usable profile" outcome, not a new behaviour.
+              let hi = raw.range(of: "</plist>", range: lo.upperBound..<raw.endIndex) else { return nil }
         let plistText = String(raw[lo.lowerBound..<hi.upperBound])
         guard let plistData = plistText.data(using: .isoLatin1),
               let obj = try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil),
