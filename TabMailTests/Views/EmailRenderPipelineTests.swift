@@ -1913,7 +1913,8 @@ struct EmailRenderPipelineTests {
     // `swap()` would leave the failsafe re-fetching everything the post-paint
     // arm withheld, and a test that only ever fires one arm cannot see it.
     private static func hiddenSectionHarness(
-        previewFilename: String?, includeEmlSections: Bool = true
+        previewFilename: String?, includeEmlSections: Bool = true,
+        includeHeadersProbe: Bool = false
     ) -> String {
         let previewSetup = previewFilename.map {
             "_previewMode = true; _selected = '\($0)'; _bodyClasses = ['tm-preview-mode'];"
@@ -1921,11 +1922,31 @@ struct EmailRenderPipelineTests {
         let emlSetup = includeEmlSections ? """
             var secA = _append(_body, _mkEl('DIV', 'tm-eml-section'));
             secA._attrs['data-filename'] = 'a.eml';
-            _append(secA, _mkEl('DIV', 'tm-eml-headers'));
+            var hdrA = _append(secA, _mkEl('DIV', 'tm-eml-headers'));
             _mkImg(_append(secA, _mkEl('DIV', 'tm-email-body')), 'emlA');
             var secB = _append(_body, _mkEl('DIV', 'tm-eml-section'));
             secB._attrs['data-filename'] = 'b.eml';
             _mkImg(_append(secB, _mkEl('DIV', 'tm-email-body')), 'emlB');
+            """ : ""
+        // Opt-in (it changes every id set and census count, so the existing tests
+        // must not inherit it). Two `.tm-eml-headers` nodes that differ ONLY in
+        // who authored them and therefore in whose CSS hides them:
+        //
+        //   `emlHdrA`   — ours, emitted by `EmlMarker.build` INSIDE `secA`,
+        //                 hidden in preview by `body.tm-preview-mode
+        //                 .tm-eml-headers`.
+        //   `senderHdr` — the sender copying our class name, hidden by the
+        //                 SENDER's own stylesheet. Nested one level below <body>
+        //                 and outside every section, so neither the
+        //                 direct-<body>-child arm nor a `.tm-eml-section`
+        //                 ancestor can be what decides it: the class arm is the
+        //                 only thing in the predicate that could.
+        let headersProbe = includeHeadersProbe ? """
+            _mkImg(hdrA, 'emlHdrA');
+            var senderWrap = _append(_body, _mkEl('DIV', ''));
+            var senderHdr = _append(senderWrap, _mkEl('DIV', 'tm-eml-headers'));
+            senderHdr._senderHidden = true;
+            _mkImg(senderHdr, 'senderHdr');
             """ : ""
         return """
         var _previewMode = false, _selected = null, _bodyClasses = [];
@@ -1962,6 +1983,7 @@ struct EmailRenderPipelineTests {
         var quoteWrap = _append(_body, _mkEl('DIV', 'tm-quote-wrapper tm-collapsed'));
         _mkImg(_append(quoteWrap, _mkEl('DIV', 'tm-quote-content')), 'quoted');
         \(emlSetup)
+        \(headersProbe)
         // EmailHTMLWrapper.wrapHTML's cascade, per element (NOT inherited).
         function _display(el) {
             if (_previewMode) {
@@ -1976,6 +1998,9 @@ struct EmailRenderPipelineTests {
             if (_hasClass(el, 'tm-quote-content') && _hasClass(el.parentElement, 'tm-collapsed')) {
                 return 'none';
             }
+            // Not one of ours: the SENDER's stylesheet. Last, so an app rule
+            // always wins the attribution when both would hide the node.
+            if (el._senderHidden) return 'none';
             return 'block';
         }
         var document = {
@@ -2021,11 +2046,13 @@ struct EmailRenderPipelineTests {
     }
 
     private func makeHiddenSectionContext(
-        previewFilename: String? = nil, includeEmlSections: Bool = true
+        previewFilename: String? = nil, includeEmlSections: Bool = true,
+        includeHeadersProbe: Bool = false
     ) -> JSContext {
         let ctx = JSContext()!
         ctx.evaluateScript(Self.hiddenSectionHarness(
-            previewFilename: previewFilename, includeEmlSections: includeEmlSections))
+            previewFilename: previewFilename, includeEmlSections: includeEmlSections,
+            includeHeadersProbe: includeHeadersProbe))
         #expect(ctx.exception == nil, "harness threw: \(ctx.exception?.toString() ?? "")")
         ctx.evaluateScript(_deferredImageLoadJS(diagnosticsEnabled: false))
         #expect(ctx.exception == nil, "swap script threw: \(ctx.exception?.toString() ?? "")")
@@ -2125,6 +2152,66 @@ struct EmailRenderPipelineTests {
             "_imgs.filter(function (im) { return im._id === 'quoted' && im.getAttribute('src') === 'https://example.com/quoted.png'; }).length"
         )?.toInt32()
         #expect(quotedFetched == 1)
+    }
+
+    @Test("main view: a SENDER-authored .tm-eml-headers does not withhold — no rule of ours governs it there")
+    func deferredSwapHeadersClauseIsScopedToPreviewMode() {
+        // The invariant `hiddenByViewMode` exists to enforce: it withholds only
+        // where an app `!important` rule governs the element IN THE CURRENT VIEW
+        // MODE. `wrapHTML`'s main-view branch emits exactly one rule
+        // (`.tm-eml-section { display:none !important }`) and none for
+        // `.tm-eml-headers`, so in main view that class is just a class — and one
+        // any sender can write. Matching it unconditionally handed SENDER CSS the
+        // withhold decision, which is the expensive direction: a sender-hidden
+        // image that a `fitViewportJS` widen later reveals renders as a permanent
+        // blank frame, with no reload to swap it back in. That is precisely why
+        // the predicate declines to honour sender-hidden content generally.
+        let ctx = makeHiddenSectionContext(includeHeadersProbe: true)
+
+        // MIS-IOS-016 — assert the setup's effect actually HAPPENED, do not
+        // perform it and trust it took. All three halves are load-bearing and
+        // none implies another:
+        //   * the sender node really is display:none at swap time — without
+        //     that, "it fetched" is what a visible image does anyway and the
+        //     assertion below passes through both the bug and the fix;
+        //   * `secA` really is hidden, so the withhold half is not vacuous;
+        //   * `hdrA` itself computes `block` in main view, which is what makes
+        //     `emlHdrA`'s withhold attributable to the SECTION arm — the arm
+        //     this fix leaves unconditional — and not to the class arm.
+        #expect(ctx.evaluateScript("_display(senderHdr)")?.toString() == "none")
+        #expect(ctx.evaluateScript("_display(secA)")?.toString() == "none")
+        #expect(ctx.evaluateScript("_display(hdrA)")?.toString() == "block")
+
+        ctx.evaluateScript("runPostPaint(); runFailsafe()")
+        #expect(ctx.exception == nil, "swap arms threw: \(ctx.exception?.toString() ?? "")")
+        // Both directions in one pair of sets: the sender's node is fetched like
+        // any other sender-hidden content, and everything our own main-view rule
+        // really does govern — including the app-emitted headers block, via its
+        // enclosing section — is still withheld.
+        #expect(fetchedIds(ctx) == "parent,quoted,senderHdr")
+        #expect(deferredIds(ctx) == "emlA,emlB,emlHdrA")
+    }
+
+    @Test("preview sheet: the .tm-eml-headers arm still withholds, and is the ONLY thing that can there")
+    func deferredSwapHeadersClauseStillWithholdsInPreview() {
+        // The other side of the gate, and the reason it is a gate rather than a
+        // deletion: in preview mode `body.tm-preview-mode .tm-eml-headers` IS
+        // emitted, so the arm has a real rule behind it and must keep firing.
+        // Pre-fix and post-fix agree here — that is the point.
+        let ctx = makeHiddenSectionContext(previewFilename: "a.eml", includeHeadersProbe: true)
+
+        // MIS-IOS-016 — the precondition that makes this non-vacuous. The
+        // selected section is VISIBLE, so the section arm cannot be what
+        // withholds `emlHdrA`; the headers node inside it is `display:none` by
+        // our own preview rule. If `secA` were hidden too, this test would pass
+        // with the `.tm-eml-headers` arm deleted outright.
+        #expect(ctx.evaluateScript("_display(secA)")?.toString() == "block")
+        #expect(ctx.evaluateScript("_display(hdrA)")?.toString() == "none")
+
+        ctx.evaluateScript("runPostPaint(); runFailsafe()")
+        #expect(ctx.exception == nil, "swap arms threw: \(ctx.exception?.toString() ?? "")")
+        #expect(fetchedIds(ctx) == "emlA")
+        #expect(deferredIds(ctx) == "emlB,emlHdrA,parent,quoted,senderHdr")
     }
 
     @Test("a withheld image keeps its deferred attributes, so a later load can still swap it")

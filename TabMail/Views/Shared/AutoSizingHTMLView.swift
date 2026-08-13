@@ -3075,7 +3075,12 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
         //   * an image inside a COLLAPSED QUOTE OR INVITE — see below, this one
         //     is load-bearing;
         //   * a hidden <img> that is itself a direct child of <body> in main
-        //     view (the direct-child arm is preview-only, see `preview`).
+        //     view (the direct-child arm is preview-only, see `preview`);
+        //   * a hidden <img> under a SENDER-authored `.tm-eml-headers` in main
+        //     view. The class is ours, but no main-view rule of ours acts on
+        //     it, so a sender who copies the class name gets bullet two's
+        //     treatment (fetches, like any sender-hidden image) rather than a
+        //     skip our CSS never earned.
         //
         // Every ancestor this DOES test is governed by one of our own
         // `!important` rules whose value is FIXED for the lifetime of the loaded
@@ -3084,6 +3089,34 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
         //     `body.tm-preview-mode > *:not(.tm-eml-section)`          (preview)
         //     `body.tm-preview-mode .tm-eml-section[data-filename=…]`  (preview)
         //     `body.tm-preview-mode .tm-eml-headers`                   (preview)
+        //
+        // ⚠️ The mode column is a GATE, not a label. `wrapHTML`'s main-view
+        // branch emits exactly ONE of those four rules; the other three exist
+        // only in the preview branch. So an arm may claim `governed` only where
+        // a rule for the CURRENT mode exists — `.tm-eml-section`
+        // unconditionally, `.tm-eml-headers` and the direct-<body>-child arm
+        // under `preview` alone. Until 2026-08-13 the `.tm-eml-headers` arm was
+        // unconditional, which let SENDER CSS decide a withhold in main view:
+        // `governed` stopped meaning "one of our rules controls this" and the
+        // predicate over-withheld on a class the sender can simply write. That
+        // direction is the expensive one here — it strands images as permanent
+        // blank frames, which is exactly why bullet two declines to honour
+        // sender-hidden content in the first place. App-emitted markup is
+        // unaffected: `EmlMarker.build` only ever emits `.tm-eml-headers`
+        // INSIDE a `.tm-eml-section`, and that section's arm is unconditional,
+        // so the walk still reaches a governed ancestor in both modes.
+        //
+        // ⚠️ SCOPE OF THAT CHANGE, stated because it was described only as WHAT
+        // is withheld: it also moves WHEN the P4 failure census is SUPPRESSED. A
+        // withheld image keeps `data-tmsrc`, so `postImageWidthRecheckJS` arms it
+        // and it reaches no terminal state, so `armedPending()` never falls to 0
+        // — that IS the `IOS-UI-004` dead zone. Narrowing this arm narrows the
+        // dead zone in MAIN VIEW: a sender-authored `.tm-eml-headers` image used
+        // to suppress the census for the whole message and now settles like any
+        // other. Toward the honest census, and no image's outcome is invented —
+        // but it is still a change in when the banner appears, which the note at
+        // `pendingImgs()` treats as a decision separate from the width re-fit.
+        //
         // Because the answer cannot change while the document is loaded, NO
         // re-run hook, MutationObserver or IntersectionObserver is needed:
         // `previewFilename` is a `wrapHTML` parameter, so selecting a different
@@ -3122,8 +3155,15 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
                 var el = im;
                 while (el && el !== body) {
                     var governed = false;
+                    // `.tm-eml-section` is governed in BOTH modes (main hides
+                    // them all, preview hides every non-selected one), so its
+                    // arm is unconditional. `.tm-eml-headers` is governed in
+                    // PREVIEW ONLY — see the mode-gate note in the doc comment
+                    // above — so it carries the same `preview` gate as the
+                    // direct-<body>-child arm below it.
                     if (el.classList && (el.classList.contains('tm-eml-section') ||
-                                         el.classList.contains('tm-eml-headers'))) {
+                                         (preview &&
+                                          el.classList.contains('tm-eml-headers')))) {
                         governed = true;
                     } else if (preview && el.parentElement === body) {
                         governed = true;
