@@ -153,13 +153,25 @@ enum EmlMarker {
     /// the main-app CSS target embedded-email content for font/spacing
     /// overrides without leaking styles onto the outer wrapper's body.
     ///
-    /// Strips `<html>`, `<head>`, `<style>`, `<meta>`, DOCTYPE. If no `<body>`
-    /// tag is present (fragment input), strips any `<style>` blocks anywhere
-    /// and wraps the remainder.
+    /// Strips `<html>`, `<head>`, `<style>`, `<meta>`, DOCTYPE. If there is no
+    /// usable `<body>`…`</body>` pair — no open tag, no close tag, or a close
+    /// that precedes the open — strips any `<style>` blocks anywhere and wraps
+    /// the remainder.
     static func extractBodyContent(from html: String) -> String {
         var inner: String
+        // `</body>` is searched BACKWARDS so the LAST close wins, but the search
+        // is bounded to start at the open tag's end. Unbounded, the two searches
+        // are independent — a `</body>` before the first `<body…>` yields a
+        // reversed Range and `String` subscripting TRAPS (an uncatchable
+        // precondition failure, not a throw). `<body\b[^>]*>` cannot match inside
+        // `</body>` (the `/` blocks it), which is exactly why they can cross.
+        // `bodyHtml` here is raw sender bytes off the wire, reached from
+        // background sync and the notification-service extension without any
+        // user gesture, so a trap is a relaunch-crash loop, not a render glitch.
         if let bodyStartRange = html.range(of: #"<body\b[^>]*>"#, options: [.regularExpression, .caseInsensitive]),
-           let bodyEndRange = html.range(of: "</body>", options: [.caseInsensitive, .backwards]) {
+           let bodyEndRange = html.range(of: "</body>",
+                                         options: [.caseInsensitive, .backwards],
+                                         range: bodyStartRange.upperBound..<html.endIndex) {
             inner = String(html[bodyStartRange.upperBound..<bodyEndRange.lowerBound])
         } else {
             inner = html

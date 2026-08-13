@@ -206,6 +206,57 @@ struct EmlRenderTests {
 
     // MARK: - Edge case: main HTML exists alongside .eml
 
+    // MARK: - Reachability of the bound-pair invariant
+
+    /// The unit invariant lives in `EmlMarkerBoundPairTests`; this proves the
+    /// crafted bytes actually REACH it. A nested `message/rfc822` `text/html`
+    /// part's `textContent` is concatenated verbatim into `nestedBodyHtml` and
+    /// handed to `EmlMarker.build` → `extractBodyContent`, so a sender-supplied
+    /// `</body>` before the first `<body…>` used to reverse the slice's bounds
+    /// and trap here — on the background-sync and NSE paths, with no user
+    /// gesture. Entirely in-process: no network, no server fake.
+    @Test("Nested .eml body whose </body> precedes its <body> renders without trapping")
+    func nestedEmlCrossedBodyTagsRender() {
+        let parts = [
+            makeTextPlainPart(section: "1", text: "Main body"),
+            makeRfc822Part(section: "2", filename: "crafted.eml"),
+            makeTextHtmlPart(section: "2.1", html: "</body><body>x"),
+        ]
+        let message = makeMessage(parts: parts)
+        // Returning at all is the assertion: a reversed Range is a `fatalError`,
+        // which Swift Testing cannot catch — a regression kills the host.
+        let result = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")
+        #expect(result != nil)
+        #expect(result!.contains("data-filename=\"crafted.eml\""))
+        // The sender's payload survives into the marker (no-pair branch), so the
+        // fix cannot be mistaken for "drop the section on crossed tags".
+        #expect(result!.contains("x"))
+        #expect(result!.contains("tm-email-body"))
+    }
+
+    /// The guarded string is **derived**, not any one part's bytes:
+    /// `renderBodyWithEmbeddedHeaders` concatenates the `textContent` of every
+    /// nested body under one `message/rfc822` part before handing the result to
+    /// `EmlMarker.build`. Neither part below crosses on its own — the crossing
+    /// only exists in the concatenation — so a parser that sanitized each part
+    /// individually would not have prevented this.
+    @Test("Crossed body tags formed only by CONCATENATION of two nested parts")
+    func nestedEmlCrossedByConcatenation() {
+        let parts = [
+            makeTextPlainPart(section: "1", text: "Main body"),
+            makeRfc822Part(section: "2", filename: "split.eml"),
+            makeTextHtmlPart(section: "2.1", html: "<p>alpha</p></body>"),
+            makeTextHtmlPart(section: "2.2", html: "<body><p>beta</p>"),
+        ]
+        let message = makeMessage(parts: parts)
+        let result = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")
+        #expect(result != nil)
+        #expect(result!.contains("data-filename=\"split.eml\""))
+        // Both halves of the concatenation survive — nothing was dropped.
+        #expect(result!.contains("alpha"))
+        #expect(result!.contains("beta"))
+    }
+
     // MARK: - extractBodyContent
 
     @Test("extractBodyContent: extracts body from full HTML document")

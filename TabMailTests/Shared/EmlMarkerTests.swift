@@ -193,3 +193,155 @@ struct EmlMarkerBuildTests {
         #expect(text.contains("CC: C"))
     }
 }
+
+/// `EmlMarker.extractBodyContent` builds a slice from two bounds searched in
+/// **opposite directions**: `<body\b[^>]*>` forward (so the FIRST open wins)
+/// and `</body>` with `.backwards` (so the LAST close wins). They used to be
+/// searched independently, so the trap condition is directional and exact —
+/// it fires iff **every** `</body>` precedes the **first** `<body…>`, which
+/// produced a **reversed** `Range`, and `String` subscripting TRAPS on one: an
+/// uncatchable precondition failure, not a throwable error.
+///
+/// That directionality is why `<body>A</body><body>B` is safe and
+/// `</body><body>B` is not, and why a fix that merely special-cased a leading
+/// `</body>` would look correct. The table below therefore carries both.
+///
+/// Its input is the concatenated `textContent` of nested `message/rfc822`
+/// parts — raw sender bytes reached from background sync and the
+/// notification-service extension with no user gesture, so the trap was a
+/// relaunch-crash loop on a retryable fetch.
+///
+/// These tests pin the **invariant**, not the one crafted string that exposed
+/// it: *for any input the extraction either slices correctly-ordered bounds or
+/// takes the no-pair branch — it never traps, and it never drops content.*
+/// The table varies the bound pair on every axis independently (ordering,
+/// presence, multiplicity, case, attributes) because a fixture that only feeds
+/// `</body><body>x` pins the example and the next spelling walks past it.
+///
+/// All HTML here is synthetic.
+@Suite("EmlMarker.extractBodyContent — bound-pair invariant")
+struct EmlMarkerBoundPairTests {
+
+    /// One row of the adversarial shape table.
+    struct Shape: CustomStringConvertible, Sendable {
+        let name: String
+        let html: String
+        /// Substrings that MUST survive into the output on whichever branch runs.
+        /// Their presence is what proves the crossed shapes fell through to the
+        /// no-pair branch rather than silently returning an empty/clamped slice.
+        let mustRetain: [String]
+        /// Substrings that must NOT survive (the `<style>` strip runs on both
+        /// branches).
+        var mustNotContain: [String] = []
+        var description: String { name }
+    }
+
+    static let shapes: [Shape] = [
+        // --- close precedes open: the reversed-Range family ---
+        Shape(name: "close before open",
+              html: "</body><body>x",
+              mustRetain: ["</body>", "<body>", "x"]),
+        Shape(name: "close before open, uppercase tags",
+              html: "</BODY><BODY>x",
+              mustRetain: ["</BODY>", "<BODY>", "x"]),
+        Shape(name: "close before open, mixed case",
+              html: "</Body><BoDy>x",
+              mustRetain: ["</Body>", "<BoDy>", "x"]),
+        Shape(name: "close before open, attributes on the open tag",
+              html: "</body><body class=\"c\" id=\"i\">x",
+              mustRetain: ["class=\"c\"", "id=\"i\"", "x"]),
+        Shape(name: "close before open, inside a full document",
+              html: "<html></body><body>x</html>",
+              mustRetain: ["x", "<html>"]),
+        Shape(name: "close before open, with a style block to strip",
+              html: "<style>.z{}</style></body><body>x",
+              mustRetain: ["x"],
+              mustNotContain: ["<style", ".z{}"]),
+        Shape(name: "close before open, open tag is the final token",
+              html: "</body>x<body>",
+              mustRetain: ["x", "</body>"]),
+
+        // --- one bound only: must take the no-pair branch, not half a slice ---
+        Shape(name: "close only",
+              html: "</body>plain",
+              mustRetain: ["plain", "</body>"]),
+        Shape(name: "open only",
+              html: "<body>plain",
+              mustRetain: ["plain"]),
+        Shape(name: "neither bound (fragment)",
+              html: "<p>fragment</p>",
+              mustRetain: ["<p>fragment</p>"]),
+        Shape(name: "empty input",
+              html: "",
+              mustRetain: []),
+
+        // --- multiplicity: an ordered pair still exists, and must still be used ---
+        Shape(name: "multiple opens",
+              html: "<body><body>a</body></html>",
+              mustRetain: ["a"]),
+        Shape(name: "multiple closes",
+              html: "<body>a</body>b</body>",
+              mustRetain: ["a"]),
+        Shape(name: "close, open, close",
+              html: "</body><body>a</body>",
+              mustRetain: ["a"]),
+        // The directional negative control. A `</body>` AFTER the first `<body>`
+        // does not cross even though a later `<body>` has no close of its own —
+        // forward-first-open vs backwards-last-close still orders correctly. A
+        // fix that special-cased "input begins with `</body>`" would pass the
+        // crossed rows above and break nothing here, which is why this row and
+        // `directionalNegativeControlUnchanged` below both exist.
+        Shape(name: "open, close, open (does NOT cross)",
+              html: "<body>A</body><body>B",
+              mustRetain: ["A"]),
+    ]
+
+    @Test("Any bound-pair shape returns a wrapped result and never traps", arguments: shapes)
+    func boundPairNeverTraps(shape: Shape) {
+        let out = EmlMarker.extractBodyContent(from: shape.html)
+        // Reaching this line IS the first half of the invariant: a reversed
+        // Range is a `fatalError`, so a regression kills the test host outright
+        // rather than recording a failure here.
+        #expect(out.hasPrefix("<div class=\"tm-email-body\">"), "\(shape.name): missing wrapper prefix")
+        #expect(out.hasSuffix("</div>"), "\(shape.name): missing wrapper suffix")
+        for needle in shape.mustRetain {
+            #expect(out.contains(needle), "\(shape.name): dropped \(needle.debugDescription)")
+        }
+        for needle in shape.mustNotContain {
+            #expect(!out.contains(needle), "\(shape.name): retained \(needle.debugDescription)")
+        }
+    }
+
+    // MARK: - Benign controls (literal expectations — a derived one could bless the bug)
+
+    @Test("Benign full document is byte-identical to the pre-fix output")
+    func benignFullDocumentUnchanged() {
+        let out = EmlMarker.extractBodyContent(from: "<html><body>hello</body></html>")
+        #expect(out == "<div class=\"tm-email-body\">hello</div>")
+    }
+
+    @Test("Benign document with head styles and body attributes keeps only the body inner")
+    func benignWithHeadStylesUnchanged() {
+        let out = EmlMarker.extractBodyContent(
+            from: "<html><head><style>.a{}</style></head><body class=\"c\"><p>Hi</p></body></html>"
+        )
+        #expect(out == "<div class=\"tm-email-body\"><p>Hi</p></div>")
+    }
+
+    @Test("The LAST close still wins inside the bounded region")
+    func lastCloseStillWins() {
+        // `.backwards` is preserved by the fix — only its search window moved.
+        let out = EmlMarker.extractBodyContent(from: "<html><body>a</body>b</body></html>")
+        #expect(out == "<div class=\"tm-email-body\">a</body>b</div>")
+    }
+
+    @Test("A close AFTER the first open does not cross — byte-identical to pre-fix")
+    func directionalNegativeControlUnchanged() {
+        // The boundary case for the trap CONDITION. An unclosed trailing `<body>`
+        // is not a crossing: the forward search takes the first open (index 0),
+        // the backwards search takes the last close (index 7), and 6 < 7. Pinned
+        // with a literal so a fix that clamps or widens the window is caught.
+        let out = EmlMarker.extractBodyContent(from: "<body>A</body><body>B")
+        #expect(out == "<div class=\"tm-email-body\">A</div>")
+    }
+}
