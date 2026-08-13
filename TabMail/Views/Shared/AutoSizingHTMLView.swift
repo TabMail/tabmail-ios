@@ -2735,6 +2735,14 @@ private let collapseICSJS = """
 /// frame grows via the ResizeObserver. (We AUTO-load rather than block-with-banner
 /// — banner-blocking was smoke-tested 2026-06-17 and broke too many messages.)
 ///
+/// `swap()` withholds the URL from images our own view-mode CSS has hidden — see
+/// `hiddenByViewMode` inside the emitted script for the predicate, its FOUR
+/// governing CSS rules, its fail-open guard, and the explicit list of what it does
+/// NOT treat as hidden. The predicate is inside `swap()` on purpose: it is called
+/// from BOTH the post-paint arm and the 1500ms failsafe, and filtering at the call
+/// sites instead would let the failsafe re-fetch everything the post-paint arm
+/// withheld — a silent no-op.
+///
 /// This script is injected UNCONDITIONALLY — it is a production render path, not
 /// a diagnostic — so the debug-only `window.__tmImageDiagWillAssign` hook is
 /// emitted only when `diagnosticsEnabled`. **Both halves of that gating matter and
@@ -2779,7 +2787,21 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
     var diagHelper = ""
     var diagSrcsetCall = ""
     var diagSrcCall = ""
+    var swapCensusLog = ""
     if diagnosticsEnabled {
+        // Per-load, per-trigger census so a failed device smoke test is
+        // diagnosable from the log without a rebuild: how many deferred images
+        // this trigger assigned a URL to, and how many it withheld because the
+        // section that owns them is hidden. `total` is the selector's match
+        // count, so `swapped + skippedHidden == total` on every line — a line
+        // where it does not is a swap that threw past the census.
+        swapCensusLog = "\n" + """
+                    try {
+                        window.webkit.messageHandlers.consoleLog.postMessage(
+                            '[DeferImg] ' + trigger + ' total=' + imgs.length +
+                            ' swapped=' + swapped + ' skippedHidden=' + skippedHidden);
+                    } catch (_) {}
+        """
         diagHelper = "\n" + """
             // Diagnostics only, and deliberately unable to affect the swap: a
             // throwing or hostile hook must never prevent the assignment below
@@ -2797,10 +2819,100 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
     }
     return """
     (function() {\(diagHelper)
+        // TRUE when `im` sits inside a part of the document that OUR OWN
+        // view-mode CSS (`EmailHTMLWrapper.wrapHTML`) has hidden. WebKit fetches
+        // an <img> even under `display:none`, so without this the swap below
+        // fires the tracking pixels of every attached `.eml` the user never
+        // opened (main view, where `.tm-eml-section` is hidden wholesale), and —
+        // in the preview sheet — those of the parent message plus every
+        // non-selected `.eml`.
+        //
+        // ⚠️ THIS IS NOT A GENERAL "IS THIS IMAGE VISIBLE" TEST, and the narrow
+        // scope is deliberate. Stated negatively, it does NOT catch:
+        //   * `visibility:hidden`, `opacity:0`, zero-size, `content-visibility`,
+        //     clipped, or merely scrolled-off-screen images;
+        //   * an image the SENDER's own CSS hides — a hidden preheader, an
+        //     `@media` desktop-only block. Those still fetch, exactly as before
+        //     this change. Closing them is NOT free: `fitViewportJS` WIDENS the
+        //     layout viewport on overflow (288 → 400 → …), which crosses the
+        //     email's own breakpoints, so a media-query-hidden image can become
+        //     visible after a widen with no reload;
+        //   * an image inside a COLLAPSED QUOTE OR INVITE — see below, this one
+        //     is load-bearing;
+        //   * a hidden <img> that is itself a direct child of <body> in main
+        //     view (the direct-child arm is preview-only, see `preview`).
+        //
+        // Every ancestor this DOES test is governed by one of our own
+        // `!important` rules whose value is FIXED for the lifetime of the loaded
+        // document:
+        //     `.tm-eml-section { display:none !important }`               (main)
+        //     `body.tm-preview-mode > *:not(.tm-eml-section)`          (preview)
+        //     `body.tm-preview-mode .tm-eml-section[data-filename=…]`  (preview)
+        //     `body.tm-preview-mode .tm-eml-headers`                   (preview)
+        // Because the answer cannot change while the document is loaded, NO
+        // re-run hook, MutationObserver or IntersectionObserver is needed:
+        // `previewFilename` is a `wrapHTML` parameter, so selecting a different
+        // `.eml` builds a different document and loads it fresh (the coordinator
+        // reloads on `loadedPreviewFilename` change), and that document's own
+        // `swap()` sees the newly-selected section visible.
+        //
+        // ⚠️ A GENERAL predicate (`offsetParent === null`,
+        // `getClientRects().length === 0`) WOULD BE WRONG HERE, and not
+        // marginally: `collapseQuotesJS` and `collapseICSJS` build
+        // `.tm-quote-wrapper.tm-collapsed`, whose `.tm-quote-content` is
+        // `display:none` until the user taps "Show quoted text" / "Show invite
+        // details". That is an IN-DOCUMENT reveal — a click handler toggling a
+        // class, with no reload — so a general test would skip those images and
+        // nothing would ever swap them back in; every quoted reply and collapsed
+        // invite would expand to blank frames. This predicate structurally
+        // cannot do that: `.tm-quote-content` carries neither of the two classes
+        // tested, and always lives inside its `.tm-quote-wrapper`, so it is
+        // never a direct child of <body>.
+        //
+        // Guarded the same way the debug-only diagnostic hook call is, and for
+        // the same reason — it runs inside the swap loop, so an uncaught throw
+        // would abort the loop and strand every remaining deferred image on the
+        // message. It FAILS OPEN (throw ⇒ treat
+        // as visible ⇒ swap), preserving the pre-change behaviour; the cost is
+        // that a DOM able to make `classList`/`getComputedStyle` throw would
+        // defeat the skip. T8 is a privacy leak, not a wrong-message or
+        // data-loss class defect, so trading a bounded privacy win for an
+        // unbounded rendering regression would be the wrong way round.
+        function hiddenByViewMode(im) {
+            try {
+                var body = document.body;
+                if (!body) return false;
+                var preview = !!(body.classList &&
+                                 body.classList.contains('tm-preview-mode'));
+                var el = im;
+                while (el && el !== body) {
+                    var governed = false;
+                    if (el.classList && (el.classList.contains('tm-eml-section') ||
+                                         el.classList.contains('tm-eml-headers'))) {
+                        governed = true;
+                    } else if (preview && el.parentElement === body) {
+                        governed = true;
+                    }
+                    if (governed &&
+                        window.getComputedStyle(el).display === 'none') return true;
+                    el = el.parentElement;
+                }
+            } catch (_) {}
+            return false;
+        }
         function swap(trigger) {
             var imgs = document.querySelectorAll('img[data-tmsrc],img[data-tmsrcset]');
+            var swapped = 0, skippedHidden = 0;
             for (var i = 0; i < imgs.length; i++) {
                 var im = imgs[i];
+                // The predicate lives INSIDE swap(), not at the two call sites,
+                // so both the post-paint arm and the 1500ms failsafe inherit it
+                // and neither can re-fetch what the other withheld.
+                // A skipped image KEEPS its data-tmsrc/data-tmsrcset and is NOT
+                // marked, so it stays eligible for a later swap and the whole
+                // function stays idempotent and re-runnable.
+                if (hiddenByViewMode(im)) { skippedHidden++; continue; }
+                swapped++;
                 var ss = im.getAttribute('data-tmsrcset');
                 if (ss) {\(diagSrcsetCall)
                     im.removeAttribute('data-tmsrcset');
@@ -2811,7 +2923,7 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
                     im.removeAttribute('data-tmsrc');
                     im.setAttribute('src', s);
                 }
-            }
+            }\(swapCensusLog)
         }
         // Kick off remote loads only AFTER the first paint, so they can't
         // re-block it. readyState reaches 'complete' fast now (no pending

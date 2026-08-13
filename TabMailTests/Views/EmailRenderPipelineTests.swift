@@ -1588,6 +1588,277 @@ struct EmailRenderPipelineTests {
         #expect(hookCalls == 3)
     }
 
+    // MARK: - Deferred swap: no remote fetch from a hidden section (T8)
+    //
+    // Behavioural, via JSContext + a mock DOM whose `getComputedStyle` reproduces
+    // `EmailHTMLWrapper.wrapHTML`'s ACTUAL view-mode cascade rather than a
+    // hand-set "hidden" flag — the four `!important` rules for main view and
+    // preview mode, plus the `.tm-collapsed .tm-quote-content` quote-collapse
+    // rule. Per real CSS, `display:none` on an ancestor does NOT change a
+    // descendant's own computed `display`, and the mock models that, because it
+    // is exactly what forces the predicate to walk ancestors.
+    //
+    // `requestAnimationFrame` and `setTimeout` QUEUE here instead of running
+    // synchronously (unlike `widthPipelineHarness`), so the post-paint arm and
+    // the 1500ms failsafe arm can be driven independently. That separation is
+    // the point: a predicate applied at the call sites instead of inside
+    // `swap()` would leave the failsafe re-fetching everything the post-paint
+    // arm withheld, and a test that only ever fires one arm cannot see it.
+    private static func hiddenSectionHarness(
+        previewFilename: String?, includeEmlSections: Bool = true
+    ) -> String {
+        let previewSetup = previewFilename.map {
+            "_previewMode = true; _selected = '\($0)'; _bodyClasses = ['tm-preview-mode'];"
+        } ?? ""
+        let emlSetup = includeEmlSections ? """
+            var secA = _append(_body, _mkEl('DIV', 'tm-eml-section'));
+            secA._attrs['data-filename'] = 'a.eml';
+            _append(secA, _mkEl('DIV', 'tm-eml-headers'));
+            _mkImg(_append(secA, _mkEl('DIV', 'tm-email-body')), 'emlA');
+            var secB = _append(_body, _mkEl('DIV', 'tm-eml-section'));
+            secB._attrs['data-filename'] = 'b.eml';
+            _mkImg(_append(secB, _mkEl('DIV', 'tm-email-body')), 'emlB');
+            """ : ""
+        return """
+        var _previewMode = false, _selected = null, _bodyClasses = [];
+        var _imgs = [], _rafQ = [], _timerQ = [], _logs = [];
+        \(previewSetup)
+        function _mkEl(tag, classes) {
+            var list = (classes || '').split(' ').filter(function (c) { return c.length > 0; });
+            var el = {
+                tagName: tag, className: classes || '', parentElement: null, _attrs: {},
+                classList: { contains: function (c) { return list.indexOf(c) >= 0; } },
+                getAttribute: function (k) { return (k in el._attrs) ? el._attrs[k] : null; },
+                setAttribute: function (k, v) { el._attrs[k] = v; },
+                removeAttribute: function (k) { delete el._attrs[k]; },
+                hasAttribute: function (k) { return (k in el._attrs); }
+            };
+            return el;
+        }
+        function _append(parent, child) { child.parentElement = parent; return child; }
+        function _mkImg(parent, id) {
+            var img = _mkEl('IMG', '');
+            img._id = id;
+            img._attrs['data-tmsrc'] = 'https://example.com/' + id + '.png';
+            _append(parent, img);
+            _imgs.push(img);
+            return img;
+        }
+        function _hasClass(el, c) { return !!(el && el.classList && el.classList.contains(c)); }
+        var _body = _mkEl('BODY', '');
+        _body.classList = { contains: function (c) { return _bodyClasses.indexOf(c) >= 0; } };
+        // The parent message's own body, and a COLLAPSED quote — the in-document
+        // reveal ("Show quoted text") that a general visibility predicate would
+        // strand. Both live in every message; the .eml sections do not.
+        _mkImg(_append(_body, _mkEl('DIV', 'tm-email-body')), 'parent');
+        var quoteWrap = _append(_body, _mkEl('DIV', 'tm-quote-wrapper tm-collapsed'));
+        _mkImg(_append(quoteWrap, _mkEl('DIV', 'tm-quote-content')), 'quoted');
+        \(emlSetup)
+        // EmailHTMLWrapper.wrapHTML's cascade, per element (NOT inherited).
+        function _display(el) {
+            if (_previewMode) {
+                if (_hasClass(el, 'tm-eml-section')) {
+                    return el.getAttribute('data-filename') === _selected ? 'block' : 'none';
+                }
+                if (el.parentElement === _body) return 'none';   // > *:not(.tm-eml-section)
+                if (_hasClass(el, 'tm-eml-headers')) return 'none';
+            } else if (_hasClass(el, 'tm-eml-section')) {
+                return 'none';
+            }
+            if (_hasClass(el, 'tm-quote-content') && _hasClass(el.parentElement, 'tm-collapsed')) {
+                return 'none';
+            }
+            return 'block';
+        }
+        var document = {
+            readyState: 'complete',
+            body: _body,
+            querySelectorAll: function (s) {
+                return _imgs.filter(function (im) {
+                    return im.hasAttribute('data-tmsrc') || im.hasAttribute('data-tmsrcset');
+                });
+            }
+        };
+        var window = {
+            addEventListener: function () {},
+            getComputedStyle: function (el) { return { display: _display(el) }; },
+            webkit: { messageHandlers: { consoleLog: { postMessage: function (s) { _logs.push(s); } } } }
+        };
+        function requestAnimationFrame(fn) { _rafQ.push(fn); }
+        function setTimeout(fn, t) { _timerQ.push(fn); }
+        // Drains nested rAF (the swap arms a double rAF) without running timers.
+        function runPostPaint() {
+            var guard = 0;
+            while (_rafQ.length && guard++ < 10) {
+                var q = _rafQ; _rafQ = [];
+                for (var i = 0; i < q.length; i++) q[i]();
+            }
+        }
+        function runFailsafe() {
+            var q = _timerQ; _timerQ = [];
+            for (var i = 0; i < q.length; i++) q[i]();
+        }
+        // Ids of images that have been assigned a real URL, and of those still
+        // holding a deferred attribute — asserted as SETS so the two halves
+        // cannot both be satisfied by an empty swap.
+        function fetchedIds() {
+            return _imgs.filter(function (im) { return im.hasAttribute('src') || im.hasAttribute('srcset'); })
+                        .map(function (im) { return im._id; }).sort().join(',');
+        }
+        function deferredIds() {
+            return _imgs.filter(function (im) { return im.hasAttribute('data-tmsrc') || im.hasAttribute('data-tmsrcset'); })
+                        .map(function (im) { return im._id; }).sort().join(',');
+        }
+        """
+    }
+
+    private func makeHiddenSectionContext(
+        previewFilename: String? = nil, includeEmlSections: Bool = true
+    ) -> JSContext {
+        let ctx = JSContext()!
+        ctx.evaluateScript(Self.hiddenSectionHarness(
+            previewFilename: previewFilename, includeEmlSections: includeEmlSections))
+        #expect(ctx.exception == nil, "harness threw: \(ctx.exception?.toString() ?? "")")
+        ctx.evaluateScript(_deferredImageLoadJS(diagnosticsEnabled: false))
+        #expect(ctx.exception == nil, "swap script threw: \(ctx.exception?.toString() ?? "")")
+        return ctx
+    }
+
+    private func fetchedIds(_ ctx: JSContext) -> String {
+        ctx.evaluateScript("fetchedIds()")?.toString() ?? "<nil>"
+    }
+
+    private func deferredIds(_ ctx: JSContext) -> String {
+        ctx.evaluateScript("deferredIds()")?.toString() ?? "<nil>"
+    }
+
+    @Test("main view: an attached .eml's images are never fetched, on BOTH swap arms")
+    func deferredSwapWithholdsHiddenEmlSectionImages() {
+        // The common manifestation of T8 and the one needing no preview sheet at
+        // all: `.tm-eml-section { display:none !important }` hides every embedded
+        // .eml, but WebKit fetches an <img> regardless — so opening an ordinary
+        // message fired the tracking pixels of every .eml attached to it.
+        let ctx = makeHiddenSectionContext()
+
+        ctx.evaluateScript("runPostPaint()")
+        #expect(ctx.exception == nil, "post-paint threw: \(ctx.exception?.toString() ?? "")")
+        // The invariant, both directions at once: the parent body and the
+        // collapsed quote ARE fetched; neither .eml section is.
+        #expect(fetchedIds(ctx) == "parent,quoted")
+        #expect(deferredIds(ctx) == "emlA,emlB")
+
+        // The failsafe arm must inherit the same predicate. If it were filtered
+        // at the call site instead of inside swap(), this line re-fetches
+        // everything 1500ms later and the fix is a silent no-op.
+        ctx.evaluateScript("runFailsafe()")
+        #expect(ctx.exception == nil, "failsafe threw: \(ctx.exception?.toString() ?? "")")
+        #expect(fetchedIds(ctx) == "parent,quoted")
+        #expect(deferredIds(ctx) == "emlA,emlB")
+    }
+
+    @Test("the failsafe arm alone honours the predicate — the post-paint arm is not what enforces it")
+    func deferredSwapFailsafeArmAloneWithholdsHiddenImages() {
+        // Drives ONLY the 1500ms failsafe (the post-paint rAF queue is never
+        // drained), which is how a starved/offscreen-throttled load actually
+        // behaves. Non-vacuous: the visible images must still arrive.
+        let ctx = makeHiddenSectionContext()
+        ctx.evaluateScript("runFailsafe()")
+        #expect(ctx.exception == nil, "failsafe threw: \(ctx.exception?.toString() ?? "")")
+        #expect(fetchedIds(ctx) == "parent,quoted")
+        #expect(deferredIds(ctx) == "emlA,emlB")
+    }
+
+    @Test("preview sheet: only the selected .eml section's images are fetched")
+    func deferredSwapPreviewModeFetchesOnlySelectedSection() {
+        // Preview mode hides the parent body (`> *:not(.tm-eml-section)`) and
+        // every non-selected section, so pre-fix, opening ONE .eml preview fired
+        // the parent message's pixels AND every other .eml's.
+        let ctx = makeHiddenSectionContext(previewFilename: "a.eml")
+        ctx.evaluateScript("runPostPaint(); runFailsafe()")
+        #expect(ctx.exception == nil, "swap arms threw: \(ctx.exception?.toString() ?? "")")
+        #expect(fetchedIds(ctx) == "emlA")
+        #expect(deferredIds(ctx) == "emlB,parent,quoted")
+    }
+
+    @Test("an ordinary message with no .eml sections still fetches every image")
+    func deferredSwapNegativeControlLoadsEverything() {
+        // The negative control that matters most: over-skipping is worse than
+        // the bug. No `.tm-eml-section` anywhere and not preview mode, so the
+        // predicate must be inert and behaviour identical to pre-fix.
+        let ctx = makeHiddenSectionContext(includeEmlSections: false)
+        ctx.evaluateScript("runPostPaint(); runFailsafe()")
+        #expect(ctx.exception == nil, "swap arms threw: \(ctx.exception?.toString() ?? "")")
+        #expect(fetchedIds(ctx) == "parent,quoted")
+        #expect(deferredIds(ctx) == "")
+    }
+
+    @Test("an image inside a COLLAPSED quote is still fetched — the reveal is in-document")
+    func deferredSwapStillFetchesInsideCollapsedQuote() {
+        // Regression guard for the hazard that rules out a general visibility
+        // predicate. `collapseQuotesJS`/`collapseICSJS` build
+        // `.tm-quote-wrapper.tm-collapsed`, whose `.tm-quote-content` is
+        // `display:none` until the user taps "Show quoted text" / "Show invite
+        // details" — a class toggle with NO document reload, so nothing would
+        // ever re-run the swap. `offsetParent === null` or
+        // `getClientRects().length === 0` would skip this image and the expanded
+        // quote would render a blank frame.
+        //
+        // Asserted on the STATE the mock reports, so it cannot pass by accident:
+        // the container really is display:none at swap time, and the image is
+        // fetched anyway.
+        let ctx = makeHiddenSectionContext()
+        let quoteDisplay = ctx.evaluateScript(
+            "_display(_imgs.filter(function (im) { return im._id === 'quoted'; })[0].parentElement)"
+        )?.toString()
+        #expect(quoteDisplay == "none")
+        ctx.evaluateScript("runPostPaint(); runFailsafe()")
+        #expect(ctx.exception == nil, "swap arms threw: \(ctx.exception?.toString() ?? "")")
+        let quotedFetched = ctx.evaluateScript(
+            "_imgs.filter(function (im) { return im._id === 'quoted' && im.getAttribute('src') === 'https://example.com/quoted.png'; }).length"
+        )?.toInt32()
+        #expect(quotedFetched == 1)
+    }
+
+    @Test("a withheld image keeps its deferred attributes, so a later load can still swap it")
+    func deferredSwapWithheldImageStaysSwappable() {
+        // Idempotence/re-runnability: the skip must not consume or mark the
+        // image. Modelled by re-running the whole pipeline against the SAME DOM
+        // in the mode where that section is selected — which is what selecting a
+        // different .eml does in production (a different wrapped document, a
+        // fresh load), and it can only work if the attributes survived.
+        let ctx = makeHiddenSectionContext()
+        ctx.evaluateScript("runPostPaint(); runFailsafe()")
+        #expect(deferredIds(ctx) == "emlA,emlB")
+
+        // Flip to preview mode with a.eml selected and re-run the production script.
+        ctx.evaluateScript("_previewMode = true; _selected = 'a.eml'; _bodyClasses = ['tm-preview-mode'];")
+        ctx.evaluateScript(_deferredImageLoadJS(diagnosticsEnabled: false))
+        ctx.evaluateScript("runPostPaint(); runFailsafe()")
+        #expect(ctx.exception == nil, "re-run threw: \(ctx.exception?.toString() ?? "")")
+        // emlA was withheld before and is fetched now; emlB stays withheld.
+        #expect(deferredIds(ctx) == "emlB")
+        let emlAFetched = ctx.evaluateScript(
+            "_imgs.filter(function (im) { return im._id === 'emlA' && im.getAttribute('src') === 'https://example.com/emlA.png'; }).length"
+        )?.toInt32()
+        #expect(emlAFetched == 1)
+    }
+
+    @Test("the swapped/withheld census is emitted per trigger, and only under the debug gate")
+    func deferredSwapCensusIsDebugGated() {
+        // Owner requirement: a failed device smoke test must be diagnosable from
+        // the log without a rebuild.
+        let ctx = JSContext()!
+        ctx.evaluateScript(Self.hiddenSectionHarness(previewFilename: nil))
+        ctx.evaluateScript(_deferredImageLoadJS(diagnosticsEnabled: true))
+        ctx.evaluateScript("runPostPaint(); runFailsafe()")
+        #expect(ctx.exception == nil, "gated script threw: \(ctx.exception?.toString() ?? "")")
+        let logs = ctx.evaluateScript("_logs.join('|')")?.toString() ?? ""
+        #expect(logs.contains("[DeferImg] post-paint total=4 swapped=2 skippedHidden=2"))
+        #expect(logs.contains("[DeferImg] failsafe-1500ms total=2 swapped=0 skippedHidden=2"))
+        // Production emits no census at all.
+        #expect(!_deferredImageLoadJS(diagnosticsEnabled: false).contains("[DeferImg]"))
+    }
+
     @Test("image diagnostics distinguish image failure sources without retrying URLs")
     func imageLoadDiagnostics() {
         // The GATED form. `enabled: false` is asserted separately below, because
