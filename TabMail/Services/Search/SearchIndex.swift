@@ -1856,8 +1856,13 @@ actor SearchIndex {
         guard !query.isEmpty else { return [] }
 
         let ftsQuery = SearchQueryParser.buildFTSMatch(query)
-        let shardList = knownYears.sorted().map(String.init).joined(separator: ", ")
-        print("[SearchIndex] search: raw='\(query.prefix(80))' fts='\(ftsQuery.prefix(100))' limit=\(limit) shards=[\(shardList)]")
+        // Debug-gated: `query` is the user's own typed search text and `ftsQuery`
+        // is derived from it, so this line echoes user content on every search.
+        // `shardList` is inside the gate because it feeds nothing else.
+        if DebugModeManager.isLoggingEnabled() {
+            let shardList = knownYears.sorted().map(String.init).joined(separator: ", ")
+            print("[SearchIndex] search: raw='\(query.prefix(80))' fts='\(ftsQuery.prefix(100))' limit=\(limit) shards=[\(shardList)]")
+        }
 
         // When query parses to empty FTS (e.g., "*") but dates are provided,
         // fall back to date-range scan (list all emails in the period)
