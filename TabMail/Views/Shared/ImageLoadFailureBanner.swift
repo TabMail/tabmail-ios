@@ -88,6 +88,33 @@ struct ImageFailureBannerState: Equatable {
     ) -> ImageFailureBannerState {
         old == new ? state : ImageFailureBannerState()
     }
+
+    /// The count to publish for a census of `reported` failures taken while the
+    /// device was (or was not) on a network.
+    ///
+    /// **Offline is the one cause the page cannot distinguish but WE can.** The
+    /// banner names the sender's image server. `onerror` fires identically for an
+    /// ATS/TLS refusal, a 404, a DNS failure, malformed bytes — and for a device
+    /// with no network at all, where EVERY remote image fails and the sentence is
+    /// wrong about every one of them. WebKit hands the page no reason code, which
+    /// is why the copy is hedged; but the app has `NWPathMonitor`, so this is the
+    /// single cause we can rule out without guessing, and ruling it out is what
+    /// keeps a hedged sentence from becoming a false accusation on a plane.
+    ///
+    /// Suppression, not correction: it publishes 0 rather than rewriting the copy.
+    /// An offline user already knows why nothing loaded, and a second sentence
+    /// telling them so is noise; there is nothing for a banner to explain. The
+    /// count is not persisted anywhere, so re-rendering the message once the
+    /// device is back on a network re-runs the census and reports honestly.
+    ///
+    /// ⚠️ Deliberately NOT `navigator.onLine` inside the page. That is
+    /// sender-observable, sender-spoofable (author script can define the
+    /// property), and answers about the WebView's view of the world rather than
+    /// the app's. The connectivity fact belongs on the Swift side of the bridge,
+    /// where the sender cannot reach it.
+    static func publishedFailureCount(reported: Int, isConnected: Bool) -> Int {
+        isConnected ? reported : 0
+    }
 }
 
 /// Dismiss-only notice shown above a rendered message when at least one of the

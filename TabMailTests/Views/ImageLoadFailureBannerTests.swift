@@ -10,9 +10,31 @@ import SwiftUI
 // =====================================================================================
 // P4 — the image-failure banner's visibility decision (ADR-IOS-076).
 //
-// THE INVARIANT THESE PIN: *the banner appears if and only if at least one remote
-// image of the document CURRENTLY on screen ended in `error` and the user has not
-// dismissed it — and nothing about it survives a document change.*
+// THE INVARIANT THESE PIN: *given a banner state and the identities of the document
+// it describes and the document now on screen, the banner is visible iff at least one
+// remote image of the CURRENT document ended in `error` and the user has not dismissed
+// it — and every input that selects which content is rendered discards both halves.*
+//
+// ⚠️ The scope sentence above is narrower than the one this header carried until
+// 2026-08-13 ("nothing about it survives a document change"), and the difference is
+// the reason `aDocumentChangeClearsBothHalves` was worthless. `documentChanged()` was
+// `self = ImageFailureBannerState()` and the test asserted `x.documentChanged();
+// x == ImageFailureBannerState()` — the implementation's own statement read back. It
+// could not fail for any implementation of "assign the initial value", and, more to
+// the point, it said nothing about WHEN the reset ran, which was the entire defect:
+// the call site fired on `html` alone, so a body refetch returning identical bytes
+// and a row re-keyed onto a different message both kept the old count and dismissal.
+// A vacuous test is not merely uninformative — it made this file LOOK like it covered
+// the wiring. The reset now takes the two document identities as ARGUMENTS, which is
+// what moves that decision into something assertable.
+//
+// ⚠️ STILL NOT COVERED HERE, stated so nobody reads more into a green run than it
+// carries: that `AutoSizingHTMLView` actually invokes `carried` at the right moments.
+// `.onChange(of: documentIdentity)` needs a SwiftUI render pass to observe, and the
+// suite has no host for one. What these tests pin is the DECISION — membership of
+// `RenderedDocumentIdentity`, and what `carried` does with it. The wiring was verified
+// by inverting it (dropping each field from the identity in turn and watching the
+// matching test below go red).
 //
 // Both directions matter, and for different reasons. A missing banner costs the user
 // an explanation. A SPURIOUS banner is worse: it is a claim about a stranger's mail
@@ -187,6 +209,42 @@ struct ImageFailureBannerStateTests {
         let fresh = ImageFailureBannerState()
         #expect(ImageFailureBannerState.carried(
             fresh, describing: Self.identity(), into: Self.identity(html: "<p>next</p>")) == fresh)
+    }
+
+    @Test("An offline device publishes no failures — the banner must not blame a server the device never reached")
+    func anOfflineCensusIsSuppressed() {
+        // On a device with no network EVERY remote image errors, so an unfiltered
+        // census reads as "the sender's image server may not support a secure
+        // connection" about a server the device never tried to reach. `onerror`
+        // gives the page no reason code, but the app has `NWPathMonitor` — this is
+        // the one cause we can rule out rather than hedge around.
+        let reported = 5
+
+        // MIS-IOS-016 — the fixture has to be a census that WOULD raise a banner,
+        // or "suppressed" and "there was nothing to suppress" are the same result
+        // and every assertion below passes against a function that does nothing.
+        #expect(ImageFailureBannerState(failedCount: reported).isVisible,
+                "the fixture must raise a banner when online, or suppression is unobservable")
+
+        #expect(ImageFailureBannerState.publishedFailureCount(reported: reported, isConnected: false) == 0)
+        let offline = ImageFailureBannerState(
+            failedCount: ImageFailureBannerState.publishedFailureCount(
+                reported: reported, isConnected: false))
+        #expect(offline.isVisible == false, "no banner while offline")
+
+        // The negative control, and it is the half that matters most: online, the
+        // census is published untouched. A suppression that swallowed the online
+        // case too would delete the feature outright while leaving the assertion
+        // above green.
+        #expect(ImageFailureBannerState.publishedFailureCount(reported: reported, isConnected: true) == reported)
+        #expect(ImageFailureBannerState(
+            failedCount: ImageFailureBannerState.publishedFailureCount(
+                reported: reported, isConnected: true)).isVisible,
+                "a real failure on a connected device must still raise the banner")
+
+        // And suppression cannot manufacture a banner in either direction.
+        #expect(ImageFailureBannerState.publishedFailureCount(reported: 0, isConnected: true) == 0)
+        #expect(ImageFailureBannerState.publishedFailureCount(reported: 0, isConnected: false) == 0)
     }
 
     @Test("The user-visible sentence stays hedged, name-free and count-free")

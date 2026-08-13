@@ -1581,8 +1581,18 @@ private struct HTMLWebView: UIViewRepresentable {
                 // and a report from the document being REPLACED is attributed to the
                 // document it came from, never to the one about to arrive.
                 guard honourOneShot(.imageFailureReport, channel: "imageLoadFailure") else { return }
-                bridgeLog("imageLoadFailure failed=\(report.failed) deferred=\(report.deferred)")
-                if failedImageCount != report.failed { failedImageCount = report.failed }
+                // A device with no network fails EVERY remote image, so an
+                // unfiltered census there accuses the sender's server of something
+                // the user's own connectivity did. The page cannot tell the two
+                // apart — WebKit gives it no reason code — but the app can. See
+                // `publishedFailureCount` for why the check lives here and not in
+                // JS as `navigator.onLine`.
+                let connected = NetworkMonitor.checkConnected()
+                let published = ImageFailureBannerState.publishedFailureCount(
+                    reported: report.failed, isConnected: connected)
+                bridgeLog("imageLoadFailure failed=\(report.failed) deferred=\(report.deferred) "
+                          + "connected=\(connected) published=\(published)")
+                if failedImageCount != published { failedImageCount = published }
             }
         }
 
@@ -3142,9 +3152,24 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
         // Because the answer cannot change while the document is loaded, NO
         // re-run hook, MutationObserver or IntersectionObserver is needed:
         // `previewFilename` is a `wrapHTML` parameter, so selecting a different
-        // `.eml` builds a different document and loads it fresh (the coordinator
-        // reloads on `loadedPreviewFilename` change), and that document's own
-        // `swap()` sees the newly-selected section visible.
+        // `.eml` builds a different document and loads it fresh, and that
+        // document's own `swap()` sees the newly-selected section visible.
+        //
+        // ⚠️ The mechanism is a REMOUNT, not a comparison. This said "the
+        // coordinator reloads on `loadedPreviewFilename` change" until
+        // 2026-08-13; it does not, and could not — `updateUIView` reloads on
+        // `html || reloadToken` and merely RECORDS `loadedPreviewFilename`
+        // alongside, and the two `.eml` previews of one message carry IDENTICAL
+        // `html` (`AttachmentListView` builds every `EmlPreviewState` from the
+        // same parent `bodyHtml`; only `filename` differs), so a coordinator
+        // comparison would have found nothing to reload. What actually rebuilds
+        // the document is `.sheet(item: $emlPreview)`: `EmlPreviewState.id` is a
+        // fresh `UUID()` per selection, so a different attachment presents a new
+        // sheet, which constructs a new `AutoSizingHTMLView` and a new
+        // `WKWebView` whose `loadedHTML` starts nil. Correct code, false reason —
+        // and the false reason is load-bearing, because a reader checking whether
+        // this predicate can go stale would have looked for a comparison that
+        // isn't there, found nothing, and concluded the invariant was broken.
         //
         // ⚠️ A GENERAL predicate (`offsetParent === null`,
         // `getClientRects().length === 0`) WOULD BE WRONG HERE, and not
