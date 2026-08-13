@@ -4685,6 +4685,39 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                             print("[IMAP] Atomic MOVE completed with malformed COPYUID; converging by sync")
                         }
                         return MoveOutcome(provenIds: ids, provenDestinations: [])
+                    } catch IMAPError.moveFailedAfterPartialCompletion(
+                        let copyUID, _
+                    ) {
+                        // RFC 6851 permits an untagged COPYUID before EXPUNGE
+                        // responses. SwiftMail retained that attempt-correlated
+                        // mapping before the later tagged failure. Some members
+                        // therefore moved, and resending the original set could
+                        // address a later source-UID occupant. Retire this wire
+                        // attempt, preserve the verified destination addresses,
+                        // and make the queue reconcile BOTH mailboxes.
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[IMAP] Atomic MOVE partially completed with COPYUID; reconciling both mailboxes without retry")
+                        }
+                        return MoveOutcome(
+                            provenIds: ids,
+                            provenDestinations: Self.copyProvenDestinations(
+                                copyUID, requested: sourceUIDs),
+                            requiresSourceReconciliation: true)
+                    } catch IMAPError.moveFailedAfterPossiblePartialCompletion {
+                        // The server may already have changed either mailbox but
+                        // supplied no trustworthy mapping. The only safe bound is
+                        // the same one used for an interrupted in-flight MOVE at
+                        // launch: never resend these source UIDs; retire the
+                        // attempt and converge from fresh source + destination
+                        // state. The user's visible remainder can then be issued
+                        // as a new, freshly-addressed gesture.
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[IMAP] Atomic MOVE may have partially completed; reconciling both mailboxes without retry")
+                        }
+                        return MoveOutcome(
+                            provenIds: ids,
+                            provenDestinations: [],
+                            requiresSourceReconciliation: true)
                     } catch {
                         // A tagged failure is terminal only when an exact LIST
                         // proves the destination disappeared. Transport loss,

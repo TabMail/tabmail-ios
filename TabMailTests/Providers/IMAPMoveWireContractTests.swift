@@ -277,6 +277,66 @@ struct IMAPMoveWireContractTests {
         #expect(server.wrongMessageViolations().isEmpty)
     }
 
+    @Test("A tagged failure after possible partial UID MOVE completes without evidence and requires source reconciliation")
+    func atomicPossiblePartialCompletionIsNotRetryable() async throws {
+        let target = "atomic-possible-partial@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "Work": [Self.message(11, target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(Int(Self.epoch), for: "Work")
+        server.failUIDMoveAfterPossiblePartialCompletion()
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let outcome = try await provider.move(
+            ids: ["11"], from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
+
+        #expect(outcome.provenIds == ["11"])
+        #expect(outcome.provenDestinations.isEmpty)
+        #expect(outcome.requiresSourceReconciliation)
+        #expect(Self.commands(server, containing: "UID MOVE").count == 1)
+        #expect(server.messageIDs(in: "Work").isEmpty)
+        #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
+        #expect(server.wrongMessageViolations().isEmpty)
+    }
+
+    @Test("A tagged failure after COPYUID-proven partial UID MOVE preserves its verified address and requires source reconciliation")
+    func atomicVerifiedPartialCompletionPreservesEvidence() async throws {
+        let target = "atomic-verified-partial@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "Work": [Self.message(12, target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(Int(Self.epoch), for: "Work")
+        server.setUidValidity(Int(Self.nextEpoch), for: "Archive")
+        server.failUIDMoveAfterVerifiedPartialCompletion()
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let outcome = try await provider.move(
+            ids: ["12"], from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
+
+        #expect(outcome.provenIds == ["12"])
+        let destination = try #require(outcome.provenDestinations.first)
+        #expect(destination.sourceProviderId == "12")
+        #expect(destination.destinationProviderId == "1")
+        #expect(destination.destinationUidValidity == Self.nextEpoch)
+        #expect(outcome.requiresSourceReconciliation)
+        #expect(Self.commands(server, containing: "UID MOVE").count == 1)
+        #expect(server.messageIDs(in: "Work").isEmpty)
+        #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
+        #expect(server.wrongMessageViolations().isEmpty)
+    }
+
     @Test("An INBOX epoch turnover after legacy flag stripping refuses before UID MOVE")
     func atomicMoveReassertsEpochAfterLegacyStrip() async throws {
         let target = "atomic-strip-turnover@example.com"

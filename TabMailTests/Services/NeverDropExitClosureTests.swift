@@ -1192,6 +1192,85 @@ struct NeverDropExitClosureTests {
         await finish(f)
     }
 
+    // MARK: - SwiftMail PR #208 — tagged failure after MOVE changed state
+
+    /// PR #208 distinguishes a normal tagged failure from a MOVE whose server
+    /// state may already have changed. Neither form below may re-enter the
+    /// durable queue: reissuing the original source UIDs can duplicate a moved
+    /// message or address a later occupant. The only safe disposition is to
+    /// retire the attempt and reconcile both affected mailboxes, retaining the
+    /// server's COPYUID mapping when one survived.
+    @Test("A possibly-partial UID MOVE is reconciled and never re-issued")
+    @MainActor
+    func aPossiblyPartialAtomicMoveIsNeverReissued() async throws {
+        try await assertPostCommitAtomicMoveFailureIsNeverReissued(
+            accountId: "closure-atomic-possible-partial",
+            target: "atomic-possible-partial@example.com",
+            configure: { $0.failUIDMoveAfterPossiblePartialCompletion() })
+    }
+
+    @Test("A COPYUID-proven partial UID MOVE is reconciled and never re-issued")
+    @MainActor
+    func aVerifiedPartialAtomicMoveIsNeverReissued() async throws {
+        try await assertPostCommitAtomicMoveFailureIsNeverReissued(
+            accountId: "closure-atomic-verified-partial",
+            target: "atomic-verified-partial@example.com",
+            configure: { $0.failUIDMoveAfterVerifiedPartialCompletion() })
+    }
+
+    @MainActor
+    private func assertPostCommitAtomicMoveFailureIsNeverReissued(
+        accountId: String,
+        target: String,
+        configure: (FakeIMAPServer) -> Void
+    ) async throws {
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 77, id: target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Archive")
+        configure(server)
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: accountId)
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let move = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        try insert([move], into: f.pool)
+
+        let context = AccountManager.DrainContext()
+        let outcome = await AccountManager.shared.executeSingleOp(
+            move, provider: provider, context: context)
+
+        #expect(outcome == .proceed)
+        #expect(
+            context.foldersToSync == ["\(f.accountId)|INBOX", "\(f.accountId)|Archive"],
+            "a post-completion failure must reconcile both the source and destination")
+        #expect(
+            server.messageIDs(in: "Archive") == ["<\(target)>"],
+            "the server-side move must have landed before its tagged failure")
+
+        // A later drain is the real retry boundary. The completed attempt must
+        // already be gone from the durable queue, so no second UID MOVE appears.
+        await AccountManager.shared.drainPendingQueue()
+        await AccountManager.shared.drainPendingQueue()
+        let moves = server.recordedCommands().filter {
+            $0.uppercased().contains("UID MOVE")
+        }
+        #expect(moves.count == 1, "the original UID MOVE was re-issued: \(moves)")
+        #expect(try operations(f.pool).isEmpty)
+        #expect(server.messageIDs(in: "INBOX").isEmpty)
+        #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
+        #expect(server.wrongMessageViolations().isEmpty)
+
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
     // MARK: - A-6 — the completed-send flag producer, at the wire
 
     /// A-6, the OUTBOX half. `imapUserLabelGestureReachesTheWire` above pins the

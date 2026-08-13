@@ -69,6 +69,21 @@ struct MoveOutcome: Sendable {
     /// Per-member destination addresses the server itself named. Never a
     /// superset of `provenIds`; frequently empty.
     let provenDestinations: [ProvenDestinationAddress]
+    /// The wire reported that MOVE may have changed only part of the source
+    /// mailbox before ending with tagged NO/BAD. Retrying the original source
+    /// identifiers is unsafe; the queue must refresh the source as well as the
+    /// destination after retiring this attempt.
+    let requiresSourceReconciliation: Bool
+
+    init(
+        provenIds: [String],
+        provenDestinations: [ProvenDestinationAddress],
+        requiresSourceReconciliation: Bool = false
+    ) {
+        self.provenIds = provenIds
+        self.provenDestinations = provenDestinations
+        self.requiresSourceReconciliation = requiresSourceReconciliation
+    }
 }
 
 /// One applied re-key. The local row that used to live at `oldHeaderId` now

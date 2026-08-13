@@ -23,15 +23,22 @@ struct ExecutedOperation: Sendable {
     /// address (IMAP and Microsoft Graph). Empty destination evidence cannot
     /// distinguish that state from Gmail's address-stable label mutation.
     let addressChangesOnMove: Bool
+    /// True when an IMAP MOVE ended after possible partial completion. The
+    /// original identifiers must not be retried, and both mailbox views must be
+    /// refreshed before the user decides whether any remainder needs a new
+    /// gesture.
+    let reconcileMoveSource: Bool
 
     init(
         provenMembers: [String]?,
         provenDestinations: [ProvenDestinationAddress],
-        addressChangesOnMove: Bool = false
+        addressChangesOnMove: Bool = false,
+        reconcileMoveSource: Bool = false
     ) {
         self.provenMembers = provenMembers
         self.provenDestinations = provenDestinations
         self.addressChangesOnMove = addressChangesOnMove
+        self.reconcileMoveSource = reconcileMoveSource
     }
 
     /// Every member dispositioned, nothing re-keyable.
@@ -1193,6 +1200,9 @@ extension AccountManager {
             await materializeDeferredMoveSuccessors(after: currentOp, result: finishResult)
             if [.archive, .delete, .move].contains(currentOp.type), let dest = currentOp.destinationPath {
                 context.foldersToSync.insert("\(currentOp.accountId)|\(dest)")
+                if executed.reconcileMoveSource {
+                    context.foldersToSync.insert("\(currentOp.accountId)|\(currentOp.folderPath)")
+                }
                 // ADR-IOS-008 decision 3's third event — "message moved to
                 // inbox" — restored. Only `.move` can name an inbox: `.archive`
                 // and `.delete` resolve their destination from the archive and
@@ -2143,7 +2153,8 @@ extension AccountManager {
                 return ExecutedOperation(
                     provenMembers: outcome.provenIds,
                     provenDestinations: outcome.provenDestinations,
-                    addressChangesOnMove: true)
+                    addressChangesOnMove: true,
+                    reconcileMoveSource: outcome.requiresSourceReconciliation)
             }
             // 🚨 THE SIBLING ARM THE `COPYUID` CENSUS NEVER REACHED
             // (`IOS-GRAPH-002`, `MIS-006` instance 5). Graph reallocates a

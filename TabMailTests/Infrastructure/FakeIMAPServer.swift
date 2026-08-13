@@ -129,6 +129,16 @@ final class FakeIMAPServer: @unchecked Sendable {
         let flagsByUID: [Int: Set<String>]
     }
 
+    private enum MoveFailureAfterCommit {
+        case none
+        /// The server changed mailbox state, supplied no trustworthy mapping,
+        /// then ended UID MOVE with tagged NO.
+        case possiblePartialCompletion
+        /// The server supplied an untagged COPYUID for the changed state, then
+        /// ended UID MOVE with tagged NO.
+        case verifiedPartialCompletion
+    }
+
     private struct State {
         var messagesByMailbox: [String: [Message]]
         var flagsByMailbox: [String: [Int: Set<String>]] = [:]
@@ -209,6 +219,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// state but before its tagged response is sent. This is the exact
         /// ambiguous-success boundary atomic retry is meant to survive.
         var disconnectAfterUIDMoveCommitCount = 0
+        /// SwiftMail PR #208's post-completion failure contract. The mutation
+        /// lands first; only the evidence accompanying tagged NO differs.
+        var moveFailureAfterCommit: MoveFailureAfterCommit = .none
         /// Whether UID SEARCH honours the RFC 3501 §6.4.4 `SINCE` / `BEFORE` date
         /// keys. `false` for every pre-existing test: this fake has always answered
         /// UID SEARCH with the WHOLE mailbox regardless of the window asked for, and
@@ -879,6 +892,18 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// after mutation and therefore models an ambiguous success.
     func disconnectAfterNextUIDMoveCommit() {
         withState { $0.disconnectAfterUIDMoveCommitCount += 1 }
+    }
+
+    /// Commit UID MOVE, then answer tagged NO without trustworthy COPYUID
+    /// evidence. A caller must reconcile both mailboxes and must not resend.
+    func failUIDMoveAfterPossiblePartialCompletion() {
+        withState { $0.moveFailureAfterCommit = .possiblePartialCompletion }
+    }
+
+    /// Commit UID MOVE, publish its COPYUID in an untagged OK, then answer
+    /// tagged NO. A caller may retain that mapping but must not resend.
+    func failUIDMoveAfterVerifiedPartialCompletion() {
+        withState { $0.moveFailureAfterCommit = .verifiedPartialCompletion }
     }
 
     /// Test seam (B1, ADR-IOS-068/D4): APPEND into `mailbox` still stores the
@@ -1950,8 +1975,8 @@ final class FakeIMAPServer: @unchecked Sendable {
             if withState({ $0.deletedMailboxes[destination] != nil }) {
                 return "\(tag) NO [TRYCREATE] UID MOVE destination does not exist\r\n"
             }
-            let (moved, destinationUidValidity, withheld, mismatched) = withState {
-                state -> ([(source: Int, destination: Int)], Int, Set<Int>, Bool) in
+            let (moved, destinationUidValidity, withheld, mismatched, failureAfterCommit) = withState {
+                state -> ([(source: Int, destination: Int)], Int, Set<Int>, Bool, MoveFailureAfterCommit) in
                 recordOracleCheck(command: "UID MOVE", mailbox: mailbox, uids: uids, state: &state)
                 let sourceMessages = state.messagesByMailbox[mailbox] ?? []
                 let moving = sourceMessages.filter { uids.contains($0.uid) }
@@ -1975,9 +2000,13 @@ final class FakeIMAPServer: @unchecked Sendable {
                     pairs,
                     state.uidValidityByMailbox[destination] ?? 1,
                     state.moveUidWithheldSourceUIDs,
-                    state.moveUidCardinalityMismatch)
+                    state.moveUidCardinalityMismatch,
+                    state.moveFailureAfterCommit)
             }
             let reported = moved.filter { !withheld.contains($0.source) }
+            if case .possiblePartialCompletion = failureAfterCommit {
+                return "\(tag) NO UID MOVE may have partially completed\r\n"
+            }
             guard capabilities.contains("UIDPLUS"), !reported.isEmpty else {
                 return "\(tag) OK UID MOVE completed\r\n"
             }
@@ -1987,6 +2016,9 @@ final class FakeIMAPServer: @unchecked Sendable {
                 ? destinations + [(destinations.max() ?? 0) + 1]
                 : destinations
             let destinationSet = advertisedDestinations.map(String.init).joined(separator: ",")
+            if case .verifiedPartialCompletion = failureAfterCommit {
+                return "* OK [COPYUID \(destinationUidValidity) \(sourceSet) \(destinationSet)] UID MOVE partially completed\r\n\(tag) NO UID MOVE ended after partial completion\r\n"
+            }
             return "\(tag) OK [COPYUID \(destinationUidValidity) \(sourceSet) \(destinationSet)] UID MOVE completed\r\n"
         case "EXPUNGE":
             // ⚠ A PREVIOUS REVISION `trimmingCharacters(in: .whitespaces)`-ED THIS
