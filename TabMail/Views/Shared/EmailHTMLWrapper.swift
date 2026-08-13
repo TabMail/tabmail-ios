@@ -425,7 +425,11 @@ enum EmailHTMLWrapper {
     /// Unwrap a full HTML document into content suitable for embedding inside our wrapper.
     /// Converts `<html>` and `<body>` tags to `<div>` (preserving inline styles),
     /// removes `<head>` while keeping `<style>` blocks, and strips orphaned `<meta>` tags.
-    /// - Note: `internal` (not private) for use by `renderBodyWithEmbeddedHeaders`.
+    /// - Note: `internal` rather than `private` only so the test target can reach
+    ///   it; `wrapHTML`, in this file, is its sole caller in the app. (This note
+    ///   previously claimed `renderBodyWithEmbeddedHeaders` needed the access.
+    ///   That function lives in `IMAPFetchMapping`, which holds no reference to
+    ///   `EmailHTMLWrapper` at all — the claim was false, not merely stale.)
     static func unwrapFullHTMLDocument(_ html: String) -> String {
         let isDbg = DebugModeManager.isLoggingEnabled()
         var result = html
@@ -446,8 +450,22 @@ enum EmailHTMLWrapper {
         }
 
         // Extract <style> blocks from <head>, then remove the entire <head>...</head>.
+        //
+        // Both searches run FORWARD (first match each) — unlike the `<body>` pair
+        // in `EmlMarker.extractBodyContent`, which mixes forward and `.backwards`.
+        // So without the bound below the trap condition here is simply "the first
+        // `</head>` precedes the first `<head…>`", and it reverses BOTH slices
+        // taken from this pair: the `headContent` read just below, and the
+        // `replaceSubrange` at the end of the block. Bounding the closing search
+        // to start after the opening tag fixes both at once; fixing the two
+        // slices separately would leave the pair itself still able to cross.
+        // A reversed `Range` is an uncatchable precondition failure, and the
+        // sender chooses this HTML (`wrapHTML` routes any body starting with
+        // `<!doctype`/`<html` here), so it must not be reachable.
         if let headStart = result.range(of: #"<head[^>]*>"#, options: [.regularExpression, .caseInsensitive]),
-           let headEnd = result.range(of: "</head>", options: .caseInsensitive) {
+           let headEnd = result.range(of: "</head>",
+                                      options: .caseInsensitive,
+                                      range: headStart.upperBound..<result.endIndex) {
             let headContent = String(result[headStart.upperBound..<headEnd.lowerBound])
             if isDbg { print("[HTMLDebug] unwrap: <head> found, headContent len=\(headContent.count)") }
             var styles = ""

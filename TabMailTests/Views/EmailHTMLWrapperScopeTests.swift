@@ -185,3 +185,129 @@ struct EmailHTMLWrapperScopeTests {
         #expect(!js.contains("scrollingElement.scrollTop"))
     }
 }
+
+/// `EmailHTMLWrapper.unwrapFullHTMLDocument` extracts the `<head>` block from two
+/// bounds. Unlike the `<body>` pair in `EmlMarker.extractBodyContent` — which
+/// mixes a forward search with a `.backwards` one — **both `<head>` searches run
+/// FORWARD**, taking the first match each. So the trap condition here is simply
+/// *the first `</head>` precedes the first `<head…>`*, and when they were
+/// searched independently that reversed BOTH slices built from the pair: the
+/// `headContent` read, and the `replaceSubrange` that swaps the head for its
+/// hoisted styles. `String` traps on a reversed `Range` — an uncatchable
+/// precondition failure, not a throwable error.
+///
+/// The sender controls this HTML: `wrapHTML` routes any body whose trimmed text
+/// starts with `<!doctype` or `<html` through here, so the crash is "user opens
+/// a crafted message". Narrower than a background-sync wedge, and stated that
+/// way rather than overstated.
+///
+/// These pin the **invariant** — *for any input the head extraction either
+/// slices correctly-ordered bounds or skips the block entirely; it never traps
+/// and never drops the message body* — over a table that varies the pair on each
+/// axis independently, plus literal-valued benign controls.
+///
+/// All HTML here is synthetic.
+@Suite("EmailHTMLWrapper.unwrapFullHTMLDocument — head bound-pair invariant")
+struct EmailHTMLWrapperHeadBoundPairTests {
+
+    struct Shape: CustomStringConvertible, Sendable {
+        let name: String
+        let html: String
+        /// The message payload must survive on whichever branch runs.
+        let mustRetain: [String]
+        var description: String { name }
+    }
+
+    static let shapes: [Shape] = [
+        // --- first close precedes first open: the reversed-Range family ---
+        Shape(name: "close before open, adjacent",
+              html: "<html></head><head></head><body>x</body></html>",
+              mustRetain: ["x"]),
+        Shape(name: "close before open, gap wider than the </head> token",
+              html: "<html></head>xxxxxxxxxxxxxxxxxxxx<head></head><body>payload</body></html>",
+              mustRetain: ["payload"]),
+        Shape(name: "close before open, uppercase tags",
+              html: "<html></HEAD><HEAD></HEAD><body>x</body></html>",
+              mustRetain: ["x"]),
+        Shape(name: "close before open, attributes on the open tag",
+              html: "<html></head><head profile=\"p\"></head><body>x</body></html>",
+              mustRetain: ["x"]),
+        Shape(name: "close before open, behind a DOCTYPE",
+              html: "<!DOCTYPE html><html></head><head></head><body>x</body></html>",
+              mustRetain: ["x"]),
+        Shape(name: "close before open, style block stranded outside",
+              html: "<html></head><style>.z{color:red}</style><head></head><body>x</body></html>",
+              mustRetain: ["x"]),
+
+        // --- one bound only: the block must be skipped, not half-applied ---
+        Shape(name: "close only",
+              html: "<html></head><body>x</body></html>",
+              mustRetain: ["x"]),
+        Shape(name: "open only",
+              html: "<html><head><body>x</body></html>",
+              mustRetain: ["x"]),
+        Shape(name: "neither bound",
+              html: "<html><body>x</body></html>",
+              mustRetain: ["x"]),
+
+        // --- multiplicity, and the directional negative control ---
+        Shape(name: "multiple opens",
+              html: "<html><head><head></head><body>x</body></html>",
+              mustRetain: ["x"]),
+        Shape(name: "multiple closes",
+              html: "<html><head></head></head><body>x</body></html>",
+              mustRetain: ["x"]),
+        // Both searches are forward, so an unclosed SECOND <head> after a
+        // well-formed pair does NOT cross. A fix that special-cased a leading
+        // `</head>` would pass the crossed rows above and still be wrong; this
+        // row and `orderedPairWithTrailingOpenUnchanged` below are what separate
+        // the condition from the example.
+        Shape(name: "open, close, open (does NOT cross)",
+              html: "<html><head></head><head><body>x</body></html>",
+              mustRetain: ["x"]),
+    ]
+
+    @Test("Any head bound-pair shape returns and never traps", arguments: shapes)
+    func headBoundPairNeverTraps(shape: Shape) {
+        let out = EmailHTMLWrapper.unwrapFullHTMLDocument(shape.html)
+        // Reaching this line IS the first half of the invariant: a reversed
+        // Range is a `fatalError`, which Swift Testing cannot catch — a
+        // regression kills the test host rather than recording a failure.
+        for needle in shape.mustRetain {
+            #expect(out.contains(needle), "\(shape.name): dropped \(needle.debugDescription)")
+        }
+    }
+
+    @Test("wrapHTML survives a crossed head pair on its full-document route")
+    func wrapHTMLSurvivesCrossedHead() {
+        // `wrapHTML` is `unwrapFullHTMLDocument`'s only caller in the app, and
+        // the `<html`-prefix test is what routes a sender's document into it.
+        let out = EmailHTMLWrapper.wrapHTML("<html></head><head></head><body>x</body></html>")
+        #expect(out.contains("x"))
+        #expect(out.contains("<body>"))
+    }
+
+    // MARK: - Benign controls (literal expectations)
+
+    @Test("Benign empty-head document is byte-identical to the pre-fix output")
+    func benignEmptyHeadUnchanged() {
+        let out = EmailHTMLWrapper.unwrapFullHTMLDocument("<html><head></head><body>hi</body></html>")
+        #expect(out == "<div><div class=\"tm-email-body\">hi</div></div>")
+    }
+
+    @Test("Benign document still hoists its head styles out of the head block")
+    func benignHeadStylesHoisted() {
+        let out = EmailHTMLWrapper.unwrapFullHTMLDocument(
+            "<html><head><style>.a{color:red}</style></head><body>hi</body></html>"
+        )
+        #expect(out == "<div><style>.a{color:red}</style><div class=\"tm-email-body\">hi</div></div>")
+    }
+
+    @Test("An ordered pair followed by a stray open tag is byte-identical to pre-fix")
+    func orderedPairWithTrailingOpenUnchanged() {
+        // The boundary case for the trap CONDITION: first open at 5, first close
+        // at 11 — ordered — so the fix must not change this at all.
+        let out = EmailHTMLWrapper.unwrapFullHTMLDocument("<html><head></head><head><body>hi</body></html>")
+        #expect(out == "<div><head><div class=\"tm-email-body\">hi</div></div>")
+    }
+}
