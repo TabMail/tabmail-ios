@@ -407,8 +407,8 @@ internal enum RenderContentWorld {
 
 // MARK: - Bridge input validation
 
-/// Swift-side validation for the three `WKScriptMessageHandler` channels
-/// (`heightChanged`, `consoleLog`, `gutterAdjust`).
+/// Swift-side validation for the four `WKScriptMessageHandler` channels
+/// (`heightChanged`, `consoleLog`, `gutterAdjust`, `imageLoadFailure`).
 ///
 /// **Why in Swift, when the page-side JS already clamps.** Because a clamp that lives in
 /// our injected JS is *advisory*: whatever runs in the world the handlers are registered in
@@ -526,6 +526,52 @@ internal enum RenderBridgeInput {
         let bounded = overflow > 0 ? String(raw.prefix(maxConsoleLineLength)) : raw
         let escaped = DebugModeManager.escapedForLogLine(bounded)
         return overflow > 0 ? escaped + "…[+\(overflow) chars truncated]" : escaped
+    }
+
+    /// Upper bound on a reported image count. A message with more `<img>` elements
+    /// than this is pathological, and a count past it is REJECTED, not clamped —
+    /// unlike `gutterAdjust`, where a clamped value is still a usable layout and
+    /// dropping it would leave the gutter stale. Here the number decides nothing
+    /// but a boolean, so there is no partially-correct version of it to salvage,
+    /// and rejecting keeps an impossible payload out of the log line and the
+    /// `failed <= deferred` comparison. Deliberately generous: the largest real
+    /// newsletters this pipeline has measured carry a few hundred images.
+    static let maxReportedImageCount = 10_000
+
+    /// Validate an `imageLoadFailure` payload (P4) — the `{failed, deferred}`
+    /// census `postImageWidthRecheckJS` posts once, after the last armed image
+    /// settles. Returns the validated pair, or `nil` to drop the message whole.
+    ///
+    /// **This channel drives user-visible UI**, which is what makes the Swift-side
+    /// check load-bearing rather than belt-and-braces: a `NaN` or negative
+    /// `failed` reaching the view decides whether a message accuses the sender's
+    /// server of a failure that did not happen. Same P1c discipline as the other
+    /// three channels — both keys must be present, finite, non-negative and
+    /// integral; anything else is malformed and the whole message is dropped
+    /// rather than half-applied.
+    ///
+    /// `failed > deferred` is REJECTED rather than clamped. The two numbers come
+    /// from the same loop in the same script, so the only way they can disagree is
+    /// that something other than that loop wrote them, and a payload that cannot
+    /// be ours is not a payload to repair.
+    static func imageFailureReport(_ body: Any) -> (failed: Int, deferred: Int)? {
+        guard let dict = body as? [String: Any] else { return nil }
+        guard let failed = imageCount(dict["failed"]),
+              let deferred = imageCount(dict["deferred"]) else { return nil }
+        guard failed <= deferred else { return nil }
+        return (failed, deferred)
+    }
+
+    /// A finite, non-negative, integral image count within `maxReportedImageCount`,
+    /// or `nil`. Fractional values are rejected rather than rounded — a count is an
+    /// integer by construction, so a fraction means the sender of the message was
+    /// not our census loop.
+    private static func imageCount(_ raw: Any?) -> Int? {
+        guard let number = raw as? NSNumber else { return nil }
+        let value = number.doubleValue
+        guard value.isFinite, value >= 0, value <= Double(maxReportedImageCount) else { return nil }
+        guard value.rounded() == value else { return nil }
+        return Int(value)
     }
 
     private static func clampToGutter(_ value: CGFloat) -> CGFloat {

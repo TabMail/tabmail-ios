@@ -157,7 +157,7 @@ final class DebugModeManager {
     /// `window.webkit.messageHandlers.consoleLog.postMessage(…)` directly with
     /// embedded newlines, bypassing `log()` entirely."* Both halves of that are now
     /// false: P1b set `allowsContentJavaScript = false` (ADR-IOS-076 decision 1) so
-    /// no sender script runs, and P3 registered the three channels in
+    /// no sender script runs, and P3 registered every bridge channel in
     /// `RenderContentWorld.isolated` so the page world has no `messageHandlers`
     /// object at all. Either alone would close it; both are single settings, and
     /// four P1b settings in that file were reversed by owner directive within a day

@@ -52,6 +52,17 @@ struct AutoSizingHTMLView: View {
     /// email's own indent.
     @State private var leadingPad: CGFloat = 16
     @State private var trailingPad: CGFloat = 16
+    /// P4 — the image-failure banner's entire state: how many of the remote
+    /// images this document deferred ended in `error` (reported ONCE by
+    /// `postImageWidthRecheckJS` after the last armed image settled), and whether
+    /// the user has dismissed the notice for the current document.
+    ///
+    /// Deliberately seeded empty and NOT cached across view recreation (contrast
+    /// `HeightSeedCache`, which exists because a recycled row that forgets its
+    /// height moves visibly). Forgetting a failure costs a banner the user has
+    /// already seen; remembering one across a rebind would risk showing it for a
+    /// message that never failed, which is the direction that must not happen.
+    @State private var imageFailure = ImageFailureBannerState()
 
     init(
         html: String,
@@ -124,7 +135,27 @@ struct AutoSizingHTMLView: View {
     private var showsLoadingPlaceholder: Bool { headerId != nil && !hasRevealed }
 
     var body: some View {
-        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, bodyContentKey: bodyContentKey, reloadToken: reloadToken, height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad)
+        // P4 — the failure banner sits ABOVE the web view, in SwiftUI, outside the
+        // rendered document entirely. It therefore cannot perturb the measure →
+        // mutate → re-measure pipeline (ADR-IOS-039): no DOM node, no CSS, no
+        // change to the web view's own frame or to the gutter it measured. Same
+        // "all chrome lives in the SwiftUI container" discipline as the gutters.
+        //
+        // The banner takes the fixed 16pt inset rather than the dynamic gutter:
+        // `leadingPad`/`trailingPad` compensate for the EMAIL's own measured
+        // indent, and this is our chrome, not the email's.
+        VStack(spacing: 0) {
+            if imageFailure.isVisible {
+                ImageLoadFailureBanner { imageFailure.dismissed = true }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+            }
+            webViewContent
+        }
+    }
+
+    private var webViewContent: some View {
+        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, bodyContentKey: bodyContentKey, reloadToken: reloadToken, height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad, failedImageCount: $imageFailure.failedCount)
             // ── P1d (ADR-IOS-076 decision 5; plan §10.1 C4): the body ContentKey is
             // part of the representable's IDENTITY, so a change to it dismantles the
             // platform view and `makeUIView` runs again.
@@ -193,6 +224,26 @@ struct AutoSizingHTMLView: View {
             // exact symptom the init seeding exists to prevent. `.onChange`
             // fires only on actual value changes, never on initial appearance.
             .onChange(of: html) { _, _ in
+                // P4 — the banner is a statement about the document currently on
+                // screen, so it dies with that document. `html` is what
+                // `updateUIView` compares to decide a reload, so this fires
+                // exactly when a new document is about to be loaded, and it is
+                // outside the `headerId != nil` guard below because the compose
+                // quote preview and the `.eml` sheet render documents too.
+                //
+                // This is the `HeightSeedCache` keying hazard applied to a
+                // different value: SwiftUI reuses this view across a rebind, so
+                // without an explicit clear the previous message's failure count
+                // would be inherited and a message that lost nothing would accuse
+                // the sender's server. The dismissal is cleared with it — a fresh
+                // document has not been dismissed — which is why the reset is one
+                // named operation (`ImageFailureBannerState.documentChanged`)
+                // rather than two loose writes an edit can clear by halves.
+                //
+                // Guarded by an equality check because `@State` does not diff for
+                // you: an unconditional assignment would invalidate this view on
+                // every content change even when nothing about the banner moved.
+                if imageFailure != ImageFailureBannerState() { imageFailure.documentChanged() }
                 guard headerId != nil else { return }
                 if hasRevealed { hasRevealed = false }
             }
@@ -344,6 +395,9 @@ private struct HTMLWebView: UIViewRepresentable {
     // value the email's own inset frees up; clamped so it can't harm other emails.
     @Binding var leadingPad: CGFloat
     @Binding var trailingPad: CGFloat
+    // P4 — remote images that ended in `error` for the CURRENT document, reported
+    // once by postImageWidthRecheckJS after the last armed image settled.
+    @Binding var failedImageCount: Int
     // Observed so SwiftUI re-invokes updateUIView on a light<->dark flip — see the
     // schemeChanged branch in updateUIView (reload so the dark-mode scripts re-run
     // for the new appearance).
@@ -356,7 +410,12 @@ private struct HTMLWebView: UIViewRepresentable {
     /// Order is the historical registration order and is not load-bearing; WebKit keys
     /// delivery by name. `heightChanged` is the only one whose loss would break the
     /// render — see the `consoleLog` gating note in the coordinator.
-    static let bridgeChannels = ["heightChanged", "consoleLog", "gutterAdjust"]
+    ///
+    /// `imageLoadFailure` (P4) is the only channel added since P1c, and the only one
+    /// that drives user-visible UI rather than layout or diagnostics. It is validated
+    /// on the Swift side exactly like the other three — see
+    /// `RenderBridgeInput.imageFailureReport`.
+    static let bridgeChannels = ["heightChanged", "consoleLog", "gutterAdjust", "imageLoadFailure"]
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -545,7 +604,7 @@ private struct HTMLWebView: UIViewRepresentable {
         config.userContentController.addUserScript(widthRefit)
         config.userContentController.addUserScript(debugReport)
         config.userContentController.addUserScript(heightDiag)
-        // P3 — the three bridge channels, registered INTO THE ISOLATED WORLD. This is the
+        // P3 — the bridge channels, registered INTO THE ISOLATED WORLD. This is the
         // half of the isolation that changes what the DOCUMENT can do, rather than what it
         // can see: `add(_:contentWorld:name:)` publishes
         // `window.webkit.messageHandlers.<name>` only in the world it names, so the page
@@ -706,7 +765,7 @@ private struct HTMLWebView: UIViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad)
+        Coordinator(height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad, failedImageCount: $failedImageCount)
     }
 
     class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
@@ -719,6 +778,13 @@ private struct HTMLWebView: UIViewRepresentable {
         /// `eatGutterMarginsJS` (= 16 − the email's own measured inset, clamped).
         @Binding var leadingPad: CGFloat
         @Binding var trailingPad: CGFloat
+        /// P4 — how many of the remote images we deferred for this document ended
+        /// in `error`. Written once per load from the `imageLoadFailure` channel;
+        /// drives the dismiss-only banner in `AutoSizingHTMLView`. Zero means
+        /// either "everything loaded" or "the settle point was never reached"
+        /// (see `postImageWidthRecheckJS`'s withheld-image note) — both correctly
+        /// show no banner.
+        @Binding var failedImageCount: Int
         var loadedHTML: String?
         var loadedPreviewFilename: String?
         var loadedHeaderId: String?
@@ -742,9 +808,11 @@ private struct HTMLWebView: UIViewRepresentable {
         /// OLD body can't clobber a newer one when the card is rebound mid-wrap.
         var loadGeneration: Int = 0
         /// `loadGeneration` of the most recent `WKScriptMessage` this coordinator
-        /// received on any of the three bridge channels (`heightChanged`,
-        /// `consoleLog`, `gutterAdjust`) — i.e. the last load for which app
-        /// JavaScript provably executed and provably reached Swift.
+        /// received on any bridge channel (`HTMLWebView.bridgeChannels`) — i.e. the
+        /// last load for which app JavaScript provably executed and provably reached
+        /// Swift. P4 added a fourth, `imageLoadFailure`; the beacon is deliberately
+        /// channel-agnostic, so a new channel widens what can prove liveness and
+        /// changes nothing else.
         ///
         /// **Why this exists at all (P1b, owner requirement 2026-08-12).** Every
         /// render behaviour in this file is a `WKUserScript`, and so is every
@@ -799,6 +867,8 @@ private struct HTMLWebView: UIViewRepresentable {
         private var fitRequestGeneration: Int?
         /// Same, for `requestWidthRefit` / `__tmWidthRefitRequested`.
         private var widthRefitRequestGeneration: Int?
+        /// Same, for P4's `imageLoadFailure` census / `__tmImageFailureReported`.
+        private var imageFailureReportGeneration: Int?
         /// Grace period between `didCommit` (P1d — it was `didFinish` until then)
         /// and the bridge-liveness verdict.
         /// `monitorHeightJS`'s ResizeObserver and the double-`rAF` reveal both
@@ -835,11 +905,12 @@ private struct HTMLWebView: UIViewRepresentable {
         /// Released in deinit.
         private var zoomObservation: NSKeyValueObservation?
 
-        init(height: Binding<CGFloat>, hasRevealed: Binding<Bool>, leadingPad: Binding<CGFloat>, trailingPad: Binding<CGFloat>) {
+        init(height: Binding<CGFloat>, hasRevealed: Binding<Bool>, leadingPad: Binding<CGFloat>, trailingPad: Binding<CGFloat>, failedImageCount: Binding<Int>) {
             self._height = height
             self._hasRevealed = hasRevealed
             self._leadingPad = leadingPad
             self._trailingPad = trailingPad
+            self._failedImageCount = failedImageCount
             super.init()
             // Re-run fitViewport on foreground return — iOS resumes the WKWebView
             // content process which may have been suspended with incomplete
@@ -1431,6 +1502,27 @@ private struct HTMLWebView: UIViewRepresentable {
                     return
                 }
                 print(line)
+            } else if message.name == "imageLoadFailure" {
+                // P4 — `postImageWidthRecheckJS` counted the remote images that
+                // ended in `error` and posted the census once, after the last
+                // armed image settled. Purely observational: receiving it changes
+                // nothing about what loaded, and nothing here re-requests anything.
+                guard let report = RenderBridgeInput.imageFailureReport(message.body) else {
+                    bridgeLog("rejected channel=imageLoadFailure reason=malformed-payload")
+                    return
+                }
+                // One-shot PER LOAD, enforced in Swift for the same reason
+                // `requestFit` and `requestWidthRefit` are: `__tmImageFailureReported`
+                // lives in the isolated world and is only advisory, so the
+                // authoritative guard is here. A second report for the same
+                // document cannot re-raise a banner the user dismissed.
+                guard imageFailureReportGeneration != loadGeneration else {
+                    bridgeLog("rejected channel=imageLoadFailure reason=duplicate-report")
+                    return
+                }
+                imageFailureReportGeneration = loadGeneration
+                bridgeLog("imageLoadFailure failed=\(report.failed) deferred=\(report.deferred)")
+                if failedImageCount != report.failed { failedImageCount = report.failed }
             }
         }
 
@@ -3089,9 +3181,12 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
 ///    `init(source:injectionTime:forMainFrameOnly:)` initialiser — the one that
 ///    takes no content world — so every one of them runs in the PAGE world,
 ///    alongside author script, sharing ONE `window`."*
-///    That is now FALSE. All 17 are built `in: RenderContentWorld.isolated`, the
-///    three bridge channels are registered with `add(_:contentWorld:name:)`, and
-///    all three `evaluateJavaScript` call sites name the same world.
+///    That is now FALSE. All 17 are built `in: RenderContentWorld.isolated`, every
+///    channel in `bridgeChannels` is registered with `add(_:contentWorld:name:)`,
+///    and all three `evaluateJavaScript` call sites name the same world.
+///    (The channel count was "three" until P4 added `imageLoadFailure`; it is read
+///    from `bridgeChannels` at the registration site, so state the SOURCE here
+///    rather than a number that goes stale the next time one is added.)
 ///    ⚠️ Re-checking this STILL needs care, and P3 made the trap worse rather than
 ///    better: `rg WKContentWorld` on this file already returned this comment
 ///    instead of nothing, and now `rg RenderContentWorld` matches the prose in
@@ -3958,6 +4053,59 @@ private var fixImageAspectRatioJS: String {
 /// document can never loop reset/fit. Images all loaded BEFORE fit() ran need
 /// nothing — fit measured them un-hidden already. Images that never fire
 /// load/error keep today's behavior (no refit).
+///
+/// ── P4: the image-failure banner rides on the SAME arming loop ──
+///
+/// The owner asked for "a banner, only if some content loading fails". That needs
+/// two facts this script already produces and nothing else in the pipeline does:
+/// *which* images ended in `error` rather than `load`, and *when* the last one
+/// settled. `reportImageFailures()` below is the whole feature — it counts the
+/// `error` fires among images WE deferred and posts the count ONCE on the
+/// dedicated `imageLoadFailure` channel.
+///
+/// ⚠️ **This is OBSERVATIONAL and must stay so.** Nothing here retries, probes,
+/// re-requests or HEAD-checks a failed URL, and nothing changes which images load
+/// or when. Re-requesting a failed URL would manufacture exactly the tracking hit
+/// the deferred-load design exists to bound. It is also NOT the block-with-banner
+/// design that was implemented, smoke-tested and REVERTED on 2026-06-17
+/// (Memory/037 bullet 30): that one BLOCKED remote images and then explained
+/// itself, and broke every message whose layout depends on images loading. This
+/// one runs strictly AFTER the fact and changes no load behaviour at all, so the
+/// revert is not precedent against it.
+///
+/// **Why it is a second reader inside this function rather than a new script.**
+/// `check()` is UNCHANGED and the failure report is scheduled AFTER it in both
+/// listeners, so the width pipeline is armed first and cannot be perturbed by a
+/// throw in the new code. The report has its OWN one-shot
+/// (`window.__tmImageFailureReported`) and deliberately does NOT inherit
+/// `check()`'s guards: it needs neither `__tmFitDone` (a failure is not a layout
+/// fact) nor `!__tmWidthRefitRequested` (a message that both loses images AND
+/// needs a re-fit must still report).
+///
+/// **Only images WE deferred are counted.** `EmailHTMLWrapper.wrapHTML` rewrites
+/// remote `http(s)` `src`/`srcset` — and only those — to
+/// `data-tmsrc`/`data-tmsrcset`, so that attribute IS the "remote" predicate. It
+/// is captured per-image at ARM time, because `deferredImageLoadJS`'s `swap()`
+/// removes the attribute before it assigns `src`, so by the time an `error` fires
+/// the image no longer carries it. A failing `cid:` or local image therefore
+/// drives the settle (it is armed on `!complete`) but never inflates the count —
+/// the copy blames a remote server and must not be shown for a local failure.
+///
+/// **Accepted imprecision, stated so nobody strengthens the copy.** `onerror`
+/// fires for far more than an ATS/TLS refusal: 404s, DNS failures, malformed image
+/// bytes, and a plain offline device all land here identically, and WebKit hands
+/// the page no distinguishing reason. The banner text is hedged accordingly.
+///
+/// **Accepted gap: the settle point is unreachable for a withheld image.** T8's
+/// `hiddenByViewMode` (`deferredImageLoadJS`) deliberately leaves
+/// `data-tmsrc`/`data-tmsrcset` in place on images inside a hidden `.eml` section,
+/// so `pendingImgs()` never reaches 0 on a message that carries an attached `.eml`,
+/// nor in the preview sheet (where every non-selected section stays withheld). No
+/// report is posted there and no banner appears. That is FAIL-CLOSED — a missing
+/// banner, never a false one — and closing it would mean changing what
+/// `pendingImgs()` counts, which is the width pipeline's settle predicate and out
+/// of scope under the standing "no behaviour changes, just security" directive.
+///
 /// Exposed for unit tests via `_postImageWidthRecheckJS`.
 internal var _postImageWidthRecheckJS: String { postImageWidthRecheckJS }
 private var postImageWidthRecheckJS: String {
@@ -4025,6 +4173,34 @@ private var postImageWidthRecheckJS: String {
             log('images settled, overflow: maxRight=' + Math.round(mr) + ' > vp=' + vp + ' — requesting re-fit');
             try { window.webkit.messageHandlers.heightChanged.postMessage({ requestWidthRefit: true }); } catch(_) {}
         }
+        // ── P4 image-failure banner (see the doc comment above) ──
+        // Purely observational: counts the `error` fires among the images WE
+        // deferred and reports the total ONCE, after the LAST armed image
+        // settles. Never retries, probes or re-requests anything, and never
+        // touches which images load or when.
+        var remoteFailures = 0;
+        var armedRemote = 0;
+        function reportImageFailures() {
+            // Own one-shot, deliberately NOT check()'s: a message that both
+            // loses images and needs a width re-fit must still report.
+            if (window.__tmImageFailureReported) return;
+            if (!document.body) return;
+            // Same settle predicate as the width recheck — reuse, do not
+            // reinvent. A FAILED image satisfies it: swap() removed its
+            // data-tmsrc before assigning src, and a broken <img> reports
+            // complete === true, so a failure settles exactly like a success.
+            if (pendingImgs() > 0) return;
+            window.__tmImageFailureReported = true;
+            log('images settled, remote failures=' + remoteFailures + ' of ' + armedRemote + ' deferred');
+            // NOT debug-gated — this one drives user-visible UI. It is the sole
+            // exception in this pipeline; every other emission here stays gated.
+            try {
+                window.webkit.messageHandlers.imageLoadFailure.postMessage({
+                    failed: remoteFailures,
+                    deferred: armedRemote
+                });
+            } catch(_) {}
+        }
         var imgs = document.getElementsByTagName('img');
         var armed = 0;
         for (var i = 0; i < imgs.length; i++) {
@@ -4032,15 +4208,35 @@ private var postImageWidthRecheckJS: String {
             // A loaded, non-deferred image is already in fit()'s measurement —
             // only not-yet-displayable images can change the layout later.
             if (im.complete && !im.hasAttribute('data-tmsrc') && !im.hasAttribute('data-tmsrcset')) continue;
-            // NOT {once}: a deferred img fires load only after
-            // deferredImageLoadJS swaps its real src in; check() is
-            // flag-guarded so extra fires are cheap no-ops. The 60ms delay
-            // lets the post-load reflow settle before measuring.
-            im.addEventListener('load', function() { setTimeout(check, 60); });
-            im.addEventListener('error', function() { setTimeout(check, 60); });
+            // P4: "did WE defer this one" — i.e. is it a remote http(s) image
+            // (the only kind wrapHTML rewrites). Captured HERE, not in the
+            // handler, because swap() removes the attribute before assigning
+            // src, so it is already gone when an error fires. The IIFE is what
+            // gives each iteration its own binding: `var` in this loop would
+            // hand every listener the LAST image's value.
+            (function(isRemote) {
+                // NOT {once}: a deferred img fires load only after
+                // deferredImageLoadJS swaps its real src in; check() is
+                // flag-guarded so extra fires are cheap no-ops. The 60ms delay
+                // lets the post-load reflow settle before measuring.
+                //
+                // check() is scheduled FIRST in both handlers so the width
+                // pipeline is armed before any P4 statement runs and cannot be
+                // perturbed by a throw in the newer code.
+                im.addEventListener('load', function() {
+                    setTimeout(check, 60);
+                    setTimeout(reportImageFailures, 60);
+                });
+                im.addEventListener('error', function() {
+                    setTimeout(check, 60);
+                    if (isRemote) remoteFailures++;
+                    setTimeout(reportImageFailures, 60);
+                });
+            })(im.hasAttribute('data-tmsrc') || im.hasAttribute('data-tmsrcset'));
+            if (im.hasAttribute('data-tmsrc') || im.hasAttribute('data-tmsrcset')) armedRemote++;
             armed++;
         }
-        if (armed) log('armed ' + armed + ' image listener(s)');
+        if (armed) log('armed ' + armed + ' image listener(s), ' + armedRemote + ' remote');
     })();
     """
 }

@@ -599,6 +599,257 @@ struct EmailRenderPipelineTests {
         #expect(refitRequests(ctx) == 0)
     }
 
+    // MARK: - P4 image-failure census (behavioral, via JSContext + mock DOM)
+    //
+    // THE INVARIANT, and it is what every test below pins:
+    //
+    //     `postImageWidthRecheckJS` reports a failure census IF AND ONLY IF at
+    //     least one armed image has settled, it reports it NEVER BEFORE THE LAST
+    //     ARMED IMAGE SETTLES, exactly ONCE, and the count it reports is the
+    //     number of images WE DEFERRED (remote `http(s)`, i.e. `data-tmsrc` /
+    //     `data-tmsrcset`) that ended in `error` — not the number that ended in
+    //     `load`, and not local/`cid:` images that failed.
+    //
+    // The banner is a claim about the SENDER'S server shown to the user, so both
+    // directions matter and both are asserted: a false banner on an image-heavy
+    // newsletter that loaded fine is worse than no banner at all.
+    //
+    // The harness models the state machine the real pipeline produces: an image
+    // we deferred carries `data-tmsrc` and reports `complete === true` (no src
+    // assigned yet); `simulateSwap()` reproduces `deferredImageLoadJS`'s
+    // attribute removal, which is why the "is this remote" fact MUST be captured
+    // at arm time; and a BROKEN image reports `complete === true` exactly like a
+    // loaded one, which is why the count comes from the `error` listener and not
+    // from any property of the element.
+
+    /// Minimal DOM stub for the failure census. `remoteCount` images carry
+    /// `data-tmsrc` (deferred by `wrapHTML` because they are remote http(s));
+    /// `localCount` images are in-flight non-deferred ones (a `cid:` inline
+    /// attachment mid-decode) — armed by `!complete`, but never counted.
+    private static func imageFailureHarness(remoteCount: Int, localCount: Int = 0) -> String {
+        """
+        var _failMsgs = [];
+        var _msgs = [];
+        function _baseEl(tag) {
+            var el = {
+                tagName: tag, className: '', parentElement: null, complete: true,
+                _attrs: {}, _listeners: {},
+                getAttribute: function (k) { return (k in el._attrs) ? el._attrs[k] : null; },
+                setAttribute: function (k, v) { el._attrs[k] = v; },
+                removeAttribute: function (k) { delete el._attrs[k]; },
+                hasAttribute: function (k) { return (k in el._attrs); },
+                getBoundingClientRect: function () { return { left: 0, right: 10, width: 10, height: 10 }; },
+                addEventListener: function (t, fn) { (el._listeners[t] = el._listeners[t] || []).push(fn); }
+            };
+            return el;
+        }
+        var _imgs = [];
+        for (var r = 0; r < \(remoteCount); r++) {
+            var rim = _baseEl('IMG');
+            // Deferred by EmailHTMLWrapper.wrapHTML: the real URL is parked in
+            // data-tmsrc and no src is assigned, so complete is true and nothing
+            // is pending yet.
+            rim._attrs['data-tmsrc'] = 'https://example.com/pixel-' + r + '.png';
+            rim._remote = true;
+            _imgs.push(rim);
+        }
+        for (var l = 0; l < \(localCount); l++) {
+            var lim = _baseEl('IMG');
+            // A cid: inline attachment mid-decode: never rewritten by wrapHTML,
+            // so no data-tmsrc — armed only because it is not complete.
+            lim._attrs['src'] = 'cid:inline-' + l;
+            lim.complete = false;
+            lim._remote = false;
+            _imgs.push(lim);
+        }
+        var document = {
+            getElementsByTagName: function (t) { return t === 'img' ? _imgs.slice() : _imgs.slice(); },
+            body: {
+                getElementsByTagName: function (t) { return t === 'img' ? _imgs.slice() : _imgs.slice(); }
+            }
+        };
+        var window = {
+            innerWidth: 288,
+            getComputedStyle: function (el) { return { overflowX: undefined }; },
+            webkit: { messageHandlers: {
+                consoleLog: { postMessage: function (s) {} },
+                heightChanged: { postMessage: function (m) { _msgs.push(m); } },
+                imageLoadFailure: { postMessage: function (m) { _failMsgs.push(m); } }
+            } }
+        };
+        function setTimeout(fn, t) { fn(); }
+        // Reproduces deferredImageLoadJS's swap(): the attribute is REMOVED before
+        // the src is assigned, so by the time load/error fires the element no
+        // longer says it was ever remote.
+        function simulateSwap() {
+            for (var i = 0; i < _imgs.length; i++) {
+                var im = _imgs[i];
+                if (im.hasAttribute('data-tmsrc')) {
+                    var s = im.getAttribute('data-tmsrc');
+                    im.removeAttribute('data-tmsrc');
+                    im.setAttribute('src', s);
+                    im.complete = false;   // now genuinely in flight
+                }
+            }
+        }
+        function fireImgEvent(idx, type) {
+            var img = _imgs[idx];
+            // A BROKEN image reports complete === true, exactly like a loaded one
+            // — the whole reason the census cannot be derived from the element.
+            img.complete = true;
+            var ls = img._listeners[type] || [];
+            for (var i = 0; i < ls.length; i++) ls[i]();
+        }
+        function failureReports() { return _failMsgs.length; }
+        function reportedFailed() { return _failMsgs.length ? _failMsgs[0].failed : -1; }
+        function reportedDeferred() { return _failMsgs.length ? _failMsgs[0].deferred : -1; }
+        """
+    }
+
+    /// Arms `postImageWidthRecheckJS` over the failure harness and performs the
+    /// deferred swap, i.e. the production ordering: the recheck script installs
+    /// its listeners at documentEnd, and `deferredImageLoadJS` assigns the real
+    /// URLs afterwards.
+    private func makeImageFailureContext(remoteCount: Int, localCount: Int = 0) -> JSContext {
+        let ctx = JSContext()!
+        ctx.evaluateScript(Self.imageFailureHarness(remoteCount: remoteCount, localCount: localCount))
+        // The census deliberately does NOT depend on __tmFitDone (a failed load is
+        // not a layout fact), so it is left unset here — a test that set it could
+        // not tell the two designs apart.
+        #expect(ctx.exception == nil, "harness threw: \(ctx.exception?.toString() ?? "")")
+        ctx.evaluateScript(_postImageWidthRecheckJS)
+        #expect(ctx.exception == nil, "recheck script threw: \(ctx.exception?.toString() ?? "")")
+        ctx.evaluateScript("simulateSwap()")
+        #expect(ctx.exception == nil, "swap threw: \(ctx.exception?.toString() ?? "")")
+        return ctx
+    }
+
+    private func failureReports(_ ctx: JSContext) -> Int32 {
+        ctx.evaluateScript("failureReports()")?.toInt32() ?? -1
+    }
+
+    private func reportedFailed(_ ctx: JSContext) -> Int32 {
+        ctx.evaluateScript("reportedFailed()")?.toInt32() ?? -99
+    }
+
+    @Test("image-failure census: one remote image errors → exactly one report, count 1, only after the LAST image settles")
+    func imageFailureCensusReportsErroredRemoteImages() {
+        let ctx = makeImageFailureContext(remoteCount: 2)
+
+        // Nothing has settled — the census must not have fired.
+        #expect(failureReports(ctx) == 0)
+
+        // First image fails. The SECOND is still in flight, so reporting now
+        // would be reporting before the last image settles — forbidden.
+        ctx.evaluateScript("fireImgEvent(0, 'error')")
+        #expect(ctx.exception == nil, "error fire threw: \(ctx.exception?.toString() ?? "")")
+        #expect(failureReports(ctx) == 0, "the census must never fire before the LAST armed image settles")
+
+        // Last image loads → the census fires, once, counting the one failure.
+        ctx.evaluateScript("fireImgEvent(1, 'load')")
+        #expect(ctx.exception == nil, "load fire threw: \(ctx.exception?.toString() ?? "")")
+        #expect(failureReports(ctx) == 1)
+        #expect(reportedFailed(ctx) == 1)
+        #expect(ctx.evaluateScript("reportedDeferred()")?.toInt32() == 2)
+
+        // A re-fire (WebKit can re-deliver, and the listeners are deliberately
+        // not {once}) must not produce a second report — the banner cannot be
+        // re-raised after the user dismissed it.
+        ctx.evaluateScript("fireImgEvent(1, 'load'); fireImgEvent(0, 'error')")
+        #expect(failureReports(ctx) == 1, "the census is one-shot per document")
+    }
+
+    @Test("image-failure census: every remote image loading reports zero failures — no banner")
+    func imageFailureCensusReportsZeroWhenEverythingLoads() {
+        // The required negative control. This is the case a spurious banner would
+        // hit hardest: an image-heavy newsletter where nothing went wrong.
+        let ctx = makeImageFailureContext(remoteCount: 3)
+        ctx.evaluateScript("fireImgEvent(0, 'load'); fireImgEvent(1, 'load')")
+        #expect(failureReports(ctx) == 0, "still one image pending")
+        ctx.evaluateScript("fireImgEvent(2, 'load')")
+        #expect(ctx.exception == nil, "load fires threw: \(ctx.exception?.toString() ?? "")")
+        #expect(failureReports(ctx) == 1, "the census still reports — it is the COUNT that decides the banner")
+        #expect(reportedFailed(ctx) == 0, "zero failures ⇒ no banner")
+    }
+
+    @Test("image-failure census: a message with no images arms nothing and never reports")
+    func imageFailureCensusStaysSilentWithNoImages() {
+        // Second required negative control: no remote images at all. Nothing is
+        // armed, so nothing can ever call the census — structurally, not by luck.
+        let ctx = makeImageFailureContext(remoteCount: 0)
+        #expect(ctx.exception == nil, "empty-document arming threw: \(ctx.exception?.toString() ?? "")")
+        #expect(failureReports(ctx) == 0)
+    }
+
+    @Test("image-failure census counts only the images WE deferred — a failing cid: image is not the sender's server")
+    func imageFailureCensusExcludesLocalImages() {
+        // The banner's copy blames a remote image server. A `cid:` inline
+        // attachment that fails to decode is OUR problem, not that server's, so
+        // it must drive the settle (it is armed on !complete) without inflating
+        // the count. Without the arm-time capture this test cannot pass: by the
+        // time the error fires, `simulateSwap()` has removed `data-tmsrc` from the
+        // remote images, so a fire-time read would classify everything as local.
+        let ctx = makeImageFailureContext(remoteCount: 1, localCount: 1)
+        ctx.evaluateScript("fireImgEvent(1, 'error')")   // the cid: image fails
+        #expect(failureReports(ctx) == 0, "the remote image has not settled yet")
+        ctx.evaluateScript("fireImgEvent(0, 'load')")    // the remote one loads
+        #expect(ctx.exception == nil, "fires threw: \(ctx.exception?.toString() ?? "")")
+        #expect(failureReports(ctx) == 1)
+        #expect(reportedFailed(ctx) == 0, "a cid: failure must NOT accuse the sender's image server")
+        #expect(ctx.evaluateScript("reportedDeferred()")?.toInt32() == 1,
+                "only the deferred remote image counts toward the deferred total")
+    }
+
+    @Test("image-failure census: every remote image erroring reports them all")
+    func imageFailureCensusCountsEveryFailure() {
+        let ctx = makeImageFailureContext(remoteCount: 3)
+        ctx.evaluateScript("fireImgEvent(0, 'error'); fireImgEvent(1, 'error'); fireImgEvent(2, 'error')")
+        #expect(ctx.exception == nil, "error fires threw: \(ctx.exception?.toString() ?? "")")
+        #expect(failureReports(ctx) == 1)
+        #expect(reportedFailed(ctx) == 3)
+    }
+
+    @Test("image-failure census is observational — the script never retries, probes or re-requests a failed URL")
+    func imageFailureCensusNeverRetries() {
+        // Static guard on the one property that makes this phase acceptable at
+        // all. A retry, a HEAD probe or a re-assignment of a failed src would
+        // manufacture exactly the tracking hit the deferred-load design bounds,
+        // and would also be the reverted 2026-06-17 design creeping back in a
+        // different direction.
+        let js = _postImageWidthRecheckJS
+        #expect(!js.contains("fetch("))
+        #expect(!js.contains("XMLHttpRequest"))
+        #expect(!js.contains("new Image"))
+        #expect(!js.contains("HEAD"))
+        // The census must not assign a src/srcset anywhere — only
+        // deferredImageLoadJS is allowed to do that, and only once.
+        #expect(!js.contains("setAttribute('src'"))
+        #expect(!js.contains("setAttribute('srcset'"))
+        #expect(!js.contains(".src ="))
+        // It must not be able to remove the deferral marker either, which would
+        // change WHICH images load — the standing "no behaviour changes" line.
+        #expect(!js.contains("removeAttribute('data-tmsrc'"))
+        // And it posts on its own dedicated channel, not by widening an existing one.
+        #expect(js.contains("messageHandlers.imageLoadFailure.postMessage"))
+    }
+
+    @Test("image-failure census reuses the settle keying rather than inventing a second one")
+    func imageFailureCensusReusesTheSettleKeying() {
+        // Memory/037 bullet 15's lockstep constraint: `measureMaxRight`'s
+        // hide-for-scan and this script's settle predicate encode the SAME
+        // "not yet displayable" key. The census must ride on that predicate, not
+        // add a third spelling — and in particular must NOT use
+        // `naturalWidth === 0`, which bullet 14 rules out because it also
+        // classifies a LOADED intrinsic-size-less SVG as pending.
+        let js = _postImageWidthRecheckJS
+        #expect(js.contains("if (pendingImgs() > 0) return;"))
+        #expect(!js.contains("naturalWidth"))
+        // Own one-shot, deliberately not check()'s: a message that both loses
+        // images AND needs a width re-fit must still report.
+        #expect(js.contains("__tmImageFailureReported"))
+        #expect(js.contains("__tmWidthRefitRequested"))
+    }
+
     // MARK: - Width-strip pass includes <hr> (OWA quoted-content separator)
 
     /// Minimal DOM stub for the width-strip pass only (line ~2862): a single
@@ -2567,7 +2818,7 @@ struct ImageAspectRatioFixTests {
 /// `messageHandlers` at all.
 /// ⚠️ **The shared-`window` shape is no longer accurate either, as of P3
 /// (2026-08-13).** All 17 user scripts now run in `RenderContentWorld.isolated` and
-/// the three channels are registered there with `add(_:contentWorld:name:)`, so the
+/// every bridge channel is registered there with `add(_:contentWorld:name:)`, so the
 /// page world has no `webkit.messageHandlers` object to post to even if author
 /// script were re-enabled. Two independent closures now, neither of them this
 /// helper. Everything below still holds regardless — the paths it tests reach

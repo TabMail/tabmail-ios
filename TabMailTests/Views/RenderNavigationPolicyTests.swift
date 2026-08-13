@@ -327,7 +327,7 @@ struct RenderLinkPolicyTests {
     }
 }
 
-@Suite("P1c bridge input validation — the three bridge channels")
+@Suite("P1c bridge input validation — every bridge channel")
 struct RenderBridgeInputTests {
 
     @Test("A well-formed height payload survives validation unchanged")
@@ -452,6 +452,87 @@ struct RenderBridgeInputTests {
         }
         #expect(bounded.hasPrefix(String(repeating: "z", count: RenderBridgeInput.maxConsoleLineLength)))
         #expect(bounded.hasSuffix("…[+37 chars truncated]"))
+    }
+
+    // ── P4: the `imageLoadFailure` channel.
+    //
+    // The counts this channel carries reach a sentence shown to the user about the
+    // sender's own server, so the validation is the same fail-closed shape as the
+    // other three: a malformed payload is DROPPED WHOLE, never coerced, never
+    // half-applied. There is no "clamp it to something plausible" branch — a count
+    // we cannot trust is a banner we do not raise.
+
+    @Test("A well-formed image-failure census survives validation unchanged")
+    func wellFormedImageFailureCensusIsAccepted() {
+        guard let some = RenderBridgeInput.imageFailureReport(["failed": 2, "deferred": 5]) else {
+            #expect(Bool(false), "an ordinary census must be accepted"); return
+        }
+        #expect(some.failed == 2)
+        #expect(some.deferred == 5)
+
+        // The overwhelmingly common report: images were deferred, none failed.
+        // It must be ACCEPTED (and then raise no banner) rather than rejected —
+        // a drop here and a zero here are indistinguishable to the user but not
+        // to a reader of the bridge log.
+        guard let none = RenderBridgeInput.imageFailureReport(["failed": 0, "deferred": 5]) else {
+            #expect(Bool(false), "zero failures is a legitimate census, not a malformed one"); return
+        }
+        #expect(none.failed == 0)
+
+        // Both boundaries: everything failed, and the ceiling itself.
+        #expect(RenderBridgeInput.imageFailureReport(["failed": 5, "deferred": 5]) != nil)
+        let ceiling = RenderBridgeInput.maxReportedImageCount
+        #expect(RenderBridgeInput.imageFailureReport(["failed": ceiling, "deferred": ceiling]) != nil)
+    }
+
+    @Test("A census that could not have happened is dropped — fail closed")
+    func hostileImageFailureCensusIsRejected() {
+        let hostile: [Any] = [
+            // Not a dictionary at all.
+            NSNumber(value: 3),
+            "3 failed",
+            [1, 2],
+            // Either half missing — a one-sided census has no meaning, and
+            // defaulting the absent side would make the count sender-aimable.
+            ["failed": 1],
+            ["deferred": 4],
+            [:] as [String: Any],
+            // Wrong type.
+            ["failed": "1", "deferred": 4],
+            ["failed": 1, "deferred": "4"],
+            ["failed": ["nested": 1], "deferred": 4],
+            // Outside the representable range.
+            ["failed": -1, "deferred": 4],
+            ["failed": 1, "deferred": -4],
+            ["failed": Double.nan, "deferred": 4],
+            ["failed": 1, "deferred": Double.infinity],
+            // Fractional — a COUNT is an integer; a fraction means the page is
+            // not the script we shipped.
+            ["failed": 1.5, "deferred": 4],
+            ["failed": 1, "deferred": 4.25],
+            // Past the ceiling.
+            ["failed": 1, "deferred": RenderBridgeInput.maxReportedImageCount + 1],
+            ["failed": RenderBridgeInput.maxReportedImageCount + 1,
+             "deferred": RenderBridgeInput.maxReportedImageCount + 1]
+        ]
+        for body in hostile {
+            #expect(RenderBridgeInput.imageFailureReport(body) == nil,
+                    "a malformed imageLoadFailure payload must be dropped, not coerced")
+        }
+    }
+
+    @Test("More failures than deferred images is impossible — and rejected, not clamped")
+    func moreFailuresThanDeferredIsRejected() {
+        // `failed` counts a SUBSET of the deferred images (the arming loop only
+        // increments it for an `img` carrying `data-tmsrc`/`data-tmsrcset`), so
+        // failed > deferred cannot arise from the shipped script. Rejecting it
+        // rather than clamping keeps the internal-consistency check meaningful:
+        // clamping would silently accept a nonsense payload as a real failure and
+        // raise the banner on it.
+        #expect(RenderBridgeInput.imageFailureReport(["failed": 6, "deferred": 5]) == nil)
+        #expect(RenderBridgeInput.imageFailureReport(["failed": 1, "deferred": 0]) == nil)
+        // The adjacent legal case, so the check is not passing for the wrong reason.
+        #expect(RenderBridgeInput.imageFailureReport(["failed": 0, "deferred": 0]) != nil)
     }
 }
 
