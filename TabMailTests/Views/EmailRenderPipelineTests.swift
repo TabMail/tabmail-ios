@@ -626,10 +626,13 @@ struct EmailRenderPipelineTests {
     /// `data-tmsrc` (deferred by `wrapHTML` because they are remote http(s));
     /// `localCount` images are in-flight non-deferred ones (a `cid:` inline
     /// attachment mid-decode) — armed by `!complete`, but never counted.
-    private static func imageFailureHarness(remoteCount: Int, localCount: Int = 0) -> String {
+    private static func imageFailureHarness(
+        remoteCount: Int, localCount: Int = 0, withheldCount: Int = 0
+    ) -> String {
         """
         var _failMsgs = [];
         var _msgs = [];
+        var _fires = 0;
         function _baseEl(tag) {
             var el = {
                 tagName: tag, className: '', parentElement: null, complete: true,
@@ -643,7 +646,13 @@ struct EmailRenderPipelineTests {
             };
             return el;
         }
-        var _imgs = [];
+        // `_imgs` is the ARM-TIME population and keeps stable indices for
+        // `fireImgEvent`. `_domImgs` is what `getElementsByTagName` returns, i.e.
+        // the LIVE document. They start identical and `removeFromDom` separates
+        // them — which is the only way to model author script detaching a node,
+        // and the only way to see the census's undercount race.
+        var _imgs = [], _domImgs = [];
+        function _addImg(im) { _imgs.push(im); _domImgs.push(im); }
         for (var r = 0; r < \(remoteCount); r++) {
             var rim = _baseEl('IMG');
             // Deferred by EmailHTMLWrapper.wrapHTML: the real URL is parked in
@@ -651,7 +660,17 @@ struct EmailRenderPipelineTests {
             // is pending yet.
             rim._attrs['data-tmsrc'] = 'https://example.com/pixel-' + r + '.png';
             rim._remote = true;
-            _imgs.push(rim);
+            _addImg(rim);
+        }
+        for (var w = 0; w < \(withheldCount); w++) {
+            // T8: inside a hidden `.eml` section, so `swap()` marks it withheld
+            // and leaves data-tmsrc in place. Armed (it is not skippable), but it
+            // will never load and never error.
+            var wim = _baseEl('IMG');
+            wim._attrs['data-tmsrc'] = 'https://example.com/withheld-' + w + '.png';
+            wim._attrs['data-tmwithheld'] = '1';
+            wim._remote = true;
+            _addImg(wim);
         }
         for (var l = 0; l < \(localCount); l++) {
             var lim = _baseEl('IMG');
@@ -660,12 +679,12 @@ struct EmailRenderPipelineTests {
             lim._attrs['src'] = 'cid:inline-' + l;
             lim.complete = false;
             lim._remote = false;
-            _imgs.push(lim);
+            _addImg(lim);
         }
         var document = {
-            getElementsByTagName: function (t) { return t === 'img' ? _imgs.slice() : _imgs.slice(); },
+            getElementsByTagName: function (t) { return _domImgs.slice(); },
             body: {
-                getElementsByTagName: function (t) { return t === 'img' ? _imgs.slice() : _imgs.slice(); }
+                getElementsByTagName: function (t) { return _domImgs.slice(); }
             }
         };
         var window = {
@@ -680,10 +699,13 @@ struct EmailRenderPipelineTests {
         function setTimeout(fn, t) { fn(); }
         // Reproduces deferredImageLoadJS's swap(): the attribute is REMOVED before
         // the src is assigned, so by the time load/error fires the element no
-        // longer says it was ever remote.
+        // longer says it was ever remote. A WITHHELD image is skipped exactly as
+        // `hiddenByViewMode` makes swap() skip it — it keeps data-tmsrc, gets no
+        // src, and therefore can never fire either terminal event.
         function simulateSwap() {
             for (var i = 0; i < _imgs.length; i++) {
                 var im = _imgs[i];
+                if (im.hasAttribute('data-tmwithheld')) continue;
                 if (im.hasAttribute('data-tmsrc')) {
                     var s = im.getAttribute('data-tmsrc');
                     im.removeAttribute('data-tmsrc');
@@ -698,7 +720,40 @@ struct EmailRenderPipelineTests {
             // — the whole reason the census cannot be derived from the element.
             img.complete = true;
             var ls = img._listeners[type] || [];
-            for (var i = 0; i < ls.length; i++) ls[i]();
+            // `_fires` counts LISTENER INVOCATIONS, not calls to this function, so
+            // a test can assert that its setup actually reached a handler rather
+            // than trusting that it did (an unarmed image has an empty list and
+            // this call is a silent no-op).
+            for (var i = 0; i < ls.length; i++) { _fires++; ls[i](); }
+        }
+        // Author script detaching a node from the document. The element and its
+        // listeners survive — the browser keeps firing events at a detached image
+        // whose request is still in flight — but the live-DOM walk stops seeing it.
+        function removeFromDom(idx) {
+            var p = _domImgs.indexOf(_imgs[idx]);
+            if (p >= 0) _domImgs.splice(p, 1);
+        }
+        // Makes one image overflow the 288pt viewport so check()'s re-fit branch
+        // is reachable; without it every rect is 10pt wide and check() always
+        // takes the "no overflow" exit.
+        function setRight(idx, px) {
+            var im = _imgs[idx];
+            im.getBoundingClientRect = function () {
+                return { left: 0, right: px, width: px, height: 10 };
+            };
+        }
+        function listenerFires() { return _fires; }
+        function domImageCount() { return _domImgs.length; }
+        function armedListenerCount(idx) {
+            var ls = _imgs[idx]._listeners;
+            return ((ls['load'] || []).length) + ((ls['error'] || []).length);
+        }
+        function refitRequests() {
+            var n = 0;
+            for (var i = 0; i < _msgs.length; i++) {
+                if (_msgs[i] && _msgs[i].requestWidthRefit) n++;
+            }
+            return n;
         }
         function failureReports() { return _failMsgs.length; }
         function reportedFailed() { return _failMsgs.length ? _failMsgs[0].failed : -1; }
@@ -710,9 +765,12 @@ struct EmailRenderPipelineTests {
     /// deferred swap, i.e. the production ordering: the recheck script installs
     /// its listeners at documentEnd, and `deferredImageLoadJS` assigns the real
     /// URLs afterwards.
-    private func makeImageFailureContext(remoteCount: Int, localCount: Int = 0) -> JSContext {
+    private func makeImageFailureContext(
+        remoteCount: Int, localCount: Int = 0, withheldCount: Int = 0
+    ) -> JSContext {
         let ctx = JSContext()!
-        ctx.evaluateScript(Self.imageFailureHarness(remoteCount: remoteCount, localCount: localCount))
+        ctx.evaluateScript(Self.imageFailureHarness(
+            remoteCount: remoteCount, localCount: localCount, withheldCount: withheldCount))
         // The census deliberately does NOT depend on __tmFitDone (a failed load is
         // not a layout fact), so it is left unset here — a test that set it could
         // not tell the two designs apart.
@@ -809,6 +867,76 @@ struct EmailRenderPipelineTests {
         #expect(reportedFailed(ctx) == 3)
     }
 
+    @Test("image-failure census counts IMAGES, not error EVENTS — a re-fired error cannot inflate the banner")
+    func imageFailureCensusCountsImagesNotErrorEvents() {
+        // THE INVARIANT: `failed` is the number of deferred images that ENDED in
+        // `error`, so it can never exceed `deferred`. The listeners are
+        // deliberately not `{once}` — a deferred <img> only fires `load` after
+        // swap() assigns its real src — which means one broken image can deliver
+        // `error` as many times as author script re-assigns its `src`. Counting
+        // fires rather than images let a sender drive the count past the number
+        // of images that existed, on a channel whose copy accuses that sender's
+        // own image server.
+        let ctx = makeImageFailureContext(remoteCount: 2)
+
+        // MIS-IOS-016 — assert the setup's effect actually happened. An unarmed
+        // image has an empty listener list and `fireImgEvent` is then a silent
+        // no-op, so "three errors were delivered" has to be observed, not assumed.
+        #expect(ctx.evaluateScript("armedListenerCount(0)")?.toInt32() == 2,
+                "image 0 must carry both a load and an error listener")
+        let firesBefore = ctx.evaluateScript("listenerFires()")?.toInt32() ?? -1
+        ctx.evaluateScript("fireImgEvent(0, 'error'); fireImgEvent(0, 'error'); fireImgEvent(0, 'error')")
+        #expect(ctx.exception == nil, "error fires threw: \(ctx.exception?.toString() ?? "")")
+        #expect(ctx.evaluateScript("listenerFires()")?.toInt32() == firesBefore + 3,
+                "all three error events must really have reached the handler")
+        #expect(failureReports(ctx) == 0, "image 1 has not settled")
+
+        ctx.evaluateScript("fireImgEvent(1, 'load')")
+        #expect(ctx.exception == nil, "load fire threw: \(ctx.exception?.toString() ?? "")")
+        #expect(failureReports(ctx) == 1)
+        // ONE image failed, however many times it said so.
+        #expect(reportedFailed(ctx) == 1)
+        #expect(ctx.evaluateScript("reportedDeferred()")?.toInt32() == 2)
+        // The relation, stated directly: a census that claims more failures than
+        // there were deferred images is unreadable as English and impossible now.
+        #expect(reportedFailed(ctx) <= (ctx.evaluateScript("reportedDeferred()")?.toInt32() ?? -1))
+    }
+
+    @Test("image-failure census settles on the ARMED SET — detaching an in-flight image does not settle it")
+    func imageFailureCensusSettlesOnTheArmedSetNotTheLiveDOM() {
+        // THE INVARIANT: the census reports only once every image WE ARMED has
+        // reached a terminal state. Asking that question of the live DOM instead
+        // made it answerable by author script: detach a still-loading <img> and
+        // the walk stops counting it, the one-shot report publishes early, and
+        // the image's later `error` has nowhere to go. The banner then
+        // under-reports — and because the report is one-shot, permanently.
+        //
+        // A detached image is NOT a hypothetical: the browser keeps servicing an
+        // in-flight request for a removed element and still fires its events.
+        let ctx = makeImageFailureContext(remoteCount: 2)
+        #expect(ctx.evaluateScript("domImageCount()")?.toInt32() == 2)
+
+        ctx.evaluateScript("removeFromDom(1)")
+
+        // MIS-IOS-016 — both halves of the precondition, and neither implies the
+        // other: the detach really took (the live DOM is down to one image), and
+        // image 1 is really still armed (its listeners survived the detach), so
+        // "it errors later" is a reachable event rather than a story.
+        #expect(ctx.evaluateScript("domImageCount()")?.toInt32() == 1)
+        #expect(ctx.evaluateScript("armedListenerCount(1)")?.toInt32() == 2)
+
+        ctx.evaluateScript("fireImgEvent(0, 'error')")
+        #expect(ctx.exception == nil, "error fire threw: \(ctx.exception?.toString() ?? "")")
+        #expect(failureReports(ctx) == 0,
+                "the detached image has reached no terminal state — the census is not complete")
+
+        ctx.evaluateScript("fireImgEvent(1, 'error')")
+        #expect(ctx.exception == nil, "error fire threw: \(ctx.exception?.toString() ?? "")")
+        #expect(failureReports(ctx) == 1)
+        #expect(reportedFailed(ctx) == 2, "leaving the document is not reaching a terminal state")
+        #expect(ctx.evaluateScript("reportedDeferred()")?.toInt32() == 2)
+    }
+
     @Test("image-failure census is observational — the script never retries, probes or re-requests a failed URL")
     func imageFailureCensusNeverRetries() {
         // Static guard on the one property that makes this phase acceptable at
@@ -842,21 +970,25 @@ struct EmailRenderPipelineTests {
         // `naturalWidth === 0`, which bullet 14 rules out because it also
         // classifies a LOADED intrinsic-size-less SVG as pending.
         let js = _postImageWidthRecheckJS
-        // ONE predicate function, asked TWO different questions by argument —
-        // never two divergent copies. That is the lockstep property worth
-        // pinning; which argument each arm passes is the part that legitimately
-        // differs, and is pinned separately by
-        // `widthRefitIgnoresWithheldImagesButTheCensusDoesNot`.
+        // ONE definition of the width pipeline's settle predicate — never two
+        // divergent copies of it.
         //
-        // ⚠️ This test previously asserted the literal string
-        // `"if (pendingImgs() > 0) return;"` — i.e. that BOTH arms made the
-        // identical bare call. That pinned the fix's mechanism rather than the
-        // invariant, and the mechanism was itself the defect: sharing one
-        // predicate let a withheld image disarm the width re-fit permanently.
-        // The test stayed green through all of it. Corrected 2026-08-13 after
-        // both audit legs flagged it.
+        // ⚠️ Twice-corrected, and the corrections are the interesting part.
+        // (1) This test once asserted the literal `"if (pendingImgs() > 0) return;"`
+        // — that BOTH arms made the identical bare call. That pinned a mechanism
+        // which was itself the defect: sharing one predicate let a withheld image
+        // disarm the width re-fit permanently, and the test stayed green through
+        // all of it. (2) Its replacement then said "ONE predicate function, asked
+        // TWO different questions by argument", which stopped being true on
+        // 2026-08-13: the census no longer calls `pendingImgs` at all, because the
+        // two arms differ in POPULATION (armed set vs live DOM) and not only in
+        // predicate, and no argument expresses that. What survives both rounds is
+        // the narrow, checkable property below — the width pipeline's predicate is
+        // singular — plus the ruled-out spelling. Which question each arm asks is
+        // behaviour, and is pinned by driving the script in
+        // `widthRefitIgnoresWithheldImagesButTheCensusDoesNot`.
         #expect(js.contains("function pendingImgs(ignoreWithheld)"),
-                "the settle predicate must remain a single function")
+                "the width settle predicate must remain a single function")
         #expect(js.components(separatedBy: "function pendingImgs").count == 2,
                 "a second pendingImgs definition would be a divergent copy")
         #expect(!js.contains("naturalWidth"))
@@ -882,18 +1014,53 @@ struct EmailRenderPipelineTests {
         //     armed image has reached no terminal state — a count that is not
         //     merely early but wrong, on a channel that accuses a sender's
         //     server. IOS-UI-004 is preserved deliberately, not incidentally.
-        let js = _postImageWidthRecheckJS
+        //
+        // ⚠️ Both halves were asserted as LITERAL SOURCE STRINGS
+        // (`"if (pendingImgs(true) > 0) return;"` and its `false` twin) until
+        // 2026-08-13. That pinned the spelling of the mechanism, not the
+        // behaviour: the census arm has since stopped calling `pendingImgs` at
+        // all — it settles on the armed set's terminal marks, because the two
+        // arms differ in POPULATION as well as in predicate — and a
+        // string-matching test would have reported that as a regression while
+        // being unable to notice an actual one. Rewritten to drive the script.
+        let ctx = makeImageFailureContext(remoteCount: 1, withheldCount: 1)
 
-        // The width arm excludes them; the census arm does not. Asserting BOTH
-        // is what makes this non-vacuous: a change that flipped either arm to
-        // match the other would satisfy one expectation and fail the other.
-        #expect(js.contains("if (pendingImgs(true) > 0) return;"),
+        // MIS-IOS-016 — the three preconditions this test's verdict rests on,
+        // asserted rather than assumed:
+        //   * the withheld image really was skipped by the swap, so it still
+        //     holds `data-tmsrc` and can never reach a terminal state;
+        //   * it really IS armed, so "it never settles" is a fact about a
+        //     listener that exists, not about an image nobody is watching;
+        //   * the visible image really did receive its src, so its `load` below
+        //     is a real settle and not a no-op.
+        #expect(ctx.evaluateScript("_imgs[1].hasAttribute('data-tmsrc')")?.toBool() == true,
+                "swap() must leave a withheld image deferred")
+        #expect(ctx.evaluateScript("_imgs[1].hasAttribute('data-tmwithheld')")?.toBool() == true)
+        #expect(ctx.evaluateScript("armedListenerCount(1)")?.toInt32() == 2,
+                "a withheld image is still armed — that is why it can block the census")
+        #expect(ctx.evaluateScript("_imgs[0].hasAttribute('data-tmsrc')")?.toBool() == false,
+                "the visible image must have been swapped")
+
+        // fit() has committed its baseline, and the visible image turns out to
+        // overflow the 288pt viewport once it loads — the exact situation the
+        // post-load width re-fit exists for.
+        ctx.evaluateScript("window.__tmFitDone = true; setRight(0, 400);")
+        ctx.evaluateScript("fireImgEvent(0, 'load')")
+        #expect(ctx.exception == nil, "load fire threw: \(ctx.exception?.toString() ?? "")")
+
+        // Half one: the withheld image did not stall the re-fit. Pre-`v1.7.8`
+        // parity — with a shared predicate this request is never posted and the
+        // message keeps its horizontal overflow until the device is rotated.
+        #expect(ctx.evaluateScript("refitRequests()")?.toInt32() == 1,
                 "the width re-fit must not wait on an image that will never load")
-        #expect(js.contains("if (pendingImgs(false) > 0) return;"),
+        // Half two: the census did NOT publish, because an armed image has
+        // reached no terminal state. This is IOS-UI-004, preserved on purpose.
+        #expect(failureReports(ctx) == 0,
                 "the census must still wait for every armed image to settle")
 
         // The exclusion is keyed to the mark `swap()` writes, not to a second
         // copy of the visibility predicate — one source of truth for "withheld".
+        let js = _postImageWidthRecheckJS
         #expect(js.contains("data-tmwithheld"),
                 "the width arm must key off the mark, not re-derive visibility")
 

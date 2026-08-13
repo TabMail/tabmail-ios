@@ -4214,11 +4214,14 @@ private var fixImageAspectRatioJS: String {
 ///
 /// **Accepted gap: the CENSUS settle point is unreachable for a withheld image.**
 /// T8's `hiddenByViewMode` (`deferredImageLoadJS`) deliberately leaves
-/// `data-tmsrc`/`data-tmsrcset` in place on images inside a hidden `.eml` section,
-/// so the census arm's `pendingImgs(false)` never reaches 0 on a message that
-/// carries an attached `.eml`, nor in the preview sheet (where every non-selected
-/// section stays withheld). No report is posted there and no banner appears. That
-/// is FAIL-CLOSED — a missing banner, never a false one — and it is `IOS-UI-004`.
+/// `data-tmsrc`/`data-tmsrcset` in place on images inside a hidden `.eml` section.
+/// Such an image IS armed — the arm loop skips only images that are `complete` AND
+/// carry no deferral attribute — and it fires neither `load` nor `error`, so its
+/// terminal mark stays null and the census arm's `armedPending()` never reaches 0
+/// on a message that carries an attached `.eml`, nor in the preview sheet (where
+/// every non-selected section stays withheld). No report is posted there and no
+/// banner appears. That is FAIL-CLOSED — a missing banner, never a false one — and
+/// it is `IOS-UI-004`.
 ///
 /// ⚠️ **The reason recorded here for NOT closing it was wrong, and it pointed the
 /// next reader the wrong way.** It used to argue that closing the gap "would mean
@@ -4258,7 +4261,17 @@ private var postImageWidthRecheckJS: String {
         //   • FAILURE CENSUS asks "has every armed image reached a terminal
         //     state?" A withheld image answers NO, honestly — it never loaded
         //     and never errored, so a census taken now would be incomplete.
-        //     That arm keeps the strict predicate and keeps IOS-UI-004.
+        //     That arm keeps IOS-UI-004.
+        //
+        // ⚠️ Since 2026-08-13 the census answers its question from the per-image
+        // terminal marks (`armedPending()`), not from this function, because the
+        // two questions differ in POPULATION as well as in predicate: the width
+        // pipeline asks about the live DOM, the census about the set it armed.
+        // `ignoreWithheld` therefore has a single caller passing `true` today. It
+        // is kept as a parameter deliberately — this function's contract is "how
+        // many images are still pending, for the question you are asking", and
+        // collapsing it to a constant would erase the distinction the parameter
+        // exists to name, which is the exact conflation that disarmed the re-fit.
         //
         // Restoring the width re-fit is deliberately NOT the same edit as
         // closing IOS-UI-004: the first undoes a regression against shipped
@@ -4334,46 +4347,124 @@ private var postImageWidthRecheckJS: String {
             try { window.webkit.messageHandlers.heightChanged.postMessage({ requestWidthRefit: true }); } catch(_) {}
         }
         // ── P4 image-failure banner (see the doc comment above) ──
-        // Purely observational: counts the `error` fires among the images WE
-        // deferred and reports the total ONCE, after the LAST armed image
-        // settles. Never retries, probes or re-requests anything, and never
-        // touches which images load or when.
-        var remoteFailures = 0;
-        var armedRemote = 0;
+        // Purely observational: records which of the images WE deferred ended in
+        // `error` and reports the total ONCE, after the LAST armed image settles.
+        // Never retries, probes or re-requests anything, and never touches which
+        // images load or when.
+        //
+        // ONE RECORD PER ARMED IMAGE, holding the FIRST terminal state that image
+        // reached. Until 2026-08-13 this was two free-running integers —
+        // `remoteFailures` counted `error` FIRES, `armedRemote` counted images —
+        // and nothing tied an increment to the image it came from. Two counters
+        // over one population is two facts that can disagree, and author script
+        // could make them disagree in both directions:
+        //
+        //   • OVERCOUNT. The listeners are deliberately not {once} (see below),
+        //     so re-assigning `src` on one broken <img> re-fires `error` as often
+        //     as the sender likes. Each fire incremented the counter, so `failed`
+        //     could exceed `deferred` outright — a banner accusing the sender's
+        //     server of more failures than there were images to fail.
+        //   • UNDERCOUNT. The settle question was asked of the LIVE DOM
+        //     (`pendingImgs(false)` walks `getElementsByTagName('img')`) while the
+        //     armed population was a snapshot taken once. Detaching a still-loading
+        //     armed <img> removed it from the predicate's view, the census read 0
+        //     pending, published its one-shot report early, and the removed image's
+        //     later `error` had nowhere to go.
+        //
+        // Deriving both numbers from the per-image marks makes `failed <= deferred`
+        // structural rather than probable, and makes "has everything settled?" a
+        // question about the images we actually armed rather than about whatever
+        // is in the DOM at the moment it is asked.
+        var armedImgs = [];
+        function settle(rec, kind) {
+            // First terminal event wins; later ones are dropped. An image cannot
+            // un-fail, and it cannot fail twice.
+            if (rec.terminal) return;
+            rec.terminal = kind;
+        }
+        function armedPending() {
+            var n = 0;
+            for (var i = 0; i < armedImgs.length; i++) {
+                if (!armedImgs[i].terminal) n++;
+            }
+            return n;
+        }
+        function armedRemoteCount() {
+            var n = 0;
+            for (var i = 0; i < armedImgs.length; i++) {
+                if (armedImgs[i].isRemote) n++;
+            }
+            return n;
+        }
+        function remoteFailureCount() {
+            var n = 0;
+            for (var i = 0; i < armedImgs.length; i++) {
+                if (armedImgs[i].isRemote && armedImgs[i].terminal === 'error') n++;
+            }
+            return n;
+        }
         function reportImageFailures() {
             // Own one-shot, deliberately NOT check()'s: a message that both
             // loses images and needs a width re-fit must still report.
             if (window.__tmImageFailureReported) return;
             if (!document.body) return;
-            // The STRICT predicate — withheld images still count as pending.
-            // A FAILED image satisfies it: swap() removed its data-tmsrc before
-            // assigning src, and a broken <img> reports complete === true, so a
-            // failure settles exactly like a success.
+            // The STRICT settle question, asked of the ARMED SET and not of the
+            // live DOM: has every image we armed reached a terminal state? A
+            // FAILED image satisfies it — a broken <img> fires `error`, which is
+            // as terminal as `load`.
             //
-            // ⚠️ This is deliberately NOT `check()`'s predicate any more, and
-            // the difference is the whole point. The census must not report
-            // while an armed image has reached no terminal state — a withheld
-            // image neither loaded nor errored, so counting it as settled would
-            // publish an incomplete census. The width pipeline has the opposite
-            // need (see pendingImgs()), so the two questions were split rather
-            // than answered by one shared call. IOS-UI-004 — the banner being
-            // unreachable on a message with an attached `.eml` — is preserved
-            // BY this arm, not in spite of it; closing it is a separate
-            // decision about P4's behaviour, not a side effect of a width fix.
-            if (pendingImgs(false) > 0) return;
+            // ⚠️ This is deliberately NOT `check()`'s question, and the
+            // difference is the whole point. The census must not report while an
+            // armed image has reached no terminal state — a withheld image
+            // neither loaded nor errored, so counting it as settled would publish
+            // an incomplete census. The width pipeline has the opposite need (see
+            // pendingImgs()), so the two questions are answered separately rather
+            // than by one shared call. IOS-UI-004 — the banner being unreachable
+            // on a message with an attached `.eml` — is preserved BY this arm,
+            // not in spite of it: a withheld image IS armed (it still carries
+            // data-tmsrc, so the loop below does not skip it) and reaches no
+            // terminal state, so `armedPending()` never falls to 0. Closing that
+            // gap remains a separate decision about P4's behaviour.
+            //
+            // ⚠️ This arm asked `pendingImgs(false)` until 2026-08-13. The
+            // replacement is strictly MORE conservative about the population it
+            // is responsible for — an armed image detached from the document
+            // still blocks the report, where the DOM walk stopped seeing it — and
+            // for the SETTLE question it drops only images that were never armed,
+            // i.e. ones injected after documentEnd, which carry no listener and
+            // whose failures this census could never have counted anyway. It does
+            // not report earlier for any image we armed, and it never reports on
+            // a withheld one.
+            //
+            // ⚠️ THE TWO SENTENCES ABOVE ARE TOO NARROW, and the missing case is
+            // an image that IS armed. `wrapHTML` rewrites `src` and `srcset`
+            // INDEPENDENTLY, so `<img src="cid:…" srcset="https://…">` keeps a
+            // live cid src AND gains `data-tmsrcset` — armed, and `isRemote`.
+            // Which terminal state it records is a RACE between the local cid
+            // fetch and the remote srcset candidate swap() assigns. If the cid
+            // wins, settle() records 'load' and the remote `error` is dropped,
+            // where the old free-running counter did `remoteFailures++` on it
+            // regardless of a prior load; and because the record is now settled
+            // while `data-tmsrcset` may still be present, the census can also
+            // publish EARLIER for this shape than `pendingImgs(false)` allowed.
+            // FAIL-CLOSED both ways (a banner that used to appear may not) and
+            // deliberately LEFT ALONE: letting one image be both loaded and
+            // failed reopens the two-facts-that-disagree problem this change
+            // existed to close.
+            if (armedPending() > 0) return;
             window.__tmImageFailureReported = true;
-            log('images settled, remote failures=' + remoteFailures + ' of ' + armedRemote + ' deferred');
+            var failed = remoteFailureCount(), deferred = armedRemoteCount();
+            log('images settled, remote failures=' + failed + ' of ' + deferred + ' deferred');
             // NOT debug-gated — this one drives user-visible UI. It is the sole
             // exception in this pipeline; every other emission here stays gated.
             try {
                 window.webkit.messageHandlers.imageLoadFailure.postMessage({
-                    failed: remoteFailures,
-                    deferred: armedRemote
+                    failed: failed,
+                    deferred: deferred
                 });
             } catch(_) {}
         }
         var imgs = document.getElementsByTagName('img');
-        var armed = 0;
         for (var i = 0; i < imgs.length; i++) {
             var im = imgs[i];
             // A loaded, non-deferred image is already in fit()'s measurement —
@@ -4382,32 +4473,40 @@ private var postImageWidthRecheckJS: String {
             // P4: "did WE defer this one" — i.e. is it a remote http(s) image
             // (the only kind wrapHTML rewrites). Captured HERE, not in the
             // handler, because swap() removes the attribute before assigning
-            // src, so it is already gone when an error fires. The IIFE is what
-            // gives each iteration its own binding: `var` in this loop would
-            // hand every listener the LAST image's value.
-            (function(isRemote) {
+            // src, so it is already gone when an error fires.
+            var rec = {
+                isRemote: im.hasAttribute('data-tmsrc') || im.hasAttribute('data-tmsrcset'),
+                terminal: null
+            };
+            armedImgs.push(rec);
+            // The IIFE is what gives each iteration its own binding: `var rec`
+            // in this loop is function-scoped, so without it every listener
+            // would mark the LAST image's record.
+            (function(rec) {
                 // NOT {once}: a deferred img fires load only after
                 // deferredImageLoadJS swaps its real src in; check() is
-                // flag-guarded so extra fires are cheap no-ops. The 60ms delay
-                // lets the post-load reflow settle before measuring.
+                // flag-guarded so extra fires are cheap no-ops, and settle()
+                // keeps only the first terminal state. The 60ms delay lets the
+                // post-load reflow settle before measuring.
                 //
                 // check() is scheduled FIRST in both handlers so the width
                 // pipeline is armed before any P4 statement runs and cannot be
                 // perturbed by a throw in the newer code.
                 im.addEventListener('load', function() {
                     setTimeout(check, 60);
+                    settle(rec, 'load');
                     setTimeout(reportImageFailures, 60);
                 });
                 im.addEventListener('error', function() {
                     setTimeout(check, 60);
-                    if (isRemote) remoteFailures++;
+                    settle(rec, 'error');
                     setTimeout(reportImageFailures, 60);
                 });
-            })(im.hasAttribute('data-tmsrc') || im.hasAttribute('data-tmsrcset'));
-            if (im.hasAttribute('data-tmsrc') || im.hasAttribute('data-tmsrcset')) armedRemote++;
-            armed++;
+            })(rec);
         }
-        if (armed) log('armed ' + armed + ' image listener(s), ' + armedRemote + ' remote');
+        if (armedImgs.length) {
+            log('armed ' + armedImgs.length + ' image listener(s), ' + armedRemoteCount() + ' remote');
+        }
     })();
     """
 }
