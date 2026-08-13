@@ -513,11 +513,76 @@ struct RenderBridgeInputTests {
             // Past the ceiling.
             ["failed": 1, "deferred": RenderBridgeInput.maxReportedImageCount + 1],
             ["failed": RenderBridgeInput.maxReportedImageCount + 1,
-             "deferred": RenderBridgeInput.maxReportedImageCount + 1]
+             "deferred": RenderBridgeInput.maxReportedImageCount + 1],
+            // A JS BOOLEAN. Bridges as `__NSCFBoolean`, which IS an `NSNumber`,
+            // so `as? NSNumber` admits it and `doubleValue` reports a clean
+            // 1 / 0 — finite, non-negative, integral, under the ceiling, and
+            // `failed <= deferred`. Every bound this list tests is satisfied;
+            // only the TYPE is wrong. Omitted from this census until both audit
+            // legs found it independently on 2026-08-13.
+            ["failed": true, "deferred": true],
+            ["failed": false, "deferred": false],
+            ["failed": true, "deferred": 4],
+            ["failed": 1, "deferred": true]
         ]
         for body in hostile {
             #expect(RenderBridgeInput.imageFailureReport(body) == nil,
                     "a malformed imageLoadFailure payload must be dropped, not coerced")
+        }
+    }
+
+    @Test("A JS boolean is not a number — no bridge validator admits one as a quantity")
+    func booleansAreNeverAdmittedAsNumericQuantities() {
+        // THE INVARIANT: a bridge payload field that must carry a NUMBER rejects a
+        // JS boolean. Stated over the whole bridge surface on purpose — this was
+        // reported against `imageFailureReport` alone, but the defect is the CAST,
+        // and the same cast validates heights and gutter insets, so fixing only the
+        // reported instance would leave the class live (A7).
+        //
+        // Why it is not obvious: `true` crosses WebKit's bridge as `__NSCFBoolean`,
+        // an `NSNumber` subclass. `as? NSNumber` succeeds, `doubleValue` is 1.0,
+        // and every range/finiteness/integrality check downstream passes. Nothing
+        // reads as wrong at any single guard; the type is simply never checked.
+        //
+        // Deliberately NOT written as "the implementation calls CFBooleanGetTypeID"
+        // — that would pin the fix's mechanism and stay green if a later refactor
+        // kept the call but changed what it gates.
+
+        // 1. The image census — the reported instance. Drives user-visible copy.
+        #expect(RenderBridgeInput.imageFailureReport(["failed": true, "deferred": true]) == nil,
+                "a boolean census must not raise the image-failure banner")
+
+        // 2. Heights — a bare boolean body, and a boolean under each numeric key.
+        #expect(RenderBridgeInput.validatedHeightBody(true) == nil,
+                "a bare boolean must not be accepted as a height")
+        for key in ["h", "vp", "scroll", "rect"] {
+            #expect(RenderBridgeInput.validatedHeightBody([key: true]) == nil,
+                    "a boolean under numeric key \(key) must drop the whole payload")
+        }
+
+        // 3. Gutter insets — a boolean must drop the message, never resolve to 1pt.
+        #expect(RenderBridgeInput.gutterPadding(["l": true], leading: 16, trailing: 16) == nil,
+                "a boolean leading inset must drop the payload, not clamp to 1pt")
+        #expect(RenderBridgeInput.gutterPadding(["r": true], leading: 16, trailing: 16) == nil,
+                "a boolean trailing inset must drop the payload, not clamp to 1pt")
+
+        // 4. THE OTHER SIDE, so this cannot be satisfied by rejecting everything:
+        //    real numbers still pass, and the keys that are SUPPOSED to be boolean
+        //    still accept booleans. A fix that hardened the numeric cast by
+        //    banning `Bool` everywhere would break the flag keys, and that break
+        //    would be invisible without this half.
+        guard let census = RenderBridgeInput.imageFailureReport(["failed": 2, "deferred": 5]) else {
+            #expect(Bool(false), "a well-formed census must still be accepted"); return
+        }
+        #expect(census.failed == 2)
+        #expect(census.deferred == 5)
+        #expect(RenderBridgeInput.validatedHeightBody(["h": 812]) != nil,
+                "a real height must still be accepted")
+        #expect(RenderBridgeInput.gutterPadding(["l": 4], leading: 16, trailing: 16) != nil,
+                "a real gutter inset must still be accepted")
+        for flag in ["revealed", "requestFit", "requestWidthRefit"] {
+            #expect(RenderBridgeInput.validatedHeightBody([flag: true]) != nil,
+                    "flag key \(flag) is SUPPOSED to be boolean and must still be accepted")
         }
     }
 

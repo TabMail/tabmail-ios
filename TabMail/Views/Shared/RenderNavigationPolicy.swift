@@ -478,7 +478,7 @@ internal enum RenderBridgeInput {
     /// it. A dictionary payload is returned with its `source` tag bounded and escaped, so
     /// the downstream log interpolation cannot be forged.
     static func validatedHeightBody(_ body: Any) -> Any? {
-        if let number = body as? NSNumber {
+        if let number = bridgedNumber(body) {
             return isAcceptableMeasurement(number) ? number : nil
         }
         guard let dict = body as? [String: Any] else { return nil }
@@ -488,7 +488,7 @@ internal enum RenderBridgeInput {
         }
         for key in numericKeys {
             guard let raw = dict[key] else { continue }
-            guard let number = raw as? NSNumber, isAcceptableMeasurement(number) else { return nil }
+            guard let number = bridgedNumber(raw), isAcceptableMeasurement(number) else { return nil }
         }
         guard let rawSource = dict["source"] else { return dict }
         guard let source = rawSource as? String else { return nil }
@@ -508,11 +508,11 @@ internal enum RenderBridgeInput {
         var resolvedLeading = leading
         var resolvedTrailing = trailing
         if let raw = dict["l"] {
-            guard let number = raw as? NSNumber, number.doubleValue.isFinite else { return nil }
+            guard let number = bridgedNumber(raw), number.doubleValue.isFinite else { return nil }
             resolvedLeading = clampToGutter(CGFloat(truncating: number))
         }
         if let raw = dict["r"] {
-            guard let number = raw as? NSNumber, number.doubleValue.isFinite else { return nil }
+            guard let number = bridgedNumber(raw), number.doubleValue.isFinite else { return nil }
             resolvedTrailing = clampToGutter(CGFloat(truncating: number))
         }
         return (resolvedLeading, resolvedTrailing)
@@ -567,7 +567,7 @@ internal enum RenderBridgeInput {
     /// integer by construction, so a fraction means the sender of the message was
     /// not our census loop.
     private static func imageCount(_ raw: Any?) -> Int? {
-        guard let number = raw as? NSNumber else { return nil }
+        guard let number = bridgedNumber(raw) else { return nil }
         let value = number.doubleValue
         guard value.isFinite, value >= 0, value <= Double(maxReportedImageCount) else { return nil }
         guard value.rounded() == value else { return nil }
@@ -576,6 +576,41 @@ internal enum RenderBridgeInput {
 
     private static func clampToGutter(_ value: CGFloat) -> CGFloat {
         min(max(value, gutterRange.lowerBound), gutterRange.upperBound)
+    }
+
+    /// A JS **number** that crossed the bridge, or `nil` — and specifically NOT a JS
+    /// boolean.
+    ///
+    /// ⚠️ **`raw as? NSNumber` alone does not exclude booleans, and every numeric
+    /// validator in this type used to assume it did.** JS `true`/`false` cross
+    /// WebKit's bridge as `__NSCFBoolean`, which IS an `NSNumber`; Swift's own
+    /// `Bool` bridges the same way. So `as? NSNumber` succeeds and `doubleValue`
+    /// reports `1` / `0` — finite, non-negative, integral, and inside every bound
+    /// the callers check. `{"failed": true, "deferred": true}` was therefore
+    /// accepted as the census `(1, 1)` and could raise the banner, and
+    /// `{"h": true}` as a height of `1`.
+    ///
+    /// That contradicted this file's own stated contract — malformed payloads are
+    /// "dropped whole, never coerced" — so the defect was the *claim* being false,
+    /// not merely a missing case. The distinction was already known here:
+    /// `validatedHeightBody`'s `flagKeys` loop guards with `raw is Bool`, the exact
+    /// discrimination the numeric paths omitted.
+    ///
+    /// **Not reachable from sender content today** — `allowsContentJavaScript` is
+    /// off and P3 registers every handler in `RenderContentWorld.isolated`, so no
+    /// page script can post at all. That is configuration, one setting each, of
+    /// exactly the kind an owner directive has already reversed once in this
+    /// workstream; it is not what makes OUR injected JS correct. Fixed here so the
+    /// validator's contract is true on its own terms.
+    ///
+    /// Found by both independent audit legs on the P4 candidate, 2026-08-13.
+    private static func bridgedNumber(_ raw: Any?) -> NSNumber? {
+        // The ONE place `as? NSNumber` is still written directly — this is the
+        // cast every other validator now routes through, so widening it here
+        // widens all of them at once.
+        guard let number = raw as? NSNumber else { return nil }
+        guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        return number
     }
 
     private static func isAcceptableMeasurement(_ number: NSNumber) -> Bool {
