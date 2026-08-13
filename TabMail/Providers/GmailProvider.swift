@@ -405,7 +405,7 @@ actor GmailProvider: EmailProvider {
             if case ProviderError.authenticationFailed = error {
                 return BackfillResult(id: id, header: nil, htmlBody: nil, textBody: nil, error: error)
             }
-            print("[Gmail] Failed to fetch backfill \(id): \(error)")
+            if DebugModeManager.isLoggingEnabled() { print("[Gmail] Failed to fetch backfill \(id): \(error)") }
             return BackfillResult(id: id, header: nil, htmlBody: nil, textBody: nil, error: error)
         }
 
@@ -418,7 +418,7 @@ actor GmailProvider: EmailProvider {
             htmlBody = try await extractBodyWithFallback(from: msg, mimeType: "text/html")
             textBody = try await extractBodyWithFallback(from: msg, mimeType: "text/plain")
         } catch {
-            print("[Gmail] Body extraction failed for \(id): \(error) — header preserved")
+            if DebugModeManager.isLoggingEnabled() { print("[Gmail] Body extraction failed for \(id): \(error) — header preserved") }
         }
 
         return BackfillResult(id: id, header: header, htmlBody: htmlBody, textBody: textBody, error: nil)
@@ -567,13 +567,13 @@ actor GmailProvider: EmailProvider {
         // No-op: both source and destination resolve to no label changes (e.g., move from
         // All Mail to All Mail). Skip the API call — Gmail rejects empty modify bodies.
         guard !remove.isEmpty || !add.isEmpty else {
-            print("[MoveTrace] GmailProvider.move — no-op (no label changes): ids=\(ids) source=\(source) dest=\(destination)")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] GmailProvider.move — no-op (no label changes): ids=\(ids) source=\(source) dest=\(destination)") }
             return
         }
-        print("[MoveTrace] GmailProvider.move — ids=\(ids) addLabels=\(add) removeLabels=\(remove)")
+        if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] GmailProvider.move — ids=\(ids) addLabels=\(add) removeLabels=\(remove)") }
         for id in ids {
             try await modifyMessage(id: id, addLabelIds: add, removeLabelIds: remove)
-            print("[MoveTrace] GmailProvider.move — modifyMessage completed for \(id)")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] GmailProvider.move — modifyMessage completed for \(id)") }
         }
     }
 
@@ -660,7 +660,7 @@ actor GmailProvider: EmailProvider {
                 if DebugModeManager.isLoggingEnabled() { print("[Gmail] saveDraft UPDATE RESPONSE: draftId=\(draftId) messageId=\(msgId ?? "nil") responseSnippet=\(String(msgSnippet.prefix(120)))") }
                 return .created(.gmail(resourceId: draftId, containedMessageId: msgId))
             }
-            print("[Gmail] saveDraft UPDATE RESPONSE: failed to parse JSON — returning existingId=\(existingId)")
+            if DebugModeManager.isLoggingEnabled() { print("[Gmail] saveDraft UPDATE RESPONSE: failed to parse JSON — returning existingId=\(existingId)") }
             return .created(.gmail(resourceId: existingId, containedMessageId: nil))
         } else {
             // Create new draft
@@ -811,7 +811,7 @@ actor GmailProvider: EmailProvider {
         )
         if trashResult.data != nil { return }
         if trashResult.statusCode == 404 {
-            print("[Gmail] deleteDraft: \(messageId) already deleted")
+            if DebugModeManager.isLoggingEnabled() { print("[Gmail] deleteDraft: \(messageId) already deleted") }
             return
         }
         if trashResult.statusCode == 401 {
@@ -876,7 +876,7 @@ actor GmailProvider: EmailProvider {
             // Safety cap: stop pagination if we've accumulated enough IDs.
             // Remaining messages are picked up on next backfill cycle via date windowing.
             if allIds.count >= maxIds {
-                print("[Gmail] WARNING: listBackfillMessageIds hit \(maxIds) ID cap — stopping pagination. This folder has an unusually large number of messages.")
+                if DebugModeManager.isLoggingEnabled() { print("[Gmail] WARNING: listBackfillMessageIds hit \(maxIds) ID cap — stopping pagination. This folder has an unusually large number of messages.") }
                 break
             }
 
@@ -933,7 +933,7 @@ actor GmailProvider: EmailProvider {
                                     return try await self.request(path: "/messages/\(id)\(metadataPath)")
                                 } catch {
                                     if case ProviderError.authenticationFailed = error { throw error }
-                                    print("[Gmail] Failed to fetch header \(id): \(error)")
+                                    if DebugModeManager.isLoggingEnabled() { print("[Gmail] Failed to fetch header \(id): \(error)") }
                                     return nil
                                 }
                             }
@@ -949,7 +949,7 @@ actor GmailProvider: EmailProvider {
                                     return try await self.request(path: "/messages/\(id)\(metadataPath)")
                                 } catch {
                                     if case ProviderError.authenticationFailed = error { throw error }
-                                    print("[Gmail] Failed to fetch header \(id): \(error)")
+                                    if DebugModeManager.isLoggingEnabled() { print("[Gmail] Failed to fetch header \(id): \(error)") }
                                     return nil
                                 }
                             }
@@ -1094,7 +1094,7 @@ actor GmailProvider: EmailProvider {
             throw ProviderError.networkError(underlying: error)
         }
         guard let delta else {
-            print("[Gmail] History expired (historyId: \(historyId)) — need full sync")
+            if DebugModeManager.isLoggingEnabled() { print("[Gmail] History expired (historyId: \(historyId)) — need full sync") }
             BackgroundSyncLogger.log("gmail.fetchHistory: 404 history expired")
             return nil
         }
@@ -1107,7 +1107,7 @@ actor GmailProvider: EmailProvider {
         let labelsAdded = delta.labelsAdded.map { HistoryLabelChange(messageId: $0.providerMessageId, labelIds: $0.labelIds) }
         let labelsRemoved = delta.labelsRemoved.map { HistoryLabelChange(messageId: $0.providerMessageId, labelIds: $0.labelIds) }
 
-        print("[Gmail] History: +\(added.count) added, -\(deleted.count) deleted, \(labelsAdded.count) label adds, \(labelsRemoved.count) label removes")
+        if DebugModeManager.isLoggingEnabled() { print("[Gmail] History: +\(added.count) added, -\(deleted.count) deleted, \(labelsAdded.count) label adds, \(labelsRemoved.count) label removes") }
 
         return HistoryResponse(
             newHistoryId: delta.cursor,
@@ -1145,7 +1145,7 @@ actor GmailProvider: EmailProvider {
                 // Normal for Gmail: history reports the messageId but the message
                 // is gone by fetch time. Skipping lets historyId advance instead
                 // of looping forever on the same 404.
-                print("[Gmail] fetchMessageDetails: skipping \(id) — \(error)")
+                if DebugModeManager.isLoggingEnabled() { print("[Gmail] fetchMessageDetails: skipping \(id) — \(error)") }
             }
         }
         return results
@@ -1189,7 +1189,7 @@ actor GmailProvider: EmailProvider {
         // building a request — Gmail returns HTTP 400 "Invalid label" otherwise.
         // Mirrors the syntheticPlaceholderId guard in fetchMessagesBatch.
         if path.contains(GmailProvider.archivePath) {
-            print("[Gmail] ERROR: synthetic folder path leaked into API path: \(path)")
+            if DebugModeManager.isLoggingEnabled() { print("[Gmail] ERROR: synthetic folder path leaked into API path: \(path)") }
             throw ProviderError.syntheticFolderPath(path)
         }
         let url = baseURL + path
@@ -1244,7 +1244,7 @@ actor GmailProvider: EmailProvider {
         body: Data?
     ) async throws -> Data {
         if path.contains(GmailProvider.archivePath) {
-            print("[Gmail] ERROR: synthetic folder path leaked into API path: \(path)")
+            if DebugModeManager.isLoggingEnabled() { print("[Gmail] ERROR: synthetic folder path leaked into API path: \(path)") }
             throw ProviderError.syntheticFolderPath(path)
         }
         let url = baseURL + path
@@ -1495,7 +1495,7 @@ actor GmailProvider: EmailProvider {
         guard let encoded = try? JSONEncoder().encode(msg),
               let json = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any],
               let metadata = GmailParse.parseMessage(json) else {
-            print("[Gmail] Missing/invalid internalDate for message \(msg.id) — treating as fetch failure, will retry")
+            if DebugModeManager.isLoggingEnabled() { print("[Gmail] Missing/invalid internalDate for message \(msg.id) — treating as fetch failure, will retry") }
             return nil
         }
 

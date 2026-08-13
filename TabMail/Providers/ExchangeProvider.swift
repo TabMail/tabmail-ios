@@ -69,7 +69,7 @@ actor ExchangeProvider: EmailProvider {
                 }
             } catch {
                 // Folder may not exist (e.g., some accounts lack an archive folder)
-                print("[Exchange] well-known folder '\(name)' not found: \(error)")
+                if DebugModeManager.isLoggingEnabled() { print("[Exchange] well-known folder '\(name)' not found: \(error)") }
             }
         }
 
@@ -81,7 +81,7 @@ actor ExchangeProvider: EmailProvider {
 
         for folder in response.value {
             let role = knownFolderIds[folder.id]
-            print("[Exchange] folder: \(folder.displayName) role=\(String(describing: role)) id=\(folder.id)")
+            if DebugModeManager.isLoggingEnabled() { print("[Exchange] folder: \(folder.displayName) role=\(String(describing: role)) id=\(folder.id)") }
 
             folders.append(FolderInfo(
                 name: folder.displayName,
@@ -98,7 +98,7 @@ actor ExchangeProvider: EmailProvider {
             }
         }
 
-        print("[Exchange] fetchFolders returning \(folders.count) folders: \(folders.map { "\($0.name)(\($0.role))" })")
+        if DebugModeManager.isLoggingEnabled() { print("[Exchange] fetchFolders returning \(folders.count) folders: \(folders.map { "\($0.name)(\($0.role))" })") }
         return folders
     }
 
@@ -201,7 +201,7 @@ actor ExchangeProvider: EmailProvider {
                     let data = try await fetchAttachment(messageId: id, attachmentId: att.id)
                     inlineImages.append(InlineImage(contentId: cid, contentType: ct, data: data))
                 } catch {
-                    print("[Exchange] Failed to fetch inline image \(cid): \(error)")
+                    if DebugModeManager.isLoggingEnabled() { print("[Exchange] Failed to fetch inline image \(cid): \(error)") }
                 }
                 continue
             }
@@ -230,7 +230,7 @@ actor ExchangeProvider: EmailProvider {
                 } catch {
                     // Fall back to surfacing the itemAttachment as an unexpandable chip.
                     // User won't be able to preview inline, but at least sees it exists.
-                    print("[Exchange] Failed to expand itemAttachment \(att.id): \(error)")
+                    if DebugModeManager.isLoggingEnabled() { print("[Exchange] Failed to expand itemAttachment \(att.id): \(error)") }
                     attachments.append(AttachmentInfo(
                         filename: att.name ?? "attached-email.eml",
                         contentType: att.contentType ?? "message/rfc822",
@@ -280,10 +280,10 @@ actor ExchangeProvider: EmailProvider {
                                 ))
                             }
                         } else {
-                            print("[Exchange] Failed to parse \(name) as RFC 822 — rendering as plain attachment")
+                            if DebugModeManager.isLoggingEnabled() { print("[Exchange] Failed to parse \(name) as RFC 822 — rendering as plain attachment") }
                         }
                     } catch {
-                        print("[Exchange] Failed to fetch bytes for \(name): \(error)")
+                        if DebugModeManager.isLoggingEnabled() { print("[Exchange] Failed to fetch bytes for \(name): \(error)") }
                     }
                 }
             }
@@ -353,7 +353,7 @@ actor ExchangeProvider: EmailProvider {
                 } catch {
                     // Marker still renders without children — the envelope/body
                     // is useful on its own.
-                    print("[Exchange] Failed to list nested attachments for \(itemAttachmentId): \(error)")
+                    if DebugModeManager.isLoggingEnabled() { print("[Exchange] Failed to list nested attachments for \(itemAttachmentId): \(error)") }
                     childList = []
                 }
                 for childAtt in childList {
@@ -461,7 +461,7 @@ actor ExchangeProvider: EmailProvider {
             let textBody = msg.body?.contentType == "text" ? msg.body?.content : nil
             return BackfillResult(id: id, header: header, htmlBody: htmlBody, textBody: textBody, error: nil)
         } catch {
-            print("[Exchange] Failed to fetch backfill \(id): \(error)")
+            if DebugModeManager.isLoggingEnabled() { print("[Exchange] Failed to fetch backfill \(id): \(error)") }
             return BackfillResult(id: id, header: nil, htmlBody: nil, textBody: nil, error: error)
         }
     }
@@ -642,7 +642,7 @@ actor ExchangeProvider: EmailProvider {
                     do {
                         try await stripLegacyCategories(id: id)
                     } catch {
-                        print("[Exchange] Legacy tm_* strip failed for \(id) (continuing): \(error)")
+                        if DebugModeManager.isLoggingEnabled() { print("[Exchange] Legacy tm_* strip failed for \(id) (continuing): \(error)") }
                     }
                 }
                 let movedId = try await moveMessage(id: id, destinationId: destination)
@@ -856,7 +856,7 @@ actor ExchangeProvider: EmailProvider {
             retryableStatusCodes: [429], session: testSession, logLabel: "Exchange"
         )
         if result.statusCode == 404 {
-            print("[Exchange] deleteDraft: draft \(draftId) already deleted (404) — treating as success")
+            if DebugModeManager.isLoggingEnabled() { print("[Exchange] deleteDraft: draft \(draftId) already deleted (404) — treating as success") }
             return
         }
         if result.data != nil { return }
@@ -952,7 +952,7 @@ actor ExchangeProvider: EmailProvider {
             allIds.append(contentsOf: response.value.map(\.id))
 
             if allIds.count >= maxIds {
-                print("[Exchange] WARNING: listBackfillMessageIds hit \(maxIds) ID cap — stopping pagination.")
+                if DebugModeManager.isLoggingEnabled() { print("[Exchange] WARNING: listBackfillMessageIds hit \(maxIds) ID cap — stopping pagination.") }
                 break
             }
 
@@ -979,7 +979,7 @@ actor ExchangeProvider: EmailProvider {
                 }
             } catch {
                 // Message may have been deleted between list and fetch — skip
-                print("[Exchange] fetchMessageHeaders: skipping \(id) — \(error)")
+                if DebugModeManager.isLoggingEnabled() { print("[Exchange] fetchMessageHeaders: skipping \(id) — \(error)") }
             }
             if (i + 1) % batchSize == 0, i + 1 < ids.count {
                 try await Task.sleep(for: .seconds(interBatchDelay))
@@ -1060,7 +1060,7 @@ actor ExchangeProvider: EmailProvider {
             } catch {
                 if link == historyId {
                     // First request failed — delta link expired
-                    print("[Exchange] Delta link expired — need full sync")
+                    if DebugModeManager.isLoggingEnabled() { print("[Exchange] Delta link expired — need full sync") }
                     BackgroundSyncLogger.log("exchange.fetchHistory: delta link expired (first request failed: \(error.localizedDescription))")
                     return nil
                 }
@@ -1089,7 +1089,7 @@ actor ExchangeProvider: EmailProvider {
         let newDeltaLink = finalDeltaLink ?? historyId
 
         BackgroundSyncLogger.log("exchange.fetchHistory: done +\(added.count) -\(deleted.count) newToken=\(finalDeltaLink != nil)")
-        print("[Exchange] Delta: +\(added.count) added/changed, -\(deleted.count) deleted")
+        if DebugModeManager.isLoggingEnabled() { print("[Exchange] Delta: +\(added.count) added/changed, -\(deleted.count) deleted") }
 
         return HistoryResponse(
             newHistoryId: newDeltaLink,
@@ -1118,7 +1118,7 @@ actor ExchangeProvider: EmailProvider {
                 }
             } catch {
                 // Message may have been deleted between delta list and detail fetch — skip
-                print("[Exchange] fetchMessageDetails: skipping \(id) — \(error)")
+                if DebugModeManager.isLoggingEnabled() { print("[Exchange] fetchMessageDetails: skipping \(id) — \(error)") }
             }
         }
         return results
@@ -1291,7 +1291,7 @@ actor ExchangeProvider: EmailProvider {
         guard let encoded = try? JSONEncoder().encode(msg),
               let json = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any],
               let metadata = GraphParse.parseMessage(json) else {
-            print("[Exchange] Missing/invalid receivedDateTime for message \(msg.id) — treating as fetch failure, will retry")
+            if DebugModeManager.isLoggingEnabled() { print("[Exchange] Missing/invalid receivedDateTime for message \(msg.id) — treating as fetch failure, will retry") }
             return nil
         }
 

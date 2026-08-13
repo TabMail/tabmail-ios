@@ -991,7 +991,7 @@ final class InboxViewModel {
         // (the warm-foreground hang; Half A / PLAN_HANG_FIX).
         await selfHealFoldersAsync()
         let folderNames = folders.map { "\($0.name)(\($0.id))" }.joined(separator: ", ")
-        print("[MoveTrace] reloadMessages — folders=[\(folderNames)] prevCount=\(loadedMessages.count)")
+        if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] reloadMessages — folders=[\(folderNames)] prevCount=\(loadedMessages.count)") }
 
         resetSnippetState()
 
@@ -1121,7 +1121,7 @@ final class InboxViewModel {
         }
         let diffMs = Int((CFAbsoluteTimeGetCurrent() - tDiff) * 1000)
 
-        print("[MoveTrace] reloadMessages — newCount=\(loadedMessages.count) hasMore=\(hasMoreMessages)")
+        if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] reloadMessages — newCount=\(loadedMessages.count) hasMore=\(hasMoreMessages)") }
         MergeSurfaceProbe.logSince("inbox reloaded (\(loadedMessages.count) rows)")
         let tRebuild = CFAbsoluteTimeGetCurrent()
         rebuildDisplayGroups()
@@ -1172,7 +1172,7 @@ final class InboxViewModel {
         let resolvedKeys = Set(resolved.map { "\($0.id):\($0.role.rawValue)" })
         if currentKeys != resolvedKeys {
             BackgroundSyncLogger.logInbox("[\(instanceTag)] selfHealFolders current=\(currentKeys.sorted()) → resolved=\(resolvedKeys.sorted())")
-            print("[MoveTrace] self-healed folders from GRDB: \(currentKeys.count) → \(resolvedKeys.count)")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] self-healed folders from GRDB: \(currentKeys.count) → \(resolvedKeys.count)") }
             folders = resolved
         }
     }
@@ -1317,7 +1317,7 @@ final class InboxViewModel {
             } catch is CancellationError {
                 // Task cancelled (e.g., view disappeared) — not user-facing
             } catch {
-                print("[InfiniteScroll] Error: \(error)")
+                if DebugModeManager.isLoggingEnabled() { print("[InfiniteScroll] Error: \(error)") }
                 if !SyncEngine.isConnectionError(error) {
                     self.error = "Failed to load older messages: \(error.localizedDescription)"
                 }
@@ -1428,7 +1428,9 @@ final class InboxViewModel {
         let failed = snippetFailed.contains(id)
         let queued = snippetQueue.contains(id)
         guard !inFlight, !failed, !queued else {
-            if failed { print("[SnippetLoader] BLOCKED by snippetFailed: \(id.prefix(40))") }
+            if failed {
+                if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] BLOCKED by snippetFailed: \(id.prefix(40))") }
+            }
             return false
         }
         snippetQueue.insert(id)
@@ -1506,7 +1508,7 @@ final class InboxViewModel {
                 needsFTS.append(headerId)
             }
         }
-        print("[SnippetLoader] Batch \(batch.count): tier0=\(snippetUpdates.count) needsFTS=\(needsFTS.count) readMs=\(readMs)")
+        if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Batch \(batch.count): tier0=\(snippetUpdates.count) needsFTS=\(needsFTS.count) readMs=\(readMs)") }
 
         var networkNeeded: [(headerId: String, header: MessageHeader)] = []
 
@@ -1532,20 +1534,23 @@ final class InboxViewModel {
             }
         }
 
-        print("[SnippetLoader] Tier1 done: ftsHits=\(snippetUpdates.count - batch.count + needsFTS.count) networkNeeded=\(networkNeeded.count)")
+        if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Tier1 done: ftsHits=\(snippetUpdates.count - batch.count + needsFTS.count) networkNeeded=\(networkNeeded.count)") }
 
         // Tier 2: Network body fetch — extract snippet + update FTS, release body immediately.
         for item in networkNeeded {
-            guard !Task.isCancelled else { print("[SnippetLoader] Tier2 cancelled"); return }
+            guard !Task.isCancelled else {
+                if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Tier2 cancelled") }
+                return
+            }
             guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: item.header.accountId) }),
                   let provider = await manager.provider(for: account) else {
-                print("[SnippetLoader] Tier2 NO PROVIDER for \(item.header.accountId) folder=\(item.header.folderPath)")
+                if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Tier2 NO PROVIDER for \(item.header.accountId) folder=\(item.header.folderPath)") }
                 // Provider temporarily unavailable (reconnecting) — don't blacklist, leave retryable
                 continue
             }
 
             do {
-                print("[SnippetLoader] Tier2 fetching msgId=\(item.header.messageId) folder=\(item.header.folderPath)")
+                if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Tier2 fetching msgId=\(item.header.messageId) folder=\(item.header.folderPath)") }
                 let fullMessage = try await provider.fetchMessage(id: item.header.messageId, folder: item.header.folderPath)
                 // We just downloaded the WHOLE body for the snippet — CACHE it now
                 // instead of discarding it. Previously this path extracted a ~150
@@ -1571,11 +1576,11 @@ final class InboxViewModel {
                         snippetUpdates.append((headerId: item.headerId, snippet: processed.snippet))
                     } else {
                         // confirmed-empty / first-empty-retry — no usable snippet this pass
-                        print("[SnippetLoader] Tier2 no body content for msgId=\(item.header.messageId)")
+                        if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Tier2 no body content for msgId=\(item.header.messageId)") }
                     }
                 }
             } catch {
-                print("[SnippetLoader] Failed for \(item.headerId): \(error)")
+                if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Failed for \(item.headerId): \(error)") }
                 // Only blacklist on non-connection errors (e.g., messageNotFound).
                 // Connection errors are transient — leave retryable for next scroll/appearance.
                 if !SyncEngine.isConnectionError(error) {
@@ -1662,7 +1667,7 @@ final class InboxViewModel {
             let resolved = await resolveFoldersFromDBAsync()
             if !resolved.isEmpty {
                 folders = resolved
-                print("[Sync] performSync self-healed folders from GRDB: \(resolved.count)")
+                if DebugModeManager.isLoggingEnabled() { print("[Sync] performSync self-healed folders from GRDB: \(resolved.count)") }
                 resetMessages()
             }
         }
@@ -1675,7 +1680,7 @@ final class InboxViewModel {
                 try Account.filter(accountIds.contains(Column("id"))).fetchAll(db)
             }
         } catch {
-            print("[Sync] Error fetching accounts: \(error)")
+            if DebugModeManager.isLoggingEnabled() { print("[Sync] Error fetching accounts: \(error)") }
             return
         }
         guard !uniqueAccounts.isEmpty else { return }
@@ -1710,14 +1715,14 @@ final class InboxViewModel {
             // momentary Microsoft Graph 503 during connect). NOT a real sync failure:
             // the next poll/refresh retries. Leave lastSyncFailed unchanged and show
             // no error banner so a single server hiccup doesn't surface to the user.
-            print("[Sync] Transient error (not surfaced): \(error)")
+            if DebugModeManager.isLoggingEnabled() { print("[Sync] Transient error (not surfaced): \(error)") }
         } catch let error where error.isDatabaseSuspensionAbort {
             // GRDB write aborted because the database is suspended (ADR-IOS-041).
             // Benign and expected at a background-suspension instant — retries on
             // the next wake — so it must NOT surface as a failed sync.
-            print("[Sync] Database suspended (not surfaced): \(error)")
+            if DebugModeManager.isLoggingEnabled() { print("[Sync] Database suspended (not surfaced): \(error)") }
         } catch {
-            print("[Sync] Error: \(error)")
+            if DebugModeManager.isLoggingEnabled() { print("[Sync] Error: \(error)") }
             AccountManagerState.shared.lastSyncFailed = true
             if !SyncEngine.isConnectionError(error) {
                 self.error = error.localizedDescription
@@ -1883,7 +1888,7 @@ final class InboxViewModel {
         // move. Role check first — see archiveIsNoOp.
         guard lookupFolderRole(message.folderId) != .archive else { return false }
         guard let archivePath = lookupFolderPath(accountId: message.accountId, role: .archive) else {
-            print("[Queue] ERROR: no archive folder for account \(message.accountId)")
+            if DebugModeManager.isLoggingEnabled() { print("[Queue] ERROR: no archive folder for account \(message.accountId)") }
             return false
         }
         guard message.folderPath != archivePath else { return false }
@@ -1949,7 +1954,7 @@ final class InboxViewModel {
         // nothing is recorded, so every id is reported skipped (un-hide).
         guard lookupFolderRole(first.folderId) != .archive else { return messageIds }
         guard let archivePath = lookupFolderPath(accountId: first.accountId, role: .archive) else {
-            print("[Queue] ERROR: no archive folder for account \(first.accountId)")
+            if DebugModeManager.isLoggingEnabled() { print("[Queue] ERROR: no archive folder for account \(first.accountId)") }
             return messageIds
         }
         guard first.folderPath != archivePath else { return messageIds }
@@ -2029,7 +2034,7 @@ final class InboxViewModel {
             return false
         }
         guard let trashPath = lookupFolderPath(accountId: message.accountId, role: .trash) else {
-            print("[Queue] ERROR: no trash folder for account \(message.accountId)")
+            if DebugModeManager.isLoggingEnabled() { print("[Queue] ERROR: no trash folder for account \(message.accountId)") }
             logRoleActionLocation(
                 action: "delete", phase: "admission", stored: stored,
                 effective: message, decision: "refuse.destinationMissing")
@@ -2127,7 +2132,7 @@ final class InboxViewModel {
         // nothing is recorded, so every id is reported skipped (un-hide).
         if folderRole == .trash { return messageIds }
         guard let trashPath = lookupFolderPath(accountId: first.accountId, role: .trash) else {
-            print("[Queue] ERROR: no trash folder for account \(first.accountId)")
+            if DebugModeManager.isLoggingEnabled() { print("[Queue] ERROR: no trash folder for account \(first.accountId)") }
             return messageIds
         }
         guard first.folderPath != trashPath else { return messageIds }
@@ -2639,7 +2644,7 @@ final class InboxViewModel {
             reconcileUserLabels(forMessageId: actionId)
         } catch {
             reconcileUserLabels(forMessageId: actionId)
-            print("[InboxViewModel] removeUserLabel failed: \(error)")
+            if DebugModeManager.isLoggingEnabled() { print("[InboxViewModel] removeUserLabel failed: \(error)") }
         }
     }
 
@@ -2688,7 +2693,7 @@ final class InboxViewModel {
             }
             loadedMessages[idx].userLabels = labels
         } catch {
-            print("[InboxViewModel] reconcileUserLabels failed for \(id): \(error)")
+            if DebugModeManager.isLoggingEnabled() { print("[InboxViewModel] reconcileUserLabels failed for \(id): \(error)") }
         }
     }
 
@@ -2699,11 +2704,11 @@ final class InboxViewModel {
     @discardableResult
     func move(_ messageId: String, toFolderPath: String) -> Bool {
         guard let message = lookupMessage(messageId) else {
-            print("[MoveTrace] ViewModel.move — lookupMessage FAILED for id=\(messageId)")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] ViewModel.move — lookupMessage FAILED for id=\(messageId)") }
             return false
         }
         let actionId = message.id
-        print("[MoveTrace] ViewModel.move — msgId=\(message.messageId) from=\(message.folderPath) to=\(toFolderPath) folderId=\(message.folderId) headerDbId=\(message.id)")
+        if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] ViewModel.move — msgId=\(message.messageId) from=\(message.folderPath) to=\(toFolderPath) folderId=\(message.folderId) headerDbId=\(message.id)") }
         let destFolderId = "\(message.accountId):\(toFolderPath)"
         // Capture the undo snapshot BEFORE this action's own retain/
         // registerMutation below — see overlayAdjustedForUndo's doc comment.

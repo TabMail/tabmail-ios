@@ -58,8 +58,14 @@ enum GraphParse {
         let parentFolderId = json["parentFolderId"] as? String
         if parentFolderId == nil {
             // Surfacing this in console makes a silent Graph schema change
-            // discoverable before users start reporting duplicate rows.
+            // discoverable before users start reporting duplicate rows. Debug
+            // builds only: on device `stdout` is discarded, so this was never a
+            // production channel. `#if DEBUG` rather than `DebugModeManager`
+            // because `Shared/` also compiles into the NSE, where that type
+            // does not exist.
+            #if DEBUG
             print("[GraphParse] messageMetadata \(id): missing parentFolderId in response — check $select")
+            #endif
         }
 
         return MessageMetadata(

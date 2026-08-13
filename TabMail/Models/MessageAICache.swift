@@ -90,7 +90,7 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
             let effectiveTag = (cachedTag == .reply && header.isReplied) ? ActionTag.none : cachedTag
             header.setActionTag(effectiveTag)
             if effectiveTag != cachedTag {
-                print("[ReplyDetect] Cache restore: reply→none for \(header.messageId) (already replied)")
+                if DebugModeManager.isLoggingEnabled() { print("[ReplyDetect] Cache restore: reply→none for \(header.messageId) (already replied)") }
             }
         }
 
@@ -103,7 +103,7 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
         cached.updatedAt = Date()
         try cached.save(db)
 
-        print("[AICache] Restored for \(header.messageId)")
+        if DebugModeManager.isLoggingEnabled() { print("[AICache] Restored for \(header.messageId)") }
     }
 
     /// Write AI state to the persistent cache (upsert).

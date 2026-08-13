@@ -91,7 +91,9 @@ enum BodyAssetStore {
         guard let container = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: BodyAssetConfig.appGroup
         ) else {
+            #if DEBUG
             print("[BodyAssetStore] App Group container unavailable")
+            #endif
             return nil
         }
         let dbURL = container.appendingPathComponent(manifestDBName)
@@ -128,7 +130,9 @@ enum BodyAssetStore {
                 try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_attachmentLookup ON bodyAsset (headerId, kind, attachmentSection)")
             }
         } catch {
+            #if DEBUG
             print("[BodyAssetStore] manifest DB open/migrate failed: \(error)")
+            #endif
             return nil
         }
         queueCache.withLock { $0 = queue }
@@ -230,7 +234,9 @@ enum BodyAssetStore {
     static var attachmentsBudgetMB: Int {
         get {
             guard let defaults = UserDefaults(suiteName: BodyAssetConfig.appGroup) else {
+                #if DEBUG
                 print("[BodyAssetStore] App Group UserDefaults suite unavailable — using compile-time default")
+                #endif
                 return BodyAssetConfig.defaultAttachmentsBudgetMB
             }
             let raw = defaults.object(forKey: BodyAssetConfig.attachmentsBudgetMBKey) as? Int
@@ -238,7 +244,9 @@ enum BodyAssetStore {
         }
         set {
             guard let defaults = UserDefaults(suiteName: BodyAssetConfig.appGroup) else {
+                #if DEBUG
                 print("[BodyAssetStore] App Group UserDefaults suite unavailable — write dropped")
+                #endif
                 return
             }
             defaults.set(newValue, forKey: BodyAssetConfig.attachmentsBudgetMBKey)
@@ -255,7 +263,9 @@ enum BodyAssetStore {
                 try Int64.fetchOne(db, sql: "SELECT COALESCE(SUM(sizeBytes), 0) FROM bodyAsset") ?? 0
             }
         } catch {
+            #if DEBUG
             print("[BodyAssetStore] usedBytes read failed: \(error)")
+            #endif
             return 0
         }
         usedBytesCache.withLock { $0 = value }
@@ -274,7 +284,9 @@ enum BodyAssetStore {
                 ) ?? 0
             }
         } catch {
+            #if DEBUG
             print("[BodyAssetStore] usedBytes(kind:) read failed: \(error)")
+            #endif
             return 0
         }
     }
@@ -480,7 +492,9 @@ enum BodyAssetStore {
             try data.write(to: fileURL, options: .atomic)
         } catch {
             discardPreparedIfOrphaned(prepared)
+            #if DEBUG
             print("[BodyAssetStore] file write failed for \(blobId): \(error)")
+            #endif
             return nil
         }
 
@@ -556,7 +570,9 @@ enum BodyAssetStore {
             // built-in `isInterruptionError` rather than the app-only
             // `Error.isDatabaseSuspensionAbort` helper.)
             if (error as? DatabaseError)?.isInterruptionError != true {
+                #if DEBUG
                 print("[BodyAssetStore] row publish failed for \(prepared.blobId): \(error)")
+                #endif
             }
             return nil
         }
@@ -863,7 +879,9 @@ enum BodyAssetStore {
                 )
             }
         } catch {
+            #if DEBUG
             print("[BodyAssetStore] attachmentAssetId read failed: \(error)")
+            #endif
             return nil
         }
     }
@@ -913,7 +931,9 @@ enum BodyAssetStore {
                 return AssetManifestRow(owner: owner, kind: kind, contentType: contentType)
             }
         } catch {
+            #if DEBUG
             print("[BodyAssetStore] assetManifestRow read failed: \(error)")
+            #endif
             return nil
         }
     }
@@ -930,7 +950,9 @@ enum BodyAssetStore {
                 )
             }
         } catch {
+            #if DEBUG
             print("[BodyAssetStore] contentType read failed: \(error)")
+            #endif
             return nil
         }
     }
@@ -962,7 +984,9 @@ enum BodyAssetStore {
                     )
                 }
             } catch {
+                #if DEBUG
                 print("[BodyAssetStore] bumpMessageAccess failed for \(contentKey): \(error)")
+                #endif
             }
         }
     }
@@ -1006,7 +1030,9 @@ enum BodyAssetStore {
                 }
             }
         } catch {
+            #if DEBUG
             print("[BodyAssetStore] oldestAccessedMessages failed: \(error)")
+            #endif
             return []
         }
     }
@@ -1047,7 +1073,9 @@ enum BodyAssetStore {
                 return (total, blobIds)
             }
         } catch {
+            #if DEBUG
             print("[BodyAssetStore] deleteAllAssets manifest failed for \(contentKey): \(error)")
+            #endif
             return 0
         }
         for blobId in deletion.blobIds {
@@ -1100,7 +1128,9 @@ enum BodyAssetStore {
                 return db.changesCount
             }
         } catch {
+            #if DEBUG
             print("[BodyAssetStore] rekeyContentKey failed for \(oldKey): \(error)")
+            #endif
             return 0
         }
         if moved < 0 {
@@ -1127,7 +1157,9 @@ enum BodyAssetStore {
                 return rows.map { (id: $0["id"], contentKey: $0["headerId"]) }
             }
         } catch {
+            #if DEBUG
             print("[BodyAssetStore] deleteAllAssets(kind:) snapshot failed: \(error)")
+            #endif
             return []
         }
         guard !snapshot.isEmpty else { return [] }
@@ -1140,7 +1172,9 @@ enum BodyAssetStore {
                 )
             }
         } catch {
+            #if DEBUG
             print("[BodyAssetStore] deleteAllAssets(kind:) manifest delete failed: \(error)")
+            #endif
         }
         for entry in snapshot {
             removeBlobIfUnreferenced(entry.id)
@@ -1165,7 +1199,9 @@ enum BodyAssetStore {
                 return Set(ids)
             }
         } catch {
+            #if DEBUG
             print("[BodyAssetStore] allManifestContentKeys failed: \(error)")
+            #endif
             return []
         }
     }
@@ -1185,7 +1221,9 @@ enum BodyAssetStore {
                 return Set(ids)
             }
         } catch {
+            #if DEBUG
             print("[BodyAssetStore] allManifestContentKeysByKind failed: \(error)")
+            #endif
             return []
         }
     }
@@ -1230,7 +1268,9 @@ enum BodyAssetStore {
                 return Set(rows)
             }
         } catch {
+            #if DEBUG
             print("[BodyAssetStore] pruneOrphanFiles known-hashes read failed: \(error)")
+            #endif
             return
         }
 
@@ -1240,7 +1280,9 @@ enum BodyAssetStore {
                 at: dir, includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey]
             )
         } catch {
+            #if DEBUG
             print("[BodyAssetStore] pruneOrphanFiles scandir failed: \(error)")
+            #endif
             return
         }
 

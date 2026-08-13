@@ -62,7 +62,7 @@ struct TabMailApp: App {
         if !hadLaunchedBefore && !dbExists {
             if UserDefaults.standard.object(forKey: "firstLaunchDate") == nil {
                 UserDefaults.standard.set(Date(), forKey: "firstLaunchDate")
-                print("[TabMailApp] Fresh install — recorded firstLaunchDate for overdue reminder suppression")
+                if DebugModeManager.isLoggingEnabled() { print("[TabMailApp] Fresh install — recorded firstLaunchDate for overdue reminder suppression") }
             }
         }
 
@@ -75,7 +75,7 @@ struct TabMailApp: App {
         if !UserDefaults.standard.bool(forKey: proactiveOnByDefaultMigrationKey) {
             UserDefaults.standard.set(true, forKey: ProactiveNotifyService.enabledKey)
             UserDefaults.standard.set(true, forKey: proactiveOnByDefaultMigrationKey)
-            print("[TabMailApp] Migration: proactive reminder notifications enabled by default")
+            if DebugModeManager.isLoggingEnabled() { print("[TabMailApp] Migration: proactive reminder notifications enabled by default") }
         }
 
 
@@ -303,7 +303,7 @@ struct TabMailApp: App {
                 try await SearchIndex.shared.initialize()
                 BootProfiler.mark("SearchIndex.initialize() DONE (FTS ready; off-main — this Δ is elapsed, not main-thread, time)")
             } catch {
-                print("[TabMailApp] FTS index initialization failed: \(error)")
+                if DebugModeManager.isLoggingEnabled() { print("[TabMailApp] FTS index initialization failed: \(error)") }
             }
         }
     }
@@ -594,7 +594,7 @@ final class AppStartup {
                     BootProfiler.mark("DemoSeed.wipe done")
                 }
             } catch {
-                print("[AppStartup] Orphan demo wipe failed: \(error)")
+                if DebugModeManager.isLoggingEnabled() { print("[AppStartup] Orphan demo wipe failed: \(error)") }
             }
         }
         // DB is usable — unblock everything parked in `awaitLaunchReady` (background

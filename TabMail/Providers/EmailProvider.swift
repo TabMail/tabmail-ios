@@ -597,7 +597,7 @@ extension EmailProvider {
         // queue regressed — see `isSyntheticPlaceholderId` doc.
         let synthetic = ids.filter(isSyntheticPlaceholderId)
         if !synthetic.isEmpty {
-            print("[Provider] ERROR: synthetic placeholder ids leaked into fetchMessagesBatch — upstream queue regression. folder=\(folder) ids=\(synthetic.prefix(5))")
+            if DebugModeManager.isLoggingEnabled() { print("[Provider] ERROR: synthetic placeholder ids leaked into fetchMessagesBatch — upstream queue regression. folder=\(folder) ids=\(synthetic.prefix(5))") }
             throw ProviderError.syntheticPlaceholderId(synthetic)
         }
         var results: [String: FullMessageInfo] = [:]
@@ -607,10 +607,10 @@ extension EmailProvider {
                 results[id] = msg
             } catch {
                 if isHttpGoneStatus(error) {
-                    print("[Provider] fetchMessagesBatch: \(id) confirmed gone (HTTP 404/410) — omitting from result")
+                    if DebugModeManager.isLoggingEnabled() { print("[Provider] fetchMessagesBatch: \(id) confirmed gone (HTTP 404/410) — omitting from result") }
                     continue
                 }
-                print("[Provider] fetchMessagesBatch: transient/parse error for \(id): \(error) — failing batch")
+                if DebugModeManager.isLoggingEnabled() { print("[Provider] fetchMessagesBatch: transient/parse error for \(id): \(error) — failing batch") }
                 throw error
             }
         }

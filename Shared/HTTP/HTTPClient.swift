@@ -93,7 +93,11 @@ func performHTTPRequest(
     }
 
     if let logLabel, let errorBodyText = String(data: data, encoding: .utf8) {
+        // Debug-gated with `#if DEBUG` rather than `DebugModeManager` because
+        // `Shared/` also compiles into the NSE, where that type does not exist.
+        #if DEBUG
         print("[\(logLabel)] HTTP \(statusCode) \(method) \(url): \(errorBodyText.prefix(500))")
+        #endif
     }
 
     return HTTPRequestResult(data: nil, statusCode: statusCode, errorBody: data.isEmpty ? nil : data)
@@ -126,7 +130,9 @@ func performHTTPRequestWithRetry(
     for attempt in 0..<maxAttempts {
         let delay = initialDelay * Double(1 << attempt)
         if let logLabel {
+            #if DEBUG
             print("[\(logLabel)] Rate limited (\(result.statusCode)), retrying in \(delay)s (attempt \(attempt + 1)/\(maxAttempts))")
+            #endif
         }
         try await Task.sleep(for: .seconds(delay))
         result = try await performHTTPRequest(

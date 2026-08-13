@@ -1086,7 +1086,7 @@ final class MessageDetailViewModel {
                 // 2. Re-attempt server fetch (connection may have recovered)
                 guard let msg = self.message else { continue }
                 fetchAttempt += 1
-                print("[MessageDetail] Poll fetch attempt \(fetchAttempt) for \(rid.prefix(40))")
+                if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] Poll fetch attempt \(fetchAttempt) for \(rid.prefix(40))") }
                 do {
                     try await self.manager.fetchBody(for: msg)
                     // Read BOTH the fetched body AND the refreshed header, THEN gate
@@ -1114,12 +1114,12 @@ final class MessageDetailViewModel {
                             self.message = nil
                         }
                         self.loadThreadMessagesAsync()
-                        print("[MessageDetail] Body fetched via poll for \(rid.prefix(40))")
+                        if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] Body fetched via poll for \(rid.prefix(40))") }
                         BootProfiler.mark("detail body via poll SERVER fetch \(rid.prefix(24))")
                         return
                     }
                 } catch {
-                    print("[MessageDetail] Poll fetch failed (attempt \(fetchAttempt)): \(error)")
+                    if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] Poll fetch failed (attempt \(fetchAttempt)): \(error)") }
                     // ⚠️ **NO REKEY RECOVERY HERE — REMOVED DELIBERATELY, DO NOT RE-ADD.**
                     //
                     // Rounds 3 and 4 of the audit each found a WRONG-MESSAGE (C3) hole in an
@@ -1223,7 +1223,7 @@ final class MessageDetailViewModel {
         // mounted (cold-start edge, multi-column layouts) — Not-Found still
         // shows rather than a blank view.
         guard await resolveTapIfNeeded() else {
-            print("[MoveTrace] loadBody — notification-tap resolve exhausted for \(messageId)")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] loadBody — notification-tap resolve exhausted for \(messageId)") }
             // Pop post only when NOTHING is over or replacing this view.
             // Three independent gates, each covering a case the others can't:
             //  - `isViewVisible` (onAppear/onDisappear) — NAVIGATION-away: a
@@ -1269,12 +1269,12 @@ final class MessageDetailViewModel {
             // `.pool` honors a `_dbPoolOverride` test pool.
             msg = try await dbPool.pool.read { db in try MessageHeader.fetchOne(db, key: mid) }
         } catch is CancellationError {
-            print("[MoveTrace] loadBody — task cancelled during initial DB read, deferring to body poll")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] loadBody — task cancelled during initial DB read, deferring to body poll") }
             BootProfiler.mark("detail loadBody CANCELLED (initial read) → poll")
             startBodyPoll()
             return
         } catch {
-            print("[MoveTrace] loadBody — DB read error: \(error)")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] loadBody — DB read error: \(error)") }
         }
         if msg == nil {
             msg = await resolveMessageAsync(compositeId: messageId)
@@ -1284,7 +1284,7 @@ final class MessageDetailViewModel {
         // Skip if task was cancelled — all async DB reads fail with CancellationError
         // in a cancelled task, so nil doesn't mean "not found".
         if msg == nil && !Task.isCancelled {
-            print("[MoveTrace] loadBody — local resolve failed for \(messageId), attempting server sync fallback")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] loadBody — local resolve failed for \(messageId), attempting server sync fallback") }
             await syncOriginalFolder()
             msg = await resolveMessageAsync(compositeId: messageId)
         }
@@ -1294,12 +1294,12 @@ final class MessageDetailViewModel {
                 // Task cancelled (e.g., SwiftUI .task during bg→fg transition).
                 // Don't mark as "not found" — defer to bodyPoll which runs in an
                 // independent Task immune to parent cancellation.
-                print("[MoveTrace] loadBody — task cancelled, deferring to body poll")
+                if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] loadBody — task cancelled, deferring to body poll") }
                 BootProfiler.mark("detail loadBody CANCELLED (resolve) → poll")
                 startBodyPoll()
                 return
             }
-            print("[MoveTrace] loadBody — message not found after server fallback: \(messageId)")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] loadBody — message not found after server fallback: \(messageId)") }
             isLoading = false
             messageNotFound = true
             return
@@ -1359,12 +1359,12 @@ final class MessageDetailViewModel {
                 return
             }
         } catch is CancellationError {
-            print("[MoveTrace] loadBody — task cancelled during body check, deferring to body poll")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] loadBody — task cancelled during body check, deferring to body poll") }
             BootProfiler.mark("detail loadBody CANCELLED (body check) → poll")
             startBodyPoll()
             return
         } catch {
-            print("[MoveTrace] loadBody — body read error: \(error)")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] loadBody — body read error: \(error)") }
         }
         // ADR-IOS-049 (notification tap): GRDB missed, but the NSE already
         // fetched + rendered this body into staging — synthesize it for DISPLAY
@@ -1400,7 +1400,7 @@ final class MessageDetailViewModel {
         // (This comment claimed "the body lands once the move completes, or once the next sync
         // re-stamps the epoch" until an audit round showed the poll cannot observe either.)
         if await manager.bodyFetchIsBlockedByPendingAddress(for: msg) {
-            print("[MoveTrace] loadBody — address not corroborated (move in flight), polling for \(rid.prefix(40))")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] loadBody — address not corroborated (move in flight), polling for \(rid.prefix(40))") }
             isLoading = true
             startBodyPoll()
             return
@@ -1410,7 +1410,7 @@ final class MessageDetailViewModel {
         // causes "cannot connect" errors because the folder connection is locked.
         let queuedInBackground = await ActiveBodyQueue.shared.isQueuedOrInFlight(headerId: rid)
         if queuedInBackground {
-            print("[MessageDetail] Body in-flight via background queue — polling for \(rid.prefix(40))")
+            if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] Body in-flight via background queue — polling for \(rid.prefix(40))") }
             isLoading = true
             startBodyPoll()
             return
@@ -1425,7 +1425,7 @@ final class MessageDetailViewModel {
                 try await fetchBodyWithRetry(for: msg)
             }
         } catch is CancellationError {
-            print("[MoveTrace] loadBody — task cancelled during fetch, deferring to body poll")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] loadBody — task cancelled during fetch, deferring to body poll") }
             BootProfiler.mark("detail loadBody CANCELLED (fetch) → poll")
             startBodyPoll()
             return
@@ -1475,10 +1475,10 @@ final class MessageDetailViewModel {
         if messageBody == nil { messageBody = previousBody }
 
         if let msg = message, await manager.bodyFetchIsBlockedByPendingAddress(for: msg) {
-            print("[Refetch] Skipped — address not corroborated (move in flight) for \(rid.prefix(40))")
+            if DebugModeManager.isLoggingEnabled() { print("[Refetch] Skipped — address not corroborated (move in flight) for \(rid.prefix(40))") }
             return
         }
-        print("[Refetch] Starting refetchBody for rid=\(rid.prefix(40))")
+        if DebugModeManager.isLoggingEnabled() { print("[Refetch] Starting refetchBody for rid=\(rid.prefix(40))") }
 
         // Refetch message (with fallback)
         var msg = try? await dbPool.read({ db in try MessageHeader.fetchOne(db, key: rid) })
@@ -1486,11 +1486,11 @@ final class MessageDetailViewModel {
             msg = await resolveMessageAsync(compositeId: messageId)
         }
         guard var msg else {
-            print("[Refetch] Message not found after resolve")
+            if DebugModeManager.isLoggingEnabled() { print("[Refetch] Message not found after resolve") }
             messageNotFound = true
             return
         }
-        print("[Refetch] Resolved message: id=\(msg.id.prefix(40)) folderPath=\(msg.folderPath) messageId=\(msg.messageId.prefix(30))")
+        if DebugModeManager.isLoggingEnabled() { print("[Refetch] Resolved message: id=\(msg.id.prefix(40)) folderPath=\(msg.folderPath) messageId=\(msg.messageId.prefix(30))") }
         applyOverlay(to: &msg)
         message = msg
 
@@ -1514,9 +1514,9 @@ final class MessageDetailViewModel {
                             for: fetchMsg,
                             replaceExistingBody: true)
                     }
-                    print("[Refetch] fetchBodyWithRetry succeeded")
+                    if DebugModeManager.isLoggingEnabled() { print("[Refetch] fetchBodyWithRetry succeeded") }
                 } catch {
-                    print("[Refetch] fetchBodyWithRetry failed: \(error)")
+                    if DebugModeManager.isLoggingEnabled() { print("[Refetch] fetchBodyWithRetry failed: \(error)") }
                     if !SyncEngine.isConnectionError(error) {
                         self.error = error.localizedDescription
                     }
@@ -1529,7 +1529,7 @@ final class MessageDetailViewModel {
                 if refreshedBody != nil { self.bodyReloadToken &+= 1 }
                 let htmlLen = self.messageBody?.htmlContent?.count ?? 0
                 let htmlPreview = String(self.messageBody?.htmlContent?.prefix(200) ?? "nil")
-                print("[Refetch] Body loaded: htmlLen=\(htmlLen) preview=\(htmlPreview)")
+                if DebugModeManager.isLoggingEnabled() { print("[Refetch] Body loaded: htmlLen=\(htmlLen) preview=\(htmlPreview)") }
                 self.isLoading = false
                 if self.messageBody == nil {
                     self.startBodyPoll()
@@ -1578,7 +1578,7 @@ final class MessageDetailViewModel {
             return false
         }
         guard let archiveFolder = lookupFolder(accountId: msg.accountId, role: .archive) else {
-            print("[Queue] ERROR: no archive folder for account \(msg.accountId)")
+            if DebugModeManager.isLoggingEnabled() { print("[Queue] ERROR: no archive folder for account \(msg.accountId)") }
             return false
         }
         guard msg.folderPath != archiveFolder.path else { return false }
@@ -1648,7 +1648,7 @@ final class MessageDetailViewModel {
             return false
         }
         guard let trashFolder = lookupFolder(accountId: msg.accountId, role: .trash) else {
-            print("[Queue] ERROR: no trash folder for account \(msg.accountId)")
+            if DebugModeManager.isLoggingEnabled() { print("[Queue] ERROR: no trash folder for account \(msg.accountId)") }
             return false
         }
         guard msg.folderPath != trashFolder.path else { return false }
@@ -1973,7 +1973,7 @@ final class MessageDetailViewModel {
         do {
             try await fetchBodyWithRetry(for: threadMsg)
         } catch {
-            print("[MessageDetail] Failed to load thread message body: \(error)")
+            if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] Failed to load thread message body: \(error)") }
         }
     }
 
@@ -1996,10 +1996,10 @@ final class MessageDetailViewModel {
                     replaceExistingBody: replaceExistingBody)
                 return
             } catch ProviderError.messageNotFound where attempt < maxAttempts {
-                print("[MessageDetail] messageNotFound (attempt \(attempt)/\(maxAttempts)), retrying...")
+                if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] messageNotFound (attempt \(attempt)/\(maxAttempts)), retrying...") }
                 try await Task.sleep(for: .milliseconds(retryDelays[attempt - 1]))
             } catch let error where attempt < maxAttempts && SyncEngine.isConnectionError(error) {
-                print("[MessageDetail] connection error (attempt \(attempt)/\(maxAttempts)): \(error), retrying...")
+                if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] connection error (attempt \(attempt)/\(maxAttempts)): \(error), retrying...") }
                 try await Task.sleep(for: .milliseconds(retryDelays[attempt - 1]))
             }
         }
@@ -2065,7 +2065,7 @@ final class MessageDetailViewModel {
             if let msg = try MessageHeader
                 .filter(Column("messageId") == msgId && Column("accountId") == accountId && Column("folderId") != "")
                 .fetchOne(db) {
-                print("[MoveTrace] resolveMessageAsync — found via cross-folder: \(msg.id)")
+                if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] resolveMessageAsync — found via cross-folder: \(msg.id)") }
                 return msg
             }
 
@@ -2073,7 +2073,7 @@ final class MessageDetailViewModel {
             if let msg = try MessageHeader
                 .filter(Column("rfc822MessageId") == normalizedMsgId && Column("accountId") == accountId && Column("folderId") != "")
                 .fetchOne(db) {
-                print("[MoveTrace] resolveMessageAsync — found via rfc822MessageId: \(msg.id)")
+                if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] resolveMessageAsync — found via rfc822MessageId: \(msg.id)") }
                 return msg
             }
 
@@ -2096,20 +2096,20 @@ final class MessageDetailViewModel {
         let folderPath = String(parts[1])
 
         guard let provider = await manager.providers[accountId] else {
-            print("[MoveTrace] syncOriginalFolder — no provider for \(accountId)")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] syncOriginalFolder — no provider for \(accountId)") }
             return
         }
         guard let folder = try? await dbPool.read({ db in
             try Folder.filter(Column("accountId") == accountId && Column("path") == folderPath).fetchOne(db)
         }) else {
-            print("[MoveTrace] syncOriginalFolder — folder not found: \(folderPath)")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] syncOriginalFolder — folder not found: \(folderPath)") }
             return
         }
         do {
             try await manager.syncEngine.syncFolderMessages(folder: folder, provider: provider)
-            print("[MoveTrace] syncOriginalFolder — completed for \(folder.name)")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] syncOriginalFolder — completed for \(folder.name)") }
         } catch {
-            print("[MoveTrace] syncOriginalFolder — failed: \(error)")
+            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] syncOriginalFolder — failed: \(error)") }
         }
     }
 
