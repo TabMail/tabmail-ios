@@ -1210,6 +1210,23 @@ struct ComposeView: View {
                                     RoundedRectangle(cornerRadius: 1.5)
                                         .fill(Color.blue.opacity(0.55))
                                         .frame(width: 3)
+                                    // P1d / plan §10.1 C5 — THE EXPLICIT CHOICE for this
+                                    // call site is "local assets are unavailable":
+                                    // `bodyContentKey` is deliberately nil, so no
+                                    // `BodyAssetSchemeHandler` is registered and any
+                                    // `tabmail-asset://` ref in the quote fails closed.
+                                    //
+                                    // ⚠️ That is NOT a P1d regression. `quotedHTML` is the
+                                    // persisted parent `MessageBody.htmlContent`, into which
+                                    // `BodyRenderer` bakes `tabmail-asset://` URLs whenever an
+                                    // `inlineImageWriter` is supplied — and this call site has
+                                    // passed no headerId since long before this work, so no
+                                    // handler was registered here on shipped code either.
+                                    // Inline images in a quoted reply are ALREADY broken today.
+                                    // Filed separately (`PLAN_EMAIL_RENDER_SECURITY.md` §11.1);
+                                    // do not attribute it to the render-hardening phases, and
+                                    // do not "fix" it by handing this view an unrestricted
+                                    // asset lookup — that is what C5 forbids.
                                     AutoSizingHTMLView(html: html)
                                         .padding(.leading, 4)
                                 }

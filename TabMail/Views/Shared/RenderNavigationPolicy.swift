@@ -273,6 +273,82 @@ internal enum RenderLinkPolicy {
     }
 }
 
+// MARK: - Bridge-liveness verdict
+
+/// The verdict a committed load reports about app-injected JavaScript.
+internal enum BridgeLivenessVerdict: String, Equatable {
+    /// A `WKScriptMessage` arrived for this load — app user scripts provably executed
+    /// and provably reached Swift.
+    case live = "LIVE"
+    /// Nothing arrived. This is the designated alarm for the catastrophic-quiet failure
+    /// mode of the whole render-hardening workstream.
+    case silent = "SILENT"
+}
+
+/// Sequences the one diagnostic in the render path that survives a total loss of page
+/// JavaScript.
+///
+/// **Why it is a type and not two lines in the `Coordinator`.** The `Coordinator` lives
+/// inside a `private struct` and cannot be reached from a test, while this can be driven
+/// directly — which matters because the invariant is about the SEQUENCE (arm, settle,
+/// exactly once), not about the text of the line.
+///
+/// ⚠️ **THE BLIND SPOT THIS CLOSES, measured on device 2026-08-12.** The verdict used to
+/// be armed from `didFinish`. In a device smoke test at `e81fd75da` — **42 loads that
+/// logged `didCommit tracked=true`, 41 that logged a `bridge=` verdict, and no id logging
+/// two** — exactly one committed load, `KH4CLK`, logged neither `LIVE` nor `SILENT`,
+/// because its images never settled and so `didFinish` never fired. Its user scripts had
+/// demonstrably run: `[ImageLoadDiag id=KH4CLK +1ms] inventory images=5` arrived one
+/// millisecond after `[NavPermit id=KH4CLK] didCommit tracked=true`, which is a page
+/// script reaching Swift. A page that hangs mid-load therefore produced **no line at
+/// all**, which made the alarm's ABSENCE indistinguishable from the alarm not existing —
+/// `MIS-019`'s shape, a check whose negative case is unobservable. Arming at `didCommit`
+/// makes the verdict a property of COMMITTING, which every rendered document does, rather
+/// than of FINISHING, which a live page may never do.
+///
+/// (The source log is a local, gitignored `logmain.log` that keeps growing, so those
+/// counts are a snapshot of one session and are **not** reproducible from the repo. The
+/// reproducible statement of the same fact is `BridgeLivenessBeaconTests` below.)
+///
+/// **What "exactly one" means, stated with its exception so it is not overstated:** every
+/// committed load emits exactly one verdict *unless a newer load supersedes it first*,
+/// and supersession is itself logged (`issued gen=…` / `superseded gen=…`), so its
+/// silence is explained rather than mysterious. That exception is the pre-existing,
+/// deliberate behaviour — a superseded load's verdict describes a document that is no
+/// longer on screen — and P1d does not change it.
+internal struct BridgeLivenessBeacon: Equatable {
+    /// The most recent generation that has been armed. A generation is armed AT MOST
+    /// ONCE, so a second `didCommit` for the same load — or a future edit that re-adds
+    /// an arm from `didFinish` — cannot produce a second verdict.
+    private(set) var armedGeneration: Int?
+
+    init(armedGeneration: Int? = nil) {
+        self.armedGeneration = armedGeneration
+    }
+
+    /// Arm the verdict timer for a committed load. Returns `true` when the caller should
+    /// actually schedule one, `false` when this generation is already armed.
+    mutating func arm(generation: Int) -> Bool {
+        guard armedGeneration != generation else { return false }
+        armedGeneration = generation
+        return true
+    }
+
+    /// The verdict for `generation` when its grace period expires, or `nil` when a newer
+    /// load has superseded it.
+    ///
+    /// Pure: the caller supplies the state, so a test drives every branch without a
+    /// timer.
+    static func settle(
+        generation: Int,
+        currentGeneration: Int,
+        lastBridgeMessageGeneration: Int?
+    ) -> BridgeLivenessVerdict? {
+        guard currentGeneration == generation else { return nil }
+        return lastBridgeMessageGeneration == generation ? .live : .silent
+    }
+}
+
 // MARK: - Bridge input validation
 
 /// Swift-side validation for the three `WKScriptMessageHandler` channels

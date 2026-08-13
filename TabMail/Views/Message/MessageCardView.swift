@@ -617,9 +617,14 @@ struct MessageCardView: View {
             // Focused card reads from viewModel.messageBody (loaded by loadBody)
             if let body = viewModel.messageBody {
                 if let html = body.htmlContent, !html.isEmpty {
+                    // P1d (plan §10.1 C3+C5): the asset owner key is the BODY's
+                    // authoritative `MessageBody.id`, carried through explicitly —
+                    // never rebuilt from `message.id`, which is a plain `String`
+                    // in a different key space.
                     AutoSizingHTMLView(
                         html: html,
                         headerId: message.id,
+                        bodyContentKey: body.id,
                         reloadToken: viewModel.bodyReloadToken)
                 } else {
                     Text("This message has no content.")
@@ -651,7 +656,8 @@ struct MessageCardView: View {
             // Thread card reads from viewModel.bodyFor() (loaded on demand)
             if let body = viewModel.bodyFor(message.id) {
                 if let html = body.htmlContent, !html.isEmpty {
-                    AutoSizingHTMLView(html: html, headerId: message.id)
+                    // P1d: same explicit ownership carry as the focused card above.
+                    AutoSizingHTMLView(html: html, headerId: message.id, bodyContentKey: body.id)
                 } else {
                     Text("This message has no content.")
                         .foregroundStyle(.secondary)

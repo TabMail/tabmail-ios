@@ -868,6 +868,56 @@ enum BodyAssetStore {
         }
     }
 
+    /// The authorization-relevant fields of ONE manifest row, for the render path.
+    ///
+    /// Deliberately carries `owner` and `kind` alongside `contentType`: the render
+    /// scheme handler must decide *whether* to serve before it decides *what* to
+    /// call the bytes, and it can only do that from the row itself.
+    struct AssetManifestRow: Sendable, Equatable {
+        /// The `headerId` COLUMN as stored right now — never a hash recomputed from
+        /// the URL. `rekeyContentKey(from:to:)` re-points this column after a move
+        /// while preserving the row `id` and the bytes on disk, so the embedded
+        /// `tabmail-asset://` URL keeps the OLD `headerHash`. Authorizing against
+        /// the column is what makes a moved message's cached images keep working;
+        /// authorizing against `headerHash(currentKey)` would reject every one.
+        let owner: ContentKey
+        let kind: BodyAssetKind
+        let contentType: String
+    }
+
+    /// Looks up the ownership + type metadata for an asset id, by exact row id.
+    ///
+    /// ⚑ THE INVARIANT THIS EXISTS FOR: **an asset is served only to the document
+    /// that owns it.** Before this, the render scheme handler paired the
+    /// unrestricted `read(assetId:)` with the unrestricted `contentType(assetId:)`
+    /// and served any asset id the document named — and asset ids are NOT secrets,
+    /// so naming another message's id was all it took. This is the single store
+    /// operation that returns what the ownership decision needs; the decision
+    /// itself is `BodyAssetServePolicy.authorize`.
+    ///
+    /// Returns nil for "no such row" and for an unreadable manifest alike — both
+    /// mean "not authorized", and the handler renders them identically on the wire.
+    static func assetManifestRow(assetId: String) -> AssetManifestRow? {
+        guard let queue = manifestQueue() else { return nil }
+        do {
+            return try queue.read { db -> AssetManifestRow? in
+                guard let row = try Row.fetchOne(
+                    db,
+                    sql: "SELECT headerId, kind, contentType FROM bodyAsset WHERE id = ?",
+                    arguments: [assetId]
+                ) else { return nil }
+                let rawKind: Int = row["kind"]
+                guard let kind = BodyAssetKind(rawValue: rawKind) else { return nil }
+                let owner: ContentKey = row["headerId"]
+                let contentType: String = row["contentType"]
+                return AssetManifestRow(owner: owner, kind: kind, contentType: contentType)
+            }
+        } catch {
+            print("[BodyAssetStore] assetManifestRow read failed: \(error)")
+            return nil
+        }
+    }
+
     /// Returns the Content-Type for an asset. Nil if no row.
     static func contentType(assetId: String) -> String? {
         guard let queue = manifestQueue() else { return nil }

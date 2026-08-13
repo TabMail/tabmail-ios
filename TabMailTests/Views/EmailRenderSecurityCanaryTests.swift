@@ -52,7 +52,7 @@ import UIKit
 // `HostedRenderView` hosts `AutoSizingHTMLView` in a live `UIWindow`, so
 // `HTMLWebView.makeUIView` builds the actual `WKWebViewConfiguration` (the JS gate, the
 // user scripts, the three message handlers, and `BodyAssetSchemeHandler` when
-// `headerId != nil`). Probe web views are then constructed FROM that configuration, so
+// `bodyContentKey != nil`). Probe web views are then constructed FROM that configuration, so
 // they inherit the real user-script set. Two things are measured on synthetic configs
 // and are labelled as such: the subresource-origin probes (they need a recording scheme
 // handler to observe the exact URL WebKit asks for) and the `allowsContentJavaScript =
@@ -395,7 +395,7 @@ enum CanaryKit {
 
 /// Hosts the REAL `AutoSizingHTMLView` in a live window so `HTMLWebView.makeUIView`
 /// builds the production `WKWebViewConfiguration` — the JS gate, the user scripts, the
-/// message handlers, and `BodyAssetSchemeHandler` when `headerId != nil`.
+/// message handlers, and `BodyAssetSchemeHandler` when `bodyContentKey != nil` (P1d).
 @MainActor
 final class HostedRenderView {
     let window: UIWindow
@@ -408,7 +408,16 @@ final class HostedRenderView {
             print("[P1A] NO UIWindowScene in the test host — cannot host SwiftUI")
             return nil
         }
-        let view = AutoSizingHTMLView(html: html, previewFilename: previewFilename, headerId: headerId)
+        // P1d: the scheme-handler opt-in moved from `headerId` to `bodyContentKey`
+        // (the body's authoritative `MessageBody.id`). The canary hosts the two
+        // together so it keeps measuring the production shape — every real call site
+        // that supplies one supplies both.
+        let view = AutoSizingHTMLView(
+            html: html,
+            previewFilename: previewFilename,
+            headerId: headerId,
+            bodyContentKey: headerId.map { ContentKey(rawValue: $0) }
+        )
         let hc = UIHostingController(rootView: VStack(spacing: 0) { view; Spacer() })
         let w = UIWindow(windowScene: scene)
         w.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
@@ -503,9 +512,12 @@ struct EmailRenderSecurityCanaryTests {
         #expect(cfg.websiteDataStore.isPersistent == true,
                 "the render web view deliberately uses the DEFAULT PERSISTENT data store (owner, 2026-08-12), so T5 — one cookie jar shared across every message and sender — is OPEN and accepted (IOS-PRIVACY-001). Do NOT describe this path as isolated")
 
-        // C4: the scheme handler is registered exactly when a headerId is present.
+        // C3/C4/C5: the scheme handler is registered exactly when an OWNERSHIP KEY is
+        // present. P1d moved the predicate off `headerId` — the handler now authorizes
+        // every asset against the body's `MessageBody.id`, so a call site that cannot
+        // supply one gets no handler at all rather than an unrestricted lookup.
         #expect(cfg.urlSchemeHandler(forURLScheme: BodyAssetConfig.urlScheme) != nil,
-                "headerId != nil must register BodyAssetSchemeHandler")
+                "bodyContentKey != nil must register BodyAssetSchemeHandler")
 
         let scripts = cfg.userContentController.userScripts
         #expect(!scripts.isEmpty, "the app injects user scripts; they must survive P1b's JS gate")
@@ -520,7 +532,7 @@ struct EmailRenderSecurityCanaryTests {
         }
         defer { hostedNil.tearDown() }
         #expect(hostedNil.webView.configuration.urlSchemeHandler(forURLScheme: BodyAssetConfig.urlScheme) == nil,
-                "headerId == nil must NOT register the scheme handler (C5: compose/.eml resolve differently)")
+                "bodyContentKey == nil must NOT register the scheme handler — C5's explicit 'local assets are unavailable' choice, taken by compose quote and .eml preview")
 
         // RE-INVERTED 2026-08-12 by owner directive. `isPersistent` alone does not measure T5 —
         // a per-view ephemeral store and one shared ephemeral singleton both report `false`, and
@@ -1509,5 +1521,93 @@ struct EmailRenderSecurityCanaryTests {
                 "the same-document jump still happens — P1a measured that .cancel does not prevent it")
         #expect(await CanaryKit.eval(wv, "String((document.getElementById('lnk')||{}).id)") == "lnk",
                 "and the document was NOT replaced")
+    }
+}
+
+// =====================================================================================
+// 13. P1d — view identity includes the body ContentKey (plan §10.1 C4).
+//
+// THE INVARIANT: *a web view built to serve message A's assets is never reused to render
+// message B's document.*
+//
+// A `WKURLSchemeHandler` is installed ONCE on the configuration, inside `makeUIView`;
+// `updateUIView` cannot replace it. SwiftUI may reuse the platform view across an update
+// in which the body ContentKey changes (row identity is `stableId`), so a handler bound
+// at construction goes stale in BOTH directions — legitimate assets denied for the new
+// document, and an old asset servable to a new document that names its id. Asset ids are
+// not secrets, so this is measured rather than argued.
+// =====================================================================================
+
+@MainActor
+@Suite("P1d view identity — the web view is recreated when the body ContentKey changes", .serialized)
+struct RenderViewIdentityTests {
+
+    /// Hosts `AutoSizingHTMLView` with a mutable root so the test can rebind it the way
+    /// SwiftUI rebinds a recycled `List` row.
+    private func host(html: String, key: ContentKey?) -> (UIWindow, UIHostingController<AnyView>)? {
+        guard let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene }).first else {
+            print("[P1D] NO UIWindowScene in the test host — cannot host SwiftUI")
+            return nil
+        }
+        let hc = UIHostingController(rootView: Self.root(html: html, key: key))
+        let w = UIWindow(windowScene: scene)
+        w.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        w.rootViewController = hc
+        w.isHidden = false
+        w.makeKeyAndVisible()
+        w.layoutIfNeeded()
+        return (w, hc)
+    }
+
+    private static func root(html: String, key: ContentKey?) -> AnyView {
+        AnyView(VStack(spacing: 0) {
+            AutoSizingHTMLView(html: html, headerId: key?.rawValue, bodyContentKey: key)
+            Spacer()
+        })
+    }
+
+    @Test("A body ContentKey change recreates the WKWebView; an html change does NOT")
+    func contentKeyChangeRecreatesTheWebView() async {
+        let keyA = ContentKey(rawValue: "acct-1:INBOX:5001")
+        let keyB = ContentKey(rawValue: "acct-1:Archive:5001")
+        guard let (window, hc) = host(html: "<p>message A</p>", key: keyA) else {
+            #expect(Bool(false), "could not host AutoSizingHTMLView"); return
+        }
+        defer { window.isHidden = true; window.rootViewController = nil }
+
+        var first: WKWebView?
+        _ = await CanaryKit.waitUntil(10) {
+            window.layoutIfNeeded()
+            first = HostedRenderView.findWebView(window)
+            return first != nil && first!.bounds.width > 50
+        }
+        guard let original = first else {
+            #expect(Bool(false), "no WKWebView appeared for the first document"); return
+        }
+
+        // NON-VACUITY FIRST, and it is the half that would silently pass if `.id(…)` were
+        // attached to something that changes on every update: a NEW DOCUMENT under the
+        // SAME key must REUSE the platform view. Recreating per document would be the
+        // rejected alternative (view churn on the appearance and process-recovery paths).
+        hc.rootView = Self.root(html: "<p>message A, edited</p>", key: keyA)
+        window.layoutIfNeeded()
+        try? await Task.sleep(for: .milliseconds(500))
+        window.layoutIfNeeded()
+        #expect(HostedRenderView.findWebView(window) === original,
+                "an html change under the same body ContentKey must NOT churn the web view")
+
+        // THE PROPERTY: the key changed — as it does when a move re-keys the row under a
+        // row identity that is `stableId` and therefore did not change — so the platform
+        // view, and with it the scheme handler bound to the old key, must be replaced.
+        hc.rootView = Self.root(html: "<p>message B</p>", key: keyB)
+        window.layoutIfNeeded()
+        let recreated = await CanaryKit.waitUntil(10) {
+            window.layoutIfNeeded()
+            let current = HostedRenderView.findWebView(window)
+            return current != nil && current !== original
+        }
+        #expect(recreated,
+                "a body ContentKey change must recreate the WKWebView — the scheme handler is installed once in makeUIView and updateUIView cannot replace it")
     }
 }

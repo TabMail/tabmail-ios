@@ -454,3 +454,93 @@ struct RenderBridgeInputTests {
         #expect(bounded.hasSuffix("…[+37 chars truncated]"))
     }
 }
+
+// =====================================================================================
+// P1d — the bridge-liveness beacon.
+//
+// THE INVARIANT: *every committed load emits exactly one bridge verdict.*
+//
+// Pinned at the sequence level, not at the text of the log line. The device evidence
+// that forced this (`KH4CLK`, 2026-08-12) is a load that COMMITTED, ran its user scripts,
+// never FINISHED, and therefore reported nothing at all — an alarm whose absence was
+// indistinguishable from the alarm not existing.
+// =====================================================================================
+
+@Suite("P1d bridge-liveness beacon — every committed load emits exactly one verdict")
+struct BridgeLivenessBeaconTests {
+
+    /// Drives the real arm/settle sequence and returns every verdict a load produced.
+    private func verdicts(
+        commits: [Int],
+        currentGeneration: Int,
+        lastBridgeMessageGeneration: Int?
+    ) -> [BridgeLivenessVerdict] {
+        var beacon = BridgeLivenessBeacon()
+        var out: [BridgeLivenessVerdict] = []
+        for generation in commits where beacon.arm(generation: generation) {
+            if let v = BridgeLivenessBeacon.settle(
+                generation: generation,
+                currentGeneration: currentGeneration,
+                lastBridgeMessageGeneration: lastBridgeMessageGeneration
+            ) { out.append(v) }
+        }
+        return out
+    }
+
+    @Test("A load that COMMITS but never FINISHES still reports — the KH4CLK blind spot")
+    func aCommittedButNeverFinishedLoadStillReports() {
+        // The whole sequence for this load is: didCommit, then nothing. `didFinish` is
+        // never called — KH4CLK's images never settled — so a verdict armed there would
+        // never fire. Armed at commit, it does.
+        let out = verdicts(commits: [1], currentGeneration: 1, lastBridgeMessageGeneration: 1)
+        #expect(out == [.live],
+                "KH4CLK's user scripts provably ran ([ImageLoadDiag id=KH4CLK +1ms] inventory images=5, the line right after its didCommit), so the verdict for a committed-but-unfinished load is LIVE — and there must BE one")
+    }
+
+    @Test("Silence is reported, not omitted")
+    func silenceIsReported() {
+        let out = verdicts(commits: [4], currentGeneration: 4, lastBridgeMessageGeneration: nil)
+        #expect(out == [.silent],
+                "SILENT is the designated alarm for the catastrophic-quiet failure mode; it must be a sentence, not an absence")
+        // A bridge message from an OLDER load proves nothing about this one.
+        let stale = verdicts(commits: [4], currentGeneration: 4, lastBridgeMessageGeneration: 3)
+        #expect(stale == [.silent])
+    }
+
+    @Test("EXACTLY one — a second commit for the same load cannot produce a second verdict")
+    func exactlyOneVerdictPerLoad() {
+        // This is the structural half of the invariant: it must be impossible to double-
+        // report, including via a future edit that re-adds an arm from `didFinish`.
+        let out = verdicts(commits: [9, 9, 9], currentGeneration: 9, lastBridgeMessageGeneration: 9)
+        #expect(out == [.live], "three arms of one generation, one verdict")
+
+        var beacon = BridgeLivenessBeacon()
+        #expect(beacon.arm(generation: 2) == true)
+        #expect(beacon.arm(generation: 2) == false, "re-arming the same generation is refused")
+        #expect(beacon.arm(generation: 3) == true, "a genuinely new load arms again")
+    }
+
+    @Test("Two distinct committed loads each get their own verdict")
+    func twoLoadsTwoVerdicts() {
+        var beacon = BridgeLivenessBeacon()
+        #expect(beacon.arm(generation: 1) == true)
+        #expect(BridgeLivenessBeacon.settle(generation: 1, currentGeneration: 1,
+                                            lastBridgeMessageGeneration: 1) == .live)
+        #expect(beacon.arm(generation: 2) == true)
+        #expect(BridgeLivenessBeacon.settle(generation: 2, currentGeneration: 2,
+                                            lastBridgeMessageGeneration: nil) == .silent)
+    }
+
+    @Test("A SUPERSEDED load is silent about itself — the one documented exception")
+    func aSupersededLoadReportsNothing() {
+        // Stated with its exception so the invariant is not overstated (MIS-019 shape):
+        // a superseded load's verdict would describe a document that is no longer on
+        // screen, and supersession is separately logged (`issued gen=…` / `superseded
+        // gen=…`), so its silence is explained rather than mysterious. Pre-existing
+        // behaviour; P1d re-sequenced the arm and deliberately did not change this.
+        #expect(BridgeLivenessBeacon.settle(generation: 5, currentGeneration: 6,
+                                            lastBridgeMessageGeneration: 5) == nil)
+        #expect(BridgeLivenessBeacon.settle(generation: 5, currentGeneration: 6,
+                                            lastBridgeMessageGeneration: nil) == nil)
+    }
+}

@@ -58,6 +58,29 @@ struct EmlAttachmentPreview: View {
                     Divider()
                         .padding(.horizontal)
                         .padding(.vertical, 10)
+                    // P1d / plan §10.1 C5 — THE EXPLICIT CHOICE for this call site is
+                    // "local assets are unavailable": `bodyContentKey` is deliberately
+                    // nil, so no `BodyAssetSchemeHandler` is registered.
+                    //
+                    // ⚠️ MEASURED 2026-08-12, and it CONTRADICTS the plan's grading. §10.1
+                    // C5 graded this path "LIKELY-provenance-free — the attachment's own
+                    // bytes, not the persisted parent body — confirm during
+                    // implementation". Confirmed FALSE: `AttachmentListView` builds
+                    // `EmlPreviewState(html: bodyHtml, …)` from its own `bodyHtml`
+                    // parameter, and both `AttachmentListView(...)` call sites in
+                    // `MessageCardView` pass `bodyHtml: body.htmlContent` — the persisted
+                    // parent `MessageBody.htmlContent`. This sheet re-renders the PARENT
+                    // body with preview-mode CSS that shows only the selected `.eml`
+                    // section; it never parses the attachment's bytes. So it is
+                    // provenance-BEARING and can carry `tabmail-asset://` refs.
+                    //
+                    // That is not a P1d regression either: this call site has never passed
+                    // a headerId, so no handler was registered here on shipped code and
+                    // those refs already fail closed — the same pre-existing shape as the
+                    // compose quote (§11.1). Carrying the parent's `MessageBody.id` here
+                    // would CHANGE behaviour (broken images would start loading), which
+                    // the standing "no behaviour changes, just security" directive puts
+                    // out of scope for this commit.
                     AutoSizingHTMLView(html: html, previewFilename: filename)
                     if !nestedAttachments.isEmpty {
                         nestedAttachmentStrip

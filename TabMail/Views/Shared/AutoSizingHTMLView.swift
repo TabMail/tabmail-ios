@@ -9,14 +9,31 @@ import Synchronization
 
 /// Auto-sizing WKWebView that reports its content height to SwiftUI.
 ///
-/// `headerId` opt-in: when non-nil, registers a `BodyAssetSchemeHandler` on the
-/// WKWebViewConfiguration so HTML `<img src="tabmail-asset://...">` refs resolve
-/// to bytes from `BodyAssetStore`. Compose preview / Eml preview / tooltip mocks
-/// pass nil and get inline data URIs (legacy path, baseURL: nil).
+/// `bodyContentKey` opt-in: when non-nil, registers a `BodyAssetSchemeHandler`
+/// BOUND TO THAT KEY on the WKWebViewConfiguration, so HTML
+/// `<img src="tabmail-asset://...">` refs resolve to bytes from `BodyAssetStore`
+/// **that this message owns** and to nothing else.
+///
+/// ⚠️ P1d changed the opt-in from `headerId` to `bodyContentKey` (ADR-IOS-076
+/// decision 5; plan §10.1 C3 + C5). The two are separate parameters on purpose:
+/// `headerId` is a `MessageHeader.id` used ONLY for the height/reveal seed cache,
+/// while the asset owner must be the body's authoritative `MessageBody.id`
+/// (`ContentKey`). Rebuilding the owner key from `headerId` is exactly the trap
+/// `MessageBody`'s own doc comment documents — a plain `String` that 35 call sites
+/// pass unwrapped with no cast, no warning and no diagnostic.
+///
+/// **Each call site chooses EXPLICITLY**: carry the source `MessageBody.id`, or
+/// accept that local assets are unavailable. Compose preview / `.eml` preview /
+/// tooltip mocks pass nil and get no scheme handler. Compensating with an
+/// unrestricted asset lookup is forbidden.
 struct AutoSizingHTMLView: View {
     let html: String
     let previewFilename: String?
     let headerId: String?
+    /// The rendered body's `MessageBody.id`, or nil for the call sites that render
+    /// something other than a persisted body. Part of the web view's IDENTITY —
+    /// see the `.id(…)` in `body`.
+    let bodyContentKey: ContentKey?
     /// Explicit same-bytes reload trigger used by pull-to-refresh.
     let reloadToken: Int
     @State private var height: CGFloat
@@ -40,11 +57,13 @@ struct AutoSizingHTMLView: View {
         html: String,
         previewFilename: String? = nil,
         headerId: String? = nil,
+        bodyContentKey: ContentKey? = nil,
         reloadToken: Int = 0
     ) {
         self.html = html
         self.previewFilename = previewFilename
         self.headerId = headerId
+        self.bodyContentKey = bodyContentKey
         self.reloadToken = reloadToken
         // Seed the initial frame height from the last applied measurement for
         // this message. SwiftUI List dismantles far-offscreen rows — when an
@@ -105,7 +124,28 @@ struct AutoSizingHTMLView: View {
     private var showsLoadingPlaceholder: Bool { headerId != nil && !hasRevealed }
 
     var body: some View {
-        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, reloadToken: reloadToken, height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad)
+        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, bodyContentKey: bodyContentKey, reloadToken: reloadToken, height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad)
+            // ── P1d (ADR-IOS-076 decision 5; plan §10.1 C4): the body ContentKey is
+            // part of the representable's IDENTITY, so a change to it dismantles the
+            // platform view and `makeUIView` runs again.
+            //
+            // A `WKURLSchemeHandler` is installed ONCE on the configuration, inside
+            // `makeUIView`; `updateUIView` cannot replace it. SwiftUI may reuse the
+            // platform view across an update in which the body ContentKey changes
+            // (row identity is `stableId`), so a handler bound at construction goes
+            // stale in BOTH directions — legitimate assets denied for the new
+            // document, and an old asset servable to a new document that names its
+            // id. Asset ids are not secrets, so that needs a structural fix rather
+            // than an argument.
+            //
+            // ⚠️ A MUTABLE handler key is worse and was REJECTED: in-flight
+            // `WKURLSchemeTask`s would straddle the mutation.
+            // ⚠️ Do NOT confuse this with the rejected alternative of recreating the
+            // web view per DOCUMENT GENERATION (view churn on the appearance and
+            // process-recovery paths). This recreates on body-ContentKey change —
+            // a different trigger, and one that fires only when the message a view
+            // is bound to actually changes identity (e.g. a move re-keys the row).
+            .id(bodyContentKey?.rawValue ?? "")
             // While a real body is still rendering, reserve room for the
             // placeholder so it's visible even before the web view reports a
             // height. Once revealed (or for non-body previews) size strictly to
@@ -155,6 +195,18 @@ struct AutoSizingHTMLView: View {
             .onChange(of: html) { _, _ in
                 guard headerId != nil else { return }
                 if hasRevealed { hasRevealed = false }
+            }
+            // P1d diagnostics: the ONE place a ContentKey-driven view recreate is
+            // observable from Swift. `.id(…)` above dismantles and rebuilds the
+            // platform view without telling anyone, so a smoke test that sees
+            // images vanish needs this line to tell "the view was rebound to a
+            // different message" from "the handler refused the asset". Truncated
+            // keys only — enough to correlate, not enough to reconstruct a mailbox
+            // path. Debug-gated per development rule 12.
+            .onChange(of: bodyContentKey) { old, new in
+                guard DebugModeManager.isLoggingEnabled() else { return }
+                let render = { (k: ContentKey?) in k.map { String($0.rawValue.prefix(12)) + "…" } ?? "(none)" }
+                print("[RenderSec] body ContentKey changed \(render(old)) → \(render(new)) — recreating the web view")
             }
             // Safety timeout so a missed reveal signal can never strand the
             // placeholder forever. `.task(id: html)` restarts on every content
@@ -280,6 +332,9 @@ private struct HTMLWebView: UIViewRepresentable {
     let html: String
     let previewFilename: String?
     let headerId: String?
+    /// The rendered body's `MessageBody.id`. Binds the asset scheme handler and is
+    /// part of this representable's SwiftUI identity (see `AutoSizingHTMLView.body`).
+    let bodyContentKey: ContentKey?
     let reloadToken: Int
     @Binding var height: CGFloat
     @Binding var hasRevealed: Bool
@@ -367,14 +422,34 @@ private struct HTMLWebView: UIViewRepresentable {
         // `decidePolicyFor`, where `mailto:` interception and P1c's allowlist live. Detectors
         // govern only PLAIN-TEXT phone numbers and BARE URLs.
         config.dataDetectorTypes = [.link, .phoneNumber]
+        // ── P1d: asset ownership binding (ADR-IOS-076 decision 5; plan §10.1 C3+C5) ──
         // Register the BodyAssetStore scheme handler when this WebView is rendering
         // a real (persisted) message body. The handler serves bytes from the App
         // Group container in-process — required because WKWebView's sandboxed
         // WebContent process can't read those files via `file://` baseURL on device.
-        // Compose / Eml / tooltip paths pass headerId=nil and use inline data URIs,
-        // so the handler isn't registered (no-op).
-        if headerId != nil {
-            config.setURLSchemeHandler(BodyAssetSchemeHandler(), forURLScheme: BodyAssetConfig.urlScheme)
+        //
+        // The predicate is `bodyContentKey != nil`, NOT `headerId != nil`: the
+        // handler now needs the body's authoritative `MessageBody.id` to authorize
+        // against, and a call site that cannot supply one gets no handler at all.
+        // That is the explicit C5 choice — "accept that local assets are
+        // unavailable" — and it fails closed. Compose / `.eml` preview / tooltip
+        // paths take that branch.
+        //
+        // ⚠️ This handler is installed ONCE, here. `updateUIView` cannot replace it,
+        // which is why `AutoSizingHTMLView` puts `bodyContentKey` in the view's
+        // `.id(…)`: the key can only change by recreating the whole web view.
+        if let ownerKey = bodyContentKey {
+            config.setURLSchemeHandler(
+                BodyAssetSchemeHandler(ownerKey: ownerKey) { line in
+                    // The gate lives here because `DebugModeManager` is an app-target
+                    // type and `BodyAssetSchemeHandler` also compiles into the NSE.
+                    // Read at call time, not captured, so toggling debug logging
+                    // takes effect without recreating the web view.
+                    guard DebugModeManager.isLoggingEnabled() else { return }
+                    print(line)
+                },
+                forURLScheme: BodyAssetConfig.urlScheme
+            )
         }
         // .atDocumentStart stamp of the per-WebView correlation id. Runs
         // synchronously before any other script, so [HeightDiag id=...] log
@@ -633,6 +708,10 @@ private struct HTMLWebView: UIViewRepresentable {
         /// correct in release too); only the *reporting* is debug-gated, per
         /// development rule 12.
         var lastBridgeMessageGeneration: Int?
+        /// One-shot arming state for the bridge-liveness verdict (P1d). See
+        /// `BridgeLivenessBeacon` for the device evidence that moved the arm from
+        /// `didFinish` to `didCommit`.
+        private var bridgeBeacon = BridgeLivenessBeacon()
         /// P1c — the permit half of the two-state navigation machine
         /// (ADR-IOS-076 decisions 2 and 4; plan §10.1 C1 + C2).
         ///
@@ -665,7 +744,8 @@ private struct HTMLWebView: UIViewRepresentable {
         private var fitRequestGeneration: Int?
         /// Same, for `requestWidthRefit` / `__tmWidthRefitRequested`.
         private var widthRefitRequestGeneration: Int?
-        /// Grace period between `didFinish` and the bridge-liveness verdict.
+        /// Grace period between `didCommit` (P1d — it was `didFinish` until then)
+        /// and the bridge-liveness verdict.
         /// `monitorHeightJS`'s ResizeObserver and the double-`rAF` reveal both
         /// post well inside this window on a normal render; it is long enough
         /// that a slow first layout does not produce a false SILENT verdict, and
@@ -760,8 +840,10 @@ private struct HTMLWebView: UIViewRepresentable {
             // capture must still be fitted and revealed, or a nil return value
             // from `loadHTMLString` would blank the message.
             clearTrackedNavigation(matching: navigation)
-            // Owner requirement (P1b): say out loud whether app JavaScript ran.
-            scheduleBridgeLivenessCheck(generation: loadGeneration)
+            // ⚠️ The bridge-liveness verdict is NOT armed here any more (P1d). It is
+            // armed at `didCommit`, because a load whose images never settle never
+            // reaches this callback and used to report nothing at all. See
+            // `BridgeLivenessBeacon` for the measured case (`KH4CLK`).
             // Wire up scrollView.contentSize KVO for diagnosis only (NOT for
             // driving the SwiftUI height — that path stays JS-push-driven via
             // ResizeObserver, since KVO would feed back into frame.height and
@@ -941,7 +1023,7 @@ private struct HTMLWebView: UIViewRepresentable {
         }
 
         /// Schedule the bridge-liveness verdict for `generation`, a short grace
-        /// period after that load's navigation finished.
+        /// period after that load COMMITTED.
         ///
         /// This is the one diagnostic in this file that survives a total loss of
         /// page JavaScript, and it exists because every other one does not: if
@@ -950,18 +1032,47 @@ private struct HTMLWebView: UIViewRepresentable {
         /// would go quiet in the same instant, which reads exactly like a quiet
         /// success. The verdict below turns that silence into a sentence.
         ///
-        /// Fires per finished navigation; the generation check makes it a no-op
-        /// for a superseded load, so a rapid rebind logs one verdict, not two.
-        /// Debug-gated per development rule 12.
+        /// ⚠️ **P1d moved the arm from `didFinish` to `didCommit`, and that is the
+        /// whole point of the change.** On device (`logmain.log`, 2026-08-12) load
+        /// `KH4CLK` logged neither `LIVE` nor `SILENT` because its images never
+        /// settled and `didFinish` never fired — while its user scripts provably ran.
+        /// A page that hangs mid-load therefore produced NO LINE AT ALL, which made
+        /// the absence of the alarm indistinguishable from the alarm not existing.
+        ///
+        /// Armed at most once per generation by `BridgeLivenessBeacon`, so a second
+        /// `didCommit` — or a future edit that re-adds an arm from `didFinish` —
+        /// cannot produce a second verdict for one load.
+        ///
+        /// The arming is ungated (one integer store, no I/O), so the one-shot is a
+        /// property of the state machine rather than of the log gate; only the
+        /// verdict itself is debug-gated, per development rule 12.
         private func scheduleBridgeLivenessCheck(generation: Int) {
+            guard bridgeBeacon.arm(generation: generation) else { return }
             guard DebugModeManager.isLoggingEnabled() else { return }
             let id = webViewId
+            // 3s measured from COMMIT is comfortably enough: the `.atDocumentEnd`
+            // user scripts post their first bridge message within a few ms of commit
+            // — `KH4CLK`'s `[ImageLoadDiag id=KH4CLK +1ms] inventory images=5` is the
+            // line immediately after its `didCommit tracked=true` — and the verdict
+            // only prints in a build where those diagnostics are injected in the
+            // first place.
             DispatchQueue.main.asyncAfter(deadline: .now() + Coordinator.bridgeLivenessGraceSeconds) { [weak self] in
                 MainActor.assumeIsolated {
-                    guard let self, self.loadGeneration == generation else { return }
-                    if self.lastBridgeMessageGeneration == generation {
+                    guard let self else { return }
+                    // A superseded load's verdict would describe a document that is no
+                    // longer on screen — and supersession is itself logged
+                    // (`issued gen=…` / `superseded gen=…`), so the silence is
+                    // explained rather than mysterious. Pre-existing behaviour; P1d
+                    // does not change it.
+                    guard let verdict = BridgeLivenessBeacon.settle(
+                        generation: generation,
+                        currentGeneration: self.loadGeneration,
+                        lastBridgeMessageGeneration: self.lastBridgeMessageGeneration
+                    ) else { return }
+                    switch verdict {
+                    case .live:
                         print("[RenderSec id=\(id) gen=\(generation)] bridge=LIVE (app user scripts executed and reached Swift)")
-                    } else {
+                    case .silent:
                         print("[RenderSec id=\(id) gen=\(generation)] bridge=SILENT — no bridge message received for this load; user scripts may not be executing")
                     }
                 }
@@ -1097,6 +1208,11 @@ private struct HTMLWebView: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
             navLog("didCommit tracked=\(isTracked(navigation))")
+            // Owner requirement (P1b), re-sequenced by P1d: say out loud whether app
+            // JavaScript ran — for EVERY committed load, including one that never
+            // finishes. Committing is the property every rendered document has;
+            // finishing is one a live page may never reach.
+            scheduleBridgeLivenessCheck(generation: loadGeneration)
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
