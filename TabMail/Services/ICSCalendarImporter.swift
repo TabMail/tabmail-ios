@@ -4,6 +4,7 @@
 
 import Network
 import SafariServices
+import Synchronization
 import UIKit
 
 /// Opens an ICS calendar file using the native iOS "Add to Calendar" dialog.
@@ -37,7 +38,33 @@ enum ICSCalendarImporter {
         private var stopped = false
         private var sawRequestAfterStop = false
 
-        func start(icsData: Data, completion: @escaping @Sendable (UInt16) -> Void) {
+        /// Single-shot guard for `completion`.
+        ///
+        /// Deliberately NOT one of the `queue`-only counters above: the two failure
+        /// paths inside `start` run on the CALLER's thread, before `listener.start`
+        /// hands anything to `queue`, while every other resolution comes from the
+        /// state handler on `queue`.
+        ///
+        /// Both directions are real. `stateUpdateHandler` can fire more than once
+        /// (`.ready` → `.waiting` → `.ready`, and `.ready` → `.cancelled` on teardown),
+        /// so resolving unguarded would present Safari twice for one tap; and until
+        /// 2026-08-13 the failure states resolved ZERO times, which is what made a
+        /// port conflict a silent no-op.
+        private let completionResolved = Mutex(false)
+
+        /// Deliver the caller's one and only answer — the bound port, or `nil` for
+        /// "this server will never serve anything". EVERY terminal state of the
+        /// listener must reach this exactly once.
+        private func resolve(_ port: UInt16?, _ completion: @Sendable (UInt16?) -> Void) {
+            let alreadyResolved = completionResolved.withLock { resolved -> Bool in
+                defer { resolved = true }
+                return resolved
+            }
+            guard !alreadyResolved else { return }
+            completion(port)
+        }
+
+        func start(icsData: Data, completion: @escaping @Sendable (UInt16?) -> Void) {
             do {
                 let params = NWParameters.tcp
                 let port: NWEndpoint.Port = 18942
@@ -59,9 +86,13 @@ enum ICSCalendarImporter {
                 }
             } catch {
                 print("[ICSImport] Failed to create listener: \(error)")
+                resolve(nil, completion)
                 return
             }
-            guard let listener else { return }
+            guard let listener else {
+                resolve(nil, completion)
+                return
+            }
 
             listener.newConnectionHandler = { [weak self] connection in
                 self?.handleConnection(connection, icsData: icsData)
@@ -72,18 +103,29 @@ enum ICSCalendarImporter {
                 case .ready:
                     if let port = self?.listener?.port?.rawValue {
                         print("[ICSImport] Server listening on port \(port)")
-                        completion(port)
+                        self?.resolve(port, completion)
+                    } else {
+                        // `.ready` without a port is terminal for the CALLER either way:
+                        // there is no URL to hand Safari. Resolving as a failure keeps the
+                        // "exactly once, on every terminal state" contract; the old code
+                        // fell through here and the caller was never told anything.
+                        print("[ICSImport] Listener ready but reported no port")
+                        self?.resolve(nil, completion)
                     }
                 case .failed(let error):
                     print("[ICSImport] Listener failed: \(error)")
                     if DebugModeManager.isLoggingEnabled() {
-                        // Makes the pre-existing silent path observable: `completion(port)` fires
-                        // only on `.ready`, so reaching here means Safari is never presented and
-                        // the user sees nothing at all. Observation only — no behaviour change.
-                        print("[ICSImport][diag] .failed reached — completion(port) will NOT be"
-                              + " called, Safari will NOT be presented, and the user gets silence")
+                        print("[ICSImport][diag] .failed reached — resolving with no port;"
+                              + " Safari will NOT be presented and the user gets silence")
                     }
                     self?.stop()
+                    self?.resolve(nil, completion)
+                case .cancelled:
+                    // Also terminal, and reachable before `.ready` ever fires: `stop()`
+                    // runs from the 2-minute safety timer and from `teardown()`. Without
+                    // this the caller's closure is simply dropped on the floor. When the
+                    // port was already delivered the single-shot guard makes it a no-op.
+                    self?.resolve(nil, completion)
                 default:
                     break
                 }
@@ -312,6 +354,20 @@ enum ICSCalendarImporter {
 
         server.start(icsData: icsData) { port in
             DispatchQueue.main.async {
+                // `nil` means the listener reached a terminal state without ever
+                // binding — a port conflict surfacing asynchronously as `.failed`, or a
+                // cancel before `.ready`. Nothing will ever be served, so release the
+                // dead server instead of parking it in `activeServer` until the next
+                // tap happens to tear it down. Identity-checked because a newer
+                // presentation may already own the slot.
+                guard let port else {
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[ICSImport][diag] server resolved with no port —"
+                              + " Safari will NOT be presented")
+                    }
+                    if activeServer === server { activeServer = nil }
+                    return
+                }
                 guard let url = URL(string: "http://127.0.0.1:\(port)/invite.ics") else {
                     print("[ICSImport] Invalid URL for port \(port)")
                     return
