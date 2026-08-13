@@ -3084,10 +3084,27 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
                 // The predicate lives INSIDE swap(), not at the two call sites,
                 // so both the post-paint arm and the 1500ms failsafe inherit it
                 // and neither can re-fetch what the other withheld.
-                // A skipped image KEEPS its data-tmsrc/data-tmsrcset and is NOT
-                // marked, so it stays eligible for a later swap and the whole
-                // function stays idempotent and re-runnable.
-                if (hiddenByViewMode(im)) { skippedHidden++; continue; }
+                // A skipped image KEEPS its data-tmsrc/data-tmsrcset, so it stays
+                // eligible for a later swap and the whole function stays
+                // idempotent and re-runnable.
+                //
+                // It is ALSO marked `data-tmwithheld`, which is what tells the
+                // width pipeline this image is never going to arrive. Without
+                // that mark T8 permanently disarms the post-load width re-fit:
+                // `pendingImgs()` counts a withheld image as still-pending
+                // forever, `check()` returns early forever, and a message
+                // carrying an attached `.eml` never gets the re-fit that shipped
+                // `v1.7.8` performed. The mark is set and cleared on EVERY pass
+                // rather than once, so an image that becomes visible between the
+                // post-paint arm and the failsafe is un-marked and swapped
+                // normally — the attribute tracks the current verdict, never a
+                // historical one.
+                if (hiddenByViewMode(im)) {
+                    im.setAttribute('data-tmwithheld', '1');
+                    skippedHidden++;
+                    continue;
+                }
+                im.removeAttribute('data-tmwithheld');
                 swapped++;
                 var ss = im.getAttribute('data-tmsrcset');
                 if (ss) {\(diagSrcsetCall)
@@ -4096,15 +4113,29 @@ private var fixImageAspectRatioJS: String {
 /// bytes, and a plain offline device all land here identically, and WebKit hands
 /// the page no distinguishing reason. The banner text is hedged accordingly.
 ///
-/// **Accepted gap: the settle point is unreachable for a withheld image.** T8's
-/// `hiddenByViewMode` (`deferredImageLoadJS`) deliberately leaves
+/// **Accepted gap: the CENSUS settle point is unreachable for a withheld image.**
+/// T8's `hiddenByViewMode` (`deferredImageLoadJS`) deliberately leaves
 /// `data-tmsrc`/`data-tmsrcset` in place on images inside a hidden `.eml` section,
-/// so `pendingImgs()` never reaches 0 on a message that carries an attached `.eml`,
-/// nor in the preview sheet (where every non-selected section stays withheld). No
-/// report is posted there and no banner appears. That is FAIL-CLOSED — a missing
-/// banner, never a false one — and closing it would mean changing what
-/// `pendingImgs()` counts, which is the width pipeline's settle predicate and out
-/// of scope under the standing "no behaviour changes, just security" directive.
+/// so the census arm's `pendingImgs(false)` never reaches 0 on a message that
+/// carries an attached `.eml`, nor in the preview sheet (where every non-selected
+/// section stays withheld). No report is posted there and no banner appears. That
+/// is FAIL-CLOSED — a missing banner, never a false one — and it is `IOS-UI-004`.
+///
+/// ⚠️ **The reason recorded here for NOT closing it was wrong, and it pointed the
+/// next reader the wrong way.** It used to argue that closing the gap "would mean
+/// changing what `pendingImgs()` counts, which is the width pipeline's settle
+/// predicate", i.e. that touching the count was the change to avoid. The truth is
+/// the reverse: T8 had ALREADY changed what that count means for the width
+/// pipeline, and by sharing one predicate it disarmed the post-load width re-fit
+/// outright on exactly these messages — a silent regression against shipped
+/// `v1.7.8`, where `swap()` had no visibility predicate and the count always
+/// reached 0. Restoring the re-fit is what the `ignoreWithheld` split does.
+///
+/// So the width half is FIXED, and only the census half remains an accepted gap.
+/// Closing that half is a decision about when a banner P4 introduced should
+/// appear — a change to new behaviour, not a restoration of shipped behaviour —
+/// and it is deliberately left to the owner rather than folded into a security
+/// pass. Found by two independent audit legs, 2026-08-13.
 ///
 /// Exposed for unit tests via `_postImageWidthRecheckJS`.
 internal var _postImageWidthRecheckJS: String { postImageWidthRecheckJS }
@@ -4115,11 +4146,38 @@ private var postImageWidthRecheckJS: String {
     return """
     (function() {
         \(logFn)
-        function pendingImgs() {
+        // `ignoreWithheld` distinguishes the pipeline's TWO settle questions,
+        // which are not the same question and were conflated until 2026-08-13.
+        //
+        //   • WIDTH RE-FIT asks "can any image still change the layout?" A
+        //     withheld image (T8, `data-tmwithheld`) answers NO — it is inside a
+        //     `display:none` subtree, contributes no box to `measureMaxRight`,
+        //     and is never going to load in this document. Waiting on it is
+        //     waiting forever, which is precisely what shipped `v1.7.8` did NOT
+        //     do: there `swap()` had no visibility predicate, every deferred
+        //     image lost `data-tmsrc`, and the count always reached 0.
+        //   • FAILURE CENSUS asks "has every armed image reached a terminal
+        //     state?" A withheld image answers NO, honestly — it never loaded
+        //     and never errored, so a census taken now would be incomplete.
+        //     That arm keeps the strict predicate and keeps IOS-UI-004.
+        //
+        // Restoring the width re-fit is deliberately NOT the same edit as
+        // closing IOS-UI-004: the first undoes a regression against shipped
+        // behaviour, the second would change when a banner P4 introduced
+        // appears. Only the first is in scope under the standing "no behaviour
+        // changes, just security" directive.
+        //
+        // NOTE the one honest difference from `v1.7.8`: there, `check()` waited
+        // for the hidden section's images to finish loading; here it does not
+        // wait at all. The MEASUREMENT is identical either way — a `display:none`
+        // image contributes nothing to the scan — so only the timing moves, and
+        // it moves earlier.
+        function pendingImgs(ignoreWithheld) {
             var imgs = document.getElementsByTagName('img');
             var n = 0;
             for (var i = 0; i < imgs.length; i++) {
                 var im = imgs[i];
+                if (ignoreWithheld && im.hasAttribute('data-tmwithheld')) continue;
                 if (im.hasAttribute('data-tmsrc') || im.hasAttribute('data-tmsrcset') || !im.complete) n++;
             }
             return n;
@@ -4131,7 +4189,10 @@ private var postImageWidthRecheckJS: String {
             // to recheck. No later event re-fires check in that case, which is
             // correct: fit-after-load sees the true widths un-hidden.
             if (!window.__tmFitDone || !document.body) return;
-            if (pendingImgs() > 0) return;
+            // Withheld images excluded — see pendingImgs(). Including them is
+            // what disarmed this re-fit entirely on any message with an
+            // attached `.eml`.
+            if (pendingImgs(true) > 0) return;
             // Committed layout viewport — NEVER bare innerWidth (WebKit bug
             // 170595); same fallback chain as monitorHeightJS.
             var vp = window.__tmLayoutVp || window.__tmDeviceWidth || window.innerWidth;
@@ -4185,11 +4246,22 @@ private var postImageWidthRecheckJS: String {
             // loses images and needs a width re-fit must still report.
             if (window.__tmImageFailureReported) return;
             if (!document.body) return;
-            // Same settle predicate as the width recheck — reuse, do not
-            // reinvent. A FAILED image satisfies it: swap() removed its
-            // data-tmsrc before assigning src, and a broken <img> reports
-            // complete === true, so a failure settles exactly like a success.
-            if (pendingImgs() > 0) return;
+            // The STRICT predicate — withheld images still count as pending.
+            // A FAILED image satisfies it: swap() removed its data-tmsrc before
+            // assigning src, and a broken <img> reports complete === true, so a
+            // failure settles exactly like a success.
+            //
+            // ⚠️ This is deliberately NOT `check()`'s predicate any more, and
+            // the difference is the whole point. The census must not report
+            // while an armed image has reached no terminal state — a withheld
+            // image neither loaded nor errored, so counting it as settled would
+            // publish an incomplete census. The width pipeline has the opposite
+            // need (see pendingImgs()), so the two questions were split rather
+            // than answered by one shared call. IOS-UI-004 — the banner being
+            // unreachable on a message with an attached `.eml` — is preserved
+            // BY this arm, not in spite of it; closing it is a separate
+            // decision about P4's behaviour, not a side effect of a width fix.
+            if (pendingImgs(false) > 0) return;
             window.__tmImageFailureReported = true;
             log('images settled, remote failures=' + remoteFailures + ' of ' + armedRemote + ' deferred');
             // NOT debug-gated — this one drives user-visible UI. It is the sole

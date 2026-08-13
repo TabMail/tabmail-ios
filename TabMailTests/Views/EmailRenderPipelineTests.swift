@@ -842,12 +842,69 @@ struct EmailRenderPipelineTests {
         // `naturalWidth === 0`, which bullet 14 rules out because it also
         // classifies a LOADED intrinsic-size-less SVG as pending.
         let js = _postImageWidthRecheckJS
-        #expect(js.contains("if (pendingImgs() > 0) return;"))
+        // ONE predicate function, asked TWO different questions by argument —
+        // never two divergent copies. That is the lockstep property worth
+        // pinning; which argument each arm passes is the part that legitimately
+        // differs, and is pinned separately by
+        // `widthRefitIgnoresWithheldImagesButTheCensusDoesNot`.
+        //
+        // ⚠️ This test previously asserted the literal string
+        // `"if (pendingImgs() > 0) return;"` — i.e. that BOTH arms made the
+        // identical bare call. That pinned the fix's mechanism rather than the
+        // invariant, and the mechanism was itself the defect: sharing one
+        // predicate let a withheld image disarm the width re-fit permanently.
+        // The test stayed green through all of it. Corrected 2026-08-13 after
+        // both audit legs flagged it.
+        #expect(js.contains("function pendingImgs(ignoreWithheld)"),
+                "the settle predicate must remain a single function")
+        #expect(js.components(separatedBy: "function pendingImgs").count == 2,
+                "a second pendingImgs definition would be a divergent copy")
         #expect(!js.contains("naturalWidth"))
         // Own one-shot, deliberately not check()'s: a message that both loses
         // images AND needs a width re-fit must still report.
         #expect(js.contains("__tmImageFailureReported"))
         #expect(js.contains("__tmWidthRefitRequested"))
+    }
+
+    @Test("The width re-fit ignores withheld images; the failure census does not")
+    func widthRefitIgnoresWithheldImagesButTheCensusDoesNot() {
+        // THE INVARIANT: a T8-withheld image (inside a hidden `.eml` section)
+        // must never be able to stall the post-image-load WIDTH RE-FIT, and must
+        // still count as unsettled for the FAILURE CENSUS.
+        //
+        // Why both halves are load-bearing:
+        //   • Drop the first and T8 silently disarms a re-fit that shipped in
+        //     v1.7.8 — every message carrying an attached `.eml` renders with
+        //     uncorrected horizontal overflow, recoverable only by rotating the
+        //     device. That regression shipped inside a "security only" commit
+        //     and survived because the two arms shared one predicate.
+        //   • Drop the second and the banner publishes a census taken while an
+        //     armed image has reached no terminal state — a count that is not
+        //     merely early but wrong, on a channel that accuses a sender's
+        //     server. IOS-UI-004 is preserved deliberately, not incidentally.
+        let js = _postImageWidthRecheckJS
+
+        // The width arm excludes them; the census arm does not. Asserting BOTH
+        // is what makes this non-vacuous: a change that flipped either arm to
+        // match the other would satisfy one expectation and fail the other.
+        #expect(js.contains("if (pendingImgs(true) > 0) return;"),
+                "the width re-fit must not wait on an image that will never load")
+        #expect(js.contains("if (pendingImgs(false) > 0) return;"),
+                "the census must still wait for every armed image to settle")
+
+        // The exclusion is keyed to the mark `swap()` writes, not to a second
+        // copy of the visibility predicate — one source of truth for "withheld".
+        #expect(js.contains("data-tmwithheld"),
+                "the width arm must key off the mark, not re-derive visibility")
+
+        // And the producer of that mark sets AND clears it, so the attribute
+        // records the current verdict rather than a historical one: an image
+        // that becomes visible between the two swap arms must still be swapped.
+        let deferJS = _deferredImageLoadJS(diagnosticsEnabled: false)
+        #expect(deferJS.contains("setAttribute('data-tmwithheld'"),
+                "swap() must mark a withheld image")
+        #expect(deferJS.contains("removeAttribute('data-tmwithheld')"),
+                "swap() must clear the mark when an image is no longer withheld")
     }
 
     // MARK: - Width-strip pass includes <hr> (OWA quoted-content separator)
