@@ -2051,11 +2051,28 @@ actor SearchIndex {
 
             let folderPlaceholders = nonEmptyFolderIds.map { ids in ids.indices.map { "?\(folderParamStart! + $0)" }.joined(separator: ", ") }
 
+            // PHASE 1 — rank and order the candidates WITHOUT computing `snippet()`.
+            //
+            // `snippet()` and `bm25()` are FTS5 auxiliary functions: SQLite evaluates them
+            // once per row that reaches the result set of each UNION ALL arm, i.e. once per
+            // *candidate*, long before the trailing `ORDER BY … LIMIT ?` has discarded all
+            // but `limit` of them. On a 260k-document / 6-shard index a scoped `project*`
+            // matched 33,335 candidates and paid for 33,335 snippets to return 50.
+            //
+            // `bm25()` MUST stay here: it is the `rank` the ORDER BY sorts on, so it is
+            // genuinely needed for every candidate. `snippet()` is display-only and nothing
+            // in the ordering depends on it, so it is deferred to phase 2 below and computed
+            // only for the rows that actually survive the LIMIT.
+            //
+            // `fts.rowid` + the shard year are carried through so phase 2 can address the
+            // survivors; the rowid space is global (allocated by `message_ids`), but the pair
+            // is used as the key anyway so the mapping cannot be confused by a shard whose
+            // rowids were ever allocated independently.
             let subqueries = knownYears.sorted().map { year -> String in
                 let table = ftsTableName(year: year)
                 var sq = """
                     SELECT meta.headerId, fts.msgId, meta.dateMs,
-                        snippet(\(table), -1, '[', ']', '\u{2026}', \(SearchConfig.snippetTokens)) AS snippet,
+                        fts.rowid AS ftsRowid, \(year) AS shardYear,
                         bm25(\(table), \(SearchConfig.bm25Weights)) AS rank
                     FROM \(table) fts
                     JOIN message_meta meta ON fts.rowid = meta.rowid
@@ -2089,13 +2106,93 @@ actor SearchIndex {
             if DebugModeManager.isLoggingEnabled() {
                 print("[SearchIndex] FTS-only returned \(rows.count) rows")
             }
+
+            // PHASE 2 — snippets for the survivors only.
+            //
+            // Deliberately inside the SAME `dbPool.read` closure as phase 1. GRDB gives one
+            // `read` block a single consistent snapshot; a second `read` would be a second
+            // snapshot, and a concurrent indexer that deleted or rewrote one of these rows in
+            // between would leave a returned row with no snippet at all. Keeping both phases
+            // on one snapshot makes "every returned row has the snippet the one-phase query
+            // would have produced" true by construction rather than by luck.
+            let snippets = try snippetsForSurvivors(rows, ftsQuery: ftsQuery, db: db)
+
             return rows.map { row in
-                FTSSearchResult(
+                let year: Int = row["shardYear"]
+                let ftsRowid: Int64 = row["ftsRowid"]
+                // `?? ""` completes a total function; it is NOT a fallback path, because
+                // one read snapshot makes a miss unreachable — phase 2 re-runs the same
+                // MATCH against the same shard for rowids phase 1 just matched.
+                //
+                // ⚠️ It must NOT throw here, and the reason is the CONSUMER's direction,
+                // not this function's. The only production caller of `keywordSearch` is
+                // `SearchView`'s debounced typing path, and it reads
+                // `(try? await …keywordSearch(…)) ?? []` — so a throw would not surface,
+                // would not log, and would silently discard the WHOLE ranked result set
+                // for that keystroke. That turns a cosmetic one-row defect into an
+                // invisible zero-results one. The row itself is still correct: the match
+                // is real and the body is intact, and an empty snippet is a display
+                // representation, explicitly not a data-integrity concern (global rule 11).
+                // So: degrade the one row, and make the anomaly observable instead.
+                let snippet = snippets[year]?[ftsRowid]
+                if snippet == nil, DebugModeManager.isLoggingEnabled() {
+                    print("[SearchIndex] FTS-only: no deferred snippet for shard \(year) rowid \(ftsRowid) — returning the row with an empty snippet")
+                }
+                return FTSSearchResult(
                     contentKey: row["headerId"], messageId: row["msgId"],
-                    snippet: row["snippet"], rank: row["rank"], dateMs: row["dateMs"]
+                    snippet: snippet ?? "", rank: row["rank"], dateMs: row["dateMs"]
                 )
             }
         }
+    }
+
+    /// Computes `snippet()` for the rows that survived `searchFTSOnly`'s `ORDER BY … LIMIT`.
+    ///
+    /// Grouped by shard so each shard costs one statement. FTS5 answers a `rowid IN (…)`
+    /// constraint with a rowid-EQ seek per value (`SCAN … VIRTUAL TABLE INDEX 0:=M7`), so the
+    /// work is bounded by the number of survivors — `SearchConfig.searchDefaultLimit` (50) on
+    /// the keystroke path — instead of by the candidate count.
+    ///
+    /// Returns `[shardYear: [ftsRowid: snippet]]`. Must be called on `db` from the same read
+    /// closure that produced `rows`; see the phase-2 comment in `searchFTSOnly`.
+    private func snippetsForSurvivors(_ rows: [Row], ftsQuery: String,
+                                      db: Database) throws -> [Int: [Int64: String]] {
+        guard !rows.isEmpty else { return [:] }
+
+        var rowidsByShard: [Int: [Int64]] = [:]
+        for row in rows {
+            let year: Int = row["shardYear"]
+            let ftsRowid: Int64 = row["ftsRowid"]
+            rowidsByShard[year, default: []].append(ftsRowid)
+        }
+
+        var snippets: [Int: [Int64: String]] = [:]
+        for (year, rowids) in rowidsByShard {
+            let table = ftsTableName(year: year)
+            let placeholders = rowids.map { _ in "?" }.joined(separator: ", ")
+            // Identical `snippet()` arguments to the ones phase 1 used to carry inline —
+            // same delimiters, same ellipsis, same `SearchConfig.snippetTokens` — so the
+            // returned text is the text the one-phase query produced.
+            let sql = """
+                SELECT rowid AS ftsRowid,
+                    snippet(\(table), -1, '[', ']', '\u{2026}', \(SearchConfig.snippetTokens)) AS snippet
+                FROM \(table)
+                WHERE \(table) MATCH ? AND rowid IN (\(placeholders))
+                """
+            var args: [DatabaseValueConvertible] = [ftsQuery]
+            args.append(contentsOf: rowids)
+            var shardSnippets: [Int64: String] = [:]
+            for row in try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args)) {
+                let ftsRowid: Int64 = row["ftsRowid"]
+                shardSnippets[ftsRowid] = row["snippet"]
+            }
+            snippets[year] = shardSnippets
+        }
+
+        if DebugModeManager.isLoggingEnabled() {
+            print("[SearchIndex] FTS-only snippets: \(rows.count) survivors across \(rowidsByShard.count) shard(s)")
+        }
+        return snippets
     }
 
     /// Date-range-only scan when FTS query is empty (e.g., "*" with date params).
