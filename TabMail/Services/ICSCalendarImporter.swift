@@ -25,6 +25,18 @@ enum ICSCalendarImporter {
         private var listener: NWListener?
         private let queue = DispatchQueue(label: "ics-server")
 
+        /// Diagnostic counters. Both are mutated only from `queue` (the listener's and every
+        /// connection's callback queue), so no additional synchronisation is needed.
+        ///
+        /// These exist because this server serves ONE request and then tears itself down in
+        /// `handleConnection`'s send completion. If iOS ever issues a `HEAD` preflight, a range
+        /// request, or a re-fetch, the second request arrives at a cancelled listener and the
+        /// import dies silently. `requestCount > 1` or `sawRequestAfterStop` proves that
+        /// happens; both staying at their initial values rules it out.
+        private var requestCount = 0
+        private var stopped = false
+        private var sawRequestAfterStop = false
+
         func start(icsData: Data, completion: @escaping @Sendable (UInt16) -> Void) {
             do {
                 let params = NWParameters.tcp
@@ -64,6 +76,13 @@ enum ICSCalendarImporter {
                     }
                 case .failed(let error):
                     print("[ICSImport] Listener failed: \(error)")
+                    if DebugModeManager.isLoggingEnabled() {
+                        // Makes the pre-existing silent path observable: `completion(port)` fires
+                        // only on `.ready`, so reaching here means Safari is never presented and
+                        // the user sees nothing at all. Observation only — no behaviour change.
+                        print("[ICSImport][diag] .failed reached — completion(port) will NOT be"
+                              + " called, Safari will NOT be presented, and the user gets silence")
+                    }
                     self?.stop()
                 default:
                     break
@@ -86,9 +105,24 @@ enum ICSCalendarImporter {
                     connection.cancel()
                     return
                 }
+                if let self {
+                    self.requestCount += 1
+                    if self.stopped { self.sawRequestAfterStop = true }
+                }
                 if let data, let request = String(data: data, encoding: .utf8) {
                     let firstLine = request.components(separatedBy: "\r\n").first ?? ""
                     print("[ICSImport] Request: \(firstLine)")
+                    if DebugModeManager.isLoggingEnabled() {
+                        let n = self?.requestCount ?? 0
+                        let late = (self?.sawRequestAfterStop ?? false) ? " ⚠️ ARRIVED AFTER stop()" : ""
+                        print("[ICSImport][diag] request #\(n)\(late) — full request head follows")
+                        // The whole head, not just the first line: the HTTP verb tells a GET from a
+                        // HEAD preflight, and `Accept:` says whether iOS is asking for calendar data
+                        // or for something else entirely.
+                        for line in request.components(separatedBy: "\r\n") where !line.isEmpty {
+                            print("[ICSImport][diag]   > \(line)")
+                        }
+                    }
                 }
 
                 var header = "HTTP/1.1 200 OK\r\n"
@@ -98,11 +132,23 @@ enum ICSCalendarImporter {
                 header += "Connection: close\r\n"
                 header += "\r\n"
 
+                if DebugModeManager.isLoggingEnabled() {
+                    // Logged verbatim because the leading hypothesis for the update-only failure is
+                    // a missing iTIP `method=` parameter here (RFC 6047 §2.1); this line is what
+                    // confirms or kills it without reading the source.
+                    print("[ICSImport][diag] response head: "
+                          + header.replacingOccurrences(of: "\r\n", with: " | "))
+                }
+
                 var responseData = Data(header.utf8)
                 responseData.append(icsData)
 
                 let server = self
                 connection.send(content: responseData, completion: .contentProcessed { _ in
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[ICSImport][diag] response sent; cancelling connection and stopping server"
+                              + " — any further request from iOS will find no listener")
+                    }
                     connection.cancel()
                     server?.stop()
                 })
@@ -110,6 +156,13 @@ enum ICSCalendarImporter {
         }
 
         func stop() {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[ICSImport][diag] stop() — listener=\(listener == nil ? "already nil" : "cancelling")"
+                      + " requestsServed=\(requestCount)"
+                      + " sawRequestAfterStop=\(sawRequestAfterStop)"
+                      + " alreadyStopped=\(stopped)")
+            }
+            stopped = true
             listener?.cancel()
             listener = nil
         }
@@ -137,6 +190,56 @@ enum ICSCalendarImporter {
     /// Whether an ICS import Safari sheet is currently presented.
     static var isActive: Bool { activeSafari != nil }
 
+    // MARK: - Diagnostics
+
+    /// Diagnostic fingerprint of an iCalendar payload — **iTIP scheduling fields only**.
+    ///
+    /// Exists to answer one question from a device log without guessing: *is this payload a
+    /// first-time invite or an update, and does it still carry what iOS needs to tell them
+    /// apart?* `METHOD`, `UID`, `SEQUENCE` and `RECURRENCE-ID` are exactly the fields that
+    /// route a payload down the iTIP scheduling path instead of a plain calendar import.
+    ///
+    /// Deliberately does NOT log `SUMMARY` / `DESCRIPTION` / `LOCATION` / attendee
+    /// addresses. Those are user content and none of them discriminate an update from an
+    /// invite, so logging them would be cost without diagnostic value. `UID` is shown as a
+    /// display-side prefix plus its length — enough to compare across two taps, which is all
+    /// the update question needs.
+    private static func itipFingerprint(_ data: Data, label: String) -> String {
+        guard let text = String(data: data, encoding: .utf8) else {
+            return "[ICSImport][diag] \(label): NOT valid UTF-8, \(data.count) B"
+        }
+        let lines = text.components(separatedBy: .newlines).map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        func value(of key: String) -> String {
+            for line in lines {
+                let upper = line.uppercased()
+                guard upper.hasPrefix("\(key):") || upper.hasPrefix("\(key);") else { continue }
+                guard let colon = line.firstIndex(of: ":") else { continue }
+                return String(line[line.index(after: colon)...])
+            }
+            return "<absent>"
+        }
+        func occurrences(of key: String) -> Int {
+            lines.reduce(0) { total, line in
+                let upper = line.uppercased()
+                return total + ((upper.hasPrefix("\(key):") || upper.hasPrefix("\(key);")) ? 1 : 0)
+            }
+        }
+        let uid = value(of: "UID")
+        let uidShown = uid == "<absent>" ? uid : "\(uid.prefix(12))…(len \(uid.count))"
+        return "[ICSImport][diag] \(label): \(data.count) B"
+            + " METHOD=\(value(of: "METHOD"))"
+            + " SEQUENCE=\(value(of: "SEQUENCE"))"
+            + " RECURRENCE-ID=\(value(of: "RECURRENCE-ID"))"
+            + " STATUS=\(value(of: "STATUS"))"
+            + " DTSTAMP=\(value(of: "DTSTAMP"))"
+            + " UID=\(uidShown)"
+            + " VEVENT=\(lines.filter { $0.uppercased() == "BEGIN:VEVENT" }.count)"
+            + " ATTENDEE=\(occurrences(of: "ATTENDEE"))"
+            + " ORGANIZER=\(value(of: "ORGANIZER") == "<absent>" ? "absent" : "present")"
+    }
+
     // MARK: - Public API
 
     @MainActor
@@ -144,7 +247,16 @@ enum ICSCalendarImporter {
         // Clean the invite before it reaches the OS: strip pathological bloat
         // (e.g. a 79 KB X-ALT-DESC) and repair RFC violations that otherwise wedge
         // iOS↔Google calendar sync. Covers both the real and demo paths below.
+        let rawICSData = icsData
         let icsData = ICSSanitizer.sanitize(icsData)
+
+        // Logged as a PAIR so the sanitizer is measured, not argued about: if an update
+        // stops being recognisable as one, these two lines say whether it arrived that way
+        // or whether we made it that way.
+        if DebugModeManager.isLoggingEnabled() {
+            print(itipFingerprint(rawICSData, label: "raw, as received"))
+            print(itipFingerprint(icsData, label: "sanitized, as served to iOS"))
+        }
         print("[ICSImport] presentCalendarImport called, activeSafari=\(activeSafari != nil)")
         // In demo mode, ICS imports MUST NOT touch the
         // real EKEventStore (would persist past demo exit). Route to the
