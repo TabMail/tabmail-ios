@@ -1,3 +1,148 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **⚠️ CURRENT ROUTING NOTE (2026-08-13) — the T8 / `IOS-PRIVACY-003` bullet reproduced below was
+> originally written INSIDE the preserved body by commit `458863e86`, which broke
+> `Scripts/compact_companion_docs.rb verify` (`hash mismatch`) and, because that verifier `abort`s on
+> its first failure, silently disabled every downstream check — the ADR census, memory routing, the
+> linked-exactly-once check, the pointer check and the index budget report. That is `MIS-IOS-009`,
+> recurrence 6. The body below is now restored byte-for-byte to its pinned source
+> (`v1.6.38:PROJECT_MEMORY.md` lines 399-434, SHA `8c614322…`) and NO manifest hash was re-pinned —
+> re-pinning would only move the abort to the byte-identity leg and destroy the reconstruction proof.
+> The knowledge is preserved verbatim here, where `exact_body` strips it before hashing.**
+>
+> **⚠️ ONE CLAUSE OF THE BULLET IS FALSE AND IS CORRECTED HERE — the bullet itself is left verbatim
+> rather than edited, per supersede-don't-delete.** The bullet states that selecting a different
+> `.eml` is a fresh load *"(`previewFilename` is a `wrapHTML` parameter; the coordinator reloads on
+> `loadedPreviewFilename` change)"*. **The parenthetical mechanism does not exist.** In
+> `HTMLWebView.updateUIView` the reload predicate is `htmlChanged || reloadChanged` only;
+> `context.coordinator.loadedPreviewFilename` is **assigned** inside that branch and **never compared**
+> anywhere. Its sole other reader is `wrapAndLoad(rawHTML:previewFilename:)` re-wrapping during a
+> reload some other condition already triggered.
+>
+> **The bullet's CONCLUSION is nonetheless true, by a different mechanism — remount, not comparison.**
+> `AttachmentListView` presents the sheet as `.sheet(item: $emlPreview)` over an `Identifiable`
+> `EmlPreviewState`, so each presentation constructs a fresh `EmlAttachmentPreview` →
+> `AutoSizingHTMLView` → `HTMLWebView`, and the document loads through `makeUIView`, never through a
+> `previewFilename` comparison. The in-sheet `nestedAttachmentStrip` downloads and QuickLooks nested
+> files; it does not re-target `previewFilename`, so no in-place section switch exists to miss.
+> **Therefore `hiddenByViewMode` remains correct and the T8 fix is unaffected** — this is a
+> documentation defect, not a behaviour defect.
+>
+> Recorded because the shape recurred twice in 24 hours: *a mechanism that explains the outcome you
+> are looking at is not thereby the mechanism that produces it.* The right conclusion was reached
+> from a mechanism that was never checked, and nothing about being right cued the check. Both this
+> and the `#expect` key-path refinement (commit `7dff5a582`) are that same failure.
+>
+> ---
+>
+> **⚠️ THE REPRODUCED BULLET'S TWO `above` REFERENCES NOW RESOLVE DOWNWARD.** They were written when
+> it sat at the END of the preserved body; moving it to the file head inverted both. *"bullet on the
+> iterative widen above"* = the **`fitViewportJS` widen is ITERATIVE** bullet; *"…`data-tmsrc` keying
+> bullets above"* = the **`measureMaxRight()` excludes not-yet-loaded images** and **Post-image-load
+> WIDTH recheck** bullets — all three in the preserved body BELOW. Its text is deliberately NOT
+> edited: it is labelled verbatim, and rewriting it would falsify that label. Corrects `c150c995d`.
+>
+> **The bullet, verbatim as written by `458863e86`:**
+>
+- **The deferred swap withholds URLs from images our own VIEW-MODE CSS hides — and a GENERAL visibility predicate is RULED OUT by the quote-collapse reveal (2026-08-12, T8 / `IOS-PRIVACY-003`).** `deferredImageLoadJS`'s `swap()` gained `hiddenByViewMode`, which walks the image's ancestors and skips it when a `.tm-eml-section` / `.tm-eml-headers` ancestor — or, in preview mode only, the direct `<body>` child containing it — computes `display:none`. WebKit fetches an `<img>` under `display:none`, so before this, opening an ORDINARY message fired the tracking pixels of every attached `.eml` (main view hides them all with `.tm-eml-section{display:none!important}`), and opening ONE `.eml` preview fired the parent body's plus every other section's. **The predicate lives INSIDE `swap()`, never at its call sites** — `swap()` is invoked from both the double-rAF `post-paint` arm and the `setTimeout(...,1500)` `failsafe-1500ms` arm, so a call-site filter would let the failsafe re-fetch everything 1500ms later and the fix would be a silent no-op. ⛔ **Do NOT replace it with `offsetParent === null` or `getClientRects().length === 0`.** Both are correct `display:none`-ancestor tests and both are wrong here: `collapseQuotesJS` and `collapseICSJS` build `.tm-quote-wrapper.tm-collapsed` whose `.tm-quote-content` is `display:none` until the user taps "Show quoted text" / "Show invite details" — an IN-DOCUMENT reveal (class toggle, no reload) that nothing re-runs the swap after, so every quoted reply and collapsed invite containing images would expand to blank frames. Second, independent reason: `fitViewportJS` widens the layout viewport past the email's own `@media` breakpoints (bullet on the iterative widen above), so a media-query-hidden image can become visible with no reload. The narrow predicate is sound precisely because every ancestor it tests is governed by one of FOUR of our own `!important` rules that are CONSTANT for the loaded document's lifetime, so its answer cannot change in-document — which is what makes "no MutationObserver / IntersectionObserver / reveal hook" a true statement rather than an assumption. Selecting a different `.eml` is a different wrapped document and a fresh load (`previewFilename` is a `wrapHTML` parameter; the coordinator reloads on `loadedPreviewFilename` change), and a withheld image KEEPS its `data-tmsrc`/`data-tmsrcset` and is never marked, so the new document's own `swap()` fetches it. It FAILS OPEN (throw ⇒ treat as visible ⇒ swap), wrapped like the sibling diagnostic-hook call, because an uncaught throw inside the swap loop strands every remaining deferred image. **Lockstep note (relates to the `measureMaxRight` / `postImageWidthRecheckJS` `data-tmsrc` keying bullets above): this adds NO new consumer of that keying** — `hiddenByViewMode` reads ancestors' computed display, never the `data-tmsrc` attributes, and never the image's own inline display except when the image is itself a direct `<body>` child in preview mode. That is why `measureMaxRight`'s temporary `display:none !important` on deferred `<img>`s cannot perturb it: it hides the IMAGE, not the ancestors tested, and its hide→scan→restore is synchronous within one JS turn so a swap cannot interleave. Debug-gated per-trigger census: `[DeferImg] <trigger> total=N swapped=N skippedHidden=N`. Tests: `EmailRenderPipelineTests.deferredSwapWithholdsHiddenEmlSectionImages`, `.deferredSwapFailsafeArmAloneWithholdsHiddenImages`, `.deferredSwapPreviewModeFetchesOnlySelectedSection`, `.deferredSwapNegativeControlLoadsEverything`, `.deferredSwapStillFetchesInsideCollapsedQuote`, `.deferredSwapWithheldImageStaysSwappable`, `.deferredSwapCensusIsDebugGated`.
+>
+> ---
+>
+> **NEW CURRENT KNOWLEDGE — P4 image-failure banner (ADR-IOS-076, 2026-08-13).** Not a reproduction
+> of anything in the preserved body: this is new knowledge, written here because the body is
+> hash-pinned and this wrapper is the append-safe surface. Its two references to the preserved body
+> below (the `measureMaxRight` scope-discipline bullet, and the reverted block-with-banner bullet)
+> were re-resolved when it moved here — it was drafted to sit at the END of the body, where both
+> read "above".
+>
+- **P4 (ADR-IOS-076, 2026-08-13) — image-failure banner, and it rides on the EXISTING arming loop rather than adding a consumer of the keying.** `postImageWidthRecheckJS` now also counts the `error` fires among the images WE deferred and posts `{ failed, deferred }` ONCE on a new `imageLoadFailure` bridge channel (fourth channel; `HTMLWebView.bridgeChannels` is the single source of that list — count it there, do not restate an integer). `ImageFailureBannerState.isVisible` raises a dismiss-only `ImageLoadFailureBanner` in SwiftUI ABOVE the web view — no DOM node, no CSS, no frame change — so the ADR-IOS-039 measure→mutate→re-measure pipeline is untouched. **Lockstep note, stated precisely because the obvious phrasing is wrong: this is NOT a third consumer of the `data-tmsrc || data-tmsrcset || !complete` keying.** Two production functions encode that key — `fitViewportJS.measureMaxRight` (hide-for-scan) and `postImageWidthRecheckJS` (`pendingImgs()`, plus the arming-loop condition which is the same key inverted) — and P4 adds one new READER of the *deferred half* at ARM time, inside the function that already owns it. It stays two functions; keep them in lockstep as before. ⚠️ **The count MUST come from the `error` listener, never from the element:** a broken `<img>` reports `complete === true` exactly like a loaded one, so nothing about the element distinguishes them afterwards — and `naturalWidth === 0` is forbidden by the `measureMaxRight` scope-discipline bullet in the PRESERVED BODY BELOW (it also calls a loaded intrinsic-size-less SVG pending). ⚠️ **"Did we defer this one" is captured at ARM time inside a per-iteration IIFE**, for two independent reasons that must both be preserved: `swap()` removes `data-tmsrc` BEFORE assigning `src`, so a fire-time read classifies every remote image as local; and ES5 `var` in that loop hands every listener the LAST image's value. The census takes its OWN one-shot (`window.__tmImageFailureReported`), deliberately NOT `check()`'s `__tmFitDone`/`__tmWidthRefitRequested` guards, because a message that both loses images AND needs a width re-fit must still report; `check()` is byte-unchanged and `setTimeout(check, 60)` is scheduled FIRST in both handlers so a throw in the newer code cannot reach the width pipeline. **Observational ONLY — no retry, no probe, no HEAD, no re-assignment of a failed `src`, and nothing about which images load or when** (static guard: `EmailRenderPipelineTests.imageFailureCensusNeverRetries`); this is NOT the block-with-banner design reverted 2026-06-17 (the block-with-banner bullet in the PRESERVED BODY BELOW), and that revert is not precedent against it. **Known dead zone, fail-closed and accepted (`IOS-UI-004`): the settle point is UNREACHABLE while any image is permanently withheld by `hiddenByViewMode`** — a withheld image keeps its `data-tmsrc`, so `pendingImgs()` never reaches 0 — hence no banner on any message carrying an attached `.eml` and none in the `.eml` preview sheet. Copy is hedged ("may not"), domain-free and count-free on purpose and is pinned (`ImageLoadFailureBannerTests.theCopyDoesNotOverclaim`): `onerror` fires for a 404, DNS failure, malformed bytes or an offline device just as for an ATS/TLS refusal, and WebKit gives the page no signal that separates them. Tests: `EmailRenderPipelineTests.imageFailureCensus*` (7), `RenderBridgeInputTests` `imageFailureReport` validation (3), `ImageFailureBannerStateTests` (6).
+>
+> **⚠️ CURRENT CORRECTION (`1051ecbf6`) — the landing paragraph above is preserved history, not
+> current mechanism.** The census no longer increments a free-running `error` counter and no longer
+> asks `pendingImgs()` whether it has settled. It records one terminal outcome per image in the
+> `armedImgs` registry, derives `failed` and `deferred` from those records, and gates publication on
+> `armedPending()`. The dead zone therefore requires a withheld armed image that receives no terminal
+> event; it is not caused by every `.eml` attachment or every withheld image. A mixed live `cid:` src
+> plus deferred remote `srcset` can settle under the accepted first-terminal rule in `IOS-UI-004`.
+> Also, page-side `__tmImageFailureReported` is set before the bridge post. If Swift
+> returns `.suppressedOffline`, the Swift one-shot remains unspent but that same document cannot post
+> a second census; a fresh render/reopen is the recovery. Do not claim an in-place later census.
+>
+> **⚠️ CURRENT COPY CORRECTION (2026-08-13 device smoke).** The landing paragraph's description
+> of a hedged server/TLS sentence is also history. On a connected device, the same message loaded
+> both public Genspark images while both Outlook `/mail/id/…` images in its quoted thread errored;
+> WebKit supplied no reason code, and the received body supplied no local MIME/CID asset for those
+> Outlook URLs. The banner now says exactly **“Some images couldn't be loaded. They may be
+> unavailable or require sign-in.”** It reports the observed failure without naming a server,
+> transport, or count. The trigger and observational constraints are unchanged: no retry, probe,
+> credential borrowing, or look-alike substitution was added.
+>
+> **⚠️ CURRENT PRODUCT CORRECTION (2026-08-13, supersedes both P4 banner paragraphs above).** The
+> owner confirmed that Apple Mail also fails the same quoted Outlook `/mail/id/…` images and chose
+> not to elevate routine broken web images into message-level chrome. The generic
+> `imageLoadFailure` `{ failed, deferred }` census is now **diagnostic-only** and has no
+> user-visible sink; ordinary 404, expired/authenticated URL, DNS, invalid-byte, offline, and ATS
+> failures are silent.
+>
+> A narrower legacy-security banner and shorter failure timeout are not implemented because the
+> public `WKWebView` surface does not expose the exact error for an `<img>` request. The measured
+> freeT host negotiates TLS 1.2 with a static-RSA cipher and fails ATS's forward-secrecy rule; that
+> is not the deprecated TLS-version condition named by `shouldAllowDeprecatedTLSFor`, and
+> `WKNavigationDelegate`'s load-error callbacks cover main-frame navigations; WKWebView exposes no
+> public per-resource error delegate for an image request.
+> JavaScript receives only `error`; timing or absent Resource Timing would misclassify slow DNS and
+> other transport failures. No timer, retry, probe, duplicate request, or security exception was
+> added. Revisit only if WebKit exposes an exact image-subresource failure reason.
+>
+> **CURRENT DISCLOSURE-LAYOUT FIX (2026-08-13, CORRECTED AFTER DEVICE SMOKE).** A quote/invite click
+> occurs inside WKWebView and does not produce SwiftUI List's `.interacting` scroll phase. Expanding
+> quoted text while `MessageDetailView`'s opening anchor was armed changed `focusedCardHeight`; the
+> late-layout correction could mistake that user-owned resize for initial materialisation and call
+> `scrollTo(..., anchor: .top)`. The quote and invite handlers set isolated-world
+> `__tmUserDisclosurePending` before toggling `.tm-collapsed`, and the first ensuing measurement
+> carries that validated Boolean in the SAME `heightChanged` payload whose height Swift considers.
+> Native disarms the one-way opening gate before handling that payload. The flag is consumed once so
+> later image/layout measurements cannot masquerade as another tap. Correctness therefore does not
+> depend on cross-channel WebKit delivery order.
+>
+> Device `logmain.log` proved the same focused WebView grew from 865 pt to 13,249 pt on each expansion
+> and returned to 865 pt on collapse while `ScrollFreezeGate` was idle; it did NOT record the outer
+> List offset and therefore did not prove UIKit compensation. A follow-up simulator canary placed the
+> production `AutoSizingHTMLView` in a live self-sizing `List`, expanded an equivalently large quote,
+> and measured zero outer-offset shift even with no preservation code. That falsified the proposed
+> `ScrollPosition` exact-y workaround, so it was removed rather than shipping speculative scroll
+> ownership machinery. That falsification harness was intentionally not retained: its negative
+> control measured no uncontrolled offset, so preserving it as a regression test would assert no
+> production behavior. The remaining concrete app-owned path was the `laterMessages.count` two-pass
+> `ScrollViewProxy` correction: its immediate and queued writes were not execution-gated and could run
+> after a disclosure or manual interaction disarmed the opening gate. All focused-card proxy writes
+> now enter one helper that revalidates `MessageDetailOpenAnchorGate` at execution, including the queued
+> pass. This deliberately trades the old unconditional correction: if the user takes control before an
+> initial related-message scan inserts rows above, TabMail accepts the insertion's natural layout rather
+> than snapping the focused card to the top. Logging-enabled sessions record every accepted/skipped
+> correction as `[DetailAnchor]`. Preserve that central
+> gate; do not add an outer-offset restoration path without a non-vacuous reproduction that first
+> proves the uncontrolled List actually moves.
+>
+> Scroll-freeze buffering is latest-wins. A user can expand and collapse before the freeze releases;
+> when the newest validated visual height equals the currently applied collapsed height, native clears
+> any older buffered expansion instead of flushing it after the user already hid the quote. Disclosure
+> posts use the same rect/scroll/viewport fields as the ResizeObserver path so widened documents compare
+> and scale in one coordinate system. The one-shot disclosure helper is installed independently at
+> document start, and every consumer fails soft to `false`, so a quote-parser failure cannot suppress
+> unrelated height delivery.
+>
+> The invite's horizontal mismatch was separate. `BodyRenderer` appends `.tm-ics-collapsible`
+> directly under `<body>`, outside the sender's indented content container, while quote wrappers
+> live inside that container. `collapseICSJS` now marks the generated wrapper `.tm-ics-wrapper`,
+> retains the exact app-created node references in the isolated content world, and
+> `eatGutterMarginsJS` applies its already-measured `minLeft`/`minRight` main-column insets only to
+> those nodes. A sender-spoofed class is not treated as ownership. Negative overflow-side insets
+> clamp to zero, and combined positive insets cannot consume the measured 60%-wide column floor.
+> Regression coverage: `EmailRenderPipelineTests.disclosureTogglesTagAppliedHeight`, the real
+> production-WKWebView canary `RenderContentWorldIsolationTests.disclosureHeightTagIsAtomic`,
+> `.inviteDisclosureAlignsToEmailInset`, and
+> `MessageDetailViewTests.disclosureDisarmsOpeningAnchor`.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ### HTML Email Render Pipeline (AutoSizingHTMLView) — MUST stay idempotent (ADR-IOS-039)
 - The render is a measure→mutate→re-measure pipeline with **two feedback-loop arms**, both now closed. Do not reopen either:
