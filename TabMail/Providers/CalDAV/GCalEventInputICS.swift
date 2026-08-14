@@ -33,9 +33,36 @@ extension GCalEventInput {
         lines.append(contentsOf: eventLines)
         lines.append("END:VCALENDAR")
 
-        // Fold long lines per RFC 5545
-        let folded = lines.map { foldICSLine($0) }
+        // Strip embedded line breaks and control characters from every assembled line BEFORE
+        // folding, then fold long lines per RFC 5545.
+        //
+        // This is the ICS-injection boundary, and it is deliberately here rather than at each
+        // interpolation site. `\r\n` is the property separator, so ANY value that reaches this point
+        // still carrying one splits its line into a second property that the CalDAV server then
+        // honours — the attacker gets to add ATTENDEE, ORGANIZER, or even END:VEVENT/BEGIN:VEVENT to
+        // an event we PUT on the user's behalf. An injected ATTENDEE is the sharp case: the server
+        // mails the invitation, so it discloses the event to an address the user never typed.
+        //
+        // Several values reach here unescaped by design (RRULE lines are structured, so they cannot
+        // pass through `escapeICSText` without corrupting `;` and `,`), and others are simply not
+        // escaped today — attendee email, transparency, TZID, all-day date strings. Guarding the one
+        // reported field would have left the rest, so the class is closed at the single point every
+        // line passes through. RFC 5545 forbids control characters in values other than HTAB, so
+        // removing them cannot damage a legitimate event.
+        let sanitized = lines.map { Self.sanitizeICSLine($0) }
+        let folded = sanitized.map { foldICSLine($0) }
         return folded.joined(separator: "\r\n") + "\r\n"
+    }
+
+    /// Remove CR, LF and other C0 control characters (keeping HTAB) from a single assembled ICS line.
+    ///
+    /// Stripping rather than rejecting: a mangled value yields a malformed property that the server
+    /// refuses, which is recoverable and visible. Silently emitting an extra property is not.
+    static func sanitizeICSLine(_ line: String) -> String {
+        guard line.unicodeScalars.contains(where: { $0.value < 0x20 && $0 != "\t" }) else { return line }
+        return String(String.UnicodeScalarView(
+            line.unicodeScalars.filter { $0.value >= 0x20 || $0 == "\t" }
+        ))
     }
 
     /// Build the VEVENT block and the set of `VTIMEZONE` components it requires.
