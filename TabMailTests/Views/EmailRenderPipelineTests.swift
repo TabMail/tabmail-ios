@@ -2287,9 +2287,15 @@ struct ImageAspectRatioFixTests {
 /// .postMessage('anything\nit likes')` itself, reaching the same Swift handler
 /// and the same `print`, without going through `log()` or `sanitize` at all.
 /// What `sanitize` actually closes is a sender-authored VALUE (a URL, an
-/// attribute) forging an extra line inside a diagnostic WE emit. What stays open
-/// while `allowsContentJavaScript` is `true` is the sender posting arbitrary
-/// forged lines directly; that closes with ADR-IOS-076 decision 1, not here.
+/// attribute) forging an extra line inside a diagnostic WE emit. What stayed open
+/// while `allowsContentJavaScript` was `true` is the sender posting arbitrary
+/// forged lines directly; that closed with ADR-IOS-076 decision 1, not here —
+/// **shipped at P1b (2026-08-12)**: `makeUIView` now sets
+/// `allowsContentJavaScript = false`, so author script cannot reach
+/// `messageHandlers` at all. The shared-`window` shape it describes is unchanged
+/// (our user scripts still run in the page world); what changed is that no
+/// sender-authored script runs there to exploit it. Everything below still holds
+/// regardless — the paths it tests reach `print` from Swift, not from JS.
 ///
 /// The attachment download / staging / preview / carry-forward
 /// paths reach `print` DIRECTLY, with sender-authored values interpolated in —

@@ -24,6 +24,20 @@ import UIKit
 // "fix" the app to satisfy this file; flip the assertion in the phase that changes the
 // behaviour.
 //
+// P1b LANDED (2026-08-12). The "INVERTS AT P1b" assertions have been flipped in place and
+// re-labelled "INVERTED AT P1b", each carrying the value it previously pinned, so the
+// pre-hardening behaviour stays readable next to the post-hardening one. Section 11 adds
+// the CSP's own tests. Two knock-on changes worth knowing before editing:
+//   • `subframeAndNewWindowActions` now loads a RAW (unwrapped, CSP-free) document. Under
+//     `frame-src 'none'` a wrapped document's iframe is blocked before it ever reaches the
+//     delegate — correct, and asserted in `shippedCSPBlocksSubframesAndPlugins` — but C2
+//     still needs the subframe CALLBACK SHAPE on record, and that shape only exists where
+//     the policy is not in force. Both halves are load-bearing; deleting either loses a
+//     fact P1c is built from.
+//   • P1b does NOT close main-frame navigation. `metaRefreshForgesAnAppLoadShape` and
+//     `appScriptsSurviveTheJavaScriptGate` both still pass: a `<meta http-equiv="refresh">`
+//     navigates with JavaScript disabled. Only P1c's per-load nonce closes it.
+//
 // FIDELITY. Where possible the measurements run against the REAL production surface:
 // `HostedRenderView` hosts `AutoSizingHTMLView` in a live `UIWindow`, so
 // `HTMLWebView.makeUIView` builds the actual `WKWebViewConfiguration` (the JS gate, the
@@ -332,6 +346,41 @@ enum CanaryKit {
         wv.navigationDelegate = probe
         return wv
     }
+
+    /// Records every `securitypolicyviolation` the document reports, as
+    /// `"<effective-directive>|<blocked-uri>"`.
+    ///
+    /// Installed as a `WKUserScript` rather than inline script because under P1b's
+    /// configuration author script does not run at all — and a page-world user script
+    /// working here is itself part of what P1b claims.
+    static func violationRecorder() -> WKUserScript {
+        WKUserScript(source: """
+        window.__tmCSPViolations = [];
+        document.addEventListener('securitypolicyviolation', function (e) {
+            window.__tmCSPViolations.push(
+                String(e.effectiveDirective || e.violatedDirective || '?') + '|' + String(e.blockedURI || ''));
+        });
+        """, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+    }
+
+    /// Synthetic stand-in for production's `deferredImageLoadJS`, which is `private` to
+    /// `AutoSizingHTMLView`. Re-arms `data-tmsrc` the same way.
+    static func imageRearmScript() -> WKUserScript {
+        WKUserScript(source: """
+        (function(){
+          var imgs = document.querySelectorAll('img[data-tmsrc]');
+          for (var i = 0; i < imgs.length; i++) { imgs[i].src = imgs[i].getAttribute('data-tmsrc'); }
+          window.__tmProbeSwapped = imgs.length;
+        })();
+        """, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+    }
+
+    static func violations(_ webView: WKWebView) async -> [String] {
+        let raw = await eval(webView, "JSON.stringify(window.__tmCSPViolations || [])")
+        guard let data = raw.data(using: .utf8),
+              let arr = (try? JSONSerialization.jsonObject(with: data)) as? [String] else { return [] }
+        return arr
+    }
 }
 
 /// Hosts the REAL `AutoSizingHTMLView` in a live window so `HTMLWebView.makeUIView`
@@ -405,22 +454,44 @@ struct EmailRenderSecurityCanaryTests {
         defer { hostedAsset.tearDown() }
         let cfg = hostedAsset.webView.configuration
 
-        // INVERTS AT P1b — the whole point of P1b is to set this to false.
-        #expect(cfg.defaultWebpagePreferences.allowsContentJavaScript == true,
-                "author JS is enabled today; P1b sets allowsContentJavaScript = false and this inverts")
+        // INVERTED AT P1b (was `== true`). T1's root cut: sender-authored <script>, inline
+        // handler attributes and javascript: URLs no longer execute.
+        #expect(cfg.defaultWebpagePreferences.allowsContentJavaScript == false,
+                "P1b: author JS is OFF in the production render configuration")
 
-        // Blocker B2: Data Detectors synthesize taps OUTSIDE the navigation delegate, so a
-        // permit state machine cannot see them. Pinned so P1b's decision here is deliberate.
+        // RE-INVERTED 2026-08-12 by owner directive, back to the `[.link, .phoneNumber]` this
+        // pinned before P1b briefly set it to `[]`. It stays a POSITIVE pin, not a blessing:
+        // the affordance is deliberate (tap-to-call and tappable bare URLs in a phone mail
+        // client), so a silent change in EITHER direction fails here.
+        // ⚠️ Blocker B2 is still TRUE, and enabling detectors does not make it false: they
+        // synthesize taps OUTSIDE the navigation delegate, so no permit state machine — and no
+        // delegate-level test, including this file — can observe them. While this value is
+        // non-empty, "every externally dispatched target passes our http/https allowlist" is
+        // FALSE; it is a documented exception, registered as IOS-UI-002 in KNOWN_ISSUES.md.
+        // Authored <a href> links are unaffected either way: they are WKNavigationActions and
+        // still reach decidePolicyFor. Detectors govern only plain-text numbers and bare URLs.
+        // ⚠️ It is not the only exception any more — link preview below is the second (IOS-UI-003).
         #expect(cfg.dataDetectorTypes == [.link, .phoneNumber],
-                "data detectors are on today (B2: their taps bypass decidePolicyFor)")
+                "detectors are deliberately ON (owner, 2026-08-12): tap-to-call and tappable bare URLs. They dispatch OUTSIDE decidePolicyFor, so the http/https allowlist has a documented exception (IOS-UI-002) and is NOT an absolute")
 
-        // INVERTS AT P1b if link preview is disabled there.
+        // RE-INVERTED 2026-08-12 by owner directive, back to the WebKit default this pinned
+        // before P1b briefly set it to `false`. It stays a POSITIVE pin, not a blessing: the
+        // affordance is deliberate, so a silent change in EITHER direction fails here.
+        // ⚠️ The security fact is unchanged: long-press preview FETCHES and PRESENTS the remote
+        // URL with no decidePolicyFor decision we ever see, so it is a SECOND non-delegate route
+        // out of the render view and a SECOND exception to "every externally dispatched target
+        // passes our http/https allowlist" — data detectors above are the first. No
+        // delegate-level test, including this one, can observe either route.
         #expect(hostedAsset.webView.allowsLinkPreview == true,
-                "link preview is on today; P1b may disable it")
+                "link preview is deliberately ON (owner, 2026-08-12): the unset WebKit default that v1.7.8 shipped. It is a non-delegate fetch route, so the http/https allowlist carries a SECOND documented exception (IOS-UI-003) alongside the detector one (IOS-UI-002)")
 
-        // INVERTS AT P1b if the store is made non-persistent.
+        // RE-INVERTED 2026-08-12 by owner directive, back to the shipped default store. T5 is
+        // therefore OPEN and accepted: ONE process-wide PERSISTENT jar shared across every
+        // message and every sender, surviving launches, reachable by remote subresources alone
+        // with no sender script. This pin is POSITIVE so the open exposure stays measured, and so
+        // a silent re-hardening is caught too — it must be an owner decision either way.
         #expect(cfg.websiteDataStore.isPersistent == true,
-                "the render web view uses the PERSISTENT data store today")
+                "the render web view deliberately uses the DEFAULT PERSISTENT data store (owner, 2026-08-12), so T5 — one cookie jar shared across every message and sender — is OPEN and accepted (IOS-PRIVACY-001). Do NOT describe this path as isolated")
 
         // C4: the scheme handler is registered exactly when a headerId is present.
         #expect(cfg.urlSchemeHandler(forURLScheme: BodyAssetConfig.urlScheme) != nil,
@@ -429,7 +500,10 @@ struct EmailRenderSecurityCanaryTests {
         let scripts = cfg.userContentController.userScripts
         #expect(!scripts.isEmpty, "the app injects user scripts; they must survive P1b's JS gate")
         print("[P1A] production userScripts.count=\(scripts.count) " +
-              "dataDetectorTypes=\(cfg.dataDetectorTypes.rawValue)")
+              "dataDetectorTypes=\(cfg.dataDetectorTypes.rawValue) " +
+              "contentJS=\(cfg.defaultWebpagePreferences.allowsContentJavaScript) " +
+              "persistentStore=\(cfg.websiteDataStore.isPersistent) " +
+              "linkPreview=\(hostedAsset.webView.allowsLinkPreview)")
 
         guard let hostedNil = await HostedRenderView(html: "<p>config probe</p>", headerId: nil) else {
             #expect(Bool(false), "could not host the headerId == nil variant"); return
@@ -437,17 +511,31 @@ struct EmailRenderSecurityCanaryTests {
         defer { hostedNil.tearDown() }
         #expect(hostedNil.webView.configuration.urlSchemeHandler(forURLScheme: BodyAssetConfig.urlScheme) == nil,
                 "headerId == nil must NOT register the scheme handler (C5: compose/.eml resolve differently)")
+
+        // RE-INVERTED 2026-08-12 by owner directive. `isPersistent` alone does not measure T5 —
+        // a per-view ephemeral store and one shared ephemeral singleton both report `false`, and
+        // identity is what distinguishes them. So the sharing is pinned DIRECTLY, in the
+        // direction the owner chose: every render view resolves to the SAME
+        // `WKWebsiteDataStore.default()` instance, which is exactly the cross-message,
+        // cross-sender correlation channel T5 names. Asserted positively so the exposure stays
+        // measured rather than assumed, and so a silent change back is caught.
+        #expect(hostedNil.webView.configuration.websiteDataStore.isPersistent == true,
+                "the headerId == nil (compose / .eml) path also uses the default PERSISTENT store")
+        #expect(hostedAsset.webView.configuration.websiteDataStore
+                === hostedNil.webView.configuration.websiteDataStore,
+                "T5 is OPEN by owner decision (IOS-PRIVACY-001): two render views SHARE one process-wide data store instance. This is the shipped v1.7.8 behaviour, deliberately restored")
     }
 
     // -------------------------------------------------------------------------------
     // 2. Script execution — author vs app.
     // -------------------------------------------------------------------------------
-    @Test("Canary: an author inline script executes today, alongside the app's user scripts")
+    @Test("Canary: an author inline script does NOT execute, and the app's user scripts still do")
     func authorScriptExecutesToday() async {
         let body = """
         <script>window.__tmCanaryAuthorRan = true;
         document.documentElement.setAttribute('data-author','yes');</script>
-        <p>author script probe</p>
+        <p onclick="window.__tmCanaryHandlerRan = true">author script probe</p>
+        <a id="jsurl" href="javascript:window.__tmCanaryJsUrlRan = true">js url</a>
         """
         guard let host = await HostedRenderView(html: body, headerId: "canary-author-script") else {
             #expect(Bool(false), "could not host AutoSizingHTMLView"); return
@@ -461,21 +549,40 @@ struct EmailRenderSecurityCanaryTests {
         let appScript = await CanaryKit.eval(wv, "typeof window.__tmReportHeight")
         print("[P1A] authorRan=\(authorRan) authorDOM=\(authorDOM) appScript=\(appScript)")
 
-        // INVERTS AT P1b — with allowsContentJavaScript = false both become "undefined"/"null".
-        #expect(authorRan == "true",
-                "author inline script RUNS today; P1b sets allowsContentJavaScript = false and this inverts")
-        #expect(authorDOM == "yes",
-                "author script mutates the DOM today; P1b inverts this")
+        // INVERTED AT P1b (was `== "true"` / `== "yes"`).
+        #expect(authorRan == "undefined",
+                "P1b: the author's inline <script> does not run")
+        #expect(authorDOM == "null",
+                "P1b: the author's script produced no DOM mutation")
+
+        // The other two author-script surfaces the same gate closes. Driven from an
+        // app-side evaluateJavaScript so the click itself is not author script — what is
+        // measured is whether WebKit runs the AUTHOR-supplied handler / URL body.
+        _ = await CanaryKit.eval(wv, "document.querySelector('p[onclick]').click(); 'clicked'")
+        _ = await CanaryKit.eval(wv, "document.getElementById('jsurl').click(); 'clicked'")
+        try? await Task.sleep(for: .milliseconds(500))
+        #expect(await CanaryKit.eval(wv, "String(window.__tmCanaryHandlerRan)") == "undefined",
+                "P1b: an inline event-handler attribute does not run")
+        #expect(await CanaryKit.eval(wv, "String(window.__tmCanaryJsUrlRan)") == "undefined",
+                "P1b: a javascript: URL does not run")
 
         // MUST NOT invert: the hardening depends on app user scripts still running.
+        // This is the HARD-STOP oracle named in the P1b brief — if it fails, the phase is
+        // wrong, not the test.
         #expect(appScript == "function",
                 "the app's WKUserScript must execute (height reporting); P1b must not break this")
+        #expect(await CanaryKit.eval(wv, "1 + 1") == "2",
+                "app-side evaluateJavaScript still works with the gate closed")
 
-        // The wrapper's CSP today is upgrade-insecure-requests only.
+        // INVERTED AT P1b (was `== "upgrade-insecure-requests"`). Compared against the
+        // stored constant, not a literal: the document must carry the policy the app
+        // believes it shipped, and a re-typed literal here could only ever agree with
+        // itself.
         let csp = await CanaryKit.eval(wv,
             "String((document.querySelector('meta[http-equiv=\"Content-Security-Policy\"]')||{}).content)")
-        #expect(csp == "upgrade-insecure-requests",
-                "P1b extends this CSP; this assertion changes there")
+        #expect(csp == EmailHTMLWrapper.contentSecurityPolicy,
+                "the rendered document carries EmailHTMLWrapper.contentSecurityPolicy verbatim")
+        print("[P1A] rendered csp=\(csp)")
     }
 
     // -------------------------------------------------------------------------------
@@ -785,10 +892,22 @@ struct EmailRenderSecurityCanaryTests {
         let wv = CanaryKit.probeWebView(cfg, probe)
 
         let n = CanaryKit.nonce()
-        let doc = EmailHTMLWrapper.wrapHTML("""
+        // ⚠️ CHANGED AT P1b — this document is deliberately NOT run through
+        // `EmailHTMLWrapper.wrapHTML`. P1b's `frame-src 'none'` blocks a wrapped
+        // document's iframe before WebKit ever asks the delegate about it (asserted in
+        // `shippedCSPBlocksSubframesAndPlugins` below), which is the intended outcome —
+        // but C2 still needs the SUBFRAME CALLBACK SHAPE on record, and that shape only
+        // exists where the policy is not in force. So the shape is measured on a raw
+        // document and the policy is measured on a wrapped one; deleting either half
+        // loses a fact P1c is built from.
+        let doc = """
+        <!DOCTYPE html><html><head>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        </head><body>
         <iframe id="f" src="\(BodyAssetConfig.urlScheme)://asset/sub-frame.html" width="100" height="50"></iframe>
         <a id="blanklnk" href="\(BodyAssetConfig.urlScheme)://asset/blank-target" target="_blank">new window</a>
-        """)
+        </body></html>
+        """
         _ = wv.loadHTMLString(doc, baseURL: CanaryKit.nonceBase(n))
         await CanaryKit.waitForFinish(probe)
         try? await Task.sleep(for: .seconds(2))
@@ -965,5 +1084,264 @@ struct EmailRenderSecurityCanaryTests {
                 "the appearance reload is indistinguishable from any other app load at the delegate")
         #expect(await CanaryKit.eval(wv, "String(window.__tmCanaryMark)") == "undefined",
                 "the appearance reload also discards the JS context")
+    }
+
+    // -------------------------------------------------------------------------------
+    // 11. P1b — the shipped Content Security Policy.
+    // -------------------------------------------------------------------------------
+
+    @Test("P1b: wrapHTML emits one complete document with the app CSP in <head> before any author element")
+    func cspIsUnconditionalAndPrecedesAuthorContent() {
+        // The invariant, stated in `EmailHTMLWrapper.contentSecurityPolicy`'s doc comment
+        // and checked here: `wrapHTML` MUST always emit ONE complete document with the app
+        // CSP in <head> before any author-controlled element, and no caller may load raw
+        // message HTML. A meta CSP only governs what follows it, so "the policy is in the
+        // document" is not the property that matters — "the policy precedes the content"
+        // is. The production caller's half is covered end-to-end by
+        // `authorScriptExecutesToday`, which reads the policy back out of a REAL render.
+        let marker = "tm-author-marker"
+        let cases: [(String, String)] = [
+            ("fragment", "<p id=\"\(marker)\">fragment body</p>"),
+            ("full document",
+             "<!DOCTYPE html><html><head><style>p{color:red}</style></head>"
+             + "<body><p id=\"\(marker)\">full document body</p></body></html>"),
+            ("author supplies its own CSP",
+             "<!DOCTYPE html><html><head>"
+             + "<meta http-equiv=\"Content-Security-Policy\" content=\"img-src *; script-src *\">"
+             + "</head><body><p id=\"\(marker)\">author tried to set a policy</p></body></html>")
+        ]
+        for (label, input) in cases {
+            for preview in [nil, "attached.eml"] as [String?] {
+                let tag = "\(label) / preview=\(preview ?? "nil")"
+                let out = EmailHTMLWrapper.wrapHTML(input, previewFilename: preview)
+                #expect(out.hasPrefix("<!DOCTYPE html>"),
+                        "\(tag): wrapHTML emits a COMPLETE document, never a bare fragment")
+
+                let appMeta = "<meta http-equiv=\"Content-Security-Policy\" content=\"\(EmailHTMLWrapper.contentSecurityPolicy)\">"
+                guard let cspRange = out.range(of: appMeta) else {
+                    #expect(Bool(false), "\(tag): the app CSP meta tag is missing from the output"); continue
+                }
+                guard let headEnd = out.range(of: "</head>"), let bodyOpen = out.range(of: "<body") else {
+                    #expect(Bool(false), "\(tag): no <head>…</head><body> structure"); continue
+                }
+                #expect(cspRange.upperBound <= headEnd.lowerBound, "\(tag): the CSP sits inside <head>")
+                #expect(cspRange.upperBound <= bodyOpen.lowerBound, "\(tag): the CSP precedes <body>")
+
+                guard let author = out.range(of: marker) else {
+                    // If the marker did not survive the wrap, every ordering assertion
+                    // above is comparing against nothing.
+                    #expect(Bool(false), "\(tag): the author marker must survive into the output or this case is vacuous")
+                    continue
+                }
+                #expect(cspRange.upperBound <= author.lowerBound,
+                        "\(tag): the CSP precedes every author-controlled element")
+
+                guard let firstPolicy = out.range(of: "Content-Security-Policy") else {
+                    #expect(Bool(false), "\(tag): unreachable — the app meta was already found"); continue
+                }
+                #expect(cspRange.lowerBound <= firstPolicy.lowerBound && firstPolicy.upperBound <= cspRange.upperBound,
+                        "\(tag): the APP's policy is the FIRST Content-Security-Policy in the document — an author meta arriving later can only add restrictions, never relax ours")
+            }
+        }
+    }
+
+    @Test("P1b: the shipped CSP is exactly the ADR-IOS-076 policy, backstop first, no header-only directives")
+    func cspDirectiveCensus() {
+        let raw = EmailHTMLWrapper.contentSecurityPolicy
+        let directives = raw.split(separator: ";").map { $0.trimmingCharacters(in: .whitespaces) }
+        let expected = [
+            "default-src 'none'",
+            "script-src 'none'",
+            "style-src 'unsafe-inline'",
+            "img-src https: data: \(BodyAssetConfig.urlScheme):",
+            "font-src https:",
+            "media-src 'none'",
+            "object-src 'none'",
+            "frame-src 'none'",
+            "connect-src 'none'",
+            "form-action 'none'",
+            "base-uri 'none'",
+            "upgrade-insecure-requests"
+        ]
+        #expect(directives == expected,
+                "the policy is ADR-IOS-076 decision 1 / PLAN_EMAIL_RENDER_SECURITY §8.4, in order, as amended 2026-08-12 by the owner-directed font-src relaxation")
+        guard directives.count == expected.count else { return }
+
+        // OWNER-DIRECTED, 2026-08-12 — pinned POSITIVELY and in BOTH directions, because this
+        // value REVERSES a P1b hardening and either drift is a defect:
+        //   * back to 'none'   => a silent behaviour regression. It broke sender typography on
+        //     device: enforced font-src blocks on a real marketing email, which then rendered in
+        //     a fallback font.
+        //   * out to * or data: => a silent widening past what was actually directed.
+        #expect(directives.contains("font-src https:"),
+                "font-src is `https:` BY OWNER DIRECTIVE (2026-08-12), mirroring img-src's TLS-only posture. The font leg of T9 is OPEN and owner-accepted (IOS-PRIVACY-002). Do not restore 'none' — that is a behaviour regression, not a hardening — and do not widen to * or add data:.")
+        #expect(!raw.contains("font-src 'none'"),
+                "font-src 'none' was REVERSED by owner directive on 2026-08-12 after a device smoke test measured it blocking real web fonts; restoring it needs the owner, not a reviewer")
+        #expect(directives.contains("media-src 'none'"),
+                "media-src 'none' was deliberately RETAINED in the same owner directive — the smoke test recorded zero media-src violations, so it costs nothing observed and must not be relaxed alongside font-src")
+
+        #expect(directives.first == "default-src 'none'",
+                "default-src 'none' is the BACKSTOP — every later directive is a deliberate widening of it, and an allowlist without it leaves every unlisted class permitted")
+
+        let names = directives.map { String($0.split(separator: " ").first ?? "") }
+        #expect(Set(names).count == names.count,
+                "no directive is declared twice — a duplicate is ignored, silently")
+
+        // Header-only directives are SILENTLY IGNORED in a <meta> CSP (ADR-IOS-076
+        // decision 8). Present here they would read as coverage that does not exist.
+        for headerOnly in ["frame-ancestors", "sandbox", "report-uri", "report-to"] {
+            #expect(!names.contains(headerOnly),
+                    "\(headerOnly) is header-only and is ignored in a meta CSP; it must not appear here")
+        }
+
+        // WITHDRAWN in the round-1 vet, verified: `BodyRenderer` replaces every resolvable
+        // cid: with a tabmail-asset:// URL or a base64 data: URI, and no cid: scheme
+        // handler is registered — so a leftover cid: is by definition unresolvable and
+        // cannot load whatever the policy says. Listing it would be harmless but not
+        // load-bearing, and the reasoning originally given for it was false.
+        #expect(!raw.contains("cid:"), "cid: is deliberately absent from img-src")
+
+        // http: is absent because upgrade-insecure-requests rewrites the request before
+        // CSP enforcement. Measured in `httpImageHandlingIsUnchangedByP1b`, not assumed.
+        #expect(!raw.contains(" http:"), "http: is deliberately absent from img-src")
+    }
+
+    @Test("P1b: the shipped CSP blocks a subframe and an <object>, while asset images still load")
+    func shippedCSPBlocksSubframesAndPlugins() async {
+        let handler = RecordingSchemeHandler()
+        let cfg = WKWebViewConfiguration()
+        cfg.defaultWebpagePreferences.allowsContentJavaScript = false   // production shape
+        cfg.setURLSchemeHandler(handler, forURLScheme: BodyAssetConfig.urlScheme)
+        let ucc = WKUserContentController()
+        ucc.addUserScript(CanaryKit.violationRecorder())
+        cfg.userContentController = ucc
+
+        let probe = NavProbe()
+        let wv = CanaryKit.probeWebView(cfg, probe)
+        let scheme = BodyAssetConfig.urlScheme
+        let doc = EmailHTMLWrapper.wrapHTML("""
+        <iframe id="f" src="\(scheme)://asset/blocked-frame.html" width="100" height="50"></iframe>
+        <object id="o" data="\(scheme)://asset/blocked-object.bin"></object>
+        <img id="ok" src="\(scheme)://asset/allowed-pixel.gif" width="10" height="10">
+        """)
+        _ = wv.loadHTMLString(doc, baseURL: CanaryKit.nonceBase(CanaryKit.nonce()))
+        await CanaryKit.waitForFinish(probe)
+        try? await Task.sleep(for: .seconds(3))
+
+        let asked = handler.urls
+        let reported = await CanaryKit.violations(wv)
+        print("[P1B] CSP-BLOCK handler.urls=\(asked)\n[P1B] CSP-BLOCK violations=\(reported)")
+
+        // POSITIVE CONTROL FIRST. Without it the two negatives below are vacuous — they
+        // would hold just as well if the scheme handler had never been wired up.
+        #expect(asked.contains { $0.hasSuffix("allowed-pixel.gif") },
+                "img-src permits tabmail-asset: — the handler IS reached for images")
+        #expect(await CanaryKit.eval(wv, "String(document.getElementById('ok').naturalWidth)") == "1",
+                "and the asset image actually decoded")
+
+        #expect(!asked.contains { $0.hasSuffix("blocked-frame.html") },
+                "frame-src 'none': the iframe never reaches the network layer")
+        #expect(!asked.contains { $0.hasSuffix("blocked-object.bin") },
+                "object-src 'none': the <object> never reaches the network layer")
+        #expect(reported.contains { $0.hasPrefix("frame-src") },
+                "the document reports the frame-src violation")
+    }
+
+    @Test("P1b: http: image handling is UNCHANGED from the pre-P1b policy")
+    func httpImageHandlingIsUnchangedByP1b() async {
+        // The pre-P1b policy was `upgrade-insecure-requests` AND NOTHING ELSE, so any
+        // change in how a plain-http image is treated would be P1b's doing. Measured as a
+        // DIFFERENCE between the two policies rather than argued from the Fetch spec's
+        // ordering (upgrade at main-fetch step 4, CSP enforcement at step 5) — the
+        // spec-reading is exactly the kind of claim this canary exists to replace.
+        //
+        // 127.0.0.1:1 — no external traffic, no DNS, no real-world domain, fails fast.
+        func measure(_ policy: String) async -> (violations: [String], asked: [String]) {
+            let handler = RecordingSchemeHandler()
+            let cfg = WKWebViewConfiguration()
+            cfg.defaultWebpagePreferences.allowsContentJavaScript = false
+            cfg.setURLSchemeHandler(handler, forURLScheme: BodyAssetConfig.urlScheme)
+            let ucc = WKUserContentController()
+            ucc.addUserScript(CanaryKit.violationRecorder())
+            cfg.userContentController = ucc
+            let probe = NavProbe()
+            let wv = CanaryKit.probeWebView(cfg, probe)
+            // Hand-built, NOT wrapHTML: the point is to vary the policy, and wrapHTML
+            // always emits the shipped one (which is the invariant the sibling test pins).
+            let doc = """
+            <!DOCTYPE html><html><head>
+            <meta http-equiv="Content-Security-Policy" content="\(policy)">
+            </head><body>
+            <img id="http" src="http://127.0.0.1:1/tm-canary-http.gif" width="10" height="10">
+            <iframe id="frame" src="\(BodyAssetConfig.urlScheme)://asset/diff-frame.html" width="50" height="20"></iframe>
+            </body></html>
+            """
+            _ = wv.loadHTMLString(doc, baseURL: CanaryKit.nonceBase(CanaryKit.nonce()))
+            await CanaryKit.waitForFinish(probe)
+            try? await Task.sleep(for: .seconds(3))
+            return (await CanaryKit.violations(wv), handler.urls)
+        }
+
+        let legacy = await measure("upgrade-insecure-requests")
+        let shipped = await measure(EmailHTMLWrapper.contentSecurityPolicy)
+        print("[P1B] LEGACY  violations=\(legacy.violations) asked=\(legacy.asked)")
+        print("[P1B] SHIPPED violations=\(shipped.violations) asked=\(shipped.asked)")
+
+        let httpOnly: ([String]) -> [String] = { $0.filter { $0.contains("127.0.0.1") }.sorted() }
+        #expect(httpOnly(legacy.violations) == httpOnly(shipped.violations),
+                "P1b did not change how a plain-http image is treated — upgrade-insecure-requests was already the ENTIRE pre-P1b policy and still runs ahead of CSP enforcement")
+
+        // NON-VACUITY, two-sided: the same harness must record a DIFFERENCE exactly where
+        // P1b intends one. Without this leg, two empty violation lists would "agree".
+        #expect(legacy.asked.contains { $0.hasSuffix("diff-frame.html") },
+                "under the pre-P1b policy the subframe DID reach the network layer")
+        #expect(!shipped.asked.contains { $0.hasSuffix("diff-frame.html") },
+                "under the shipped policy frame-src 'none' stops it — so both the harness and the recorder are live")
+    }
+
+    @Test("P1b: a benign real-world-shaped email still renders — quote collapse, tables, inline image, live bridge")
+    func benignEmailRendersUnderTheShippedPolicy() async {
+        // 1×1 transparent GIF as a data: URI — the inline-image shape BodyRenderer
+        // produces for a small cid: part.
+        let pixel = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+        let headerId = "canary-benign-\(CanaryKit.nonce())"
+        let body = """
+        <div>Hi — confirming the numbers below.</div>
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+          <tr><td style="padding:8px">Item</td><td style="padding:8px">Qty</td></tr>
+          <tr><td style="padding:8px">Widget</td><td style="padding:8px">2</td></tr>
+        </table>
+        <img id="inline" src="\(pixel)" width="1" height="1">
+        <div>-----Original Message-----</div>
+        <div>From: Someone &lt;someone@example.com&gt;</div>
+        <div>Subject: Re: numbers</div>
+        <div>Original text that should end up inside the collapsed quote.</div>
+        """
+        guard let host = await HostedRenderView(html: body, headerId: headerId) else {
+            #expect(Bool(false), "could not host AutoSizingHTMLView"); return
+        }
+        defer { host.tearDown() }
+        let wv = host.webView
+        try? await Task.sleep(for: .seconds(4))
+
+        #expect(await CanaryKit.eval(wv, "String(document.getElementById('inline').naturalWidth)") == "1",
+                "img-src's data: source: an inline image still decodes under the shipped policy")
+        #expect(await CanaryKit.eval(wv, "String(document.querySelectorAll('.tm-quote-wrapper').length)") == "1",
+                "collapseQuotesJS (a WKUserScript) still transforms the DOM under the shipped policy")
+        #expect(await CanaryKit.eval(wv, "String(document.querySelectorAll('table').length)") == "1",
+                "the table layout survives")
+
+        // BRIDGE LIVENESS, end to end, WITHOUT trusting a JS-side self-report: a
+        // HeightSeedCache entry is only ever written from the NUMERIC branch of
+        // `Coordinator.handleHeightMessage`, so its presence proves the whole chain —
+        // user script → ResizeObserver → postMessage → WKScriptMessageHandler → applied
+        // height. This is the same fact the Swift-side liveness beacon reports in the
+        // log; asserting it here makes the P1b brief's HARD STOP machine-checked instead
+        // of eyeballed.
+        let seeded = await CanaryKit.waitUntil(10) {
+            (AutoSizingHTMLView.seededHeight(headerId: headerId) ?? 0) > 1
+        }
+        #expect(seeded, "the app's height bridge delivered a real measurement for this message")
+        print("[P1B] benign render seededHeight=\(String(describing: AutoSizingHTMLView.seededHeight(headerId: headerId)))")
     }
 }

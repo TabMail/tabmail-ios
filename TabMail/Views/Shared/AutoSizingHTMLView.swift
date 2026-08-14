@@ -296,7 +296,76 @@ private struct HTMLWebView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
-        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        // ── P1b render hardening (ADR-IOS-076 decision 1; PLAN_EMAIL_RENDER_SECURITY.md §11) ──
+        // The message document is FULLY attacker-controlled input: anyone who can mail the user
+        // authors it, there is no origin authentication, and there is no user gesture between
+        // arrival and render. What remains of P1b's WebKit-boundary half is exactly ONE setting —
+        // `allowsContentJavaScript = false` (T1, immediately below). The other half is the CSP in
+        // `EmailHTMLWrapper.contentSecurityPolicy`.
+        // ⚠️ THREE of the settings P1b introduced here were REVERSED on 2026-08-12 by explicit
+        // owner directive — *"no behaviour changes, just security"* — and each was returned to the
+        // state `v1.7.8` shipped, which for two of them means UNSET rather than assigned:
+        //   • `dataDetectorTypes` — set below, back to `[.link, .phoneNumber]`; own comment there.
+        //   • `websiteDataStore` — now UNSET; T5 is OPEN. Read the comment where it used to be.
+        //   • `allowsLinkPreview` — now UNSET (WebKit default ON); read the web-view comment below.
+        // Do not re-introduce any of the three without asking the owner first.
+        // ⚠️ "THREE" is scoped to the settings in THIS file. There is a FOURTH owner reversal under
+        // the same directive, in the OTHER half of P1b: `font-src 'none'` → `font-src https:` inside
+        // `EmailHTMLWrapper.contentSecurityPolicy` (font leg of T9 open, `IOS-PRIVACY-002`). So the
+        // reversal count is four and the reverted-settings count is three; do not restate one as
+        // the other.
+
+        // T1 (ROOT). Sender-authored `<script>`, inline event-handler attributes and `javascript:`
+        // URLs stop executing. App-injected `WKUserScript`s and `evaluateJavaScript` are UNAFFECTED
+        // — WebKit evaluates injected source directly, outside the document's script gate — which
+        // is load-bearing here because every single thing this view does (height reporting, reveal,
+        // dark mode, quote/ICS collapse, deferred images, width fixes) is a user script. Measured,
+        // not assumed: `EmailRenderSecurityCanaryTests` runs the real configuration.
+        config.defaultWebpagePreferences.allowsContentJavaScript = false
+
+        // T5 — OPEN, BY OWNER DECISION (2026-08-12), and stated plainly rather than buried.
+        // `websiteDataStore` is deliberately NOT set here, so this web view gets
+        // `WKWebsiteDataStore.default()`: ONE process-wide PERSISTENT cookie / localStorage /
+        // cache jar shared by every message and every sender, surviving app launches. That is a
+        // stable cross-sender correlation channel usable by remote subresources ALONE — no sender
+        // script required, so `allowsContentJavaScript = false` does not touch it. P1b closed it
+        // with a per-view `.nonPersistent()` store; the owner reversed that under *"no behaviour
+        // changes, just security"*, AGAINST the implementing side's recommendation to keep the
+        // ephemeral store. Registered as `IOS-PRIVACY-001`.
+        // ⚠️ Consequences for anyone reading or editing this file:
+        //   • Do NOT describe this render path as "isolated" or "sandboxed from other messages".
+        //     It shares state with every other render and with any other WKWebView in the app that
+        //     also uses the default store.
+        //   • Do NOT re-add a store here — neither `.nonPersistent()` per view nor a single shared
+        //     ephemeral singleton as a compromise — without asking the owner. Both were considered
+        //     and the shipped persistent store was chosen over both.
+        // Pinned positively by `EmailRenderSecurityCanaryTests.productionConfiguration`, which
+        // asserts BOTH that the store is persistent and that two render views share one instance.
+
+        // Data Detectors: RESTORED to `[.link, .phoneNumber]` on 2026-08-12 by explicit owner
+        // directive, reversing P1b's `[]`. TabMail is a PHONE mail client: tap-to-call on a
+        // plain-text number in a signature and a tappable bare URL are core affordances, and the
+        // owner overruled both the removal and the narrower `[.phoneNumber]`-only compromise that
+        // was recommended in its place. Do not re-remove either half without asking the owner.
+        //
+        // ⚠️ THE SECURITY FACT IS UNCHANGED AND STILL TRUE — §9.1 B2 (verified): Data Detectors
+        // sit OUTSIDE the navigation delegate. WebKit's anchor-activation path can present
+        // detector UI BEFORE `changeLocation`, so a detected target may never reach
+        // `decidePolicyFor` at all. Therefore *"every externally dispatched target passes our
+        // `http`/`https` allowlist"* is FALSE while detectors are enabled, and it is false in a
+        // way NO delegate-side test can observe. That absolute must never be restated — here, in
+        // a test, in an ADR, or in a commit body — without this exception (`MIS-019` shape).
+        // This is a KNOWN, ACCEPTED exception: the affordance was chosen over an unqualified
+        // absolute, registered as `IOS-UI-002` in `KNOWN_ISSUES.md`.
+        // ⚠️ AND IT IS NO LONGER THE ONLY ONE. Since 2026-08-12 `allowsLinkPreview` is unset too
+        // (see the web-view comment below), so long-press preview is a SECOND non-delegate fetch
+        // route and a second exception to the same absolute — `IOS-UI-003`. Qualify every
+        // restatement with BOTH.
+        //
+        // Scope of the exception, so it is not overstated: authored `<a href>` links are
+        // UNAFFECTED by `dataDetectorTypes` — they are `WKNavigationAction`s and still reach
+        // `decidePolicyFor`, where `mailto:` interception and P1c's allowlist live. Detectors
+        // govern only PLAIN-TEXT phone numbers and BARE URLs.
         config.dataDetectorTypes = [.link, .phoneNumber]
         // Register the BodyAssetStore scheme handler when this WebView is rendering
         // a real (persisted) message body. The handler serves bytes from the App
@@ -384,6 +453,21 @@ private struct HTMLWebView: UIViewRepresentable {
         config.userContentController.add(context.coordinator, name: "gutterAdjust")
 
         let webView = WKWebView(frame: .zero, configuration: config)
+        // `allowsLinkPreview` is deliberately UNSET, so WebKit's default (ON) applies — the
+        // `v1.7.8` shipped behaviour, RESTORED 2026-08-12 by explicit owner directive after P1b
+        // set it to `false`. Long-press on a link previews its destination.
+        //
+        // ⚠️ THE SECURITY FACT IS UNCHANGED AND STILL TRUE: link preview FETCHES and PRESENTS the
+        // remote URL without any `decidePolicyFor` decision we ever see. It is therefore a SECOND
+        // route out of this view that P1c's `http`/`https` allowlist does not govern — data
+        // detectors, set above, are the first. *"Every externally dispatched target passes our
+        // `http`/`https` allowlist"* is FALSE for TWO independent reasons now, and it is false in
+        // a way NO delegate-side test can observe in either case. That absolute must never be
+        // restated — here, in a test, in an ADR, or in a commit body — without BOTH exceptions
+        // (`MIS-019` shape). The sound form remains *"every `.linkActivated` target passes the
+        // allowlist"*.
+        // This is a KNOWN, ACCEPTED exception registered as `IOS-UI-003`; do not re-disable link
+        // preview without asking the owner.
         webView.isOpaque = false
         webView.backgroundColor = .clear
         // Lock the inner scroll view at 1:1 zoom. The webview is sized to its
@@ -527,6 +611,34 @@ private struct HTMLWebView: UIViewRepresentable {
         /// `loadHTMLString` if a newer load superseded it — so a slow wrap of an
         /// OLD body can't clobber a newer one when the card is rebound mid-wrap.
         var loadGeneration: Int = 0
+        /// `loadGeneration` of the most recent `WKScriptMessage` this coordinator
+        /// received on any of the three bridge channels (`heightChanged`,
+        /// `consoleLog`, `gutterAdjust`) — i.e. the last load for which app
+        /// JavaScript provably executed and provably reached Swift.
+        ///
+        /// **Why this exists at all (P1b, owner requirement 2026-08-12).** Every
+        /// render behaviour in this file is a `WKUserScript`, and so is every
+        /// JS-side diagnostic. If WebKit ever stopped executing app-injected
+        /// script — the exact hazard `allowsContentJavaScript = false` and
+        /// `script-src 'none'` raise — the render would break AND the
+        /// instrumentation that would report it would go silent in the same
+        /// instant. The owner would see a blank or mangled message and an empty
+        /// log, which is the least diagnosable possible outcome, because SILENCE
+        /// IS CURRENTLY INDISTINGUISHABLE FROM SUCCESS.
+        ///
+        /// So this one signal deliberately does **not** depend on page JavaScript:
+        /// it is written from the Swift side of the bridge, and
+        /// `scheduleBridgeLivenessCheck()` says out loud when nothing arrived.
+        /// The *recording* is ungated (a single assignment, no I/O, so it is
+        /// correct in release too); only the *reporting* is debug-gated, per
+        /// development rule 12.
+        var lastBridgeMessageGeneration: Int?
+        /// Grace period between `didFinish` and the bridge-liveness verdict.
+        /// `monitorHeightJS`'s ResizeObserver and the double-`rAF` reveal both
+        /// post well inside this window on a normal render; it is long enough
+        /// that a slow first layout does not produce a false SILENT verdict, and
+        /// short enough that the line lands next to the load it describes.
+        private static let bridgeLivenessGraceSeconds: TimeInterval = 3.0
         private nonisolated(unsafe) var foregroundObserver: NSObjectProtocol?
         private nonisolated(unsafe) var scrollFreezeObserver: NSObjectProtocol?
         /// Per-Coordinator (i.e. per-WebView lifetime) random id. Stamped into
@@ -610,6 +722,8 @@ private struct HTMLWebView: UIViewRepresentable {
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             self.webView = webView
             lastMeasuredWidth = webView.bounds.width
+            // Owner requirement (P1b): say out loud whether app JavaScript ran.
+            scheduleBridgeLivenessCheck(generation: loadGeneration)
             // Wire up scrollView.contentSize KVO for diagnosis only (NOT for
             // driving the SwiftUI height — that path stays JS-push-driven via
             // ResizeObserver, since KVO would feed back into frame.height and
@@ -724,7 +838,67 @@ private struct HTMLWebView: UIViewRepresentable {
                     print("[HTMLDebug] HTMLWebView.wrapAndLoad: wrapped len=\(wrapped.count)")
                     print("[Load id=\(self.webViewId)] bytes=\(wrapped.count) fp=\(fp) hasHeader=\(hasHeader)")
                 }
+                self.logRenderSecurityPosture(webView: webView, generation: gen, schemeHandlerRegistered: hasHeader)
                 webView.loadHTMLString(wrapped, baseURL: base)
+            }
+        }
+
+        /// Report the render-security posture that is actually in force for this
+        /// load — once per load, immediately before `loadHTMLString`.
+        ///
+        /// Both halves are read back from the objects that will serve the load
+        /// rather than restated from the code that set them, which is the only
+        /// version worth logging: a configuration line that echoes the literals
+        /// in `makeUIView` would keep printing `false` after a future edit
+        /// silently stopped applying them, and a CSP line assembled in the log
+        /// statement would keep printing the intended policy after the wrapper
+        /// began emitting a different one. `EmailHTMLWrapper.contentSecurityPolicy`
+        /// is the *same stored constant the meta tag interpolates*, so it cannot
+        /// drift from the document; the WebKit values come off `webView` and its
+        /// live `configuration`.
+        ///
+        /// Debug-gated per development rule 12 — a no-op in production.
+        private func logRenderSecurityPosture(webView: WKWebView, generation: Int, schemeHandlerRegistered: Bool) {
+            guard DebugModeManager.isLoggingEnabled() else { return }
+            let cfg = webView.configuration
+            print("[RenderSec id=\(webViewId) gen=\(generation)] "
+                  + "contentJS=\(cfg.defaultWebpagePreferences.allowsContentJavaScript) "
+                  + "persistentStore=\(cfg.websiteDataStore.isPersistent) "
+                  + "dataDetectors=\(cfg.dataDetectorTypes.rawValue) "
+                  + "linkPreview=\(webView.allowsLinkPreview) "
+                  + "assetSchemeHandler=\(schemeHandlerRegistered)")
+            // The policy is app-authored and fixed at build time — no sender
+            // content reaches it — so it needs no escaping, and printing it whole
+            // is the point: a truncated CSP cannot be compared against the
+            // `securitypolicyviolation` reports in the same log.
+            print("[RenderSec id=\(webViewId) gen=\(generation)] csp=\(EmailHTMLWrapper.contentSecurityPolicy)")
+        }
+
+        /// Schedule the bridge-liveness verdict for `generation`, a short grace
+        /// period after that load's navigation finished.
+        ///
+        /// This is the one diagnostic in this file that survives a total loss of
+        /// page JavaScript, and it exists because every other one does not: if
+        /// `allowsContentJavaScript = false` or `script-src 'none'` ever did
+        /// suppress our own `WKUserScript`s, the render would break and the logs
+        /// would go quiet in the same instant, which reads exactly like a quiet
+        /// success. The verdict below turns that silence into a sentence.
+        ///
+        /// Fires per finished navigation; the generation check makes it a no-op
+        /// for a superseded load, so a rapid rebind logs one verdict, not two.
+        /// Debug-gated per development rule 12.
+        private func scheduleBridgeLivenessCheck(generation: Int) {
+            guard DebugModeManager.isLoggingEnabled() else { return }
+            let id = webViewId
+            DispatchQueue.main.asyncAfter(deadline: .now() + Coordinator.bridgeLivenessGraceSeconds) { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, self.loadGeneration == generation else { return }
+                    if self.lastBridgeMessageGeneration == generation {
+                        print("[RenderSec id=\(id) gen=\(generation)] bridge=LIVE (app user scripts executed and reached Swift)")
+                    } else {
+                        print("[RenderSec id=\(id) gen=\(generation)] bridge=SILENT — no bridge message received for this load; user scripts may not be executing")
+                    }
+                }
             }
         }
 
@@ -764,6 +938,20 @@ private struct HTMLWebView: UIViewRepresentable {
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            // Bridge-liveness beacon (see `lastBridgeMessageGeneration`). Recorded
+            // for EVERY channel and BEFORE any dispatch, because the question this
+            // answers is "did app JavaScript run at all", not "did the height
+            // arrive" — a script that ran and then threw still proves the gate is
+            // open. Ungated on purpose: one integer store, no I/O; only the
+            // verdict in `scheduleBridgeLivenessCheck` prints, and that is gated.
+            //
+            // Sound as an APP-script signal only because `allowsContentJavaScript`
+            // is false: before P1b, sender script shared this `window` and could
+            // post to `consoleLog` itself, which would have let a message forge a
+            // LIVE verdict for a load where none of our scripts ran. Re-enabling
+            // author JS re-opens that, and this beacon would have to move to a
+            // channel author script cannot reach (a separate `WKContentWorld`).
+            lastBridgeMessageGeneration = loadGeneration
             if message.name == "heightChanged" {
                 handleHeightMessage(message.body)
             } else if message.name == "gutterAdjust", let d = message.body as? [String: Any] {
