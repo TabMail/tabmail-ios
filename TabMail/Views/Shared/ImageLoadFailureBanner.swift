@@ -30,8 +30,10 @@ import SwiftUI
 /// reload of the SAME content. Scoping the banner to reloads rather than to
 /// content would re-raise a notice the user had dismissed on the message they
 /// are still looking at, every time the appearance changed. Also excluded:
-/// `previewFilename`, which does not itself trigger a reload — see the
-/// `.eml`-sheet note in `deferredImageLoadJS`'s doc comment.
+/// `previewFilename`. `HTMLWebView.updateUIView` can reload when that value
+/// changes, but production preview selection presents a fresh UUID-keyed sheet
+/// and therefore a fresh enclosing state; there is no in-place selector whose
+/// state survives. See the `.eml`-sheet note in `deferredImageLoadJS`.
 struct RenderedDocumentIdentity: Equatable {
     let html: String
     let reloadToken: Int
@@ -93,14 +95,32 @@ struct ImageFailureBannerState: Equatable {
     /// document's single census slot.
     enum Census: Equatable {
         /// The device had no network, so the census says nothing about the sender's
-        /// server. Nothing is published, **and the document's one-shot is left
-        /// UNSPENT** so a later, honest census for the same document can still use it.
+        /// server. Nothing is published, and the document's Swift one-shot is left
+        /// unspent. The page has already spent its own one-shot, so this is a fail-safe
+        /// property rather than a same-document retry path.
         case suppressedOffline
         /// `CommittedDocumentGate` refused: no document is committed, or this document
         /// has already published a census.
         case refused(OneShotRefusal)
         /// Publish this count. The document's one-shot is now spent.
         case publish(Int)
+    }
+
+    /// The binding update produced by a census. `nil` means the census was
+    /// refused and therefore has no authority to change the current banner.
+    ///
+    /// Kept beside `census` so offline suppression cannot drift into a log-only
+    /// branch in the coordinator while a banner from an earlier rendering of the
+    /// same content remains visible.
+    static func replacementFailedCount(after census: Census) -> Int? {
+        switch census {
+        case .suppressedOffline:
+            return 0
+        case .refused:
+            return nil
+        case .publish(let count):
+            return count
+        }
     }
 
     /// Resolve a census of `reported` failures against the device's connectivity and
@@ -126,8 +146,9 @@ struct ImageFailureBannerState: Equatable {
     /// `RenderOneShot.imageFailureReport` BEFORE reading `NetworkMonitor.checkConnected()`,
     /// so a path flip to unsatisfied in that instant burned the document's only census
     /// slot on a report that published nothing — permanently, because the page's own
-    /// `__tmImageFailureReported` also stops it re-posting, leaving re-opening the
-    /// message as the only recovery. `Coordinator` is nested in a `private struct` and
+    /// `__tmImageFailureReported` also stops it re-posting. Leaving the Swift slot
+    /// unspent is defense-in-depth if delivery is ever retried or that page-side policy
+    /// changes; it is not a recovery path in today's document. `Coordinator` is nested in a `private struct` and
     /// unreachable from a test (see the header of `RenderNavigationPolicy.swift`), so an
     /// order expressed as a statement sequence there is one nothing can assert; this is
     /// one that can be.

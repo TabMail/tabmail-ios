@@ -13,7 +13,9 @@ import SwiftUI
 // THE INVARIANT THESE PIN: *given a banner state and the identities of the document
 // it describes and the document now on screen, the banner is visible iff at least one
 // remote image of the CURRENT document ended in `error` and the user has not dismissed
-// it — and every input that selects which content is rendered discards both halves.*
+// it — and every input that can change rendered content while this enclosing state
+// survives discards both halves.* Preview attachment selection is a fresh UUID-keyed
+// sheet/remount, so `previewFilename` is deliberately outside this value-level identity.
 //
 // ⚠️ The scope sentence above is narrower than the one this header carried until
 // 2026-08-13 ("nothing about it survives a document change"), and the difference is
@@ -122,8 +124,8 @@ struct ImageFailureBannerStateTests {
     /// predecessor of these tests managed to assert nothing.
     private static let accusingAndDismissed = ImageFailureBannerState(failedCount: 4, dismissed: true)
 
-    @Test("Every input that selects the CONTENT is part of the document's identity")
-    func everyContentInputParticipatesInTheIdentity() {
+    @Test("Every content selector whose enclosing state survives is part of the document identity")
+    func everySurvivingContentInputParticipatesInTheIdentity() {
         // Membership asserted directly, one field at a time, because the wiring
         // reads this type's `==` and nothing else. Dropping a field here is exactly
         // the shape of the defect being fixed: the reset then does not fire for a
@@ -269,23 +271,43 @@ struct ImageFailureBannerStateTests {
             reported: 0, isConnected: false, in: &emptyOffline) == .suppressedOffline)
     }
 
-    @Test("Suppressing a census for offline does not consume the document's one-shot")
-    func anOfflineCensusDoesNotSpendTheOneShot() {
-        // THE INVARIANT. A census suppressed for offline published nothing, so it
-        // must leave the document able to publish an honest one later. Spending the
-        // slot on a report that said nothing is unrecoverable in practice: the page's
-        // own `__tmImageFailureReported` also stops it re-posting, so the only way
-        // back is re-opening the message.
+    @Test("An offline census clears a visible result from an earlier rendering of the same content")
+    func anOfflineReloadClearsAStaleVisibleBanner() {
+        // Reachable production precondition: a connected rendering published a
+        // failure, then a colour-scheme flip or content-process recovery reloads
+        // the SAME content while the device is offline. Document identity carries
+        // the state across that reload, so suppression must actively retract the
+        // old count rather than merely decline to publish a new one.
+        let stale = ImageFailureBannerState(failedCount: 4, dismissed: false)
+        #expect(stale.isVisible, "the fixture must start with an observable stale accusation")
+
+        let replacement = ImageFailureBannerState.replacementFailedCount(after: .suppressedOffline)
+        #expect(replacement == 0,
+                "offline suppression must retract the earlier result for this still-visible content")
+
+        // Negative controls: a connected publication replaces the count, while a
+        // gate refusal has no authority to erase a valid result.
+        #expect(ImageFailureBannerState.replacementFailedCount(after: .publish(2)) == 2)
+        #expect(ImageFailureBannerState.replacementFailedCount(after: .refused(.duplicate)) == nil)
+    }
+
+    @Test("Offline suppression leaves the Swift one-shot unspent as a fail-safe")
+    func offlineSuppressionLeavesTheSwiftOneShotUnspentAsAFailSafe() {
+        // The page sets `__tmImageFailureReported` before its sole post, so this
+        // same-document second call is NOT a production recovery route. The Swift
+        // gate still should not manufacture a spent slot for a report it refused to
+        // publish: that keeps the authority honest if delivery is ever retried or the
+        // page-side one-shot changes later.
         var gate = committedGate()
 
         #expect(ImageFailureBannerState.census(
             reported: 4, isConnected: false, in: &gate) == .suppressedOffline)
 
-        // Same document, network back. This is the assertion that fails when the
-        // one-shot is spent before connectivity is read.
+        // Directly probe the Swift authority after connectivity returns. This is a
+        // fail-safe property of the gate, not a claim that today's page posts twice.
         #expect(ImageFailureBannerState.census(
             reported: 4, isConnected: true, in: &gate) == .publish(4),
-                "the offline census must not have burned the slot the honest one needs")
+                "a suppressed report must not create an authoritative publication record")
 
         // Non-vacuity, both sides. The slot IS a one-shot — otherwise the assertion
         // above would hold against a gate that never refuses anything...

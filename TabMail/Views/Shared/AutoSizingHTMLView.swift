@@ -1594,13 +1594,16 @@ private struct HTMLWebView: UIViewRepresentable {
                 // reason `requestFit` and `requestWidthRefit` are:
                 // `__tmImageFailureReported` lives in the isolated world and is only
                 // advisory, so the authoritative guard is here. A second report for
-                // the same document cannot re-raise a banner the user dismissed —
-                // and a report from the document being REPLACED is attributed to the
-                // document it came from, never to the one about to arrive.
+                // the same document cannot re-raise a banner the user dismissed.
+                // The committed-generation gate attributes an outgoing document's
+                // late report to that document, but the SwiftUI binding has no identity
+                // token of its own; the unverified remount/rebound timing residual is
+                // registered as IOS-UI-006 rather than denied here.
                 let connected = NetworkMonitor.checkConnected()
-                switch ImageFailureBannerState.census(reported: report.failed,
-                                                      isConnected: connected,
-                                                      in: &documentGate) {
+                let census = ImageFailureBannerState.census(reported: report.failed,
+                                                            isConnected: connected,
+                                                            in: &documentGate)
+                switch census {
                 case .suppressedOffline:
                     bridgeLog("imageLoadFailure failed=\(report.failed) deferred=\(report.deferred) "
                               + "connected=false suppressed=offline one-shot=unspent")
@@ -1610,7 +1613,10 @@ private struct HTMLWebView: UIViewRepresentable {
                 case .publish(let published):
                     bridgeLog("imageLoadFailure failed=\(report.failed) deferred=\(report.deferred) "
                               + "connected=true published=\(published)")
-                    if failedImageCount != published { failedImageCount = published }
+                }
+                if let replacement = ImageFailureBannerState.replacementFailedCount(after: census),
+                   failedImageCount != replacement {
+                    failedImageCount = replacement
                 }
             }
         }
@@ -3173,9 +3179,12 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
         //
         // ⚠️ SCOPE OF THAT CHANGE, stated because it was described only as WHAT
         // is withheld: it also moves WHEN the P4 failure census is SUPPRESSED. A
-        // withheld image keeps `data-tmsrc`, so `postImageWidthRecheckJS` arms it
-        // and it reaches no terminal state, so `armedPending()` never falls to 0
-        // — that IS the `IOS-UI-004` dead zone. Narrowing this arm narrows the
+        // A withheld image whose live candidates cannot settle keeps its deferral
+        // attribute, is armed, and reaches no terminal state, so `armedPending()`
+        // never falls to 0 — that is the `IOS-UI-004` dead zone. A mixed live
+        // `cid:` src plus deferred remote `srcset` can settle from the live src;
+        // that accepted first-terminal exception is also recorded in IOS-UI-004.
+        // Narrowing this arm narrows the
         // dead zone in MAIN VIEW: a sender-authored `.tm-eml-headers` image used
         // to suppress the census for the whole message and now settles like any
         // other. Toward the honest census, and no image's outcome is invented —
@@ -4283,25 +4292,29 @@ private var fixImageAspectRatioJS: String {
 /// `data-tmsrc`/`data-tmsrcset`, so that attribute IS the "remote" predicate. It
 /// is captured per-image at ARM time, because `deferredImageLoadJS`'s `swap()`
 /// removes the attribute before it assigns `src`, so by the time an `error` fires
-/// the image no longer carries it. A failing `cid:` or local image therefore
-/// drives the settle (it is armed on `!complete`) but never inflates the count —
-/// the copy blames a remote server and must not be shown for a local failure.
+/// the image no longer carries it. A purely local image with no deferral attribute
+/// therefore drives the settle (it is armed on `!complete`) but never inflates the
+/// count. A mixed live `cid:` src plus deferred remote `srcset` is remote at arm
+/// time and uses the accepted first-terminal rule: a cid error that wins that race
+/// can count. IOS-UI-004 records the trade-off; do not restate the pure-local claim
+/// as applying to that mixed shape.
 ///
 /// **Accepted imprecision, stated so nobody strengthens the copy.** `onerror`
 /// fires for far more than an ATS/TLS refusal: 404s, DNS failures, malformed image
 /// bytes, and a plain offline device all land here identically, and WebKit hands
 /// the page no distinguishing reason. The banner text is hedged accordingly.
 ///
-/// **Accepted gap: the CENSUS settle point is unreachable for a withheld image.**
+/// **Accepted gap: the CENSUS settle point is unreachable for a withheld armed
+/// image that receives no other terminal event.**
 /// T8's `hiddenByViewMode` (`deferredImageLoadJS`) deliberately leaves
 /// `data-tmsrc`/`data-tmsrcset` in place on images inside a hidden `.eml` section.
 /// Such an image IS armed — the arm loop skips only images that are `complete` AND
-/// carry no deferral attribute — and it fires neither `load` nor `error`, so its
-/// terminal mark stays null and the census arm's `armedPending()` never reaches 0
-/// on a message that carries an attached `.eml`, nor in the preview sheet (where
-/// every non-selected section stays withheld). No report is posted there and no
-/// banner appears. That is FAIL-CLOSED — a missing banner, never a false one — and
-/// it is `IOS-UI-004`.
+/// carry no deferral attribute. For the ordinary remote-only withheld shape it fires
+/// neither `load` nor `error`, so its terminal mark stays null and the census arm's
+/// `armedPending()` never reaches 0. This suppresses the report only when a document
+/// actually contains at least one such non-settling image; merely carrying an `.eml`
+/// attachment is not sufficient. A mixed live-src/deferred-srcset image may settle.
+/// The remaining gap is FAIL-CLOSED and registered as `IOS-UI-004`.
 ///
 /// ⚠️ **The reason recorded here for NOT closing it was wrong, and it pointed the
 /// next reader the wrong way.** It used to argue that closing the gap "would mean
@@ -4495,16 +4508,17 @@ private var postImageWidthRecheckJS: String {
             //
             // ⚠️ This is deliberately NOT `check()`'s question, and the
             // difference is the whole point. The census must not report while an
-            // armed image has reached no terminal state — a withheld image
-            // neither loaded nor errored, so counting it as settled would publish
-            // an incomplete census. The width pipeline has the opposite need (see
+            // armed image has reached no terminal state — an ordinary remote-only
+            // withheld image neither loaded nor errored, so counting it as settled
+            // would publish an incomplete census. A mixed live `cid:` src can settle
+            // despite its deferred `srcset`; IOS-UI-004 records that exception.
+            // The width pipeline has the opposite need (see
             // pendingImgs()), so the two questions are answered separately rather
-            // than by one shared call. IOS-UI-004 — the banner being unreachable
-            // on a message with an attached `.eml` — is preserved BY this arm,
-            // not in spite of it: a withheld image IS armed (it still carries
-            // data-tmsrc, so the loop below does not skip it) and reaches no
-            // terminal state, so `armedPending()` never falls to 0. Closing that
-            // gap remains a separate decision about P4's behaviour.
+            // than by one shared call. IOS-UI-004 is preserved BY this arm, not in
+            // spite of it: a withheld armed image with no terminal event keeps
+            // `armedPending()` above zero. The condition is the non-settling image,
+            // not the mere presence of an attached `.eml`. Closing that gap remains
+            // a separate decision about P4's behaviour.
             //
             // ⚠️ This arm asked `pendingImgs(false)` until 2026-08-13. The
             // replacement is strictly MORE conservative about the population it
