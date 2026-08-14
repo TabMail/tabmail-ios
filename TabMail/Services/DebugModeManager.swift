@@ -126,6 +126,50 @@ final class DebugModeManager {
         loggingAllowedCache.withLock { $0 = nil }
     }
 
+    /// Neutralises line terminators — and every other control character — in a
+    /// value that is about to be interpolated into a diagnostic log line.
+    ///
+    /// `print` is a LINE-oriented sink: one call becomes one line in the device
+    /// log. So a sender-authored value carrying a raw CR/LF does not corrupt one
+    /// line, it FORGES a second, entirely plausible one. A MIME `filename` of
+    /// `"invoice.pdf\n[Attachment] QuickLook presenting payroll.pdf from …"` reads
+    /// back as two ordinary diagnostics, and the reader has no way to tell which
+    /// of them the app actually emitted. Attachment filenames, `Content-Type`
+    /// parameters and error descriptions carrying a server-supplied path are all
+    /// sender-authored, and all of them reach `print` interpolations.
+    ///
+    /// Escaped rather than stripped, so the line still shows what the sender
+    /// actually sent. The escaped set is the C0 range, `DEL` + the C1 range, and
+    /// U+2028/U+2029 — deliberately the same class `imageLoadDiagnosticJS`'s
+    /// `sanitize` closes on the webview's `postMessage` channel, which this
+    /// channel is NOT covered by. U+0085 (NEL) needs no separate case: it is
+    /// inside the C1 range.
+    ///
+    /// ⚠️ This is NOT a reversible encoding and NOT injective. A backslash in the
+    /// input is passed through unchanged, so a sender who writes the six literal
+    /// characters backslash-u-0-0-0-a renders identically to one who writes a real
+    /// newline. That ambiguity is deliberate — it is exactly what the JS choke point does,
+    /// and matching it keeps one rule rather than two — and it is not the property
+    /// being bought here. The invariant is that no sender-controlled value can
+    /// introduce a LINE BREAK into a diagnostic line, which an ambiguous but
+    /// break-free rendering satisfies. A future consumer that PARSES these lines
+    /// rather than reading them needs a real encoding; this is not one.
+    ///
+    /// Pinned by `DiagnosticLogLineForgeryTests`.
+    static nonisolated func escapedForLogLine(_ value: String) -> String {
+        var escaped = String()
+        escaped.reserveCapacity(value.unicodeScalars.count)
+        for scalar in value.unicodeScalars {
+            let code = scalar.value
+            if code < 0x20 || (code >= 0x7F && code <= 0x9F) || code == 0x2028 || code == 0x2029 {
+                escaped += String(format: "\\u%04x", code)
+            } else {
+                escaped.unicodeScalars.append(scalar)
+            }
+        }
+        return escaped
+    }
+
     /// Call on each version label tap. Returns true when debug mode is freshly unlocked.
     @discardableResult
     func registerTap() -> Bool {

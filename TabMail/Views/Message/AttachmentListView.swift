@@ -237,14 +237,14 @@ struct AttachmentListView: View {
                     identityStamp: identityStamp),
                    let storedURL = BodyAssetStore.urlOnDisk(assetId: assetId) {
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[Attachment] Cache HIT for \(attachment.filename) — skipping network")
+                        print("[Attachment] Cache HIT for \(DebugModeManager.escapedForLogLine(attachment.filename)) — skipping network")
                     }
                     BodyAssetStore.bumpMessageAccess(contentKey: ContentKey(rawValue: message.id))
                     data = try Data(contentsOf: storedURL)
                 } else {
                     data = try await manager.fetchAttachment(for: message, section: attachment.section, encoding: attachment.encoding)
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[Attachment] Downloaded \(data.count) bytes for \(attachment.filename)")
+                        print("[Attachment] Downloaded \(data.count) bytes for \(DebugModeManager.escapedForLogLine(attachment.filename))")
                     }
                     // Cache to BodyAssetStore — best-effort, and only for a message whose
                     // identity we can prove. An unstamped row would be unreadable by
@@ -281,7 +281,13 @@ struct AttachmentListView: View {
                     return
                 }
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[Attachment] Staged at \(fileURL.path), QuickLook presented")
+                    // The last component is the sender's filename VERBATIM — it
+                    // reached here only by satisfying
+                    // `AttachmentFilename.isSafeFileComponent`, which refuses
+                    // separators and the C0/C1 controls, so no line break can
+                    // reach this line-oriented sink through the path. The escape
+                    // stays because the rest of the path is not that guarded.
+                    print("[Attachment] Staged at \(DebugModeManager.escapedForLogLine(fileURL.path)), QuickLook presented")
                 }
                 downloadedFiles[attachment.section] = fileURL
                 presented = true
