@@ -256,14 +256,10 @@ enum ICSCalendarImporter {
     /// reported at its FOLD WIDTH rather than its length, silently and with no sign
     /// that anything had been cut.
     ///
-    /// That is not a hypothetical: a device log read one event's `UID` as `(len 71)`
-    /// raw and `(len 70)` sanitized, which reads exactly like the sanitizer corrupting
-    /// iTIP identity. It is not. `ICSSanitizerConfig.physicalLineOctetLimit` is 75 and
-    /// `foldWidthOctets` is 74, so 75 - `"UID:".count` = 71 is the SENDER's fold width
-    /// and 74 - `"UID:".count` = 70 is ours. Both numbers were fold widths; the UID's
-    /// true length was never measured and never changed — the byte counts were
-    /// identical on both lines. The instrument manufactured a false corruption signal
-    /// in the one place it exists to rule one out.
+    /// Synthetic boundary fixtures reproduce the failure: values folded at the sender
+    /// and app widths report those physical widths instead of the same logical length.
+    /// The instrument manufactured a false corruption signal in the one place it exists
+    /// to rule one out.
     ///
     /// Internal rather than private so the unfold invariant is testable; the only
     /// production caller is still the debug-gated pair in `presentCalendarImport`.

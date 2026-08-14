@@ -78,8 +78,8 @@ changes, revisit the default.
 ## Relationship to the rest of the remote-image posture
 
 This does **not** make the render path "tracking-free" and must not be described that way.
-`img-src https:` is open by owner decision, and `IOS-PRIVACY-002` records the same capture showing
-20+ tracking-pixel requests leaving the device for the message the user *did* open. What changed is
+`img-src https:` is open by owner decision, and `IOS-PRIVACY-002` records that image subresource
+requests still leave for the message the user *did* open. What changed is
 narrower and exactly stateable: **the user no longer fetches remote content on behalf of a message
 they never opened.** CSS `background-image` URLs are untouched — the deferral rewrite only ever
 rewrote `<img src/srcset>` — and remain the open remainder of T9.

@@ -199,10 +199,8 @@ struct ICSCalendarImporterFingerprintTests {
 
     @Test("itipFingerprint reports a folded UID's TRUE length, not the fold width")
     func fingerprintUnfoldsBeforeMeasuringLength() {
-        // Reproduces the device-log shape that made a byte-for-byte no-op sanitize look
-        // like iTIP corruption: ONE uid, folded by the sender at 75 octets and re-folded
-        // by us at 74, reported as `(len 71)` and `(len 70)`. Both were fold widths minus
-        // `"UID:".count`; the uid itself never changed.
+        // Synthetic boundary control: one UID folded at 75 octets and re-folded at 74.
+        // Both physical widths must still produce the same logical length.
         let uid = String(repeating: "u", count: 120)
 
         // Non-vacuity: if the fixture were not actually folded, both halves below would
@@ -219,8 +217,8 @@ struct ICSCalendarImporterFingerprintTests {
                 "pre-fix this read (len 71) — 75 minus \"UID:\", the SENDER's fold width")
         #expect(atOurWidth.contains("(len 120)"),
                 "pre-fix this read (len 70) — 74 minus \"UID:\", OUR fold width")
-        // Said the other way round too, naming the exact two numbers the device log
-        // produced: neither fold width may ever be reported as a length.
+        // Said the other way round too: neither synthetic fold width may ever be
+        // reported as the logical value length.
         #expect(!atSenderWidth.contains("(len 71)"))
         #expect(!atOurWidth.contains("(len 70)"))
     }

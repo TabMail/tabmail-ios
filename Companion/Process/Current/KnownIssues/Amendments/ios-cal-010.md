@@ -45,8 +45,7 @@ mail.** Two wiring sites build the same `ICSBuilder`-backed closure, whose outpu
 `BodyRenderer.render` appends to the body as `<div class="tm-ics-collapsible">`:
 `IMAPFetchMapping.renderBody` (shared with the notification extension's IMAP client) and
 `BodyFetchProcessor.renderBody` (main app, provider-agnostic; both of its call sites supply an
-attachment fetcher). Verified live, not only by reading: the working first-time invite in the
-device log rendered a real invite card.
+attachment fetcher). Synthetic renderer tests exercise the inbound invite-card path.
 
 ⚠️ **But showing the responder's status is strictly larger than gating the tap, and this is what
 sizes the work.** `ICSBuilder.ParsedInvite.attendees` is typed `[(name: String, email: String)]`
@@ -65,8 +64,7 @@ already weighed and rejected.
 
 ## An open LEAD, deliberately not stated as a cause
 
-In the device log the invite card did not render **at all** for the `REPLY` message, so a
-`PARTSTAT`-bearing card would not by itself have shown the owner anything. What is established:
+Construction also exposes a provider-path lead independent of the tap gate. What is established:
 `parseIncoming` cannot have returned nil (it returns nil only when no `BEGIN:VEVENT` line exists,
 and the payload had one); `FullMessageInfo.icsData` is populated in exactly **two** places, **both
 IMAP**, and defaults to nil everywhere else; and the notification extension's non-IMAP clients
@@ -76,22 +74,18 @@ an `icsRenderer`, while those functions construct their ingredients with `icsDat
 false, and the body persists looking complete. `hasUnresolvedICS` has no consumer that would
 re-render such a body.
 
-**What was NOT established:** that this particular message's stored body came from the extension
-rather than a main-app fetch, and whether `MessageDetailViewModel.refetchBody` would have
-re-rendered it. The mechanism is therefore **reachable by construction but unconfirmed as this
-message's history** — recorded as a lead with its predicate, not as a cause (`MIS-032`). A related
-inference to re-derive rather than trust: the account was read as non-IMAP from folder-name casing
-in a single log line, not from a provider field.
+**What is NOT established:** how often a stored body reaches that path, or whether
+`MessageDetailViewModel.refetchBody` would re-render it. The mechanism is therefore reachable by
+construction but unconfirmed as a field cause — recorded as a lead with its predicate, not as a
+measured owner-message history (`MIS-032`).
 
 ## Instrument fix owed before any UID-comparing re-test — ✅ FIXED 2026-08-13
 
-`ICSCalendarImporter.itipFingerprint` splits on newlines without unfolding RFC 5545 line folding
-(§3.1), so it reports only a folded value's first physical line. One byte-identical payload in the
-device log logged its `UID` length as differing by one between raw and sanitized purely because
-the sanitizer re-folds one octet earlier — nothing was removed, and identical total sizes prove it.
-The instrument exists to compare a `UID` across two taps, so normalize CRLF and bare CR to LF, then
-remove LF+SPACE/LF+HTAB continuations before splitting, matching `ICSSanitizer.unfold`. Debug-gated,
-no import behaviour change.
+`ICSCalendarImporter.itipFingerprint` split on newlines without unfolding RFC 5545 line folding
+(§3.1), so it reported only a folded value's first physical line. A synthetic boundary fixture
+reproduces a one-unit apparent mismatch when equivalent payloads use different physical fold widths;
+nothing is removed. Normalize CRLF and bare CR to LF, then remove LF+SPACE/LF+HTAB continuations
+before splitting, matching `ICSSanitizer.unfold`. Debug-gated, no import behaviour change.
 
 ✅ **Done 2026-08-13, then completed for every accepted line ending in the correction round.** The
 first fix handled CRLF/LF continuations. Review found that bare-CR folds still disagreed with
@@ -99,15 +93,13 @@ first fix handled CRLF/LF continuations. Review found that bare-CR folds still d
 continuations, splitting, or trimming. **The ORDER remains the point:** the fold marker is leading
 SPACE/HTAB and must be consumed before per-line trim destroys it.
 
-The reported numbers were both **fold widths**, and that is worth keeping because it made a
-byte-for-byte no-op look like corruption: `ICSSanitizerConfig.physicalLineOctetLimit` is 75 and
-`foldWidthOctets` is 74, so the log's `(len 71)` is 75 − `"UID:".count` (the SENDER's fold width)
-and `(len 70)` is 74 − `"UID:".count` (ours). The `UID`'s true length was never measured on either
-line.
+The apparent values were both **fold widths**, not logical value lengths. The synthetic fixtures use
+different physical boundaries to make the byte-for-byte no-op look like corruption and assert the
+true unfolded logical length instead.
 
 Four tests in `ICSCalendarImporterFingerprintTests` pin the invariant *a folded value's parsed
 length equals its unfolded TRUE length*: one folds a 120-character `UID` at 75 and at 74 and
-requires 120 both times (red pre-fix at 71 and 70 respectively, the exact device-log pair); one
+requires 120 both times; one
 pins the same ordering defect on the COUNT axis, where a folded continuation beginning `ATTENDEE:`
 was trimmed into a second attendee (red pre-fix at `ATTENDEE=2`); one negative control asserts
 an unfolded payload is unperturbed; and one uses bare CR for both a 90-byte UID fold and a forged
@@ -115,13 +107,11 @@ ATTENDEE continuation (red at UID length 45 and `ATTENDEE=2`). `itipFingerprint`
 production caller is still the debug-gated pair in `presentCalendarImport`.
 
 ⚠️ **Build status of the instrumentation, corrected.** A draft of this record stated that the commit
-introducing `itipFingerprint` had never been compiled. **That was wrong, and wrong twice over:** the
-commit is an ancestor of a later commit whose full-suite build compiled `ICSCalendarImporter.swift`
-byte-identically (verified by an empty `git diff` between the two for that path), and the device log
-analysed here *contains `itipFingerprint`'s own output*, which is only possible if the code compiled
-and ran on the device. The claim survived several restatements because nobody re-checked it against
-evidence already in hand — `MIS-032` shape, and the reason it is recorded here rather than silently
-dropped.
+introducing `itipFingerprint` had never been compiled. That was wrong: the commit is an ancestor of
+a later commit whose full-suite build compiled `ICSCalendarImporter.swift` byte-identically
+(verified by an empty `git diff` between the two for that path). The claim survived several
+restatements because nobody re-checked it against evidence already in hand — `MIS-032` shape, and
+the reason it is recorded here rather than silently dropped.
 
 ## Related but separate — a code defect carried here so it is not lost
 

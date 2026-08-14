@@ -82,9 +82,8 @@ struct InboxMoveIntoDisplayedFolderVisibilityTests {
     /// Reproduce what `AccountManagerActions.optimisticMoveToFolder` writes: the row's
     /// `folderId`/`folderPath`/`isInInbox` follow the destination immediately, while its
     /// **primary key keeps naming the source address** until `MessageHeaderRekey.finishMove`
-    /// re-keys it at drain time (THE ADDRESS PROBLEM). The owner's log shows exactly this
-    /// state — `id=…:Archive:55922 folderId=…:INBOX folderPath=INBOX` — and it is the id
-    /// that a dismissal names, so the test must not skip it.
+    /// re-keys it at drain time (THE ADDRESS PROBLEM). The test deliberately models that
+    /// address/content divergence because a dismissal names the stale primary key.
     private func applyOptimisticMove(
         _ pool: DatabasePool, storedId: String, destination: Folder
     ) throws {
