@@ -739,18 +739,67 @@ enum CalendarToolHelpers {
         }
 
         // Recurrence
+        //
+        // `freq` and `until` are model-supplied strings that get interpolated into a structured RRULE
+        // line, which cannot be run through the ICS text escaper (that would corrupt the `;` and `,`
+        // separators the rule depends on). FREQ is a closed token set in RFC 5545, so validate it
+        // instead of escaping it: an unrecognised value drops the recurrence rather than emitting a
+        // rule built from arbitrary text. `GCalEventInputICS.sanitizeICSLine` is the backstop that
+        // stops any residue from splitting the line into a second ICS property.
         if case .dictionary(let rec) = arguments["recurrence"],
-           case .string(let freq) = rec["freq"] {
-            var rrule = "RRULE:FREQ=\(freq.uppercased())"
+           case .string(let rawFreq) = rec["freq"],
+           let freq = Self.validatedRRuleFreq(rawFreq) {
+            var rrule = "RRULE:FREQ=\(freq)"
             if case .int(let n) = rec["interval"], n > 1 { rrule += ";INTERVAL=\(n)" }
             else if case .double(let d) = rec["interval"], Int(d) > 1 { rrule += ";INTERVAL=\(Int(d))" }
             if case .int(let count) = rec["count"] { rrule += ";COUNT=\(count)" }
             else if case .double(let count) = rec["count"] { rrule += ";COUNT=\(Int(count))" }
-            else if case .string(let until) = rec["until"] { rrule += ";UNTIL=\(until.replacingOccurrences(of: "-", with: "").replacingOccurrences(of: ":", with: "").replacingOccurrences(of: "T", with: "T"))" }
+            else if case .string(let until) = rec["until"],
+                    let normalizedUntil = Self.validatedRRuleUntil(until) { rrule += ";UNTIL=\(normalizedUntil)" }
             input.recurrence = [rrule]
         }
 
         return input
+    }
+
+    /// RFC 5545 `FREQ` is a closed token set. Returns the canonical token, or nil if unrecognised.
+    ///
+    /// Validated rather than escaped because an RRULE is structured: passing it through the ICS text
+    /// escaper would escape the `;` and `,` that separate its own parts. Returning nil drops the
+    /// recurrence — the event is still created, just non-recurring, which is recoverable by one user
+    /// edit. See `GCalEventInputICS.sanitizeICSLine` for why an unvalidated value is dangerous.
+    static func validatedRRuleFreq(_ raw: String) -> String? {
+        let token = raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let legal: Set<String> = ["SECONDLY", "MINUTELY", "HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY"]
+        return legal.contains(token) ? token : nil
+    }
+
+    /// RFC 5545 `UNTIL` is a DATE (`YYYYMMDD`) or UTC DATE-TIME (`YYYYMMDDTHHMMSSZ`).
+    ///
+    /// Accepts the ISO-ish spellings the model tends to emit, normalises separators away, then checks
+    /// the SHAPE. Anything else returns nil and the UNTIL clause is omitted, which leaves an
+    /// unbounded recurrence — deliberately preferred over emitting arbitrary text into the rule.
+    static func validatedRRuleUntil(_ raw: String) -> String? {
+        let compact = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: ":", with: "")
+            .uppercased()
+        let isDate = compact.count == 8 && compact.allSatisfy { $0.isASCII && $0.isNumber }
+        if isDate { return compact }
+        // YYYYMMDDTHHMMSS with an optional trailing Z; always emitted as UTC.
+        let scalars = Array(compact)
+        if (scalars.count == 15 || scalars.count == 16),
+           scalars[8] == "T",
+           scalars.count == 15 || scalars[15] == "Z" {
+            let datePart = String(scalars[0..<8])
+            let timePart = String(scalars[9..<15])
+            if datePart.allSatisfy({ $0.isASCII && $0.isNumber }),
+               timePart.allSatisfy({ $0.isASCII && $0.isNumber }) {
+                return "\(datePart)T\(timePart)Z"
+            }
+        }
+        return nil
     }
 
     /// Convert a naive ISO string (yyyy-MM-dd'T'HH:mm:ss) to RFC 3339 with timezone offset.

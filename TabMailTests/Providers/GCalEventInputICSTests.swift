@@ -246,4 +246,119 @@ struct GCalEventInputJSONTests {
         let json = input.toJSON()
         #expect(json["id"] as? String == "event-123")
     }
+
+    // MARK: - ICS line injection (S2-F6)
+
+    /// A value that still carries CRLF when the lines are joined splits its own line into a SECOND
+    /// ICS property that the CalDAV server then honours. ATTENDEE is the sharp case: the server mails
+    /// the invitation, disclosing the event to an address the user never typed.
+    ///
+    /// `recurrence` is the reachable entry point — `CalendarToolHelpers.buildGCalEventInput` builds the
+    /// RRULE from model-supplied `freq`/`until` strings, and an RRULE cannot be passed through the ICS
+    /// text escaper without corrupting the `;` and `,` that separate its own parts.
+    @Test("A CRLF in a recurrence rule cannot inject a second ICS property")
+    func recurrenceCannotInjectProperty() {
+        var input = GCalEventInput(summary: "Meeting", startDateTime: "2024-03-15T10:00:00Z", endDateTime: "2024-03-15T11:00:00Z")
+        input.recurrence = ["RRULE:FREQ=WEEKLY\r\nATTENDEE;CN=\"x\":mailto:attacker@evil.example"]
+        let ics = input.toICS(uid: "u")
+
+        // The injected property must not exist as a property — i.e. must not start a line.
+        let lines = ics.components(separatedBy: "\r\n")
+        #expect(!lines.contains { $0.hasPrefix("ATTENDEE") }, "injected ATTENDEE became a real property:\n\(ics)")
+        // Non-vacuity: the event itself must still have been produced.
+        #expect(lines.contains("BEGIN:VEVENT"))
+        #expect(lines.contains("END:VEVENT"))
+    }
+
+    @Test("A bare LF in a recurrence rule cannot inject a property either")
+    func recurrenceBareLFCannotInject() {
+        var input = GCalEventInput(summary: "M", startDateTime: "2024-03-15T10:00:00Z", endDateTime: "2024-03-15T11:00:00Z")
+        input.recurrence = ["RRULE:FREQ=DAILY\nORGANIZER:mailto:attacker@evil.example"]
+        let ics = input.toICS(uid: "u")
+        // Split on ANY newline, not just CRLF. Splitting on "\r\n" would make this test vacuous — a
+        // bare LF never produces a separate element, so the assertion would pass even with the
+        // sanitizer removed (verified: it did, 2026-08-12). Real ICS parsers are lenient about bare
+        // LF, so the oracle has to be at least as lenient as the parser we are defending.
+        let lines = ics.split(whereSeparator: \.isNewline).map(String.init)
+        #expect(!lines.contains { $0.hasPrefix("ORGANIZER") }, "bare LF injected a property:\n\(ics)")
+        #expect(lines.contains { $0.hasPrefix("RRULE:FREQ=DAILY") }, "non-vacuity: no RRULE emitted:\n\(ics)")
+    }
+
+    @Test("A recurrence rule cannot close the VEVENT early to append a second event")
+    func recurrenceCannotForgeExtraEvent() {
+        var input = GCalEventInput(summary: "M", startDateTime: "2024-03-15T10:00:00Z", endDateTime: "2024-03-15T11:00:00Z")
+        input.recurrence = ["RRULE:FREQ=DAILY\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nSUMMARY:forged"]
+        let ics = input.toICS(uid: "u")
+        // The oracle must be LINE-level, not substring-level. Sanitizing strips the CRLFs rather than
+        // rejecting the value, so the attacker's text survives as inert RRULE *value* text on a single
+        // line — `ics.contains("BEGIN:VEVENT")` is therefore true twice by design and says nothing
+        // about safety. What makes an ICS property is being at the START of an unfolded line, so that
+        // is what this asserts. (A substring count here failed against the working fix, 2026-08-12.)
+        let lines = ics.components(separatedBy: "\r\n")
+        #expect(lines.filter { $0 == "BEGIN:VEVENT" }.count == 1, "extra VEVENT forged:\n\(ics)")
+        #expect(lines.filter { $0 == "END:VEVENT" }.count == 1, "extra VEVENT terminator forged:\n\(ics)")
+        #expect(!lines.contains { $0.hasPrefix("SUMMARY:forged") }, "forged SUMMARY became a property:\n\(ics)")
+        // Non-vacuity: the legitimate SUMMARY must still be a property line of its own.
+        #expect(lines.contains("SUMMARY:M"), "real event body missing:\n\(ics)")
+    }
+
+    @Test("sanitizeICSLine strips control characters but preserves ordinary text and TAB")
+    func sanitizeLineIsTwoSided() {
+        // Two-sided: a function that returned "" would satisfy the stripping assertions alone.
+        #expect(GCalEventInput.sanitizeICSLine("RRULE:FREQ=WEEKLY") == "RRULE:FREQ=WEEKLY")
+        #expect(GCalEventInput.sanitizeICSLine("a\r\nb") == "ab")
+        #expect(GCalEventInput.sanitizeICSLine("a\nb") == "ab")
+        #expect(GCalEventInput.sanitizeICSLine("a\rb") == "ab")
+        #expect(GCalEventInput.sanitizeICSLine("a\tb") == "a\tb", "HTAB is legal in ICS values")
+        #expect(GCalEventInput.sanitizeICSLine("café") == "café", "non-ASCII must survive")
+    }
+
+    // MARK: - RRULE field validation (the reachable entry point)
+
+    @Test("Only RFC 5545 FREQ tokens are accepted")
+    func freqIsValidated() {
+        // Two-sided: legal tokens must pass, or the rejection half is vacuous.
+        #expect(CalendarToolHelpers.validatedRRuleFreq("weekly") == "WEEKLY")
+        #expect(CalendarToolHelpers.validatedRRuleFreq("DAILY") == "DAILY")
+        #expect(CalendarToolHelpers.validatedRRuleFreq("YEARLY") == "YEARLY")
+        // Anything else is dropped rather than interpolated.
+        #expect(CalendarToolHelpers.validatedRRuleFreq("WEEKLY\r\nATTENDEE:mailto:x@y.z") == nil)
+        #expect(CalendarToolHelpers.validatedRRuleFreq("") == nil)
+        #expect(CalendarToolHelpers.validatedRRuleFreq("NOTAFREQ") == nil)
+    }
+
+    /// The two tests above check the validators in isolation, which only proves the validators work —
+    /// not that the code path that builds an event actually calls them. This one asserts the SYSTEM
+    /// property: model-supplied tool arguments in, ICS text out, no injected property. It stays
+    /// meaningful if the validation moves to a different layer.
+    @Test("A poisoned freq cannot become an ICS property, end to end from tool arguments")
+    func poisonedFreqCannotInjectThroughToolPath() {
+        let args: [String: JSONValue] = [
+            "recurrence": .dictionary([
+                "freq": .string("DAILY\r\nATTENDEE;ROLE=REQ-PARTICIPANT:mailto:attacker@evil.example")
+            ])
+        ]
+        let ics = CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false).toICS(uid: "u")
+        let lines = ics.split(whereSeparator: \.isNewline).map(String.init)
+        #expect(!lines.contains { $0.hasPrefix("ATTENDEE") }, "injected ATTENDEE became a property:\n\(ics)")
+
+        // Two-sided: a legitimate freq must still produce a rule, or the assertion above would also
+        // hold for a build path that silently emitted no recurrence at all.
+        let legalArgs: [String: JSONValue] = ["recurrence": .dictionary(["freq": .string("weekly")])]
+        let legalICS = CalendarToolHelpers.buildGCalEventInput(legalArgs, isAllDay: false).toICS(uid: "u")
+        #expect(legalICS.split(whereSeparator: \.isNewline).map(String.init)
+            .contains { $0.hasPrefix("RRULE:FREQ=WEEKLY") }, "legal recurrence dropped:\n\(legalICS)")
+    }
+
+    @Test("UNTIL must be a DATE or UTC DATE-TIME shape")
+    func untilIsValidated() {
+        #expect(CalendarToolHelpers.validatedRRuleUntil("2026-12-31") == "20261231")
+        #expect(CalendarToolHelpers.validatedRRuleUntil("20261231") == "20261231")
+        #expect(CalendarToolHelpers.validatedRRuleUntil("2026-12-31T23:59:59") == "20261231T235959Z")
+        #expect(CalendarToolHelpers.validatedRRuleUntil("2026-12-31T23:59:59Z") == "20261231T235959Z")
+        // Injection and junk are dropped.
+        #expect(CalendarToolHelpers.validatedRRuleUntil("20261231\r\nATTENDEE:mailto:x@y.z") == nil)
+        #expect(CalendarToolHelpers.validatedRRuleUntil("tomorrow") == nil)
+        #expect(CalendarToolHelpers.validatedRRuleUntil("") == nil)
+    }
 }
