@@ -110,6 +110,7 @@ enum ICSCalendarImporter {
                         // "exactly once, on every terminal state" contract; the old code
                         // fell through here and the caller was never told anything.
                         print("[ICSImport] Listener ready but reported no port")
+                        self?.stop()
                         self?.resolve(nil, completion)
                     }
                 case .failed(let error):
