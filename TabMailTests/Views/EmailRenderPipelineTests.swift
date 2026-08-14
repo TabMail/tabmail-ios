@@ -465,7 +465,7 @@ struct EmailRenderPipelineTests {
         // Phase 2 — recheck arms its listeners (documentEnd), then the deferred
         // swap runs and the images stream in one at a time.
         ctx.evaluateScript(_postImageWidthRecheckJS)
-        ctx.evaluateScript(_deferredImageLoadJS)
+        ctx.evaluateScript(_deferredImageLoadJS(diagnosticsEnabled: false))
         #expect(ctx.exception == nil, "phase-2 scripts threw: \(ctx.exception?.toString() ?? "")")
         #expect(refitRequests(ctx) == 0)
         ctx.evaluateScript("fireImgEvent(0, 'load')")
@@ -496,7 +496,7 @@ struct EmailRenderPipelineTests {
         ctx.evaluateScript("window.__tmDeviceWidth = 288;" + _fitViewportJS)
         #expect(layoutVp(ctx) == 400)
         ctx.evaluateScript(_postImageWidthRecheckJS)
-        ctx.evaluateScript(_deferredImageLoadJS)
+        ctx.evaluateScript(_deferredImageLoadJS(diagnosticsEnabled: false))
         ctx.evaluateScript("fireImgEvent(0, 'load'); fireImgEvent(1, 'load')")
         #expect(ctx.exception == nil, "scripts threw: \(ctx.exception?.toString() ?? "")")
         #expect(refitRequests(ctx) == 0)
@@ -1497,13 +1497,290 @@ struct EmailRenderPipelineTests {
 
     @Test("deferredImageLoadJS auto-swaps data-tmsrc back to src after first paint")
     func deferredImageSwapScript() {
-        let js = _deferredImageLoadJS
+        // The PRODUCTION form — this script is injected unconditionally, so what
+        // ships is the ungated one.
+        let js = _deferredImageLoadJS(diagnosticsEnabled: false)
         // Restores the real URL automatically, only AFTER a paint cycle (double
         // rAF) so the remote loads can't re-block the first paint. Failsafe timeout.
         #expect(js.contains("img[data-tmsrc]"))
         #expect(js.contains("setAttribute('src'"))
-        #expect(js.contains("requestAnimationFrame(function() { requestAnimationFrame(swap)"))
-        #expect(js.contains("setTimeout(swap, 1500)"))
+        #expect(js.contains("swap('post-paint')"))
+        // Pin the failsafe's actual DELAY, not just its label: the reason string
+        // spells "1500ms" but is only a diagnostic tag, so asserting the label
+        // alone would stay green if the timeout were retuned to 3000ms.
+        #expect(js.contains("setTimeout(function() { swap('failsafe-1500ms'); }, 1500)"))
+        // The `__tmImageDiagWillAssign` assertion that used to live here — "the
+        // swap notifies the diagnostic hook" — has NOT been dropped: it moved to
+        // `deferredImageSwapHookIsDebugGated` below, which pins it on the GATED
+        // form (where the hook belongs) and pins its absence here. Asserting it
+        // on this form is what the fix makes wrong, not the property itself.
+    }
+
+    @Test("the diagnostic hook is emitted ONLY under the debug gate")
+    func deferredImageSwapHookIsDebugGated() {
+        // `deferredImageLoadJS` is a PRODUCTION render path, injected
+        // unconditionally at .atDocumentEnd — unlike `imageLoadDiagnosticJS`,
+        // which returns "" when diagnostics are off. So in an ungated build the
+        // only party that could define `window.__tmImageDiagWillAssign` is
+        // sender-authored script (author JS is still enabled in the message
+        // webview). The swap must therefore not name that global at all.
+        let production = _deferredImageLoadJS(diagnosticsEnabled: false)
+        #expect(!production.contains("__tmImageDiagWillAssign"))
+        #expect(!production.contains("diag("))
+        // Non-vacuity: it is the HOOK that is gone, not the swap.
+        #expect(production.contains("im.setAttribute('src', s)"))
+        #expect(production.contains("im.setAttribute('srcset', ss)"))
+
+        // Gated build: the hook is called on both attribute arms, and the
+        // installing script (imageLoadDiagnosticJS) defines it.
+        let gated = _deferredImageLoadJS(diagnosticsEnabled: true)
+        #expect(gated.contains("window.__tmImageDiagWillAssign(im, attribute, raw, trigger)"))
+        #expect(gated.contains("diag(im, 'srcset', ss, trigger)"))
+        #expect(gated.contains("diag(im, 'src', s, trigger)"))
+        #expect(
+            _imageLoadDiagnosticJS(enabled: true)
+                .contains("Object.defineProperty(window, '__tmImageDiagWillAssign'")
+        )
+    }
+
+    @Test("a throwing diagnostic hook cannot abort the deferred-image swap")
+    func deferredImageSwapSurvivesHostileDiagnosticHook() {
+        // BEHAVIOURAL, not string-shaped: the production JS runs in JSContext
+        // against the width-pipeline mock DOM, so this asserts the END STATE
+        // (every deferred image swapped) rather than the presence of a
+        // try/catch. `Object.defineProperty` on `__tmImageDiagId` is the same
+        // class of abort — it throws inside OUR hook body — and is covered by
+        // the same wrapper.
+        let ctx = makeWidthPipelineContext(trueWidth: 515)
+        // Give one image a srcset too, so BOTH assignment arms are exercised.
+        ctx.evaluateScript("_imgs[0]._attrs['data-tmsrcset'] = 'https://example.com/banner-2x.png 2x';")
+        // What a hostile message body can do today: define the global our own
+        // swap used to call unguarded. Pre-fix this threw out of swap() before
+        // the removeAttribute/setAttribute pair, aborting the loop — so every
+        // deferred image on the message stayed hidden, on BOTH the post-paint
+        // arm and the 1500ms failsafe.
+        ctx.evaluateScript("""
+            var _hookCalls = 0;
+            window.__tmImageDiagWillAssign = function() { _hookCalls++; throw new Error('hostile'); };
+            """)
+        ctx.evaluateScript(_deferredImageLoadJS(diagnosticsEnabled: true))
+        #expect(ctx.exception == nil, "swap script threw: \(ctx.exception?.toString() ?? "")")
+
+        // The invariant: no deferred attribute survives, and every image now
+        // carries the real URL.
+        let unswapped = ctx.evaluateScript(
+            "_imgs.filter(function (im) { return im.hasAttribute('data-tmsrc') || im.hasAttribute('data-tmsrcset'); }).length"
+        )?.toInt32()
+        #expect(unswapped == 0)
+        let withSrc = ctx.evaluateScript(
+            "_imgs.filter(function (im) { return im.getAttribute('src') === 'https://example.com/banner.png'; }).length"
+        )?.toInt32()
+        #expect(withSrc == 2)
+        let withSrcset = ctx.evaluateScript(
+            "_imgs.filter(function (im) { return im.getAttribute('srcset') === 'https://example.com/banner-2x.png 2x'; }).length"
+        )?.toInt32()
+        #expect(withSrcset == 1)
+        // Non-vacuity, the half that makes the assertions above mean anything:
+        // the hostile hook really did run and really did throw, once per
+        // assignment (2 src + 1 srcset). A wrapper that skipped the call
+        // entirely would also pass the swap assertions.
+        let hookCalls = ctx.evaluateScript("_hookCalls")?.toInt32()
+        #expect(hookCalls == 3)
+    }
+
+    @Test("image diagnostics distinguish image failure sources without retrying URLs")
+    func imageLoadDiagnostics() {
+        // The GATED form. `enabled: false` is asserted separately below, because
+        // the property there is "there is no script at all", not "the script is
+        // quiet".
+        let js = _imageLoadDiagnosticJS(enabled: true)
+        #expect(js.contains("securitypolicyviolation"))
+        #expect(js.contains("event=assign-"))
+        #expect(js.contains("reportImageEvent('load'"))
+        #expect(js.contains("reportImageEvent('error'"))
+        #expect(js.contains("performance.getEntriesByName"))
+        #expect(js.contains("querySelectorAll('[background]')"))
+        #expect(js.contains("url.pathname"))
+        // The no-amplification property, from the negative side. The old pair
+        // (`fetch(` / `XMLHttpRequest`) named only the two primitives nobody
+        // reaches for in a render-pipeline script and MISSED every primitive that
+        // actually re-requests a sender URL from inside a webview — which is how
+        // `71c19d554`'s "cannot amplify a tracking pixel" claim was asserted
+        // against a test that could not have detected the violation.
+        #expect(!js.contains("fetch("))
+        #expect(!js.contains("XMLHttpRequest"))
+        #expect(!js.contains("new Image"))
+        #expect(!js.contains("sendBeacon"))
+        #expect(!js.contains("importScripts"))
+        // No assignment of a resource-fetching attribute anywhere in the
+        // diagnostic source — the diagnostics READ `src`/`srcset`/`background`,
+        // they never write one.
+        //
+        // NB for whoever edits the script next: these bans are literal substring
+        // checks over the EMITTED source, so they cannot tell code from a JS
+        // comment. Explaining the amplification vector inside the injected string
+        // fails this test (it did, the first time this fix was written). That
+        // explanation lives on `imageLoadDiagnosticJS`'s Swift doc comment, which
+        // is not part of the emitted source. Do not relax these to keep a comment.
+        //
+        // ⚠️ What these bans DO NOT cover, recorded 2026-08-12 so the green is not
+        // read as more than it is: they scan OUR source for OUR primitives. The
+        // amplification path in item 4 of `imageLoadDiagnosticJS`'s dependency
+        // list — sender script installing a non-throwing, request-issuing accessor
+        // on `image.__tmImageDiagId` / `complete` / `naturalWidth` /
+        // `naturalHeight`, which our hook then reads — puts no new substring in
+        // our source at all, so every assertion here stays green through it. This
+        // test pins "the diagnostics do not re-request"; it cannot pin "the
+        // diagnostics cannot be made to cause a request", and nothing currently
+        // does.
+        #expect(!js.contains(".src ="))
+        #expect(!js.contains(".srcset ="))
+        #expect(!js.contains("setAttribute('src'"))
+        #expect(!js.contains("setAttribute('srcset'"))
+        #expect(!js.contains("setAttribute('background'"))
+
+        // Ungated: no script at all, therefore no page-visible hook. The
+        // presence assertion above (`event=assign-`) is correct for the gated
+        // build — the hook is what the diagnostics are FOR — but it must not be
+        // read as blessing a global that exists in a shipped build, so its
+        // negative case is pinned here.
+        let ungated = _imageLoadDiagnosticJS(enabled: false)
+        #expect(ungated.isEmpty)
+        #expect(!ungated.contains("__tmImageDiagWillAssign"))
+    }
+
+    @Test("the diagnostic hook is installed non-replaceable, so sender script cannot occupy it")
+    func imageDiagnosticHookIsNonReplaceable() {
+        // The amplification variant that try/catch cannot address: a substitute
+        // hook that does NOT throw but issues its own request
+        // (`new Image().src = …`) turns our production swap() into a second
+        // disclosure of the user's IP to the sender. The countermeasure is that
+        // the property cannot be replaced at all, not that the call is guarded.
+        let js = _imageLoadDiagnosticJS(enabled: true)
+        #expect(js.contains("Object.defineProperty(window, '__tmImageDiagWillAssign'"))
+        #expect(js.contains("writable: false"))
+        #expect(js.contains("configurable: false"))
+        // A plain assignment would be writable+configurable by default; if the
+        // install ever regresses to one, this fails.
+        #expect(!js.contains("window.__tmImageDiagWillAssign ="))
+
+        // Behavioural: install it, then do exactly what a hostile body does.
+        let ctx = JSContext()!
+        ctx.evaluateScript(Self.imageDiagnosticHarness)
+        ctx.evaluateScript(js)
+        #expect(ctx.exception == nil, "diagnostic script threw: \(ctx.exception?.toString() ?? "")")
+        ctx.evaluateScript("var _ourHook = window.__tmImageDiagWillAssign;")
+        // Non-strict assignment: silently ignored. (In the sender's own strict
+        // mode it is a TypeError, which aborts THEIR script, not ours.)
+        ctx.evaluateScript("""
+            var _hostileRan = 0;
+            try { window.__tmImageDiagWillAssign = function () { _hostileRan++; }; } catch (_) {}
+            try { delete window.__tmImageDiagWillAssign; } catch (_) {}
+            try {
+                Object.defineProperty(window, '__tmImageDiagWillAssign', { value: function () { _hostileRan++; } });
+            } catch (_) {}
+            """)
+        #expect(
+            ctx.evaluateScript("window.__tmImageDiagWillAssign === _ourHook")?.toBool() == true,
+            "sender script replaced or deleted the diagnostic hook"
+        )
+        // Non-vacuity: our hook is still a live function that logs, so the
+        // identity check above is not passing on a hollowed-out value.
+        ctx.evaluateScript("_logs.length = 0; window.__tmImageDiagWillAssign(_mkImg('https://example.com/a.png'), 'src', 'https://example.com/a.png', 'test');")
+        #expect(ctx.evaluateScript("_logs.length")?.toInt32() == 1)
+        #expect(ctx.evaluateScript("_hostileRan")?.toInt32() == 0)
+    }
+
+    /// Minimal JSContext stand-in for the pieces `imageLoadDiagnosticJS` touches.
+    /// `URL` is deliberately absent, which is what puts `safeURL` on its CATCH
+    /// arm — the arm the log-forging finding lives on. That is faithful to the
+    /// crafted value used below: after WHATWG newline-removal
+    /// `https://\n[ImageLoadDiag …]` parses its host as `[…]`, an invalid IPv6
+    /// literal, so `new URL()` throws in WebKit too.
+    private static let imageDiagnosticHarness = """
+        var _logs = [];
+        var _bgNodes = [];
+        var _images = [];
+        var _docListeners = {};
+        var performance = {
+            now: function () { return 0; },
+            getEntriesByName: function () { return []; }
+        };
+        function _mkImg(src) {
+            var attrs = { src: src };
+            return {
+                tagName: 'IMG', complete: true, naturalWidth: 10, naturalHeight: 10,
+                offsetWidth: 10, offsetHeight: 10, isConnected: true, currentSrc: '',
+                getAttribute: function (k) { return (k in attrs) ? attrs[k] : null; },
+                hasAttribute: function (k) { return (k in attrs); }
+            };
+        }
+        var document = {
+            baseURI: 'about:blank',
+            addEventListener: function (type, fn) { (_docListeners[type] = _docListeners[type] || []).push(fn); },
+            getElementsByTagName: function (t) { return t === 'img' ? _images.slice() : []; },
+            querySelectorAll: function (s) { return _bgNodes.slice(); }
+        };
+        var window = {
+            __tmDiagId: 'TESTID',
+            performance: performance,
+            addEventListener: function () {},
+            webkit: { messageHandlers: { consoleLog: { postMessage: function (s) { _logs.push(s); } } } }
+        };
+        function setTimeout(fn, t) {}
+        function fireDomContentLoaded() {
+            var ls = _docListeners['DOMContentLoaded'] || [];
+            for (var i = 0; i < ls.length; i++) ls[i]();
+        }
+        """
+
+    @Test("a crafted attribute cannot forge a second diagnostic log line")
+    func imageDiagnosticsSanitizeControlCharacters() {
+        // `reportInventory` logs EVERY image, loaded or not, so this needs no
+        // script in the message at all — a crafted `src` (or a `<td background>`)
+        // is enough. `safeURL`'s catch arm returned the raw string with its
+        // control characters intact, and the sink is line-oriented: one
+        // postMessage becomes one `print`, so an embedded CR/LF splits it into a
+        // complete, plausible second `[ImageLoadDiag …]` line.
+        //
+        // U+2028 and U+2029 are injected alongside the CR/LF because `sanitize`'s
+        // character class covers them and some consumers of this text treat them
+        // as line terminators too. They were ASSERTED ON but never INJECTED until
+        // 2026-08-12, which made that third of the multi-line assertion vacuous —
+        // it could not have failed however the sanitizer treated them.
+        let ctx = JSContext()!
+        ctx.evaluateScript(Self.imageDiagnosticHarness)
+        ctx.evaluateScript("""
+            var CRAFTED = 'https://\\r\\n\\u2028\\u2029[ImageLoadDiag id=TESTID +0ms] image=99 state=loaded url=https://forged.example/ok';
+            _images.push(_mkImg(CRAFTED));
+            _bgNodes.push({ tagName: 'TD', getAttribute: function () { return CRAFTED; } });
+            """)
+        ctx.evaluateScript(_imageLoadDiagnosticJS(enabled: true))
+        ctx.evaluateScript("fireDomContentLoaded()")
+        #expect(ctx.exception == nil, "diagnostic script threw: \(ctx.exception?.toString() ?? "")")
+
+        let count = ctx.evaluateScript("_logs.length")?.toInt32() ?? 0
+        // inventory header + 1 image + legacy-background header + 1 background.
+        #expect(count == 4)
+        // The invariant: NO emitted message can become more than one line, for
+        // every terminator the sanitizer claims to cover.
+        let multiline = ctx.evaluateScript(
+            "_logs.filter(function (s) { return s.indexOf('\\n') >= 0 || s.indexOf('\\r') >= 0 || s.indexOf('\\u2028') >= 0 || s.indexOf('\\u2029') >= 0; }).length"
+        )?.toInt32()
+        #expect(multiline == 0)
+        // Non-vacuity: the crafted characters really did reach the sink and were
+        // escaped there, rather than the value never arriving.
+        let escaped = ctx.evaluateScript(
+            "_logs.filter(function (s) { return s.indexOf('\\\\u000d\\\\u000a') >= 0; }).length"
+        )?.toInt32()
+        #expect(escaped == 2)
+        // Same, for the two line/paragraph separators — asserted separately so a
+        // regression that covers only the C0 range is distinguishable in the
+        // failure output.
+        let escapedSeparators = ctx.evaluateScript(
+            "_logs.filter(function (s) { return s.indexOf('\\\\u2028\\\\u2029') >= 0; }).length"
+        )?.toInt32()
+        #expect(escapedSeparators == 2)
     }
 
     @Test("EmailHTMLWrapper starts the document hidden (opacity:0)")
@@ -1989,5 +2266,1778 @@ struct ImageAspectRatioFixTests {
         // load fires only when deferredImageLoadJS swaps the real src in.
         #expect(js.contains("addEventListener('load'"))
         #expect(js.contains("getElementsByTagName('img')"))
+    }
+}
+
+// MARK: - Diagnostic log-line forgery, the Swift `print` channel
+
+/// The sibling of `imageLoadDiagnostics`' `sanitize` assertions above, on the
+/// channel that one does NOT cover.
+///
+/// `imageLoadDiagnosticJS.sanitize` closes log forgery in the diagnostics OUR OWN
+/// script emits.
+///
+/// ⚠️ **It does NOT close "the webview's `postMessage` path", which is what this
+/// comment claimed until 2026-08-12.** `sanitize` is applied inside
+/// `imageLoadDiagnosticJS`'s `log()` wrapper, immediately before that wrapper
+/// calls `window.webkit.messageHandlers.consoleLog.postMessage`. Every
+/// `WKUserScript` in `AutoSizingHTMLView.makeUIView` is installed WITHOUT a
+/// content world, so our script and author script share one `window` — which
+/// means sender script can call `window.webkit.messageHandlers.consoleLog
+/// .postMessage('anything\nit likes')` itself, reaching the same Swift handler
+/// and the same `print`, without going through `log()` or `sanitize` at all.
+/// What `sanitize` actually closes is a sender-authored VALUE (a URL, an
+/// attribute) forging an extra line inside a diagnostic WE emit. What stays open
+/// while `allowsContentJavaScript` is `true` is the sender posting arbitrary
+/// forged lines directly; that closes with ADR-IOS-076 decision 1, not here.
+///
+/// The attachment download / staging / preview / carry-forward
+/// paths reach `print` DIRECTLY, with sender-authored values interpolated in —
+/// a MIME `filename` parameter, a `Content-Type`, an error description carrying a
+/// server-supplied path. `print` is line-oriented: one call becomes one line, so a
+/// raw CR/LF in any of those does not corrupt a line, it forges a whole extra one.
+///
+/// The invariant asserted here is the SYSTEM property, not the escaper's spelling:
+/// **a sender-controlled value interpolated into a diagnostic log line cannot make
+/// that line become more than one line.** Nothing below asserts what the escape
+/// looks like, so a different escaping that preserves the property still passes.
+@Suite("Diagnostic log-line forgery — the Swift print channel")
+struct DiagnosticLogLineForgeryTests {
+
+    /// Payloads a sender controls end to end. Each carries a terminator followed by
+    /// a COMPLETE, plausible second diagnostic copied from a real call site, so a
+    /// failure here looks like the attack rather than like noise.
+    private static let forgedValues: [String] = [
+        "invoice.pdf\n[Attachment] QuickLook presenting payroll.pdf from PreviewController",
+        "invoice.pdf\r[Attachment] Downloaded 4096 bytes for payroll.pdf",
+        "invoice.pdf\r\n[ComposeForward] Attached payroll.pdf (4096 bytes)",
+        "invoice.pdf\u{0085}[Attachment] Staged at /tmp/x/payroll.pdf, QuickLook presented",
+        "invoice.pdf\u{2028}[Attachment] Download failed: none",
+        "invoice.pdf\u{2029}[Attachment] Starting download: section=1 filename=payroll.pdf",
+        "invoice.pdf\u{000B}\u{000C}[EmlNestedAttachment] Download failed: none",
+    ]
+
+    /// Renders a diagnostic the way the production sites do — a fixed prefix, the
+    /// sender's value interpolated, a fixed suffix. Deliberately a copy of the
+    /// SHAPE rather than a call into a view, because the property under test is a
+    /// property of the shape.
+    private func logLine(_ senderValue: String) -> String {
+        "[Attachment] QuickLook presenting \(senderValue) from PreviewController"
+    }
+
+    /// Two APIs, deliberately both: `Character.isNewline` and
+    /// `CharacterSet.newlines`. They agree on the same seven scalars today
+    /// (measured: U+000A, U+000B, U+000C, U+000D, U+0085, U+2028, U+2029), so this
+    /// is not two independent oracles — it is protection against one of them
+    /// changing under us, which is worth two lines.
+    private func spansMoreThanOneLine(_ line: String) -> Bool {
+        line.contains(where: \.isNewline)
+            || line.unicodeScalars.contains(where: CharacterSet.newlines.contains)
+    }
+
+    @Test("Non-vacuity: every payload really does forge a second line when interpolated raw")
+    func rawPayloadsForgeASecondLine() {
+        for value in Self.forgedValues {
+            let raw = logLine(value)
+            #expect(
+                spansMoreThanOneLine(raw),
+                "this payload cannot forge anything, so the escaped case below proves nothing about it: \(value.debugDescription)"
+            )
+            #expect(
+                raw.split(whereSeparator: \.isNewline).count >= 2,
+                "payload did not split the line: \(value.debugDescription)"
+            )
+        }
+    }
+
+    @Test("No sender-controlled value can introduce a line break into a diagnostic log line")
+    func escapedValuesCannotForgeASecondLine() {
+        for value in Self.forgedValues {
+            let line = logLine(DebugModeManager.escapedForLogLine(value))
+            #expect(
+                !spansMoreThanOneLine(line),
+                "a sender value forged a line break: \(value.debugDescription) rendered \(line.debugDescription)"
+            )
+            #expect(
+                line.split(whereSeparator: \.isNewline).count == 1,
+                "diagnostic became more than one line: \(line.debugDescription)"
+            )
+        }
+    }
+
+    /// Exhaustive over the terminators rather than over the ones someone thought
+    /// of, because "the payload list is complete" is exactly the absolute this
+    /// series keeps getting wrong.
+    ///
+    /// ⚠️ The scan is BOUNDED at U+3000, and the bound is a runtime cost trade,
+    /// not a claim that no line terminator can exist above it. Every scalar Swift
+    /// currently reports as `isNewline` is below U+2030; if a future Unicode
+    /// version adds one higher, this scan does not see it.
+    @Test("Every scalar Swift treats as a line break is neutralised, not just the sampled ones")
+    func everyLineTerminatorScalarIsNeutralised() {
+        var found: [UInt32] = []
+        for code in UInt32(0)...UInt32(0x3000) {
+            guard let scalar = Unicode.Scalar(code) else { continue }
+            guard Character(scalar).isNewline || CharacterSet.newlines.contains(scalar) else { continue }
+            found.append(code)
+            let sender = "invoice\(String(scalar))pdf"
+            // Two-sided per scalar: raw must break the line, escaped must not.
+            // Without the first half a scalar that never breaks anything would
+            // pass the second half for free.
+            #expect(
+                spansMoreThanOneLine(logLine(sender)),
+                "U+\(String(code, radix: 16)) does not break a raw line, so escaping it proves nothing"
+            )
+            #expect(
+                !spansMoreThanOneLine(logLine(DebugModeManager.escapedForLogLine(sender))),
+                "U+\(String(code, radix: 16)) survived escaping and forged a line break"
+            )
+        }
+        // Non-vacuity for the scan itself: it must actually have hit terminators,
+        // and the set must be the seven measured ones. A regression that made
+        // `isNewline` report nothing would otherwise pass this test silently.
+        #expect(found == [0x0A, 0x0B, 0x0C, 0x0D, 0x85, 0x2028, 0x2029],
+                "the line-terminator set changed: \(found.map { String($0, radix: 16) })")
+    }
+
+    @Test("Escaping preserves a value that carries no control characters")
+    func benignValuesAreUnchanged() {
+        // The no-op case, so the escaper cannot pass the tests above by mangling
+        // everything. Negative case, stated because it is the same absolute this
+        // series keeps overreaching on: this is NOT "the escaper is a no-op for
+        // every name" — it is a no-op only for names with no C0/C1/DEL scalar and
+        // no U+2028/U+2029, and the very next assertion shows one that changes.
+        for benign in ["invoice.pdf", "notes ..txt", "réservé — 2026.pdf", "a/b/c.png", "", "日本語.txt"] {
+            #expect(DebugModeManager.escapedForLogLine(benign) == benign,
+                    "a benign name was altered: \(benign.debugDescription)")
+        }
+        #expect(DebugModeManager.escapedForLogLine("invoice\u{0007}.pdf") != "invoice\u{0007}.pdf",
+                "a control character survived unescaped")
+    }
+}
+
+// MARK: - Where the sender's MIME values actually reach the log sinks
+
+/// A REGRESSION GUARD for the defect class fixed alongside it. It is not a proof
+/// that log-line forgery is impossible, and nothing here should be cited as one.
+///
+/// `DiagnosticLogLineForgeryTests` above pins the ESCAPER: given a hostile
+/// string, `escapedForLogLine` cannot leave a line break in it. That is a
+/// property of one function, and it stays green if every production CALL to that
+/// function is deleted — which is exactly what two independent audits reported as
+/// the gap. Nothing connected the escaper to the sites that need it.
+///
+/// This suite closes that specific gap from the other side: it reads the
+/// render-path sources and checks the CALL SITES. At the log sinks it can see, a
+/// sender-authored MIME value must sit inside an escaper call, and the sink must
+/// be debug-gated (global `CLAUDE.md` rule 12).
+///
+/// ⚠️ **WHAT THIS SUITE DOES NOT CLAIM — read before extending it.**
+/// A source scan is evadable by construction. Each shape below carries a sender
+/// value to a log sink while passing every assertion here. They are written down
+/// because the next person extending this file needs to know where the edge is —
+/// and because shape 5 already exists in the tree and only passes because it is
+/// named explicitly.
+///
+///   1. A sink this suite does not name — a new logging wrapper, `Logger`, a C
+///      API. Only `print` / `debugPrint` / `NSLog` / `os_log` are recognised.
+///   2. Two-step: `let msg = "… \(part.filename)"; print(msg)`. The sink call
+///      then contains no accessor at all and is not examined.
+///   3. Concatenation with an operand bound earlier: `print("… " + name)`.
+///   4. Aliasing the VALUE: `let n = part.filename` … `print("\(n)")`.
+///   5. Aliasing the ESCAPER, which hides the escape rather than the value.
+///      `AttachmentListView.downloadAndPreview` does exactly this
+///      (`let escape = DebugModeManager.escapedForLogLine`), so `escape(` is an
+///      accepted spelling — but ONLY in the one file that binds it, because
+///      `escaperAliasStillPointsAtTheEscaper` only verifies the binding there.
+///      In any other scanned file `escape(` reads as no escape at all.
+///   6. A sender-authored value under an accessor not listed below —
+///      `.disposition`, a Content-Type parameter, a nested part's name.
+///      `.subject` is EXCLUDED DELIBERATELY: `MessageInfo.subject` is
+///      sender-authored while `Draft.subject` is the user's own text, and the
+///      accessor name alone cannot separate them, so scanning for it would
+///      demand escapes on the user's own composition to stay green.
+///   7. A TRANSITIVELY derived value. `AttachmentListView` escapes
+///      `url.lastPathComponent` because the staged file's name came from the
+///      sender's `filename` — no accessor below appears on that line, and the
+///      escape is there because a human put it there, not because anything
+///      mechanical demanded it.
+///   8. The sender's MESSAGE BODY, which is not reached through any accessor
+///      below. `HTMLWebView.updateUIView` dumps a slice of the raw HTML into
+///      `print`; the value arrives as a plain `html` parameter, so scanning
+///      `AutoSizingHTMLView.swift` sees the sink and finds no accessor in it.
+///      That site is escaped because a human escaped it. Widening the accessor
+///      list to catch it would mean scanning for `html`, which is not an
+///      accessor and is not sender-authored everywhere it appears.
+///
+/// It also does not cover `Shared/`. Those files compile into the
+/// notification-service extension as well, where `DebugModeManager` — and so
+/// `escapedForLogLine` — does not exist; `Shared/Persistence/BodyAssetStore.swift`
+/// documents the same constraint at the `#if DEBUG` prints in its `catch` arms.
+///
+/// ⚠️ **Corrections to commit messages that cannot be amended.** Recorded here
+/// because a commit body is the one artifact no review round re-reads as a claim.
+/// NOT asserted to be every false statement in those messages — only what has been
+/// re-measured so far.
+///
+///   * `8f408fbcb` reports its old-vs-new comparison "over all 189 sinks … 8 sinks
+///     flip `gated` true->false … 9 flip false->true". **At `8f408fbcb` this suite
+///     scanned FIVE files** — `AutoSizingHTMLView.swift` is added by the NEXT
+///     commit, `436bd7a87`, whose own message says "175 to 189". Re-measured at
+///     `8f408fbcb` with both detectors over the file contents AT that commit:
+///     **175 sinks, 8 flip true->false, 2 flip false->true**
+///     (`IMAPProvider.swift:661` and `:662` at that commit). Re-measured at
+///     `436bd7a87`: 189 sinks, the same 8, and 9 false->true — so 189 and 9 are
+///     true numbers about the WRONG TREE STATE. What does hold at `8f408fbcb`:
+///     the eight true->false flips and their file:line list, and "all 12 accessor
+///     sites read escaped=true gated=true under both detectors".
+///   * `8f408fbcb` also describes the two-sidedness fixture as carrying "a gate six
+///     lines up". It carried a gate FOUR lines up, inside the very window the
+///     commit retired. Six is true of `IMAPProvider.buildFullMessageInfo`'s rfc822
+///     gate and its third print — a different subject, measured elsewhere in the
+///     same message. The fixture in `anEnclosingGateReadsAsGated` now separates
+///     them by 25 lines and derives that number rather than stating it.
+///   * `1521467ed` — the round-7 fix — states as load-bearing that "The span ENDS
+///     at the token, so a negation to its right still arms". That was the
+///     round-8 DEFECT described as a feature: everything to the right of the token
+///     was unexamined, so `if <gate> || force`, `if <gate> == false` and
+///     `if <gate> ? true : force` all armed a gate over release code. The
+///     *conclusion* about the site it cites survives —
+///     `AccountManagerOutbox.cleanOrphanedAttachmentDirs` really does still arm —
+///     but for a different reason: `,` is a conjunction, so the other element
+///     cannot reach the gate. ⚠️ That last sentence held for exactly one round.
+///     Under the canonical-spelling detector this file has carried since
+///     2026-08-12 that site does NOT arm, and neither does
+///     `SyncEngineFullSync.syncMessages`: a comma-list gate is no longer a
+///     recognised spelling. Both are false FAILs by construction and neither is in
+///     `scannedFiles`. Its NOT CLAIMED section was right about the runtime gate
+///     while this suite's own assertion message was wrong about it — see
+///     `senderAuthoredValueSinksAreDebugGated`.
+///   * `decdc0266` — the round-8 fix — says its allowlist "reads the whole
+///     condition — both sides of the token, forward across newlines to the body
+///     brace". FALSE for a gate token on a CONTINUATION line: there the examined
+///     line prefix is empty, no keyword matches, and the condition is never read
+///     at all. The same message also says "Splitting a Swift condition on its
+///     depth-0 commas is sound whatever the other elements contain". Also false —
+///     the splitter skipped string and raw-string literals but not bare REGEX
+///     literals, so a `{`, `(` or `)` inside one moved the depth and a comma at
+///     true depth 0 could be missed. Neither error changed that commit's measured
+///     results, and both mechanisms are deleted: round 9 removed condition
+///     analysis entirely.
+///   * `6af518558` says `rawStringLiteralEnd` "skips a raw literal whole". It
+///     SEARCHES for the closer, so a body carrying its own closer ends the skip
+///     early. Corrected and bounded at `rawStringLiteralEnd`.
+///   * `4dafe4a32` says `GmailAPI.fetchInlineImagesIfAny` "is the twin of
+///     `GmailProvider.fetchInlineImages`, whose own doc calls this function the
+///     mirror". `GmailProvider.fetchInlineImages`'s doc is one line and says
+///     nothing of the kind; the sentence is in `fetchInlineImagesIfAny`'s OWN doc.
+///     The attribution is off by one function; the relationship it describes is
+///     real.
+@Suite("Render-path log sinks — sender-authored MIME values")
+struct RenderPathLogSinkTests {
+
+    /// Render-path files in the `TabMail` target, where `escapedForLogLine` is
+    /// reachable. This list is maintained by hand and is NOT asserted to be every
+    /// file on the render path; it is the set this guard covers.
+    private static let scannedFiles = [
+        "TabMail/Providers/IMAPProvider.swift",
+        "TabMail/Providers/GmailProvider.swift",
+        "TabMail/Views/Message/AttachmentListView.swift",
+        "TabMail/Views/Message/EmlAttachmentPreview.swift",
+        "TabMail/Views/Compose/ComposeView.swift",
+        "TabMail/Views/Shared/AutoSizingHTMLView.swift",
+    ]
+
+    /// Recognised line-oriented log sinks. Anything else is invisible here.
+    private static let logSinks = ["print", "debugPrint", "NSLog", "os_log"]
+
+    /// Accessors whose value is MIME header text the sender chose. Kept to the
+    /// ones that cannot also be user-authored under the same spelling — see
+    /// limitation 6 above.
+    private static let senderAuthoredAccessors = [".filename", ".contentType", ".contentId"]
+
+    /// The spelling accepted in EVERY scanned file: the escaper called by name.
+    private static let universalEscaperSpellings = ["escapedForLogLine("]
+
+    /// The one file that BINDS the file-local alias, the binding, and the
+    /// spelling it licenses.
+    ///
+    /// `escape(` used to be accepted in every scanned file while
+    /// `escaperAliasStillPointsAtTheEscaper` verified the binding in this one —
+    /// so a `let escape = String.init` in any other scanned file would have read
+    /// as an escape with that meta-test still green. Of the two ways to close
+    /// that, accepting the alias only where it is checked is the narrower change;
+    /// verifying a binding in files that do not have one would need a new rule
+    /// every time the file list grows.
+    ///
+    /// ⚠️ **Scope of what the meta-test earns, stated because this doc used to
+    /// claim the acceptance "stays true without maintenance" and it does not.**
+    /// `escaperAliasStillPointsAtTheEscaper` catches the binding being RENAMED or
+    /// REMOVED. It did NOT catch a SECOND `escape` binding being added elsewhere in
+    /// the same file — `let escape = { (s: String) in s }` in another function,
+    /// with the real binding left intact, read as an escape and the meta-test
+    /// stayed green (found independently by both reviewers, 2026-08-12). The check
+    /// is now over EVERY `let`/`var` binding of the identifier in that file rather
+    /// than over the presence of one, which closes that case. It still earns
+    /// nothing about shadowing across scopes, a binding assembled at run time, or
+    /// any file other than this one.
+    static let aliasEscaperFile = "TabMail/Views/Message/AttachmentListView.swift"
+    private static let aliasEscaperIdentifier = "escape"
+    private static let aliasEscaperBinding = "let escape = DebugModeManager.escapedForLogLine"
+    private static let aliasEscaperSpelling = "escape("
+
+    private static func escaperSpellings(for file: String) -> [String] {
+        file == aliasEscaperFile
+            ? universalEscaperSpellings + [aliasEscaperSpelling]
+            : universalEscaperSpellings
+    }
+
+    struct Site: CustomStringConvertible, Sendable {
+        let file: String
+        let line: Int
+        let accessor: String
+        let escaped: Bool
+        let gated: Bool
+        var description: String {
+            "\(file):\(line) \(accessor) escaped=\(escaped) gated=\(gated)"
+        }
+    }
+
+    struct ScanResult: Sendable {
+        var sinkCount = 0
+        var sites: [Site] = []
+        /// Sinks whose argument list the scanner could not balance. Reported as a
+        /// failure rather than skipped: a scanner that quietly ignores what it
+        /// cannot read is how a source test becomes vacuous without anyone noticing.
+        var unparsableSinkLines: [Int] = []
+    }
+
+    // MARK: Source access
+
+    private static func projectFile(_ relativePath: String) throws -> String {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // Views
+            .deletingLastPathComponent()   // TabMailTests
+            .deletingLastPathComponent()   // repository root
+        return try String(contentsOf: root.appendingPathComponent(relativePath), encoding: .utf8)
+    }
+
+    // MARK: Scanner primitives
+
+    /// The argument text of a call whose `(` is at `open`, or `nil` when the
+    /// source uses a shape this scanner cannot parse. Tracks string literals and
+    /// `\(…)` interpolation so a paren inside a string does not unbalance it.
+    ///
+    /// ⚠️ Multiline (`"""`) literals ARE handled, and the doc said the opposite
+    /// until 2026-08-12 ("they surface as `nil`"). They work by accident of QUOTE
+    /// PARITY: the opening `"""` flips `inString` three times and so does the
+    /// closing one, so an ordinary multiline body balances.
+    ///
+    /// The real hazard is the inverse: quote parity INSIDE the body can leave the
+    /// scanner believing it is in a string when it is not, or the reverse. From
+    /// there either
+    ///
+    ///   * an unbalanced `)` in the body is read as code and closes the argument
+    ///     range EARLY, so every accessor past that point is never examined. That
+    ///     is a MISSED SITE — the false-PASS direction, and it is SILENT: the sink
+    ///     is still counted and `unparsableSinkLines` stays empty; or
+    ///   * the range never balances, `nil` comes back, and the sink lands in
+    ///     `unparsableSinkLines`, which `theScanIsNotVacuous` reports as a failure.
+    ///
+    /// Both were reproduced 2026-08-12. No live impact: `rg 'print\("""'` and the
+    /// same for `debugPrint`/`NSLog`/`os_log` over the six `scannedFiles` return
+    /// nothing, so no scanned sink opens a multiline literal at all, and
+    /// `unparsableSinkLines` is empty.
+    ///
+    /// ⚠️ **The trigger stated as a mechanism was WRONG, and it is corrected here
+    /// rather than in `731e32459`, whose body cannot be amended.** Both that
+    /// message and this doc said an **odd number of `"` inside a multiline body**
+    /// *necessarily* inverts the parity. It does not. What inverts the parity is an
+    /// odd number of quotes the scanner actually TOGGLES ON, which is not the same
+    /// count: while it believes it is inside a string a `\"` is consumed as an
+    /// escape and toggles nothing, a `\(` opens an interpolation and hands quote
+    /// tracking to a different region, and the same characters behave differently
+    /// once the parity has already flipped. An odd raw count CAN invert parity and
+    /// commonly does; it is not a rule, and the mechanism was asserted without
+    /// being characterised exhaustively. The two OUTCOMES above are unaffected —
+    /// they were reproduced, and they are what matters here.
+    ///
+    /// COMMENTS are skipped, using the spans `lex` already computes and `scan`
+    /// already uses to tell a `print(` in code from one in prose. Until 2026-08-12
+    /// they were computed and not passed, so a `)` inside a `//` or `/* */` comment
+    /// **inside a sink's own argument list** closed the range early and every
+    /// accessor past it went unexamined — silently, in the false-PASS direction,
+    /// with the sink still counted and `unparsableSinkLines` still empty:
+    ///
+    ///     print("[X] head", /* a ) here */ part.filename ?? "?")   // sites=0
+    ///     print("[X] head", /* a here */   part.filename ?? "?")   // sites=1
+    ///
+    /// RAW string literals (`#"…"#`) are skipped whole for the same reason — see
+    /// `rawStringLiteralEnd`. Both were reproduced before the fix and are pinned by
+    /// `aCommentInsideASinkArgumentListDoesNotCloseIt`. Live impact of either:
+    /// none. Measured over the six `scannedFiles` — zero `#"` openers, and the sink
+    /// and site counts are identical before and after the change.
+    static func argumentRange(
+        in source: String, openParenAt open: String.Index, skipping comments: [Range<String.Index>]
+    ) -> Range<String.Index>? {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var interpolationDepths: [Int] = []
+        // `lex` returns its comment spans in source order and they do not overlap,
+        // so one forward cursor is enough to test membership in O(1).
+        var pendingComments = comments.drop { $0.upperBound <= open }
+        var i = open
+        while i < source.endIndex {
+            let c = source[i]
+            if !inString {
+                while let next = pendingComments.first, next.upperBound <= i {
+                    pendingComments = pendingComments.dropFirst()
+                }
+                if let next = pendingComments.first, next.contains(i) {
+                    i = next.upperBound   // a `)` in a comment closes nothing
+                    continue
+                }
+                if c == "#", let end = rawStringLiteralEnd(source, from: i) {
+                    i = end               // …and neither does one in `#"…"#`
+                    continue
+                }
+            }
+            if inString {
+                if escaped {
+                    escaped = false
+                } else if c == "\\" {
+                    let next = source.index(after: i)
+                    if next < source.endIndex, source[next] == "(" {
+                        interpolationDepths.append(depth)
+                        inString = false
+                        depth += 1
+                        i = source.index(after: next)
+                        continue
+                    }
+                    escaped = true
+                } else if c == "\"" {
+                    inString = false
+                }
+            } else if c == "\"" {
+                inString = true
+            } else if c == "(" {
+                depth += 1
+            } else if c == ")" {
+                depth -= 1
+                if interpolationDepths.last == depth {
+                    interpolationDepths.removeLast()
+                    inString = true
+                } else if depth == 0 {
+                    return source.index(after: open)..<i
+                }
+            }
+            i = source.index(after: i)
+        }
+        return nil
+    }
+
+    private static func occurrences(
+        of needle: String, in source: String, within bounds: Range<String.Index>
+    ) -> [Range<String.Index>] {
+        var found: [Range<String.Index>] = []
+        var cursor = bounds.lowerBound
+        while cursor < bounds.upperBound,
+              let r = source.range(of: needle, range: cursor..<bounds.upperBound) {
+            found.append(r)
+            cursor = source.index(after: r.lowerBound)
+        }
+        return found
+    }
+
+    private static func previousCharacter(before index: String.Index, in source: String) -> Character? {
+        guard index > source.startIndex else { return nil }
+        return source[source.index(before: index)]
+    }
+
+    private static func lineNumber(of index: String.Index, in source: String) -> Int {
+        source[source.startIndex..<index].reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
+    }
+
+    // MARK: Gate enclosure
+
+    static let gateToken = "DebugModeManager.isLoggingEnabled()"
+
+    /// One `{`…`}` scope while the lexer is inside it.
+    private struct BraceFrame {
+        let bodyStart: String.Index
+        /// This whole scope is a gate body (`if …isLoggingEnabled()… {`).
+        var isGateBody: Bool
+        /// This scope is the `else` arm of a `guard …isLoggingEnabled() else {`.
+        var isGuardElse: Bool
+        /// A `guard` gate fired in the PARENT scope at this index, so everything
+        /// from here to the parent's `}` is gated.
+        var gatedFrom: String.Index?
+    }
+
+    /// One `#if`…`#endif` while the lexer is inside it.
+    private struct IfdefFrame {
+        /// Start of the arm that only compiles in DEBUG, while that arm is open.
+        var debugArmStart: String.Index?
+        /// `#if !DEBUG`, whose `#else` arm is the DEBUG one.
+        var negated: Bool
+    }
+
+    private enum PendingGate { case none, ifGate, guardGate }
+
+    /// The COMPLETE, exact spellings that arm a gate. Nothing else does.
+    ///
+    /// **This replaced a condition ANALYSER, and the DELETION is the fix.** Rounds
+    /// 6-9 each found a false-PASS class in that analyser: proximity where enclosure
+    /// was meant; inversion from the LEFT of the token; anything to the RIGHT of it;
+    /// and then — after round 8 turned the arming rule into an allowlist that no
+    /// reviewer could break on condition GRAMMAR at all — three more that came from
+    /// the LEXER underneath it: which `{` a pending gate binds to, what a `/` that
+    /// might open a regex literal does to brace tracking, and the fact that a
+    /// `switch` case body is not a brace scope.
+    ///
+    /// Hardening a decision procedure buys nothing while the thing that FEEDS it can
+    /// still be confused. So there is no decision procedure left. A gate is armed by
+    /// a line whose code begins with one of the two literal strings below, and by
+    /// nothing else; the condition is never read, because it is not a variable.
+    ///
+    /// **Measured over the six `scannedFiles` 2026-08-12**, which is what makes the
+    /// deletion affordable rather than reckless: 82 gate lines are exactly
+    /// `if <gate> {`, 59 are `#if DEBUG`, 2 are `guard <gate> else { … }`, 4 more
+    /// are `if <gate> { … }` closed on one line, and **every one of the 12 accessor
+    /// sites this suite protects sits under the first form**.
+    ///
+    /// The shapes now refused DO occur in those files — two `} else if …` gates and
+    /// two comma-list gates. **The brief that ordered this change said there were
+    /// ZERO of either; the census says otherwise**, and the census is where the
+    /// numbers above come from. None of the four encloses a site, so refusing them
+    /// costs nothing today and costs a false FAIL — the safe direction — if someone
+    /// later puts a sender-authored value under one.
+    ///
+    /// The match is a PREFIX of the line's code rather than the whole line, and that
+    /// is deliberate: both strings END at the `{` that opens the region, so whatever
+    /// follows on the same line is already inside that region and brace tracking
+    /// handles it. That is also why the one-line `if <gate> { print(…) }` form needs
+    /// no separate spelling. Nothing can sit between the keyword and that brace,
+    /// because the text in between is fixed.
+    static let canonicalIfGate = "if \(gateToken) {"
+    static let canonicalGuardGate = "guard \(gateToken) else {"
+
+    /// The character ranges over which a debug gate is actually OPEN.
+    ///
+    /// This replaced a proximity heuristic that asked only whether a gate TOKEN
+    /// appeared in the few lines above a sink. That answered the wrong question:
+    /// a CLOSED block inside the window counted, so a `#if DEBUG` test hook whose
+    /// `#endif` precedes the sink, or a sibling `if isLoggingEnabled() { }`
+    /// belonging to a preceding `catch` arm, made a genuinely ungated release
+    /// `print` read as gated. Eight sinks in the scanned files read that way — and
+    /// widening the window (the natural response to a gate that sits further up
+    /// than it allows) widens the hole rather than closing it. Enclosure retires
+    /// the class; proximity could only move its boundary.
+    ///
+    /// Recognised gate shapes, and there are exactly three:
+    ///
+    ///   * `#if DEBUG` … `#endif`, and `#if DEBUG` … `#else` (whose else-arm is
+    ///     NOT gated). `#if` nesting is tracked, so an inner `#if canImport(…)`
+    ///     cannot close an outer `DEBUG` block. This shape needs no brace tracking
+    ///     at all.
+    ///   * A line whose code begins with `canonicalIfGate`. The brace body that
+    ///     follows is the gated region.
+    ///   * A line whose code begins with `canonicalGuardGate`. Everything after the
+    ///     guard's `else` block is gated, to the end of the enclosing brace scope
+    ///     or to the next `case`/`default` label in that same scope, whichever
+    ///     comes first.
+    ///
+    /// **Everything else is UNGATED, however obviously it looks like a gate** —
+    /// `} else if <gate> {`, `if <gate>, other {`, `if <gate> && other {`,
+    /// `while <gate> {`, `if <gate>` with the brace on the next line, every value
+    /// binding, and every negation, disjunction, comparison or call-wrapping of the
+    /// token. Read `canonicalIfGate` for why the condition is not examined at all.
+    ///
+    /// **The brace tracking that remains is FAIL-CLOSED**, because it is still a
+    /// lexer and round 9's three defects all came from a lexer. Every input it
+    /// cannot classify with certainty resolves to UNGATED rather than to gated:
+    ///
+    ///   * a `/` that is not `//`, not `/*`, and not followed by a space, tab,
+    ///     newline or `=` — i.e. one that could open a bare regex literal, whose
+    ///     body may carry a `{`, a `}` or a `"` that silently shifts every scope
+    ///     boundary after it. `let opener = /\{/` did exactly that: the `{` opened
+    ///     a phantom frame, the gate body's own `}` closed the phantom instead, and
+    ///     the gate stayed open over the release code below it;
+    ///   * a `#` that opens neither a raw string literal, nor a compiler directive,
+    ///     nor an identifier-like literal (`#file`, `#line`, `#selector`);
+    ///   * a `}` with no open frame.
+    ///
+    /// On any of those the lexer SURRENDERS at that index: every open gate region is
+    /// closed there — the part before it lexed cleanly, so it is still true — and
+    /// nothing after it is gated at all. Comment collection continues past a
+    /// surrender, because `scan` needs comment spans to tell a `print(` in code from
+    /// one in prose, and dropping them would INVENT sinks rather than hide them.
+    ///
+    /// **The `case`/`default` truncation is the third round-9 defect.** A Swift
+    /// switch case body is not a brace scope, so a `guard <gate> else { return }`
+    /// written inside `case .a` used to gate the remainder of the whole switch —
+    /// including `case .b`, which the guard never ran for. A label at the same brace
+    /// depth therefore ends the region.
+    ///
+    /// **Measured over the six `scannedFiles` 2026-08-12, the fail-closed rules cost
+    /// nothing:** every `/` in code there is followed by a space (6, all division),
+    /// and every `#` opens a directive (119) or `#file`/`#line`/`#selector` (5).
+    /// Zero surrenders; sinks 188, sites 12, and all 12 read `gated=true` under this
+    /// lexer exactly as they did under the analyser it replaces.
+    ///
+    /// What it deliberately does NOT recognise, each of which reads as UNGATED —
+    /// the direction that fails the gate test rather than passing it:
+    ///
+    ///   * Binding the gate to a value (`let on = …isLoggingEnabled()`; `if on {`).
+    ///     Several exist in `AutoSizingHTMLView.swift`. A sink that needs one of
+    ///     those to read as gated must be rewritten or the shape added here.
+    ///   * A gate expressed by anything other than `gateToken` verbatim.
+    ///   * Any line that does not BEGIN with a canonical spelling, including a gate
+    ///     token on a CONTINUATION line — `AccountManagerQueue.executeSingleOp` is
+    ///     that shape — and including `} else if <gate> {`, which round 8 added and
+    ///     round 9 removed again.
+    ///
+    /// ⚠️ **This list is the set of shapes that are not RECOGNISED. It is not the
+    /// set of ways this detector can be wrong, and reading it as one is what kept a
+    /// false-PASS class invisible for FOUR CONSECUTIVE ROUNDS** — each round's
+    /// unrecognised-shapes list was true, and each time the false PASS came from a
+    /// shape the list said nothing about. What changed in round 9 is not the list.
+    /// It is that there is almost nothing left to recognise, so there is almost
+    /// nothing left for a Swift shape to hide behind.
+    ///
+    /// The conservative direction costs false FAILs, which are acceptable: a
+    /// correctly-gated sink can read ungated and turn the suite RED on correct code.
+    ///
+    /// `//` and nesting `/* */` comments, `"` literals (tracking `\(…)`
+    /// interpolation), `"""` literals and `#"…"#` raw literals are all skipped, so a
+    /// brace inside any of them cannot open or close a scope. ⚠️ The last two are
+    /// skipped by SEARCHING FOR A TERMINATOR, not by parsing, which is why the older
+    /// wording — "skipped whole" — claimed more than the code does: a `"""` body
+    /// that contains `"""`, or a `#"…"#` body that contains `"#`, ends the skip
+    /// early and resumes lexing inside a literal. An UNTERMINATED one runs to end of
+    /// file, where the lexer emits nothing for the frames still open, which is the
+    /// safe direction. Measured over the six `scannedFiles`: zero `#"` openers, and
+    /// no `"""` body carries its own terminator.
+    ///
+    /// It returns the comment spans it skipped as well, because `scan` finds sinks
+    /// by raw text and needs them to tell a `print(` in code from one in prose —
+    /// see `scan`'s own doc.
+    static func lex(_ source: String) -> (gates: [Range<String.Index>], comments: [Range<String.Index>]) {
+        var regions: [Range<String.Index>] = []
+        var comments: [Range<String.Index>] = []
+        var frames: [BraceFrame] = []
+        var ifdefs: [IfdefFrame] = []
+        var pending: PendingGate = .none
+        var blockCommentDepth = 0
+        var blockCommentStart = source.startIndex
+        /// Cleared by `surrender`. Once false, nothing more is gated.
+        var trusted = true
+
+        var i = source.startIndex
+        var lineStart = source.startIndex
+
+        func endOfLine(from idx: String.Index) -> String.Index {
+            source[idx...].firstIndex(of: "\n") ?? source.endIndex
+        }
+
+        /// Whether nothing but whitespace precedes `idx` on its own line. Bounded by
+        /// the indent, and it returns at the line's first non-space character, so
+        /// the common (mid-line) answer costs a handful of comparisons.
+        func atLineStart(_ idx: String.Index) -> Bool {
+            var j = lineStart
+            while j < idx {
+                let ch = source[j]
+                if ch != " " && ch != "\t" { return false }
+                j = source.index(after: j)
+            }
+            return true
+        }
+
+        /// Something unclassifiable at `stop`. Close every open region there — the
+        /// source up to `stop` lexed cleanly, so those regions are still true — and
+        /// gate nothing afterwards.
+        func surrender(at stop: String.Index) {
+            for frame in frames {
+                if frame.isGateBody { regions.append(frame.bodyStart..<stop) }
+                if let from = frame.gatedFrom { regions.append(from..<stop) }
+            }
+            for frame in ifdefs {
+                if let start = frame.debugArmStart { regions.append(start..<stop) }
+            }
+            frames = []
+            ifdefs = []
+            pending = .none
+            trusted = false
+        }
+
+        while i < source.endIndex {
+            let c = source[i]
+
+            if c == "\n" {
+                i = source.index(after: i)
+                lineStart = i
+                continue
+            }
+
+            if blockCommentDepth > 0 {
+                let next = source.index(after: i)
+                if c == "*", next < source.endIndex, source[next] == "/" {
+                    blockCommentDepth -= 1
+                    i = source.index(after: next)
+                    if blockCommentDepth == 0 { comments.append(blockCommentStart..<i) }
+                    continue
+                }
+                if c == "/", next < source.endIndex, source[next] == "*" {
+                    blockCommentDepth += 1
+                    i = source.index(after: next)
+                    continue
+                }
+                i = next
+                continue
+            }
+
+            if c == "/" {
+                let next = source.index(after: i)
+                let n: Character? = next < source.endIndex ? source[next] : nil
+                if n == "/" {
+                    let lineEnd = endOfLine(from: i)
+                    comments.append(i..<lineEnd)
+                    i = lineEnd
+                    continue
+                }
+                if n == "*" {
+                    blockCommentDepth = 1
+                    blockCommentStart = i
+                    i = source.index(i, offsetBy: 2)
+                    continue
+                }
+                // A bare regex literal cannot open with whitespace (SE-0354), and
+                // `/=` is the compound-assignment operator. Anything else here is a
+                // `/` this lexer cannot classify.
+                if n == nil || n == " " || n == "\t" || n == "\n" || n == "=" {
+                    i = next
+                    continue
+                }
+                if trusted { surrender(at: i) }
+                i = next
+                continue
+            }
+
+            if c == "\"" {
+                if source[i...].hasPrefix("\"\"\"") {
+                    let after = source.index(i, offsetBy: 3)
+                    i = source.range(of: "\"\"\"", range: after..<source.endIndex)?.upperBound
+                        ?? source.endIndex
+                    continue
+                }
+                i = skipStringLiteral(source, from: i)
+                continue
+            }
+
+            if c == "#" {
+                if let end = rawStringLiteralEnd(source, from: i) {
+                    i = end   // `#"…"#` — a brace inside it opens no scope
+                    continue
+                }
+                let directive = source[i..<endOfLine(from: i)]
+                if directive.hasPrefix("#if ") || directive == "#if" {
+                    let condition = directive.dropFirst(3).trimmingCharacters(in: .whitespaces)
+                    let armStart = endOfLine(from: i)
+                    if trusted {
+                        ifdefs.append(IfdefFrame(
+                            debugArmStart: condition == "DEBUG" ? armStart : nil,
+                            negated: condition == "!DEBUG"))
+                    }
+                    i = armStart
+                    continue
+                }
+                if directive.hasPrefix("#else") || directive.hasPrefix("#elseif") {
+                    if var top = ifdefs.popLast() {
+                        if let start = top.debugArmStart {
+                            regions.append(start..<i)
+                            top.debugArmStart = nil
+                        } else if top.negated, directive.hasPrefix("#else") {
+                            top.debugArmStart = endOfLine(from: i)
+                            top.negated = false
+                        }
+                        ifdefs.append(top)
+                    }
+                    i = endOfLine(from: i)
+                    continue
+                }
+                if directive.hasPrefix("#endif") {
+                    if let top = ifdefs.popLast(), let start = top.debugArmStart {
+                        regions.append(start..<i)
+                    }
+                    i = endOfLine(from: i)
+                    continue
+                }
+                // `#file`, `#line`, `#selector`, `#Predicate`, a macro: the token
+                // itself carries no brace, quote or comment, so stepping over the
+                // `#` is enough. A `#` followed by anything else is unclassified.
+                let next = source.index(after: i)
+                if next < source.endIndex, source[next].isLetter || source[next] == "_" {
+                    i = next
+                    continue
+                }
+                if trusted { surrender(at: i) }
+                i = next
+                continue
+            }
+
+            // The whole of gate recognition. `i` lands ON the trailing `{` of the
+            // canonical spelling, so the `{` branch below binds `pending` to that
+            // exact brace and nothing can intervene.
+            if trusted, c == "i" || c == "g", atLineStart(i) {
+                if source[i...].hasPrefix(canonicalIfGate) {
+                    pending = .ifGate
+                    i = source.index(i, offsetBy: canonicalIfGate.count - 1)
+                    continue
+                }
+                if source[i...].hasPrefix(canonicalGuardGate) {
+                    pending = .guardGate
+                    i = source.index(i, offsetBy: canonicalGuardGate.count - 1)
+                    continue
+                }
+            }
+
+            // A switch case body is not a brace scope, so a `guard` gate inside one
+            // does not reach the next label.
+            if trusted, c == "c" || c == "d", frames.last?.gatedFrom != nil, atLineStart(i),
+               source[i...].hasPrefix("case ") || source[i...].hasPrefix("case\t")
+                || source[i...].hasPrefix("default") {
+                if let from = frames[frames.count - 1].gatedFrom {
+                    regions.append(from..<i)
+                    frames[frames.count - 1].gatedFrom = nil
+                }
+                i = source.index(after: i)
+                continue
+            }
+
+            if c == "{" {
+                let bodyStart = source.index(after: i)
+                if trusted {
+                    frames.append(BraceFrame(
+                        bodyStart: bodyStart,
+                        isGateBody: pending == .ifGate,
+                        isGuardElse: pending == .guardGate,
+                        gatedFrom: nil))
+                }
+                pending = .none
+                i = bodyStart
+                continue
+            }
+
+            if c == "}" {
+                if trusted {
+                    guard let closed = frames.popLast() else {
+                        surrender(at: i)   // unbalanced: nothing here can be trusted
+                        i = source.index(after: i)
+                        continue
+                    }
+                    if closed.isGateBody { regions.append(closed.bodyStart..<i) }
+                    if let from = closed.gatedFrom { regions.append(from..<i) }
+                    // A guard gate arms the REST of the scope that contains it.
+                    if closed.isGuardElse, !frames.isEmpty,
+                       frames[frames.count - 1].gatedFrom == nil {
+                        frames[frames.count - 1].gatedFrom = source.index(after: i)
+                    }
+                }
+                i = source.index(after: i)
+                continue
+            }
+
+            i = source.index(after: i)
+        }
+        return (regions, comments)
+    }
+
+    /// Index just past the raw string literal (`#"…"#`, `##"…"##`, `#"""…"""#`)
+    /// that opens at `open`, or `nil` when `open` does not open one — `#if DEBUG`
+    /// and every other directive return `nil` here and fall through to their own
+    /// handling.
+    ///
+    /// A raw literal honours no backslash escape at its own delimiter count, so
+    /// nothing inside it can open a scope, close an argument list, start a comment
+    /// or flip quote parity. Added 2026-08-12; before it,
+    /// `print(#"a " b )"# + (part.filename ?? "?"))` closed its argument range at
+    /// the `)` inside the literal and the accessor past it was never examined.
+    ///
+    /// ⚠️ **The end is FOUND BY SEARCHING for the closer, not by parsing, so
+    /// "skipped whole" — which this doc and `6af518558`'s body both said — claims
+    /// more than the code does.** A body containing its own closer (`"#` at
+    /// delimiter count 1) ends the skip early and the caller resumes lexing inside
+    /// the literal; an UNTERMINATED literal returns `endIndex`, which ends the
+    /// caller's scan and so gates nothing further — the safe direction. Measured
+    /// over the six `scannedFiles` 2026-08-12: zero `#"` openers of any delimiter
+    /// count.
+    static func rawStringLiteralEnd(_ source: String, from open: String.Index) -> String.Index? {
+        var hashes = 0
+        var i = open
+        while i < source.endIndex, source[i] == "#" {
+            hashes += 1
+            i = source.index(after: i)
+        }
+        guard hashes > 0, i < source.endIndex, source[i] == "\"" else { return nil }
+        let closer = "\"" + String(repeating: "#", count: hashes)
+        let after = source.index(after: i)
+        guard after < source.endIndex,
+              let end = source.range(of: closer, range: after..<source.endIndex) else {
+            return source.endIndex
+        }
+        return end.upperBound
+    }
+
+    /// Index just past the `"` literal that opens at `open`. Interpolations are
+    /// skipped whole (balanced parens, nested literals honoured) because their
+    /// contents cannot open a scope that outlives the literal.
+    private static func skipStringLiteral(_ source: String, from open: String.Index) -> String.Index {
+        var i = source.index(after: open)
+        while i < source.endIndex {
+            let c = source[i]
+            if c == "\\" {
+                let next = source.index(after: i)
+                guard next < source.endIndex else { return source.endIndex }
+                if source[next] == "(" {
+                    var depth = 1
+                    var j = source.index(after: next)
+                    while j < source.endIndex, depth > 0 {
+                        let d = source[j]
+                        if d == "\"" {
+                            j = skipStringLiteral(source, from: j)
+                            continue
+                        }
+                        if d == "(" { depth += 1 }
+                        if d == ")" { depth -= 1 }
+                        j = source.index(after: j)
+                    }
+                    i = j
+                    continue
+                }
+                i = source.index(after: next)
+                continue
+            }
+            if c == "\"" { return source.index(after: i) }
+            if c == "\n" { return i }   // unterminated — never run past the line
+            i = source.index(after: i)
+        }
+        return source.endIndex
+    }
+
+    /// Runs the whole scan over one source string. Exposed so
+    /// `theScannerItselfSeesAnUnescapedValue` can drive it with a fixture whose
+    /// answer is known, rather than only with sources that are expected to pass.
+    ///
+    /// Sinks are found by RAW TEXT SEARCH, so a mention of `print(` in prose reads
+    /// as a call. `lex` already knows where the comments are, so they are skipped:
+    /// before this, `AutoSizingHTMLView.fixImageAspectRatioJS`'s own comment
+    /// ("…which `print()`s only when logging is enabled") was counted as a sink,
+    /// which is harmless for a bare `print()` but would turn the suite RED on code
+    /// that does not exist as soon as a commented-out sink carried an accessor —
+    /// and `theScanIsNotVacuous`'s floor counted it.
+    ///
+    /// STRING LITERALS are NOT skipped. `print(` inside one is not a call either,
+    /// but measured 2026-08-12 over the six `scannedFiles` there are zero such
+    /// occurrences (against one in a comment), so the skip is not earned yet and
+    /// over-skipping is the missed-site direction.
+    static func scan(source: String, file: String) -> ScanResult {
+        var result = ScanResult()
+        let (openGates, commentSpans) = lex(source)
+        let spellings = escaperSpellings(for: file)
+        for sink in logSinks {
+            var cursor = source.startIndex
+            while cursor < source.endIndex,
+                  let call = source.range(of: sink + "(", range: cursor..<source.endIndex) {
+                cursor = source.index(after: call.lowerBound)
+                if let prev = previousCharacter(before: call.lowerBound, in: source),
+                   prev.isLetter || prev.isNumber || prev == "_" || prev == "." {
+                    continue   // `debugPrint(` matched as `print(`, `foo.print(`, …
+                }
+                if commentSpans.contains(where: { $0.contains(call.lowerBound) }) {
+                    continue   // prose, not a call
+                }
+                let openParen = source.index(before: call.upperBound)
+                result.sinkCount += 1
+                guard let args = argumentRange(
+                    in: source, openParenAt: openParen, skipping: commentSpans) else {
+                    result.unparsableSinkLines.append(lineNumber(of: call.lowerBound, in: source))
+                    continue
+                }
+
+                // Every escaper call's argument span inside this sink call.
+                var escapedSpans: [Range<String.Index>] = []
+                for spelling in spellings {
+                    for hit in occurrences(of: spelling, in: source, within: args) {
+                        if let prev = previousCharacter(before: hit.lowerBound, in: source),
+                           prev.isLetter || prev.isNumber || prev == "_" {
+                            continue   // a longer identifier merely ending in this spelling
+                        }
+                        let escOpen = source.index(before: hit.upperBound)
+                        if let span = argumentRange(
+                            in: source, openParenAt: escOpen, skipping: commentSpans) {
+                            escapedSpans.append(span)
+                        }
+                    }
+                }
+
+                let line = lineNumber(of: call.lowerBound, in: source)
+                let gated = openGates.contains { $0.contains(call.lowerBound) }
+                for accessor in senderAuthoredAccessors {
+                    for hit in occurrences(of: accessor, in: source, within: args) {
+                        let covered = escapedSpans.contains { $0.contains(hit.lowerBound) }
+                        result.sites.append(Site(
+                            file: file, line: line, accessor: accessor,
+                            escaped: covered, gated: gated))
+                    }
+                }
+            }
+        }
+        return result
+    }
+
+    private static func scanProjectFiles() throws -> ScanResult {
+        var combined = ScanResult()
+        for path in scannedFiles {
+            let one = scan(source: try projectFile(path), file: path)
+            combined.sinkCount += one.sinkCount
+            combined.sites += one.sites
+            combined.unparsableSinkLines += one.unparsableSinkLines
+        }
+        return combined
+    }
+
+    // MARK: The invariants
+
+    @Test("No sender-authored MIME value reaches a scanned render-path log sink unescaped")
+    func senderAuthoredValuesAreEscapedAtTheSink() throws {
+        let result = try Self.scanProjectFiles()
+        let offenders = result.sites.filter { !$0.escaped }
+        let offenderList = offenders.map(\.description).joined(separator: "\n")
+        #expect(offenders.isEmpty,
+                """
+                a sender-authored MIME value is interpolated into a log line without passing \
+                through `DebugModeManager.escapedForLogLine`, so a CR/LF/U+2028 in the header \
+                forges an extra diagnostic line:
+                \(offenderList)
+                """)
+    }
+
+    /// ⚠️ **What an accepted gate does and does not buy, because this assertion
+    /// used to say "a no-op in production builds" and that is true of only one of
+    /// the two gate kinds it accepts.**
+    ///
+    ///   * `#if DEBUG` is a COMPILE-TIME gate: the code is not in a release binary
+    ///     at all, so "no-op in production" is exact.
+    ///   * `DebugModeManager.isLoggingEnabled()` is a RUNTIME gate. It is TRUE for
+    ///     an unlocked account in a release build, so the log is CONDITIONAL in
+    ///     production, not absent. What the gate buys is that an ordinary user's
+    ///     device does not emit it — which is what rule 12 asks for, and it is why
+    ///     the escaping invariant next door is not redundant: on an unlocked
+    ///     release build these lines really do run with sender-authored data in
+    ///     them.
+    ///
+    /// `1521467ed`'s body already stated this correctly in its NOT CLAIMED section
+    /// while this assertion's own message conflated the two.
+    @Test("Every scanned render-path log sink carrying a sender MIME value is debug-gated")
+    func senderAuthoredValueSinksAreDebugGated() throws {
+        let result = try Self.scanProjectFiles()
+        let ungated = result.sites.filter { !$0.gated }
+        let ungatedList = ungated.map(\.description).joined(separator: "\n")
+        #expect(ungated.isEmpty,
+                """
+                global CLAUDE.md rule 12: a diagnostic log carrying sender-authored data must be \
+                gated. `#if DEBUG` removes it from a release binary outright; \
+                `DebugModeManager.isLoggingEnabled()` is a RUNTIME gate that is TRUE for an \
+                unlocked account in a release build, so it makes the log conditional rather than \
+                absent. Neither is satisfied here:
+                \(ungatedList)
+                """)
+    }
+
+    @Test("The scan reached the sources it claims to cover")
+    func theScanIsNotVacuous() throws {
+        let result = try Self.scanProjectFiles()
+        #expect(result.unparsableSinkLines.isEmpty,
+                """
+                the scanner could not balance these sink calls, so it did not examine them: \
+                \(result.unparsableSinkLines)
+                """)
+        // Floors, not equalities — these files change often and an exact count is a
+        // false absolute waiting to happen. But they sit AT the measured values, not
+        // far below them, and that is the point: the floors were 100 and 10 against
+        // actuals of 188 and 12, which left room for TWO sites to vanish with every
+        // assertion in this suite still green. A silently missed site (the class
+        // `aCommentInsideASinkArgumentListDoesNotCloseIt` pins) reduces
+        // `sites.count` WITHOUT touching `sinkCount` or `unparsableSinkLines`, so
+        // this number is the only thing that can see it.
+        //
+        // Measured 2026-08-12 over the six `scannedFiles`: 188 sinks, 12 sites.
+        // A legitimate removal of a log line will fail this — UPDATE IT DELIBERATELY,
+        // after confirming the drop is a deletion and not a scanner regression.
+        #expect(result.sinkCount >= 188,
+                """
+                expected the scan to reach at least 188 log sinks (the count measured \
+                2026-08-12), saw \(result.sinkCount) — a DROP here is either a deleted log \
+                line or a scanner that stopped seeing them
+                """)
+        #expect(result.sites.count >= 12,
+                """
+                expected at least 12 sender-authored accessor uses at log sinks (the count \
+                measured 2026-08-12), saw \(result.sites.count) — a site can disappear \
+                SILENTLY, with the sink still counted and nothing else in this suite moving, \
+                so a drop here is a scanner regression until proven otherwise
+                """)
+    }
+
+    @Test("The scanner itself distinguishes an escaped value from a bare one")
+    func theScannerItselfSeesAnUnescapedValue() {
+        // Two-sided on the scanner, not just on the tree. Without this, a scanner
+        // bug that reported every site as escaped would make the two invariants
+        // above pass forever.
+        let bare = """
+        func f() {
+            print("[X] parse failed for \\(part.filename ?? "?") — falling back")
+        }
+        """
+        let wrapped = """
+        func f() {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[X] parse failed for \\(DebugModeManager.escapedForLogLine(part.filename ?? "?")) — falling back")
+            }
+        }
+        """
+        let bareResult = Self.scan(source: bare, file: "fixture-bare")
+        #expect(bareResult.sites.count == 1, "fixture should present exactly one accessor use")
+        #expect(bareResult.sites.first?.escaped == false, "an unwrapped accessor must read as unescaped")
+        #expect(bareResult.sites.first?.gated == false, "an ungated sink must read as ungated")
+
+        let wrappedResult = Self.scan(source: wrapped, file: "fixture-wrapped")
+        #expect(wrappedResult.sites.count == 1, "fixture should present exactly one accessor use")
+        #expect(wrappedResult.sites.first?.escaped == true, "a wrapped accessor must read as escaped")
+        #expect(wrappedResult.sites.first?.gated == true, "a gated sink must read as gated")
+
+        // The alias spelling, which limitation 5 above is about. Driven under the
+        // path of the file that BINDS the alias, because that is now the only
+        // file where the spelling is accepted.
+        let aliased = """
+        if DebugModeManager.isLoggingEnabled() {
+            let escape = DebugModeManager.escapedForLogLine
+            print("[X] \\(escape(attachment.filename))")
+        }
+        """
+        let aliasResult = Self.scan(source: aliased, file: Self.aliasEscaperFile)
+        #expect(aliasResult.sites.first?.escaped == true, "the accepted alias must read as escaped")
+
+        // …and the other side of that acceptance: the same source under any other
+        // file reads as UNESCAPED, because nothing verifies a binding there.
+        let aliasElsewhere = Self.scan(source: aliased, file: "TabMail/Providers/IMAPProvider.swift")
+        #expect(aliasElsewhere.sites.first?.escaped == false,
+                "a bare `escape(` outside the file that binds it must not read as an escape")
+    }
+
+    /// Every `let`/`var` binding of the alias identifier in that file must be the
+    /// real escaper — not merely "at least one of them is".
+    ///
+    /// The weaker check (`source.contains(binding)`) caught a rename and a removal
+    /// and MISSED a second binding: adding `let escape = { (s: String) in s }` in
+    /// another function of the same file, with the real binding untouched, made
+    /// every `escape(` in that function read as an escape while this test stayed
+    /// green. `theScannerItselfSeesAnUnescapedValue` cannot see it either — it
+    /// drives the alias with a fixture, not with the real file.
+    @Test("The escaper alias this scan accepts is still bound to the real escaper")
+    func escaperAliasStillPointsAtTheEscaper() throws {
+        let source = try Self.projectFile(Self.aliasEscaperFile)
+        let bindings = Self.bindingLines(of: Self.aliasEscaperIdentifier, in: source)
+        #expect(!bindings.isEmpty,
+                """
+                the scan accepts a bare `escape(` as an escape in \(Self.aliasEscaperFile), and \
+                that file no longer binds `\(Self.aliasEscaperIdentifier)` at all. Renamed or \
+                removed, the acceptance is unearned and this scan starts passing sites it should \
+                fail.
+                """)
+        let impostors = bindings.filter { !$0.contains(Self.aliasEscaperBinding) }
+        #expect(impostors.isEmpty,
+                """
+                \(Self.aliasEscaperFile) binds `\(Self.aliasEscaperIdentifier)` to something that \
+                is NOT `DebugModeManager.escapedForLogLine`, so a bare `escape(` there is not an \
+                escape and this scan would accept it as one:
+                \(impostors.map { $0.trimmingCharacters(in: .whitespaces) }.joined(separator: "\n"))
+                """)
+    }
+
+    /// Every line binding `name` with `let` or `var` IN CODE, whatever type
+    /// annotation or initialiser follows. Deliberately blind to scope.
+    ///
+    /// ⚠️ **Comments are skipped, and the doc here said the opposite until
+    /// 2026-08-12: "a commented-out binding reads as one, which is the false-FAIL
+    /// direction". That was affirmatively wrong in the dangerous direction.** A
+    /// commented-out canonical binding satisfied BOTH halves of
+    /// `escaperAliasStillPointsAtTheEscaper` — it made `bindings` non-empty and it
+    /// contained `aliasEscaperBinding`, so it was not an impostor either. A real
+    /// impostor binding elsewhere in the file could therefore coexist with this
+    /// suite green, and the alias acceptance would be unearned with nothing red.
+    ///
+    /// Same root cause as round 8's `argumentRange` fix: `lex` computes the comment
+    /// spans and the consumer was never given them. Pinned by
+    /// `aCommentedOutAliasBindingIsNotABinding`.
+    private static func bindingLines(of name: String, in source: String) -> [String] {
+        let comments = lex(source).comments
+        var found: [String] = []
+        for keyword in ["let ", "var "] {
+            var cursor = source.startIndex
+            while cursor < source.endIndex,
+                  let hit = source.range(of: keyword + name, range: cursor..<source.endIndex) {
+                cursor = source.index(after: hit.lowerBound)
+                if hit.upperBound < source.endIndex {
+                    let next = source[hit.upperBound]
+                    // a longer identifier that merely starts with `name`
+                    if next.isLetter || next.isNumber || next == "_" { continue }
+                }
+                if comments.contains(where: { $0.contains(hit.lowerBound) }) { continue }
+                let start = source[source.startIndex..<hit.lowerBound].lastIndex(of: "\n")
+                    .map { source.index(after: $0) } ?? source.startIndex
+                let end = source[hit.upperBound...].firstIndex(of: "\n") ?? source.endIndex
+                found.append(String(source[start..<end]))
+            }
+        }
+        return found
+    }
+
+    /// RED-FIRST FIXTURE for the round-9 finding above. Two-sided: a binding that
+    /// exists ONLY in a comment must not count, and a real one in code must still be
+    /// found — otherwise the fix could pass by reporting nothing at all, which would
+    /// turn `escaperAliasStillPointsAtTheEscaper`'s non-empty check red instead.
+    @Test("A binding that exists only in a comment is not a binding")
+    func aCommentedOutAliasBindingIsNotABinding() {
+        let onlyInAComment = """
+        struct S {
+            // \(Self.aliasEscaperBinding)
+            /* \(Self.aliasEscaperBinding) */
+            func f() { print("[X] head") }
+        }
+        """
+        #expect(Self.bindingLines(of: Self.aliasEscaperIdentifier, in: onlyInAComment).isEmpty,
+                """
+                a commented-out `\(Self.aliasEscaperBinding)` satisfied both the non-empty check \
+                and the no-impostor check, so a real impostor binding elsewhere in the file could \
+                sit beside it with this suite green
+                """)
+
+        // The impostor that shape was hiding: the ONLY binding in code is the fake
+        // one, and the canonical text present in the file is prose.
+        let impostorBesideACommentedCanonical = """
+        struct S {
+            // \(Self.aliasEscaperBinding)
+            func f(part: Part) {
+                let \(Self.aliasEscaperIdentifier) = { (s: String) in s }
+                print("[X] \\(\(Self.aliasEscaperIdentifier)(part.filename))")
+            }
+        }
+        """
+        let bindings = Self.bindingLines(
+            of: Self.aliasEscaperIdentifier, in: impostorBesideACommentedCanonical)
+        #expect(bindings.count == 1,
+                "exactly the one binding written in CODE must be reported, saw \(bindings)")
+        #expect(bindings.allSatisfy { !$0.contains(Self.aliasEscaperBinding) },
+                """
+                the impostor binding must be reported as an impostor — the commented canonical \
+                line must not launder it: \(bindings)
+                """)
+    }
+
+    /// `scan` finds sinks by raw text, so before the comment skip landed a
+    /// `print(` written in PROSE was counted as one. Exactly one such sink existed
+    /// in the scanned sources — `AutoSizingHTMLView.fixImageAspectRatioJS`'s
+    /// comment — and it was harmless only because the mention is a bare `print()`
+    /// with no accessor in it.
+    ///
+    /// The second half pins the corrected `argumentRange` doc: a multiline (`"""`)
+    /// literal at a sink IS parsed, by quote parity. It used to say those surface
+    /// as `nil`.
+    @Test("A log sink written in a comment is not a sink, and a multiline literal at one is parsed")
+    func proseIsNotASinkAndMultilineLiteralsAreParsed() {
+        let commented = """
+        func a(part: Part) {
+            // Lands on the handler, which `print()`s only when logging is enabled.
+            /* and a block comment mentioning print("\\(part.filename ?? "?")") too */
+            if DebugModeManager.isLoggingEnabled() {
+                print("[X] real \\(part.contentType)")
+            }
+        }
+        """
+        let commentedResult = Self.scan(source: commented, file: "fixture-commented")
+        #expect(commentedResult.sinkCount == 1,
+                """
+                only the real call is a sink; the two mentions in comments are prose, \
+                saw sinkCount=\(commentedResult.sinkCount)
+                """)
+        #expect(commentedResult.sites.count == 1,
+                "the accessor inside the block comment must not produce a site")
+        #expect(commentedResult.unparsableSinkLines.isEmpty,
+                "a commented sink must not be reported as unparsable either")
+
+        let multiline = """
+        func b(part: Part) {
+            if DebugModeManager.isLoggingEnabled() {
+                print(\"\"\"
+                [X] failed for \\(part.filename ?? "?")
+                \"\"\")
+            }
+        }
+        """
+        let multilineResult = Self.scan(source: multiline, file: "fixture-multiline")
+        #expect(multilineResult.unparsableSinkLines.isEmpty,
+                """
+                a multiline literal at a sink is parsed by quote parity, not surfaced as nil: \
+                \(multilineResult.unparsableSinkLines)
+                """)
+        #expect(multilineResult.sites.count == 1,
+                "the accessor inside the multiline literal must still be seen")
+    }
+
+    /// RED-FIRST FIXTURE for the missed-site class closed on 2026-08-12.
+    ///
+    /// `lex` computes comment spans and `scan` uses them to tell a `print(` in code
+    /// from one in prose — but they were never passed to `argumentRange`, so a `)`
+    /// inside a comment INSIDE A SINK'S OWN ARGUMENT LIST closed the range there.
+    /// Every accessor past that point went unexamined while the sink was still
+    /// counted and `unparsableSinkLines` stayed empty: a silently missed site, the
+    /// false-PASS direction. `#"…"#` raw strings had the same effect and were also
+    /// unhandled.
+    ///
+    /// Each case carries its own CONTROL — the identical source with the offending
+    /// `)` removed — so a failure distinguishes "the fixture stopped presenting a
+    /// site" from "the scanner stopped seeing it".
+    @Test("A comment or raw string inside a sink's argument list does not close it")
+    func aCommentInsideASinkArgumentListDoesNotCloseIt() {
+        func wrap(_ sink: String) -> String {
+            """
+            func f(part: Part) {
+                if DebugModeManager.isLoggingEnabled() {
+                    \(sink)
+                }
+            }
+            """
+        }
+        let cases: [(String, String, String)] = [
+            ("block comment",
+             wrap(#"print("[X] head", /* a ) here */ part.filename ?? "?")"#),
+             wrap(#"print("[X] head", /* a here */ part.filename ?? "?")"#)),
+            ("line comment",
+             wrap("print(\"[X] head\",   // a ) here\n            part.filename ?? \"?\")"),
+             wrap("print(\"[X] head\",   // a here\n            part.filename ?? \"?\")")),
+            ("raw string literal",
+             wrap(##"print(#"a " b )"# + (part.filename ?? "?"))"##),
+             wrap(##"print(#"a " b "# + (part.filename ?? "?"))"##)),
+        ]
+        for (label, hostile, control) in cases {
+            let controlResult = Self.scan(source: control, file: "fixture-control-\(label)")
+            #expect(controlResult.sites.count == 1,
+                    "the `\(label)` CONTROL must present one accessor use, saw \(controlResult.sites.count)")
+
+            let result = Self.scan(source: hostile, file: "fixture-\(label)")
+            #expect(result.sinkCount == 1,
+                    "the `\(label)` fixture must present exactly one sink, saw \(result.sinkCount)")
+            #expect(result.unparsableSinkLines.isEmpty,
+                    """
+                    the `\(label)` fixture must be parsable — an unparsable sink is the LOUD \
+                    failure direction, and the defect this pins is the silent one: \
+                    \(result.unparsableSinkLines)
+                    """)
+            #expect(result.sites.count == 1,
+                    """
+                    a `)` inside a \(label) closed the sink's argument range early, so the \
+                    accessor past it was never examined — a MISSED SITE, invisible to every \
+                    other assertion here because the sink is still counted
+                    """)
+        }
+    }
+
+    // MARK: The gate detector's own two sides
+
+    /// RED-FIRST FIXTURE for the false-PASS the enclosure detector replaced.
+    ///
+    /// Both shapes below were reported `gated=true` by the proximity detector
+    /// this suite used until 2026-08-12 — a `#if DEBUG` block whose `#endif`
+    /// precedes the sink, and an `if isLoggingEnabled() { … }` belonging to a
+    /// preceding statement. Neither encloses the sink; both sinks run in RELEASE.
+    /// Captured against both detectors in `scratchpad/R6-RED-EVIDENCE.txt`.
+    @Test("A CLOSED debug block above a sink is not a gate")
+    func aClosedDebugBlockAboveASinkIsNotAGate() {
+        let closedIfdef = """
+        func f(part: Part) {
+            #if DEBUG
+            if let hook = testHook { hook() }
+            #endif
+            guard ok else {
+                print("[X] failed for \\(part.filename ?? "?")")
+                return
+            }
+        }
+        """
+        let ifdefResult = Self.scan(source: closedIfdef, file: "fixture-closed-ifdef")
+        #expect(ifdefResult.sites.count == 1, "fixture should present exactly one accessor use")
+        #expect(ifdefResult.sites.first?.gated == false,
+                "a `#if DEBUG` block closed above the sink does not gate it")
+
+        let closedRuntimeGate = """
+        func g(part: Part) {
+            do {
+                try work()
+            } catch {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[X] soft failure")
+                }
+                print("[X] hard failure for \\(part.contentType)")
+            }
+        }
+        """
+        let runtimeResult = Self.scan(source: closedRuntimeGate, file: "fixture-closed-gate")
+        #expect(runtimeResult.sites.count == 1, "fixture should present exactly one accessor use")
+        #expect(runtimeResult.sites.first?.gated == false,
+                "a sibling `if isLoggingEnabled() { }` block does not gate what follows it")
+    }
+
+    /// The other side. A detector that answered `false` unconditionally would
+    /// pass the fixture above and make `senderAuthoredValueSinksAreDebugGated`
+    /// fail on correct code — so the shapes that DO enclose must stay gated,
+    /// including a gate far enough above the sink that no proximity window would
+    /// have reached it.
+    ///
+    /// The distance is not asserted as a literal here, and neither is it described
+    /// in prose. It is DERIVED from the fixture at run time and checked, because
+    /// this fixture previously carried a gate FOUR lines above its sink while its
+    /// message, its doc and `8f408fbcb`'s body all said six — a number that was
+    /// true of a real gate in `IMAPProvider.buildFullMessageInfo` and false of
+    /// anything here.
+    @Test("A gate that encloses the sink still reads as gated, however far above it sits")
+    func anEnclosingGateReadsAsGated() {
+        let enclosing = """
+        func h(part: Part) {
+            if DebugModeManager.isLoggingEnabled() {
+                // a comment with a stray brace { in it
+                let banner = "and a string with a brace { in it"
+                /* a nested /* block comment */ with a } in it */
+                let multi = \"\"\"
+                a multiline literal with a { and a } in it
+                \"\"\"
+                if banner.isEmpty {
+                    // an ordinary nested scope, opened and closed again
+                }
+                do {
+                    try work()
+                } catch {
+                    // a catch arm, opened and closed again
+                }
+                switch part.section {
+                case .first:
+                    break
+                default:
+                    break
+                }
+                while false {
+                    // and a loop, opened and closed again
+                }
+                for p in parts {
+                    print("[X] \\(banner) \\(multi) \\(p.filename ?? "nil")")
+                }
+            }
+            #if DEBUG
+            print("[X] ifdef \\(part.contentId)")
+            #endif
+            guard DebugModeManager.isLoggingEnabled() else { return }
+            print("[X] guarded \\(part.contentType)")
+        }
+        """
+        // Derived, so the sentence below cannot go stale the way the old one did.
+        let fixtureLines = enclosing.split(separator: "\n", omittingEmptySubsequences: false)
+        let gateLine = fixtureLines.firstIndex { $0.contains("if DebugModeManager.isLoggingEnabled()") }
+        let sinkLine = fixtureLines.firstIndex { $0.contains("\\(banner)") }
+        #expect(gateLine != nil && sinkLine != nil,
+                "the fixture no longer contains the runtime gate or the sink this test measures")
+        let distance = (sinkLine ?? 0) - (gateLine ?? 0)
+        // The retired proximity heuristic looked at `gateProximityLines = 6` lines
+        // plus the sink's own, so anything past 7 is beyond it. 15 leaves margin
+        // for editing the fixture without silently re-entering the old window.
+        #expect(distance >= 15,
+                """
+                the enclosing gate is only \(distance) lines above the sink, which a proximity \
+                window could plausibly have reached — this fixture exists to prove ENCLOSURE, so \
+                the distance must stay past any such window
+                """)
+
+        let result = Self.scan(source: enclosing, file: "fixture-enclosing")
+        #expect(result.sites.count == 3, "fixture should present exactly three accessor uses")
+        let ungated = result.sites.filter { !$0.gated }
+        #expect(ungated.isEmpty,
+                """
+                every sink here is enclosed by a gate — a runtime gate \(distance) lines up whose \
+                body also contains a brace in a comment, in a string, in a nested block comment \
+                and in a multiline literal, plus four sibling scopes opened and closed in between; \
+                an open `#if DEBUG`; and a `guard` gate covering the rest of the scope: \
+                \(ungated.map(\.description).joined(separator: "\n"))
+                """)
+    }
+
+    /// RED-FIRST FIXTURE for the false-PASS class this detector kept producing —
+    /// FOUR CONSECUTIVE ROUNDS, each fix correct and each followed by another.
+    ///
+    /// Round 6 found proximity where enclosure was meant. Round 7 found conditions
+    /// that invert from the LEFT of the token and fixed them by REJECTING `!` and
+    /// `||` there. Round 8 found the mirror — everything to the RIGHT of the token,
+    /// plus two branches that never consulted the condition at all — and replaced
+    /// the denylist of dangerous operators with an ALLOWLIST of provable
+    /// conjunctions.
+    ///
+    /// **That allowlist HELD.** Round 9's two reviewers could not break it on
+    /// condition grammar: not on operator precedence, not on comma injection, not on
+    /// comments in the prefix, not on delimiter imbalance. They broke the LEXER
+    /// underneath it instead, three times over, and `roundNineFalsePasses` below is
+    /// exactly those three.
+    ///
+    /// So the lesson is no longer "allowlist, not denylist" — that was round 8's, it
+    /// was right, and it was insufficient. It is that a decision procedure is only
+    /// as sound as the thing that feeds it, and that the way to stop paying for a
+    /// parser is to stop needing one. `lex` now recognises two exact strings and
+    /// treats every other input as ungated, so there is no condition analysis left
+    /// for a Swift shape to fool.
+    ///
+    /// The `armed` half is load-bearing twice over: without it the fix could pass by
+    /// refusing everything, and `senderAuthoredValueSinksAreDebugGated` would then
+    /// fail on correct code.
+    ///
+    /// Captured against both detectors in `scratchpad/R9-RED-EVIDENCE.txt` (round
+    /// 8's is in `R8-RED-EVIDENCE.txt`, round 7's in `R7-RED-EVIDENCE.txt`).
+    @Test("Only an exact canonical gate spelling arms a gate")
+    func onlyACanonicalGateSpellingArmsTheGate() {
+        /// Each fixture carries exactly one sender-authored accessor at its sink,
+        /// so `sites.count == 1` is itself a check that the shape reached the
+        /// scanner rather than being skipped.
+        func fixture(_ condition: String, guardShape: Bool = false) -> String {
+            guardShape
+                ? """
+                  func f(part: Part, force: Bool, changed: Bool, x: [Int], y: Bool?) {
+                      \(condition)
+                      print("[X] \\(part.filename ?? "?")")
+                  }
+                  """
+                : """
+                  func f(part: Part, force: Bool, changed: Bool, x: [Int], y: Bool?) {
+                      \(condition)
+                          print("[X] \\(part.filename ?? "?")")
+                      }
+                  }
+                  """
+        }
+
+        func expectUngated(_ label: String, _ source: String) {
+            let result = Self.scan(source: source, file: "fixture-\(label)")
+            #expect(result.sites.count == 1,
+                    "fixture `\(label)` should present exactly one accessor use, saw \(result.sites.count)")
+            #expect(result.sites.first?.gated == false,
+                    """
+                    `\(label)` reads as GATED, but the sink runs in a release build: only a \
+                    line that BEGINS with an exact canonical gate spelling may arm one
+                    """)
+        }
+
+        // ROUND 9. None of these is a condition-grammar defect — each one confused
+        // the LEXER, and each was reported `gated=true` by the round-8 detector.
+        //
+        //   1. BRACE BINDING. `pending` bound to the first `{` the lexer met after
+        //      the keyword, which here belongs to a closure IN THE CONDITION. The
+        //      guard's `gatedFrom` then covered the else arm — the code that runs
+        //      when the gate is FALSE — and everything after it.
+        //   2. REGEX LITERAL. `/\{/` matches a literal brace. To the old lexer the
+        //      `{` opened a scope, so the gate body's own `}` closed that phantom
+        //      instead and the gate stayed open over the release sink below.
+        //   3. SWITCH CASE. A case body is not a brace scope, so a `guard` gate in
+        //      `case .a` gated the rest of the switch, including `case .b`, which
+        //      the guard never ran for.
+        let roundNineFalsePasses: [(String, String)] = [
+            ("brace binding — a closure in the condition", """
+             func f(part: Part) {
+                 guard DebugModeManager.isLoggingEnabled(), attempt({ }) else {
+                     print("[X] \\(part.filename ?? "?")")
+                     return
+                 }
+             }
+             """),
+            ("regex literal in a gate body", """
+             func f(part: Part) {
+                 if DebugModeManager.isLoggingEnabled() {
+                     let opener = /\\{/
+                     _ = opener
+                 }
+                 print("[X] \\(part.filename ?? "?")")
+             }
+             """),
+            ("guard gate in case .a, sink in case .b", """
+             func f(part: Part, which: Kind) {
+                 switch which {
+                 case .a:
+                     guard DebugModeManager.isLoggingEnabled() else { return }
+                     print("[X] genuinely gated")
+                 case .b:
+                     print("[X] \\(part.filename ?? "?")")
+                 }
+             }
+             """),
+        ]
+        for (label, source) in roundNineFalsePasses { expectUngated(label, source) }
+
+        // Shapes the canonical allowlist REFUSES that the round-8 allowlist armed.
+        // Each is a genuine runtime gate; refusing it is a false FAIL, which is the
+        // safe direction and is why none of them may enclose one of the 12 sites.
+        let refusedButReal: [(String, String)] = [
+            ("if gate, other", fixture("if DebugModeManager.isLoggingEnabled(), !x.isEmpty {")),
+            ("if other, gate", fixture("if changed, DebugModeManager.isLoggingEnabled() {")),
+            ("if gate && other", fixture("if DebugModeManager.isLoggingEnabled() && !x.isEmpty {")),
+            ("if other && gate", fixture("if changed && DebugModeManager.isLoggingEnabled() {")),
+            ("while gate", fixture("while DebugModeManager.isLoggingEnabled() {")),
+            ("if gate, brace on the next line",
+             fixture("if DebugModeManager.isLoggingEnabled()\n    {")),
+            ("guard gate, other else",
+             fixture("guard DebugModeManager.isLoggingEnabled(), changed else { return }",
+                     guardShape: true)),
+        ]
+        for (label, source) in refusedButReal { expectUngated(label, source) }
+
+        // Rounds 7 and 8, kept as regression anchors: these are NOT gates, and the
+        // canonical allowlist must go on refusing them for its own reason.
+        let disarmed: [(String, String)] = [
+            ("if gate || force", fixture("if DebugModeManager.isLoggingEnabled() || force {")),
+            ("guard gate || force else",
+             fixture("guard DebugModeManager.isLoggingEnabled() || force else { return }",
+                     guardShape: true)),
+            ("if changed, gate || force",
+             fixture("if changed, DebugModeManager.isLoggingEnabled() || force {")),
+            ("if gate == false", fixture("if DebugModeManager.isLoggingEnabled() == false {")),
+            ("if gate != true", fixture("if DebugModeManager.isLoggingEnabled() != true {")),
+            ("if gate ? true : force",
+             fixture("if DebugModeManager.isLoggingEnabled() ? true : force {")),
+            ("if y ?? gate", fixture("if y ?? DebugModeManager.isLoggingEnabled() {")),
+            ("if shouldLog(gate)", fixture("if shouldLog(DebugModeManager.isLoggingEnabled()) {")),
+            ("if force || gate", fixture("if force || DebugModeManager.isLoggingEnabled() {")),
+            ("if !gate", fixture("if !DebugModeManager.isLoggingEnabled() {")),
+            ("guard !gate else",
+             fixture("guard !DebugModeManager.isLoggingEnabled() else { return }",
+                     guardShape: true)),
+            ("if gate\\n || force",
+             fixture("if DebugModeManager.isLoggingEnabled()\n        || force {")),
+        ]
+        for (label, source) in disarmed { expectUngated(label, source) }
+
+        // `else if` needs a preceding `if` arm, so it cannot use `fixture`. Round 8
+        // ADDED this spelling because `IMAPProvider.move` is that shape; round 9
+        // removes it again, because a line beginning with `}` is not a canonical
+        // spelling and `IMAPProvider.move` encloses no accessor site.
+        expectUngated("} else if gate {", """
+        func f(part: Part, ok: Bool) {
+            if ok {
+                work()
+            } else if DebugModeManager.isLoggingEnabled() {
+                print("[X] \\(part.filename ?? "?")")
+            }
+        }
+        """)
+
+        // The other side. Every canonical spelling, including the one-line body form
+        // that the PREFIX match — rather than a whole-line match — is what buys.
+        let armed: [(String, String)] = [
+            ("if gate {", fixture("if DebugModeManager.isLoggingEnabled() {")),
+            ("guard gate else",
+             fixture("guard DebugModeManager.isLoggingEnabled() else { return }", guardShape: true)),
+            ("if gate { SINK } on one line", """
+             func f(part: Part) {
+                 if DebugModeManager.isLoggingEnabled() { print("[X] \\(part.filename ?? "?")") }
+             }
+             """),
+            ("#if DEBUG", """
+             func f(part: Part) {
+                 #if DEBUG
+                 print("[X] \\(part.filename ?? "?")")
+                 #endif
+             }
+             """),
+        ]
+        for (label, source) in armed {
+            let result = Self.scan(source: source, file: "fixture-\(label)")
+            #expect(result.sites.count == 1,
+                    "fixture `\(label)` should present exactly one accessor use, saw \(result.sites.count)")
+            #expect(result.sites.first?.gated == true,
+                    "`\(label)` is a canonical spelling enclosing the sink and must read as gated")
+        }
+    }
+
+    /// The fail-closed half of `lex`, driven directly: an input the lexer cannot
+    /// classify must SURRENDER, and a surrender must leave everything after it
+    /// ungated rather than carry a stale scope forward.
+    ///
+    /// Separate from the fixtures above because these are not gate SPELLINGS — they
+    /// are the lexer's own error paths, and a detector can get every spelling right
+    /// while silently mis-tracking braces past an input it never understood. That is
+    /// precisely how rounds 6-9 kept happening.
+    @Test("An input the lexer cannot classify gates nothing after it")
+    func anUnclassifiableInputSurrenders() {
+        // Each source gates the FIRST sink (before the unclassifiable input) and
+        // must NOT gate the second (after it). Two-sided per case, so a lexer that
+        // surrendered unconditionally could not pass.
+        let cases: [(String, String)] = [
+            ("regex literal", """
+             func f(part: Part) {
+                 if DebugModeManager.isLoggingEnabled() {
+                     print("[X] before \\(part.filename ?? "?")")
+                     let opener = /\\{/
+                     _ = opener
+                     print("[X] after \\(part.contentType)")
+                 }
+             }
+             """),
+            // Not valid Swift today, and that is the point: an unrecognised `#`
+            // form must surrender rather than be stepped over as if understood.
+            // `#"…"#`, `#if`, and `#file`-style literals are all classified.
+            ("unclassified hash", """
+             func f(part: Part) {
+                 if DebugModeManager.isLoggingEnabled() {
+                     print("[X] before \\(part.filename ?? "?")")
+                     let n = #42
+                     _ = n
+                     print("[X] after \\(part.contentType)")
+                 }
+             }
+             """),
+            ("unbalanced closing brace", """
+             func f(part: Part) {
+                 if DebugModeManager.isLoggingEnabled() {
+                     print("[X] before \\(part.filename ?? "?")")
+                 }
+             }
+             }
+             if DebugModeManager.isLoggingEnabled() {
+                 print("[X] after \\(part.contentType)")
+             }
+             """),
+        ]
+        for (label, source) in cases {
+            let result = Self.scan(source: source, file: "fixture-surrender-\(label)")
+            #expect(result.sites.count == 2,
+                    "the `\(label)` fixture must present two accessor uses, saw \(result.sites.count)")
+            guard result.sites.count == 2 else { continue }
+            #expect(result.sites[0].gated == true,
+                    """
+                    `\(label)`: the sink BEFORE the unclassifiable input is genuinely inside the \
+                    gate body and must still read gated — otherwise this test would pass for a \
+                    lexer that gives up on everything
+                    """)
+            #expect(result.sites[1].gated == false,
+                    """
+                    `\(label)`: the lexer met an input it cannot classify and then reported the \
+                    sink after it as GATED. Every ambiguity must resolve to ungated — a regex \
+                    body can carry a brace, and a brace it mis-tracks moves every scope boundary \
+                    after it
+                    """)
+        }
     }
 }

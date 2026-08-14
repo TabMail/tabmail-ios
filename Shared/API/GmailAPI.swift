@@ -173,6 +173,12 @@ enum GmailAPI {
     /// inline base64url body when Gmail returned it (small images), else
     /// fetches the attachment bytes. Errors on any single image are logged
     /// and skipped; the renderer will simply leave that `cid:` ref unresolved.
+    ///
+    /// ⚠️ `4dafe4a32`'s message attributes the sentence above to
+    /// `GmailProvider.fetchInlineImages`'s doc ("whose own doc calls this function
+    /// the mirror"). That doc is one line and says nothing of the kind — the
+    /// sentence is this one. Correcting it here because the commit cannot be
+    /// amended and this is where a reader checking the attribution lands.
     private static func fetchInlineImagesIfAny(
         http: AuthedHTTP,
         messageId: String,

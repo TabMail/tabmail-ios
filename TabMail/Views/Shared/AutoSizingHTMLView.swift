@@ -319,13 +319,29 @@ private struct HTMLWebView: UIViewRepresentable {
             ? "window.__tmDiagId='\(context.coordinator.webViewId)';"
             : ""
         let idStamp = WKUserScript(source: idStampJS, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+        // Install before parsing reaches any author image/background resources so
+        // debug logs can distinguish an actual WebKit load error from a deferred
+        // URL that simply has not been assigned yet. Production source is empty.
+        let imageLoadDiag = WKUserScript(
+            source: imageLoadDiagnosticJS(enabled: DebugModeManager.isLoggingEnabled()),
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
         let mediaFix = WKUserScript(source: enforceMediaDisplayJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let widthFix = WKUserScript(source: constrainWidthsJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let darkMode = WKUserScript(source: fixDarkModeColorsJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let emlCleanup = WKUserScript(source: cleanupEmlBodyJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let quoteCollapse = WKUserScript(source: collapseQuotesJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let icsCollapse = WKUserScript(source: collapseICSJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
-        let deferImages = WKUserScript(source: deferredImageLoadJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        // Production render path — always injected. Only its diagnostic hook is
+        // gated, and it is gated by the SAME flag that decides whether
+        // imageLoadDiagnosticJS above installs the hook at all, so an ungated
+        // build's swap never names a global that only sender script could define.
+        let deferImages = WKUserScript(
+            source: deferredImageLoadJS(diagnosticsEnabled: DebugModeManager.isLoggingEnabled()),
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true
+        )
         // After the layout-affecting transforms (quote/ics collapse, eml cleanup)
         // and before height monitoring/fit, so it measures the settled layout.
         let leftFix = WKUserScript(source: constrainLeftOverflowJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
@@ -347,6 +363,7 @@ private struct HTMLWebView: UIViewRepresentable {
         let debugReport = WKUserScript(source: htmlDebugReportJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let heightDiag = WKUserScript(source: heightDiagnosticJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         config.userContentController.addUserScript(idStamp)
+        config.userContentController.addUserScript(imageLoadDiag)
         config.userContentController.addUserScript(mediaFix)
         config.userContentController.addUserScript(widthFix)
         config.userContentController.addUserScript(darkMode)
@@ -406,10 +423,20 @@ private struct HTMLWebView: UIViewRepresentable {
                 // Log input HTML in chunks so we can see EXACTLY what's being rendered
                 let inputChunkSize = 800
                 let inputPreview = String(html.prefix(inputChunkSize * 3))
+                // `html` is the SENDER's message body and `print` is a
+                // line-oriented sink, so its newlines forge plausible extra
+                // diagnostic lines. The enclosing `isLoggingEnabled()` gate is a
+                // RUNTIME one that is true for unlocked accounts in RELEASE, so
+                // this reaches users; and there is no precondition beyond
+                // "the document changed", so every render emits it. Escaping
+                // costs the dump its line breaks, which is the point — the
+                // invariant `escapedForLogLine` buys outranks readability of a
+                // debug dump.
                 for (i, chunkStart) in stride(from: 0, to: inputPreview.count, by: inputChunkSize).enumerated() {
                     let start = inputPreview.index(inputPreview.startIndex, offsetBy: chunkStart)
                     let end = inputPreview.index(start, offsetBy: min(inputChunkSize, inputPreview.count - chunkStart))
-                    print("[HTMLDebug] INPUT HTML chunk #\(i): \(inputPreview[start..<end])")
+                    let chunk = DebugModeManager.escapedForLogLine(String(inputPreview[start..<end]))
+                    print("[HTMLDebug] INPUT HTML chunk #\(i): \(chunk)")
                 }
                 // Count <style>, <p>, <span>, <br>, and font-size occurrences
                 let styleCount = html.components(separatedBy: "<style").count - 1
@@ -706,6 +733,9 @@ private struct HTMLWebView: UIViewRepresentable {
             // Reload the content to restore rendering. Mirror the original
             // baseURL choice: nil for compose/Eml, BodyAssetConfig.baseURL when
             // a headerId is present (so scheme-handler-served images still load).
+            if DebugModeManager.isLoggingEnabled() {
+                print("[ImageLoadDiag id=\(webViewId)] web-content-process-terminated persistedBody=\(loadedHeaderId != nil)")
+            }
             if let html = loadedHTML {
                 let base: URL? = (loadedHeaderId != nil) ? BodyAssetConfig.baseURL : nil
                 // Off-main wrap + reload, same path as updateUIView.
@@ -2122,31 +2152,472 @@ private let collapseICSJS = """
 /// the real URLs once the first paint has happened, so images stream in and the
 /// frame grows via the ResizeObserver. (We AUTO-load rather than block-with-banner
 /// — banner-blocking was smoke-tested 2026-06-17 and broke too many messages.)
-/// Exposed for unit tests via `_deferredImageLoadJS`.
-internal var _deferredImageLoadJS: String { deferredImageLoadJS }
-private let deferredImageLoadJS = """
-    (function() {
-        function swap() {
+///
+/// This script is injected UNCONDITIONALLY — it is a production render path, not
+/// a diagnostic — so the debug-only `window.__tmImageDiagWillAssign` hook is
+/// emitted only when `diagnosticsEnabled`. **Both halves of that gating matter and
+/// neither is sufficient alone:**
+///
+/// 1. When diagnostics are OFF the hook call is not emitted at all, so an ungated
+///    build's script contains no reference to a global that only sender-authored
+///    script could define. (Author JavaScript is still enabled in the message
+///    webview; the CSP / `allowsContentJavaScript` hardening is a later phase.)
+/// 2. When diagnostics are ON the call is still wrapped, because the hook can
+///    genuinely exist on a user's device — `DebugModeManager.isLoggingEnabled()`
+///    is true for unlocked accounts in release builds. An uncaught throw out of
+///    the hook would skip the `removeAttribute`/`setAttribute` pair AND abort the
+///    whole loop, so every remaining deferred image on that message would stay
+///    hidden forever (the post-paint arm and the 1500ms failsafe abort at the
+///    same element). The throw the wrap actually has to catch is one raised
+///    inside OUR OWN hook body, which reads sender-controlled DOM properties off
+///    the image: `imageId()` reads `image.__tmImageDiagId`, and the log line
+///    reads `image.complete`, `image.naturalWidth` and `image.naturalHeight`.
+///    Author script can turn any of those into a throwing accessor with
+///    `Object.defineProperty` on the element — an own property shadows the
+///    prototype getter — and our hook has no way to read them safely.
+///
+///    ⚠️ Until 2026-08-12 this clause also said the wrap was needed "because
+///    author script can overwrite OUR hook after we install it". That stopped
+///    being true at `cb46bc46c`, which installs `__tmImageDiagWillAssign` with
+///    `writable: false, configurable: false`; the sibling doc on
+///    `imageLoadDiagnosticJS` and its **Amplification** bullet now both DEPEND on
+///    the sender being unable to do that. A reader who trusted the stale clause
+///    would conclude the non-replaceable install is decorative and could be
+///    relaxed. The wrap survives on the clause above it, not on this one — and a
+///    justification that outlives its reason is not a weaker justification, it is
+///    a false statement about the system sitting next to correct code.
+///
+/// Exposed for unit tests via `_deferredImageLoadJS(diagnosticsEnabled:)`.
+internal func _deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
+    deferredImageLoadJS(diagnosticsEnabled: diagnosticsEnabled)
+}
+private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
+    // Emitted only under the debug gate; see the doc comment above for why the
+    // gate and the try/catch are BOTH required.
+    var diagHelper = ""
+    var diagSrcsetCall = ""
+    var diagSrcCall = ""
+    if diagnosticsEnabled {
+        diagHelper = "\n" + """
+            // Diagnostics only, and deliberately unable to affect the swap: a
+            // throwing or hostile hook must never prevent the assignment below
+            // or abort the loop over the remaining deferred images.
+            function diag(im, attribute, raw, trigger) {
+                try {
+                    if (typeof window.__tmImageDiagWillAssign === 'function') {
+                        window.__tmImageDiagWillAssign(im, attribute, raw, trigger);
+                    }
+                } catch (_) {}
+            }
+        """
+        diagSrcsetCall = "\n                diag(im, 'srcset', ss, trigger);"
+        diagSrcCall = "\n                diag(im, 'src', s, trigger);"
+    }
+    return """
+    (function() {\(diagHelper)
+        function swap(trigger) {
             var imgs = document.querySelectorAll('img[data-tmsrc],img[data-tmsrcset]');
             for (var i = 0; i < imgs.length; i++) {
                 var im = imgs[i];
                 var ss = im.getAttribute('data-tmsrcset');
-                if (ss) { im.removeAttribute('data-tmsrcset'); im.setAttribute('srcset', ss); }
+                if (ss) {\(diagSrcsetCall)
+                    im.removeAttribute('data-tmsrcset');
+                    im.setAttribute('srcset', ss);
+                }
                 var s = im.getAttribute('data-tmsrc');
-                if (s) { im.removeAttribute('data-tmsrc'); im.setAttribute('src', s); }
+                if (s) {\(diagSrcCall)
+                    im.removeAttribute('data-tmsrc');
+                    im.setAttribute('src', s);
+                }
             }
         }
         // Kick off remote loads only AFTER the first paint, so they can't
         // re-block it. readyState reaches 'complete' fast now (no pending
         // images); a double rAF lands after the first compositor frame.
-        function arm() { requestAnimationFrame(function() { requestAnimationFrame(swap); }); }
+        function arm() {
+            requestAnimationFrame(function() {
+                requestAnimationFrame(function() { swap('post-paint'); });
+            });
+        }
         if (document.readyState === 'complete') arm();
         else window.addEventListener('load', arm, { once: true });
         // Failsafe: images must load even if 'load'/rAF are starved (offscreen
         // throttling, etc.). swap() is idempotent.
-        setTimeout(swap, 1500);
+        setTimeout(function() { swap('failsafe-1500ms'); }, 1500);
     })();
     """
+}
+
+/// Debug-only image network diagnostics installed at document start. This is
+/// deliberately observational: nothing in the emitted script retries or probes a
+/// remote URL, so viewing an email cannot generate duplicate tracking requests.
+///
+/// ⚠️ **That property is true of the END STATE but is NOT a property of this
+/// script alone**, which is why the sentence above is scoped to what the script
+/// emits. Read it together with the **Amplification** bullet in
+/// `imageLoadDiagnosticJS`'s own doc comment, which records the unscoped version
+/// of this exact claim (commit `71c19d554`'s) as REFUTED. Things outside this
+/// script are load-bearing for it, and they include at least the following.
+/// **The list below is NOT asserted to be
+/// exhaustive, and the count has been removed on purpose.** It said "two" until
+/// 2026-08-12 and then "four"; both times a reviewer reading this same paragraph
+/// found another. An enumeration of a claim's dependencies is itself an absolute
+/// and inherits this entry's whole failure mode, so the honest form is "among the
+/// things outside this script that are load-bearing for it are…" — and the way to
+/// find out whether the set has grown is to re-derive it, not to read this list.
+/// 1. the CALL-SITE OMISSION — `deferredImageLoadJS` emits the
+///    `window.__tmImageDiagWillAssign` invocation only when diagnostics are on,
+///    so an ungated build never calls a global only sender script could define;
+/// 2. the NON-REPLACEABLE INSTALL — `Object.defineProperty(…, writable: false,
+///    configurable: false)` at `.atDocumentStart`, which is what keeps the
+///    function our own swap invokes OURS rather than the sender's;
+/// 3. FRAME-SCOPE PARITY between the install and the swap. Both `WKUserScript`s
+///    are `forMainFrameOnly: true` today (`imageLoadDiag` at `.atDocumentStart`,
+///    `deferImages` at `.atDocumentEnd`), which is what makes 1 and 2 mean
+///    anything. If the SWAP is ever widened to subframes while the install stays
+///    main-frame-only, then inside a sender-controlled `<iframe>` the install
+///    never ran, while the swap still evaluates
+///    `typeof window.__tmImageDiagWillAssign === 'function'` against THAT frame's
+///    window — where the sender defined it. `writable: false` is no help:
+///    non-replaceability is a property of one window object, not of the name.
+///    Do NOT change either flag to fix something else without re-reading this;
+///    they are correct as they stand, and they are correct TOGETHER; and
+/// 4. the PURITY of every sender-controlled property the hook reads. The hook
+///    itself, not just the callee, touches author-controllable state:
+///    `imageId()` touches `image.__tmImageDiagId` more than once, and the log line
+///    reads `image.complete`, `image.naturalWidth` and `image.naturalHeight`.
+///    `Object.defineProperty` on the element installs an own accessor that shadows
+///    the prototype getter, and a NON-throwing one that issues a request amplifies
+///    from inside our own hook. The try/catch in `deferredImageLoadJS` is aimed at
+///    a throwing accessor and does nothing here because nothing throws.
+///
+///    ⚠️ **This clause said `imageId()` reads the property "TWICE (the `if` test,
+///    then the `return`)" until 2026-08-12. Do not restore a count, and do not
+///    read the operations as all being GETs.** `imageId` is
+///    `if (!image.__tmImageDiagId) image.__tmImageDiagId = nextImageId++; return
+///    image.__tmImageDiagId;`. For a TRUTHY stored value that is two gets. For a
+///    FALSY one — an accessor returning `0`, `''`, `null` — the `if` test gets,
+///    the assignment fires the **SETTER**, and the `return` gets again: at least
+///    three operations on a sender-installed accessor pair, one of which is a
+///    WRITE. **The setter is a sender-reachable write channel and the old text
+///    never mentioned it**: `Object.defineProperty(img, '__tmImageDiagId', {set:
+///    …})` runs sender code on assignment, from inside our hook, on a path the
+///    ungated build does not even reach. A sender who wants to be invoked simply
+///    returns a falsy id.
+/// 5. CONTENT-WORLD PARITY between our scripts and the sender's. Every
+///    `WKUserScript` in `makeUIView` is created with the
+///    `init(source:injectionTime:forMainFrameOnly:)` initialiser — the one that
+///    takes no content world — so every one of them runs in the PAGE world,
+///    alongside author script, sharing ONE `window`.
+///    ⚠️ Re-checking this needs care, because writing it down made the obvious
+///    search self-matching: `rg WKContentWorld` on this file now returns THIS
+///    COMMENT, where before it returned nothing. The invariant is *"no
+///    `WKUserScript` here is constructed with a content-world argument"* — read
+///    the `WKUserScript(` call sites in `makeUIView`, do not count identifier
+///    hits. (Same trap as
+///    `Companion/Memory/Current/105-a-print-is-not-production-observability-on-ios.md`,
+///    where a correction mentioning `freopen`/`dup2` turned a zero-hit grep into
+///    a four-hit one.)
+///    Page-world sharing is precisely what makes the non-replaceable
+///    install in 2 load-bearing rather than belt-and-braces: in a separate world
+///    the sender could not see, shadow or replace `__tmImageDiagWillAssign` at
+///    all, and 2 would be redundant. It is listed because it is a silent
+///    dependency — nothing in the code says "page world", it is the default — so
+///    a future change that moves our scripts into `.defaultClient` would make 2
+///    unnecessary, while a change that moves only SOME of them would break the
+///    pairing that 3 describes.
+///
+/// Relax any of these — `writable: false` in particular — and the sender chooses,
+/// or shares, what our render path does, at which point "cannot generate duplicate
+/// tracking requests" stops being true of the end state too.
+///
+/// ⚠️ Item 4 is NOT covered by any test. `EmailRenderPipelineTests`'
+/// `imageLoadDiagnostics` bans the amplification primitives as literal substrings
+/// of the emitted source; an accessor installed by the SENDER contains none of
+/// those substrings in our source, so that test stays green through it. Severity
+/// is low for the same reason the Amplification bullet gives — while
+/// `allowsContentJavaScript` is `true` the sender can issue the request directly —
+/// but it must not survive into the phase where content JS is disabled.
+///
+/// **What each log line actually omits.** `safeURL`'s `return` statements do not
+/// all guarantee the same thing, and the ones that produce a URL-derived string
+/// are described below. **No count is given, deliberately** — this paragraph said
+/// "THREE arms, not two" until 2026-08-12, which is a counted absolute in a doc
+/// whose own next paragraph tells the reader to *count exits, not branches*, and
+/// counting exits gives a different number than counting URL-producing arms
+/// because `if (!raw) return '(none)'` is an exit that produces neither. Read the
+/// function; the enumeration below is not asserted to be exhaustive of its exits.
+/// Measured 2026-08-12 by running this exact function body against a
+/// WHATWG-conformant `URL` implementation (node's) over the inputs named below.
+/// `path` throughout is `url.pathname`, truncated to 177 characters plus `...`
+/// when it exceeds 180:
+/// - SUCCESS, host present — `url.protocol + '//' + url.host + url.pathname`.
+///   Omits the query, the fragment AND any userinfo: `url.host` is host+port only,
+///   credentials are not part of it. `https://user:pw@host/px.gif?x` logs
+///   `https://host/px.gif`.
+/// - SUCCESS, host EMPTY — `url.protocol + url.pathname`. Taken by every
+///   opaque-path scheme (`blob:`, `data:`, `mailto:`), where there is no host and
+///   the whole remainder — userinfo included — lives in `pathname`. So it drops
+///   the query and the fragment and KEEPS userinfo:
+///   `blob:https://user:pw@tracker.example/px.gif` logs itself back unchanged, and
+///   the `?q=1` variant logs the same string with only the query gone.
+/// - CATCH, taken whenever `new URL()` throws — `String(raw).split(/[?#]/, 1)[0]`
+///   truncated to 200 characters. Drops the query and the fragment, KEEPS
+///   userinfo. `https://user:pw@ho st/px.gif?x` (space in the host) throws and
+///   logs `https://user:pw@ho st/px.gif`.
+///
+/// So userinfo is PRESERVED on the empty-host success arm and on the catch arm,
+/// and DROPPED on the host-present success arm. That is what the three bullets
+/// above measure and all this paragraph asserts — **no fraction, no count, and
+/// the enumeration is not asserted exhaustive**; if a further exit is added, this
+/// sentence is silently wrong and nothing will fail, which is why the security
+/// conclusion below does not rest on it. A credential-bearing value needs no
+/// sender script to reach those arms: `reportLegacyBackgrounds` passes the raw
+/// `[background]` attribute straight to `safeURL`, and `reportInventory` does the
+/// same with `imageURL`'s raw `src` / `data-tmsrc` / `data-tmsrcset`.
+/// Left as it is on purpose — those are the *sender's* credentials, in a
+/// `DebugModeManager`-gated `print` — so this is a description of the behaviour,
+/// not a defect report. The security conclusion is unchanged by the correction;
+/// only the description was wrong.
+///
+/// ⚠️ Until 2026-08-12 this paragraph said the success arm "omits … AND any
+/// userinfo" and that a credential-bearing `src` reaches the log "only when it is
+/// ALSO unparseable". Both false, for the second success arm. The ⚠️ immediately
+/// below already warns that a true mechanism can carry an unreachable example —
+/// and this is the same failure one level up: the arms were enumerated from the
+/// `if (url.host)` branch that was being described rather than from the `return`
+/// statements in the function, so the fall-through arm was never counted. Count
+/// exits, not branches.
+///
+/// ⚠️ **A well-formed credential URL does NOT reach the catch arm**, and the
+/// example that stood here from the moment this paragraph was written until it
+/// was first committed claimed it did: `https://user:pw@host/px.gif?x` is a
+/// VALID URL, so `new URL()` does not throw on it, it takes the SUCCESS arm, and
+/// it logs `https://host/px.gif` — userinfo dropped, the opposite of what that
+/// example asserted. The mechanism above was right and only the illustration was
+/// wrong, which is the failure mode worth naming: this paragraph was itself
+/// written to retract false absolutes, was labelled "measured, not inferred",
+/// and still shipped an input→output pair nobody had run. Reachability is part
+/// of the claim — an example that cannot reach the arm it illustrates is not
+/// evidence about that arm.
+///
+/// ⚠️ Not measurable in the JSC harness. `JSContext` has no `URL` constructor, so
+/// under `EmailRenderPipelineTests`' JavaScriptCore harness EVERY input takes the
+/// catch arm — including the ones that take a success arm in WKWebView. Any future
+/// assertion about `safeURL`'s success behaviour written against that harness is
+/// vacuous by construction.
+///
+/// Exposed to unit tests at BOTH gate settings — the disabled form (what ships)
+/// must be empty, not merely quiet, so tests can pin the absence of the
+/// page-visible hook as well as the presence of the diagnostics.
+internal func _imageLoadDiagnosticJS(enabled: Bool) -> String {
+    imageLoadDiagnosticJS(enabled: enabled)
+}
+
+/// ### Why `window.__tmImageDiagWillAssign` is installed non-replaceable
+///
+/// It is the one page-visible surface these diagnostics expose, and the
+/// PRODUCTION `deferredImageLoadJS` swap calls whatever occupies it. Two
+/// distinct hostile substitutions exist and they need different countermeasures:
+///
+/// - **Denial.** A hook that throws aborts `swap()` before the
+///   `removeAttribute`/`setAttribute` pair, so every remaining deferred image on
+///   that message stays hidden. Countered on the *caller* side: `swap()` wraps
+///   the invocation (see `deferredImageLoadJS`).
+/// - **Amplification.** A hook that does NOT throw but constructs an image
+///   element and assigns a sender URL to it makes *our* render path issue an
+///   extra request, disclosing the user's IP to the sender a second time. A
+///   try/catch does nothing against this. Countered here, on the *install* side:
+///   the property cannot be replaced or deleted.
+///
+/// This refutes, as literally stated, commit `71c19d554`'s claim that the script
+/// "never re-requests anything… cannot amplify a tracking pixel or turn a
+/// diagnostic into a second disclosure of the user's IP to the sender": with the
+/// hook writable, the sender chose what our swap called. Calibration: while
+/// `defaultWebpagePreferences.allowsContentJavaScript` is `true` (it is, at
+/// `AutoSizingHTMLView`'s webview config) the sender can issue that request
+/// directly, so this is not a capability they lack today — it is LOW severity.
+/// It matters because it must not survive into the phase where content JS is
+/// disabled, where it would become a genuine bypass of that hardening.
+///
+/// **Ours always wins the race, verified rather than assumed:** this script is a
+/// `WKUserScript` with `injectionTime: .atDocumentStart`, added second (right
+/// after the id stamp) in `makeUIView`, and `.atDocumentStart` runs after the
+/// document element is created but before any author content is parsed — so no
+/// sender `<script>` can claim the name first. `writable: false` +
+/// `configurable: false` then make a later assignment a no-op (a `TypeError`
+/// inside the sender's own strict-mode code, aborting theirs and not ours) and
+/// make `delete` fail.
+///
+/// **The rationale lives here and not in the injected JS on purpose.**
+/// `EmailRenderPipelineTests.imageLoadDiagnostics` bans the amplification
+/// primitives as literal substrings of the emitted source, which is a crude ban
+/// that cannot tell code from a comment — spelling them out in a JS comment
+/// fails that test, as it did when this fix was first written. Swift comments
+/// are not part of the emitted string.
+private func imageLoadDiagnosticJS(enabled: Bool) -> String {
+    guard enabled else { return "" }
+    return """
+    (function() {
+        if (window.__tmImageDiagInstalled) return;
+        window.__tmImageDiagInstalled = true;
+        var startedAt = performance.now();
+        var nextImageId = 1;
+
+        // Every logged field is sender-influenced (URLs, filenames, tag names,
+        // CSP directives), and the log is a LINE-oriented channel: one
+        // postMessage becomes exactly one `print`. A raw CR/LF anywhere in the
+        // message therefore forges a second, entirely plausible diagnostic line.
+        // Sanitizing here rather than at the one field found doing it means no
+        // future field can reopen it — this is the choke point every emission
+        // passes through. Escaped rather than stripped so the line still shows
+        // what the sender actually sent. U+2028/U+2029 are included because they
+        // are line terminators to some consumers of this text.
+        function sanitize(text) {
+            return String(text).replace(
+                /[\\u0000-\\u001F\\u007F-\\u009F\\u2028\\u2029]/g,
+                function (character) {
+                    return '\\\\u' + ('000' + character.charCodeAt(0).toString(16)).slice(-4);
+                }
+            );
+        }
+
+        function log(message) {
+            try {
+                var id = window.__tmDiagId || '?';
+                var elapsed = Math.round(performance.now() - startedAt);
+                window.webkit.messageHandlers.consoleLog.postMessage(
+                    sanitize('[ImageLoadDiag id=' + id + ' +' + elapsed + 'ms] ' + message)
+                );
+            } catch (_) {}
+        }
+
+        function absoluteURL(raw) {
+            if (!raw) return '';
+            try { return new URL(String(raw), document.baseURI).href; }
+            catch (_) { return String(raw); }
+        }
+
+        function safeURL(raw) {
+            if (!raw) return '(none)';
+            try {
+                var url = new URL(String(raw), document.baseURI);
+                var path = url.pathname || '';
+                if (path.length > 180) path = path.substring(0, 177) + '...';
+                if (url.host) return url.protocol + '//' + url.host + path;
+                return url.protocol + path;
+            } catch (_) {
+                return String(raw).split(/[?#]/, 1)[0].substring(0, 200);
+            }
+        }
+
+        function imageId(image) {
+            if (!image.__tmImageDiagId) image.__tmImageDiagId = nextImageId++;
+            return image.__tmImageDiagId;
+        }
+
+        function imageURL(image) {
+            return image.currentSrc || image.getAttribute('src')
+                || image.getAttribute('data-tmsrc') || image.getAttribute('data-tmsrcset') || '';
+        }
+
+        function resourceTiming(raw) {
+            if (!raw || !window.performance || !performance.getEntriesByName) return 'unavailable';
+            var entries;
+            try { entries = performance.getEntriesByName(absoluteURL(raw)); }
+            catch (_) { return 'lookup-error'; }
+            if (!entries || entries.length === 0) return 'none';
+            var entry = entries[entries.length - 1];
+            var status = (typeof entry.responseStatus === 'number') ? entry.responseStatus : 'na';
+            var transfer = (typeof entry.transferSize === 'number') ? entry.transferSize : 'na';
+            var encoded = (typeof entry.encodedBodySize === 'number') ? entry.encodedBodySize : 'na';
+            var protocol = entry.nextHopProtocol || 'na';
+            return 'present status=' + status + ' duration=' + Math.round(entry.duration || 0)
+                + 'ms transfer=' + transfer + ' encoded=' + encoded + ' protocol=' + protocol;
+        }
+
+        function reportImageEvent(kind, image) {
+            setTimeout(function() {
+                var raw = imageURL(image);
+                log('image=' + imageId(image) + ' event=' + kind
+                    + ' url=' + safeURL(raw)
+                    + ' complete=' + image.complete
+                    + ' natural=' + image.naturalWidth + 'x' + image.naturalHeight
+                    + ' rendered=' + image.offsetWidth + 'x' + image.offsetHeight
+                    + ' connected=' + image.isConnected
+                    + ' resourceTiming=' + resourceTiming(raw));
+            }, 50);
+        }
+
+        // Capture resource outcomes even for parser-created images. `load` and
+        // `error` do not bubble, so capture=true is required.
+        document.addEventListener('load', function(event) {
+            if (event.target && event.target.tagName === 'IMG') reportImageEvent('load', event.target);
+        }, true);
+        document.addEventListener('error', function(event) {
+            if (event.target && event.target.tagName === 'IMG') reportImageEvent('error', event.target);
+        }, true);
+
+        document.addEventListener('securitypolicyviolation', function(event) {
+            log('csp-violation directive=' + (event.effectiveDirective || event.violatedDirective || 'unknown')
+                + ' blocked=' + safeURL(event.blockedURI)
+                + ' disposition=' + (event.disposition || 'unknown'));
+        });
+
+        function reportInventory() {
+            var images = document.getElementsByTagName('img');
+            log('inventory images=' + images.length);
+            for (var i = 0; i < images.length; i++) {
+                var image = images[i];
+                var deferred = image.hasAttribute('data-tmsrc') || image.hasAttribute('data-tmsrcset');
+                var state = deferred ? 'deferred'
+                    : (!image.complete ? 'pending' : (image.naturalWidth > 0 ? 'loaded' : 'broken'));
+                log('image=' + imageId(image) + ' state=' + state
+                    + ' url=' + safeURL(imageURL(image))
+                    + ' complete=' + image.complete
+                    + ' natural=' + image.naturalWidth + 'x' + image.naturalHeight);
+            }
+        }
+
+        function reportLegacyBackgrounds(phase) {
+            var nodes = document.querySelectorAll('[background]');
+            log('legacy-backgrounds phase=' + phase + ' count=' + nodes.length);
+            for (var i = 0; i < nodes.length; i++) {
+                var raw = nodes[i].getAttribute('background') || '';
+                log('legacy-background=' + (i + 1) + ' phase=' + phase
+                    + ' element=' + nodes[i].tagName
+                    + ' url=' + safeURL(raw)
+                    + ' resourceTiming=' + resourceTiming(raw));
+            }
+        }
+
+        // Called synchronously by deferredImageLoadJS immediately before the
+        // real src/srcset is assigned. Installed NON-REPLACEABLE — see the
+        // Swift doc comment on imageLoadDiagnosticJS for why, and why the
+        // rationale is written there rather than here.
+        Object.defineProperty(window, '__tmImageDiagWillAssign', {
+            value: function(image, attribute, raw, trigger) {
+                log('image=' + imageId(image) + ' event=assign-' + attribute
+                    + ' trigger=' + trigger + ' url=' + safeURL(raw)
+                    + ' complete-before=' + image.complete
+                    + ' natural-before=' + image.naturalWidth + 'x' + image.naturalHeight);
+            },
+            writable: false,
+            configurable: false,
+            enumerable: false
+        });
+
+        document.addEventListener('DOMContentLoaded', function() {
+            reportInventory();
+            reportLegacyBackgrounds('dom-content-loaded');
+        }, { once: true });
+        window.addEventListener('load', function() {
+            setTimeout(function() { reportLegacyBackgrounds('window-load'); }, 50);
+        }, { once: true });
+        setTimeout(function() { reportLegacyBackgrounds('t2000'); }, 2000);
+    })();
+    """
+}
 
 /// Crop a WHOLESALE per-region content indent — the case `eatGutterMarginsJS`
 /// (below) and the negative-body-margin approach it replaced (2026-06-30) can
@@ -2832,15 +3303,18 @@ private var htmlDebugReportJS: String {
 
                 // Image audit
                 var allImgs = emailBody.querySelectorAll('img');
-                var loaded = 0, broken = 0, pending = 0, zeroSize = 0;
+                var loaded = 0, broken = 0, pending = 0, deferred = 0, zeroSize = 0;
                 for (var ii = 0; ii < allImgs.length; ii++) {
                     var img = allImgs[ii];
-                    if (img.complete) { if (img.naturalWidth > 0) loaded++; else broken++; } else { pending++; }
+                    if (img.hasAttribute('data-tmsrc') || img.hasAttribute('data-tmsrcset')) deferred++;
+                    else if (img.complete) { if (img.naturalWidth > 0) loaded++; else broken++; }
+                    else pending++;
                     if (img.offsetWidth === 0 && img.offsetHeight === 0) zeroSize++;
                 }
                 window.webkit.messageHandlers.consoleLog.postMessage(
                     '[HTMLDebug] IMAGE AUDIT: total=' + allImgs.length
-                    + ' loaded=' + loaded + ' broken=' + broken + ' pending=' + pending + ' zeroSize=' + zeroSize
+                    + ' loaded=' + loaded + ' broken=' + broken + ' pending=' + pending
+                    + ' deferred=' + deferred + ' zeroSize=' + zeroSize
                 );
                 for (var ii = 0; ii < Math.min(allImgs.length, 3); ii++) {
                     var img = allImgs[ii];
