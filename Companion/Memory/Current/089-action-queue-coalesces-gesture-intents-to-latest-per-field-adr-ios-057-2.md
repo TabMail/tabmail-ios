@@ -1,11 +1,40 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **⚠️ CURRENT ROUTING NOTE (2026-08-12) — the `Deliberately NOT coalesced yet` bullet below is
+> STALE. Moves and undo ARE coalesced as of 2026-08-09. Read this note before that bullet; the body
+> is preserved unedited because its bytes are hash-pinned in `Companion/Memory/manifest.tsv` and
+> reconstruct `PROJECT_MEMORY.md`.**
+>
+> The bullet beginning *"**Deliberately NOT coalesced yet**: moves + undo (one refcounted closure per
+> op) — phase-2 design in `PLAN_OVERLAY_CALLSITE_AUDIT.md` §5"* describes work that has since landed.
+> Its final sentence about batch `markRead(_:)` is still true and is repeated below so the correction
+> does not read as retiring it.
+>
+> **Move/Undo follow-up (2026-08-09):** restored the simple v1.6.38 interaction model without
+> restoring its unsafe RFC Message-ID move-back. Undo pops the exact displayed top action and paints
+> its source overlay before any suspension, then appends the inverse behind earlier local admissions
+> without waiting for provider work. Exact never-sent opposites annihilate. If an IMAP MOVE is already
+> in flight, the latest opposite stays process-local until `COPYUID` supplies the destination UID,
+> then re-enters the same FIFO as an ordinary move; another gesture in either direction coalesces
+> through that FIFO. Process death may drop this convenience intent and sync exposes server truth. No
+> migration, receipt, alias, second queue, or Message-ID mutation lookup. Regression scenarios:
+> `UndoProviderIdentitySafetyTests` and
+> `QueueCoreInvariantTests.newestUndoDoesNotRetargetWhileForwardWriteIsQueued`.
+>
+> Batch `markRead(_:)` keeps its own closure (off-screen resolution; one-direction idempotent writes).
+>
+> **Provenance.** This text is the amendment `345c04a6f` (2026-08-10) wrote directly into the
+> preserved body, which broke the manifest's byte-identity leg and left `verify` aborting on its first
+> check from 2026-08-10 to 2026-08-12. The knowledge was correct; only its location was wrong. It is
+> reproduced here verbatim and the body below is restored to its pinned bytes. See `MIS-IOS-009`
+> instance 5.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ## Action queue coalesces gesture intents to latest-per-field (ADR-IOS-057, 2026-07-10) + overlay call-site audit closed
 
 - **Intent register**: `AccountManager.registerGestureIntent(id:_:)` / `executeIntentCycle(id:)` over `pendingIntentCycles` — first gesture on an id opens a cycle (ONE overlay retain, ONE queued executor); later gestures while queued only update the register + display overlay. Executor consumes the cycle atomically, resolves the header off-main, writes only fields whose target differs from the resolved header's current truth (round-3; identical to the gesture-time baseline for undisturbed cycles — out-of-band writers like markAllAsRead or remote flips get corrected to the user's latest visualized intent). Even-count toggles / tag-back-to-original = clean no-op: zero writes, zero `PendingOperation`s, zero unreadCount/badge churn, zero remote flips (fixes the backgrounded badge-bounce field report). Covers isRead/isFlagged/actionTag; wired from inbox `toggleRead`/`toggleFlag`/`applyManualTag` and detail `toggleRead`/`toggleReadForThread`/`markReadOnOpenIfNeeded`/`applyManualTag`.
 - **Ordering invariant**: on a NEW cycle, `retainOverlayEntry` runs BEFORE `registerMutation` — a sibling op's final release in the gap would strip the just-registered intent (same invariant the pre-register gesture paths documented).
 - **Call-site audit (PLAN_OVERLAY_CALLSITE_AUDIT.md §1-§2) CLOSED**: every production `removeOverlayEntries` caller converted to retain/release — move family (inbox+detail, single+thread), `UndoService.undo`, tags. Sole remaining production caller is `releaseOverlayEntry`'s zero-count branch. Overlay entry lifetime = union of ALL in-flight ops for the id; the mixed-path refcount bypass (direct removal stripping a refcounted sibling's entry, and the reverse) is dead. Regression tests: `mixedToggleAndArchiveOnSameId` + reverse order.
-- **Move/Undo follow-up (2026-08-09):** restored the simple v1.6.38 interaction model without restoring its unsafe RFC Message-ID move-back. Undo pops the exact displayed top action and paints its source overlay before any suspension, then appends the inverse behind earlier local admissions without waiting for provider work. Exact never-sent opposites annihilate. If an IMAP MOVE is already in flight, the latest opposite stays process-local until `COPYUID` supplies the destination UID, then re-enters the same FIFO as an ordinary move; another gesture in either direction coalesces through that FIFO. Process death may drop this convenience intent and sync exposes server truth. No migration, receipt, alias, second queue, or Message-ID mutation lookup. Regression scenarios: `UndoProviderIdentitySafetyTests` and `QueueCoreInvariantTests.newestUndoDoesNotRetargetWhileForwardWriteIsQueued`.
-- Batch `markRead(_:)` keeps its own closure (off-screen resolution; one-direction idempotent writes).
+- **Deliberately NOT coalesced yet**: moves + undo (one refcounted closure per op) — phase-2 design in `PLAN_OVERLAY_CALLSITE_AUDIT.md` §5 (UndoService reconciliation, `localMovePins`, `ensureDurable`, MOVE-vs-STORE UID-rekeying). Batch `markRead(_:)` keeps its own closure (off-screen resolution; one-direction idempotent writes).
 - **TB parity**: deliberate divergence — TB addon fire-and-forgets `browser.messages.update` to TB core (no queue/debounce); iOS owns its own IMAP write path, so the coalescing layer lives here (recorded in ADR-IOS-057).
 - Tests: `InboxGestureActionTests` now 24 (cancel-out, odd-count-one-write, cycle-consume-then-new-cycle, tag coalescing, mixed-path both orders, undo retain hygiene, strand checks on refcount + register).
 

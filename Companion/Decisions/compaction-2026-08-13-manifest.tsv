@@ -1,0 +1,17 @@
+# companion-compact manifest — tabmail-ios / Decisions tree (2026-08-13 pass)
+# Source: DECISIONS.md BEFORE this pass (27720 B, sha256 00a507b1a1d2a0b9b67b23d467a4c47f42902294394c5bc9105314bc6954edbc)
+# CONTENT DELETED: none. Every row below is a byte-exact fragment MOVED out of the index
+# into the named route target; the index kept a shortened routing line in its place.
+# Each fragment is the pre-pass catalog BULLET, preserved inside a ```text fence so its DECISIONS.md-relative link is not re-resolved from Companion/Decisions/V3/.
+# Stage 4a rebuild (run from tabmail-ios/):
+#   python3 - <<'EOF'
+#   import re, hashlib
+#   cur = open('DECISIONS.md').read().split('\n')
+#   doc = open('Companion/Decisions/V3/pre-compaction-index-lines.md').read()
+#   for m in re.finditer(r'## Source line (\d+) — `(ADR-IOS-\d+)`\n\n<!-- BEGIN VERBATIM BULLET \2 -->\n\n```text\n(.*?)\n```', doc, re.S):
+#       cur[int(m.group(1))-1] = m.group(3)
+#   b = '\n'.join(cur).encode(); print(len(b), hashlib.sha256(b).hexdigest())
+#   EOF
+fragment_id	route_target	index_line	bytes	sha256
+ADR-IOS-076	Companion/Decisions/V3/pre-compaction-index-lines.md	148	5489	f9a977dead5c77d37be46071e1fa49863bcfae516360e520af3e3e900bfe69a9
+ADR-IOS-077	Companion/Decisions/V3/pre-compaction-index-lines.md	149	1621	16dd59eac2399b68595a07235cf45fc395235a94a29bbc2a268cc14cda7f2e2d

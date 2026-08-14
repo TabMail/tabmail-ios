@@ -1,0 +1,37 @@
+# companion-compact manifest — tabmail-ios / Memory tree (2026-08-13 pass)
+# Source: PROJECT_MEMORY.md BEFORE this pass (31036 B, sha256 7be13856953317afaa8e14700642a302d4e834a3d6ab4accd2d062674ea3ebf2)
+# CONTENT DELETED: none. Every row below is a byte-exact fragment MOVED out of the index
+# into the named route target; the index kept a shortened routing line in its place.
+# Each fragment is the pre-pass *Topic / search terms* CELL of one row of the Post-`v1.6.38` table; the Status and [read in full] cells were not modified. Passes 1-3 of the same history file are documented in its own headings.
+# Stage 4a rebuild (run from tabmail-ios/):
+#   python3 - <<'EOF'
+#   import re, hashlib
+#   cur = open('PROJECT_MEMORY.md').read().split('\n')
+#   src = open('Companion/Memory/History/110-pre-compaction-index-row-abstracts.md').read()
+#   seen = set()
+#   for tag in ('pass 4', 'pass 4b'):
+#       for m in re.finditer(r'<!-- BEGIN VERBATIM ROW (\d+) \(%s\) -->\n(.*?)\n<!-- END VERBATIM ROW \1 \(%s\) -->' % (tag, tag), src, re.S):
+#           ln = int(m.group(1))
+#           if ln in seen: continue
+#           seen.add(ln); p = cur[ln-1].split(' | '); cur[ln-1] = '%s | %s | %s' % (p[0], m.group(2), p[2])
+#   b = '\n'.join(cur).encode(); print(len(b), hashlib.sha256(b).hexdigest())
+#   EOF
+fragment_id	route_target	index_line	bytes	sha256
+row-143 (pass 4)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	143	152	dbdfabd42d3d8d7595a52916b27671d91fdccf34d2d7bd40118ce84759438fba
+row-144 (pass 4)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	144	395	1dc01ffb59bf9a88facb7087f7d918e8675ab974c7f1268ef77a71d6f37309e0
+row-145 (pass 4)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	145	176	3b04722a6692cc401ef4e08363012d2020d80122871aa95e89c0e05e1ef70f44
+row-146 (pass 4)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	146	178	2cc3f30306acafb04b961065199298816f3cfa123c31e40c52c605029c42c095
+row-147 (pass 4)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	147	191	d02fabe95ad97435e45d454dc7182660fb1473ae4dd1d8426cc2f0ed4d7eb2cb
+row-148 (pass 4)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	148	195	013cb2a9fd04321249ef33c7dca605267bfdec2959f8dec9b081467ae69f1a81
+row-149 (pass 4)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	149	211	c1bbdeba1f0af070f800d97f37bad81e0cf882ee7f1ed1c255380626c5940708
+row-150 (pass 4)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	150	221	1caa45b966e53b443d22525062d49e7fb44132a0803dbde14a2c183f9762ed4e
+row-151 (pass 4)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	151	525	03eb5778aeff678b59b0c9207e3024d3e717e6f73a77ee791c8b19e417807c56
+row-152 (pass 4b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	152	205	f1b09fa989a5fd18fbd45c8beff6e2dd0c3e183ce406c5b50e3f8a198f6b4d12
+row-153 (pass 4b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	153	199	d6c3822ba261a0f1752295b81143d44d7ed38795d3b952e3670de3e87ddb436c
+row-154 (pass 4)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	154	496	38b78821cab4ceb23c9037c5344ac1f8eaab3475a49ddf620b00ffdcd9ea22af
+row-155 (pass 4b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	155	186	719a217fd885229b0b2d512316e1bc0d2fd3262d690b6fa0276cc89d73f16d59
+row-156 (pass 4b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	156	184	747166b4fbebada6a1f0a2793de08202e3e9cecf10b2730ab7043b9bd430172d
+row-157 (pass 4b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	157	204	48b8d8caa9dd975db469803c3435d97399ed0cea5f179e0ec4f91dca276f17f6
+row-162 (pass 4)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	162	329	6a47bbd429c37f6e1e0aee997c1b7bfa570e5c82cfb656eedc561e845643a30f
+row-163 (pass 4)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	163	814	593018a9647c977f70cc3ef93c75d2fcd4ace9288f1abf5febc3cc302fb85ad6
+row-164 (pass 4)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	164	4957	2b3ff32af9c3079ee3dc6a4bfea3b13edf5a1d625b164e31d72f0baa1ac1c9d3

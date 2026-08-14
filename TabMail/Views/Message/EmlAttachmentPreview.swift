@@ -276,7 +276,11 @@ struct EmlAttachmentPreview: View {
             self.error = SyncEngine.isConnectionError(error)
                 ? "Download failed. Check your connection and try again."
                 : "Download failed: \(error.localizedDescription)"
-            print("[EmlNestedAttachment] Download failed: \(error)")
+            if DebugModeManager.isLoggingEnabled() {
+                // `error` can carry a server- or sender-supplied path, and `print`
+                // is a line-oriented sink: see `DebugModeManager.escapedForLogLine`.
+                print("[EmlNestedAttachment] Download failed: \(DebugModeManager.escapedForLogLine(String(describing: error)))")
+            }
         }
     }
 

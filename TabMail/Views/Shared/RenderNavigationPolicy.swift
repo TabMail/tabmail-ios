@@ -219,6 +219,22 @@ internal enum LinkDispatch: Equatable {
     case refuse(LinkRefusal)
 }
 
+/// ⚠️ **The allowlist below is not an absolute over every externally dispatched target.**
+/// There are **TWO** documented exceptions, both created by owner directive on 2026-08-12 and
+/// both invisible to any test of this file:
+///
+/// 1. **Data Detectors** (`IOS-UI-002`). `HTMLWebView.makeUIView` sets
+///    `dataDetectorTypes = [.link, .phoneNumber]`, and detectors sit OUTSIDE the navigation
+///    delegate: WebKit can present detector UI before `changeLocation`, so a target detected in
+///    PLAIN TEXT may never arrive here at all.
+/// 2. **Long-press link preview** (`IOS-UI-003`). `allowsLinkPreview` is left UNSET, so WebKit's
+///    default (ON) applies. Preview FETCHES and PRESENTS the remote URL without producing a
+///    `decidePolicyFor` decision, so that fetch never reaches this allowlist either.
+///
+/// Say *"every `.linkActivated` target passes the `http`/`https` allowlist"* — never *"every
+/// externally dispatched target"* — and qualify any restatement with BOTH exceptions
+/// (`MIS-019` shape). Authored `<a href>` links are unaffected by either and do reach
+/// `decidePolicyFor`.
 internal enum RenderLinkPolicy {
     /// Where a `.linkActivated` action goes, given the URL of the document we loaded.
     ///

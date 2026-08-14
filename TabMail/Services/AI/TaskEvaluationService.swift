@@ -233,8 +233,9 @@ actor TaskEvaluationService {
         // so it is scoped deliberately; widening it is a backend decision (systemPromptTiers.json),
         // never a token swap at this call site.
         //
-        // This named token is a versioned client/backend contract. Coordinate any future token
-        // change across both sides; do not substitute another prompt token locally.
+        // ⚠️ DEPLOY ORDER: the backend must ship this token BEFORE this line does — its tier lookup
+        // throws on an unknown token rather than failing closed, so a client that ships first breaks
+        // task evaluation outright instead of degrading.
         let systemMessage = CompletionsMessage(
             role: "system",
             content: Self.taskEvalSystemPrompt,

@@ -309,3 +309,135 @@ Authored after `v1.6.38`, so the pinned compaction has no byte-identical twin. D
 | Current | 🚨 **AN ENUM WITH NO SILENT CASE DOES NOT PREVENT A SILENT PATH** — `ResultTapOutcome`'s "cannot reintroduce silence" comment was FALSE AND LOAD-BEARING (`case …: break` compiles); the old tap suite stayed GREEN under it (`438f632cf`) | [read in full](../Current/109-an-enum-with-no-silent-case-does-not-prevent-a-silent-path.md) |
 <!-- END VERBATIM ROW 163 (pass 3) -->
 
+---
+
+# Pass 4 — 2026-08-13 `companion-compact`, source `working-tree`
+
+`tabmail-ios/PROJECT_MEMORY.md` had grown to **31,036 B, 24% over its 25,000 B budget**, almost
+entirely in the *Post-`v1.6.38` topics* table, whose cells had again become abstracts rather than
+routing lines (one cell alone was **4,957 B**). The index now carries a shortened cell for each row
+below; the text here is what those cells were compressed from, **byte-for-byte**, so nothing a past
+plan, review prompt, or commit body quoted has become unsearchable.
+
+As in passes 1–3, only the *Topic / search terms* cell is preserved — the `Status` and
+`[read in full]` cells were not modified, and the normative detail was always the linked
+`Companion/Memory/` topic file named in each heading, never this file.
+
+
+### Source line 143 — Historical → `094-retained-inline-no-byte-identical-routed-twin.md`
+
+<!-- BEGIN VERBATIM ROW 143 (pass 4) -->
+Compaction drift list — why a post-`v1.6.38` amendment can differ from its `Companion/Memory/` twin, and the check-the-routed-twin-before-editing rule
+<!-- END VERBATIM ROW 143 (pass 4) -->
+
+### Source line 144 — Current → `095-v3-provider-id-action-queue-forward-port-resume-state.md`
+
+<!-- BEGIN VERBATIM ROW 144 (pass 4) -->
+v3 provider-id action-queue forward-port — ✅ **COMPLETE, SHIPPED as v1.7.0 (2026-08-07)**; the `v3` branch is **DELETED and `main` IS that line**; rules **R0/R3 RETIRED** — no mandatory `v2final` consult; ⛔ **`v2final` is preserved history, NOT a reference** (a `v1.6.38` SIBLING that never shipped; in-code `PORT — v2final:…` comments are PROVENANCE only); `PLAN_IOS_REFACTOR_V3.md`
+<!-- END VERBATIM ROW 144 (pass 4) -->
+
+### Source line 145 — Current → `096-t1-3-new-gesture-fails-closed-on-unknown-uidvalidity-epoch.md`
+
+<!-- BEGIN VERBATIM ROW 145 (pass 4) -->
+T1.3 — a NEW gesture fails CLOSED on an unknown UIDVALIDITY epoch: `newGestureRefusedForUnknownEpoch` is a silent no-op (`IOS-EPOCH-001`, C3), never "fixed" back to fail-open
+<!-- END VERBATIM ROW 145 (pass 4) -->
+
+### Source line 146 — Historical → `097-t4-s6-follow-up-superseded-v3-intermediate-draft-epoch-stamp.md`
+
+<!-- BEGIN VERBATIM ROW 146 (pass 4) -->
+T4.S6 — **SUPERSEDED v3 intermediate, never implement from it**: `v69` `observedUidValidity` draft stamp, `v72` draft queue epoch; ⛔ the RETRACTED bare mailbox-wide `EXPUNGE`
+<!-- END VERBATIM ROW 146 (pass 4) -->
+
+### Source line 147 — Current → `098-imap-external-deletion-blind-spot-amended-adr-ios-051.md`
+
+<!-- BEGIN VERBATIM ROW 147 (pass 4) -->
+IMAP external-deletion blind spot — server-deleted messages linger forever; FIXED by **ADR-IOS-051** Ph1+2: `SyncEngineDeletionReconcile`, `handleVanishedUIDs`, `deletionReconcileChunkSize`
+<!-- END VERBATIM ROW 147 (pass 4) -->
+
+### Source line 148 — Current → `099-persistent-nse-log-file-watchdog-partial-delivery-audit-rounds.md`
+
+<!-- BEGIN VERBATIM ROW 148 (pass 4) -->
+Persistent NSE log + watchdog partial-result delivery, audit rounds 1–7: `NSELogStore`/`nse.log`, `PartialSignalHolder`; **idle-timer-vs-SSE** root cause; zombie-resume `OneShotFlag.hasFired()`
+<!-- END VERBATIM ROW 148 (pass 4) -->
+
+### Source line 149 — Current → `100-two-instant-wake-handoff-elapsed-means-do-it-now.md`
+
+<!-- BEGIN VERBATIM ROW 149 (pass 4) -->
+Two-instant wake handoff — deadline elapses between the query and the re-check ⇒ arm nothing; "elapsed" means DO IT NOW (`AccountManager.wakeUpDelay`, `holdUntil`, `IOS-OUTBOX-005`, `UInt64(negative)` traps)
+<!-- END VERBATIM ROW 149 (pass 4) -->
+
+### Source line 150 — Current → `101-isdeletedonserver-has-four-materialisation-paths.md`
+
+<!-- BEGIN VERBATIM ROW 150 (pass 4) -->
+`isDeletedOnServer` — FOUR materialisation paths **plus a FIFTH PRESENTATION path the census missed** (`SearchView.searchAccount` sends no `NOT DELETED`), `IOS-IMAP-001`; ⚠️ ERRATUM `deepBackfillFolder` is DEAD CODE
+<!-- END VERBATIM ROW 150 (pass 4) -->
+
+### Source line 151 — Current → `102-there-are-four-irreversible-wire-operations-not-one.md`
+
+<!-- BEGIN VERBATIM ROW 151 (pass 4) -->
+⚠️ **SIX irreversible wire operations at `967e5b3c5`, not one** — the five deletion-family members plus `CalDAVProvider.splitSeries`'s cap `PUT`. Membership is defined by loss of server-side authored content without a reached per-item recovery path, not by a verb. Atomic `UID MOVE` is excluded: success retains each member in the destination and the fork has no destructive fallback. Current lower-bound census A/B/C/D/E = 7/3/5/2/2 (C has 2 live scoped calls + 3 comments); `CLAUDE.md`'s six-member MANTRA is current.
+<!-- END VERBATIM ROW 151 (pass 4) -->
+
+### Source line 154 — Current → `105-a-print-is-not-production-observability-on-ios.md`
+
+<!-- BEGIN VERBATIM ROW 154 (pass 4) -->
+🚨 a bare `print` is NOT production observability on iOS — `stdout` is DISCARDED on device; use `BackgroundSyncLogger.logError`; a gate inside a BRANCH CONDITION picks the branch (`MIS-019`); **a RESIDUAL RECORD ("not changed: …") is an absolute in humility's clothing** — `f947acb4c`'s named only `ComposeView` while 6 release-executing render-path sinks went unchecked; corrected non-exhaustive list of remaining ungated/unescaped print sinks + `RenderPathLogSinkTests` scope lives here
+<!-- END VERBATIM ROW 154 (pass 4) -->
+
+### Source line 162 — Current → `114-both-uidvalidity-redrive-owners-iterate-syncablefolders.md`
+
+<!-- BEGIN VERBATIM ROW 162 (pass 4) -->
+🚨 **BOTH UIDVALIDITY RE-DRIVE OWNERS ITERATED `syncableFolders`** (`fullSync` + `imapDeltaSync`), so an armed CUSTOM NON-FAVOURITE folder had NO re-drive — quarantined forever, mail purged; 26 folders / 145,754 rows (85%) on the reference device. `syncFolderMessages` is now the third owner. Count PREDICATES, not call sites
+<!-- END VERBATIM ROW 162 (pass 4) -->
+
+### Source line 163 — Current → `115-known-issues-register-is-byte-frozen-and-has-no-append-path.md`
+
+<!-- BEGIN VERBATIM ROW 163 (pass 4) -->
+✅ **`KNOWN_ISSUES.md` APPEND PATH — RESOLVED 2026-08-12** (was: byte-frozen, no append path) — `compact_known_issues.rb generate` re-sources from the hash-pinned `known-issues-pre-hierarchy-2026-08-09.txt` whenever it exists, and `verify` byte-compares, so an appended row is `content mismatch` and a new detail file is `orphan detail`. THE MANTRA's "register it in `KNOWN_ISSUES.md`" was unexecutable until `compact_known_issues.rb` gained a strip-before-compare amendment block (`KNOWN-ISSUES-AMENDMENT-BEGIN`/`-END`) plus a non-globbed `KnownIssues/Amendments/` dir — first used by `IOS-IMAP-015`; the 4 unregistered `RRULE UNTIL` residuals (all-day `Z`-drop, `.floating` DTSTART, explicit `all_day` honoured, and the resolving-GET-vs-merge-GET type-of-check/type-of-use race) are recorded there instead
+<!-- END VERBATIM ROW 163 (pass 4) -->
+
+### Source line 164 — Current → `116-a-path-component-is-capped-in-nfd-utf16-units-not-bytes-or-characters.md`
+
+<!-- BEGIN VERBATIM ROW 164 (pass 4) -->
+🚨 **ATTACHMENT FILENAMES REJECTED, NOT REDUCED** (owner 2026-08-12) — reducer + co-edit twin DELETED; one predicate `AttachmentFilename.isSafeFileComponent` (6 rules), `AttachmentFilenameError` thrown by both `saveAttachments` + `AttachmentPreviewStager.createAttempt`, display via `displayLabel`; message REASON-AGNOSTIC, long-Hangul false rejection ACCEPTED with no breadcrumb; `metaBase`/`afterIndexPrefix` STAY (the merging char is one the STORE adds). Everything below is now the ACCEPTANCE BOUNDARY — read "stripped"/"truncated" as "refused". **A path COMPONENT is capped at 255 NFD UTF-16 units — NOT 255 UTF-8 bytes, NOT 255 `Character`s**, and the two wrong guesses fail in OPPOSITE directions (86×`U+6F22` = 258 bytes STORES; 128×`U+00E9` = 128 characters is REFUSED because APFS decomposes to 256 units). Over-length write = `NSCocoaErrorDomain` 514 / `NSPOSIXErrorDomain` 63 `File name too long`. Bisected on APFS + the simulator, 0/400 randomised-mixed-string disagreements. Overlong attachment filenames are now TRUNCATED (owner, 2026-08-12), stem cut on whole grapheme clusters, extension preserved, budget = `255 - String(Int.max).count - 1 - ".meta".count` = 230 because the `.meta` SIDECAR is the longest derived name (sidecar overflows 5 units before the data file does). ⚠️ also records the CLOSED filename control-strip defect: `CharacterSet.controlCharacters` is **24,970 scalars — NOT Cc, NOT Cc ∪ Cf** (Cc 65 + Cf 170 + 97 Mn + 24,638 unassigned plane-14), so `.subtracting(Cf)` does NOT recover Cc — **ROOT CAUSE: SOME set operators on a BUILT-IN `CharacterSet` materialise it and WHICH IS NOT PREDICTABLE FROM THE EXPRESSION — `.subtracting(CharacterSet())` collapses `controlCharacters` to Cc∪Cf=235 but `.union(CharacterSet())`, `formUnion(empty)` and `.inverted.inverted` PRESERVE 24,970 (same identity, opposite answers); `union(self)`/`intersection(self)` collapse.** Exactly 2 of 20 built-ins are unstable and they move OPPOSITE ways: `controlCharacters` −24,735, **`illegalCharacters` +24,499 (EXPANDS, so `x.subtracting(.illegalCharacters)` is broader than predicted — dangerous for a rejection predicate)**; `nonBaseCharacters` and the other 17 are stable. Bare `controlCharacters` is INCOHERENT in plane 14 — contains `U+E0101` but NOT `U+E0100`/`U+E0102`–`U+E011F`, matching no Unicode property — so a red proof using a GENERIC variation selector had a 143-in-240 chance of proving nothing and blessing the bug; the suite is safe only because its exemplars came from the OBSERVED defect. The `MessageIdentity` RFC-id guard's `whitespacesAndNewlines.union(.controlCharacters)` is only 254 and never reaches plane 14, and it is fail-OPEN at the consumer (no witness ⇒ header KEPT ⇒ address-only auth), so widening it enlarges the witness-less population — the direction `IOS-IDENTITY-001` forbids. Constructed-set unions are exact (`strippedFilenameScalars`=74, re-measured on the SHIPPED expression after a probe verified a MIRROR instead). It stripped `U+200D` ZWJ (flattening `👨‍👩‍👦` to `👨👩👦`) and the `U+E0020`–`U+E007F` TAG chars (Scotland flag → plain black flag at the SAME char count). Narrowed to `strippedFilenameScalars` = Cc ranges + enumerated bidi `U+202A`–`U+202E` / `U+2066`–`U+2069`; ~~RLM/LRM/ALM KEPT~~ — 🚨 **OVERRULED 2026-08-12 `592bd9922`: `U+200E`/`U+200F`/`U+061C` ARE STRIPPED (owner, "strip them everywhere"), because a mark reorders the RUNS rather than reversing one — `"\u{200F}pdf\u{200F}.exe"` renders `exe.pdf`; the KEEP decision was measured but every fixture was `report`-PREFIXED, which anchors paragraph direction and makes the spoof structurally impossible (`MIS-030` recurrence — fixture never held the precondition). `U+2028`/`U+2029` added too: mandatory line breaks, `"invoice.pdf\u{2028}.exe"` hides `.exe` on line 2 (`CTTypesetterSuggestLineBreak` @100,000pt); they are the only two outside Cc. AND every `unassigned` scalar is stripped — swept on APFS, the FS-REFUSED set is EXACTLY the 814,730 unassigned scalars, 0 disagreements either way, `open(2)` raises `EILSEQ`/errno 92, so `"invoice\u{0378}.pdf"` made `saveAttachments` THROW; the narrowing WIDENED that (old bare set covered 24,638, narrowed covers 0, 790,092 never covered). Post-fix sweep: 1,112,064 scalars reduced then written as `<Int.max>_<reduced>.meta`, 0 failures. Shipped set is now 79 scalars. ALSO: length truncation CAN yield `Attachment` — one grapheme cluster wider than the budget (`"a"`+300×`U+0301`+`.pdf`) left no stem and returned `".pdf"`, whose `pathExtension` is EMPTY; the stem now becomes `Attachment` and the extension survives.** `report\u{202E}fdp.exe` renders `reportexe.pdf` (CoreText-measured) so the bidi half must never be re-narrowed; the containment probe was never dependent on the Cf half. The suite's multi-byte test had been BLESSING it via a baseline recomputed from the defect's own predicate
+<!-- END VERBATIM ROW 164 (pass 4) -->
+
+---
+
+# Pass 4b — 2026-08-13 `companion-compact`, source `working-tree`
+
+Pass 4 left the index at 25,841 B, still over its 25,000 B budget, so the remaining
+*Post-`v1.6.38`* cells were tightened too. Rows already routed by pass 4 are **not** repeated here:
+their pre-pass originals are above, and only my own pass-4 replacement text was shortened. The five
+cells below had never been routed and are preserved byte-for-byte before trimming.
+
+
+### Source line 152 — Current → `103-await-dbpool-read-is-not-a-short-suspension.md`
+
+<!-- BEGIN VERBATIM ROW 152 (pass 4b) -->
+🚨 `await dbPool.read` is NOT a short suspension — the ASYNC overload first `await`s `NSEDataBridge.mergeIfStagingPending()`, a measured 7.6 s cold-boot write; check-then-act across it is never BOUNDED
+<!-- END VERBATIM ROW 152 (pass 4b) -->
+
+### Source line 153 — Current → `104-a-latch-that-authorises-a-transition-must-be-held-across-the-write.md`
+
+<!-- BEGIN VERBATIM ROW 153 (pass 4b) -->
+🚨 a latch that AUTHORISES a transition must be HELD across the write — reading `isDrainingOutbox` then `await`ing proves nothing; ACQUIRE it (`IOS-OUTBOX-006`, `reconcileOutbox`, no Sent APPEND)
+<!-- END VERBATIM ROW 153 (pass 4b) -->
+
+### Source line 155 — Current → `106-a-filter-after-the-limit-narrows-the-page-instead-of-selecting-it.md`
+
+<!-- BEGIN VERBATIM ROW 155 (pass 4b) -->
+🚨 a filter applied AFTER a query's `LIMIT` narrows the page instead of selecting it — `InboxListReader.gather`, `hasMoreMessages` (`IOS-SCROLL-002`, `IOS-BACKFILL-001`, `6d460aa99`)
+<!-- END VERBATIM ROW 155 (pass 4b) -->
+
+### Source line 156 — Current → `107-a-staging-key-that-names-an-address-must-re-prove-identity-before-reusing-payload.md`
+
+<!-- BEGIN VERBATIM ROW 156 (pass 4b) -->
+🚨 a staging key that names an ADDRESS must re-prove identity before it reuses payload — `nse_processed_message`'s PK holds a UID, `stageHeader`'s `ON CONFLICT` (`IOS-NSE-005`, C3)
+<!-- END VERBATIM ROW 156 (pass 4b) -->
+
+### Source line 157 — Current → `113-a-swift-string-comparison-does-not-reproduce-sqlite-binary-collation.md`
+
+<!-- BEGIN VERBATIM ROW 157 (pass 4b) -->
+🚨 a Swift `String` comparison does NOT reproduce SQLite **BINARY** collation and is not even a total order — compare `utf8.lexicographicallyPrecedes`; `InboxOrdering`, keyset cursor, `IOS-SCROLL-002`
+<!-- END VERBATIM ROW 157 (pass 4b) -->

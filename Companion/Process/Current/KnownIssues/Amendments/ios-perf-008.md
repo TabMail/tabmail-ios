@@ -12,7 +12,7 @@ watchdog reporting that the app exceeded its disk-write budget:
 | v1.6.38 (347), 2026-08-06 | 1.07 GB | 85,167 s | **12.61 KB/s** | 12.43 KB/s |
 | v1.7.8 (356), 2026-08-11 | 17.18 GB | 68,490 s | **250.84 KB/s** | 198.84 KB/s |
 
-Source: `~/Library/Logs/CrashReporter/MobileDevice/<device-name>/TabMail.diskwrites_resource-*.ips`.
+Source: `~/Library/Logs/CrashReporter/MobileDevice/iphone.kmyid/TabMail.diskwrites_resource-*.ips`.
 The v1.7.8 report is on a TestFlight build (`is_beta: 1`, `distributor_id: com.apple.TestFlight`).
 
 ## What is and is NOT comparable — read before citing these numbers

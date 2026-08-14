@@ -1064,6 +1064,20 @@ struct AttachmentFilenameContainmentTests {
         return String(out)
     }
 
+    /// How many UTF-16 units the typesetter puts on the FIRST line when the line is
+    /// 100,000pt wide. At that width nothing breaks for want of room, so a break
+    /// here is a MANDATORY one — which is the thing that can hide the rest of a name
+    /// from a `.lineLimit(1)` label.
+    private func firstLineUnits(_ text: String) -> Int {
+        let font = CTFontCreateWithName("Helvetica" as CFString, 14, nil)
+        let attributed = NSAttributedString(
+            string: text,
+            attributes: [kCTFontAttributeName as NSAttributedString.Key: font]
+        )
+        let typesetter = CTTypesetterCreateWithAttributedString(attributed)
+        return CTTypesetterSuggestLineBreak(typesetter, 0, 100_000)
+    }
+
     /// The INSTRUMENT check, not a product assertion: `visibleOrder` must return a
     /// plain LTR string unchanged, including one that forms ligatures.
     ///
@@ -1084,20 +1098,6 @@ struct AttachmentFilenameContainmentTests {
                 "the harness lost or reordered a character in plain LTR text: \(text.debugDescription)"
             )
         }
-    }
-
-    /// How many UTF-16 units the typesetter puts on the FIRST line when the line is
-    /// 100,000pt wide. At that width nothing breaks for want of room, so a break
-    /// here is a MANDATORY one — which is the thing that can hide the rest of a name
-    /// from a `.lineLimit(1)` label.
-    private func firstLineUnits(_ text: String) -> Int {
-        let font = CTFontCreateWithName("Helvetica" as CFString, 14, nil)
-        let attributed = NSAttributedString(
-            string: text,
-            attributes: [kCTFontAttributeName as NSAttributedString.Key: font]
-        )
-        let typesetter = CTTypesetterCreateWithAttributedString(attributed)
-        return CTTypesetterSuggestLineBreak(typesetter, 0, 100_000)
     }
 
     /// The invariant: **no INVISIBLE scalar can make what the user reads lay out in

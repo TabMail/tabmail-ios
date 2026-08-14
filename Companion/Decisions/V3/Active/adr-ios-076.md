@@ -2,23 +2,38 @@
 
 **Date:** 2026-08-11
 
-**Status:** Active. Specification frozen 2026-08-11 (owner). This routed ADR and the named production
-policies/tests below are the public specification; ignored working-plan files are not durable
-references. Any later change to this specification is an audit finding against a commit candidate,
-not an informal plan revision.
+**Status:** Active. Specification frozen 2026-08-11 (owner). The frozen text is
+`PLAN_EMAIL_RENDER_SECURITY.md` §8.4 + §9.1 (B1–B3) + §10.1 (C1–C5) + §2.9 (T11), implemented in the
+commit order of that plan's §11. Any later change to this specification is an audit finding against a
+commit candidate, not a plan revision.
 
 **Context.** The message document is **fully attacker-controlled input**. Anyone who can send mail to
 the user authors it; there is no origin authentication, no reputation gate, and **no user gesture
 between arrival and render** — the detail view renders on open and `MessageCardView` renders expanded
-cards inside a list. Before this hardening train, those call sites inherited general-purpose WebKit
-defaults and did not enforce one auditable document, navigation, bridge, and asset-authorization
-boundary. This ADR records the current defensive contract and its regression surfaces; it does not
-preserve a reproduction guide for pre-fix releases.
+cards inside a list. Against that, the shipped renderer treated the document as ordinary web content:
+
+- `HTMLWebView.makeUIView` sets `config.defaultWebpagePreferences.allowsContentJavaScript = true`, so
+  sender-authored script executes on open.
+- No sanitizer exists in the render path. `EmailHTMLWrapper.wrapHTML` strips exactly three things —
+  `loading="lazy"`, external stylesheet `<link>`, and remote `img src` → `data-tmsrc`. `<script>`,
+  inline event-handler attributes, `javascript:` URLs, `<iframe>`, `<form>`, `<object>`/`<embed>` and
+  `<meta http-equiv="refresh">` pass through untouched. SwiftSoup is a declared SPM dependency, but
+  its only occurrence in the app source is the credits list in `AcknowledgmentsView`; it cleans
+  nothing. `EmailFilter`'s `<script>`/`<style>` skipping is the **plain-text extraction** path
+  (snippets, AI input) and must never be cited as a render-path sanitizer.
+- The Content-Security-Policy emitted by `wrapHTML` consists solely of `upgrade-insecure-requests`.
+  A CSP delivery vehicle therefore already exists — this decision **extends one meta tag**, it does
+  not introduce a mechanism.
 
 All four render call sites share the one `WKWebViewConfiguration` built in `HTMLWebView.makeUIView`:
 two in `MessageCardView`, one in `EmlAttachmentPreview` (an attacker-supplied `.eml`, opaque origin),
-one in `ComposeView` (the quoted original rendered inside compose). All four now route through the
-same boundary.
+one in `ComposeView` (the quoted original rendered inside compose). All four inherited content JS.
+
+This is **shipped behaviour, not a regression** — the security-relevant sequence is byte-identical at
+the immutable tag `v1.7.8` and at the plan's HEAD `ef5457ba7` (A1 verified; the plan's positional
+citations are pinned to that tag, which is the only form of `file:line` citation this repo accepts —
+everything named in this ADR is a symbol). There was no shipped mitigation to inherit, so shipped is
+the thing being fixed.
 
 **Decision.** The message document is untrusted content, and that is enforced **at the WebKit
 boundary** — configuration, navigation policy, and asset authorization — rather than by trying to
@@ -610,16 +625,25 @@ must, images behave per CSP, the nonce-in-path load works with **both** `nil` an
 base URLs, plus fragment click, `history.back`, two overlapping app loads, process termination and
 appearance reload, on the minimum and current supported iOS.
 
-**Provenance.** Decided 2026-08-11 by the owner after three cross-model design-review rounds, then
-checked again against the exact implementation diff. Findings that changed the proposed mechanisms
-were independently re-verified before they were folded; the source tests and hosted WebKit canaries
-named above are the durable evidence.
+**Provenance.** Decided 2026-08-11 by the owner after a **three-round cross-model plan vet** (rounds 1,
+2 and 3 recorded in `PLAN_EMAIL_RENDER_SECURITY.md` §8, §9 and §10). Round 3 returned **zero new
+attack surface** — its blockers were all corrections to mechanisms invented in round 2, plus one
+structural finding — which satisfied the owner's stop condition ("keep vetting while genuinely NEW
+vulnerability angles appear"). §10.3 recommended a narrowly-scoped round 4; the owner froze instead.
+**A8 budget: 3 of 5 rounds spent; the remaining 2 are RESERVED for the post-implementation exact-diff
+audit train (A4), not for plan text.** Two process facts worth carrying forward: round 2's first
+attempt was refused at the output stage by GPT's cyber-safety classifier after ~270k tokens of
+completed research — a refusal is **not** a clean round and was not recorded as one — and the
+defensively re-framed prompt ("review these mitigations for correctness and missing validation", never
+"how would you bypass this") completed with the same information needs. Three of the vet's findings
+overturned the plan's own conclusions, which is why each was independently re-verified before folding.
 
 **Relates:** ADR-IOS-039 (render idempotency + reveal contract — any change to script injection or the
 fit path must preserve it), ADR-IOS-066 / ADR-IOS-072 (content is addressed by the message it belongs
 to, never by the slot it occupies — decision 5 is that principle applied to asset serving),
 ADR-IOS-045 (QuickLook presented imperatively — adjacent to decision 9), ADR-IOS-052
 (presentation-time ICS sanitizer — the other place we treat inbound content as hostile), cross-cutting
-ADR-004 (zero retention — why an image proxy is rejected), and the routed render-pipeline memory topic
+ADR-004 (zero retention — why an image proxy is rejected), `PLAN_EMAIL_RENDER_SECURITY.md` §8.4, §9.1,
+§10.1, §2.9 and §11, and the routed render-pipeline memory topic
 `Companion/Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md`
 (bullet 30 records the reverted block-with-banner experiment).

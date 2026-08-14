@@ -129,7 +129,7 @@ assertion: delete the `else if scrubbedStaleStagedRows` branch and a bounded wai
 
 ```
 xcodebuild test-without-building -project TabMail.xcodeproj -scheme TabMail \
-  -destination 'id=<simulator-udid>' -derivedDataPath /tmp/tabmail-dd \
+  -destination 'id=E390B52E-FAD7-4CD7-BD60-328CD0BF7D65' -derivedDataPath /tmp/tabmail-dd \
   -only-testing:'TabMailTests/InboxEndToEndInvariantTests/scrubOnlyWakeStillConverges()' \
   -test-iterations 40 -run-tests-until-failure > E1.log 2>&1
 ```
@@ -192,7 +192,7 @@ tolerating a known failure. That is the expensive part, independent of whether a
 | full suite, `p4_test.log`, 2026-08-13 01:39 | 9042 tests in 1222 suites | **✘ failed** |
 | suite alone, `-only-testing:TabMailTests/InboxEndToEndInvariantTests` | 18 tests in 1 suite | **✔ passed**, 0 `✘`, 0 issues |
 
-Same commit, same simulator (`iPhone 17 Pro`, id `<simulator-udid>`), same shared derivedData.
+Same commit, same simulator (`iPhone 17 Pro`, id `E390B52E-…`), same shared derivedData.
 
 **It is NOT a timeout flake.** It failed after **0.280 s** on a real assertion, at
 `InboxEndToEndInvariantTests.swift:600` (cited by line only because this entry is about a specific

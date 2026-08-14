@@ -706,9 +706,15 @@ def verify_repository_companion_references
     next unless relative_path.match?(/\.(?:md|swift|html|rb|sh|ya?ml)\z/)
 
     body = File.binread(path)
-    body.scan(%r{Companion/(?:Memory|Decisions|Process|Rules|Mistakes)/[^\s`'"\])>]+\.md}).uniq.each do |target|
+    # A `../Companion/…` reference names the MONOREPO-ROOT companion tree, not this subproject's.
+    # Matching from `Companion/` onwards discarded that prefix and resolved every such pointer
+    # against ROOT, so a CORRECT root-tree reference was reported broken and aborted the whole
+    # verifier (MIS-IOS-009 records this against the mistake file that hit it first). Honour the
+    # prefix and resolve against the parent directory instead.
+    body.scan(%r{(?:\.\./)?Companion/(?:Memory|Decisions|Process|Rules|Mistakes)/[^\s`'"\])>]+\.md}).uniq.each do |target|
       checked += 1
-      missing << "#{relative_path}: #{target}" unless File.file?(File.join(ROOT, target))
+      base = target.start_with?("../") ? File.dirname(ROOT) : ROOT
+      missing << "#{relative_path}: #{target}" unless File.file?(File.join(base, target.delete_prefix("../")))
     end
   end
   abort("broken repository companion references:\n#{missing.join("\n")}") unless missing.empty?
