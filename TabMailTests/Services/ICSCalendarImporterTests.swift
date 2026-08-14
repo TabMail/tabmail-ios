@@ -225,6 +225,22 @@ struct ICSCalendarImporterFingerprintTests {
         #expect(!atOurWidth.contains("(len 70)"))
     }
 
+    @Test("itipFingerprint unfolds a bare-CR continuation before measuring or counting")
+    func fingerprintUnfoldsBareCRContinuations() {
+        let uid = String(repeating: "b", count: 90)
+        let split = uid.index(uid.startIndex, offsetBy: 45)
+        let ics = "BEGIN:VCALENDAR\rMETHOD:REQUEST\rBEGIN:VEVENT\rUID:"
+            + uid[..<split] + "\r " + uid[split...]
+            + "\rDESCRIPTION:continuation\r ATTENDEE:not-a-property\r"
+            + "ATTENDEE:mailto:real@example.com\rEND:VEVENT\rEND:VCALENDAR\r"
+
+        #expect(ics.contains("\r "), "fixture must exercise bare-CR folding")
+        let out = ICSCalendarImporter.itipFingerprint(Data(ics.utf8), label: "bare-cr")
+        #expect(out.contains("UID=bbbbbbbbbbbb…(len 90)"))
+        #expect(out.contains(" ATTENDEE=1"),
+                "a folded continuation must not be promoted to a second property")
+    }
+
     @Test("itipFingerprint unfolds before counting, so a continuation cannot forge a property")
     func fingerprintUnfoldsBeforeCounting() {
         // The same ordering defect on the COUNT axis. Trimming each physical line strips

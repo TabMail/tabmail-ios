@@ -271,12 +271,14 @@ enum ICSCalendarImporter {
         guard let text = String(data: data, encoding: .utf8) else {
             return "[ICSImport][diag] \(label): NOT valid UTF-8, \(data.count) B"
         }
-        // Join continuation lines onto their predecessor BEFORE any trimming. Same four
-        // replacements as `ICSBuilder.parseIncoming` / `ICSParser.unfold`, written out
-        // here rather than reached for across the CalDAV boundary.
-        let unfolded = text
-            .replacingOccurrences(of: "\r\n ", with: "")
-            .replacingOccurrences(of: "\r\n\t", with: "")
+        // Normalise every RFC-permitted line ending, then join continuation lines onto
+        // their predecessor BEFORE any trimming. This matches `ICSSanitizer.unfold`;
+        // keeping bare CR here matters because a diagnostic that disagrees with the
+        // sanitizer manufactures a corruption signal from unchanged input.
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let unfolded = normalized
             .replacingOccurrences(of: "\n ", with: "")
             .replacingOccurrences(of: "\n\t", with: "")
         let lines = unfolded.components(separatedBy: .newlines).map {
