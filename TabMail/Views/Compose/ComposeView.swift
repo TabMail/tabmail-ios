@@ -3051,7 +3051,9 @@ struct ComposeView: View {
     /// on was simply untrue. Concurrency and one complete, correctly-attributed alert are not in
     /// tension; they just need the counter.
     private func carryForwardAttachments(from reply: MessageHeader, attachments atts: [AttachmentInfo]) {
-        print("[ComposeForward] Carrying over \(atts.count) attachment(s) from \(reply.id)")
+        if DebugModeManager.isLoggingEnabled() {
+            print("[ComposeForward] Carrying over \(atts.count) attachment(s) from \(DebugModeManager.escapedForLogLine(reply.id))")
+        }
         guard !atts.isEmpty else { return }
         attachmentCarryGate.begin(atts.count)
         for att in atts {
@@ -3068,9 +3070,18 @@ struct ComposeView: View {
                     )
                     self.attachments.append(draftAtt)
                     succeeded = true
-                    print("[ComposeForward] Attached \(att.filename) (\(data.count) bytes)")
+                    // `att.filename` is the raw, unchecked sender-authored MIME
+                    // `filename` parameter — the same value
+                    // `AttachmentFilename.isSafeFileComponent` judges before it
+                    // may become a path component — and `print` is a
+                    // line-oriented sink. See `DebugModeManager.escapedForLogLine`.
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[ComposeForward] Attached \(DebugModeManager.escapedForLogLine(att.filename)) (\(data.count) bytes)")
+                    }
                 } catch {
-                    print("[ComposeForward] Failed to carry \(att.filename): \(error)")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[ComposeForward] Failed to carry \(DebugModeManager.escapedForLogLine(att.filename)): \(DebugModeManager.escapedForLogLine(String(describing: error)))")
+                    }
                     if case ProviderError.addressPendingMove = error {
                         self.carryForwardBlockedByMove = true
                     }

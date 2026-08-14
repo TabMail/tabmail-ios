@@ -180,7 +180,9 @@ struct AttachmentListView: View {
                 ICSCalendarImporter.presentCalendarImport(icsData: data)
             } catch {
                 self.error = SyncEngine.isConnectionError(error) ? "Download failed. Check your connection and try again." : "Download failed: \(error.localizedDescription)"
-                print("[Attachment] ICS download failed: \(error)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Attachment] ICS download failed: \(DebugModeManager.escapedForLogLine(String(describing: error)))")
+                }
             }
             downloadingSection = nil
         }
@@ -189,7 +191,13 @@ struct AttachmentListView: View {
     private func downloadAndPreview(_ attachment: AttachmentInfo) {
         downloadingSection = attachment.section
         error = nil
-        print("[Attachment] Starting download: section=\(attachment.section) contentType=\(attachment.contentType) filename=\(attachment.filename) encoding=\(attachment.encoding ?? "nil")")
+        // Every field here is a sender-authored MIME value, and `print` is a
+        // line-oriented sink, so each one is escaped: see
+        // `DebugModeManager.escapedForLogLine`.
+        if DebugModeManager.isLoggingEnabled() {
+            let escape = DebugModeManager.escapedForLogLine
+            print("[Attachment] Starting download: section=\(escape(attachment.section)) contentType=\(escape(attachment.contentType)) filename=\(escape(attachment.filename)) encoding=\(escape(attachment.encoding ?? "nil"))")
+        }
         Task {
             // Reserve the one global QuickLook slot before the network fetch or
             // staging. A second scene therefore cannot materialize or mutate any
@@ -293,7 +301,9 @@ struct AttachmentListView: View {
                 presented = true
             } catch {
                 self.error = SyncEngine.isConnectionError(error) ? "Download failed. Check your connection and try again." : "Download failed: \(error.localizedDescription)"
-                print("[Attachment] Download failed: \(error)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Attachment] Download failed: \(DebugModeManager.escapedForLogLine(String(describing: error)))")
+                }
             }
             downloadingSection = nil
         }
@@ -555,7 +565,9 @@ enum AttachmentQuickLook {
     @discardableResult
     static func present(url: URL) -> Bool {
         guard reservePresentation() else {
-            print("[Attachment] QuickLook already presented — ignoring tap")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Attachment] QuickLook already presented — ignoring tap")
+            }
             return false
         }
         return presentReserved(url: url)
@@ -572,7 +584,9 @@ enum AttachmentQuickLook {
         }
         guard let presenter = topViewController() else {
             presentationReserved = false
-            print("[Attachment] QuickLook: no view controller to present from")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Attachment] QuickLook: no view controller to present from")
+            }
             return false
         }
         let source = PreviewSource(url: url)
@@ -583,7 +597,12 @@ enum AttachmentQuickLook {
         activeSource = source
         presentationReserved = false
         PreviewFreezeGate.shared.begin()
-        print("[Attachment] QuickLook presenting \(url.lastPathComponent) from \(type(of: presenter))")
+        if DebugModeManager.isLoggingEnabled() {
+            // `lastPathComponent` is the sender's filename after the stager's
+            // reduction, which removes `U+002F` and nothing else — a CR/LF in the
+            // MIME `filename` parameter reaches here intact.
+            print("[Attachment] QuickLook presenting \(DebugModeManager.escapedForLogLine(url.lastPathComponent)) from \(type(of: presenter))")
+        }
         presenter.present(controller, animated: true)
         return true
     }
@@ -596,7 +615,9 @@ enum AttachmentQuickLook {
         activeController = nil
         activeSource = nil
         PreviewFreezeGate.shared.end()
-        print("[Attachment] QuickLook dismissed — freeze released")
+        if DebugModeManager.isLoggingEnabled() {
+            print("[Attachment] QuickLook dismissed — freeze released")
+        }
     }
 
     private static func topViewController() -> UIViewController? {
