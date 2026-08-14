@@ -43,7 +43,7 @@ baseline measurement.
 rg -c 'Test Case .*<NewTestName>.* (passed|failed)' <log> || echo 'NEW TEST NEVER RAN'
 ```
 
-Use the one shared `derivedDataPath` (`/tmp/tabmail-dd`) — per-job paths once filled 194 GB — but
+Use one shared `derivedDataPath` (for example, `$DERIVED_DATA_PATH`) — per-job paths once filled 194 GB — but
 remember that disjoint file **paths** do not mean disjoint **verification**: concurrent agents
 sharing one derivedData contaminate each other's builds.
 
@@ -89,11 +89,11 @@ reported the inverted code **passing**. I had that backwards: the test was fine 
 never happened.
 
 ```
-error: unable to attach DB: … /tmp/tabmail-dd/…/build.db: database is locked
+error: unable to attach DB: … <shared-derived-data>/…/build.db: database is locked
 Possibly there are two concurrent builds running in the same filesystem location
 ```
 
-A peer Claude session was building into the **same shared `derivedDataPath` `/tmp/tabmail-dd`** — which
+A peer review session was building into the **same shared `derivedDataPath`** — which
 is the correct path to use (per-job paths once filled 194 GB) and is exactly the contamination the
 existing *What actually happened* section already names. `build-for-testing` therefore produced no new
 bundle, and `test-without-building` dutifully ran the **previous** one, which still contained the

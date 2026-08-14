@@ -61,18 +61,11 @@ message **after** the move processes it, while an open **before** the move corre
 a retry, or **one ordinary user gesture** — and tapping the message is exactly that gesture. This is
 therefore a registered fail-closed residual, not a defect requiring a mechanism.
 
-**Device evidence (owner's device, 2026-08-12), two observable episodes, both consistent.** In each,
-the move was durably admitted, and the first AI activity of any kind for that message was the
-priority direct path on a **re-open** — with zero enqueue lines of any kind between the move and the
-open. The only ordinary-queue enqueue in the whole capture came from a routine foreground
-`repopulateFromDatabase`, not from a move. The owner's own uncertainty — *"not sure if it started only
-then"* — resolves in their favour: it started only then.
-
-⚠️ **A third, earlier episode is UNVERIFIABLE.** The owner's first report was that a pull-to-refresh
-was needed before AI appeared, which is consistent with this gap plus the then-unfixed visibility
-defect (the row was hidden, so the tap gesture was unavailable, and detail pull-to-refresh forced a
-body re-fetch into `BodyFetchProcessor`'s enqueue). That capture was **overwritten** before it could
-be re-read, so this reading is recorded as the likely explanation and **not** as a measurement.
+**Anonymized device observations were consistent with this mechanism.** In each retained episode,
+the move was durably admitted and the first AI activity for the message was the priority direct path
+on re-open, with no move-triggered enqueue between those events. A separate earlier report lacked a
+retained trace and is not treated as measurement evidence. No message identity, account, or mailbox
+activity from those observations is part of this public record.
 
 ## The narrow case that does NOT recover
 

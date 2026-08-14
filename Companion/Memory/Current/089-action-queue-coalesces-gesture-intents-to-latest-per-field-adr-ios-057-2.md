@@ -5,7 +5,7 @@
 > reconstruct `PROJECT_MEMORY.md`.**
 >
 > The bullet beginning *"**Deliberately NOT coalesced yet**: moves + undo (one refcounted closure per
-> op) — phase-2 design in `PLAN_OVERLAY_CALLSITE_AUDIT.md` §5"* describes work that has since landed.
+> op) — phase-2 design"* describes work that has since landed.
 > Its final sentence about batch `markRead(_:)` is still true and is repeated below so the correction
 > does not read as retiring it.
 >

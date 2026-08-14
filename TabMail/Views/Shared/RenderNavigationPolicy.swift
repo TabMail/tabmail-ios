@@ -322,8 +322,7 @@ internal enum BridgeLivenessVerdict: String, Equatable {
 /// makes the verdict a property of COMMITTING, which every rendered document does, rather
 /// than of FINISHING, which a live page may never do.
 ///
-/// (The source log is a local, gitignored `logmain.log` that keeps growing, so those
-/// counts are a snapshot of one session and are **not** reproducible from the repo. The
+/// (Those counts are a snapshot of one device session and are **not** reproducible from the repo. The
 /// reproducible statement of the same fact is `BridgeLivenessBeaconTests` below.)
 ///
 /// **What "exactly one" means, stated with its exception so it is not overstated:** every

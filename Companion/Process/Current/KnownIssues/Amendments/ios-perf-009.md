@@ -43,7 +43,7 @@ and **both** must fail before this bites:
 1. The folder set is `SELECT id FROM folder WHERE role = ?` with `role = inbox` — as written it can
    never be pointed at Archive or Gmail All Mail.
 2. `AND isRead = 0` narrows the sorter's input to the **unread inbox count**, not the inbox row count.
-   On the reporting device that was **2** (`[UnreadCount] Badge set to 2`, `[BGSyncLog] badge: 2`).
+   That count was small in the observed measurement; exact owner-mailbox counts are not public evidence.
 
 **It goes live when the unread inbox backlog becomes large** — a user who leaves thousands of inbox
 messages unread, or a first full sync of an account whose inbox arrives entirely unread before any

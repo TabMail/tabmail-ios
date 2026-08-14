@@ -1266,7 +1266,7 @@ struct EmailRenderSecurityCanaryTests {
         // OWNER-DIRECTED, 2026-08-12 — pinned POSITIVELY and in BOTH directions, because this
         // value REVERSES a P1b hardening and either drift is a defect:
         //   * back to 'none'   => a silent behaviour regression. It broke sender typography on
-        //     device: enforced font-src blocks on a real marketing email, which then rendered in
+        //     a runtime smoke test: an HTTPS web font was refused and the message then rendered in
         //     a fallback font.
         //   * out to * or data: => a silent widening past what was actually directed.
         #expect(directives.contains("font-src https:"),

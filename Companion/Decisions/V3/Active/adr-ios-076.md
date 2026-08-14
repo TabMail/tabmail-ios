@@ -2,10 +2,9 @@
 
 **Date:** 2026-08-11
 
-**Status:** Active. Specification frozen 2026-08-11 (owner). The frozen text is
-`PLAN_EMAIL_RENDER_SECURITY.md` §8.4 + §9.1 (B1–B3) + §10.1 (C1–C5) + §2.9 (T11), implemented in the
-commit order of that plan's §11. Any later change to this specification is an audit finding against a
-commit candidate, not a plan revision.
+**Status:** Active. Specification frozen 2026-08-11 (owner). This routed ADR and the named production
+policies and tests below are the public specification. Any later change is an audit finding against a
+commit candidate, not an informal plan revision.
 
 **Context.** The message document is **fully attacker-controlled input**. Anyone who can send mail to
 the user authors it; there is no origin authentication, no reputation gate, and **no user gesture
@@ -47,8 +46,8 @@ make attacker HTML safe.
 
    **↳ AMENDED 2026-08-12 (owner): `font-src 'none'` → `font-src https:`.** The policy quoted just
    above is preserved as P1b shipped it; the live value is `EmailHTMLWrapper.contentSecurityPolicy`,
-   and the two now differ in exactly that one directive. A device smoke test measured enforced
-   `font-src` blocks on a real marketing email's web font, and the owner relaxed the directive under
+   and the two now differ in exactly that one directive. A runtime smoke test measured enforced
+   `font-src` blocking an HTTPS web font and causing fallback rendering, and the owner relaxed the directive under
    *"no behaviour changes, just security"* — the anti-tracking rationale being inconsistent with the
    open `img-src https:` in the same policy. The **font leg of T9 is therefore OPEN and
    owner-accepted** (`IOS-PRIVACY-002`); `media-src 'none'` was explicitly retained. Do not read the
@@ -625,25 +624,16 @@ must, images behave per CSP, the nonce-in-path load works with **both** `nil` an
 base URLs, plus fragment click, `history.back`, two overlapping app loads, process termination and
 appearance reload, on the minimum and current supported iOS.
 
-**Provenance.** Decided 2026-08-11 by the owner after a **three-round cross-model plan vet** (rounds 1,
-2 and 3 recorded in `PLAN_EMAIL_RENDER_SECURITY.md` §8, §9 and §10). Round 3 returned **zero new
-attack surface** — its blockers were all corrections to mechanisms invented in round 2, plus one
-structural finding — which satisfied the owner's stop condition ("keep vetting while genuinely NEW
-vulnerability angles appear"). §10.3 recommended a narrowly-scoped round 4; the owner froze instead.
-**A8 budget: 3 of 5 rounds spent; the remaining 2 are RESERVED for the post-implementation exact-diff
-audit train (A4), not for plan text.** Two process facts worth carrying forward: round 2's first
-attempt was refused at the output stage by GPT's cyber-safety classifier after ~270k tokens of
-completed research — a refusal is **not** a clean round and was not recorded as one — and the
-defensively re-framed prompt ("review these mitigations for correctness and missing validation", never
-"how would you bypass this") completed with the same information needs. Three of the vet's findings
-overturned the plan's own conclusions, which is why each was independently re-verified before folding.
+**Provenance.** Decided 2026-08-11 by the owner after three cross-model design-review rounds, then
+checked again against the exact implementation diff. Findings that changed the proposed mechanisms
+were independently re-verified before they were folded; the source tests and hosted WebKit canaries
+named above are the durable evidence.
 
 **Relates:** ADR-IOS-039 (render idempotency + reveal contract — any change to script injection or the
 fit path must preserve it), ADR-IOS-066 / ADR-IOS-072 (content is addressed by the message it belongs
 to, never by the slot it occupies — decision 5 is that principle applied to asset serving),
 ADR-IOS-045 (QuickLook presented imperatively — adjacent to decision 9), ADR-IOS-052
 (presentation-time ICS sanitizer — the other place we treat inbound content as hostile), cross-cutting
-ADR-004 (zero retention — why an image proxy is rejected), `PLAN_EMAIL_RENDER_SECURITY.md` §8.4, §9.1,
-§10.1, §2.9 and §11, and the routed render-pipeline memory topic
+ADR-004 (zero retention — why an image proxy is rejected), and the routed render-pipeline memory topic
 `Companion/Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md`
 (bullet 30 records the reverted block-with-banner experiment).

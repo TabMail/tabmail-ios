@@ -4594,7 +4594,7 @@ struct RenderPathLogSinkTests {
     /// this suite used until 2026-08-12 — a `#if DEBUG` block whose `#endif`
     /// precedes the sink, and an `if isLoggingEnabled() { … }` belonging to a
     /// preceding statement. Neither encloses the sink; both sinks run in RELEASE.
-    /// Captured against both detectors in `scratchpad/R6-RED-EVIDENCE.txt`.
+    /// The red-first run exercised both detector implementations.
     @Test("A CLOSED debug block above a sink is not a gate")
     func aClosedDebugBlockAboveASinkIsNotAGate() {
         let closedIfdef = """
@@ -4739,8 +4739,7 @@ struct RenderPathLogSinkTests {
     /// refusing everything, and `senderAuthoredValueSinksAreDebugGated` would then
     /// fail on correct code.
     ///
-    /// Captured against both detectors in `scratchpad/R9-RED-EVIDENCE.txt` (round
-    /// 8's is in `R8-RED-EVIDENCE.txt`, round 7's in `R7-RED-EVIDENCE.txt`).
+    /// Red-first runs exercised both detector implementations across three rounds.
     @Test("Only an exact canonical gate spelling arms a gate")
     func onlyACanonicalGateSpellingArmsTheGate() {
         /// Each fixture carries exactly one sender-authored accessor at its sink,

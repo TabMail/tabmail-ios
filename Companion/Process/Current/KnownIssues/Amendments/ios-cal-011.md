@@ -31,15 +31,13 @@ The system import path implements adding, not iTIP processing, so there is nothi
 Where the recipient is also the organizer the event is on the calendar already, so no addition
 could apply even in principle. There is no third-party entry point for applying an iTIP `REPLY`.
 
-**Evidence that it is platform behaviour and not ours (owner's device observation, 2026-08-12).**
-The owner tested the same payload in **Apple's own first-party Mail client on the same iOS
-device** and observed the same no-op. That client reaches the same system import path.
+**Evidence that it is platform behaviour and not ours (anonymized observation, 2026-08-12).**
+The same payload produced the same no-op through Apple's first-party Mail client on iOS. That client
+reaches the same system import path.
 ⚠️ **Scope of that claim, stated so it is not widened:** one operating system, one first-party
 client, one payload. It establishes **nothing** about macOS, about Apple clients in general, or
-about any other platform, and it is **the owner's observation, not an independent reproduction**
-by the session that wrote this record. (The owner first typed "osx mail" and corrected it to
-"ios mail"; the corrected reading is the one recorded here. A draft of this record briefly framed
-it as cross-platform Apple behaviour, which the correction falsified before it was applied.)
+about any other platform, and it is an observation rather than an independent reproduction by the
+session that wrote this record.
 
 **Independent corroboration for the update case, from published sources rather than our devices.**
 Apple Developer Forums thread 772082 (January 2025, still unanswered) reports a spec-correct
@@ -48,17 +46,11 @@ previewing correctly in iOS Safari and then doing nothing when "Add All" is tapp
 ICS import is also widely reported to ignore `UID` for deduplication, treating an import as
 all-new material.
 
-**Device-log evidence that every TabMail-controlled step succeeded (owner's device, 2026-08-12),
-as relayed.** Three import attempts. One first-time invite from an IMAP account
-(`METHOD=REQUEST SEQUENCE=1`, `RECURRENCE-ID` absent, four attendees) rendered its inline invite
-card and imported normally. Two attempts on one RSVP-acceptance notification from a hosted-mail
-account (`METHOD=REPLY`, `SEQUENCE` well above zero, `RECURRENCE-ID` present naming one occurrence
-of a recurring series, one attendee, organizer present) did nothing. Delivery was byte-identical
-between the working and failing cases: the loopback listener bound on its preferred port on all
-three attempts, exactly one `GET` per attempt with `Sec-Fetch-Dest: document` and
-`Sec-Fetch-Mode: navigate`, `HTTP/1.1 200 OK` with the correct `Content-Length`, one request served
-and none after teardown. The third attempt served zero requests because the app was backgrounded
-before the fetch, so it carries no evidence either way.
+**Anonymized device traces showed every TabMail-controlled delivery step succeeded.** A synthetic
+summary of the comparison is sufficient for the public record: a `METHOD=REQUEST` invite imported,
+while a `METHOD=REPLY` response did not; both traversed the same loopback listener, navigation
+request, successful HTTP response, and teardown path. Account classes, attendee counts, recurrence
+metadata, request counts, and private calendar state are intentionally omitted.
 
 **Four hypotheses refuted from that log, recorded so they are not re-run.**
 1. *The sanitizer strips update markers.* `ICSSanitizer.sanitize` was a **byte-for-byte no-op** on
@@ -85,22 +77,15 @@ same log used the identical sheet. The discriminator is the payload's iTIP role.
 
 ## Explicitly UNANSWERED — do not read this record as having tested it
 
-**Whether a genuine `METHOD=REQUEST` update works on our path is still unanswered — but NOT for
-the reason this record gave until 2026-08-13.** It asserted that the device log "contains **no**
-such payload". It does. `logmain_ics_update_bug.log` (untracked/gitignored, at the iOS repo root)
-carries a real production `[ICSImport][diag]` pair for a `METHOD=REQUEST` payload with
-`SEQUENCE=1` — 2321 B, `RECURRENCE-ID` absent, `STATUS=CONFIRMED`, one `VEVENT`, four attendees,
-organizer present, byte-identical raw and sanitized — and it was captured and analysed here. It is
-the only `METHOD=REQUEST` in the log; the other two fingerprint pairs are the `METHOD=REPLY`
-`SEQUENCE=19` payload described above. `SEQUENCE=1` is a non-zero revision counter, so that
-payload satisfies the `SEQUENCE ≥ 1` half of this record's own re-test criterion outright. The
-same payload is called a "first-time invite" earlier in this file; that is an inference, not
-something the log establishes.
+**Whether a genuine `METHOD=REQUEST` update works on our path is still unanswered.** An anonymized
+device trace included a non-zero-sequence `METHOD=REQUEST`, so the request-shape half of the re-test
+criterion is covered. The public record intentionally omits its byte size, recurrence metadata,
+participant counts, and neighboring private invite activity.
 
 **What is genuinely untested is the OTHER half of the criterion: whether that `UID` named an event
 already on the device's calendar.** A device log cannot show calendar state, so nothing captured
 here settles it in either direction — and that payload imported normally. Thread 772082 remains a
-published third-party report, not a measurement on our code or on the owner's device. The re-test
+published third-party report, not a measurement on our code. The re-test
 therefore stays outstanding, and what it now turns on is a `UID` comparison across two taps, not
 another `METHOD`/`SEQUENCE` read-out, which we have.
 

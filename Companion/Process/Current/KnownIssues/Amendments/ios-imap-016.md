@@ -94,63 +94,16 @@ The library still needs its own fix on its own merits: **a library must not emit
 character in a header regardless of what its caller did.** Any other caller of SwiftMail, including a
 future call site of ours, gets no protection from our boundary encode.
 
-## Measured base rate — real device, shipped build WITHOUT the fix
+## Public validation scope
 
-Measured 2026-08-12 against the owner's own device (iPhone 14 Pro, `ai.tabmail.ios` **1.7.8** build
-356 — the shipped release without the fix). Container pulled via `devicectl`, queried read-only, **copy
-deleted immediately after**. Corpus: `messageHeader`, **251,938 non-empty subjects**.
+The public record intentionally omits measurements taken from a private device and mailbox. They are
+not required to establish the defect or the fix: deterministic synthetic fixtures cover literal
+controls, legal folding whitespace, non-ASCII text, and ordinary ASCII in both app-side encoders.
 
-This is what turns "reachable in principle" into a number, in both directions at once: the hostile
-precondition is **common**, and the attack has **never been attempted against this mailbox**.
-
-| shape | count |
-|---|---:|
-| subjects carrying a forbidden control (C0 minus HTAB, DEL, C1) | **116** (≈1 in 2,170) |
-| … CR/LF only at the very END | 61 |
-| … with an INTERNAL break (would split the outgoing header field) | 48 |
-| …… internal break followed by SP/HTAB (a legal fold, harmless) | 9 |
-| …… **internal break followed by a header-field-shaped token `^[A-Za-z][A-Za-z0-9-]*:`** | **0** |
-
-Code-point tally: `U+000A ×138`, `U+000D ×69`, `U+0010 ×1`, `U+0092 ×2`, `U+0096 ×5`.
-
-**Zero injection payloads.** So the fix is validated as necessary (the precondition occurs 116 times in
-real mail) and simultaneously **not** an emergency. That distinction is what governs deploy ordering: it
-does **not** justify jumping iOS ahead of backend.
-
-⚠️ **Do NOT record the 61 trailing-only cases as harmless — that is unverified.** `.whitespaces`
-excludes CR and LF, so `ThreadUtils.normalizeSubject` does **not** trim them, and `Subject: v\r\n` plus
-the emitter's own CRLF ends the header **block** early. Nothing attacker-controlled follows, so it is
-not injection — but "harmless" has not been checked and must not be asserted.
-
-### Independent correctness finding, separate from the security one
-
-**48 stored messages would emit a MALFORMED outgoing message if replied to or forwarded on 1.7.8** —
-the internal CR/LF ends `Subject:` and the remainder is parsed as headers. No attacker needed; a plain
-correctness defect that the same fix closes. Worth stating because it is a user-visible benefit the
-security framing hides.
-
-### Product-degradation bound, on real data
-
-| class | count | share | effect of the fix |
-|---|---:|---:|---|
-| pure ASCII, no control | 217,910 | **86.49%** | byte-identical on the wire, untouched |
-| non-ASCII | 33,973 | 13.48% | already encoded before today, unchanged |
-| carries a forbidden control | 116 | 0.046% | newly encoded |
-| … of those, also non-ASCII | 61 | — | already encoded on the Gmail path |
-
-- **IMAP/SMTP path** (`encodeIfNotEmittableLiterally`): newly encoded = **116 = 0.0460%**.
-- **Gmail path** (`encodeHeaderValue`): newly encoded = **55** (the other 61 were non-ASCII already).
-
-Under one subject in two thousand changes, and provably nothing else — a *measured* no-degradation
-statement rather than an argument for one, which is what the owner's minimal-fix directive asks for.
-
-### Not completed on that pull — do not claim it was
-
-The same pull was intended to also check the open reply-draft `headerId`-with-four-colons issue. **The
-query failed and was not retried:** the `draft` table has no `headerId` column (it has `id`,
-`replyToId`, `rfc822MessageId`), and the DB copy was deleted before the column name was corrected. The
-`messageHeader` colon-count distribution therefore **never ran** and nothing about that issue was
-learned. A re-pull costs ~90 s if it becomes worth doing.
+No prevalence or per-mailbox degradation claim is made here. The durable statement is narrower: the
+old predicate admitted a header-breaking input class, the boundary encoder now closes that class, and
+ordinary inputs retain their existing encoding path. Any future base-rate study must use a synthetic
+corpus or publish only privacy-reviewed aggregate data.
 
 ## Why the "structured field" argument was wrong
 

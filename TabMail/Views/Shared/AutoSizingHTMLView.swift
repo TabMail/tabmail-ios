@@ -1148,8 +1148,8 @@ private struct HTMLWebView: UIViewRepresentable {
         /// success. The verdict below turns that silence into a sentence.
         ///
         /// ⚠️ **P1d moved the arm from `didFinish` to `didCommit`, and that is the
-        /// whole point of the change.** On device (`logmain.log`, 2026-08-12) load
-        /// `KH4CLK` logged neither `LIVE` nor `SILENT` because its images never
+        /// whole point of the change.** In the 2026-08-12 device measurement, one load
+        /// logged neither `LIVE` nor `SILENT` because its images never
         /// settled and `didFinish` never fired — while its user scripts provably ran.
         /// A page that hangs mid-load therefore produced NO LINE AT ALL, which made
         /// the absence of the alarm indistinguishable from the alarm not existing.

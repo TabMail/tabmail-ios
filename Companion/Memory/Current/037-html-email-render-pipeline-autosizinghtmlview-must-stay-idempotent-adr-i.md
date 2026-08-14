@@ -104,7 +104,7 @@
 > later image/layout measurements cannot masquerade as another tap. Correctness therefore does not
 > depend on cross-channel WebKit delivery order.
 >
-> Device `logmain.log` proved the same focused WebView grew from 865 pt to 13,249 pt on each expansion
+> Device smoke measurement showed the same focused WebView grew from 865 pt to 13,249 pt on each expansion
 > and returned to 865 pt on collapse while `ScrollFreezeGate` was idle; it did NOT record the outer
 > List offset and therefore did not prove UIKit compensation. A follow-up simulator canary placed the
 > production `AutoSizingHTMLView` in a live self-sizing `List`, expanded an equivalently large quote,

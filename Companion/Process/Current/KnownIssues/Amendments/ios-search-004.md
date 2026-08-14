@@ -49,8 +49,8 @@ experiences as a network-latency-shaped wait.
    range" affordance is a natural product request and would silently put this query on the
    per-keystroke path.
 2. `message_meta` growing to mailbox scale with a scoped call — it already holds one row per indexed
-   document (**252,178** on the reporting device, per `[SearchIndex] Initialized with 252178
-   documents`), so **the volume is already there; only the callers are protecting it.**
+   document and has been observed at mailbox scale, so **the volume can be there; only the callers are
+   protecting it.** Exact owner-mailbox counts are intentionally omitted.
 3. The AI tool being called in a loop (a multi-step agent turn issuing several date-scoped searches).
 
 ## Confirm or refute with one measurement

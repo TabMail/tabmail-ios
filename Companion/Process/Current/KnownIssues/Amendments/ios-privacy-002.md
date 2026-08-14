@@ -18,15 +18,14 @@ narrowed it with `font-src 'none'`; it is now **not mitigated at all**. The rest
 
 ## Why it is open
 
-P1b shipped `font-src 'none'`. The owner's on-device smoke test the same day measured the cost:
-enforced `font-src` violations on a real marketing email (`…/fonts/sofia/sofia_reg.woff`,
-`disposition=enforce`), which then rendered in a fallback font. That is a visible change from
+P1b shipped `font-src 'none'`. A runtime smoke test the same day measured the cost:
+an HTTPS web font was refused by the enforced policy and the message rendered in a fallback font. That is a visible change from
 `v1.7.8` under the standing directive applied to every P1b setting that removed shipped behaviour:
 
 > *"no behaviour changes, just security"*
 
 **The anti-tracking rationale did not survive contact with the rest of this policy.** `img-src` is
-`https:`, and the same capture shows 20+ tracking-pixel requests leaving the device regardless — so
+`https:`, and the same capture showed image subresource requests leaving the device regardless — so
 the correlation channel `font-src 'none'` closed is wide open through images. Visible typography
 cost, ~zero marginal privacy gain.
 
@@ -72,7 +71,7 @@ This restores **every remote font that ever worked**, i.e. every font fetched ov
 
 **Measurement note (`MIS-007`).** The device evidence must be counted **per log capture**, not summed
 across captures: three captures of the same session contain the same blocks, and summing them
-triple-counts. In `logmain.log`: 59 absolute-`https:` font blocks (50 + 9 across two sender hosts)
+triple-counts. The device measurement recorded 59 absolute-`https:` font blocks (50 + 9 across two sender hosts)
 and 45 `tabmail-asset:`-scheme ones. An earlier draft of this record said "135 of 194", which was
 that aggregation error and is withdrawn.
 

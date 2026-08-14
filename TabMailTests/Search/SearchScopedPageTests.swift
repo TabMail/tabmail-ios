@@ -20,7 +20,7 @@ import Testing
 /// sorter defeats the `LIMIT`** — every row in the scoped folders is materialised
 /// and sorted before the first 200 are taken. Scoped to the INBOX folders that is
 /// a few thousand rows and invisible; scoped to Archive / Gmail All Mail it is the
-/// whole mailbox, and on the reporting device it cost 1.4–1.9 s of main-thread
+/// whole mailbox, and at mailbox scale it produced a user-visible main-thread
 /// stall per character typed. The *unscoped* ("all" flag) query has no `WHERE`
 /// clause at all, so it walks `messageHeader_date` and stops after 200 rows — which
 /// is why searching everything stayed fast while searching Archive did not.

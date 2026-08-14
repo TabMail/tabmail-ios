@@ -1112,8 +1112,8 @@ struct SearchView: View {
     /// The sorter **defeats the `LIMIT`**: every row in the scoped folders is materialised
     /// and sorted before `budget` are taken, so cost is O(rows in scope), not O(budget).
     /// Scoped to the INBOX folders that is a few thousand rows and invisible (24ms);
-    /// scoped to Archive / Gmail All Mail it is the whole mailbox (~215k rows, 833ms on a
-    /// warm Mac ⇒ 1.4–1.9s measured on device) — and because `legacyLocalSearch` is called
+    /// scoped to Archive / Gmail All Mail it is the whole mailbox (mailbox-scale in the
+    /// observed benchmark, with a user-visible multi-hundred-ms stall) — and because `legacyLocalSearch` is called
     /// **synchronously on the main actor, once per keystroke** from `onQueryChanged`, that
     /// landed directly on the typing thread. The *unscoped* query has no `WHERE` clause at
     /// all, so it walks `messageHeader_date` and stops after `budget` rows; that is why

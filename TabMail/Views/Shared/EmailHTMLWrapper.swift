@@ -78,12 +78,11 @@ enum EmailHTMLWrapper {
     /// - `font-src https:` — **relaxed from `'none'` by explicit owner directive, 2026-08-12.**
     ///   P1b shipped `font-src 'none'`, justified as closing the `@font-face` + `unicode-range`
     ///   conditional-request channel (T9), which survives disabling JavaScript. The owner's
-    ///   on-device smoke test the same day measured the cost: enforced `font-src` blocks on a real
-    ///   marketing email (`…/fonts/sofia/sofia_reg.woff`, `disposition=enforce`), which then
-    ///   rendered in a fallback font — a visible change from `v1.7.8` under the standing directive
+    ///   runtime smoke test the same day measured the cost: an HTTPS web font was refused by the
+    ///   enforced policy and the message rendered in a fallback font — a visible change from `v1.7.8` under the standing directive
     ///   *"no behaviour changes, just security"*.
     ///   **The anti-tracking rationale did not survive contact with the rest of this policy.**
-    ///   `img-src` is `https:`, and the same capture shows 20+ tracking-pixel requests leaving the
+    ///   `img-src` is `https:`, and the same capture shows image subresource requests leaving the
     ///   device regardless, so the correlation channel `font-src 'none'` closed is wide open through
     ///   images. Visible cost, ~zero marginal privacy gain.
     ///   **The counter-argument was weighed and DECLINED — recorded so it is not rediscovered:**
