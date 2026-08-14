@@ -383,7 +383,7 @@ private struct HTMLWebView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
-        // ── P1b render hardening (ADR-IOS-076 decision 1; PLAN_EMAIL_RENDER_SECURITY.md §11) ──
+        // ── P1b render hardening (ADR-IOS-076 decision 1) ──
         // The message document is FULLY attacker-controlled input: anyone who can mail the user
         // authors it, there is no origin authentication, and there is no user gesture between
         // arrival and render. What remains of P1b's WebKit-boundary half is exactly ONE setting —

@@ -1210,7 +1210,7 @@ struct ComposeView: View {
                                     RoundedRectangle(cornerRadius: 1.5)
                                         .fill(Color.blue.opacity(0.55))
                                         .frame(width: 3)
-                                    // P1d / plan §10.1 C5 — THE EXPLICIT CHOICE for this
+                                    // P1d / ADR-IOS-076 decision 5 — THE EXPLICIT CHOICE for this
                                     // call site is "local assets are unavailable":
                                     // `bodyContentKey` is deliberately nil, so no
                                     // `BodyAssetSchemeHandler` is registered and any
@@ -1223,7 +1223,7 @@ struct ComposeView: View {
                                     // passed no headerId since long before this work, so no
                                     // handler was registered here on shipped code either.
                                     // Inline images in a quoted reply are ALREADY broken today.
-                                    // Filed separately (`PLAN_EMAIL_RENDER_SECURITY.md` §11.1);
+                                    // Registered separately as `IOS-ASSET-001`;
                                     // do not attribute it to the render-hardening phases, and
                                     // do not "fix" it by handing this view an unrestricted
                                     // asset lookup — that is what C5 forbids.

@@ -8,7 +8,7 @@ import WebKit
 // =====================================================================================
 // P1d — asset ownership binding for the `tabmail-asset://` scheme.
 //
-// ADR-IOS-076 decision 5; PLAN_EMAIL_RENDER_SECURITY.md §10.1 C3 + C5, §10.2.
+// ADR-IOS-076 decision 5.
 //
 // THE INVARIANT: **an asset is served only to the document that owns it.**
 //

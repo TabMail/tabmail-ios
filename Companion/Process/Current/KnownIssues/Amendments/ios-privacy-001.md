@@ -18,7 +18,7 @@ failure mode this file exists to prevent.
   sender-controlled host to set and later read a cookie. Two different senders whose mail loads
   subresources from the same host can correlate the same reader across messages, and across sessions.
 
-That is threat **T5** in `ADR-IOS-076` / `PLAN_EMAIL_RENDER_SECURITY.md`. It is **not mitigated**. Do
+That is threat **T5** in `ADR-IOS-076`. It is **not mitigated**. Do
 not describe the message render path as "isolated", "sandboxed per message", or "ephemeral"; none of
 those is true.
 

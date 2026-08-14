@@ -12,10 +12,8 @@ import Foundation
 enum EmailHTMLWrapper {
 
     /// The app-owned Content-Security-Policy embedded in the `<head>` of **every**
-    /// document `wrapHTML` emits (ADR-IOS-076 decision 1; `PLAN_EMAIL_RENDER_SECURITY.md`
-    /// §8.4, frozen 2026-08-11 — **as amended 2026-08-12 by the owner-directed `font-src`
-    /// relaxation**; both of those documents quote the P1b policy verbatim as history, so THIS
-    /// constant is the live value and the two differ in exactly one directive).
+    /// document `wrapHTML` emits (ADR-IOS-076 decision 1, including the 2026-08-12
+    /// owner-directed `font-src` relaxation). This constant is the live value.
     ///
     /// ## ⚠️ THE INVARIANT THIS DEPENDS ON — do not weaken it, and do not add a second builder
     ///
@@ -24,7 +22,7 @@ enum EmailHTMLWrapper {
     /// into a render web view.**
     ///
     /// This is what makes a `<meta>`-delivered CSP sound here. Meta delivery is appropriate for
-    /// `loadHTMLString` with a custom-scheme base URL (plan §9.2, confirmed), and the *fragment*
+    /// `loadHTMLString` with a custom-scheme base URL (ADR-IOS-076, confirmed), and the *fragment*
     /// branch of `wrapHTML` is safe **because of the sentence above**: the author's bytes are
     /// interpolated into `<body>`, strictly after our `<head>`, so the policy is already in force
     /// when the parser reaches them. An author CSP `<meta>` inside the body can only combine

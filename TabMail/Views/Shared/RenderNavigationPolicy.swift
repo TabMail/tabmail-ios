@@ -8,8 +8,8 @@ import WebKit
 // =====================================================================================
 // P1c — the decision logic behind the message-render navigation boundary.
 //
-// ADR-IOS-076 decisions 2, 3, 6 and 7; PLAN_EMAIL_RENDER_SECURITY.md §10.1 C1 + C2,
-// **as amended by the P1a measurements** (`bc7572eb1`).
+// ADR-IOS-076 decisions 2, 3, 6 and 7, as amended by the P1a measurements
+// pinned in the render-policy regression tests.
 //
 // THE GUARANTEE, STATED EXACTLY: *no unapproved new main-frame document is admitted.*
 // It does NOT claim that fragment or history-state mutations are prevented — P1a measured

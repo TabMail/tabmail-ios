@@ -9,7 +9,7 @@ Body assets; render security P1d; `BodyAssetSchemeHandler`; `BodyAssetServePolic
 `BodyAssetStore.assetManifestRow`; `BodyAssetStore.rekeyContentKey`; `AccountManagerQueue`
 `publishRekeys` / `publishMoveFinish`; `MessageHeaderRekey.finishMove`; `ContentKey`;
 `tabmail-asset://`; asset ownership; moved message; broken inline images; `IOS-ASSET-001` sibling;
-`PLAN_EMAIL_RENDER_SECURITY.md` §10.2 / §11.1; ADR-IOS-076 decision 5.
+ADR-IOS-076 decision 5.
 
 ## What this record is
 
@@ -37,10 +37,9 @@ THE MANTRA's test is recoverability, and this passes it twice over:
    the assets against the now-corrected rows.
 2. Reopening the message — one ordinary user gesture — is sufficient on its own.
 
-`PLAN_EMAIL_RENDER_SECURITY.md` §10.2 assessed this window before P1d landed and reached the same
-conclusion: *"Result is temporary broken images, not cross-message disclosure … Consistent with THE
-MANTRA — recoverable, so it does not gate."* §11.1 lists it under *filed separately*, as
-**registered, not gated**. This record is that registration.
+ADR-IOS-076 decision 5 makes ownership fail closed, and this record applies THE MANTRA to the
+temporary publication-order window: broken images are recoverable; a cross-message read is not.
+The limitation is therefore **registered, not gated**.
 
 ## The direction that is NOT acceptable, stated so it is not "fixed" the wrong way
 
@@ -49,8 +48,8 @@ to an unrestricted lookup, or re-derive ownership from the URL's `headerHash`. *
 forbidden**, and the third is also simply wrong:
 
 - Widening to "source or destination" re-opens the cross-message read for exactly the pair of keys an
-  attacker-controlled document would most like, and `PLAN_EMAIL_RENDER_SECURITY.md` §10.1 C5 forbids
-  compensating with an unrestricted lookup outright.
+  attacker-controlled document would most like, and ADR-IOS-076 decision 5 forbids compensating
+  with an unrestricted lookup outright.
 - Re-deriving from the URL cannot work at all: `BodyAssetStore.rekeyContentKey(from:to:)` deliberately
   re-points the row while preserving the row `id` and the bytes on disk, so the URL baked into the
   cached HTML keeps the **old** `headerHash` forever. A computed `headerHash(currentKey)` would

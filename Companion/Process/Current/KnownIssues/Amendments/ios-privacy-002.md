@@ -11,7 +11,7 @@ the browser downloads a given font subset only when the document actually contai
 that range, so the *set of requests* leaks information about the rendered content back to a
 sender-controlled host — without any script, and unaffected by `allowsContentJavaScript = false`.
 
-That is the font half of threat **T9** in `ADR-IOS-076` / `PLAN_EMAIL_RENDER_SECURITY.md`. P1b
+That is the font half of threat **T9** in `ADR-IOS-076`. P1b
 narrowed it with `font-src 'none'`; it is now **not mitigated at all**. The rest of T9 — CSS
 `background-image` URLs, which the deferral rewrite never touched because it only rewrites
 `<img src/srcset>` — was already open and remains so.

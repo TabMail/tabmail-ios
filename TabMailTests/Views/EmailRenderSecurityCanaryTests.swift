@@ -1260,7 +1260,7 @@ struct EmailRenderSecurityCanaryTests {
             "upgrade-insecure-requests"
         ]
         #expect(directives == expected,
-                "the policy is ADR-IOS-076 decision 1 / PLAN_EMAIL_RENDER_SECURITY §8.4, in order, as amended 2026-08-12 by the owner-directed font-src relaxation")
+                "the policy is ADR-IOS-076 decision 1, in order, as amended 2026-08-12 by the owner-directed font-src relaxation")
         guard directives.count == expected.count else { return }
 
         // OWNER-DIRECTED, 2026-08-12 — pinned POSITIVELY and in BOTH directions, because this

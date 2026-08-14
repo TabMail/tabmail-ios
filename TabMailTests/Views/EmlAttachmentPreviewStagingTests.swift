@@ -6,7 +6,7 @@ import Testing
 import Foundation
 @testable import TabMail
 
-/// T11 (`PLAN_EMAIL_RENDER_SECURITY.md` §2.9) — the invariant this suite pins is
+/// ADR-IOS-076 decision 9 — the invariant this suite pins is
 /// **no attachment write from the `.eml` preview lands outside the preview staging
 /// root**, whatever the sender put in the MIME `filename` parameter.
 ///
