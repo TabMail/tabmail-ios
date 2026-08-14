@@ -943,7 +943,18 @@ struct AttachmentFilenameContainmentTests {
             let mid = (pLow + pHigh + 1) / 2
             if AttachmentFilename.isSafeFileComponent(String(repeating: "a", count: mid)) { pLow = mid } else { pHigh = mid - 1 }
         }
+        // ⚠️ GUARDED, and the guard is load-bearing rather than defensive noise.
+        // Everything below derives a fixture LENGTH from `budget`, and
+        // `String(repeating:count:)` TRAPS on a negative count — a `fatalError`
+        // Swift Testing cannot catch, which takes the whole process down and hides
+        // every other result in the run. Measured 2026-08-12: with the predicate
+        // inverted for the red-first proof, `budget` bisects to 0, `budget - 4`
+        // traps, and the suite could not report its own red evidence — xcodebuild
+        // simply relaunched the crashed host over and over. A test that cannot fail
+        // honestly under inversion is not red-first evidence.
         let budget = pLow
+        #expect(budget > 8, "the predicate accepts no usable name at all — every fixture below is degenerate")
+        guard budget > 8 else { return }
         #expect(!AttachmentFilename.isSafeFileComponent(String(repeating: "a", count: budget + 1)))
 
         // THE POINT OF THE BUDGET: what has to fit is the DERIVED name, not the
