@@ -77,3 +77,16 @@ the `messageHeader_folderId[_isRead]_date` composite indexes accelerate that. Th
 *display* may use date; *sync/stale/cursor* decisions on IMAP must use UID. The single source of
 truth is `SyncEngine.selectStaleHeaders` gated on `provider.staleWindowMode`; do not bypass it or add
 a parallel date-based sync path.
+
+---
+
+## Pre-compaction index line (verbatim, 2026-08-13, pass 4)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 62% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced block
+so its index-relative link is not re-resolved from this directory, because the index line had
+accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-002](Companion/Mistakes/Active/MIS-IOS-002-date-window-for-imap-sync.md)** — windowed an IMAP sync query by date; UID is archive-time, not message-date → multi-month Archive data loss (ADR-IOS-042, `4145d2a`, `v59`). Display ordering is exempt. Instance 2: same mass-deletion outcome through a different door — the wrong **provenance** rather than the wrong unit. `if fetched.count < limit` read a `compactMap` **parse-survivor** count as server coverage, so one unparseable INTERNALDATE on a full page claimed whole-folder knowledge and returned survivors with no floor (red: 7 of 12 rows destroyed by one bad sibling); a short FETCH (`[IMAP-FETCH-GAP]`) forges it too. **A count that gates a deletion must be SERVER-reported and travel bound to the fetch — a client-side survivor count is a statement about the client.** Closed structurally by `6d460aa99` (`coverage:` replaces `limit:`). (×2)
+```

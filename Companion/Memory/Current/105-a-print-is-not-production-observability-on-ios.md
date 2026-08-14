@@ -164,3 +164,68 @@ which hides the condition from any walker keyed on the flag), and the register r
 > `IOS-SCROLL-003`; the fix belongs in `InboxViewModel`, not in the view. **So the sentence "`self.error`
 > is a user-visible surface" is now TRUE — but only for non-connection errors.** State it with that
 > qualifier or it becomes the same over-broad claim the correction above was written to retract.
+
+---
+
+## The residual record of `f947acb4c` was wrong, and residual records are where this keeps happening (2026-08-12)
+
+`f947acb4c` gated and escaped the attachment diagnostics. Its closing paragraph reads:
+
+> Not changed: the many other ungated `print`s elsewhere in `ComposeView` (roughly fifteen, outside
+> `carryForwardAttachments`). They are the same Rule 12 class and should be swept, but doing it here
+> would have buried this fix.
+
+**That names `ComposeView` and nothing else, and it was false when it was written.** A mechanical
+scan one round later found six more sites in the same subsystem, on the same message-render path,
+every one of them both ungated AND unescaped — the exact pair of defects that commit existed to
+close. All six executed in RELEASE builds:
+
+| symbol | value | fixed in |
+|---|---|---|
+| `IMAPProvider.buildFullMessageInfo` (×2) | `part.contentType`, `part.filename` | `fa90c60bc` |
+| `GmailProvider.extractBodyAndEmlMarkers` (×2) | `part.filename` | `fa90c60bc` |
+| `GmailProvider.extractNestedFromFileUploadedEmls` | `part.filename` | `fa90c60bc` |
+| `GmailProvider.extractInlineImages` | `item.contentId` | `fa90c60bc` |
+
+**The corrected record, phrased so it cannot be read as a complete set.** Sites in the same class
+that are known to remain — *this list is not asserted to be exhaustive, and the enforcement is the
+test, not this paragraph*:
+
+- `IMAPFetchMapping.renderBodyWithEmbeddedHeaders` (2 prints). Now `#if DEBUG`-gated, so release
+  builds do not emit them, but `part.filename` there is still **UNESCAPED**: `Shared/` compiles into
+  the NSE target too, where `DebugModeManager` — and therefore `escapedForLogLine` — does not exist.
+  Closing that half means moving the escaper into `Shared/`.
+- `IMAPProvider.fetchFolders` and `IMAPProvider.dedupRoles` — server-controlled FOLDER names,
+  ungated. Same rule-12 class, off the render path.
+- `IMAPProvider`'s date-parse-failure print — `info.subject`, sender-authored, ungated. Deliberately
+  NOT covered by the scan: `Draft.subject` is the user's own text under the same accessor spelling,
+  so scanning `.subject` would demand escaping the user's composition.
+- `ComposeView` outside `carryForwardAttachments`, as the original paragraph said.
+- `GoogleCalendarProvider` — a comment in `executeCalendarOperation` records "9 ungated `print`s and
+  0 `DebugModeManager` references" in that file. ⚠️ Quoted as the state that comment DESCRIBED, not
+  as a current count: the very next line of that file is `if DebugModeManager.isLoggingEnabled() {`,
+  so the "0 references" half was already false the moment the comment shipped. Re-derive before
+  citing either number.
+
+**Why this is recorded here rather than only in a commit message.** It cannot be recorded in the
+commit message: `f947acb4c`'s body is what is wrong, and a commit message cannot be amended once it
+is in history. That is the structural reason a durable claim does not belong in one — the same
+lesson as the `UNGATED BY DECISION` claim in §1 above, reached from the other end.
+
+**The generalisation, and it is the load-bearing part.** A *residual record* — the "here is what I
+deliberately did NOT fix" paragraph — is an absolute in humility's clothing. Its grammar is
+confession, it exists to pre-empt "your fix was too narrow", and a reader's reaction to it is relief
+rather than suspicion. It is written last, when the work is done and verified, so it gets the least
+evidence and the most trust. Two independent reviewers read this commit; both flagged the test above
+that paragraph and neither flagged the paragraph.
+
+`f947acb4c` *did* enumerate a class — that is where "the audit's four plus the ones in the same
+functions" came from. It enumerated by **function neighbourhood** (which sites sit next to the ones
+I am editing) instead of by **property** (which sites interpolate a sender-authored value into a log
+sink). The first noun cannot reach another file; the second can. A census inherits the shape of the
+thing you searched for.
+
+**Countermeasure, because a better prose list is not one:** `RenderPathLogSinkTests`
+(`TabMailTests/Views/EmailRenderPipelineTests.swift`) re-derives the set on every run and fails with
+the offending `file:line accessor` triples. It is scoped as a regression guard, not a proof, and its
+doc comment enumerates seven evasion shapes it cannot see. Recorded as `MIS-019` instance 18.

@@ -2,7 +2,7 @@
 
 **Class:** documentation / verification
 **Severity:** high
-**First seen:** 2026-08-04 · **Recurrences:** 4 · **Status:** Active
+**First seen:** 2026-08-04 · **Recurrences:** 7 (**7: killed `verify` with a GLOB — `…/KnownIssues/ios-*.md` written into a Ruby comment, by the exact mechanism the note below this line already describes; see "Instance 7" at the end.** **6: broke again the DAY AFTER instance 5 was repaired — see "Instance 6" at the end.** 5: was fail-open for two days — `345c04a6f` edited a preserved body and `verify` aborted on its FIRST check from 2026-08-10 to 2026-08-12, silently disabling the ADR census, routing, link, pointer and budget checks. ✅ REPAIRED 2026-08-12 the prescribed way — body restored byte-for-byte from the pinned source, amendment moved into a `COMPANION-CURRENT-NOTE` wrapper, SHA **not** re-pinned. See "Instance 5 — resolution" at the end of this file**) · **Status:** Active
 **Related:** [MIS-IOS-006](MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md); **MIS-023** and
 **MIS-027** in the monorepo-root tree (`rg -n 'MIS-023|MIS-027' ../MISTAKES.md`) — both are the same
 shape: reading a number instead of reading how far the run got.
@@ -222,3 +222,244 @@ normalized to the local basename so it resolves after routing. The round-trip ch
 original target before hashing. Nothing was summarised, merged, or dropped.
 
 > - **[MIS-IOS-009](MIS-IOS-009-amended-a-hash-pinned-fragment-and-killed-the-verifier.md)** — wrote a correct amendment **inside** a hash-pinned routed fragment (`adr-ios-031.md`, `9430ef418`), so `compact_companion_docs.rb verify` aborted at `hash mismatch:` on manifest row 33 and **every later check silently stopped running for a day** — the ADR census, 91-fragment memory routing, 212-file link check, 279 pointer check, and the budget report that was holding a live 38%-over `CLAUDE.md` finding. The tree has a designed amendment surface (`<!-- COMPANION-CURRENT-NOTE-BEGIN/END -->`, stripped by `exact_body` before hashing) but the marker is invisible at the edit site. **A file whose path appears in a `manifest.tsv` with a `sha256` column has immutable bytes: prepend the wrapper, never edit the body — not even to append a pointer.** An `abort`-on-first-failure verifier is fail-open for everything after the abort; read its LAST line, not its first. **Instance 2 is the same failure with a different grammar:** four unescaped `|` quoted from shell commands into `KNOWN_ISSUES.md` table cells silently SPLIT those rows' fields (`\|` is the file's own convention). Generalised: **before amending any file, ask what MACHINE reads it besides a human — a manifest verifier, a GFM table parser, a census script — and verify STRUCTURALLY (per-row field count vs `HEAD`), not visually.** ⚠️ **TWO pinning conventions decide the repair:** `{Memory,Decisions}/manifest.tsv` hashes the **stripped** body and must NEVER be re-pinned (it also asserts a source-line range + full-document reconstruction); `ported-manifest.tsv` / `amendments-manifest.tsv` / `Decisions/V3/manifest.tsv` hash the **raw** file and MUST be re-pinned. Fixing the first abort revealed 14 broken links + 1 dead pointer hidden behind it since 2026-08-06 — **routing a file deeper silently breaks its root-relative links, and byte-for-byte fidelity preserves the breakage.** (×3)
+
+---
+
+## Instance 5 (found 2026-08-12; live since 2026-08-10) — the verifier has been fail-open for TWO DAYS, and nobody noticed because nothing announces it
+
+**Found by:** a documentation subagent doing an unrelated job (authoring ADR-IOS-076), which tried to run
+the verifier to check its own edit and could not get past the first check. **Not found by any gate** —
+there is no gate; `verify` is run by hand.
+
+**State.** `ruby Scripts/compact_companion_docs.rb verify` aborts immediately with:
+
+```
+hash mismatch: Companion/Memory/Current/089-action-queue-coalesces-gesture-intents-to-latest-per-field-adr-ios-057-2.md
+```
+
+Because `abort` is the first statement to fire, **every downstream check has silently not run since
+2026-08-10**: the ADR census, memory routing/status, the linked-exactly-once check, the pointer check,
+and the index budget report. Two days of companion edits — including a new ADR and several `Mistakes/`
+entries written the same day this was found — went in unverified.
+
+**Cause.** Commit `345c04a6f` (2026-08-10, *"fix(ios): coalesce immediate move undo"*) edited the
+**preserved body** of a routed memory file: one bullet replaced by two, +2/−1. The knowledge itself is
+real and worth keeping — a genuine move/undo coalescing update. It was written into the wrong kind of
+surface.
+
+**Why the obvious fix is WRONG, and this is the part worth remembering.** The instinct is to re-pin:
+recompute the SHA, paste it into `Companion/Memory/manifest.tsv`, watch `verify` go green. That would
+**destroy the proof rather than repair it.** The manifest hash is not a checksum, it is one leg of a
+no-content-loss argument:
+
+```
+actual_sha == expected_sha                      # leg 1 — the hash
+preserved_body == source.lines[start..end]      # leg 2 — byte-identity with v1.6.38:PROJECT_MEMORY.md
+reconstructed == source                         # leg 3 — the whole file rebuilds byte-for-byte
+```
+
+`exact_body` strips only a leading current-note block; **everything else in a routed file must remain
+byte-identical to its historical source range.** So re-pinning the hash merely moves the abort from
+leg 1 to leg 2, and if someone "fixed" leg 2 as well, leg 3 — the actual guarantee that compaction lost
+nothing — would be gone with no error to show for it. **A green verifier obtained by editing the
+expectations is worth less than a red one.**
+
+**The real repair is a routing decision, not a hash edit:** preserved bodies are immutable history;
+new current knowledge needs an append-safe surface (a current-note block, or a new routed topic with
+its own index line). That decision belongs to the owner, so it is recorded here and deliberately not
+made unilaterally.
+
+**The tell:** *I edited a file under `Companion/` and did not run `verify` afterwards* — and the
+second-order tell, which is the one that cost two days: *`verify` printed one line and stopped, and I
+read that as "one problem" rather than "all remaining checks are now disabled."* An `abort`-on-first-
+failure verifier does not degrade gracefully; it goes from proving everything to proving nothing, and
+the output looks almost identical.
+
+**Countermeasure:** run `verify` **before and after** any `Companion/` edit, and treat a non-zero exit
+as *"verification is OFF"*, never as *"one file is wrong."* ⚠️ In this repo's zsh, a piped
+`ruby … | head` reports `head`'s status — `${PIPESTATUS[0]}` is a bash-ism and reads empty here — so
+check the exit code unpiped or the abort will look like a success.
+
+## Instance 5 — resolution (2026-08-12), and the SECOND defect the outage was hiding
+
+The owner authorised the routing repair this entry deferred. It was carried out exactly as the rule
+above prescribes, and the cost of getting it wrong is worth restating: the tempting fix — recompute
+the SHA and paste it into the manifest — would have moved the abort to the byte-identity leg, and
+"fixing" that too would have destroyed leg 3, the proof that compaction lost nothing, with no error
+left to show for it.
+
+**What was done.** Routed memory fragment **089** (`action-queue-coalesces-gesture-intents…`, in
+`Companion/Memory/Current/`) was restored byte-for-byte from
+`v1.6.38:PROJECT_MEMORY.md` lines 1005-1035 (the restored body hashes to the manifest's pinned
+`18d40fdb…`, unchanged), and `345c04a6f`'s move/undo amendment was reproduced verbatim inside a
+prepended `COMPANION-CURRENT-NOTE` wrapper. **No manifest hash was re-pinned.** No knowledge was
+lost: the amendment is still present, still `rg`-findable, and now carries its own provenance.
+
+**And then the outage turned out to be hiding a defect in the verifier itself.** With the abort
+cleared, `verify` advanced and immediately failed on 27 repository pointers across two `PLAN_*.md`
+files — every one of them a FALSE POSITIVE. `verify_repository_companion_references` scanned for
+`Companion/<Tree>/….md` starting at `Companion/`, which discards a leading `../`, then resolved the
+hit against `tabmail-ios/`. So a **correct** reference to the monorepo-root companion tree was
+reported broken. A standalone probe resolved all 144 such references in the `PLAN_*.md` set with the
+prefix honoured: **144 ok, 0 broken.** The scan now matches an optional `../` and resolves those
+against the parent directory; `verify` reports 453 pointers checked, all existing.
+
+That bug is documented in this entry's own preamble — the first draft of this file broke `verify` by
+writing a correct root-tree path in full — and the standing workaround was to cite root-tree files by
+bare id and explain why. **The workaround outlived the need for it by long enough to become
+convention.** Nobody fixed the tool because the tool's output was never seen: it had been aborting
+before that check on most days it mattered.
+
+**The compounding lesson, which is the one to keep.** An `abort`-on-first-failure verifier does not
+merely stop early — it *preserves* every later defect in amber. Two days of hidden checks concealed a
+tool bug that had been mis-teaching the repo's own citation convention. When you repair the first
+abort, do not stop at green: **read what the newly-reached checks say, and treat their first report
+as evidence about how long they have been silent**, not as a fresh problem introduced by your fix.
+
+**Also repaired in the same pass, found by looking rather than by any verifier:**
+`Companion/Mistakes/manifest.tsv` listed `MIS-IOS-001`–`006` while the directory held `001`–`012`.
+Six entries — including this one — were missing from their own index. That manifest has no `sha256`
+column, so the mechanical sweep in this entry skips it (`next unless pi && si`), and **no script
+reads it at all**; only `MISTAKES.md`, which was current, points at it. An index nothing verifies
+drifts silently, which is the same failure mode as the one above with the alarm removed. Rows for
+`007`–`012` were added and checked structurally: 12 ids matching the directory exactly, uniform
+7-field rows, every path resolving.
+
+---
+
+## Instance 6 (2026-08-12, found and repaired 2026-08-13) — broke again the DAY AFTER instance 5's repair, by the session that had just read this entry
+
+**Commit `458863e86`** ("Withhold remote image URLs from hidden email sections", the T8 / `IOS-PRIVACY-003`
+fix) appended **one bullet** to the preserved body of
+`Companion/Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md`.
+One line. `verify` aborted at `hash mismatch:` from that commit until the repair.
+
+**Provenance, established by hashing rather than by reading the diff:**
+
+| rev | `exact_body` SHA | |
+|---|---|---|
+| manifest pin | `8c614322…` | |
+| `7172743b2` (pre-commit) | `8c614322…` | green |
+| **`458863e86`** | `61368a99…` | **broke here** |
+
+**Why this instance is worth its own section rather than a tally bump.**
+
+- **Instance 5 was repaired on 2026-08-12 and this landed on 2026-08-12.** The countermeasure did not
+  survive one day. The repairing session and the breaking session were both in this repo, hours apart.
+- **The commit body is ~120 lines of unusually careful engineering prose** — it enumerates rejected
+  alternatives, states failure direction, separates a foreign test census term, and names every new
+  test. The author was demonstrably not being careless. **Care about the CONTENT is not care about
+  the CONTAINER**, and this entry's tell is precisely that the container's constraint is invisible at
+  the edit site.
+- **It was found by a subagent doing an unrelated job** (authoring the P4 image-failure banner), which
+  ran `verify` to check its *own* Companion edit — the same way instance 5 was found. **Twice now the
+  finder has been an unrelated agent's incidental check, and never a gate**, because there is no gate.
+- **The agent that found it then nearly made the mirror mistake**: it checked `Decisions/manifest.tsv`
+  and `ported-manifest.tsv` for its own ADR, concluded "not pinned", and had **not** checked
+  `Decisions/V3/manifest.tsv` — the *other* convention, which would have required the **opposite**
+  repair (re-pin, not wrap). It got the right answer by luck and said so. **The two-convention table
+  above is the part of this entry that most needs reading, and it is the part most easily skipped.**
+- **`rc` was masked twice.** `ruby … | tail` reports `tail`'s status in this zsh, so a casual piped run
+  showed `RC=0` while the real exit was `1`. Run it unpiped. This is the same trap already recorded in
+  instance 5.
+
+**The repair, done exactly as the rule prescribes.** The body was restored byte-for-byte from
+`7172743b2` (proved identical to `v1.6.38:PROJECT_MEMORY.md` lines 399-434, hashing to the pinned
+`8c614322…`), and the bullet was reproduced **verbatim** — extracted mechanically from
+`git diff -U0`, never retyped — inside a prepended `COMPANION-CURRENT-NOTE` wrapper. **No manifest
+hash was re-pinned.** Full mechanical sweep across every manifest afterwards: `mismatched=0`.
+
+**And clearing the abort revealed a false claim the outage had preserved, which is this entry's
+compounding lesson holding for the third time.** The restored bullet asserts that selecting a
+different `.eml` is a fresh load *"(the coordinator reloads on `loadedPreviewFilename` change)"*.
+**That mechanism does not exist:** `HTMLWebView.updateUIView`'s predicate is `htmlChanged ||
+reloadChanged`, and `loadedPreviewFilename` is **assigned** inside that branch and **never compared**
+anywhere in the tree. The bullet's *conclusion* is still true by a different route — the sheet is
+`.sheet(item:)` over an `Identifiable` state, so each presentation remounts and loads via
+`makeUIView` — so the T8 fix is unaffected and this is a documentation defect, not a behaviour one.
+The correction is recorded in the wrapper alongside the verbatim bullet rather than by editing it.
+
+**Newly-reached checks, reported per this entry's rule that their first output is evidence of how
+long they were silent, not a fresh problem:** with the abort cleared, `verify` advanced through all
+nine checks — PROJECT_MEMORY and DECISIONS both reconstructing byte-identical, ADR census 55, ported
+decisions 9, memory routing 91, ported memory topics 2, 398 Markdown links, 484 repository pointers,
+0 un-routed duplicate bodies — and now exits 1 **only** on the budget verdict: root `MISTAKES.md`
+**+87%**, `CLAUDE.md` +5%, iOS `PROJECT_MEMORY.md` +24%, iOS `DECISIONS.md` +10%, iOS `MISTAKES.md`
++36%, scope total over. That verdict had been invisible for the whole outage.
+
+---
+
+## Pre-compaction index line (verbatim, 2026-08-13, pass 4)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 62% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced block
+so its index-relative link is not re-resolved from this directory, because the index line had
+accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-009](Companion/Mistakes/Active/MIS-IOS-009-amended-a-hash-pinned-fragment-and-killed-the-verifier.md)** — edited a hash-pinned fragment in place, killed `compact_companion_docs.rb verify`, and hid later checks; inspect manifest grammar, use the correct wrapper/re-pin convention, escape GFM table pipes, and re-resolve links after routing. **×6 broke it again the DAY AFTER ×5's repair** — one bullet appended to pinned memory `037` by `458863e86`, found by an unrelated subagent's incidental `verify`, never by a gate; **`ruby … | tail` masks rc in zsh — run it UNPIPED**; and the finder had checked two manifests but not `Decisions/V3/manifest.tsv`, the convention needing the OPPOSITE repair. (×6)
+```
+
+---
+
+## Instance 7 (2026-08-13) — I killed the verifier with a GLOB in a code comment, by the exact mechanism the header of this file warns about
+
+The Phase-1 countermeasure for root `MIS-039` instance 2 was a warning comment above
+`Scripts/compact_known_issues.rb`'s `generate`, describing its second destruction mechanism. One
+sentence of it read:
+
+```text
+# silently deleted, and the script exits 0 printing a success line. It also `File.delete`s every
+# `…/KnownIssues/ios-*.md` absent from the archive (the `Amendments/`
+# subdirectory escapes only because that glob does not descend into it).
+```
+
+`verify_repository_companion_references` scans every `.md`/`.rb`/`.swift`/`.sh`/`.ya?ml` file for
+anything shaped like `Companion/{Memory,Decisions,Process,Rules,Mistakes}/….md` and aborts the whole
+run when the target is not a file. **A glob is not a file.** So `verify` began failing with
+
+```text
+broken repository companion references:
+Scripts/compact_known_issues.rb: …/KnownIssues/ios-*.md
+```
+
+and — this is the damage, not the message — **every check after it stopped running**: the ADR
+census, memory routing, ported-decision hashes, the 405-file link check, and the budget report. The
+Phase-1 commit therefore landed with the verifier fail-open, exactly as instances 5 and 6 did.
+
+**What makes this a recurrence and not a new id:** the header block of *this file*, written after
+instance 4, already states the mechanism verbatim — *"`verify_repository_companion_references` scans
+every tracked and untracked file for the literal substring `Companion/<Tree>/…​.md` … so a correct
+relative path to the root tree written out in full aborts the verifier. That is this very mistake,
+one level up: the first draft of this file broke `verify` the same afternoon it was written to
+describe breaking `verify`."* I read this entry during the same session — it is one of the 13 index
+lines I routed — and still wrote a bare `…/KnownIssues/ios-*.md` into a Ruby comment forty
+minutes later. The countermeasure is documented, correct, and did not fire, which is the property
+that matters.
+
+**Second-order detail worth keeping:** the shape that broke it was not a *wrong* path. It was a path
+that is not a path at all — a glob standing in for a set of files, in prose describing what a
+command deletes. Instance 4's variant was a byte-faithful *correct* link resolved from the wrong
+base. Both are "the checker is a substring scanner and does not know what your sentence meant".
+
+**Repair (2026-08-13):** the sentence now names the directory through its constant,
+`DETAIL_DIR_REL`, and describes the glob in words. The comment also now carries a note explaining
+*why* it is written that way, so the next editor does not helpfully expand it back.
+
+**Detection:** not by a gate. It surfaced because the `companion-compact` Stage-4 protocol requires
+running `compact_companion_docs.rb verify` **unpiped** and reading its output — the same route that
+found instance 6. Three of the last four instances were found by someone running `verify` for an
+unrelated reason.
+
+### Mechanical check
+
+Before committing any file that mentions a `Companion/` path in prose or a comment:
+
+```bash
+ruby Scripts/compact_companion_docs.rb verify   # UNPIPED — `| tail` masks rc in zsh
+# and specifically:
+rg -n 'Companion/(Memory|Decisions|Process|Rules|Mistakes)/[^ `"'"'"']*\*' -g '!Companion/**'
+```
+
+A `*` anywhere inside a `Companion/…​.md`-shaped substring means the reference checker will try to
+`File.file?` a glob and abort.

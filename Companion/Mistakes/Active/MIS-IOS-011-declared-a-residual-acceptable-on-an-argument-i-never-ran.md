@@ -69,3 +69,16 @@ And when a finding says *X is persisted before the guard runs*, enumerate **ever
 of the guarded operation before classifying — rows, index entries, and files on disk. A guard that
 covers two of three durable outputs is not a guard, and the missing one is invisible precisely
 because the other two are the ones the code reads back.
+
+---
+
+## Pre-compaction index line (verbatim, 2026-08-13, pass 4)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 62% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced block
+so its index-relative link is not re-resolved from this directory, because the index line had
+accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-011](Companion/Mistakes/Active/MIS-IOS-011-declared-a-residual-acceptable-on-an-argument-i-never-ran.md)** — classified a codex finding as an **accepted residual** under THE MANTRA's *recoverable ⇒ fail closed* exit and wrote the registration comment **in the same motion as deciding it qualified**, with the justification stated as fact about a mechanism I had not opened. The render phase persists inline images via `BodyAssetStore.makeInlineImageWriter` keyed by the **victim's** content key, *before* `BodyAddressGate` can refuse the body write; the case I never worked is a later legitimate fetch whose HTML references a **colliding CID** while that one attachment re-fetch fails — the victim's message then renders the **stranger's image**, and nothing undoes it while the fetch keeps failing. Not recoverable, so not a residual. Root shape: I treated the `MessageBody` row and the FTS entry as the only durable outputs of a body fetch; **asset files on disk are a third**, invisible because they are the one output the code never reads back. Fixed by refusing **before render** on both render paths (the write-time refusal stays authoritative — pre-render cannot see a move landing during the fetch). ***Tell: writing "accepted residual" before having written down the concrete inputs that reach the bad state — THE MANTRA's test is mechanically checkable, so if I cannot NAME the recovering event, I invoked the rule's name instead of running it.*** (×1)
+```

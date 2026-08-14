@@ -76,3 +76,16 @@ the pattern would not match the same call reformatted by an autoformatter, it is
 Repaired in the follow-up commit: `carryForwardAttachments` now aggregates failures and surfaces
 them in a `CarryForwardFailureAlert`, which also fixes the pre-existing silent-drop on ordinary
 network failures.
+
+---
+
+## Pre-compaction index line (verbatim, 2026-08-13, pass 4)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 62% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced block
+so its index-relative link is not re-resolved from this directory, because the index line had
+accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-012](Companion/Mistakes/Active/MIS-IOS-012-guarded-one-reader-on-a-caller-census-whose-grep-shape-hid-half-the-callers.md)** — added a fail-closed throw to `AccountManager.fetchAttachment` and enumerated its callers with `rg "\.fetchAttachment\(for:"`, which encodes the call's TYPOGRAPHY: two of the four callers wrap their arguments so `fetchAttachment(` and `for:` sit on different lines and cannot match. The unseen `ComposeView.carryForwardAttachments` catches every error and only `print`s it, so the new deterministic refusal turned a forward into a draft SILENTLY missing the original's attachments — a permanent dropped intention in an outbound path, found by codex round 7 after I had declared caller impact analysed. **Enumerate by the BARE SYMBOL when a change makes a function throw, then read every catch and write down whether it retries, reports, swallows, or terminalizes** — a catch that swallows is not "unaffected", it is the one that converts transient into permanent. A pattern that would not match the same call after an autoformatter touched it is not a census. (×1)
+```

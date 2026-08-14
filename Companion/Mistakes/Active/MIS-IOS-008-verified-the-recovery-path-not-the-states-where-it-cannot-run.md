@@ -2,7 +2,7 @@
 
 **Class:** review-discipline / fail-closed design
 **Severity:** high (a false "recoverable" claim shipped in a commit body, and it was the load-bearing justification for the fix's accepted cost)
-**First seen:** 2026-08 · **Recurrences:** 1 · **Status:** Active
+**First seen:** 2026-08 · **Recurrences:** 2 · **Status:** Active
 **Related:** `MIS-IOS-007` (the same session, the same guard — a premise that felt checked because real code was read) · **Rule owner:** `tabmail-ios/CLAUDE.md` § *THE MANTRA*
 
 ## The tell
@@ -92,3 +92,55 @@ When about to write **"recoverable"**, do not stop at naming the recovery path. 
 This is the repo-local form of the standing rule that an absolute claim needs its negative case. The
 mantra's test is **recoverability of the state**, never **existence of a mechanism** — and those two
 come apart precisely where a guard on the recovery path excludes the same rows the refusal caught.
+
+---
+
+## Instance 2 — 2026-08-12, `IOS-AI-004`: the recovery gesture required the row to be ON SCREEN
+
+Registering `IOS-AI-004` (no AI enqueue when a message enters an inbox by local move) as an accepted
+MANTRA residual rather than a defect. The load-bearing sentence was:
+
+> **Masked in ordinary use because opening the message processes it on demand via
+> `AccountManager.processOpenedMessage` — that tap IS the MANTRA recovery gesture.**
+
+`processOpenedMessage` is real, it is reached from `MessageDetailViewModel.loadBody`, it enqueues with
+priority, and its `guard let opened, opened.current.isInInbox` is correct. Every fact checked out —
+**again**. And again the quantifier was wrong: **a tap gesture requires a tappable row**, and the row
+was hidden by the then-unfixed move-visibility defect. Both device episodes that motivated the record
+were captured *before* the visibility fix landed, i.e. from states where the named recovery gesture
+**could not be performed at all**. The record even says so, in its own next clause — the precondition
+was written down, adjacent to the claim, and still did not travel back into the claim.
+
+**What makes this instance distinct from instance 1, and worth its own entry:** there the blocking
+guard was in the *code* of the recovery path (`NOT EXISTS`, an all-RFC-less sample). Here the recovery
+path's code was fine and the blocker was **elsewhere in the product** — a UI defect in a different
+subsystem, filed as its own issue, that removed the affordance the gesture needs. So step 2 of the
+countermeasure is too narrow as written: *"read the guards on the recovery path itself"* would not have
+caught this, because there was nothing wrong with the recovery path.
+
+**Countermeasure, amended — extend step 2 with the affordance question:**
+
+> 2b. If the recovery is **a user gesture**, name what the user must be able to see or reach in order
+>     to perform it, and check that *that* is true in the failing state. A gesture is not a mechanism
+>     you can read in one function; it is a mechanism plus an affordance, and the affordance is
+>     usually owned by a different subsystem than the one you are registering.
+
+**Sequel, and the reason this entry is not merely historical:** the gap was closed on 2026-08-13 by
+`1eb41702e`, which added the missing trigger — so the residual that remains is *not* the one this
+argument was made about. The MANTRA argument was never re-run against the narrowed state; the record
+now carries an explicit reopen condition instead. **A residual that changes shape needs its
+recoverability argument re-run, not inherited.** Related: `MIS-IOS-011` (invoking THE MANTRA's name
+instead of running its test).
+
+---
+
+## Pre-compaction index line (verbatim, 2026-08-13, pass 4)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 62% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced block
+so its index-relative link is not re-resolved from this directory, because the index line had
+accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-008](Companion/Mistakes/Active/MIS-IOS-008-verified-the-recovery-path-not-the-states-where-it-cannot-run.md)** — proved a recovery path EXISTS and wrote "recoverable"; never asked from which states that path itself is blocked. The mantra's test is recoverability of the STATE, not existence of a MECHANISM, and they come apart exactly where a guard on the recovery path excludes the same rows the refusal caught. Shipped a false cost claim in `6b689890d`'s body; both round-2 reviewers found it independently (`IOS-AI-003`). A refusal retried forever is not inert — check the retry ceiling too. **Instance 2 (`IOS-AI-004`): the recovery path's CODE was fine — the blocker was an affordance owned by a DIFFERENT subsystem.** "Tapping the message is the recovery gesture" needs a **tappable row**, and the row was hidden by the then-unfixed move-visibility defect, so both motivating device episodes came from states where the gesture could not be performed. Reading the recovery path's own guards would not have caught it. New step 2b: if the recovery is a **user gesture**, name the affordance it requires and check *that* in the failing state. Also — a residual that later changes shape needs its recoverability argument **re-run, not inherited**. (×2)
+```
