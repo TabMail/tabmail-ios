@@ -1020,11 +1020,28 @@ struct AttachmentFilenameContainmentTests {
     /// it came from. Equal to the logical string exactly when nothing was
     /// reordered.
     ///
+    /// ⚠️ **LIGATURES ARE DISABLED, and the harness is WRONG without that.** This
+    /// reconstruction assumes one glyph per UTF-16 unit: a LIGATURE is one glyph
+    /// standing for two units, so the unit it does not report is simply missing
+    /// from the result. Measured 2026-08-12: with ligatures on, Helvetica renders
+    /// the `fi` of `"Unsupported file name"` as a single glyph and this function
+    /// returns `"Unsupported fle name"` — an apparent reordering failure on a
+    /// string that is laid out perfectly in order. `kCTLigatureAttributeName = 0`
+    /// makes the glyph stream faithful again. Ligature formation is orthogonal to
+    /// the bidi ordering this harness exists to measure, so turning it off narrows
+    /// the instrument to its question rather than weakening the assertion.
+    ///
+    /// This never surfaced before because no fixture contained an `fi`, `fl` or
+    /// `ff` pair — a reminder that a harness can be quietly wrong for every input
+    /// anyone happened to try.
     private func visibleOrder(_ text: String) -> String {
         let font = CTFontCreateWithName("Helvetica" as CFString, 14, nil)
         let attributed = NSAttributedString(
             string: text,
-            attributes: [kCTFontAttributeName as NSAttributedString.Key: font]
+            attributes: [
+                kCTFontAttributeName as NSAttributedString.Key: font,
+                kCTLigatureAttributeName as NSAttributedString.Key: 0,
+            ]
         )
         let line = CTLineCreateWithAttributedString(attributed)
         guard let runs = CTLineGetGlyphRuns(line) as? [CTRun] else { return "" }
@@ -1045,6 +1062,28 @@ struct AttachmentFilenameContainmentTests {
             if let scalar = Unicode.Scalar(utf16[index]) { out.append(scalar) }
         }
         return String(out)
+    }
+
+    /// The INSTRUMENT check, not a product assertion: `visibleOrder` must return a
+    /// plain LTR string unchanged, including one that forms ligatures.
+    ///
+    /// Without this, the harness's ligature bug is indistinguishable from the
+    /// defect it exists to detect — it reports a missing character as a reordering,
+    /// and the only thing separating "this name renders out of order" from "my
+    /// measuring device drops glyphs" is a test that pins the device.
+    @Test("The layout-order harness reconstructs an in-order string exactly, ligatures included")
+    func layoutOrderHarnessIsFaithful() {
+        for text in [
+            "Unsupported file name",      // `fi` — the pair that caught this
+            "waffle flight offer",        // `ff`, `fl`, `ffl`
+            "invoice.pdf",
+            "Invoice (final) - 2026 v2.pdf",
+        ] {
+            #expect(
+                visibleOrder(text) == text,
+                "the harness lost or reordered a character in plain LTR text: \(text.debugDescription)"
+            )
+        }
     }
 
     /// How many UTF-16 units the typesetter puts on the FIRST line when the line is
