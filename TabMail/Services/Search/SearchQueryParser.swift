@@ -130,9 +130,17 @@ enum SearchQueryParser {
 
     // MARK: - Field alias translation
 
+    /// Rewrite `from:` / `to:` to the FTS column aliases.
+    ///
+    /// Scans BYTES because the word-boundary helpers below compare UTF-8 byte patterns, but
+    /// accumulates BYTES too and decodes once at the end. Appending
+    /// `Character(UnicodeScalar(bytes[i]))` — which is what this did — reinterprets each UTF-8 byte as
+    /// a Unicode scalar, i.e. as Latin-1: `café` (`63 61 66 C3 A9`) came back out as `cafÃ©`, so every
+    /// non-ASCII search term was corrupted before it ever reached FTS and silently matched nothing.
+    /// Multi-byte scalars must survive the scan untouched.
     private static func translateAliases(_ q: String) -> String {
         let bytes = Array(q.utf8)
-        var out = ""
+        var out: [UInt8] = []
         var i = 0
 
         while i < bytes.count {
@@ -141,7 +149,7 @@ enum SearchQueryParser {
                 var j = end
                 while j < bytes.count && bytes[j] == 0x20 { j += 1 }  // skip spaces
                 if j < bytes.count && bytes[j] == 0x3A {  // ':'
-                    out += "from_:"
+                    out += Array("from_:".utf8)
                     i = j + 1
                     continue
                 }
@@ -151,21 +159,50 @@ enum SearchQueryParser {
                 var j = end
                 while j < bytes.count && bytes[j] == 0x20 { j += 1 }
                 if j < bytes.count && bytes[j] == 0x3A {
-                    out += "to_:"
+                    out += Array("to_:".utf8)
                     i = j + 1
                     continue
                 }
             }
-            out.append(Character(UnicodeScalar(bytes[i])))
+            out.append(bytes[i])
             i += 1
         }
 
-        return out
+        return String(decoding: out, as: UTF8.self)
     }
 
     private static func startsWordAt(_ haystack: [UInt8], i: Int, needle: [UInt8]) -> Bool {
         guard i + needle.count <= haystack.count else { return false }
         // Word boundary check
+        //
+        // ⚠️ This still builds a `Character` from a SINGLE BYTE, the idiom removed from `isIdentStart`
+        // and `isIdentChar` — the removal there was scoped to those two, and this site is deliberately
+        // left alone. But the MECHANISM this comment used to state was measured and is false, so it is
+        // corrected here rather than left to mislead the next reader (`MIS-032`).
+        //
+        // It claimed a continuation byte of a multi-byte LETTER "lands on a Latin-1 letter and reports
+        // `isLetter == true`, which is the right answer", and that the only wrong case was a multi-byte
+        // NON-letter. Measured over the whole continuation range `0x80`–`0xBF`, read as Latin-1:
+        //
+        //   isLetter: 3 bytes — 0xAA ª, 0xB5 µ, 0xBA º
+        //   isNumber: 6 bytes — 0xB2 ² 0xB3 ³ 0xB9 ¹ 0xBC ¼ 0xBD ½ 0xBE ¾
+        //   neither: 55 bytes — C1 controls and Latin-1 punctuation/symbols
+        //
+        // So the claimed behaviour is the exception (9 of 64 bytes reject the boundary), and the real
+        // failure direction is the OPPOSITE of the one described: the common case is a word ending in a
+        // non-ASCII letter whose LAST byte is neither letter nor number, so the boundary check passes
+        // and the alias IS translated in the middle of a Unicode word. `caféfrom:bob` (é is C3 A9,
+        // trailing byte © ), `日本from:bob` (本 is E6 9C AC, trailing ¬ ) and `Ωfrom:bob` (CE A9) all
+        // become `…from_:bob`. `füfrom:bob` does not, because ü ends 0xBC ¼ which is `isNumber` — the
+        // outcome is decided by the last byte's Latin-1 identity, which is unrelated to the scalar.
+        //
+        // Unchanged conclusion: this is not a security concern. The translated token is
+        // `caféfrom_:bob`, and `splitField` hands the field part to `canonicalFTSColumn`, which does not
+        // recognise it — so the whole token falls through as LITERAL TEXT. The user gets a query that
+        // finds nothing instead of a search of the `from_` column, and no column name or operator
+        // reaches the MATCH expression. Deliberately not fixed here. A proper fix decodes the
+        // preceding SCALAR rather than the byte, which changes alias behaviour next to every kind of
+        // non-ASCII text; that is a search-behaviour change, not part of the field-prefix fix.
         if i > 0 {
             let prev = haystack[i - 1]
             let ch = Character(UnicodeScalar(prev))
