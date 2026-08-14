@@ -975,4 +975,35 @@ struct CommittedDocumentGateTests {
         #expect(fresh.commit(isIssuedLoad: false) == nil)
         #expect(fresh.evaluate(.fit) == .refuse(.noCommittedDocument))
     }
+
+    @Test("Bridge diagnostics name the COMMITTED document while a newer load is only issued")
+    func bridgeDiagnosticsUseTheCommittedGeneration() {
+        var gate = CommittedDocumentGate()
+        issueAndCommit(&gate, generation: 1)
+        gate.issue(generation: 2)
+
+        #expect(RenderBridgeDiagnostics.prefix(webViewId: "ABC123", gate: gate)
+            == "[RenderBridge id=ABC123 committedGen=1]",
+            "the outgoing document still owns bridge messages until generation 2 commits")
+
+        gate.commit(isIssuedLoad: true)
+        #expect(RenderBridgeDiagnostics.prefix(webViewId: "ABC123", gate: gate)
+            == "[RenderBridge id=ABC123 committedGen=2]")
+    }
+
+    @Test("The nil-navigation fallback adopts only when there is no newer tracked identity")
+    func nilNavigationFallbackPinsBothDirections() {
+        #expect(NavigationCommitCorrelation.shouldAdoptIssuedGeneration(
+            callbackMatchesTrackedNavigation: false,
+            hasTrackedNavigation: false),
+            "loadHTMLString returning nil leaves no identity to match; refusing would strand the real document")
+        #expect(!NavigationCommitCorrelation.shouldAdoptIssuedGeneration(
+            callbackMatchesTrackedNavigation: false,
+            hasTrackedNavigation: true),
+            "an unrelated callback must not adopt a newer tracked load's generation")
+        #expect(NavigationCommitCorrelation.shouldAdoptIssuedGeneration(
+            callbackMatchesTrackedNavigation: true,
+            hasTrackedNavigation: true),
+            "the ordinary identity-matched path must still adopt")
+    }
 }

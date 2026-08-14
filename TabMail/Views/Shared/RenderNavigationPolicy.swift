@@ -540,6 +540,28 @@ internal struct CommittedDocumentGate: Equatable {
     }
 }
 
+/// The one correlation decision `Coordinator.webView(_:didCommit:)` makes.
+/// Extracted so the nil-`WKNavigation` fallback and its fail-closed opposite can
+/// be pinned without trying to manufacture an opaque `WKNavigation` in a unit test.
+internal enum NavigationCommitCorrelation {
+    static func shouldAdoptIssuedGeneration(
+        callbackMatchesTrackedNavigation: Bool,
+        hasTrackedNavigation: Bool
+    ) -> Bool {
+        callbackMatchesTrackedNavigation || !hasTrackedNavigation
+    }
+}
+
+/// Builds the stable prefix for every Swift-side render-bridge diagnostic.
+/// Keeping the generation choice here makes the issued-before-commit window a
+/// testable property of the actual string production logs use.
+internal enum RenderBridgeDiagnostics {
+    static func prefix(webViewId: String, gate: CommittedDocumentGate) -> String {
+        let generation = gate.committedGeneration.map(String.init) ?? "-"
+        return "[RenderBridge id=\(webViewId) committedGen=\(generation)]"
+    }
+}
+
 // MARK: - Content-world isolation
 
 /// The `WKContentWorld` that EVERY app-injected render script, EVERY bridge message

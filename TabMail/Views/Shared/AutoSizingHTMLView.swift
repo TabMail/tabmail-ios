@@ -1384,7 +1384,10 @@ private struct HTMLWebView: UIViewRepresentable {
             // document with no committed generation and refuse all three of its
             // one-shots.
             let tracked = isTracked(navigation)
-            let isIssuedLoad = tracked || trackedNavigation == nil
+            let isIssuedLoad = NavigationCommitCorrelation.shouldAdoptIssuedGeneration(
+                callbackMatchesTrackedNavigation: tracked,
+                hasTrackedNavigation: trackedNavigation != nil
+            )
             let committed = documentGate.commit(isIssuedLoad: isIssuedLoad)
             navLog("didCommit tracked=\(tracked) adoptedIssued=\(isIssuedLoad) "
                    + "committedGen=\(committed.map(String.init) ?? "-")")
@@ -1641,11 +1644,13 @@ private struct HTMLWebView: UIViewRepresentable {
             bridgeLog("rejected channel=\(channel) reason=\(refusal.rawValue)-\(oneShot.rawValue)")
         }
 
-        /// Debug-gated bridge diagnostic — the rejection half of the three
-        /// channels' validation. Same production-silence rule as `navLog`.
+        /// Debug-gated bridge diagnostic — the rejection half of the channels'
+        /// validation. The prefix names the COMMITTED generation because an outgoing
+        /// document continues posting after a newer load is issued and until it commits.
+        /// Same production-silence rule as `navLog`.
         private func bridgeLog(_ line: @autoclosure () -> String) {
             guard DebugModeManager.isLoggingEnabled() else { return }
-            print("[RenderBridge id=\(webViewId) gen=\(loadGeneration)] \(line())")
+            print("\(RenderBridgeDiagnostics.prefix(webViewId: webViewId, gate: documentGate)) \(line())")
         }
 
         /// Consume the `{ h, vp }` payload from `monitorHeightJS` (ResizeObserver-
