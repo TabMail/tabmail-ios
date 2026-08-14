@@ -1,3 +1,39 @@
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **✅ RESOLVED (2026-08-12) by SwiftMail PR #208 — this is no longer an accepted limitation. The
+> body below is preserved unedited (it is regenerated from the hash-pinned archive and byte-compared)
+> and its status line, which reads "ACCEPTED LIMITATION … do not re-litigate it", is now WRONG.**
+>
+> **What this entry registered.** That the catch around `server.copy(...)` had a precondition
+> BROADER than "the `COPYUID` did not parse", because `CapabilityHandler.handleTaggedErrorResponse`
+> also raises `IMAPError.commandFailed` and is reachable inside `server.copy` through lazy re-auth
+> and reconnect. The accepted cost was one source message left `\Deleted`-but-present after a COPY
+> that never ran.
+>
+> **Why it is gone.** The entry's own §"THE DURABLE REMEDY IS UPSTREAM" asked `CopyHandler` to raise
+> a distinct case for "tagged OK + unparseable `COPYUID`" instead of reusing `.commandFailed`, and
+> said that "would make the catch's precondition exactly its intent and retire this row." PR #208
+> did exactly that, and `f8eb8acb9` re-keyed both arms of `IMAPProvider.move` onto the new case.
+>
+> **Verified at the pinned fork revision `7aee922d94c7a3f7f09167564a2e231ead85b076`** (the entry
+> cites the superseded `078a09b8`):
+>
+> - `IMAPError.malformedCopyUIDAfterTaggedOK` has exactly four raisers, all of them `COPY`/`MOVE`
+>   `COPYUID`-parsing sites: `ServerCommands.swift:46`, `MoveCommand.swift:33`,
+>   `MoveHandler.swift:63`, and `ServerHandlers.swift:61` (`CopyHandler`).
+> - `CapabilityHandler` raises `IMAPError.commandFailed` and **never** the new case.
+> - `IMAPProvider.move` no longer catches `.commandFailed` on either arm.
+>
+> The trigger conjunction this entry documents required a `CAPABILITY` tagged NO/BAD to be caught by
+> the `server.copy` handler. That error is `.commandFailed`, which now propagates and stays
+> retryable, so the conjunction can no longer fire. **The catch's precondition is now exactly its
+> intent, which is the condition this row itself set for its own retirement.**
+>
+> ⚠️ **Not claimed:** the structural bound the body asserts (the irreversible `UID EXPUNGE` is
+> unreachable with `copyEvidence == nil`) is unaffected and still holds — it was never what made this
+> a limitation. This amendment retires the *breadth*, not the bound. This row is kept rather than
+> deleted because its trigger analysis is the reason the narrow catch must never be widened back to
+> a bare `IMAPError` or a bare `catch`.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-IMAP-009
 
 > Routed from `KNOWN_ISSUES.md` line 103 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).

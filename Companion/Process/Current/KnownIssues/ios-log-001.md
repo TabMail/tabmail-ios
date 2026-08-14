@@ -1,3 +1,43 @@
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **⚠️ AMENDMENT (2026-08-13) — ONE SITE LEFT THIS ROW'S `TabMail/Services/` CORPUS. The disposition
+> below is unchanged (still CLOSED AS A DECISION), and the body is preserved unedited because it is
+> regenerated from the hash-pinned archive and byte-compared.**
+>
+> `beff4dc19` ("Debug-gate the search entry point's echo of the user's query text") gated **exactly
+> one** site inside this row's registered `TabMail/Services/` corpus: the opening `print` of
+> `SearchIndex.search(query:fromDateMs:toDateMs:limit:folderIds:)`, which interpolated
+> `query.prefix(80)` — the text the user typed into the search field — alongside the `ftsQuery`
+> derived from it, and fired on every search. This is a **narrow amendment to the closed decision,
+> not a sweep of it.** The row's range-not-corpus rule bounds what gets SWEPT; it never asserted that
+> a user-content site inside the corpus is correct as written, and the body below already separates
+> the sites interpolating plausible USER CONTENT as the stronger subclass — it records `ad9d9047d`
+> gating the two `SearchView` prints that carried the account address as *"this same round doing
+> exactly that"*. `SearchIndex.swift`'s other 34 ungated prints **stay**, per the decision.
+>
+> **Post-census, as stated by `beff4dc19`'s own commit body at that commit's HEAD:**
+> `TabMail/Services/` **1,309 → 1,308**; `SearchIndex.swift` **35 → 34**; `TabMail/Views/` unchanged
+> at **159**; `IOS-LOG-003`'s calendar family unchanged at **77**; the tree-wide `print(` population
+> unchanged at **2,180** — nothing was deleted, one site was gated. This discharges the follow-up
+> that commit's body records as owed to this row.
+>
+> ⚠️ **Those figures are `beff4dc19`'s, and were NOT independently re-derived here.** The brace-frame
+> census script that produced them is not in the tree, so no positive control could be run against
+> this row's own published figures the way the 2026-08-05 scope extension did. Treat them as a lead
+> pinned to that commit, not as a bound (`MIS-044`).
+>
+> 🚫 **DO NOT "correct" the 1,474 / 1,370 figures in the body below to match 1,309 / 1,308.** They
+> are neither stale nor the same measurement: they are **revision-pinned** claims about shipped
+> `07a4bb703` and candidate `1d1557187`, revisions `beff4dc19` did not touch, while 1,309 → 1,308 is
+> a later HEAD over the same corpus. Editing a rev-pinned census so it tracks a newer HEAD falsifies
+> it (`MIS-007` instances 27, 45, 59). Independently, **editing the preserved body at all breaks
+> `ruby Scripts/compact_known_issues.rb verify` byte-for-byte** — an amendment may only ADD, which is
+> why this correction is a wrapped block rather than an edit to the sentence it corrects.
+>
+> **Everything else in this row is unchanged:** the five closure elements, the negative bound (no
+> durable or network channel, no secret-bearing site, no licence to add ungated prints), the
+> predicate and its documented `guard` blind spot, and the instruction that any future sweep
+> re-derive its own count with the predicate restated beside it.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-LOG-001
 
 > Routed from `KNOWN_ISSUES.md` line 988 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).

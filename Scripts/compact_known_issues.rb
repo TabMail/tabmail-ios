@@ -15,6 +15,28 @@ MANIFEST = File.join(ROOT, MANIFEST_REL)
 README_REL = "#{DETAIL_DIR_REL}/README.md"
 README = File.join(ROOT, README_REL)
 
+# The register is regenerated from a hash-pinned archive and byte-compared, so before this surface
+# existed there was NO supported way to record an issue found after the 2026-08-09 freeze, and no
+# way to correct an entry the code had since falsified. THE MANTRA's "fail closed, register it in
+# KNOWN_ISSUES.md, move on" was literally unexecutable.
+#
+# An amendment block is stripped from a file's bytes before the byte-comparison, exactly as
+# `exact_body` does for the hash-pinned companion fragments. The preserved text around it must still
+# match the regenerated expectation exactly, so an amendment can only ADD; wrapping preserved text
+# deletes it from the comparison and fails closed. Blocks are stripped wherever they appear: at the
+# head of a detail file to correct a falsified entry, or at the tail of `KNOWN_ISSUES.md` to append
+# a post-freeze row.
+#
+# Detail files for post-freeze issues live in `#{DETAIL_DIR_REL}/Amendments/`, which the orphan
+# check does not glob, so they need no archive row.
+AMENDMENT_BEGIN = "<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->"
+AMENDMENT_END = "<!-- KNOWN-ISSUES-AMENDMENT-END -->"
+AMENDMENT_PATTERN = /#{Regexp.escape(AMENDMENT_BEGIN)}\n.*?\n#{Regexp.escape(AMENDMENT_END)}\n/m
+
+def preserved_body(bytes)
+  bytes.gsub(AMENDMENT_PATTERN, "")
+end
+
 DISPOSITIONS = [
   ["open", "🔓 **OPEN"],
   ["closed-decision", "✅ **CLOSED AS A DECISION"],
@@ -273,6 +295,29 @@ def write_if_changed(path, content)
   File.binwrite(path, content)
 end
 
+# ⚠️ DESTRUCTIVE — DO NOT RUN THIS AFTER THE 2026-08-09 HIERARCHY SPLIT LANDED.
+#
+# `generate` is the one-time, archive-pinned extraction command. Its ONLY source of truth is the
+# FROZEN archive named in ARCHIVE_REL above, so it rebuilds `KNOWN_ISSUES.md` as that archive would
+# have produced it and `write_if_changed` overwrites whatever is there. Everything recorded since
+# the freeze — the whole `KNOWN-ISSUES-AMENDMENT` block and every post-freeze row inside it — is
+# silently deleted, and the script exits 0 printing a success line. It also `File.delete`s every
+# `ios-*` detail file directly under DETAIL_DIR_REL that is absent from the archive (the
+# `Amendments/` subdirectory escapes only because that glob does not descend into it).
+#
+# The path above is written via the constant name on purpose: `compact_companion_docs.rb`'s
+# `verify_repository_companion_references` scans every `.rb`/`.md`/`.swift`/… file for anything
+# shaped like `Companion/<Tree>/….md` and aborts the WHOLE verifier when the target does not exist,
+# and a GLOB is not a file. Spelling it out here once cost a false `broken repository companion
+# references` failure that hid every later check (`MIS-IOS-009` instance 7).
+#
+# The supported workflow for any register change is: edit the detail file (adding an amendment
+# block if the preserved body would otherwise change), then run `verify`. `verify` is the proof;
+# `generate` is not a safer `verify`.
+#
+# This comment exists because a subagent brief said "regenerate and verify" for a one-row edit and
+# the agent had to refuse it. The identical warning already existed for the sibling
+# `compact_companion_docs.rb` and did not travel to this file. See root `MIS-039` instance 2.
 def generate
   current = read_utf8(INDEX)
   if File.exist?(ARCHIVE)
@@ -307,7 +352,7 @@ def verify
     rel = path.delete_prefix("#{ROOT}/")
     if !File.exist?(path)
       failures << "missing #{rel}"
-    elsif File.binread(path).b != expected.b
+    elsif preserved_body(File.binread(path).b) != expected.b
       failures << "content mismatch #{rel}"
     end
   end

@@ -1,3 +1,20 @@
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **⚠️ AMENDMENT (2026-08-13) — SwiftMail PR #208 also added typed tagged-failure outcomes after
+> possible partial MOVE completion. The body below predates that contract and is preserved unedited.**
+>
+> `IMAPError.moveFailedAfterPossiblePartialCompletion` and
+> `moveFailedAfterPartialCompletion(copyUID:reason:)` mean the server may already have changed the
+> source or destination before tagged NO/BAD. They are therefore the same no-retry safety class as
+> an atomic success with missing evidence, not ordinary failures. `IMAPProvider.move` now retires
+> the original source identifiers on both typed outcomes, preserves admissible `COPYUID` destination
+> addresses on the verified form, and marks the outcome for source reconciliation. The queue then
+> schedules **both source and destination** folder syncs instead of reissuing UID MOVE.
+>
+> Pinned by two independent layers: `IMAPMoveWireContractTests` verifies the provider's evidence and
+> reconciliation flag, while `NeverDropExitClosureTests` runs the durable queue across later drains
+> and asserts one UID MOVE on the wire, an empty operation row, and both folder sync keys. The red
+> proof emitted two or three UID MOVEs and scheduled neither folder before the adaptation.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-IMAP-012
 
 > Routed from `KNOWN_ISSUES.md` line 1433 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).

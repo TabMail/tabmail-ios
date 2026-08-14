@@ -1,3 +1,48 @@
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **⚠️ CORRECTION (2026-08-12) — ONE CLAUSE OF THE STATUS CELL BELOW IS FACTUALLY WRONG, AND IT WAS
+> WRONG BEFORE THIS AMENDMENT.** The body is preserved unedited (it is regenerated from the
+> hash-pinned archive and byte-compared); this block records the correction instead.
+>
+> **The wrong clause.** The Status cell's MOVE-family paragraph ends: *"this is a transient phantom
+> DISMISSAL, not a phantom persisted success — **the row is back the next time the list is
+> rebuilt.**"* The final clause is false, and it **contradicts its own first half**, which correctly
+> says the MOVE family *"leaves the row hidden for the life of `InboxView`'s `dismissedMessages`
+> `@State`"*.
+>
+> **Why it is false.** `InboxView` computes `visibleGroups = displayGroups − dismissedMessages`. A
+> list *rebuild* recomputes `displayGroups` but does **not** clear `dismissedMessages`, which is
+> `@State` and therefore survives every rebuild. The row returns only when that `@State` is
+> **destroyed** — i.e. on view teardown and recreation, which in practice means the user leaving the
+> list and coming back. **Corrected reading: "the row is back only when that `@State` is destroyed —
+> on view teardown, not on a rebuild."**
+>
+> **Why this mattered enough to record rather than quietly fix.** This false reassurance is the most
+> plausible reason the visibility defect survived review for as long as it did: a reader who reaches
+> "the row is back the next time the list is rebuilt" concludes the phantom dismissal self-heals
+> within a frame, and stops looking. It is a `MIS-019` shape — an absolute stated without its
+> negative case — and the cost was not the sentence but the attention it diverted. A wrong
+> reassurance in a register is worse than no statement at all, because it terminates enquiry.
+>
+> **What the 2026-08-12 fix (`bbd4fef2b`, "Keep a row visible when its move destination is a
+> displayed folder") does and does NOT change here.**
+> - The first clause **remains accurate and unchanged**: the guard keys on the move's *destination
+>   folder*, not on admission, so an admission-refused move whose destination is **not** a displayed
+>   folder still dismisses the row permanently for the life of the `@State`. That is exactly the
+>   state this record describes, and it is untouched.
+> - **Narrow addition, not a contradiction:** when the refused move's destination **is** a displayed
+>   folder, the guard now declines to dismiss at all, so the phantom dismissal no longer fires for
+>   that sub-case.
+> - **None of the flip-back conditions (α)–(δ) is triggered** by that change. It adds no exit, weakens
+>   no gate, creates no `PendingOperation`, and does not widen the shape beyond one row after one user
+>   gesture.
+>
+> **Corroboration from the same investigation, offered because it exercised this record's own
+> branch.** A device capture showed a move completing with *"0 with a server-named destination
+> address"* — this record's condition (a) — **without** condition (b), because the destination did not
+> answer for the source UID (`onlyLocal` and `onlyRemote` named different UIDs). The UID-remap healer
+> then resolved it, which is precisely what this record predicts for that branch. The closure is
+> undisturbed.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-MOVE-002
 
 > Routed from `KNOWN_ISSUES.md` line 1092 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).

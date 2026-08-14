@@ -1,3 +1,35 @@
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **⚠️ AMENDMENT (2026-08-12) — the upstream remedy this entry asks for HAS LANDED. The disposition
+> below is unchanged (still FIXED); two of its mechanism statements are now false and are corrected
+> here. The body is preserved unedited because it is regenerated from the hash-pinned archive and
+> byte-compared.**
+>
+> **SwiftMail PR #208 is accepted.** `CopyHandler.handleTaggedOKResponse` now wraps `extractCopyUID`
+> and re-raises `IMAPError.malformedCopyUIDAfterTaggedOK(_:)` — the dedicated error case this entry
+> names as "the only real fix" and defers to the owner's PR. It is no longer future work.
+>
+> Consequently, **two statements in the body are false at the pinned revision:**
+>
+> 1. *"The malformed case is `.commandFailed`, raised by `CopyUID.init(nio:)`'s three throw sites."*
+>    `CopyUID.init(nio:)` still throws `.commandFailed` in isolation, but no caller sees it: the
+>    handler catches and re-types it. `IMAPProvider.move` sees `.malformedCopyUIDAfterTaggedOK`.
+> 2. *"The structural fix belongs upstream in SwiftMail's `CopyHandler` … (owner's PR)."* Done.
+>
+> **The fork revision cited throughout this entry (`078a09b8`) is superseded.** The 2026-08-12
+> review pinned integration commit `7aee922d94c7a3f7f09167564a2e231ead85b076`; the completed
+> 2026-08-13 upstream sync now pins `f8469b14f7620ef7b1105eccbfa19271448819d5`. Re-derive against
+> `f8469b1`, not either older revision.
+>
+> ⚠️ **The re-typing silently unhooked a catch, and that is the durable lesson.** A typed
+> `catch IMAPError.commandFailed` keyed on a case the error no longer is does not fail to compile,
+> does not warn, and does not fire — it simply stops matching. Only the atomic `server.move` arm was
+> updated when #208 landed; the `server.copy` fallback arm lost its mapping and the wedge this entry
+> records returned until `f8eb8acb9` restored it. Both arms of `IMAPProvider.move` catch
+> `IMAPError.malformedCopyUIDAfterTaggedOK` at HEAD (verified by reading the two arms).
+>
+> **The residual registered as `IOS-IMAP-009` is resolved by the same change** — see the amendment
+> on that entry. This entry stays FIXED.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-IMAP-005
 
 > Routed from `KNOWN_ISSUES.md` line 102 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).
