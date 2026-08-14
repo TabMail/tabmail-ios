@@ -221,9 +221,16 @@ enum SearchQueryParser {
 
     // MARK: - Field-quoted extraction
 
+    /// Pull `field:"quoted value"` segments out into placeholders before quote-splitting.
+    ///
+    /// Same byte-accumulation rule as `translateAliases`, and for the same reason: rebuilding the
+    /// passthrough text with `Character(UnicodeScalar(byte))` reinterpreted UTF-8 as Latin-1, so any
+    /// non-ASCII text OUTSIDE the extracted segments was corrupted. Note the extracted `field` and
+    /// `val` above were always decoded correctly (`String(bytes:encoding:.utf8)`) — so a quoted value
+    /// survived while the surrounding query did not, which is why this failed so quietly.
     private static func extractFieldQuoted(_ q: String, store: inout [(String, String)]) -> String {
         let bytes = Array(q.utf8)
-        var out = ""
+        var out: [UInt8] = []
         var i = 0
 
         while i < bytes.count {
@@ -238,29 +245,52 @@ enum SearchQueryParser {
                     if k < bytes.count && bytes[k] == 0x22 {
                         let field = String(bytes: Array(bytes[startIdent..<j]), encoding: .utf8) ?? ""
                         let val = String(bytes: Array(bytes[(j + 2)..<k]), encoding: .utf8) ?? ""
+                        // Only a REAL FTS column may become a column-scoped phrase.
+                        //
+                        // This route never reaches `splitField`, so restricting that function alone
+                        // left the same defect live here: `tag:"urgent"` was re-emitted verbatim as
+                        // `tag:"urgent"`, FTS5 rejected the whole MATCH with "no such column: tag",
+                        // `SearchIndex.keywordSearchShard` threw, and the user got nothing back — the
+                        // identical silent-empty-result the unquoted fix was for. Any ordinary
+                        // `word:"phrase"` query did it (`note:"call mom"`, `label:"work"`).
+                        //
+                        // On a non-column, fall through and copy the bytes: the token then goes down
+                        // the normal quote-splitting path and is searched as text.
+                        guard let canonical = canonicalFTSColumn(field) else {
+                            out.append(bytes[i])
+                            i += 1
+                            continue
+                        }
                         let placeholder = "__FQ\(store.count)__"
-                        store.append((field, val))
-                        out += placeholder
+                        store.append((canonical, val))
+                        out += Array(placeholder.utf8)
                         i = k + 1
                         continue
                     }
                 }
             }
-            out.append(Character(UnicodeScalar(bytes[i])))
+            out.append(bytes[i])
             i += 1
         }
 
-        return out
+        return String(decoding: out, as: UTF8.self)
     }
 
+    /// ASCII-only on purpose.
+    ///
+    /// These decide whether a byte can begin/continue a `field:` prefix, and the only legal fields are
+    /// the FTS5 column names, all of which are ASCII. The previous form built a `Character` from a
+    /// single byte, which reinterprets a UTF-8 continuation byte as a Latin-1 scalar: both `0xC3` (`Ã`)
+    /// and `0xAA` (`ª`) report `isLetter == true`, so `ê:"x"` (bytes `C3 AA`) was accepted as a field
+    /// named `ê` and emitted into the MATCH expression, which FTS5 then rejected outright — the same
+    /// silent-empty-result as every other non-ASCII search. Restricting to ASCII removes the misread
+    /// rather than compensating for it.
     private static func isIdentStart(_ b: UInt8) -> Bool {
-        let ch = Character(UnicodeScalar(b))
-        return ch.isLetter || b == 0x5F  // '_'
+        (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || b == 0x5F  // A-Z a-z _
     }
 
     private static func isIdentChar(_ b: UInt8) -> Bool {
-        let ch = Character(UnicodeScalar(b))
-        return ch.isLetter || ch.isNumber || b == 0x5F
+        isIdentStart(b) || (b >= 0x30 && b <= 0x39)  // + 0-9
     }
 
     // MARK: - Placeholder handling
@@ -282,16 +312,54 @@ enum SearchQueryParser {
         tok.allSatisfy { !$0.isLetter && !$0.isNumber && $0 != "_" }
     }
 
+    /// The only FTS5 columns a `field:value` token may target.
+    ///
+    /// Must stay in step with the `CREATE VIRTUAL TABLE … USING fts5(…)` column list in `SearchIndex`.
+    private static let ftsColumns: [String] = ["msgId", "subject", "from_", "to_", "cc", "bcc", "body"]
+
+    /// The canonical spelling of `field` if it names a real FTS column, else nil.
+    ///
+    /// Shared by BOTH field routes — `splitField` for `field:value` and `extractFieldQuoted` for
+    /// `field:"value"`. They are separate code paths that produce the same kind of output (a
+    /// column-scoped MATCH term), so a check that lives in only one of them leaves the other open;
+    /// that is exactly how the quoted route stayed broken after the unquoted one was fixed.
+    ///
+    /// SQLite column names are case-insensitive, so the comparison is too, and the CANONICAL spelling
+    /// is returned rather than the user's — the MATCH expression should never contain user-chosen text
+    /// in the column position.
+    private static func canonicalFTSColumn(_ field: String) -> String? {
+        ftsColumns.first { $0.compare(field, options: .caseInsensitive) == .orderedSame }
+    }
+
+    /// Split `field:value`, but ONLY when `field` names a real FTS column.
+    ///
+    /// Previously any token whose prefix started with a letter or `_` was treated as a column name and
+    /// emitted straight into the MATCH expression. Two consequences, both silent:
+    ///
+    ///  - `https://example.com` split at the first colon into field `https`, so the query became
+    ///    `https://example.com` — `https` is not a column, and FTS5 rejects the whole expression. The
+    ///    user got nothing back from a perfectly ordinary paste, with no indication why.
+    /// Unrecognised prefixes now fall through as ordinary search text, which is what a user typing a
+    /// URL or a `word:word` phrase actually meant.
+    ///
+    /// ⚠️ A second consequence was claimed here and was WRONG: that a token like `a"b:c` could put a
+    /// bare double quote into the MATCH expression and terminate a phrase early. It cannot.
+    /// `buildFTSMatch` splits the query on every `"` BEFORE tokenising, so no token reaching this
+    /// function can contain a quote at all — as `SearchQueryParserCoverageTests` already documented.
+    /// The claim is retracted rather than deleted because a false security rationale in a comment
+    /// outlives the person who wrote it, and the test written to pin it was vacuous for the same
+    /// reason (it passed against the unfixed parser).
     private static func splitField(_ tok: String) -> (String?, String) {
         guard let colonIdx = tok.firstIndex(of: ":") else {
             return (nil, tok)
         }
         let field = String(tok[tok.startIndex..<colonIdx])
         let rest = String(tok[tok.index(after: colonIdx)...])
-        if !field.isEmpty && (field.first!.isLetter || field.first == "_") {
-            return (field, rest)
+        guard let canonical = canonicalFTSColumn(field)
+        else {
+            return (nil, tok)
         }
-        return (nil, tok)
+        return (canonical, rest)
     }
 
     private static func trimTrailingSlashQuestion(_ s: String) -> String {

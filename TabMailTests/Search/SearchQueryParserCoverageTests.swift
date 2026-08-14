@@ -19,14 +19,28 @@ struct SearchQueryParserCoverageTests {
 
     @Test("Field with empty quoted value goes through field-quoted extraction")
     func fieldEmptyQuotedValue() {
+        // `!isEmpty` was the whole assertion here and it cannot distinguish a correct MATCH expression
+        // from a corrupted one — the same vacuity that let the Latin-1 mojibake defect live under a
+        // test named for it. Assert the shape instead: `subject` is a real FTS column, so it survives
+        // as a column prefix, and the result must not be a bare dangling colon.
         let r1 = SearchQueryParser.buildFTSMatch("subject:\"\"")
         #expect(!r1.isEmpty)
+        #expect(!r1.hasSuffix(":"), "emitted a column prefix with nothing after it: \(r1)")
+        #expect(r1.contains("subject:"), "a real column must survive as a column prefix: \(r1)")
     }
 
     @Test("Incomplete quote after field colon does not crash")
     func incompleteQuoteAfterField() {
+        // `x` is not an FTS column, so it must not reach the MATCH expression in the column position;
+        // previously any ident-led prefix did. The value must still be searchable as text.
         let r2 = SearchQueryParser.buildFTSMatch("x:\"abc")
         #expect(!r2.isEmpty)
+        // Structural oracle: what makes something a column is being UNQUOTED in the column position.
+        // `x:` appearing inside a quoted phrase is text and is fine, so a substring check would fail
+        // against the working fix.
+        #expect(!r2.hasPrefix("x:"), "unknown column emitted into MATCH: \(r2)")
+        #expect(r2.contains("\"x:\""), "the prefix should be quoted as text: \(r2)")
+        #expect(r2.lowercased().contains("abc"), "the typed text became unsearchable: \(r2)")
     }
 
     // MARK: - Lines 76-78: Naked wildcard "*" → empty core → "."
