@@ -665,7 +665,7 @@ internal enum RenderBridgeInput {
 
     /// Boolean command keys. Present-but-not-a-`Bool` is a malformed payload, not a
     /// falsey one.
-    private static let flagKeys = ["revealed", "requestFit", "requestWidthRefit"]
+    private static let flagKeys = ["revealed", "requestFit", "requestWidthRefit", "userDisclosure"]
 
     /// P3 — the FRAME gate, applied to every channel before any payload is read and before
     /// the bridge-liveness beacon records anything.

@@ -340,7 +340,7 @@ struct RenderBridgeInputTests {
         }
         #expect((validated["h"] as? NSNumber)?.doubleValue == 4349)
         #expect(validated["source"] as? String == "RO")
-        for flag in ["revealed", "requestFit", "requestWidthRefit"] {
+        for flag in ["revealed", "requestFit", "requestWidthRefit", "userDisclosure"] {
             #expect(RenderBridgeInput.validatedHeightBody([flag: true]) != nil)
         }
     }
@@ -361,6 +361,7 @@ struct RenderBridgeInputTests {
             ["revealed": "yes"],
             ["requestFit": "1"],
             ["requestWidthRefit": ["nested": true]],
+            ["userDisclosure": "yes"],
             ["source": 5],
             "a bare string",
             [1, 2, 3]
@@ -579,7 +580,7 @@ struct RenderBridgeInputTests {
                 "a real height must still be accepted")
         #expect(RenderBridgeInput.gutterPadding(["l": 4], leading: 16, trailing: 16) != nil,
                 "a real gutter inset must still be accepted")
-        for flag in ["revealed", "requestFit", "requestWidthRefit"] {
+        for flag in ["revealed", "requestFit", "requestWidthRefit", "userDisclosure"] {
             #expect(RenderBridgeInput.validatedHeightBody([flag: true]) != nil,
                     "flag key \(flag) is SUPPOSED to be boolean and must still be accepted")
         }

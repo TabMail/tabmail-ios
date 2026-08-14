@@ -10,6 +10,52 @@ import GRDB
 @Suite("MessageDetailView — List conversion & address display")
 struct MessageDetailViewTests {
 
+    private func detailViewSource() throws -> String {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        return try String(
+            contentsOf: projectRoot.appendingPathComponent(
+                "TabMail/Views/Message/MessageDetailView.swift"
+            ),
+            encoding: .utf8
+        )
+    }
+
+    @Test("A user disclosure permanently disarms late-layout opening re-anchors")
+    func disclosureDisarmsOpeningAnchor() {
+        var gate = MessageDetailOpenAnchorGate()
+        #expect(gate.shouldReanchor(hasLaterMessages: true))
+        #expect(!gate.shouldReanchor(hasLaterMessages: false))
+
+        gate.userTookControl()
+
+        #expect(!gate.shouldReanchor(hasLaterMessages: true))
+    }
+
+    @Test("Every focused-card proxy scroll revalidates the opening gate")
+    func focusedCardProxyWritesStayCentralized() throws {
+        let source = try detailViewSource()
+        let helperStart = try #require(source.range(
+            of: "private func reanchorFocusedCard("
+        ))
+        let helperTail = source[helperStart.lowerBound...]
+        let helperEnd = try #require(helperTail.range(
+            of: "@ViewBuilder\n    private func messageContent"
+        ))
+        let helper = helperTail[..<helperEnd.lowerBound]
+        let gate = try #require(helper.range(
+            of: "openAnchorGate.shouldReanchor(hasLaterMessages: hasLaterMessages)"
+        ))
+        let write = try #require(helper.range(of: "proxy.scrollTo("))
+
+        #expect(gate.lowerBound < write.lowerBound,
+                "the gate must run before the centralized proxy write")
+        #expect(source.components(separatedBy: "proxy.scrollTo(").count - 1 == 1,
+                "a new direct proxy write would bypass execution-time gate revalidation")
+    }
+
     // MARK: - Address Field Persistence (validates .fixedSize display fix)
 
     @Test("MessageHeader cc field persists through DB roundtrip")

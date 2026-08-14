@@ -4,6 +4,21 @@
 
 import SwiftUI
 
+/// One-way gate for the late-layout scroll correction used while a threaded
+/// detail view first opens. Once the user scrolls or expands in-message chrome,
+/// subsequent row-height changes belong to the user and must not call scrollTo.
+struct MessageDetailOpenAnchorGate: Equatable {
+    private(set) var isArmed = true
+
+    mutating func userTookControl() {
+        isArmed = false
+    }
+
+    func shouldReanchor(hasLaterMessages: Bool) -> Bool {
+        isArmed && hasLaterMessages
+    }
+}
+
 struct MessageDetailView: View {
     @State var viewModel: MessageDetailViewModel
     @State var chatExpanded = false
@@ -26,8 +41,7 @@ struct MessageDetailView: View {
     @State private var focusedCardHeight: CGFloat = 0
     @State private var agentToast: AgentToastPayload?
     @State private var agentToastDismiss: Task<Void, Never>?
-    @State private var userHasScrolledDetail = false
-    @State private var openAnchorArmed = true
+    @State private var openAnchorGate = MessageDetailOpenAnchorGate()
     /// Pushed-pill opens only (`opensWithSkeletonDwell`): the header resolves
     /// ~10-20ms after construction — before the push transition's first
     /// visible frame — so the natural skeleton branch never gets a visible
@@ -312,7 +326,18 @@ struct MessageDetailView: View {
             onTagAction: { executeTaggedAction($0) },
             onSelected: { chatContextMessage = $0 },
             onFlashComplete: { flashedCardId = nil },
-            onManageLabels: { labelMenuMessage = $0 }
+            onManageLabels: { labelMenuMessage = $0 },
+            onBodyDisclosureInteraction: {
+                // The quote/invite tap happens inside WKWebView, so List's
+                // scroll-phase callback never sees it. The height bridge carries
+                // an atomic userDisclosure bit and invokes this immediately
+                // before native considers that tagged measurement; otherwise an
+                // ensuing resize can be mistaken for late initial layout.
+                openAnchorGate.userTookControl()
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[DetailAnchor] user disclosure disarmed opening anchor card=\(msg.stableId)")
+                }
+            }
         )
     }
 
@@ -347,11 +372,26 @@ struct MessageDetailView: View {
 
     /// Pin the focused card to the viewport top without animation (disabled
     /// to avoid a visible snap/flash of the reply bubble).
-    private func reanchorFocusedCard(_ proxy: ScrollViewProxy, to stableId: String) {
+    private func reanchorFocusedCard(
+        _ proxy: ScrollViewProxy,
+        to stableId: String,
+        hasLaterMessages: Bool
+    ) {
+        // Revalidate at execution time. The user can take control between a
+        // first pass and its queued retry, or while thread rows merge in.
+        guard openAnchorGate.shouldReanchor(hasLaterMessages: hasLaterMessages) else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[DetailAnchor] skip card=\(stableId) armed=\(openAnchorGate.isArmed) later=\(hasLaterMessages)")
+            }
+            return
+        }
         var tx = Transaction()
         tx.disablesAnimations = true
         withTransaction(tx) {
             proxy.scrollTo(stableId, anchor: .top)
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            print("[DetailAnchor] scrollTo card=\(stableId) later=\(hasLaterMessages)")
         }
     }
 
@@ -407,8 +447,7 @@ struct MessageDetailView: View {
                     // the user has taken the wheel, the opening re-anchor
                     // must never fight them again.
                     if newPhase == .interacting {
-                        userHasScrolledDetail = true
-                        openAnchorArmed = false
+                        openAnchorGate.userTookControl()
                     }
                 }
                 .background(GeometryReader { geo in Color.clear.onAppear { listHeight = geo.size.height }.onChange(of: geo.size.height) { _, h in listHeight = h } })
@@ -427,7 +466,11 @@ struct MessageDetailView: View {
                     }
                 }
                 .onChange(of: viewModel.laterMessages.count) { _, _ in
-                    // Re-anchor when later messages load above (prevents focused card from jumping down).
+                    // Re-anchor when the initial later-message scan inserts rows
+                    // above, but only while the opening gate still owns scroll.
+                    // If the user pans or opens body disclosure before the scan
+                    // lands, we deliberately accept the insertion's natural
+                    // layout instead of snapping the focused card to the top.
                     // TWO-PASS: the immediate pass runs in the same transaction as the
                     // bulk insertion, when the List still has ESTIMATED heights for the
                     // inserted rows — a long thread (chat pill opening an old mid-thread
@@ -436,9 +479,17 @@ struct MessageDetailView: View {
                     // re-fires on the next run-loop tick, after UIKit laid the inserted
                     // rows out with real heights; one tick is imperceptible, so it
                     // cannot fight a user-initiated scroll.
-                    reanchorFocusedCard(proxy, to: message.stableId)
+                    reanchorFocusedCard(
+                        proxy,
+                        to: message.stableId,
+                        hasLaterMessages: !viewModel.laterMessages.isEmpty
+                    )
                     Task { @MainActor in
-                        reanchorFocusedCard(proxy, to: message.stableId)
+                        reanchorFocusedCard(
+                            proxy,
+                            to: message.stableId,
+                            hasLaterMessages: !viewModel.laterMessages.isEmpty
+                        )
                     }
                 }
                 .onChange(of: focusedCardHeight) { _, _ in
@@ -449,11 +500,13 @@ struct MessageDetailView: View {
                     // view rests on the thread cards above (logmain.log
                     // 2026-07-07). Every focused-card height change while the
                     // open-anchor is still armed re-pins — armed ends on the
-                    // user's first touch (never fights a user scroll) or when
-                    // the view goes away.
-                    guard openAnchorArmed, !userHasScrolledDetail else { return }
-                    guard !viewModel.laterMessages.isEmpty else { return }
-                    reanchorFocusedCard(proxy, to: message.stableId)
+                    // user's first scroll OR in-message disclosure tap (never
+                    // fights user-owned layout) or when the view goes away.
+                    reanchorFocusedCard(
+                        proxy,
+                        to: message.stableId,
+                        hasLaterMessages: !viewModel.laterMessages.isEmpty
+                    )
                 }
             }
             .background(Palette.previewPaneBg)

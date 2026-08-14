@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import Synchronization
 import Security
 import WebKit
 import SwiftUI
@@ -51,7 +52,7 @@ import UIKit
 // FIDELITY. Where possible the measurements run against the REAL production surface:
 // `HostedRenderView` hosts `AutoSizingHTMLView` in a live `UIWindow`, so
 // `HTMLWebView.makeUIView` builds the actual `WKWebViewConfiguration` (the JS gate, the
-// user scripts, the three message handlers, and `BodyAssetSchemeHandler` when
+// user scripts, the four message handlers, and `BodyAssetSchemeHandler` when
 // `bodyContentKey != nil`). Probe web views are then constructed FROM that configuration, so
 // they inherit the real user-script set. Two things are measured on synthetic configs
 // and are labelled as such: the subresource-origin probes (they need a recording scheme
@@ -434,7 +435,12 @@ final class HostedRenderView {
     let controller: UIViewController
     let webView: WKWebView
 
-    init?(html: String, headerId: String?, previewFilename: String? = nil) async {
+    init?(
+        html: String,
+        headerId: String?,
+        previewFilename: String? = nil,
+        onUserDisclosureToggle: @escaping () -> Void = {}
+    ) async {
         guard let scene = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene }).first else {
             print("[P1A] NO UIWindowScene in the test host — cannot host SwiftUI")
@@ -448,7 +454,8 @@ final class HostedRenderView {
             html: html,
             previewFilename: previewFilename,
             headerId: headerId,
-            bodyContentKey: headerId.map { ContentKey(rawValue: $0) }
+            bodyContentKey: headerId.map { ContentKey(rawValue: $0) },
+            onUserDisclosureToggle: onUserDisclosureToggle
         )
         let hc = UIHostingController(rootView: VStack(spacing: 0) { view; Spacer() })
         let w = UIWindow(windowScene: scene)
@@ -490,7 +497,7 @@ final class HostedRenderView {
 // MARK: - The canary
 
 @MainActor
-@Suite("P1a render-security canary — measured WKWebView behaviour", .serialized)
+@Suite("P1a render-security canary — measured WKWebView behaviour", .serialized, .processGlobalState)
 struct EmailRenderSecurityCanaryTests {
 
     // -------------------------------------------------------------------------------
@@ -553,6 +560,9 @@ struct EmailRenderSecurityCanaryTests {
 
         let scripts = cfg.userContentController.userScripts
         #expect(!scripts.isEmpty, "the app injects user scripts; they must survive P1b's JS gate")
+        #expect(scripts.first?.injectionTime == .atDocumentStart)
+        #expect(scripts.first?.source.contains("window.__tmConsumeUserDisclosure = function()") == true,
+                "the fail-soft height bridge bootstrap must not depend on quote parsing")
         print("[P1A] production userScripts.count=\(scripts.count) " +
               "dataDetectorTypes=\(cfg.dataDetectorTypes.rawValue) " +
               "contentJS=\(cfg.defaultWebpagePreferences.allowsContentJavaScript) " +
@@ -1587,7 +1597,7 @@ struct EmailRenderSecurityCanaryTests {
 // =====================================================================================
 
 @MainActor
-@Suite("P1d view identity — the web view is recreated when the body ContentKey changes", .serialized)
+@Suite("P1d view identity — the web view is recreated when the body ContentKey changes", .serialized, .processGlobalState)
 struct RenderViewIdentityTests {
 
     /// Hosts `AutoSizingHTMLView` with a mutable root so the test can rebind it the way
@@ -1706,7 +1716,7 @@ final class FrameProbeHandler: NSObject, WKScriptMessageHandler {
 }
 
 @MainActor
-@Suite("P3 content-world isolation — the render pipeline is out of the document's reach", .serialized)
+@Suite("P3 content-world isolation — the render pipeline is out of the document's reach", .serialized, .processGlobalState)
 struct RenderContentWorldIsolationTests {
 
     /// Ungated render-state globals. The debug-only ones (`__tmDiagId`,
@@ -1717,6 +1727,7 @@ struct RenderContentWorldIsolationTests {
     static let renderStateGlobals = [
         "__tmReportHeight", "__tmFixImgAspect", "__tmLayoutVp",
         "__tmDeviceWidth", "__tmFitDone", "__tmFitRequested",
+        "__tmUserDisclosurePending", "__tmConsumeUserDisclosure",
     ]
 
     /// `'reachable'` only where the bridge channel actually exists. Every failure mode
@@ -1806,6 +1817,216 @@ struct RenderContentWorldIsolationTests {
         #expect(seeded,
                 "the bridge must still round-trip end to end with the handlers registered in the isolated world")
         print("[P3] seededHeight=\(String(describing: AutoSizingHTMLView.seededHeight(headerId: headerId)))")
+    }
+
+    // -------------------------------------------------------------------------------
+    @Test("A disclosure-tagged height reaches native before that expanded height is applied")
+    func disclosureHeightTagIsAtomic() async {
+        let headerId = "canary-disclosure-height-\(CanaryKit.nonce())"
+        let quotedLines = (0..<40)
+            .map { "<p>Quoted line \($0): enough content to produce a material row-height change.</p>" }
+            .joined()
+        let body = """
+        <p>Current message stays visible.</p>
+        <div>-----Original Message-----</div>
+        <div>From: Someone &lt;someone@example.com&gt;</div>
+        \(quotedLines)
+        """
+        var disclosureSignals = 0
+        var seedAtFirstSignal: CGFloat?
+        guard let host = await HostedRenderView(
+            html: body,
+            headerId: headerId,
+            onUserDisclosureToggle: {
+                disclosureSignals += 1
+                if seedAtFirstSignal == nil {
+                    // Production invokes this immediately before the validated
+                    // height payload enters handleHeightMessage.
+                    seedAtFirstSignal = AutoSizingHTMLView.seededHeight(headerId: headerId)
+                }
+            }
+        ) else {
+            #expect(Bool(false), "could not host AutoSizingHTMLView"); return
+        }
+        defer { host.tearDown() }
+        let wv = host.webView
+
+        let seeded = await CanaryKit.waitUntil(10) {
+            (AutoSizingHTMLView.seededHeight(headerId: headerId) ?? 0) > 1
+        }
+        #expect(seeded, "collapsed quote must receive its initial production height")
+        try? await Task.sleep(for: .milliseconds(500))
+        let collapsedHeight = AutoSizingHTMLView.seededHeight(headerId: headerId) ?? 0
+        #expect(await CanaryKit.eval(
+            wv,
+            "String(document.querySelector('.tm-quote-wrapper').classList.contains('tm-collapsed'))",
+            in: RenderContentWorld.isolated
+        ) == "true")
+
+        _ = await CanaryKit.eval(
+            wv,
+            "document.querySelector('.tm-quote-toggle').click(); 'clicked'",
+            in: RenderContentWorld.isolated
+        )
+        let signalled = await CanaryKit.waitUntil(5) { seedAtFirstSignal != nil }
+        let resized = await CanaryKit.waitUntil(5) {
+            (AutoSizingHTMLView.seededHeight(headerId: headerId) ?? 0) > collapsedHeight
+        }
+        guard resized else {
+            #expect(Bool(false), "expanding the material quote must apply a larger native row height")
+            return
+        }
+        // Force a later production ResizeObserver report after the click's own
+        // delayed post has also had time to run. A sticky disclosure flag would
+        // invoke native again here and make the final count exceed one.
+        try? await Task.sleep(for: .milliseconds(100))
+        let heightBeforeLaterWitness = AutoSizingHTMLView.seededHeight(headerId: headerId) ?? 0
+        #expect(heightBeforeLaterWitness > collapsedHeight)
+        _ = await CanaryKit.eval(
+            wv,
+            "document.body.insertAdjacentHTML('beforeend','<p style=\"height:80px\">later witness</p>'); 'mutated'",
+            in: RenderContentWorld.isolated
+        )
+        let laterHeightWasHandled = await CanaryKit.waitUntil(5) {
+            (AutoSizingHTMLView.seededHeight(headerId: headerId) ?? 0) > heightBeforeLaterWitness
+        }
+
+        #expect(signalled,
+                "the real production coordinator/callback wiring must consume the disclosure bit")
+        #expect(seedAtFirstSignal == collapsedHeight,
+                "native must disarm before handling the disclosure-tagged height")
+        #expect(laterHeightWasHandled,
+                "the one-shot assertion requires a witnessed later production height report")
+        #expect(disclosureSignals == 1,
+                "the one-shot disclosure bit must not classify later resize measurements")
+        #expect(await CanaryKit.eval(
+            wv,
+            "String(document.querySelector('.tm-quote-wrapper').classList.contains('tm-collapsed'))",
+            in: RenderContentWorld.isolated
+        ) == "false")
+    }
+
+    // -------------------------------------------------------------------------------
+    @Test("A collapsed height supersedes a buffered expansion before scroll-freeze release")
+    func collapsedHeightClearsBufferedExpansion() async {
+        let headerId = "canary-disclosure-latest-wins-\(CanaryKit.nonce())"
+        var disclosureSignals = 0
+        let flushHeights = Mutex<[Double]>([])
+        let flushObserver = NotificationCenter.default.addObserver(
+            forName: .renderHeightFlushCompletedForTests,
+            object: nil,
+            queue: nil
+        ) { note in
+            guard note.userInfo?["headerId"] as? String == headerId,
+                  let height = note.userInfo?["height"] as? Double else { return }
+            flushHeights.withLock { $0.append(height) }
+        }
+        defer { NotificationCenter.default.removeObserver(flushObserver) }
+        guard let host = await HostedRenderView(
+            html: "<p>Native pending-height latest-wins probe.</p>",
+            headerId: headerId,
+            onUserDisclosureToggle: { disclosureSignals += 1 }
+        ) else {
+            #expect(Bool(false), "could not host AutoSizingHTMLView"); return
+        }
+        defer {
+            ScrollFreezeGate.shared.end()
+            host.tearDown()
+        }
+        let wv = host.webView
+        let seeded = await CanaryKit.waitUntil(10) {
+            (AutoSizingHTMLView.seededHeight(headerId: headerId) ?? 0) > 1
+        }
+        #expect(seeded)
+        try? await Task.sleep(for: .milliseconds(500))
+        let collapsedHeight = AutoSizingHTMLView.seededHeight(headerId: headerId) ?? 0
+        let syntheticExpandedHeight = collapsedHeight + 1_000
+        let deviceWidth = wv.bounds.width
+        #expect(collapsedHeight > 1 && deviceWidth > 1)
+
+        // Positive control: prove this hosted production Coordinator really
+        // receives the async release notification and flushes a buffered
+        // height. Without this half, a broken/no-op flush path could make the
+        // latest-wins assertion below pass vacuously.
+        let controlExpandedHeight = collapsedHeight + 500
+        ScrollFreezeGate.shared.begin()
+        _ = await CanaryKit.eval(
+            wv,
+            "window.webkit.messageHandlers.heightChanged.postMessage({h:\(controlExpandedHeight),vp:\(deviceWidth),userDisclosure:true,source:'canary-flush-control'}); 'control-buffered'",
+            in: RenderContentWorld.isolated
+        )
+        let controlWasBuffered = await CanaryKit.waitUntil(5) {
+            disclosureSignals >= 1
+                && AutoSizingHTMLView.seededHeight(headerId: headerId) == collapsedHeight
+        }
+        #expect(controlWasBuffered)
+        let controlFlushGeneration = flushHeights.withLock { $0.count }
+        ScrollFreezeGate.shared.end()
+        let controlFlushSettled = await CanaryKit.waitUntil(5) {
+            flushHeights.withLock { $0.count } > controlFlushGeneration
+        }
+        let controlObservedHeight = flushHeights.withLock { $0.last }
+        #expect(controlFlushSettled)
+        #expect(controlObservedHeight == Double(controlExpandedHeight),
+                "the positive control must witness the production async flush path")
+        guard controlFlushSettled,
+              controlObservedHeight == Double(controlExpandedHeight) else { return }
+
+        // Return native state to the real collapsed measurement before the
+        // show→hide case. This is unfrozen, so the bridge must apply it now.
+        _ = await CanaryKit.eval(
+            wv,
+            "window.webkit.messageHandlers.heightChanged.postMessage({h:\(collapsedHeight),vp:\(deviceWidth),userDisclosure:false,source:'canary-control-reset'}); 'control-reset'",
+            in: RenderContentWorld.isolated
+        )
+        let controlWasReset = await CanaryKit.waitUntil(5) {
+            AutoSizingHTMLView.seededHeight(headerId: headerId) == collapsedHeight
+        }
+        #expect(controlWasReset)
+        guard controlWasReset else { return }
+
+        // Drive the REAL validated production bridge with a known-different
+        // height. Unlike a DOM expansion, this is a positive witness by
+        // construction: if native accepts the signal while frozen, it must
+        // buffer (not deduplicate) the 1,000 pt larger value.
+        ScrollFreezeGate.shared.begin()
+        _ = await CanaryKit.eval(
+            wv,
+            "window.webkit.messageHandlers.heightChanged.postMessage({h:\(syntheticExpandedHeight),vp:\(deviceWidth),userDisclosure:true,source:'canary-buffer'}); 'buffered'",
+            in: RenderContentWorld.isolated
+        )
+        let expansionWasBuffered = await CanaryKit.waitUntil(5) {
+            disclosureSignals >= 2
+                && AutoSizingHTMLView.seededHeight(headerId: headerId) == collapsedHeight
+        }
+        #expect(expansionWasBuffered)
+
+        _ = await CanaryKit.eval(
+            wv,
+            "window.webkit.messageHandlers.heightChanged.postMessage({h:\(collapsedHeight),vp:\(deviceWidth),userDisclosure:true,source:'canary-latest'}); 'superseded'",
+            in: RenderContentWorld.isolated
+        )
+        let collapseWasHandled = await CanaryKit.waitUntil(5) {
+            disclosureSignals >= 3
+        }
+        #expect(collapseWasHandled,
+                "the equal collapsed measurement must reach the native handler before release")
+
+        let latestWinsFlushGeneration = flushHeights.withLock { $0.count }
+        #expect(latestWinsFlushGeneration == controlFlushGeneration + 1,
+                "no foreign scroll-freeze release may flush the candidate window")
+        ScrollFreezeGate.shared.end()
+        let latestWinsFlushSettled = await CanaryKit.waitUntil(5) {
+            flushHeights.withLock { $0.count } > latestWinsFlushGeneration
+        }
+        let heightAtLatestWinsFlush = flushHeights.withLock { $0.last }
+        let finalFlushGeneration = flushHeights.withLock { $0.count }
+        #expect(latestWinsFlushSettled,
+                "the negative assertion requires the production async flush turn to complete")
+        #expect(finalFlushGeneration == latestWinsFlushGeneration + 1,
+                "the candidate release must produce exactly one ordered flush completion")
+        #expect(heightAtLatestWinsFlush == Double(collapsedHeight),
+                "an obsolete buffered expansion must not flush after show→hide")
     }
 
     // -------------------------------------------------------------------------------

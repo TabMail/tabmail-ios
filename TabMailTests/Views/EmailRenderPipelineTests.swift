@@ -1212,10 +1212,100 @@ struct EmailRenderPipelineTests {
         #expect(js.contains("var x = Math.max(0, Math.min(minLeft, minRight, GUTTER))"))
         #expect(js.contains("var pad = GUTTER - x"))
         #expect(js.contains("{ l: pad, r: pad }"))                                // same padding both sides
-        #expect(js.contains("messageHandlers.gutterAdjust.postMessage"))          // posts to Swift, doesn't mutate DOM
-        // Regression guard: must NOT pull the body (the old, ineffective approach).
-        #expect(!js.contains("margin-left"))
-        #expect(!js.contains("margin-right"))
+        #expect(js.contains("messageHandlers.gutterAdjust.postMessage"))          // posts reduced outer gutter to Swift
+        // The sender's body/layout is never pulled. Only the dedicated app-owned,
+        // body-level invite wrapper receives the measured content inset.
+        #expect(js.contains("window.__tmICSDisclosureWrappers || []"))
+        #expect(js.contains("bw - WIDE"))
+        #expect(!js.contains("document.body.style"))
+    }
+
+    @Test("User disclosure toggles atomically tag the height applied by native")
+    func disclosureTogglesTagAppliedHeight() {
+        let disclosureMark = "window.__tmUserDisclosurePending = true"
+        let taggedHeight = "userDisclosure: \(_consumeUserDisclosureExpression)"
+        let domToggle = ".classList.toggle('tm-collapsed')"
+
+        func assertEveryClickMarksFirst(_ js: String, expectedClicks: Int) {
+            let handlers = js.components(separatedBy: "addEventListener('click'").dropFirst()
+            #expect(handlers.count == expectedClicks)
+            for handler in handlers {
+                let mark = handler.range(of: disclosureMark)
+                let toggle = handler.range(of: domToggle)
+                #expect(mark != nil)
+                #expect(toggle != nil)
+                if let mark, let toggle {
+                    #expect(mark.lowerBound < toggle.lowerBound)
+                }
+            }
+            #expect(js.components(separatedBy: taggedHeight).count - 1 == expectedClicks)
+        }
+
+        assertEveryClickMarksFirst(_collapseQuotesJS, expectedClicks: 2)
+        assertEveryClickMarksFirst(_collapseICSJS, expectedClicks: 1)
+        #expect(_monitorHeightJS.contains(taggedHeight))
+        #expect(_fitViewportJS.contains(taggedHeight))
+        #expect(_userDisclosureOwnershipJS.contains("window.__tmUserDisclosurePending = false"))
+        #expect(_userDisclosureOwnershipJS.contains("window.__tmConsumeUserDisclosure = function()"))
+        #expect(_postDisclosureHeightJS.contains("vp: tmVp"))
+        #expect(_postDisclosureHeightJS.contains("scroll: tmScroll"))
+        #expect(_postDisclosureHeightJS.contains("rect: tmRect"))
+        #expect(!_renderBridgeChannels.contains("userDisclosureToggle"),
+                "disclosure must travel in the height payload, not race it on a separate channel")
+
+        let stickyHeight = "userDisclosure: window.__tmUserDisclosurePending === true"
+        #expect(!_collapseQuotesJS.contains(stickyHeight))
+        #expect(!_collapseICSJS.contains(stickyHeight))
+        #expect(!_monitorHeightJS.contains(stickyHeight))
+        #expect(!_fitViewportJS.contains(stickyHeight))
+
+        let ctx = JSContext()!
+        ctx.evaluateScript("var window = this; \(_userDisclosureOwnershipJS)")
+        ctx.evaluateScript("window.__tmUserDisclosurePending = true")
+        #expect(ctx.evaluateScript("window.__tmConsumeUserDisclosure()")?.toBool() == true)
+        #expect(ctx.evaluateScript("window.__tmConsumeUserDisclosure()")?.toBool() == false,
+                "only the first height after a tap may claim disclosure ownership")
+        ctx.evaluateScript("window.__tmConsumeUserDisclosure = undefined")
+        #expect(ctx.evaluateScript(_consumeUserDisclosureExpression)?.toBool() == false,
+                "a missing disclosure helper must fail soft instead of dropping the height post")
+    }
+
+    @Test("Body-level invite disclosure aligns to the measured email content inset")
+    func inviteDisclosureAlignsToEmailInset() {
+        #expect(_collapseICSJS.contains("tm-ics-wrapper"))
+        #expect(_collapseICSJS.contains("window.__tmICSDisclosureWrappers = ownedWrappers"))
+        #expect(_collapseICSJS.contains("ownedWrappers.push(wrapper)"))
+        #expect(!_alignBodyLevelDisclosureJS.contains("querySelectorAll"))
+
+        let ctx = JSContext()!
+        ctx.evaluateScript("""
+        var ownedApplied = {};
+        var spoofedApplied = {};
+        var ownedWrapper = { style: { setProperty: function(name, value, priority) {
+            ownedApplied[name] = value + '|' + priority;
+        } } };
+        var spoofedClassWrapper = { style: { setProperty: function(name, value, priority) {
+            spoofedApplied[name] = value + '|' + priority;
+        } } };
+        \(_alignBodyLevelDisclosureJS)
+        alignBodyLevelDisclosure([ownedWrapper], 24, 12, 160);
+        """)
+        #expect(ctx.exception == nil, "alignment JS threw: \(ctx.exception?.toString() ?? "")")
+        #expect(ctx.evaluateScript("ownedApplied['margin-left']")?.toString() == "24px|important")
+        #expect(ctx.evaluateScript("ownedApplied['margin-right']")?.toString() == "12px|important")
+        #expect(ctx.evaluateScript("spoofedApplied['margin-left']").isUndefined)
+
+        // A desktop layout that overflows one side must never pull app chrome
+        // outside the body with a negative margin.
+        ctx.evaluateScript("alignBodyLevelDisclosure([ownedWrapper], -8, 5, 160);")
+        #expect(ctx.evaluateScript("ownedApplied['margin-left']")?.toString() == "0px|important")
+        #expect(ctx.evaluateScript("ownedApplied['margin-right']")?.toString() == "5px|important")
+
+        // Extreme finite geometry is proportionally bounded so left+right never
+        // consumes more than the space outside the 60%-wide main-column floor.
+        ctx.evaluateScript("alignBodyLevelDisclosure([ownedWrapper], 1000, 1000, 40);")
+        #expect(ctx.evaluateScript("ownedApplied['margin-left']")?.toString() == "20px|important")
+        #expect(ctx.evaluateScript("ownedApplied['margin-right']")?.toString() == "20px|important")
     }
 
     @Test("fixDarkModeColorsJS dims only LIGHT LOW-SATURATION text fills — preserves textless + saturated colors")
@@ -2783,7 +2873,7 @@ struct EmailRenderPipelineTests {
 /// `.serialized`: `end()` posts the global `.scrollFreezeReleased`
 /// notification, so two tests of this suite running in parallel would bump
 /// each other's observer counters.
-@Suite("ScrollFreezeGate", .serialized)
+@Suite("ScrollFreezeGate", .serialized, .processGlobalState)
 struct ScrollFreezeGateTests {
 
     @Test("begin/end transitions are idempotent")

@@ -62,6 +62,7 @@ struct MessageCardView: View {
     let shouldFlash: Bool
     let onFlashComplete: () -> Void
     var onManageLabels: ((MessageHeader) -> Void)?
+    let onBodyDisclosureInteraction: () -> Void
 
     /// Live message from ViewModel — always current after mutations.
     private var message: MessageHeader {
@@ -132,7 +133,8 @@ struct MessageCardView: View {
         onTagAction: @escaping (MessageHeader) -> Void,
         onSelected: @escaping (MessageHeader) -> Void = { _ in },
         onFlashComplete: @escaping () -> Void = {},
-        onManageLabels: ((MessageHeader) -> Void)? = nil
+        onManageLabels: ((MessageHeader) -> Void)? = nil,
+        onBodyDisclosureInteraction: @escaping () -> Void = {}
     ) {
         self.messageId = message.id
         self.initialMessage = message
@@ -144,6 +146,7 @@ struct MessageCardView: View {
         self.onSelected = onSelected
         self.onFlashComplete = onFlashComplete
         self.onManageLabels = onManageLabels
+        self.onBodyDisclosureInteraction = onBodyDisclosureInteraction
         self._expanded = State(initialValue: isFocused)
     }
 
@@ -625,7 +628,8 @@ struct MessageCardView: View {
                         html: html,
                         headerId: message.id,
                         bodyContentKey: body.id,
-                        reloadToken: viewModel.bodyReloadToken)
+                        reloadToken: viewModel.bodyReloadToken,
+                        onUserDisclosureToggle: onBodyDisclosureInteraction)
                 } else {
                     Text("This message has no content.")
                         .foregroundStyle(.secondary)
@@ -657,7 +661,11 @@ struct MessageCardView: View {
             if let body = viewModel.bodyFor(message.id) {
                 if let html = body.htmlContent, !html.isEmpty {
                     // P1d: same explicit ownership carry as the focused card above.
-                    AutoSizingHTMLView(html: html, headerId: message.id, bodyContentKey: body.id)
+                    AutoSizingHTMLView(
+                        html: html,
+                        headerId: message.id,
+                        bodyContentKey: body.id,
+                        onUserDisclosureToggle: onBodyDisclosureInteraction)
                 } else {
                     Text("This message has no content.")
                         .foregroundStyle(.secondary)

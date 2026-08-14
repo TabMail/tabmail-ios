@@ -7,6 +7,15 @@ import WebKit
 import CryptoKit
 import Synchronization
 
+/// Native channels exposed only to TabMail's isolated content world.
+/// Kept top-level so the exact registration set is regression-testable.
+internal let _renderBridgeChannels = [
+    "heightChanged",
+    "consoleLog",
+    "gutterAdjust",
+    "imageLoadFailure"
+]
+
 /// Auto-sizing WKWebView that reports its content height to SwiftUI.
 ///
 /// `bodyContentKey` opt-in: when non-nil, registers a `BodyAssetSchemeHandler`
@@ -36,6 +45,9 @@ struct AutoSizingHTMLView: View {
     let bodyContentKey: ContentKey?
     /// Explicit same-bytes reload trigger used by pull-to-refresh.
     let reloadToken: Int
+    /// Called immediately before native applies a height payload atomically
+    /// tagged as originating after app-owned quote/invite disclosure.
+    let onUserDisclosureToggle: () -> Void
     @State private var height: CGFloat
     /// True once the WKWebView has actually revealed its content (the JS
     /// `reveal()` flips opacity 0→1 and posts `{revealed:true}`). Until then a
@@ -57,13 +69,15 @@ struct AutoSizingHTMLView: View {
         previewFilename: String? = nil,
         headerId: String? = nil,
         bodyContentKey: ContentKey? = nil,
-        reloadToken: Int = 0
+        reloadToken: Int = 0,
+        onUserDisclosureToggle: @escaping () -> Void = {}
     ) {
         self.html = html
         self.previewFilename = previewFilename
         self.headerId = headerId
         self.bodyContentKey = bodyContentKey
         self.reloadToken = reloadToken
+        self.onUserDisclosureToggle = onUserDisclosureToggle
         // Seed the initial frame height from the last applied measurement for
         // this message. SwiftUI List dismantles far-offscreen rows — when an
         // expanded card scrolls back toward the viewport, the whole view
@@ -123,7 +137,7 @@ struct AutoSizingHTMLView: View {
     private var showsLoadingPlaceholder: Bool { headerId != nil && !hasRevealed }
 
     var body: some View {
-        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, bodyContentKey: bodyContentKey, reloadToken: reloadToken, height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad)
+        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, bodyContentKey: bodyContentKey, reloadToken: reloadToken, onUserDisclosureToggle: onUserDisclosureToggle, height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad)
             // ── P1d (ADR-IOS-076 decision 5; plan §10.1 C4): the body ContentKey is
             // part of the representable's IDENTITY, so a change to it dismantles the
             // platform view and `makeUIView` runs again.
@@ -267,6 +281,11 @@ extension Notification.Name {
     /// Posted by `ScrollFreezeGate.end()`. `HTMLWebView.Coordinator`s apply
     /// their buffered `pendingHeight` on receipt.
     static let scrollFreezeReleased = Notification.Name("scrollFreezeReleased")
+    #if DEBUG
+    /// Test-only completion witness for the Coordinator's async main-queue
+    /// scroll-freeze flush turn. Production behavior does not consume it.
+    static let renderHeightFlushCompletedForTests = Notification.Name("renderHeightFlushCompletedForTests")
+    #endif
 }
 
 /// In-memory cache of the last APPLIED visual height per message
@@ -335,6 +354,7 @@ private struct HTMLWebView: UIViewRepresentable {
     /// part of this representable's SwiftUI identity (see `AutoSizingHTMLView.body`).
     let bodyContentKey: ContentKey?
     let reloadToken: Int
+    let onUserDisclosureToggle: () -> Void
     @Binding var height: CGFloat
     @Binding var hasRevealed: Bool
     // Dynamic horizontal gutter: starts at the 16pt minimum and is REDUCED by the
@@ -356,10 +376,10 @@ private struct HTMLWebView: UIViewRepresentable {
     /// delivery by name. `heightChanged` is the only one whose loss would break the
     /// render — see the `consoleLog` gating note in the coordinator.
     ///
-    /// `imageLoadFailure` (P4) is the only channel added since P1c. It is now
-    /// diagnostic-only and is validated on the Swift side like the other three — see
-    /// `RenderBridgeInput.imageFailureReport`.
-    static let bridgeChannels = ["heightChanged", "consoleLog", "gutterAdjust", "imageLoadFailure"]
+    /// `imageLoadFailure` (P4) is diagnostic-only. Disclosure ownership travels
+    /// atomically inside `heightChanged`, not on a separate channel whose native
+    /// delivery could race the resize it is meant to classify.
+    static let bridgeChannels = _renderBridgeChannels
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -463,17 +483,16 @@ private struct HTMLWebView: UIViewRepresentable {
                 forURLScheme: BodyAssetConfig.urlScheme
             )
         }
-        // .atDocumentStart stamp of the per-WebView correlation id. Runs
-        // synchronously before any other script, so [HeightDiag id=...] log
-        // lines emitted by setTimeout-scheduled callbacks always have the right
-        // id. The previous approach (evaluateJavaScript queued from didFinish)
-        // raced with the t100 setTimeout on image-heavy emails — Fireworks
-        // consistently produced [HeightDiag id=?] entries because the stamp
-        // landed after t100 fired. Debug-gated; in production the diag
-        // doesn't read __tmDiagId so we skip injecting it entirely.
-        let idStampJS = DebugModeManager.isLoggingEnabled()
-            ? "window.__tmDiagId='\(context.coordinator.webViewId)';"
-            : ""
+        // .atDocumentStart bootstrap. Disclosure ownership is installed here,
+        // independently of quote parsing, so a later quote-script failure can
+        // never break every height producer. The optional per-WebView diagnostic
+        // stamp runs in the same first script; the previous didFinish evaluation
+        // raced Fireworks' t100 callback and produced [HeightDiag id=?].
+        let renderBootstrapJS = _userDisclosureOwnershipJS + (
+            DebugModeManager.isLoggingEnabled()
+                ? "window.__tmDiagId='\(context.coordinator.webViewId)';"
+                : ""
+        )
         // ── P3: every script below is built `in: RenderContentWorld.isolated` ──
         // Read `RenderContentWorld` before touching any of the 17 constructions in this
         // block, the 3 `add(…)` registrations, or the 3 `evaluateJavaScript` call sites.
@@ -485,7 +504,7 @@ private struct HTMLWebView: UIViewRepresentable {
         // dies whole (no height, no dark mode, no quote collapse, no deferred images) in a
         // way no non-`WKWebView` test can observe. This is defense-in-depth; it did NOT
         // enable the CSP, which shipped in P1b with every script still in the page world.
-        let idStamp = WKUserScript(source: idStampJS, injectionTime: .atDocumentStart, forMainFrameOnly: true, in: RenderContentWorld.isolated)
+        let renderBootstrap = WKUserScript(source: renderBootstrapJS, injectionTime: .atDocumentStart, forMainFrameOnly: true, in: RenderContentWorld.isolated)
         // Install before parsing reaches any author image/background resources so
         // debug logs can distinguish an actual WebKit load error from a deferred
         // URL that simply has not been assigned yet. Production source is empty.
@@ -531,7 +550,7 @@ private struct HTMLWebView: UIViewRepresentable {
         let widthRefit = WKUserScript(source: postImageWidthRecheckJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
         let debugReport = WKUserScript(source: htmlDebugReportJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
         let heightDiag = WKUserScript(source: heightDiagnosticJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
-        config.userContentController.addUserScript(idStamp)
+        config.userContentController.addUserScript(renderBootstrap)
         config.userContentController.addUserScript(imageLoadDiag)
         config.userContentController.addUserScript(mediaFix)
         config.userContentController.addUserScript(widthFix)
@@ -614,6 +633,9 @@ private struct HTMLWebView: UIViewRepresentable {
 
     func updateUIView(_ webView: WKWebView, context: Context) {
         context.coordinator.webView = webView
+        // A representable's coordinator outlives individual SwiftUI value updates.
+        // Keep the callback current even when the surrounding card is rebound.
+        context.coordinator.onUserDisclosureToggle = onUserDisclosureToggle
         let currentWidth = webView.bounds.width
         let htmlChanged = html != context.coordinator.loadedHTML
         let reloadChanged = reloadToken != context.coordinator.loadedReloadToken
@@ -709,7 +731,13 @@ private struct HTMLWebView: UIViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad)
+        Coordinator(
+            height: $height,
+            hasRevealed: $hasRevealed,
+            leadingPad: $leadingPad,
+            trailingPad: $trailingPad,
+            onUserDisclosureToggle: onUserDisclosureToggle
+        )
     }
 
     class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
@@ -722,6 +750,7 @@ private struct HTMLWebView: UIViewRepresentable {
         /// `eatGutterMarginsJS` (= 16 − the email's own measured inset, clamped).
         @Binding var leadingPad: CGFloat
         @Binding var trailingPad: CGFloat
+        var onUserDisclosureToggle: () -> Void
         var loadedHTML: String?
         var loadedPreviewFilename: String?
         var loadedHeaderId: String?
@@ -832,11 +861,18 @@ private struct HTMLWebView: UIViewRepresentable {
         /// Released in deinit.
         private var zoomObservation: NSKeyValueObservation?
 
-        init(height: Binding<CGFloat>, hasRevealed: Binding<Bool>, leadingPad: Binding<CGFloat>, trailingPad: Binding<CGFloat>) {
+        init(
+            height: Binding<CGFloat>,
+            hasRevealed: Binding<Bool>,
+            leadingPad: Binding<CGFloat>,
+            trailingPad: Binding<CGFloat>,
+            onUserDisclosureToggle: @escaping () -> Void
+        ) {
             self._height = height
             self._hasRevealed = hasRevealed
             self._leadingPad = leadingPad
             self._trailingPad = trailingPad
+            self.onUserDisclosureToggle = onUserDisclosureToggle
             super.init()
             // Re-run fitViewport on foreground return — iOS resumes the WKWebView
             // content process which may have been suspended with incomplete
@@ -866,12 +902,28 @@ private struct HTMLWebView: UIViewRepresentable {
                 // WKScriptMessageHandler are @MainActor protocols), so assert
                 // the isolation rather than smuggling access past the checker.
                 MainActor.assumeIsolated {
-                    guard let self, let pending = self.pendingHeight else { return }
-                    self.pendingHeight = nil
-                    if pending > 0 && pending != self.height {
-                        self.height = pending
-                        if let hid = self.loadedHeaderId { HeightSeedCache.shared[hid] = pending }
+                    guard let self else { return }
+                    if let pending = self.pendingHeight {
+                        self.pendingHeight = nil
+                        if pending > 0 && pending != self.height {
+                            self.height = pending
+                            if let hid = self.loadedHeaderId { HeightSeedCache.shared[hid] = pending }
+                        }
                     }
+                    #if DEBUG
+                    // Ordered test seam: emitted synchronously at the end of
+                    // this main-queue flush turn, including the no-pending
+                    // latest-wins case. Tests can therefore distinguish a
+                    // genuinely cleared buffer from a pre-flush cache sample.
+                    NotificationCenter.default.post(
+                        name: .renderHeightFlushCompletedForTests,
+                        object: nil,
+                        userInfo: [
+                            "headerId": self.loadedHeaderId as Any,
+                            "height": Double(self.height),
+                        ]
+                    )
+                    #endif
                 }
             }
         }
@@ -1439,6 +1491,13 @@ private struct HTMLWebView: UIViewRepresentable {
                     bridgeLog("rejected channel=heightChanged reason=malformed-payload")
                     return
                 }
+                // The disclosure bit and the measurement it classifies are one
+                // validated payload, so no cross-channel WebKit delivery
+                // ordering is assumed.
+                if let dict = validated as? [String: Any],
+                   dict["userDisclosure"] as? Bool == true {
+                    onUserDisclosureToggle()
+                }
                 handleHeightMessage(validated)
             } else if message.name == "gutterAdjust" {
                 // eatGutterMarginsJS measured the email's own content inset and sent
@@ -1650,6 +1709,14 @@ private struct HTMLWebView: UIViewRepresentable {
                     print(String(format: "[MeasureHeight id=%@] +300ms zoom=%.3f contentH=%.0f frameH=%.0f visual=%.0f overflow=%.0f",
                                  id, z, cH, frameH, visualHeightSnapshot, max(0, cH - frameH)))
                 }
+            }
+            if visualHeight > 0 && visualHeight == height {
+                // Latest-wins while frozen: show→hide can return to the
+                // already-applied height before the buffered expanded height
+                // flushes. Drop that obsolete buffer instead of expanding the
+                // row after the user has collapsed it again.
+                pendingHeight = nil
+                return
             }
             if visualHeight > 0 && visualHeight != height {
                 // Scroll freeze: applying a CHANGED height while the user is
@@ -2463,12 +2530,40 @@ function sweepQuoteContent(quoteStart, content, body, logFn) {
 /// when debug logging is off, `_log` is injected as a no-op so per-line DOM / QuoteDetect
 /// traces don't cross the JS↔native bridge (they can saturate the WebProcess message
 /// queue and contribute to WebContent crashes on pathological bodies).
+internal var _collapseQuotesJS: String { collapseQuotesJS }
+internal let _userDisclosureOwnershipJS = """
+window.__tmUserDisclosurePending = false;
+window.__tmConsumeUserDisclosure = function() {
+    var pending = window.__tmUserDisclosurePending === true;
+    window.__tmUserDisclosurePending = false;
+    return pending;
+};
+"""
+internal let _consumeUserDisclosureExpression = "(typeof window.__tmConsumeUserDisclosure === 'function' ? window.__tmConsumeUserDisclosure() : false)"
+internal let _postDisclosureHeightJS = """
+var tmScroll = document.body.scrollHeight;
+var tmRect = Math.ceil(document.body.getBoundingClientRect().height);
+var tmHeight = tmRect > 0 && tmRect < tmScroll ? tmRect : tmScroll;
+var tmVp = window.__tmLayoutVp || window.__tmDeviceWidth || window.innerWidth;
+if (tmHeight > 0) {
+    window.webkit.messageHandlers.heightChanged.postMessage({
+        h: tmHeight,
+        vp: tmVp,
+        scroll: tmScroll,
+        rect: tmRect,
+        userDisclosure: \(_consumeUserDisclosureExpression)
+    });
+}
+"""
 private var collapseQuotesJS: String {
     let logBody = DebugModeManager.isLoggingEnabled()
         ? "try { window.webkit.messageHandlers.consoleLog.postMessage(m); } catch(_) {}"
         : ""
     return """
     (function() {
+        // The flag is one-shot: only the first height after a real disclosure
+        // tap may disarm the detail view's opening anchor. Leaving it sticky
+        // would misclassify unrelated later image/layout heights as new taps.
         function _log(m) { \(logBody) }
         \(walkUpToWrapStartJS)
         \(splitBlockBeforeTargetJS)
@@ -2711,11 +2806,12 @@ private var collapseQuotesJS: String {
                 toggleI.innerHTML = '<span class="tm-quote-toggle-text">' + showLabelI + '</span>';
                 toggleI.addEventListener('click', function(e) {
                     e.stopPropagation();
+                    window.__tmUserDisclosurePending = true;
                     wrapperI.classList.toggle('tm-collapsed');
                     var collapsed = wrapperI.classList.contains('tm-collapsed');
                     toggleI.innerHTML = '<span class="tm-quote-toggle-text">' + (collapsed ? showLabelI : hideLabelI) + '</span>';
                     setTimeout(function() {
-                        try { window.webkit.messageHandlers.heightChanged.postMessage(document.body.scrollHeight); } catch(ex) {}
+                        try { \(_postDisclosureHeightJS) } catch(ex) {}
                     }, 50);
                 });
                 var contentI = document.createElement('div');
@@ -2823,12 +2919,13 @@ private var collapseQuotesJS: String {
         toggle.innerHTML = '<span class="tm-quote-toggle-text">' + showLabel + '</span>';
         toggle.addEventListener('click', function(e) {
             e.stopPropagation();
+            window.__tmUserDisclosurePending = true;
             wrapper.classList.toggle('tm-collapsed');
             var collapsed = wrapper.classList.contains('tm-collapsed');
             toggle.innerHTML = '<span class="tm-quote-toggle-text">' + (collapsed ? showLabel : hideLabel) + '</span>';
             // Signal native side to re-measure height
             setTimeout(function() {
-                try { window.webkit.messageHandlers.heightChanged.postMessage(document.body.scrollHeight); } catch(ex) {}
+                try { \(_postDisclosureHeightJS) } catch(ex) {}
             }, 50);
         });
 
@@ -2852,8 +2949,14 @@ private var collapseQuotesJS: String {
 /// Separate script for ICS invite collapsible sections.
 /// Runs independently from quote collapse — finds `.tm-ics-collapsible` markers
 /// and wraps them using the same CSS classes as quotes.
+internal var _collapseICSJS: String { collapseICSJS }
 private let collapseICSJS = """
     (function() {
+        // Keep exact app-created node references in the isolated content world.
+        // A CSS class is not an ownership boundary: sender HTML can spoof any
+        // class name even though sender script cannot see this isolated global.
+        var ownedWrappers = [];
+        window.__tmICSDisclosureWrappers = ownedWrappers;
         var icsMarkers = document.querySelectorAll('.tm-ics-collapsible');
         if (!icsMarkers.length) return;
         for (var i = 0; i < icsMarkers.length; i++) {
@@ -2861,18 +2964,23 @@ private let collapseICSJS = """
                 var showLabel = 'Show invite details';
                 var hideLabel = 'Hide invite details';
                 var wrapper = document.createElement('div');
-                wrapper.className = 'tm-quote-wrapper tm-collapsed';
+                // BodyRenderer appends the invite marker directly under body,
+                // outside sender-owned inset containers. The dedicated class lets
+                // eatGutterMarginsJS align this app chrome to the measured email
+                // column without mutating sender content.
+                wrapper.className = 'tm-quote-wrapper tm-ics-wrapper tm-collapsed';
                 wrapper.style.marginTop = '12px';
                 var toggle = document.createElement('div');
                 toggle.className = 'tm-quote-toggle';
                 toggle.innerHTML = '<span class="tm-quote-toggle-text">' + showLabel + '</span>';
                 toggle.addEventListener('click', function(e) {
                     e.stopPropagation();
+                    window.__tmUserDisclosurePending = true;
                     wrapper.classList.toggle('tm-collapsed');
                     var collapsed = wrapper.classList.contains('tm-collapsed');
                     toggle.innerHTML = '<span class="tm-quote-toggle-text">' + (collapsed ? showLabel : hideLabel) + '</span>';
                     setTimeout(function() {
-                        try { window.webkit.messageHandlers.heightChanged.postMessage(document.body.scrollHeight); } catch(ex) {}
+                        try { \(_postDisclosureHeightJS) } catch(ex) {}
                     }, 50);
                 });
                 var content = document.createElement('div');
@@ -2884,6 +2992,7 @@ private let collapseICSJS = """
                 wrapper.appendChild(toggle);
                 wrapper.appendChild(content);
                 icsDiv.parentNode.removeChild(icsDiv);
+                ownedWrappers.push(wrapper);
             })(icsMarkers[i]);
         }
     })();
@@ -2900,6 +3009,8 @@ private let collapseICSJS = """
 ///     prevents the viewport-height floor from inflating it)
 ///   - `vp`: `window.innerWidth` in CSS px (the layout viewport,
 ///     post-widening)
+///   - `userDisclosure`: true after app-owned quote/invite chrome was
+///     toggled, so native disarms its opening anchor before applying `h`
 /// Swift converts the height to device points with
 /// `bounds.width / vp` and sets `@State height`. One message per real
 /// layout change, content-only measurement.
@@ -3787,6 +3898,30 @@ private var normalizeIndentJS: String {
     """
 }
 
+/// App-owned disclosure chrome appended directly under `<body>` does not inherit
+/// the sender's content container inset. Align only the exact app-created nodes
+/// retained by `collapseICSJS`; a class selector would let sender HTML spoof
+/// ownership. The combined positive inset is bounded so the aligned control keeps
+/// at least the same 60%-wide floor as the measured main column. Kept standalone
+/// so ownership and bounds are executable in JSContext.
+internal let _alignBodyLevelDisclosureJS = """
+function alignBodyLevelDisclosure(wrappers, leftInset, rightInset, maxCombinedInset) {
+    var limit = isFinite(maxCombinedInset) ? Math.max(0, maxCombinedInset) : 0;
+    var left = isFinite(leftInset) ? Math.max(0, Math.min(leftInset, limit)) : 0;
+    var right = isFinite(rightInset) ? Math.max(0, Math.min(rightInset, limit)) : 0;
+    var total = left + right;
+    if (total > limit && total > 0) {
+        var scale = limit / total;
+        left *= scale;
+        right *= scale;
+    }
+    for (var i = 0; i < wrappers.length; i++) {
+        wrappers[i].style.setProperty('margin-left', left + 'px', 'important');
+        wrappers[i].style.setProperty('margin-right', right + 'px', 'important');
+    }
+}
+"""
+
 /// Make the SwiftUI gutter act as a MINIMUM "indent" that ABSORBS an email's own
 /// outer horizontal inset, instead of the two STACKING (our 16pt + the email's own
 /// 8px cell padding ≈ 24pt, which reads as over-inset now that we no longer shrink
@@ -3820,6 +3955,7 @@ private var eatGutterMarginsJS: String {
     return """
     (function() {
         \(gl)
+        \(_alignBodyLevelDisclosureJS)
         if (!document.body) return;
         try {
             // MUST match AutoSizingHTMLView's default .padding gutter. We only ever
@@ -3847,6 +3983,18 @@ private var eatGutterMarginsJS: String {
                 var ri = b.right - r.right; if (ri < minRight) minRight = ri;
             }
             if (!isFinite(minLeft) || !isFinite(minRight)) { gl('no wide text content — keep 16'); return; }
+            // The invite card is app-owned and appended at body level, so it does
+            // not inherit the sender's content-column inset the way an in-body
+            // quote wrapper does. Apply the measured per-side inset only to that
+            // exact app-created wrappers before the height/fit pipeline measures
+            // layout. `bw - WIDE` preserves the same 60%-wide column floor even
+            // when hostile/off-body geometry reports an extreme positive inset.
+            alignBodyLevelDisclosure(
+                window.__tmICSDisclosureWrappers || [],
+                minLeft,
+                minRight,
+                bw - WIDE
+            );
             // SYMMETRIC reduction: reduce BOTH sides by the SMALLER inset, clamped
             // [0, GUTTER]. Using the min keeps the gutter symmetric so content can
             // never end up flush on one side while padded on the other — the
@@ -3929,7 +4077,13 @@ private let monitorHeightJS = """
             if (h > 0 && h !== lastH) {
                 lastH = h;
                 try {
-                    window.webkit.messageHandlers.heightChanged.postMessage({ h: h, vp: vp, scroll: scroll, rect: rect });
+                    window.webkit.messageHandlers.heightChanged.postMessage({
+                        h: h,
+                        vp: vp,
+                        scroll: scroll,
+                        rect: rect,
+                        userDisclosure: \(_consumeUserDisclosureExpression)
+                    });
                 } catch(e) {}
             }
         }
@@ -5451,7 +5605,14 @@ private let fitViewportJS: String = {
                 var vp = window.__tmLayoutVp || window.innerWidth;
                 if (h > 0) {
                     log('postWiden(' + stage + ') firing: scroll=' + scroll + ' rect=' + rect + ' h=' + h + ' innerW=' + window.innerWidth);
-                    window.webkit.messageHandlers.heightChanged.postMessage({ h: h, vp: vp, scroll: scroll, rect: rect, source: 'postWiden-' + stage });
+                    window.webkit.messageHandlers.heightChanged.postMessage({
+                        h: h,
+                        vp: vp,
+                        scroll: scroll,
+                        rect: rect,
+                        source: 'postWiden-' + stage,
+                        userDisclosure: \(_consumeUserDisclosureExpression)
+                    });
                 }
             } catch(e) {
                 log('postWiden(' + stage + ') ERROR: ' + (e && e.message ? e.message : e));
