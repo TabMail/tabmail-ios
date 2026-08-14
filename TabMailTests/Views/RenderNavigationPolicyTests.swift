@@ -456,11 +456,11 @@ struct RenderBridgeInputTests {
 
     // ── P4: the `imageLoadFailure` channel.
     //
-    // The counts this channel carries reach a sentence shown to the user about the
-    // sender's own server, so the validation is the same fail-closed shape as the
+    // The counts this channel carries are diagnostic-only. Validation retains the
+    // same fail-closed shape as the
     // other three: a malformed payload is DROPPED WHOLE, never coerced, never
     // half-applied. There is no "clamp it to something plausible" branch — a count
-    // we cannot trust is a banner we do not raise.
+    // we cannot trust is a diagnostic we do not print.
 
     @Test("A well-formed image-failure census survives validation unchanged")
     func wellFormedImageFailureCensusIsAccepted() {
@@ -471,9 +471,8 @@ struct RenderBridgeInputTests {
         #expect(some.deferred == 5)
 
         // The overwhelmingly common report: images were deferred, none failed.
-        // It must be ACCEPTED (and then raise no banner) rather than rejected —
-        // a drop here and a zero here are indistinguishable to the user but not
-        // to a reader of the bridge log.
+        // It must be ACCEPTED rather than rejected — a drop and a true zero are
+        // distinguishable to a reader of the bridge log.
         guard let none = RenderBridgeInput.imageFailureReport(["failed": 0, "deferred": 5]) else {
             #expect(Bool(false), "zero failures is a legitimate census, not a malformed one"); return
         }
@@ -548,9 +547,9 @@ struct RenderBridgeInputTests {
         // — that would pin the fix's mechanism and stay green if a later refactor
         // kept the call but changed what it gates.
 
-        // 1. The image census — the reported instance. Drives user-visible copy.
+        // 1. The image census — the reported instance. Diagnostic-only today.
         #expect(RenderBridgeInput.imageFailureReport(["failed": true, "deferred": true]) == nil,
-                "a boolean census must not raise the image-failure banner")
+                "a boolean census must not falsify the image-failure diagnostic")
 
         // 2. Heights — a bare boolean body, and a boolean under each numeric key.
         #expect(RenderBridgeInput.validatedHeightBody(true) == nil,
@@ -592,8 +591,7 @@ struct RenderBridgeInputTests {
         // increments it for an `img` carrying `data-tmsrc`/`data-tmsrcset`), so
         // failed > deferred cannot arise from the shipped script. Rejecting it
         // rather than clamping keeps the internal-consistency check meaningful:
-        // clamping would silently accept a nonsense payload as a real failure and
-        // raise the banner on it.
+        // clamping would silently accept a nonsense payload as a real diagnostic.
         #expect(RenderBridgeInput.imageFailureReport(["failed": 6, "deferred": 5]) == nil)
         #expect(RenderBridgeInput.imageFailureReport(["failed": 1, "deferred": 0]) == nil)
         // The adjacent legal case, so the check is not passing for the wrong reason.
@@ -907,7 +905,7 @@ struct CommittedDocumentGateTests {
         issueAndCommit(&gate, generation: 1)
         #expect(gate.evaluate(.fit) == .honour)
         // A second commit callback for the same navigation must not hand the document a
-        // fresh slot — that would be a second banner for one document.
+        // fresh slot — that would be a second one-shot publication for one document.
         gate.commit(isIssuedLoad: true)
         #expect(gate.evaluate(.fit) == .refuse(.duplicate))
 

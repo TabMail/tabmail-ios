@@ -52,18 +52,6 @@ struct AutoSizingHTMLView: View {
     /// email's own indent.
     @State private var leadingPad: CGFloat = 16
     @State private var trailingPad: CGFloat = 16
-    /// P4 — the image-failure banner's entire state: how many of the remote
-    /// images this document deferred ended in `error` (reported ONCE by
-    /// `postImageWidthRecheckJS` after the last armed image settled), and whether
-    /// the user has dismissed the notice for the current document.
-    ///
-    /// Deliberately seeded empty and NOT cached across view recreation (contrast
-    /// `HeightSeedCache`, which exists because a recycled row that forgets its
-    /// height moves visibly). Forgetting a failure costs a banner the user has
-    /// already seen; remembering one across a rebind would risk showing it for a
-    /// message that never failed, which is the direction that must not happen.
-    @State private var imageFailure = ImageFailureBannerState()
-
     init(
         html: String,
         previewFilename: String? = nil,
@@ -134,35 +122,8 @@ struct AutoSizingHTMLView: View {
     /// previews pass headerId == nil) and only until the first reveal.
     private var showsLoadingPlaceholder: Bool { headerId != nil && !hasRevealed }
 
-    /// Which document this view is currently showing, for the P4 banner's scope.
-    /// See `RenderedDocumentIdentity` for why membership is these three inputs
-    /// and not "whatever makes `updateUIView` reload".
-    private var documentIdentity: RenderedDocumentIdentity {
-        RenderedDocumentIdentity(html: html, reloadToken: reloadToken, bodyContentKey: bodyContentKey)
-    }
-
     var body: some View {
-        // P4 — the failure banner sits ABOVE the web view, in SwiftUI, outside the
-        // rendered document entirely. It therefore cannot perturb the measure →
-        // mutate → re-measure pipeline (ADR-IOS-039): no DOM node, no CSS, no
-        // change to the web view's own frame or to the gutter it measured. Same
-        // "all chrome lives in the SwiftUI container" discipline as the gutters.
-        //
-        // The banner takes the fixed 16pt inset rather than the dynamic gutter:
-        // `leadingPad`/`trailingPad` compensate for the EMAIL's own measured
-        // indent, and this is our chrome, not the email's.
-        VStack(spacing: 0) {
-            if imageFailure.isVisible {
-                ImageLoadFailureBanner { imageFailure.dismissed = true }
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 8)
-            }
-            webViewContent
-        }
-    }
-
-    private var webViewContent: some View {
-        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, bodyContentKey: bodyContentKey, reloadToken: reloadToken, height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad, failedImageCount: $imageFailure.failedCount)
+        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, bodyContentKey: bodyContentKey, reloadToken: reloadToken, height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad)
             // ── P1d (ADR-IOS-076 decision 5; plan §10.1 C4): the body ContentKey is
             // part of the representable's IDENTITY, so a change to it dismantles the
             // platform view and `makeUIView` runs again.
@@ -233,41 +194,6 @@ struct AutoSizingHTMLView: View {
             .onChange(of: html) { _, _ in
                 guard headerId != nil else { return }
                 if hasRevealed { hasRevealed = false }
-            }
-            // P4 — the banner is a statement about the document currently on
-            // screen, so it dies with that document.
-            //
-            // ⚠️ This used to hang off `.onChange(of: html)` with the comment
-            // "`html` is what `updateUIView` compares to decide a reload, so this
-            // fires exactly when a new document is about to be loaded". That was
-            // FALSE in both directions and the false half was the bug:
-            // `updateUIView` reloads on `html || reloadToken`, so a body refetch
-            // returning identical bytes loaded a new document without firing it;
-            // and it reloads again on a colour-scheme flip, which is a reload
-            // that must NOT clear a dismissal because the message has not
-            // changed. `RenderedDocumentIdentity` names the three inputs that
-            // select CONTENT, which is the banner's actual scope; see its doc
-            // comment for why the colour scheme is excluded.
-            //
-            // It is outside the `headerId != nil` guard above because the compose
-            // quote preview and the `.eml` sheet render documents too.
-            //
-            // This is the `HeightSeedCache` keying hazard applied to a different
-            // value: SwiftUI reuses this view across a rebind — the `.id(…)`
-            // above dismantles the WEB VIEW, not the `@State` on the enclosing
-            // `AutoSizingHTMLView` — so without an explicit clear the previous
-            // message's failure count would be inherited and a message that lost
-            // nothing would accuse the sender's server. The dismissal is cleared
-            // with it, because a fresh document has not been dismissed, which is
-            // why this is one named operation returning a whole value rather than
-            // two loose writes an edit can clear by halves.
-            //
-            // Guarded by an equality check because `@State` does not diff for
-            // you: an unconditional assignment would invalidate this view on
-            // every content change even when nothing about the banner moved.
-            .onChange(of: documentIdentity) { old, new in
-                let next = ImageFailureBannerState.carried(imageFailure, describing: old, into: new)
-                if imageFailure != next { imageFailure = next }
             }
             // P1d diagnostics: the ONE place a ContentKey-driven view recreate is
             // observable from Swift. `.id(…)` above dismantles and rebuilds the
@@ -417,9 +343,6 @@ private struct HTMLWebView: UIViewRepresentable {
     // value the email's own inset frees up; clamped so it can't harm other emails.
     @Binding var leadingPad: CGFloat
     @Binding var trailingPad: CGFloat
-    // P4 — remote images that ended in `error` for the CURRENT document, reported
-    // once by postImageWidthRecheckJS after the last armed image settled.
-    @Binding var failedImageCount: Int
     // Observed so SwiftUI re-invokes updateUIView on a light<->dark flip — see the
     // schemeChanged branch in updateUIView (reload so the dark-mode scripts re-run
     // for the new appearance).
@@ -433,9 +356,8 @@ private struct HTMLWebView: UIViewRepresentable {
     /// delivery by name. `heightChanged` is the only one whose loss would break the
     /// render — see the `consoleLog` gating note in the coordinator.
     ///
-    /// `imageLoadFailure` (P4) is the only channel added since P1c, and the only one
-    /// that drives user-visible UI rather than layout or diagnostics. It is validated
-    /// on the Swift side exactly like the other three — see
+    /// `imageLoadFailure` (P4) is the only channel added since P1c. It is now
+    /// diagnostic-only and is validated on the Swift side like the other three — see
     /// `RenderBridgeInput.imageFailureReport`.
     static let bridgeChannels = ["heightChanged", "consoleLog", "gutterAdjust", "imageLoadFailure"]
 
@@ -787,7 +709,7 @@ private struct HTMLWebView: UIViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad, failedImageCount: $failedImageCount)
+        Coordinator(height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad)
     }
 
     class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
@@ -800,13 +722,6 @@ private struct HTMLWebView: UIViewRepresentable {
         /// `eatGutterMarginsJS` (= 16 − the email's own measured inset, clamped).
         @Binding var leadingPad: CGFloat
         @Binding var trailingPad: CGFloat
-        /// P4 — how many of the remote images we deferred for this document ended
-        /// in `error`. Written once per load from the `imageLoadFailure` channel;
-        /// drives the dismiss-only banner in `AutoSizingHTMLView`. Zero means
-        /// either "everything loaded" or "the settle point was never reached"
-        /// (see `postImageWidthRecheckJS`'s withheld-image note) — both correctly
-        /// show no banner.
-        @Binding var failedImageCount: Int
         var loadedHTML: String?
         var loadedPreviewFilename: String?
         var loadedHeaderId: String?
@@ -917,12 +832,11 @@ private struct HTMLWebView: UIViewRepresentable {
         /// Released in deinit.
         private var zoomObservation: NSKeyValueObservation?
 
-        init(height: Binding<CGFloat>, hasRevealed: Binding<Bool>, leadingPad: Binding<CGFloat>, trailingPad: Binding<CGFloat>, failedImageCount: Binding<Int>) {
+        init(height: Binding<CGFloat>, hasRevealed: Binding<Bool>, leadingPad: Binding<CGFloat>, trailingPad: Binding<CGFloat>) {
             self._height = height
             self._hasRevealed = hasRevealed
             self._leadingPad = leadingPad
             self._trailingPad = trailingPad
-            self._failedImageCount = failedImageCount
             super.init()
             // Re-run fitViewport on foreground return — iOS resumes the WKWebView
             // content process which may have been suspended with incomplete
@@ -1570,54 +1484,22 @@ private struct HTMLWebView: UIViewRepresentable {
             } else if message.name == "imageLoadFailure" {
                 // P4 — `postImageWidthRecheckJS` counted the remote images that
                 // ended in `error` and posted the census once, after the last
-                // armed image settled. Purely observational: receiving it changes
-                // nothing about what loaded, and nothing here re-requests anything.
-                guard let report = RenderBridgeInput.imageFailureReport(message.body) else {
+                // armed image settled. This is DIAGNOSTIC ONLY: JavaScript's bare
+                // `error` cannot distinguish a routine 404/expired URL from TLS,
+                // so this channel has no path to user-visible notice state.
+                let disposition = ImageLoadFailureReportDisposition.classify(message.body)
+                guard case .diagnosticOnly(let failed, let deferred) = disposition else {
                     bridgeLog("rejected channel=imageLoadFailure reason=malformed-payload")
                     return
                 }
-                // A device with no network fails EVERY remote image, so an
-                // unfiltered census there accuses the sender's server of something
-                // the user's own connectivity did. The page cannot tell the two
-                // apart — WebKit gives it no reason code — but the app can. See
-                // `ImageFailureBannerState.census` for why the check lives here and
-                // not in JS as `navigator.onLine`.
-                //
-                // ⚠️ Connectivity is read BEFORE the one-shot is consulted, and the
-                // suppressed-offline arm leaves the one-shot UNSPENT — that ORDER is
-                // the invariant, and it is expressed inside `census` rather than as a
-                // statement sequence here because `Coordinator` is unreachable from a
-                // test. Spending it first burned the document's only census slot on a
-                // report that published nothing.
-                //
                 // One-shot PER COMMITTED DOCUMENT, enforced in Swift for the same
                 // reason `requestFit` and `requestWidthRefit` are:
                 // `__tmImageFailureReported` lives in the isolated world and is only
-                // advisory, so the authoritative guard is here. A second report for
-                // the same document cannot re-raise a banner the user dismissed.
-                // The committed-generation gate attributes an outgoing document's
-                // late report to that document, but the SwiftUI binding has no identity
-                // token of its own; the unverified remount/rebound timing residual is
-                // registered as IOS-UI-006 rather than denied here.
-                let connected = NetworkMonitor.checkConnected()
-                let census = ImageFailureBannerState.census(reported: report.failed,
-                                                            isConnected: connected,
-                                                            in: &documentGate)
-                switch census {
-                case .suppressedOffline:
-                    bridgeLog("imageLoadFailure failed=\(report.failed) deferred=\(report.deferred) "
-                              + "connected=false suppressed=offline one-shot=unspent")
-                case .refused(let refusal):
-                    logOneShotRefusal(refusal, oneShot: .imageFailureReport,
-                                      channel: "imageLoadFailure")
-                case .publish(let published):
-                    bridgeLog("imageLoadFailure failed=\(report.failed) deferred=\(report.deferred) "
-                              + "connected=true published=\(published)")
-                }
-                if let replacement = ImageFailureBannerState.replacementFailedCount(after: census),
-                   failedImageCount != replacement {
-                    failedImageCount = replacement
-                }
+                // advisory, so the authoritative duplicate guard remains here even
+                // though this report no longer changes UI.
+                guard honourOneShot(.imageFailureReport, channel: "imageLoadFailure") else { return }
+                bridgeLog("imageLoadFailure failed=\(failed) deferred=\(deferred) "
+                          + "notice=none diagnostic-only=true")
             }
         }
 
@@ -1640,10 +1522,7 @@ private struct HTMLWebView: UIViewRepresentable {
 
         /// The refusal log line, in ONE place.
         ///
-        /// P4's census resolves its own gate call through
-        /// `ImageFailureBannerState.census` — connectivity has to be read first, which
-        /// `honourOneShot`'s Bool cannot express — so without this the token format
-        /// would be spelled twice and the two spellings would drift.
+        /// Kept in one place so every one-shot channel uses the same refusal token.
         private func logOneShotRefusal(_ refusal: OneShotRefusal,
                                        oneShot: RenderOneShot,
                                        channel: String) {
@@ -3179,7 +3058,7 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
         //
         // ⚠️ SCOPE OF THAT CHANGE, stated because it was described only as WHAT
         // is withheld: it also moves WHEN the P4 failure census is SUPPRESSED. A
-        // A withheld image whose live candidates cannot settle keeps its deferral
+        // withheld image whose live candidates cannot settle keeps its deferral
         // attribute, is armed, and reaches no terminal state, so `armedPending()`
         // never falls to 0 — that is the `IOS-UI-004` dead zone. A mixed live
         // `cid:` src plus deferred remote `srcset` can settle from the live src;
@@ -3187,9 +3066,9 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
         // Narrowing this arm narrows the
         // dead zone in MAIN VIEW: a sender-authored `.tm-eml-headers` image used
         // to suppress the census for the whole message and now settles like any
-        // other. Toward the honest census, and no image's outcome is invented —
-        // but it is still a change in when the banner appears, which the note at
-        // `pendingImgs()` treats as a decision separate from the width re-fit.
+        // other. Toward the honest diagnostic census, and no image's outcome is
+        // invented. The note at `pendingImgs()` keeps that diagnostic decision
+        // separate from the load-bearing width re-fit.
         //
         // Because the answer cannot change while the document is loaded, NO
         // re-run hook, MutationObserver or IntersectionObserver is needed:
@@ -4259,14 +4138,14 @@ private var fixImageAspectRatioJS: String {
 /// nothing — fit measured them un-hidden already. Images that never fire
 /// load/error keep today's behavior (no refit).
 ///
-/// ── P4: the image-failure banner rides on the SAME arming loop ──
+/// ── P4: the generic image-failure DIAGNOSTIC rides on the SAME arming loop ──
 ///
-/// The owner asked for "a banner, only if some content loading fails". That needs
-/// two facts this script already produces and nothing else in the pipeline does:
-/// *which* images ended in `error` rather than `load`, and *when* the last one
-/// settled. `reportImageFailures()` below is the whole feature — it counts the
-/// `error` fires among images WE deferred and posts the count ONCE on the
-/// dedicated `imageLoadFailure` channel.
+/// `reportImageFailures()` records which images ended in `error` rather than
+/// `load`, waits until the armed set settles, and posts one bounded census on the
+/// dedicated `imageLoadFailure` channel. As of the 2026-08-13 owner decision,
+/// this census is diagnostic-only and cannot raise user-visible UI: a bare JS
+/// image `error` does not distinguish a 404/expired URL from a TLS failure. The
+/// app therefore shows no image-failure notice.
 ///
 /// ⚠️ **This is OBSERVATIONAL and must stay so.** Nothing here retries, probes,
 /// re-requests or HEAD-checks a failed URL, and nothing changes which images load
@@ -4275,8 +4154,7 @@ private var fixImageAspectRatioJS: String {
 /// design that was implemented, smoke-tested and REVERTED on 2026-06-17
 /// (Memory/037 bullet 30): that one BLOCKED remote images and then explained
 /// itself, and broke every message whose layout depends on images loading. This
-/// one runs strictly AFTER the fact and changes no load behaviour at all, so the
-/// revert is not precedent against it.
+/// census runs strictly AFTER the fact and changes no load behaviour at all.
 ///
 /// **Why it is a second reader inside this function rather than a new script.**
 /// `check()` is UNCHANGED and the failure report is scheduled AFTER it in both
@@ -4299,10 +4177,11 @@ private var fixImageAspectRatioJS: String {
 /// can count. IOS-UI-004 records the trade-off; do not restate the pure-local claim
 /// as applying to that mixed shape.
 ///
-/// **Accepted imprecision, stated so nobody strengthens the copy.** `onerror`
-/// fires for far more than an ATS/TLS refusal: 404s, DNS failures, malformed image
-/// bytes, and a plain offline device all land here identically, and WebKit hands
-/// the page no distinguishing reason. The banner text is hedged accordingly.
+/// **No cause diagnosis, stated so nobody reconnects this to UI.** `onerror` fires for
+/// far more than an ATS/TLS refusal: 404s, DNS failures, malformed image bytes,
+/// authenticated or expired URLs, and a plain offline device all land here
+/// identically, and WebKit hands the page no distinguishing reason. This census
+/// may describe only observed errors in diagnostics; it must not make a product claim.
 ///
 /// **Accepted gap: the CENSUS settle point is unreachable for a withheld armed
 /// image that receives no other terminal event.**
@@ -4326,11 +4205,9 @@ private var fixImageAspectRatioJS: String {
 /// `v1.7.8`, where `swap()` had no visibility predicate and the count always
 /// reached 0. Restoring the re-fit is what the `ignoreWithheld` split does.
 ///
-/// So the width half is FIXED, and only the census half remains an accepted gap.
-/// Closing that half is a decision about when a banner P4 introduced should
-/// appear — a change to new behaviour, not a restoration of shipped behaviour —
-/// and it is deliberately left to the owner rather than folded into a security
-/// pass. Found by two independent audit legs, 2026-08-13.
+/// So the width half is FIXED, and only the diagnostic census half remains an
+/// accepted observability gap. It has no user-visible consequence. Found by two
+/// independent audit legs, 2026-08-13.
 ///
 /// Exposed for unit tests via `_postImageWidthRecheckJS`.
 internal var _postImageWidthRecheckJS: String { postImageWidthRecheckJS }
@@ -4351,7 +4228,7 @@ private var postImageWidthRecheckJS: String {
         //     waiting forever, which is precisely what shipped `v1.7.8` did NOT
         //     do: there `swap()` had no visibility predicate, every deferred
         //     image lost `data-tmsrc`, and the count always reached 0.
-        //   • FAILURE CENSUS asks "has every armed image reached a terminal
+        //   • DIAGNOSTIC CENSUS asks "has every armed image reached a terminal
         //     state?" A withheld image answers NO, honestly — it never loaded
         //     and never errored, so a census taken now would be incomplete.
         //     That arm keeps IOS-UI-004.
@@ -4367,10 +4244,8 @@ private var postImageWidthRecheckJS: String {
         // exists to name, which is the exact conflation that disarmed the re-fit.
         //
         // Restoring the width re-fit is deliberately NOT the same edit as
-        // closing IOS-UI-004: the first undoes a regression against shipped
-        // behaviour, the second would change when a banner P4 introduced
-        // appears. Only the first is in scope under the standing "no behaviour
-        // changes, just security" directive.
+        // closing IOS-UI-004: the first restores shipped width behaviour; the
+        // second changes only the completeness timing of a diagnostic census.
         //
         // NOTE the one honest difference from `v1.7.8`: there, `check()` waited
         // for the hidden section's images to finish loading; here it does not
@@ -4439,7 +4314,7 @@ private var postImageWidthRecheckJS: String {
             log('images settled, overflow: maxRight=' + Math.round(mr) + ' > vp=' + vp + ' — requesting re-fit');
             try { window.webkit.messageHandlers.heightChanged.postMessage({ requestWidthRefit: true }); } catch(_) {}
         }
-        // ── P4 image-failure banner (see the doc comment above) ──
+        // ── P4 image-failure diagnostic (see the doc comment above) ──
         // Purely observational: records which of the images WE deferred ended in
         // `error` and reports the total ONCE, after the LAST armed image settles.
         // Never retries, probes or re-requests anything, and never touches which
@@ -4455,8 +4330,8 @@ private var postImageWidthRecheckJS: String {
         //   • OVERCOUNT. The listeners are deliberately not {once} (see below),
         //     so re-assigning `src` on one broken <img> re-fires `error` as often
         //     as the sender likes. Each fire incremented the counter, so `failed`
-        //     could exceed `deferred` outright — a banner accusing the sender's
-        //     server of more failures than there were images to fail.
+        //     could exceed `deferred` outright — an impossible diagnostic claiming
+        //     more failures than there were images to fail.
         //   • UNDERCOUNT. The settle question was asked of the LIVE DOM
         //     (`pendingImgs(false)` walks `getElementsByTagName('img')`) while the
         //     armed population was a snapshot taken once. Detaching a still-loading
@@ -4518,7 +4393,7 @@ private var postImageWidthRecheckJS: String {
             // spite of it: a withheld armed image with no terminal event keeps
             // `armedPending()` above zero. The condition is the non-settling image,
             // not the mere presence of an attached `.eml`. Closing that gap remains
-            // a separate decision about P4's behaviour.
+            // a separate decision about P4's diagnostic completeness.
             //
             // ⚠️ This arm asked `pendingImgs(false)` until 2026-08-13. The
             // replacement is strictly MORE conservative about the population it
@@ -4541,7 +4416,7 @@ private var postImageWidthRecheckJS: String {
             // regardless of a prior load; and because the record is now settled
             // while `data-tmsrcset` may still be present, the census can also
             // publish EARLIER for this shape than `pendingImgs(false)` allowed.
-            // FAIL-CLOSED both ways (a banner that used to appear may not) and
+            // Conservative both ways (a diagnostic count may be lower) and
             // deliberately LEFT ALONE: letting one image be both loaded and
             // failed reopens the two-facts-that-disagree problem this change
             // existed to close.
@@ -4549,8 +4424,8 @@ private var postImageWidthRecheckJS: String {
             window.__tmImageFailureReported = true;
             var failed = remoteFailureCount(), deferred = armedRemoteCount();
             log('images settled, remote failures=' + failed + ' of ' + deferred + ' deferred');
-            // NOT debug-gated — this one drives user-visible UI. It is the sole
-            // exception in this pipeline; every other emission here stays gated.
+            // The post itself remains available in every build, but Swift treats
+            // it as diagnostic-only and emits its line only under the debug gate.
             try {
                 window.webkit.messageHandlers.imageLoadFailure.postMessage({
                     failed: failed,

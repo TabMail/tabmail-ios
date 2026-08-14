@@ -452,8 +452,8 @@ internal enum OneShotDecision: Equatable {
 ///     restore, recoverable only by rotating the device.
 ///   * `fit` is genuinely self-healing: `didFinish` calls `fit()` directly, so losing the
 ///     early request costs timing, not correctness.
-///   * `imageFailureReport` shows document A's accusation over document B — a claim about a
-///     stranger's mail server, on a message that may have lost nothing.
+///   * `imageFailureReport` misattributes document A's diagnostic census to document B.
+///     It no longer drives UI, but honest document attribution still matters in logs.
 ///
 /// **The fix is to key on a COMMITTED generation.** `loadGeneration` keeps its meaning
 /// unchanged — `wrapAndLoad`'s own supersession check `guard self.loadGeneration == gen`
@@ -755,11 +755,11 @@ internal enum RenderBridgeInput {
     /// census `postImageWidthRecheckJS` posts once, after the last armed image
     /// settles. Returns the validated pair, or `nil` to drop the message whole.
     ///
-    /// **This channel drives user-visible UI**, which is what makes the Swift-side
-    /// check load-bearing rather than belt-and-braces: a `NaN` or negative
-    /// `failed` reaching the view decides whether a message accuses the sender's
-    /// server of a failure that did not happen. Same P1c discipline as the other
-    /// three channels — both keys must be present, finite, non-negative and
+    /// This channel is diagnostic-only as of 2026-08-13; it has no user-visible
+    /// notice sink. The Swift-side contract remains authoritative for honest,
+    /// bounded logs. Same
+    /// P1c discipline as the other three channels — both keys must be present,
+    /// finite, non-negative and
     /// integral; anything else is malformed and the whole message is dropped
     /// rather than half-applied.
     ///
@@ -800,7 +800,7 @@ internal enum RenderBridgeInput {
     /// `Bool` bridges the same way. So `as? NSNumber` succeeds and `doubleValue`
     /// reports `1` / `0` — finite, non-negative, integral, and inside every bound
     /// the callers check. `{"failed": true, "deferred": true}` was therefore
-    /// accepted as the census `(1, 1)` and could raise the banner, and
+    /// accepted as the census `(1, 1)` and could falsify the diagnostic, and
     /// `{"h": true}` as a height of `1`.
     ///
     /// That contradicted this file's own stated contract — malformed payloads are

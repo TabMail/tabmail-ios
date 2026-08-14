@@ -610,9 +610,8 @@ struct EmailRenderPipelineTests {
     //     `data-tmsrcset`) that ended in `error` — not the number that ended in
     //     `load`, and not local/`cid:` images that failed.
     //
-    // The banner is a claim about the SENDER'S server shown to the user, so both
-    // directions matter and both are asserted: a false banner on an image-heavy
-    // newsletter that loaded fine is worse than no banner at all.
+    // This census is diagnostic-only as of 2026-08-13. Both directions still
+    // matter because a false or incomplete count makes the device log misleading.
     //
     // The harness models the state machine the real pipeline produces: an image
     // we deferred carries `data-tmsrc` and reports `complete === true` (no src
@@ -811,23 +810,22 @@ struct EmailRenderPipelineTests {
         #expect(ctx.evaluateScript("reportedDeferred()")?.toInt32() == 2)
 
         // A re-fire (WebKit can re-deliver, and the listeners are deliberately
-        // not {once}) must not produce a second report — the banner cannot be
-        // re-raised after the user dismissed it.
+        // not {once}) must not produce a second report for one document.
         ctx.evaluateScript("fireImgEvent(1, 'load'); fireImgEvent(0, 'error')")
         #expect(failureReports(ctx) == 1, "the census is one-shot per document")
     }
 
-    @Test("image-failure census: every remote image loading reports zero failures — no banner")
+    @Test("image-failure census: every remote image loading reports zero failures")
     func imageFailureCensusReportsZeroWhenEverythingLoads() {
-        // The required negative control. This is the case a spurious banner would
-        // hit hardest: an image-heavy newsletter where nothing went wrong.
+        // The required negative control: an image-heavy newsletter where nothing
+        // went wrong must report a true zero.
         let ctx = makeImageFailureContext(remoteCount: 3)
         ctx.evaluateScript("fireImgEvent(0, 'load'); fireImgEvent(1, 'load')")
         #expect(failureReports(ctx) == 0, "still one image pending")
         ctx.evaluateScript("fireImgEvent(2, 'load')")
         #expect(ctx.exception == nil, "load fires threw: \(ctx.exception?.toString() ?? "")")
-        #expect(failureReports(ctx) == 1, "the census still reports — it is the COUNT that decides the banner")
-        #expect(reportedFailed(ctx) == 0, "zero failures ⇒ no banner")
+        #expect(failureReports(ctx) == 1, "the diagnostic still reports its true zero")
+        #expect(reportedFailed(ctx) == 0)
     }
 
     @Test("image-failure census: a message with no images arms nothing and never reports")
@@ -839,12 +837,12 @@ struct EmailRenderPipelineTests {
         #expect(failureReports(ctx) == 0)
     }
 
-    @Test("image-failure census counts only the images WE deferred — a failing cid: image is not the sender's server")
+    @Test("image-failure census counts only the images WE deferred — a failing cid: image is not a remote failure")
     func imageFailureCensusExcludesLocalImages() {
-        // The banner's copy blames a remote image server. A `cid:` inline
-        // attachment that fails to decode is OUR problem, not that server's, so
-        // it must drive the settle (it is armed on !complete) without inflating
-        // the count. Without the arm-time capture this test cannot pass: by the
+        // The census reports deferred remote-image failures. A `cid:` inline
+        // attachment that fails to decode is a different class, so it drives settle
+        // (it is armed on !complete) without inflating the count. Without the
+        // arm-time capture this test cannot pass: by the
         // time the error fires, `simulateSwap()` has removed `data-tmsrc` from the
         // remote images, so a fire-time read would classify everything as local.
         let ctx = makeImageFailureContext(remoteCount: 1, localCount: 1)
@@ -853,7 +851,7 @@ struct EmailRenderPipelineTests {
         ctx.evaluateScript("fireImgEvent(0, 'load')")    // the remote one loads
         #expect(ctx.exception == nil, "fires threw: \(ctx.exception?.toString() ?? "")")
         #expect(failureReports(ctx) == 1)
-        #expect(reportedFailed(ctx) == 0, "a cid: failure must NOT accuse the sender's image server")
+        #expect(reportedFailed(ctx) == 0, "a cid: failure is not a deferred-remote failure")
         #expect(ctx.evaluateScript("reportedDeferred()")?.toInt32() == 1,
                 "only the deferred remote image counts toward the deferred total")
     }
@@ -867,7 +865,7 @@ struct EmailRenderPipelineTests {
         #expect(reportedFailed(ctx) == 3)
     }
 
-    @Test("image-failure census counts IMAGES, not error EVENTS — a re-fired error cannot inflate the banner")
+    @Test("image-failure census counts IMAGES, not error EVENTS")
     func imageFailureCensusCountsImagesNotErrorEvents() {
         // THE INVARIANT: `failed` is the number of deferred images that ENDED in
         // `error`, so it can never exceed `deferred`. The listeners are
@@ -875,8 +873,7 @@ struct EmailRenderPipelineTests {
         // swap() assigns its real src — which means one broken image can deliver
         // `error` as many times as author script re-assigns its `src`. Counting
         // fires rather than images let a sender drive the count past the number
-        // of images that existed, on a channel whose copy accuses that sender's
-        // own image server.
+        // of images that existed, making the diagnostic census false.
         let ctx = makeImageFailureContext(remoteCount: 2)
 
         // MIS-IOS-016 — assert the setup's effect actually happened. An unarmed
@@ -908,8 +905,8 @@ struct EmailRenderPipelineTests {
         // reached a terminal state. Asking that question of the live DOM instead
         // made it answerable by author script: detach a still-loading <img> and
         // the walk stops counting it, the one-shot report publishes early, and
-        // the image's later `error` has nowhere to go. The banner then
-        // under-reports — and because the report is one-shot, permanently.
+        // the image's later `error` has nowhere to go. The one-shot diagnostic
+        // then under-reports permanently for that document.
         //
         // A detached image is NOT a hypothetical: the browser keeps servicing an
         // in-flight request for a removed element and still fires its events.
@@ -1010,10 +1007,11 @@ struct EmailRenderPipelineTests {
         //     uncorrected horizontal overflow, recoverable only by rotating the
         //     device. That regression shipped inside a "security only" commit
         //     and survived because the two arms shared one predicate.
-        //   • Drop the second and the banner publishes a census taken while an
+        //   • Drop the second and the diagnostic publishes a census while an
         //     armed image has reached no terminal state — a count that is not
-        //     merely early but wrong, on a channel that accuses a sender's
-        //     server. IOS-UI-004 is preserved deliberately, not incidentally.
+        //     merely early but wrong, on a channel that describes this message
+        //     as having lost content. IOS-UI-004 is preserved deliberately, not
+        //     incidentally.
         //
         // ⚠️ Both halves were asserted as LITERAL SOURCE STRINGS
         // (`"if (pendingImgs(true) > 0) return;"` and its `false` twin) until
