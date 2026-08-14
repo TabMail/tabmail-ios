@@ -209,13 +209,35 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
 
     /// Save attachments from a DraftMessage to disk.
     /// Returns the directory name (same as message id) or nil if no attachments.
+    ///
+    /// Throws `AttachmentFilenameError.unsupported` when any attachment's name is
+    /// one the app refuses to use as a path component — checked BEFORE the
+    /// directory is created, so a refused set writes nothing at all. Outbox
+    /// Reliability Rule 5 is satisfied by throwing: `persistQueuedSend` never
+    /// inserts the row, so nothing is ever sent with a wrong or missing
+    /// attachment, and the compose view keeps the user's message on screen.
     static func saveAttachments(_ attachments: [DraftAttachment], dirName: String) throws {
         guard !attachments.isEmpty else { return }
+        if let refused = attachments.first(where: { !AttachmentFilename.isSafeFileComponent($0.filename) }) {
+            throw AttachmentFilenameError.unsupported(name: refused.filename)
+        }
         let dir = attachmentsBaseDir.appendingPathComponent(dirName, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
         for (index, attachment) in attachments.enumerated() {
-            // Use index prefix to preserve ordering and avoid filename collisions
+            // Use index prefix to preserve ordering and avoid filename collisions.
+            // The attachment's own name is used VERBATIM, and the guard above is
+            // what makes that safe: it arrives unchecked from the sender-authored
+            // MIME `filename` parameter, and joining it unchecked made containment
+            // an accident of the index prefix while making a name with a LEADING
+            // or INTERIOR slash (`photos/img.png`) throw a filesystem error —
+            // which fails `queueSend` and leaves the message unsendable with no
+            // usable explanation. NOT any slash-bearing name, which is what this
+            // comment said until 2026-08-12: a trailing slash is dropped by
+            // `appendingPathComponent`, so `report/` stored as `0_report`. Same
+            // predicate, same reason, as the draft store; see
+            // `AttachmentFilename.isSafeFileComponent`, whose doc carries the
+            // measured breakdown.
             let filename = "\(index)_\(attachment.filename)"
             let fileURL = dir.appendingPathComponent(filename)
             try attachment.data.write(to: fileURL)
@@ -241,15 +263,22 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
         // attachment literally named `*.meta` (stored `<idx>_x.meta`, sidecar
         // `<idx>_x.meta.meta`) as a sidecar and SILENTLY DROPPED it, sending the email
         // WITHOUT that attachment (silent data corruption — Outbox Rule 5).
+        // The `.meta` test is SCALAR-WISE, via the one shared decision both stores
+        // use: `hasSuffix`/`dropLast` compare `Character`s, and a trailing
+        // `Prepend` scalar grapheme-merges with the following "." so the suffix
+        // test silently answered false — the sidecar was then loaded as a DATA
+        // file and its metadata bytes were SENT as an extra attachment, while the
+        // fail-closed guard below (which asked the same question) never fired.
+        // See `DraftAttachmentStorage.metaBase`.
         let allNames = Set(files.map { $0.lastPathComponent })
         func isSidecar(_ name: String) -> Bool {
-            name.hasSuffix(".meta") && allNames.contains(String(name.dropLast(".meta".count)))
+            DraftAttachmentStorage.metaBase(name).map(allNames.contains) ?? false
         }
         let dataFiles = files.filter { !isSidecar($0.lastPathComponent) }
         // Fail closed on a DATA file whose name ends in ".meta" but whose OWN sidecar
         // ("<name>.meta") is absent: indistinguishable from a lost-data orphan, so
         // THROW rather than send an email with a missing/wrong attachment.
-        for url in dataFiles where url.lastPathComponent.hasSuffix(".meta") {
+        for url in dataFiles where DraftAttachmentStorage.metaBase(url.lastPathComponent) != nil {
             guard allNames.contains(url.lastPathComponent + ".meta") else {
                 throw DraftAttachmentLoadError.ambiguousMetaFilename(name: url.lastPathComponent)
             }
@@ -264,9 +293,13 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
             let metaLines = metaContent.components(separatedBy: "\n")
             let mimeType = metaLines[0]
             let isAlternative = metaLines.contains("isAlternative")
-            // Strip the index prefix to recover original filename
+            // Strip the index prefix to recover original filename. Scalar-wise —
+            // a `Character`-wise strip handed the store's own `0_` prefix back as
+            // the sender's name, or cut the front off it, for any filename
+            // beginning with a combining mark. This name goes on the wire.
+            // See `DraftAttachmentStorage.afterIndexPrefix`.
             let filename = fileURL.lastPathComponent
-            let originalName = filename.contains("_") ? String(filename.drop(while: { $0 != "_" }).dropFirst()) : filename
+            let originalName = DraftAttachmentStorage.afterIndexPrefix(filename)
             return DraftAttachment(filename: originalName, mimeType: mimeType, data: data, isAlternative: isAlternative)
         }
     }

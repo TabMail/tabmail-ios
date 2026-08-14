@@ -1246,7 +1246,17 @@ struct ComposeView: View {
                                     .buttonStyle(.plain)
                                     Image(systemName: "doc")
                                         .font(.caption2)
-                                    Text(attachment.filename)
+                                    // The LABEL. A forwarded attachment carries
+                                    // the SENDER's raw MIME filename
+                                    // (`carryForwardAttachments` copies it
+                                    // unchecked), so a bidi override in it would
+                                    // make this chip claim a type the bytes do not
+                                    // have — and this chip is what the user checks
+                                    // before sending it on. A chip reading
+                                    // `AttachmentFilename.unsupportedLabel` is also
+                                    // the one that will make the save and the send
+                                    // throw, so the chip is the warning.
+                                    Text(AttachmentFilename.displayLabel(attachment.filename))
                                         .font(.caption)
                                         .lineLimit(1)
                                         .truncationMode(.middle)

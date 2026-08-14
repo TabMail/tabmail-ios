@@ -68,7 +68,13 @@ struct EmlAttachmentPreview: View {
                 .padding(.top, 12)
             }
             .background(Theme.cardBackground)
-            .navigationTitle(filename)
+            // The LABEL. `filename` itself must stay RAW everywhere else on
+            // this view — `AutoSizingHTMLView(previewFilename:)` and
+            // `parseEmlSectionMetadata` MATCH it against the `data-filename`
+            // attribute the renderer wrote from the same MIME parameter, so
+            // labelling it there would stop the section from being found. Only
+            // the human-readable title is checked.
+            .navigationTitle(AttachmentFilename.displayLabel(filename))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -137,7 +143,12 @@ struct EmlAttachmentPreview: View {
                         .foregroundStyle(Theme.accent)
                         .frame(width: 28)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(attachment.filename)
+                        // The LABEL — same reason as the top-level attachment
+                        // row in `AttachmentListView`: the raw value is a
+                        // sender-authored MIME parameter, and a bidi override or
+                        // mark in it makes this label claim a type the bytes do
+                        // not have. See `AttachmentFilename.displayLabel`.
+                        Text(AttachmentFilename.displayLabel(attachment.filename))
                             .font(.subheadline)
                             .foregroundStyle(Theme.textPrimary)
                             .lineLimit(1)
@@ -205,6 +216,16 @@ struct EmlAttachmentPreview: View {
         _ attachment: AttachmentInfo,
         fetch: (AttachmentInfo) async throws -> Data
     ) async {
+        // Refused BEFORE the fetch, for the same reason as the top-level row in
+        // `AttachmentListView.downloadAndPreview`: the staged file's last path
+        // component is this name, the stager will not create an attempt for a name
+        // `AttachmentFilename` refuses, and fetching bytes nothing can open costs
+        // the user data for nothing. The strip already reads
+        // `AttachmentFilename.unsupportedLabel` for this attachment.
+        guard AttachmentFilename.isSafeFileComponent(attachment.filename) else {
+            error = AttachmentFilename.unsupportedMessage
+            return
+        }
         do {
             let data = try await fetch(attachment)
             // `attachment.filename` is a raw MIME parameter authored by whoever

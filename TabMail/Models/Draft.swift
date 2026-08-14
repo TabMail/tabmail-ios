@@ -665,6 +665,500 @@ enum DraftAttachmentStorageError: Error {
     case escapesStorageRoot(dirName: String)
 }
 
+/// A sender-authored attachment filename this app REFUSES to use.
+///
+/// Thrown by both attachment stores (`DraftAttachmentStorage.saveAttachments`,
+/// `OutboxMessage.saveAttachments`) and by `AttachmentPreviewStager`, because all
+/// three ask `AttachmentFilename` the same question and one condition must not
+/// have three spellings. It is a peer of `DraftAttachmentStorageError` rather than
+/// a case on it because the preview stager is not a draft store.
+enum AttachmentFilenameError: LocalizedError {
+    /// `name` failed `AttachmentFilename.isSafeFileComponent`. The raw name is
+    /// carried for LOGGING (escaped at the sink) and never for display — see
+    /// `errorDescription`.
+    case unsupported(name: String)
+
+    /// Deliberately REASON-AGNOSTIC, and deliberately not the sender's name.
+    ///
+    /// - Reason-agnostic because six independent rules can refuse a name and only
+    ///   one of them is length: a 48-unit name with a 32-mark combining run is
+    ///   refused nowhere near the length budget, so "the file name is too long"
+    ///   would be simply false for five of the six (owner decision, 2026-08-12:
+    ///   one message for all six rules, no per-rule table, no diagnostic
+    ///   breadcrumb).
+    /// - Not the sender's name, because the name is exactly the string that was
+    ///   refused for being able to misrepresent itself — `"report\u{202E}fdp.exe"`
+    ///   renders to a human as `reportexe.pdf`. Quoting it into an error banner
+    ///   would put the spoof back on screen at the moment the user is deciding
+    ///   what went wrong.
+    var errorDescription: String? { AttachmentFilename.unsupportedMessage }
+}
+
+/// THE one decision about a sender-authored attachment filename: may it be used
+/// VERBATIM as a single path component, and what does the user read when it may
+/// not.
+///
+/// **This replaced a REDUCER on 2026-08-12 (owner decision).** The previous
+/// design transformed a hostile name into a safe one — a strip filter, an
+/// unassigned-scalar filter, a combining-run cap, a length truncation with
+/// extension preservation, and an emptied-stem refill. Five confirmed defects
+/// across three audit rounds all lived in that machinery: a name that must be
+/// TRANSFORMED to be safe has a large and delicate correctness surface, while a
+/// name that is merely TESTED has almost none. This is `CLAUDE.md`'s THE MANTRA
+/// applied — *"Simplicity and robustness trumps complications for minor rare edge
+/// cases. Edge cases still must be recoverable … if so, fail closed and let it
+/// be."* A refused attachment is recoverable: the message is still on the server
+/// and the user can reach the file another way, so refusing is a fail-closed edge
+/// and not a dropped intention.
+///
+/// **Accepted cost, stated rather than hidden (owner, 2026-08-12): a LEGITIMATE
+/// name can be refused.** A long Hangul or Devanagari name is the realistic case —
+/// NFD decomposes each syllable into two or three units, so such a name reaches
+/// the 230-unit budget at well under 230 characters. It is refused with the same
+/// generic message as a crafted one and with no breadcrumb, and that is
+/// deliberate: no debug affordance, no "show original name" escape hatch, no
+/// telemetry hook, no per-rule diagnostic.
+enum AttachmentFilename {
+
+    /// What a display site renders IN PLACE OF a refused name. A bare literal,
+    /// matching the surrounding views (this app has no `String(localized:)`
+    /// convention in them).
+    static let unsupportedLabel = "Unsupported file name"
+
+    /// What a refused ACTION says. See `AttachmentFilenameError.errorDescription`
+    /// for why it names no reason and quotes no name.
+    static let unsupportedMessage = "This attachment's file name isn't supported."
+
+    /// The MEASURED upper bound on one path component, in the unit the
+    /// filesystem actually counts in: NFD-normalised UTF-16 code units. Bisected
+    /// against a real filesystem rather than read off a document — see
+    /// `isSafeFileComponent`'s doc for the two guesses this refutes, and
+    /// `AttachmentFilenameContainmentTests`' measured-cap test, which re-derives
+    /// it wherever the suite runs instead of trusting this constant.
+    private static let maxPathComponentUnits = 255
+
+    /// What a filename may spend, i.e. the component limit minus the widest
+    /// wrapper any caller adds to it. `saveAttachments`' sidecar is that widest
+    /// name: `"\(index)_" + component + ".meta"`. The index comes from
+    /// `enumerated()`, so `String(Int.max).count` is the only bound that cannot be
+    /// wrong; the `1` is the `"_"`.
+    ///
+    /// `AttachmentPreviewStager` adds no wrapper at all, so the same budget is
+    /// merely conservative there — one shared budget is what keeps every caller
+    /// asking one question.
+    private static let attachmentComponentBudgetUnits =
+        maxPathComponentUnits - String(Int.max).count - 1 - ".meta".count
+
+    /// The MEASURED upper bound on one CANONICAL COMBINING SEQUENCE inside a path
+    /// component — a starter plus the non-starters that follow it — counted on the
+    /// NFD form. INDEPENDENT of `maxPathComponentUnits`, which is why it needs its
+    /// own budget: see `isSafeFileComponent`'s doc for the sweep behind both the
+    /// value and the unit.
+    private static let maxCombiningSequenceScalars = 32
+
+    /// What a filename may spend on CONSECUTIVE NON-STARTERS. The sequence limit
+    /// above is spent by the starter too, and a caller's wrapper can supply that
+    /// starter — `saveAttachments`' `"\(index)_"` puts a `_` immediately in front
+    /// of a LEADING run — so one scalar is reserved for it and one more is left as
+    /// margin. Ten times the widest run measured in any real orthography (3).
+    private static let combiningRunBudgetScalars = maxCombiningSequenceScalars - 2
+
+    /// The scalars a filename may not CONTAIN. Enumerated deliberately, because
+    /// the two halves are here for two DIFFERENT reasons and a future reader has
+    /// to be able to tell which is which before touching either.
+    ///
+    /// ⚠️ These 79 scalars were STRIPPED from a name until 2026-08-12; a name
+    /// carrying one is now refused whole. The measurements below are why each
+    /// range is in the set, and they are unchanged by that — a scalar that could
+    /// make a name misrepresent itself is exactly as unacceptable in a name that
+    /// is kept verbatim.
+    ///
+    /// **Cc — `U+0000...U+001F` and `U+007F...U+009F`.** `U+0000` truncates any C
+    /// string the name is handed to, and none of the rest render, so a name
+    /// carrying them displays as something other than what it is. Measured on
+    /// this toolchain (Apple Swift 6.3.3) by sweeping `U+0000...U+10FFFF`: these
+    /// two ranges are EXACTLY Unicode general category Cc, with no member
+    /// outside them.
+    ///
+    /// **The bidi embeddings, overrides and isolates — `U+202A...U+202E` and
+    /// `U+2066...U+2069`.** These let a SENDER pick an extension the user never
+    /// sees. Measured through CoreText — the real bidi algorithm — by differencing
+    /// the visible glyph order against the same name without the scalar:
+    /// `"report\u{202E}fdp.exe"` lays out to a human as `reportexe.pdf`, so the
+    /// user opens what reads as a PDF. On an all-Latin name `U+202E` is the ONLY
+    /// one that does this; the embeddings and isolates changed nothing there, but
+    /// they DO reposition runs once the name also holds a strong RTL character
+    /// (the Trojan-Source shape, CVE-2021-42574) and they have no legitimate role
+    /// in a filename, so the whole enumerated block goes.
+    ///
+    /// ⚠️ **This was `CharacterSet.controlCharacters` until 2026-08-12, and that
+    /// is the thing not to go back to.** That set is NOT category Cc, and it is
+    /// not Cc ∪ Cf either — swept on this toolchain it holds **24,970** scalars:
+    /// Cc 65, Cf 170, 97 nonspacing marks, and 24,638 scalars the standard
+    /// library reports UNASSIGNED (essentially all of plane 14). So
+    /// `controlCharacters.subtracting(<the Cf scalars>)` is NOT a way to get back
+    /// to Cc; the explicit ranges above are. Using it mangled ordinary names with
+    /// no truncation involved: `U+200D` ZWJ went, so `👨‍👩‍👦report.pdf` was
+    /// stored as `👨👩👦report.pdf` — one family emoji flattened into three — and
+    /// the `U+E0020...U+E007F` tag characters went, turning the Scotland flag
+    /// `🏴󠁧󠁢󠁳󠁣󠁴󠁿` into a plain black flag AT THE SAME CHARACTER COUNT.
+    /// `U+200C` ZWNJ is a letter-shaping distinction in Persian, not decoration.
+    /// Under REJECTION the same over-wide set would be worse still: every one of
+    /// those ordinary names would now be refused outright rather than mangled,
+    /// which is why the set stays enumerated and narrow.
+    ///
+    /// **The directional MARKS — `U+200E` LRM, `U+200F` RLM, `U+061C` ALM — are
+    /// in the set as well (owner decision, 2026-08-12: "strip them everywhere").**
+    /// They were deliberately KEPT until then, on the measured ground that they
+    /// "cannot reverse a run of strong LTR characters, so they cannot manufacture
+    /// the all-Latin extension swap". The premise is still true and the
+    /// conclusion drawn from it was wrong: a mark does not have to reverse
+    /// anything INSIDE a run, because it reorders the RUNS. Re-measured through
+    /// the same CoreText glyph-position harness, with the mark LEADING so no
+    /// strong-LTR character anchors the paragraph direction:
+    ///
+    ///     "\u{200F}pdf\u{200F}.exe"    logical ext .exe    VISIBLE  exe.pdf   <-- SPOOF
+    ///     "\u{061C}pdf\u{061C}.exe"    logical ext .exe    VISIBLE  exe.pdf   <-- SPOOF
+    ///     "report\u{200F}fdp.exe"      logical ext .exe    VISIBLE  reportfdp.exe
+    ///
+    /// ⚠️ **Why two rounds of measurement missed this, which is the transferable
+    /// part:** every earlier fixture inserted the mark into a name BEGINNING with
+    /// strong-LTR text (`report…`), which fixes the paragraph direction and makes
+    /// the swap impossible. A `report`-prefixed fixture is green on the unfixed
+    /// code and proves nothing, so `AttachmentFilenameContainmentTests` pins the
+    /// LEADING-mark shape instead.
+    ///
+    /// `U+200E` LRM alone did NOT reorder that fixture (`"\u{200E}pdf\u{200E}.exe"`
+    /// lays out as `pdf.exe`); it goes with the other two because the owner's
+    /// decision covers the set, and because "this mark reorders runs and that one
+    /// does not, in this paragraph context" is not a distinction a filename can
+    /// carry. The legitimate use these had — fixing the order of a mixed Arabic
+    /// or Hebrew filename — does not need them: a name's own strong-RTL letters
+    /// order correctly with no explicit mark present (measured, `דוח.pdf` lays
+    /// out as `pdf.חוד`).
+    ///
+    /// **`U+2028` (Zl) and `U+2029` (Zp) — the mandatory line breaks outside
+    /// Cc.** Measured with `CTTypesetterSuggestLineBreak` at 100,000pt, so the
+    /// break is mandatory rather than width-driven: `"invoice.pdf\u{2028}.exe"`
+    /// breaks after `invoice.pdf`, so a one-line label shows a PDF and the `.exe`
+    /// is on a line nobody sees. Sweeping for that property found exactly seven
+    /// mandatory-break scalars — `U+000A`, `U+000B`, `U+000C`, `U+000D`,
+    /// `U+0085`, `U+2028`, `U+2029` — and the first five are already covered,
+    /// because they are Cc. These two were the only ones the set missed.
+    ///
+    /// ⚠️ **WHAT THIS BUYS, STATED AT THE WIDTH IT ACTUALLY HOLDS: no INVISIBLE
+    /// scalar can make an ACCEPTED filename render as a different type. NOT "a
+    /// filename cannot render as a different type" — that is not achievable by
+    /// refusing a scalar set, and this comment must never be widened back to
+    /// it.** The vector survives in ORDINARY VISIBLE LETTERS. Measured 2026-08-12
+    /// through the same CoreText glyph-position harness: of the 63 visible
+    /// strong-RTL letters swept (Hebrew `U+05D0...U+05EA`, Arabic
+    /// `U+0621...U+063A` and `U+0641...U+064A`), **all 63** make
+    /// `"<X>pdf<X>.exe"` lay out with a rendered extension different from the
+    /// stored one — `"\u{05D0}pdf\u{05D0}.exe"` reads as `exe.אpdfא`. They are
+    /// letters, not format characters; refusing them would refuse every Hebrew
+    /// and Arabic filename, which is strictly worse than the spoof.
+    ///
+    /// And the reorder is not even a reliable SIGNAL of a spoof, which is why no
+    /// membership rule can separate the two cases: the legitimate Hebrew name
+    /// `דוח.pdf` lays out as `pdf.חוד` on exactly the same measurement. That is
+    /// CORRECT bidi rendering of a genuine RTL name, and it is indistinguishable
+    /// from the crafted case by layout alone. So the residual risk is BOUNDED, not
+    /// eliminated: a filename holding strong-RTL letters can still read to a human
+    /// as a different type. Directional isolates (`U+2066`/`U+2069`) around the
+    /// name AT EACH DISPLAY SITE are the mitigation for that, and they are
+    /// deliberately NOT applied here — `displayLabel`'s output also names a real
+    /// staged file, so wrapping it would corrupt the filename on disk. It is a
+    /// display-layer follow-up, tracked, not done.
+    ///
+    /// Pinned by `AttachmentFilenameContainmentTests`.
+    private static let refusedFilenameScalars: CharacterSet =
+        CharacterSet(charactersIn: "\u{0000}"..."\u{001F}")
+        .union(CharacterSet(charactersIn: "\u{007F}"..."\u{009F}"))
+        .union(CharacterSet(charactersIn: "\u{061C}"..."\u{061C}"))
+        .union(CharacterSet(charactersIn: "\u{200E}"..."\u{200F}"))
+        .union(CharacterSet(charactersIn: "\u{2028}"..."\u{2029}"))
+        .union(CharacterSet(charactersIn: "\u{202A}"..."\u{202E}"))
+        .union(CharacterSet(charactersIn: "\u{2066}"..."\u{2069}"))
+
+    /// What a display site renders for `filename`: the sender's own name when it
+    /// is safe, and `unsupportedLabel` when it is not.
+    ///
+    /// Every ATTACHMENT-LIST, COMPOSE-CHIP and `.eml`-SHEET display site renders
+    /// this rather than `attachment.filename`, and that requirement came from a
+    /// defect rather than from tidiness: `AttachmentListView.body` rendered
+    /// `Text(attachment.filename)` — the RAW sender-authored MIME parameter — so
+    /// measured, `"report\u{202E}fdp.exe"` appeared in the list row as
+    /// `reportexe.pdf`, on the exact screen where the user decides whether to tap.
+    ///
+    /// ⚠️ **NOT "every display site".** Two sites render a RAW attachment filename
+    /// and are outside the scan that pins this property
+    /// (`attachmentFilenamesAreRenderedThroughThePredicate` walks three view
+    /// files):
+    /// - `EmlMarker.embeddedHeadersHtml` puts the filename in a `<b>` banner. It is
+    ///   CSS-hidden in BOTH view modes — `EmailHTMLWrapper` emits
+    ///   `.tm-eml-section { display: none !important; }` in main view, and
+    ///   `body.tm-preview-mode .tm-eml-headers { display: none !important; }` in
+    ///   preview mode — so it does not reach the screen. Confirmed by reading both
+    ///   branches, not inferred from the class name.
+    /// - `EmlMarker.embeddedHeadersPlainText` emits `--- <filename> ---` into the
+    ///   PLAIN-TEXT body, and that one is **NOT** hidden: its own call site in
+    ///   `IMAPFetchMapping.renderBodyWithEmbeddedHeaders` says so in as many words
+    ///   ("Plain text mode: keep the historical flat interleaving (no CSS to
+    ///   apply, no preview sheet — users read plain text inline)"), and
+    ///   `BodyRenderer` renders that text through `EmailFilter.plainTextToHTML`
+    ///   when the message has no HTML part. So a message with no `text/html` part
+    ///   and a nested `.eml` shows the sender's RAW attachment filename inline. It
+    ///   is escaped exactly once, so this is a rendering-order exposure and not an
+    ///   injection one.
+    /// Neither site is a regression from this round; both predate it. They are
+    /// recorded rather than fixed because routing them through this label changes
+    /// the FTS-indexed and wire-visible body text, which is a different blast
+    /// radius from a label.
+    ///
+    /// The two `data-filename` MATCH-KEY sites are deliberately RAW as well:
+    /// `AutoSizingHTMLView(previewFilename:)` and
+    /// `EmailFilter.parseEmlSectionMetadata` match the value against the
+    /// `data-filename` attribute the renderer wrote from the same MIME parameter,
+    /// so labelling it there would stop the section from being found.
+    static func displayLabel(_ filename: String) -> String {
+        isSafeFileComponent(filename) ? filename : unsupportedLabel
+    }
+
+    /// Whether `filename` may be used VERBATIM as ONE path component — the whole
+    /// question this type exists to answer, asked identically by
+    /// `DraftAttachmentStorage.saveAttachments`, `OutboxMessage.saveAttachments`,
+    /// `AttachmentPreviewStager` and every display site.
+    ///
+    /// `att.filename` reaches all of them UNREDUCED from `AttachmentInfo.filename`
+    /// — the sender-authored MIME `filename` parameter — carried in by
+    /// `ComposeView.carryForwardAttachments` on the compose side and straight off
+    /// the wire on the display side. A name is safe iff ALL SIX hold. Each rule
+    /// below existed as a TRANSFORMATION in the reducer this replaced, and carries
+    /// the measurement that sized it.
+    ///
+    /// **1 — it is not empty and does not spell `.` or `..`, in any encoding.**
+    /// Asserted as an OUTCOME, not as a list of refused names: the candidate is
+    /// appended to a probe directory, the result standardised, and its parent must
+    /// be the probe.
+    ///
+    /// ⚠️ **It WAS a list of refused names until 2026-08-12, and the list was
+    /// incomplete in a way no list could have fixed.** The guard refused exactly
+    /// the strings `"."` and `".."`, and `URL.appendingPathComponent` DROPS a
+    /// trailing NUL — so `"..\u{0}"` passed the guard and resolved to the PARENT of
+    /// the directory it was appended to, and `"\u{0}"` collapsed to that directory
+    /// itself. Measured against a real filesystem: the write fails
+    /// `NSCocoaErrorDomain` 512, no bytes land and a planted sibling survives, so
+    /// it was not exploitable — but the post-condition was false, and adding
+    /// `"..\u{0}"` to the list would have been the same mistake one entry longer.
+    ///
+    /// ⚠️ **THE PROBE DIRECTORY IS NOT ARBITRARY: IT MUST HAVE DEPTH ≥ 1.** This
+    /// comment claimed until 2026-08-12 that it *was* arbitrary "because
+    /// `appendingPathComponent` transforms the component independently of the base,
+    /// so the verdict cannot depend on which directory it is checked against". The
+    /// claim is false and so is the mechanism it cites.
+    /// - Measured: **at the root, `"."`, `".."`, `""`, `"\u{0}"` and `"..\u{0}"` all
+    ///   PASS**; at every depth ≥ 1 they all fail. `/probe` (depth 1) is what makes
+    ///   rule 1 able to refuse anything at all.
+    /// - The verdict turns on **`.standardized`**, not on `appendingPathComponent`.
+    ///   `.standardized` collapses `..` against the base's own DEPTH: `/a/..`
+    ///   collapses to `/`, whose parent `/` differs from `/a`, so the test says
+    ///   ESCAPED — while `/..` also collapses to `/`, and there
+    ///   `deletingLastPathComponent` is a FIXPOINT, so the test says CONTAINED.
+    ///   `appendingPathComponent` really is base-oblivious; it is simply not the
+    ///   step the verdict comes from.
+    /// The property that actually holds — invariance across bases of depth ≥ 1,
+    /// PLUS the divergence at depth 0, PLUS this predicate's own probe being
+    /// non-root — is pinned by
+    /// `containmentVerdictIsInvariantBelowTheRootAndDivergesAtIt`. **If this probe
+    /// is ever relocated, it must stay below the root**, or rule 1 silently accepts
+    /// every traversal name it exists to refuse.
+    ///
+    /// **2 — it contains no `U+002F`, and appending it nests below nothing.** Both
+    /// halves are needed and neither implies the other. The probe alone accepts
+    /// `"invoice.pdf/"`, because `appendingPathComponent` DROPS a trailing
+    /// separator — the name would then be used verbatim in a string context (the
+    /// `"\(index)_\(name)"` data name and its `"\(that).meta"` sidecar) while
+    /// resolving to something else on disk. The scalar test alone accepts `".."`.
+    ///
+    /// ⚠️ The scalar test runs over UNICODE SCALARS, not `Character`s, and that is
+    /// load-bearing. Swift `String` iterates EXTENDED GRAPHEME CLUSTERS, so
+    /// `U+002F` followed by a combining mark (e.g. `U+0301`) forms ONE cluster that
+    /// is **not** equal to `Character("/")` — a `Character`-wise test does not see
+    /// it, while the UTF-8 bytes still carry a real `0x2F` that the filesystem
+    /// treats as a path separator. Measured pre-fix: such a name came back
+    /// unreduced, so `"\(index)_\(name)"` was a MULTI-COMPONENT path
+    /// (`0_../́x.pdf`) whose first component the slot does not contain, the write
+    /// threw, and the draft was unsavable and the message unsendable. On the
+    /// preview path the same name landed the bytes one level up, in the
+    /// per-message namespace a sibling preview reads from.
+    ///
+    /// **3 — it contains no scalar in `refusedFilenameScalars`** (79 scalars: C0,
+    /// C1, the bidi overrides/embeddings/isolates, ALM, LRM/RLM, LS/PS). The
+    /// measurement behind each range is on that constant.
+    ///
+    /// **4 — it contains no scalar whose general category is `unassigned`, and
+    /// that one is a FILESYSTEM requirement rather than a rendering one.**
+    /// Measured 2026-08-12 by sweeping every scalar `U+0000...U+10FFFF` as a real
+    /// path component on APFS: the set the filesystem refuses is EXACTLY the
+    /// scalars whose general category is `unassigned` — 814,730 of them, with zero
+    /// disagreements in either direction. `open(2)` itself raises `EILSEQ` (errno
+    /// 92, confirmed with a raw POSIX open), surfacing as `NSCocoaErrorDomain` 512
+    /// / `NSPOSIXErrorDomain` 92. The predicate is the scalar's OWN Unicode
+    /// property rather than a range list, because a range list goes stale at every
+    /// Unicode revision while the property tracks whatever this toolchain knows —
+    /// which is also what decides whether the name normalises to something the
+    /// filesystem will accept.
+    ///
+    /// **5 — no canonical combining SEQUENCE is longer than
+    /// `combiningRunBudgetScalars`, counted on the NFD form.** A path component may
+    /// not contain a canonical combining sequence — one starter plus the
+    /// non-starters that follow it — longer than `maxCombiningSequenceScalars`, and
+    /// `open(2)` raises `EILSEQ` when it does. Measured 2026-08-12:
+    /// `"invoice" + 32 × U+0301 + "-2026.pdf"` is 48 NFD units against a 230-unit
+    /// budget and still fails the write.
+    ///
+    /// ⚠️ **THE PREDICATE IS THE CANONICAL COMBINING CLASS, NOT GENERAL CATEGORY
+    /// `Mn`/`Mc`/`Me`, AND IT IS MEASURED ON THE NFD FORM.** Both halves were
+    /// swept rather than assumed:
+    /// - Every `ccc != 0` scalar tried failed at exactly the same length —
+    ///   `U+0301` (230), `U+0323` (220), `U+0345` (240), `U+05B0` (10), `U+0E48`
+    ///   (107), `U+3099` (8), `U+0483` (230), `U+0F71` (129), `U+064B` (27),
+    ///   `U+0655` (220) — while every `ccc == 0` scalar was unlimited to 60
+    ///   repetitions **including the marks** `U+0E31` (Mn), `U+0903` (Mc),
+    ///   `U+093E` (Mc), `U+20DD` (Me) and `U+FE0F` (Mn). A category test would be
+    ///   wrong in both directions.
+    /// - `U+00E1 + 31` marks is REFUSED although its literal sequence is 32,
+    ///   because it decomposes to `a` + 32 marks; `U+1EC7` (which decomposes to
+    ///   `e` + two marks) fails two marks earlier again. So the count runs on
+    ///   `decomposedStringWithCanonicalMapping`.
+    /// - Any `ccc == 0` scalar RESETS the run, so the `"\(index)_"` prefix and the
+    ///   `".meta"` suffix cannot lengthen one — but a `_` immediately before a
+    ///   LEADING run does occupy one slot of the sequence, which is why
+    ///   `combiningRunBudgetScalars` reserves a starter.
+    /// - The two caps are INDEPENDENT and the length one never engages first:
+    ///   `200 × "a" + 32` marks is 232 units and fails `EILSEQ`, while
+    ///   `240 × "a" + 31` marks is 271 units and fails `ENAMETOOLONG` instead.
+    /// Cross-checked over 3,999 randomised names (runs 0–40, 0–4 runs per name,
+    /// leading/interior/trailing, precomposed and decomposed bases, lengths
+    /// straddling 255) plus 968 non-starter scalars × two boundary lengths: zero
+    /// disagreements with `nfd units <= 255 && longest sequence <= 32 && nothing
+    /// unassigned`.
+    ///
+    /// Legitimate orthography is nowhere near the cap: the widest sequence in a
+    /// 41-name multi-script fixture set is 4 scalars, and the widest run any single
+    /// assigned scalar produces through its own decomposition is 3 (`U+1F82`).
+    ///
+    /// **6 — it fits `attachmentComponentBudgetUnits`, in NFD UTF-16 units.**
+    ///
+    /// ⚠️ **THE UNIT IS MEASURED, AND IT IS NEITHER OF THE TWO OBVIOUS GUESSES.**
+    /// Bisected against the real filesystem 2026-08-12 (macOS host APFS, and
+    /// re-measured inside the simulator by the test named below): a path component
+    /// is accepted iff `decomposedStringWithCanonicalMapping.utf16.count <= 255` —
+    /// NFD-normalised UTF-16 code units.
+    /// - NOT 255 UTF-8 bytes. 86 × `U+6F22` is 258 bytes and stores fine.
+    /// - NOT 255 `Character`s. 128 × `U+00E9` is 128 characters and 128 UTF-16
+    ///   units, and is REFUSED, because APFS decomposes it to 256 units.
+    /// - Cross-checked over 400 randomised mixed strings straddling the boundary:
+    ///   0 disagreements with that predicate.
+    /// Both wrong units are wrong in the UNSAFE direction, which is why neither is
+    /// an acceptable conservative stand-in.
+    ///
+    /// **THE BUDGET IS THE COMPONENT LIMIT MINUS THE WIDEST WRAPPER ANY CALLER
+    /// ADDS**, because what has to fit is the DERIVED name, not this argument:
+    /// `saveAttachments` writes `"\(index)_\(name)"` and a `"\(that).meta"`
+    /// sidecar, so the sidecar is the longest of the three and it is what overflows
+    /// first. Accepted cost, stated rather than hidden: a name between the budget
+    /// and the raw component limit is refused although it would have fitted the
+    /// preview path, which adds no wrapper. That is ~25 units off a name already at
+    /// the filesystem ceiling.
+    ///
+    /// ⚠️ **WHAT REFUSAL COSTS, so it is not discovered later as a surprise.** On
+    /// the OUTGOING path the user cannot save the draft or send the message while
+    /// that attachment is attached — `saveAttachments` throws
+    /// `AttachmentFilenameError` and compose shows it without dismissing (Outbox
+    /// Reliability Rules 1 and 5: never dropped, never sent with a wrong or missing
+    /// attachment). On the INCOMING path the row is labelled `unsupportedLabel` and
+    /// the download/preview is refused. The message itself is untouched on the
+    /// server either way, which is the recoverability the mantra requires.
+    ///
+    /// **LOADING needs no migration. RE-SAVING a legacy draft CAN fail closed, and
+    /// that is an accepted cost, not a guarantee.**
+    ///
+    /// The loader half is unconditional and unchanged: neither loader ever
+    /// recomputes an attachment's DATA filename in order to locate it —
+    /// `loadAttachments` here and `OutboxMessage.loadAttachments` both
+    /// `contentsOfDirectory` the slot and strip the `<index>_` prefix off whatever
+    /// they find — so every name already on disk still loads, and its row still
+    /// renders (through `displayLabel`, as `unsupportedLabel` when the name is
+    /// refused).
+    ///
+    /// ⚠️ **This comment also claimed, until 2026-08-12, that every name already on
+    /// disk — "including every name the old reducer transformed" — is ACCEPTED by
+    /// this predicate "because the reducer's output satisfied exactly these six
+    /// rules by construction", so a draft saved before this round could always be
+    /// reopened AND RE-SAVED. That is FALSE, and the premise under it never
+    /// existed: NO SHIPPED BUILD EVER RAN A REDUCER.** `v1.7.6`, `v1.7.7` and
+    /// `v1.7.8` (the newest tag) contain neither `safeAttachmentFileComponent` nor
+    /// `isSafeFileComponent`, and `v1.7.8`'s two stores write
+    /// `"\(index)_\(att.filename)"` verbatim and unchecked. The reducer was
+    /// introduced by `711afc6b8` and deleted by `c35cfdca2` on the same unreleased
+    /// line, ~15 hours apart. So the population on disk in any shipped install is
+    /// RAW SENDER-AUTHORED names.
+    ///
+    /// The at-risk set is narrower than "refused names", because `v1.7.8` wrote
+    /// unchecked but `open(2)` still had to accept the data file AND its `.meta`
+    /// sidecar. Measured intersection — three shapes: **any of the 79 refused
+    /// scalars** (all 79 wrote, zero filesystem refusals); **231–248 NFD units at a
+    /// single-digit index**, 18 units wide, because the 230 budget reserves
+    /// `String(Int.max).count` while a real index spends two characters; and **a
+    /// combining run of exactly 31**, one value wide, because
+    /// `combiningRunBudgetScalars` is `32 - 2` while the filesystem accepts a
+    /// 32-scalar sequence. Unassigned scalars, runs ≥ 32, separators and every
+    /// containment failure CANNOT be on disk — `v1.7.8` could not write them.
+    ///
+    /// What that costs, stated at the width it actually holds:
+    /// - **Loading and display are unaffected** — the loader half above.
+    /// - **Every WRITE path throws `AttachmentFilenameError.unsupported`:**
+    ///   `ComposeView.saveDraftAndDismiss` and `ComposeView.send`'s COW staging,
+    ///   `DynamicIslandChatButton.autoSaveDraft`, and `AccountManager.queueSend` →
+    ///   `persistQueuedSend` → `OutboxMessage.saveAttachments`. Compose shows the
+    ///   generic message and does NOT dismiss (Outbox Reliability Rules 1 and 5).
+    /// - **Recovery is one ordinary gesture — remove the attachment.** The draft
+    ///   then saves and the message sends; the original is untouched on the server.
+    /// - **An outbox row ALREADY QUEUED before the upgrade is unaffected.** The
+    ///   drain runs `OutboxMessage.toDraftMessage` → `loadAttachments`, which reads
+    ///   the files that are already there and never re-saves them, so a send in
+    ///   flight still goes out.
+    ///
+    /// Registered as `IOS-ATTACH-001`. Per THE MANTRA this is a recoverable
+    /// fail-closed edge, so it is registered rather than mechanised: **do NOT add a
+    /// migration, a rename-on-load, or a grandfathering path.** Re-introducing a
+    /// transformation is exactly what `ADR-IOS-077` deleted.
+    static func isSafeFileComponent(_ filename: String) -> Bool {
+        // Rules 2, 3 and 4, in one pass over the scalars the SENDER wrote.
+        for scalar in filename.unicodeScalars {
+            if scalar == "/" { return false }
+            if refusedFilenameScalars.contains(scalar) { return false }
+            if scalar.properties.generalCategory == .unassigned { return false }
+        }
+        // Rules 5 and 6, on the DECOMPOSED form, because that is what the
+        // filesystem counts: a precomposed base contributes its own marks to both.
+        let decomposed = filename.decomposedStringWithCanonicalMapping
+        var run = 0
+        for scalar in decomposed.unicodeScalars {
+            run = scalar.properties.canonicalCombiningClass == .notReordered ? 0 : run + 1
+            if run > combiningRunBudgetScalars { return false }
+        }
+        guard decomposed.utf16.count <= attachmentComponentBudgetUnits else { return false }
+        // Rule 1, and the half of rule 2 no scalar test can express: the OUTCOME.
+        let probe = URL(fileURLWithPath: "/", isDirectory: true)
+            .appendingPathComponent("probe", isDirectory: true)
+        return probe.appendingPathComponent(filename).standardized
+            .deletingLastPathComponent().path == probe.standardized.path
+    }
+}
+
 /// Mirrors OutboxMessage's attachment storage pattern for drafts.
 /// Attachments stored under `Application Support/TabMail/draft_attachments/{dirName}/`.
 enum DraftAttachmentStorage {
@@ -755,16 +1249,31 @@ enum DraftAttachmentStorage {
         UUID().uuidString
     }
 
-    /// Save attachments to disk. Throws if any write fails, and throws
+    /// Save attachments to disk. Throws if any write fails, throws
     /// `DraftAttachmentStorageError.escapesStorageRoot` rather than creating
-    /// directories and writing attachment bytes outside the storage root.
+    /// directories and writing attachment bytes outside the storage root, and
+    /// throws `AttachmentFilenameError.unsupported` rather than storing an
+    /// attachment under a name the app refuses (see
+    /// `AttachmentFilename.isSafeFileComponent` for the six rules and for what a
+    /// refusal costs the user).
+    ///
+    /// ⚠️ Every name is checked BEFORE the directory is created, so a refused set
+    /// writes nothing at all and leaves no partial slot behind. Refusing per
+    /// attachment inside the write loop would leave the earlier attachments on
+    /// disk under a directory the caller is about to abandon.
     static func saveAttachments(_ attachments: [DraftAttachment], dirName: String, root: URL? = nil) throws {
         guard !attachments.isEmpty else { return }
+        if let refused = attachments.first(where: { !AttachmentFilename.isSafeFileComponent($0.filename) }) {
+            throw AttachmentFilenameError.unsupported(name: refused.filename)
+        }
         guard let dir = containedDirURL(for: dirName, root: root) else {
             throw DraftAttachmentStorageError.escapesStorageRoot(dirName: dirName)
         }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         for (index, att) in attachments.enumerated() {
+            // The name is used VERBATIM, and the guard above is what makes that
+            // safe: it is one path component of `dir` rather than a sub-path the
+            // sender chose. See `AttachmentFilename.isSafeFileComponent`.
             let dataName = "\(index)_\(att.filename)"
             try att.data.write(to: dir.appendingPathComponent(dataName))
             // Write metadata sidecar — uses indexed name to avoid collision when
@@ -772,6 +1281,98 @@ enum DraftAttachmentStorage {
             let meta = "\(att.mimeType)\n\(att.isAlternative)"
             try meta.write(to: dir.appendingPathComponent("\(dataName).meta"), atomically: true, encoding: .utf8)
         }
+    }
+
+    /// `name` with a trailing `".meta"` removed, or `nil` when it does not end in
+    /// `".meta"` at all. THE one place either loader decides whether a filename
+    /// names a metadata sidecar.
+    ///
+    /// ⚠️ SCALAR-WISE, and that is the whole reason this function exists.
+    /// `hasSuffix` and `dropLast` operate on `Character`s — extended grapheme
+    /// clusters — and a trailing scalar whose grapheme-break property is `Prepend`
+    /// merges with the FOLLOWING `.` into ONE `Character`. For a data file
+    /// `0_invoice\u{0605}` the sidecar `0_invoice\u{0605}.meta` has last five
+    /// `Character`s `"\u{0605}."`, `m`, `e`, `t`, `a`, so `hasSuffix(".meta")` is
+    /// FALSE and `dropLast(5)` returns `0_invoice` — the wrong base, having eaten
+    /// the sender's own scalar. Measured 2026-08-12 by sweeping every scalar
+    /// `U+0000...U+10FFFF`: 27 assigned scalars have that property (`U+0600` …
+    /// `U+11F02`), and `AttachmentFilename.isSafeFileComponent` ACCEPTS every name
+    /// carrying one — they are assigned, they carry no combining class, they are
+    /// outside `refusedFilenameScalars` and they cost one unit — so a
+    /// sender-authored MIME `filename` parameter reaches the loaders intact.
+    ///
+    /// ⚠️ **Refusing hostile names at SAVE time did not make this unnecessary, and
+    /// deleting it would reopen the defect.** `"invoice\u{0605}"` is SAFE by all
+    /// six rules; it is stored verbatim, and it is its SIDECAR
+    /// `0_invoice\u{0605}.meta` that grapheme-merges the `.`. The name that breaks
+    /// the loader is a name the predicate has no reason to refuse.
+    ///
+    /// Both consequences landed in the SAME function: the sidecar was classified
+    /// as a DATA file, so `loadAttachments` returned two attachments for one saved
+    /// file, and the `ambiguousMetaFilename` fail-closed guard — which tested the
+    /// same `hasSuffix(".meta")` — never fired for it either. On the outbox side
+    /// that is the SEND path, so the mail went out carrying the sidecar's bytes as
+    /// an extra attachment (Outbox Reliability Rule 5). The classifier and the
+    /// guard both key off THIS function now, so they cannot disagree again.
+    ///
+    /// Existing on-disk files parse identically: for every name whose last five
+    /// scalars are not `.meta` this returns `nil`, exactly as the old suffix test
+    /// answered false; for every name that does end in those scalars AND has no
+    /// `Prepend` scalar in front of the `.`, the scalar-wise and `Character`-wise
+    /// answers coincide. Only the 27-scalar class changes, and it changes from a
+    /// wrong answer to the right one.
+    static func metaBase(_ name: String) -> String? {
+        let suffix = ".meta".unicodeScalars
+        let scalars = name.unicodeScalars
+        guard scalars.count >= suffix.count,
+              scalars.suffix(suffix.count).elementsEqual(suffix) else { return nil }
+        var base = String.UnicodeScalarView()
+        base.append(contentsOf: scalars.dropLast(suffix.count))
+        return String(base)
+    }
+
+    /// Recovers the sender's filename from a stored `"<index>_<name>"` path
+    /// component by dropping everything up to and including the FIRST `_` SCALAR.
+    /// THE one place either loader undoes the `"\(index)_"` prefix
+    /// `saveAttachments` adds.
+    ///
+    /// ⚠️ SCALAR-WISE, and both halves of the `Character`-wise version were wrong.
+    /// It was
+    /// `fullName.contains("_") ? String(fullName.drop(while: { $0 != "_" }).dropFirst()) : fullName`,
+    /// and a filename BEGINNING with a combining mark makes the stored component
+    /// `0_\u{0301}foo.pdf`, in which `_` and the mark are ONE `Character`:
+    /// - `contains("_")` is FALSE, so the store's own `0_` prefix was handed back
+    ///   as the user's filename — on screen, and on the wire as the MIME
+    ///   `filename` parameter of a sent message.
+    /// - With a LATER `_` in the sender's own name, `contains("_")` is true and
+    ///   `drop(while:)` ran past the merged cluster to the SECOND `_`:
+    ///   `\u{0301}foo_bar.pdf`, stored as `0_\u{0301}foo_bar.pdf`, came back as
+    ///   `bar.pdf`. **`foo` was silently cut.**
+    /// Measured 2026-08-12 by sweeping every scalar `U+0000...U+10FFFF`: 2,619
+    /// assigned scalars trigger both shapes, and
+    /// `AttachmentFilename.isSafeFileComponent` ACCEPTS every name that begins
+    /// with one — they are ordinary combining marks, from every script that has
+    /// them, and a run of ONE is nowhere near `combiningRunBudgetScalars`.
+    ///
+    /// ⚠️ **Refusing hostile names at SAVE time did not make this unnecessary, and
+    /// deleting it would reopen the defect.** `"\u{0301}foo.pdf"` is SAFE by all
+    /// six rules — short, assigned, unrefused, run length 1 — and it is the
+    /// store's OWN `"\(index)_"` prefix that merges with the sender's leading mark
+    /// into one `Character`. The name that breaks the loader is a name the
+    /// predicate has no reason to refuse.
+    ///
+    /// Existing on-disk files parse identically. `saveAttachments` always writes
+    /// `"\(index)_"`, so the first `_` scalar of a stored component is always the
+    /// store's own separator; for any name where the old expression found that
+    /// same `_`, the two agree exactly. Only the merged-cluster class changes, and
+    /// it changes from a wrong answer to the right one. A component with no `_`
+    /// scalar at all is returned unchanged, as before.
+    static func afterIndexPrefix(_ name: String) -> String {
+        let scalars = name.unicodeScalars
+        guard let underscore = scalars.firstIndex(of: "_") else { return name }
+        var recovered = String.UnicodeScalarView()
+        recovered.append(contentsOf: scalars[scalars.index(after: underscore)...])
+        return String(recovered)
     }
 
     /// PORT — `v2final`'s `DraftAttachmentStorage.loadAttachments(dirName:root:)`
@@ -807,14 +1408,16 @@ enum DraftAttachmentStorage {
         // ".meta" file whose base is ABSENT is itself a DATA file.
         let allNames = Set(files.map { $0.lastPathComponent })
         func isSidecar(_ name: String) -> Bool {
-            name.hasSuffix(".meta") && allNames.contains(String(name.dropLast(".meta".count)))
+            metaBase(name).map(allNames.contains) ?? false
         }
         let dataFiles = files.filter { !isSidecar($0.lastPathComponent) }
         // Fail closed on a DATA file whose name ends in ".meta" but whose OWN
         // sidecar ("<name>.meta") is absent: it is indistinguishable from a
         // lost-data orphan (the real data file gone, only its ".meta" sidecar
         // left), so throw rather than load metadata bytes as the attachment.
-        for url in dataFiles where url.lastPathComponent.hasSuffix(".meta") {
+        // Keyed off `metaBase` — the same decision the classifier makes — because
+        // when the two disagreed BOTH failed for the same input.
+        for url in dataFiles where metaBase(url.lastPathComponent) != nil {
             guard allNames.contains(url.lastPathComponent + ".meta") else {
                 throw DraftAttachmentLoadError.ambiguousMetaFilename(name: url.lastPathComponent)
             }
@@ -830,8 +1433,10 @@ enum DraftAttachmentStorage {
                 throw DraftAttachmentLoadError.fileUnreadable(name: fileURL.lastPathComponent, underlying: error)
             }
             let fullName = fileURL.lastPathComponent
-            // Strip index prefix: "0_filename.pdf" → "filename.pdf"
-            let filename = fullName.contains("_") ? String(fullName.drop(while: { $0 != "_" }).dropFirst()) : fullName
+            // Strip index prefix: "0_filename.pdf" → "filename.pdf". Scalar-wise —
+            // see `afterIndexPrefix` for the two ways the `Character`-wise version
+            // handed back the prefix or cut the sender's name.
+            let filename = afterIndexPrefix(fullName)
             // Meta sidecar uses full indexed name (matching save). A missing/
             // unreadable sidecar is not data loss (bytes are intact) — keep the
             // MIME fallback rather than throwing.

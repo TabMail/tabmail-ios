@@ -93,7 +93,16 @@ struct AttachmentListView: View {
                                 .frame(width: 28)
 
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(attachment.filename)
+                                // The LABEL, not `attachment.filename`. The raw
+                                // value is a sender-authored MIME parameter, and
+                                // measured, `report<RLO>fdp.exe` renders here as
+                                // `reportexe.pdf` — a label claiming a type the
+                                // bytes do not have, on the screen where the user
+                                // decides whether to tap. A refused name shows
+                                // `AttachmentFilename.unsupportedLabel` instead,
+                                // and the tap below refuses for the same reason,
+                                // so the row and the action cannot disagree.
+                                Text(AttachmentFilename.displayLabel(attachment.filename))
                                     .font(.subheadline)
                                     .foregroundStyle(Theme.textPrimary)
                                     .lineLimit(1)
@@ -171,6 +180,21 @@ struct AttachmentListView: View {
         }
     }
 
+    /// ⚠️ **Deliberately NOT gated on `AttachmentFilename.isSafeFileComponent`, and
+    /// that asymmetry with `downloadAndPreview` below is the intended behaviour.**
+    ///
+    /// The filename never becomes a path component here: the fetched bytes go
+    /// straight to `ICSCalendarImporter.presentCalendarImport(icsData:)`, which
+    /// names its own temporary file. Nothing downstream parses the sender's string,
+    /// so there is nothing for a refusal to protect — and refusing would turn a
+    /// legitimate calendar invitation into an unopenable row over a bidi mark in a
+    /// name this path discards.
+    ///
+    /// The consequence to expect, so it is not later read as a bug: the ROW can
+    /// read `AttachmentFilename.unsupportedLabel` while the tap still works. The
+    /// label is a statement about the NAME, not a prediction about the action; the
+    /// two only have to agree where the name is load-bearing, which is the staging
+    /// path (`AttachmentFilenameContainmentTests.theLabelAndTheStagedFileAgree`).
     private func downloadAndImportICS(_ attachment: AttachmentInfo) {
         downloadingSection = attachment.section
         error = nil
@@ -189,6 +213,16 @@ struct AttachmentListView: View {
     }
 
     private func downloadAndPreview(_ attachment: AttachmentInfo) {
+        // Refused BEFORE the fetch: the staged file's last path component is this
+        // name, `AttachmentPreviewStager` will not create an attempt for it, and
+        // downloading bytes nothing can open costs the user data for nothing. The
+        // row already reads `AttachmentFilename.unsupportedLabel`; this is the
+        // fuller sentence on the action, and it names no reason and quotes no name
+        // (see `AttachmentFilenameError.errorDescription`).
+        guard AttachmentFilename.isSafeFileComponent(attachment.filename) else {
+            error = AttachmentFilename.unsupportedMessage
+            return
+        }
         downloadingSection = attachment.section
         error = nil
         // Every field here is a sender-authored MIME value, and `print` is a
@@ -349,17 +383,79 @@ struct AttachmentListView: View {
 ///    `Documents/`/`tmp/`/`Caches/`, rendering App-Group-located previews as a
 ///    blank gray sheet.
 ///
-/// **Attempt lifetime.** A directory is created only after the QuickLook slot is
-/// reserved, and exactly one of three things happens to it: staging fails and
-/// `stage` removes it; presentation is refused and `finishPresentation` removes
-/// it; or presentation succeeds and it is retained deliberately — QuickLook
-/// reads it for the life of the preview, and `downloadedFiles[section]` keeps
-/// referencing it afterwards for re-present and `ShareLink`. That retention is
-/// bounded: once `downloadedFiles[section]` is set, every later tap takes the
-/// re-present branch, so a given attachment stages at most once per view, and
-/// the surviving directories are reclaimed with the rest of `tmp/`.
+/// **Attempt lifetime — there are TWO call-site shapes, and they do not have the
+/// same lifetime.** This paragraph is the contract a third call site must pick
+/// from deliberately; it said "a directory is created only after the QuickLook
+/// slot is reserved, and exactly one of three things happens to it" until
+/// 2026-08-12, which `1820a4fb3` had already falsified on both limbs.
+///
+/// 1. **Reserved + imperative** — `stageAndPresent`, used by
+///    `AttachmentListView.downloadAndPreview`. That caller takes the single
+///    global QuickLook slot (`AttachmentQuickLook.reservePresentation`) before the
+///    fetch, so no directory exists until the slot is held, and exactly one of
+///    three things happens to the attempt: staging fails and `stageAttempt`
+///    removes it; presentation is refused and `finishPresentation` removes it; or
+///    presentation succeeds and it is retained deliberately — QuickLook reads it
+///    for the life of the preview, and `downloadedFiles[section]` keeps
+///    referencing it afterwards for re-present and `ShareLink`.
+/// 2. **Unreserved + declarative** — `stage`, used by
+///    `EmlAttachmentPreview.downloadAndPreview(_:fetch:)` since `1820a4fb3`. That
+///    view presents by assigning `previewURL` to SwiftUI's `.quickLookPreview`,
+///    so it reserves NOTHING, passes no presenter, and never reaches
+///    `finishPresentation`: the refusal arm is unreachable from here and the
+///    directory is created without any slot being held. Only two outcomes exist —
+///    staging throws and `stageAttempt` removes the attempt, or staging succeeds
+///    and the attempt is retained.
+///
+/// ⚠️ **The residue, stated so it is not lost — and deliberately NOT mechanised.**
+/// On shape 2 the retention is unconditional, because nothing on that path can
+/// observe that the bytes were never read. An `.eml` attachment staged but never
+/// previewed — the sheet dismissed while the download was in flight — leaks one
+/// attempt directory into `tmp/`. It loses the user nothing, and `tmp/` reclaims
+/// it.
+///
+/// ⚠️ **The bound on that leak is PER VIEW INSTANCE, not per attachment.**
+/// `09ee68157` said it was "bounded at one per staged nested attachment", which
+/// reads as a global bound and is false. `EmlAttachmentPreview.downloadedFiles`
+/// is `@State private var` — it dies with the view — so the re-present branch it
+/// gates bounds restaging only inside ONE presentation. Dismiss the `.eml` sheet
+/// and open it again and the new view starts with an empty dictionary, so the
+/// same nested attachment stages a second directory; N opens leak up to N. The
+/// staging task is unstructured (`Task { … }` in the private
+/// `downloadAndPreview`), so it can also complete staging AFTER the sheet is
+/// gone, with nothing left to read the result. The same `@State` scoping applies
+/// to `AttachmentListView.downloadedFiles`, so shape 1's "at most once" is a
+/// per-view statement too; there it is not a leak, because a presented preview
+/// is reachable and the refusal arm removes the attempt.
+/// No test exercises repeated dismissal and recreation, so nothing would go red
+/// if the per-open cost grew.
+///
+/// Retention is otherwise bounded on both shapes: once `downloadedFiles[section]`
+/// is set, every later tap ON THAT VIEW takes the re-present branch, so a given
+/// attachment stages at most once per view instance, and the surviving
+/// directories are reclaimed with the rest of `tmp/`.
 enum AttachmentPreviewStager {
     private static let stagingDirectoryName = "TabMailAttachmentPreviews"
+
+    /// One staging attempt: the directory `createAttempt` created, plus the file
+    /// inside it the bytes are written to.
+    ///
+    /// The directory is carried EXPLICITLY rather than re-derived from
+    /// `fileURL.deletingLastPathComponent()`, because re-deriving it means
+    /// computing a delete target from a path built by joining the sender's
+    /// filename. Any name that survives the reduction still holding a separator —
+    /// or that resolves back to the attempt directory itself — makes that
+    /// derivation walk somewhere the stager never created, and the failure paths
+    /// then delete it. The creator already knows the answer; nothing may ask the
+    /// attacker-influenced path for it again.
+    private struct StagedAttempt {
+        /// The per-attempt `<UUID>` directory. The ONLY thing any failure path
+        /// here is permitted to remove.
+        let directory: URL
+        /// The file inside `directory` the attachment bytes are written to, and
+        /// the URL every caller of `stage` / `stageAndPresent` receives.
+        let fileURL: URL
+    }
 
     static func stage(
         data: Data,
@@ -371,22 +467,42 @@ enum AttachmentPreviewStager {
             try data.write(to: url, options: .atomic)
         }
     ) throws -> URL {
-        let destination = try destinationURL(
+        try stageAttempt(
+            data: data,
+            messageId: messageId,
+            originalFilename: originalFilename,
+            rootDirectory: rootDirectory,
+            fileManager: fileManager,
+            writeData: writeData
+        ).fileURL
+    }
+
+    private static func stageAttempt(
+        data: Data,
+        messageId: String,
+        originalFilename: String,
+        rootDirectory: URL,
+        fileManager: FileManager,
+        writeData: (Data, URL) throws -> Void
+    ) throws -> StagedAttempt {
+        let attempt = try createAttempt(
             messageId: messageId,
             originalFilename: originalFilename,
             rootDirectory: rootDirectory,
             fileManager: fileManager
         )
         do {
-            try writeData(data, destination)
+            try writeData(data, attempt.fileURL)
         } catch {
-            // `destinationURL` has already created the attempt directory, so a
+            // `createAttempt` has already created the attempt directory, so a
             // failed write would otherwise strand an empty directory in tmp/
-            // forever. Remove it, then report the real failure unchanged.
-            discardAttempt(at: destination, fileManager: fileManager)
+            // forever. Remove exactly THAT directory — the one we created, not a
+            // parent re-derived from the destination path — then report the real
+            // failure unchanged.
+            discardAttemptDirectory(at: attempt.directory, fileManager: fileManager)
             throw error
         }
-        return destination
+        return attempt
     }
 
     @MainActor
@@ -403,7 +519,7 @@ enum AttachmentPreviewStager {
     ) throws -> URL? {
         try finishPresentation(
             staging: {
-                try stage(
+                try stageAttempt(
                     data: data,
                     messageId: messageId,
                     originalFilename: originalFilename,
@@ -417,39 +533,70 @@ enum AttachmentPreviewStager {
         )
     }
 
-    /// Removes ONE attempt — the `<attempt UUID>` directory, i.e. exactly what
-    /// `destinationURL` created. Never a sibling attempt, never the per-message
-    /// namespace, never the shared root, so it cannot touch a file another
-    /// preview is reading. Best-effort: failing to delete leaks one directory
-    /// into `tmp/`, which is strictly better than failing an operation that
-    /// otherwise succeeded.
-    static func discardAttempt(at stagedURL: URL, fileManager: FileManager = .default) {
-        try? fileManager.removeItem(at: stagedURL.deletingLastPathComponent())
+    /// Removes ONE attempt — the `<attempt UUID>` directory it is handed, i.e.
+    /// exactly what `createAttempt` created. Never a sibling attempt, never the
+    /// per-message namespace, never the shared root, so it cannot touch a file
+    /// another preview is reading.
+    ///
+    /// It removes the URL it is GIVEN and does not walk up from it: the previous
+    /// form took the staged FILE and deleted its parent, which made the delete
+    /// target a function of the sender-authored filename that built that path.
+    /// Callers pass `StagedAttempt.directory`, which the stager created and
+    /// therefore knows independently of anything the sender wrote.
+    ///
+    /// Best-effort: failing to delete leaks one directory into `tmp/`, which is
+    /// strictly better than failing an operation that otherwise succeeded.
+    ///
+    /// ⚠️ `private`, and named for the DIRECTORY, because this function's
+    /// contract was INVERTED in place: it used to take the staged FILE and
+    /// delete that file's parent. Same name, same `internal` visibility,
+    /// opposite meaning — so an in-module caller written against the old
+    /// contract would compile, delete a single file, and silently leak the
+    /// attempt directory. The name now states which of the two it is, and the
+    /// visibility keeps the pairing with `createAttempt` (the only thing that
+    /// knows this URL) from being reachable at all outside this type.
+    private static func discardAttemptDirectory(
+        at attemptDirectory: URL,
+        fileManager: FileManager = .default
+    ) {
+        try? fileManager.removeItem(at: attemptDirectory)
     }
 
     @MainActor
     private static func finishPresentation(
-        staging: () throws -> URL,
+        staging: () throws -> StagedAttempt,
         fileManager: FileManager,
         presenter: (URL) -> Bool
     ) rethrows -> URL? {
-        let stagedURL = try staging()
-        guard presenter(stagedURL) else {
+        let attempt = try staging()
+        guard presenter(attempt.fileURL) else {
             // The slot was lost between reservation and presentation, or there
             // was no view controller to present from. Nothing will ever read
             // these bytes, so the attempt must not outlive the failed attempt.
-            discardAttempt(at: stagedURL, fileManager: fileManager)
+            discardAttemptDirectory(at: attempt.directory, fileManager: fileManager)
             return nil
         }
-        return stagedURL
+        return attempt.fileURL
     }
 
-    private static func destinationURL(
+    /// Builds the attempt, and REFUSES the ones that must not exist.
+    ///
+    /// The name is used verbatim as the final path component, so a name
+    /// `AttachmentFilename` refuses never reaches the filesystem: the throw
+    /// happens BEFORE `createDirectory`, so a refused attachment leaves no attempt
+    /// directory behind and no cleanup path has anything to remove. This is the
+    /// enforcement point; `AttachmentListView.downloadAndPreview` and
+    /// `EmlAttachmentPreview.downloadAndPreview` also ask the same question before
+    /// they fetch, so the user gets the message without paying for the download.
+    private static func createAttempt(
         messageId: String,
         originalFilename: String,
         rootDirectory: URL,
         fileManager: FileManager
-    ) throws -> URL {
+    ) throws -> StagedAttempt {
+        guard AttachmentFilename.isSafeFileComponent(originalFilename) else {
+            throw AttachmentFilenameError.unsupported(name: originalFilename)
+        }
         // `messageId` IS this message's content key — the same value the cache
         // read and write re-hydrate — so hashing it through the store's own
         // helper reuses one hashing rule instead of introducing a second. The
@@ -467,50 +614,12 @@ enum AttachmentPreviewStager {
             at: directory,
             withIntermediateDirectories: true
         )
-        return directory.appendingPathComponent(
-            displayFilename(originalFilename)
+        return StagedAttempt(
+            directory: directory,
+            fileURL: directory.appendingPathComponent(originalFilename)
         )
     }
 
-    /// Reduces an attachment filename to a single safe path component, so a
-    /// crafted name containing separators cannot escape the attempt directory —
-    /// and, just as importantly, so no name can resolve BACK to the attempt
-    /// directory itself.
-    ///
-    /// The reduction splits textually on `/`. It deliberately does NOT go through
-    /// `URL(fileURLWithPath:).lastPathComponent`, which was wrong in two separate
-    /// directions:
-    ///
-    /// 1. It resolves a RELATIVE path against the process working directory
-    ///    before taking the last component, so `""`, `"."` and `".."` came back
-    ///    as a component of the CWD (measured: `"tabmail-ios"`, `"tabmail-ios"`,
-    ///    `"tabmail"`). The `.`/`..`/empty guard below could therefore never fire
-    ///    — it was dead code and its `"Attachment"` fallback was unreachable.
-    /// 2. For the root path it returns `"/"` itself, which passed that guard.
-    ///    `appendingPathComponent("/")` then collapses to the ATTEMPT DIRECTORY,
-    ///    so the atomic write fails `EISDIR` and `stage`'s error path calls
-    ///    `discardAttempt`, whose `deletingLastPathComponent()` removes the
-    ///    per-message NAMESPACE rather than the attempt — contradicting
-    ///    `discardAttempt`'s own contract and destroying a sibling attempt whose
-    ///    bytes a live QuickLook preview and its `ShareLink` are still reading.
-    ///    Both preview call sites stage under the same `messageId`
-    ///    (`AttachmentListView.downloadAndPreview` passes `message.id`,
-    ///    `EmlAttachmentPreview.downloadAndPreview` passes `parentMessage.id`),
-    ///    so a nested `.eml` part could reach a top-level attachment.
-    ///
-    /// `split(separator:)` omits empty subsequences, so its last element is
-    /// always exactly one non-empty component containing no `/` — which IS the
-    /// safety property — or there is no element at all (`""`, `"/"`, `"///"`).
-    /// `.` and `..` survive the split as single components and are refused
-    /// explicitly: neither names a file inside the attempt directory.
-    private static func displayFilename(_ originalFilename: String) -> String {
-        guard let candidate = originalFilename.split(separator: "/").last.map(String.init),
-              candidate != ".", candidate != ".."
-        else {
-            return "Attachment"
-        }
-        return candidate
-    }
 }
 
 /// Imperative QuickLook presentation, deliberately detached from the SwiftUI
