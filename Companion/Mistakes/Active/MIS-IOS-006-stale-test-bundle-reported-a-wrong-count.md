@@ -2,7 +2,10 @@
 
 **Class:** testing
 **Severity:** high
-**First seen:** 2026 · **Recurrences:** 5 (**5: the BUILD failed on a peer session's `build.db` lock and
+**First seen:** 2026 · **Recurrences:** 6 (**6: two serialized runs compiled the selected test
+target but executed zero tests and stalled waiting for workers because the copied ignored
+`TabMail.xcodeproj` omitted the existing test file; the by-name selector was exact, but target
+membership was false**; **5: the BUILD failed on a peer session's `build.db` lock and
 `test-without-building` then ran the PREVIOUS bundle, reporting my red-proof inversion as PASSING —
 I had read only the test log**; 4: a brand-new test FILE, never added to the target because
 `./Scripts/xcodegen.sh` was not re-run — `** TEST SUCCEEDED **` having executed ZERO of it, with no
@@ -129,6 +132,33 @@ Never take a verdict — least of all a red-proof verdict — from a test run wh
 seen say `TEST BUILD SUCCEEDED`. A red proof is the *most* dangerous run to take from a stale bundle,
 because the answer it produces ("it passed") is the answer that makes you stop looking.
 
+## Instance 6 (2026-08-15, open-issue campaign) — exact selectors compiled, then zero workers materialized
+
+The issue #5 invariant suite lived in an **existing** tracked test file, so the implementation
+correctly avoided the familiar new-file membership trap. The isolated worktree initially had no
+generated project, however, and copied an ignored `TabMail.xcodeproj` from a sibling worktree whose
+`project.pbxproj` did not contain `ICSCalendarImporterTests.swift`. Two centralized attempts compiled
+the selected test target, executed zero tests, and stalled at `waiting for workers to materialize`.
+The five `-only-testing:` selectors were exact and carried `()`; selector correctness did not make
+the source a target member.
+
+The tell is broader than instance 4's "brand-new test file":
+
+> *I proved the source file is tracked and the selector is exact, and inferred target membership
+> from those two facts without reading the generated Sources phase.*
+
+The primary caught the zero-test state before accepting a verdict, preserved both interrupted
+xcresults, and mechanically found no `ICSCalendarImporterTests.swift` reference in
+`TabMail.xcodeproj/project.pbxproj`. Regenerating only the ignored project produced four references
+(build file, file reference, group, Sources phase); the next conventional RED executed 5 tests and
+failed exactly the two intended invariants, and GREEN executed the same 5 and passed all 5.
+
+**Countermeasure extension:** before the first test run in any isolated iOS worktree, verify every
+selected source file appears in the generated project's `PBXSourcesBuildPhase`; do this even for an
+old tracked test file. By-name verification proves execution only after workers exist. If the run
+stalls waiting for workers or reports zero, inspect target membership before changing selectors or
+retrying the same project.
+
 ---
 
 ## Pre-compaction index line (verbatim, 2026-08-13, pass 4)
@@ -139,5 +169,5 @@ so its index-relative link is not re-resolved from this directory, because the i
 accumulated recurrence detail that exists nowhere else in this file.
 
 ```text
-- **[MIS-IOS-006](Companion/Mistakes/Active/MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md)** — recorded a baseline from a stale `.xctest`; verify new tests ran **by name**, never by total count. A NEW test file is not in the target until `./Scripts/xcodegen.sh` runs, so it reports `** TEST SUCCEEDED **` having executed ZERO of it. A peer build holding `build.db` makes `build-for-testing` fail and `test-without-building` measure the PREVIOUS bundle — so a **red proof reported PASSING**; a name proves *selection*, only the BUILD log proves *freshness*, so gate every run on `TEST BUILD SUCCEEDED`. *Tell: green plus relief, faster than expected, with no count — or reading the verdict from the TEST log having never opened the BUILD log.* (×5)
+- **[MIS-IOS-006](Companion/Mistakes/Active/MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md)** — recorded a baseline from a stale `.xctest`; verify new tests ran **by name**, never by total count. A NEW test file is not in the target until `./Scripts/xcodegen.sh` runs, so it reports `** TEST SUCCEEDED **` having executed ZERO of it. A peer build holding `build.db` makes `build-for-testing` fail and `test-without-building` measure the PREVIOUS bundle — so a **red proof reported PASSING**; a name proves *selection*, only the BUILD log proves *freshness*, so gate every run on `TEST BUILD SUCCEEDED`. *Tell: green plus relief, faster than expected, with no count — or reading the verdict from the TEST log having never opened the BUILD log.* (×6)
 ```

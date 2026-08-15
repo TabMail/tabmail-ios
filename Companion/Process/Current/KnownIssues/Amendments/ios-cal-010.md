@@ -6,8 +6,8 @@
 
 ## Status
 
-🛠️ **FIX CANDIDATE (2026-08-15) — still OPEN pending serialized build/test evidence, exact-diff
-Claude review, promotion and merge.** The open-issue campaign lifted the prior "for now" deferral
+🛠️ **FIX CANDIDATE (2026-08-15) — serialized invariant RED/GREEN complete; still OPEN pending
+exact-diff Claude review, promotion and merge.** The open-issue campaign lifted the prior "for now" deferral
 for this bounded gate. The candidate fetches the attachment as before, uses
 `ICSBuilder.parseIncoming` to refuse exactly `REPLY`, `COUNTER`, `DECLINECOUNTER` and `REFRESH`,
 and puts a neutral explanation in `AttachmentListView`'s existing visible error surface instead
@@ -37,6 +37,24 @@ entered a flow that could neither apply them nor explain its no-op.
   `METHOD=REQUEST` update modifies an existing UID is still untested. The open listener
   port-conflict retry, sanitizer-scope item, provider-side invite-card lead, and filename-less
   Gmail/Exchange row asymmetry are not closed by this candidate.
+
+## Candidate validation evidence
+
+- **RED:** on the documented two-line re-break (policy always permits; tap presents
+  unconditionally), binary diff SHA-256
+  `dc03374cd5c574ab1a2229203b73dc7851deeb8cec0ce54e1c99eada083b1d6d`, xcodebuild exited 65
+  with 5 selected tests: 3 passed and exactly 2 failed — the denied-method policy at
+  `METHOD:REPLY` and the production wiring at zero policy calls. Artifact:
+  `/private/tmp/tabmail-campaign-results/issue5-red-authoritative.xcresult`.
+- **GREEN:** exact code/test commit `9226608a0f80160d24fc64b31dffcade1d390992` exited 0 with
+  `TEST SUCCEEDED`: the same 5 tests all passed, with no failure, skip, or expected failure.
+  Artifact: `/private/tmp/tabmail-campaign-results/issue5-green-authoritative.xcresult`.
+- Coverage reports `ICSCalendarImporter.allowsAddToCalendar(_:)` at 100% (12/12). The
+  `AttachmentListView` branch is deliberately pinned by the non-vacuous source-structural test;
+  the focused suite does not pretend to drive its UIKit/network attachment tap at runtime.
+- The mandatory exact-diff Claude review remains externally blocked by the account's weekly quota
+  until 2026-08-18 13:00 America/Vancouver. The draft PR and GitHub issue stay open until that gate
+  is completed and reconciled.
 
 ## Subsystem and search terms
 
