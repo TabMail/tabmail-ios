@@ -77,8 +77,13 @@ separate validity check:
   requeues the remaining claimed lane members;
 - `evidenceRefused` prevents a same-drain repeat while the durable row remains for a later drain;
 - successful retirement and partial narrowing are transactional;
-- launch reconciliation returns ordinary stale `inFlight` operations to `queued`; an attempted MOVE is
-  conservatively dropped rather than blindly replayed, and foreground sync restores server truth.
+- launch reconciliation returns ordinary stale `inFlight` operations to `queued`; under the accepted
+  `IOS-MOVE-003` limitation, a durably claimed MOVE is dropped rather than blindly replayed.
+
+For the MOVE case, `everAttempted` is set at claim time before any provider I/O. A process death can
+therefore drop an intention that never emitted a command. Foreground sync restores server truth, not the
+gesture; the user must repeat the move if it did not land. That accepted recovery narrows a hypothetical
+crash's consequences but does not make memory unsafety acceptable.
 
 Those fallbacks materially bound failures, but they do not establish the disposition. Actor serialization
 does: the hypothesized corruption cannot occur.
@@ -98,21 +103,32 @@ though the closure only forwards the reference back to the actor. It is therefor
 evidence of a current race: the annotation pays for the isolation crossing, while actor discipline makes
 the accesses safe.
 
-The type does not encode that discipline. This conclusion must be re-opened if a future change accesses a
-plain context field directly inside the provider-work closure, a `Task.detached`/task-group child, a GRDB
-closure, or any other nonisolated context. Such a change must restore the actor hop or protect the moved
-state with `Mutex` per resilience rule 5.
+The type does not encode that discipline. Because the class is `@unchecked Sendable`, a future
+context-only mutation inside the provider-work closure, `Task.detached`, a task-group child, or a GRDB
+closure would compile without an isolation diagnostic. A detached copy that also touches actor-isolated
+`self` is rejected, but that does not guard the actual field-level hazard.
 
-`enteredInbox` keeps its existing `Mutex`. A nonisolated test seam reads it directly, and value-level
-protection is harmless future-proofing; its lock is not evidence that the actor-isolated sibling fields
-are racy.
+⚠️ **Policy deviation, recorded rather than hidden:** resilience rule 5 currently permits
+`@unchecked Sendable` only for a Mutex-protected inner value or a wrapper around an inherently
+thread-safe API. `DrainContext` is neither. The current runtime is safe by actor ownership, but the
+annotation falls outside that rule's stated exceptions. Reclassifying the race as `not-defect` does not
+silently waive the policy: this record inventories the deviation. A future hygiene change can remove the
+annotation by keeping the context wholly actor-owned and eliminating the `@Sendable` capture; until then,
+every new access must be censused and must restore the actor hop or protect moved state with `Mutex`.
+
+`enteredInbox` keeps its existing `Mutex` as deliberate value-level future-proofing; its lock is not
+evidence that the actor-isolated sibling fields are racy. Preserve it and protect consistency upward if a
+sibling ever moves off-actor—never remove this lock merely because the plain siblings currently rely on
+actor discipline.
 
 ### Why there is no source fix or red-first fuzz test
 
 Adding locks would make a falsified premise appear confirmed, add overhead, and still not close the only
 real TOCTOU across the provider `await`. A race fuzz test cannot go red on the parent revision because its
-required precondition—two simultaneous field mutations—is prohibited by the actor executor. The honest
-guard is the existing Swift 6 isolation check: a detached version of the lane closure does not compile.
+required precondition—two simultaneous field mutations—is prohibited by the actor executor. There is no
+compiler guard on a future context-only off-actor mutation because `@unchecked Sendable` admits it; the
+current invariant is proven by the complete access census and remains review-enforced until the
+annotation is eliminated or the stored state gains value-level synchronization.
 
 ### Retracted original report
 

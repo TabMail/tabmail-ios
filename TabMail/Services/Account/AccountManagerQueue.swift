@@ -101,8 +101,10 @@ extension AccountManager {
     /// captures the reference; it does NOT make the fields thread-safe. A future
     /// direct access from that closure, `Task.detached`, a GRDB closure, or another
     /// nonisolated context would violate this contract and must add synchronization
-    /// or restore the actor hop (`IOS-QUEUE-010`). `internal` (not `private`) so
-    /// tests can construct it directly to call `executeSingleOp`.
+    /// or restore the actor hop. Because the annotation lets a context-only
+    /// off-actor access compile, this is a documented policy deviation rather than
+    /// a compiler-enforced invariant; see `IOS-QUEUE-010`. `internal` (not
+    /// `private`) so tests can construct it directly to call `executeSingleOp`.
     class DrainContext: @unchecked Sendable {
         /// Accounts whose PROVIDER is failing — a connectivity fact, deliberately
         /// account-wide, so one drain does not hammer a server that is down.
@@ -137,11 +139,11 @@ extension AccountManager {
         /// sync — the moment both the durable row and its FTS entry are under
         /// their final ids (ADR-IOS-008 decision 3; see `recordMembersThatEnteredInbox`).
         ///
-        /// `Mutex`-protected even though production accesses currently inherit
-        /// `AccountManager` isolation. A nonisolated test seam reads this collection
-        /// after execution, and keeping protection on the value itself makes any
-        /// future off-actor reader safe. The plain sibling fields are safe only by
-        /// the actor-isolation contract on `DrainContext` above (`IOS-QUEUE-010`).
+        /// `Mutex`-protected even though current accesses inherit `AccountManager`
+        /// isolation. This value-level protection is deliberate future-proofing:
+        /// preserve the lock and protect consistency upward if a sibling ever moves
+        /// off-actor; never unprotect this field merely because the plain siblings
+        /// currently rely on the actor contract above (`IOS-QUEUE-010`).
         let enteredInbox = Mutex<[String: [InboxEntry]]>([:])
         /// `PendingOperation.id`s whose provider could not obtain the evidence its
         /// own safety gate requires (`ProviderEvidenceUnavailable`). Per-op, not
