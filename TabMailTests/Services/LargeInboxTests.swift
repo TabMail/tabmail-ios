@@ -99,7 +99,7 @@ struct LargeInboxTests {
             "the unfinished 101st row is outside the automatic backlog window")
     }
 
-    @Test("A directly selected old job executes even when automatic repopulation excludes it")
+    @Test("Automatic body production excludes an old row while a direct job executes it")
     func directOldJobExecutesOutsideBacklogWindow() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
@@ -128,16 +128,24 @@ struct LargeInboxTests {
             Issue.record("Expected the directly selected target")
             return
         }
-        let evidence = try db.read { db -> (Int, [(headerId: String, accountId: String)]) in
+        let processed = BodyFetchProcessor.ProcessedItem(
+            contentKey: ContentKey(rawValue: target.id),
+            headerId: target.id,
+            accountId: target.accountId,
+            isInInbox: true,
+            body: "old body producer fixture",
+            snippet: "old body producer fixture")
+        let evidence = try db.read { db -> (Int, [BodyFetchProcessor.ProcessedItem]) in
             let newerCount = try MessageHeader
                 .filter(Column("isInInbox") == true)
                 .filter(Column("date") > target.date)
                 .fetchCount(db)
-            let candidates = try ActiveAIQueue.repopulationCandidates(db: db)
+            let candidates = try BodyFetchProcessor.automaticAIEnqueueCandidates(
+                from: [processed], db: db)
             return (newerCount, candidates)
         }
         #expect(evidence.0 == SyncConfig.maxRecentEmails)
-        #expect(!evidence.1.contains { $0.headerId == target.id })
+        #expect(evidence.1.isEmpty)
         #expect(ActiveAIQueue.jobStartDisposition(
             message: target, jobType: .summary, admission: .admissible) == .execute)
     }

@@ -658,8 +658,10 @@ actor ActiveAIQueue {
 
     /// Terminal preflight for a selected job. Recency is intentionally absent:
     /// `repopulationCandidates` bounds the automatic backlog, while direct event
-    /// producers (new body, push merge, and move into inbox) mirror TB's uncapped
-    /// `processMessage` path. Applying the same cap again here strands a direct
+    /// producers (user-opened body, push merge, and move into inbox) mirror TB's
+    /// uncapped `processMessage` path. Automatic ActiveBodyQueue production is
+    /// intersected with this queue's recent selector at `BodyFetchProcessor`.
+    /// Applying the same cap again here strands a direct
     /// old-message job in `jobCompleted`'s retry loop.
     enum JobStartDisposition: Sendable, Equatable {
         case execute

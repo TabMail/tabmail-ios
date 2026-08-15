@@ -829,8 +829,9 @@ extension AccountManager {
             return
         }
         // Per-item `enqueue` (S + R, with A chained by the summary job) mirrors
-        // the sibling event-driven site, `BodyFetchProcessor.flushBatch`'s
-        // `enableAI && item.isInInbox` arm.
+        // `BodyFetchProcessor.flushBatch`'s `.directEvent` arm. Its
+        // `.automaticRecentWindow` arm has a producer-level backlog cap that a
+        // proved move event deliberately bypasses, matching TB `processMessage`.
         for item in resolved {
             await ActiveAIQueue.shared.enqueue(headerId: item.headerId, accountId: item.accountId)
         }

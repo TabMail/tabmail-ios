@@ -1606,7 +1606,8 @@ final class InboxViewModel {
                 if case .success(let fetchResult) = await BodyFetchProcessor.renderFetched(item: processorItem, fullMessage: fullMessage) {
                     let (_, processed) = await BodyFetchProcessor.process(fetchResult: fetchResult, enableAI: enableAI)
                     if let processed {
-                        await BodyFetchProcessor.flushBatch([processed], enableAI: enableAI)
+                        await BodyFetchProcessor.flushBatch(
+                            [processed], enableAI: enableAI, aiEnqueueScope: .directEvent)
                         snippetUpdates.append((headerId: item.headerId, snippet: processed.snippet))
                     } else {
                         // confirmed-empty / first-empty-retry — no usable snippet this pass

@@ -400,7 +400,8 @@ struct WriteTierRoutingTests {
         // touching any pool); avoids entangling ActiveAIQueue/ActiveEmbeddingQueue
         // LLM/CoreML side effects in this DB-write-tier assertion.
         await PriorityGate.normal {
-            await BodyFetchProcessor.flushBatch([processed], enableAI: false)
+            await BodyFetchProcessor.flushBatch(
+                [processed], enableAI: false, aiEnqueueScope: .automaticRecentWindow)
         }
         await clearObserver()
 

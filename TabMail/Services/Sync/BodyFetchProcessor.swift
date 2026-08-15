@@ -194,6 +194,30 @@ enum BodyFetchProcessor {
         let snippet: String
     }
 
+    /// The body producer's authority to enqueue AI after it makes a body durable.
+    /// Automatic ActiveBodyQueue work must stay inside the same recent-inbox
+    /// window as ActiveAIQueue repopulation. Explicit user-visible fetches are a
+    /// direct event, like a proved move or NSE push, and may process their selected
+    /// message outside that window.
+    enum AIEnqueueScope: Sendable {
+        case automaticRecentWindow
+        case directEvent
+    }
+
+    /// Production boundary for the automatic body producer. Reuses the AI
+    /// queue's bounded selector instead of mirroring its SQL, so a cold-start
+    /// ActiveBodyQueue pass cannot turn every old incomplete inbox body into
+    /// model work after the executor-level age gate is removed.
+    nonisolated static func automaticAIEnqueueCandidates(
+        from confirmedItems: [ProcessedItem], db: Database
+    ) throws -> [ProcessedItem] {
+        let inboxItems = confirmedItems.filter(\.isInInbox)
+        guard !inboxItems.isEmpty else { return [] }
+        let recentIds = Set(
+            try ActiveAIQueue.repopulationCandidates(db: db).map { $0.headerId })
+        return inboxItems.filter { recentIds.contains($0.headerId) }
+    }
+
     /// Process phase: write MessageBody to GRDB, return data for batched FTS write.
     /// FTS writes are deferred to the caller for batching (avoids per-item FTS overhead).
     ///
@@ -431,7 +455,11 @@ enum BodyFetchProcessor {
 
     /// Flush a batch of processed items to FTS + GRDB flags in one go.
     /// Batching FTS writes avoids per-item FTS5 index maintenance overhead.
-    static func flushBatch(_ items: [ProcessedItem], enableAI: Bool) async {
+    static func flushBatch(
+        _ items: [ProcessedItem],
+        enableAI: Bool,
+        aiEnqueueScope: AIEnqueueScope
+    ) async {
         guard !items.isEmpty else { return }
         let t0 = CFAbsoluteTimeGetCurrent()
         let dbPool = AppDatabase.dbPool
@@ -488,8 +516,35 @@ enum BodyFetchProcessor {
         let dbMs = Int((CFAbsoluteTimeGetCurrent() - tDb) * 1000)
 
         // 3. Enqueue downstream processing — only for items actually written to FTS.
+        // ActiveBodyQueue is an AUTOMATIC producer and repopulates every incomplete
+        // inbox body without a LIMIT, so it must be intersected with the bounded AI
+        // selector here. Direct user fetches keep their explicit-event authority.
+        let aiItems: [ProcessedItem]
+        if enableAI {
+            switch aiEnqueueScope {
+            case .automaticRecentWindow:
+                do {
+                    aiItems = try await dbPool.read { db in
+                        try Self.automaticAIEnqueueCandidates(from: confirmedItems, db: db)
+                    }
+                } catch {
+                    // The body and its nil AI fields stay durable, so queue repopulation
+                    // can recover on a later drain/foreground. Refuse only this derived
+                    // automatic enqueue when its policy boundary cannot be read.
+                    if !error.isDatabaseSuspensionAbort {
+                        print("[BodyFetch] Automatic AI candidate selection failed: \(error)")
+                    }
+                    aiItems = []
+                }
+            case .directEvent:
+                aiItems = confirmedItems.filter(\.isInInbox)
+            }
+        } else {
+            aiItems = []
+        }
+        let aiHeaderIds = Set(aiItems.map(\.headerId))
         for item in confirmedItems {
-            if enableAI && item.isInInbox {
+            if aiHeaderIds.contains(item.headerId) {
                 await ActiveAIQueue.shared.enqueue(headerId: item.headerId, accountId: item.accountId)
             }
             if enableAI {
@@ -648,7 +703,8 @@ enum BodyFetchProcessor {
                 enableAI: enableAI,
                 replaceExistingBody: replaceExistingBody)
             if let processed {
-                await flushBatch([processed], enableAI: enableAI)
+                await flushBatch(
+                    [processed], enableAI: enableAI, aiEnqueueScope: .directEvent)
             }
             return outcome
         case .failure(let result):

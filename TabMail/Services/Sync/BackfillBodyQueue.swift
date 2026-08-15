@@ -557,7 +557,10 @@ actor BackfillBodyQueue {
                         // (bodyComplete) yield to UI; the explicit yield above
                         // covers the separate SearchIndex (FTS) sidecar pool.
                         await PriorityGate.background {
-                            await BodyFetchProcessor.flushBatch(processedItems, enableAI: false)
+                            await BodyFetchProcessor.flushBatch(
+                                processedItems,
+                                enableAI: false,
+                                aiEnqueueScope: .automaticRecentWindow)
                         }
                     }
 

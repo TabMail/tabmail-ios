@@ -573,7 +573,10 @@ actor ActiveBodyQueue {
                     // .normal-tagged (ADR-IOS-056) — see the process() call above.
                     if !processedItems.isEmpty {
                         await PriorityGate.normal {
-                            await BodyFetchProcessor.flushBatch(processedItems, enableAI: true)
+                            await BodyFetchProcessor.flushBatch(
+                                processedItems,
+                                enableAI: true,
+                                aiEnqueueScope: .automaticRecentWindow)
                         }
                     }
 
