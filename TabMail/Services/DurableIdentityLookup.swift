@@ -140,11 +140,37 @@ enum DurableIdentityLookup {
         }
 
         // Step 3: rfc822 fallback (IMAP UID-remap after MOVE).
+        //
+        // The index hint is load-bearing on a fresh install: migrations leave
+        // statistics only for four empty partial indexes, so SQLite otherwise
+        // chooses `messageHeader_accountId_messageId (accountId=?)` and walks the
+        // account. On the current migrated schema with 200k rows / 100k per
+        // account, the unhinted hit/miss medians were 15.0–15.3 ms (20.1 ms miss
+        // p95) while this RFC seek took 0.004–0.006 ms; after `ANALYZE`, both forms
+        // took 0.003–0.006 ms. The statement stays read-only and adds no write or
+        // space cost. Its placement is unchanged: some callers run it in merge
+        // savepoints and the inbox gather can synchronously initiate it from
+        // `@MainActor`, so removing the account walk also shortens writer/UI work.
+        // Its small temp sort is retained and bounded to the siblings sharing one
+        // RFC identity, never the whole account.
+        //
+        // Do not replace this with another composite index (per-message write +
+        // space cost) or a foreground `ANALYZE` (whole-database work, and not all
+        // query classes improve with fresh statistics). The v1 single-column RFC
+        // index already supplies the needed seek. If a migration drops or renames
+        // it, the statement throws instead of silently regressing. Because `find`
+        // is shared by the unified inbox gather, that failure can surface as an
+        // empty inbox; live hinted reads already have this fail-safe class, but this
+        // patch deliberately widens it to these consumers.
+        //
+        // The ORDER BY is a deliberate narrowing of the formerly unspecified
+        // duplicate-RFC winner. The same folder as the staged observation is the
+        // intended remap target; if it is absent, an inbox sibling wins, then `id`
+        // supplies a stable final tie-break. That makes the folder/inbox fields read
+        // by the merge, stale-by-move checks, and unified reader deterministic.
         if let rfc822 = rfc822MessageId, !rfc822.isEmpty,
-           let row = try Row.fetchOne(db, sql: """
-            SELECT id, folderId, folderPath, isInInbox, rfc822MessageId FROM messageHeader
-            WHERE accountId = ? AND rfc822MessageId = ?
-            """, arguments: [accountId, rfc822]) {
+           let row = try Row.fetchOne(db, sql: Self.rfc822FallbackSQL,
+                                      arguments: [accountId, rfc822, folderPath]) {
             return DurableHeaderRef(
                 id: row["id"], folderId: row["folderId"], folderPath: row["folderPath"],
                 isInInbox: row["isInInbox"], rfc822MessageId: row["rfc822MessageId"]
@@ -153,6 +179,16 @@ enum DurableIdentityLookup {
 
         return nil
     }
+
+    /// The exact step-3 statement, exposed so plan coverage cannot drift from
+    /// production's durable-identity fallback.
+    static let rfc822FallbackSQL = """
+        SELECT id, folderId, folderPath, isInInbox, rfc822MessageId
+        FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
+        WHERE accountId = ? AND rfc822MessageId = ?
+        ORDER BY CASE WHEN folderPath = ? THEN 0 ELSE 1 END, isInInbox DESC, id ASC
+        LIMIT 1
+        """
 
     /// The IN-MEMORY counterpart of `find`'s step-2 rejection, for the two
     /// call sites that dedup against rows already held in memory rather than

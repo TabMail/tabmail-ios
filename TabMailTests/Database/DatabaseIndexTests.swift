@@ -27,6 +27,8 @@ struct DatabaseIndexTests {
                 "v64 (folderId, messageId) composite missing — folderId+messageId lookups will folder-scan")
         #expect(indexes.contains("messageHeader_accountId_messageId"),
                 "v64 (accountId, messageId) composite missing — accountId+messageId lookups (NSE merge / AppDelegate) will account-scan")
+        #expect(indexes.contains("messageHeader_rfc822MessageId"),
+                "v1 RFC index missing — live INDEXED BY identity lookups will throw")
         // v64 drops the now-redundant single-column accountId index (the composite's
         // leading column serves accountId-only queries).
         #expect(!indexes.contains("messageHeader_accountId"),
@@ -365,6 +367,79 @@ struct DatabaseIndexTests {
             """)
         #expect(pre.contains("messageHeader_accountId_messageId"),
                 "the un-hinted form must still exhibit the regression, or the assertions above prove nothing: \(pre)")
+    }
+
+    /// IOS-PERF-012 — both hot durable-identity lookups must seek the stable RFC
+    /// id even in the statistics-poor state left by the production migration
+    /// chain. A wall-clock threshold would be device-dependent; the account walk
+    /// is the invariant that caused the measured 15–26 ms tail.
+    @Test("IOS-PERF-012 — durable identity lookups seek the RFC id with stale and fresh statistics")
+    func durableIdentityLookupsSeekRfcIdAcrossStatisticsRegimes() throws {
+        let db = try TestDatabase.make()
+        let fullIndexStatRows = try db.read { dbConn in
+            try Row.fetchAll(dbConn, sql: """
+                SELECT idx FROM sqlite_stat1
+                WHERE idx IN (
+                    'messageHeader_rfc822MessageId',
+                    'messageHeader_rfc822MessageId_date',
+                    'messageHeader_accountId_messageId'
+                )
+                """)
+        }
+        #expect(fullIndexStatRows.isEmpty,
+                "the stale-plan witness requires migration-left statistics with no rows for the three competing full indexes")
+        let productionStatements = [
+            ("durable fallback", DurableIdentityLookup.rfc822FallbackSQL),
+            ("moved-inbox AI target", AccountManager.inboxEntryAITargetSQL),
+        ]
+
+        for (label, production) in productionStatements {
+            let stalePlan = try plan(db, production)
+            #expect(stalePlan.contains("USING INDEX messageHeader_rfc822MessageId"),
+                    "\(label) must seek the RFC index with migration-left statistics: \(stalePlan)")
+            #expect(stalePlan.contains("rfc822MessageId=?"),
+                    "\(label) must seek the RFC value, not merely scan its index: \(stalePlan)")
+            #expect(!stalePlan.contains("messageHeader_accountId_messageId"),
+                    "\(label) walked the account with migration-left statistics: \(stalePlan)")
+
+            // TWO-SIDED (MIS-030): remove exactly the production hint. If this
+            // control stops reproducing the account walk, the positive assertion
+            // above no longer proves the planner defect or its fix.
+            let unhinted = production.replacingOccurrences(
+                of: " INDEXED BY messageHeader_rfc822MessageId", with: "")
+            #expect(unhinted != production,
+                    "\(label) production SQL no longer carries the hint this test pins")
+            let unhintedPlan = try plan(db, unhinted)
+            #expect(unhintedPlan.contains("messageHeader_accountId_messageId"),
+                    "\(label) unhinted control no longer reproduces the stale-statistics account walk: \(unhintedPlan)")
+        }
+
+        // Populate through the shared helper, then refresh real planner statistics
+        // rather than hand-building a schema or editing sqlite_stat1. The hint must
+        // remain a valid RFC seek after the planner has current cardinalities too.
+        try TestDatabase.insertAccount(db, id: "stats-a", email: "a@example.com")
+        try TestDatabase.insertAccount(db, id: "stats-b", email: "b@example.com")
+        try TestDatabase.insertFolder(db, accountId: "stats-a")
+        try TestDatabase.insertFolder(db, accountId: "stats-b")
+        for i in 0..<20 {
+            try TestDatabase.insertMessageHeader(
+                db, messageId: "a-\(i)", folderId: "stats-a:INBOX", accountId: "stats-a",
+                rfc822MessageId: "<a-\(i)@example.com>")
+            try TestDatabase.insertMessageHeader(
+                db, messageId: "b-\(i)", folderId: "stats-b:INBOX", accountId: "stats-b",
+                rfc822MessageId: "<b-\(i)@example.com>")
+        }
+        try db.write { try $0.execute(sql: "ANALYZE") }
+
+        for (label, production) in productionStatements {
+            let freshPlan = try plan(db, production)
+            #expect(freshPlan.contains("USING INDEX messageHeader_rfc822MessageId"),
+                    "\(label) must keep seeking the RFC index with fresh statistics: \(freshPlan)")
+            #expect(freshPlan.contains("rfc822MessageId=?"),
+                    "\(label) must keep seeking the RFC value with fresh statistics: \(freshPlan)")
+            #expect(!freshPlan.contains("messageHeader_accountId_messageId"),
+                    "\(label) walked the account with fresh statistics: \(freshPlan)")
+        }
     }
 
     @Test("MessageHeader ordered by date DESC for inbox view")

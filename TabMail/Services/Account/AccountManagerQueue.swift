@@ -880,6 +880,26 @@ extension AccountManager {
     /// So the priority is INVERTED relative to `find`: the rfc822 identity is
     /// the only thing that survives both re-key paths, so it is required rather
     /// than used as a fallback.
+    ///
+    /// The RFC index hint is load-bearing with migration-left statistics. Without
+    /// it SQLite walks `messageHeader_accountId_messageId (accountId=?)`; on the
+    /// current migrated schema with 200k rows / 100k per account, a hit/miss took
+    /// 17.0–26.2 ms (p95) versus 0.004–0.005 ms through the v1 single-column RFC
+    /// index. After `ANALYZE`, both forms took 0.003–0.006 ms. This loop is already
+    /// off-main and the hint adds no write, space, or concurrency cost.
+    ///
+    /// A composite index would add per-message write/space cost, while foreground
+    /// whole-database `ANALYZE` is disproportionate and does not improve every
+    /// query class. If the named index disappears, the statement throws and this
+    /// caller's existing `try?` resolves no AI target rather than guessing.
+    ///
+    /// The destination-folder predicate already selects the intended move target;
+    /// `ORDER BY id ASC LIMIT 1` deliberately makes same-folder duplicate-RFC rows
+    /// deterministic. It does NOT prefer or require `isInInbox`, because
+    /// `ActiveAIQueue.readJobOutcome` remains the authoritative live scope check.
+    /// The bounded N+1 is retained: entries are only the members of one completed
+    /// operation, and per-entry refusal/logging remains clearer than broadening this
+    /// fix into a set-based identity rewrite.
     nonisolated static func resolveInboxEntryAITargets(
         entries: [DrainContext.InboxEntry], folderPath: String, db: Database
     ) throws -> [(headerId: String, accountId: String)] {
@@ -905,10 +925,10 @@ extension AccountManager {
             // refuses a job whose row is no longer in an inbox (`.scopeExited`).
             // A redundant conjunct in a correctness guard can mask the failure of
             // the one that matters.
-            guard let id = try String.fetchOne(db, sql: """
-                SELECT id FROM messageHeader
-                WHERE accountId = ? AND folderPath = ? AND rfc822MessageId = ?
-                """, arguments: [entry.accountId, folderPath, rfc822])
+            guard let id = try String.fetchOne(
+                db, sql: Self.inboxEntryAITargetSQL,
+                arguments: [entry.accountId, folderPath, rfc822]
+            )
             else {
                 queueLog("[MoveTrace] entered inbox — no live row in \(folderPath) for rfc822 identity of uid=\(entry.messageId), nothing enqueued")
                 continue
@@ -917,6 +937,15 @@ extension AccountManager {
         }
         return out
     }
+
+    /// The exact moved-inbox AI-target statement, exposed so plan coverage
+    /// exercises production SQL instead of a test-only copy.
+    nonisolated static let inboxEntryAITargetSQL = """
+        SELECT id FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
+        WHERE accountId = ? AND folderPath = ? AND rfc822MessageId = ?
+        ORDER BY id ASC
+        LIMIT 1
+        """
 
     // MARK: - Queued-member identity lookup
 

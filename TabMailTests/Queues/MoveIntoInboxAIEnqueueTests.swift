@@ -270,4 +270,33 @@ struct MoveIntoInboxAIEnqueueTests {
                 """)
         #expect(resolvedBody != decoyBody, "and must never be the UID-collision victim's body")
     }
+
+    @Test("Same-folder duplicate RFC targets have one deterministic lowest-id winner")
+    func duplicateRfcAITargetIsDeterministic() throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "acc-enter-inbox-duplicate-rfc"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+
+        let sharedRfc = "duplicate-target@example.com"
+        let insertedFirst = try insertHeader(
+            accountId: accountId, folderPath: "INBOX", uid: "z-uid",
+            rfc822: sharedRfc, isInInbox: true, pool: pool)
+        let lowestId = try insertHeader(
+            accountId: accountId, folderPath: "INBOX", uid: "a-uid",
+            rfc822: sharedRfc, isInInbox: true, pool: pool)
+        #expect(lowestId < insertedFirst)
+
+        let context = AccountManager.DrainContext()
+        context.enteredInbox.withLock {
+            $0["\(accountId)|INBOX"] = [AccountManager.DrainContext.InboxEntry(
+                accountId: accountId, messageId: "stale-source-uid", rfc822MessageId: sharedRfc)]
+        }
+        let targets = try resolveTargets(
+            context, accountId: accountId, folderPath: "INBOX", pool: pool)
+
+        #expect(targets.map { $0.headerId } == [lowestId],
+                "the first-inserted row must not win merely because the RFC index reaches it first")
+    }
 }

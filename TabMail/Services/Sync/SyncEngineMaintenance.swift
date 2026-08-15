@@ -693,12 +693,15 @@ extension SyncEngine {
     ///      BY\s+messageHeader_unreadSweep' TabMail/ Shared/
     ///      TabMailNotificationService/` → **no output, exit 1**.
     ///   2. **Non-vacuity, so a broken regex cannot pass as a clean result.**
-    ///      The same command without the index name returns exactly the **four**
+    ///      The same command without the index name returns exactly the **seven**
     ///      live hints — `messageHeader_folderId_messageId` (`MessageContentStore`),
-    ///      `messageHeader_rfc822MessageId` (`MessageContentStore`, `ChatStore`) and
-    ///      `messageHeader_triage_display` (`InboxListReader`) — every one built by
-    ///      a SHIPPED migration (`v64`, `v1` ×2, `v38`), none deferred. Check 1 is
-    ///      meaningful only when check 2 is non-empty.
+    ///      `messageHeader_rfc822MessageId` (`MessageContentStore`, `ChatStore`,
+    ///      `AccountManager`'s computed queued-member hint,
+    ///      `DurableIdentityLookup.rfc822FallbackSQL`, and
+    ///      `AccountManager.inboxEntryAITargetSQL`), and
+    ///      `messageHeader_triage_display` (`InboxListReader`). Every named index is
+    ///      built by a SHIPPED migration (`v64`, `v1`, `v38`), none deferred. Check
+    ///      1 is meaningful only when check 2 is non-empty.
     ///
     /// CONVERGENCE (Data Integrity rule 5). `v83`'s body is now empty, so the two
     /// populations diverge for exactly as long as it takes this pass to run: a

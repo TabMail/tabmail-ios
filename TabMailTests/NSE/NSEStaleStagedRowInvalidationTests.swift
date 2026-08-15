@@ -239,6 +239,43 @@ struct NSEStaleStagedRowInvalidationTests {
         #expect(durable?.isInInbox == false)
     }
 
+    @Test("Duplicate RFC siblings: the observed-folder copy prevents a false stale-by-move verdict")
+    func duplicateRfcObservedFolderCopyIsNotStaleByMove() async throws {
+        let (dir, pool, inbox, archive, previous) = try makeAppDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        resetGlobals()
+        let sharedRfc = "shared-stale-check@example.com"
+        try await pool.write { db in
+            var archived = MessageHeader(
+                messageId: "old-archive-uid", subject: "Archive sibling", from: "Sender",
+                fromAddress: "sender@example.com", to: "user@example.com", date: Date(), snippet: "",
+                folderId: archive.id, accountId: "acc1", folderPath: "Archive", isInInbox: false)
+            archived.rfc822MessageId = sharedRfc
+            try archived.insert(db)
+
+            var inboxCopy = MessageHeader(
+                messageId: "old-inbox-uid", subject: "Inbox sibling", from: "Sender",
+                fromAddress: "sender@example.com", to: "user@example.com", date: Date(), snippet: "",
+                folderId: inbox.id, accountId: "acc1", folderPath: "INBOX", isInInbox: true)
+            inboxCopy.rfc822MessageId = sharedRfc
+            try inboxCopy.insert(db)
+        }
+
+        // Both provider-id lookups miss the new UID, forcing the RFC fallback.
+        // Archive is inserted first so a bare hinted fetch chooses it by rowid and
+        // incorrectly reports the staged Inbox row as moved. Production's explicit
+        // observed-folder precedence must instead select the live Inbox sibling.
+        let staged = makeStaged(
+            folderPath: "INBOX", messageId: "new-inbox-uid", rfc822: sharedRfc,
+            observedUidValidity: nil)
+        let stale = await NSEDataBridge.detectStaleByMoveRows([staged])
+        #expect(stale.isEmpty,
+                "an observed-folder duplicate-RFC copy exists, so the staged Inbox row is not stale-by-move")
+    }
+
     @Test("A normal new message (no durable header yet) is NOT invalidated — merges normally")
     func newMessageWithoutDurableHeaderMergesNormally() async throws {
         let (dir, pool, inbox, _, previous) = try makeAppDatabase()
