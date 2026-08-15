@@ -203,8 +203,13 @@ regenerated from it; their detail files live in
 ## GitHub live trackers (2026-08-14)
 
 Only records classified `open` were migrated. Accepted limitations, resolved records, and historical
-audit/provenance files remain documentation-only. The future app-owned ATS image loader is
-[issue #1](https://github.com/TabMail/tabmail-ios/issues/1). Open register mappings:
+audit/provenance files remain documentation-only. The app-owned ATS image loader remains a deferred
+feature under [issue #1](https://github.com/TabMail/tabmail-ios/issues/1). Current WebKit subresource
+failures are cause-opaque, but a same-bytes/one-request loader would require a comprehensive
+custom-scheme rewrite plus new redirect, cookie/cache, decode, coalescing, and asynchronous
+cancellation policy. That changes the explicitly retained persistent WebKit behavior and introduces
+a scheme-task stop/completion exception boundary, so no bounded campaign fix is justified without
+explicit product authorization or a public exact subresource-error API. Open register mappings:
 
 - `IOS-AI-004` [#2](https://github.com/TabMail/tabmail-ios/issues/2); `IOS-AI-005` [#3](https://github.com/TabMail/tabmail-ios/issues/3); `IOS-BILLING-002` [#4](https://github.com/TabMail/tabmail-ios/issues/4); `IOS-CAL-010` [#5](https://github.com/TabMail/tabmail-ios/issues/5)
 - `IOS-COMPOSE-002` [#7](https://github.com/TabMail/tabmail-ios/issues/7); `IOS-COMPOSE-003` [#8](https://github.com/TabMail/tabmail-ios/issues/8); `IOS-IMAP-015` [#9](https://github.com/TabMail/tabmail-ios/issues/9); `IOS-IMAP-016` [#10](https://github.com/TabMail/tabmail-ios/issues/10)
