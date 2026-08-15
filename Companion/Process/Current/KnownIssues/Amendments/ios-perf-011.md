@@ -1,15 +1,36 @@
 # IOS-PERF-011
 
-- Register classification: `open`
+- Register classification: `resolved`
 - New post-freeze record (2026-08-12) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
 ## Status
 
-🔓 **OPEN (2026-08-12)** — `SettingsView.loadOldMessageCount` is a **synchronous main-actor `COUNT(*)`**
-over the inbox folder set — the exact hazard `InboxViewModel.checkLargeInbox` documents having already
-fixed. Found while enumerating the `IOS-PERF-010` class; not reproduced from a user report.
-Classification: **open**.
+✅ **RESOLVED (2026-08-14)** — `SettingsView.loadOldMessageCount` now awaits the asynchronous database
+read overload, so reader contention suspends rather than occupies `MainActor`. This is a small
+policy/correctness-hygiene fix; no user-visible Settings stall was measured. Classification:
+**resolved**.
+
+## 2026-08-14 validity verdict and fix
+
+The original issue overstated practical severity. The query is a covering-index count and remained
+bounded by inbox-folder scope. On a synthetic 250k-row database with 100k matching old inbox rows, it
+completed in roughly 2–3 ms when uncontended; current pool sizing also makes ordinary reader
+exhaustion unlikely. No owner-device hitch or field stall was reproduced, so this record must **not**
+be cited as evidence of a demonstrated user-visible performance problem.
+
+The code shape was still real: SwiftUI's `.task` and the state mutation are main-actor isolated, the
+old call selected the synchronous `PrioritizedDatabase.read` overload, and there was no off-main
+wrapper or fallback. The direct conversion is therefore worthwhile as repo-policy hygiene: the
+display-only count may arrive after first paint, and contention no longer blocks interaction. The
+prioritized async read intentionally retains NSE staging read-through; if a pending merge takes
+seconds, the count is delayed rather than stale, but the main actor remains available. A real
+one-reader WAL-pool test holds the sole reader for about 350 ms; the async implementation waits about
+361 ms while a 20 ms `MainActor` heartbeat advances 17 times. Replacing it with the old synchronous
+shape yields about the same wait but zero heartbeat ticks and fails the regression test.
+
+No query, index, migration, dialog threshold, or archive behavior changed. The adjacent unbounded
+`archiveOldMessages` materialisation remains a separate, confirmation-gated memory-ceiling question.
 
 ## Subsystem and search terms
 
@@ -19,7 +40,7 @@ Classification: **open**.
 `messageHeader_folderId_date` covering index; `InboxViewModel.checkLargeInbox` prior art;
 member of the `IOS-PERF-010` blocked-reader class; unbounded `fetchAll` with no LIMIT
 
-## Full detail
+## Original registration detail (historical; current severity narrowed above)
 
 **The shape.** `SettingsView.loadOldMessageCount`, invoked from a `.task { }` in the view body, runs
 
@@ -70,7 +91,7 @@ memory.
 `async` and behind an explicit user confirmation. It is a **memory-ceiling** question rather than a
 UI-stall one, and it belongs here **only as a cross-reference, not as the same defect.**
 
-## Why registered rather than fixed
+## Why it was originally registered rather than fixed
 
 `SettingsView.swift` was outside the file claims and outside the scope of the search-performance fix
 during which it was found. The fix is mechanical and carries no product decision, so this is the

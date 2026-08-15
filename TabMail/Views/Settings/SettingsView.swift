@@ -412,7 +412,7 @@ struct SettingsView: View {
             Text("This will remove \(accountToDelete?.emailAddress ?? "this account") and all its local data.")
         }
         .task {
-            loadOldMessageCount()
+            await loadOldMessageCount()
         }
         .alert("Archive Old Emails?", isPresented: $showArchiveConfirm) {
             Button("Continue") {
@@ -692,16 +692,33 @@ struct SettingsView: View {
         return "\(used) / \(limit)"
     }
 
-    private func loadOldMessageCount() {
+    private func loadOldMessageCount() async {
         let archiveCutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.archiveAgeDays, to: Date()) ?? Date()
         let inboxFolderIds = Set(navigationStore.folders.filter { $0.role == .inbox }.map(\.id))
         guard !inboxFolderIds.isEmpty else { return }
-        oldMessageCount = (try? AppDatabase.dbPool.read { db in
+
+        oldMessageCount = (try? await Self.oldMessageCount(
+            folderIds: inboxFolderIds,
+            archiveCutoff: archiveCutoff,
+            database: AppDatabase.dbPool
+        )) ?? 0
+    }
+
+    /// The Settings `.task` is main-actor isolated. Keep the database wait in the
+    /// async GRDB overload so opening Settings never synchronously occupies the UI
+    /// thread, even if the reader pool is contended.
+    @MainActor
+    static func oldMessageCount(
+        folderIds: Set<String>,
+        archiveCutoff: Date,
+        database: PrioritizedDatabase
+    ) async throws -> Int {
+        try await database.read { db in
             try MessageHeader
-                .filter(inboxFolderIds.contains(Column("folderId")))
+                .filter(folderIds.contains(Column("folderId")))
                 .filter(Column("date") < archiveCutoff)
                 .fetchCount(db)
-        }) ?? 0
+        }
     }
 
     private func archiveOldMessages() async {
