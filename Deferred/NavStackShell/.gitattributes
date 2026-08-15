@@ -1,0 +1,6 @@
+# The two preserved documents and source patch are byte-identical historical
+# artifacts. Retain their original whitespace while keeping `git diff --check`
+# useful for newly-authored handoff material.
+KNOWN_NAVIGATIONSPLITVIEW_BUG.md whitespace=-blank-at-eol
+PLAN_NAV_STACK_SHELL.md whitespace=-blank-at-eol
+NAV_STACK_SHELL_WIP.patch whitespace=-blank-at-eol

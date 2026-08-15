@@ -1,0 +1,347 @@
+diff --git a/TabMail/Views/MailNavigationView.swift b/TabMail/Views/MailNavigationView.swift
+index b22dd0d..8c843e1 100644
+--- a/TabMail/Views/MailNavigationView.swift
++++ b/TabMail/Views/MailNavigationView.swift
+@@ -63,16 +63,16 @@ struct MailNavigationView: View {
+     /// `provider == "outlook"`. Separate state because the explainer copy +
+     /// brand differ per provider; the underlying consent call is unified.
+     @State private var pendingOutlookConsentExplainerEmail: String?
+-    @State private var selection: MailboxSelection?
++    /// Root navigation path. Hosts heterogeneous values:
++    /// `MailboxSelection` for sidebar pushes (inbox, settings, etc.) and
++    /// `String` for message-detail pushes from `InboxView`'s list rows.
++    /// Deep-link handlers replace the whole path atomically.
++    @State private var path = NavigationPath()
++    /// Drives row highlight in `InboxView` (via `List(selection:)`). No
++    /// longer drives detail rendering — that's the String destination on
++    /// `path`. Cleared in the String destination's `.onDisappear` so
++    /// pop-back leaves InboxView's internal checks (L383, L698) seeing fresh nil.
+     @State private var selectedMessageId: String?
+-    /// One-shot guard for `onChange(of: selection)` to suppress the default
+-    /// "clear detail pane" behavior during programmatic notification-tap
+-    /// navigation. The handler sets selection + selectedMessageId together
+-    /// once the async merge+lookup resolves; without this flag the onChange
+-    /// nils selectedMessageId one render before the assignment lands,
+-    /// causing a visible inbox-then-detail flash on every tap.
+-    @State private var isHandlingNotificationDeepLink = false
+-    @State private var columnVisibility = NavigationSplitViewVisibility.automatic
+     @State private var expandedAccounts: Set<String> = []
+     private var manager: AccountManager { AccountManager.shared }
+     private var state: AccountManagerState { AccountManagerState.shared }
+@@ -80,14 +80,26 @@ struct MailNavigationView: View {
+     init(initialSelection: MailboxSelection? = .unified(.inbox)) {
+         self.initialSelection = initialSelection
+         // If a plan navigation is pending (e.g. from "Start Free Trial" banner),
+-        // start with nil selection to avoid flashing inbox before navigating to plan.
++        // start with empty path — the `.task` below will push planPicker after
++        // a 100ms yield so the view is mounted first.
+         if UserDefaults.standard.bool(forKey: "pending_plan_navigation") {
+-            _selection = State(initialValue: nil)
++            _path = State(initialValue: NavigationPath())
++        } else if let initialSelection {
++            _path = State(initialValue: Self.pathTo(initialSelection))
+         } else {
+-            _selection = State(initialValue: initialSelection)
++            _path = State(initialValue: NavigationPath())
+         }
+     }
+ 
++    /// Builds a fresh NavigationPath for deep-link / initial-path assignments.
++    /// **`static`** so it's callable from `init` before `self` is fully init'd.
++    private static func pathTo(_ sel: MailboxSelection, message: String? = nil) -> NavigationPath {
++        var p = NavigationPath()
++        p.append(sel)
++        if let message { p.append(message) }
++        return p
++    }
++
+     /// Roles shown in the unified section, in display order
+     private let unifiedRoles: [FolderRole] = [.inbox, .archive, .sent, .drafts, .trash, .spam]
+ 
+@@ -99,8 +111,8 @@ struct MailNavigationView: View {
+     @Environment(\.syncNow) private var statusNow
+ 
+     var body: some View {
+-        NavigationSplitView(columnVisibility: $columnVisibility) {
+-            List(selection: $selection) {
++        NavigationStack(path: $path) {
++            List {
+                 Group {
+                     // Free trial / subscription prompt.
+                     // - Signed-out users: always show (the tap routes to sign-in).
+@@ -114,7 +126,7 @@ struct MailNavigationView: View {
+                         Section {
+                             Button {
+                                 if hasTabMailSession {
+-                                    selection = .planPicker
++                                    path = Self.pathTo(.planPicker)
+                                 } else {
+                                     UserDefaults.standard.set(true, forKey: "pending_plan_navigation")
+                                     showSignInSheet = true
+@@ -366,40 +378,56 @@ struct MailNavigationView: View {
+             )).font(.subheadline))
+             .scrollContentBackground(.hidden)
+             .background(Palette.previewPaneBg)
+-        } content: {
+-            // Extracted into separate structs so NavigationStore refreshes in
+-            // MailNavigationView don't cascade into the content pane.
+-            // Without this, GRDB ValueObservation updates destroy the
+-            // NavigationStack in TabMailSettingsView, wiping pushed views.
+-            MailContentColumn(selection: selection, selectedMessageId: $selectedMessageId)
+-        } detail: {
+-            // Extracted into a separate struct so NavigationStore refreshes in
+-            // MailNavigationView don't cascade into the detail pane.
+-            // SwiftUI skips MessageDetailContainer.body when selectedMessageId
+-            // hasn't changed, even if the parent re-renders.
+-            MessageDetailContainer(selectedMessageId: selectedMessageId)
+-        }
+-        .background(Palette.previewPaneBg)
+-        .onChange(of: selection) { _, _ in
+-            // Clear the detail pane when the user navigates between folders
+-            // / mailboxes. EXCEPT: when a notification-tap handler programm-
+-            // atically sets `selection = .unified(.inbox)` alongside a
+-            // `selectedMessageId` in the same tick, we must not clobber
+-            // the assignment. `isHandlingNotificationDeepLink` is raised
+-            // by the handler right before the selection change and lowered
+-            // right after — gives us a tight window of "this selection
+-            // change is mine, leave it alone."
+-            if isHandlingNotificationDeepLink {
+-                isHandlingNotificationDeepLink = false
+-            } else {
+-                selectedMessageId = nil
++            .navigationDestination(for: MailboxSelection.self) { sel in
++                switch sel {
++                case .unified, .folder:
++                    InboxColumnResolver(selection: sel, selectedMessageId: $selectedMessageId)
++                case .outbox:
++                    OutboxView(accountId: nil)
++                case .outboxForAccount(let accountId):
++                    OutboxView(accountId: accountId)
++                case .account:
++                    AccountDashboardView()
++                case .planPicker:
++                    PlanPickerView()
++                case .prompts:
++                    TabMailSettingsView()
++                case .settings:
++                    SettingsView()
++                case .scheduledTasks:
++                    ScheduledTasksSettingsView()
++                case .reminders:
++                    RemindersSettingsView()
++                case .calendar:
++                    CalendarPickerView()
++                case .contacts:
++                    ContactContainerPickerView()
++                case .debug:
++                    DebugMenuView()
++                }
++            }
++            .navigationDestination(for: String.self) { id in
++                MessageDetailContainer(selectedMessageId: id)
++                    .id(id)
++                    .onDisappear {
++                        // Pop-back clears the stale id so InboxView's internal
++                        // `selectedMessageId == nil` (L383) and `!= messageId`
++                        // (L698) checks see fresh state. The id-equality guard
++                        // protects a detail→detail swap (deep-link changing
++                        // the open message): the incoming handler writes
++                        // `selectedMessageId = <newId>` before the outgoing
++                        // onDisappear fires, so `selectedMessageId == id`
++                        // (old id) is already false and we skip the clear.
++                        if selectedMessageId == id { selectedMessageId = nil }
++                    }
+             }
+         }
++        .background(Palette.previewPaneBg)
+         .onReceive(NotificationCenter.default.publisher(for: .navigateToSettings).receive(on: DispatchQueue.main)) { _ in
+-            selection = .settings
++            path = Self.pathTo(.settings)
+         }
+         .onReceive(NotificationCenter.default.publisher(for: .navigateToAccount).receive(on: DispatchQueue.main)) { _ in
+-            selection = .account
++            path = Self.pathTo(.account)
+         }
+         .sheet(isPresented: $showSignInSheet) {
+             TabMailLoginView {
+@@ -421,13 +449,17 @@ struct MailNavigationView: View {
+             guard !aiDisabled else { return }
+             // Brief yield to let the view mount before navigating
+             try? await Task.sleep(for: .milliseconds(100))
+-            selection = .planPicker
++            path = Self.pathTo(.planPicker)
+         }
+         .onReceive(NotificationCenter.default.publisher(for: .emailPillTapped).receive(on: DispatchQueue.main)) { notification in
+             // Fallback handler: ensures email navigation works even when InboxView
+             // isn't mounted (e.g., user is viewing Settings/Calendar/Contacts).
+             // When InboxView IS mounted, both handlers fire — harmless (same state).
+             guard let realId = notification.userInfo?["realId"] as? String else { return }
++            // Row-highlight parity: the destination renders via path, but
++            // InboxView's List(selection:) still reads selectedMessageId
++            // for the highlight after pop-back. Set both.
++            path = Self.pathTo(.unified(.inbox), message: realId)
+             selectedMessageId = realId
+         }
+         .onReceive(NotificationCenter.default.publisher(for: .proactiveNotificationTapped).receive(on: DispatchQueue.main)) { notification in
+@@ -506,22 +538,25 @@ struct MailNavigationView: View {
+             // Consume any deep link stored during cold start (notification tap
+             // before MailNavigationView was mounted).
+             if let pending = PendingDeepLinkStore.consume() {
+-                selection = .unified(.inbox)
+                 switch pending {
+                 case .message(let id):
+                     let exists = (try? AppDatabase.dbPool.read { db in
+                         try MessageHeader.fetchOne(db, key: id) != nil
+                     }) ?? false
+                     if exists {
++                        path = Self.pathTo(.unified(.inbox), message: id)
+                         selectedMessageId = id
+                         print("[MailNav] Cold-start deep link: navigating to message \(id.prefix(30))")
+                     } else {
++                        path = Self.pathTo(.unified(.inbox))
+                         print("[MailNav] Cold-start deep link: message gone, falling back to inbox")
+                     }
+                 case .taskResult(let taskHash):
+                     // Navigate to inbox — InboxView handles expanding chat pill via notification
++                    path = Self.pathTo(.unified(.inbox))
+                     print("[MailNav] Cold-start deep link: navigating to inbox for task result \(taskHash)")
+                 case .inbox:
++                    path = Self.pathTo(.unified(.inbox))
+                     print("[MailNav] Cold-start deep link: navigating to inbox")
+                 }
+             }
+@@ -536,19 +571,17 @@ struct MailNavigationView: View {
+ 
+         guard let messageId = userInfo?["messageId"] as? String, !messageId.isEmpty else {
+             // No messageId → just land in inbox (no detail to open).
+-            selection = .unified(.inbox)
++            path = Self.pathTo(.unified(.inbox))
++            selectedMessageId = nil
+             print("[MailNav] Notification deep link: navigating to inbox")
+             return
+         }
+ 
+-        // Resolve BEFORE toggling selection so the inbox/detail views don't
+-        // flash "inbox only" for the duration of the async merge+lookup.
+-        //
+         // Drain-then-lookup: if the NSE merge hasn't run yet (common on cold
+         // launch from notification tap), the row we want to open is still
+         // sitting in the NSE staging DB. Running the merge first materializes
+         // it into GRDB before we probe — otherwise we fall through to the
+-        // inbox even though the message is about to exist. See bug 1.
++        // inbox even though the message is about to exist.
+         //
+         // Lookup shape: the push payload's `messageId` is the PROVIDER
+         // messageId (Gmail id / Graph AQMk… / IMAP UID), NOT the composite
+@@ -565,20 +598,18 @@ struct MailNavigationView: View {
+                     .fetchOne(db)?.id
+             }
+ 
+-            // Commit both state changes in the same tick. Raise the flag
+-            // first so `.onChange(of: selection)` skips its
+-            // `selectedMessageId = nil` wipe — otherwise the wipe fires
+-            // between our two assignments and the detail view momentarily
+-            // goes blank.
++            // Atomic path assignment — no flag needed (NavigationPath replace
++            // is a single state write; no intermediate `.onChange` can split
++            // it). Also set `selectedMessageId` for row-highlight parity on
++            // pop-back (InboxView reads it via List(selection:)).
+             if let id = compositeId {
+-                isHandlingNotificationDeepLink = true
+-                selection = .unified(.inbox)
++                path = Self.pathTo(.unified(.inbox), message: id)
+                 selectedMessageId = id
+                 print("[MailNav] Notification deep link: navigating to message \(messageId.prefix(30))")
+             } else {
+                 // Message genuinely gone (deleted/moved off-device before tap).
+-                // Safe to let the default onChange behavior clear the detail.
+-                selection = .unified(.inbox)
++                path = Self.pathTo(.unified(.inbox))
++                selectedMessageId = nil
+                 print("[MailNav] Notification deep link: message gone, falling back to inbox")
+             }
+         }
+@@ -633,66 +664,6 @@ struct MailNavigationView: View {
+ 
+ }
+ 
+-// MARK: - Content Column Container
+-
+-/// Isolated from MailNavigationView's NavigationStore observation so that GRDB
+-/// writes don't cascade into the content pane's NavigationStack (which would
+-/// destroy pushed views like PromptHistoryView).
+-private struct MailContentColumn: View {
+-    let selection: MailboxSelection?
+-    @Binding var selectedMessageId: String?
+-
+-    var body: some View {
+-        switch selection {
+-        case .unified, .folder:
+-            if let selection {
+-                InboxColumnResolver(selection: selection, selectedMessageId: $selectedMessageId)
+-                    .id(selection)
+-            }
+-        case .outbox:
+-            OutboxView(accountId: nil)
+-        case .outboxForAccount(let accountId):
+-            OutboxView(accountId: accountId)
+-        default:
+-            SettingsContentColumn(selection: selection)
+-        }
+-    }
+-}
+-
+-/// Handles non-inbox content selections. Has no NavigationStore dependency,
+-/// so its body is skipped entirely when selection hasn't changed.
+-/// No NavigationStack here — the NavigationSplitView provides its own
+-/// navigation for each column. Adding one causes invisible navigation
+-/// (no animation, no back button) in compact mode.
+-private struct SettingsContentColumn: View {
+-    let selection: MailboxSelection?
+-
+-    var body: some View {
+-        switch selection {
+-        case .account:
+-            AccountDashboardView()
+-        case .planPicker:
+-            PlanPickerView()
+-        case .prompts:
+-            TabMailSettingsView()
+-        case .settings:
+-            SettingsView()
+-        case .scheduledTasks:
+-            ScheduledTasksSettingsView()
+-        case .reminders:
+-            RemindersSettingsView()
+-        case .calendar:
+-            CalendarPickerView()
+-        case .contacts:
+-            ContactContainerPickerView()
+-        case .debug:
+-            DebugMenuView()
+-        default:
+-            ContentUnavailableView("Select a Mailbox", systemImage: "tray", description: Text("Choose a folder from the sidebar"))
+-        }
+-    }
+-}
+-
+ /// Resolves inbox/folder selection to title + matching folders via NavigationStore.
+ /// Isolated so only inbox views observe NavigationStore, not settings views.
+ private struct InboxColumnResolver: View {
+diff --git a/TabMail/Views/Previews/Tooltips/RemindersMenuTip+Preview.swift b/TabMail/Views/Previews/Tooltips/RemindersMenuTip+Preview.swift
+index 71f4a97..de0db76 100644
+--- a/TabMail/Views/Previews/Tooltips/RemindersMenuTip+Preview.swift
++++ b/TabMail/Views/Previews/Tooltips/RemindersMenuTip+Preview.swift
+@@ -9,7 +9,11 @@ import TipKit
+     PreviewMocks.spotlight(RemindersMenuTip.self)
+     let navStore = PreviewMocks.navigationStore()
+ 
+-    return MailNavigationView()
++    // initialSelection: nil — the new NavigationStack shell auto-pushes
++    // into inbox when a default initial selection is set, which would hide
++    // the sidebar and the tip. Passing nil keeps the stack at the sidebar
++    // root so the tooltip is visible in the preview canvas.
++    return MailNavigationView(initialSelection: nil)
+         .environment(navStore)
+         .environment(\.hasTabMailSession, true)
+ }
