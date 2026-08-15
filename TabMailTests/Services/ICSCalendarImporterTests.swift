@@ -6,6 +6,140 @@ import Testing
 import Foundation
 @testable import TabMail
 
+@Suite("ICSCalendarImporter Add-to-Calendar policy")
+struct ICSCalendarImporterAddPolicyTests {
+
+    private func calendar(method: String?) -> Data {
+        let methodLine = method.map { "METHOD:\($0)\n" } ?? ""
+        return Data(
+            """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            \(methodLine)BEGIN:VEVENT
+            SUMMARY:Policy fixture
+            END:VEVENT
+            END:VCALENDAR
+            """.utf8
+        )
+    }
+
+    @Test("Response and control methods cannot enter the add-only Calendar flow")
+    func refusesNonAddITIPMethods() {
+        for method in ["REPLY", "REFRESH", "COUNTER", "DECLINECOUNTER", "reply"] {
+            let data = calendar(method: method)
+            let expected = method.uppercased()
+            let parsed = ICSBuilder.parseIncoming(String(decoding: data, as: UTF8.self))
+            #expect(parsed?.method == expected, "fixture must exercise METHOD:\(method)")
+            #expect(!ICSCalendarImporter.allowsAddToCalendar(data), "METHOD:\(method)")
+        }
+    }
+
+    @Test("Event-bearing, missing, and unknown methods retain Calendar import")
+    func allowsEventBearingAndUnknownMethods() {
+        for method in ["REQUEST", "PUBLISH", "ADD", "CANCEL", "X-WHATEVER"] {
+            let data = calendar(method: method)
+            let expected = method.uppercased()
+            let parsed = ICSBuilder.parseIncoming(String(decoding: data, as: UTF8.self))
+            #expect(parsed?.method == expected, "fixture must exercise METHOD:\(method)")
+            #expect(ICSCalendarImporter.allowsAddToCalendar(data), "METHOD:\(method)")
+        }
+
+        let noMethod = calendar(method: nil)
+        let parsed = ICSBuilder.parseIncoming(String(decoding: noMethod, as: UTF8.self))
+        #expect(parsed?.method == "REQUEST", "missing METHOD must exercise the parser default")
+        #expect(ICSCalendarImporter.allowsAddToCalendar(noMethod))
+    }
+
+    @Test("Unreadable and non-event payloads fail open")
+    func allowsUnreadableAndNonEventPayloads() {
+        let fixtures = [
+            Data([0xFF, 0xFE, 0xFD]),
+            Data("BEGIN:VCALENDAR\nMETHOD:REPLY\nEND:VCALENDAR".utf8),
+            Data(),
+        ]
+        for data in fixtures {
+            #expect(ICSCalendarImporter.allowsAddToCalendar(data))
+        }
+    }
+
+    @Test("METHOD after the first event remains an explicit fail-open residual")
+    func allowsMethodAfterEvent() {
+        let data = Data(
+            """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            SUMMARY:Late method
+            END:VEVENT
+            METHOD:REPLY
+            END:VCALENDAR
+            """.utf8
+        )
+        let parsed = ICSBuilder.parseIncoming(String(decoding: data, as: UTF8.self))
+        #expect(parsed?.method == "REQUEST", "the shared parser stops at the first VEVENT")
+        #expect(ICSCalendarImporter.allowsAddToCalendar(data))
+    }
+
+    @Test("The attachment tap branches on policy and explains refusal")
+    func attachmentTapConsultsPolicyBeforePresentation() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: projectRoot.appendingPathComponent(
+                "TabMail/Views/Message/AttachmentListView.swift"
+            ),
+            encoding: .utf8
+        )
+        let functionStart = try #require(source.range(of: "private func downloadAndImportICS("))
+        let nextFunction = try #require(
+            source.range(
+                of: "private func downloadAndPreview(",
+                range: functionStart.upperBound..<source.endIndex
+            )
+        )
+        let functionBody = source[functionStart.lowerBound..<nextFunction.lowerBound]
+        let codeLines = functionBody.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.hasPrefix("//") && !$0.hasPrefix("///") }
+        let policySites = codeLines.indices.filter {
+            codeLines[$0].contains("ICSCalendarImporter.allowsAddToCalendar(")
+        }
+        let presentationSites = codeLines.indices.filter {
+            codeLines[$0].contains("ICSCalendarImporter.presentCalendarImport(")
+        }
+        let refusalNoticeSites = codeLines.indices.filter {
+            codeLines[$0].contains("calendar item can’t be added to Calendar")
+        }
+
+        #expect(policySites.count == 1, "the tap found \(policySites.count) policy calls")
+        #expect(
+            presentationSites.count == 1,
+            "the tap found \(presentationSites.count) import presentations, so the scan is vacuous"
+        )
+        #expect(
+            refusalNoticeSites.count == 1,
+            "the tap found \(refusalNoticeSites.count) user-visible refusal notices"
+        )
+        if let policySite = policySites.first,
+           let presentationSite = presentationSites.first,
+           let refusalNoticeSite = refusalNoticeSites.first {
+            #expect(
+                codeLines[policySite].hasPrefix("if ICSCalendarImporter.allowsAddToCalendar("),
+                "the policy result must control a branch rather than being discarded"
+            )
+            #expect(
+                presentationSite == policySite + 1,
+                "Calendar presentation must be inside the policy-approved branch"
+            )
+            #expect(
+                refusalNoticeSite == presentationSite + 2,
+                "policy refusal must take the visible-message branch"
+            )
+        }
+    }
+}
+
 @Suite("ICSCalendarImporter State")
 struct ICSCalendarImporterStateTests {
 

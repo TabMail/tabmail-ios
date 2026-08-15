@@ -6,12 +6,37 @@
 
 ## Status
 
-🔓 **OPEN (2026-08-12) — live in the shipped release, and DEFERRED by owner decision the same
-day.** The attachment row offers the native add-to-calendar affordance for **every**
-`text/calendar` part, deciding on the MIME type alone and never consulting the iTIP `METHOD`. For
-`REPLY`, `COUNTER`, `DECLINECOUNTER` and `REFRESH` that starts a flow which cannot succeed and
-which, by the mechanism's design, reports nothing. The owner has characterised the result as a UX
-problem rather than a defect and has explicitly declined the work for now.
+🛠️ **FIX CANDIDATE (2026-08-15) — still OPEN pending serialized build/test evidence, exact-diff
+Claude review, promotion and merge.** The open-issue campaign lifted the prior "for now" deferral
+for this bounded gate. The candidate fetches the attachment as before, uses
+`ICSBuilder.parseIncoming` to refuse exactly `REPLY`, `COUNTER`, `DECLINECOUNTER` and `REFRESH`,
+and puts a neutral explanation in `AttachmentListView`'s existing visible error surface instead
+of dispatching those payloads into the add-only system import flow. It adds no provider parsing,
+fallback, listener behavior, sanitizer behavior, or SwiftMail-fork deviation.
+
+**Prior disposition, preserved:** on 2026-08-12 the owner characterised the result as a UX problem
+rather than a defect and explicitly declined the work for then. At that point the row offered the
+native add-to-calendar affordance for every surfaced `text/calendar` attachment, deciding on MIME
+type alone and never consulting `METHOD`; the four response/control methods above therefore
+entered a flow that could neither apply them nor explain its no-op.
+
+## Candidate invariant and accepted residuals
+
+- The denylist is exactly `REPLY`, `REFRESH`, `COUNTER`, `DECLINECOUNTER`; lowercased values are
+  normalized by the already-existing parser.
+- `REQUEST`, missing `METHOD`, `PUBLISH`, `ADD`, `CANCEL`, unknown values, non-UTF-8 data, empty
+  input and a calendar with no `VEVENT` fail open to the existing importer. Removing a legitimate
+  import is the expensive failure direction; an uncertain allow retains today's recoverable no-op.
+- `METHOD` after the first `END:VEVENT` remains allowed because `parseIncoming` stops at the first
+  event and defaults to `REQUEST`. Changing that shared display parser for an unobserved ordering
+  is outside this issue; the policy test pins the residual explicitly.
+- A future production caller that invokes `presentCalendarImport` directly could bypass this tap
+  gate. The importer header now tells mail-attachment callers to consult the policy first; the
+  current census still finds one production attachment caller.
+- `IOS-CAL-011` remains accepted and unchanged. In particular, whether a genuine
+  `METHOD=REQUEST` update modifies an existing UID is still untested. The open listener
+  port-conflict retry, sanitizer-scope item, provider-side invite-card lead, and filename-less
+  Gmail/Exchange row asymmetry are not closed by this candidate.
 
 ## Subsystem and search terms
 

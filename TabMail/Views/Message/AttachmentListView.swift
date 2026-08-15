@@ -184,11 +184,11 @@ struct AttachmentListView: View {
     /// that asymmetry with `downloadAndPreview` below is the intended behaviour.**
     ///
     /// The filename never becomes a path component here: the fetched bytes go
-    /// straight to `ICSCalendarImporter.presentCalendarImport(icsData:)`, which
-    /// names its own temporary file. Nothing downstream parses the sender's string,
-    /// so there is nothing for a refusal to protect — and refusing would turn a
-    /// legitimate calendar invitation into an unopenable row over a bidi mark in a
-    /// name this path discards.
+    /// through `ICSCalendarImporter.allowsAddToCalendar(_:)` and then to
+    /// `presentCalendarImport(icsData:)`, which names its own temporary file.
+    /// Neither step consumes the sender's filename, so there is nothing for a
+    /// filename refusal to protect — and refusing would turn a legitimate calendar
+    /// invitation into an unopenable row over a bidi mark in a name this path discards.
     ///
     /// The consequence to expect, so it is not later read as a bug: the ROW can
     /// read `AttachmentFilename.unsupportedLabel` while the tap still works. The
@@ -201,7 +201,11 @@ struct AttachmentListView: View {
         Task {
             do {
                 let data = try await manager.fetchAttachment(for: message, section: attachment.section, encoding: attachment.encoding)
-                ICSCalendarImporter.presentCalendarImport(icsData: data)
+                if ICSCalendarImporter.allowsAddToCalendar(data) {
+                    ICSCalendarImporter.presentCalendarImport(icsData: data)
+                } else {
+                    self.error = "This calendar item can’t be added to Calendar."
+                }
             } catch {
                 self.error = SyncEngine.isConnectionError(error) ? "Download failed. Check your connection and try again." : "Download failed: \(error.localizedDescription)"
                 if DebugModeManager.isLoggingEnabled() {
