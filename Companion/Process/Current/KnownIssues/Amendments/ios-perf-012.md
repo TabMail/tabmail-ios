@@ -164,7 +164,8 @@ tree, so filing there would bury the row.
   both carry a pointer back here for exactly that reason.
 - `IOS-AI-004` — the ADR-IOS-008 decision-3 restoration that is this row's lowest-frequency consumer, and
   the work during which the row was found.
-- `IOS-QUEUE-010` — the other pre-existing defect found in the same pass.
+- `IOS-QUEUE-010` — the same-pass report later retracted as a false positive after actor-isolation
+  re-audit.
 - ✅ **The whole-SQL-surface audit COMPLETED (2026-08-13).** 164 ordering/grouping sites enumerated, 138
   read in full, 25 shapes measured under **both** stat regimes (~47 measurements), 9 findings, **zero
   correctness defects**. Its coverage claim was tested rather than accepted: `IOS-PERF-009` and
