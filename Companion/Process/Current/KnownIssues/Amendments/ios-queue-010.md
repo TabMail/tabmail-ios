@@ -144,4 +144,5 @@ omitted inherited actor isolation and is retracted. Task lifetime overlap is not
   the precedent for fixing documentation about the drain in place rather than silently.
 - `IOS-AI-004` — the ADR-IOS-008 decision-3 restoration whose new field prompted the false-positive
   report.
-- `IOS-PERF-012` — the other pre-existing defect found in the same pass.
+- `IOS-PERF-012` — the pre-existing defect found in the same pass; this row was the pass's other report
+  and was retracted.
