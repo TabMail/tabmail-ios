@@ -15,6 +15,19 @@ actor PushClient {
         self.baseURL = URL(string: PushConfig.baseURL)!
     }
 
+    private struct WorkerErrorBody: Decodable {
+        let error: String?
+    }
+
+    /// Preserve the worker's stable error code for durable deletion decisions.
+    /// A bare 403 can be emitted by infrastructure before the handler runs; only
+    /// the handler's `user_mismatch` response proves caller-owned state was
+    /// revoked before the shared singleton was refused.
+    nonisolated private static func deletionError(data: Data, statusCode: Int) -> PushError {
+        let errorCode = (try? JSONDecoder().decode(WorkerErrorBody.self, from: data))?.error
+        return .workerRequestFailed(statusCode: statusCode, errorCode: errorCode)
+    }
+
     // MARK: - Auth
 
     private func currentAuthToken() async -> String? {
@@ -121,11 +134,11 @@ actor PushClient {
         request.httpMethod = "DELETE"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
-        let (_, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
             print("[PushClient] unregisterDeviceAccount failed (\(accountEmail)): HTTP \(code)")
-            throw PushError.requestFailed(statusCode: code)
+            throw Self.deletionError(data: data, statusCode: code)
         }
         print("[PushClient] Unregistered \(accountEmail)")
     }
@@ -184,11 +197,11 @@ actor PushClient {
         var request = try await authRequest(path: "/push-consent/gmail/revoke", method: "POST")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["userEmail": userEmail])
 
-        let (_, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
             print("[PushClient] deleteGmailConsent failed: HTTP \(code)")
-            throw PushError.requestFailed(statusCode: code)
+            throw Self.deletionError(data: data, statusCode: code)
         }
         print("[PushClient] Deleted Gmail consent")
     }
@@ -232,11 +245,11 @@ actor PushClient {
         request.httpMethod = "DELETE"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
-        let (_, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
             print("[PushClient] unregisterDevice failed: HTTP \(code)")
-            throw PushError.requestFailed(statusCode: code)
+            throw Self.deletionError(data: data, statusCode: code)
         }
         print("[PushClient] Device unregistered")
     }
@@ -362,11 +375,11 @@ actor PushClient {
         let body: [String: Any] = ["userEmail": userEmail]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (_, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
             print("[PushClient] unsubscribeIMAP failed for \(userEmail): HTTP \(code)")
-            throw PushError.requestFailed(statusCode: code)
+            throw Self.deletionError(data: data, statusCode: code)
         }
         print("[PushClient] Unsubscribed IMAP push for \(userEmail)")
     }
@@ -385,11 +398,11 @@ actor PushClient {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (_, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
             print("[PushClient] unsubscribe failed for \(userEmail): HTTP \(code)")
-            throw PushError.requestFailed(statusCode: code)
+            throw Self.deletionError(data: data, statusCode: code)
         }
         print("[PushClient] Unsubscribed \(provider) push for \(userEmail)")
     }
@@ -437,11 +450,11 @@ actor PushClient {
         var request = try await authRequest(path: "/push-consent/outlook/revoke", method: "POST")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["userEmail": userEmail])
 
-        let (_, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
             print("[PushClient] deleteOutlookConsent failed: HTTP \(code)")
-            throw PushError.requestFailed(statusCode: code)
+            throw Self.deletionError(data: data, statusCode: code)
         }
         print("[PushClient] Deleted Outlook consent")
     }
@@ -474,6 +487,8 @@ actor PushClient {
 enum PushError: Error {
     case noAuthToken
     case requestFailed(statusCode: Int)
+    /// Worker deletion failure with a parsed stable JSON `error` code.
+    case workerRequestFailed(statusCode: Int, errorCode: String?)
 }
 
 /// Narrow seam consumed by `PushNotificationService.checkPushConsentStatusForForeground`
@@ -486,3 +501,24 @@ protocol PushConsentChecking: Sendable {
 }
 
 extension PushClient: PushConsentChecking {}
+
+/// Narrow worker API used to retire every device-side route for a removed
+/// account. Keeping this separate from the full client makes the durable retry
+/// path failure-injectable without teaching tests about URLSession or auth.
+protocol RemovedAccountPushCleaning: Sendable {
+    func unregisterDeviceAccount(deviceId: String, accountEmail: String) async throws
+    func registerDevice(
+        deviceToken: String,
+        deviceId: String,
+        userId: String,
+        accountEmails: [String],
+        apnsSandbox: Bool
+    ) async throws
+    func unregisterDevice(deviceId: String) async throws
+    func unsubscribeIMAP(userEmail: String) async throws
+    func deleteGmailConsent(userEmail: String) async throws
+    func deleteOutlookConsent(userEmail: String) async throws
+    func unsubscribe(provider: String, userEmail: String, accessToken: String) async throws
+}
+
+extension PushClient: RemovedAccountPushCleaning {}

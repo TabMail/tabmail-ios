@@ -38,6 +38,10 @@ struct MemoryHit: Sendable, Hashable {
 actor MemoryIndex {
     static let shared = MemoryIndex()
 
+    enum MemoryIndexError: Error {
+        case unavailable
+    }
+
     private var dbPool: DatabasePool?
     private var isInitialized = false
 
@@ -346,18 +350,25 @@ actor MemoryIndex {
     /// History" to remove memory as well; otherwise `memory_search` keeps
     /// surfacing cleared content, which is a privacy regression.
     func deleteAll() {
-        ensureReady()
-        guard let dbPool else { return }
         do {
-            try dbPool.write { db in
-                try db.execute(sql: "DELETE FROM memory_vec")
-                try db.execute(sql: "DELETE FROM memory_meta")
-                try db.execute(sql: "DELETE FROM memory_fts")
-            }
-            print("[MemoryIndex] Cleared all memory turns")
+            try deleteAllThrowing()
         } catch {
             print("[MemoryIndex] deleteAll failed: \(error)")
         }
+    }
+
+    /// Throwing variant for destructive Settings/factory-reset paths that must
+    /// never report success while the local-only memory index still contains
+    /// deleted conversations.
+    func deleteAllThrowing() throws {
+        if !isInitialized { try initialize() }
+        guard let dbPool else { throw MemoryIndexError.unavailable }
+        try dbPool.write { db in
+            try db.execute(sql: "DELETE FROM memory_vec")
+            try db.execute(sql: "DELETE FROM memory_meta")
+            try db.execute(sql: "DELETE FROM memory_fts")
+        }
+        print("[MemoryIndex] Cleared all memory turns")
     }
 
     /// Purge memory rows whose `sessionId` starts with the given prefix.

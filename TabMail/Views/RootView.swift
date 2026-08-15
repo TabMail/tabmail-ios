@@ -305,6 +305,12 @@ struct RootView: View {
         }
         // loadInitialData() is called eagerly in TabMailApp.init() (after DB creation)
         // so isInitialLoadComplete is already true before the first render.
+        .task {
+            // Removed-account debt must drain even when the removed account was
+            // the last mail account. The account-scoped startup task below is
+            // deliberately gated on a non-empty list and cannot provide this.
+            await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
+        }
         .task(id: navigationStore.accounts.isEmpty) {
             // Re-trigger when accounts transition from empty → non-empty
             guard !navigationStore.accounts.isEmpty else { return }
@@ -617,6 +623,9 @@ struct RootView: View {
             BootProfiler.mark("◐ scenePhase → \(phaseName) (accounts=\(navigationStore.accounts.count))")
             switch phase {
             case .active:
+                Task {
+                    await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
+                }
                 if !navigationStore.accounts.isEmpty {
                     syncScheduler.startForegroundPolling()
                 }

@@ -5,6 +5,17 @@
 import Foundation
 import GRDB
 
+enum AccountRemovalError: LocalizedError {
+    case searchIndexCleanupFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .searchIndexCleanupFailed(let detail):
+            "The account was removed, but its search index could not be cleared: \(detail)"
+        }
+    }
+}
+
 extension AccountManager {
 
     // MARK: - Gmail Account Setup
@@ -458,59 +469,87 @@ extension AccountManager {
 
     // MARK: - Account Management
 
-    func removeAccount(_ account: Account) async {
-        // Unsubscribe from push before disconnecting (needs access token still in Keychain)
-        await PushNotificationService.shared.unsubscribeAccount(account)
-        // Revoke any stored server-side metadata-scope consent. Provider-
-        // agnostic — dispatches per provider internally, no-ops for
-        // non-push-capable accounts (IMAP/iCloud/CalDAV).
-        await PushNotificationService.shared.revokePushConsentForAccount(account)
-
-        // SECURITY: Clear Keychain tokens BEFORE disconnecting — closes the race window
-        // where a background task could load tokens between disconnect and delete.
-        // Push unsubscribe (above) is the only operation that needs the access token.
-        KeychainHelper.delete(key: KeychainHelper.passwordKey(accountId: account.id))
-        KeychainHelper.delete(key: KeychainHelper.accessTokenKey(accountId: account.id))
-        KeychainHelper.delete(key: KeychainHelper.refreshTokenKey(accountId: account.id))
-
-        await disconnectAccount(account)
-
-        // Clean up CalDAV Keychain entries (L11) — must happen before DB cascade delete
-        do {
-            let caldavConfigs = try await dbPool.read { db in
-                try CalDAVConfig.filter(Column("accountId") == account.id).fetchAll(db)
-            }
-            for config in caldavConfigs {
-                KeychainHelper.delete(key: "caldav_password_\(config.id)")
-            }
-        } catch {
-            print("[AccountManager] WARNING: Could not clean CalDAV keychain for \(account.id): \(error)")
-        }
-
+    func removeAccount(_ account: Account) async throws {
         let acctId = account.id
 
-        // Clean up outbox attachment files BEFORE cascade-deleting DB rows
-        // (DB cascade deletes outboxMessage rows, but not their disk attachments)
-        do {
-            let outboxMsgs = try await dbPool.read { db in
-                try OutboxMessage.filter(Column("accountId") == acctId).fetchAll(db)
-            }
-            for msg in outboxMsgs {
-                msg.deleteAttachments()
-            }
-        } catch {
-            print("[AccountManager] WARNING: Could not clean outbox attachments for \(acctId): \(error)")
+        // Capture every identifier needed for post-commit file/Keychain cleanup
+        // while the account graph still exists. These are reads only. If either
+        // fails, nothing has been changed and the error is surfaced to Settings.
+        let cleanupInventory = try await dbPool.read { db -> ([String], [OutboxMessage]) in
+            let caldavIds = try CalDAVConfig
+                .filter(Column("accountId") == acctId)
+                .fetchAll(db)
+                .map(\.id)
+            let outboxMessages = try OutboxMessage
+                .filter(Column("accountId") == acctId)
+                .fetchAll(db)
+            return (caldavIds, outboxMessages)
+        }
+        // A raw current access token is the most we retain for the one-shot
+        // upstream watch stop. It is never persisted as cleanup debt and may be
+        // stale; durable worker delivery-gate removal remains authoritative.
+        let upstreamAccessToken: String?
+        switch account.provider {
+        case .gmail, .outlook:
+            upstreamAccessToken = KeychainHelper.loadString(
+                key: KeychainHelper.accessTokenKey(accountId: acctId)
+            )
+        default:
+            upstreamAccessToken = nil
         }
 
+        let push = PushNotificationService.shared
         let wasPrimary = account.isPrimary
-        try? await dbPool.write { db in
-            try Self.removeAccountRowsTxn(db, accountId: acctId, wasPrimary: wasPrimary)
+        // Fail closed before the DB commit so process death can never leave a
+        // committed deletion with usable NSE identity. If the row remains live,
+        // the catch below or launch-time mirrorAllState restores both mirrors.
+        NSEDataBridge.removeAccountFromMirrors(
+            accountId: acctId,
+            email: account.emailAddress
+        )
+        let cleanupGeneration = await push.prepareRemovedAccountCleanup(
+            account,
+            caldavConfigIds: cleanupInventory.0,
+            outboxAttachmentDirNames: cleanupInventory.1.compactMap(\.attachmentsDirName)
+        )
+
+        do {
+            try await dbPool.write { db in
+                try Self.removeAccountRowsTxn(db, accountId: acctId, wasPrimary: wasPrimary)
+            }
+        } catch {
+            await push.cancelPreparedRemovedAccountCleanup(generation: cleanupGeneration)
+            // The DB row is still authoritative. Re-derive both maps rather
+            // than restoring a possibly stale captured Account snapshot.
+            NSEDataBridge.mirrorAccountMap()
+            NSEDataBridge.mirrorIMAPAccounts()
+            throw error
         }
 
         NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
 
-        // Mirror updated account map to shared UserDefaults for NSE
-        NSEDataBridge.mirrorAccountMap()
+        // This actor enters disconnectAccount synchronously: it tombstones the
+        // account, removes every runtime route, invalidates OAuth/queue state,
+        // and deletes credentials before that method reaches its first await.
+        await disconnectAccount(account, deletingCredentials: cleanupInventory.0)
+        await push.commitPreparedRemovedAccountCleanup(
+            generation: cleanupGeneration,
+            capturedOAuthAccessToken: upstreamAccessToken
+        )
+        for message in cleanupInventory.1 {
+            message.deleteAttachments()
+        }
+
+        // The local removal is complete. Remote attempts must not hold Settings
+        // open: every action was persisted before commit and foreground/launch
+        // retries it after a failure or process death. Only this immediate pass
+        // can use the raw token snapshot; relaunch sends an empty token, which
+        // still revokes worker ownership and its subscription record.
+        Task {
+            await push.retryPendingRemovedAccountCleanups(
+                onlyEmail: account.emailAddress
+            )
+        }
 
         // Rerun the foreground consent-status scan so the banner drops the
         // just-removed account from its error list immediately.
@@ -518,10 +557,15 @@ extension AccountManager {
             await PushNotificationService.shared.checkPushConsentStatusForForeground()
         }
 
-        // Clean up FTS entries for this account (separate GRDB database, not the main db)
-        Task.detached(priority: .utility) {
-            try? await SearchIndex.shared.removeMessagesForAccount(accountId: acctId)
+        // FTS is derived and follows the authoritative commit, but a failure
+        // still contains removed-account content. Surface the partial result
+        // truthfully instead of logging false success.
+        do {
+            try await SearchIndex.shared.removeMessagesForAccount(accountId: acctId)
             print("[AccountManager] Cleaned up FTS entries for removed account \(acctId)")
+        } catch {
+            print("[AccountManager] Removed account but FTS cleanup failed for \(acctId): \(error)")
+            throw AccountRemovalError.searchIndexCleanupFailed(error.localizedDescription)
         }
     }
 
@@ -566,10 +610,15 @@ extension AccountManager {
     /// Update IMAP password and reconnect.
     func updateIMAPPassword(_ newPassword: String, for account: Account) async throws {
         guard account.provider == .imap else { return }
+        guard !isRuntimeRemoved(account.id) else { throw ProviderError.notConnected }
 
         // Test connection with new password before saving
         let testProvider = try createIMAPProvider(for: account, passwordOverride: newPassword)
         try await testProvider.connect()
+        guard !isRuntimeRemoved(account.id) else {
+            try? await testProvider.disconnect()
+            throw ProviderError.notConnected
+        }
 
         // Save new password to Keychain
         try KeychainHelper.save(newPassword, for: KeychainHelper.passwordKey(accountId: account.id))
@@ -585,6 +634,14 @@ extension AccountManager {
         let queue = ProviderWorkQueue(provider: testProvider, maxConcurrency: concurrency)
         workQueues[account.id] = queue
         await syncEngine.register(accountId: account.id, provider: testProvider, workQueue: queue)
+        if isRuntimeRemoved(account.id) {
+            providers.removeValue(forKey: account.id)
+            workQueues.removeValue(forKey: account.id)
+            await queue.invalidate()
+            await syncEngine.remove(accountId: account.id)
+            try? await testProvider.disconnect()
+            throw ProviderError.notConnected
+        }
         authFailedAccounts.remove(account.id)
     }
 

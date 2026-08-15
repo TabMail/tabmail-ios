@@ -101,14 +101,21 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Current tracker census (2026-08-13): 19 `open` records.** The “Open 2” census above is the
+> **Current tracker census (2026-08-14): 18 `open` records.** The “Open 2” census above is the
 > hash-preserved 2026-08-09 snapshot, not the live post-freeze count. GitHub migration and release
-> triage must include the open rows in this amendment block as well as the two base rows.
+> triage must include the open rows in this amendment block plus the still-open base
+> `IOS-PUSH-001`; the base `IOS-CLEANUP-001` row is superseded by the resolved override below.
 
 Records added after the 2026-08-09 hierarchy freeze, through the amendment surface in
 `Scripts/compact_known_issues.rb`. They have no row in the hash-pinned archive and are not
 regenerated from it; their detail files live in
 [`Companion/Process/Current/KnownIssues/Amendments/`](Companion/Process/Current/KnownIssues/Amendments/).
+
+### Base-register current disposition overrides
+
+| ID | Class | Current disposition |
+|---|---|---|
+| [IOS-CLEANUP-001](Companion/Process/Current/KnownIssues/ios-cleanup-001.md) | `resolved` | ✅ **RESOLVED (2026-08-14)** — destructive account removal, account reset, and local-index deletion now use the authoritative GRDB write as their side-effect boundary, surface precommit failure without deleting credentials/files/indexes, and report postcommit derived-index failure truthfully. The routed detail carries the exact implementation and failure-injection proof. GitHub issue [#6](https://github.com/TabMail/tabmail-ios/issues/6) closes with this fix. |
 
 ### BILLING (1)
 
@@ -205,13 +212,13 @@ regenerated from it; their detail files live in
 |---|---|---|
 | [IOS-TEST-001](Companion/Process/Current/KnownIssues/Amendments/ios-test-001.md) | `open` | 🔓 OPEN (2026-08-13) **ROOT-CAUSED — the fix is to the TEST; the production code is CORRECT.** ⚠️ **The original "order- or shared-state-dependent" framing is REFUTED — nothing was polluted, there is no interfering suite, and the subset bisection is ABANDONED, not deferred.** Log-diff shows the production path **identical** in the passing and failing runs: `NSEDataBridge.performMerge`'s `else if scrubbedStaleStagedRows` branch **posted the signal in both**. Only the position of the `.inboxDataDidChange`-driven reload relative to the `#expect` differs. Mechanism: `performMerge` posts inside `Task { @MainActor }` and `E2EWorld`'s observer appends inside a **second** one, so `capturedSignals` needs **two** main-actor drains and the test synchronises **neither**. 🚨 **The scenario is also VACUOUS, and this is now MEASURED 50/50** (E1 40 iterations + E2 10): `E2EWorld.apply(.silentStateChangePush)` re-stages the same folder+spec, differing only in `processedAt`, which `StagedMessage.toInboxRow` does **not project** ⇒ `stagedSetChangedSinceLastPost` sees no change ⇒ `.messagesStaged` suppressed ⇒ `wireStagedRowViewGlue` never fires ⇒ **the phantom is never inserted** (`prevCount=0` in every run, green ones included). So `waitUntil(5)` never suspends — its condition was already true — and **the eviction assertion has never once exercised F1's eviction path**; a fast `waitUntil` return is NOT evidence of convergence. `resetStageMemoForTesting` resets `stageMemo` but **not** `lastPostedStagedRows`. **Results:** E1 40/40 green, E2 10/10 green, and **three** green full-suite runs (Agent E 9053/1224 0 failures; B0 9053/1224 in 377.304 s with the target passing in 0.292 s) — so **full suite is 1 red in ≥3 runs**, and the prediction "red is the structural default" is refuted. ⚠️ E1/E2 run the suite **alone**, where no other main-actor work exists, so they arguably cannot exhibit the failure at all — they bound the alone-rate (0/50), not the full-suite rate; but the refined "needs a busy main thread" model is **also unconfirmed**, since B0 is that configuration and went green. 🚫 **RETRACTED, was recorded here and is FALSE:** "the red ran in 0.280 s, faster than every green" — B0's **green** ran in **0.292 s**, so that gap was full-suite-vs-alone **configuration**, not a red/green signal; and B0 ran **slower overall** (377.3 s vs 366.0 s) and stayed green, so duration does not predict outcome. **Do not carry the duration datum forward.** Frequency and the missing ingredient are **NOT established — do not manufacture them** Render workstream exonerated **structurally** (`ImageFailureBannerStateTests` is synchronous, value-type-only, no `@MainActor`/globals/notifications) — the earlier changed-line symbol grep could not have refuted order-dependence and is superseded. 🚨 **FALSIFIED COUNTERMEASURE:** the test file's own 2026-07-30 note records the identical `captured=[]` symptom, blames a fifth suite, declares `.processGlobalState` the fix and **forbids "adding a wait"** — the trait is applied and it recurred, and the forbidden remedy is the repo's own `IOS-TEST-009` bound-wait-on-the-witness idiom. **Two independent repairs needed:** synchronise on `capturedSignals` (⚠️ `E2EWorld` observers use `object: nil`, so a concurrent suite can satisfy the capture spuriously — scope it), **and** restore the scenario's premise so the eviction half stops being vacuous |
 
-## GitHub live trackers (2026-08-13)
+## GitHub live trackers (2026-08-14)
 
 Only records classified `open` were migrated. Accepted limitations, resolved records, and historical
 audit/provenance files remain documentation-only. The future app-owned ATS image loader is
 [issue #1](https://github.com/TabMail/tabmail-ios/issues/1). Open register mappings:
 
-- `IOS-AI-004` [#2](https://github.com/TabMail/tabmail-ios/issues/2); `IOS-AI-005` [#3](https://github.com/TabMail/tabmail-ios/issues/3); `IOS-BILLING-002` [#4](https://github.com/TabMail/tabmail-ios/issues/4); `IOS-CAL-010` [#5](https://github.com/TabMail/tabmail-ios/issues/5); `IOS-CLEANUP-001` [#6](https://github.com/TabMail/tabmail-ios/issues/6)
+- `IOS-AI-004` [#2](https://github.com/TabMail/tabmail-ios/issues/2); `IOS-AI-005` [#3](https://github.com/TabMail/tabmail-ios/issues/3); `IOS-BILLING-002` [#4](https://github.com/TabMail/tabmail-ios/issues/4); `IOS-CAL-010` [#5](https://github.com/TabMail/tabmail-ios/issues/5)
 - `IOS-COMPOSE-002` [#7](https://github.com/TabMail/tabmail-ios/issues/7); `IOS-COMPOSE-003` [#8](https://github.com/TabMail/tabmail-ios/issues/8); `IOS-IMAP-015` [#9](https://github.com/TabMail/tabmail-ios/issues/9); `IOS-IMAP-016` [#10](https://github.com/TabMail/tabmail-ios/issues/10)
 - `IOS-PERF-008` [#11](https://github.com/TabMail/tabmail-ios/issues/11); `IOS-PERF-009` [#12](https://github.com/TabMail/tabmail-ios/issues/12); `IOS-PERF-010` [#13](https://github.com/TabMail/tabmail-ios/issues/13); `IOS-PERF-011` [#14](https://github.com/TabMail/tabmail-ios/issues/14); `IOS-PERF-012` [#15](https://github.com/TabMail/tabmail-ios/issues/15)
 - `IOS-PUSH-001` [#16](https://github.com/TabMail/tabmail-ios/issues/16); `IOS-QUEUE-010` [#17](https://github.com/TabMail/tabmail-ios/issues/17); `IOS-SEARCH-004` [#18](https://github.com/TabMail/tabmail-ios/issues/18); `IOS-TEST-001` [#19](https://github.com/TabMail/tabmail-ios/issues/19); `IOS-UI-005` [#20](https://github.com/TabMail/tabmail-ios/issues/20)

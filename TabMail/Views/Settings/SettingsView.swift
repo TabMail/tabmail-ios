@@ -10,6 +10,8 @@ struct SettingsView: View {
     @Environment(NavigationStore.self) private var navigationStore
     @Environment(\.scenePhase) private var scenePhase
     @State private var accountToDelete: Account?
+    @State private var settingsErrorMessage = ""
+    @State private var showSettingsError = false
     @AppStorage(SyncScheduler.wifiOnlyKey) private var backgroundSyncWiFiOnly = true
     @AppStorage("isLargeInbox") private var isLargeInbox = false
     @State private var storageBudgetMB: Int = StorageEstimator.budgetMB
@@ -390,10 +392,20 @@ struct SettingsView: View {
             Button("Cancel", role: .cancel) { accountToDelete = nil }
             Button("Remove", role: .destructive) {
                 if let account = accountToDelete {
-                    Task {
-                        await AccountManager.shared.removeAccount(account)
-                    }
                     accountToDelete = nil
+                    Task {
+                        do {
+                            try await AccountManager.shared.removeAccount(account)
+                        } catch let error as AccountRemovalError {
+                            print("[Settings] Account removal completed with derived cleanup failure: \(error)")
+                            settingsErrorMessage = error.localizedDescription
+                            showSettingsError = true
+                        } catch {
+                            print("[Settings] Account removal failed before commit: \(error)")
+                            settingsErrorMessage = "TabMail couldn’t remove the account’s local data. Nothing was removed. Please try again."
+                            showSettingsError = true
+                        }
+                    }
                 }
             }
         } message: {
@@ -457,6 +469,11 @@ struct SettingsView: View {
             }
         } message: {
             Text("This deletes all cached attachment files and inline images. Inline images will re-download next time you open each affected message; file attachments will re-download on next tap. The Email Index is not touched.")
+        }
+        .alert("Operation Result", isPresented: $showSettingsError) {
+            Button("OK") {}
+        } message: {
+            Text(settingsErrorMessage)
         }
         .overlay {
             if isNuking || isWipingAttachments {
@@ -563,14 +580,14 @@ struct SettingsView: View {
         // ⚠ Agent Chat turns are user-authored and exist on NO server, so these
         // two lines are a PERMANENT deletion, not a cache drop. They are kept
         // deliberately — this gesture also wipes `memory.db`
-        // (`MemoryIndex.shared.deleteAll()` in `nukeDatabase`), and `chatHistory`
+        // (`MemoryIndex.shared.deleteAllThrowing()` in `nukeDatabase`), and `chatHistory`
         // IS that memory store, so excising chat here would leave the two halves
         // of one feature inconsistent; chat turns also carry raw `[Email](N)`
         // references into the `messageHeader` rows this transaction destroys.
         // What was wrong was that the confirmation alert never said so. The alert
         // now names Agent Chat as permanently deleted (`IOS-SETTINGS-001`), which
         // is the consent defect actually at issue. Do not remove these lines
-        // without also revisiting `MemoryIndex.deleteAll()`.
+        // without also revisiting `MemoryIndex.deleteAllThrowing()`.
         "DELETE FROM chatTurn",
         "DELETE FROM chatHistory",
         "DELETE FROM pendingOperation WHERE type != '\(OperationType.saveDraft.rawValue)'",
@@ -591,28 +608,60 @@ struct SettingsView: View {
 
         // 1. Stop all sync activity
         SyncScheduler.shared.stopPolling()
-
-        // 2. Delete all email data from GRDB (preserve accounts + folders)
-        try? await AppDatabase.dbPool.write { db in
-            for sql in Self.localIndexWipeStatements {
-                try db.execute(sql: sql)
-            }
+        defer {
+            SyncScheduler.shared.startForegroundPolling()
+            isNuking = false
         }
-        // Wipe memory.db (ADR-IOS-034)
-        await MemoryIndex.shared.deleteAll()
+
+        // 2. Authoritative GRDB transaction (preserve accounts + folders).
+        // Nothing in a sibling database is touched unless this commits.
+        do {
+            try await AppDatabase.dbPool.write { db in
+                try Self.localIndexWipeTxn(db)
+            }
+        } catch {
+            print("[NukeDB] Authoritative database wipe failed: \(error)")
+            settingsErrorMessage = "TabMail couldn’t delete the local email data. Nothing was removed. Please try again."
+            showSettingsError = true
+            return
+        }
+
+        var derivedIndexFailures: [String] = []
+        // Wipe memory.db (ADR-IOS-034). This local-only store cannot repair
+        // itself after chatHistory committed absent, so failure must be visible.
+        do {
+            try await MemoryIndex.shared.deleteAllThrowing()
+        } catch {
+            print("[NukeDB] Memory index reset failed after GRDB commit: \(error)")
+            derivedIndexFailures.append("conversation memory")
+        }
         // 3. Reset sync-related UserDefaults
         UserDefaults.standard.set(false, forKey: "ccBccBackfillDone")
 
         // 4. Compact GRDB — checkpoint WAL then VACUUM to reclaim disk space
-        try? await AppDatabase.dbPool.writeWithoutTransaction { db in
-            try db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
-            try db.execute(sql: "VACUUM")
+        do {
+            try await AppDatabase.dbPool.writeWithoutTransaction { db in
+                try db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
+                try db.execute(sql: "VACUUM")
+            }
+        } catch {
+            // Compaction is optional after the authoritative rows are gone.
+            print("[NukeDB] Database compaction deferred: \(error)")
         }
-        print("[NukeDB] Deleted all email data from GRDB + compacted")
+        print("[NukeDB] Deleted all email data from GRDB")
 
         // 5. Delete FTS database
-        try? await SearchIndex.shared.resetAll()
-        print("[NukeDB] Reset FTS database")
+        do {
+            try await SearchIndex.shared.resetAll()
+            print("[NukeDB] Reset FTS database")
+        } catch {
+            print("[NukeDB] FTS reset failed after GRDB commit: \(error)")
+            derivedIndexFailures.append("email search")
+        }
+        if !derivedIndexFailures.isEmpty {
+            settingsErrorMessage = "Email data was deleted, but some local index data could not be cleared. Please try Delete All Email Index Data again."
+            showSettingsError = true
+        }
 
         // 5b. Sweep BodyAssetStore — every bodyAsset row now references a
         // deleted messageHeader, so the cross-DB sweep deletes them. The
@@ -622,11 +671,15 @@ struct SettingsView: View {
         await BodyAssetMaintenance.pruneOrphans()
         print("[NukeDB] Pruned BodyAssetStore orphans")
 
-        // 6. Restart sync — fresh backfill from top
-        SyncScheduler.shared.startForegroundPolling()
+        // 6. `defer` restarts sync — fresh backfill from top — on every exit.
         print("[NukeDB] Sync restarted — backfill will re-walk all folders")
+    }
 
-        isNuking = false
+    /// Execute the user-visible local-index deletion as one transaction.
+    nonisolated static func localIndexWipeTxn(_ db: Database) throws {
+        for sql in localIndexWipeStatements {
+            try db.execute(sql: sql)
+        }
     }
 
     private var storageUsageText: String {

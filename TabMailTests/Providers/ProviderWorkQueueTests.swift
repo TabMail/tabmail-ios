@@ -320,6 +320,32 @@ struct ProviderWorkQueueDynamicTests {
 @Suite("ProviderWorkQueue - Cancellation")
 struct ProviderWorkQueueCancellationTests {
 
+    @Test("Invalidated account queue refuses both throwing and fire-and-forget work")
+    func invalidatedQueueRefusesNewWork() async {
+        let provider = WorkQueueMockProvider()
+        let queue = ProviderWorkQueue(provider: provider, maxConcurrency: 1)
+        let order = OrderTracker()
+
+        await queue.invalidate()
+        await queue.execute(priority: .userAction) {
+            await order.record("fire-and-forget-ran")
+        }
+
+        do {
+            let _: Int = try await queue.execute(priority: .userAction) {
+                await order.record("throwing-ran")
+                return 1
+            }
+            Issue.record("Invalidated queue should refuse throwing work")
+        } catch ProviderError.notConnected {
+            // Expected terminal account-teardown state.
+        } catch {
+            Issue.record("Unexpected invalidated-queue error: \(error)")
+        }
+
+        #expect(await order.sequence.isEmpty)
+    }
+
     @Test("Cancelled waiter throws CancellationError without running work")
     func cancelledWaiterThrows() async throws {
         let provider = WorkQueueMockProvider()

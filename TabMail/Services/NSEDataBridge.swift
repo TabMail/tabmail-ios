@@ -331,8 +331,8 @@ enum NSEDataBridge {
 
     /// Mirror account email→accountId mapping.
     /// Call on account add/remove.
-    static func mirrorAccountMap() {
-        guard let suite else { return }
+    static func mirrorAccountMap(defaults override: UserDefaults? = nil) {
+        guard let target = override ?? suite else { return }
         do {
             let accounts = try AppDatabase.dbPool.read { db in
                 try Row.fetchAll(db, sql: "SELECT id, emailAddress FROM account")
@@ -344,9 +344,50 @@ enum NSEDataBridge {
                 }
             }
             let data = try JSONEncoder().encode(map)
-            suite.set(String(data: data, encoding: .utf8), forKey: "nse.accountMap")
+            target.set(String(data: data, encoding: .utf8), forKey: "nse.accountMap")
         } catch {
             print("[NSEDataBridge] Failed to mirror account map: \(error)")
+        }
+    }
+
+    /// Remove one deleted account from both NSE identity mirrors without a
+    /// second database read. Account removal calls this as reversible,
+    /// fail-closed preparation before the authoritative GRDB commit, eliminating
+    /// the commit→mirror process-kill window. Malformed mirror data is cleared
+    /// rather than retaining an identity we can no longer prove current.
+    static func removeAccountFromMirrors(
+        accountId: String,
+        email: String,
+        defaults override: UserDefaults? = nil
+    ) {
+        guard let target = override ?? suite else { return }
+
+        if let json = target.string(forKey: "nse.accountMap"),
+           let data = json.data(using: .utf8),
+           var map = try? JSONDecoder().decode([String: String].self, from: data) {
+            map = map.filter { key, value in
+                value != accountId && key.caseInsensitiveCompare(email) != .orderedSame
+            }
+            if let encoded = try? JSONEncoder().encode(map) {
+                target.set(String(data: encoded, encoding: .utf8), forKey: "nse.accountMap")
+            } else {
+                target.removeObject(forKey: "nse.accountMap")
+            }
+        } else {
+            target.removeObject(forKey: "nse.accountMap")
+        }
+
+        if let json = target.string(forKey: "nse.imapAccounts"),
+           let data = json.data(using: .utf8),
+           var map = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
+            map.removeValue(forKey: accountId)
+            if let encoded = try? JSONSerialization.data(withJSONObject: map, options: [.sortedKeys]) {
+                target.set(String(data: encoded, encoding: .utf8), forKey: "nse.imapAccounts")
+            } else {
+                target.removeObject(forKey: "nse.imapAccounts")
+            }
+        } else {
+            target.removeObject(forKey: "nse.imapAccounts")
         }
     }
 
@@ -356,8 +397,8 @@ enum NSEDataBridge {
     /// (`KeychainHelper.passwordKey(accountId:)` reads/writes via the
     /// app-group access group, so NSE reads it via `SharedKeychain`).
     /// Call on account add / remove / IMAP-config edit.
-    static func mirrorIMAPAccounts() {
-        guard let suite else { return }
+    static func mirrorIMAPAccounts(defaults override: UserDefaults? = nil) {
+        guard let target = override ?? suite else { return }
         do {
             let rows = try AppDatabase.dbPool.read { db in
                 try Row.fetchAll(
@@ -392,7 +433,7 @@ enum NSEDataBridge {
                 map[id] = entry
             }
             let data = try JSONSerialization.data(withJSONObject: map, options: [.sortedKeys])
-            suite.set(String(data: data, encoding: .utf8), forKey: "nse.imapAccounts")
+            target.set(String(data: data, encoding: .utf8), forKey: "nse.imapAccounts")
         } catch {
             print("[NSEDataBridge] Failed to mirror IMAP accounts: \(error)")
         }

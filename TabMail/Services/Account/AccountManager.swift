@@ -99,15 +99,19 @@ struct BackfillProgress {
 /// Prevents race where mail + calendar providers both get 401 and refresh the same token.
 /// Microsoft rotates refresh tokens on use — second caller with the old token would fail.
 actor OAuthRefreshCoordinator {
-    private var inFlightTask: Task<String, any Error>?
+    private var inFlightTask: (id: UUID, task: Task<OAuthTokens, any Error>)?
     /// Once invalidated, all future refresh attempts immediately fail.
     /// Prevents stale closures from refreshing tokens after account removal.
     private var invalidated = false
 
+    init(invalidated: Bool = false) {
+        self.invalidated = invalidated
+    }
+
     /// Mark this coordinator as invalidated. Cancels any in-flight refresh.
     func invalidate() {
         invalidated = true
-        inFlightTask?.cancel()
+        inFlightTask?.task.cancel()
         inFlightTask = nil
     }
 
@@ -122,33 +126,43 @@ actor OAuthRefreshCoordinator {
             throw ProviderError.authenticationFailed
         }
 
-        // Dedup: if another refresh is already in flight, await it
+        let taskId: UUID
+        let task: Task<OAuthTokens, any Error>
         if let existing = inFlightTask {
             print("[OAuth] Awaiting in-flight refresh for \(email)...")
-            return try await existing.value
+            taskId = existing.id
+            task = existing.task
+        } else {
+            taskId = UUID()
+            task = Task<OAuthTokens, any Error> {
+                guard let refreshToken = KeychainHelper.loadString(key: KeychainHelper.refreshTokenKey(accountId: accountId)) else {
+                    print("[OAuth] Auth failed for \(email): refresh token missing from keychain")
+                    throw ProviderError.authenticationFailed
+                }
+                print("[OAuth] Refreshing access token for \(email)...")
+                return try await refresher(refreshToken)
+            }
+            inFlightTask = (taskId, task)
         }
 
-        let task = Task<String, any Error> {
-            guard let refreshToken = KeychainHelper.loadString(key: KeychainHelper.refreshTokenKey(accountId: accountId)) else {
-                print("[OAuth] Auth failed for \(email): refresh token missing from keychain")
+        do {
+            let tokens = try await task.value
+            if inFlightTask?.id == taskId { inFlightTask = nil }
+
+            // `invalidate()` can run while the network refresh is suspended.
+            // Persist only after returning to this actor and re-checking the
+            // terminal bit; no await exists between this guard and the writes.
+            guard !invalidated else {
+                print("[OAuth] Discarding refreshed token for \(email): account removed")
                 throw ProviderError.authenticationFailed
             }
-            print("[OAuth] Refreshing access token for \(email)...")
-            let tokens = try await refresher(refreshToken)
             try KeychainHelper.save(tokens.accessToken, for: KeychainHelper.accessTokenKey(accountId: accountId))
             if let newRefresh = tokens.refreshToken {
                 try KeychainHelper.save(newRefresh, for: KeychainHelper.refreshTokenKey(accountId: accountId))
             }
             return tokens.accessToken
-        }
-        inFlightTask = task
-
-        do {
-            let result = try await task.value
-            inFlightTask = nil
-            return result
         } catch {
-            inFlightTask = nil
+            if inFlightTask?.id == taskId { inFlightTask = nil }
             throw error
         }
     }
@@ -202,8 +216,19 @@ actor AccountManager {
     /// Per-account OAuth refresh coordinators — shared between mail + calendar providers
     /// to prevent concurrent refresh token rotation races.
     private var oauthCoordinators: [String: OAuthRefreshCoordinator] = [:]
+    /// Process-local terminal fence for rows that committed absent. It is
+    /// synchronous because OAuth accessors captured by providers outlive their
+    /// AccountManager dictionary entry and must consult it without an actor hop.
+    private nonisolated let removedAccountRuntimeFence = Mutex<Set<String>>([])
+
+    nonisolated func isRuntimeRemoved(_ accountId: String) -> Bool {
+        removedAccountRuntimeFence.withLock { $0.contains(accountId) }
+    }
 
     private func oauthCoordinator(for accountId: String) -> OAuthRefreshCoordinator {
+        guard !isRuntimeRemoved(accountId) else {
+            return OAuthRefreshCoordinator(invalidated: true)
+        }
         if let existing = oauthCoordinators[accountId] {
             return existing
         }
@@ -1205,15 +1230,23 @@ actor AccountManager {
     }
 
     func connectAccount(_ account: Account) async throws {
+        guard !isRuntimeRemoved(account.id) else {
+            throw ProviderError.notConnected
+        }
         // Calendar-only accounts skip email provider creation
         if account.calendarOnly {
             switch account.provider {
             case .gmail:
-                calendarProviders[account.id] = await createGoogleCalendarProvider(for: account)
+                let calendar = await createGoogleCalendarProvider(for: account)
+                guard !isRuntimeRemoved(account.id) else { throw ProviderError.notConnected }
+                calendarProviders[account.id] = calendar
             case .outlook:
-                calendarProviders[account.id] = await createExchangeCalendarProvider(for: account)
+                let calendar = await createExchangeCalendarProvider(for: account)
+                guard !isRuntimeRemoved(account.id) else { throw ProviderError.notConnected }
+                calendarProviders[account.id] = calendar
             case .caldav:
                 if let caldavProvider = try await createCalDAVProvider(for: account) {
+                    guard !isRuntimeRemoved(account.id) else { throw ProviderError.notConnected }
                     calendarProviders[account.id] = caldavProvider
                 }
             default:
@@ -1227,28 +1260,40 @@ actor AccountManager {
         switch account.provider {
         case .gmail:
             provider = await createGmailProvider(for: account)
-            calendarProviders[account.id] = await createGoogleCalendarProvider(for: account)
+            let calendar = await createGoogleCalendarProvider(for: account)
+            guard !isRuntimeRemoved(account.id) else { throw ProviderError.notConnected }
+            calendarProviders[account.id] = calendar
         case .outlook:
             provider = await createExchangeProvider(for: account)
-            calendarProviders[account.id] = await createExchangeCalendarProvider(for: account)
+            let calendar = await createExchangeCalendarProvider(for: account)
+            guard !isRuntimeRemoved(account.id) else { throw ProviderError.notConnected }
+            calendarProviders[account.id] = calendar
         case .imap:
             provider = try createIMAPProvider(for: account)
             // Check for linked CalDAV config
             if let caldavProvider = try await createCalDAVProvider(for: account) {
+                guard !isRuntimeRemoved(account.id) else { throw ProviderError.notConnected }
                 calendarProviders[account.id] = caldavProvider
             }
         case .icloud:
             provider = try createIMAPProvider(for: account)
             // iCloud accounts always check for linked CalDAV
             if let caldavProvider = try await createCalDAVProvider(for: account) {
+                guard !isRuntimeRemoved(account.id) else { throw ProviderError.notConnected }
                 calendarProviders[account.id] = caldavProvider
             }
         case .caldav:
             // Pure calendar-only — should have been handled above
             if let caldavProvider = try await createCalDAVProvider(for: account) {
+                guard !isRuntimeRemoved(account.id) else { throw ProviderError.notConnected }
                 calendarProviders[account.id] = caldavProvider
             }
             return
+        }
+
+        guard !isRuntimeRemoved(account.id) else {
+            calendarProviders.removeValue(forKey: account.id)
+            throw ProviderError.notConnected
         }
 
         // Boot-timeline tag — provider type + short account-id prefix (NOT the
@@ -1278,6 +1323,14 @@ actor AccountManager {
             let queue = ProviderWorkQueue(provider: provider, maxConcurrency: concurrency)
             workQueues[account.id] = queue
             await syncEngine.register(accountId: account.id, provider: provider, workQueue: queue)
+            if isRuntimeRemoved(account.id) {
+                providers.removeValue(forKey: account.id)
+                workQueues.removeValue(forKey: account.id)
+                calendarProviders.removeValue(forKey: account.id)
+                await queue.invalidate()
+                await syncEngine.remove(accountId: account.id)
+                throw ProviderError.notConnected
+            }
         }
 
         let connectT0 = CFAbsoluteTimeGetCurrent()
@@ -1285,6 +1338,10 @@ actor AccountManager {
         do {
             try await withTimeout(seconds: SyncConfig.connectTimeoutSeconds) {
                 try await provider.connect()
+            }
+            guard !isRuntimeRemoved(account.id) else {
+                try? await provider.disconnect()
+                throw ProviderError.notConnected
             }
             authFailedAccounts.remove(account.id)
             BootProfiler.mark("connectAccount[\(acctTag)]: provider.connect() DONE in \(Int((CFAbsoluteTimeGetCurrent() - connectT0) * 1000))ms")
@@ -1382,20 +1439,55 @@ actor AccountManager {
         // items for deleted accounts will be skipped when provider lookup fails.
     }
 
-    func disconnectAccount(_ account: Account) async {
-        // SECURITY: Invalidate OAuth coordinator FIRST — prevents stale closures
-        // (captured by old providers) from refreshing tokens after account removal.
-        if let coordinator = oauthCoordinators[account.id] {
-            await coordinator.invalidate()
+    func disconnectAccount(
+        _ account: Account,
+        deletingCredentials caldavConfigIds: [String]? = nil
+    ) async {
+        // Detach every actor-owned route in one synchronous AccountManager turn
+        // BEFORE the first await. Once this method suspends, a reentrant
+        // foreground/sync call can no longer discover this account's provider,
+        // queue, calendar provider, or refresh coordinator.
+        if caldavConfigIds != nil {
+            _ = removedAccountRuntimeFence.withLock { $0.insert(account.id) }
         }
-        oauthCoordinators.removeValue(forKey: account.id)
+        let coordinator = oauthCoordinators.removeValue(forKey: account.id)
+        let provider = providers.removeValue(forKey: account.id)
+        let queue = workQueues.removeValue(forKey: account.id)
+        calendarProviders.removeValue(forKey: account.id)
+        // Synchronous, nonisolated admission close for committed removal: a
+        // stale queue reference cannot start work while the actor-level waiter
+        // drain is pending. Re-authentication keeps the old queue alive long
+        // enough for its captured drain closures to fail/requeue normally.
+        if caldavConfigIds != nil { queue?.markInvalidated() }
 
-        if let provider = providers[account.id] {
+        // Account removal deletes credentials before the first actor/network
+        // await. The synchronous runtime fence above also makes every captured
+        // OAuth accessor refuse cached-token and refresh paths immediately.
+        if let caldavConfigIds {
+            KeychainHelper.delete(key: KeychainHelper.passwordKey(accountId: account.id))
+            KeychainHelper.delete(key: KeychainHelper.accessTokenKey(accountId: account.id))
+            KeychainHelper.delete(key: KeychainHelper.refreshTokenKey(accountId: account.id))
+            for configId in caldavConfigIds {
+                KeychainHelper.delete(key: "caldav_password_\(configId)")
+            }
+        }
+
+        // Refuse queued work and discard any refresh result that was already in
+        // flight. Delete OAuth keys again after invalidation closes the narrow
+        // race where the network result returned just before invalidate ran.
+        if let coordinator { await coordinator.invalidate() }
+        if caldavConfigIds != nil {
+            KeychainHelper.delete(key: KeychainHelper.accessTokenKey(accountId: account.id))
+            KeychainHelper.delete(key: KeychainHelper.refreshTokenKey(accountId: account.id))
+        }
+        if caldavConfigIds != nil, let queue { await queue.invalidate() }
+
+        // Tear down the provider socket before waiting for sync tasks. Their
+        // cancellation is cooperative, so a read parked in SwiftMail may not
+        // return until disconnect closes the underlying connection.
+        if let provider {
             try? await provider.disconnect()
         }
-        providers.removeValue(forKey: account.id)
-        workQueues.removeValue(forKey: account.id)
-        calendarProviders.removeValue(forKey: account.id)
         await syncEngine.remove(accountId: account.id)
         // AI processing is now handled by ActiveBodyQueue + ActiveAIQueue actors
         // Clean up stale backfill progress
@@ -1428,6 +1520,9 @@ actor AccountManager {
     /// Callers outside provider factory (e.g. PushNotificationService) should use this
     /// instead of reading raw Keychain tokens that may be expired.
     func freshAccessToken(for account: Account) async throws -> String {
+        guard !isRuntimeRemoved(account.id) else {
+            throw ProviderError.authenticationFailed
+        }
         let coordinator = oauthCoordinator(for: account.id)
         let oauthService = await self.oauthService
 
@@ -1460,11 +1555,18 @@ actor AccountManager {
     ) -> @Sendable (_ forceRefresh: Bool) async throws -> String {
         let coordinator = oauthCoordinator(for: accountId)
         return { @Sendable forceRefresh in
+            guard !self.isRuntimeRemoved(accountId) else {
+                throw ProviderError.authenticationFailed
+            }
             if !forceRefresh,
                let token = KeychainHelper.loadString(key: KeychainHelper.accessTokenKey(accountId: accountId)) {
                 return token
             }
-            return try await coordinator.refresh(accountId: accountId, email: email, using: refresher)
+            let token = try await coordinator.refresh(accountId: accountId, email: email, using: refresher)
+            guard !self.isRuntimeRemoved(accountId) else {
+                throw ProviderError.authenticationFailed
+            }
+            return token
         }
     }
 

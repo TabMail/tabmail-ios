@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Synchronization
 
 /// Priority tier for provider work queue operations.
 /// Workers drain the highest-priority non-empty tier first.
@@ -41,6 +42,10 @@ actor ProviderWorkQueue {
 
     private var maxConcurrency: Int
     private var activeCount: Int = 0
+    private var isInvalidated = false
+    /// Synchronous admission fence used by account removal before its first
+    /// actor hop. The actor-owned bit below still owns waiter retirement.
+    private nonisolated let invalidatedFence = Mutex<Bool>(false)
 
     /// A queued slot waiter. `id` lets cancellation remove the entry; the
     /// continuation resumes `true` when granted a slot, `false` when cancelled
@@ -62,7 +67,7 @@ actor ProviderWorkQueue {
     /// Increase max concurrency when the server's actual connection limit is discovered.
     /// Immediately wakes queued waiters if slots are now available.
     func updateMaxConcurrency(_ newMax: Int) {
-        guard newMax > maxConcurrency else { return }
+        guard !isInvalidated, newMax > maxConcurrency else { return }
         let oldMax = maxConcurrency
         maxConcurrency = newMax
         if DebugModeManager.isLoggingEnabled() { print("[WorkQueue] Max concurrency updated \(oldMax) → \(newMax)") }
@@ -87,7 +92,12 @@ actor ProviderWorkQueue {
     /// Cancellation-aware: if the calling task is cancelled while waiting for a slot,
     /// throws `CancellationError` immediately — no slot is consumed and `work` never runs.
     func execute<T: Sendable>(priority: WorkPriority = .bodyFetch, _ work: @Sendable () async throws -> T) async throws -> T {
+        guard !invalidatedFence.withLock({ $0 }) else { throw ProviderError.notConnected }
         try await acquireSlotCancellable(priority: priority)
+        guard !invalidatedFence.withLock({ $0 }) else {
+            releaseSlot()
+            throw ProviderError.notConnected
+        }
         do {
             let result = try await work()
             releaseSlot()
@@ -104,9 +114,32 @@ actor ProviderWorkQueue {
     /// when written with `try await`. For the cancellation-aware path the closure
     /// must throw or return a value.
     func execute(priority: WorkPriority = .bodyFetch, _ work: @Sendable () async -> Void) async {
-        await acquireSlot(priority: priority)
+        guard !invalidatedFence.withLock({ $0 }) else { return }
+        guard await acquireSlot(priority: priority) else { return }
+        guard !invalidatedFence.withLock({ $0 }) else {
+            releaseSlot()
+            return
+        }
         await work()
         releaseSlot()
+    }
+
+    /// Permanently close this account's queue. New work is refused and every
+    /// queued waiter is resumed without running its closure. Already-active
+    /// provider calls are retired by the matching provider disconnect.
+    nonisolated func markInvalidated() {
+        invalidatedFence.withLock { $0 = true }
+    }
+
+    func invalidate() {
+        markInvalidated()
+        guard !isInvalidated else { return }
+        isInvalidated = true
+        let stranded = waiters.flatMap { $0 }
+        waiters = [[], [], []]
+        for waiter in stranded {
+            waiter.continuation.resume(returning: false)
+        }
     }
 
     /// Current number of in-flight operations.
@@ -117,14 +150,16 @@ actor ProviderWorkQueue {
 
     // MARK: - Slot Management
 
-    private func acquireSlot(priority: WorkPriority) async {
+    private func acquireSlot(priority: WorkPriority) async -> Bool {
+        guard !isInvalidated else { return false }
         if activeCount < maxConcurrency {
             activeCount += 1
-            return
+            return true
         }
         // Queue is full — wait in the appropriate tier. No cancellation handler:
-        // fire-and-forget callers always run their work once a slot frees up.
-        _ = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+        // fire-and-forget callers run once a slot frees up unless account
+        // teardown invalidates the queue first.
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             waiters[priority.rawValue].append(Waiter(id: UUID(), continuation: continuation))
         }
     }
@@ -134,6 +169,7 @@ actor ProviderWorkQueue {
     /// entry is removed so it never receives (or blocks) a slot.
     private func acquireSlotCancellable(priority: WorkPriority) async throws {
         try Task.checkCancellation()
+        guard !isInvalidated else { throw ProviderError.notConnected }
         if activeCount < maxConcurrency {
             activeCount += 1
             return
@@ -147,7 +183,13 @@ actor ProviderWorkQueue {
         } onCancel: {
             Task { await self.cancelWaiter(id: id) }
         }
-        if !granted { throw CancellationError() }
+        if !granted {
+            // `false` means either caller cancellation or account teardown.
+            // Preserve CancellationError for the former and report the queue's
+            // terminal state for the latter.
+            try Task.checkCancellation()
+            throw ProviderError.notConnected
+        }
         // Race: releaseSlot can grant the slot before the spawned cancelWaiter
         // task runs on this actor. The waiter then holds a slot but its task is
         // cancelled — release and bail instead of running doomed work. (The
