@@ -4,9 +4,8 @@
 
 import Foundation
 
-/// RFC 2047 "encoded-word" ENCODING for non-ASCII email *header* values
-/// (Subject, etc.) on the outgoing Gmail-API path (`GmailProvider.buildRFC822` /
-/// `buildMIMEMessage`).
+/// RFC 2047 "encoded-word" encoding for outgoing email *header* values
+/// (Subject, etc.) at TabMail's Gmail and IMAP/SMTP provider boundaries.
 ///
 /// RFC 5322 requires header field bodies to be 7-bit ASCII; non-ASCII text must
 /// be wrapped in an encoded-word. Injecting raw 8-bit UTF-8 into a header
@@ -16,9 +15,8 @@ import Foundation
 /// "ÃªÂ°Â…"). Bodies are unaffected because they carry an explicit charset +
 /// Content-Transfer-Encoding; headers have no mechanism other than RFC 2047.
 ///
-/// Decoding is the inverse: `RFC5322Parse.decodeRFC2047`. Kept byte-for-byte in
-/// step with SwiftMail's `String.rfc2047EncodedHeader()` (the IMAP/SMTP path);
-/// the two repos can't share code because SwiftMail is a remote SPM dependency.
+/// Decoding is the inverse: `RFC5322Parse.decodeRFC2047`. Exchange is excluded:
+/// its Graph JSON `subject` is semantic text, not an RFC 5322 field body.
 enum RFC2047 {
     /// Max UTF-8 bytes per encoded-word. `=?UTF-8?B?` (10) + `?=` (2) is 12
     /// octets of overhead and Base64 of N bytes is `4*ceil(N/3)`; 45 bytes → 60
@@ -43,10 +41,27 @@ enum RFC2047 {
         return scalar.value <= 0x1F || scalar.value == 0x7F || (0x80...0x9F).contains(scalar.value)
     }
 
+    /// RFC 2047 readers recognize `=?` as an encoded-word introducer at the start
+    /// of an unstructured field body or immediately after linear whitespace. If
+    /// sender-authored ASCII contains it at either boundary, emitting it literally
+    /// lets a reader reinterpret the following bytes instead of preserving the
+    /// text. Compare scalars because this is a wire-format decision, not a
+    /// user-perceived grapheme operation.
+    private static func containsRecognizableEncodedWordIntroducer(_ value: String) -> Bool {
+        var canStartEncodedWord = true
+        var previousWasBoundaryEquals = false
+        for scalar in value.unicodeScalars {
+            if previousWasBoundaryEquals, scalar.value == 0x3F { return true } // `?`
+            previousWasBoundaryEquals = canStartEncodedWord && scalar.value == 0x3D // `=`
+            canStartEncodedWord = scalar.value == 0x20 || scalar.value == 0x09 // SP / HTAB
+        }
+        return false
+    }
+
     /// Encode `value` as one or more RFC 2047 Base64 encoded-words when it
-    /// contains any non-ASCII character **or any character that cannot appear
-    /// literally in a header field body**; otherwise it is returned unchanged
-    /// (already a valid header value).
+    /// contains any non-ASCII scalar, any scalar that cannot appear literally in
+    /// a header field body, or the encoded-word introducer `=?`; otherwise it is
+    /// returned unchanged (already a valid header value).
     ///
     /// ⚠️ **The control-character half of that trigger is load-bearing, and the
     /// obvious-looking `!$0.isASCII` test is not sufficient — CR and LF ARE
@@ -67,33 +82,14 @@ enum RFC2047 {
     /// recipient still sees exactly what the sender wrote.
     ///
     /// Multiple words are folded with `CRLF SPACE` so each stays within the
-    /// 75-octet limit; a character's UTF-8 bytes are never split across words, so
-    /// each word decodes independently. Round-trips through
+    /// 75-octet limit; a Unicode scalar's UTF-8 bytes are never split across
+    /// words, so every word is independently valid UTF-8. Round-trips through
     /// `RFC5322Parse.decodeRFC2047`.
     static func encodeHeaderValue(_ value: String) -> String {
-        let needsEncoding = value.contains { character in
-            !character.isASCII || character.unicodeScalars.contains(where: isForbiddenLiteralInHeader)
-        }
+        let needsEncoding = value.unicodeScalars.contains { scalar in
+            scalar.value > 0x7F || isForbiddenLiteralInHeader(scalar)
+        } || containsRecognizableEncodedWordIntroducer(value)
         guard needsEncoding else { return value }
-        return encodeAsWords(value)
-    }
-
-    /// Encode ONLY when `value` cannot be emitted literally in a header body —
-    /// non-ASCII text is returned unchanged.
-    ///
-    /// For the IMAP/SMTP path, where **SwiftMail is the emitter**: it already
-    /// applies `String.rfc2047EncodedHeader()` to the subject, so non-ASCII is its
-    /// job and re-encoding here would change nothing on the wire while enlarging
-    /// the diff. What it does *not* do is catch a control character — its guard is
-    /// the same `!$0.isASCII` this file's used to be — so that half, and only that
-    /// half, has to happen before the value crosses the boundary. Deliberately
-    /// narrower than `encodeHeaderValue`, which the Gmail builders need because
-    /// there we are the emitter.
-    static func encodeIfNotEmittableLiterally(_ value: String) -> String {
-        // Not named `unsafe`: that is a contextual keyword for Swift's strict
-        // memory-safety expression marker and the parser rejects it here.
-        let hasForbiddenLiteral = value.unicodeScalars.contains(where: isForbiddenLiteralInHeader)
-        guard hasForbiddenLiteral else { return value }
         return encodeAsWords(value)
     }
 
@@ -108,8 +104,8 @@ enum RFC2047 {
             chunk.removeAll(keepingCapacity: true)
         }
 
-        for character in value {
-            let bytes = Array(String(character).utf8)
+        for scalar in value.unicodeScalars {
+            let bytes = Array(String(scalar).utf8)
             if !chunk.isEmpty, chunk.count + bytes.count > maxBytesPerWord {
                 flush()
             }

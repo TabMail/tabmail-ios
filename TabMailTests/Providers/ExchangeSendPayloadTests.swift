@@ -51,4 +51,12 @@ struct ExchangeSendPayloadTests {
         #expect(header("References", in: payload) == "<root@example.com>")
         #expect(header("In-Reply-To", in: payload) == nil)
     }
+
+    @Test("Graph subject remains semantic text at its JSON boundary")
+    func graphSubjectRemainsSemanticText() {
+        let subject = "Re: =?UTF-8?B?SGVsbG8=?= explained"
+        let draft = DraftMessage(to: ["alice@example.com"], subject: subject, body: "Hi")
+        let payload = makeProvider().buildGraphSendPayload(draft: draft)
+        #expect(payload["subject"] as? String == subject)
+    }
 }
