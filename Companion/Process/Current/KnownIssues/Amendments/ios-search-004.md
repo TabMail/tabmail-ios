@@ -1,14 +1,52 @@
 # IOS-SEARCH-004
 
-- Register classification: `open`
+- Register classification: `not-defect`
 - New post-freeze record (2026-08-12) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
 ## Status
 
-🔓 **OPEN (2026-08-12)** — **latent, shape-confirmed, not reproduced.** `SearchIndex.scanByDateRange`
-has the IN-list sorter shape **and `message_meta` has no `(folderId, dateMs)` composite at all**, so it
-is strictly worse on the index side than the `messageHeader` case. Classification: **open**.
+✅ **NOT A DEFECT (2026-08-15)** — the filed multi-folder date-range query is not reachable from any
+production or test caller. The sole production caller of `SearchIndex.search`, `EmailSearchTool`,
+passes date bounds but never `folderIds`; `SearchView` uses `keywordSearch` and never reaches
+`scanByDateRange`. No multi-folder query is therefore constructed, and no user-visible defect in that
+query exists to fix.
+
+## 2026-08-15 campaign disposition
+
+**Exact reachability correction.** A bare-symbol caller census found one production call to
+`SearchIndex.shared.search`: `EmailSearchTool.execute`. Its call supplies `query`, `fromDateMs`,
+`toDateMs`, and `limit`, but not `folderIds`. No test calls this entry point with `folderIds` either.
+The `folderId IN (...)` branch remains valid parameter plumbing inside `scanByDateRange`, but it is
+dead today. This explicitly retracts the historical wording below that treated the AI tool as a
+caller of the multi-folder statement; the tool reaches only the unscoped arm.
+
+**Actually reachable residual, preserved rather than hidden.** A model can still improvise
+`query = "*"` with a date bound. That reaches the unscoped statement on the `SearchIndex` actor's
+separate `fts.db` pool. The prior whole-SQL-surface audit measured that arm at **22 ms** and found no
+`dateMs` index. It remains a real full scan, but it is off-main, does not contend the main GRDB pool,
+is not on the typing path, and has no demonstrated user-visible delay. There is no local query
+fallback: tool failure becomes a tool error, while the successful result set is capped at 50.
+
+**Why no adjacent index was added.** An independent solution audit considered a single-column
+`dateMs` index for the reachable unscoped arm. That would optimize a different query than the filed
+multi-folder issue while adding permanent storage and write amplification plus a one-time sidecar
+index build. Those costs are not proportionate to the measured 22 ms, agent-only, off-main residual.
+A `(folderId, dateMs)` composite would optimize only the dead branch. The historical suggestion that
+a per-folder rewrite is a no-schema remedy is also withdrawn: unlike `messageHeader`,
+`message_meta` has no folder/date ordering index for such a rewrite to restore, so each per-folder
+statement still sorts. No index, rewrite, new fallback, or test-only machinery is justified now.
+
+**Shipped comparison and reopen trigger.** `v1.6.38`, latest shipped `v1.7.9`, and current `main`
+carry the same query shape and relevant index set; no shipped remedy was overlooked. Reopen and
+re-cost this record if a production caller begins supplying `folderIds`, if a date-filter UI places
+the query on an interactive path, or if the reachable unscoped arm is measured causing a
+user-visible agent delay. At that point prove result-set equivalence, duplicate-folder semantics,
+inclusive date boundaries, deterministic equal-date ordering, and cost scaling before choosing a
+schema or query-shape change.
+
+Everything below is preserved as the original registration and subsequent measurement history. Its
+multi-folder reachability and proposed-remedy statements are superseded by the correction above.
 
 ## Subsystem and search terms
 
