@@ -125,7 +125,9 @@
 > later than the focus above it and expands 150 hidden paragraphs, then records direct hosted-DOM/native
 > geometry plus isolated-world rAF frames on a shared epoch clock. The verified run recorded drop0,
 > bounded native/WebKit/pairing gaps, and zero visible toggle/card excursion through insertion,
-> collapse, and reopen. Release behavior remains unchanged and **no outer restoration was added**.
+> collapse, and reopen. That historical cadence evidence remains intact; the current suite treats
+> individual callback gaps as scheduler diagnostics and gates the shared-epoch pairing of frames that
+> were actually produced. Release behavior remains unchanged and **no outer restoration was added**.
 > This evidence is simulator-only; a physical device was unavailable for the permanent-suite run.
 >
 > **CURRENT R3 VIEWPORT CORRECTION (2026-08-14; SUPERSEDES THE EARLIER NO-RESTORATION
@@ -217,8 +219,12 @@
 > R2a recorded 86 native frames/drop0 and zero visible excursion while row insertion changed the raw
 > coordinate by `+2181 pt`; collapse recorded 44/drop0 and a compensated `+168.33 pt` raw coordinate
 > shift with visible geometry zero; reopen recorded 34/drop0 and all-zero movement. Native and isolated-
-> world rAF samples share an epoch clock, enforce bounded frame/pairing gaps, and keep per-frame liveness
-> assertions active.
+> world rAF samples share an epoch clock, log each producer's callback cadence, enforce the cross-process
+> pairing bound, and keep per-frame liveness assertions active. Individual cadence is not a correctness
+> gate: `CADisplayLink` can miss callbacks when the app main run loop is starved, and WebKit
+> `requestAnimationFrame` pauses with its content process. Loaded simulator runs exceeded the former
+> 120 ms limit while their printed frame-derived geometry witnesses remained stable. The current gate
+> preserves produced-frame accuracy, but deliberately does not claim a fixed scheduler sampling density.
 >
 > The final bridge/isolation/freeze selection remains green at 15 tests across three suites, including
 > ownership/anchor validation and survival of the same-height untagged `+50 ms` confirmation;
