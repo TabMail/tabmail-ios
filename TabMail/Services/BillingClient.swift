@@ -27,6 +27,17 @@ actor BillingClient {
     struct CancelDeletionResponse: Decodable {
         let status: String?      // "restored"
         let error: String?
+        // Match the worker's additive wire key without changing decoder policy.
+        // swiftlint:disable:next identifier_name
+        let subscription_outcome: String?
+
+        /// The account was kept, but its paid subscription ended during the
+        /// deletion grace period and must be purchased again. Keep the wire
+        /// value forward-compatible: an unknown future outcome must not turn a
+        /// successful cancellation into a decoding failure.
+        var subscriptionLapsedDuringGrace: Bool {
+            subscription_outcome == "expired_during_grace"
+        }
     }
 
     struct DeletionStatusResponse: Decodable {

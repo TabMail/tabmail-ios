@@ -40,6 +40,8 @@ struct CancelDeletionResponseDecodableTests {
         let response = try JSONDecoder().decode(BillingClient.CancelDeletionResponse.self, from: Data(json.utf8))
         #expect(response.status == "restored")
         #expect(response.error == nil)
+        #expect(response.subscription_outcome == nil)
+        #expect(!response.subscriptionLapsedDuringGrace)
     }
 
     @Test("Decodes error response")
@@ -48,6 +50,57 @@ struct CancelDeletionResponseDecodableTests {
         let response = try JSONDecoder().decode(BillingClient.CancelDeletionResponse.self, from: Data(json.utf8))
         #expect(response.status == nil)
         #expect(response.error == "no pending deletion")
+        #expect(response.subscription_outcome == nil)
+        #expect(!response.subscriptionLapsedDuringGrace)
+    }
+
+    // These decoding-level tests pin the predicate consumed by RootView. They
+    // do not render RootView or exercise the final SwiftUI alert/navigation hop.
+    @Test("Flags only expired_during_grace")
+    func flagsOnlyExpiredDuringGrace() throws {
+        let lapsedJSON = #"{"status":"restored","subscription_outcome":"expired_during_grace"}"#
+        let lapsed = try JSONDecoder().decode(
+            BillingClient.CancelDeletionResponse.self,
+            from: Data(lapsedJSON.utf8)
+        )
+        #expect(lapsed.subscription_outcome == "expired_during_grace")
+        #expect(lapsed.subscriptionLapsedDuringGrace)
+
+        for outcome in ["restored", "none", "unknown"] {
+            let healthyJSON = #"{"status":"restored","subscription_outcome":"\#(outcome)"}"#
+            let healthy = try JSONDecoder().decode(
+                BillingClient.CancelDeletionResponse.self,
+                from: Data(healthyJSON.utf8)
+            )
+            #expect(!healthy.subscriptionLapsedDuringGrace)
+        }
+    }
+
+    @Test("Missing and null subscription outcomes are not flagged")
+    func missingAndNullOutcomesAreNotFlagged() throws {
+        for json in [
+            #"{"status":"restored"}"#,
+            #"{"status":"restored","subscription_outcome":null}"#
+        ] {
+            let response = try JSONDecoder().decode(
+                BillingClient.CancelDeletionResponse.self,
+                from: Data(json.utf8)
+            )
+            #expect(response.subscription_outcome == nil)
+            #expect(!response.subscriptionLapsedDuringGrace)
+        }
+    }
+
+    @Test("Unknown future outcome remains forward-compatible")
+    func futureOutcomeRemainsForwardCompatible() throws {
+        let json = #"{"status":"restored","subscription_outcome":"needs_manual_review","future_field":true}"#
+        let response = try JSONDecoder().decode(
+            BillingClient.CancelDeletionResponse.self,
+            from: Data(json.utf8)
+        )
+        #expect(response.status == "restored")
+        #expect(response.subscription_outcome == "needs_manual_review")
+        #expect(!response.subscriptionLapsedDuringGrace)
     }
 }
 
