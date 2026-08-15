@@ -6,20 +6,57 @@
 
 ## Status
 
-🔓 **OPEN (2026-08-12)** — **residual of the Archive-search fix, deliberately registered rather than
-fixed.** `IOS-PERF-001`'s QoS census enumerated pool **HOLDERS**; the **blocked main-thread READER**
-half of the same inversion was never enumerated, so no row covers it, and **closing `IOS-PERF-001` did
-not make it safe.** `SearchView.legacyLocalSearch` is one such reader. Classification: **open**.
+🔓 **OPEN — NARROWED (2026-08-14)** — the two concrete `SearchView` members named by this record are
+fixed, but the record's broader by-state acceptance criterion is not complete. Classification remains
+**open**; do not close GitHub #13 from this change.
+
+## 2026-08-14 implementation and residual
+
+The confirmed typing-path stalls are removed without moving the legacy result behind the 150 ms FTS
+debounce:
+
+- `legacyLocalSearch` still starts before the debounce, but its bounded recent-header query and
+  account map now share one asynchronous raw-`DatabasePool` reader acquisition. Cancellation is
+  checked before publishing its result. While that reader is pending, Search shows its existing
+  loading state instead of a false empty result, and any remote rows that arrive first retain
+  identity ownership: account-wide provider rows supersede same-account local folder copies, while
+  folder-scoped IMAP rows supersede only the matching folder UID.
+- `ftsResultsToSearchResults` now resolves a ranked page under one asynchronous reader acquisition.
+  The common path is two set-wise statements (accounts plus exact header ids), replacing the old
+  per-result acquisitions. The rare Gmail/Outlook stable-id drift fallback is grouped into one indexed
+  query per affected account. Input rank order, folder scoping, diagnostics, and both FTS self-heals
+  are preserved.
+- Both per-keystroke Search reads use the raw pool rather than `PrioritizedDatabase` read-through.
+  A pending NSE staging merge may legitimately take seconds, and cannot add a header to the FTS page
+  that was already queried, so making it part of this hot display path would change semantics without
+  improving the current result. Settings retains read-through for its eventual display-only count.
+- A real WAL `DatabasePool` test with `maximumReaderCount = 1` holds the only reader for about 350 ms.
+  The fixed paths wait about 361 ms while a 20 ms `MainActor` heartbeat advances 17 times. The inverse
+  synchronous control waits about 364 ms with zero heartbeat ticks and fails the regression test.
+
+This is a **proven reachable stall**, not a query-duration theory: the original device stack already
+ended in `dispatch_sync`, and the inverse control reproduces the actor starvation under reader
+contention. It is also a query-count improvement: the exact FTS path no longer performs N+1 pool
+acquisitions.
+
+**Residual scope keeping this record open.** This pass did a current-state census sufficient to cover
+the two issue-listed Search paths, but it did not certify every synchronous database state reachable
+from every `@MainActor` context. At least `SearchView.openResult` still contains one synchronous,
+indexed header lookup on an explicit result tap. `UndoService.push` also retains synchronous
+main-actor diagnostic reads, now wholly behind the debug-logging gate fixed by `IOS-PERF-016`; that is
+not ordinary production work, but must be classified explicitly in a full census. Close #13 only
+after that complete by-state inventory either converts or consciously classifies every survivor.
 
 ## Subsystem and search terms
 
 synchronous `dbPool.read` on `@MainActor`; main-thread block; priority inversion;
 `Thread Performance Checker`; `User-interactive waiting on … Utility`; `PrioritizedDatabase.read`;
+raw `DatabasePool.read` async overload; NSE staging read-through;
 blocked reader vs pool holder; `SearchView.legacyLocalSearch`; `SearchView.onQueryChanged`;
 `.onChange(of: query)`; per-keystroke DB read; debounce bypass; `IOS-PERF-001` census scope error;
 `Task.detached(priority: .utility)`; `MAIN THREAD STALL`; cheap-but-synchronous; census by state
 
-## Full detail
+## Original registration detail (historical; named SearchView sites fixed 2026-08-14)
 
 **The gap, stated plainly.** `IOS-PERF-001` enumerated **18 sites / 7 violations / 2 mechanism-only** of
 the QoS inversion, and its unit of enumeration was *"sites that HOLD one of our pools at the wrong
@@ -61,7 +98,7 @@ folder set, fixed by moving to the async overload:
 
 **The reasoning existed, was written down, and was never applied to the search field.**
 
-## Why registered rather than fixed
+## Why it was originally registered rather than fixed
 
 The fix is an async conversion, and that is **not a local edit**. `SearchView.legacyLocalSearch` is
 called from `SearchView.onQueryChanged` as `results = legacyLocalSearch(trimmed)` **above** the 150 ms
@@ -97,7 +134,7 @@ time.
 - `IOS-PERF-011` — a confirmed member of this class, with no UX trade-off blocking its fix.
 - `53d17514e` — removed the cost, not the blocking.
 
-## 📏 A SECOND CONFIRMED MEMBER — `SearchView.ftsResultsToSearchResults` (2026-08-13)
+## 📏 Historical second confirmed member — `SearchView.ftsResultsToSearchResults` (fixed 2026-08-14)
 
 The whole-SQL-surface audit enumerated this class **by state**, as the scope note above demands, and
 found a second member in the same file as the founding one:

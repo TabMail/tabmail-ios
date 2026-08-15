@@ -15,6 +15,7 @@ struct SearchView: View {
     @State private var searchAll = false
     @State private var results: [SearchResult] = []
     @State private var pendingAccounts: Int = 0
+    @State private var isLocalPassInFlight = false
     @State private var hasSearched = false
     @State private var searchTask: Task<Void, Never>?
     @State private var debounceTask: Task<Void, Never>?
@@ -49,7 +50,7 @@ struct SearchView: View {
     private let olderStepDays: Int = 60
 
     private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
-    private var isSearching: Bool { pendingAccounts > 0 }
+    private var isSearching: Bool { isLocalPassInFlight || pendingAccounts > 0 }
 
     /// Folder IDs for scoped search, or nil for search-all.
     private var activeFolderIds: [String]? {
@@ -706,6 +707,7 @@ struct SearchView: View {
         debounceTask = nil
         searchTask?.cancel()
         searchTask = nil
+        isLocalPassInFlight = false
         pendingAccounts = 0
     }
 
@@ -716,6 +718,7 @@ struct SearchView: View {
 
         debounceTask?.cancel()
         searchTask?.cancel()
+        isLocalPassInFlight = false
         pendingAccounts = 0
         searchGeneration += 1
 
@@ -730,12 +733,37 @@ struct SearchView: View {
         hasSearched = true
         canLoadOlder = false
         hasSubmittedRemote = false
-        results = legacyLocalSearch(trimmed)
+        isLocalPassInFlight = true
+        // The previous query's rows must not remain tappable while the new local
+        // snapshot waits for a reader. The old synchronous read also prevented
+        // them from repainting, but did so by freezing the main actor.
+        results = []
 
         // Typing only searches locally (FTS). Remote search fires on submit
         // (keyboard search key → triggerRemoteSearch) to avoid a network call
         // per keystroke.
         debounceTask = Task { @MainActor in
+            // Keep the legacy substring pass ahead of the debounce, as before. It
+            // now suspends instead of synchronously occupying the typing thread.
+            let legacyResults = await Self.legacyLocalSearch(
+                trimmed,
+                folderIds: activeFolderIds,
+                pool: AppDatabase.rawPool
+            )
+            guard !Task.isCancelled else { return }
+            isLocalPassInFlight = false
+
+            // A scope change can re-submit remote search while this async read is
+            // in flight. Preserve any same-generation remote rows that arrived in
+            // that window; the old synchronous path necessarily finished first.
+            let remoteRowsAtLegacyPublish = results.filter { $0.source == .remote }
+            var initialResults = Self.localResultsNotSupersededByRemote(
+                legacyResults,
+                remoteResults: remoteRowsAtLegacyPublish
+            ) + remoteRowsAtLegacyPublish
+            initialResults.sort { $0.date > $1.date }
+            results = initialResults
+
             try? await Task.sleep(for: .milliseconds(150))
             guard !Task.isCancelled else { return }
 
@@ -744,20 +772,24 @@ struct SearchView: View {
                 folderIds: activeFolderIds)) ?? []
             guard !Task.isCancelled else { return }
 
-            let searchResults = ftsResultsToSearchResults(ftsResults)
+            let searchResults = await ftsResultsToSearchResults(ftsResults)
+            guard !Task.isCancelled else { return }
             // Union, don't replace (ADR-IOS-007 graceful degradation): the
             // substring scan can still catch what token-based FTS misses — e.g.
             // a mid-fragment like "marc-sup" inside "dmarc-support", or content
             // beyond FTS's ranked cutoff. Show FTS's ranked hits first, then any
             // legacy hits FTS missed.
             let ftsIds = Set(searchResults.compactMap(\.headerId))
-            let legacyExtras = results.filter { result in
-                result.source == .local && (result.headerId.map { !ftsIds.contains($0) } ?? true)
+            let legacyExtras = legacyResults.filter { result in
+                result.headerId.map { !ftsIds.contains($0) } ?? true
             }
-            let remoteResults = results.filter { $0.source == .remote }
-            results = searchResults + legacyExtras + remoteResults
+            let remoteRowsAtFTSPublish = results.filter { $0.source == .remote }
+            results = Self.localResultsNotSupersededByRemote(
+                searchResults + legacyExtras,
+                remoteResults: remoteRowsAtFTSPublish
+            ) + remoteRowsAtFTSPublish
             if DebugModeManager.isLoggingEnabled() {
-                print("[Search] debounce merge: fts=\(ftsResults.count) →searchResults=\(searchResults.count) +legacyExtras=\(legacyExtras.count) +remote=\(remoteResults.count) ⇒ results=\(results.count) query='\(trimmed.prefix(40))'")
+                print("[Search] debounce merge: fts=\(ftsResults.count) →searchResults=\(searchResults.count) +legacyExtras=\(legacyExtras.count) +remote=\(remoteRowsAtFTSPublish.count) ⇒ results=\(results.count) query='\(trimmed.prefix(40))'")
             }
         }
     }
@@ -873,9 +905,12 @@ struct SearchView: View {
                         // also collapses the local row (folderPath="INBOX") against the
                         // account-wide remote row (folderPath="").
                         let isSameMessage: (SearchResult) -> Bool = { r in
-                            r.accountId == accountId
-                                && remoteIds.contains(r.messageId)
-                                && (folderPath.isEmpty || r.folderPath == folderPath)
+                            Self.isSameMessage(
+                                r,
+                                remoteAccountId: accountId,
+                                remoteMessageIds: remoteIds,
+                                remoteFolderPath: folderPath
+                            )
                         }
                         // Preserve snippets from local results when remote has none.
                         let localSnippets = Dictionary(
@@ -955,24 +990,137 @@ struct SearchView: View {
     /// Convert FTS results to SearchResults by looking up headers from the main DB.
     /// Self-healing: if FTS returned a result whose folderId is stale (message moved),
     /// exclude it from results and correct the FTS entry in the background.
-    private func ftsResultsToSearchResults(_ ftsResults: [FTSSearchResult]) -> [SearchResult] {
+    private func ftsResultsToSearchResults(_ ftsResults: [FTSSearchResult]) async -> [SearchResult] {
+        let scope = activeFolderIds
+        let logging = DebugModeManager.isLoggingEnabled()
+        let resolution = await Self.localFTSResolution(
+            ftsResults,
+            activeFolderIds: scope,
+            logging: logging,
+            pool: AppDatabase.rawPool
+        )
+
+        // Fire-and-forget: correct stale FTS folderIds so future searches are accurate
+        if !resolution.staleCorrections.isEmpty {
+            Task {
+                for correction in resolution.staleCorrections {
+                    try? await SearchIndex.shared.updateFolderIds(
+                        contentKeys: [ContentKey(rawValue: correction.headerId)],
+                        newFolderId: correction.correctFolderId)
+                }
+            }
+        }
+
+        // Fire-and-forget: re-key drifted FTS entries to the current GRDB id so the
+        // index self-repairs for all consumers. Re-key first, THEN realign the
+        // scoping folderId (rekeyHeaders only moves the id, not meta.folderId).
+        if !resolution.rekeyHeals.isEmpty {
+            let heals = resolution.rekeyHeals
+            Task {
+                try? await SearchIndex.shared.rekeyHeaders(
+                    heals.map { (oldKey: ContentKey(rawValue: $0.old), newKey: ContentKey(rawValue: $0.new),
+                                 newMessageId: $0.newMessageId) })
+                for heal in heals {
+                    try? await SearchIndex.shared.updateFolderIds(
+                        contentKeys: [ContentKey(rawValue: heal.new)], newFolderId: heal.newFolderId)
+                }
+            }
+        }
+
+        if logging {
+            print("[Search] ftsResultsToSearchResults: in=\(ftsResults.count) out=\(resolution.results.count) healedDrift=\(resolution.healedDrift) droppedNoHeader=\(resolution.droppedNoHeader) droppedOutOfScope=\(resolution.droppedOutOfScope) scope=\(scope == nil ? "ALL" : "\(scope!.count) folders")")
+            if !resolution.noHeaderSamples.isEmpty {
+                print("[Search]   noHeader sample FTS headerIds: \(resolution.noHeaderSamples)")
+            }
+        }
+
+        return resolution.results
+    }
+
+    /// Resolve one ranked FTS page under one asynchronous raw-pool reader
+    /// acquisition. This hot path must not trigger an NSE staging merge: a merge
+    /// cannot add a header to the FTS page that was already queried, and may take
+    /// seconds. The database work remains bounded by
+    /// `SearchConfig.searchDefaultLimit`; exact ids and accounts are fetched
+    /// set-wise, while the rare stable-provider drift fallback is one indexed
+    /// query per affected account.
+    @MainActor
+    static func localFTSResolution(
+        _ ftsResults: [FTSSearchResult],
+        activeFolderIds: [String]?,
+        logging: Bool,
+        pool: DatabasePool
+    ) async -> LocalFTSResolution {
+        guard !ftsResults.isEmpty else { return .empty }
+        return (try? await pool.read { db in
+            try Self.localFTSResolution(
+                ftsResults,
+                activeFolderIds: activeFolderIds,
+                logging: logging,
+                db: db
+            )
+        }) ?? .empty
+    }
+
+    nonisolated static func localFTSResolution(
+        _ ftsResults: [FTSSearchResult],
+        activeFolderIds: [String]?,
+        logging: Bool,
+        db: Database
+    ) throws -> LocalFTSResolution {
         // ⚠ Both heal lists are consumed by `SearchIndex` (content-key space) but
         // are populated from `MessageHeader.id` values — another E1 crossing.
-        var staleCorrections: [(headerId: String, correctFolderId: String)] = []
+        var staleCorrections: [LocalFTSFolderCorrection] = []
         // Drift heal: stale FTS headerId → current GRDB id (+ folderId). The FTS
         // key embeds the folder ("accountId:folder:messageId"); a folder move
         // (Gmail archive/trash, any re-key) re-keys the GRDB header but can leave
         // the FTS entry pointing at a dead id. Re-keying here repairs the index
         // for EVERY consumer (search, AI, embeddings), not just this query.
-        var rekeyHeals: [(old: String, new: String, newMessageId: String?, newFolderId: String)] = []
+        var rekeyHeals: [LocalFTSRekeyHeal] = []
 
         // Diagnostics: count *why* FTS hits get dropped on the way to the UI.
         var droppedNoHeader = 0
         var droppedOutOfScope = 0
         var healedDrift = 0
         var noHeaderSamples: [String] = []
-        let logging = DebugModeManager.isLoggingEnabled()
-        let scope = activeFolderIds
+        let scope = activeFolderIds.map(Set.init)
+
+        let accounts = try Account.fetchAll(db)
+        let accountsById = Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, $0) })
+
+        // Exact primary-key lookups are the common path. Fetch the ranked page's
+        // whole key set in one statement instead of acquiring the reader once per
+        // result row.
+        let headerIds = Set(ftsResults.map { $0.contentKey.rawValue })
+        let exactHeaders = try MessageHeader
+            .filter(headerIds.contains(Column("id")))
+            .fetchAll(db)
+        let exactById = Dictionary(uniqueKeysWithValues: exactHeaders.map { ($0.id, $0) })
+
+        // Stable-provider drift recovery is grouped by account. IMAP/iCloud stay
+        // excluded because their per-folder UID is not move-stable identity.
+        var fallbackIdsByAccount: [String: Set<String>] = [:]
+        for ftsResult in ftsResults {
+            let headerId = ftsResult.contentKey.rawValue
+            guard exactById[headerId] == nil else { continue }
+            let accountId = String(headerId.prefix(while: { $0 != ":" }))
+            guard let provider = accountsById[accountId]?.provider,
+                  provider == .gmail || provider == .outlook else { continue }
+            fallbackIdsByAccount[accountId, default: []].insert(ftsResult.messageId)
+        }
+
+        var fallbackByIdentity: [LocalFTSLookupKey: [MessageHeader]] = [:]
+        for (accountId, messageIds) in fallbackIdsByAccount {
+            let matches = try MessageHeader
+                .filter(Column("accountId") == accountId && messageIds.contains(Column("messageId")))
+                .fetchAll(db)
+            for match in matches {
+                fallbackByIdentity[
+                    LocalFTSLookupKey(accountId: accountId, messageId: match.messageId),
+                    default: []
+                ].append(match)
+            }
+        }
 
         let results: [SearchResult] = ftsResults.compactMap { ftsResult in
             // 🚨 STAGE E1 — DAY-ONE BREAKAGE, already known to the plan.
@@ -984,9 +1132,7 @@ struct SearchView: View {
             // accounts. A content-key → header-id resolution must land first.
             let headerId = ftsResult.contentKey.rawValue
             // 1. Exact lookup by the FTS-stored id.
-            var header = (try? dbPool.read { db in
-                try MessageHeader.fetchOne(db, key: headerId)
-            }).flatMap { $0 }
+            var header = exactById[headerId]
             var recovered = false
 
             // 2. Drift recovery: the id missed. The message likely changed folder
@@ -998,18 +1144,21 @@ struct SearchView: View {
             //    (the sync-side re-key + delta-sync source fix own IMAP).
             if header == nil {
                 let accountId = String(headerId.prefix(while: { $0 != ":" }))
-                let moved = (try? dbPool.read { db -> MessageHeader? in
-                    guard let provider = try Account.fetchOne(db, key: accountId)?.provider,
-                          provider == .gmail || provider == .outlook else { return nil }
-                    let matches = try MessageHeader
-                        .filter(Column("accountId") == accountId && Column("messageId") == ftsResult.messageId)
-                        .fetchAll(db)
-                    // Same Gmail message can live in several folders (INBOX + All
-                    // Mail + labels); any is the same message. Prefer one in scope.
-                    return matches.first(where: { h in scope.map { $0.contains(h.folderId) } ?? true }) ?? matches.first
-                }).flatMap { $0 }
+                let matches = fallbackByIdentity[
+                    LocalFTSLookupKey(accountId: accountId, messageId: ftsResult.messageId)
+                ] ?? []
+                // Same Gmail message can live in several folders (INBOX + All
+                // Mail + labels); any is the same message. Prefer one in scope.
+                let moved = matches.first(where: { h in
+                    scope.map { $0.contains(h.folderId) } ?? true
+                }) ?? matches.first
                 if let moved, moved.id != headerId {
-                    rekeyHeals.append((old: headerId, new: moved.id, newMessageId: moved.messageId, newFolderId: moved.folderId))
+                    rekeyHeals.append(LocalFTSRekeyHeal(
+                        old: headerId,
+                        new: moved.id,
+                        newMessageId: moved.messageId,
+                        newFolderId: moved.folderId
+                    ))
                     healedDrift += 1
                     header = moved
                     recovered = true
@@ -1030,15 +1179,16 @@ struct SearchView: View {
                 // Recovered hits re-key below (which also realigns folderId); don't
                 // also queue a folderId-only fix against the about-to-be-replaced id.
                 if !recovered {
-                    staleCorrections.append((headerId: header.id, correctFolderId: header.folderId))
+                    staleCorrections.append(LocalFTSFolderCorrection(
+                        headerId: header.id,
+                        correctFolderId: header.folderId
+                    ))
                 }
                 droppedOutOfScope += 1
                 return nil
             }
 
-            let accountEmail = (try? dbPool.read { db in
-                try Account.fetchOne(db, key: header.accountId)
-            })?.emailAddress ?? ""
+            let accountEmail = accountsById[header.accountId]?.emailAddress ?? ""
 
             return SearchResult(
                 source: .local,
@@ -1061,40 +1211,15 @@ struct SearchView: View {
             )
         }
 
-        // Fire-and-forget: correct stale FTS folderIds so future searches are accurate
-        if !staleCorrections.isEmpty {
-            Task {
-                for (headerId, correctFolderId) in staleCorrections {
-                    try? await SearchIndex.shared.updateFolderIds(
-                        contentKeys: [ContentKey(rawValue: headerId)], newFolderId: correctFolderId)
-                }
-            }
-        }
-
-        // Fire-and-forget: re-key drifted FTS entries to the current GRDB id so the
-        // index self-repairs for all consumers. Re-key first, THEN realign the
-        // scoping folderId (rekeyHeaders only moves the id, not meta.folderId).
-        if !rekeyHeals.isEmpty {
-            let heals = rekeyHeals
-            Task {
-                try? await SearchIndex.shared.rekeyHeaders(
-                    heals.map { (oldKey: ContentKey(rawValue: $0.old), newKey: ContentKey(rawValue: $0.new),
-                                 newMessageId: $0.newMessageId) })
-                for heal in heals {
-                    try? await SearchIndex.shared.updateFolderIds(
-                        contentKeys: [ContentKey(rawValue: heal.new)], newFolderId: heal.newFolderId)
-                }
-            }
-        }
-
-        if DebugModeManager.isLoggingEnabled() {
-            print("[Search] ftsResultsToSearchResults: in=\(ftsResults.count) out=\(results.count) healedDrift=\(healedDrift) droppedNoHeader=\(droppedNoHeader) droppedOutOfScope=\(droppedOutOfScope) scope=\(activeFolderIds == nil ? "ALL" : "\(activeFolderIds!.count) folders")")
-            if !noHeaderSamples.isEmpty {
-                print("[Search]   noHeader sample FTS headerIds: \(noHeaderSamples)")
-            }
-        }
-
-        return results
+        return LocalFTSResolution(
+            results: results,
+            staleCorrections: staleCorrections,
+            rekeyHeals: rekeyHeals,
+            droppedNoHeader: droppedNoHeader,
+            droppedOutOfScope: droppedOutOfScope,
+            healedDrift: healedDrift,
+            noHeaderSamples: noHeaderSamples
+        )
     }
 
     /// The most-recent page `legacyLocalSearch` scans, with optional folder scope.
@@ -1158,49 +1283,93 @@ struct SearchView: View {
         return merged.count > budget ? Array(merged.prefix(budget)) : merged
     }
 
-    private func legacyLocalSearch(_ query: String) -> [SearchResult] {
-        let folderIds = activeFolderIds
+    /// Preserve the remote merge's identity ownership when an asynchronous local
+    /// snapshot finishes second. The production remote path removes the matching
+    /// local row before appending a server result; the reverse arrival order must
+    /// apply the same account/folder identity rule without disturbing local rank.
+    nonisolated static func localResultsNotSupersededByRemote(
+        _ localResults: [SearchResult],
+        remoteResults: [SearchResult]
+    ) -> [SearchResult] {
+        localResults.filter { local in
+            !remoteResults.contains { isSameMessage(local, asRemote: $0) }
+        }
+    }
 
+    /// The single source of message-identity semantics for every remote/local
+    /// merge. Provider account-wide batches have an empty remote folder and use
+    /// account-global ids; IMAP batches keep their folder-scoped UID identity.
+    nonisolated static func isSameMessage(
+        _ candidate: SearchResult,
+        remoteAccountId: String,
+        remoteMessageIds: Set<String>,
+        remoteFolderPath: String
+    ) -> Bool {
+        candidate.accountId == remoteAccountId
+            && remoteMessageIds.contains(candidate.messageId)
+            && (remoteFolderPath.isEmpty || candidate.folderPath == remoteFolderPath)
+    }
+
+    nonisolated private static func isSameMessage(
+        _ candidate: SearchResult,
+        asRemote remote: SearchResult
+    ) -> Bool {
+        guard case .remote = remote.source else { return false }
+        return isSameMessage(
+            candidate,
+            remoteAccountId: remote.accountId,
+            remoteMessageIds: [remote.messageId],
+            remoteFolderPath: remote.folderPath
+        )
+    }
+
+    /// The legacy substring pass intentionally remains ahead of the 150 ms FTS
+    /// debounce. Its bounded page and account map share one raw-pool async reader
+    /// acquisition, so typing never dispatch-syncs onto a GRDB reader queue and
+    /// does not add the hot per-keystroke path as an NSE read-through merge trigger.
+    @MainActor
+    static func legacyLocalSearch(
+        _ query: String,
+        folderIds: [String]?,
+        pool: DatabasePool
+    ) async -> [SearchResult] {
         // Bounded fetch — most recent page, with optional folder scope. See
         // `recentHeaders` for why the scope is NOT expressed as `folderId IN (…)`.
-        guard let messages: [MessageHeader] = try? dbPool.read({ db in
-            try Self.recentHeaders(
+        return (try? await pool.read { db in
+            let messages = try Self.recentHeaders(
                 db, folderIds: folderIds, budget: SearchConfig.legacySubstringScanRows
             )
-        }) else { return [] }
+            let accounts = try Account.fetchAll(db)
+            let accountEmails = Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, $0.emailAddress) })
 
-        let accountEmails: [String: String] = {
-            guard let accounts = try? dbPool.read({ db in try Account.fetchAll(db) }) else { return [:] }
-            return Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, $0.emailAddress) })
-        }()
-
-        return messages
-            .filter {
-                $0.subject.localizedCaseInsensitiveContains(query) ||
-                $0.from.localizedCaseInsensitiveContains(query) ||
-                $0.fromAddress.localizedCaseInsensitiveContains(query) ||
-                $0.snippet.localizedCaseInsensitiveContains(query)
-            }
-            .prefix(50)
-            .map { msg in
-                SearchResult(
-                    source: .local,
-                    accountId: msg.accountId,
-                    accountEmail: accountEmails[msg.accountId] ?? "",
-                    messageId: msg.messageId,
-                    folderPath: msg.folderPath,
-                    subject: msg.subject,
-                    from: msg.from,
-                    fromAddress: msg.fromAddress,
-                    date: msg.date,
-                    snippet: msg.snippet,
-                    isRead: msg.isRead,
-                    isFlagged: msg.isFlagged,
-                    headerId: msg.id,
-                    // Same row every other field above comes from — zero extra I/O.
-                    capturedRfc822MessageId: msg.rfc822MessageId
-                )
-            }
+            return messages
+                .filter {
+                    $0.subject.localizedCaseInsensitiveContains(query) ||
+                    $0.from.localizedCaseInsensitiveContains(query) ||
+                    $0.fromAddress.localizedCaseInsensitiveContains(query) ||
+                    $0.snippet.localizedCaseInsensitiveContains(query)
+                }
+                .prefix(50)
+                .map { msg in
+                    SearchResult(
+                        source: .local,
+                        accountId: msg.accountId,
+                        accountEmail: accountEmails[msg.accountId] ?? "",
+                        messageId: msg.messageId,
+                        folderPath: msg.folderPath,
+                        subject: msg.subject,
+                        from: msg.from,
+                        fromAddress: msg.fromAddress,
+                        date: msg.date,
+                        snippet: msg.snippet,
+                        isRead: msg.isRead,
+                        isFlagged: msg.isFlagged,
+                        headerId: msg.id,
+                        // Same row every other field above comes from — zero extra I/O.
+                        capturedRfc822MessageId: msg.rfc822MessageId
+                    )
+                }
+        }) ?? []
     }
 
     // MARK: - Remote Search (per account, with timeout)
@@ -1403,8 +1572,41 @@ struct SearchView: View {
 
 // MARK: - Search Result Model
 
-struct SearchResult: Identifiable {
-    enum Source { case local, remote }
+private struct LocalFTSLookupKey: Hashable, Sendable {
+    let accountId: String
+    let messageId: String
+}
+
+struct LocalFTSFolderCorrection: Sendable, Equatable {
+    let headerId: String
+    let correctFolderId: String
+}
+
+struct LocalFTSRekeyHeal: Sendable, Equatable {
+    let old: String
+    let new: String
+    let newMessageId: String?
+    let newFolderId: String
+}
+
+struct LocalFTSResolution: Sendable {
+    let results: [SearchResult]
+    let staleCorrections: [LocalFTSFolderCorrection]
+    let rekeyHeals: [LocalFTSRekeyHeal]
+    let droppedNoHeader: Int
+    let droppedOutOfScope: Int
+    let healedDrift: Int
+    let noHeaderSamples: [String]
+
+    static let empty = LocalFTSResolution(
+        results: [], staleCorrections: [], rekeyHeals: [],
+        droppedNoHeader: 0, droppedOutOfScope: 0, healedDrift: 0,
+        noHeaderSamples: []
+    )
+}
+
+struct SearchResult: Identifiable, Sendable {
+    enum Source: Sendable { case local, remote }
 
     /// Stable, content-derived identity. NEVER use a fresh `UUID()` here: the
     /// results array is rebuilt and re-sorted on every keystroke/FTS merge/remote
