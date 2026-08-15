@@ -189,7 +189,7 @@ terminal event, `armedPending()` never falls to 0.
 | Route into the dead zone | Its `hiddenByViewMode` arm | Status |
 |---|---|---|
 | App-emitted `.tm-eml-section` containing at least one non-settling armed image | unconditional (main **and** preview) | **OPEN.** Untouched by `7f8c40eb2`. This is the route this entry is scoped to. |
-| Sender-authored `.tm-eml-section` (`IOS-UI-005`) | the same unconditional arm | **OPEN.** Same mechanism, sender-triggered rather than attachment-triggered. |
+| Sender-authored `.tm-eml-section` (`IOS-UI-005`) | the same unconditional arm | **ACCEPTED LIMITATION.** Same mechanism, sender-triggered rather than attachment-triggered. |
 | Sender-authored `.tm-eml-headers` | gated on `preview` since `7f8c40eb2` | **CLOSED IN MAIN VIEW.** No main-view rule of ours hides that class, so the images swap, reach a terminal state, and the census can publish. Still withheld inside the preview sheet, where `body.tm-preview-mode .tm-eml-headers` genuinely applies. |
 
 App-emitted `.tm-eml-headers` is not a fourth row. The ancestor walk is inside-out: in preview mode
