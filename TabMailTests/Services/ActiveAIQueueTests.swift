@@ -618,7 +618,7 @@ struct AIWriteIdentityGuardTests {
         }
 
         let snapshot = try db.read {
-            try OpenedAIProcessingSnapshot.capture(headerId: original.id, db: $0)
+            try OpenedAIProcessingSnapshot.capture(message: original, db: $0)
         }
         let captured = try #require(snapshot)
 
@@ -694,6 +694,36 @@ struct AIWriteIdentityGuardTests {
         #expect(outcome == .written)
         let after = try blurb(db, Self.headerId)
         #expect(after == "X's summary", "the ordinary healthy write must land — this is the whole product")
+    }
+
+    @Test("The final guarded AI write clears durable direct authority atomically")
+    func fullGuardedWriteClearsDirectPending() throws {
+        let db = try makeFixture(folderEpoch: 111)
+        var original = makeHeader(
+            subject: "Direct completion", rfc822: "<direct-complete@example.com>",
+            observedEpoch: 111)
+        original.bodyComplete = true
+        try db.write { db in
+            try original.insert(db)
+            try ActiveAIQueue.markDirectPending(headerIds: [original.id], db: db)
+        }
+        let target = try #require(try capture(db, original))
+
+        let outcome = try attemptFullAIWrite(
+            db, target: target, blurb: "Direct summary")
+        let evidence = try db.read { db -> (MessageHeader?, Int) in
+            let current = try MessageHeader.fetchOne(db, key: original.id)
+            let pending = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [original.id]) ?? 0
+            return (current, pending)
+        }
+        #expect(outcome == .written)
+        #expect(evidence.0?.summaryBlurb == "Direct summary")
+        #expect(evidence.0?.actionTag == .reply)
+        #expect(evidence.0?.cachedReply == "X's precomputed reply")
+        #expect(evidence.1 == 0,
+                "field completion and marker retirement share the guarded write")
     }
 
     /// 🚨 AUDIT ROUND 4 / `IOS-ROUND3-D6` — **RE-SCOPED, NOT DELETED.** Its previous
@@ -1196,6 +1226,28 @@ struct AIWriteIdentityGuardTests {
                 "We could not look" is not "nothing has happened here" — it is the absence of \
                 evidence, and a write needs positive evidence (C3).
                 """)
+    }
+
+    @Test("The final AI write refuses a stable-provider row after its Inbox folder vanishes")
+    func stableProviderFolderLossRefusesAtMutationBoundary() throws {
+        // Gmail's provider id is itself stable identity, so resolveCurrentHeader
+        // alone deliberately accepts it. This fixture therefore discriminates the
+        // final live-Inbox scope guard from the older identity-only guard.
+        let db = try makeFixture(folderEpoch: nil, provider: .gmail)
+        let original = makeHeader(
+            subject: "Stable provider", rfc822: "<stable@example.com>",
+            observedEpoch: nil)
+        try db.write { try original.insert($0) }
+        let target = try #require(try capture(db, original))
+
+        try db.write { db in _ = try Folder.deleteOne(db, key: Self.folderId) }
+        #expect(try db.read { try MessageHeader.fetchOne($0, key: Self.headerId) } != nil)
+        try proveBareWriteLandsThenUndo(db, headerId: Self.headerId)
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "must not land")
+        #expect(outcome == .dropped)
+        #expect(try blurb(db, Self.headerId) == nil,
+                "identity proof cannot substitute for current live-Inbox scope")
     }
 
     /// Invariant: **a folder whose numbering was never observed does not authorize a

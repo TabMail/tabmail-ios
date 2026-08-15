@@ -693,4 +693,296 @@ struct RFC822IdentityMergeGuardTests {
         // Failing closed may defer the incoming occupant until sync vacates the
         // ambiguous address; it must never cannibalise the moved-in row.
     }
+
+    @Test("A proved pre-sync reclaim carries direct authority to the current address")
+    func preSyncReclaimCarriesProvedDirectPending() async throws {
+        let (pool, dir, previous) = try makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        try seedAccountAndFolders(pool)
+        try await pool.writeWithoutTransaction { db in
+            try Folder(
+                name: "Focused", path: "Focused", role: .inbox,
+                accountId: "acc1"
+            ).insert(db)
+        }
+
+        let movedInId = try insertHeader(
+            pool, messageId: "610", rfc822: "moved-610@example.com",
+            pkFolderPath: "Focused", folderPath: "Focused",
+            bodyHTML: "<p>proved moved body</p>")
+        try await pool.writeWithoutTransaction { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET isInInbox = 1, bodyComplete = 1 WHERE id = ?",
+                arguments: [movedInId])
+            try ActiveAIQueue.markDirectPending(headerIds: [movedInId], db: db)
+        }
+
+        let provider = await mock([
+            headerInfo(messageId: "610", rfc822: "moved-610@example.com")
+        ])
+        _ = try await sync(pool, folderId: "acc1:INBOX", provider: provider)
+
+        let currentId = "acc1:INBOX:610"
+        let evidence = try await pool.read { db -> (Bool, Int, Int) in
+            let oldExists = try MessageHeader.fetchOne(db, key: movedInId) != nil
+            let pending = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [currentId]) ?? 0
+            let bodyComplete = try Int.fetchOne(
+                db, sql: "SELECT bodyComplete FROM messageHeader WHERE id = ?",
+                arguments: [currentId]) ?? 1
+            return (oldExists, pending, bodyComplete)
+        }
+        #expect(!evidence.0)
+        #expect(evidence.1 == 1, "RFC equality proves which current row owns the event")
+        #expect(evidence.2 == 0,
+                "the current key must recover/re-index its body before AI admission")
+    }
+
+    @Test("Pre-sync reclaim cannot steal a different row's shared RFC mirror")
+    func preSyncReclaimPreservesSharedDirectMirrorOwner() async throws {
+        let (pool, dir, previous) = try makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        try seedAccountAndFolders(pool)
+        try await pool.writeWithoutTransaction { db in
+            try Folder(
+                name: "Focused", path: "Focused", role: .inbox,
+                accountId: "acc1"
+            ).insert(db)
+        }
+
+        let reclaimId = try insertHeader(
+            pool, messageId: "710", rfc822: "shared-reclaim@example.com",
+            pkFolderPath: "Focused", folderPath: "Focused")
+        let tailId = try insertHeader(
+            pool, messageId: "710", rfc822: "shared-reclaim@example.com",
+            pkFolderPath: "Archive", folderPath: "Archive")
+        let ownerId = try insertHeader(
+            pool, messageId: "711", rfc822: "shared-reclaim@example.com",
+            pkFolderPath: "Focused", folderPath: "Focused")
+        let oldKey = try #require(MessageAICache.cacheKey(
+            accountId: "acc1", folderPath: "Focused",
+            rfc822MessageId: "shared-reclaim@example.com"))
+        let newKey = try #require(MessageAICache.cacheKey(
+            accountId: "acc1", folderPath: "INBOX",
+            rfc822MessageId: "shared-reclaim@example.com"))
+        try await pool.writeWithoutTransaction { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET isInInbox = 1 WHERE id IN (?, ?)",
+                arguments: [reclaimId, ownerId])
+            try db.execute(sql: """
+                UPDATE messageHeader
+                SET folderId = 'acc1:Focused', folderPath = 'Focused', isInInbox = 1
+                WHERE id = ?
+            """, arguments: [tailId])
+            try ActiveAIQueue.markDirectPending(headerIds: [ownerId], db: db)
+            try db.execute(
+                sql: "UPDATE messageAICache SET summaryBlurb = ? WHERE key = ?",
+                arguments: ["Shared cached summary", oldKey])
+        }
+
+        let provider = await mock([
+            headerInfo(messageId: "710", rfc822: "shared-reclaim@example.com")
+        ])
+        _ = try await sync(pool, folderId: "acc1:INBOX", provider: provider)
+
+        let currentId = "acc1:INBOX:710"
+        let evidence = try await pool.read {
+            db -> (Bool, Bool, Int, Bool?, Int, Bool?, String?) in
+            let oldReclaimed = try MessageHeader.fetchOne(db, key: reclaimId) == nil
+            let tailReclaimed = try MessageHeader.fetchOne(db, key: tailId) == nil
+            let ownerPending = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [ownerId]) ?? 0
+            let oldMirror = try Bool.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageAICache WHERE key = ?",
+                arguments: [oldKey])
+            let newPending = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [currentId]) ?? 0
+            let newMirror = try Bool.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageAICache WHERE key = ?",
+                arguments: [newKey])
+            let copiedSummary = try String.fetchOne(
+                db, sql: "SELECT summaryBlurb FROM messageAICache WHERE key = ?",
+                arguments: [newKey])
+            return (oldReclaimed, tailReclaimed, ownerPending, oldMirror,
+                    newPending, newMirror, copiedSummary)
+        }
+        #expect(evidence.0)
+        #expect(evidence.1, "the tail duplicate must exercise cleanup too")
+        #expect(evidence.2 == 1)
+        #expect(evidence.3 == true,
+                "the different live row must retain its reset-survival authority")
+        #expect(evidence.4 == 0)
+        #expect(evidence.5 == false,
+                "payload copying cannot donate another row's direct authority")
+        #expect(evidence.6 == "Shared cached summary")
+    }
+
+    @Test("A proved direct row, not an ambiguous duplicate, donates reclaimed AI state")
+    func preSyncReclaimChoosesTheProvedDirectDonor() async throws {
+        let (pool, dir, previous) = try makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        try seedAccountAndFolders(pool)
+        try await pool.writeWithoutTransaction { db in
+            try Folder(
+                name: "Focused", path: "Focused", role: .inbox,
+                accountId: "acc1"
+            ).insert(db)
+        }
+
+        let ambiguousId = try insertHeader(
+            pool, messageId: "730", rfc822: nil,
+            pkFolderPath: "Archive", folderPath: "Focused",
+            bodyHTML: "<p>wrong ambiguous body</p>")
+        let provedId = try insertHeader(
+            pool, messageId: "730", rfc822: "proved-730@example.com",
+            pkFolderPath: "Focused", folderPath: "Focused",
+            bodyHTML: "<p>proved direct body</p>")
+        try await pool.writeWithoutTransaction { db in
+            try db.execute(sql: """
+                UPDATE messageHeader
+                SET summaryBlurb = 'WRONG', actionTag = 'none', cachedReply = 'WRONG',
+                    isInInbox = 1, bodyComplete = 1
+                WHERE id = ?
+            """, arguments: [ambiguousId])
+            try db.execute(
+                sql: "UPDATE messageHeader SET isInInbox = 1, bodyComplete = 1 WHERE id = ?",
+                arguments: [provedId])
+            try ActiveAIQueue.markDirectPending(headerIds: [provedId], db: db)
+        }
+
+        let provider = await mock([
+            headerInfo(messageId: "730", rfc822: "proved-730@example.com")
+        ])
+        _ = try await sync(pool, folderId: "acc1:INBOX", provider: provider)
+
+        let currentId = "acc1:INBOX:730"
+        let evidence = try await pool.read { db -> (Int, String?, String?) in
+            let pending = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [currentId]) ?? 0
+            let summary = try String.fetchOne(
+                db, sql: "SELECT summaryBlurb FROM messageHeader WHERE id = ?",
+                arguments: [currentId])
+            let body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: currentId))?
+                .htmlContent
+            return (pending, summary, body)
+        }
+        #expect(evidence.0 == 1)
+        #expect(evidence.1 == nil,
+                "the nil-RFC duplicate cannot donate completed AI to the proved target")
+        #expect(evidence.2 == "<p>proved direct body</p>")
+    }
+
+    @Test("Transferred reset authority retires the old cache coordinate")
+    func preSyncReclaimRetiresResetPendingOldCoordinate() async throws {
+        let (pool, dir, previous) = try makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        try seedAccountAndFolders(pool)
+        try await pool.writeWithoutTransaction { db in
+            var focused = Folder(
+                name: "Focused", path: "Focused", role: .inbox,
+                accountId: "acc1")
+            focused.uidValidityResetPendingAt = Date()
+            try focused.insert(db)
+        }
+        let oldId = try insertHeader(
+            pool, messageId: "740", rfc822: "reset-transfer@example.com",
+            pkFolderPath: "Focused", folderPath: "Focused")
+        let oldKey = try #require(MessageAICache.cacheKey(
+            accountId: "acc1", folderPath: "Focused",
+            rfc822MessageId: "reset-transfer@example.com"))
+        let newKey = try #require(MessageAICache.cacheKey(
+            accountId: "acc1", folderPath: "INBOX",
+            rfc822MessageId: "reset-transfer@example.com"))
+        try await pool.writeWithoutTransaction { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET isInInbox = 1 WHERE id = ?",
+                arguments: [oldId])
+            try ActiveAIQueue.markDirectPending(headerIds: [oldId], db: db)
+        }
+
+        let provider = await mock([
+            headerInfo(messageId: "740", rfc822: "reset-transfer@example.com")
+        ])
+        _ = try await sync(pool, folderId: "acc1:INBOX", provider: provider)
+
+        let currentId = "acc1:INBOX:740"
+        try await pool.writeWithoutTransaction { db in
+            try db.execute(sql: """
+                UPDATE messageHeader
+                SET summaryBlurb = 'done', actionTag = 'none', cachedReply = ''
+                WHERE id = ?
+            """, arguments: [currentId])
+            try ActiveAIQueue.clearDirectPendingIfComplete(
+                headerId: currentId, db: db)
+        }
+        let transferred = try await pool.read { db -> (Bool?, Bool?, Int) in
+            let oldMirror = try Bool.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageAICache WHERE key = ?",
+                arguments: [oldKey])
+            let newMirror = try Bool.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageAICache WHERE key = ?",
+                arguments: [newKey])
+            let currentPending = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [currentId]) ?? -1
+            return (oldMirror, newMirror, currentPending)
+        }
+        #expect(transferred.0 != true)
+        #expect(transferred.1 == false)
+        #expect(transferred.2 == 0)
+
+        var resyncSnapshot = MessageHeader(
+            messageId: "741", subject: "Old path resync", from: "Sender",
+            fromAddress: "sender@example.com", to: "user@example.com",
+            date: Date(), snippet: "", folderId: "acc1:Focused",
+            accountId: "acc1", folderPath: "Focused", isInInbox: true)
+        resyncSnapshot.rfc822MessageId = "reset-transfer@example.com"
+        let oldPathResync = resyncSnapshot
+        try await pool.writeWithoutTransaction { try oldPathResync.insert($0) }
+        #expect(try await pool.read {
+            try Int.fetchOne(
+                $0, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [oldPathResync.id])
+        } == 0, "the old reset coordinate cannot resurrect transferred authority")
+    }
+
+    @Test("An RFC-less pre-sync collision never transfers direct authority by UID alone")
+    func rfcLessPreSyncReclaimRetainsAuthorityOnTheUnprovedRow() async throws {
+        let (pool, dir, previous) = try makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        try seedAccountAndFolders(pool)
+
+        let movedInId = try insertHeader(
+            pool, messageId: "620", rfc822: nil,
+            pkFolderPath: "Archive", folderPath: "INBOX",
+            bodyHTML: "<p>unproved moved body</p>")
+        try await pool.writeWithoutTransaction { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE id = ?",
+                arguments: [movedInId])
+            try ActiveAIQueue.markDirectPending(headerIds: [movedInId], db: db)
+        }
+
+        let provider = await mock([headerInfo(messageId: "620", rfc822: nil)])
+        _ = try await sync(pool, folderId: "acc1:INBOX", provider: provider)
+
+        let incomingId = "acc1:INBOX:620"
+        let evidence = try await pool.read { db -> (Bool, Int, Int) in
+            let oldExists = try MessageHeader.fetchOne(db, key: movedInId) != nil
+            let oldPending = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [movedInId]) ?? 0
+            let incomingPending = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [incomingId]) ?? 0
+            return (oldExists, oldPending, incomingPending)
+        }
+        #expect(evidence.0, "nil identity cannot authorize deleting the moved row")
+        #expect(evidence.1 == 1, "the direct event stays with the row that received it")
+        #expect(evidence.2 == 0, "a coinciding inbox UID receives no borrowed authority")
+    }
 }

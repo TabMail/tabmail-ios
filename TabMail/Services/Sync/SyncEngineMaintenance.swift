@@ -71,22 +71,19 @@ extension SyncEngine {
             for folder in folders {
                 guard StorageEstimator.isOverBudget() else { break }
                 while StorageEstimator.isOverBudget() {
-                    let currentCount = (try? dbPool.read { db in
-                        try MessageHeader.filter(Column("folderId") == folder.id).fetchCount(db)
-                    }) ?? 0
-                    guard currentCount > floor else { break }
-                    let batch: [MessageHeader] = (try? dbPool.read { db in
-                        try MessageHeader
-                            .filter(Column("folderId") == folder.id)
-                            .order(Column("date").asc)
-                            .limit(pruneChunkSize)
-                            .fetchAll(db)
-                    }) ?? []
-                    guard !batch.isEmpty else { break }
-
                     var chunkIds: [String] = []
                     do {
                         try dbPool.write { db in
+                            let currentCount = try MessageHeader
+                                .filter(Column("folderId") == folder.id)
+                                .fetchCount(db)
+                            guard currentCount > floor else { return }
+                            let batch = try MessageHeader
+                                .filter(Column("folderId") == folder.id)
+                                .filter(Column("aiDirectPending") == false)
+                                .order(Column("date").asc, Column("id").asc)
+                                .limit(min(pruneChunkSize, currentCount - floor))
+                                .fetchAll(db)
                             for msg in batch {
                                 guard StorageEstimator.isOverBudget() else { break }
                                 chunkIds.append(msg.id)
@@ -97,6 +94,10 @@ extension SyncEngine {
                     } catch {
                         print("[Prune] Delete failed: \(error)")
                     }
+                    // Direct-event markers are intentionally pinned until AI work
+                    // reaches a durable terminal state. If only pinned rows remain,
+                    // no amount of rescanning can make progress in this folder.
+                    guard !chunkIds.isEmpty else { break }
                     if !chunkIds.isEmpty {
                         // Routed through `MessageContentStore`. The headers were
                         // deleted in the write transaction just above, so this
@@ -321,7 +322,10 @@ extension SyncEngine {
         let chunkSize = SyncConfig.pruneChunkSize
 
         let count = (try? dbPool.read { db in
-            try MessageAICache.filter(Column("updatedAt") < cutoff).fetchCount(db)
+            try MessageAICache
+                .filter(Column("updatedAt") < cutoff)
+                .filter(Column("aiDirectPending") == false)
+                .fetchCount(db)
         }) ?? 0
         guard count > 0 else { return }
 
@@ -334,6 +338,7 @@ extension SyncEngine {
                 let batchResult = try dbPool.write { db -> (purged: Int, rescued: Int, batchEmpty: Bool) in
                     let batch = try MessageAICache
                         .filter(Column("updatedAt") < cutoff)
+                        .filter(Column("aiDirectPending") == false)
                         .limit(chunkSize, offset: skipCount)
                         .fetchAll(db)
                     guard !batch.isEmpty else { return (0, 0, true) }

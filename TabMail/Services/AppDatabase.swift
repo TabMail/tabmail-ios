@@ -1999,7 +1999,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v84 RANGE ─────────────────────
+        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v85 RANGE ─────────────────────
         //
         // `registerTimedMigration`'s DEFAULT stays `.deferred` and is NOT
         // changed. v1…v67 have never been adjudicated for `.immediate` safety,
@@ -2062,6 +2062,10 @@ final class AppDatabase: Sendable {
         //   • v84 — `ALTER TABLE … ADD COLUMN` only (`pendingCalendarOperation`
         //     `failureReason`). Same argument as the `ADD COLUMN` bullet above:
         //     adding a column writes no key of either kind.
+        //   • v85 — two `ALTER TABLE … ADD COLUMN` statements, a sparse index,
+        //     and four `messageHeader` triggers; none changes an FK-bearing key.
+        //     Existing rows take the false defaults, so the sparse direct-request
+        //     index starts empty. Creating triggers mutates no row or key.
         //
         //   • v82 — `DROP`/`CREATE` of `userLabel` + `messageUserLabel`. FK-clean
         //     per statement, verified statement by statement in that migration's own
@@ -2072,16 +2076,16 @@ final class AppDatabase: Sendable {
         //     the body safe.
         //
         // ⚑ AMENDED 2026-08-06, RANGE RE-DERIVED AT R17-6 — **EVERY MIGRATION IN
-        // v68…v84 NOW RUNS `.immediate`, so this range runs ZERO whole-database
+        // v68…v85 NOW RUNS `.immediate`, so this range runs ZERO whole-database
         // foreign-key checks.** The range is an OPEN interval that moves with the
         // top of the chain, so it is re-derived rather than restated (`MIS-031` — a
         // sentence that enumerates is a cache, and this one had gone stale at `v84`
         // in five places at once). Comments excluded so this paragraph cannot
         // satisfy its own predicate (`MIS-033`, `IOS-DOC-002`):
         //   rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' \
-        //      TabMail/Services/AppDatabase.swift                            → 17
+        //      TabMail/Services/AppDatabase.swift                            → 18
         //   rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' \
-        //      TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 17
+        //      TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 18
         // Equal counts are the invariant: every migration from v68 to the top runs
         // `.immediate`, and none below v68 does. The sentence
         // that stood here said *"`v71` and `v82` stay `.deferred`, each for a
@@ -2851,11 +2855,13 @@ final class AppDatabase: Sendable {
         //        `messageUserLabel`. (Naive: 3.)
         //      · `rg -c --pcre2 '^(?!\s*(///|//)).*references\("messageUserLabel"'` →
         //        **no output, exit 1** — nothing can be cascaded into. (Naive: 1.)
-        //      · `rg -i -c --pcre2 '^(?!\s*(///|//)).*CREATE TRIGGER'` → **no output,
-        //        exit 1** — no triggers anywhere in the tree. (Naive: 1.)
-        //    Non-vacuity for the two claimed zeros, so a broken regex cannot pass as a
-        //    clean result: the FIRST predicate uses the identical lookahead and returns
-        //    a non-empty 2, so the lookahead demonstrably does not swallow live code.
+        //      · `rg -i -c --pcre2 '^(?!\s*(///|//)).*CREATE TRIGGER'` → **4**,
+        //        all later v85 direct-AI lifecycle triggers. None exists while v82
+        //        runs, and SQLite's implicit `DROP TABLE` delete does not fire
+        //        triggers in any case. (Before v85 this live census was zero.)
+        //    Non-vacuity for the predicates: the FIRST returns a non-empty 2 and the
+        //    trigger predicate returns 4, so the lookahead demonstrably does not
+        //    swallow live code.
         //    The two `CREATE TABLE … AS SELECT` snapshots carry no constraints (SQLite
         //    copies none through CTAS), so they neither block a drop nor participate in
         //    a cascade, and SQLite's implicit delete does not fire triggers in any case.
@@ -2914,7 +2920,8 @@ final class AppDatabase: Sendable {
         // do not restore the gate as a cost instrument; it is a correctness one.
         //
         // With this change the `.immediate` range — `v68` to the top of the chain,
-        // `v84` as of R17-6 — runs ZERO whole-database foreign-key gates.
+        // `v85` as of the IOS-AI-006 durability correction — runs ZERO
+        // whole-database foreign-key gates.
         // `v2_dropMessageHeaderFolderFK` is the only explicitly `.deferred` migration
         // left in the file, and it applied on every shipped device long ago. (This
         // said "the v68…v83 range"; the regime is an open interval and the endpoint
@@ -2986,7 +2993,12 @@ final class AppDatabase: Sendable {
             //            rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' <this file> | sort -n -u | wc -l
             //            rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' <this file>
             //            rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.deferred'  <this file>
-            //          ⚠️ THIS MIGRATION IS ONE OF THE 17: reason (b) below is now a
+            //          Re-derived after v85: **85** registered, **18** explicit
+            //          `.immediate` (v68…v85, contiguous), **1** explicit
+            //          `.deferred`, **66** default ⇒ **67 of 85** end with the
+            //          whole-database check and 18 do not. The 67 is unchanged
+            //          because v85 joined the immediate side.
+            //          ⚠️ THIS MIGRATION IS ONE OF THE 18: reason (b) below is now a
             //          statement about migrations that
             //          ran on shipped devices long ago, not about this chain.
             //          Confirmed against GRDB's own
@@ -3413,9 +3425,9 @@ final class AppDatabase: Sendable {
         // `IOS-DOC-002` the predicate ships with the sentence, comments excluded so
         // it cannot count its own recording (`MIS-033`):
         //   rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' TabMail/Services/AppDatabase.swift \
-        //     | sort -n -u | awk '$1>=68' | wc -l                                  → 17
+        //     | sort -n -u | awk '$1>=68' | wc -l                                  → 18
         //   rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' \
-        //      TabMail/Services/AppDatabase.swift                                  → 17
+        //      TabMail/Services/AppDatabase.swift                                  → 18
         // The two must be EQUAL. A new migration keeps them equal by declaring
         // `.immediate`; one that cannot must say why, here.
         migrator.registerTimedMigration(
@@ -3424,6 +3436,169 @@ final class AppDatabase: Sendable {
             try db.alter(table: "pendingCalendarOperation") { t in
                 t.add(column: "failureReason", .text)
             }
+        }
+
+        // v85 — durable authority for an uncapped DIRECT AI event.
+        //
+        // `maxRecentEmails` is the owner-confirmed automatic working-inbox policy:
+        // it selects the newest population before filtering cached work. A message
+        // explicitly opened, pushed, or moved into Inbox bypasses that population,
+        // matching Thunderbird's direct `processMessage` path. The ActiveAI queue
+        // is in-memory, so that bypass needs one durable bit or a relaunch can erase
+        // the event and leave an old message outside automatic eligibility forever.
+        // RFC-bearing intent is mirrored in `messageAICache`, whose existing
+        // content key survives UIDVALIDITY delete-and-resync; RFC-less rows remain
+        // deliberately fail-closed because no durable content identity exists.
+        //
+        // The live header column is deliberately schema-only: `MessageHeader` does
+        // not encode it, so ordinary provider/sync model saves cannot reset it.
+        // Direct producers and guarded AI completion mutate it with raw SQL. Re-key
+        // code explicitly carries it because delete+insert cannot carry a column the
+        // model does not know about. Existing rows default false; there is no
+        // backfill and therefore no invented historical direct intent.
+        //
+        // The partial index starts empty on upgrade and contains only direct-work
+        // rows. Keeping the predicate at the durable authority bit makes BOTH the
+        // live-work selector and terminal cleanup seek this sparse index; indexing
+        // only the live-work predicate would make cleanup scan the full header table.
+        migrator.registerTimedMigration(
+            "v85_addDirectAIPending", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "messageHeader") { t in
+                t.add(column: "aiDirectPending", .boolean).notNull().defaults(to: false)
+            }
+            try db.alter(table: "messageAICache") { t in
+                t.add(column: "aiDirectPending", .boolean).notNull().defaults(to: false)
+            }
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_directAIPending
+                ON messageHeader(date DESC, id DESC)
+                WHERE aiDirectPending = 1
+            """)
+            // Scope exit is terminal for direct Inbox work. A folder-path or RFC
+            // identity change must also relocate the RFC-keyed mirror: the outer
+            // UPDATE has already written NEW coordinates before a nested marker-
+            // clear trigger runs, so relying on that nested transition would strand
+            // the OLD cache key. NEW.date supplies a correctly encoded non-NULL
+            // timestamp when a previously RFC-less row first gains an identity;
+            // pending mirrors are excluded from TTL expiry until they retire.
+            try db.execute(sql: """
+                CREATE TRIGGER IF NOT EXISTS messageHeader_clearDirectPendingOnInboxExit
+                AFTER UPDATE OF isInInbox, folderPath, rfc822MessageId ON messageHeader
+                WHEN OLD.aiDirectPending = 1
+                  AND (NEW.isInInbox = 0
+                       OR OLD.folderPath != NEW.folderPath
+                       OR OLD.rfc822MessageId IS NOT NEW.rfc822MessageId)
+                BEGIN
+                    UPDATE messageAICache SET aiDirectPending = 0
+                    WHERE key = OLD.accountId || ':' || OLD.folderPath || ':' || OLD.rfc822MessageId
+                      AND OLD.rfc822MessageId IS NOT NULL
+                      AND OLD.rfc822MessageId != ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM messageHeader AS live
+                          WHERE live.aiDirectPending = 1
+                            AND live.id != NEW.id
+                            AND live.accountId = OLD.accountId
+                            AND live.folderPath = OLD.folderPath
+                            AND live.rfc822MessageId = OLD.rfc822MessageId
+                      );
+                    INSERT INTO messageAICache (
+                        key, rfc822MessageId, aiDirectPending, updatedAt
+                    )
+                    SELECT NEW.accountId || ':' || NEW.folderPath || ':' || NEW.rfc822MessageId,
+                           NEW.rfc822MessageId, 1,
+                           COALESCE((
+                               SELECT oldCache.updatedAt
+                               FROM messageAICache AS oldCache
+                               WHERE oldCache.key = OLD.accountId || ':' || OLD.folderPath || ':' || OLD.rfc822MessageId
+                           ), NEW.date)
+                    WHERE NEW.aiDirectPending = 1
+                      AND NEW.isInInbox = 1
+                      AND NEW.rfc822MessageId IS NOT NULL
+                      AND NEW.rfc822MessageId != ''
+                      AND EXISTS (
+                          SELECT 1 FROM folder AS f
+                          WHERE f.id = NEW.folderId
+                            AND f.accountId = NEW.accountId
+                            AND f.role = 'inbox'
+                      )
+                    ON CONFLICT(key) DO UPDATE SET
+                        aiDirectPending = 1,
+                        updatedAt = excluded.updatedAt;
+                    UPDATE messageHeader SET aiDirectPending = 0
+                    WHERE id = NEW.id AND NEW.isInInbox = 0;
+                END
+            """)
+            // Every Swift setter for the live bit also persists the RFC-keyed cache
+            // mirror. These trigger arms own the inverse lifecycle so ordinary
+            // archive/delete paths cannot leave a direct event ready to resurrect.
+            try db.execute(sql: """
+                CREATE TRIGGER IF NOT EXISTS messageHeader_clearDirectPendingCache
+                AFTER UPDATE OF aiDirectPending ON messageHeader
+                WHEN OLD.aiDirectPending = 1 AND NEW.aiDirectPending = 0
+                  AND OLD.rfc822MessageId IS NOT NULL
+                  AND OLD.rfc822MessageId != ''
+                BEGIN
+                    UPDATE messageAICache SET aiDirectPending = 0
+                    WHERE key = OLD.accountId || ':' || OLD.folderPath || ':' || OLD.rfc822MessageId
+                      AND NOT EXISTS (
+                          SELECT 1 FROM messageHeader AS live
+                          WHERE live.aiDirectPending = 1
+                            AND live.accountId = OLD.accountId
+                            AND live.folderPath = OLD.folderPath
+                            AND live.rfc822MessageId = OLD.rfc822MessageId
+                      );
+                END
+            """)
+            try db.execute(sql: """
+                CREATE TRIGGER IF NOT EXISTS messageHeader_clearDirectPendingCacheOnDelete
+                AFTER DELETE ON messageHeader
+                WHEN OLD.aiDirectPending = 1
+                  AND OLD.rfc822MessageId IS NOT NULL
+                  AND OLD.rfc822MessageId != ''
+                  AND NOT EXISTS (
+                      SELECT 1 FROM folder AS f
+                      WHERE f.id = OLD.folderId
+                        AND f.uidValidityResetPendingAt IS NOT NULL
+                  )
+                BEGIN
+                    UPDATE messageAICache SET aiDirectPending = 0
+                    WHERE key = OLD.accountId || ':' || OLD.folderPath || ':' || OLD.rfc822MessageId
+                      AND NOT EXISTS (
+                          SELECT 1 FROM messageHeader AS live
+                          WHERE live.aiDirectPending = 1
+                            AND live.accountId = OLD.accountId
+                            AND live.folderPath = OLD.folderPath
+                            AND live.rfc822MessageId = OLD.rfc822MessageId
+                      );
+                END
+            """)
+            // A reset purge deliberately leaves the cache mirror armed. The first
+            // identity-matching resync insert restores the live sparse marker in
+            // that insert transaction; RFC-less rows remain fail-closed.
+            try db.execute(sql: """
+                CREATE TRIGGER IF NOT EXISTS messageHeader_restoreDirectPendingAfterInsert
+                AFTER INSERT ON messageHeader
+                WHEN NEW.isInInbox = 1 AND NEW.bodyEmptyConfirmed = 0
+                  AND NEW.rfc822MessageId IS NOT NULL
+                  AND NEW.rfc822MessageId != ''
+                  AND (NEW.summaryBlurb IS NULL OR NEW.summaryBlurb = ''
+                       OR NEW.actionTag IS NULL OR NEW.cachedReply IS NULL)
+                  AND EXISTS (
+                      SELECT 1 FROM folder AS f
+                      WHERE f.id = NEW.folderId
+                        AND f.accountId = NEW.accountId
+                        AND f.role = 'inbox'
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM messageAICache AS c
+                      WHERE c.key = NEW.accountId || ':' || NEW.folderPath || ':' || NEW.rfc822MessageId
+                        AND c.aiDirectPending = 1
+                  )
+                BEGIN
+                    UPDATE messageHeader SET aiDirectPending = 1 WHERE id = NEW.id;
+                END
+            """)
         }
     }
 

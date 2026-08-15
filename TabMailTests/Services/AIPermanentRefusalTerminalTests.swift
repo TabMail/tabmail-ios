@@ -372,7 +372,8 @@ struct AIPermanentRefusalTerminalTests {
 
         await queue.noteUnattributableForTesting(summary)
         await queue.noteUnattributableForTesting(reply)
-        await queue.enqueue(headerId: Self.headerId, accountId: Self.accountId)
+        await queue.enqueueUnboundForCancellationTest(
+            headerId: Self.headerId, accountId: Self.accountId)
         let idle = await queue.isIdle
         #expect(idle,
                 "a structurally-refused job must not be re-armed by the drain-time repopulate")

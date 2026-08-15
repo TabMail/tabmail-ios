@@ -414,12 +414,10 @@ enum SyncConfig {
 
     // MARK: - Large Inbox Management
     // Matches TB's SETTINGS.inboxManagement. Inboxes larger than maxRecentEmails
-    // are treated as "large" — automatic backlog selection considers only the
-    // newest window. Direct events still process their selected message, matching
-    // TB's uncapped processMessage path.
+    // are treated as "large" — only recent messages are AI-processed.
 
-    /// Maximum recent inbox emails considered by automatic AI backlog selection.
-    /// Direct event jobs are not subject to this selection cap.
+    /// Maximum recent inbox emails to AI-process (summary, action, reply).
+    /// Inboxes larger than this only have the N most recent messages processed.
     /// Matches TB's inboxManagement.maxRecentEmails.
     static let maxRecentEmails = 100
     /// Age threshold (days) for the archive prompt. Messages older than this

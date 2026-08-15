@@ -164,6 +164,70 @@ struct WriteTierRoutingTests {
         #expect(snapshot.allSatisfy { $0.0 == .priority }, "on-demand path must stay .priority, got \(snapshot.map(\.0))")
     }
 
+    @Test("A direct body publication refuses a replacement at the opened UID address")
+    func directBodyWriteRevalidatesOpenedIdentity() async throws {
+        let (header, restore) = try makeTestDB()
+        defer { restore() }
+
+        let target = try await AppDatabase.rawPool.write { db -> AIWriteTarget in
+            guard var account = try Account.fetchOne(db, key: header.accountId),
+                  var folder = try Folder.fetchOne(db, key: header.folderId),
+                  var original = try MessageHeader.fetchOne(db, key: header.id)
+            else {
+                throw NSError(
+                    domain: "WriteTierRoutingTests", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "missing direct-body fixture"])
+            }
+            account.provider = .imap
+            folder.lastKnownUidValidity = 10
+            original.rfc822MessageId = "<opened-x@example.com>"
+            original.observedUidValidity = 10
+            try account.update(db)
+            try folder.update(db)
+            try original.update(db)
+            return try #require(try AIWriteTarget.capture(message: original, db: db))
+        }
+
+        // Same composite address, demonstrably different physical message.
+        try await AppDatabase.rawPool.write { db in
+            guard var folder = try Folder.fetchOne(db, key: header.folderId),
+                  var replacement = try MessageHeader.fetchOne(db, key: header.id)
+            else {
+                throw NSError(
+                    domain: "WriteTierRoutingTests", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "missing replacement fixture"])
+            }
+            folder.lastKnownUidValidity = 20
+            replacement.rfc822MessageId = "<replacement-y@example.com>"
+            replacement.observedUidValidity = 20
+            try folder.update(db)
+            try replacement.update(db)
+        }
+
+        let fetchResult = makeFetchResult(
+            headerId: header.id, accountId: header.accountId,
+            folderPath: header.folderPath, messageId: header.messageId)
+        let (outcome, processed) = await BodyFetchProcessor.process(
+            fetchResult: fetchResult,
+            enableAI: true,
+            directTarget: target)
+
+        #expect(outcome == .retry)
+        #expect(processed == nil)
+        let state = try await AppDatabase.rawPool.read { db -> (Bool, Bool, Int) in
+            let body = try MessageBody.fetchOne(db, key: header.id) != nil
+            let current = try #require(try MessageHeader.fetchOne(db, key: header.id))
+            let pending = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [header.id]) ?? 0
+            return (body, current.bodyComplete, pending)
+        }
+        #expect(!state.0)
+        #expect(!state.1)
+        #expect(state.2 == 0,
+                "the fetched X body/event must not be attached to replacement Y")
+    }
+
     @Test("replaceExistingBody swaps only after a complete body is ready")
     func replaceExistingBodyUsesCurrentRowAsFallback() async throws {
         let (header, restore) = try makeTestDB()
@@ -191,6 +255,9 @@ struct WriteTierRoutingTests {
                 ])
         }
 
+        let target = try await AppDatabase.rawPool.read { db in
+            try #require(try AIWriteTarget.capture(message: header, db: db))
+        }
         let result = makeFetchResult(
             headerId: header.id,
             accountId: header.accountId,
@@ -199,7 +266,8 @@ struct WriteTierRoutingTests {
         let (outcome, processed) = await BodyFetchProcessor.process(
             fetchResult: result,
             enableAI: false,
-            replaceExistingBody: true)
+            replaceExistingBody: true,
+            directTarget: target)
 
         #expect(outcome == .success)
         if processed == nil {
@@ -225,6 +293,13 @@ struct WriteTierRoutingTests {
         #expect((state.1?["summaryBlurb"] as String?) == nil)
         #expect((state.1?["actionTag"] as String?) == nil)
         #expect((state.1?["tagSortOrder"] as Int?) == 99)
+        let pending = try await AppDatabase.rawPool.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [header.id]) ?? 0
+        }
+        #expect(pending == 1,
+                "a confirmed-empty refresh re-arms the direct event with the new body transaction")
     }
 
     @Test("A failed body-cache write stays retryable and produces no FTS candidate")
@@ -321,6 +396,62 @@ struct WriteTierRoutingTests {
         }
         #expect(updated?.bodyComplete == false)
         #expect(updated?.bodyEmptyConfirmed == false)
+    }
+
+    @Test("A confirmed-empty direct event terminates reply work and durable recovery")
+    func confirmedEmptyDirectEventIsTerminal() async throws {
+        let (header, restore) = try makeTestDB()
+        defer { restore() }
+        try await AppDatabase.rawPool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET emptyFetchCount = 2 WHERE id = ?",
+                arguments: [header.id])
+            try ActiveAIQueue.markDirectPending(headerIds: [header.id], db: db)
+        }
+
+        let before = try await AppDatabase.rawPool.read { db -> (Int, String?) in
+            let row = try Row.fetchOne(db, sql: """
+                SELECT aiDirectPending, cachedReply FROM messageHeader WHERE id = ?
+            """, arguments: [header.id])
+            return (row?["aiDirectPending"] ?? 0, row?["cachedReply"])
+        }
+        #expect(before.0 == 1)
+        #expect(before.1 == nil)
+
+        let item = BodyFetchProcessor.Item(
+            headerId: header.id, accountId: header.accountId,
+            folderPath: header.folderPath, messageId: header.messageId,
+            isInInbox: true)
+        let fetchResult = BodyFetchProcessor.FetchResult(
+            item: item,
+            renderedBody: MessageBody.create(
+                contentKey: ContentKey(rawValue: header.id), htmlBody: ""),
+            plainText: nil, hasAttachments: false,
+            hasUnresolvedICS: false, fetchedRfc822MessageId: nil)
+
+        let (outcome, processed) = await BodyFetchProcessor.process(
+            fetchResult: fetchResult, enableAI: true)
+        #expect(outcome == .confirmedEmpty)
+        #expect(processed == nil)
+
+        let terminal = try await AppDatabase.rawPool.read { db -> (MessageHeader?, Int, Bool) in
+            let current = try MessageHeader.fetchOne(db, key: header.id)
+            let pending = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [header.id]) ?? 0
+            let selected = try ActiveAIQueue.repopulationCandidates(db: db)
+                .contains { $0.headerId == header.id }
+            return (current, pending, selected)
+        }
+        let current = try #require(terminal.0)
+        #expect(current.bodyEmptyConfirmed)
+        #expect(current.cachedReply == nil,
+                "a provider-empty body is terminal state, not invented AI output")
+        #expect(terminal.1 == 0)
+        #expect(!terminal.2)
+        #expect(ActiveAIQueue.jobStartDisposition(
+            message: current, jobType: .reply, admission: .admissible
+        ) == .alreadyComplete)
     }
 
     @Test("A privileged merge context wins over the .normal wrap — PrioritizedDatabase.effectivePriority checks inPrivilegedContext first")

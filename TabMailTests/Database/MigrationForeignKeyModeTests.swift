@@ -29,14 +29,14 @@ import GRDB
 /// (`MIS-033`), rather than trusting any integer here:
 /// ```
 /// rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' \
-///    TabMail/Services/AppDatabase.swift                                    → 17
+///    TabMail/Services/AppDatabase.swift                                    → 18
 /// rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' \
-///    TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 17
+///    TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 18
 /// ```
 /// Equal counts are the invariant: every migration from `v68` up runs
 /// `.immediate`, none below `v68` does, and `everyLiveForeignKeyCascades` below
-/// checks the premise that licenses it. At R17b the top of the chain is `v84`
-/// and the two counts are 17; at 84 registered migrations that leaves 67 still
+/// checks the premise that licenses it. The top of the chain is now `v85`
+/// and the two counts are 18; at 85 registered migrations that leaves 67 still
 /// running the whole-database check (66 on the GRDB default plus `v2`, the only
 /// explicit `.deferred` left).
 ///
@@ -315,8 +315,9 @@ struct MigrationForeignKeyModeTests {
         // range repairs it either. (An orphan in `messageBody` would prove nothing —
         // v70 drops the table outright.) Re-derive rather than trust the range:
         //   rg -n 'messageReference' TabMail/Services/AppDatabase.swift
-        // → every DDL hit is v27's create; `v84` only adds a column to
-        //   `pendingCalendarOperation`.
+        // → every DDL hit is v27's create; `v84` adds an unrelated column, while
+        //   `v85` adds direct-AI columns/index/lifecycle triggers but never rebuilds
+        //   or repairs `messageReference`.
         //
         // Foreign keys have to be off to CREATE the orphan, which is the whole
         // point: a real one arrives the same way — written under a schema or a

@@ -6,33 +6,46 @@
 
 ## Status
 
-📋 **ACCEPTED LIMITATION (2026-08-15) — the RFC-less guard costs immediacy, not identity
-reachability, and matches Thunderbird.** `resolveInboxEntryAITargets` must still refuse a moved
-member with no RFC 822 Message-ID: its input UID is intentionally stale after the destination sync,
-and using that UID against the destination folder has already selected an unrelated message. The
-rejected direct-ID candidate did not change that safely: it was defeated by Gmail canonicalization
-in the remap case and added a second identity path for derived, recomputable content.
+📋 **ACCEPTED LIMITATION (2026-08-15) — durable event authority cannot manufacture RFC-less
+identity.** `resolveInboxEntryAITargets` must still refuse a moved member
+with no RFC 822 Message-ID: its recorded UID is intentionally stale after destination sync, and
+using that UID against the destination folder has already selected an unrelated message. The
+rejected direct-ID candidate remains unsafe because Gmail canonicalization defeats it in the remap
+case.
 
-The durable fallback does **not** re-identify the moved member.
-`ActiveAIQueue.repopulationCandidates` selects current rows by state (`isInInbox`, `bodyComplete`,
-missing AI fields), so an RFC-less row is just as discoverable as an RFC-bearing row after relaunch,
-foreground return, AI re-enable, or drain-time re-query. RFC therefore governs whether the immediate
-post-move event can resolve; **recency** governs whether automatic backlog selection can reach the
-row. Rows outside `SyncConfig.maxRecentEmails` remain a bounded product limitation.
+The fix candidate does not weaken that identity guard. Instead, the move-retirement transaction
+sets the schema-only `messageHeader.aiDirectPending` bit on the provider-proved inbox row before the
+ephemeral post-drain enqueue. Identity-proved header re-keys carry the bit, and
+launch/foreground/drain recovery selects marked rows without the automatic population cap. The bit
+therefore prevents a valid direct event from being lost merely because it is older than the
+configured population. RFC-bearing intent also mirrors into the existing `messageAICache` identity
+so a UIDVALIDITY delete-and-resync restores the bit on the same physical message. It does **not**
+make an unproved RFC-less IMAP re-key safe: if neither RFC
+identity nor a corroborated epoch arrives, guarded write admission still refuses and no AI output
+lands. Retaining that refusal is the accepted limitation; resolving a stale UID would be a
+wrong-message mutation.
 
-This is also reference parity, not a fork-local gap: Thunderbird's `enqueueProcessMessage` calls
-`getUniqueMessageKey` and rejects the same RFC-less input, and its folder scan passes through that
-same identity requirement. Adding a durable local token solely to exceed both reference behaviours
-would be disproportionate to recomputable AI output. The SwiftMail fork remains unchanged.
+`SyncConfig.maxRecentEmails` remains exactly the existing configured automatic policy: select the
+newest N rows in each inbox before filtering cached AI work. It is not a queue batch, and the fix
+does not change its value. Thunderbird applies the same per-inbox startup population rule, while
+its separate persistent process-message queue retains direct events. The iOS bit supplies only the
+missing persistence property; it does not make the SwiftMail fork diverge.
 
 This disposition does **not** accept three independent defects found during the audit. They are
 registered separately as `IOS-AI-006` (the executor's duplicate recency gate never retires a refused
 job), `IOS-AI-007` (partial-success moves omitted the entered-inbox event), and `IOS-AI-008` (missing
-post-drain sync prerequisites discarded a recorded event). Their bounded fixes preserve this
-RFC-less refusal and the recent-backlog limit.
+post-drain sync prerequisites discarded a recorded event). Their integrated fixes preserve this
+RFC-less refusal and the configured recent population while making identity-proved direct-event
+authority durable.
+They remain tracked independently; this record accepts only the RFC-less limitation.
 
 <details>
 <summary>Superseded investigation and shipped-trigger history (2026-08-12 through 2026-08-13)</summary>
+
+> **Historical scope:** every present-tense failure statement inside this collapsed section describes
+> the pre-v85/shipped investigation. The candidate status and surviving RFC-less limitation are stated
+> above; this retained history is not a claim that the new durable-marker path still has no enqueue or
+> relaunch recovery.
 
 ## Subsystem and search terms
 
@@ -88,7 +101,7 @@ trigger for universal.
 This is what keeps the record OPEN rather than closed, and it is deliberately **not** in THE MANTRA's
 blocking set: AI output is **derived, recomputable content**, not authored user data and not a queued
 user intention, so nothing is dropped in the never-drop sense, no operation starves, there is no
-wrong-message mutation, and nothing bricks. Owner ruling of 2026-08-12 applies directly — a non-minimal
+wrong-message mutation, and nothing bricks. The 2026-08-12 disposition applies directly — a non-minimal
 fix belongs in the register for a later session.
 
 ## What shipped (2026-08-13, `1eb41702e`) — and the one thing it does not cover
@@ -133,7 +146,7 @@ records why they never need one.
   where the destination `folder.role` is in scope.
 - Mirror `onMoved.js`'s architecture rather than inventing one — ADR-IOS-008 parity is mandatory.
 
-## The owner re-test — now a CONFIRMATION test, not a justification test
+## Confirmation retest
 
 Same single gesture, but its meaning has inverted. Move a message into the inbox **from the inbox
 list's move sheet** — not from a detail view — and **do not open it**. Before `1eb41702e` this was the

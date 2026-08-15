@@ -907,7 +907,7 @@ actor BackfillBodyQueue {
     /// EXPLICITLY, on every exit including `duplicateDropped`.
     ///
     /// 🚨 **THE DELETE+REINSERT IS NOW DELEGATED TO `MessageHeaderRekey.apply`
-    /// (R16-2)**, which owns all four carrier legs. It is the same shape, not a new
+    /// (R16-2)**, which owns the complete header-local carrier set. It is the same shape, not a new
     /// one — see the block comment at the call site for what the local copy was
     /// silently destroying, and `MessageHeaderRekey.apply`'s own doc for the two
     /// cascading child tables and why one is carried and the other rebuilt.
@@ -950,13 +950,14 @@ actor BackfillBodyQueue {
                 // exists at the new id later syncs take the merge branch and never
                 // re-create them.
                 //
-                // `MessageHeaderRekey.apply` is the sibling carrier that has always
-                // done all four legs (body carry, label CARRY — there is no rebuild
-                // source — reference REBUILD, and the collision guard), and it is
-                // safe on BOTH legs here: it deletes the old row and its body before
-                // the collision check and returns `false` WITHOUT inserting anything,
-                // so a dropped duplicate's labels can never be filed onto the
-                // survivor. That collision return is exactly `.duplicateDropped`.
+                // `MessageHeaderRekey.apply` is the sibling carrier that owns body
+                // carry, label CARRY (there is no rebuild source), reference REBUILD,
+                // durable direct-AI authority, and the collision guard; it is
+                // safe on BOTH legs here: an ordinary collision keeps the historical
+                // delete-old/return-false contract, while a marked Inbox collision
+                // without positive identity proof throws before deletion so the
+                // direct event remains recoverable. The caller maps that refusal to
+                // `.failed` and retries rather than filing it onto the survivor.
                 guard try MessageHeaderRekey.apply(from: header, to: migrated, db: db) else {
                     // The new UID was independently backfilled — old row was a duplicate.
                     return .duplicateDropped
