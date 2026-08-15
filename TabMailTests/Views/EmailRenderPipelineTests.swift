@@ -1222,19 +1222,23 @@ struct EmailRenderPipelineTests {
 
     @Test("User disclosure toggles atomically tag the height applied by native")
     func disclosureTogglesTagAppliedHeight() {
-        let disclosureMark = "window.__tmUserDisclosurePending = true"
-        let taggedHeight = "userDisclosure: \(_consumeUserDisclosureExpression)"
+        let disclosureMark = "window.__tmArmUserDisclosure(toggle"
+        let disclosureGuard = "typeof window.__tmArmUserDisclosure === 'function'"
+        let taggedHeight = "...\(_consumeUserDisclosureExpression)"
         let domToggle = ".classList.toggle('tm-collapsed')"
 
         func assertEveryClickMarksFirst(_ js: String, expectedClicks: Int) {
             let handlers = js.components(separatedBy: "addEventListener('click'").dropFirst()
             #expect(handlers.count == expectedClicks)
             for handler in handlers {
+                let guardMark = handler.range(of: disclosureGuard)
                 let mark = handler.range(of: disclosureMark)
                 let toggle = handler.range(of: domToggle)
+                #expect(guardMark != nil)
                 #expect(mark != nil)
                 #expect(toggle != nil)
-                if let mark, let toggle {
+                if let guardMark, let mark, let toggle {
+                    #expect(guardMark.lowerBound < mark.lowerBound)
                     #expect(mark.lowerBound < toggle.lowerBound)
                 }
             }
@@ -1246,10 +1250,25 @@ struct EmailRenderPipelineTests {
         #expect(_monitorHeightJS.contains(taggedHeight))
         #expect(_fitViewportJS.contains(taggedHeight))
         #expect(_userDisclosureOwnershipJS.contains("window.__tmUserDisclosurePending = false"))
+        #expect(_userDisclosureOwnershipJS.contains("toggle.getBoundingClientRect().top"))
+        #expect(_userDisclosureOwnershipJS.contains("disclosure.disclosureAnchorTop = top"))
         #expect(_userDisclosureOwnershipJS.contains("window.__tmConsumeUserDisclosure = function()"))
         #expect(_postDisclosureHeightJS.contains("vp: tmVp"))
         #expect(_postDisclosureHeightJS.contains("scroll: tmScroll"))
         #expect(_postDisclosureHeightJS.contains("rect: tmRect"))
+        func assertOwnershipPrecedesMeasuredHeight(_ js: String, height: String) {
+            let ownershipRange = js.range(of: taggedHeight)
+            let heightRange = js.range(of: height)
+            #expect(ownershipRange != nil)
+            #expect(heightRange != nil)
+            if let ownershipRange, let heightRange {
+                #expect(ownershipRange.lowerBound < heightRange.lowerBound,
+                        "disclosure metadata must not override authoritative height geometry")
+            }
+        }
+        assertOwnershipPrecedesMeasuredHeight(_postDisclosureHeightJS, height: "h: tmHeight")
+        assertOwnershipPrecedesMeasuredHeight(_monitorHeightJS, height: "h: h")
+        assertOwnershipPrecedesMeasuredHeight(_fitViewportJS, height: "h: h")
         #expect(!_renderBridgeChannels.contains("userDisclosureToggle"),
                 "disclosure must travel in the height payload, not race it on a separate channel")
 
@@ -1261,13 +1280,52 @@ struct EmailRenderPipelineTests {
 
         let ctx = JSContext()!
         ctx.evaluateScript("var window = this; \(_userDisclosureOwnershipJS)")
-        ctx.evaluateScript("window.__tmUserDisclosurePending = true")
-        #expect(ctx.evaluateScript("window.__tmConsumeUserDisclosure()")?.toBool() == true)
-        #expect(ctx.evaluateScript("window.__tmConsumeUserDisclosure()")?.toBool() == false,
+        ctx.evaluateScript("window.__tmArmUserDisclosure({ getBoundingClientRect: function() { return { top: 42 }; } })")
+        ctx.evaluateScript("var validDisclosure = window.__tmConsumeUserDisclosure()")
+        #expect(ctx.evaluateScript("validDisclosure.userDisclosure")?.toBool() == true)
+        #expect(ctx.evaluateScript("validDisclosure.disclosureAnchorTop")?.toDouble() == 42)
+        ctx.evaluateScript("window.__tmArmUserDisclosure({ getBoundingClientRect: function() { return { top: NaN }; } })")
+        ctx.evaluateScript("var geometrylessDisclosure = window.__tmConsumeUserDisclosure()")
+        #expect(ctx.evaluateScript("geometrylessDisclosure.userDisclosure")?.toBool() == true,
+                "a real app-owned tap must retain ownership even when optional anchor geometry fails")
+        #expect(ctx.evaluateScript("typeof geometrylessDisclosure.disclosureAnchorTop")?.toString() == "undefined")
+        #expect(ctx.evaluateScript("window.__tmConsumeUserDisclosure().userDisclosure")?.toBool() == false,
                 "only the first height after a tap may claim disclosure ownership")
         ctx.evaluateScript("window.__tmConsumeUserDisclosure = undefined")
-        #expect(ctx.evaluateScript(_consumeUserDisclosureExpression)?.toBool() == false,
+        #expect(ctx.evaluateScript("\(_consumeUserDisclosureExpression).userDisclosure")?.toBool() == false,
                 "a missing disclosure helper must fail soft instead of dropping the height post")
+    }
+
+    @Test("The delayed same-height disclosure confirmation does not shorten the 250ms anchor lease")
+    func sameHeightDisclosureConfirmationDoesNotSupersedeLease() async throws {
+        // The production producer posts this duplicate at +50 ms. Delay beyond
+        // that boundary so this test pins the height/tag decision instead of an
+        // accidental effective 50 ms timer.
+        try await Task.sleep(for: .milliseconds(60))
+        #expect(!UserDisclosureAnchorLeaseSupersession.shouldRetire(
+            expectedVisualHeight: 14_067,
+            incomingVisualHeight: 14_067,
+            incomingIsUserDisclosure: false,
+            incomingHasSupersedingCommand: false
+        ))
+        #expect(UserDisclosureAnchorLeaseSupersession.shouldRetire(
+            expectedVisualHeight: 14_067,
+            incomingVisualHeight: 14_068,
+            incomingIsUserDisclosure: false,
+            incomingHasSupersedingCommand: false
+        ))
+        #expect(UserDisclosureAnchorLeaseSupersession.shouldRetire(
+            expectedVisualHeight: 14_067,
+            incomingVisualHeight: 14_067,
+            incomingIsUserDisclosure: true,
+            incomingHasSupersedingCommand: false
+        ))
+        #expect(UserDisclosureAnchorLeaseSupersession.shouldRetire(
+            expectedVisualHeight: 14_067,
+            incomingVisualHeight: 14_067,
+            incomingIsUserDisclosure: false,
+            incomingHasSupersedingCommand: true
+        ))
     }
 
     @Test("Body-level invite disclosure aligns to the measured email content inset")

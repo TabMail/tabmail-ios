@@ -16,6 +16,88 @@ internal let _renderBridgeChannels = [
     "imageLoadFailure"
 ]
 
+/// A pending disclosure lease survives an untagged confirmation of the exact
+/// height it already owns. The app deliberately emits that confirmation 50 ms
+/// after every disclosure click, so treating it as supersession would silently
+/// shorten the lease's validated 250 ms budget. Every other tagged disclosure,
+/// command, or genuinely different height still supersedes the lease.
+internal enum UserDisclosureAnchorLeaseSupersession {
+    static func shouldRetire(
+        expectedVisualHeight: CGFloat,
+        incomingVisualHeight: CGFloat,
+        incomingIsUserDisclosure: Bool,
+        incomingHasSupersedingCommand: Bool
+    ) -> Bool {
+        incomingIsUserDisclosure
+            || incomingHasSupersedingCommand
+            || incomingVisualHeight != expectedVisualHeight
+    }
+}
+
+#if DEBUG
+/// Two-sided simulator control for the new List viewport correction. It is
+/// compiled out of Release and synchronized because test cleanup may race a
+/// queued main-turn settlement after a failure.
+internal enum UserDisclosureViewportAnchorTestControl {
+    internal struct Witness: Sendable {
+        let settledCount: Int
+        let appliedCorrectionCount: Int
+        let lastAppliedCorrection: CGFloat?
+        let lastCorrectedNetOffsetFromLeaseBaseline: CGFloat?
+    }
+
+    private struct State: Sendable {
+        var bypass = false
+        var settledCount = 0
+        var appliedCorrectionCount = 0
+        var lastAppliedCorrection: CGFloat?
+        var lastCorrectedNetOffsetFromLeaseBaseline: CGFloat?
+    }
+
+    private static let state = Mutex(State())
+
+    static func reset(bypass: Bool = false) {
+        state.withLock {
+            $0.bypass = bypass
+            $0.settledCount = 0
+            $0.appliedCorrectionCount = 0
+            $0.lastAppliedCorrection = nil
+            $0.lastCorrectedNetOffsetFromLeaseBaseline = nil
+        }
+    }
+
+    static var shouldBypass: Bool { state.withLock { $0.bypass } }
+    static var witness: Witness {
+        state.withLock {
+            Witness(
+                settledCount: $0.settledCount,
+                appliedCorrectionCount: $0.appliedCorrectionCount,
+                lastAppliedCorrection: $0.lastAppliedCorrection,
+                lastCorrectedNetOffsetFromLeaseBaseline:
+                    $0.lastCorrectedNetOffsetFromLeaseBaseline
+            )
+        }
+    }
+
+    static func recordNoOpSettledLease() {
+        state.withLock { $0.settledCount += 1 }
+    }
+
+    static func recordAppliedCorrection(
+        _ appliedCorrection: CGFloat,
+        correctedNetOffsetFromLeaseBaseline: CGFloat
+    ) {
+        state.withLock {
+            $0.settledCount += 1
+            $0.appliedCorrectionCount += 1
+            $0.lastAppliedCorrection = appliedCorrection
+            $0.lastCorrectedNetOffsetFromLeaseBaseline =
+                correctedNetOffsetFromLeaseBaseline
+        }
+    }
+}
+#endif
+
 /// Auto-sizing WKWebView that reports its content height to SwiftUI.
 ///
 /// `bodyContentKey` opt-in: when non-nil, registers a `BodyAssetSchemeHandler`
@@ -346,6 +428,18 @@ final class HeightSeedCache: Sendable {
     }
 }
 
+/// Gives the disclosure lease a synchronous hook at the exact native layout
+/// pass that applies SwiftUI's tagged height. The callback is weakly wired by
+/// HTMLWebView and cleared on dismantle; ordinary layouts do one nil/lease guard.
+private final class DisclosureLayoutWebView: WKWebView {
+    var onDidLayoutSubviews: (() -> Void)?
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        onDidLayoutSubviews?()
+    }
+}
+
 private struct HTMLWebView: UIViewRepresentable {
     let html: String
     let previewFilename: String?
@@ -597,7 +691,11 @@ private struct HTMLWebView: UIViewRepresentable {
             }
         }
 
-        let webView = WKWebView(frame: .zero, configuration: config)
+        let webView = DisclosureLayoutWebView(frame: .zero, configuration: config)
+        context.coordinator.webView = webView
+        webView.onDidLayoutSubviews = { [weak coordinator = context.coordinator] in
+            coordinator?.disclosureWebViewDidLayout()
+        }
         // `allowsLinkPreview` is deliberately UNSET, so WebKit's default (ON) applies — the
         // `v1.7.8` shipped behaviour, RESTORED 2026-08-12 by explicit owner directive after P1b
         // set it to `false`. Long-press on a link previews its destination.
@@ -629,6 +727,10 @@ private struct HTMLWebView: UIViewRepresentable {
         webView.scrollView.bounces = false
         webView.navigationDelegate = context.coordinator
         return webView
+    }
+
+    static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
+        (uiView as? DisclosureLayoutWebView)?.onDidLayoutSubviews = nil
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
@@ -825,6 +927,56 @@ private struct HTMLWebView: UIViewRepresentable {
         /// messages stamped with the NEW document's generation, and the new
         /// document's own request refused as a duplicate.
         private var documentGate = CommittedDocumentGate()
+        /// One matching app-owned disclosure height may preserve the real toggle's
+        /// position while SwiftUI/List self-sizes the containing row. This is not a
+        /// general height anchor: ordinary ResizeObserver/image updates never create
+        /// it, and every refusal or completion retires it.
+        private final class UserDisclosureAnchorLease {
+            weak var webView: WKWebView?
+            weak var window: UIWindow?
+            weak var outerScrollView: UICollectionView?
+            weak var hostedCell: UICollectionViewCell?
+            let token: UInt
+            let committedGeneration: Int
+            let anchorTopInWebView: CGFloat
+            let anchorWindowY: CGFloat
+            let baselineOuterOffsetY: CGFloat
+            let expectedWebViewHeight: CGFloat
+            let expectedHostedCellHeight: CGFloat
+            let deadlineUptime: TimeInterval
+
+            init(
+                webView: WKWebView,
+                window: UIWindow,
+                outerScrollView: UICollectionView,
+                hostedCell: UICollectionViewCell,
+                token: UInt,
+                committedGeneration: Int,
+                anchorTopInWebView: CGFloat,
+                anchorWindowY: CGFloat,
+                baselineOuterOffsetY: CGFloat,
+                expectedWebViewHeight: CGFloat,
+                expectedHostedCellHeight: CGFloat,
+                deadlineUptime: TimeInterval
+            ) {
+                self.webView = webView
+                self.window = window
+                self.outerScrollView = outerScrollView
+                self.hostedCell = hostedCell
+                self.token = token
+                self.committedGeneration = committedGeneration
+                self.anchorTopInWebView = anchorTopInWebView
+                self.anchorWindowY = anchorWindowY
+                self.baselineOuterOffsetY = baselineOuterOffsetY
+                self.expectedWebViewHeight = expectedWebViewHeight
+                self.expectedHostedCellHeight = expectedHostedCellHeight
+                self.deadlineUptime = deadlineUptime
+            }
+        }
+        private var userDisclosureAnchorLease: UserDisclosureAnchorLease?
+        private var userDisclosureAnchorToken: UInt = 0
+        private var isSettlingUserDisclosureAnchorLease = false
+        private static let userDisclosureAnchorTimeout: TimeInterval = 0.25
         /// Grace period between `didCommit` (P1d — it was `didFinish` until then)
         /// and the bridge-liveness verdict.
         /// `monitorHeightJS`'s ResizeObserver and the double-`rAF` reveal both
@@ -1051,6 +1203,7 @@ private struct HTMLWebView: UIViewRepresentable {
         /// armed. The base URL is minted here rather than passed in, because
         /// every call site must get one — see `RenderDocumentURL`.
         func wrapAndLoad(rawHTML: String, previewFilename: String?) {
+            retireUserDisclosureAnchorLease(reason: "new-document-issued")
             loadGeneration &+= 1
             let gen = loadGeneration
             let hasHeader = loadedHeaderId != nil
@@ -1329,6 +1482,7 @@ private struct HTMLWebView: UIViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            retireUserDisclosureAnchorLease(reason: "document-committed")
             // THE document identity a `WKScriptMessage` does not carry. Committing is
             // the moment the issued load actually replaced the document on screen, so
             // it is the moment its one-shot slots become the live ones — see
@@ -1393,6 +1547,7 @@ private struct HTMLWebView: UIViewRepresentable {
 
         /// Drop both halves of the navigation state.
         private func invalidateNavigationState(reason: String) {
+            retireUserDisclosureAnchorLease(reason: reason)
             if let dropped = permit.invalidate() {
                 navLog("invalidated reason=\(reason) gen=\(dropped.generation) "
                        + "nonce=\(RenderDocumentURL.logPrefix(forDocumentURL: dropped.url))")
@@ -1603,6 +1758,19 @@ private struct HTMLWebView: UIViewRepresentable {
         /// device points using the web view's actual frame width.
         private func handleHeightMessage(_ body: Any) {
             guard let webView = webView, webView.bounds.width > 0 else { return }
+            let incomingDictionary = body as? [String: Any]
+            let incomingUserDisclosure = incomingDictionary?["userDisclosure"] as? Bool == true
+            let incomingHasSupersedingCommand = incomingDictionary?["revealed"] as? Bool == true
+                || incomingDictionary?["requestFit"] as? Bool == true
+                || incomingDictionary?["requestWidthRefit"] as? Bool == true
+            if userDisclosureAnchorLease != nil,
+               incomingUserDisclosure || incomingHasSupersedingCommand {
+                retireUserDisclosureAnchorLease(
+                    reason: incomingUserDisclosure
+                        ? "superseded-by-disclosure"
+                        : "superseded-by-command"
+                )
+            }
             // Pinch-zoomed — the user is interactively zooming, so don't
             // fight them by snapping the frame back. Use isZooming (set ONLY
             // during user pinch) instead of `zoomScale != 1.0`, which also
@@ -1613,7 +1781,13 @@ private struct HTMLWebView: UIViewRepresentable {
             // re-fires that catch the body=4191→4349 image-load growth — which
             // is exactly the Fireworks bug we were chasing. isZooming is the
             // right signal for "user gesture in progress."
-            if webView.scrollView.isZooming || webView.scrollView.isZoomBouncing { return }
+            if webView.scrollView.isZooming || webView.scrollView.isZoomBouncing {
+                retireUserDisclosureAnchorLease(reason: "web-zoom")
+                if incomingUserDisclosure {
+                    bridgeLog("disclosure-anchor skipped reason=web-zoom")
+                }
+                return
+            }
 
             let h: CGFloat
             let vp: CGFloat
@@ -1686,6 +1860,24 @@ private struct HTMLWebView: UIViewRepresentable {
             let effectiveVp = vp > 0 ? vp : boundsWidth
             let scale = (effectiveVp > boundsWidth) ? (boundsWidth / effectiveVp) : 1.0
             let visualHeight = ceil(h * scale)
+            if let activeLease = userDisclosureAnchorLease {
+                if UserDisclosureAnchorLeaseSupersession.shouldRetire(
+                    expectedVisualHeight: activeLease.expectedWebViewHeight,
+                    incomingVisualHeight: visualHeight,
+                    incomingIsUserDisclosure: incomingUserDisclosure,
+                    incomingHasSupersedingCommand: incomingHasSupersedingCommand
+                ) {
+                    retireUserDisclosureAnchorLease(reason: "superseded-height")
+                } else {
+                    bridgeLog("disclosure-anchor confirmation token=\(activeLease.token) height=\(visualHeight)")
+                }
+            }
+            let disclosureAnchorTop = incomingDictionary
+                .flatMap { $0["disclosureAnchorTop"] as? NSNumber }
+                .map { CGFloat(truncating: $0) }
+            if incomingUserDisclosure && disclosureAnchorTop == nil {
+                bridgeLog("disclosure-anchor skipped reason=missing-anchor")
+            }
             if DebugModeManager.isLoggingEnabled() {
                 // [MeasureHeight] is fired ON EACH ResizeObserver event from JS.
                 // It captures: the JS body measurement we received, our
@@ -1711,6 +1903,9 @@ private struct HTMLWebView: UIViewRepresentable {
                 }
             }
             if visualHeight > 0 && visualHeight == height {
+                if incomingUserDisclosure {
+                    bridgeLog("disclosure-anchor skipped reason=unchanged-height")
+                }
                 // Latest-wins while frozen: show→hide can return to the
                 // already-applied height before the buffered expanded height
                 // flushes. Drop that obsolete buffer instead of expanding the
@@ -1733,16 +1928,347 @@ private struct HTMLWebView: UIViewRepresentable {
                 // mid-scroll layout shift, so the first real height applies
                 // immediately.
                 if ScrollFreezeGate.shared.isFrozen && height > 1 {
+                    if incomingUserDisclosure {
+                        bridgeLog("disclosure-anchor skipped reason=scroll-freeze")
+                    }
                     pendingHeight = visualHeight
                     if DebugModeManager.isLoggingEnabled() {
                         print("[MeasureHeight id=\(webViewId)] deferred during scroll: \(Int(visualHeight)) (frame stays \(Int(height)))")
                     }
                 } else {
                     pendingHeight = nil
+                    let disclosureLease = disclosureAnchorTop.flatMap {
+                        makeUserDisclosureAnchorLease(
+                            webView: webView,
+                            anchorTopCSS: $0,
+                            viewportScale: scale,
+                            expectedWebViewHeight: visualHeight
+                        )
+                    }
+                    // Install the lease before changing the Binding. A synchronous
+                    // hosted-web-view layout pass may begin from that write, and
+                    // its layout callback must be able to observe this exact lease.
+                    if let disclosureLease {
+                        userDisclosureAnchorLease = disclosureLease
+                    }
                     height = visualHeight
                     if let hid = loadedHeaderId { HeightSeedCache.shared[hid] = visualHeight }
+                    if let disclosureLease {
+                        scheduleUserDisclosureAnchorCompensation(token: disclosureLease.token)
+                    }
                 }
             }
+        }
+
+        /// Find the native List owner of vertical movement outside the WKWebView.
+        /// Only UICollectionView is eligible: AutoSizingHTMLView is also hosted in
+        /// compose and preview ScrollViews, whose caret/preview motion must never
+        /// be attributed to this List-specific self-sizing correction.
+        private func outerScrollView(containing webView: WKWebView) -> UICollectionView? {
+            var ancestor = webView.superview
+            while let view = ancestor {
+                if let collectionView = view as? UICollectionView {
+                    return collectionView
+                }
+                ancestor = view.superview
+            }
+            return nil
+        }
+
+        private func hostedCell(containing webView: WKWebView) -> UICollectionViewCell? {
+            var ancestor = webView.superview
+            while let view = ancestor {
+                if let cell = view as? UICollectionViewCell {
+                    return cell
+                }
+                ancestor = view.superview
+            }
+            return nil
+        }
+
+        private func makeUserDisclosureAnchorLease(
+            webView: WKWebView,
+            anchorTopCSS: CGFloat,
+            viewportScale: CGFloat,
+            expectedWebViewHeight: CGFloat
+        ) -> UserDisclosureAnchorLease? {
+            func refuse(_ reason: String) -> UserDisclosureAnchorLease? {
+                bridgeLog("disclosure-anchor skipped reason=\(reason)")
+                return nil
+            }
+
+#if DEBUG
+            guard !UserDisclosureViewportAnchorTestControl.shouldBypass else {
+                return refuse("test-bypass")
+            }
+#endif
+            guard !ScrollFreezeGate.shared.isFrozen else { return refuse("scroll-freeze") }
+            guard !webView.scrollView.isZooming,
+                  !webView.scrollView.isZoomBouncing,
+                  webView.scrollView.zoomScale <= 1.01 else {
+                return refuse("web-zoom")
+            }
+            guard let window = webView.window, webView.superview != nil else {
+                return refuse("missing-window-or-view")
+            }
+            guard let outerScrollView = outerScrollView(containing: webView),
+                  outerScrollView.window === window else {
+                return refuse("missing-outer-scroll")
+            }
+            guard let hostedCell = hostedCell(containing: webView),
+                  hostedCell.window === window,
+                  hostedCell.isDescendant(of: outerScrollView) else {
+                return refuse("missing-hosted-cell")
+            }
+            // Arm and settle must read the same post-layout coordinate space.
+            // Without this symmetric flush, a dirty SwiftUI/List layout can be
+            // mistaken for disclosure movement and produce a wrong correction.
+            UIView.performWithoutAnimation {
+                window.layoutIfNeeded()
+                outerScrollView.layoutIfNeeded()
+            }
+            guard webView.window === window,
+                  self.outerScrollView(containing: webView) === outerScrollView,
+                  self.hostedCell(containing: webView) === hostedCell else {
+                return refuse("hierarchy-changed-during-arm")
+            }
+            guard !outerScrollView.isTracking,
+                  !outerScrollView.isDragging,
+                  !outerScrollView.isDecelerating,
+                  outerScrollView.panGestureRecognizer.state != .began,
+                  outerScrollView.panGestureRecognizer.state != .changed else {
+                return refuse("outer-scroll-interaction")
+            }
+            guard outerScrollView.zoomScale <= outerScrollView.minimumZoomScale + 0.01 else {
+                return refuse("outer-zoom")
+            }
+            guard let committedGeneration = documentGate.committedGeneration else {
+                return refuse("no-committed-document")
+            }
+
+            let anchorTopInWebView = anchorTopCSS * viewportScale
+            guard anchorTopInWebView.isFinite, anchorTopInWebView >= 0 else {
+                return refuse("invalid-anchor")
+            }
+            let expectedHostedCellHeight = hostedCell.bounds.height
+                + expectedWebViewHeight - webView.bounds.height
+            guard expectedHostedCellHeight.isFinite,
+                  expectedHostedCellHeight >= 0 else {
+                return refuse("invalid-expected-hosted-cell-height")
+            }
+            let point = CGPoint(
+                x: webView.bounds.midX,
+                y: webView.bounds.minY + anchorTopInWebView
+            )
+            let anchorWindowY = webView.convert(point, to: window).y
+            guard anchorWindowY.isFinite,
+                  anchorWindowY >= window.bounds.minY - 1,
+                  anchorWindowY <= window.bounds.maxY + 1 else {
+                return refuse("anchor-not-visible")
+            }
+            userDisclosureAnchorToken &+= 1
+            let lease = UserDisclosureAnchorLease(
+                webView: webView,
+                window: window,
+                outerScrollView: outerScrollView,
+                hostedCell: hostedCell,
+                token: userDisclosureAnchorToken,
+                committedGeneration: committedGeneration,
+                anchorTopInWebView: anchorTopInWebView,
+                anchorWindowY: anchorWindowY,
+                baselineOuterOffsetY: outerScrollView.contentOffset.y,
+                expectedWebViewHeight: expectedWebViewHeight,
+                expectedHostedCellHeight: expectedHostedCellHeight,
+                deadlineUptime: ProcessInfo.processInfo.systemUptime
+                    + Self.userDisclosureAnchorTimeout
+            )
+            bridgeLog(String(format:
+                "disclosure-anchor accepted token=%llu anchorY=%.2f targetHeight=%.2f",
+                lease.token,
+                anchorWindowY,
+                expectedWebViewHeight
+            ))
+            return lease
+        }
+
+        private func scheduleUserDisclosureAnchorCompensation(token: UInt) {
+            // SwiftUI consumes the Binding write and performs List self-sizing on
+            // a later layout pass. `DisclosureLayoutWebView.layoutSubviews` is
+            // the primary same-pass trigger; this main-turn attempt is only the
+            // bounded fallback/cancellation driver.
+            DispatchQueue.main.async { [weak self] in
+                self?.settleUserDisclosureAnchorLease(token: token)
+            }
+        }
+
+        fileprivate func disclosureWebViewDidLayout() {
+            guard let lease = userDisclosureAnchorLease,
+                  let webView = lease.webView,
+                  abs(webView.bounds.height - lease.expectedWebViewHeight) <= 1 else {
+                return
+            }
+            settleUserDisclosureAnchorLease(token: lease.token, fromLayoutCallback: true)
+        }
+
+        private func settleUserDisclosureAnchorLease(
+            token: UInt,
+            fromLayoutCallback: Bool = false
+        ) {
+            guard !isSettlingUserDisclosureAnchorLease else { return }
+            guard let lease = userDisclosureAnchorLease, lease.token == token else { return }
+            isSettlingUserDisclosureAnchorLease = true
+            defer { isSettlingUserDisclosureAnchorLease = false }
+
+            func refuse(_ reason: String) {
+                retireUserDisclosureAnchorLease(reason: reason)
+            }
+
+            guard ProcessInfo.processInfo.systemUptime <= lease.deadlineUptime else {
+                refuse("timeout")
+                return
+            }
+            guard !ScrollFreezeGate.shared.isFrozen else { refuse("scroll-freeze-after-height"); return }
+            guard documentGate.committedGeneration == lease.committedGeneration else {
+                refuse("stale-document")
+                return
+            }
+            guard let webView = lease.webView,
+                  let window = lease.window,
+                  let outerScrollView = lease.outerScrollView,
+                  let hostedCell = lease.hostedCell,
+                  self.webView === webView,
+                  webView.window === window,
+                  outerScrollView.window === window,
+                  hostedCell.window === window else {
+                refuse("missing-window-or-view-after-height")
+                return
+            }
+            guard self.outerScrollView(containing: webView) === outerScrollView,
+                  self.hostedCell(containing: webView) === hostedCell,
+                  hostedCell.isDescendant(of: outerScrollView) else {
+                refuse("outer-scroll-changed")
+                return
+            }
+            guard !webView.scrollView.isZooming,
+                  !webView.scrollView.isZoomBouncing,
+                  webView.scrollView.zoomScale <= 1.01,
+                  !outerScrollView.isTracking,
+                  !outerScrollView.isDragging,
+                  !outerScrollView.isDecelerating,
+                  outerScrollView.panGestureRecognizer.state != .began,
+                  outerScrollView.panGestureRecognizer.state != .changed,
+                  outerScrollView.zoomScale <= outerScrollView.minimumZoomScale + 0.01 else {
+                refuse("interaction-or-zoom-after-height")
+                return
+            }
+
+            // A DisclosureLayoutWebView callback already runs inside the hosted
+            // hierarchy's layout pass. Forcing its window/List ancestors here
+            // would recursively re-enter layout. Only the bounded main-turn
+            // fallback needs to flush dirty SwiftUI/List geometry itself.
+            if !fromLayoutCallback {
+                UIView.performWithoutAnimation {
+                    window.layoutIfNeeded()
+                    outerScrollView.layoutIfNeeded()
+                }
+            }
+            // Do not spend the lease until the matching Binding write has reached
+            // the hosted WKWebView. Layout normally re-enters through
+            // `disclosureWebViewDidLayout`; this low-frequency bounded fallback
+            // only advances timeout/cancellation when no layout callback arrives.
+            let webViewHeightMatches =
+                abs(webView.bounds.height - lease.expectedWebViewHeight) <= 1
+            let hostedCellHeightMatches =
+                abs(hostedCell.bounds.height - lease.expectedHostedCellHeight) <= 1
+            let hostedLayoutHeightMatches: Bool
+            if let indexPath = outerScrollView.indexPath(for: hostedCell),
+               let attributes = outerScrollView.layoutAttributesForItem(at: indexPath) {
+                hostedLayoutHeightMatches =
+                    abs(attributes.frame.height - lease.expectedHostedCellHeight) <= 1
+            } else {
+                hostedLayoutHeightMatches = false
+            }
+            guard webViewHeightMatches,
+                  hostedCellHeightMatches,
+                  hostedLayoutHeightMatches else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) { [weak self] in
+                    self?.settleUserDisclosureAnchorLease(token: token)
+                }
+                return
+            }
+
+            userDisclosureAnchorLease = nil
+            let point = CGPoint(
+                x: webView.bounds.midX,
+                y: webView.bounds.minY + lease.anchorTopInWebView
+            )
+            let liveAnchorWindowY = webView.convert(point, to: window).y
+            guard liveAnchorWindowY.isFinite else {
+                bridgeLog("disclosure-anchor skipped reason=nonfinite-live-anchor")
+                return
+            }
+            let residual = liveAnchorWindowY - lease.anchorWindowY
+            guard abs(residual) > 0.25 else {
+#if DEBUG
+                UserDisclosureViewportAnchorTestControl.recordNoOpSettledLease()
+#endif
+                bridgeLog(String(format:
+                    "disclosure-anchor settled token=%llu residual=%.2f action=no-op",
+                    token,
+                    residual
+                ))
+                return
+            }
+
+            let minimumY = -outerScrollView.adjustedContentInset.top
+            let maximumY = max(
+                minimumY,
+                outerScrollView.contentSize.height
+                    - outerScrollView.bounds.height
+                    + outerScrollView.adjustedContentInset.bottom
+            )
+            let requestedY = outerScrollView.contentOffset.y + residual
+            let correctedY = min(max(requestedY, minimumY), maximumY)
+            let offsetBeforeCorrection = outerScrollView.contentOffset.y
+            UIView.performWithoutAnimation {
+                outerScrollView.setContentOffset(
+                    CGPoint(x: outerScrollView.contentOffset.x, y: correctedY),
+                    animated: false
+                )
+                if !fromLayoutCallback {
+                    window.layoutIfNeeded()
+                }
+            }
+            let offsetAfterCorrection = outerScrollView.contentOffset.y
+            let appliedCorrection = offsetAfterCorrection - offsetBeforeCorrection
+#if DEBUG
+            if abs(appliedCorrection) > 0.25 {
+                UserDisclosureViewportAnchorTestControl.recordAppliedCorrection(
+                    appliedCorrection,
+                    correctedNetOffsetFromLeaseBaseline:
+                        offsetAfterCorrection - lease.baselineOuterOffsetY
+                )
+            } else {
+                UserDisclosureViewportAnchorTestControl.recordNoOpSettledLease()
+            }
+#endif
+            let finalAnchorWindowY = webView.convert(point, to: window).y
+            bridgeLog(String(format:
+                "disclosure-anchor settled token=%llu residual=%.2f offset=%.2f->%.2f finalResidual=%.2f clamped=%@",
+                token,
+                residual,
+                offsetBeforeCorrection,
+                offsetAfterCorrection,
+                finalAnchorWindowY - lease.anchorWindowY,
+                correctedY == requestedY && abs(offsetAfterCorrection - correctedY) <= 0.25
+                    ? "false" : "true"
+            ))
+        }
+
+        private func retireUserDisclosureAnchorLease(reason: String) {
+            guard let lease = userDisclosureAnchorLease else { return }
+            userDisclosureAnchorLease = nil
+            bridgeLog("disclosure-anchor skipped token=\(lease.token) reason=\(reason)")
         }
     }
 }
@@ -2531,15 +3057,30 @@ function sweepQuoteContent(quoteStart, content, body, logFn) {
 /// traces don't cross the JS↔native bridge (they can saturate the WebProcess message
 /// queue and contribute to WebContent crashes on pathological bodies).
 internal var _collapseQuotesJS: String { collapseQuotesJS }
+// Installed at document start in RenderContentWorld.isolated, before the
+// document-end quote/invite scripts install their click handlers. Keep the
+// helper and those producers in the same world/order: a missing arm helper
+// would throw before the handler can toggle disclosure state.
 internal let _userDisclosureOwnershipJS = """
 window.__tmUserDisclosurePending = false;
+window.__tmUserDisclosureAnchorTop = null;
+window.__tmArmUserDisclosure = function(toggle) {
+    var top = toggle && toggle.getBoundingClientRect ? toggle.getBoundingClientRect().top : NaN;
+    window.__tmUserDisclosurePending = true;
+    window.__tmUserDisclosureAnchorTop = Number.isFinite(top) && top >= 0 ? top : null;
+};
 window.__tmConsumeUserDisclosure = function() {
     var pending = window.__tmUserDisclosurePending === true;
+    var top = window.__tmUserDisclosureAnchorTop;
     window.__tmUserDisclosurePending = false;
-    return pending;
+    window.__tmUserDisclosureAnchorTop = null;
+    if (!pending) return { userDisclosure: false };
+    var disclosure = { userDisclosure: true };
+    if (Number.isFinite(top) && top >= 0) disclosure.disclosureAnchorTop = top;
+    return disclosure;
 };
 """
-internal let _consumeUserDisclosureExpression = "(typeof window.__tmConsumeUserDisclosure === 'function' ? window.__tmConsumeUserDisclosure() : false)"
+internal let _consumeUserDisclosureExpression = "(typeof window.__tmConsumeUserDisclosure === 'function' ? window.__tmConsumeUserDisclosure() : { userDisclosure: false })"
 internal let _postDisclosureHeightJS = """
 var tmScroll = document.body.scrollHeight;
 var tmRect = Math.ceil(document.body.getBoundingClientRect().height);
@@ -2547,11 +3088,11 @@ var tmHeight = tmRect > 0 && tmRect < tmScroll ? tmRect : tmScroll;
 var tmVp = window.__tmLayoutVp || window.__tmDeviceWidth || window.innerWidth;
 if (tmHeight > 0) {
     window.webkit.messageHandlers.heightChanged.postMessage({
+        ...\(_consumeUserDisclosureExpression),
         h: tmHeight,
         vp: tmVp,
         scroll: tmScroll,
-        rect: tmRect,
-        userDisclosure: \(_consumeUserDisclosureExpression)
+        rect: tmRect
     });
 }
 """
@@ -2806,7 +3347,9 @@ private var collapseQuotesJS: String {
                 toggleI.innerHTML = '<span class="tm-quote-toggle-text">' + showLabelI + '</span>';
                 toggleI.addEventListener('click', function(e) {
                     e.stopPropagation();
-                    window.__tmUserDisclosurePending = true;
+                    if (typeof window.__tmArmUserDisclosure === 'function') {
+                        window.__tmArmUserDisclosure(toggleI);
+                    }
                     wrapperI.classList.toggle('tm-collapsed');
                     var collapsed = wrapperI.classList.contains('tm-collapsed');
                     toggleI.innerHTML = '<span class="tm-quote-toggle-text">' + (collapsed ? showLabelI : hideLabelI) + '</span>';
@@ -2919,7 +3462,9 @@ private var collapseQuotesJS: String {
         toggle.innerHTML = '<span class="tm-quote-toggle-text">' + showLabel + '</span>';
         toggle.addEventListener('click', function(e) {
             e.stopPropagation();
-            window.__tmUserDisclosurePending = true;
+            if (typeof window.__tmArmUserDisclosure === 'function') {
+                window.__tmArmUserDisclosure(toggle);
+            }
             wrapper.classList.toggle('tm-collapsed');
             var collapsed = wrapper.classList.contains('tm-collapsed');
             toggle.innerHTML = '<span class="tm-quote-toggle-text">' + (collapsed ? showLabel : hideLabel) + '</span>';
@@ -2975,7 +3520,9 @@ private let collapseICSJS = """
                 toggle.innerHTML = '<span class="tm-quote-toggle-text">' + showLabel + '</span>';
                 toggle.addEventListener('click', function(e) {
                     e.stopPropagation();
-                    window.__tmUserDisclosurePending = true;
+                    if (typeof window.__tmArmUserDisclosure === 'function') {
+                        window.__tmArmUserDisclosure(toggle);
+                    }
                     wrapper.classList.toggle('tm-collapsed');
                     var collapsed = wrapper.classList.contains('tm-collapsed');
                     toggle.innerHTML = '<span class="tm-quote-toggle-text">' + (collapsed ? showLabel : hideLabel) + '</span>';
@@ -4078,11 +4625,11 @@ private let monitorHeightJS = """
                 lastH = h;
                 try {
                     window.webkit.messageHandlers.heightChanged.postMessage({
+                        ...\(_consumeUserDisclosureExpression),
                         h: h,
                         vp: vp,
                         scroll: scroll,
-                        rect: rect,
-                        userDisclosure: \(_consumeUserDisclosureExpression)
+                        rect: rect
                     });
                 } catch(e) {}
             }
@@ -5606,12 +6153,12 @@ private let fitViewportJS: String = {
                 if (h > 0) {
                     log('postWiden(' + stage + ') firing: scroll=' + scroll + ' rect=' + rect + ' h=' + h + ' innerW=' + window.innerWidth);
                     window.webkit.messageHandlers.heightChanged.postMessage({
+                        ...\(_consumeUserDisclosureExpression),
                         h: h,
                         vp: vp,
                         scroll: scroll,
                         rect: rect,
-                        source: 'postWiden-' + stage,
-                        userDisclosure: \(_consumeUserDisclosureExpression)
+                        source: 'postWiden-' + stage
                     });
                 }
             } catch(e) {

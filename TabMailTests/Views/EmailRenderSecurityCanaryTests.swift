@@ -1727,7 +1727,8 @@ struct RenderContentWorldIsolationTests {
     static let renderStateGlobals = [
         "__tmReportHeight", "__tmFixImgAspect", "__tmLayoutVp",
         "__tmDeviceWidth", "__tmFitDone", "__tmFitRequested",
-        "__tmUserDisclosurePending", "__tmConsumeUserDisclosure",
+        "__tmUserDisclosurePending", "__tmUserDisclosureAnchorTop",
+        "__tmArmUserDisclosure", "__tmConsumeUserDisclosure",
     ]
 
     /// `'reachable'` only where the bridge channel actually exists. Every failure mode
@@ -1952,7 +1953,7 @@ struct RenderContentWorldIsolationTests {
         ScrollFreezeGate.shared.begin()
         _ = await CanaryKit.eval(
             wv,
-            "window.webkit.messageHandlers.heightChanged.postMessage({h:\(controlExpandedHeight),vp:\(deviceWidth),userDisclosure:true,source:'canary-flush-control'}); 'control-buffered'",
+            "window.webkit.messageHandlers.heightChanged.postMessage({h:\(controlExpandedHeight),vp:\(deviceWidth),userDisclosure:true,disclosureAnchorTop:40,source:'canary-flush-control'}); 'control-buffered'",
             in: RenderContentWorld.isolated
         )
         let controlWasBuffered = await CanaryKit.waitUntil(5) {
@@ -1992,7 +1993,7 @@ struct RenderContentWorldIsolationTests {
         ScrollFreezeGate.shared.begin()
         _ = await CanaryKit.eval(
             wv,
-            "window.webkit.messageHandlers.heightChanged.postMessage({h:\(syntheticExpandedHeight),vp:\(deviceWidth),userDisclosure:true,source:'canary-buffer'}); 'buffered'",
+            "window.webkit.messageHandlers.heightChanged.postMessage({h:\(syntheticExpandedHeight),vp:\(deviceWidth),userDisclosure:true,disclosureAnchorTop:40,source:'canary-buffer'}); 'buffered'",
             in: RenderContentWorld.isolated
         )
         let expansionWasBuffered = await CanaryKit.waitUntil(5) {
@@ -2003,7 +2004,7 @@ struct RenderContentWorldIsolationTests {
 
         _ = await CanaryKit.eval(
             wv,
-            "window.webkit.messageHandlers.heightChanged.postMessage({h:\(collapsedHeight),vp:\(deviceWidth),userDisclosure:true,source:'canary-latest'}); 'superseded'",
+            "window.webkit.messageHandlers.heightChanged.postMessage({h:\(collapsedHeight),vp:\(deviceWidth),userDisclosure:true,disclosureAnchorTop:40,source:'canary-latest'}); 'superseded'",
             in: RenderContentWorld.isolated
         )
         let collapseWasHandled = await CanaryKit.waitUntil(5) {

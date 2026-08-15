@@ -106,22 +106,147 @@
 >
 > Device smoke measurement showed the same focused WebView grew from 865 pt to 13,249 pt on each expansion
 > and returned to 865 pt on collapse while `ScrollFreezeGate` was idle; it did NOT record the outer
-> List offset and therefore did not prove UIKit compensation. A follow-up simulator canary placed the
-> production `AutoSizingHTMLView` in a live self-sizing `List`, expanded an equivalently large quote,
-> and measured zero outer-offset shift even with no preservation code. That falsified the proposed
-> `ScrollPosition` exact-y workaround, so it was removed rather than shipping speculative scroll
-> ownership machinery. That falsification harness was intentionally not retained: its negative
-> control measured no uncontrolled offset, so preserving it as a regression test would assert no
-> production behavior. The remaining concrete app-owned path was the `laterMessages.count` two-pass
-> `ScrollViewProxy` correction: its immediate and queued writes were not execution-gated and could run
-> after a disclosure or manual interaction disarmed the opening gate. All focused-card proxy writes
-> now enter one helper that revalidates `MessageDetailOpenAnchorGate` at execution, including the queued
-> pass. This deliberately trades the old unconditional correction: if the user takes control before an
-> initial related-message scan inserts rows above, TabMail accepts the insertion's natural layout rather
-> than snapping the focused card to the top. Logging-enabled sessions record every accepted/skipped
-> correction as `[DetailAnchor]`. Preserve that central
-> gate; do not add an outer-offset restoration path without a non-vacuous reproduction that first
-> proves the uncontrolled List actually moves.
+> List offset and therefore did not prove UIKit compensation. A follow-up one-off simulator canary put
+> the production `AutoSizingHTMLView` in a live self-sizing `List`, measured zero outer-offset shift,
+> and falsified the proposed `ScrollPosition` exact-y workaround, so that speculative restoration was
+> removed. **The older statement that this falsification harness was intentionally not retained is now
+> superseded.** On 2026-08-14 issue #21 gained the permanent, real production-chain simulator suite
+> `MessageDisclosureViewportMeasurementTests`, which hosts
+> `MessageDetailView -> List -> MessageCardView -> AutoSizingHTMLView`. Its three named methods are
+> `productionDetailConfigurations()`, `productionDetailC4SensitivityControl()`, and
+> `productionDetailStressTransitions()`. C1/C2 are no-later-message support coverage, C3 covers the
+> production opening position, and C4 is the discriminating programmatically-scrolled configuration.
+> The C4 sensitivity method is two-sided and DEBUG-only: its injected initializer flag bypasses
+> `openAnchorGate.userTookControl()` for the disclosure callback, and its viewport test control bypasses
+> the independent disclosure lease; both are absent from Release. With both protections bypassed, quote
+> and invite reproduce the known-bad outer re-anchor exactly
+> (`toggle/card +574 pt`, List offset `-574 pt`); with production behavior, all eight quote/invite C1-C4
+> matrix legs settle at zero toggle, card, and outer-offset drift. The stress leg inserts 40 messages
+> later than the focus above it and expands 150 hidden paragraphs, then records direct hosted-DOM/native
+> geometry plus isolated-world rAF frames on a shared epoch clock. The verified run recorded drop0,
+> bounded native/WebKit/pairing gaps, and zero visible toggle/card excursion through insertion,
+> collapse, and reopen. Release behavior remains unchanged and **no outer restoration was added**.
+> This evidence is simulator-only; a physical device was unavailable for the permanent-suite run.
+>
+> **CURRENT R3 VIEWPORT CORRECTION (2026-08-14; SUPERSEDES THE EARLIER NO-RESTORATION
+> CONCLUSION).** The preceding claims that no outer restoration was added or needed, that every C1-C4
+> leg had zero raw List-offset drift, and that an outer-offset path still lacked a non-vacuous
+> reproduction are historical conclusions superseded by the later `logmain` evidence and permanent real
+> R3 fixture. With the disclosure toggle above the List midpoint (`toggleY 262`, midpoint `422`) and the
+> WebView scrolled to an interior DOM offset, expanding the real quote made UIKit's owning
+> `UICollectionView` perform a row-bottom re-anchor: raw content offset moved `+13381 pt`, the directly
+> measured toggle and card top moved `-13381 pt`, the row/card bottom stayed fixed, and DOM coordinates
+> and bounds origin stayed stable. The initial fresh-host below-midpoint simulator control (`toggleY
+> 582`) had zero raw or visible drift, but that was not a valid eligibility boundary: the later physical-
+> device `logmain` kept the corrected card/WebView alive, repositioned its toggle below midpoint, then
+> recorded four `anchor-not-above-midpoint` refusals while the user observed the reciprocal scroll
+> failure. This proved a native, card-agnostic and **position-symmetric** correction was required; the fix therefore lives in
+> `AutoSizingHTMLView`/its `HTMLWebView` native disclosure-height path, not in focused-message
+> `MessageDetailView` state.
+>
+> The production mechanism is a one-shot, validated user-disclosure anchor lease. An app-owned quote or
+> invite tap arms an exact isolated-world ownership tag and, when available, the real DOM toggle's window
+> top; the first matching height message consumes them atomically. Ownership remains valid when the DOM
+> top is unavailable, so the opening `DetailAnchor` disarm still occurs, but the bridge rejects anchor
+> geometry without `userDisclosure: true` and native refuses the viewport lease without a finite,
+> nonnegative anchor. Disclosure metadata is spread into the JavaScript message first and authoritative
+> measured `h`/viewport/scroll/rect/source fields afterward, so metadata cannot overwrite measurements;
+> every `__tmArmUserDisclosure` call is also guarded by a `typeof ... === 'function'` soft-failure check.
+> The opening `MessageDetailOpenAnchorGate.userTookControl()` behavior and its DEBUG-only sensitivity
+> bypass remain a separate mechanism from this viewport lease.
+>
+> A lease is eligible for every validated app-owned disclosure in the exact owning `UICollectionView`,
+> regardless of whether the captured toggle is above or below the List midpoint. It expires after 250
+> ms and retains the captured document generation, window,
+> WebView, owning collection cell, collection identity/hierarchy, pre-height window position, and target
+> WebView/cell geometry. Settlement requires the same document/window/WebView/List/cell, the WebView at
+> the expected height, and the owning cell plus collection layout attributes at the matching expected
+> height. `DisclosureLayoutWebView.layoutSubviews` provides the synchronous layout-bound settle before
+> presentation; a bounded main-turn fallback (approximately one frame, not 1 ms full-window polling)
+> exists for dirty layout, cancellation, and timeout. Settlement recomputes the live window-space
+> residual and, only when material, adjusts the owning List's legally clamped `contentOffset` without
+> animation. The lease is cleared before `setContentOffset` can recurse, and DEBUG evidence records the
+> realized post-write delta plus baseline-to-corrected net offset rather than merely the requested delta.
+> Already-stable cases at any screen position and the reverse collapse settle as no-ops; ordinary
+> ResizeObserver/image height changes never acquire this lease. The unconditional untagged `+50 ms`
+> same-height confirmation preserves the matching lease rather than reducing its effective lifetime.
+>
+> The lease refuses or cancels for `ScrollFreezeGate`, user tracking/dragging/deceleration, WebView or
+> outer-scroll zoom, missing or changed window/view/WebView/List/cell/hierarchy, stale or new document,
+> expected-height/layout mismatch, timeout, or supersession. A new tagged disclosure, a genuinely
+> different height, `requestFit`, `requestWidthRefit`, or `revealed` supersedes it; only the one matching
+> tagged height can be corrected. This confines the correction to the production owning
+> `UICollectionView` and prevents similarly shaped compose/preview scroll views from being adjusted.
+>
+> Permanent coverage now names all six production-hierarchy methods in
+> `MessageDisclosureViewportMeasurementTests`: `productionDetailConfigurations()`,
+> `productionDetailC4SensitivityControl()`, `productionDetailStressTransitions()`,
+> `productionDetailAboveMidpointReproduction()`,
+> `productionDetailAboveMidpointViewportCorrectionSensitivityControl()`, and
+> `productionDetailBelowMidpointControl()`. C1/C2 remain no-later-message support coverage, C3 is the
+> opening-position case, and C4 is the discriminating programmatically scrolled case. The original
+> DEBUG-only `DetailAnchor` sensitivity now bypasses both its disclosure disarm and the viewport lease,
+> keeping the two-sided control independent of callback order; it reproduces quote and invite at List
+> offset `-574 pt` with toggle/card movement `+574 pt`. The independent DEBUG-only R3 sensitivity disables only the new
+> viewport lease and reproduces the stronger above-midpoint row-bottom signature: raw offset
+> `+13381 pt`, toggle/card `-13381 pt`, fixed card bottom, stable DOM, and material movement over 500 pt.
+>
+> With production correction enabled, three consecutive above-midpoint expansion/collapse executions
+> each applied exactly one realized expansion correction of `-13381 pt`, returned the baseline-to-final
+> raw offset to zero, retained zero toggle/card net or transient excursion, and dropped zero sampled
+> frames. The same-toggle reverse collapse remained above midpoint but UIKit was already stable:
+> WebView `13961 -> 580 pt`, hosted cell `14078.67 -> 697.67 pt` (exact expected `697.67 pt`), and card
+> height `-13381 pt`; the lease was exercised once as a validated no-op (`settled=1`, `applied=0`) with
+> zero net/transient movement. The permanent host now continues through the same retained WebView,
+> `UICollectionView`, collection cell, and isolated-world document: it repositions the collapsed toggle
+> below midpoint and expands again. Three consecutive runs kept raw/toggle/card/WebKit excursion zero
+> and exercised the same lease as `settled=1`, `applied=0`; the separate fresh-host below control also
+> settles once with no applied correction. Re-adding any positional refusal therefore turns the retained
+> test red. The simulator does not choose the physical device's bad below-position anchor, so below-
+> position corrective arithmetic remains device-log evidence rather than a manufactured simulator
+> movement; the permanent simulator legs prove position-independent eligibility and prevent
+> overcorrection of already-stable layout. These no-op witnesses are load-bearing: correction is not
+> inferred merely from lease settlement.
+>
+> The strict C1-C4 matrix keeps direct toggle window Y, card-top window Y, hosted-cell/WebView window
+> origins, and final direct-versus-layout geometry as hard invariants. C1/C2/C4 have raw offset zero. C3
+> quote and invite each show a benign raw List coordinate normalization of `+33.67 pt` while every
+> user-visible and hosted-window value remains zero; it is classified
+> `outer-offset-compensation-anchor-stable`, with raw offset diagnostic rather than a waiver based on a
+> correction witness. Stress coverage still inserts 40 later rows and expands 150 hidden paragraphs:
+> R2a recorded 86 native frames/drop0 and zero visible excursion while row insertion changed the raw
+> coordinate by `+2181 pt`; collapse recorded 44/drop0 and a compensated `+168.33 pt` raw coordinate
+> shift with visible geometry zero; reopen recorded 34/drop0 and all-zero movement. Native and isolated-
+> world rAF samples share an epoch clock, enforce bounded frame/pairing gaps, and keep per-frame liveness
+> assertions active.
+>
+> The final bridge/isolation/freeze selection remains green at 15 tests across three suites, including
+> ownership/anchor validation and survival of the same-height untagged `+50 ms` confirmation;
+> render-world global census, content-world isolation, and the scroll-freeze canary are included. Fresh Debug and Release builds
+> reported only the sanctioned AppIntents metadata-skip warnings (three and two respectively). Release
+> contains the production viewport correction, but its string census found zero DEBUG sensitivity seam
+> or witness strings: the earlier broad statement that Release behavior was unchanged is superseded only
+> for the new production correction, while every test bypass/diagnostic remains absent from Release.
+>
+> Residual limits are explicit. This evidence is simulator-only because a physical device was
+> unavailable. Repeated R3 corrections settled synchronously through `layoutSubviews`, so the bounded
+> fallback correction branch was not directly forced. A rare unrelated *programmatic* sibling geometry
+> change inside the at-most-250-ms lease could be absorbed into the residual at any toggle position;
+> user scrolling remains
+> recoverable and the tracking/drag/deceleration gates refuse correction. This is a transient viewport
+> risk only, with no message-data or persisted-state risk. Preserve both the opening `DetailAnchor` gate
+> and the new independently validated viewport lease; the older prohibition on outer restoration is
+> superseded by the proven R3 reproduction above.
+>
+> The remaining concrete app-owned path was the `laterMessages.count` two-pass `ScrollViewProxy`
+> correction: its immediate and queued writes were not execution-gated and could run after a disclosure
+> or manual interaction disarmed the opening gate. All focused-card proxy writes now enter one helper
+> that revalidates `MessageDetailOpenAnchorGate` at execution, including the queued pass. This
+> deliberately trades the old unconditional correction: if the user takes control before an initial
+> related-message scan inserts rows above, TabMail accepts the insertion's natural layout rather than
+> snapping the focused card to the top. Logging-enabled sessions record every accepted/skipped
+> correction as `[DetailAnchor]`. Preserve that central gate; do not add an outer-offset restoration
+> path without a non-vacuous reproduction that first proves the uncontrolled List actually moves.
 >
 > Scroll-freeze buffering is latest-wins. A user can expand and collapse before the freeze releases;
 > when the newest validated visual height equals the currently applied collapsed height, native clears

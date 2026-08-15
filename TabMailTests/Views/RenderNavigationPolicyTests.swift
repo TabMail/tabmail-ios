@@ -343,6 +343,11 @@ struct RenderBridgeInputTests {
         for flag in ["revealed", "requestFit", "requestWidthRefit", "userDisclosure"] {
             #expect(RenderBridgeInput.validatedHeightBody([flag: true]) != nil)
         }
+        #expect(RenderBridgeInput.validatedHeightBody([
+            "h": 812,
+            "userDisclosure": true,
+            "disclosureAnchorTop": 96,
+        ]) != nil)
     }
 
     @Test("Non-finite, negative and non-numeric heights are dropped — fail closed")
@@ -358,10 +363,14 @@ struct RenderBridgeInputTests {
             ["vp": Double.nan],
             ["scroll": -1],
             ["rect": Double.infinity],
+            ["disclosureAnchorTop": Double.nan],
+            ["disclosureAnchorTop": -1],
             ["revealed": "yes"],
             ["requestFit": "1"],
             ["requestWidthRefit": ["nested": true]],
             ["userDisclosure": "yes"],
+            ["userDisclosure": false, "disclosureAnchorTop": 40],
+            ["disclosureAnchorTop": 40],
             ["source": 5],
             "a bare string",
             [1, 2, 3]
@@ -555,7 +564,7 @@ struct RenderBridgeInputTests {
         // 2. Heights — a bare boolean body, and a boolean under each numeric key.
         #expect(RenderBridgeInput.validatedHeightBody(true) == nil,
                 "a bare boolean must not be accepted as a height")
-        for key in ["h", "vp", "scroll", "rect"] {
+        for key in ["h", "vp", "scroll", "rect", "disclosureAnchorTop"] {
             #expect(RenderBridgeInput.validatedHeightBody([key: true]) == nil,
                     "a boolean under numeric key \(key) must drop the whole payload")
         }
@@ -584,6 +593,10 @@ struct RenderBridgeInputTests {
             #expect(RenderBridgeInput.validatedHeightBody([flag: true]) != nil,
                     "flag key \(flag) is SUPPOSED to be boolean and must still be accepted")
         }
+        #expect(RenderBridgeInput.validatedHeightBody([
+            "userDisclosure": true,
+            "disclosureAnchorTop": 42,
+        ]) != nil, "a disclosure flag must remain accepted with its required numeric anchor")
     }
 
     @Test("More failures than deferred images is impossible — and rejected, not clamped")

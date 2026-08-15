@@ -676,7 +676,7 @@ internal enum RenderBridgeInput {
     /// during the vet and then REJECTED, because it truncates a legitimately long
     /// newsletter and buys little (ADR-IOS-076 decision 7). Finite and non-negative is the
     /// whole contract.
-    private static let numericKeys = ["h", "vp", "scroll", "rect"]
+    private static let numericKeys = ["h", "vp", "scroll", "rect", "disclosureAnchorTop"]
 
     /// Boolean command keys. Present-but-not-a-`Bool` is a malformed payload, not a
     /// falsey one.
@@ -718,6 +718,14 @@ internal enum RenderBridgeInput {
             guard let raw = dict[key] else { continue }
             guard let number = bridgedNumber(raw), isAcceptableMeasurement(number) else { return nil }
         }
+        // Anchor geometry is meaningful only when owned by an app-created
+        // disclosure tap. The ownership bit intentionally remains valid without
+        // geometry: it must still disarm MessageDetail's opening anchor if a
+        // defensive DOM probe cannot produce a point. Native simply refuses the
+        // optional viewport lease in that case.
+        let isUserDisclosure = dict["userDisclosure"] as? Bool == true
+        let hasDisclosureAnchor = dict["disclosureAnchorTop"] != nil
+        guard !hasDisclosureAnchor || isUserDisclosure else { return nil }
         guard let rawSource = dict["source"] else { return dict }
         guard let source = rawSource as? String else { return nil }
         var sanitized = dict

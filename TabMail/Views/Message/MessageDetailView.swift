@@ -59,6 +59,11 @@ struct MessageDetailView: View {
     /// or notification deep link. Only the pill path dwells the skeleton
     /// overlay — see `skeletonOverlayVisible` doc comment above.
     let opensWithSkeletonDwell: Bool
+#if DEBUG
+    /// Test-only sensitivity seam. Production callers keep the default and
+    /// disarm the opening anchor before applying disclosure-driven heights.
+    let testBypassesDisclosureOpenAnchorDisarm: Bool
+#endif
     var showSideButtons: Bool { !chatExpanded && sideButtonsReady }
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) var optOutAllAI = false
     @Environment(\.dismiss) var dismiss
@@ -92,6 +97,23 @@ struct MessageDetailView: View {
     /// cannot durably mark a different message read. See
     /// `MessageDetailViewModel.openIdentity`. Defaulted `nil` (fail open) so every
     /// opener that has no witness keeps today's behaviour unchanged.
+#if DEBUG
+    init(
+        messageId: String,
+        opensWithSkeletonDwell: Bool = false,
+        expectedRfc822MessageId: String? = nil,
+        testBypassesDisclosureOpenAnchorDisarm: Bool = false
+    ) {
+        self._viewModel = State(initialValue: MessageDetailViewModel(
+            messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId))
+        self.opensWithSkeletonDwell = opensWithSkeletonDwell
+        self.testBypassesDisclosureOpenAnchorDisarm = testBypassesDisclosureOpenAnchorDisarm
+        self._skeletonOverlayVisible = State(initialValue: opensWithSkeletonDwell)
+        if DebugModeManager.isLoggingEnabled() {
+            print("[DetailRender] MessageDetailView.init msgId=\(messageId.prefix(40))")
+        }
+    }
+#else
     init(
         messageId: String,
         opensWithSkeletonDwell: Bool = false,
@@ -105,6 +127,7 @@ struct MessageDetailView: View {
             print("[DetailRender] MessageDetailView.init msgId=\(messageId.prefix(40))")
         }
     }
+#endif
 
     var body: some View {
         bodyContent
@@ -333,10 +356,19 @@ struct MessageDetailView: View {
                 // an atomic userDisclosure bit and invokes this immediately
                 // before native considers that tagged measurement; otherwise an
                 // ensuing resize can be mistaken for late initial layout.
+#if DEBUG
+                if !testBypassesDisclosureOpenAnchorDisarm {
+                    openAnchorGate.userTookControl()
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[DetailAnchor] user disclosure disarmed opening anchor card=\(msg.stableId)")
+                    }
+                }
+#else
                 openAnchorGate.userTookControl()
                 if DebugModeManager.isLoggingEnabled() {
                     print("[DetailAnchor] user disclosure disarmed opening anchor card=\(msg.stableId)")
                 }
+#endif
             }
         )
     }
