@@ -360,31 +360,32 @@ struct QueueCoreInvariantTests {
     // `narrowedRetirementCarriesTheDestinationAddressTheServerNamed` fails —
     // the surviving row is still `…:INBOX:77` with `messageId == "77"`.
 
-    @Test("a member retired in a narrowing pass ends the drain carrying the destination address COPYUID proved")
+    @Test("a member retired in a narrowing pass carries its proved inbox address into the AI event")
     func narrowedRetirementCarriesTheDestinationAddressTheServerNamed() async throws {
         let fixture = try fixture(accountId: "acc-queue-005-proven")
         defer { finish(fixture) }
 
         // The optimistic half of a move already ran: the row is shown in
-        // Archive but still keyed by, and named by, its INBOX address.
+        // INBOX but still keyed by, and named by, its Archive address.
         try seedHeader(
-            fixture, messageId: "77", folderPath: "Archive",
-            keyedFromFolderPath: "INBOX", epoch: nil)
+            fixture, messageId: "77", folderPath: "INBOX",
+            keyedFromFolderPath: "Archive", epoch: nil)
 
         let op = PendingOperation(
             type: .move, messageIds: ["77", "88"], accountId: fixture.accountId,
-            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
+            folderPath: "Archive", destinationPath: "INBOX", observedUidValidity: 42)
         try insertOp(op, fixture)
 
+        let context = AccountManager.DrainContext()
         await AccountManager.shared.retirePartiallyCompletedOp(
             op, provenMembers: ["77"], remaining: ["88"],
             provenDestinations: [ProvenDestinationAddress(
                 sourceProviderId: "77", destinationProviderId: "5", destinationUidValidity: 42)],
             addressChangesOnMove: true,
-            context: AccountManager.DrainContext())
+            context: context)
 
         let destinationId = MessageIdentity.headerId(
-            accountId: fixture.accountId, folderPath: "Archive", messageId: "5")
+            accountId: fixture.accountId, folderPath: "INBOX", messageId: "5")
         let rows = try await fixture.pool.read { db in
             try MessageHeader.filter(Column("accountId") == fixture.accountId).fetchAll(db)
         }
@@ -399,6 +400,16 @@ struct QueueCoreInvariantTests {
         #expect(
             rows[0].observedUidValidity == 42,
             "the destination epoch the server reported agrees with the folder, so it is stamped")
+
+        // A partial-success retirement is still a completed move for its proven
+        // members. The same member must reach the post-drain entered-inbox event;
+        // otherwise an RFC-bearing row misses the trigger solely because another
+        // member in its bundle was unproven.
+        let entered = context.enteredInbox.withLock {
+            $0["\(fixture.accountId)|INBOX"] ?? []
+        }
+        #expect(entered.count == 1)
+        #expect(entered.first?.messageId == "5")
 
         // The unproven member is preserved, narrowed — never dropped.
         let after = try fetchOp(op.id, fixture)

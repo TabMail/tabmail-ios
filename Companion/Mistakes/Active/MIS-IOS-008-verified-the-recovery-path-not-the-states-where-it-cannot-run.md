@@ -2,7 +2,7 @@
 
 **Class:** review-discipline / fail-closed design
 **Severity:** high (a false "recoverable" claim shipped in a commit body, and it was the load-bearing justification for the fix's accepted cost)
-**First seen:** 2026-08 · **Recurrences:** 2 · **Status:** Active
+**First seen:** 2026-08 · **Recurrences:** 3 · **Status:** Active
 **Related:** `MIS-IOS-007` (the same session, the same guard — a premise that felt checked because real code was read) · **Rule owner:** `tabmail-ios/CLAUDE.md` § *THE MANTRA*
 
 ## The tell
@@ -131,6 +131,37 @@ argument was made about. The MANTRA argument was never re-run against the narrow
 now carries an explicit reopen condition instead. **A residual that changes shape needs its
 recoverability argument re-run, not inherited.** Related: `MIS-IOS-011` (invoking THE MANTRA's name
 instead of running its test).
+
+---
+
+## Instance 3 — 2026-08-15, `IOS-AI-004`: checked identity on a recovery path that selects by state
+
+The narrowed record correctly named `ActiveAIQueue.repopulationCandidates` as the durable fallback
+and correctly named its recent-window boundary. It nevertheless continued to describe the residual
+as RFC-less identity recovery: either construct a way to re-identify the moved row across a remap,
+or keep the issue open.
+
+That asks the recovery path to satisfy a precondition it does not have. The production query contains
+no RFC or provider-address predicate; it selects the row in its **current** location by
+`isInInbox`, `bodyComplete`, and missing AI fields. Gmail canonicalization may change the id and an
+IMAP path may leave it unchanged, but either way the query reads the durable row now present. RFC
+governs the immediate move-event resolver only. The negative pass belongs on the selector's actual
+preconditions: body readiness and membership in the recent backlog window.
+
+This is the same quantifier error from the opposite direction. Instances 1 and 2 proved that a named
+recovery mechanism was not runnable from every claimed state. This instance imposed an identity
+requirement on the fallback without checking whether the fallback used identity at all. The amended
+countermeasure is: **enumerate the recovery mechanism's predicates mechanically; do not transfer a
+predicate from the failing path merely because both paths target the same user-visible state.**
+
+### Pre-compaction index line (verbatim, 2026-08-15)
+
+The Instance 3 recurrence initially pushed the mandatory index over its 12 KB budget. Its full index
+text is preserved byte-for-byte here before the startup-context pointer was shortened:
+
+```text
+- **[MIS-IOS-008](Companion/Mistakes/Active/MIS-IOS-008-verified-the-recovery-path-not-the-states-where-it-cannot-run.md)** — proved a recovery path EXISTS and wrote "recoverable", never asking from which states that path is itself blocked (`IOS-AI-003`; false cost claim shipped in `6b689890d`). THE MANTRA's test is recoverability of the STATE, not existence of a MECHANISM. Instance 2 (`IOS-AI-004`) showed that a gesture also needs a reachable affordance. **Instance 3 imposed an RFC identity requirement on `repopulationCandidates`, even though that fallback selects current rows by state and contains no identity predicate. Enumerate the recovery mechanism's actual predicates; do not transfer a guard from the failing path merely because both target the same visible state.** A changed residual needs its recoverability argument re-run. (×3)
+```
 
 ---
 

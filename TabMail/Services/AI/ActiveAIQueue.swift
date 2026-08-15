@@ -209,9 +209,11 @@ actor ActiveAIQueue {
 
     /// Repopulate queue from GRDB on app launch / AI re-enable.
     /// Finds inbox messages that have body in FTS but are missing summary/action.
-    /// Only the most recent `SyncConfig.maxRecentEmails` inbox messages are considered,
-    /// matching TB's inboxManagement.maxRecentEmails cap. Older messages in large
-    /// inboxes are not AI-processed to save LLM tokens and battery.
+    /// Only unfinished work among the most recent `SyncConfig.maxRecentEmails`
+    /// inbox messages is considered, matching TB's inboxManagement.maxRecentEmails
+    /// cap. The window is selected BEFORE filtering for unfinished AI fields: a
+    /// LIMIT over only needs-AI rows would paginate through the whole inbox as each
+    /// drain completes and self-repopulates.
     func repopulateFromDatabase() async {
         // Throttle: skip if cancelAllInFlight() fired < 2s ago.
         // Prevents the cancel→repopulate→dispatch cycle from creating duplicate job storms
@@ -248,19 +250,26 @@ actor ActiveAIQueue {
         }
     }
 
-    /// The durable arbiter behind every direct-path redrive. Internal so the
-    /// UID-rekey regression can prove that a guarded drop is rediscovered by
-    /// the same production query, without launching an LLM in the test.
+    /// The durable automatic-backlog arbiter behind direct-path redrive inside
+    /// the recent window. Internal so the UID-rekey regression can prove that a
+    /// guarded drop is rediscovered by the same production query, without
+    /// launching an LLM in the test.
     nonisolated static func repopulationCandidates(
         db: Database
     ) throws -> [(headerId: String, accountId: String)] {
         let rows = try Row.fetchAll(db, sql: """
-            SELECT id, accountId FROM messageHeader
-            WHERE isInInbox = 1 AND bodyComplete = 1
-            AND (summaryBlurb IS NULL OR summaryBlurb = ''
-                 OR actionTag IS NULL OR cachedReply IS NULL)
+            SELECT id, accountId FROM (
+                SELECT id, accountId, bodyComplete, summaryBlurb, actionTag,
+                       cachedReply, date
+                FROM messageHeader
+                WHERE isInInbox = 1
+                ORDER BY date DESC
+                LIMIT ?
+            )
+            WHERE bodyComplete = 1
+              AND (summaryBlurb IS NULL OR summaryBlurb = ''
+                   OR actionTag IS NULL OR cachedReply IS NULL)
             ORDER BY date DESC
-            LIMIT ?
         """, arguments: [SyncConfig.maxRecentEmails])
         return rows.map { ($0["id"] as String, $0["accountId"] as String) }
     }
@@ -647,6 +656,35 @@ actor ActiveAIQueue {
         case structurallyRefused
     }
 
+    /// Terminal preflight for a selected job. Recency is intentionally absent:
+    /// `repopulationCandidates` bounds the automatic backlog, while direct event
+    /// producers (new body, push merge, and move into inbox) mirror TB's uncapped
+    /// `processMessage` path. Applying the same cap again here strands a direct
+    /// old-message job in `jobCompleted`'s retry loop.
+    enum JobStartDisposition: Sendable, Equatable {
+        case execute
+        case alreadyComplete
+        case structurallyRefused
+    }
+
+    nonisolated static func jobStartDisposition(
+        message: MessageHeader,
+        jobType: AIJob.JobType,
+        admission: WriteAdmission
+    ) -> JobStartDisposition {
+        switch jobType {
+        case .summary:
+            guard message.summaryBlurb == nil || message.summaryBlurb?.isEmpty == true else {
+                return .alreadyComplete
+            }
+        case .action:
+            guard message.actionTag == nil else { return .alreadyComplete }
+        case .reply:
+            guard message.cachedReply == nil else { return .alreadyComplete }
+        }
+        return admission == .structurallyRefused ? .structurallyRefused : .execute
+    }
+
     /// See `WriteAdmission`. `target` MUST have been captured from the current row in
     /// this same read.
     nonisolated static func writeAdmission(_ db: Database, target: AIWriteTarget) throws -> WriteAdmission {
@@ -686,15 +724,7 @@ actor ActiveAIQueue {
     private func repopulateOnDrain() async -> Bool {
         do {
             let items: [(headerId: String, accountId: String)] = try await dbPool.read { db in
-                let rows = try Row.fetchAll(db, sql: """
-                    SELECT id, accountId FROM messageHeader
-                    WHERE isInInbox = 1 AND bodyComplete = 1
-                    AND (summaryBlurb IS NULL OR summaryBlurb = ''
-                         OR actionTag IS NULL OR cachedReply IS NULL)
-                    ORDER BY date DESC
-                    LIMIT ?
-                """, arguments: [SyncConfig.maxRecentEmails])
-                return rows.map { ($0["id"] as String, $0["accountId"] as String) }
+                try Self.repopulationCandidates(db: db)
             }
             guard !items.isEmpty else { return false }
             BackgroundSyncLogger.logAIProcessing("[DRAIN] Self-repopulate enqueued \(items.count) messages")
@@ -767,31 +797,9 @@ actor ActiveAIQueue {
         let message = captured.message
         let target = captured.target
 
-        // Large inbox gate: skip messages outside the top N most recent.
-        if message.isInInbox {
-            let isRecent = (try? await dbPool.read { db in
-                let newerCount = try MessageHeader
-                    .filter(Column("isInInbox") == true)
-                    .filter(Column("date") > message.date)
-                    .fetchCount(db)
-                return newerCount < SyncConfig.maxRecentEmails
-            }) ?? true
-            if !isRecent { return .ordinary(retry: false) }
-        }
-
-        // Check if this specific job type is already done
-        switch job.jobType {
-        case .summary:
-            guard message.summaryBlurb == nil || message.summaryBlurb?.isEmpty == true else { return .ordinary(retry: false) }
-        case .action:
-            guard message.actionTag == nil else { return .ordinary(retry: false) }
-        case .reply:
-            guard message.cachedReply == nil else { return .ordinary(retry: false) }
-        }
-
-        // `IOS-AI-002` / `IOS-AI-003`. The job genuinely still needs its field, and
-        // the guarded write-back that would deliver it CANNOT be admitted from this
-        // database state — and, because the target is re-captured every attempt, will
+        // `IOS-AI-002` / `IOS-AI-003`. If a job still needs its field but its
+        // guarded write-back CANNOT be admitted from this database state, then —
+        // because the target is re-captured every attempt — the write will
         // not be admitted by any retry either. Everything below this line costs money
         // (the model call), battery (FTS + HTTP) or a lease slot the NSE also wants,
         // and every one of those costs would be spent on a result that is discarded at
@@ -800,9 +808,16 @@ actor ActiveAIQueue {
         //
         // NOT a relaxation of the refusal: nothing below would have been WRITTEN
         // anyway. The only thing that changes is that it is no longer paid for.
-        if captured.admission == .structurallyRefused {
+        switch Self.jobStartDisposition(
+            message: message, jobType: job.jobType, admission: captured.admission
+        ) {
+        case .alreadyComplete:
+            return .ordinary(retry: false)
+        case .structurallyRefused:
             BackgroundSyncLogger.logAIProcessing("[JOB] \(Self.logId(job.headerId)).\(job.jobType.rawValue) skipped — write target structurally unattributable (no RFC 822 Message-ID and no proven numbering)")
             return .unattributable
+        case .execute:
+            break
         }
 
         didLLMWorkSinceDrain = true

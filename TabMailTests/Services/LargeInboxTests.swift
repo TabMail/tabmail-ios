@@ -9,8 +9,9 @@ import GRDB
 
 /// Tests for the large inbox support feature (matching TB's inboxManagement):
 /// 1. SyncConfig constants exist and are reasonable
-/// 2. AI queue repopulate only considers the N most recent inbox messages
-/// 3. AI queue recency gate skips old messages in large inboxes
+/// 2. Automatic AI repopulation only considers unfinished work inside the N
+///    most recent inbox messages
+/// 3. Direct event jobs are not re-gated by inbox age after selection
 /// 4. Large inbox detection logic (total >= maxRecentEmails AND old > 0)
 /// 5. Bulk archive query selects correct messages by age cutoff
 @Suite("Large Inbox Support")
@@ -38,193 +39,107 @@ struct LargeInboxTests {
         #expect(SyncConfig.archiveAgeDays > 0)
     }
 
-    // MARK: - AI queue repopulate cap (query pattern)
+    // MARK: - AI queue backlog selection and direct-event execution
 
-    @Test("Repopulate query returns at most maxRecentEmails messages")
+    @Test("Automatic repopulation returns at most the newest maxRecentEmails inbox messages")
     func repopulateQueryCap() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         let folder = try TestDatabase.insertFolder(db)
 
-        // Insert 150 inbox messages (more than maxRecentEmails), all missing AI data
         let now = Date()
         for i in 0..<150 {
-            let date = now.addingTimeInterval(Double(-i) * 3600) // 1hr apart
-            try TestDatabase.insertMessageHeader(
-                db, messageId: "msg\(i)", date: date,
+            var header = try TestDatabase.insertMessageHeader(
+                db, messageId: "msg\(i)", date: now.addingTimeInterval(Double(-i) * 3600),
                 folderId: folder.id, accountId: "acc1", folderPath: "INBOX",
                 isInInbox: true
             )
+            header.bodyComplete = true
+            try db.write { try header.update($0) }
         }
 
-        // Query matching repopulateFromDatabase: top N by date, then filter missing AI
-        let recentHeaders = try db.read { db in
-            try MessageHeader
-                .filter(Column("isInInbox") == true)
-                .order(Column("date").desc)
-                .limit(SyncConfig.maxRecentEmails)
-                .fetchAll(db)
+        let candidates = try db.read { db in
+            try ActiveAIQueue.repopulationCandidates(db: db)
         }
 
-        #expect(recentHeaders.count == SyncConfig.maxRecentEmails)
-        guard let oldestRecent = recentHeaders.last?.date else { return }
-
-        // Verify the oldest message in results is newer than the oldest overall
-        let oldestOverall = try db.read { db in
-            try MessageHeader
-                .filter(Column("isInInbox") == true)
-                .order(Column("date").asc)
-                .fetchOne(db)?.date
-        }
-        guard let oldestOverall else {
-            Issue.record("Expected at least one message in database")
-            return
-        }
-        #expect(oldestRecent > oldestOverall)
+        #expect(candidates.count == SyncConfig.maxRecentEmails)
+        #expect(candidates.first?.headerId.hasSuffix(":msg0") == true)
+        #expect(candidates.last?.headerId.hasSuffix(":msg99") == true)
+        #expect(!candidates.contains { $0.headerId.hasSuffix(":msg100") })
     }
 
-    @Test("Repopulate query filters to messages missing AI data within recent window")
+    @Test("Automatic repopulation filters within the recent window instead of backfilling older rows")
     func repopulateQueryFiltersAI() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         let folder = try TestDatabase.insertFolder(db)
 
         let now = Date()
-        // 5 recent messages: 3 missing summary, 2 fully processed
-        for i in 0..<3 {
-            try TestDatabase.insertMessageHeader(
-                db, messageId: "missing\(i)", date: now.addingTimeInterval(Double(-i) * 3600),
+        for i in 0...SyncConfig.maxRecentEmails {
+            var header = try TestDatabase.insertMessageHeader(
+                db, messageId: "msg\(i)", date: now.addingTimeInterval(Double(-i) * 3600),
                 folderId: folder.id, accountId: "acc1", folderPath: "INBOX",
                 isInInbox: true
             )
-        }
-        for i in 0..<2 {
-            var header = try TestDatabase.insertMessageHeader(
-                db, messageId: "done\(i)", date: now.addingTimeInterval(Double(-(i + 3)) * 3600),
-                folderId: folder.id, accountId: "acc1", folderPath: "INBOX",
-                isInInbox: true, actionTag: .reply
-            )
-            header.summaryBlurb = "Summary"
-            header.cachedReply = "Reply"
+            header.bodyComplete = true
+            if i < SyncConfig.maxRecentEmails {
+                header.summaryBlurb = "Summary"
+                header.actionTag = .reply
+                header.cachedReply = "Reply"
+            }
             try db.write { try header.update($0) }
         }
 
-        // Repopulate pattern: fetch recent, filter in Swift
-        let recentHeaders = try db.read { db in
-            try MessageHeader
-                .filter(Column("isInInbox") == true)
-                .order(Column("date").desc)
-                .limit(SyncConfig.maxRecentEmails)
-                .fetchAll(db)
+        let candidates = try db.read { db in
+            try ActiveAIQueue.repopulationCandidates(db: db)
         }
 
-        let needsAI = recentHeaders.filter { h in
-            h.summaryBlurb == nil || h.summaryBlurb?.isEmpty == true ||
-            h.actionTag == nil || h.cachedReply == nil
-        }
-
-        #expect(recentHeaders.count == 5)
-        #expect(needsAI.count == 3)
+        #expect(
+            candidates.isEmpty,
+            "the unfinished 101st row is outside the automatic backlog window")
     }
 
-    // MARK: - Recency gate (processItem pattern)
-
-    @Test("Recency gate: message within top N passes")
-    func recencyGatePasses() throws {
+    @Test("A directly selected old job executes even when automatic repopulation excludes it")
+    func directOldJobExecutesOutsideBacklogWindow() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         let folder = try TestDatabase.insertFolder(db)
 
         let now = Date()
-        // Insert exactly maxRecentEmails messages
-        for i in 0..<SyncConfig.maxRecentEmails {
-            try TestDatabase.insertMessageHeader(
+        var target: MessageHeader?
+        for i in 0...SyncConfig.maxRecentEmails {
+            var header = try TestDatabase.insertMessageHeader(
                 db, messageId: "msg\(i)", date: now.addingTimeInterval(Double(-i) * 3600),
                 folderId: folder.id, accountId: "acc1", folderPath: "INBOX",
                 isInInbox: true
             )
+            header.bodyComplete = true
+            if i < SyncConfig.maxRecentEmails {
+                header.summaryBlurb = "Summary"
+                header.actionTag = .reply
+                header.cachedReply = "Reply"
+            } else {
+                target = header
+            }
+            try db.write { try header.update($0) }
         }
 
-        // The most recent message should pass the gate
-        let newest = try db.read { db in
-            try MessageHeader.filter(Column("messageId") == "msg0").fetchOne(db)!
+        guard let target else {
+            Issue.record("Expected the directly selected target")
+            return
         }
-        let newerCount = try db.read { db in
-            try MessageHeader
+        let evidence = try db.read { db -> (Int, [(headerId: String, accountId: String)]) in
+            let newerCount = try MessageHeader
                 .filter(Column("isInInbox") == true)
-                .filter(Column("date") > newest.date)
+                .filter(Column("date") > target.date)
                 .fetchCount(db)
+            let candidates = try ActiveAIQueue.repopulationCandidates(db: db)
+            return (newerCount, candidates)
         }
-        #expect(newerCount < SyncConfig.maxRecentEmails)
-    }
-
-    @Test("Recency gate: message outside top N is rejected")
-    func recencyGateRejects() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        let folder = try TestDatabase.insertFolder(db)
-
-        let now = Date()
-        // Insert maxRecentEmails + 10 messages
-        let total = SyncConfig.maxRecentEmails + 10
-        for i in 0..<total {
-            try TestDatabase.insertMessageHeader(
-                db, messageId: "msg\(i)", date: now.addingTimeInterval(Double(-i) * 3600),
-                folderId: folder.id, accountId: "acc1", folderPath: "INBOX",
-                isInInbox: true
-            )
-        }
-
-        // The oldest message (msg109) should fail the gate
-        let oldest = try db.read { db in
-            try MessageHeader.filter(Column("messageId") == "msg\(total - 1)").fetchOne(db)!
-        }
-        let newerCount = try db.read { db in
-            try MessageHeader
-                .filter(Column("isInInbox") == true)
-                .filter(Column("date") > oldest.date)
-                .fetchCount(db)
-        }
-        #expect(newerCount >= SyncConfig.maxRecentEmails)
-    }
-
-    @Test("Recency gate: non-inbox messages are not subject to the gate")
-    func recencyGateSkipsNonInbox() throws {
-        // The gate only applies to isInInbox messages.
-        // Non-inbox messages (sent, drafts) don't count.
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-        try TestDatabase.insertFolder(db, name: "Sent", path: "Sent", role: .sent)
-
-        let now = Date()
-        // 50 inbox + 60 sent = 110 total, but only 50 inbox
-        for i in 0..<50 {
-            try TestDatabase.insertMessageHeader(
-                db, messageId: "inbox\(i)", date: now.addingTimeInterval(Double(-i) * 3600),
-                folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX",
-                isInInbox: true
-            )
-        }
-        for i in 0..<60 {
-            try TestDatabase.insertMessageHeader(
-                db, messageId: "sent\(i)", date: now.addingTimeInterval(Double(-i) * 3600),
-                folderId: "acc1:Sent", accountId: "acc1", folderPath: "Sent",
-                isInInbox: false
-            )
-        }
-
-        // The oldest inbox message should still pass (only 50 inbox, < 100)
-        let oldestInbox = try db.read { db in
-            try MessageHeader.filter(Column("messageId") == "inbox49").fetchOne(db)!
-        }
-        let newerInboxCount = try db.read { db in
-            try MessageHeader
-                .filter(Column("isInInbox") == true)
-                .filter(Column("date") > oldestInbox.date)
-                .fetchCount(db)
-        }
-        #expect(newerInboxCount < SyncConfig.maxRecentEmails)
+        #expect(evidence.0 == SyncConfig.maxRecentEmails)
+        #expect(!evidence.1.contains { $0.headerId == target.id })
+        #expect(ActiveAIQueue.jobStartDisposition(
+            message: target, jobType: .summary, admission: .admissible) == .execute)
     }
 
     // MARK: - Large inbox detection
@@ -468,70 +383,4 @@ struct LargeInboxTests {
         #expect(oldMessages.isEmpty)
     }
 
-    // MARK: - Edge cases
-
-    @Test("Recency gate with exactly maxRecentEmails messages — all pass")
-    func recencyGateExactLimit() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        let folder = try TestDatabase.insertFolder(db)
-
-        let now = Date()
-        for i in 0..<SyncConfig.maxRecentEmails {
-            try TestDatabase.insertMessageHeader(
-                db, messageId: "msg\(i)", date: now.addingTimeInterval(Double(-i) * 3600),
-                folderId: folder.id, accountId: "acc1", folderPath: "INBOX",
-                isInInbox: true
-            )
-        }
-
-        // Even the oldest (msg99) should pass — exactly 99 newer messages
-        let oldest = try db.read { db in
-            try MessageHeader
-                .filter(Column("isInInbox") == true)
-                .order(Column("date").asc)
-                .fetchOne(db)!
-        }
-        let newerCount = try db.read { db in
-            try MessageHeader
-                .filter(Column("isInInbox") == true)
-                .filter(Column("date") > oldest.date)
-                .fetchCount(db)
-        }
-        #expect(newerCount == SyncConfig.maxRecentEmails - 1)
-        #expect(newerCount < SyncConfig.maxRecentEmails) // passes gate
-    }
-
-    @Test("Recency gate with maxRecentEmails + 1 — oldest is rejected")
-    func recencyGateOnePastLimit() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        let folder = try TestDatabase.insertFolder(db)
-
-        let now = Date()
-        let total = SyncConfig.maxRecentEmails + 1
-        for i in 0..<total {
-            try TestDatabase.insertMessageHeader(
-                db, messageId: "msg\(i)", date: now.addingTimeInterval(Double(-i) * 3600),
-                folderId: folder.id, accountId: "acc1", folderPath: "INBOX",
-                isInInbox: true
-            )
-        }
-
-        // The 101st oldest (msg100) should fail the gate
-        let oldest = try db.read { db in
-            try MessageHeader
-                .filter(Column("isInInbox") == true)
-                .order(Column("date").asc)
-                .fetchOne(db)!
-        }
-        let newerCount = try db.read { db in
-            try MessageHeader
-                .filter(Column("isInInbox") == true)
-                .filter(Column("date") > oldest.date)
-                .fetchCount(db)
-        }
-        #expect(newerCount == SyncConfig.maxRecentEmails) // exactly at limit = rejected
-        #expect(newerCount >= SyncConfig.maxRecentEmails)
-    }
 }

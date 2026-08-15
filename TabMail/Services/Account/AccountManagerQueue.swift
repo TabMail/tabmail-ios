@@ -689,25 +689,30 @@ extension AccountManager {
                 guard parts.count == 2 else { continue }
                 let accountId = String(parts[0])
                 let folderPath = String(parts[1])
-                guard let queue = workQueues[accountId] else { continue }
-                guard let folder = try? await dbPool.read({ db in
-                    try Folder.filter(Column("accountId") == accountId && Column("path") == folderPath).fetchOne(db)
-                }) else {
-                    queueLog("[MoveTrace] post-drain sync — folder not found: \(accountId)|\(folderPath)")
-                    continue
-                }
-                do {
-                    try await queue.execute(priority: .userAction) {
-                        try await self.syncEngine.syncFolderMessages(folder: folder, provider: queue.provider)
+                if let queue = workQueues[accountId] {
+                    if let folder = try? await dbPool.read({ db in
+                        try Folder.filter(Column("accountId") == accountId && Column("path") == folderPath).fetchOne(db)
+                    }) {
+                        do {
+                            try await queue.execute(priority: .userAction) {
+                                try await self.syncEngine.syncFolderMessages(folder: folder, provider: queue.provider)
+                            }
+                            queueLog("[MoveTrace] post-drain sync — completed for \(folder.name)")
+                        } catch {
+                            queueLog("[MoveTrace] post-drain sync — failed for \(folder.name): \(error)")
+                        }
+                    } else {
+                        queueLog("[MoveTrace] post-drain sync — folder not found: \(accountId)|\(folderPath)")
                     }
-                    queueLog("[MoveTrace] post-drain sync — completed for \(folder.name)")
-                } catch {
-                    queueLog("[MoveTrace] post-drain sync — failed for \(folder.name): \(error)")
+                } else {
+                    queueLog("[MoveTrace] post-drain sync — work queue not found: \(accountId)|\(folderPath)")
                 }
                 // ADR-IOS-008 decision 3. Deliberately AFTER the sync attempt and
-                // OUTSIDE its do/catch — see `enqueueAIForMembersThatEnteredInbox`
-                // for why either branch is a safe place to resolve an id, and why
-                // no earlier one is.
+                // OUTSIDE every sync precondition and its do/catch — a missing
+                // account queue/folder can skip refresh, but must not discard the
+                // already-recorded entered-inbox event. See
+                // `enqueueAIForMembersThatEnteredInbox` for why either sync outcome
+                // is a safe place to resolve an id, and why no earlier one is.
                 await enqueueAIForMembersThatEnteredInbox(key: key, folderPath: folderPath, context: ctx)
             }
         }
@@ -1876,6 +1881,12 @@ extension AccountManager {
             }
             await publishMoveFinish(finishResult)
             await materializeDeferredMoveSuccessors(after: frozenRetiredOp, result: finishResult)
+            if frozenRetiredOp.type == .move,
+               let dest = frozenRetiredOp.destinationPath,
+               dest != frozenRetiredOp.folderPath {
+                await recordMembersThatEnteredInbox(
+                    frozenRetiredOp, destinationPath: dest, context: context)
+            }
         } catch {
             // The narrowing write failed. NEVER leave the row `inFlight` (it
             // would only unstick at the next launch's crash recovery) and never
