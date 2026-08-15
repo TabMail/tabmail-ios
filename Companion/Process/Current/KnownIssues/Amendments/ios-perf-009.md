@@ -48,7 +48,7 @@ the otherwise unchanged `INDEXED BY messageHeader_folderId_isRead_date` statemen
 **0.356 ms median**, returned the same 200 rows, and still reported the temporary sort. An independent
 exact-schema audit found the same direction at three inboxes: **33.08 ms → 1.33 ms** at 100,000
 unread. The earlier verification asked whether the sorter disappeared, so its predicate could not
-express the winning result; this is the existing `MIS-007`/`MIS-033` family, not evidence for a new
+express the winning result; this is the existing `MIS-007` family, not evidence for a new
 per-folder mechanism.
 
 **Why it is latent, stated as the trigger condition rather than the shape.** Three independent
