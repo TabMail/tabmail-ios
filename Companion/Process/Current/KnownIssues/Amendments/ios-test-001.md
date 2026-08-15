@@ -1,8 +1,51 @@
-# IOS-TEST-001 — `scrubOnlyWakeStillConverges`: ROOT-CAUSED. A vacuous scenario plus an unsynchronised assertion, not an order-dependent production defect
+# IOS-TEST-001 — RESOLVED: `scrubOnlyWakeStillConverges` now proves its premise and awaits its scoped witness
 
-**Status:** 🔓 OPEN (2026-08-13) — **root cause established; the fix is to the TEST, and the production
-code is correct.** Kept open because the test still needs repairing in two independent places, and
-because a 2026-07-30 countermeasure recorded in the test file has been **falsified** by this recurrence.
+**Status:** ✅ **FIXED (2026-08-14).** The test now creates the exact phantom it claims to evict and
+waits on an RFC822-scoped, synchronised witness. Production was independently revalidated and did not
+need a change. GitHub [#19](https://github.com/TabMail/tabmail-ios/issues/19) can close when the repair is
+accepted.
+
+## Resolution (2026-08-14)
+
+The defect was in the test in two independent ways:
+
+1. Its second terminal stage projected to the same `StagedInboxRow` as the first, so production's
+   replace-all memo suppressed `.messagesStaged`. The wired view model never received a phantom, and the
+   original "phantom gone" predicate was true before its wait began.
+2. Its global `object: nil`, `queue: .main` signal capture appended through another `Task { @MainActor }`
+   and asserted without awaiting that job. An unrelated post could also have satisfied the capture.
+
+The bounded, test-only repair keeps `NSEDataBridge` unchanged:
+
+- after the first terminal row drains, the scenario performs one real empty
+  `mergeNSEStagingData(stagingPathOverride:)`. This advances the production replace-all memo from
+  `[row]` to `[]`, so re-staging the identical row truthfully publishes `[row]` again;
+- the `.messagesStaged` glue observes synchronously with `queue: nil`, filters for the world's unique
+  UUID-derived RFC822 identity, and records payload capture plus view-model insertion in a `Mutex`;
+- a bounded `#require` proves that exact row reached the real wired view model before the test may assert
+  a bounded eviction; and
+- the weak raw `.inboxDataDidChange || .messagesStaged` disjunction is removed. The lower-level
+  `NSEStaleStagedRowInvalidationTests.scrubOnlyWakePostsExactlyOneImmediateReload` already pins the
+  scrub-only notification contract exactly.
+
+### Conventional red and fallback proof
+
+- **Premise red:** with the scoped witness present but before the empty merge was added, exactly one test
+  ran and failed only at `PREMISE VIOLATED` after 5.115 seconds. This mechanically reproduces the
+  original vacuity.
+- **Eviction red:** after the repair, temporarily disabling only production's
+  `else if scrubbedStaleStagedRows` reload kept the premise green but timed out the eviction after 5.182
+  seconds. The real view model retained the phantom and the existing I1/I6/I10 invariants also failed.
+  No fallback or unrelated notification made the repaired test pass.
+- **Green:** restoring the unchanged production branch made the scoped target pass with one test in one
+  suite in 0.203 seconds.
+
+An independent Claude read-only audit reached the same smallest repair. Rejected alternatives were a
+new production notification-scoping key, a projected content change that would no longer re-stage the
+identical message, and a direct private-memo reset seam; each adds production test machinery or weakens
+the scenario when the real empty-merge lifecycle already supplies the required transition.
+
+Everything below is retained as the root-cause and historical investigation record.
 
 ⚠️ **The 2026-08-13 registration below was wrong in its central framing and is preserved rather than
 edited.** It called this "order- or shared-state-dependent" and set up a subset bisection to find the

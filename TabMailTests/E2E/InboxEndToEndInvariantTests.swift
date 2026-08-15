@@ -57,8 +57,9 @@ import Testing
 // this trait the suite ran outside the shared critical section, and the I8
 // signal-liveness check below failed intermittently with `captured=[]` once a
 // fifth long-running annotated suite (T0.7's UIDVALIDITY fuzzer) widened the
-// overlap window. Diagnosed 2026-07-30 — do NOT "fix" a recurrence by relaxing
-// the I8 assertion or adding a wait; the trait is the fix.
+// overlap window. Diagnosed 2026-07-30. The trait remains required for the
+// process globals above, but it cannot synchronize notification jobs queued by
+// the scenario itself; those must bound-wait on a scoped witness.
 @Suite(
     "Inbox end-to-end invariant layer (PLAN_INBOX_UNIFIED_READ §5B Phase 7)",
     .serialized, .processGlobalState
@@ -153,13 +154,12 @@ struct InboxEndToEndInvariantTests {
         NSEDataBridge.resetStageMemoForTesting()
         // NOTE: `NSEDataBridge`'s `lastPostedStagedRows` memo (gates
         // `.messagesStaged` re-post suppression) has no public test seam —
-        // it's `private static`. Every scenario below uses a distinct
-        // `accountId`/`messageId`/date per message key, so a stale memo from
-        // a prior test can never content-match a later test's staged row and
-        // spuriously suppress its post. Documented here instead of papered
-        // over — see PLAN_INBOX_UNIFIED_READ.md §5B / CLAUDE.md "no
-        // fallbacks" rule (a seam would need production code changes, out of
-        // scope for a test-only phase).
+        // it's `private static`. Cross-test isolation comes from each world's
+        // UUID-derived RFC822 identity (and fresh date), not from accountId or
+        // messageId: multiple scenarios intentionally reuse acc1/m1/101. The
+        // scrub-only scenario resets this memo through a real empty merge before
+        // re-staging the identical row; never bypass that production lifecycle
+        // with a direct memo-reset seam.
     }
 
     // MARK: - Staging helpers (mirror NSEGradualMergeTests' stageHeaderRow / stageBodyRow / stageAIRow)
@@ -249,11 +249,13 @@ struct InboxEndToEndInvariantTests {
 
     // MARK: - waitUntil (mirrors MessageDetailHeaderRecoveryTests / MessageDetailStagedPublishTests)
 
-    private func waitUntil(_ deadline: TimeInterval = 3, _ cond: () -> Bool) async {
+    @discardableResult
+    private func waitUntil(_ deadline: TimeInterval = 3, _ cond: () -> Bool) async -> Bool {
         let end = Date().addingTimeInterval(deadline)
         while !cond() && Date() < end {
             try? await Task.sleep(for: .milliseconds(25))
         }
+        return cond()
     }
 
     // MARK: - Invariant assertions (I1-I10)
@@ -455,7 +457,7 @@ struct InboxEndToEndInvariantTests {
         _ step: E2EWorld.Step, _ key: String, world: E2EWorld, vm: InboxViewModel,
         ai: inout E2EAITracker, scenario: String
     ) async throws {
-        world.clearSignals()
+        world.clearScopedStagedWitness()
         try await world.apply(step, key, vm: vm, stageTerminal: stageTerminalRow)
         await vm.reloadMessages()
         try await assertE2EInvariants(
@@ -488,10 +490,29 @@ struct InboxEndToEndInvariantTests {
     /// ~1749) so a WIRED-mode scenario can exercise the real
     /// merge-publish → instant-insert → reload-eviction pipeline end to end.
     /// Caller must remove the returned observer token.
-    private func wireStagedRowViewGlue(_ vm: InboxViewModel) -> NSObjectProtocol {
-        NotificationCenter.default.addObserver(forName: .messagesStaged, object: nil, queue: .main) { note in
-            guard let rows = note.object as? [StagedInboxRow] else { return }
-            Task { @MainActor in vm.insertStagedRows(rows) }
+    private func wireStagedRowViewGlue(
+        _ vm: InboxViewModel,
+        world: E2EWorld,
+        matchingRfc822MessageId: String
+    ) -> NSObjectProtocol {
+        NotificationCenter.default.addObserver(forName: .messagesStaged, object: nil, queue: nil) { note in
+            guard let rows = note.object as? [StagedInboxRow],
+                  rows.contains(where: { $0.rfc822MessageId == matchingRfc822MessageId }) else {
+                return
+            }
+            // Record the exact payload synchronously on the posting thread. The
+            // production View mutation remains MainActor-isolated below.
+            world.recordScopedStagedPayload(rfc822MessageId: matchingRfc822MessageId)
+            Task { @MainActor in
+                vm.insertStagedRows(rows)
+                if vm.loadedMessages.contains(where: {
+                    $0.rfc822MessageId == matchingRfc822MessageId
+                }) {
+                    world.recordScopedStagedRowApplied(
+                        rfc822MessageId: matchingRfc822MessageId
+                    )
+                }
+            }
         }
     }
 
@@ -562,12 +583,10 @@ struct InboxEndToEndInvariantTests {
         )
         defer { world.teardown() }
         let base = Date()
-        world.addMessage("m1", uid: "101", minutesAgo: 5, base: base)
+        let spec = world.addMessage("m1", uid: "101", minutesAgo: 5, base: base)
 
         let vm = InboxViewModel(folders: [fixture.inbox])
         vm.start()
-        let glueObs = wireStagedRowViewGlue(vm)
-        defer { NotificationCenter.default.removeObserver(glueObs) }
         var ai = E2EAITracker()
 
         // Land it durably in inbox, then archive it (setup — not under test).
@@ -580,6 +599,22 @@ struct InboxEndToEndInvariantTests {
         #expect(!vm.loadedMessages.contains { $0.messageId == "101" }, "setup assumption violated: archived row must be off-screen before the scrub-only wake")
         try await assertE2EInvariants(world: world, vm: vm, ai: &ai, context: "scrubOnlyWakeStillConverges pre-scrub settle")
 
+        // The initial terminal merge drained the staging DB. Observe that real
+        // empty state once before re-staging the identical row so production's
+        // replace-all notification memo advances from [row] to []. Without this
+        // lifecycle transition, the second [row] payload is equal to the memo
+        // and no phantom ever reaches the WIRED VM — making eviction vacuous.
+        await NSEDataBridge.mergeNSEStagingData(
+            stagingPathOverride: world.stagingPath
+        )
+
+        let glueObs = wireStagedRowViewGlue(
+            vm,
+            world: world,
+            matchingRfc822MessageId: spec.rfc822
+        )
+        defer { NotificationCenter.default.removeObserver(glueObs) }
+
         // THE SCRUB-ONLY WAKE under test: a later, unrelated push re-stages
         // the SAME message with push-time INBOX truth. The merge finds the
         // durable copy stale-by-move (now in Archive) — no durable write
@@ -588,18 +623,25 @@ struct InboxEndToEndInvariantTests {
         // IN-MEMORY phantom, exactly boot_logs 3's shape. I8 requires a
         // render signal to follow that evicts it — WITHOUT any manual
         // reloadMessages() call from this test.
-        world.clearSignals()
+        world.clearScopedStagedWitness()
         try await world.apply(.silentStateChangePush, "m1", vm: vm, stageTerminal: stageTerminalRow)
 
-        await waitUntil(5) { !vm.loadedMessages.contains { $0.messageId == "101" } }
+        let phantomWasApplied = await waitUntil(5) {
+            world.didCaptureScopedStagedPayload(rfc822MessageId: spec.rfc822)
+                && world.didApplyScopedStagedRow(rfc822MessageId: spec.rfc822)
+        }
+        try #require(
+            phantomWasApplied,
+            "PREMISE VIOLATED: the exact re-staged RFC822 row never passed through .messagesStaged and the wired VM — the eviction assertion would be vacuous"
+        )
+
+        let phantomWasEvicted = await waitUntil(5) {
+            !vm.loadedMessages.contains { $0.rfc822MessageId == spec.rfc822 }
+        }
 
         #expect(
-            !vm.loadedMessages.contains { $0.messageId == "101" },
+            phantomWasEvicted,
             "F1 REGRESSION: scrub-only wake's phantom never left the WIRED VM's screen — the render signal that should evict it did not converge"
-        )
-        #expect(
-            world.capturedSignals.contains("inboxDataDidChange") || world.capturedSignals.contains("messagesStaged"),
-            "I8 signal-liveness VIOLATED: scrub-only wake changed the expected-visible set (evicted the phantom) but posted no .inboxDataDidChange/.messagesStaged — captured=\(world.capturedSignals)"
         )
         try await assertE2EInvariants(world: world, vm: vm, ai: &ai, context: "scrubOnlyWakeStillConverges post-scrub settle")
     }
@@ -1256,7 +1298,8 @@ struct InboxEndToEndInvariantTests {
 /// so the fuzz mode's legality function can enumerate legal (step, key) pairs
 /// WITHOUT a database round-trip per check — the bookkeeping is kept in sync
 /// with reality because this World is the sole writer for the identities it
-/// tracks. Captures `.inboxDataDidChange`/`.messagesStaged` posts for I8.
+/// tracks. The WIRED scrub-only scenario also records its exact staged payload
+/// and applied VM row through a synchronous, RFC822-scoped witness.
 @MainActor
 final class E2EWorld {
     let pool: DatabasePool
@@ -1297,11 +1340,11 @@ final class E2EWorld {
     /// Sorted for deterministic fuzz enumeration.
     var messageKeys: [String] { specs.keys.sorted() }
 
-    /// I8 signal capture — every `.inboxDataDidChange`/`.messagesStaged` post
-    /// observed since the last `clearSignals()`.
-    private(set) var capturedSignals: [String] = []
-    private var obsInboxChange: NSObjectProtocol?
-    private var obsStaged: NSObjectProtocol?
+    private struct ScopedStagedWitness: Sendable {
+        var capturedRfc822MessageIds: Set<String> = []
+        var appliedRfc822MessageIds: Set<String> = []
+    }
+    private nonisolated let scopedStagedWitness = Mutex(ScopedStagedWitness())
 
     init(pool: DatabasePool, stagingPath: String, stagingQueue: DatabaseQueue, accountId: String, inbox: Folder, archive: Folder) {
         self.pool = pool
@@ -1310,26 +1353,35 @@ final class E2EWorld {
         self.accountId = accountId
         self.inbox = inbox
         self.archive = archive
-        obsInboxChange = NotificationCenter.default.addObserver(
-            forName: .inboxDataDidChange, object: nil, queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.capturedSignals.append("inboxDataDidChange") }
-        }
-        obsStaged = NotificationCenter.default.addObserver(
-            forName: .messagesStaged, object: nil, queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.capturedSignals.append("messagesStaged") }
-        }
     }
 
     func teardown() {
-        if let obsInboxChange { NotificationCenter.default.removeObserver(obsInboxChange) }
-        if let obsStaged { NotificationCenter.default.removeObserver(obsStaged) }
-        obsInboxChange = nil
-        obsStaged = nil
+        clearScopedStagedWitness()
     }
 
-    func clearSignals() { capturedSignals = [] }
+    nonisolated func clearScopedStagedWitness() {
+        scopedStagedWitness.withLock { $0 = ScopedStagedWitness() }
+    }
+
+    nonisolated func recordScopedStagedPayload(rfc822MessageId: String) {
+        scopedStagedWitness.withLock {
+            _ = $0.capturedRfc822MessageIds.insert(rfc822MessageId)
+        }
+    }
+
+    nonisolated func recordScopedStagedRowApplied(rfc822MessageId: String) {
+        scopedStagedWitness.withLock {
+            _ = $0.appliedRfc822MessageIds.insert(rfc822MessageId)
+        }
+    }
+
+    nonisolated func didCaptureScopedStagedPayload(rfc822MessageId: String) -> Bool {
+        scopedStagedWitness.withLock { $0.capturedRfc822MessageIds.contains(rfc822MessageId) }
+    }
+
+    nonisolated func didApplyScopedStagedRow(rfc822MessageId: String) -> Bool {
+        scopedStagedWitness.withLock { $0.appliedRfc822MessageIds.contains(rfc822MessageId) }
+    }
 
     // MARK: Message registration
 
