@@ -9,6 +9,97 @@ import Synchronization
 import UIKit
 import UserNotifications
 
+/// Minimal durable debt retained after an account row is removed.
+///
+/// The email is the remote worker's deletion key; no token, message data, or
+/// account credentials are retained. Every action is idempotent. A record is
+/// deleted only when all actions succeed, or when an authoritative active row
+/// proves the prepared delete did not commit. A new row for the same email can
+/// retire email-keyed remote debt only after old account-ID artifacts are gone.
+struct PendingRemovedAccountPushCleanup: Codable, Equatable, Sendable {
+    enum Action: String, Codable, Hashable, Sendable {
+        /// Remove the preferred per-(device, account) dispatch record.
+        case deviceAccount
+        /// Delete orphanable Keychain entries and captured outbox directories.
+        case localArtifacts
+        /// Rewrite/delete the legacy device registration's account-email list.
+        case deviceRegistration
+        /// Delete Gmail/Outlook smart-classifier consent held by the worker.
+        case consent
+        /// Revoke worker account ownership + provider-subscription KV, then
+        /// best-effort stop the provider watch when an access token is present.
+        case providerSubscription
+        /// Delete the IMAP/iCloud IDLE subscription (worker-authenticated).
+        case imapSubscription
+    }
+
+    let accountId: String
+    let generation: UUID
+    let caldavConfigIds: [String]
+    let outboxAttachmentDirNames: [String]
+    /// Supabase subject whose worker-owned records may be deleted. Nil means
+    /// local cleanup can proceed but remote outcomes must not advance.
+    let workerUserId: String?
+    let email: String
+    let provider: String
+    var actions: Set<Action>
+
+    init(
+        account: Account,
+        caldavConfigIds: [String],
+        outboxAttachmentDirNames: [String],
+        workerUserId: String?
+    ) {
+        accountId = account.id
+        generation = UUID()
+        self.caldavConfigIds = caldavConfigIds
+        self.outboxAttachmentDirNames = outboxAttachmentDirNames
+        self.workerUserId = workerUserId
+        email = account.emailAddress
+        provider = account.provider.rawValue
+        // Worker deletes are scoped to the Supabase subject. If removal occurs
+        // while signed out, retaining remote actions would create debt no later
+        // session can safely claim (a different co-owner may share the email).
+        // Local account-ID artifacts remain fully cleanable without auth.
+        guard workerUserId != nil else {
+            actions = [.localArtifacts]
+            return
+        }
+        switch account.provider {
+        case .gmail, .outlook:
+            actions = [.localArtifacts, .deviceAccount, .deviceRegistration, .consent, .providerSubscription]
+        case .imap, .icloud:
+            actions = [.localArtifacts, .deviceAccount, .deviceRegistration, .imapSubscription]
+        case .caldav:
+            actions = [.localArtifacts, .deviceRegistration]
+        }
+    }
+
+    static func load(from defaults: UserDefaults) -> [Self] {
+        guard let data = defaults.data(forKey: PushConfig.removedAccountCleanupKey),
+              let records = try? JSONDecoder().decode([Self].self, from: data) else {
+            return []
+        }
+        return records
+    }
+
+    static func save(_ records: [Self], to defaults: UserDefaults) {
+        guard !records.isEmpty else {
+            defaults.removeObject(forKey: PushConfig.removedAccountCleanupKey)
+            return
+        }
+        guard let data = try? JSONEncoder().encode(records) else { return }
+        defaults.set(data, forKey: PushConfig.removedAccountCleanupKey)
+    }
+}
+
+/// `UserDefaults` is documented thread-safe but is not Sendable in this SDK.
+/// The cleanup actor serializes all production access; this wrapper lets the
+/// DEBUG harness install an isolated suite without weakening actor checking.
+struct SendableRemovedAccountCleanupDefaults: @unchecked Sendable {
+    let value: UserDefaults
+}
+
 /// Manages push notification registration, device token handling,
 /// and per-account Gmail/Outlook push subscriptions.
 ///
@@ -34,6 +125,16 @@ actor PushNotificationService {
     func _setConsentCheckerForTesting(_ checker: (any PushConsentChecking)?) {
         self.consentCheckerOverride = checker
     }
+
+    private var removedAccountCleanupClientOverride: (any RemovedAccountPushCleaning)?
+    private var removedAccountCleanupDefaultsOverride: SendableRemovedAccountCleanupDefaults?
+    func _setRemovedAccountCleanupDependenciesForTesting(
+        client: (any RemovedAccountPushCleaning)?,
+        defaults: SendableRemovedAccountCleanupDefaults?
+    ) {
+        removedAccountCleanupClientOverride = client
+        removedAccountCleanupDefaultsOverride = defaults
+    }
     func _resetConsentScanStateForTesting() {
         self.hasSucceededConsentScanOnce = false
     }
@@ -53,6 +154,27 @@ actor PushNotificationService {
     private var consentChecker: any PushConsentChecking { pushClient }
     private var settingsProvider: any NotificationSettingsProviding { SystemNotificationSettingsProvider.shared }
     #endif
+
+    private var removedAccountCleanupClient: any RemovedAccountPushCleaning {
+        #if DEBUG
+        removedAccountCleanupClientOverride ?? pushClient
+        #else
+        pushClient
+        #endif
+    }
+
+    private var removedAccountCleanupDefaults: UserDefaults {
+        #if DEBUG
+        removedAccountCleanupDefaultsOverride?.value ?? .standard
+        #else
+        .standard
+        #endif
+    }
+
+    private var preparedRemovedAccountGenerations: Set<UUID> = []
+    private var removedAccountCleanupDrainActive = false
+    private var removedAccountCleanupDrainRequested = false
+    private var pendingRemovedAccountAccessTokens: [UUID: String] = [:]
 
     /// Set to true after the first foreground consent-status scan that produced
     /// at least one authoritative per-account status (ok / error / missing).
@@ -205,18 +327,380 @@ actor PushNotificationService {
         }
     }
 
-    /// Unregister this device from push worker (sign-out / factory reset).
-    func unregisterDevice() async {
-        do {
-            try await pushClient.unregisterDevice(deviceId: deviceId)
-            UserDefaults.standard.removeObject(forKey: PushConfig.lastDeviceTokenKey)
-            UserDefaults.standard.removeObject(forKey: PushConfig.registeredEmailsKey)
-            print("[Push] Device unregistered")
-            BackgroundSyncLogger.logPush("Device unregistered")
-        } catch {
-            print("[Push] Device unregister failed: \(error)")
-            BackgroundSyncLogger.logPush("Device unregister FAILED: \(error.localizedDescription)")
+    /// Factory reset cannot report success and clear the auth/session state if
+    /// the final worker device route was not removed. Failure remains visible so
+    /// the still-authenticated reset gesture remains retryable.
+    func unregisterDeviceForReset() async throws {
+        try await pushClient.unregisterDevice(deviceId: deviceId)
+        UserDefaults.standard.removeObject(forKey: PushConfig.lastDeviceTokenKey)
+        UserDefaults.standard.removeObject(forKey: PushConfig.registeredEmailsKey)
+        print("[Push] Device unregistered for factory reset")
+        BackgroundSyncLogger.logPush("Device unregistered for factory reset")
+    }
+
+    // MARK: - Removed-account cleanup debt
+
+    /// Persist the worker-owned cleanup tuple before the authoritative account
+    /// delete begins. If that delete fails, the caller must cancel this record.
+    /// On relaunch, retry first verifies that the email is no longer active, so
+    /// a kill between preparation and the GRDB commit cannot disconnect a live
+    /// account.
+    func prepareRemovedAccountCleanup(
+        _ account: Account,
+        caldavConfigIds: [String],
+        outboxAttachmentDirNames: [String]
+    ) -> UUID {
+        var records = PendingRemovedAccountPushCleanup.load(from: removedAccountCleanupDefaults)
+        // Every attempt gets an independent generation. Never replace an older
+        // same-email or same-ID record: it may still own local artifacts or a
+        // worker revocation that this attempt cannot safely cancel.
+        let record = PendingRemovedAccountPushCleanup(
+            account: account,
+            caldavConfigIds: caldavConfigIds,
+            outboxAttachmentDirNames: outboxAttachmentDirNames,
+            workerUserId: currentRemovedAccountCleanupUserId()
+        )
+        records.append(record)
+        preparedRemovedAccountGenerations.insert(record.generation)
+        PendingRemovedAccountPushCleanup.save(records, to: removedAccountCleanupDefaults)
+        if removedAccountCleanupDrainActive { removedAccountCleanupDrainRequested = true }
+        return record.generation
+    }
+
+    /// Roll back the prepared marker when the authoritative GRDB deletion did
+    /// not commit. No remote action has run at this point.
+    func cancelPreparedRemovedAccountCleanup(generation: UUID) {
+        preparedRemovedAccountGenerations.remove(generation)
+        pendingRemovedAccountAccessTokens.removeValue(forKey: generation)
+        var records = PendingRemovedAccountPushCleanup.load(from: removedAccountCleanupDefaults)
+        records.removeAll { $0.generation == generation }
+        PendingRemovedAccountPushCleanup.save(records, to: removedAccountCleanupDefaults)
+        if removedAccountCleanupDrainActive { removedAccountCleanupDrainRequested = true }
+    }
+
+    /// End the in-process prepare fence only after the row committed absent and
+    /// AccountManager installed its runtime tombstone. A drain that overlapped
+    /// the transaction then performs another pass against the authoritative DB.
+    func commitPreparedRemovedAccountCleanup(
+        generation: UUID,
+        capturedOAuthAccessToken: String? = nil
+    ) {
+        if let capturedOAuthAccessToken,
+           PendingRemovedAccountPushCleanup.load(from: removedAccountCleanupDefaults)
+            .contains(where: { $0.generation == generation }) {
+            pendingRemovedAccountAccessTokens[generation] = capturedOAuthAccessToken
         }
+        preparedRemovedAccountGenerations.remove(generation)
+        if removedAccountCleanupDrainActive { removedAccountCleanupDrainRequested = true }
+    }
+
+    /// Retry idempotent worker-owned cleanup for locally removed accounts.
+    ///
+    /// `onlyEmail` is used by the removal flow for an immediate attempt. The
+    /// unfiltered form runs on every foreground push re-subscription, which is
+    /// the durable offline/relaunch recovery path. A current account census is
+    /// mandatory before any request: if the database cannot be read, no remote
+    /// state is changed; if the same email has been re-added, its stale record
+    /// is expired so cleanup cannot tear down the new registration.
+    func retryPendingRemovedAccountCleanups(
+        onlyEmail: String? = nil
+    ) async {
+        if removedAccountCleanupDrainActive {
+            removedAccountCleanupDrainRequested = true
+            return
+        }
+
+        removedAccountCleanupDrainActive = true
+        var nextOnlyEmail = onlyEmail
+        repeat {
+            removedAccountCleanupDrainRequested = false
+            await drainPendingRemovedAccountCleanupsOnce(onlyEmail: nextOnlyEmail)
+            nextOnlyEmail = nil
+        } while removedAccountCleanupDrainRequested
+        removedAccountCleanupDrainActive = false
+    }
+
+    func hasPendingRemovedAccountCleanups() -> Bool {
+        !PendingRemovedAccountPushCleanup.load(from: removedAccountCleanupDefaults).isEmpty
+    }
+
+    private func drainPendingRemovedAccountCleanupsOnce(onlyEmail: String?) async {
+        let snapshot = PendingRemovedAccountPushCleanup.load(from: removedAccountCleanupDefaults)
+        guard !snapshot.isEmpty else { return }
+
+        let activeAccounts: [Account]
+        do {
+            activeAccounts = try await dbPool.read { db in
+                try Account.filter(Column("isActive") == true).fetchAll(db)
+            }
+        } catch {
+            print("[Push] Removed-account cleanup deferred: account census failed: \(error)")
+            return
+        }
+        let currentWorkerUserId = currentRemovedAccountCleanupUserId()
+
+        var outcomes: [UUID: Set<PendingRemovedAccountPushCleanup.Action>] = [:]
+        var selected: [PendingRemovedAccountPushCleanup] = []
+        for var record in snapshot {
+            // An in-process owner has not yet installed the runtime/credential
+            // fence. Relaunch is still recoverable because this set is memory-
+            // only; cancel removes the exact record and commit releases it.
+            if preparedRemovedAccountGenerations.contains(record.generation) {
+                continue
+            }
+            let sameEmail = activeAccounts.filter {
+                $0.emailAddress.caseInsensitiveCompare(record.email) == .orderedSame
+            }
+            if sameEmail.contains(where: { $0.id == record.accountId }) {
+                // Relaunch after a kill before commit: the original row is
+                // still authoritative and no in-process deletion owns it.
+                outcomes[record.generation] = []
+                continue
+            }
+
+            if record.actions.contains(.localArtifacts) {
+                cleanupRemovedAccountLocalArtifacts(record)
+                record.actions.remove(.localArtifacts)
+                outcomes[record.generation] = record.actions
+            }
+
+            // Worker deletions are scoped by the current JWT subject. Never let
+            // a signed-out or different user advance another user's debt.
+            guard let workerUserId = record.workerUserId,
+                  workerUserId == currentWorkerUserId else {
+                // The raw snapshot is immediate-pass-only. A sign-out or user
+                // switch must not retain it for the rest of the process.
+                pendingRemovedAccountAccessTokens.removeValue(forKey: record.generation)
+                continue
+            }
+
+            if !sameEmail.isEmpty {
+                // The replacement owns email-global device routes. Provider-
+                // specific debt is suppressed only when it would delete the
+                // replacement's own state.
+                // CalDAV-only replacements never register a mailbox/device
+                // route, so the old mailbox route must still be deleted.
+                if sameEmail.contains(where: { $0.provider != .caldav }) {
+                    record.actions.remove(.deviceAccount)
+                    record.actions.remove(.deviceRegistration)
+                }
+                let replacementProviders = Set(sameEmail.map { $0.provider })
+                if let oldProvider = AccountProvider(rawValue: record.provider) {
+                    if replacementProviders.contains(oldProvider) {
+                        record.actions.remove(.consent)
+                        record.actions.remove(.providerSubscription)
+                    }
+                    if oldProvider == .imap || oldProvider == .icloud,
+                       !replacementProviders.isDisjoint(with: [.imap, .icloud]) {
+                        record.actions.remove(.imapSubscription)
+                    }
+                }
+                outcomes[record.generation] = record.actions
+                guard !record.actions.isEmpty else { continue }
+            }
+            if let onlyEmail,
+               record.email.caseInsensitiveCompare(onlyEmail) != .orderedSame {
+                continue
+            }
+            selected.append(record)
+        }
+
+        guard !selected.isEmpty else {
+            mergeRemovedAccountCleanupOutcomes(outcomes)
+            return
+        }
+
+        let client = removedAccountCleanupClient
+        let cleanupDeviceId = removedAccountCleanupDefaults.string(forKey: PushConfig.deviceIdKey) ?? deviceId
+
+        for index in selected.indices {
+            if selected[index].actions.contains(.deviceAccount) {
+                do {
+                    try await client.unregisterDeviceAccount(
+                        deviceId: cleanupDeviceId,
+                        accountEmail: selected[index].email
+                    )
+                    selected[index].actions.remove(.deviceAccount)
+                } catch {
+                    print("[Push] Removed-account device route cleanup deferred for \(selected[index].email): \(error)")
+                }
+            }
+
+            if selected[index].actions.contains(.consent) {
+                do {
+                    switch selected[index].provider {
+                    case AccountProvider.gmail.rawValue:
+                        try await client.deleteGmailConsent(userEmail: selected[index].email)
+                    case AccountProvider.outlook.rawValue:
+                        try await client.deleteOutlookConsent(userEmail: selected[index].email)
+                    default:
+                        break
+                    }
+                    selected[index].actions.remove(.consent)
+                } catch {
+                    if isTerminalRemovedAccountOwnershipRefusal(error) {
+                        // Shared-address singleton belongs to another user. The
+                        // worker already revoked this caller's provider proof.
+                        selected[index].actions.remove(.consent)
+                    } else {
+                        print("[Push] Removed-account consent cleanup deferred for \(selected[index].email): \(error)")
+                    }
+                }
+            }
+
+            // Consent must be removed before `/unsubscribe`: legacy consent
+            // rows use the account-ownership proof for authorization, while
+            // `/unsubscribe` deliberately revokes that proof first. Reversing
+            // these calls can turn a transient consent failure into a durable
+            // 403 with no proof left to authorize its retry.
+            if selected[index].actions.contains(.providerSubscription),
+               !selected[index].actions.contains(.consent) {
+                do {
+                    // The raw snapshot gets exactly one attempt. On failure the
+                    // durable action remains, but every later pass sends empty
+                    // so account credentials do not gain a new lifetime here.
+                    let token = pendingRemovedAccountAccessTokens.removeValue(
+                        forKey: selected[index].generation
+                    ) ?? ""
+                    try await client.unsubscribe(
+                        provider: selected[index].provider,
+                        userEmail: selected[index].email,
+                        accessToken: token
+                    )
+                    selected[index].actions.remove(.providerSubscription)
+                } catch {
+                    if isTerminalRemovedAccountOwnershipRefusal(error) {
+                        // `/unsubscribe` revokes the caller's proof before it
+                        // refuses teardown of a co-owner's singleton watch.
+                        selected[index].actions.remove(.providerSubscription)
+                    } else {
+                        print("[Push] Removed-account provider subscription cleanup deferred for \(selected[index].email): \(error)")
+                    }
+                }
+            }
+
+            if selected[index].actions.contains(.imapSubscription) {
+                do {
+                    try await client.unsubscribeIMAP(userEmail: selected[index].email)
+                    selected[index].actions.remove(.imapSubscription)
+                } catch {
+                    print("[Push] Removed-account IMAP cleanup deferred for \(selected[index].email): \(error)")
+                }
+            }
+
+            // The access-token snapshot is only for this immediate pass. If a
+            // prerequisite deferred `/unsubscribe`, later retries use empty.
+            pendingRemovedAccountAccessTokens.removeValue(forKey: selected[index].generation)
+        }
+
+        // The legacy device record is global, so one successful refresh retires
+        // every selected tombstone's copy of this action.
+        if selected.contains(where: { $0.actions.contains(.deviceRegistration) }) {
+            do {
+                try await refreshDeviceRegistrationForRemovedAccountCleanup(
+                    activeEmails: activeAccounts.map(\.emailAddress),
+                    client: client,
+                    deviceId: cleanupDeviceId
+                )
+                for index in selected.indices {
+                    selected[index].actions.remove(.deviceRegistration)
+                }
+            } catch {
+                print("[Push] Removed-account legacy device cleanup deferred: \(error)")
+            }
+        }
+
+        for record in selected {
+            outcomes[record.generation] = record.actions
+        }
+        mergeRemovedAccountCleanupOutcomes(outcomes)
+    }
+
+    private func cleanupRemovedAccountLocalArtifacts(_ record: PendingRemovedAccountPushCleanup) {
+        KeychainHelper.delete(key: KeychainHelper.passwordKey(accountId: record.accountId))
+        KeychainHelper.delete(key: KeychainHelper.accessTokenKey(accountId: record.accountId))
+        KeychainHelper.delete(key: KeychainHelper.refreshTokenKey(accountId: record.accountId))
+        for configId in record.caldavConfigIds {
+            KeychainHelper.delete(key: "caldav_password_\(configId)")
+        }
+
+        let base = OutboxMessage.attachmentsBaseDir.standardizedFileURL
+        for dirName in record.outboxAttachmentDirNames {
+            let candidate = base.appendingPathComponent(dirName, isDirectory: true).standardizedFileURL
+            guard candidate.deletingLastPathComponent() == base else {
+                print("[Push] Refusing unsafe removed-account attachment directory: \(dirName)")
+                continue
+            }
+            try? FileManager.default.removeItem(at: candidate)
+        }
+    }
+
+    /// Merge only action results for the exact generations this pass loaded.
+    /// A prepare/cancel that re-entered while network or DB work was suspended
+    /// creates/removes a different generation and therefore cannot be clobbered.
+    private func mergeRemovedAccountCleanupOutcomes(
+        _ outcomes: [UUID: Set<PendingRemovedAccountPushCleanup.Action>]
+    ) {
+        guard !outcomes.isEmpty else { return }
+        var latest = PendingRemovedAccountPushCleanup.load(from: removedAccountCleanupDefaults)
+        for index in latest.indices.reversed() {
+            guard let remaining = outcomes[latest[index].generation] else { continue }
+            if remaining.isEmpty {
+                pendingRemovedAccountAccessTokens.removeValue(forKey: latest[index].generation)
+                latest.remove(at: index)
+            } else {
+                latest[index].actions = remaining
+            }
+        }
+        PendingRemovedAccountPushCleanup.save(latest, to: removedAccountCleanupDefaults)
+    }
+
+    private func currentRemovedAccountCleanupUserId() -> String? {
+        guard let data = KeychainHelper.load(key: "tabmail_session"),
+              let session = try? JSONDecoder().decode(TabMailSession.self, from: data) else {
+            return nil
+        }
+        return session.userId
+    }
+
+    private func isTerminalRemovedAccountOwnershipRefusal(_ error: any Error) -> Bool {
+        guard let pushError = error as? PushError,
+              case .workerRequestFailed(let statusCode, let errorCode) = pushError else {
+            return false
+        }
+        return statusCode == 403 && errorCode == "user_mismatch"
+    }
+
+    private func refreshDeviceRegistrationForRemovedAccountCleanup(
+        activeEmails: [String],
+        client: any RemovedAccountPushCleaning,
+        deviceId: String
+    ) async throws {
+        guard !activeEmails.isEmpty else {
+            try await client.unregisterDevice(deviceId: deviceId)
+            removedAccountCleanupDefaults.removeObject(forKey: PushConfig.registeredEmailsKey)
+            return
+        }
+
+        guard let sessionData = KeychainHelper.load(key: "tabmail_session"),
+              let session = try? JSONDecoder().decode(TabMailSession.self, from: sessionData) else {
+            throw PushError.noAuthToken
+        }
+        guard let token = removedAccountCleanupDefaults.string(forKey: PushConfig.lastDeviceTokenKey) else {
+            // No APNs token means this install could not have registered a
+            // legacy device record. Retire the stale local email snapshot too.
+            removedAccountCleanupDefaults.removeObject(forKey: PushConfig.registeredEmailsKey)
+            return
+        }
+
+        try await client.registerDevice(
+            deviceToken: token,
+            deviceId: deviceId,
+            userId: session.userId,
+            accountEmails: activeEmails,
+            apnsSandbox: PushConfig.isAPNsSandbox
+        )
+        removedAccountCleanupDefaults.set(activeEmails, forKey: PushConfig.registeredEmailsKey)
     }
 
     // MARK: - Account Subscription
@@ -360,36 +844,15 @@ actor PushNotificationService {
         }
     }
 
-    /// Unsubscribe a single account from push notifications.
-    func unsubscribeAccount(_ account: Account) async {
-        do {
-            switch account.provider {
-            case .gmail, .outlook:
-                let accessToken = try await AccountManager.shared.freshAccessToken(for: account)
-                try await pushClient.unsubscribe(
-                    provider: account.provider.rawValue,
-                    userEmail: account.emailAddress,
-                    accessToken: accessToken
-                )
-                BackgroundSyncLogger.logPush("Unsubscribed \(account.emailAddress)")
-                return
-            case .imap, .icloud:
-                try await pushClient.unsubscribeIMAP(userEmail: account.emailAddress)
-                BackgroundSyncLogger.logPush("Unsubscribed IMAP \(account.emailAddress)")
-                return
-            case .caldav:
-                return  // no mailbox, no subscription
-            }
-        } catch {
-            print("[Push] Unsubscribe failed for \(account.emailAddress): \(error)")
-            BackgroundSyncLogger.logPush("Unsubscribe FAILED for \(account.emailAddress): \(error.localizedDescription)")
-        }
-    }
-
     /// Subscribe all active accounts (Gmail/Outlook + IMAP via DO IDLE proxy),
     /// then re-register device once. Account subscriptions run in parallel —
     /// each is an independent worker round-trip with no shared state.
     func subscribeAllAccounts() async {
+        // Ordinary foreground subscription cannot heal a deleted account: it
+        // enumerates only live rows, and the old per-account dispatch record is
+        // therefore never named. Drain compact removal debt first.
+        await retryPendingRemovedAccountCleanups()
+
         do {
             let accounts = try await dbPool.read { db in
                 try Account.filter(Column("isActive") == true).fetchAll(db)

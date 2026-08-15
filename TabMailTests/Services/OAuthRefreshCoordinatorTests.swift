@@ -103,6 +103,54 @@ struct OAuthRefreshCoordinatorTests {
         }
     }
 
+    @Test("invalidation during a refresh discards a late network result without recreating credentials")
+    func invalidationDuringRefreshDoesNotRecreateToken() async throws {
+        let coordinator = OAuthRefreshCoordinator()
+        let accountId = "test-inflight-invalidation-\(UUID().uuidString)"
+        let refreshKey = KeychainHelper.refreshTokenKey(accountId: accountId)
+        let accessKey = KeychainHelper.accessTokenKey(accountId: accountId)
+        try KeychainHelper.save("fake-refresh", for: refreshKey)
+        defer {
+            KeychainHelper.delete(key: refreshKey)
+            KeychainHelper.delete(key: accessKey)
+        }
+
+        let completion = Mutex<CheckedContinuation<OAuthTokens, Never>?>(nil)
+        let (started, startedContinuation) = AsyncStream<Void>.makeStream()
+        let refreshTask = Task {
+            try await coordinator.refresh(
+                accountId: accountId,
+                email: "test@example.com"
+            ) { _ in
+                startedContinuation.yield()
+                startedContinuation.finish()
+                return await withCheckedContinuation { continuation in
+                    completion.withLock { $0 = continuation }
+                }
+            }
+        }
+
+        var iterator = started.makeAsyncIterator()
+        _ = await iterator.next()
+        await coordinator.invalidate()
+        KeychainHelper.delete(key: refreshKey)
+        completion.withLock { continuation in
+            continuation?.resume(returning: OAuthTokens(
+                accessToken: "must-not-be-saved",
+                refreshToken: "must-not-be-saved-either",
+                expiresAt: nil,
+                idToken: nil
+            ))
+            continuation = nil
+        }
+
+        await #expect(throws: ProviderError.self) {
+            try await refreshTask.value
+        }
+        #expect(KeychainHelper.loadString(key: accessKey) == nil)
+        #expect(KeychainHelper.loadString(key: refreshKey) == nil)
+    }
+
     // MARK: - Deduplication
 
     @Test("concurrent refresh calls are deduplicated")

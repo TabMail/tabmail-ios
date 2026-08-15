@@ -16,6 +16,7 @@ struct AccountDetailView: View {
     @State private var reauthError: String?
     @State private var showResetConfirmation = false
     @State private var isResetting = false
+    @State private var resetError: String?
     @State private var folders: [Folder] = []
     @State private var signatureText = ""
     @FocusState private var signatureFocused: Bool
@@ -366,6 +367,14 @@ struct AccountDetailView: View {
         } message: {
             Text("This will delete all cached messages, search index, and AI summaries for \(account.emailAddress). Messages will be re-downloaded from the server on next sync.")
         }
+        .alert("Reset Message Data", isPresented: Binding(
+            get: { resetError != nil },
+            set: { if !$0 { resetError = nil } }
+        )) {
+            Button("OK") { resetError = nil }
+        } message: {
+            Text(resetError ?? "")
+        }
         .alert("Update Password", isPresented: $showPasswordPrompt) {
             SecureField("New Password", text: $newPassword)
             Button("Cancel", role: .cancel) { newPassword = "" }
@@ -510,59 +519,64 @@ struct AccountDetailView: View {
         isResetting = true
         Task {
             let acctId = account.id
-
-            // Delete all headers for this account, and their cached bodies.
-            // Stage D (`v70_dropMessageBodyHeaderFK`) removed the FK cascade that
-            // used to take `messageBody` out with the header, so the body rows are
-            // deleted explicitly — in the SAME transaction, by content-key prefix.
-            // Content keys share the header id's `accountId:folderPath:` prefix.
-            try? await dbPool.write { db in
-                try db.execute(
-                    sql: "DELETE FROM messageHeader WHERE accountId = ?",
-                    arguments: [acctId]
-                )
-                try db.execute(
-                    sql: #"DELETE FROM messageBody WHERE id LIKE ? ESCAPE '\'"#,
-                    arguments: [MessageIdentity.escapeForLike(acctId) + ":%"]
-                )
+            do {
+                // This is the authoritative boundary. A failure rolls the whole
+                // account-scoped reset back and stops every derived cleanup.
+                try await dbPool.write { db in
+                    try Self.resetMessageDataTxn(db, accountId: acctId)
+                }
+            } catch {
+                print("[Reset] Account-scoped database reset failed: \(error)")
+                resetError = "TabMail couldn’t delete the local message data. Nothing was removed. Please try again."
+                isResetting = false
+                return
             }
 
-            // Clean up MessageAICache entries for this account
-            let cachePrefix = acctId + ":"
-            try? await dbPool.write { db in
-                try db.execute(
-                    sql: "DELETE FROM messageAICache WHERE key LIKE ?",
-                    arguments: [cachePrefix + "%"]
-                )
-            }
-
-            // Remove FTS entries for this account only
-            try? await SearchIndex.shared.removeMessagesForAccount(accountId: acctId)
-
-            // Reset folder backfill state
-            try? await dbPool.write { db in
-                try db.execute(
-                    sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?",
-                    arguments: [acctId]
-                )
-                try db.execute(
-                    sql: "UPDATE folder SET backfillComplete = 0, oldestSyncedDate = NULL, lastKnownUidNext = NULL, backfillUidCursor = NULL, backfillPageToken = NULL WHERE accountId = ?",
-                    arguments: [acctId]
-                )
+            var derivedCleanupFailed = false
+            do {
+                try await SearchIndex.shared.removeMessagesForAccount(accountId: acctId)
+            } catch {
+                derivedCleanupFailed = true
+                print("[Reset] Account-scoped search cleanup failed: \(error)")
             }
 
             print("[Reset] Cleared all message data for \(account.emailAddress)")
-
-            // Clear in-memory backfill completion flag so backfill re-launches
             await manager.resetBackfill(accountId: acctId)
-
             reloadFolders()
-
-            // Trigger re-sync
             _ = try? await manager.syncAccount(account)
 
+            if derivedCleanupFailed {
+                resetError = "Message data was reset, but the search index could not be cleared. Reindexing or the next sync will repair it."
+            }
             isResetting = false
         }
+    }
+
+    /// Authoritative account-scoped reset in one GRDB transaction. Split-out
+    /// for a real injected-ABORT test; no FTS/memory/UI side effect belongs here.
+    nonisolated static func resetMessageDataTxn(_ db: Database, accountId: String) throws {
+        try db.execute(
+            sql: "DELETE FROM messageHeader WHERE accountId = ?",
+            arguments: [accountId]
+        )
+        // Stage D (`v70_dropMessageBodyHeaderFK`) removed the body FK, so the
+        // content-key prefix delete must remain in this same transaction.
+        try db.execute(
+            sql: #"DELETE FROM messageBody WHERE id LIKE ? ESCAPE '\'"#,
+            arguments: [MessageIdentity.escapeForLike(accountId) + ":%"]
+        )
+        try db.execute(
+            sql: "DELETE FROM messageAICache WHERE key LIKE ?",
+            arguments: [accountId + ":%"]
+        )
+        try db.execute(
+            sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?",
+            arguments: [accountId]
+        )
+        try db.execute(
+            sql: "UPDATE folder SET backfillComplete = 0, oldestSyncedDate = NULL, lastKnownUidNext = NULL, backfillUidCursor = NULL, backfillPageToken = NULL WHERE accountId = ?",
+            arguments: [accountId]
+        )
     }
 
     // MARK: - Helpers

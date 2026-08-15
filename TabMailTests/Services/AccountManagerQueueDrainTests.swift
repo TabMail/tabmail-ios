@@ -74,6 +74,78 @@ struct AccountManagerQueueDrainTests {
         }
     }
 
+    @Test("OAuth reconnect never strands a claimed MOVE without a wire attempt")
+    func reconnectPreservesClaimedMoveAdmission() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let accountId = "reconnect-claimed-move"
+        try insertStableProviderFixture(accountId: accountId, pool: pool)
+        var account = Account(
+            emailAddress: "\(accountId)@example.com",
+            displayName: "Reconnect",
+            provider: .gmail
+        )
+        account.id = accountId
+
+        var claimed = PendingOperation(
+            type: .move,
+            messageIds: ["claimed-message"],
+            accountId: accountId,
+            folderPath: "INBOX",
+            destinationPath: "Archive"
+        )
+        claimed.status = PendingStatus.inFlight.rawValue
+        claimed.everAttempted = true
+        try insertOp(claimed, pool: pool)
+        let claimedSnapshot = claimed
+
+        let provider = MockEmailProvider()
+        await provider.setMoveThrows(
+            ProviderError.networkError(underlying: URLError(.notConnectedToInternet))
+        )
+        let queue = ProviderWorkQueue(provider: provider, maxConcurrency: 1)
+        await AccountManager.shared.installReconnectQueueTestRuntime(
+            accountId: accountId,
+            provider: provider,
+            queue: queue
+        )
+
+        let gate = ReconnectWorkGate()
+        let blocker = Task {
+            await queue.execute(priority: .bodyFetch) { await gate.hold() }
+        }
+        await gate.waitUntilHeld()
+
+        let queuedDrain = Task {
+            await queue.execute(priority: .userAction) {
+                _ = await AccountManager.shared.executeSingleOp(
+                    claimedSnapshot,
+                    provider: provider,
+                    context: AccountManager.DrainContext()
+                )
+            }
+        }
+        for _ in 0..<1_000 {
+            if await queue.waitingCount == 1 { break }
+            await Task.yield()
+        }
+        #expect(await queue.waitingCount == 1, "the claimed MOVE must be waiting when reconnect detaches runtime state")
+
+        // Re-authentication uses the nil `deletingCredentials` path. It may
+        // detach the old queue from AccountManager, but must not invalidate the
+        // captured drain closure: ordinary provider failure requeues the claim.
+        await AccountManager.shared.disconnectAccount(account)
+        await gate.release()
+        await blocker.value
+        await queuedDrain.value
+
+        let after = try fetchOp(claimedSnapshot.id, pool: pool)
+        #expect(after?.status == PendingStatus.queued.rawValue)
+        #expect(after?.everAttempted == true)
+        #expect(await provider.movedIds.count == 1, "reconnect must not skip the claimed MOVE's provider attempt")
+    }
+
     // MARK: - 3. Tag ops keep their immediate best-effort drop
 
     @Test(".setTag completes immediately (local-only, ADR-IOS-036): op deleted, outcome .proceed, provider never called")
@@ -663,5 +735,39 @@ struct AccountManagerQueueDrainTests {
             server.transient503OnModifyServedCount() == 1,
             "503 is outside HTTPRetryPolicy.gmail's retryable set, so it is served exactly once: \(server.transient503OnModifyServedCount())"
         )
+    }
+}
+
+private actor ReconnectWorkGate {
+    private var held = false
+    private var heldWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func hold() async {
+        held = true
+        for waiter in heldWaiters { waiter.resume() }
+        heldWaiters.removeAll()
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilHeld() async {
+        if held { return }
+        await withCheckedContinuation { heldWaiters.append($0) }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private extension AccountManager {
+    func installReconnectQueueTestRuntime(
+        accountId: String,
+        provider: any EmailProvider,
+        queue: ProviderWorkQueue
+    ) {
+        providers[accountId] = provider
+        workQueues[accountId] = queue
     }
 }

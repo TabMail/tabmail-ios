@@ -84,6 +84,11 @@ enum PushConfig {
     /// List of account emails currently registered with the push worker.
     static let registeredEmailsKey = "push_registered_emails"
 
+    /// Compact, retryable cleanup debt for accounts whose authoritative local
+    /// row has been removed. It retains only remote keys and local artifact IDs,
+    /// never credentials or content, and is deleted at a proven terminal state.
+    static let removedAccountCleanupKey = "push_removed_account_cleanup_v1"
+
     /// Whether push notifications are enabled (user-facing setting).
     /// Default: true. When disabled, the push worker registration still happens
     /// but the NSE suppresses all non-error notifications.
