@@ -121,7 +121,7 @@ regenerated from it; their detail files live in
 
 | ID | Class | Executive statement |
 |---|---|---|
-| [IOS-BILLING-002](Companion/Process/Current/KnownIssues/Amendments/ios-billing-002.md) | `open` | 🔓 OPEN (2026-08-12) — `cancelAccountDeletion` discards the response body, so the new four-valued `subscription_outcome` never reaches the UI and a user whose subscription lapsed irrecoverably during the grace window (`expired_during_grace`, unreactivatable in Stripe) sees the same silent success as one whose subscription was restored; `status` is `'restored'` in all four cases. Not yet reachable — the field is absent from the deployed worker. Old builds are safe: unknown keys are ignored and the body is discarded |
+| [IOS-BILLING-002](Companion/Process/Current/KnownIssues/Amendments/ios-billing-002.md) | `open` | 🛠 FIX CANDIDATE (2026-08-15, `814fcd26e`) — current worker `origin/main` returns the four-valued `subscription_outcome`, while released iOS through `v1.7.9` drops it. The candidate decodes the additive string and presents only exact `expired_during_grace` from stable RootView with the existing plan-picker route; no billing state is written. Static proof is green; serialized iOS red/green/build evidence and exact-diff Claude review remain required before resolution. Live authenticated handler behavior remains unverified per worker `BW-VERIFY-001` |
 
 ### IMAP (2)
 
