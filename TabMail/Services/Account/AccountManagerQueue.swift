@@ -90,10 +90,19 @@ extension AccountManager {
 
     // MARK: - Persistent Action Queue
 
-    /// Shared mutable state for parallel drain tasks. Reference type so concurrent
-    /// lane Tasks (launched from the `AccountManager` actor) see each other's updates
-    /// at await points. `internal` (not `private`) so tests can construct it directly
-    /// to call `executeSingleOp`.
+    /// Shared mutable state for parallel drain tasks. Reference type so lane Tasks
+    /// see each other's updates when they interleave at await points. The Tasks
+    /// inherit `AccountManager` isolation, and the `@Sendable` closure passed to
+    /// `ProviderWorkQueue.execute` only forwards the context back through
+    /// `await self.executeSingleOp`, so every mutation below is serialized by the
+    /// actor even while provider I/O overlaps.
+    ///
+    /// `@unchecked Sendable` is required solely because that `@Sendable` closure
+    /// captures the reference; it does NOT make the fields thread-safe. A future
+    /// direct access from that closure, `Task.detached`, a GRDB closure, or another
+    /// nonisolated context would violate this contract and must add synchronization
+    /// or restore the actor hop (`IOS-QUEUE-010`). `internal` (not `private`) so
+    /// tests can construct it directly to call `executeSingleOp`.
     class DrainContext: @unchecked Sendable {
         /// Accounts whose PROVIDER is failing — a connectivity fact, deliberately
         /// account-wide, so one drain does not hammer a server that is down.
@@ -128,15 +137,11 @@ extension AccountManager {
         /// sync — the moment both the durable row and its FTS entry are under
         /// their final ids (ADR-IOS-008 decision 3; see `recordMembersThatEnteredInbox`).
         ///
-        /// ⚠️ `Mutex`-protected while its siblings above are not, and that is
-        /// deliberate rather than inconsistent. The per-lane drain tasks run
-        /// CONCURRENTLY (`drainPendingQueue` appends a `Task` per lane and only
-        /// then awaits them), so every field here is written from several tasks
-        /// at once — which is what `@unchecked Sendable` on this class is
-        /// currently papering over. That exposure is pre-existing for
-        /// `foldersToSync`/`failedAccounts` and is reported separately rather
-        /// than widened here: a new racy field is not excused by the old ones
-        /// (`Companion/Rules/Active/resilience.md` mandates `Mutex`, SE-0433).
+        /// `Mutex`-protected even though production accesses currently inherit
+        /// `AccountManager` isolation. A nonisolated test seam reads this collection
+        /// after execution, and keeping protection on the value itself makes any
+        /// future off-actor reader safe. The plain sibling fields are safe only by
+        /// the actor-isolation contract on `DrainContext` above (`IOS-QUEUE-010`).
         let enteredInbox = Mutex<[String: [InboxEntry]]>([:])
         /// `PendingOperation.id`s whose provider could not obtain the evidence its
         /// own safety gate requires (`ProviderEvidenceUnavailable`). Per-op, not
@@ -868,8 +873,7 @@ extension AccountManager {
     /// The distinction that keeps the two apart: the lockstep list is about
     /// **dedup identity** for the merge and the reader. This is **AI-target
     /// selection after a known move**, whose input address is stale on purpose.
-    /// Same shape as `IOS-QUEUE-010`'s deliberate asymmetry — consistency here
-    /// must not be bought by reintroducing the defect.
+    /// Consistency must not be bought by reintroducing the wrong-message defect.
     ///
     /// So the priority is INVERTED relative to `find`: the rfc822 identity is
     /// the only thing that survives both re-key paths, so it is required rather

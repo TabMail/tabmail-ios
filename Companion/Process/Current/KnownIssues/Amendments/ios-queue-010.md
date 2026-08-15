@@ -1,90 +1,131 @@
 # IOS-QUEUE-010
 
-- Register classification: `open`
+- Register classification: `not-defect`
 - New post-freeze record (2026-08-13) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
 ## Status
 
-🔓 **OPEN (2026-08-13)** — `AccountManager.DrainContext`'s shared fields are mutated **concurrently and
-without synchronisation** by the per-lane drain tasks. Pre-existing; found while adding a field to the
-same type for ADR-IOS-008 decision 3, and **not** introduced by it. Registered rather than fixed: the fix
-changes the drain's concurrency contract and needs its own red-first coverage.
+✅ **NOT A DEFECT (2026-08-14)** — the race premise was re-audited before implementation and is false.
+The lane tasks overlap provider I/O, but every `DrainContext` read and write runs on the serial
+`AccountManager` actor. GitHub [#17](https://github.com/TabMail/tabmail-ios/issues/17) should close as a
+false positive; no runtime change or race-shaped regression test is warranted.
 
 ## Subsystem and search terms
 
-`AccountManager.DrainContext`; `drainPendingQueue`; `executeSingleOp`; `@unchecked Sendable`;
-`foldersToSync`; `failedAccounts`; `evidenceRefused`; `diagnosedOpIds`; `enteredInbox`; per-lane `Task`;
-`buildLanes`; concurrent `Set` mutation; copy-on-write buffer reallocation; data race; undefined
-behaviour; heap corruption; crash inside the drain; missing post-drain folder sync; `Mutex` SE-0433;
-iOS resilience rule 5; `nonisolated(unsafe)`; "do not tidy the asymmetry"
+`AccountManager.DrainContext`; `drainPendingQueue`; `executeSingleOp`; `ProviderWorkQueue.execute`;
+`@unchecked Sendable`; `@Sendable`; inherited actor context; `@isolated(any)`; `hop_to_executor`;
+`foldersToSync`; `failedAccounts`; `evidenceRefused`; `diagnosedOpIds`; `executedAny`; `enteredInbox`;
+per-lane `Task`; actor reentrancy; logical interleaving; physical concurrency; Swift 6 strict
+concurrency; false-positive data race; v1.6.38; v1.7.8
 
 ## Full detail
 
-**The mechanism.** `drainPendingQueue` builds one `Task` per lane and appends every one of them before
-awaiting any:
+### Executor trace
 
-```swift
-tasks.append(task)
-…
-for task in tasks { await task.value }
-```
+`AccountManager` is an actor. `drainPendingQueue` creates each lane with `Task { [self] in … }` from an
+actor-isolated method, so Swift's `Task` initializer inherits the actor context. The closure itself proves
+that contract at compile time: it reads actor-isolated `self.workQueues` and `dbPool` without an `await`.
+The project builds under Swift 6 with complete strict concurrency; moving the same access into
+`Task.detached` is rejected.
 
-Each lane task calls `executeSingleOp(_:provider:context:)` with the **same** `DrainContext` instance, and
-that function mutates the context directly — `context.foldersToSync.insert(…)`, `context.failedAccounts`,
-`context.evidenceRefused`, `context.diagnosedOpIds`. All four are plain stored properties on a
-`class DrainContext: @unchecked Sendable`, and **the `@unchecked` is precisely what suppresses the
-diagnostic that would otherwise flag this.**
+The closure passed to `ProviderWorkQueue.execute` is genuinely `@Sendable` and can run away from the
+`AccountManager` executor, but it does not read or mutate the context. Its only context-bearing operation
+is `await self.executeSingleOp(…, context: capturedCtx)`, which hops back to `AccountManager` before the
+first access. Provider calls can therefore overlap across actor suspension points while the shared
+bookkeeping remains physically serialized.
 
-⚠️ **This is undefined behaviour, not a lost update, and the distinction is the reason the row exists.**
-It is tempting to read a racy `Set.insert` as "one of the two writes wins" — a benign, recoverable
-outcome. **It is not.** Swift's `Set` is copy-on-write: two concurrent writers can both observe a
-non-uniquely-referenced buffer, both reallocate, and free or write through the same allocation. The
-honest worst case is **heap corruption**, i.e. a crash whose stack need not implicate the drain at all.
-**Anyone triaging this must not reason from "we might miss a folder".**
+An independent Swift 6 strict-concurrency probe reproduced this shape, and emitted SIL marked the lane
+closure `@sil_isolated Owner` with `hop_to_executor`. A `Task.detached` negative control failed to compile.
 
-**Blast radius, per outcome.**
+### Mechanical class and access census
 
-- *Lost `foldersToSync` entry* — a destination folder is not post-drain synced, so its new UIDs are picked
-  up by the next ordinary sync instead. **Fully recoverable.**
-- *Lost `failedAccounts` entry* — one extra provider attempt against a server that is already failing.
-  **Harmless.**
-- *Heap corruption* — a crash. **No durable state and no user intention is at risk:** every
-  `PendingOperation` row is written and deleted through `retryWrite` in its own transaction, none of these
-  four fields gates retirement, and the queue re-drains on next launch.
+`DrainContext` has exactly five plain mutable stored properties:
 
-**Reachability.** Requires two or more lanes in one drain — i.e. two queued operations whose members do
-not share an address (`buildLanes` groups by connected components over `(account, folder, UID)`), on
-accounts that each have a live work queue. That is **ordinary** for a user who acts on several threads
-before the drain fires. No field report is known; this is a latent defect found by reading.
+- `failedAccounts`
+- `foldersToSync`
+- `evidenceRefused`
+- `executedAny`
+- `diagnosedOpIds`
 
-**Attribution class:** latent concurrency defect, discovered by inspection, no observed instance.
+It also has the `let enteredInbox = Mutex<…>` value and the immutable nested `InboxEntry` type. Every
+production access to the five plain fields is inside `drainPendingQueue`, its actor-inheriting lane task,
+`executeSingleOp`, or `retirePartiallyCompletedOp`; none is inside `Task.detached`, a task-group child, a
+GRDB closure, or a `nonisolated` function. The outer-pass and post-drain reads happen only after
+`for task in tasks { await task.value }` joins every lane.
 
-## Why registered rather than fixed
+Test seams construct a fresh context, await the actor-isolated operation, and only then inspect it. No
+test or production caller shares one context between independent concurrent callers.
 
-The fix is to route all four fields through a lock, which touches every mutation site across
-`executeSingleOp`'s success and failure arms plus every read in the post-drain phase — **a change to the
-drain's concurrency contract, not a local repair.** It belongs in its own commit with its own red-first
-coverage, and a concurrency invariant is exactly the kind that needs a **fuzz harness** rather than a unit
-test (global testing rule 11). Nothing in THE MANTRA's blocking set is engaged: no dropped intention, no
-starving op, no wrong-message mutation, no secret exposure. The crash outcome is brick-*adjacent* but not
-a **launch** crash and loses no data.
+### Logical interleaving is not a memory race
 
-## ⚠️ The asymmetry is deliberate — do not "tidy" it
+Actor reentrancy lets lane B make progress while lane A awaits its provider, but the actor totally orders
+the synchronous `Set` and `Bool` accesses. There is no pair of physically overlapping accesses, so the
+original copy-on-write/heap-corruption escalation does not apply.
 
-The ADR-IOS-008 decision-3 field added alongside these, `DrainContext.enteredInbox`, is
-**`Mutex`-protected on its own** rather than joining the unsynchronised group, and it carries a comment
-saying so at its declaration.
+The only meaningful cross-lane timing effect is already benign: another lane may pass the
+`failedAccounts` check before the first failure is recorded and make one extra provider attempt. A mutex
+around the set cannot close that check-to-provider-call window because it spans an `await`.
 
-A future cleanup pass that sees one `Mutex`-protected field among several bare ones will be tempted to
-make them consistent — **and the tempting direction is the wrong one.** Consistency here must be achieved
-by **protecting the other three, never by unprotecting the one.** Adding a fifth racy field because four
-already exist is the "no pre-existing excuses" failure mode.
+### Durable fallback and retry audit
+
+The queue's recovery mechanics do not make a real data race acceptable, but they were traced as a
+separate validity check:
+
+- claim status is persisted as `inFlight` in its own GRDB transaction;
+- provider-evidence refusal and generic transient failure requeue the current operation, and `.haltLane`
+  requeues the remaining claimed lane members;
+- `evidenceRefused` prevents a same-drain repeat while the durable row remains for a later drain;
+- successful retirement and partial narrowing are transactional;
+- launch reconciliation returns ordinary stale `inFlight` operations to `queued`; an attempted MOVE is
+  conservatively dropped rather than blindly replayed, and foreground sync restores server truth.
+
+Those fallbacks materially bound failures, but they do not establish the disposition. Actor serialization
+does: the hypothesized corruption cannot occur.
+
+### Shipped-release comparison
+
+`v1.6.38` and `v1.7.8` already have the same owning sequence: `actor AccountManager`, an actor-inheriting
+`Task { [self] in … }`, direct actor-property access inside that task, and actor-isolated
+`executeSingleOp`. The isolation guarantee is not a new repair at `v1.7.9`; the alleged race did not exist
+in those shipped releases either.
+
+### What `@unchecked Sendable` actually means here
+
+The annotation is required by the current shape because `capturedCtx` is captured by the `@Sendable`
+closure passed to `ProviderWorkQueue.execute`; removing it produces a Swift 6 sendable-capture error even
+though the closure only forwards the reference back to the actor. It is therefore misleading but not
+evidence of a current race: the annotation pays for the isolation crossing, while actor discipline makes
+the accesses safe.
+
+The type does not encode that discipline. This conclusion must be re-opened if a future change accesses a
+plain context field directly inside the provider-work closure, a `Task.detached`/task-group child, a GRDB
+closure, or any other nonisolated context. Such a change must restore the actor hop or protect the moved
+state with `Mutex` per resilience rule 5.
+
+`enteredInbox` keeps its existing `Mutex`. A nonisolated test seam reads it directly, and value-level
+protection is harmless future-proofing; its lock is not evidence that the actor-isolated sibling fields
+are racy.
+
+### Why there is no source fix or red-first fuzz test
+
+Adding locks would make a falsified premise appear confirmed, add overhead, and still not close the only
+real TOCTOU across the provider `await`. A race fuzz test cannot go red on the parent revision because its
+required precondition—two simultaneous field mutations—is prohibited by the actor executor. The honest
+guard is the existing Swift 6 isolation check: a detached version of the lane closure does not compile.
+
+### Retracted original report
+
+The 2026-08-13 record inferred physical concurrency from the facts that all lane tasks are created before
+any is awaited and that they share one `@unchecked Sendable` reference. It then escalated concurrent
+`Set.insert` to copy-on-write heap corruption and prescribed `Mutex` for every field. That inference
+omitted inherited actor isolation and is retracted. Task lifetime overlap is not executor overlap.
 
 ## Related
 
 - `IOS-QUEUE-001` — the lane key omitting the folder; same `buildLanes` neighbourhood, different defect.
 - `IOS-QUEUE-004` — a census in this same file's comments that was wrong and is recorded as corrected;
   the precedent for fixing documentation about the drain in place rather than silently.
-- `IOS-AI-004` — the ADR-IOS-008 decision-3 restoration whose new field prompted this discovery.
+- `IOS-AI-004` — the ADR-IOS-008 decision-3 restoration whose new field prompted the false-positive
+  report.
 - `IOS-PERF-012` — the other pre-existing defect found in the same pass.
