@@ -101,7 +101,7 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Current tracker census (2026-08-14): 14 `open` records.** The “Open 2” census above is the
+> **Current tracker census (2026-08-15): 13 `open` records.** The “Open 2” census above is the
 > hash-preserved 2026-08-09 snapshot, not the live post-freeze count. GitHub migration and release
 > triage must include the open rows in this amendment block plus the still-open base
 > `IOS-PUSH-001`; the base `IOS-CLEANUP-001` row is superseded by the resolved override below.
@@ -123,12 +123,11 @@ regenerated from it; their detail files live in
 |---|---|---|
 | [IOS-BILLING-002](Companion/Process/Current/KnownIssues/Amendments/ios-billing-002.md) | `open` | 🔓 OPEN (2026-08-12) — `cancelAccountDeletion` discards the response body, so the new four-valued `subscription_outcome` never reaches the UI and a user whose subscription lapsed irrecoverably during the grace window (`expired_during_grace`, unreactivatable in Stripe) sees the same silent success as one whose subscription was restored; `status` is `'restored'` in all four cases. Not yet reachable — the field is absent from the deployed worker. Old builds are safe: unknown keys are ignored and the body is discarded |
 
-### IMAP (2)
+### IMAP (1)
 
 | ID | Class | Executive statement |
 |---|---|---|
 | [IOS-IMAP-015](Companion/Process/Current/KnownIssues/Amendments/ios-imap-015.md) | `open` | 🔓 OPEN (2026-08-12) — a leaked SwiftNIO promise on SwiftMail's pipelined-FETCH path aborts the test process mid-run while the run still reports "passed" with zero failure markers; test-infrastructure only, since NIO gates the trap behind `debugOnly` and release builds compile it out. Fix deferred; remedy is upstream |
-| [IOS-IMAP-016](Companion/Process/Current/KnownIssues/Amendments/ios-imap-016.md) | `open` | 🔓 OPEN (2026-08-12) — SwiftMail's `rfc2047EncodedHeader()` guards on `!$0.isASCII` and **CR/LF ARE ASCII**, so `Email+Content.swift:84` emits a CRLF-bearing `Subject:` raw and the field ends mid-value; byte-for-byte the same inverted guard the app-side helper had, because `RFC2047.swift`'s doc comment says it is kept in step with it — the defect was copied with the helper (`MIS-019`×29). Also 5 sites interpolating a filename into `name=`/`filename=` unescaped. **Mitigated app-side** — `IMAPProvider.buildEmail` now pre-encodes via `RFC2047.encodeIfNotEmittableLiterally`, which composes as a no-op with SwiftMail's own encoder — but the library protects no other caller. Remedy is UPSTREAM at Cocoanetics, not the fork |
 
 ### COMPOSE (2)
 
@@ -200,16 +199,17 @@ regenerated from it; their detail files live in
 | [IOS-SEARCH-004](Companion/Process/Current/KnownIssues/Amendments/ios-search-004.md) | `open` | 🔓 OPEN (2026-08-12) — **latent, shape-confirmed, not reproduced.** `SearchIndex.scanByDateRange` has the same IN-list sorter shape as `IOS-PERF-009` but no `(folderId, dateMs)` composite, so the sorter is unavoidable. It is non-urgent because only the AI date-search tool reaches it; the per-keystroke search path does not. The index has been observed at mailbox scale, with exact owner-corpus counts omitted. It becomes urgent if the query gains a typing-path caller. Remedies are a per-folder rewrite or an idempotent SearchIndex-side composite index |
 | [IOS-SEARCH-005](Companion/Process/Current/KnownIssues/Amendments/ios-search-005.md) | `resolved` | ✅ **RESOLVED (2026-08-13, `374a8b3c1`)** — `SearchIndex.searchFTSOnly` generated an FTS5 `snippet()` for **every row every arm matched**, then discarded all but the rows surviving the final `LIMIT`. The 6-arm `UNION ALL` carries **no per-arm `ORDER BY`/`LIMIT`** — ordering and limiting happen once over the union — so `snippet()`, which reassembles and tokenises the matched column, ran across the entire match set while only `SearchConfig.searchDefaultLimit` rows were displayed. Split into two phases (select `fts.rowid` + `bm25`, order and limit, then snippet only the survivors): **1,145 ms → ~597 ms per keystroke, −48%**. ⚠️ **NOT the index-defeating sorter class** despite the shared audit: that class's remedy is a per-partition rewrite, which works only where an ordering index exists, and **FTS5 `MATCH` output has no date order** — measured per-folder 187 ms vs IN-list 191 ms, so the rewrite buys nothing here. The cost was the **auxiliary function**, not the plan. 🚨 **A defect in the FIRST version was caught pre-commit and its lesson is the reusable part:** it threw `SearchIndexError.snippetMissing` for the "impossible" surviving-row-without-snippet case, but the only per-keystroke consumer is `SearchView`'s `(try? await …keywordSearch(…)) ?? []` — so the throw would have **silently discarded the entire ranked result set**, turning a cosmetic single-row defect into a whole-result-set one. Rule-4 pincer: the argument for the throw was that both phases share one `dbPool.read` snapshot, making the case impossible ⇒ the throw is either dead code or actively harmful, and **neither branch justifies it**. **Before adding a `throw` to a fail-closed guard, grep the call chain for `try?` and `?? []`** — fail-closed is only fail-*safe* if someone is listening. ⚠️ **Same shape survives in `SearchIndex.searchFTSCandidates`** (hybrid/agent-chat path via `EmailSearchTool`, not per-keystroke) — left untouched by scope; start there when sweeping |
 
-## GitHub live trackers (2026-08-14)
+## GitHub live trackers (2026-08-15)
 
 Only records classified `open` were migrated. Accepted limitations, resolved records, and historical
 audit/provenance files remain documentation-only. The future app-owned ATS image loader is
 [issue #1](https://github.com/TabMail/tabmail-ios/issues/1). Open register mappings:
 
 - `IOS-AI-004` [#2](https://github.com/TabMail/tabmail-ios/issues/2); `IOS-AI-005` [#3](https://github.com/TabMail/tabmail-ios/issues/3); `IOS-BILLING-002` [#4](https://github.com/TabMail/tabmail-ios/issues/4); `IOS-CAL-010` [#5](https://github.com/TabMail/tabmail-ios/issues/5)
-- `IOS-COMPOSE-002` [#7](https://github.com/TabMail/tabmail-ios/issues/7); `IOS-COMPOSE-003` [#8](https://github.com/TabMail/tabmail-ios/issues/8); `IOS-IMAP-015` [#9](https://github.com/TabMail/tabmail-ios/issues/9); `IOS-IMAP-016` [#10](https://github.com/TabMail/tabmail-ios/issues/10)
+- `IOS-COMPOSE-002` [#7](https://github.com/TabMail/tabmail-ios/issues/7); `IOS-COMPOSE-003` [#8](https://github.com/TabMail/tabmail-ios/issues/8); `IOS-IMAP-015` [#9](https://github.com/TabMail/tabmail-ios/issues/9)
 - `IOS-PERF-009` [#12](https://github.com/TabMail/tabmail-ios/issues/12); `IOS-PERF-010` [#13](https://github.com/TabMail/tabmail-ios/issues/13); `IOS-PERF-012` [#15](https://github.com/TabMail/tabmail-ios/issues/15)
 - `IOS-PUSH-001` [#16](https://github.com/TabMail/tabmail-ios/issues/16); `IOS-SEARCH-004` [#18](https://github.com/TabMail/tabmail-ios/issues/18); `IOS-UI-005` [#20](https://github.com/TabMail/tabmail-ios/issues/20)
+- Retired mapping: `IOS-IMAP-016` [#10](https://github.com/TabMail/tabmail-ios/issues/10) — reclassified `closed-decision` on 2026-08-15 after SwiftMail 1.11.0 revalidation confirmed an upstream-only remedy and deviation-free fork. This is a repository decision, not a fix: two TabMail-reachable filename sites and two reachable content-type interpolations remain unsafe, the library still merits fixes for other callers, and `additionalHeaders` remains an unproven lead. Proven app-side residues stay open under #7/#8; current task scope authorizes neither a fork deviation nor an external Cocoanetics PR, so close on GitHub as not planned when this disposition is accepted
 - Retired mapping: `IOS-QUEUE-010` [#17](https://github.com/TabMail/tabmail-ios/issues/17) — reclassified `not-defect` on 2026-08-14 after the actor-isolation re-audit; close on GitHub when this correction is accepted
 - Retired mapping: `IOS-TEST-001` [#19](https://github.com/TabMail/tabmail-ios/issues/19) — repaired in tests on 2026-08-14; close on GitHub when the PR is accepted
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
