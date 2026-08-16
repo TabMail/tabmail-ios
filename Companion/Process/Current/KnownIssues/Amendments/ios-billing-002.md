@@ -4,19 +4,17 @@
 > amendment surface in `Scripts/compact_known_issues.rb`. It has no row in
 > `known-issues-pre-hierarchy-2026-08-09.txt` and is deliberately not regenerated from that archive.
 
-- Register classification: `open`
-- Disposition: 🛠 **FIX CANDIDATE (2026-08-15, `814fcd26e`)** — the client implementation and
-  invariant-level tests are committed on the issue branch. The record stays open until the primary
-  agent's serialized iOS queue validates the exact commit and an exact-diff Claude review is
-  obtained; the first review attempt was blocked by Claude Code's weekly quota.
+- Register classification: `resolved`
+- Disposition: ✅ **RESOLVED (2026-08-16)** — the owner approved the bounded client behavior after
+  the exact loss-only branch passed its authoritative red/green suite. The response remains
+  forward-compatible, and the client writes no billing or entitlement state.
 
 ## Status
 
-🛠 **FIX CANDIDATE — the current source contract reaches a shipped client that cannot distinguish a
-restored subscription from one permanently lost.** `POST /account/cancel-deletion` returns a
-four-valued `subscription_outcome`, but iOS through released `v1.7.9` decodes only `status`/`error`
-and discards the entire response body. A user whose subscription lapsed irrecoverably during the
-grace period therefore sees the same silent success as one whose subscription came back.
+✅ **RESOLVED — cancelling account deletion now distinguishes a restored subscription from one
+that permanently lapsed during the grace period.** `POST /account/cancel-deletion` returns a
+four-valued `subscription_outcome`; the client presents only exact `expired_during_grace` and routes
+the user to the existing plan picker. All other, missing, and future string outcomes remain silent.
 
 **Reachability boundary, re-verified 2026-08-15.** The earlier claim that the field existed only in
 unpushed worker commits is stale: current `tabmail-billing-worker` `origin/main` at `d0b9f12` returns
@@ -80,7 +78,7 @@ the body is discarded, **shipped builds cannot crash or misbehave when the new f
 worker change is backward-compatible and the iOS fix remains backward-compatible with a deployed
 worker that omits the optional field.
 
-## 2026-08-15 fix candidate and proof boundary
+## 2026-08-15 fix and proof boundary
 
 Commit `814fcd26e` adds the additive wire key as `String?`, then exposes one named predicate that is
 true only for the exact literal `expired_during_grace`. It deliberately does **not** use a raw-value
@@ -102,10 +100,10 @@ causal result and reuses the existing plan route.
 missing/null keys, and an additive future outcome. The tests explicitly cover the pure predicate
 consumed by `RootView`; they do not render SwiftUI or exercise the final alert/navigation hop.
 Static parsing and diff hygiene pass. Targeted SwiftLint adds no violation over the pre-existing
-file baseline. The primary agent still owns the serialized iOS proof: run the whole suite with the
-predicate inverted for red sensitivity, restore exact commit `814fcd26e`, then run the same suite
-green plus compile/build validation. Do not promote this record to `resolved` until that evidence
-and the exact-diff Claude review exist.
+file baseline. The authoritative inverse-predicate RED selected all five tests and failed 5/5 for
+the intended two-sided reasons; exact production commit `814fcd26e` then passed the same suite 5/5,
+with the predicate getter and all five test bodies fully covered. The owner approved the resulting
+alert and existing plan-picker route on 2026-08-16.
 
 **Attribution correction.** The old unpushed SHAs named here were backup-history references, not
 current `origin/main`. The current worker history containing the outcome is pushed: `14a76f8`

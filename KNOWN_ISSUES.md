@@ -101,7 +101,7 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Current tracker census (2026-08-16): 12 `open` records (11 amendment rows plus base
+> **Current tracker census (2026-08-16): 11 `open` records (10 amendment rows plus base
 > `IOS-PUSH-001`).** The “Open 2” census above is the
 > hash-preserved 2026-08-09 snapshot, not the live post-freeze count. GitHub migration and release
 > triage must include the open rows in this amendment block plus the still-open base
@@ -122,7 +122,7 @@ regenerated from it; their detail files live in
 
 | ID | Class | Executive statement |
 |---|---|---|
-| [IOS-BILLING-002](Companion/Process/Current/KnownIssues/Amendments/ios-billing-002.md) | `open` | 🛠 FIX CANDIDATE (2026-08-15, `814fcd26e`) — current worker `origin/main` returns the four-valued `subscription_outcome`, while released iOS through `v1.7.9` drops it. The candidate decodes the additive string and presents only exact `expired_during_grace` from stable RootView with the existing plan-picker route; no billing state is written. Static proof is green; serialized iOS red/green/build evidence and exact-diff Claude review remain required before resolution. Live authenticated handler behavior remains unverified per worker `BW-VERIFY-001` |
+| [IOS-BILLING-002](Companion/Process/Current/KnownIssues/Amendments/ios-billing-002.md) | `resolved` | ✅ **RESOLVED (2026-08-16, `814fcd26e`)** — cancelling account deletion now consumes the worker's additive `subscription_outcome`, presents only exact `expired_during_grace` from stable RootView, and reuses the existing plan-picker route. Missing, healthy, and future string outcomes remain silent; no billing or entitlement state is written. The authoritative inverse RED failed 5/5 and exact production GREEN passed 5/5 before owner approval. Live authenticated handler behavior remains unverified per worker `BW-VERIFY-001` |
 
 ### IMAP (2)
 
@@ -207,11 +207,12 @@ Only records classified `open` were migrated. Accepted limitations, resolved rec
 audit/provenance files remain documentation-only. The future app-owned ATS image loader is
 [issue #1](https://github.com/TabMail/tabmail-ios/issues/1). Open register mappings:
 
-- `IOS-AI-004` [#2](https://github.com/TabMail/tabmail-ios/issues/2); `IOS-AI-005` [#3](https://github.com/TabMail/tabmail-ios/issues/3); `IOS-BILLING-002` [#4](https://github.com/TabMail/tabmail-ios/issues/4)
+- `IOS-AI-004` [#2](https://github.com/TabMail/tabmail-ios/issues/2); `IOS-AI-005` [#3](https://github.com/TabMail/tabmail-ios/issues/3)
 - `IOS-COMPOSE-002` [#7](https://github.com/TabMail/tabmail-ios/issues/7); `IOS-COMPOSE-003` [#8](https://github.com/TabMail/tabmail-ios/issues/8); `IOS-IMAP-015` [#9](https://github.com/TabMail/tabmail-ios/issues/9); `IOS-IMAP-016` [#10](https://github.com/TabMail/tabmail-ios/issues/10)
 - `IOS-PERF-009` [#12](https://github.com/TabMail/tabmail-ios/issues/12); `IOS-PERF-010` [#13](https://github.com/TabMail/tabmail-ios/issues/13); `IOS-PERF-012` [#15](https://github.com/TabMail/tabmail-ios/issues/15)
 - `IOS-PUSH-001` [#16](https://github.com/TabMail/tabmail-ios/issues/16); `IOS-UI-005` [#20](https://github.com/TabMail/tabmail-ios/issues/20)
 - Retired mapping: `IOS-CAL-010` [#5](https://github.com/TabMail/tabmail-ios/issues/5) — resolved by the owner-approved PR #34; close on merge
+- Retired mapping: `IOS-BILLING-002` [#4](https://github.com/TabMail/tabmail-ios/issues/4) — resolved by the owner-approved PR #36; close on merge
 - Retired mapping: `IOS-SEARCH-004` [#18](https://github.com/TabMail/tabmail-ios/issues/18) — reclassified `not-defect` on 2026-08-15 after the exact caller census proved the filed multi-folder statement is never constructed; close on GitHub when this correction is accepted
 - Retired mapping: `IOS-QUEUE-010` [#17](https://github.com/TabMail/tabmail-ios/issues/17) — reclassified `not-defect` on 2026-08-14 after the actor-isolation re-audit; close on GitHub when this correction is accepted
 - Retired mapping: `IOS-TEST-001` [#19](https://github.com/TabMail/tabmail-ios/issues/19) — repaired in tests on 2026-08-14; close on GitHub when the PR is accepted
