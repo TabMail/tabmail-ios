@@ -1,14 +1,14 @@
 # IOS-CAL-010
 
-- Register classification: `open`
+- Register classification: `resolved`
 - New post-freeze record (2026-08-12) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
 ## Status
 
-🛠️ **FIX CANDIDATE (2026-08-16) — invariant RED/GREEN and a real iOS 26.5 system-import
-matrix are complete; fresh-context exact-diff review is clean; still OPEN in a draft PR pending
-final owner approval.** The owner lifted the prior "for now" deferral for this bounded gate. The candidate
+✅ **RESOLVED (2026-08-16) — invariant RED/GREEN and a real iOS 26.5 system-import
+matrix are complete; fresh-context exact-diff review is clean; the owner approved the exact
+reviewed PR #34 for merge.** The owner lifted the prior "for now" deferral for this bounded gate. The implementation
 fetches the attachment as before, uses
 `ICSBuilder.parseIncoming` to refuse exactly `REPLY`, `COUNTER`, `DECLINECOUNTER` and `REFRESH`,
 and puts a neutral explanation in `AttachmentListView`'s existing visible error surface instead
@@ -21,7 +21,7 @@ native add-to-calendar affordance for every surfaced `text/calendar` attachment,
 type alone and never consulting `METHOD`; the four response/control methods above therefore
 entered a flow that could neither apply them nor explain its no-op.
 
-## Candidate invariant and accepted residuals
+## Implemented invariant and accepted residuals
 
 - The denylist is exactly `REPLY`, `REFRESH`, `COUNTER`, `DECLINECOUNTER`; method values, the
   RFC-case-insensitive `METHOD` property name, and `BEGIN/END:VEVENT` boundaries are normalized
@@ -42,9 +42,9 @@ entered a flow that could neither apply them nor explain its no-op.
   higher-`SEQUENCE` `REQUEST` was recognized and offered Update Event, but accepting it left the
   stored original unchanged. The open listener
   port-conflict retry, sanitizer-scope item, provider-side invite-card lead, and filename-less
-  Gmail/Exchange row asymmetry are not closed by this candidate.
+  Gmail/Exchange row asymmetry are not closed by this implementation.
 
-## Candidate validation evidence
+## Validation evidence
 
 - **RED:** on the documented two-line re-break (policy always permits; tap presents
   unconditionally), binary diff SHA-256
@@ -77,9 +77,9 @@ entered a flow that could neither apply them nor explain its no-op.
   remaining gate.
 - Claude's exact-diff runner remains quota-blocked until 2026-08-18, so the owner-directed interim
   gate used a fresh-context subagent review of the refreshed exact diff. It found case-insensitive
-  `METHOD`-property and `VEVENT`-boundary bypasses; both were repaired, covered, and the final r3
-  exact-range review is clean. The draft PR and issue stay open until the owner approves the final
-  diff; do not merge this behavioral change automatically.
+  `METHOD`-property and `VEVENT`-boundary bypasses; both were repaired and covered. Fresh-context
+  review of the final concise notice (`No new event to add.`) and exact range is clean; the owner
+  then explicitly approved the behavioral PR for merge and closure of GitHub issue #5.
 
 ## Subsystem and search terms
 
