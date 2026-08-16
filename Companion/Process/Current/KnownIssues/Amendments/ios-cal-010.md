@@ -7,8 +7,8 @@
 ## Status
 
 🛠️ **FIX CANDIDATE (2026-08-16) — invariant RED/GREEN and a real iOS 26.5 system-import
-matrix are complete; still OPEN in a draft PR pending fresh-context exact-diff review and final
-owner approval.** The owner lifted the prior "for now" deferral for this bounded gate. The candidate
+matrix are complete; fresh-context exact-diff review is clean; still OPEN in a draft PR pending
+final owner approval.** The owner lifted the prior "for now" deferral for this bounded gate. The candidate
 fetches the attachment as before, uses
 `ICSBuilder.parseIncoming` to refuse exactly `REPLY`, `COUNTER`, `DECLINECOUNTER` and `REFRESH`,
 and puts a neutral explanation in `AttachmentListView`'s existing visible error surface instead
@@ -76,9 +76,10 @@ entered a flow that could neither apply them nor explain its no-op.
   occurrences). The owner judged this investigation conclusive; first-party Mail parity is not a
   remaining gate.
 - Claude's exact-diff runner remains quota-blocked until 2026-08-18, so the owner-directed interim
-  gate is a fresh-context subagent review of the refreshed exact diff. The draft PR and issue stay
-  open until that review is reconciled and the owner approves the final diff; do not merge this
-  behavioral change automatically.
+  gate used a fresh-context subagent review of the refreshed exact diff. It found case-insensitive
+  `METHOD`-property and `VEVENT`-boundary bypasses; both were repaired, covered, and the final r3
+  exact-range review is clean. The draft PR and issue stay open until the owner approves the final
+  diff; do not merge this behavioral change automatically.
 
 ## Subsystem and search terms
 
