@@ -68,7 +68,7 @@ entered a flow that could neither apply them nor explain its no-op.
   cancelled placeholder when accepted; `REPLY`, `REFRESH`, and isolated `COUNTER` produced no
   Calendar action and no event; `DECLINECOUNTER` incorrectly offered Add and created a normal
   standalone event when accepted. The last result is the strongest sensitivity witness for the
-  gate. Test build and every isolated probe exited 0; result bundles are under
+  gate. The test build and every evidence-bearing isolated probe exited 0; result bundles are under
   `/tmp/tabmail-issue5-system-probe-dd/Logs/Test/`. The temporary probes were removed, the branch
   was restored clean, and test events were removed through Calendar (zero active probe
   occurrences). The owner judged this investigation conclusive; first-party Mail parity is not a
