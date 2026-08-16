@@ -6,12 +6,13 @@
 
 ## Status
 
-🛠️ **FIX CANDIDATE (2026-08-15) — serialized invariant RED/GREEN complete; still OPEN pending
-exact-diff Claude review, promotion and merge.** The open-issue campaign lifted the prior "for now" deferral
-for this bounded gate. The candidate fetches the attachment as before, uses
+🛠️ **FIX CANDIDATE (2026-08-16) — invariant RED/GREEN and a real iOS 26.5 system-import
+matrix are complete; still OPEN in a draft PR pending fresh-context exact-diff review and final
+owner approval.** The owner lifted the prior "for now" deferral for this bounded gate. The candidate
+fetches the attachment as before, uses
 `ICSBuilder.parseIncoming` to refuse exactly `REPLY`, `COUNTER`, `DECLINECOUNTER` and `REFRESH`,
 and puts a neutral explanation in `AttachmentListView`'s existing visible error surface instead
-of dispatching those payloads into the add-only system import flow. It adds no provider parsing,
+of dispatching those payloads into the partial system import flow. It adds no provider parsing,
 fallback, listener behavior, sanitizer behavior, or SwiftMail-fork deviation.
 
 **Prior disposition, preserved:** on 2026-08-12 the owner characterised the result as a UX problem
@@ -26,15 +27,19 @@ entered a flow that could neither apply them nor explain its no-op.
   normalized by the already-existing parser.
 - `REQUEST`, missing `METHOD`, `PUBLISH`, `ADD`, `CANCEL`, unknown values, non-UTF-8 data, empty
   input and a calendar with no `VEVENT` fail open to the existing importer. Removing a legitimate
-  import is the expensive failure direction; an uncertain allow retains today's recoverable no-op.
+  import is the expensive failure direction; an uncertain allow leaves the decision to Calendar.
+  `CANCEL` is deliberately allowed: a matching UID produces Update/Remove choices and stores a
+  cancelled event, while an unknown UID offers a user-mediated cancelled placeholder.
 - `METHOD` after the first `END:VEVENT` remains allowed because `parseIncoming` stops at the first
   event and defaults to `REQUEST`. Changing that shared display parser for an unobserved ordering
   is outside this issue; the policy test pins the residual explicitly.
 - A future production caller that invokes `presentCalendarImport` directly could bypass this tap
   gate. The importer header now tells mail-attachment callers to consult the policy first; the
   current census still finds one production attachment caller.
-- `IOS-CAL-011` remains accepted and unchanged. In particular, whether a genuine
-  `METHOD=REQUEST` update modifies an existing UID is still untested. The open listener
+- `IOS-CAL-011` remains accepted but its platform description is corrected by the 2026-08-16
+  matrix: the system importer is partial, not uniformly add-only. A genuine same-UID,
+  higher-`SEQUENCE` `REQUEST` was recognized and offered Update Event, but accepting it left the
+  stored original unchanged. The open listener
   port-conflict retry, sanitizer-scope item, provider-side invite-card lead, and filename-less
   Gmail/Exchange row asymmetry are not closed by this candidate.
 
@@ -49,12 +54,29 @@ entered a flow that could neither apply them nor explain its no-op.
 - **GREEN:** exact code/test commit `9226608a0f80160d24fc64b31dffcade1d390992` exited 0 with
   `TEST SUCCEEDED`: the same 5 tests all passed, with no failure, skip, or expected failure.
   Artifact: `/private/tmp/tabmail-campaign-results/issue5-green-authoritative.xcresult`.
+- **REFRESHED GREEN:** after rebasing onto current `main` and correcting the platform record, the
+  exact five-test suite rebuilt successfully and passed 5/5 again. Artifact:
+  `/private/tmp/tabmail-campaign-results/issue5-final-green-20260816.xcresult`.
 - Coverage reports `ICSCalendarImporter.allowsAddToCalendar(_:)` at 100% (12/12). The
   `AttachmentListView` branch is deliberately pinned by the non-vacuous source-structural test;
   the focused suite does not pretend to drive its UIKit/network attachment tap at runtime.
-- The mandatory exact-diff Claude review remains externally blocked by the account's weekly quota
-  until 2026-08-18 13:00 America/Vancouver. The draft PR and GitHub issue stay open until that gate
-  is completed and reconciled.
+- **Real system-import matrix (iOS 26.5 simulator, 2026-08-16):** temporary probes drove the exact
+  production `ICSCalendarImporter` loopback-listener + hidden-`SFSafariViewController` handoff, and
+  Calendar storage was checked after each action. A new `REQUEST` added one event; a same-UID,
+  higher-sequence `REQUEST` offered Update Event but left the original unchanged; matching `CANCEL`
+  offered Update/Remove and stored cancelled status; unknown `CANCEL` offered Add and created a
+  cancelled placeholder when accepted; `REPLY`, `REFRESH`, and isolated `COUNTER` produced no
+  Calendar action and no event; `DECLINECOUNTER` incorrectly offered Add and created a normal
+  standalone event when accepted. The last result is the strongest sensitivity witness for the
+  gate. Test build and every isolated probe exited 0; result bundles are under
+  `/tmp/tabmail-issue5-system-probe-dd/Logs/Test/`. The temporary probes were removed, the branch
+  was restored clean, and test events were removed through Calendar (zero active probe
+  occurrences). The owner judged this investigation conclusive; first-party Mail parity is not a
+  remaining gate.
+- Claude's exact-diff runner remains quota-blocked until 2026-08-18, so the owner-directed interim
+  gate is a fresh-context subagent review of the refreshed exact diff. The draft PR and issue stay
+  open until that review is reconciled and the owner approves the final diff; do not merge this
+  behavioral change automatically.
 
 ## Subsystem and search terms
 
@@ -72,8 +94,10 @@ entered a flow that could neither apply them nor explain its no-op.
 **The defect.** The `text/calendar` branch of the attachment button in `AttachmentListView.body`
 tests only `attachment.contentType.lowercased().contains("text/calendar")` before dispatching to
 `AttachmentListView.downloadAndImportICS`. Nothing on that path reads the iTIP `METHOD`. Since the
-system import path is add-only (`IOS-CAL-011`), the affordance is offered for four iTIP methods it
-can never satisfy, and the user's tap produces no event, no message and no log line.
+system import path implements only part of iTIP (`IOS-CAL-011`), the affordance is offered for four
+methods it cannot safely satisfy: `REPLY`, `REFRESH`, and `COUNTER` silently no-op, while
+`DECLINECOUNTER` is misread as a new event and offered for addition. The user receives no TabMail
+explanation in either direction.
 
 ## Known-good fix direction — recorded so a future session does not re-derive it
 
@@ -206,7 +230,10 @@ No test: `Server` is a private class driving a real `NWListener` and `SFSafariVi
 `beginPresentation`, with no seam a unit test can reach, and extracting one is the restructuring
 this fix was scoped to avoid.
 
-## Explicitly UNANSWERED
+## Genuine REQUEST update — answered 2026-08-16
 
-Whether a genuine `METHOD=REQUEST` update works was **never tested** — see `IOS-CAL-011`. Nothing
-in this record should be read as having exercised the update case.
+The simulator matrix seeded a new `REQUEST`, then presented the same UID with higher `SEQUENCE` and
+changed summary. Calendar recognized the relationship and offered **Update Event**, proving UID
+correlation reached the system UI; after accepting, the stored row retained the original summary
+and did not take the new sequence. The path therefore recognizes but does not apply this update in
+the measured iOS 26.5 environment. `IOS-CAL-011` carries the platform disposition and scope.

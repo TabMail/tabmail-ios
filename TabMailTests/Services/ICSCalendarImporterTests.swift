@@ -23,7 +23,7 @@ struct ICSCalendarImporterAddPolicyTests {
         )
     }
 
-    @Test("Response and control methods cannot enter the add-only Calendar flow")
+    @Test("Response and control methods cannot enter the unsafe system Calendar flow")
     func refusesNonAddITIPMethods() {
         for method in ["REPLY", "REFRESH", "COUNTER", "DECLINECOUNTER", "reply"] {
             let data = calendar(method: method)

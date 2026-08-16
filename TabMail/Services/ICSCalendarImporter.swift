@@ -313,10 +313,10 @@ enum ICSCalendarImporter {
 
     // MARK: - Public API
 
-    /// Whether the add-only system Calendar import flow can apply this payload.
-    /// Unknown or unreadable payloads retain the existing import behavior: a
-    /// false refusal removes the user's only import path, while allowing one
-    /// retains today's recoverable no-op.
+    /// Whether the system Calendar import UI should receive this payload.
+    /// Unknown or unreadable payloads retain the existing user-mediated handoff:
+    /// refusing one removes the user's only system import path, while allowing it
+    /// leaves the decision to Calendar.
     static func allowsAddToCalendar(_ icsData: Data) -> Bool {
         guard let icsText = String(data: icsData, encoding: .utf8),
               let method = ICSBuilder.parseIncoming(icsText)?.method else {
