@@ -9,8 +9,8 @@ import Foundation
 @Suite("ICSCalendarImporter Add-to-Calendar policy")
 struct ICSCalendarImporterAddPolicyTests {
 
-    private func calendar(method: String?) -> Data {
-        let methodLine = method.map { "METHOD:\($0)\n" } ?? ""
+    private func calendar(method: String?, methodPropertyName: String = "METHOD") -> Data {
+        let methodLine = method.map { "\(methodPropertyName):\($0)\n" } ?? ""
         return Data(
             """
             BEGIN:VCALENDAR
@@ -31,6 +31,22 @@ struct ICSCalendarImporterAddPolicyTests {
             let parsed = ICSBuilder.parseIncoming(String(decoding: data, as: UTF8.self))
             #expect(parsed?.method == expected, "fixture must exercise METHOD:\(method)")
             #expect(!ICSCalendarImporter.allowsAddToCalendar(data), "METHOD:\(method)")
+        }
+
+        for propertyName in ["method", "MeThOd"] {
+            let data = calendar(
+                method: "DECLINECOUNTER",
+                methodPropertyName: propertyName
+            )
+            let parsed = ICSBuilder.parseIncoming(String(decoding: data, as: UTF8.self))
+            #expect(
+                parsed?.method == "DECLINECOUNTER",
+                "fixture must exercise \(propertyName):DECLINECOUNTER"
+            )
+            #expect(
+                !ICSCalendarImporter.allowsAddToCalendar(data),
+                "\(propertyName):DECLINECOUNTER"
+            )
         }
     }
 
