@@ -204,7 +204,7 @@ struct AttachmentListView: View {
                 if ICSCalendarImporter.allowsAddToCalendar(data) {
                     ICSCalendarImporter.presentCalendarImport(icsData: data)
                 } else {
-                    self.error = "This is a scheduling message, so there’s no new event to add."
+                    self.error = "No new event to add."
                 }
             } catch {
                 self.error = SyncEngine.isConnectionError(error) ? "Download failed. Check your connection and try again." : "Download failed: \(error.localizedDescription)"

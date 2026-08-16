@@ -139,7 +139,7 @@ struct ICSCalendarImporterAddPolicyTests {
             codeLines[$0].contains("ICSCalendarImporter.presentCalendarImport(")
         }
         let refusalNoticeSites = codeLines.indices.filter {
-            codeLines[$0].contains("scheduling message, so there’s no new event to add")
+            codeLines[$0].contains("No new event to add")
         }
 
         #expect(policySites.count == 1, "the tap found \(policySites.count) policy calls")
