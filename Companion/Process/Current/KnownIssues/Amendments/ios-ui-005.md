@@ -1,16 +1,15 @@
 # IOS-UI-005
 
-- Register classification: `accepted`
+- Register classification: `open`
 - New post-freeze record (2026-08-13) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
 ## Status
 
-📋 **ACCEPTED LIMITATION (2026-08-15) — mechanism remains reachable; a marker-provenance change is
-not justified at NEAR-NIL impact.** The `tm-*` class namespace is **not reserved** against
+🔓 **OPEN — NARROWED FIX CANDIDATE (2026-08-15).** The `tm-*` class namespace is **not reserved** against
 sender-authored markup, so a sender's `class="tm-eml-section"` remains indistinguishable from an app
 marker to app CSS and to `EmailFilter.parseEmlSectionMetadata`. The only app decision found outside
-that accepted cosmetic boundary — `hiddenByViewMode` choosing its app stylesheet branch from
+that low-impact cosmetic boundary — `hiddenByViewMode` choosing its app stylesheet branch from
 sender-writeable `document.body.classList` — is independently hardened to take the view mode from
 Swift's app-owned `previewFilename` instead.
 
@@ -18,7 +17,7 @@ Swift's app-owned `previewFilename` instead.
 framed as "attacker-chosen From/Subject/Date in native SwiftUI chrome", which sounds severe and is
 misleading. See *Why the severity is near-nil* — that reasoning is the durable part.
 
-## 2026-08-15 current-main revalidation and disposition
+## 2026-08-15 current-main revalidation and narrowed candidate
 
 - Reproduced structurally at `origin/main` `98dde448b8587c9a47828a8aaaf64ff5e747cdc6` on the IMAP,
   Gmail and Exchange assembly paths described below. The owning marker/parser files are byte-identical
@@ -39,7 +38,7 @@ misleading. See *Why the severity is near-nil* — that reasoning is the durable
   `previewFilename != nil` decision from Swift. The two-sided test models a forged body class while
   the app remains in main mode and verifies that the forged class cannot change which image groups
   are fetched or withheld.
-- The remaining marker collision is accepted with its precise boundary: sender-controlled native
+- The remaining marker collision stays open with its precise boundary: sender-controlled native
   preview header/body disagreement, reply/forward quote mismatch, and diagnostic/withhold
   observability. Both competing envelopes are sender-authored, and none escapes into attachment
   routing or account state.
@@ -146,7 +145,7 @@ provider fetch.
 A real provenance boundary would carry the parsed nested envelope and section association out-of-band
 in an app-owned typed record (the existing optional `AttachmentInfo` sidecar is the natural migration
 surface), then render and preview from that record rather than reparsing an HTML marker. That is a
-storage/schema change with provider parity and migration work. The accepted cosmetic residual does not
+storage/schema change with provider parity and migration work. The currently measured cosmetic residual does not
 justify it today; revisit only if a marker begins driving a non-cosmetic decision or trusted provider
 metadata becomes materially different from the attached sender-authored bytes.
 
@@ -155,7 +154,7 @@ metadata becomes materially different from the attached sender-authored bytes.
 - `IOS-UI-004` — the render dead zone; its "Attribution class" section states the dead zone is *"not
   reachable by a sender's choice in any useful direction"*, which **this record falsifies** for the
   `tm-eml-section` route (a sender-authored section hides an image, so the census never settles). The
-  trusted Swift view-mode gate closes only the sibling body-class route; this accepted marker route
+  trusted Swift view-mode gate closes only the sibling body-class route; this open marker route
   remains.
 - `IOS-PRIVACY-002` — the render-family privacy record.
 - ADR-IOS-076 — the render pipeline decisions, including the per-load nonce this record's fix sketch borrows.
