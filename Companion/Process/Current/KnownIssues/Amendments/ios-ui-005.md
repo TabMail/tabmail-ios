@@ -157,4 +157,5 @@ metadata becomes materially different from the attached sender-authored bytes.
   trusted Swift view-mode gate closes only the sibling body-class route; this open marker route
   remains.
 - `IOS-PRIVACY-002` — the render-family privacy record.
-- ADR-IOS-076 — the render pipeline decisions, including the per-load nonce this record's fix sketch borrows.
+- ADR-IOS-076 — the adjacent render-pipeline and app-owned view-mode decisions; its per-load nonce
+  does not establish provenance for markers already persisted in sender-influenced HTML.
