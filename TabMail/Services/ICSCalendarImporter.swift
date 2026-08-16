@@ -18,6 +18,8 @@ import UIKit
 ///
 /// Dismissal is handled externally: re-tapping the ICS attachment tears down and re-presents,
 /// and navigating away from the message calls `dismiss()`.
+/// Mail-attachment callers must consult `allowsAddToCalendar(_:)` first; this type deliberately
+/// keeps the OS presentation mechanism separate from that user-facing policy decision.
 enum ICSCalendarImporter {
 
     // MARK: - Local HTTP Server
@@ -310,6 +312,23 @@ enum ICSCalendarImporter {
     }
 
     // MARK: - Public API
+
+    /// Whether the system Calendar import UI should receive this payload.
+    /// Unknown or unreadable payloads retain the existing user-mediated handoff:
+    /// refusing one removes the user's only system import path, while allowing it
+    /// leaves the decision to Calendar.
+    static func allowsAddToCalendar(_ icsData: Data) -> Bool {
+        guard let icsText = String(data: icsData, encoding: .utf8),
+              let method = ICSBuilder.parseIncoming(icsText)?.method else {
+            return true
+        }
+        switch method {
+        case "REPLY", "REFRESH", "COUNTER", "DECLINECOUNTER":
+            return false
+        default:
+            return true
+        }
+    }
 
     @MainActor
     static func presentCalendarImport(icsData: Data) {

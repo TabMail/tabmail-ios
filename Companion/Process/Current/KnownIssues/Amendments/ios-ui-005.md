@@ -6,14 +6,42 @@
 
 ## Status
 
-🔓 **OPEN (2026-08-13) — mechanism CONFIRMED on all three providers; impact deliberately assessed as
-NEAR-NIL and registered rather than fixed.** The `tm-*` class namespace is **not reserved** against
-sender-authored markup, so a sender's `class="tm-eml-section"` is indistinguishable from an app marker
-to app CSS, to `hiddenByViewMode`, and to `EmailFilter.parseEmlSectionMetadata`.
+🔓 **OPEN — NARROWED FIX CANDIDATE (2026-08-15).** The `tm-*` class namespace is **not reserved** against
+sender-authored markup, so a sender's `class="tm-eml-section"` remains indistinguishable from an app
+marker to app CSS and to `EmailFilter.parseEmlSectionMetadata`. The only app decision found outside
+that low-impact cosmetic boundary — `hiddenByViewMode` choosing its app stylesheet branch from
+sender-writeable `document.body.classList` — is independently hardened to take the view mode from
+Swift's app-owned `previewFilename` instead.
 
 ⚠️ **This record exists as much to stop the finding being RE-ESCALATED as to track it.** It was first
 framed as "attacker-chosen From/Subject/Date in native SwiftUI chrome", which sounds severe and is
 misleading. See *Why the severity is near-nil* — that reasoning is the durable part.
+
+## 2026-08-15 current-main revalidation and narrowed candidate
+
+- Reproduced structurally at `origin/main` `98dde448b8587c9a47828a8aaaf64ff5e747cdc6` on the IMAP,
+  Gmail and Exchange assembly paths described below. The owning marker/parser files are byte-identical
+  to shipped iOS `v1.7.9` (`EmlMarker.swift` and `EmailFilter.swift`), and the relevant render/wrapper
+  paths have no `v1.7.9..origin/main` change. This is a current shipped-app limitation, not history.
+- Re-ran the consumer census: `EmlSectionMetadata.partSection` still has no production read, while
+  nested attachment fetch and filtering still use typed `AttachmentInfo.section` and
+  `parentEmlSection`. No fetch, message identity, mutation, or wrong-message decision trusts marker
+  text.
+- Audited the apparent fallback before proposing machinery. The `tm_*` action-tag namespace is a
+  separate local-only system under ADR-IOS-036: all provider `setActionTag` implementations are
+  no-ops, and legacy server residue is only stripped best-effort during inbox-exit moves. Likewise,
+  `UserLabelStore`'s `tm_` exclusion reserves action-tag labels; it neither authenticates nor migrates
+  `tm-*` HTML classes. There is no dormant provenance fallback to enable.
+- A broader `tm-*` census found one distinct invariant worth fixing: deferred-image policy inferred
+  preview mode from `body.tm-preview-mode`, although sender HTML can contribute a second `<body>` and
+  therefore donate that class to the parsed body. `deferredImageLoadJS` now receives the app-owned
+  `previewFilename != nil` decision from Swift. The two-sided test models a forged body class while
+  the app remains in main mode and verifies that the forged class cannot change which image groups
+  are fetched or withheld.
+- The remaining marker collision stays open with its precise boundary: sender-controlled native
+  preview header/body disagreement, reply/forward quote mismatch, and diagnostic/withhold
+  observability. Both competing envelopes are sender-authored, and none escapes into attachment
+  routing or account state.
 
 ## Subsystem and search terms
 
@@ -40,7 +68,7 @@ The only place author `class` is touched at all is `EmailHTMLWrapper.unwrapFullH
 - **Exchange** — `ExchangeProvider.fetchMessage`: `htmlBody` starts as the raw Graph body, then
   `htmlBody = (htmlBody ?? "") + markerHtml` at both marker sites.
 
-**No sanitization between generation and storage.** `BodyRenderer.render` only appends the ICS block,
+**No marker-provenance boundary between generation and storage.** `BodyRenderer.render` only appends the ICS block,
 substitutes `cid:` refs and picks `displayHtml`; `MessageBody.create` stores the string unchanged; the
 NSE path (`NSEDataBridge.toBodySnapshot` → `toMessageBody`) uses the same `BodyRenderer` output.
 
@@ -106,19 +134,28 @@ therefore make what the user **quotes** differ from what the user **saw**.
   (`IMAPProviderEmlRenderTests.parseEmlSectionMetadataMultiple`, `EmlMarkerTests`) exercise only
   app-generated markers.
 
-## If it is ever fixed
+## If future evidence raises the impact
 
 The fix is **not** to sanitize author `class` attributes — that is a behaviour change to sender content
-and the owner's standing ruling is security-only, no behaviour changes. The right shape is to make the
-app's markers **distinguishable from sender markup by construction** (a per-load nonce in the marker
-attribute, mirroring the render pipeline's existing per-load nonce base URL), so `parseEmlSectionMetadata`
-can require provenance rather than position.
+and the owner's standing ruling is security-only, no behaviour changes. It is also **not** a static
+rename, or a nonce written into and then trusted from the same stored HTML: both are still
+sender-declarable, and a render-time nonce arrives too late for markers already emitted and persisted by
+provider fetch.
+
+A real provenance boundary would carry the parsed nested envelope and section association out-of-band
+in an app-owned typed record (the existing optional `AttachmentInfo` sidecar is the natural migration
+surface), then render and preview from that record rather than reparsing an HTML marker. That is a
+storage/schema change with provider parity and migration work. The currently measured cosmetic residual does not
+justify it today; revisit only if a marker begins driving a non-cosmetic decision or trusted provider
+metadata becomes materially different from the attached sender-authored bytes.
 
 ## Related
 
 - `IOS-UI-004` — the render dead zone; its "Attribution class" section states the dead zone is *"not
   reachable by a sender's choice in any useful direction"*, which **this record falsifies** for the
-  `tm-eml-section` route (a sender-authored section hides an image, so the census never settles). That
-  route is **not** closed by gating the `tm-eml-headers` arm.
+  `tm-eml-section` route (a sender-authored section hides an image, so the census never settles). The
+  trusted Swift view-mode gate closes only the sibling body-class route; this open marker route
+  remains.
 - `IOS-PRIVACY-002` — the render-family privacy record.
-- ADR-IOS-076 — the render pipeline decisions, including the per-load nonce this record's fix sketch borrows.
+- ADR-IOS-076 — the adjacent render-pipeline and app-owned view-mode decisions; its per-load nonce
+  does not establish provenance for markers already persisted in sender-influenced HTML.

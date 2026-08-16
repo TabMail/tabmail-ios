@@ -245,8 +245,11 @@ enum ICSBuilder {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty { continue }
 
-            if trimmed == "BEGIN:VEVENT" { inEvent = true; continue }
-            if trimmed == "END:VEVENT" { break }
+            if trimmed.caseInsensitiveCompare("BEGIN:VEVENT") == .orderedSame {
+                inEvent = true
+                continue
+            }
+            if trimmed.caseInsensitiveCompare("END:VEVENT") == .orderedSame { break }
 
             // Skip nested components inside VEVENT (e.g., VALARM).
             // Their properties (like DESCRIPTION:REMINDER) must not overwrite event-level ones.
@@ -258,7 +261,11 @@ enum ICSBuilder {
 
             // Calendar-level properties
             if !inEvent {
-                if let val = extractValue(trimmed, property: "METHOD") {
+                if let val = extractValue(
+                    trimmed,
+                    property: "METHOD",
+                    caseInsensitivePropertyName: true
+                ) {
                     method = val.uppercased()
                 }
                 continue
@@ -408,8 +415,16 @@ enum ICSBuilder {
 
     /// Extract the value for a simple property (e.g., "SUMMARY:Meeting" → "Meeting").
     /// Handles properties with parameters (e.g., "SUMMARY;LANGUAGE=en:Meeting" → "Meeting").
-    private static func extractValue(_ line: String, property: String) -> String? {
-        guard line.hasPrefix(property) else { return nil }
+    private static func extractValue(
+        _ line: String,
+        property: String,
+        caseInsensitivePropertyName: Bool = false
+    ) -> String? {
+        let propertyPrefix = line.prefix(property.count)
+        let propertyMatches = caseInsensitivePropertyName
+            ? String(propertyPrefix).caseInsensitiveCompare(property) == .orderedSame
+            : String(propertyPrefix) == property
+        guard propertyMatches else { return nil }
         let after = line.dropFirst(property.count)
         if after.hasPrefix(":") {
             return String(after.dropFirst())

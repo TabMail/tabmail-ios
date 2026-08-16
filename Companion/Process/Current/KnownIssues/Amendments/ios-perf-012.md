@@ -160,8 +160,10 @@ tree, so filing there would bury the row.
 
 - **ADR-IOS-029** and its 2026-08-05 amendment — owns the statistics latch and the
   migrations-should-only-be-blocking directive this interacts with.
-- `IOS-PERF-009`, `IOS-SEARCH-004` — sorter-shape rows whose *observed plan* is governed by this latch;
-  both carry a pointer back here for exactly that reason.
+- `IOS-PERF-009`, `IOS-SEARCH-004` — sorter-shape rows that still require both statistics regimes in
+  any plan-touching measurement. ⚠️ **CORRECTED 2026-08-15:** both rows measured the same plan under
+  stale and fresh statistics, so their observed plans are **not** governed by this latch; they point
+  here for the general false-green trap, not because statistics decided their result.
 - `IOS-AI-004` — the ADR-IOS-008 decision-3 restoration that is this row's lowest-frequency consumer, and
   the work during which the row was found.
 - `IOS-QUEUE-010` — the same-pass report later retracted as a false positive after actor-isolation

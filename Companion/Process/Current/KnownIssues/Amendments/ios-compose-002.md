@@ -1,4 +1,4 @@
-# IOS-COMPOSE-002 — attachment `filename` and `mimeType` are interpolated into MIME parameters without quoting
+# IOS-COMPOSE-002 — attachment `filename` and `mimeType` are interpolated into MIME headers without encoding or validation
 
 **Class:** `open` · **Opened:** 2026-08-12 · **Attribution:** pre-existing
 **Deferred deliberately** — see *Why this is deferred* below. The higher-severity member of the same
@@ -6,7 +6,7 @@ class was fixed the same day (sender-authored CRLF in an outbound `Subject:`); t
 
 ## What is wrong
 
-`GmailProvider.buildMIMEMessage` builds three header lines by interpolation:
+`GmailProvider.buildMIMEMessage` contains three header-line interpolations:
 
 ```swift
 partHeader += "Content-Type: \(alt.mimeType)\r\n"
@@ -14,27 +14,50 @@ partHeader += "Content-Type: \(attachment.mimeType); name=\"\(attachment.filenam
 partHeader += "Content-Disposition: attachment; filename=\"\(attachment.filename)\"\r\n"
 ```
 
-- **`filename` lands in a quoted-string unescaped.** `"` is a legal filename scalar and
-  `AttachmentFilename.isSafeFileComponent` deliberately accepts it, so `a"; boundary="X.pdf` closes
-  the quoted-string early and appends an attacker-chosen parameter. RFC 2045 quoting (escape `\` and
-  `"`) or RFC 2231 encoding is the fix; **stripping is not** — the filename is user-visible data.
-- **`mimeType` has no validation at all.** On a forward it is the incoming part's Content-Type
-  (`ComposeView.carryForwardAttachments` → `att.contentType`).
+- **`filename` lands in a quoted-string unescaped.** `"` and `\` are legal filename scalars and
+  `AttachmentFilename.isSafeFileComponent` deliberately accepts both. `a"; boundary="X.pdf` closes
+  the quoted-string early and appends another parameter; a benign `report\final.pdf` is interpreted as
+  a quoted-pair by conforming parsers and can display as `reportfinal.pdf`. RFC 2231 encoding is the
+  full fix; **stripping is not** — the filename is user-visible data.
+- **The regular attachment's `mimeType` has no outbound validation.** On a forward,
+  `ComposeView.carryForwardAttachments` copies `AttachmentInfo.contentType` unchanged into the
+  `DraftAttachment`; the From picker can then send it through Gmail even when another provider parsed
+  it. This proves structural propagation, **not** that arbitrary original Content-Type header bytes
+  survive every provider parser: SwiftMail/NIO reconstructs IMAP type/subtype plus at most `charset`,
+  Gmail exposes a separate parsed `MessagePart.mimeType`, Graph supplies a `contentType`, and local
+  sources use UTType or fixed defaults.
+- **The `alt.mimeType` interpolation is model/persisted-state capability, not a current UI/forward
+  route.** No production constructor in current, v1.7.9, or v1.7.8 sets
+  `DraftAttachment.isAlternative = true`; ordinary attachments therefore take the regular branch.
 - **Non-ASCII filenames go out as raw UTF-8 inside a quoted-string**, which is non-conformant; RFC
   2231 (`filename*=UTF-8''…`) is the conformant carrier. Cosmetic beside the above, same fix.
 
 The same shape exists **library-side** on the IMAP/SMTP path, so it is not confined to our code:
-`EMLSerializer.swift:137,148` and `Email+Content.swift:195,199,298` in SwiftMail interpolate
-`filename` into the same two parameters with no escaping (see `IOS-IMAP-016`).
+SwiftMail has six raw filename interpolations across `EMLSerializer.serializePartHeaders`,
+`Email.writeMultipartMixed`, and `Email.writeHTMLWithInlineAttachments`. Only the two
+`Email.writeMultipartMixed` filename sites are reachable from TabMail today. SwiftMail has four raw
+content-type interpolations in total; its regular-attachment and calendar-alternative sites are the two
+TabMail-reachable members. The related upstream evidence remains tracked separately in the
+still-open `IOS-IMAP-016` record.
 
 ## Blast radius, and what it can NOT do
 
-Confined to **one MIME part's parameter list**. A control character is required to end a header field
-and start a new one, and controls in a filename are refused by `AttachmentFilename.isSafeFileComponent`
-(`c35cfdca2`, `ADR-IOS-077`) — which the finding session flagged as an **incidental** closure, not a
-designed guard: it holds only while that predicate keeps refusing controls. So this issue cannot forge a
-header, cannot add a recipient, and cannot escape the part. It can confuse a receiving client's
-parameter parsing for one attachment.
+The proven filename consequence is confined to **one MIME part's parameter list**. A control character
+is required to end a header field and start a new one, and controls in a filename are refused by
+`AttachmentFilename.isSafeFileComponent` (`c35cfdca2`, `ADR-IOS-077`) — which the finding session
+flagged as an **incidental** closure, not a designed guard: it holds only while that predicate keeps
+refusing controls. So the proven filename route cannot forge a header, add a recipient, or escape the
+part; it can confuse a receiving client's parameter parsing for one attachment. The regular `mimeType`
+path is structurally reachable and lacks an outbound validator, but no audit has shown an arbitrary
+control-bearing original header surviving the provider parsers above; do not upgrade that leg to
+header injection without tracing such a value.
+
+**Persisted-draft `mimeType` lead, not a finding.** `DraftAttachmentStorage.loadAttachments` uses
+Swift `String.split(separator: "\n")`; because CRLF is one extended grapheme cluster, a CRLF can remain
+inside the first `mimeType` element. The outbox loader instead uses
+`components(separatedBy: "\n")` and truncates at LF. No production attachment/provider source was
+shown to write a control-bearing MIME type into that sidecar, so this is a provenance lead for the
+future boundary audit, not a demonstrated header-injection route.
 
 ⚠️ **CORRECTED 2026-08-12 — this paragraph said "refused at attach time", which was wrong twice and
 wrong in the direction that makes a defence sound broader than it is.** Raised by
@@ -83,18 +106,25 @@ This one is **not minimal** and its risk **is** ignorable for now:
   product's outbound mail, not a contained predicate edit.
 - It touches the Gmail builder **and** the IMAP `Attachment` boundary, and the library half needs an
   upstream PR — three surfaces, one of them not ours.
-- No header can be forged through it (above).
+- The proven filename route cannot forge a header (above); no control-bearing `mimeType` value has
+  been traced through a provider parser.
 
 ## Reachability
 
-Requires the user to **forward** a message carrying a crafted attachment filename, on a **Gmail**
-account for the app-side sites, or any IMAP/SMTP account for the library-side ones. No hostile server
-needed for the quote — `"` survives every predicate on the path by design.
+No hostile sender is required. The Files importer constructs a `DraftAttachment` with
+`url.lastPathComponent`; APFS permits `"` and `\`, and the predicate accepts both. Forwarding a
+sender-named attachment is a second route. Gmail reaches `buildMIMEMessage` through both outbox send
+and saved-draft upload (`DraftStore` → `DraftAttachmentStorage.loadAttachments` → provider
+`saveDraft` → `buildUrlSafeBase64`/`buildMIMEMessage`); IMAP/SMTP reaches the library sites through
+the shared `IMAPProvider.buildEmail` boundary. Regular attachment `mimeType` propagation is also
+current-reachable; Gmail's alternative branch is only legacy/model-state capable.
 
 ## When revisited
 
-1. One parameter encoder, used at every site: RFC 2231 when the value is non-ASCII or contains
-   specials/controls, otherwise a quoted-string with `\`-escaped `\` and `"`.
+1. One parameter encoder, used at every site. RFC 2231 `filename*=` alone is a complete carrier for
+   special/non-ASCII values. Do not add a competing ASCII fallback until a recipient matrix proves
+   which value clients select; a quote-only Gmail patch would diverge from SwiftMail, and TabMail's
+   EML parser does not currently decode quoted-pairs.
 2. Red-first test asserting the emitted part header **re-parses to exactly one `filename` parameter
    whose value is the original string** — not "the encoder was called".
 3. Non-vacuity twin with a benign filename emitting unchanged output.
