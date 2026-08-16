@@ -9,15 +9,20 @@ import Foundation
 @Suite("ICSCalendarImporter Add-to-Calendar policy")
 struct ICSCalendarImporterAddPolicyTests {
 
-    private func calendar(method: String?, methodPropertyName: String = "METHOD") -> Data {
+    private func calendar(
+        method: String?,
+        methodPropertyName: String = "METHOD",
+        beginEvent: String = "BEGIN:VEVENT",
+        endEvent: String = "END:VEVENT"
+    ) -> Data {
         let methodLine = method.map { "\(methodPropertyName):\($0)\n" } ?? ""
         return Data(
             """
             BEGIN:VCALENDAR
             VERSION:2.0
-            \(methodLine)BEGIN:VEVENT
+            \(methodLine)\(beginEvent)
             SUMMARY:Policy fixture
-            END:VEVENT
+            \(endEvent)
             END:VCALENDAR
             """.utf8
         )
@@ -48,6 +53,15 @@ struct ICSCalendarImporterAddPolicyTests {
                 "\(propertyName):DECLINECOUNTER"
             )
         }
+
+        let mixedCaseEvent = calendar(
+            method: "DECLINECOUNTER",
+            beginEvent: "begin:vevent",
+            endEvent: "End:VEvent"
+        )
+        let parsed = ICSBuilder.parseIncoming(String(decoding: mixedCaseEvent, as: UTF8.self))
+        #expect(parsed?.method == "DECLINECOUNTER", "fixture must exercise mixed-case VEVENT")
+        #expect(!ICSCalendarImporter.allowsAddToCalendar(mixedCaseEvent))
     }
 
     @Test("Event-bearing, missing, and unknown methods retain Calendar import")

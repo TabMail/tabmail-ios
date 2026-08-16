@@ -245,8 +245,11 @@ enum ICSBuilder {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty { continue }
 
-            if trimmed == "BEGIN:VEVENT" { inEvent = true; continue }
-            if trimmed == "END:VEVENT" { break }
+            if trimmed.caseInsensitiveCompare("BEGIN:VEVENT") == .orderedSame {
+                inEvent = true
+                continue
+            }
+            if trimmed.caseInsensitiveCompare("END:VEVENT") == .orderedSame { break }
 
             // Skip nested components inside VEVENT (e.g., VALARM).
             // Their properties (like DESCRIPTION:REMINDER) must not overwrite event-level ones.

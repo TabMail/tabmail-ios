@@ -23,8 +23,9 @@ entered a flow that could neither apply them nor explain its no-op.
 
 ## Candidate invariant and accepted residuals
 
-- The denylist is exactly `REPLY`, `REFRESH`, `COUNTER`, `DECLINECOUNTER`; method values and the
-  RFC-case-insensitive `METHOD` property name are normalized by the shared parser.
+- The denylist is exactly `REPLY`, `REFRESH`, `COUNTER`, `DECLINECOUNTER`; method values, the
+  RFC-case-insensitive `METHOD` property name, and `BEGIN/END:VEVENT` boundaries are normalized
+  by the shared parser.
 - `REQUEST`, missing `METHOD`, `PUBLISH`, `ADD`, `CANCEL`, unknown values, non-UTF-8 data, empty
   input and a calendar with no `VEVENT` fail open to the existing importer. Removing a legitimate
   import is the expensive failure direction; an uncertain allow leaves the decision to Calendar.
@@ -56,8 +57,8 @@ entered a flow that could neither apply them nor explain its no-op.
   Artifact: `/private/tmp/tabmail-campaign-results/issue5-green-authoritative.xcresult`.
 - **REFRESHED GREEN:** after rebasing onto current `main` and correcting the platform record, the
   exact five-test suite rebuilt successfully and passed 5/5 again, including lower- and mixed-case
-  `METHOD` property-name witnesses added during exact review. Artifact:
-  `/private/tmp/tabmail-campaign-results/issue5-final-green-r2-20260816.xcresult`.
+  `METHOD` property-name plus mixed-case `VEVENT` boundary witnesses added during exact review.
+  Artifact: `/private/tmp/tabmail-campaign-results/issue5-final-green-r3-20260816.xcresult`.
 - Coverage reports `ICSCalendarImporter.allowsAddToCalendar(_:)` at 100% (12/12). The
   `AttachmentListView` branch is deliberately pinned by the non-vacuous source-structural test;
   the focused suite does not pretend to drive its UIKit/network attachment tap at runtime.
