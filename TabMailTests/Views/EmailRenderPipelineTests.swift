@@ -2367,7 +2367,10 @@ struct EmailRenderPipelineTests {
             previewFilename: previewFilename, includeEmlSections: includeEmlSections,
             includeHeadersProbe: includeHeadersProbe))
         #expect(ctx.exception == nil, "harness threw: \(ctx.exception?.toString() ?? "")")
-        ctx.evaluateScript(_deferredImageLoadJS(diagnosticsEnabled: false))
+        ctx.evaluateScript(_deferredImageLoadJS(
+            diagnosticsEnabled: false,
+            previewMode: previewFilename != nil
+        ))
         #expect(ctx.exception == nil, "swap script threw: \(ctx.exception?.toString() ?? "")")
         return ctx
     }
@@ -2505,6 +2508,36 @@ struct EmailRenderPipelineTests {
         #expect(deferredIds(ctx) == "emlA,emlB,emlHdrA")
     }
 
+    @Test("sender markup cannot choose the app's view-mode gate")
+    func deferredSwapViewModeComesFromTheApp() {
+        let ctx = JSContext()!
+        ctx.evaluateScript(Self.hiddenSectionHarness(
+            previewFilename: nil,
+            includeHeadersProbe: true
+        ))
+        #expect(ctx.exception == nil, "harness threw: \(ctx.exception?.toString() ?? "")")
+
+        // Model WebKit's standard second-<body> attribute donation: sender
+        // markup can put `tm-preview-mode` on document.body even though the app
+        // built a main-view document. Prove both halves of that disagreement so
+        // the end-state assertion cannot pass on a fixture that never entered
+        // the failing state.
+        ctx.evaluateScript("_bodyClasses = ['tm-preview-mode'];")
+        #expect(ctx.evaluateScript("_body.classList.contains('tm-preview-mode')")?.toBool() == true)
+        #expect(ctx.evaluateScript("_previewMode")?.toBool() == false)
+        #expect(ctx.evaluateScript("_display(senderHdr)")?.toString() == "none")
+
+        ctx.evaluateScript(_deferredImageLoadJS(diagnosticsEnabled: false))
+        ctx.evaluateScript("runPostPaint(); runFailsafe()")
+        #expect(ctx.exception == nil, "swap arms threw: \(ctx.exception?.toString() ?? "")")
+
+        // Main-view policy comes from the app, never from a class the sender can
+        // write. Sender-hidden content therefore retains the ordinary auto-load
+        // behaviour, while app-hidden .eml sections stay withheld.
+        #expect(fetchedIds(ctx) == "parent,quoted,senderHdr")
+        #expect(deferredIds(ctx) == "emlA,emlB,emlHdrA")
+    }
+
     @Test("preview sheet: the .tm-eml-headers arm still withholds, and is the ONLY thing that can there")
     func deferredSwapHeadersClauseStillWithholdsInPreview() {
         // The other side of the gate, and the reason it is a gate rather than a
@@ -2540,7 +2573,7 @@ struct EmailRenderPipelineTests {
 
         // Flip to preview mode with a.eml selected and re-run the production script.
         ctx.evaluateScript("_previewMode = true; _selected = 'a.eml'; _bodyClasses = ['tm-preview-mode'];")
-        ctx.evaluateScript(_deferredImageLoadJS(diagnosticsEnabled: false))
+        ctx.evaluateScript(_deferredImageLoadJS(diagnosticsEnabled: false, previewMode: true))
         ctx.evaluateScript("runPostPaint(); runFailsafe()")
         #expect(ctx.exception == nil, "re-run threw: \(ctx.exception?.toString() ?? "")")
         // emlA was withheld before and is fetched now; emlB stays withheld.

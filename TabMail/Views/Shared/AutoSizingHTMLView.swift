@@ -619,7 +619,10 @@ private struct HTMLWebView: UIViewRepresentable {
         // imageLoadDiagnosticJS above installs the hook at all, so an ungated
         // build's swap never names a global that only sender script could define.
         let deferImages = WKUserScript(
-            source: deferredImageLoadJS(diagnosticsEnabled: DebugModeManager.isLoggingEnabled()),
+            source: deferredImageLoadJS(
+                diagnosticsEnabled: DebugModeManager.isLoggingEnabled(),
+                previewMode: previewFilename != nil
+            ),
             injectionTime: .atDocumentEnd,
             forMainFrameOnly: true,
             in: RenderContentWorld.isolated
@@ -3620,11 +3623,14 @@ private let collapseICSJS = """
 ///    justification that outlives its reason is not a weaker justification, it is
 ///    a false statement about the system sitting next to correct code.
 ///
-/// Exposed for unit tests via `_deferredImageLoadJS(diagnosticsEnabled:)`.
-internal func _deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
-    deferredImageLoadJS(diagnosticsEnabled: diagnosticsEnabled)
+/// Exposed for unit tests via `_deferredImageLoadJS(diagnosticsEnabled:previewMode:)`.
+internal func _deferredImageLoadJS(
+    diagnosticsEnabled: Bool,
+    previewMode: Bool = false
+) -> String {
+    deferredImageLoadJS(diagnosticsEnabled: diagnosticsEnabled, previewMode: previewMode)
 }
-private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
+private func deferredImageLoadJS(diagnosticsEnabled: Bool, previewMode: Bool) -> String {
     // Emitted only under the debug gate; see the doc comment above for why the
     // gate and the try/catch are BOTH required.
     var diagHelper = ""
@@ -3714,6 +3720,13 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
         // INSIDE a `.tm-eml-section`, and that section's arm is unconditional,
         // so the walk still reaches a governed ancestor in both modes.
         //
+        // The gate comes from Swift's `previewFilename != nil`, not from
+        // `document.body.classList`. Sender markup can contain another <body>
+        // whose attributes WebKit donates to the document body, including the
+        // app's `tm-preview-mode` spelling. A sender-writeable class is useful
+        // for styling but cannot be authority for which app stylesheet branch
+        // this script is enforcing.
+        //
         // ⚠️ SCOPE OF THAT CHANGE, stated because it was described only as WHAT
         // is withheld: it also moves WHEN the P4 failure census is SUPPRESSED. A
         // withheld image whose live candidates cannot settle keeps its deferral
@@ -3776,8 +3789,7 @@ private func deferredImageLoadJS(diagnosticsEnabled: Bool) -> String {
             try {
                 var body = document.body;
                 if (!body) return false;
-                var preview = !!(body.classList &&
-                                 body.classList.contains('tm-preview-mode'));
+                var preview = \(previewMode ? "true" : "false");
                 var el = im;
                 while (el && el !== body) {
                     var governed = false;
