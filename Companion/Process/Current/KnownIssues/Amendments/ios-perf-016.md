@@ -1,15 +1,16 @@
 # IOS-PERF-016
 
-- Register classification: `open`
+- Register classification: `resolved`
 - New post-freeze record (2026-08-13) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
 ## Status
 
-🔓 **OPEN (2026-08-13)** — `UndoService.push` performs **ungated, main-actor, N+1 database reads plus an
-unbounded `PendingOperation` fetch, in production, feeding nothing but `print()`.** It runs on every
-archive, delete and move — the most-travelled gesture path in the app. Found by the whole-SQL-surface
-audit (its finding 8) and independently confirmed by reading. **Development rule 12 violation.**
+✅ **RESOLVED (2026-08-13, `731856296`)** — `UndoService.push` formerly performed **ungated,
+main-actor, N+1 database reads plus an unbounded `PendingOperation` fetch, in production, feeding
+nothing but `print()`.** The whole diagnostic task is now debug-gated, including eager argument
+construction. The focused suite recorded zero push, per-member database-state, or pending-operation
+dumps after the fix, versus 48, 56, and 48 before it.
 
 ## Subsystem and search terms
 
@@ -91,13 +92,13 @@ finding 9 confirmed that helper gets it right.
 Latent performance/hygiene defect, found by audit and confirmed by reading. No field report. Not
 introduced by any recent change.
 
-## ⚠️ For whoever takes it — the class is bigger than this row
+## Residual class remains separately tracked
 
 The same audit reported `SearchIndex.swift` carrying **~35–38 further ungated `print(` sites**, several
-interpolating whole bind-argument arrays. That sweep is tracked separately. **Do not close this row on
-the strength of fixing `UndoService` alone**, and when sweeping, enumerate by **state** — every
-diagnostic site whose *work* is ungated — rather than by grepping for `print(`, which finds emissions
-and misses the reads that feed them.
+interpolating whole bind-argument arrays. That sweep is tracked separately; this row resolves only
+the travelled `UndoService.push` defect. When sweeping the remaining class, enumerate by **state** —
+every diagnostic site whose *work* is ungated — rather than by grepping for `print(`, which finds
+emissions and misses the reads that feed them.
 
 ## Related
 

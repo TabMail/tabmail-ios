@@ -101,7 +101,8 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Current tracker census (2026-08-15): 13 `open` records.** The “Open 2” census above is the
+> **Current tracker census (2026-08-16): 12 `open` records (11 amendment rows plus base
+> `IOS-PUSH-001`).** The “Open 2” census above is the
 > hash-preserved 2026-08-09 snapshot, not the live post-freeze count. GitHub migration and release
 > triage must include the open rows in this amendment block plus the still-open base
 > `IOS-PUSH-001`; the base `IOS-CLEANUP-001` row is superseded by the resolved override below.
@@ -183,8 +184,8 @@ regenerated from it; their detail files live in
 
 | ID | Class | Executive statement |
 |---|---|---|
-| [IOS-CAL-011](Companion/Process/Current/KnownIssues/Amendments/ios-cal-011.md) | `accepted` | 📋 ACCEPTED LIMITATION (2026-08-12) — iOS's `text/calendar` download-import path is **add-only**: it performs no iTIP reconciliation, so `METHOD:REPLY` produces no UI or event change. An anonymized comparison observed the same no-op in Apple's first-party Mail client on iOS, consistent with the shared system import path; the claim remains scoped to one OS, one client, and one payload class. A `METHOD=REQUEST` control traversed the same TabMail delivery path and imported, so the invisible sheet is not the discriminator. Whether a genuine update request modifies an existing UID remains untested; private invite metadata and calendar state are intentionally omitted |
-| [IOS-CAL-010](Companion/Process/Current/KnownIssues/Amendments/ios-cal-010.md) | `open` | 🔓 OPEN (2026-08-12), deferred by owner decision — the attachment row offers add-to-calendar for every `text/calendar` part without consulting `METHOD`, so response and control methods can enter a flow that cannot apply them. `ICSBuilder.parseIncoming` already extracts the method, but participant status and recurrence context are discarded, making status display a larger change than gating the tap. Listener terminal-state handling and fingerprint unfolding were fixed separately; synthetic folding tests pin logical values across CRLF, LF, and bare-CR inputs. |
+| [IOS-CAL-011](Companion/Process/Current/KnownIssues/Amendments/ios-cal-011.md) | `accepted` | 📋 ACCEPTED PLATFORM LIMITATION (updated 2026-08-16) — iOS's system importer implements only part of iTIP. A real simulator matrix proved new `REQUEST` addition and matching-`CANCEL` reconciliation, but a same-UID higher-sequence `REQUEST` offered Update and then left the original unchanged; `REPLY`, `REFRESH`, and `COUNTER` no-op; `DECLINECOUNTER` is misread as a new event. The owner accepted the matrix as conclusive without a first-party Mail parity gate. |
+| [IOS-CAL-010](Companion/Process/Current/KnownIssues/Amendments/ios-cal-010.md) | `resolved` | ✅ **RESOLVED (2026-08-16)** — the owner approved the exact reviewed PR #34. The bounded gate refuses `REPLY`, `REFRESH`, `COUNTER`, and `DECLINECOUNTER` before system import with `No new event to add.`, while retaining working `CANCEL` behavior. Conventional RED/GREEN and the final concise-copy run passed 5/5; the real iOS 26.5 matrix proved the unsafe/no-op methods, and fresh-context review found and closed both RFC casing bypasses. GitHub issue #5 closes with the merge. |
 
 ### AI (2)
 
@@ -206,10 +207,11 @@ Only records classified `open` were migrated. Accepted limitations, resolved rec
 audit/provenance files remain documentation-only. The future app-owned ATS image loader is
 [issue #1](https://github.com/TabMail/tabmail-ios/issues/1). Open register mappings:
 
-- `IOS-AI-004` [#2](https://github.com/TabMail/tabmail-ios/issues/2); `IOS-AI-005` [#3](https://github.com/TabMail/tabmail-ios/issues/3); `IOS-BILLING-002` [#4](https://github.com/TabMail/tabmail-ios/issues/4); `IOS-CAL-010` [#5](https://github.com/TabMail/tabmail-ios/issues/5)
+- `IOS-AI-004` [#2](https://github.com/TabMail/tabmail-ios/issues/2); `IOS-AI-005` [#3](https://github.com/TabMail/tabmail-ios/issues/3); `IOS-BILLING-002` [#4](https://github.com/TabMail/tabmail-ios/issues/4)
 - `IOS-COMPOSE-002` [#7](https://github.com/TabMail/tabmail-ios/issues/7); `IOS-COMPOSE-003` [#8](https://github.com/TabMail/tabmail-ios/issues/8); `IOS-IMAP-015` [#9](https://github.com/TabMail/tabmail-ios/issues/9); `IOS-IMAP-016` [#10](https://github.com/TabMail/tabmail-ios/issues/10)
 - `IOS-PERF-009` [#12](https://github.com/TabMail/tabmail-ios/issues/12); `IOS-PERF-010` [#13](https://github.com/TabMail/tabmail-ios/issues/13); `IOS-PERF-012` [#15](https://github.com/TabMail/tabmail-ios/issues/15)
 - `IOS-PUSH-001` [#16](https://github.com/TabMail/tabmail-ios/issues/16); `IOS-UI-005` [#20](https://github.com/TabMail/tabmail-ios/issues/20)
+- Retired mapping: `IOS-CAL-010` [#5](https://github.com/TabMail/tabmail-ios/issues/5) — resolved by the owner-approved PR #34; close on merge
 - Retired mapping: `IOS-SEARCH-004` [#18](https://github.com/TabMail/tabmail-ios/issues/18) — reclassified `not-defect` on 2026-08-15 after the exact caller census proved the filed multi-folder statement is never constructed; close on GitHub when this correction is accepted
 - Retired mapping: `IOS-QUEUE-010` [#17](https://github.com/TabMail/tabmail-ios/issues/17) — reclassified `not-defect` on 2026-08-14 after the actor-isolation re-audit; close on GitHub when this correction is accepted
 - Retired mapping: `IOS-TEST-001` [#19](https://github.com/TabMail/tabmail-ios/issues/19) — repaired in tests on 2026-08-14; close on GitHub when the PR is accepted

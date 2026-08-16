@@ -6,10 +6,11 @@
 
 ## Status
 
-📋 **ACCEPTED LIMITATION (2026-08-12)** — iOS's `text/calendar`-download import path is **add-only**.
-It performs no iTIP reconciliation, so it neither applies an iTIP `REPLY` nor updates an event
-already on the calendar, and it gives a third-party app no observable signal that it declined.
-Attribution is platform, not TabMail.
+📋 **ACCEPTED PLATFORM LIMITATION (updated 2026-08-16)** — iOS's `text/calendar` download-import
+path implements only part of iTIP. It adds a new `REQUEST` and reconciles a matching `CANCEL`, but
+does not apply a same-UID higher-sequence `REQUEST`, `REPLY`, `REFRESH`, or `COUNTER`; it can also
+misread `DECLINECOUNTER` as a new event. A third-party app receives no programmatic result.
+Attribution remains platform, while `IOS-CAL-010` owns TabMail's user-facing method gate.
 
 ## Subsystem and search terms
 
@@ -27,7 +28,7 @@ nothing, changes nothing, and shows nothing. No error, no alert, no log line ind
 **Why it is correct behaviour for that payload.** Under RFC 5546 §3.2.3 a `REPLY` is an
 *attendee → organizer* response whose only defined effect is to set that attendee's `PARTSTAT` on
 the organizer's **already-existing** copy of the event. It is not an event-bearing object to add.
-The system import path implements adding, not iTIP processing, so there is nothing for it to do.
+The system import path does not implement this response, so there is nothing for it to do.
 Where the recipient is also the organizer the event is on the calendar already, so no addition
 could apply even in principle. There is no third-party entry point for applying an iTIP `REPLY`.
 
@@ -39,7 +40,7 @@ client, one payload. It establishes **nothing** about macOS, about Apple clients
 about any other platform, and it is an observation rather than an independent reproduction by the
 session that wrote this record.
 
-**Independent corroboration for the update case, from published sources rather than our devices.**
+**Historical corroboration for the update case, now superseded by our direct measurement.**
 Apple Developer Forums thread 772082 (January 2025, still unanswered) reports a spec-correct
 update — unchanged `UID`, `SEQUENCE` incremented, refreshed `DTSTAMP` and `LAST-MODIFIED` —
 previewing correctly in iOS Safari and then doing nothing when "Add All" is tapped. iOS Calendar's
@@ -75,30 +76,28 @@ having no failure surface is a true observation about the *design* — and it is
 silence rather than a message — but it is **not the cause**: the working first-time invite in the
 same log used the identical sheet. The discriminator is the payload's iTIP role.
 
-## Explicitly UNANSWERED — do not read this record as having tested it
+## Conclusive system-import matrix — 2026-08-16
 
-**Whether a genuine `METHOD=REQUEST` update works on our path is still unanswered.** An anonymized
-device trace included a non-zero-sequence `METHOD=REQUEST`, so the request-shape half of the re-test
-criterion is covered. The public record intentionally omits its byte size, recurrence metadata,
-participant counts, and neighboring private invite activity.
+Temporary tests drove TabMail's real loopback-listener + hidden-`SFSafariViewController` handoff on
+the existing iOS 26.5 simulator and inspected Calendar storage after each user action:
 
-**What is genuinely untested is the OTHER half of the criterion: whether that `UID` named an event
-already on the device's calendar.** A device log cannot show calendar state, so nothing captured
-here settles it in either direction — and that payload imported normally. Thread 772082 remains a
-published third-party report, not a measurement on our code. The re-test
-therefore stays outstanding, and what it now turns on is a `UID` comparison across two taps, not
-another `METHOD`/`SEQUENCE` read-out, which we have.
+- a new `REQUEST` offered Add and created one event;
+- the same UID with higher `SEQUENCE` and a changed summary offered Update Event, but accepting it
+  left the stored original unchanged;
+- matching `CANCEL` offered Update/Remove and stored cancelled status;
+- unknown `CANCEL` offered Add and, when accepted, stored a cancelled placeholder;
+- `REPLY`, `REFRESH`, and isolated `COUNTER` produced no Calendar action or event;
+- `DECLINECOUNTER` offered Add and, when accepted, created a normal standalone event.
 
-The `METHOD`/`SEQUENCE` read-out needed **no new build** — the debug-gated fingerprint was already
-in the shipped device build, and `METHOD` is a short value never subject to RFC 5545 line folding,
-so the folding defect noted in `IOS-CAL-010` never affected it. ⚠️ **The `UID` comparison the
-outstanding re-test now turns on is exactly what that defect DID affect**, and it is fixed as of
-2026-08-13 — `ICSCalendarImporter.itipFingerprint` unfolds before splitting — so the re-test does
-need a build carrying that fix.
+This replaces the former unanswered update section and corrects the broad “add-only” shorthand:
+the importer performs limited cancellation reconciliation but not general iTIP processing. Result
+bundles are under `/tmp/tabmail-issue5-system-probe-dd/Logs/Test/`; temporary source and active
+events were removed. The owner accepted this matrix as conclusive and waived first-party Mail
+parity as a remaining gate.
 
 ## Related but separate
 
-- `IOS-CAL-010` — the affordance is offered for payloads that cannot succeed (ours, open, deferred),
+- `IOS-CAL-010` — the affordance is offered for payloads that no-op or mis-import (ours, open fix candidate),
   and it carries the `NWListener` `.failed` fix item and the instrument-unfold fix item.
 - **A latent scope error in the sanitizer, not this bug and not fixed.**
   `ICSSanitizer.sanitizeProperty(_:organizerAddress:)` drops the `ATTENDEE` whose address equals
