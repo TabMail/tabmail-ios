@@ -9,7 +9,7 @@ same algorithm, which is why it lands here rather than as an app-side fix.
 
 ## What is wrong
 
-Three defects in the pinned fork at `7aee922`:
+Three defect families in the current pinned fork at `a2d4a94`:
 
 **1. `String+RFC2047Encode.swift:31` — the inverted guard.**
 
@@ -31,16 +31,21 @@ helper**, and the comment recording the duplication is the same comment that wou
 Recorded as `MIS-019` instance 29 — a note saying "this is a deliberate duplicate of X" is a
 blast-radius statement.
 
-**2. Raw filename interpolation into MIME parameters** — `EMLSerializer.swift:137,148` and
-`Email+Content.swift:195,199,298`:
+**2. Raw filename and content-type interpolation into MIME part headers.** SwiftMail has six raw
+filename sites: two in `EMLSerializer.serializePartHeaders`, two in
+`Email.writeMultipartMixed`, and two in `Email.writeHTMLWithInlineAttachments`:
 
 ```swift
 contentType += "; name=\"\(filename)\""
 dispValue   += "; filename=\"\(filename)\""
 ```
 
-No escaping, so an embedded `"` closes the quoted-string. Five sites. App-side twin:
-`IOS-COMPOSE-002`.
+No escaping, so an embedded `"` closes the quoted-string. The two `writeMultipartMixed` filename
+sites are TabMail-reachable today. SwiftMail also has four raw content-type interpolations: the
+serializer part header plus the regular-attachment, calendar-alternative, and HTML-inline arms in
+`Email+Content.swift`. TabMail reaches the regular-attachment and calendar-alternative members
+through `IMAPProvider.buildEmail`; the other two remain library capability. The app-side twin and
+provider-boundary qualifications are recorded in `IOS-COMPOSE-002`.
 
 **3. `rfc2047EncodedHeader()` can emit an encoded-word over RFC 2047 §2's 75-octet ceiling.**
 Added 2026-08-12; **pre-existing**, not introduced by any TabMail change, and present in the app-side
@@ -119,7 +124,9 @@ the MIME server-side, so there is no header line of ours to break.
 1. Upstream PR to Cocoanetics: widen `rfc2047EncodedHeader()`'s trigger to non-ASCII **or any
    C0/C1/DEL control**, excluding HTAB (which is WSP and legal literal text in an unstructured field
    body — the app-side fix over-reached on exactly this and its own non-vacuity test caught it).
-2. Same PR or a sibling: quote or RFC 2231-encode the filename parameter at the five sites.
+2. Same PR or a sibling: RFC 2231-encode the filename parameter at all six sites, and validate or
+   safely serialize the four content-type values. Recipient fallback behavior remains an owner
+   compatibility decision; do not ship a Gmail-only quote patch that leaves the library divergent.
 3. Same PR or a sibling: bound the 75-octet word. Whatever is chosen must be applied to the app-side
    `RFC2047.encodeAsWords` in the same change — they are one algorithm in two repos, and fixing one is
    how they diverged in the first place. **Red-first test asserting every emitted word is ≤ 75
