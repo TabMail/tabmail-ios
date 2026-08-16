@@ -36,6 +36,7 @@ struct RootView: View {
     /// iCloud setup prompt state (Feature 2 — post-Apple sign-in)
     @State private var showAccountGoneAlert = false
     @State private var showSignedOutAlert = false
+    @State private var showSubscriptionLapsedAlert = false
     /// True while checking /whoami for prior consent — show splash instead of consent gate
     @State private var isCheckingConsent = false
 
@@ -609,6 +610,17 @@ struct RootView: View {
         } message: {
             Text("Your TabMail account no longer exists. You have been signed out. Your email accounts and messages remain on this device.")
         }
+        .alert("Subscription Ended", isPresented: $showSubscriptionLapsedAlert) {
+            Button("Choose a Plan") {
+                NotificationCenter.default.post(name: .navigateToPlanPicker, object: nil)
+            }
+            Button("Not Now", role: .cancel) {}
+        } message: {
+            Text(
+                "Your account was kept, but your subscription ended during the 30 days before deletion "
+                    + "and could not be restored. Choose a plan to subscribe again."
+            )
+        }
         .onReceive(NotificationCenter.default.publisher(for: .tabMailDidSignIn).receive(on: DispatchQueue.main)) { _ in
             withAnimation { hasTabMailSession = true }
             // Restore consent state for the signed-in user (avoids re-showing consent)
@@ -789,8 +801,9 @@ struct RootView: View {
 
     private func cancelDeletion() async -> Bool {
         do {
-            _ = try await BillingClient().cancelAccountDeletion()
+            let response = try await BillingClient().cancelAccountDeletion()
             pendingDeletionDate = nil
+            showSubscriptionLapsedAlert = response.subscriptionLapsedDuringGrace
             print("[RootView] Account deletion cancelled")
             return true
         } catch BackendError.requestFailed(let statusCode) where statusCode == 409 || statusCode == 404 {
