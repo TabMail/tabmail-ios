@@ -4,8 +4,8 @@
 
 import Foundation
 
-/// RFC 2047 "encoded-word" encoding for outgoing email *header* values
-/// (Subject, etc.) at TabMail's Gmail and IMAP/SMTP provider boundaries.
+/// RFC 2047 "encoded-word" encoding for outgoing email Subject values at
+/// TabMail's Gmail and IMAP/SMTP raw-header boundaries.
 ///
 /// RFC 5322 requires header field bodies to be 7-bit ASCII; non-ASCII text must
 /// be wrapped in an encoded-word. Injecting raw 8-bit UTF-8 into a header
@@ -18,11 +18,18 @@ import Foundation
 /// Decoding is the inverse: `RFC5322Parse.decodeRFC2047`. Exchange is excluded:
 /// its Graph JSON `subject` is semantic text, not an RFC 5322 field body.
 enum RFC2047 {
-    /// Max UTF-8 bytes per encoded-word. `=?UTF-8?B?` (10) + `?=` (2) is 12
+    /// Max UTF-8 bytes per continuation encoded-word. `=?UTF-8?B?` (10) + `?=` (2) is 12
     /// octets of overhead and Base64 of N bytes is `4*ceil(N/3)`; 45 bytes → 60
     /// Base64 chars → a 72-octet word, safely under RFC 2047 §2's 75-octet
     /// per-encoded-word ceiling.
-    private static let maxBytesPerWord = 45
+    private static let maxBytesPerContinuationWord = 45
+
+    /// The first word shares its physical line with the nine-octet `Subject: `
+    /// prefix. 39 UTF-8 bytes become a 64-octet encoded-word, so the complete
+    /// first encoded line is 73 octets. 40 bytes would expand to a 68-octet word
+    /// and a 77-octet line. Continuation lines spend one leading WSP octet and
+    /// use the wider continuation budget above.
+    private static let maxBytesPerFirstSubjectWord = 39
 
     /// A control character can never appear literally in a header field body
     /// (RFC 5322 §2.2 restricts it to printable US-ASCII plus SP and HTAB), and a
@@ -41,27 +48,49 @@ enum RFC2047 {
         return scalar.value <= 0x1F || scalar.value == 0x7F || (0x80...0x9F).contains(scalar.value)
     }
 
-    /// RFC 2047 readers recognize `=?` as an encoded-word introducer at the start
-    /// of an unstructured field body or immediately after linear whitespace. If
-    /// sender-authored ASCII contains it at either boundary, emitting it literally
-    /// lets a reader reinterpret the following bytes instead of preserving the
-    /// text. Compare scalars because this is a wire-format decision, not a
-    /// user-perceived grapheme operation.
-    private static func containsRecognizableEncodedWordIntroducer(_ value: String) -> Bool {
-        var canStartEncodedWord = true
-        var previousWasBoundaryEquals = false
-        for scalar in value.unicodeScalars {
-            if previousWasBoundaryEquals, scalar.value == 0x3F { return true } // `?`
-            previousWasBoundaryEquals = canStartEncodedWord && scalar.value == 0x3D // `=`
-            canStartEncodedWord = scalar.value == 0x20 || scalar.value == 0x09 // SP / HTAB
+    /// The app's two shipped readers use the same unanchored encoded-word pattern:
+    /// `RFC5322Parse.decodeRFC2047` for Gmail and `String.decodeMIMEHeader` from
+    /// SwiftMail for IMAP. They therefore consume a complete syntactically shaped
+    /// substring even when it is not at the RFC 2047 §6.1 word boundary. Protect
+    /// every substring they would consume so send -> readback preserves the exact
+    /// semantic Subject value. Bare and unterminated shapes do not match.
+    private static func containsDecoderConsumableEncodedWordSubstring(_ value: String) -> Bool {
+        value.range(
+            of: #"=\?[^?]+\?[BQbq]\?[^?]*\?="#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    /// Find complete encoded-word-like tokens at the field start or after SP/HTAB.
+    /// RFC 2047 §6.1 reader recognition additionally requires the complete §2
+    /// syntax and 75-octet ceiling. RFC 2047 §7 gives composers a stronger
+    /// obligation: a boundary word that begins with `=?` and ends with `?=` must
+    /// be a valid encoded-word. Protecting the entire value therefore also covers
+    /// complete malformed/oversized composer words, including the minimal `=?=`,
+    /// without over-encoding a bare or unterminated shape.
+    ///
+    /// Split the scalar view because SP/HTAB and the ASCII delimiters are wire
+    /// syntax, not user-perceived grapheme boundaries. CR/LF never reaches this
+    /// classification as a literal: the forbidden-control trigger encodes it.
+    private static func containsBoundaryEncodedWordLikeToken(_ value: String) -> Bool {
+        value.unicodeScalars.split(whereSeparator: { scalar in
+            scalar.value == 0x20 || scalar.value == 0x09 // SP / HTAB
+        }).contains { token in
+            guard token.count >= 3,
+                  token.first?.value == 0x3D, // `=`
+                  token.dropFirst().first?.value == 0x3F, // `?`
+                  token.dropLast().last?.value == 0x3F, // `?`
+                  token.last?.value == 0x3D // `=`
+            else { return false }
+            return true
         }
-        return false
     }
 
     /// Encode `value` as one or more RFC 2047 Base64 encoded-words when it
     /// contains any non-ASCII scalar, any scalar that cannot appear literally in
-    /// a header field body, or the encoded-word introducer `=?`; otherwise it is
-    /// returned unchanged (already a valid header value).
+    /// a header field body, a complete substring consumed by either shipped
+    /// decoder, or a complete boundary composer word shaped like an encoded-word;
+    /// otherwise it is returned unchanged (already a valid header value).
     ///
     /// ⚠️ **The control-character half of that trigger is load-bearing, and the
     /// obvious-looking `!$0.isASCII` test is not sufficient — CR and LF ARE
@@ -88,7 +117,8 @@ enum RFC2047 {
     static func encodeHeaderValue(_ value: String) -> String {
         let needsEncoding = value.unicodeScalars.contains { scalar in
             scalar.value > 0x7F || isForbiddenLiteralInHeader(scalar)
-        } || containsRecognizableEncodedWordIntroducer(value)
+        } || containsDecoderConsumableEncodedWordSubstring(value)
+            || containsBoundaryEncodedWordLikeToken(value)
         guard needsEncoding else { return value }
         return encodeAsWords(value)
     }
@@ -97,16 +127,18 @@ enum RFC2047 {
 
         var words: [String] = []
         var chunk: [UInt8] = []
+        var byteBudget = maxBytesPerFirstSubjectWord
 
         func flush() {
             guard !chunk.isEmpty else { return }
             words.append("=?UTF-8?B?\(Data(chunk).base64EncodedString())?=")
             chunk.removeAll(keepingCapacity: true)
+            byteBudget = maxBytesPerContinuationWord
         }
 
         for scalar in value.unicodeScalars {
             let bytes = Array(String(scalar).utf8)
-            if !chunk.isEmpty, chunk.count + bytes.count > maxBytesPerWord {
+            if !chunk.isEmpty, chunk.count + bytes.count > byteBudget {
                 flush()
             }
             chunk.append(contentsOf: bytes)

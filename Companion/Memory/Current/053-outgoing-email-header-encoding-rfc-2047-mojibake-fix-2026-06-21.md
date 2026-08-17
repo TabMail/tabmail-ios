@@ -1,3 +1,15 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current note — PR #37:** TabMail's app encoder now owns the complete raw Subject boundary for
+> both Gmail builders and `IMAPProvider.buildEmail`; it is deliberately no longer byte-identical to
+> SwiftMail's encoder. This supersedes the historical "keep the two byte-for-byte identical"
+> instruction retained below. It protects complete substrings consumed by the shipped unanchored
+> Gmail/SwiftMail decoders, plus complete SP/HTAB-delimited composer words (including malformed
+> `=?=`), while bare/unterminated shapes remain literal. It splits between Unicode scalars and uses
+> 39-byte first / 45-byte continuation budgets so encoded-words stay within 75 octets and encoded
+> physical Subject lines within 76. SwiftMail's equivalent library defects and
+> MIME parameter interpolation remain open upstream work under `IOS-IMAP-016` / issue #10; the fork
+> remains deviation-free.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ### Outgoing email header encoding — RFC 2047 (mojibake fix, 2026-06-21)
 - **Header fields MUST be 7-bit ASCII.** Non-ASCII Subject/display-name text must be wrapped in an RFC 2047 encoded-word (`=?UTF-8?B?…?=`). Injecting raw 8-bit UTF-8 into a header (the old behavior) lets downstream agents charset-guess and mojibake it (Korean `가` → `ÃªÂ°Â…` = double UTF-8-as-Latin-1). Bodies were never affected — they carry `charset=UTF-8` + Content-Transfer-Encoding; headers have no mechanism except RFC 2047.

@@ -27,16 +27,34 @@ struct IMAPProviderBuildEmailTests {
         return body
     }
 
+    private func subjectPhysicalLines(in message: String) -> [String] {
+        let headerLines = (message.components(separatedBy: "\r\n\r\n").first ?? message)
+            .components(separatedBy: "\r\n")
+        guard let subjectIndex = headerLines.firstIndex(where: { $0.hasPrefix("Subject: ") }) else {
+            return []
+        }
+
+        var lines = [headerLines[subjectIndex]]
+        var index = subjectIndex + 1
+        while index < headerLines.count,
+              headerLines[index].hasPrefix(" ") || headerLines[index].hasPrefix("\t") {
+            lines.append(headerLines[index])
+            index += 1
+        }
+        return lines
+    }
+
     // MARK: - Control characters reaching an outbound header line
 
     /// **The IMAP path is vulnerable through the LIBRARY, not through our code, and
     /// "we hand SwiftMail a structured field" is not a defence.** SwiftMail's
     /// `Email+Content` emits `"Subject: \(subject.rfc2047EncodedHeader())\r\n"`, and
     /// `String+RFC2047Encode` opens with the same `guard contains(where: { !$0.isASCII })`
-    /// our own helper had — CR and LF are ASCII, so a CRLF-bearing subject is passed
-    /// through untouched and ends the header field. The duplication was predictable:
-    /// `RFC2047.swift`'s doc comment says it is kept byte-for-byte in step with that
-    /// function, so the bug was copied along with the helper.
+    /// our own helper had before `1d28552c1` — CR and LF are ASCII, so a CRLF-bearing
+    /// subject is passed through untouched and ends the header field. That historical
+    /// duplication is why the library residual remains tracked upstream. The app
+    /// helper now deliberately owns a stricter Subject boundary and is no longer kept
+    /// byte-for-byte in step with SwiftMail.
     ///
     /// We therefore encode at OUR boundary. Upstream still needs its own fix (a
     /// library must not emit an unencoded control character in a header regardless of
@@ -72,13 +90,49 @@ struct IMAPProviderBuildEmailTests {
         guard let emittedSubject else { return }
         #expect(RFC5322Parse.decodeRFC2047(emittedSubject) == subject)
         #expect(emittedSubject.decodeMIMEHeader() == subject)
+        let physicalLines = subjectPhysicalLines(in: email.constructContent())
+        #expect(!physicalLines.isEmpty)
+        guard !physicalLines.isEmpty else { return }
+        for line in physicalLines {
+            #expect(line.utf8.count <= 76, "physical Subject line was \(line.utf8.count) octets")
+        }
         #expect(email.subject.rfc2047EncodedHeader() == email.subject,
                 "SwiftMail must not double-encode the app boundary's ASCII encoded-word")
+    }
+
+    @Test("Final IMAP emitter protects complete substrings consumed by SwiftMail")
+    func decoderConsumableSubstringsRoundTripThroughFinalEmitter() {
+        let validWord = "=?UTF-8?B?SGVsbG8=?="
+        let subjects = ["prefix\(validWord)", "Re: \(validWord)suffix", "=?="]
+
+        for subject in subjects {
+            if subject != "=?=" {
+                #expect(subject.decodeMIMEHeader() != subject,
+                        "the raw compatibility control must be consumed before protection")
+            }
+            let email = IMAPProvider.buildEmail(
+                from: DraftMessage(to: ["alice@example.com"], subject: subject, body: "body"),
+                senderEmail: "sender@example.com"
+            )
+
+            let content = email.constructContent()
+            let emittedSubject = subjectFieldBody(in: content)
+            #expect(emittedSubject != nil)
+            guard let emittedSubject else { continue }
+            #expect(emittedSubject != subject)
+            #expect(emittedSubject.decodeMIMEHeader() == subject)
+            let physicalLines = subjectPhysicalLines(in: content)
+            #expect(!physicalLines.isEmpty)
+            for line in physicalLines {
+                #expect(line.utf8.count <= 76, "physical Subject line was \(line.utf8.count) octets")
+            }
+        }
     }
 
     @Test("Final IMAP emitter keeps every encoded-word within 75 octets")
     func scalarBoundaryKeepsFinalEmitterWithinEncodedWordLimit() {
         let subject = "a" + String(repeating: "\u{0301}", count: 23)
+            + String(repeating: "b", count: 50)
         let email = IMAPProvider.buildEmail(
             from: DraftMessage(to: ["alice@example.com"], subject: subject, body: "body"),
             senderEmail: "sender@example.com"
@@ -94,6 +148,12 @@ struct IMAPProviderBuildEmailTests {
         for word in words {
             #expect(word.hasPrefix("=?UTF-8?B?") && word.hasSuffix("?="))
             #expect(word.utf8.count <= 75, "encoded-word was \(word.utf8.count) octets")
+        }
+        let physicalLines = subjectPhysicalLines(in: email.constructContent())
+        #expect(!physicalLines.isEmpty)
+        guard !physicalLines.isEmpty else { return }
+        for line in physicalLines {
+            #expect(line.utf8.count <= 76, "physical Subject line was \(line.utf8.count) octets")
         }
         #expect(email.subject.rfc2047EncodedHeader() == email.subject,
                 "SwiftMail must not double-encode the app boundary's ASCII encoded-word")
