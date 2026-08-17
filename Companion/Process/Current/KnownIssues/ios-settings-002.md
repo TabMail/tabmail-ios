@@ -1,3 +1,20 @@
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **AMENDMENT (2026-08-17) — the account-field half is fixed; the folder-role half remains the
+> accepted limitation.** The preserved body below describes the pre-fix implementation and is not
+> edited because it is regenerated from the hash-pinned archive.
+>
+> Name, email address, signature placement, IMAP username, and signature now update presentation
+> immediately and persist through the async priority writer. An app-lifetime, account+field-keyed
+> owner on `NavigationStore` serializes every accepted value across account-detail view lifetimes,
+> overlays pending/failed values onto full navigation refreshes until disk observation, and retains
+> the latest failure for every field as an independently visible Retry row. Superseded failures do
+> not replace newer UI; a later success clears only that field. No settings outbox, schema change,
+> coalescing, cancellation, or server mutation was added.
+>
+> The three folder-role helpers still swallow their synchronous writes and immediately reload
+> folders. That lower-frequency residual keeps `IOS-SETTINGS-002` classified `accepted`; it requires
+> a separate ordered-visible-state proof before conversion.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-SETTINGS-002
 
 > Routed from `KNOWN_ISSUES.md` line 1446 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).

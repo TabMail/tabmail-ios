@@ -39,6 +39,33 @@ struct AccountDetailView: View {
         state.backfillCapReachedAccounts.contains(account.id)
     }
 
+    @ViewBuilder
+    private var accountSaveFailureSection: some View {
+        let failures = navigationStore.accountFieldPersistence.failures(accountId: account.id)
+        if !failures.isEmpty {
+            Section {
+                ForEach(failures) { failure in
+                    HStack {
+                        Label(
+                            "\(failure.field.displayLabel) couldn’t be saved",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .foregroundStyle(.orange)
+                        Spacer()
+                        Button(failure.isRetrying ? "Retrying…" : "Retry") {
+                            navigationStore.accountFieldPersistence.retry(failure.key)
+                        }
+                        .disabled(failure.isRetrying)
+                    }
+                }
+            } header: {
+                Text("Unsaved Account Changes")
+            } footer: {
+                Text("Your edits remain visible. Retry each field when you’re ready.")
+            }
+        }
+    }
+
     var body: some View {
         List {
             Group {
@@ -72,8 +99,9 @@ struct AccountDetailView: View {
                     TextField("Name", text: Binding(
                         get: { account.displayName },
                         set: { newValue in
-                            account.displayName = newValue
-                            saveAccountField("displayName", value: newValue)
+                            applyAccountField(.displayName, value: .text(newValue)) {
+                                account.displayName = newValue
+                            }
                         }
                     ))
                     .multilineTextAlignment(.trailing)
@@ -83,8 +111,9 @@ struct AccountDetailView: View {
                     TextField("Email", text: Binding(
                         get: { account.emailAddress },
                         set: { newValue in
-                            account.emailAddress = newValue
-                            saveAccountField("emailAddress", value: newValue)
+                            applyAccountField(.emailAddress, value: .text(newValue)) {
+                                account.emailAddress = newValue
+                            }
                         }
                     ))
                     .multilineTextAlignment(.trailing)
@@ -125,6 +154,8 @@ struct AccountDetailView: View {
                     Text("The primary account is used as the default sender when composing new emails.")
                 }
             }
+
+            accountSaveFailureSection
 
             // Sync progress — shown when backfill is not yet complete for this account
             if folders.contains(where: { !$0.backfillComplete && !$0.path.isEmpty }) {
@@ -196,8 +227,9 @@ struct AccountDetailView: View {
                 Toggle("Place below quote", isOn: Binding(
                     get: { account.signatureBelowQuote },
                     set: { newValue in
-                        account.signatureBelowQuote = newValue
-                        saveAccountField("signatureBelowQuote", value: newValue)
+                        applyAccountField(.signatureBelowQuote, value: .boolean(newValue)) {
+                            account.signatureBelowQuote = newValue
+                        }
                     }
                 ))
                 .font(.subheadline)
@@ -212,8 +244,9 @@ struct AccountDetailView: View {
                             get: { account.imapUsername ?? "" },
                             set: { newValue in
                                 let val = newValue.isEmpty ? nil : newValue
-                                account.imapUsername = val
-                                saveAccountField("imapUsername", value: val)
+                                applyAccountField(.imapUsername, value: .text(val)) {
+                                    account.imapUsername = val
+                                }
                             }
                         ))
                         .multilineTextAlignment(.trailing)
@@ -394,18 +427,32 @@ struct AccountDetailView: View {
 
     // MARK: - GRDB Helpers
 
-    private func saveAccountField(_ column: String, value: some DatabaseValueConvertible) {
-        try? dbPool.write { db in
-            try db.execute(
-                sql: "UPDATE account SET \(column) = ? WHERE id = ?",
-                arguments: [value, account.id]
-            )
+    private func applyAccountField(
+        _ field: AccountEditableField,
+        value: AccountEditableValue,
+        updateUI: () -> Void
+    ) {
+        let accountId = account.id
+        let database = dbPool
+        updateUI()
+        // Propagate immediately so re-navigation cannot reinitialize this view
+        // from stale in-memory data while persistence is queued.
+        if let index = navigationStore.accounts.firstIndex(where: { $0.id == accountId }) {
+            navigationStore.accounts[index] = account
         }
-        // Propagate the change to NavigationStore so re-navigating to this
-        // account detail doesn't re-initialize @State from stale data.
-        if let idx = navigationStore.accounts.firstIndex(where: { $0.id == account.id }) {
-            navigationStore.accounts[idx] = account
-        }
+        navigationStore.accountFieldPersistence.accept(
+            accountId: accountId,
+            field: field,
+            value: value,
+            persist: {
+                try await AccountFieldPersistenceStore.persist(
+                    accountId: accountId,
+                    field: field,
+                    value: value,
+                    database: database
+                )
+            }
+        )
     }
 
     /// Persist the signature if it changed. Called on focus loss, view
@@ -413,8 +460,9 @@ struct AccountDetailView: View {
     private func commitSignature() {
         let sig = signatureText.isEmpty ? nil : signatureText
         guard sig != account.signature else { return }
-        account.signature = sig
-        saveAccountField("signature", value: sig)
+        applyAccountField(.signature, value: .text(sig)) {
+            account.signature = sig
+        }
     }
 
     /// Refresh sync-managed fields (lastSyncedAt, etc.) from DB without

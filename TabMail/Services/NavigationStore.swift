@@ -5,6 +5,226 @@
 import Foundation
 import GRDB
 
+enum AccountEditableField: String, CaseIterable, Sendable {
+    case displayName
+    case emailAddress
+    case signatureBelowQuote
+    case imapUsername
+    case signature
+
+    var displayLabel: String {
+        switch self {
+        case .displayName: "Name"
+        case .emailAddress: "Email"
+        case .signatureBelowQuote: "Signature placement"
+        case .imapUsername: "IMAP username"
+        case .signature: "Signature"
+        }
+    }
+}
+
+enum AccountEditableValue: Sendable, Equatable {
+    case text(String?)
+    case boolean(Bool)
+
+    func apply(field: AccountEditableField, to account: inout Account) {
+        switch (field, self) {
+        case (.displayName, .text(let value)):
+            account.displayName = value ?? ""
+        case (.emailAddress, .text(let value)):
+            account.emailAddress = value ?? ""
+        case (.signatureBelowQuote, .boolean(let value)):
+            account.signatureBelowQuote = value
+        case (.imapUsername, .text(let value)):
+            account.imapUsername = value
+        case (.signature, .text(let value)):
+            account.signature = value
+        case (.displayName, .boolean), (.emailAddress, .boolean),
+             (.signatureBelowQuote, .text), (.imapUsername, .boolean),
+             (.signature, .boolean):
+            assertionFailure("Invalid value type for account field \(field.rawValue)")
+        }
+    }
+
+    func matches(field: AccountEditableField, account: Account) -> Bool {
+        switch (field, self) {
+        case (.displayName, .text(let value)):
+            account.displayName == value ?? ""
+        case (.emailAddress, .text(let value)):
+            account.emailAddress == value ?? ""
+        case (.signatureBelowQuote, .boolean(let value)):
+            account.signatureBelowQuote == value
+        case (.imapUsername, .text(let value)):
+            account.imapUsername == value
+        case (.signature, .text(let value)):
+            account.signature == value
+        case (.displayName, .boolean), (.emailAddress, .boolean),
+             (.signatureBelowQuote, .text), (.imapUsername, .boolean),
+             (.signature, .boolean):
+            false
+        }
+    }
+}
+
+struct AccountFieldKey: Hashable, Sendable {
+    let accountId: String
+    let field: AccountEditableField
+}
+
+struct AccountFieldSaveFailure: Identifiable, Sendable {
+    let key: AccountFieldKey
+    let isRetrying: Bool
+
+    var id: AccountFieldKey { key }
+    var field: AccountEditableField { key.field }
+}
+
+/// App-lifetime owner for accepted account-field writes and their optimistic values.
+///
+/// Account-detail views are disposable navigation destinations. Keeping this owner on
+/// `NavigationStore` preserves accepted ordering, refresh overlays, and field-specific
+/// failures when one view disappears and another is created for the same account.
+@Observable
+@MainActor
+final class AccountFieldPersistenceStore {
+    private enum Phase: Equatable {
+        case pending
+        case committedAwaitingObservation
+        case failed
+    }
+
+    private struct Entry {
+        let generation: Int
+        let value: AccountEditableValue
+        var phase: Phase
+        let persist: @MainActor () async throws -> Void
+    }
+
+    private var tail: Task<Void, Never>?
+    private var nextGeneration = 0
+    private var entries: [AccountFieldKey: Entry] = [:]
+    private var failedKeys: Set<AccountFieldKey> = []
+    private var retryingKeys: Set<AccountFieldKey> = []
+
+    var hasOutstandingValues: Bool { !entries.isEmpty }
+
+    func failures(accountId: String) -> [AccountFieldSaveFailure] {
+        AccountEditableField.allCases.compactMap { field in
+            let key = AccountFieldKey(accountId: accountId, field: field)
+            guard failedKeys.contains(key) else { return nil }
+            return AccountFieldSaveFailure(key: key, isRetrying: retryingKeys.contains(key))
+        }
+    }
+
+    /// Accepts one value synchronously, then persists every accepted value in that
+    /// same order. A superseded failure cannot replace the latest field state.
+    @discardableResult
+    func accept(
+        accountId: String,
+        field: AccountEditableField,
+        value: AccountEditableValue,
+        persist: @escaping @MainActor () async throws -> Void
+    ) -> Task<Void, Never> {
+        let key = AccountFieldKey(accountId: accountId, field: field)
+        return enqueue(key: key, value: value, persist: persist, isRetry: false)
+    }
+
+    @discardableResult
+    func retry(_ key: AccountFieldKey) -> Task<Void, Never>? {
+        guard let entry = entries[key], entry.phase == .failed else { return nil }
+        return enqueue(key: key, value: entry.value, persist: entry.persist, isRetry: true)
+    }
+
+    /// Applies accepted values to a freshly-read account snapshot. A successful
+    /// write remains overlaid until a refresh actually observes that value on disk;
+    /// this prevents a refresh that started before commit from reverting the UI.
+    func applyingOverlay(to freshAccounts: [Account]) -> [Account] {
+        var accounts = freshAccounts
+        var observed: [AccountFieldKey] = []
+
+        for (key, entry) in entries {
+            guard let index = accounts.firstIndex(where: { $0.id == key.accountId }) else { continue }
+            if entry.phase == .committedAwaitingObservation,
+               entry.value.matches(field: key.field, account: accounts[index]) {
+                observed.append(key)
+            } else {
+                entry.value.apply(field: key.field, to: &accounts[index])
+            }
+        }
+
+        for key in observed {
+            entries.removeValue(forKey: key)
+            failedKeys.remove(key)
+            retryingKeys.remove(key)
+        }
+        return accounts
+    }
+
+    /// One indexed single-row update. The field enum is the column allow-list.
+    nonisolated static func persist(
+        accountId: String,
+        field: AccountEditableField,
+        value: AccountEditableValue,
+        database: PrioritizedDatabase
+    ) async throws {
+        try await database.write(label: "account.settings.\(field.rawValue)") { db in
+            switch value {
+            case .text(let text):
+                try db.execute(
+                    sql: "UPDATE account SET \(field.rawValue) = ? WHERE id = ?",
+                    arguments: [text, accountId]
+                )
+            case .boolean(let flag):
+                try db.execute(
+                    sql: "UPDATE account SET \(field.rawValue) = ? WHERE id = ?",
+                    arguments: [flag.databaseValue, accountId.databaseValue]
+                )
+            }
+        }
+    }
+
+    private func enqueue(
+        key: AccountFieldKey,
+        value: AccountEditableValue,
+        persist: @escaping @MainActor () async throws -> Void,
+        isRetry: Bool
+    ) -> Task<Void, Never> {
+        nextGeneration += 1
+        let generation = nextGeneration
+        entries[key] = Entry(
+            generation: generation,
+            value: value,
+            phase: .pending,
+            persist: persist
+        )
+        if isRetry {
+            retryingKeys.insert(key)
+        } else {
+            failedKeys.remove(key)
+            retryingKeys.remove(key)
+        }
+
+        let predecessor = tail
+        let task = Task { @MainActor in
+            await predecessor?.value
+            do {
+                try await persist()
+                guard entries[key]?.generation == generation else { return }
+                entries[key]?.phase = .committedAwaitingObservation
+                failedKeys.remove(key)
+                retryingKeys.remove(key)
+            } catch {
+                guard entries[key]?.generation == generation else { return }
+                entries[key]?.phase = .failed
+                failedKeys.insert(key)
+                retryingKeys.remove(key)
+            }
+        }
+        tail = task
+        return task
+    }
+}
+
 /// Store for sidebar navigation data — accounts, folders, outbox.
 /// Uses explicit refresh (pull model) instead of GRDB ValueObservation.
 /// Refresh is gated by RenderGate — deferred while user is interacting.
@@ -13,6 +233,7 @@ import GRDB
 final class NavigationStore {
     var accounts: [Account] = []
     var folders: [Folder] = []
+    let accountFieldPersistence = AccountFieldPersistenceStore()
     /// Outbox messages for display in sidebar/message list.
     var outboxMessages: [OutboxMessage] = []
     /// True when ANY active account exists, including calendar-only accounts
@@ -38,6 +259,7 @@ final class NavigationStore {
     private var unreadObserver: NSObjectProtocol?
     private var inboxObserver: NSObjectProtocol?
     private var refreshDebounceTask: Task<Void, Never>?
+    private var refreshGeneration = 0
 
     /// Load initial data synchronously. Must be called once at startup.
     /// Registers 3 targeted notification listeners:
@@ -222,6 +444,8 @@ final class NavigationStore {
     /// during the foreground catch-up burst (Half A / PLAN_HANG_FIX); the
     /// @Observable assignments happen on the main actor after it resolves.
     private func refreshNow() async {
+        refreshGeneration += 1
+        let generation = refreshGeneration
         let demoActive = DemoModeStore.shared.isActive
         do {
             let bundle = try await AppDatabase.dbPool.read { db -> SidebarBundle in
@@ -232,7 +456,10 @@ final class NavigationStore {
                     hasAny: try Account.filter(Column("isActive") == true).fetchCount(db) > 0
                 )
             }
-            self.accounts = bundle.accounts
+            // A newer refresh owns presentation. This also prevents an older
+            // pre-commit snapshot from landing after a newer post-commit one.
+            guard generation == refreshGeneration else { return }
+            self.accounts = accountFieldPersistence.applyingOverlay(to: bundle.accounts)
             self.folders = bundle.folders
             self.outboxMessages = bundle.outbox
             self.hasAnyAccount = bundle.hasAny

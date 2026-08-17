@@ -39,13 +39,98 @@ ended in `dispatch_sync`, and the inverse control reproduces the actor starvatio
 contention. It is also a query-count improvement: the exact FTS path no longer performs N+1 pool
 acquisitions.
 
-**Residual scope keeping this record open.** This pass did a current-state census sufficient to cover
-the two issue-listed Search paths, but it did not certify every synchronous database state reachable
-from every `@MainActor` context. At least `SearchView.openResult` still contains one synchronous,
-indexed header lookup on an explicit result tap. `UndoService.push` also retains synchronous
-main-actor diagnostic reads, now wholly behind the debug-logging gate fixed by `IOS-PERF-016`; that is
-not ordinary production work, but must be classified explicitly in a full census. Close #13 only
-after that complete by-state inventory either converts or consciously classifies every survivor.
+**Historical residual after the 2026-08-14 Search pass.** That pass did not certify every synchronous
+database state reachable from every `@MainActor` context. The 2026-08-15 census below discharges that
+inventory debt; this paragraph remains to show why the broader pass was required.
+
+## 2026-08-15 complete census and bounded account-field closure
+
+**Census revision and predicate.** At exact pre-change revision
+`98dde448b8587c9a47828a8aaaf64ff5e747cdc6`, walk every tracked Swift source under `TabMail/`,
+`Shared/`, and `TabMailNotificationService/`; select `read`, `write`, and
+`writeWithoutTransaction` calls whose receiver has a GRDB pool/queue/writer/reader type; exclude
+comment-only lines and `String`/`Data.write(to:)`; classify the synchronous overload when the call
+expression contains no `await`. That semantically yields **662 GRDB accessor calls: 424 async and
+238 synchronous (131 reads, 107 writes)**. Positive controls are `SearchView.openResult`, both
+`UndoService.push` reads, `InboxListReader.fetchSync`, and both `InboxViewModel.lookupMessage` reads.
+Negative controls are the PR-24-converted Search readers and `SettingsView.loadOldMessageCount`.
+After this change, the same semantic predicate yields **662 total / 425 async / 237 synchronous
+(131 reads, 106 writes)**: exactly the account-field write moves from the synchronous to the async
+class. The earlier receiver-name heuristic missed the replacement because its local receiver is named
+`database`; its static type is still `PrioritizedDatabase`, and `AccountFieldPersistenceStore.persist`
+is now an explicit positive control. The change therefore never reduced query count.
+
+The pre-change arithmetic closes as follows; no member is inferred safe merely because its query is
+cheap:
+
+| Synchronous state bucket | Count | Main-actor disposition |
+|---|---:|---|
+| Actor-isolated Search/Memory/Sync/Chat/Draft stores | 118 | Runs on the owning actor; 12 static/nonisolated members were caller-traced separately |
+| `PrioritizedDatabase` sync overload implementations | 3 | Mechanism, not a caller |
+| Notification-service process/test-only `NSEStagingDB` | 8 | Not in the main-app target |
+| Preview/demo/screenshot-only | 8 | Not a production state |
+| Sidecar/App-Group queues | 30 | Five `BodyAssetStore` states are MainActor-reachable but do not contend for the main pool |
+| Cold-start initialization/migration | 9 | Pre-UI, pre-contention |
+| Proven off-main actor/detached work | 15 | Caller/gate traced, including NSE mirrors/merge and thread detection |
+| Main-app MainActor-reachable synchronous | 47 | 41 reads and 6 writes before this change; now 46 synchronous states, plus the converted async write |
+
+Including two nonisolated `DraftStore.load` callers and five MainActor-reached `BodyAssetStore`
+sidecar states, the complete pre-change MainActor-reachable synchronous set is **54**; this change
+leaves **53 synchronous states** and one converted async state.
+The direct main-app path families are: `NavigationStore.loadInitialData`; `InboxListReader.fetchSync`;
+`InboxViewModel` folder/account/message/role/undo/label reads; `MessageDetailViewModel` action/body
+reads; `SearchView.openResult`; `InboxView` draft-tap and move-picker reads; `ComposeView` account,
+edit-context, quote, and suggestion reads; `UndoReopenCompose`; `PendingSendService.undo`;
+`MailNavigationView` draft classification; label/filter menus; account/reply-all compose helpers;
+the Device-Sync AI-cache probe; `AIChat`/cached-user-email lookups; `AccountDetailView`; the two
+`AccountManagerOutbox` decision writes; and the debug-gated `UndoService.push` diagnostics. The
+adjacent ungated deletion diagnostic discovered by the same predicate belongs to the
+`IOS-PERF-016` recurrence audit, not to this bounded change.
+
+**The fixed high-frequency invariant.** `AccountDetailView.saveAccountField` was byte-identical in
+shipped `v1.6.38`: Name, Email, and IMAP username field setters synchronously entered GRDB's single
+writer on every keystroke (the same helper also persisted signature placement and focus-loss
+signature commits). A synchronous `PrioritizedDatabase.write` cannot await `DatabaseWriteQueue`, so
+it bypassed priority ordering and blocked MainActor behind the current SQLite writer. The replacement
+updates the field and `NavigationStore` before returning, then the app-lifetime
+`AccountFieldPersistenceStore` chains every persistence task behind its predecessor and uses the
+async priority writer. No intent is cancelled or coalesced; accepted order is durable order, so a
+rapid edit remains last-write-wins even across pop/re-enter. A pending or failed account+field value
+overlays `NavigationStore.refreshNow` until a post-commit refresh actually observes it on disk, so a
+stale refresh cannot revert accepted presentation. Failures are stored and presented independently
+per account+field with Retry; a superseded failure cannot overwrite newer UI, and a successful retry
+clears only its own field. SQL remains one `UPDATE account ... WHERE id = ?`; query count,
+cardinality, schema, and index requirements are unchanged.
+
+**Consciously classified survivors — keep this record and GitHub #13 open.**
+
+- `SearchView.openResult` remains one indexed one-row lookup on an explicit tap. The synchronous
+  overload intentionally skips the async read-through NSE merge, which has measured multi-second
+  suspension potential; the read revalidates rendered identity, and inserting an `await` would admit
+  a second tap between decision and navigation/alert application. Shipped `v1.6.38` skipped local
+  revalidation and therefore is not an architecture to restore. Keep this site synchronous unless a
+  generation/cancellation design and device evidence justify the added state machine.
+- Inbox/detail gesture lookups and label reconciliations preserve visualized-snapshot, undo,
+  destination, and atomic read-then-observable-mutation rules. They are indexed/small-set and benefit
+  from the 64-reader pool backstop; naive suspension would reopen action reentrancy/order defects.
+- `InboxListReader.fetchSync`, initial folder resolution, and `NavigationStore.loadInitialData` retain
+  the documented first-paint/pagination and cold-start contracts. Render/on-appear reads in compose,
+  draft routing, move/label pickers, and thread cards remain scheduling exposure, but are bounded and
+  have no measured surviving stall; converting them requires tri-state/loading machinery rather than
+  a local scheduling edit.
+- `UndoService.push` reads are reachable only after the debug-logging gate and are not ordinary
+  production work. The Device-Sync AI-cache probe remains a background-triggered 2N MainActor read
+  shape and needs its own set-wise result-equivalence proof before conversion.
+- Five synchronous MainActor writes remain after this closure: the three explicit folder-role writes
+  in `AccountDetailView`, plus `AccountManagerOutbox.retryOutboxMessage` and
+  `discardOutboxMessageConfirmed`. The Outbox pair synchronously return a decision consumed by the
+  Undo-Send state machine; do not insert a suspension without re-proving its authority/never-drop
+  exits. The lower-frequency folder-role actions need the same ordered visible-state proof as this
+  field change before conversion.
+
+The census is revision-bound, not a future-proof certification. No surviving member has a measured
+post-PR-24 user-visible stall; the synchronous-write subclass is justified by its unmitigated single
+writer dependency, while the reader survivors are consciously narrowed rather than called harmless.
 
 ## Subsystem and search terms
 
