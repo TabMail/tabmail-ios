@@ -119,7 +119,7 @@ struct MoveIntoInboxAIEnqueueTests {
     private func resolveTargets(
         _ context: AccountManager.DrainContext, accountId: String, folderPath: String,
         pool: DatabasePool
-    ) throws -> [(headerId: String, accountId: String)] {
+    ) throws -> [ActiveAIQueue.Candidate] {
         let entries = context.enteredInbox.withLock { $0["\(accountId)|\(folderPath)"] ?? [] }
         return try pool.read { db in
             try AccountManager.resolveInboxEntryAITargets(
@@ -165,6 +165,13 @@ struct MoveIntoInboxAIEnqueueTests {
             isInInbox: true, pool: pool)
         let context = try await runMove(
             accountId: accountId, from: "Archive", to: "INBOX", uids: ["100"], pool: pool)
+        let pendingBeforeSync = try await pool.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [sourceId]) ?? 0
+        }
+        #expect(pendingBeforeSync == 1,
+                "the move-retirement transaction must commit direct intent before the later sync")
 
         // The sync then corrects the address — AFTER the drain recorded the member.
         let remappedId = try await applySyncUidRemap(
@@ -173,8 +180,15 @@ struct MoveIntoInboxAIEnqueueTests {
         defer { Task { try? await index.removeMessages(contentKeys: [ContentKey(rawValue: remappedId)]) } }
 
         let targets = try resolveTargets(context, accountId: accountId, folderPath: "INBOX", pool: pool)
+        let pendingAfterSync = try await pool.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [remappedId]) ?? 0
+        }
 
         #expect(targets.count == 1, "the message that entered the inbox must produce exactly one AI target")
+        #expect(pendingAfterSync == 1,
+                "a provider-address re-key must not erase the durable direct event")
         guard targets.count == 1 else { return }
         // THE SYSTEM PROPERTY: the enqueued id must still address a real indexed
         // body. An id that resolves to nothing produces a job that is dropped,
@@ -188,6 +202,134 @@ struct MoveIntoInboxAIEnqueueTests {
                 and is silently dropped, so the row keeps its spinner and never gains a tag.
                 """)
         #expect(targets[0].accountId == accountId)
+    }
+
+    @Test("A retirement failure rolls back the completed move's durable event")
+    func moveRetirementAndDirectMarkerRollbackTogether() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "acc-enter-inbox-marker-rollback"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "Archive", role: .archive, pool: pool)
+
+        let sourceId = try insertHeader(
+            accountId: accountId, folderPath: "Archive", uid: "marker-rollback",
+            rfc822: "marker-rollback@example.com", isInInbox: false, pool: pool)
+        try applyOptimisticMove(
+            headerId: sourceId, accountId: accountId, toFolderPath: "INBOX",
+            isInInbox: true, pool: pool)
+        var op = PendingOperation(
+            type: .move, messageIds: ["marker-rollback"], accountId: accountId,
+            folderPath: "Archive", destinationPath: "INBOX")
+        op.status = PendingStatus.inFlight.rawValue
+        let inFlightOp = op
+        let opId = inFlightOp.id
+        try await pool.write { db in
+            try inFlightOp.insert(db)
+            try db.execute(sql: """
+                CREATE TEMP TRIGGER fail_move_retirement
+                BEFORE DELETE ON pendingOperation
+                WHEN OLD.id = '\(opId)'
+                  AND EXISTS (
+                      SELECT 1 FROM messageHeader
+                      WHERE id = '\(sourceId)' AND aiDirectPending = 1
+                  )
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected move retirement failure');
+                END
+            """)
+        }
+
+        let context = AccountManager.DrainContext()
+        let outcome = await AccountManager.shared.executeSingleOp(
+            inFlightOp, provider: MockEmailProvider(), context: context)
+        #expect(outcome == .proceed,
+                "the marker transaction must preserve the pre-existing drain outcome")
+        let evidence = try await pool.read { db -> (Bool, Int, PendingOperation?) in
+            let rowExists = try MessageHeader.fetchOne(db, key: sourceId) != nil
+            let pending = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [sourceId]) ?? 0
+            return (rowExists, pending, try PendingOperation.fetchOne(db, key: opId))
+        }
+        #expect(evidence.0, "the source header survives the failed retirement transaction")
+        #expect(evidence.1 == 0)
+        #expect(evidence.2 != nil,
+                "the completed operation and its direct marker must commit atomically")
+        #expect(evidence.2?.status == PendingStatus.inFlight.rawValue,
+                "launch recovery, not a new same-drain replay, owns the surviving claim")
+        #expect(context.enteredInbox.withLock { $0.isEmpty })
+    }
+
+    @Test("A whole proved move never gives direct authority to a contradictory collision")
+    func wholeMoveContradictoryCollisionKeepsAuthorityOnSource() async throws {
+        let server = StatefulExchangeActionServer(messages: [
+            .init(
+                rfc822MessageId: "whole-moved@example.com",
+                providerMessageId: "graph-old", folderId: "Archive"),
+        ])
+        defer { server.close() }
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let accountId = "acc-enter-inbox-whole-collision"
+        _ = try FolderEpochTestFixture.makeAccount(
+            id: accountId, provider: .outlook, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "Archive", role: .archive, pool: pool)
+
+        let sourceId = try insertHeader(
+            accountId: accountId, folderPath: "Archive", uid: "graph-old",
+            rfc822: "whole-moved@example.com", isInInbox: false, pool: pool)
+        try applyOptimisticMove(
+            headerId: sourceId, accountId: accountId,
+            toFolderPath: "INBOX", isInInbox: true, pool: pool)
+        let survivorId = try insertHeader(
+            accountId: accountId, folderPath: "INBOX", uid: "graph/moved+1=",
+            rfc822: "contradictory-survivor@example.com",
+            isInInbox: true, pool: pool)
+        var op = PendingOperation(
+            type: .move, messageIds: ["graph-old"], accountId: accountId,
+            folderPath: "Archive", destinationPath: "INBOX")
+        op.status = PendingStatus.inFlight.rawValue
+        let inFlightOp = op
+        let opId = inFlightOp.id
+        try await pool.write { db in try inFlightOp.insert(db) }
+
+        let context = AccountManager.DrainContext()
+        let outcome = await AccountManager.shared.executeSingleOp(
+            inFlightOp, provider: server.provider(), context: context)
+        #expect(outcome == .proceed)
+        let evidence = try await pool.read {
+            db -> (Bool, Int, String?, Int, PendingOperation?) in
+            let oldExists = try MessageHeader.fetchOne(db, key: sourceId) != nil
+            let oldPending = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [sourceId]) ?? 0
+            let survivorRFC = try MessageHeader.fetchOne(
+                db, key: survivorId)?.rfc822MessageId
+            let survivorPending = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [survivorId]) ?? 0
+            return (oldExists, oldPending, survivorRFC, survivorPending,
+                    try PendingOperation.fetchOne(db, key: opId))
+        }
+
+        #expect(server.snapshot(providerMessageId: "graph/moved+1=")?.folderId == "INBOX",
+                "non-vacuity: Graph proved the destination address on the wire")
+        #expect(evidence.0, "contradictory content keeps the marked optimistic source")
+        #expect(evidence.1 == 1)
+        #expect(evidence.2 == "contradictory-survivor@example.com")
+        #expect(evidence.3 == 0,
+                "provider-address proof cannot overrule contradictory content identity")
+        #expect(evidence.4 == nil, "the successfully completed move still retires")
     }
 
     // MARK: - 2. The negative direction — "always enqueue" must not pass
@@ -215,6 +357,13 @@ struct MoveIntoInboxAIEnqueueTests {
         let recorded = context.enteredInbox.withLock { $0["\(accountId)|Receipts"] ?? [] }
         #expect(recorded.isEmpty,
                 "a destination that is not an inbox must record nothing — otherwise every move enqueues AI")
+        let directPending = try await pool.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [sourceId]) ?? 0
+        }
+        #expect(directPending == 0,
+                "a non-inbox move must not invent direct AI authority")
         let targets = try resolveTargets(context, accountId: accountId, folderPath: "Receipts", pool: pool)
         #expect(targets.isEmpty, "and therefore produce no AI target")
     }
@@ -287,6 +436,10 @@ struct MoveIntoInboxAIEnqueueTests {
             accountId: accountId, folderPath: "INBOX", uid: "a-uid",
             rfc822: sharedRfc, isInInbox: true, pool: pool)
         #expect(lowestId < insertedFirst)
+        try pool.write { db in
+            try ActiveAIQueue.markDirectPending(
+                headerIds: [insertedFirst, lowestId], db: db)
+        }
 
         let context = AccountManager.DrainContext()
         context.enteredInbox.withLock {

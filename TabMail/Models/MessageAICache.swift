@@ -31,6 +31,11 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
     var cachedReply: String?
     var replyGeneratedAt: Date?
 
+    /// RFC-bearing uncapped direct-event authority that survives a UIDVALIDITY
+    /// purge. The live header bit is the fast selector; this cache-keyed mirror is
+    /// only the identity-safe carry across delete-and-resync.
+    var aiDirectPending: Bool
+
     var updatedAt: Date
 
     // GRDB Identifiable: use `key` as the primary key
@@ -42,6 +47,7 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
     init(key: String, rfc822MessageId: String? = nil) {
         self.key = key
         self.rfc822MessageId = rfc822MessageId
+        self.aiDirectPending = false
         self.updatedAt = Date()
     }
 

@@ -1,36 +1,51 @@
 # IOS-AI-004
 
-- Register classification: `open`
+- Register classification: `accepted`
 - New post-freeze record (2026-08-12) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
 ## Status
 
-🔓 **OPEN (2026-08-13), NARROWED — the trigger now exists; the residual is RFC-less rows.** The
-2026-08-12 registration below said "there is no *message entered the inbox* trigger anywhere in the
-tree." **That is no longer true.** `1eb41702e` added one, at the exact site this record had already
-settled on. What survives is smaller and has a different cause: `resolveInboxEntryAITargets`
-**requires an rfc822 Message-ID** and refuses — deliberately, fail-closed, with a debug-gated log —
-for any member that has none. So a message with no `Message-ID` header that enters an inbox by local
-move, is **never opened**, and falls outside `repopulationCandidates`' window still receives no AI
-processing. See *What shipped* below.
+📋 **ACCEPTED LIMITATION (2026-08-15) — durable event authority cannot manufacture RFC-less
+identity.** `resolveInboxEntryAITargets` must still refuse a moved member
+with no RFC 822 Message-ID: its recorded UID is intentionally stale after destination sync, and
+using that UID against the destination folder has already selected an unrelated message. The
+rejected direct-ID candidate remains unsafe because Gmail canonicalization defeats it in the remap
+case.
+
+The fix candidate does not weaken that identity guard. Instead, the move-retirement transaction
+sets the schema-only `messageHeader.aiDirectPending` bit on the provider-proved inbox row before the
+ephemeral post-drain enqueue. Identity-proved header re-keys carry the bit, and
+launch/foreground/drain recovery selects marked rows without the automatic population cap. The bit
+therefore prevents a valid direct event from being lost merely because it is older than the
+configured population. RFC-bearing intent also mirrors into the existing `messageAICache` identity
+so a UIDVALIDITY delete-and-resync restores the bit on the same physical message. It does **not**
+make an unproved RFC-less IMAP re-key safe: if neither RFC
+identity nor a corroborated epoch arrives, guarded write admission still refuses and no AI output
+lands. Retaining that refusal is the accepted limitation; resolving a stale UID would be a
+wrong-message mutation.
+
+`SyncConfig.maxRecentEmails` remains exactly the existing configured automatic policy: select the
+newest N rows in each inbox before filtering cached AI work. It is not a queue batch, and the fix
+does not change its value. Thunderbird applies the same per-inbox startup population rule, while
+its separate persistent process-message queue retains direct events. The iOS bit supplies only the
+missing persistence property; it does not make the SwiftMail fork diverge.
+
+This disposition does **not** accept three independent defects found during the audit. They are
+registered separately as `IOS-AI-006` (the executor's duplicate recency gate never retires a refused
+job), `IOS-AI-007` (partial-success moves omitted the entered-inbox event), and `IOS-AI-008` (missing
+post-drain sync prerequisites discarded a recorded event). Their integrated fixes preserve this
+RFC-less refusal and the configured recent population while making identity-proved direct-event
+authority durable.
+They remain tracked independently; this record accepts only the RFC-less limitation.
 
 <details>
-<summary>Superseded status text (2026-08-12), preserved</summary>
+<summary>Superseded investigation and shipped-trigger history (2026-08-12 through 2026-08-13)</summary>
 
-🔓 **OPEN (2026-08-12) — registered under THE MANTRA, not deferred as a defect.** A message that
-enters an inbox by a **local move** is never enqueued for AI processing at move time. There is no
-"message entered the inbox" trigger anywhere in the tree. The gap is masked in ordinary use because
-opening the message processes it on demand, which is the recovery gesture — so the user normally sees
-AI output arrive when they tap the message rather than never.
-
-</details>
-
-⚠️ **The 2026-08-12 MANTRA argument above was made on a recovery gesture that was BLOCKED from the
-state that produced the report.** "Tapping the message is the recovery gesture" is true only while
-the row is on screen, and the row was hidden until the visibility fix of the *same day*; both device
-episodes predate it. Naming a recovery mechanism without enumerating the states it cannot run from is
-`MIS-IOS-008`, and this is its second recorded instance.
+> **Historical scope:** every present-tense failure statement inside this collapsed section describes
+> the pre-v85/shipped investigation. The candidate status and surviving RFC-less limitation are stated
+> above; this retained history is not a claim that the new durable-marker path still has no enqueue or
+> relaunch recovery.
 
 ## Subsystem and search terms
 
@@ -86,7 +101,7 @@ trigger for universal.
 This is what keeps the record OPEN rather than closed, and it is deliberately **not** in THE MANTRA's
 blocking set: AI output is **derived, recomputable content**, not authored user data and not a queued
 user intention, so nothing is dropped in the never-drop sense, no operation starves, there is no
-wrong-message mutation, and nothing bricks. Owner ruling of 2026-08-12 applies directly — a non-minimal
+wrong-message mutation, and nothing bricks. The 2026-08-12 disposition applies directly — a non-minimal
 fix belongs in the register for a later session.
 
 ## What shipped (2026-08-13, `1eb41702e`) — and the one thing it does not cover
@@ -131,7 +146,7 @@ records why they never need one.
   where the destination `folder.role` is in scope.
 - Mirror `onMoved.js`'s architecture rather than inventing one — ADR-IOS-008 parity is mandatory.
 
-## The owner re-test — now a CONFIRMATION test, not a justification test
+## Confirmation retest
 
 Same single gesture, but its meaning has inverted. Move a message into the inbox **from the inbox
 list's move sheet** — not from a detail view — and **do not open it**. Before `1eb41702e` this was the
@@ -142,8 +157,13 @@ reopens at its original width.
 ⚠️ **This test has not been run.** `1eb41702e` has been verified by reading and by
 `MoveIntoInboxAIEnqueueTests`; no device pass has confirmed the user-visible outcome.
 
+</details>
+
 ## Related
 
 - `IOS-AI-005` — a *separate* defect that can discard an AI result which WAS computed.
+- `IOS-AI-006` — the separate non-retiring duplicate recency gate.
+- `IOS-AI-007` — partial-success moves omitted the entered-inbox event.
+- `IOS-AI-008` — missing sync prerequisites discarded a recorded event.
 - `IOS-MOVE-002` — its 2026-08-12 amendment; the visibility fix that restored the tap gesture.
 - ADR-IOS-008 — TB parity, authoritative for any implementation.

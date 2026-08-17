@@ -142,9 +142,15 @@ struct MoveFinishResult: Sendable, Equatable {
     var applied: [HeaderRekeyRecord] = []
     var unsafeUndoOldHeaderIds: [String] = []
     var removedOldHeaderIds: [String] = []
+    /// Provider-proven destination row for every locally resolved member. Unlike
+    /// `applied`, this also includes the collision arm where an existing destination
+    /// row survives and the optimistic old row is removed.
+    var destinationHeaderIdsByOldId: [String: String] = [:]
 
     static let empty = MoveFinishResult()
 }
+
+struct DirectAIRekeyCollisionUnproven: Error, Equatable {}
 
 // MARK: - The re-key itself
 
@@ -161,6 +167,15 @@ enum MessageHeaderRekey {
     /// not durable state.
     private static let addressHandoffs = Mutex(AddressHandoffState())
     private static let addressHandoffLimit = 512
+
+    private static func sameNonemptyRFCIdentity(
+        _ lhs: String?, _ rhs: String?
+    ) -> Bool {
+        guard let lhs, let rhs else { return false }
+        let left = EmailFilter.normalizeMessageId(lhs)
+        let right = EmailFilter.normalizeMessageId(rhs)
+        return !left.isEmpty && left == right
+    }
 
     /// Register from inside the transaction that performs the re-key. GRDB runs
     /// the commit callback on its serialized writer queue, after a successful
@@ -247,11 +262,13 @@ enum MessageHeaderRekey {
     /// rather than by an RFC 822 match. Both callers share this body, so the
     /// two paths cannot drift.
     ///
-    /// **ORDERING IS LOAD-BEARING.** The body fetch, the user-label capture and
-    /// BOTH deletes must precede EVERY exit — including the collision return —
-    /// or the leg that skips the re-insert still leaves the orphan behind. The
-    /// `messageBody` FK cascade that used to reclaim the body row is gone as of
-    /// Stage D, so the delete is explicit.
+    /// **ORDERING IS LOAD-BEARING after collision admission.** An occupied new id
+    /// with no positive direct-event identity proof throws before either delete and
+    /// retains the source row. Once admitted, the body fetch, user-label capture,
+    /// and BOTH deletes must precede every remaining exit — including the proved
+    /// collision return — or the leg that skips re-insert still leaves the orphan
+    /// behind. The `messageBody` FK cascade that used to reclaim the body row is
+    /// gone as of Stage D, so the delete is explicit.
     ///
     /// **THE TWO CHILD TABLES THAT CASCADE**, both declared
     /// `.references("messageHeader", onDelete: .cascade)` in `AppDatabase`, and
@@ -416,39 +433,92 @@ enum MessageHeaderRekey {
     ///    and unchanged by this helper — sync's UID-remap path has re-keyed
     ///    headers out from under it since long before the drain did.
     ///
-    /// - Returns: `true` when `migrated` was inserted. `false` when a row
-    ///   already occupies the new id — in which case the old row is still gone,
-    ///   which is the pre-existing behaviour of the sync path's `continue`
-    ///   (the new id is the survivor and the old id's FTS entry is dropped by
-    ///   the caller's ordinary stale handling rather than re-keyed).
+    /// - Returns: `true` when `migrated` was inserted. `false` when an
+    ///   identity-proved row already occupies the new id — in which case the old
+    ///   row is gone, preserving the sync path's pre-existing `continue` behavior
+    ///   (the new id survives and ordinary stale handling drops the old FTS entry).
+    ///   An unproved direct-event collision throws before deletion instead of
+    ///   returning `false`.
     @discardableResult
-    static func apply(from old: MessageHeader, to migrated: MessageHeader, db: Database) throws -> Bool {
+    static func apply(
+        from old: MessageHeader,
+        to migrated: MessageHeader,
+        directCollisionIdentityProven: Bool = false,
+        db: Database
+    ) throws -> Bool {
         let oldId = old.id
         let newId = migrated.id
         // Everything the delete destroys is read FIRST — see "ORDERING IS
-        // LOAD-BEARING" above. Both deletes then run unconditionally, so the
-        // collision return below cannot leave a duplicate plus a leak.
+        // LOAD-BEARING" above. A direct-event collision without positive identity
+        // proof refuses before either delete; all other collision arms retain the
+        // pre-existing delete-old/keep-survivor contract.
         let oldBody = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId))
         let carriedLabels = try MessageUserLabel
             .filter(Column("messageId") == oldId)
             .fetchAll(db)
+        let directAIPending = try Int.fetchOne(
+            db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+            arguments: [oldId]) == 1
+        let collisionBeforeDelete = try MessageHeader.fetchOne(db, key: newId)
+        let carryDirectAIPending = directAIPending && migrated.isInInbox
+        if carryDirectAIPending, let collisionBeforeDelete,
+           !directCollisionIdentityProven,
+           !sameNonemptyRFCIdentity(
+               old.rfc822MessageId, collisionBeforeDelete.rfc822MessageId
+           ) {
+            // Unknown identity is not authority to move a durable direct event.
+            // Throw before either delete so the caller's transaction retains the
+            // marked source row for a later, better-corroborated sync pass.
+            throw DirectAIRekeyCollisionUnproven()
+        }
         try old.delete(db)
         _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
         // Defensive — if a concurrent path already inserted this id, skip
-        // instead of throwing UNIQUE.
-        guard try MessageHeader.fetchOne(db, key: newId) == nil else { return false }
-        try migrated.insert(db)
-        if var body = oldBody {
-            body.id = ContentKey(rawValue: newId)
-            try body.insert(db)
+        // instead of throwing UNIQUE. A collision receives direct authority only
+        // under the positive identity check below.
+        guard let collisionSurvivor = try MessageHeader.fetchOne(db, key: newId) else {
+            var inserted = migrated
+            if carryDirectAIPending {
+                // GRDB and FTS re-key in separate databases. Leaving this false
+                // makes a crash between them fall into ordinary body recovery.
+                inserted.bodyComplete = false
+            }
+            try inserted.insert(db)
+            if carryDirectAIPending {
+                try ActiveAIQueue.markDirectPending(headerIds: [newId], db: db)
+            }
+            if var body = oldBody {
+                body.id = ContentKey(rawValue: newId)
+                try body.insert(db)
+            }
+            for label in carriedLabels {
+                var carried = label
+                carried.messageId = newId
+                try carried.insert(db)
+            }
+            try ThreadUtils.insertMessageReferences(for: inserted, db: db)
+            return true
         }
-        for label in carriedLabels {
-            var carried = label
-            carried.messageId = newId
-            try carried.insert(db)
+        // A collision survivor receives direct-event authority only on positive
+        // content identity. A bare destination key can be reused after IMAP
+        // UIDVALIDITY turnover; OR-ing onto that row would process the wrong email.
+        let matchingRFC = sameNonemptyRFCIdentity(
+            old.rfc822MessageId, collisionSurvivor.rfc822MessageId)
+        if carryDirectAIPending, directCollisionIdentityProven,
+           collisionSurvivor.rfc822MessageId?.isEmpty != false,
+           let carriedRFC = old.rfc822MessageId, !carriedRFC.isEmpty {
+            // The provider/epoch proof says the destination-key survivor is this
+            // physical message. Preserve the sole known content identity before
+            // re-arming its marker, or the live bit survives while the RFC-keyed
+            // UID-reset mirror is silently lost.
+            try db.execute(
+                sql: "UPDATE messageHeader SET rfc822MessageId = ? WHERE id = ?",
+                arguments: [carriedRFC, newId])
         }
-        try ThreadUtils.insertMessageReferences(for: migrated, db: db)
-        return true
+        if carryDirectAIPending, directCollisionIdentityProven || matchingRFC {
+            try ActiveAIQueue.markDirectPending(headerIds: [newId], db: db)
+        }
+        return false
     }
 
     /// FINISH THE MOVE LOCALLY: re-key each member for which the provider
@@ -524,6 +594,7 @@ enum MessageHeaderRekey {
         // G2 — read the folder's OWN epoch; the stamp is admitted only if the
         // server's reported epoch agrees with it.
         let folderEpoch = try Folder.fetchOne(db, key: destinationFolderId)?.lastKnownUidValidity
+        let accountProvider = try Account.fetchOne(db, key: op.accountId)?.provider
         let memberIds = Set(op.messageIds)
         let inScope = destinations.filter { memberIds.contains($0.sourceProviderId) }
         let sourceCounts = Dictionary(
@@ -603,7 +674,53 @@ enum MessageHeaderRekey {
                 migrated.observedUidValidity = nil
             }
 
-            guard try apply(from: row, to: migrated, db: db) else {
+            let collisionSurvivor = try MessageHeader.fetchOne(db, key: newId)
+            let collisionIdentityProven = collisionSurvivor.map { survivor in
+                let sourceRFC = row.rfc822MessageId.map(EmailFilter.normalizeMessageId)
+                    .flatMap { $0.isEmpty ? nil : $0 }
+                let survivorRFC = survivor.rfc822MessageId.map(EmailFilter.normalizeMessageId)
+                    .flatMap { $0.isEmpty ? nil : $0 }
+                if let sourceRFC, let survivorRFC, sourceRFC != survivorRFC {
+                    // Provider-address corroboration cannot overrule positive
+                    // content contradiction. Keep the marked source row rather
+                    // than authorize AI against the survivor's cached body.
+                    return false
+                }
+                if sourceRFC != nil, sourceRFC == survivorRFC {
+                    return true
+                }
+                if let accountProvider,
+                   accountProvider != .imap && accountProvider != .icloud {
+                    // Gmail bypasses address repair; Graph/other stable provider ids
+                    // are globally stable, so the server-named destination key is identity.
+                    return true
+                }
+                guard let provenEpoch = destination.destinationUidValidity,
+                      provenEpoch > 0,
+                      folderEpoch == Int(provenEpoch),
+                      survivor.observedUidValidity == Int(provenEpoch)
+                else { return false }
+                return true
+            } ?? false
+            let directAIPending = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [oldId]) == 1
+            // Only an already-durable direct event changes the collision outcome.
+            // Ordinary/non-inbox rekeys keep the historical delete-old contract.
+            // The move-retirement caller marks an optimistic inbox-entry row before
+            // this call, so an unproven survivor cannot steal that authority.
+            if directAIPending, collisionSurvivor != nil, !collisionIdentityProven {
+                result.unsafeUndoOldHeaderIds.append(oldId)
+                continue
+            }
+            let inserted = try apply(
+                from: row, to: migrated,
+                directCollisionIdentityProven: collisionIdentityProven,
+                db: db)
+            if inserted || collisionIdentityProven {
+                result.destinationHeaderIdsByOldId[oldId] = newId
+            }
+            guard inserted else {
                 // The new id was already occupied, so `apply` deleted the old
                 // row and inserted nothing. `oldId` now names no header at all
                 // — report it so the caller can drop it from the stores that

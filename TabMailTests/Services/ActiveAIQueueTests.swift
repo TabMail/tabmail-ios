@@ -618,7 +618,7 @@ struct AIWriteIdentityGuardTests {
         }
 
         let snapshot = try db.read {
-            try OpenedAIProcessingSnapshot.capture(headerId: original.id, db: $0)
+            try OpenedAIProcessingSnapshot.capture(message: original, db: $0)
         }
         let captured = try #require(snapshot)
 
@@ -694,6 +694,36 @@ struct AIWriteIdentityGuardTests {
         #expect(outcome == .written)
         let after = try blurb(db, Self.headerId)
         #expect(after == "X's summary", "the ordinary healthy write must land — this is the whole product")
+    }
+
+    @Test("The final guarded AI write clears durable direct authority atomically")
+    func fullGuardedWriteClearsDirectPending() throws {
+        let db = try makeFixture(folderEpoch: 111)
+        var original = makeHeader(
+            subject: "Direct completion", rfc822: "<direct-complete@example.com>",
+            observedEpoch: 111)
+        original.bodyComplete = true
+        try db.write { db in
+            try original.insert(db)
+            try ActiveAIQueue.markDirectPending(headerIds: [original.id], db: db)
+        }
+        let target = try #require(try capture(db, original))
+
+        let outcome = try attemptFullAIWrite(
+            db, target: target, blurb: "Direct summary")
+        let evidence = try db.read { db -> (MessageHeader?, Int) in
+            let current = try MessageHeader.fetchOne(db, key: original.id)
+            let pending = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [original.id]) ?? 0
+            return (current, pending)
+        }
+        #expect(outcome == .written)
+        #expect(evidence.0?.summaryBlurb == "Direct summary")
+        #expect(evidence.0?.actionTag == .reply)
+        #expect(evidence.0?.cachedReply == "X's precomputed reply")
+        #expect(evidence.1 == 0,
+                "field completion and marker retirement share the guarded write")
     }
 
     /// 🚨 AUDIT ROUND 4 / `IOS-ROUND3-D6` — **RE-SCOPED, NOT DELETED.** Its previous
@@ -1198,6 +1228,28 @@ struct AIWriteIdentityGuardTests {
                 """)
     }
 
+    @Test("The final AI write refuses a stable-provider row after its Inbox folder vanishes")
+    func stableProviderFolderLossRefusesAtMutationBoundary() throws {
+        // Gmail's provider id is itself stable identity, so resolveCurrentHeader
+        // alone deliberately accepts it. This fixture therefore discriminates the
+        // final live-Inbox scope guard from the older identity-only guard.
+        let db = try makeFixture(folderEpoch: nil, provider: .gmail)
+        let original = makeHeader(
+            subject: "Stable provider", rfc822: "<stable@example.com>",
+            observedEpoch: nil)
+        try db.write { try original.insert($0) }
+        let target = try #require(try capture(db, original))
+
+        try db.write { db in _ = try Folder.deleteOne(db, key: Self.folderId) }
+        #expect(try db.read { try MessageHeader.fetchOne($0, key: Self.headerId) } != nil)
+        try proveBareWriteLandsThenUndo(db, headerId: Self.headerId)
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "must not land")
+        #expect(outcome == .dropped)
+        #expect(try blurb(db, Self.headerId) == nil,
+                "identity proof cannot substitute for current live-Inbox scope")
+    }
+
     /// Invariant: **a folder whose numbering was never observed does not authorize a
     /// write it cannot otherwise identify.** The row here IS stamped; the folder is
     /// not, so no three-way agreement is obtainable and there is no content witness.
@@ -1348,12 +1400,11 @@ struct AIWriteIdentityGuardTests {
     }
 
     /// NON-VACUITY, the other side: **arm 6 was not weakened.** The folder row is
-    /// ABSENT — the strongest form of "no numbering evidence" — and the write still
-    /// lands, because the RFC 2822 Message-ID names the CONTENT rather than the
-    /// address, and an AI summary is derived content. Without this control the fix
-    /// would be free to degrade into "refuse whenever the folder is not stamped",
-    /// which is a blanket refusal wearing a guard's clothes.
-    @Test("The RFC content witness still carries a row whose Folder row is gone")
+    /// ABSENT — the strongest form of "no numbering evidence" — but the RFC 2822
+    /// Message-ID still resolves the physical message. That identity proof does not
+    /// replace the final live-Inbox scope requirement: a guarded mutation must drop
+    /// after the folder itself has vanished.
+    @Test("The RFC witness resolves identity after Folder loss, but the final write drops")
     func contentWitnessStillCarriesARowWithNoFolder() throws {
         let db = try makeFixture(folderEpoch: 111)
         let original = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: nil)
@@ -1367,22 +1418,22 @@ struct AIWriteIdentityGuardTests {
         let folderAfter = try db.read { try Folder.fetchOne($0, key: Self.folderId) }
         #expect(folderAfter == nil, "the folder row must be gone, so only the content witness can carry this")
 
+        let identityResolved = try db.read { try target.resolveCurrentHeader(db: $0) }
+        #expect(identityResolved?.id == Self.headerId,
+                "the RFC content witness must remain sufficient for identity resolution")
+
         let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
-        #expect(outcome == .written)
-        #expect(try blurb(db, Self.headerId) == "X's summary",
-                """
-                The content witness was weakened along with arm 7. An RFC 2822 Message-ID that still \
-                agrees identifies the MESSAGE regardless of what its folder metadata says, and derived \
-                content is exactly what it is the correct instrument for (ADR-IOS-068 §7, ADR-IOS-072).
-                """)
+        #expect(outcome == .dropped)
+        #expect(try blurb(db, Self.headerId) == nil,
+                "identity proof cannot substitute for current live-Inbox scope")
     }
 
     /// Arm 4's early return, swept over EVERY non-epoch-addressed provider rather
     /// than the two that happened to have a test. Their id spaces are never
     /// renumbered, so the address IS the identity and no folder or epoch state may
-    /// influence the decision — asserted here in the harshest state the fix creates:
-    /// no folder row at all, no stamp anywhere, no content witness.
-    @Test("A provider whose ids are never renumbered is unaffected by any folder-epoch state",
+    /// influence that identity decision. The final mutation still requires a live
+    /// Inbox folder — asserted here with no folder row, stamp, or content witness.
+    @Test("Stable-provider identity ignores epochs, but the final write needs a live Inbox",
           arguments: [AccountProvider.gmail, AccountProvider.outlook, AccountProvider.caldav])
     func nonEpochAddressedProvidersAreUnaffected(provider: AccountProvider) throws {
         let db = try makeFixture(folderEpoch: nil, provider: provider)
@@ -1395,17 +1446,21 @@ struct AIWriteIdentityGuardTests {
 
         try db.write { db in _ = try Folder.deleteOne(db, key: Self.folderId) }
 
+        let identityResolved = try db.read { try target.resolveCurrentHeader(db: $0) }
+        #expect(identityResolved?.id == Self.headerId,
+                "\(provider.rawValue) ids are stable — arm 4 must return before every epoch arm")
+
         let outcome = try attemptSummaryWrite(db, target: target, blurb: "\(provider.rawValue) summary")
-        #expect(outcome == .written)
-        #expect(try blurb(db, Self.headerId) == "\(provider.rawValue) summary",
-                "\(provider.rawValue) ids are never renumbered — arm 4 must return before any epoch arm")
+        #expect(outcome == .dropped)
+        #expect(try blurb(db, Self.headerId) == nil,
+                "stable identity cannot substitute for current live-Inbox scope")
     }
 
     /// The demo account is IMAP-shaped and served by `DemoProvider`, so nothing can
-    /// ever stamp it. It is excluded BY ID at arm 4; this pins the exclusion in the
-    /// state the fix would otherwise black out permanently — no folder row, no
-    /// content witness, no stamp.
-    @Test("The demo account writes through with no folder row, no witness and no stamp")
+    /// ever stamp it. It is excluded BY ID at arm 4, so identity still resolves
+    /// without a folder row, content witness, or stamp. The final mutation has the
+    /// same live-Inbox requirement as every other account.
+    @Test("Demo identity bypasses epochs, but the final write needs a live Inbox")
     func demoAccountIsUnaffectedByTheFolderEpochRequirement() throws {
         let db = try makeFixture(folderEpoch: nil, accountId: DemoSeed.demoAccountId, provider: .imap)
         let original = makeHeader(
@@ -1422,9 +1477,13 @@ struct AIWriteIdentityGuardTests {
                     accountId: DemoSeed.demoAccountId, folderPath: Self.folderPath))
         }
 
+        let identityResolved = try db.read { try target.resolveCurrentHeader(db: $0) }
+        #expect(identityResolved?.id == original.id,
+                "Demo Mode can never stamp an epoch and must remain identity-resolvable")
+
         let outcome = try attemptSummaryWrite(db, target: target, blurb: "demo summary")
-        #expect(outcome == .written)
-        #expect(try blurb(db, original.id) == "demo summary",
-                "Demo Mode has no server and can never stamp an epoch — it must never be epoch-refused")
+        #expect(outcome == .dropped)
+        #expect(try blurb(db, original.id) == nil,
+                "the demo epoch bypass cannot substitute for current live-Inbox scope")
     }
 }

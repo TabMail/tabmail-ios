@@ -14,9 +14,8 @@ struct AwaitDrainCancellationTests {
         // Enqueue items to ActiveAIQueue so it's NOT idle
         // (can't actually process without providers, but that's fine —
         // we just need isIdle == false to test that drain doesn't hang)
-        await ActiveAIQueue.shared.enqueueBatch([
-            (headerId: "test:INBOX:1", accountId: "test")
-        ])
+        await ActiveAIQueue.shared.enqueueUnboundForCancellationTest(
+            headerId: "test:INBOX:1", accountId: "test")
 
         let drainTask = Task {
             await ActiveAIQueue.shared.awaitDrain()

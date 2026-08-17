@@ -300,25 +300,33 @@ actor ActiveBodyQueue {
         scheduleDispatch()
     }
 
+    /// Durable incomplete-body discovery. Direct AI authority does not need a
+    /// second predicate here: every incomplete inbox body remains eligible, so a
+    /// marked old row can reach FTS before the AI selector applies its policy.
+    nonisolated static func repopulationCandidates(db: Database) throws -> [Item] {
+        try Row.fetchAll(db, sql: """
+            SELECT id, accountId, folderPath, messageId, isInInbox
+            FROM messageHeader
+            WHERE headerComplete = 1 AND bodyComplete = 0
+              AND bodyEmptyConfirmed = 0 AND isInInbox = 1
+            ORDER BY date DESC
+            """)
+        .map { row in
+            Item(
+                headerId: row["id"],
+                accountId: row["accountId"],
+                folderPath: row["folderPath"],
+                messageId: row["messageId"],
+                isInInbox: row["isInInbox"]
+            )
+        }
+    }
+
     func repopulateFromDatabase() async {
         let t0 = CFAbsoluteTimeGetCurrent()
         do {
             let items: [Item] = try await dbPool.read { db in
-                try Row.fetchAll(db, sql: """
-                    SELECT id, accountId, folderPath, messageId, isInInbox
-                    FROM messageHeader
-                    WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                    ORDER BY date DESC
-                    """)
-                .map { row in
-                    Item(
-                        headerId: row["id"],
-                        accountId: row["accountId"],
-                        folderPath: row["folderPath"],
-                        messageId: row["messageId"],
-                        isInInbox: row["isInInbox"]
-                    )
-                }
+                try Self.repopulationCandidates(db: db)
             }
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             guard !items.isEmpty else {
@@ -573,7 +581,10 @@ actor ActiveBodyQueue {
                     // .normal-tagged (ADR-IOS-056) — see the process() call above.
                     if !processedItems.isEmpty {
                         await PriorityGate.normal {
-                            await BodyFetchProcessor.flushBatch(processedItems, enableAI: true)
+                            await BodyFetchProcessor.flushBatch(
+                                processedItems,
+                                enableAI: true,
+                                aiEnqueueScope: .automaticRecentWindow)
                         }
                     }
 
@@ -817,21 +828,7 @@ actor ActiveBodyQueue {
     private func repopulateOnDrain() async {
         do {
             let items: [Item] = try await dbPool.read { db in
-                try Row.fetchAll(db, sql: """
-                    SELECT id, accountId, folderPath, messageId, isInInbox
-                    FROM messageHeader
-                    WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                    ORDER BY date DESC
-                    """)
-                .map { row in
-                    Item(
-                        headerId: row["id"],
-                        accountId: row["accountId"],
-                        folderPath: row["folderPath"],
-                        messageId: row["messageId"],
-                        isInInbox: row["isInInbox"]
-                    )
-                }
+                try Self.repopulationCandidates(db: db)
             }
             guard !items.isEmpty else { return }
             var added = 0

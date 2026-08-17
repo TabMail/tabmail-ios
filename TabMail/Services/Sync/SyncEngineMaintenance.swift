@@ -65,30 +65,60 @@ extension SyncEngine {
             print("[Prune] Removed \(bodiesRemoved) message bodies")
         }
 
+        let headersRemoved = pruneHeadersWhileOverBudget(
+            dbPool: dbPool,
+            accounts: accounts,
+            foldersByAccount: foldersByAccount,
+            floor: floor,
+            pruneChunkSize: pruneChunkSize,
+            isOverBudget: { StorageEstimator.isOverBudget() },
+            releaseContent: { keys in
+                Task.detached(priority: .medium) {
+                    await MessageContentStore.releaseUnowned(
+                        keys, stores: [.searchIndex, .body], pool: dbPool)
+                }
+            })
+        if headersRemoved > 0 {
+            print("[Prune] Removed \(headersRemoved) message headers")
+        }
+        print("[Prune] Done — now \(String(format: "%.1f", StorageEstimator.totalSizeMB()))MB")
+    }
+
+    /// Production header-budget phase, separated from the disk-size probe so its
+    /// mixed regular/direct-marker behavior can be exercised deterministically.
+    /// `runPruneIfOverBudget` is the only production caller and supplies the real
+    /// storage predicate; tests supply a fixed predicate, not a duplicate SQL loop.
+    @discardableResult
+    nonisolated static func pruneHeadersWhileOverBudget(
+        dbPool: PrioritizedDatabase,
+        accounts: [Account],
+        foldersByAccount: [String: [Folder]],
+        floor: Int,
+        pruneChunkSize: Int,
+        isOverBudget: () -> Bool,
+        releaseContent: ([ContentKey]) -> Void
+    ) -> Int {
         var headersRemoved = 0
         for account in accounts {
             let folders = foldersByAccount[account.id] ?? []
             for folder in folders {
-                guard StorageEstimator.isOverBudget() else { break }
-                while StorageEstimator.isOverBudget() {
-                    let currentCount = (try? dbPool.read { db in
-                        try MessageHeader.filter(Column("folderId") == folder.id).fetchCount(db)
-                    }) ?? 0
-                    guard currentCount > floor else { break }
-                    let batch: [MessageHeader] = (try? dbPool.read { db in
-                        try MessageHeader
-                            .filter(Column("folderId") == folder.id)
-                            .order(Column("date").asc)
-                            .limit(pruneChunkSize)
-                            .fetchAll(db)
-                    }) ?? []
-                    guard !batch.isEmpty else { break }
-
+                guard isOverBudget() else { break }
+                while isOverBudget() {
                     var chunkIds: [String] = []
                     do {
                         try dbPool.write { db in
+                            let currentCount = try MessageHeader
+                                .filter(Column("folderId") == folder.id)
+                                .fetchCount(db)
+                            guard currentCount > floor else { return }
+                            let batch = try MessageHeader
+                                .filter(Column("folderId") == folder.id)
+                                .filter(Column("aiDirectPending") == false)
+                                .order(Column("date").asc, Column("id").asc)
+                                .limit(min(pruneChunkSize, currentCount - floor))
+                                .fetchAll(db)
                             for msg in batch {
-                                guard StorageEstimator.isOverBudget() else { break }
+                                guard isOverBudget() else { break }
                                 chunkIds.append(msg.id)
                                 try msg.delete(db)
                                 headersRemoved += 1
@@ -97,39 +127,31 @@ extension SyncEngine {
                     } catch {
                         print("[Prune] Delete failed: \(error)")
                     }
-                    if !chunkIds.isEmpty {
-                        // Routed through `MessageContentStore`. The headers were
-                        // deleted in the write transaction just above, so this
-                        // detached release counts owners in the post-delete world.
-                        //
-                        // `.body` joins `.searchIndex` from Stage D and MATTERS MOST
-                        // here: this whole function exists to reclaim disk when the
-                        // user is over their storage budget, and without it the
-                        // bodies — the bulk of the bytes — would sit for up to
-                        // `bodyCacheTTLHours` waiting on `runEvictStaleBodies`.
-                        //
-                        // ⚠️ `.medium`, NOT `.utility` — ADR-IOS-031's floor for any
-                        // background task that touches GRDB. `releaseUnowned` runs on
-                        // the MAIN pool (`dbPool`/`syncPool`/`backgroundPool` all wrap
-                        // the same `rawPool`; `PrioritizedDatabase.priority` is the DB
-                        // write-queue TIER, not a `TaskPriority`), so at QoS 17 it
-                        // contended both with MainActor reads at `.userInitiated` (25)
-                        // and with this function's own delete loop. Scheduling priority
-                        // is the only change; the work, its ordering and its failure
-                        // handling are untouched.
-                        let keys = chunkIds.map(ContentKey.init(rawValue:))
-                        Task.detached(priority: .medium) {
-                            await MessageContentStore.releaseUnowned(
-                                keys, stores: [.searchIndex, .body], pool: dbPool)
-                        }
-                    }
+                    // Direct-event markers are intentionally pinned until AI work
+                    // reaches a durable terminal state. If only pinned rows remain,
+                    // no amount of rescanning can make progress in this folder.
+                    guard !chunkIds.isEmpty else { break }
+
+                    // Routed through `MessageContentStore`. The headers were
+                    // deleted in the write transaction just above, so this detached
+                    // release counts owners in the post-delete world.
+                    //
+                    // `.body` joins `.searchIndex` from Stage D and MATTERS MOST
+                    // here: this whole function exists to reclaim disk when the user
+                    // is over their storage budget, and without it the bodies — the
+                    // bulk of the bytes — would sit for up to `bodyCacheTTLHours`
+                    // waiting on `runEvictStaleBodies`.
+                    //
+                    // ⚠️ `.medium`, NOT `.utility` — ADR-IOS-031's floor for any
+                    // background task that touches GRDB. `releaseUnowned` runs on the
+                    // MAIN pool (`dbPool`/`syncPool`/`backgroundPool` all wrap the
+                    // same `rawPool`; `PrioritizedDatabase.priority` is the DB write-
+                    // queue TIER, not a `TaskPriority`).
+                    releaseContent(chunkIds.map(ContentKey.init(rawValue:)))
                 }
             }
         }
-        if headersRemoved > 0 {
-            print("[Prune] Removed \(headersRemoved) message headers")
-        }
-        print("[Prune] Done — now \(String(format: "%.1f", StorageEstimator.totalSizeMB()))MB")
+        return headersRemoved
     }
 
     /// Nonisolated evict — runs entirely off the main thread.
@@ -321,7 +343,10 @@ extension SyncEngine {
         let chunkSize = SyncConfig.pruneChunkSize
 
         let count = (try? dbPool.read { db in
-            try MessageAICache.filter(Column("updatedAt") < cutoff).fetchCount(db)
+            try MessageAICache
+                .filter(Column("updatedAt") < cutoff)
+                .filter(Column("aiDirectPending") == false)
+                .fetchCount(db)
         }) ?? 0
         guard count > 0 else { return }
 
@@ -334,6 +359,7 @@ extension SyncEngine {
                 let batchResult = try dbPool.write { db -> (purged: Int, rescued: Int, batchEmpty: Bool) in
                     let batch = try MessageAICache
                         .filter(Column("updatedAt") < cutoff)
+                        .filter(Column("aiDirectPending") == false)
                         .limit(chunkSize, offset: skipCount)
                         .fetchAll(db)
                     guard !batch.isEmpty else { return (0, 0, true) }

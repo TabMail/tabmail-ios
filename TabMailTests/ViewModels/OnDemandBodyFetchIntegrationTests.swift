@@ -159,6 +159,75 @@ struct OnDemandBodyFetchGRDBTests {
         #expect(vm.isLoading == false)
     }
 
+    @Test("Opening a body miss persists direct AI authority before provider fetch")
+    @MainActor
+    func openedBodyMissPersistsIntentBeforeFetch() async throws {
+        let (pool, _) = try makeTestPool()
+        let header = try await insertFixtures(
+            pool, messageId: "odf_direct_intent_\(UUID().uuidString)")
+
+        var markerObservedByFetch = false
+        let vm = MessageDetailViewModel(
+            messageId: header.id,
+            dbPool: pool,
+            fetchBodyOverride: { _ in
+                markerObservedByFetch = try await pool.read { db in
+                    try Int.fetchOne(
+                        db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                        arguments: [header.id]) == 1
+                }
+            }
+        )
+
+        await vm.loadBody()
+
+        #expect(markerObservedByFetch,
+                "the display event must be durable before any fallible body fetch")
+        let persisted = try await pool.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [header.id]) ?? 0
+        }
+        #expect(persisted == 1,
+                "a failed/empty fetch must leave the old direct event recoverable")
+    }
+
+    @Test("A stale opened snapshot cannot mark the replacement at a reused UID address")
+    func staleOpenedSnapshotDoesNotMarkReplacement() async throws {
+        let (pool, _) = try makeTestPool()
+        var openedSnapshot = try await insertFixtures(
+            pool, messageId: "odf_reused_uid_\(UUID().uuidString)")
+        openedSnapshot.rfc822MessageId = "captured@example.com"
+        openedSnapshot.observedUidValidity = 10
+        let captured = openedSnapshot
+        try await pool.write { db in
+            guard var account = try Account.fetchOne(db, key: captured.accountId),
+                  var folder = try Folder.fetchOne(db, key: captured.folderId)
+            else { return }
+            account.provider = .imap
+            folder.lastKnownUidValidity = 20
+            try account.update(db)
+            try folder.update(db)
+            var replacement = captured
+            replacement.rfc822MessageId = "replacement@example.com"
+            replacement.observedUidValidity = 20
+            try replacement.update(db)
+        }
+
+        let admitted = await AccountManager.shared.recordOpenedDirectIntent(
+            captured, in: PrioritizedDatabase(pool: pool))
+        await AccountManager.shared.processOpenedMessage(
+            captured, in: PrioritizedDatabase(pool: pool))
+        let pending = try await pool.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [captured.id]) ?? 0
+        }
+        #expect(!admitted)
+        #expect(pending == 0,
+                "a stale tap/fetch snapshot must not authorize the replacement row")
+    }
+
     @Test("loadBody handles message not found in DB")
     @MainActor
     func loadBodyMessageNotFound() async throws {

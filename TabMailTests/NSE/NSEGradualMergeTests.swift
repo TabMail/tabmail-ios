@@ -164,6 +164,13 @@ struct NSEGradualMergeTests {
         #expect(h1.subject == "Subject under test")
         #expect(h1.summaryBlurb == nil)
         #expect(h1.actionTag == nil)
+        let directPending1 = try await pool.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [headerId()]) ?? 0
+        }
+        #expect(directPending1 == 1,
+                "push authority must commit with the header, before body/FTS work")
         // No body yet.
         let bodyCount1 = try await pool.read { try MessageBody.filter(Column("id") == headerId()).fetchCount($0) }
         #expect(bodyCount1 == 0)
