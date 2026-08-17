@@ -237,6 +237,128 @@ struct LargeInboxTests {
         #expect(complete.1 == false)
     }
 
+    @Test("Drain recovery preserves full, partial, and body-pending direct events across relaunch")
+    func productionDrainRecoveryPreservesEveryNonterminalDirectShape() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        let folder = try TestDatabase.insertFolder(db)
+        let oldDate = try #require(Calendar.current.date(
+            byAdding: .day, value: -(SyncConfig.archiveAgeDays + 1), to: Date()))
+
+        var full = try TestDatabase.insertMessageHeader(
+            db, messageId: "direct-full", date: oldDate,
+            folderId: folder.id, accountId: "acc1", folderPath: "INBOX",
+            isInInbox: true, rfc822MessageId: "direct-full@example.com")
+        full.bodyComplete = true
+
+        var partial = try TestDatabase.insertMessageHeader(
+            db, messageId: "direct-partial", date: oldDate.addingTimeInterval(1),
+            folderId: folder.id, accountId: "acc1", folderPath: "INBOX",
+            isInInbox: true, rfc822MessageId: "direct-partial@example.com")
+        partial.bodyComplete = true
+        partial.summaryBlurb = "Already summarized"
+
+        var bodyPending = try TestDatabase.insertMessageHeader(
+            db, messageId: "direct-body-pending", date: oldDate.addingTimeInterval(2),
+            folderId: folder.id, accountId: "acc1", folderPath: "INBOX",
+            isInInbox: true, rfc822MessageId: "direct-body-pending@example.com")
+        bodyPending.headerComplete = true
+        bodyPending.bodyComplete = false
+
+        try db.write { db in
+            try full.update(db)
+            try partial.update(db)
+            try bodyPending.update(db)
+            try ActiveAIQueue.markDirectPending(
+                headerIds: [full.id, partial.id, bodyPending.id], db: db)
+        }
+
+        func recover() throws -> ([String: ActiveAIQueue.Candidate.Authority], [String: Int]) {
+            try db.write { db in
+                let candidates = try ActiveAIQueue.drainRecoveryCandidates(db: db)
+                let authorities = Dictionary(uniqueKeysWithValues:
+                    candidates.map { ($0.headerId, $0.authority) })
+                let markers = try Row.fetchAll(db, sql: """
+                    SELECT id, aiDirectPending FROM messageHeader
+                    WHERE id IN (?, ?, ?)
+                    """, arguments: [full.id, partial.id, bodyPending.id])
+                return (authorities, Dictionary(uniqueKeysWithValues: markers.map {
+                    (($0["id"] as String), ($0["aiDirectPending"] as Int))
+                }))
+            }
+        }
+
+        let firstLaunch = try recover()
+        #expect(firstLaunch.0[full.id] == .direct)
+        #expect(firstLaunch.0[partial.id] == .direct)
+        #expect(firstLaunch.0[bodyPending.id] == nil,
+                "body-incomplete direct work remains discoverable by ActiveBodyQueue first")
+        #expect(firstLaunch.1.values.allSatisfy { $0 == 1 })
+        #expect(try db.read { try ActiveBodyQueue.repopulationCandidates(db: $0) }
+            .contains { $0.headerId == bodyPending.id })
+
+        let secondLaunch = try recover()
+        #expect(secondLaunch.0[full.id] == .direct)
+        #expect(secondLaunch.0[partial.id] == .direct)
+        #expect(secondLaunch.0[bodyPending.id] == nil)
+        #expect(secondLaunch.1.values.allSatisfy { $0 == 1 },
+                "production pruning cannot age out a valid direct event")
+    }
+
+    @Test("All automatic body producers refuse the 101st row until a direct marker exists")
+    func automaticBodyProducerScopesShareTheBoundedAdmission() throws {
+        // These labels are the three production origins that reach
+        // `.automaticRecentWindow`: ActiveBodyQueue (including provider-delta
+        // body work), and InboxViewModel's list-snippet fetch. They intentionally
+        // converge on the same production finalizer and candidate selector.
+        for producer in ["active-body", "provider-delta", "list-snippet"] {
+            let db = try TestDatabase.make()
+            try TestDatabase.insertAccount(db)
+            let folder = try TestDatabase.insertFolder(db)
+            let now = Date()
+            var target: MessageHeader?
+            for i in 0...SyncConfig.maxRecentEmails {
+                var header = try TestDatabase.insertMessageHeader(
+                    db, messageId: "\(producer)-\(i)",
+                    date: now.addingTimeInterval(Double(-i)),
+                    folderId: folder.id, accountId: "acc1", folderPath: "INBOX",
+                    isInInbox: true)
+                header.bodyComplete = i != SyncConfig.maxRecentEmails
+                if i < SyncConfig.maxRecentEmails {
+                    header.summaryBlurb = "Complete"
+                    header.actionTag = ActionTag.none
+                    header.cachedReply = "Complete"
+                } else {
+                    target = header
+                }
+                try db.write { try header.update($0) }
+            }
+            let old = try #require(target)
+            let processed = BodyFetchProcessor.ProcessedItem(
+                contentKey: ContentKey(rawValue: old.id), headerId: old.id,
+                accountId: old.accountId, isInInbox: true,
+                body: "body", snippet: "snippet")
+
+            let unmarked = try db.write { db -> [BodyFetchProcessor.AIEnqueueCandidate] in
+                let durable = try BodyFetchProcessor.finalizeConfirmedItems(
+                    [processed], aiEnqueueScope: .automaticRecentWindow, db: db)
+                return try BodyFetchProcessor.automaticAIEnqueueCandidates(
+                    from: durable, db: db)
+            }
+            #expect(unmarked.isEmpty,
+                    "\(producer) must not turn an out-of-window body into automatic AI work")
+
+            let marked = try db.write { db -> [BodyFetchProcessor.AIEnqueueCandidate] in
+                try ActiveAIQueue.markDirectPending(headerIds: [old.id], db: db)
+                return try BodyFetchProcessor.automaticAIEnqueueCandidates(
+                    from: [processed], db: db)
+            }
+            #expect(marked.map { $0.item.headerId } == [old.id])
+            #expect(marked.first?.candidate.authority == .direct,
+                    "a separate direct event admits the exact same physical row")
+        }
+    }
+
     @Test("A marked old row crosses production body discovery and AI admission selectors")
     func markedOldBodyFlowsFromBodyFetchToAI() throws {
         let db = try TestDatabase.make()
@@ -542,6 +664,116 @@ struct LargeInboxTests {
         #expect(evidence.0 == 0)
         #expect(evidence.1 == .automatic,
                 "re-entry may qualify automatically, but cannot reactivate stale direct authority")
+    }
+
+    @Test("Inbox role loss atomically retires only that folder's direct authority")
+    func folderRoleLossClearsMarkerAndMirrorWithoutResurrection() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "one@example.com")
+        try TestDatabase.insertAccount(db, id: "acc2", email: "two@example.com")
+        let affectedFolder = try TestDatabase.insertFolder(db, accountId: "acc1")
+        let bystanderFolder = Folder(
+            name: "Focused", path: "Focused", role: .inbox, accountId: "acc1")
+        try db.write { try bystanderFolder.insert($0) }
+
+        var affected = try TestDatabase.insertMessageHeader(
+            db, messageId: "affected", folderId: affectedFolder.id,
+            accountId: "acc1", folderPath: "INBOX", isInInbox: true,
+            rfc822MessageId: "affected@example.com")
+        affected.bodyComplete = true
+        var bystander = try TestDatabase.insertMessageHeader(
+            db, messageId: "bystander", folderId: bystanderFolder.id,
+            accountId: "acc1", folderPath: "Focused", isInInbox: true,
+            rfc822MessageId: "bystander@example.com")
+        bystander.bodyComplete = true
+        var foreignAccount = try TestDatabase.insertMessageHeader(
+            db, messageId: "foreign-account", folderId: affectedFolder.id,
+            accountId: "acc2", folderPath: "INBOX", isInInbox: true,
+            rfc822MessageId: "foreign-account@example.com")
+        foreignAccount.bodyComplete = true
+
+        let affectedKey = try #require(MessageAICache.cacheKey(
+            accountId: affected.accountId, folderPath: affected.folderPath,
+            rfc822MessageId: affected.rfc822MessageId))
+        let bystanderKey = try #require(MessageAICache.cacheKey(
+            accountId: bystander.accountId, folderPath: bystander.folderPath,
+            rfc822MessageId: bystander.rfc822MessageId))
+        let foreignKey = try #require(MessageAICache.cacheKey(
+            accountId: foreignAccount.accountId, folderPath: foreignAccount.folderPath,
+            rfc822MessageId: foreignAccount.rfc822MessageId))
+
+        try db.write { db in
+            try affected.update(db)
+            try bystander.update(db)
+            try foreignAccount.update(db)
+            try ActiveAIQueue.markDirectPending(
+                headerIds: [affected.id, bystander.id], db: db)
+
+            // This intentionally inconsistent row proves the trigger validates
+            // account as well as folder identity. messageHeader.folderId has no FK;
+            // a bulk role cleanup must not treat the bare folder id as authority.
+            try db.execute(
+                sql: "UPDATE messageHeader SET aiDirectPending = 1 WHERE id = ?",
+                arguments: [foreignAccount.id])
+            var foreignMirror = MessageAICache(
+                key: foreignKey, rfc822MessageId: foreignAccount.rfc822MessageId)
+            foreignMirror.aiDirectPending = true
+            try foreignMirror.insert(db)
+
+            try db.execute(
+                sql: "UPDATE folder SET role = ? WHERE id = ?",
+                arguments: [FolderRole.archive.rawValue, affectedFolder.id])
+        }
+
+        let afterLoss = try db.read { db -> ([String: Int], [String: Bool?], Bool) in
+            let markers = try Row.fetchAll(db, sql: """
+                SELECT id, aiDirectPending FROM messageHeader
+                WHERE id IN (?, ?, ?)
+                """, arguments: [affected.id, bystander.id, foreignAccount.id])
+            let markerById = Dictionary(uniqueKeysWithValues: markers.map {
+                (($0["id"] as String), ($0["aiDirectPending"] as Int))
+            })
+            let mirrors = [affectedKey, bystanderKey, foreignKey]
+            let mirrorByKey = Dictionary(uniqueKeysWithValues: try mirrors.map { key in
+                (key, try Bool.fetchOne(
+                    db, sql: "SELECT aiDirectPending FROM messageAICache WHERE key = ?",
+                    arguments: [key]))
+            })
+            let staleInboxBit = try Bool.fetchOne(
+                db, sql: "SELECT isInInbox FROM messageHeader WHERE id = ?",
+                arguments: [affected.id]) ?? false
+            return (markerById, mirrorByKey, staleInboxBit)
+        }
+        #expect(afterLoss.0[affected.id] == 0)
+        #expect(afterLoss.1[affectedKey] == false,
+                "the nested header trigger must retire the RFC mirror in the same transaction")
+        #expect(afterLoss.2,
+                "the role trigger must not depend on the stale denormalized isInInbox bit")
+        #expect(afterLoss.0[bystander.id] == 1)
+        #expect(afterLoss.1[bystanderKey] == true)
+        #expect(afterLoss.0[foreignAccount.id] == 1)
+        #expect(afterLoss.1[foreignKey] == true)
+
+        try db.write { db in
+            try db.execute(
+                sql: "UPDATE folder SET role = ? WHERE id = ?",
+                arguments: [FolderRole.inbox.rawValue, affectedFolder.id])
+        }
+        let afterReassignment = try db.write { db -> (Int, Bool?, ActiveAIQueue.Candidate.Authority?) in
+            let candidates = try ActiveAIQueue.drainRecoveryCandidates(db: db)
+            let marker = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [affected.id]) ?? -1
+            let mirror = try Bool.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageAICache WHERE key = ?",
+                arguments: [affectedKey])
+            return (marker, mirror,
+                    candidates.first { $0.headerId == affected.id }?.authority)
+        }
+        #expect(afterReassignment.0 == 0)
+        #expect(afterReassignment.1 == false)
+        #expect(afterReassignment.2 == .automatic,
+                "role reassignment may restore automatic eligibility, never the retired direct event")
     }
 
     @Test("Inbox exit clears the source-path mirror before an old-path reinsert")

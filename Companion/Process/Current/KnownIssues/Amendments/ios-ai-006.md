@@ -62,6 +62,14 @@ the provider confirms an empty body, when the row leaves Inbox, or when its inbo
 The final AI mutation guard repeats both physical-message and live account-owned Inbox proof after
 the model await; preflight is only a cost gate and never write authority.
 
+Migration `v86_retireDirectAIOnInboxRoleExit` closes the remaining scope-lifecycle path: a folder
+can lose its Inbox role without any header row changing. A database trigger atomically clears the
+sparse marker only for headers matching both the changed folder and its owning account; the existing
+v85 header trigger retires the RFC-keyed mirror in the same outer transaction. The migration is
+appended rather than folded into v85 so databases that already recorded the candidate v85 body
+converge with fresh installs. Reassigning the role to Inbox does not resurrect the retired event;
+only a later direct producer may create new authority.
+
 The body producer retains its existing explicit scope. ActiveBodyQueue uses
 `.automaticRecentWindow`, whose `BodyFetchProcessor.automaticAIEnqueueCandidates` intersects
 confirmed automatic bodies with the same production selector. The user-open body path uses
@@ -82,14 +90,15 @@ identity-safe re-key carry.
 
 ## Verification
 
-The exact runtime/code snapshot passed 149/149 tests across the 11 executed suites, with zero
-failures, skips, expected failures, build errors, warnings, or analyzer warnings. The focused
-automatic/direct-policy pass was 63/63. Three conventional sensitivity inversions then failed only
-their intended invariants: removing the uncapped direct union failed the three old-direct recovery
-tests; removing marker idempotency failed the NSE terminal re-merge test; and removing the
-canonical-survivor Inbox normalization failed the direct-marker carry test. Each inversion was
-restored byte-for-byte before the final static gates (`git diff --check`, Swift frontend parsing,
-known-issue verification, and iOS-rules verification).
+The final current-main-integrated runtime/code snapshot passed 156/156 tests across the 12 executed
+suites, with zero failures, skips, expected failures, build errors, source warnings, or analyzer
+warnings; the one emitted build diagnostic was the repository's exact permitted AppIntents metadata
+message. The focused role-lifecycle, migration, pruning, and automatic/direct-policy pass was 42/42.
+The earlier candidate's three conventional sensitivity inversions remain applicable: removing the
+uncapped direct union failed the three old-direct recovery tests; removing marker idempotency failed
+the NSE terminal re-merge test; and removing the canonical-survivor Inbox normalization failed the
+direct-marker carry test. Each inversion was restored byte-for-byte before the final static gates
+(`git diff --check`, Swift frontend parsing, known-issue verification, and iOS-rules verification).
 
 ## Reference and residuals
 

@@ -29,14 +29,14 @@ import GRDB
 /// (`MIS-033`), rather than trusting any integer here:
 /// ```
 /// rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' \
-///    TabMail/Services/AppDatabase.swift                                    → 18
+///    TabMail/Services/AppDatabase.swift                                    → 19
 /// rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' \
-///    TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 18
+///    TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 19
 /// ```
 /// Equal counts are the invariant: every migration from `v68` up runs
 /// `.immediate`, none below `v68` does, and `everyLiveForeignKeyCascades` below
-/// checks the premise that licenses it. The top of the chain is now `v85`
-/// and the two counts are 18; at 85 registered migrations that leaves 67 still
+/// checks the premise that licenses it. The top of the chain is now `v86`
+/// and the two counts are 19; at 86 registered migrations that leaves 67 still
 /// running the whole-database check (66 on the GRDB default plus `v2`, the only
 /// explicit `.deferred` left).
 ///
@@ -292,6 +292,66 @@ struct MigrationForeignKeyModeTests {
         #expect(applied.contains("v83_markAllAsReadUnreadSweepIndex"))
     }
 
+    // MARK: - v86 upgrade convergence
+
+    @Test("An existing v85 database gains folder-role direct-AI retirement")
+    func v85UpgradeGainsFolderRoleRetirement() throws {
+        let db = try Self.makeV67Database()
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: "v85_addDirectAIPending")
+
+        let fixture = try db.write { db -> (folderId: String, headerId: String, cacheKey: String) in
+            var account = Account(
+                emailAddress: "upgrade@example.com", displayName: "Upgrade",
+                provider: .gmail)
+            account.id = "upgrade-account"
+            try account.insert(db)
+
+            let folder = Folder(
+                name: "INBOX", path: "INBOX", role: .inbox,
+                accountId: account.id)
+            try folder.insert(db)
+
+            var header = MessageHeader(
+                messageId: "91", subject: "Pending", from: "Sender",
+                fromAddress: "sender@example.com", to: "upgrade@example.com",
+                date: Date(), snippet: "", folderId: folder.id,
+                accountId: account.id, folderPath: folder.path, isInInbox: true)
+            header.rfc822MessageId = "upgrade-pending@example.com"
+            try header.insert(db)
+            try ActiveAIQueue.markDirectPending(headerIds: [header.id], db: db)
+
+            return (
+                folder.id, header.id,
+                "\(account.id):\(folder.path):upgrade-pending@example.com")
+        }
+
+        #expect(!(try Self.appliedIdentifiers(db))
+            .contains("v86_retireDirectAIOnInboxRoleExit"))
+        try Self.migrateToHead(db)
+
+        try db.write { db in
+            try db.execute(
+                sql: "UPDATE folder SET role = ? WHERE id = ?",
+                arguments: [FolderRole.archive.rawValue, fixture.folderId])
+        }
+        let retired = try db.read { db -> (Int, Bool?) in
+            let marker = try Int.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
+                arguments: [fixture.headerId]) ?? -1
+            let mirror = try Bool.fetchOne(
+                db, sql: "SELECT aiDirectPending FROM messageAICache WHERE key = ?",
+                arguments: [fixture.cacheKey])
+            return (marker, mirror)
+        }
+        #expect(retired.0 == 0)
+        #expect(retired.1 == false,
+                "the v85 header trigger must run inside the new v86 folder trigger")
+        #expect((try Self.appliedIdentifiers(db))
+            .contains("v86_retireDirectAIOnInboxRoleExit"))
+    }
+
     // MARK: - 2. The accepted residual: a pre-existing orphan is walked past
 
     /// The deliberate END STATE of the 2026-08-06 change, asserted so it is a
@@ -316,8 +376,9 @@ struct MigrationForeignKeyModeTests {
         // v70 drops the table outright.) Re-derive rather than trust the range:
         //   rg -n 'messageReference' TabMail/Services/AppDatabase.swift
         // → every DDL hit is v27's create; `v84` adds an unrelated column, while
-        //   `v85` adds direct-AI columns/index/lifecycle triggers but never rebuilds
-        //   or repairs `messageReference`.
+        //   `v85` adds direct-AI columns/index/lifecycle triggers and `v86` adds a
+        //   folder-role lifecycle trigger; neither rebuilds or repairs
+        //   `messageReference`.
         //
         // Foreign keys have to be off to CREATE the orphan, which is the whole
         // point: a real one arrives the same way — written under a schema or a

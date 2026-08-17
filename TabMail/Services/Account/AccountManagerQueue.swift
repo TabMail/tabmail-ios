@@ -947,8 +947,10 @@ extension AccountManager {
     ///
     /// The destination-folder predicate already selects the intended move target;
     /// `ORDER BY id ASC LIMIT 1` deliberately makes same-folder duplicate-RFC rows
-    /// deterministic. It does NOT prefer or require `isInInbox`, because
-    /// `ActiveAIQueue.readJobOutcome` remains the authoritative live scope check.
+    /// deterministic. It does NOT prefer or require `isInInbox` in this SQL:
+    /// `ActiveAIQueue.directCandidate` immediately requires the resolved row to
+    /// own a durable marker in a live account-owned Inbox, and
+    /// `readJobOutcome` repeats that scope proof after asynchronous AI work.
     /// The bounded N+1 is retained: entries are only the members of one completed
     /// operation, and per-entry refusal/logging remains clearer than broadening this
     /// fix into a set-based identity rewrite.
@@ -973,8 +975,9 @@ extension AccountManager {
             // one that entered THIS inbox. `isInInbox = 1` is deliberately NOT a
             // conjunct here: `folderPath` already pins the folder, the capture in
             // `recordMembersThatEnteredInbox` only records rows that were
-            // `isInInbox`, and `ActiveAIQueue.readJobOutcome` independently
-            // refuses a job whose row is no longer in an inbox (`.scopeExited`).
+            // `isInInbox`. `ActiveAIQueue.directCandidate` is the immediate live-
+            // scope admission guard, and `readJobOutcome` independently repeats
+            // that proof after the job (`.scopeExited` on loss).
             // A redundant conjunct in a correctness guard can mask the failure of
             // the one that matters.
             guard let id = try String.fetchOne(

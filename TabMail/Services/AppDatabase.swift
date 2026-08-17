@@ -1999,7 +1999,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v85 RANGE ─────────────────────
+        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v86 RANGE ─────────────────────
         //
         // `registerTimedMigration`'s DEFAULT stays `.deferred` and is NOT
         // changed. v1…v67 have never been adjudicated for `.immediate` safety,
@@ -2066,6 +2066,8 @@ final class AppDatabase: Sendable {
         //     and four `messageHeader` triggers; none changes an FK-bearing key.
         //     Existing rows take the false defaults, so the sparse direct-request
         //     index starts empty. Creating triggers mutates no row or key.
+        //   • v86 — one `folder` role-change trigger. Creating a trigger mutates no
+        //     row or key; its later UPDATE targets only a non-key header column.
         //
         //   • v82 — `DROP`/`CREATE` of `userLabel` + `messageUserLabel`. FK-clean
         //     per statement, verified statement by statement in that migration's own
@@ -2076,16 +2078,16 @@ final class AppDatabase: Sendable {
         //     the body safe.
         //
         // ⚑ AMENDED 2026-08-06, RANGE RE-DERIVED AT R17-6 — **EVERY MIGRATION IN
-        // v68…v85 NOW RUNS `.immediate`, so this range runs ZERO whole-database
+        // v68…v86 NOW RUNS `.immediate`, so this range runs ZERO whole-database
         // foreign-key checks.** The range is an OPEN interval that moves with the
         // top of the chain, so it is re-derived rather than restated (`MIS-031` — a
         // sentence that enumerates is a cache, and this one had gone stale at `v84`
         // in five places at once). Comments excluded so this paragraph cannot
         // satisfy its own predicate (`MIS-033`, `IOS-DOC-002`):
         //   rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' \
-        //      TabMail/Services/AppDatabase.swift                            → 18
+        //      TabMail/Services/AppDatabase.swift                            → 19
         //   rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' \
-        //      TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 18
+        //      TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 19
         // Equal counts are the invariant: every migration from v68 to the top runs
         // `.immediate`, and none below v68 does. The sentence
         // that stood here said *"`v71` and `v82` stay `.deferred`, each for a
@@ -2920,7 +2922,7 @@ final class AppDatabase: Sendable {
         // do not restore the gate as a cost instrument; it is a correctness one.
         //
         // With this change the `.immediate` range — `v68` to the top of the chain,
-        // `v85` as of the IOS-AI-006 durability correction — runs ZERO
+        // `v86` as of the folder-role lifecycle correction — runs ZERO
         // whole-database foreign-key gates.
         // `v2_dropMessageHeaderFolderFK` is the only explicitly `.deferred` migration
         // left in the file, and it applied on every shipped device long ago. (This
@@ -2998,7 +3000,12 @@ final class AppDatabase: Sendable {
             //          `.deferred`, **66** default ⇒ **67 of 85** end with the
             //          whole-database check and 18 do not. The 67 is unchanged
             //          because v85 joined the immediate side.
-            //          ⚠️ THIS MIGRATION IS ONE OF THE 18: reason (b) below is now a
+            //          Re-derived after v86: **86** registered, **19** explicit
+            //          `.immediate` (v68…v86, contiguous), **1** explicit
+            //          `.deferred`, **66** default ⇒ **67 of 86** end with the
+            //          whole-database check and 19 do not. The 67 is unchanged
+            //          because v86 joined the immediate side.
+            //          ⚠️ THIS MIGRATION IS ONE OF THE 19: reason (b) below is now a
             //          statement about migrations that
             //          ran on shipped devices long ago, not about this chain.
             //          Confirmed against GRDB's own
@@ -3597,6 +3604,36 @@ final class AppDatabase: Sendable {
                   )
                 BEGIN
                     UPDATE messageHeader SET aiDirectPending = 1 WHERE id = NEW.id;
+                END
+            """)
+        }
+
+        // v86 — a folder role is live Inbox scope, not just presentation metadata.
+        //
+        // v85's marker lifecycle already retires direct authority when a header
+        // leaves Inbox, but a folder role can change without touching any header.
+        // Every current and future writer is covered at the database boundary: an
+        // inbox→non-inbox transition clears the sparse live marker only for headers
+        // whose account and folder both match the row that changed. The existing
+        // `messageHeader_clearDirectPendingCache` trigger then retires each RFC-keyed
+        // mirror in the same outer transaction. Reassigning the folder to Inbox does
+        // not restore either bit; only a new direct event may do that.
+        //
+        // This is a new migration rather than an amendment to v85. Candidate
+        // simulators may already have recorded v85, so appending to that body would
+        // leave upgraded databases without the trigger while fresh installs had it.
+        migrator.registerTimedMigration(
+            "v86_retireDirectAIOnInboxRoleExit", foreignKeyChecks: .immediate
+        ) { db in
+            try db.execute(sql: """
+                CREATE TRIGGER IF NOT EXISTS folder_retireDirectAIOnInboxRoleExit
+                AFTER UPDATE OF role ON folder
+                WHEN OLD.role = 'inbox' AND NEW.role != 'inbox'
+                BEGIN
+                    UPDATE messageHeader SET aiDirectPending = 0
+                    WHERE aiDirectPending = 1
+                      AND folderId = OLD.id
+                      AND accountId = OLD.accountId;
                 END
             """)
         }

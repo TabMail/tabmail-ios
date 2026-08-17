@@ -436,6 +436,10 @@ struct MoveIntoInboxAIEnqueueTests {
             accountId: accountId, folderPath: "INBOX", uid: "a-uid",
             rfc822: sharedRfc, isInInbox: true, pool: pool)
         #expect(lowestId < insertedFirst)
+        try pool.write { db in
+            try ActiveAIQueue.markDirectPending(
+                headerIds: [insertedFirst, lowestId], db: db)
+        }
 
         let context = AccountManager.DrainContext()
         context.enteredInbox.withLock {

@@ -101,7 +101,7 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Current tracker census (2026-08-16): 9 `open` records (8 amendment rows plus base
+> **Current tracker census (2026-08-16): 11 `open` records (10 amendment rows plus base
 > `IOS-PUSH-001`).** The “Open 2” census above is the
 > hash-preserved 2026-08-09 snapshot, not the live post-freeze count. GitHub migration and release
 > triage must include the open rows in this amendment block plus the still-open base
