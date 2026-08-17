@@ -268,13 +268,29 @@
 > retains the exact app-created node references in the isolated content world, and
 > `eatGutterMarginsJS` derives one symmetric absorbed inset from the smaller measured main-column
 > side, clamps it to the app's 16-point gutter, and applies that value only to those nodes. It posts
-> the remaining SwiftUI padding as `16 - inset`, so the owned wrapper margin plus native padding is
-> always 16 points per edge instead of copying the sender's raw indentation. A sender-spoofed class
-> is not treated as ownership. Negative overflow-side insets clamp to zero, and combined positive
-> insets cannot consume the measured 60%-wide column floor.
+> the remaining native SwiftUI padding as `16 - inset`. At the device-width baseline, where one CSS
+> pixel is one native point, wrapper margin plus native padding is 16 per edge. That is deliberately
+> **not** a visible 16-point promise after `fitViewportJS` widens the layout viewport: for page scale
+> `s < 1`, the visible sum is `(16 - initialInset) + settledInset*s`. The initial native pad remains
+> the device-width baseline decision. Because either a widen or a supported reset can cross the
+> sender's own responsive breakpoint, every non-idempotent terminal `fitViewportJS` layout
+> (successful widen, no-overflow/device-width settlement, too-small skip, and runaway restore)
+> remeasures the sender column and reapplies only the exact retained wrapper margins before height
+> or reveal delivery. This includes rotation/sheet resize and the sanctioned post-image reset+refit
+> path. The settlement first requires a non-empty exact-owned wrapper array, so ordinary messages do
+> not pay a second full-DOM scan; the initial gutter pass still always measures/posts its native
+> remainder. It does not repost `gutterAdjust`, schedule work, add an observer, or re-enter fit, so
+> it adds no native-width feedback arm to ADR-IOS-039's bounded pipeline. The exact
+> owned-wrapper subtree is excluded from the sender measurement so its previous margin cannot feed
+> the next result; a sender-spoofed class is neither excluded nor mutated. The issue-46 invariant is
+> sender/wrapper alignment in final CSS layout coordinates, without copying raw per-side indentation
+> or promising a new post-fit 16-point floor. Negative overflow-side insets clamp to zero, and
+> combined positive insets cannot consume the measured 60%-wide column floor.
 > Regression coverage: `EmailRenderPipelineTests.disclosureTogglesTagAppliedHeight`, the real
 > production-WKWebView canary `RenderContentWorldIsolationTests.disclosureHeightTagIsAtomic`,
-> `.inviteDisclosureAlignsToEmailInset`, and
+> `.inviteDisclosureAlignsToEmailInset` (stateful 12px→6px initial fit→14px image refit, reset-to-no-
+> widen, runaway restore, empty-owned fast path, native bridge-count, owned-subtree feedback,
+> sender-spoof, sender-write, overflow/bound, and idempotency controls), and
 > `MessageDetailViewTests.disclosureDisarmsOpeningAnchor`.
 <!-- COMPANION-CURRENT-NOTE-END -->
 
