@@ -157,6 +157,59 @@ struct NavigationStoreTests {
 @Suite("NavigationStore refresh behavior", .serialized, .processGlobalState)
 struct NavigationStoreRefreshTests {
 
+    private actor RefreshReadController {
+        private var readCount = 0
+        private var released: Set<Int> = []
+        private var waiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
+
+        func beforeRead() async {
+            readCount += 1
+            let read = readCount
+            guard !released.contains(read) else { return }
+            await withCheckedContinuation { continuation in
+                waiters[read, default: []].append(continuation)
+            }
+        }
+
+        func release(_ read: Int) {
+            released.insert(read)
+            let parked = waiters.removeValue(forKey: read) ?? []
+            for waiter in parked { waiter.resume() }
+        }
+
+        func count() -> Int { readCount }
+    }
+
+    @MainActor
+    private final class RefreshReturnProbe {
+        var didReturn = false
+    }
+
+    private func waitForRead(
+        _ expected: Int,
+        controller: RefreshReadController,
+        attempts: Int = 2_000
+    ) async -> Bool {
+        for _ in 0..<attempts {
+            if await controller.count() >= expected { return true }
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        return await controller.count() >= expected
+    }
+
+    @MainActor
+    private func waitForRequest(
+        _ expected: Int,
+        store: NavigationStore,
+        attempts: Int = 2_000
+    ) async -> Bool {
+        for _ in 0..<attempts {
+            if store.refreshRequestCountForTesting >= expected { return true }
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        return store.refreshRequestCountForTesting >= expected
+    }
+
     @MainActor
     private func withTestDB(_ body: @MainActor (DatabasePool) async throws -> Void) async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -211,6 +264,73 @@ struct NavigationStoreRefreshTests {
             let store = NavigationStore()
             await store.refreshFolders()
             #expect(store.folders.map(\.name) == ["Archive", "INBOX", "Trash"])
+        }
+    }
+
+    @Test("An awaited refresh follows a notification supersession through the applied result")
+    @MainActor func awaitedRefreshCannotReturnOnDiscardedSnapshot() async throws {
+        try await withTestDB { pool in
+            try await pool.write { db in
+                var first = Account(
+                    emailAddress: "first@example.com",
+                    displayName: "First",
+                    provider: .gmail
+                )
+                first.id = "first"
+                try first.insert(db)
+            }
+
+            let controller = RefreshReadController()
+            let store = NavigationStore(
+                accountFieldPersistence: AccountFieldPersistenceStore(),
+                beforeSidebarReadForTesting: { await controller.beforeRead() }
+            )
+            store.loadInitialData()
+            #expect(store.accounts.map(\.id) == ["first"])
+
+            let returned = RefreshReturnProbe()
+            let explicitRefresh = Task { @MainActor in
+                await store.refresh()
+                returned.didReturn = true
+            }
+            guard await waitForRead(1, controller: controller) else {
+                Issue.record("the explicit refresh never reached its controlled read")
+                await controller.release(1)
+                return
+            }
+
+            try await pool.write { db in
+                var second = Account(
+                    emailAddress: "second@example.com",
+                    displayName: "Second",
+                    provider: .gmail
+                )
+                second.id = "second"
+                try second.insert(db)
+            }
+            NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
+            guard await waitForRequest(2, store: store) else {
+                Issue.record("the notification refresh was never registered")
+                await controller.release(1)
+                return
+            }
+
+            // The first read is now superseded. The explicit caller must remain
+            // joined to the same flight while its current follow-up is applied.
+            await controller.release(1)
+            guard await waitForRead(2, controller: controller) else {
+                Issue.record("the superseded read did not schedule a follow-up")
+                await controller.release(2)
+                return
+            }
+            #expect(!returned.didReturn)
+            #expect(store.accounts.map(\.id) == ["first"])
+
+            await controller.release(2)
+            await explicitRefresh.value
+            #expect(returned.didReturn)
+            #expect(Set(store.accounts.map(\.id)) == Set(["first", "second"]))
+            #expect(store.hasAnyAccount)
         }
     }
 

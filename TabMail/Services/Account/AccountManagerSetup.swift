@@ -513,11 +513,16 @@ extension AccountManager {
             outboxAttachmentDirNames: cleanupInventory.1.compactMap(\.attachmentsDirName)
         )
 
+        // Account removal is authoritative over optimistic settings edits.
+        // Await any write already admitted to GRDB, fence queued closures, and
+        // purge retry/overlay state before the row-delete transaction begins.
+        await AccountFieldPersistenceStore.production.discardAccount(acctId)
         do {
             try await dbPool.write { db in
                 try Self.removeAccountRowsTxn(db, accountId: acctId, wasPrimary: wasPrimary)
             }
         } catch {
+            await AccountFieldPersistenceStore.production.reactivateAccount(acctId)
             await push.cancelPreparedRemovedAccountCleanup(generation: cleanupGeneration)
             // The DB row is still authoritative. Re-derive both maps rather
             // than restoring a possibly stale captured Account snapshot.

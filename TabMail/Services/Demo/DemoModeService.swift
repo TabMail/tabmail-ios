@@ -55,8 +55,18 @@ final class DemoModeService {
 
         // Defensive wipe of any leftover demo rows from a previous session
         // that exited badly.
+        await AccountFieldPersistenceStore.production.discardAccount(DemoSeed.demoAccountId)
         if let db = AppDatabase.shared.withLock({ $0 }) {
-            try? await db.dbPool.write { conn in try DemoSeed.wipe(conn) }
+            do {
+                try await db.dbPool.write { conn in try DemoSeed.wipe(conn) }
+            } catch {
+                // The old row is still authoritative when the transaction rolls
+                // back. It will be discarded again before completeSetup seeds.
+                AccountFieldPersistenceStore.production.reactivateAccount(DemoSeed.demoAccountId)
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[DemoMode] start(): defensive GRDB wipe failed: \(error)")
+                }
+            }
         }
 
         store.isActive = true
@@ -107,8 +117,17 @@ final class DemoModeService {
         // user could tap "Try the demo". So seeding here is safe — nothing wipes it
         // afterward. (Previously these resets ran async after the seed and wiped it.)
 
-        // Seed messages, folders, calendar events.
-        try DemoSeed.seed()
+        // Seed messages, folders, calendar events. The fixed demo account id is
+        // reopened only after the replacement row commits successfully.
+        await AccountFieldPersistenceStore.production.discardAccount(DemoSeed.demoAccountId)
+        do {
+            try DemoSeed.seed()
+            AccountFieldPersistenceStore.production.reactivateAccount(DemoSeed.demoAccountId)
+        } catch {
+            // DemoSeed is transactional: failure restores the prior row, if any.
+            AccountFieldPersistenceStore.production.reactivateAccount(DemoSeed.demoAccountId)
+            throw error
+        }
 
         // Index seeded headers + bodies in FTS so search works in demo.
         await indexSeededFTS()
@@ -167,10 +186,12 @@ final class DemoModeService {
         DemoTokenManager.clearSession()
         await AccountManager.shared.unregisterDemoProviders(accountId: DemoSeed.demoAccountId)
 
+        await AccountFieldPersistenceStore.production.discardAccount(DemoSeed.demoAccountId)
         if let db = AppDatabase.shared.withLock({ $0 }) {
             do {
                 try await db.dbPool.write { conn in try DemoSeed.wipe(conn) }
             } catch {
+                AccountFieldPersistenceStore.production.reactivateAccount(DemoSeed.demoAccountId)
                 print("[DemoMode] exit(): GRDB wipe failed: \(error)")
             }
         }
@@ -218,8 +239,16 @@ final class DemoModeService {
     /// found but no demo session is active (force-quit recovery; also covers
     /// edge cases). Also called when the user signs up with a real account.
     static func purgeOrphanedDemoData() async {
+        await AccountFieldPersistenceStore.production.discardAccount(DemoSeed.demoAccountId)
         if let db = AppDatabase.shared.withLock({ $0 }) {
-            try? await db.dbPool.write { conn in try DemoSeed.wipe(conn) }
+            do {
+                try await db.dbPool.write { conn in try DemoSeed.wipe(conn) }
+            } catch {
+                AccountFieldPersistenceStore.production.reactivateAccount(DemoSeed.demoAccountId)
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[DemoMode] orphan GRDB wipe failed: \(error)")
+                }
+            }
         }
         await SearchIndex.shared.purgeForAccount(DemoSeed.demoAccountId)
         await MemoryIndex.shared.purgeForSessionPrefix("demo:")
