@@ -810,12 +810,11 @@ extension AccountManager {
     ) async {
         let entries = context.enteredInbox.withLock { $0.removeValue(forKey: key) } ?? []
         guard !entries.isEmpty else { return }
-        // `DurableIdentityLookup` is the SHARED identity resolver (NSE merge +
-        // unified inbox reader). Its step 1 catches the `COPYUID` case (already
-        // re-keyed, exact folder+UID hit) and its step 3 catches the sync-remap
-        // case (rfc822 fallback — the doc comment names "IMAP UID remaps after a
-        // server-side MOVE" as its purpose). Re-checking `isInInbox` closes the
-        // window where a later gesture moved the message straight back out again.
+        // This path intentionally uses the dedicated destination-scoped,
+        // RFC-first resolver below: the recorded UID may be stale after the move,
+        // so `DurableIdentityLookup` cannot prove identity for this caller. A
+        // successful rekey leaves the destination row available by RFC identity;
+        // `ActiveAIQueue` later revalidates its live Inbox scope.
         let resolved: [(headerId: String, accountId: String)] = (try? await dbPool.read { db in
             try Self.resolveInboxEntryAITargets(
                 entries: entries, folderPath: folderPath, db: db)
