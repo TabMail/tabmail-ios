@@ -79,6 +79,10 @@ struct AccountFieldSaveFailure: Identifiable, Sendable {
     var field: AccountEditableField { key.field }
 }
 
+enum AccountFieldPersistenceError: Error {
+    case accountMissing
+}
+
 /// App-lifetime owner for accepted account-field writes and their optimistic values.
 ///
 /// Account-detail views are disposable navigation destinations. Keeping this owner on
@@ -87,6 +91,10 @@ struct AccountFieldSaveFailure: Identifiable, Sendable {
 @Observable
 @MainActor
 final class AccountFieldPersistenceStore {
+    /// The application-lifetime owner used by every navigation store and by
+    /// account-removal boundaries. Tests can still instantiate isolated stores.
+    static let production = AccountFieldPersistenceStore()
+
     private enum Phase: Equatable {
         case pending
         case committedAwaitingObservation
@@ -100,8 +108,22 @@ final class AccountFieldPersistenceStore {
         let persist: @MainActor () async throws -> Void
     }
 
-    private var tail: Task<Void, Never>?
+    private struct AccountTail {
+        let generation: Int
+        let task: Task<Void, Never>
+    }
+
+    private struct QueuedPersist {
+        let accountId: String
+        let persist: @MainActor () async throws -> Void
+    }
+
+    private var tails: [String: AccountTail] = [:]
+    private var queuedPersists: [Int: QueuedPersist] = [:]
     private var nextGeneration = 0
+    private var nextTailGeneration = 0
+    private var lifecycleGenerations: [String: Int] = [:]
+    private var discardedAccountIds: Set<String> = []
     private var entries: [AccountFieldKey: Entry] = [:]
     private var failedKeys: Set<AccountFieldKey> = []
     private var retryingKeys: Set<AccountFieldKey> = []
@@ -160,6 +182,30 @@ final class AccountFieldPersistenceStore {
         return accounts
     }
 
+    /// Makes row removal authoritative for this account. Already-admitted work
+    /// is allowed to finish before this method returns, while work that was only
+    /// queued behind it is fenced by the lifecycle generation and never runs.
+    /// Purging the entries also releases their retry closures immediately.
+    func discardAccount(_ accountId: String) async {
+        lifecycleGenerations[accountId, default: 0] += 1
+        discardedAccountIds.insert(accountId)
+        purgeState(accountId: accountId)
+
+        guard let tail = tails[accountId] else { return }
+        await tail.task.value
+        if tails[accountId]?.generation == tail.generation {
+            tails.removeValue(forKey: accountId)
+        }
+    }
+
+    /// Opens a newly-created row that intentionally reuses an old identifier
+    /// (the demo account). No state from the discarded lifetime is retained.
+    func reactivateAccount(_ accountId: String) {
+        lifecycleGenerations[accountId, default: 0] += 1
+        discardedAccountIds.remove(accountId)
+        purgeState(accountId: accountId)
+    }
+
     /// One indexed single-row update. The field enum is the column allow-list.
     nonisolated static func persist(
         accountId: String,
@@ -180,6 +226,9 @@ final class AccountFieldPersistenceStore {
                     arguments: [flag.databaseValue, accountId.databaseValue]
                 )
             }
+            guard db.changesCount == 1 else {
+                throw AccountFieldPersistenceError.accountMissing
+            }
         }
     }
 
@@ -189,12 +238,21 @@ final class AccountFieldPersistenceStore {
         persist: @escaping @MainActor () async throws -> Void,
         isRetry: Bool
     ) -> Task<Void, Never> {
+        guard !discardedAccountIds.contains(key.accountId) else {
+            return Task { }
+        }
+
         nextGeneration += 1
         let generation = nextGeneration
+        let lifecycleGeneration = lifecycleGenerations[key.accountId, default: 0]
         entries[key] = Entry(
             generation: generation,
             value: value,
             phase: .pending,
+            persist: persist
+        )
+        queuedPersists[generation] = QueuedPersist(
+            accountId: key.accountId,
             persist: persist
         )
         if isRetry {
@@ -204,15 +262,22 @@ final class AccountFieldPersistenceStore {
             retryingKeys.remove(key)
         }
 
-        let predecessor = tail
+        let predecessor = tails[key.accountId]?.task
         let task = Task { @MainActor in
             await predecessor?.value
+            guard lifecycleGenerations[key.accountId, default: 0] == lifecycleGeneration,
+                  !discardedAccountIds.contains(key.accountId),
+                  let persist = queuedPersists.removeValue(forKey: generation)?.persist else { return }
             do {
                 try await persist()
                 guard entries[key]?.generation == generation else { return }
                 entries[key]?.phase = .committedAwaitingObservation
                 failedKeys.remove(key)
                 retryingKeys.remove(key)
+            } catch AccountFieldPersistenceError.accountMissing {
+                lifecycleGenerations[key.accountId, default: 0] += 1
+                discardedAccountIds.insert(key.accountId)
+                purgeState(accountId: key.accountId)
             } catch {
                 guard entries[key]?.generation == generation else { return }
                 entries[key]?.phase = .failed
@@ -220,8 +285,19 @@ final class AccountFieldPersistenceStore {
                 retryingKeys.remove(key)
             }
         }
-        tail = task
+        nextTailGeneration += 1
+        tails[key.accountId] = AccountTail(generation: nextTailGeneration, task: task)
         return task
+    }
+
+    private func purgeState(accountId: String) {
+        queuedPersists = queuedPersists.filter { $0.value.accountId != accountId }
+        let keys = entries.keys.filter { $0.accountId == accountId }
+        for key in keys {
+            entries.removeValue(forKey: key)
+            failedKeys.remove(key)
+            retryingKeys.remove(key)
+        }
     }
 }
 
@@ -233,7 +309,7 @@ final class AccountFieldPersistenceStore {
 final class NavigationStore {
     var accounts: [Account] = []
     var folders: [Folder] = []
-    let accountFieldPersistence = AccountFieldPersistenceStore()
+    let accountFieldPersistence: AccountFieldPersistenceStore
     /// Outbox messages for display in sidebar/message list.
     var outboxMessages: [OutboxMessage] = []
     /// True when ANY active account exists, including calendar-only accounts
@@ -259,7 +335,20 @@ final class NavigationStore {
     private var unreadObserver: NSObjectProtocol?
     private var inboxObserver: NSObjectProtocol?
     private var refreshDebounceTask: Task<Void, Never>?
-    private var refreshGeneration = 0
+    private var refreshRequestedGeneration = 0
+    private var refreshAppliedGeneration = 0
+    private var refreshFlight: Task<Void, Never>?
+    private let beforeSidebarReadForTesting: (@MainActor @Sendable () async -> Void)?
+
+    init(
+        accountFieldPersistence: AccountFieldPersistenceStore = .production,
+        beforeSidebarReadForTesting: (@MainActor @Sendable () async -> Void)? = nil
+    ) {
+        self.accountFieldPersistence = accountFieldPersistence
+        self.beforeSidebarReadForTesting = beforeSidebarReadForTesting
+    }
+
+    var refreshRequestCountForTesting: Int { refreshRequestedGeneration }
 
     /// Load initial data synchronously. Must be called once at startup.
     /// Registers 3 targeted notification listeners:
@@ -329,7 +418,19 @@ final class NavigationStore {
     /// Refresh all data from GRDB. Always safe to call — overlay guarantees correctness.
     func refresh() async {
         let t0 = CFAbsoluteTimeGetCurrent()
-        await refreshNow()
+        refreshRequestedGeneration += 1
+        let flight: Task<Void, Never>
+        if let existing = refreshFlight {
+            flight = existing
+        } else {
+            let created = Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.runRefreshFlight()
+            }
+            refreshFlight = created
+            flight = created
+        }
+        await flight.value
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
         if ms >= 50 {
             BackgroundSyncLogger.logInbox("[NavStore] refresh \(ms)ms (accounts=\(accounts.count) folders=\(folders.count) outbox=\(outboxMessages.count))")
@@ -443,29 +544,37 @@ final class NavigationStore {
     /// The GRDB read runs off the main thread (async) so it can't block the UI
     /// during the foreground catch-up burst (Half A / PLAN_HANG_FIX); the
     /// @Observable assignments happen on the main actor after it resolves.
-    private func refreshNow() async {
-        refreshGeneration += 1
-        let generation = refreshGeneration
-        let demoActive = DemoModeStore.shared.isActive
-        do {
-            let bundle = try await AppDatabase.dbPool.read { db -> SidebarBundle in
-                SidebarBundle(
-                    accounts: try Account.sidebarRequest(demoActive: demoActive).fetchAll(db),
-                    folders: try Folder.sidebarRequest(demoActive: demoActive).fetchAll(db),
-                    outbox: try OutboxMessage.order(Column("createdAt").desc).fetchAll(db),
-                    hasAny: try Account.filter(Column("isActive") == true).fetchCount(db) > 0
-                )
+    private func runRefreshFlight() async {
+        while refreshAppliedGeneration < refreshRequestedGeneration {
+            let generation = refreshRequestedGeneration
+            let demoActive = DemoModeStore.shared.isActive
+            await beforeSidebarReadForTesting?()
+            do {
+                let bundle = try await AppDatabase.dbPool.read { db -> SidebarBundle in
+                    SidebarBundle(
+                        accounts: try Account.sidebarRequest(demoActive: demoActive).fetchAll(db),
+                        folders: try Folder.sidebarRequest(demoActive: demoActive).fetchAll(db),
+                        outbox: try OutboxMessage.order(Column("createdAt").desc).fetchAll(db),
+                        hasAny: try Account.filter(Column("isActive") == true).fetchCount(db) > 0
+                    )
+                }
+                // A request that arrived while the read was suspended owns the
+                // result. Discard this snapshot and perform its follow-up before
+                // completing any waiter joined to the current flight.
+                guard generation == refreshRequestedGeneration else { continue }
+                self.accounts = accountFieldPersistence.applyingOverlay(to: bundle.accounts)
+                self.folders = bundle.folders
+                self.outboxMessages = bundle.outbox
+                self.hasAnyAccount = bundle.hasAny
+                refreshAppliedGeneration = generation
+            } catch {
+                print("[NavigationStore] Refresh error: \(error)")
+                if generation == refreshRequestedGeneration {
+                    refreshAppliedGeneration = generation
+                }
             }
-            // A newer refresh owns presentation. This also prevents an older
-            // pre-commit snapshot from landing after a newer post-commit one.
-            guard generation == refreshGeneration else { return }
-            self.accounts = accountFieldPersistence.applyingOverlay(to: bundle.accounts)
-            self.folders = bundle.folders
-            self.outboxMessages = bundle.outbox
-            self.hasAnyAccount = bundle.hasAny
-        } catch {
-            print("[NavigationStore] Refresh error: \(error)")
         }
+        refreshFlight = nil
     }
 
     /// Toggle favorite status for a folder. Async: the write runs OFF the main

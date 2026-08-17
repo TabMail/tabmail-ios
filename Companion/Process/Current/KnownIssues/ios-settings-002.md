@@ -4,12 +4,15 @@
 > edited because it is regenerated from the hash-pinned archive.
 >
 > Name, email address, signature placement, IMAP username, and signature now update presentation
-> immediately and persist through the async priority writer. An app-lifetime, account+field-keyed
-> owner on `NavigationStore` serializes every accepted value across account-detail view lifetimes,
+> immediately and persist through the async priority writer. A shared app-lifetime,
+> account+field-keyed owner serializes every accepted value across account-detail view lifetimes,
 > overlays pending/failed values onto full navigation refreshes until disk observation, and retains
 > the latest failure for every field as an independently visible Retry row. Superseded failures do
-> not replace newer UI; a later success clears only that field. No settings outbox, schema change,
-> coalescing, cancellation, or server mutation was added.
+> not replace newer UI; a later success clears only that field. Account deletion and every demo-row
+> wipe purge that account's overlay/failures/closures, drain a write already admitted to GRDB, and
+> fence queued work; recreating the fixed demo id begins with a clean lifecycle. A zero-row update is
+> treated as authoritative account disappearance. No settings outbox, schema change, live-account
+> coalescing/cancellation, or server mutation was added.
 >
 > The three folder-role helpers still swallow their synchronous writes and immediately reload
 > folders. That lower-frequency residual keeps `IOS-SETTINGS-002` classified `accepted`; it requires

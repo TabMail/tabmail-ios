@@ -69,6 +69,8 @@ struct AccountDetailFieldPersistenceTests {
         case refused
     }
 
+    private final class LifetimeProbe {}
+
     /// Represents one disposable AccountDetailView lifetime. The production
     /// persistence owner is intentionally injected rather than owned here.
     @MainActor
@@ -92,7 +94,7 @@ struct AccountDetailFieldPersistenceTests {
         }
     }
 
-    private func makeEnvironment() throws -> Environment {
+    private func makeEnvironment(accountId: String = "acc1") throws -> Environment {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("account-field-persistence-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -118,7 +120,7 @@ struct AccountDetailFieldPersistenceTests {
             displayName: "Original",
             provider: .gmail
         )
-        account.id = "acc1"
+        account.id = accountId
         try pool.write { db in try account.insert(db) }
 
         return Environment(
@@ -159,6 +161,17 @@ struct AccountDetailFieldPersistenceTests {
                 }
             }
         }
+    }
+
+    private func eventually(
+        attempts: Int = 1_000,
+        _ condition: @MainActor () -> Bool
+    ) async -> Bool {
+        for _ in 0..<attempts {
+            if condition() { return true }
+            await Task.yield()
+        }
+        return condition()
     }
 
     @Test("Rapid edits update immediately, suspend behind the writer, and persist last-write-wins")
@@ -485,5 +498,256 @@ struct AccountDetailFieldPersistenceTests {
         #expect(AccountEditableField.allCases.map(\.displayLabel) == [
             "Name", "Email", "Signature placement", "IMAP username", "Signature",
         ])
+    }
+
+    @Test("Discard purges failures and overlays, releases queued closures, and fences queued writes")
+    func discardPurgesAllRetainedStateAndQueuedWork() async {
+        let persistence = AccountFieldPersistenceStore()
+
+        let failed = persistence.accept(
+            accountId: "acc1",
+            field: .emailAddress,
+            value: .text("failed@example.com"),
+            persist: { throw ProbeError.refused }
+        )
+        await failed.value
+        #expect(persistence.failures(accountId: "acc1").map(\.field) == [.emailAddress])
+
+        let started = Gate()
+        let release = Gate()
+        _ = persistence.accept(
+            accountId: "acc1",
+            field: .displayName,
+            value: .text("running"),
+            persist: {
+                await started.open()
+                await release.wait()
+            }
+        )
+        await started.wait()
+
+        let queuedInvocations = Mutex(0)
+        var queuedProbe: LifetimeProbe? = LifetimeProbe()
+        weak let weakQueuedProbe = queuedProbe
+        let queued = persistence.accept(
+            accountId: "acc1",
+            field: .signature,
+            value: .text("must not persist"),
+            persist: { [queuedProbe] in
+                withExtendedLifetime(queuedProbe) {
+                    queuedInvocations.withLock { $0 += 1 }
+                }
+            }
+        )
+        queuedProbe = nil
+        #expect(weakQueuedProbe != nil, "the queued entry must initially own its retry closure")
+
+        let discard = Task { @MainActor in
+            await persistence.discardAccount("acc1")
+        }
+        #expect(await eventually { !persistence.hasOutstandingValues })
+        #expect(persistence.failures(accountId: "acc1").isEmpty)
+        #expect(weakQueuedProbe == nil, "discard must release a queued persistence closure immediately")
+
+        var fresh = Account(emailAddress: "fresh@example.com", displayName: "Fresh", provider: .gmail)
+        fresh.id = "acc1"
+        #expect(persistence.applyingOverlay(to: [fresh]).first?.displayName == "Fresh")
+
+        await release.open()
+        await discard.value
+        await queued.value
+        #expect(queuedInvocations.withLock { $0 } == 0)
+
+        let postDiscardInvocations = Mutex(0)
+        let rejected = persistence.accept(
+            accountId: "acc1",
+            field: .displayName,
+            value: .text("resurrected"),
+            persist: { postDiscardInvocations.withLock { $0 += 1 } }
+        )
+        await rejected.value
+        #expect(postDiscardInvocations.withLock { $0 } == 0)
+        #expect(!persistence.hasOutstandingValues)
+    }
+
+    @Test("One blocked account neither stalls nor loses another account's state")
+    func accountQueuesAndDiscardAreIsolated() async {
+        let persistence = AccountFieldPersistenceStore()
+        let accountAStarted = Gate()
+        let releaseAccountA = Gate()
+        _ = persistence.accept(
+            accountId: "account-a",
+            field: .displayName,
+            value: .text("A"),
+            persist: {
+                await accountAStarted.open()
+                await releaseAccountA.wait()
+            }
+        )
+        await accountAStarted.wait()
+
+        let accountBStarted = Mutex(false)
+        let accountB = persistence.accept(
+            accountId: "account-b",
+            field: .displayName,
+            value: .text("B"),
+            persist: {
+                accountBStarted.withLock { $0 = true }
+                throw ProbeError.refused
+            }
+        )
+        #expect(
+            await eventually { accountBStarted.withLock { $0 } },
+            "account B must not queue behind account A's blocked write"
+        )
+        await accountB.value
+
+        let discardA = Task { @MainActor in
+            await persistence.discardAccount("account-a")
+        }
+        #expect(await eventually { persistence.failures(accountId: "account-a").isEmpty })
+        #expect(persistence.failures(accountId: "account-b").map(\.field) == [.displayName])
+
+        await releaseAccountA.open()
+        await discardA.value
+        #expect(persistence.failures(accountId: "account-b").map(\.field) == [.displayName])
+    }
+
+    @Test("Demo id recreation waits admitted work, fences queued work, and accepts only the new lifetime")
+    func fixedDemoIdRecreationCannotInheritOldEdits() async throws {
+        let environment = try makeEnvironment(accountId: DemoSeed.demoAccountId)
+        defer { finish(environment) }
+
+        let persistence = AccountFieldPersistenceStore()
+        let releaseWriter = DispatchSemaphore(value: 0)
+        await holdWriter(environment.pool, until: releaseWriter)
+        let admittedToWriterQueue = Mutex(false)
+        await DatabaseWriteQueue.shared.setTestObserverForTesting { _, label in
+            if label == "account.settings.displayName" {
+                admittedToWriterQueue.withLock { $0 = true }
+            }
+        }
+        do {
+            let admitted = persistence.accept(
+                accountId: environment.accountId,
+                field: .displayName,
+                value: .text("admitted-old-lifetime"),
+                persist: {
+                    try await AccountFieldPersistenceStore.persist(
+                        accountId: environment.accountId,
+                        field: .displayName,
+                        value: .text("admitted-old-lifetime"),
+                        database: environment.database
+                    )
+                }
+            )
+            #expect(
+                await eventually { admittedToWriterQueue.withLock { $0 } },
+                "the first old-lifetime write never acquired the shared writer slot"
+            )
+            let queuedInvocations = Mutex(0)
+            let queued = persistence.accept(
+                accountId: environment.accountId,
+                field: .displayName,
+                value: .text("queued-old-lifetime"),
+                persist: {
+                    queuedInvocations.withLock { $0 += 1 }
+                    try await AccountFieldPersistenceStore.persist(
+                        accountId: environment.accountId,
+                        field: .displayName,
+                        value: .text("queued-old-lifetime"),
+                        database: environment.database
+                    )
+                }
+            )
+
+            let discard = Task { @MainActor in
+                await persistence.discardAccount(environment.accountId)
+            }
+            #expect(await eventually { !persistence.hasOutstandingValues })
+            releaseWriter.signal()
+            await admitted.value
+            await discard.value
+            await queued.value
+
+            let valueBeforeRemoval = try await environment.pool.read { db in
+                try Account.fetchOne(db, key: environment.accountId)?.displayName
+            }
+            #expect(valueBeforeRemoval == "admitted-old-lifetime")
+            #expect(queuedInvocations.withLock { $0 } == 0)
+
+            try await environment.pool.write { db in
+                _ = try Account.deleteOne(db, key: environment.accountId)
+                var replacement = Account(
+                    emailAddress: "demo@example.com",
+                    displayName: "replacement",
+                    provider: .imap
+                )
+                replacement.id = environment.accountId
+                try replacement.insert(db)
+            }
+            persistence.reactivateAccount(environment.accountId)
+
+            let replacementWrite = persistence.accept(
+                accountId: environment.accountId,
+                field: .displayName,
+                value: .text("new-lifetime"),
+                persist: {
+                    try await AccountFieldPersistenceStore.persist(
+                        accountId: environment.accountId,
+                        field: .displayName,
+                        value: .text("new-lifetime"),
+                        database: environment.database
+                    )
+                }
+            )
+            await replacementWrite.value
+            let replacementValue = try await environment.pool.read { db in
+                try Account.fetchOne(db, key: environment.accountId)?.displayName
+            }
+            #expect(replacementValue == "new-lifetime")
+            #expect(persistence.failures(accountId: environment.accountId).isEmpty)
+        } catch {
+            releaseWriter.signal()
+            await DatabaseWriteQueue.shared.setTestObserverForTesting(nil)
+            throw error
+        }
+        await DatabaseWriteQueue.shared.setTestObserverForTesting(nil)
+    }
+
+    @Test("A zero-row UPDATE tombstones the missing account instead of reporting success or retry")
+    func missingAccountUpdateIsAuthoritativeRemoval() async throws {
+        let environment = try makeEnvironment()
+        defer { finish(environment) }
+        try await environment.pool.write { db in
+            _ = try Account.deleteOne(db, key: environment.accountId)
+        }
+
+        let persistence = AccountFieldPersistenceStore()
+        let write = persistence.accept(
+            accountId: environment.accountId,
+            field: .displayName,
+            value: .text("gone"),
+            persist: {
+                try await AccountFieldPersistenceStore.persist(
+                    accountId: environment.accountId,
+                    field: .displayName,
+                    value: .text("gone"),
+                    database: environment.database
+                )
+            }
+        )
+        await write.value
+
+        #expect(!persistence.hasOutstandingValues)
+        #expect(persistence.failures(accountId: environment.accountId).isEmpty)
+        let laterInvocations = Mutex(0)
+        await persistence.accept(
+            accountId: environment.accountId,
+            field: .signature,
+            value: .text("must not run"),
+            persist: { laterInvocations.withLock { $0 += 1 } }
+        ).value
+        #expect(laterInvocations.withLock { $0 } == 0)
     }
 }

@@ -6,9 +6,10 @@
 
 ## Status
 
-🔓 **OPEN — NARROWED (2026-08-14)** — the two concrete `SearchView` members named by this record are
-fixed, but the record's broader by-state acceptance criterion is not complete. Classification remains
-**open**; do not close GitHub #13 from this change.
+🔓 **OPEN — CENSUS COMPLETE; CONSCIOUS SURVIVORS RETAINED (2026-08-17)** — the two concrete
+`SearchView` members are fixed and the complete by-state inventory is discharged below. Classification
+remains **open** only for the explicitly classified synchronous survivors and their required
+state-machine/evidence work; do not close GitHub #13 from this change.
 
 ## 2026-08-14 implementation and residual
 
@@ -93,14 +94,18 @@ writer on every keystroke (the same helper also persisted signature placement an
 signature commits). A synchronous `PrioritizedDatabase.write` cannot await `DatabaseWriteQueue`, so
 it bypassed priority ordering and blocked MainActor behind the current SQLite writer. The replacement
 updates the field and `NavigationStore` before returning, then the app-lifetime
-`AccountFieldPersistenceStore` chains every persistence task behind its predecessor and uses the
-async priority writer. No intent is cancelled or coalesced; accepted order is durable order, so a
+`AccountFieldPersistenceStore` chains each account's persistence tasks behind their predecessor and
+uses the async priority writer. No live-account intent is cancelled or coalesced; accepted order is
+durable order, so a
 rapid edit remains last-write-wins even across pop/re-enter. A pending or failed account+field value
-overlays `NavigationStore.refreshNow` until a post-commit refresh actually observes it on disk, so a
+overlays `NavigationStore.refresh` until a post-commit refresh actually observes it on disk, so a
 stale refresh cannot revert accepted presentation. Failures are stored and presented independently
 per account+field with Retry; a superseded failure cannot overwrite newer UI, and a successful retry
-clears only its own field. SQL remains one `UPDATE account ... WHERE id = ?`; query count,
-cardinality, schema, and index requirements are unchanged.
+clears only its own field. Account-row removal is authoritative: it drains a write already admitted
+to GRDB, purges retry/overlay state, and fences queued closures; deliberate fixed-id demo recreation
+opens a clean lifecycle. A zero-row `UPDATE` is therefore handled as account disappearance rather
+than a false success. SQL remains one `UPDATE account ... WHERE id = ?`; query count, schema, and
+index requirements are unchanged.
 
 **Consciously classified survivors — keep this record and GitHub #13 open.**
 

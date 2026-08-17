@@ -106,6 +106,12 @@ enum AppDataWiper {
             cleanupGenerations.append(generation)
         }
 
+        // Make row removal authoritative over every accepted settings edit.
+        // Each discard drains already-admitted work but fences queued closures.
+        for plan in plans {
+            await AccountFieldPersistenceStore.production.discardAccount(plan.account.id)
+        }
+
         // 1. Nuke all database tables. This is the authoritative boundary and
         // deliberately precedes every credential/provider/local-index side effect.
         // If it throws, `wipeAll` throws and nothing else is deleted.
@@ -128,6 +134,9 @@ enum AppDataWiper {
                 try db.execute(sql: "DELETE FROM account")
             }
         } catch {
+            for plan in plans {
+                AccountFieldPersistenceStore.production.reactivateAccount(plan.account.id)
+            }
             for generation in cleanupGenerations {
                 await push.cancelPreparedRemovedAccountCleanup(generation: generation)
             }
