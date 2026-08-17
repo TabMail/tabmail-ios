@@ -101,7 +101,7 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Current tracker census (2026-08-16): 10 `open` records (9 amendment rows plus base
+> **Current tracker census (2026-08-16): 9 `open` records (8 amendment rows plus base
 > `IOS-PUSH-001`).** The “Open 2” census above is the
 > hash-preserved 2026-08-09 snapshot, not the live post-freeze count. GitHub migration and release
 > triage must include the open rows in this amendment block plus the still-open base
@@ -129,14 +129,13 @@ regenerated from it; their detail files live in
 | ID | Class | Executive statement |
 |---|---|---|
 | [IOS-IMAP-015](Companion/Process/Current/KnownIssues/Amendments/ios-imap-015.md) | `open` | 🔓 OPEN (2026-08-12; re-audited 2026-08-15) — one SwiftMail pipelined-FETCH gap remains before dispatcher installation: an install failure strands the just-created part promises, so debug/test builds can abort mid-run while the run still reports "passed". The install error reaches the app before any caller awaits those futures; the connection path releases the production closed-channel case as unhealthy and the body queue retries, so there is no release hang or app-side fix. The six-line candidate belongs upstream at Cocoanetics; the fork remains deviation-free and upstream work still needs owner authorization |
-| [IOS-IMAP-016](Companion/Process/Current/KnownIssues/Amendments/ios-imap-016.md) | `open` | 🔓 OPEN (2026-08-12) — SwiftMail's `rfc2047EncodedHeader()` guards on `!$0.isASCII` and **CR/LF ARE ASCII**, so `Email+Content.swift:84` emits a CRLF-bearing `Subject:` raw and the field ends mid-value; byte-for-byte the same inverted guard the app-side helper had, because `RFC2047.swift`'s doc comment says it is kept in step with it — the defect was copied with the helper (`MIS-019`×29). Current pin `a2d4a94` also has six raw filename and four raw content-type interpolations; TabMail reaches two of each, including the calendar-alternative content-type arm. **Mitigated app-side for Subject only** — `IMAPProvider.buildEmail` pre-encodes via `RFC2047.encodeIfNotEmittableLiterally`, which composes as a no-op with SwiftMail's own encoder — but filename/content-type residuals and every other library caller remain open. Remedy is UPSTREAM at Cocoanetics, not the fork |
+| [IOS-IMAP-016](Companion/Process/Current/KnownIssues/Amendments/ios-imap-016.md) | `open` | 🔓 OPEN (2026-08-12) — SwiftMail's current RFC 2047 encoder still admits raw controls and can exceed encoded-word and full physical Subject-line limits; its MIME builders also contain six raw filename and four raw content-type interpolations, two of each TabMail-reachable. PR #37 fully protects TabMail's current Subject paths at the app boundary with `RFC2047.encodeHeaderValue`, but that does not fix SwiftMail for other callers and the attachment parameter family remains live. Remedy is upstream at Cocoanetics followed by fork synchronization; issue #10 remains open |
 
-### COMPOSE (2)
+### COMPOSE (1)
 
 | ID | Class | Executive statement |
 |---|---|---|
 | [IOS-COMPOSE-002](Companion/Process/Current/KnownIssues/Amendments/ios-compose-002.md) | `open` | 🔓 OPEN (2026-08-12) — Gmail interpolates regular `attachment.filename` into two quoted-string parameters unescaped and propagates provider-parsed `attachment.mimeType` without outbound validation. No hostile sender is required: Files import preserves APFS-legal `"`/`\`; outbox send and saved-draft upload both reach the builder. Arbitrary original Content-Type bytes were not proven to survive provider parsing, and a CRLF retained by the persisted-draft metadata splitter has no proven production writer, so MIME header injection remains a lead. Gmail's `alt.mimeType` arm is legacy/model-state capable, not current UI/forward reachable. SwiftMail carries six raw filename and four raw content-type interpolations; two of each are TabMail-reachable, including its calendar route. The proven filename effect is confined to one part's parameter list because controls are refused. DEFERRED as not-minimal; the related SwiftMail residual is tracked separately by the still-open `IOS-IMAP-016` record |
-| [IOS-COMPOSE-003](Companion/Process/Current/KnownIssues/Amendments/ios-compose-003.md) | `open` | 🔓 OPEN (2026-08-12) — **pre-existing**, not introduced by `1d28552c1`: a subject that is printable ASCII and contains valid RFC 2047 encoded-word syntax **as literal text** (`Re: =?UTF-8?B?SGVsbG8=?= explained`) is passed through unchanged by `RFC2047.encodeHeaderValue` (trigger: non-ASCII or a control), by `RFC2047.encodeIfNotEmittableLiterally` (trigger: control only) **and** by SwiftMail's `rfc2047EncodedHeader()` (trigger: `!$0.isASCII`), so a receiving decoder — including our own `RFC5322Parse.decodeRFC2047` — interprets it and shows text the sender never wrote. **Display fidelity of one header; it cannot forge a field, add a recipient or change structure** — that needs a control character, closed on every path by `1d28552c1`. Not minimal: widening the trigger to the literal `=?` changes the wire bytes of every ordinary subject containing it, on every provider, and the same widening is needed inside SwiftMail (`IOS-IMAP-016`) |
 
 ### ASSET (1)
 
@@ -208,10 +207,11 @@ audit/provenance files remain documentation-only. The future app-owned ATS image
 [issue #1](https://github.com/TabMail/tabmail-ios/issues/1). Open register mappings:
 
 - `IOS-AI-004` [#2](https://github.com/TabMail/tabmail-ios/issues/2)
-- `IOS-COMPOSE-002` [#7](https://github.com/TabMail/tabmail-ios/issues/7); `IOS-COMPOSE-003` [#8](https://github.com/TabMail/tabmail-ios/issues/8); `IOS-IMAP-015` [#9](https://github.com/TabMail/tabmail-ios/issues/9); `IOS-IMAP-016` [#10](https://github.com/TabMail/tabmail-ios/issues/10)
+- `IOS-COMPOSE-002` [#7](https://github.com/TabMail/tabmail-ios/issues/7); `IOS-IMAP-015` [#9](https://github.com/TabMail/tabmail-ios/issues/9); `IOS-IMAP-016` [#10](https://github.com/TabMail/tabmail-ios/issues/10)
 - `IOS-PERF-009` [#12](https://github.com/TabMail/tabmail-ios/issues/12); `IOS-PERF-010` [#13](https://github.com/TabMail/tabmail-ios/issues/13); `IOS-PERF-012` [#15](https://github.com/TabMail/tabmail-ios/issues/15)
 - `IOS-PUSH-001` [#16](https://github.com/TabMail/tabmail-ios/issues/16); `IOS-UI-005` [#20](https://github.com/TabMail/tabmail-ios/issues/20)
 - Retired mapping: `IOS-AI-005` [#3](https://github.com/TabMail/tabmail-ios/issues/3) — resolved by the owner-approved PR #42; close with this disposition
+- Retired mapping: `IOS-COMPOSE-003` [#8](https://github.com/TabMail/tabmail-ios/issues/8) — fixed by PR #37; close when that PR merges
 - Retired mapping: `IOS-CAL-010` [#5](https://github.com/TabMail/tabmail-ios/issues/5) — resolved by the owner-approved PR #34; close on merge
 - Retired mapping: `IOS-BILLING-002` [#4](https://github.com/TabMail/tabmail-ios/issues/4) — resolved by the owner-approved PR #36; close on merge
 - Retired mapping: `IOS-SEARCH-004` [#18](https://github.com/TabMail/tabmail-ios/issues/18) — reclassified `not-defect` on 2026-08-15 after the exact caller census proved the filed multi-folder statement is never constructed; close on GitHub when this correction is accepted

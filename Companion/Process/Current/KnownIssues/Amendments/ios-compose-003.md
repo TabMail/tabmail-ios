@@ -1,65 +1,68 @@
-# IOS-COMPOSE-003 — a subject that is literally shaped like an encoded-word is sent unencoded and decoded by the recipient
+# IOS-COMPOSE-003 — outgoing subject encoded-word conformance: literal syntax and physical line limits
 
-**Class:** `open` · **Opened:** 2026-08-12 · **Attribution:** **pre-existing** — not introduced by
-`1d28552c1`. The previous non-ASCII-only trigger reached the same code with the same outcome.
-**Registered, not fixed** — cosmetic, recoverable, and not minimal to fix; half the remedy is upstream.
-Classed `open` rather than `accepted` because it is a conformance defect to be closed eventually, not a
-deliberate limitation.
+**Class:** `fixed` · **Opened:** 2026-08-12 · **Fixed:** PR #37 · **Attribution:** pre-existing
 
-## What is wrong
+## What was wrong
 
-RFC 2047 §5 says an encoded-word is recognised **anywhere** in an unstructured field body. So a
-subject the user typed *as literal text* that happens to spell valid encoded-word syntax —
-`Re: =?UTF-8?B?SGVsbG8=?= explained` — must be protected before it is emitted, or the recipient
-decodes it and shows text the sender never wrote (here, `Re: Hello explained`).
+The two Gmail raw-message builders and the IMAP/SMTP path could emit sender-authored printable ASCII
+that was itself shaped like an RFC 2047 encoded-word. A receiving reader could then decode part of the
+literal subject and display text the sender never wrote. Separately, the encoder split only between
+Swift `Character` values, so one extended grapheme wider than 45 UTF-8 bytes could produce an
+encoded-word over RFC 2047 §2's 75-octet ceiling. Even compliant 72-octet words could make the first
+physical line too long once the `Subject: ` prefix was included.
 
-**All three encoders on the outbound path let it through unchanged**, because each triggers only on
-content the header cannot carry, and such a subject is pure printable ASCII:
+These were display and interoperability defects, not header injection. The control-bearing subject
+class was already fixed by `1d28552c1`; Base64 encoded-word output contains no CR or LF capable of
+ending the field.
 
-| encoder | trigger | verdict on an encoded-word-shaped ASCII subject |
-|---|---|---|
-| `RFC2047.encodeHeaderValue` (Gmail builders) | non-ASCII **or** a C0/C1/DEL control | returned unchanged |
-| `RFC2047.encodeIfNotEmittableLiterally` (IMAP/SMTP boundary) | a C0/C1/DEL control only | returned unchanged |
-| SwiftMail `String.rfc2047EncodedHeader()` | `!$0.isASCII` | returned unchanged |
+## Fixed behavior
 
-The conformant remedy is to encode the whole value whenever it contains the literal sequence `=?`,
-so the encoded-word carries the user's text and the recipient reassembles exactly what was typed.
+`RFC2047.encodeHeaderValue` now owns the complete raw Subject boundary for both Gmail emitters and for
+the sole `IMAPProvider.buildEmail` construction path before SwiftMail serializes the message. It:
 
-## Blast radius
+1. Parses SP/HTAB-delimited scalar tokens at the field-body start or after whitespace. A complete,
+   valid encoded-word at that boundary is the standard RFC 2047 §6.1 reader-recognition case.
+2. Also protects every complete substring matched by TabMail's shipped readers, including valid
+   non-boundary and suffixed substrings. Both `RFC5322Parse.decodeRFC2047` and SwiftMail's
+   `decodeMIMEHeader()` use an unanchored encoded-word pattern and would otherwise consume that
+   substring on send -> readback. This is a deliberate compatibility guarantee beyond §6.1, not a
+   claim that a conforming reader must recognize those placements.
+3. Leaves bare and unterminated `=?` shapes literal because neither shipped decoder consumes them.
+4. Protects complete malformed or oversized boundary shapes too, including the minimal `=?=`. They
+   are intentionally a separate composer-conformance case: a reader recognises only valid §2 syntax
+   within 75 octets, while §7
+   requires a composer not to emit a boundary word that begins with `=?` and ends with `?=` unless it
+   is valid. Encoding the whole value makes the outer word valid and preserves the literal text.
+5. Splits encoded data between Unicode scalars, so every word is independently valid UTF-8 and no
+   word exceeds the RFC 2047 ceiling.
+6. Uses a 39-byte first-word budget and 45-byte continuation budget. When encoding is required, the
+   final emitted physical Subject lines are at most 76 octets including `Subject: ` on the first line
+   and continuation WSP thereafter. Literal ASCII pass-through is outside this encoded-line claim.
 
-**Display fidelity of one header, in the recipient's client.** It cannot forge a header field, add a
-recipient, or change the message structure — none of that is reachable without a control character,
-and the control half is already closed on every path (that was `1d28552c1`'s fix). The reverse
-direction is symmetric and already handled: our own reader, `RFC5322Parse.decodeRFC2047`, is exactly
-the "receiving decoder" that interprets such a subject, so TabMail-to-TabMail shows the effect too.
+The helper returns ASCII, so SwiftMail's current non-ASCII-only encoder is a no-op rather than a
+double encoder. Exchange/Graph remains deliberately outside this transformation: it receives the
+subject as semantic JSON and constructs MIME server-side.
 
-Worst realistic case: a subject renders as something other than what the sender typed, and a reply
-carries the decoded text onward. The sender's original text is not destroyed anywhere durable — it is
-in the sender's own Sent copy verbatim.
+## Verification
 
-## Why it is registered rather than fixed
+- Field start, SP, and HTAB valid-token recognition boundaries.
+- Non-boundary and suffixed compatibility cases proved through the actual unanchored Gmail and
+  SwiftMail decoders; bare and unterminated literal negative controls.
+- Complete malformed encoding and Base64 payload shapes, plus valid ≤75 and oversized >75 shapes,
+  including `=?=`, with the §7 reason asserted separately from reader recognition.
+- Both Gmail raw emitters → `RFC5322Parse.decodeRFC2047` and final SwiftMail `constructContent()` →
+  `decodeMIMEHeader()`: exact Subject round-trip, scalar integrity, every encoded-word within 75
+  octets, and every physical Subject line within 76.
+- The final test fixtures were run unchanged against the pre-compatibility predicate: 51 of 54
+  focused cases passed, with only the three new decoder-compatibility cases failing, before GREEN.
+- Ordinary ASCII and non-ASCII behavior controls, CR/LF injection invariants, and Exchange semantic
+  JSON preservation.
 
-Owner directive, 2026-08-12: *"these fixes … should really be security fixes, minimal — and if it's
-not minimal, it's OK to have it into known issues."* This is not a security fix and it is not minimal:
-widening the trigger to `=?` changes the wire bytes of every ordinary subject that contains that
-sequence, on every provider, and the same widening is needed **inside SwiftMail** for the IMAP/SMTP
-path — an upstream PR, not a fork edit (`IOS-IMAP-016`).
+## Remaining separate work
 
-## When revisited
+- `IOS-COMPOSE-002` / issue #7 remains open for Gmail attachment MIME parameter serialization.
+- `IOS-IMAP-016` / issue #10 remains open until the equivalent SwiftMail library fixes are accepted
+  upstream and TabMail's deviation-free fork is synchronized. App-side closure here does not fix
+  SwiftMail for other callers.
 
-1. Widen both `RFC2047` triggers to *"non-ASCII, or a forbidden literal, **or the literal sequence
-   `=?`**"*, and mirror it in the upstream SwiftMail PR.
-2. Red-first test: a literal `Re: =?UTF-8?B?SGVsbG8=?= explained` must survive
-   `encode → RFC5322Parse.decodeRFC2047` **byte-identically**. Assert the round-trip, not that the
-   encoder was called.
-3. Non-vacuity twin: an ordinary ASCII subject with no `=?` must still be emitted unchanged, so the
-   widening does not start Base64-ing all outbound mail.
-4. Note that this and the 75-octet ceiling (`IOS-IMAP-016`) share one function on both sides; if both
-   are taken, take them in the same PR.
-
-## Related
-
-- `IOS-IMAP-016` — the SwiftMail half of the same encoder, which also carries the 75-octet
-  encoded-word ceiling defect.
-- `IOS-COMPOSE-002` — the other open outbound-conformance cost (MIME parameter quoting).
-- `1d28552c1` — the fix that closed the control-character half of this encoder's trigger.
+Issue #8 can close when PR #37 merges. PR #38 was documentation-only and did not implement this fix.

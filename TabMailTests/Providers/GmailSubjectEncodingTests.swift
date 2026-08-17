@@ -17,6 +17,68 @@ struct GmailSubjectEncodingTests {
         GmailProvider(userEmail: "me@example.com", accessToken: { _ in "tok" })
     }
 
+    private func subjectFieldBody(in message: String) -> String? {
+        let headerLines = (message.components(separatedBy: "\r\n\r\n").first ?? message)
+            .components(separatedBy: "\r\n")
+        guard let subjectIndex = headerLines.firstIndex(where: { $0.hasPrefix("Subject: ") }) else {
+            return nil
+        }
+
+        var body = String(headerLines[subjectIndex].dropFirst("Subject: ".count))
+        var index = subjectIndex + 1
+        while index < headerLines.count,
+              headerLines[index].hasPrefix(" ") || headerLines[index].hasPrefix("\t") {
+            body += "\r\n" + headerLines[index]
+            index += 1
+        }
+        return body
+    }
+
+    private func subjectPhysicalLines(in message: String) -> [String] {
+        let headerLines = (message.components(separatedBy: "\r\n\r\n").first ?? message)
+            .components(separatedBy: "\r\n")
+        guard let subjectIndex = headerLines.firstIndex(where: { $0.hasPrefix("Subject: ") }) else {
+            return []
+        }
+
+        var lines = [headerLines[subjectIndex]]
+        var index = subjectIndex + 1
+        while index < headerLines.count,
+              headerLines[index].hasPrefix(" ") || headerLines[index].hasPrefix("\t") {
+            lines.append(headerLines[index])
+            index += 1
+        }
+        return lines
+    }
+
+    private func assertSubjectRoundTrips(_ message: String, as expected: String) {
+        let emittedSubject = subjectFieldBody(in: message)
+        #expect(emittedSubject != nil)
+        guard let emittedSubject else { return }
+        #expect(RFC5322Parse.decodeRFC2047(emittedSubject) == expected)
+    }
+
+    private func assertEncodedWordsFitRFC2047(_ message: String) {
+        let emittedSubject = subjectFieldBody(in: message)
+        #expect(emittedSubject != nil)
+        guard let emittedSubject else { return }
+        let words = emittedSubject.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
+        #expect(!words.isEmpty)
+        for word in words {
+            #expect(word.hasPrefix("=?UTF-8?B?") && word.hasSuffix("?="))
+            #expect(word.utf8.count <= 75, "encoded-word was \(word.utf8.count) octets")
+        }
+    }
+
+    private func assertSubjectPhysicalLinesFit(_ message: String) {
+        let lines = subjectPhysicalLines(in: message)
+        #expect(!lines.isEmpty, "message did not contain a Subject field")
+        guard !lines.isEmpty else { return }
+        for line in lines {
+            #expect(line.utf8.count <= 76, "physical Subject line was \(line.utf8.count) octets")
+        }
+    }
+
     // MARK: - Encoder
 
     @Test("ASCII subject passes through unchanged")
@@ -122,11 +184,66 @@ struct GmailSubjectEncodingTests {
     /// encoding all input.
     @Test("Widening the trigger did not start encoding benign subjects")
     func benignSubjectsStillPassThrough() {
-        for subject in ["Plain subject", "Re: Q3 numbers (final)", "a b\tc", "", "50% off — no"] {
+        for subject in [
+            "Plain subject", "Re: Q3 numbers (final)", "a b\tc", "",
+            "Budget = 2026? yes", "serial=?not-an-encoded-word", "50% off — no",
+        ] {
             let encoded = RFC2047.encodeHeaderValue(subject)
             if subject.allSatisfy({ $0.isASCII }) {
                 #expect(encoded == subject, "benign ASCII subject was altered: \(subject.debugDescription)")
             }
+        }
+    }
+
+    @Test("Complete decoder-consumable substrings and composer words trigger protection")
+    func completeEncodedWordShapesTriggerProtection() {
+        let validWord = "=?UTF-8?B?SGVsbG8=?="
+        let decoderCompatibilitySubjects = [
+            "prefix\(validWord)",
+            "Re: \(validWord)suffix",
+        ]
+        for subject in [validWord, "Re: \(validWord)", "Re:\t\(validWord)"]
+            + decoderCompatibilitySubjects + ["=?="] {
+            let encoded = RFC2047.encodeHeaderValue(subject)
+            #expect(encoded != subject, "complete encoded-word shape was emitted literally")
+            #expect(RFC5322Parse.decodeRFC2047(encoded) == subject)
+        }
+
+        for subject in decoderCompatibilitySubjects {
+            #expect(RFC5322Parse.decodeRFC2047(subject) != subject,
+                    "the compatibility control must be consumed by the shipped decoder")
+        }
+
+        for subject in [
+            "Re: =?UTF-8?B?SGVsbG8=",
+            "Re: =?",
+            "serial=?not-an-encoded-word",
+        ] {
+            #expect(RFC2047.encodeHeaderValue(subject) == subject,
+                    "non-token text was unnecessarily encoded: \(subject)")
+        }
+    }
+
+    @Test("Complete valid, invalid, and oversized boundary tokens are protected")
+    func completeInvalidAndOversizedTokensAreProtectedSeparately() {
+        let withinLimitText = String(repeating: "a", count: 45)
+        let oversizedText = String(repeating: "a", count: 48)
+        let withinLimit = "=?UTF-8?B?" + Data(withinLimitText.utf8).base64EncodedString() + "?="
+        let oversized = "=?UTF-8?B?" + Data(oversizedText.utf8).base64EncodedString() + "?="
+        #expect(withinLimit.utf8.count == 72)
+        #expect(oversized.utf8.count == 76)
+        #expect(RFC5322Parse.decodeRFC2047(withinLimit) == withinLimitText,
+                "the within-limit control must be reader-recognizable")
+
+        for subject in [
+            "Re: =?UTF-8?X?SGVsbG8=?=", // unsupported encoding token
+            "Re: =?UTF-8?B?***?=",       // malformed Base64 payload
+            withinLimit,
+            oversized,
+        ] {
+            let encoded = RFC2047.encodeHeaderValue(subject)
+            #expect(encoded != subject, "complete encoded-word-like token was emitted literally")
+            #expect(RFC5322Parse.decodeRFC2047(encoded) == subject)
         }
     }
 
@@ -168,6 +285,92 @@ struct GmailSubjectEncodingTests {
         if let subjectLine {
             #expect(RFC5322Parse.decodeRFC2047(String(subjectLine.dropFirst("Subject: ".count))) == injected)
         }
+    }
+
+    @Test("Both Gmail emitters preserve a literal RFC 2047-shaped subject")
+    func literalEncodedWordShapeRoundTripsThroughBothEmitters() {
+        let subject = "Re: =?UTF-8?B?SGVsbG8=?= explained"
+        let plainDraft = DraftMessage(to: ["you@example.com"], subject: subject, body: "body")
+        let attachmentDraft = DraftMessage(
+            to: ["you@example.com"],
+            subject: subject,
+            body: "body",
+            attachments: [
+                DraftAttachment(filename: "proof.txt", mimeType: "text/plain", data: Data("proof".utf8)),
+            ]
+        )
+        let provider = makeProvider()
+
+        let rfc822 = provider.buildRFC822(draft: plainDraft)
+        let mime = String(decoding: provider.buildMIMEMessage(draft: attachmentDraft), as: UTF8.self)
+        #expect(mime.contains("Content-Type: multipart/mixed;"), "attachment builder arm was not exercised")
+        assertSubjectRoundTrips(rfc822, as: subject)
+        assertSubjectRoundTrips(mime, as: subject)
+        assertSubjectPhysicalLinesFit(rfc822)
+        assertSubjectPhysicalLinesFit(mime)
+    }
+
+    @Test("Both Gmail emitters protect complete substrings consumed by the shipped decoder")
+    func decoderConsumableSubstringsRoundTripThroughBothEmitters() {
+        let validWord = "=?UTF-8?B?SGVsbG8=?="
+        let subjects = ["prefix\(validWord)", "Re: \(validWord)suffix", "=?="]
+        let provider = makeProvider()
+
+        for subject in subjects {
+            if subject != "=?=" {
+                #expect(RFC5322Parse.decodeRFC2047(subject) != subject,
+                        "the raw compatibility control must be consumed before protection")
+            }
+            let plainDraft = DraftMessage(to: ["you@example.com"], subject: subject, body: "body")
+            let attachmentDraft = DraftMessage(
+                to: ["you@example.com"],
+                subject: subject,
+                body: "body",
+                attachments: [
+                    DraftAttachment(filename: "proof.txt", mimeType: "text/plain", data: Data("proof".utf8)),
+                ]
+            )
+
+            let rfc822 = provider.buildRFC822(draft: plainDraft)
+            let mime = String(decoding: provider.buildMIMEMessage(draft: attachmentDraft), as: UTF8.self)
+            #expect(subjectFieldBody(in: rfc822) != subject)
+            #expect(subjectFieldBody(in: mime) != subject)
+            assertSubjectRoundTrips(rfc822, as: subject)
+            assertSubjectRoundTrips(mime, as: subject)
+            assertSubjectPhysicalLinesFit(rfc822)
+            assertSubjectPhysicalLinesFit(mime)
+        }
+    }
+
+    @Test("Both Gmail emitters keep every encoded-word within 75 octets")
+    func scalarBoundaryKeepsBothEmittersWithinEncodedWordLimit() {
+        // One extended grapheme: 1 ASCII byte + 23 two-byte combining scalars.
+        // Encoding the Character atomically creates a 76-octet encoded-word;
+        // splitting only between Unicode scalars keeps every word valid UTF-8.
+        // The ASCII tail fills a continuation chunk to its 45-byte budget, so
+        // both the scalar split and the continuation-word ceiling are exercised.
+        let subject = "a" + String(repeating: "\u{0301}", count: 23)
+            + String(repeating: "b", count: 50)
+        let plainDraft = DraftMessage(to: ["you@example.com"], subject: subject, body: "body")
+        let attachmentDraft = DraftMessage(
+            to: ["you@example.com"],
+            subject: subject,
+            body: "body",
+            attachments: [
+                DraftAttachment(filename: "proof.txt", mimeType: "text/plain", data: Data("proof".utf8)),
+            ]
+        )
+        let provider = makeProvider()
+
+        let rfc822 = provider.buildRFC822(draft: plainDraft)
+        let mime = String(decoding: provider.buildMIMEMessage(draft: attachmentDraft), as: UTF8.self)
+        #expect(mime.contains("Content-Type: multipart/mixed;"), "attachment builder arm was not exercised")
+        assertSubjectRoundTrips(rfc822, as: subject)
+        assertSubjectRoundTrips(mime, as: subject)
+        assertEncodedWordsFitRFC2047(rfc822)
+        assertEncodedWordsFitRFC2047(mime)
+        assertSubjectPhysicalLinesFit(rfc822)
+        assertSubjectPhysicalLinesFit(mime)
     }
 
     // MARK: - buildRFC822 integration (no-attachment send path)
