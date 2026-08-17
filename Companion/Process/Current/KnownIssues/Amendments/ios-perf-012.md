@@ -23,7 +23,8 @@ migration, statistics refresh, query, write, or cache. The shared resolver also 
 planner-dependent duplicate-RFC pick deliberate: prefer the sibling in the staged row's observed
 folder, then an inbox sibling, then lowest `id`. The moved-inbox target is already destination-folder
 scoped and chooses lowest `id`. **That ordering is a correctness guard for the hint, not the performance
-mechanism.** Eight other scoped-RFC query sites remain below and keep this class open.
+mechanism.** Ten residual statement sites across nine logical query groups remain below and keep this
+class open.
 
 ## Subsystem and search terms
 
@@ -172,11 +173,13 @@ filters, `accountId`/`folderId` forms, and sibling selective identity columns. T
 are mitigated. Three shipped members were already safe: `MessageContentStore.ownersSQL`,
 `ChatStore.findByStableIdSQL`, and `AccountManager.queuedMemberIdentitySQL`.
 
-The following members remain unhinted and keep this record open:
+The following **ten statement sites across nine logical query groups** remain unhinted and keep this
+record open. `SyncEngineDeltaSync` is one logical group but contains two distinct statements:
 
 1. `SyncEngineFullSync` optimistic Drafts/Sent dedup (`folderId` + RFC + `messageId !=`), per header
    inside the sync write transaction.
-2. `SyncEngineDeltaSync`'s two optimistic Sent/Drafts dedup probes, the same write-path shape.
+2. `SyncEngineDeltaSync`'s **two statements** for optimistic Sent/Drafts dedup, the same write-path
+   shape.
 3. `ReplyParentResolver.updateParentsForReplies` (`accountId` + RFC `IN` + `isReplied = 0`), byte-shape
    equivalent to the already-hinted queued-member RFC arm.
 4. `Draft` reply/forward strategy 2 (`accountId` + RFC, `LIMIT 2`), paid on draft open.
@@ -185,6 +188,8 @@ The following members remain unhinted and keep this record open:
 6. `InboxView.lookupMessageId` (`accountId` + RFC), paid on notification/deep-link resolution.
 7. `AccountManagerOutbox.appendToSentFolder` (`folderId` + RFC), one idempotency probe per send.
 8. `StuckMessageDiagnostics`' correlated account + RFC sibling check, debug-only.
+9. `AccountManager.logStuckOpDiagnostic`'s per-member `(messageId OR rfc822MessageId) AND accountId`
+   GRDB query, the same stale-statistics account-walk shape, debug-only.
 
 The GRDB query-interface members cannot express `INDEXED BY`; converting each to raw SQL is a larger
 semantic/test surface and is deliberately not smuggled into this bounded change. The first sites to
