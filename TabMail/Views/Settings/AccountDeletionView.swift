@@ -2,7 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import StoreKit
 import SwiftUI
+import UIKit
 
 struct AccountDeletionView: View {
     /// Length of the server-side deletion grace period, mirrored from
@@ -13,8 +15,10 @@ struct AccountDeletionView: View {
     private static let gracePeriodDays = 30
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(StoreKitManager.self) private var storeKit
     @State private var confirmed = false
-    @State private var isDeleting = false
+    @State private var deletionAttemptGate = AccountDeletionAttemptGate()
+    @State private var progressMessage = "Schedule Deletion"
     @State private var errorMessage: String?
     @State private var deletionComplete = false
     /// Formatted `deletion_date` from the server response. Nil when the
@@ -33,7 +37,7 @@ struct AccountDeletionView: View {
         .background(Palette.previewPaneBg)
         .navigationTitle(deletionComplete ? "" : "Delete Account")
         .navigationBarTitleDisplayMode(.inline)
-        .navigationBarBackButtonHidden(deletionComplete)
+        .navigationBarBackButtonHidden(deletionComplete || deletionAttemptGate.isRunning)
         .dismissKeyboardOnTap()
     }
 
@@ -55,26 +59,35 @@ struct AccountDeletionView: View {
             // it contradicts what a "Delete Account" screen normally implies.
             GroupBox {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Nothing is deleted today. Your TabMail account is scheduled for deletion \(Self.gracePeriodDays) days from now, and keeps working normally until then.")
+                    Text(AccountDeletionCopy.gracePeriodDescription(days: Self.gracePeriodDays))
                         .font(.subheadline)
 
-                    BulletPoint("To call it off, sign in to TabMail again before that date and tap Keep Account on the banner at the top of your inbox.")
+                    BulletPoint(
+                        "To call it off, sign in to TabMail again before that date and tap Keep Account " +
+                            "on the banner at the top of your inbox."
+                    )
                     BulletPoint("If you do nothing, the deletion goes ahead on its own and cannot be undone.")
                 }
                 .padding(.vertical, 4)
             } label: {
-                Label("You have \(Self.gracePeriodDays) days to change your mind", systemImage: "clock.arrow.circlepath")
+                Label(
+                    "You have \(Self.gracePeriodDays) days to change your mind",
+                    systemImage: "clock.arrow.circlepath"
+                )
                     .font(.headline)
             }
 
             // What will be deleted
             GroupBox {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Once the \(Self.gracePeriodDays) days are up, this is permanently deleted:")
+                    Text(
+                        "After \(Self.gracePeriodDays) days, your TabMail account and associated data " +
+                            "are deleted, subject to the Privacy Policy and legally or operationally " +
+                            "required retention."
+                    )
                         .font(.subheadline)
 
                     BulletPoint("Your account credentials and profile")
-                    BulletPoint("All data stored on our servers")
                     BulletPoint("Active AI processing and sync")
                 }
                 .padding(.vertical, 4)
@@ -101,19 +114,20 @@ struct AccountDeletionView: View {
             // Subscription info
             GroupBox {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Active subscriptions will be automatically cancelled at the end of your current billing period.")
+                    Text("Renewal must be off before account deletion.")
                         .font(.subheadline)
+                    Text(
+                        "Stripe is handled automatically. If an Apple subscription is still " +
+                            "renewing, you’ll briefly open Apple Subscriptions to turn off auto-renew."
+                    )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 .padding(.vertical, 4)
             } label: {
                 Label("Subscription", systemImage: "creditcard")
                     .font(.headline)
             }
-
-            // Legal
-            Text("Anonymized transaction records may be retained for legal compliance.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
 
             Divider()
 
@@ -136,21 +150,21 @@ struct AccountDeletionView: View {
 
             // Delete button
             Button(role: .destructive) {
-                Task { await deleteAccount() }
+                startDeletion()
             } label: {
                 HStack {
-                    if isDeleting {
+                    if deletionAttemptGate.isRunning {
                         ProgressView()
                             .tint(.white)
                     }
-                    Text("Schedule Deletion")
+                    Text(progressMessage)
                         .bold()
                 }
                 .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .tint(.red)
-            .disabled(!confirmed || isDeleting)
+            .disabled(!confirmed || deletionAttemptGate.isRunning)
             .padding(.top, 4)
         }
         .padding()
@@ -172,20 +186,27 @@ struct AccountDeletionView: View {
             // The date comes from the server response. If it could not be
             // parsed we say nothing about timing rather than invent a date.
             Text(scheduledDateText.map {
-                "Your TabMail account is scheduled for permanent deletion on \($0). Your email accounts and messages remain on this device."
-            } ?? "Your TabMail account is scheduled for permanent deletion. Your email accounts and messages remain on this device.")
+                "Your TabMail account is scheduled for permanent deletion on \($0). " +
+                    "Your email accounts and messages remain on this device."
+            } ?? (
+                "Your TabMail account is scheduled for permanent deletion. " +
+                    "Your email accounts and messages remain on this device."
+            ))
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal)
 
-            Text("Changed your mind? Sign in to TabMail again before then and tap Keep Account on the banner at the top of your inbox. After that date the deletion is permanent.")
+            Text(
+                "Changed your mind? Sign in to TabMail again before then and tap Keep Account on the " +
+                    "banner at the top of your inbox. After that date the deletion is permanent."
+            )
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal)
 
-            Text("Active subscriptions will be cancelled at the end of your billing period.")
+            Text(AccountDeletionCopy.keepAccountConsequence)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -206,21 +227,67 @@ struct AccountDeletionView: View {
         }
         .padding()
     }
+}
 
+private extension AccountDeletionView {
     // MARK: - Actions
 
-    private func deleteAccount() async {
-        isDeleting = true
+    private func startDeletion() {
+        // Claim the operation synchronously in the button action. Two rapid
+        // activations therefore cannot enqueue overlapping StoreKit sheets or
+        // cancellation requests before SwiftUI has time to re-render.
+        guard deletionAttemptGate.begin() else { return }
         errorMessage = nil
+        progressMessage = "Checking Subscription…"
+        // This operation intentionally outlives a transient view redraw. The
+        // back button is hidden while it runs, and cancelling an in-flight
+        // destructive POST would itself create an ambiguous outcome.
+        Task {
+            await deleteAccount()
+        }
+    }
+
+    private func deleteAccount() async {
+        defer {
+            deletionAttemptGate.finish()
+            progressMessage = "Schedule Deletion"
+        }
 
         do {
-            let response = try await BillingClient().requestAccountDeletion()
-            print("[AccountDeletion] Scheduled: \(response.status), date: \(response.deletion_date)")
+            let billingClient = BillingClient()
+            let backendClient = BackendClient()
+            let execution = try await AccountDeletionSubscriptionCoordinator.execute(
+                fetchAccountInfo: { try await backendClient.fetchAccountInfo() },
+                cancelStripe: { try await billingClient.cancelSubscription() },
+                appleRenewalState: {
+                    guard let userId = TabMailAuthService.getSession()?.userId else {
+                        return .unavailable
+                    }
+                    return await storeKit.accountDeletionRenewalState(
+                        currentUserId: userId
+                    )
+                },
+                manageAppleSubscription: { await presentAppleSubscriptions() },
+                scheduleDeletion: { try await billingClient.requestAccountDeletion() },
+                fetchDeletionStatus: { try await billingClient.checkDeletionStatus() },
+                progress: { progressMessage = $0.buttonLabel }
+            )
 
+            let deletionDate: String?
+            switch execution {
+            case .scheduled(let scheduledDate):
+                deletionDate = scheduledDate
+            case .schedulingNotConfirmed:
+                errorMessage = AccountDeletionCopy.schedulingNotConfirmed
+                return
+            case .blocked(let preparation):
+                errorMessage = blockedMessage(for: preparation)
+                return
+            }
             // Show the server's scheduled date, not a locally computed one.
             // Stays nil if the timestamp doesn't parse, in which case the
             // confirmation screen omits the date entirely.
-            scheduledDateText = Date.fromISO8601(response.deletion_date)
+            scheduledDateText = deletionDate.flatMap(Date.fromISO8601)
                 .map { $0.formatted(date: .long, time: .omitted) }
 
             // Scoped cleanup: clear TabMail account data, preserve email accounts & messages
@@ -231,11 +298,51 @@ struct AccountDeletionView: View {
                 deletionComplete = true
             }
         } catch {
-            errorMessage = "Couldn't schedule the deletion. Please try again."
-            print("[AccountDeletion] Error: \(error)")
+            errorMessage = "We couldn’t confirm subscription status, so deletion wasn’t scheduled. Please try again."
+            if DebugModeManager.isLoggingEnabled() {
+                print("[AccountDeletion] Error: \(error)")
+            }
+        }
+    }
+
+    private func blockedMessage(
+        for outcome: AccountDeletionSubscriptionCoordinator.Outcome
+    ) -> String {
+        switch outcome {
+        case .ready:
+            assertionFailure("A ready deletion must execute the scheduling request")
+            return "Couldn't schedule the deletion. Please try again."
+        case .cancellationNotConfirmed:
+            return "Renewal could not be confirmed as off. Please try again."
+        case .cancellationStillUpdating:
+            return "Cancellation is still updating. Please try again in a moment."
+        case .appleManagementUnavailable:
+            return "Open Apple Subscriptions, turn off auto-renew, then try again."
+        case .appleConfirmationPending:
+            return AccountDeletionCopy.appleConfirmationPending
+        case .appleStatusUnavailable:
+            return "We couldn’t check Apple subscription status. Please try again."
+        case .unsupportedActiveProvider:
+            return "Turn off subscription renewal before deleting your account."
+        }
+    }
+
+    private func presentAppleSubscriptions() async -> Bool {
+        guard let windowScene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first else {
+            return false
         }
 
-        isDeleting = false
+        do {
+            try await AppStore.showManageSubscriptions(in: windowScene)
+            return true
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[AccountDeletion] Failed to open Apple subscriptions: \(error)")
+            }
+            return false
+        }
     }
 
     /// Clears TabMail session and stops AI processing while preserving all local data.
@@ -249,7 +356,9 @@ struct AccountDeletionView: View {
         // 3. Disconnect Device Sync
         DeviceSyncService.shared.disconnect()
 
-        print("[AccountDeletion] Scoped cleanup complete — email accounts and messages preserved")
+        if DebugModeManager.isLoggingEnabled() {
+            print("[AccountDeletion] Scoped cleanup complete — email accounts and messages preserved")
+        }
 
         // 4. Signal sign-out → RootView stays in inbox (email accounts still exist)
         NotificationCenter.default.post(name: .tabMailDidSignOut, object: nil)

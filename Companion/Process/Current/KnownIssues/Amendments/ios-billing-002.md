@@ -120,16 +120,20 @@ is part of this issue.
 - If the first successful response is lost and a retry receives the existing already-resolved 404,
   the client no longer has the outcome to present. Persisting or re-querying it would require a new
   backend contract.
-- The worker reports `restored` as soon as any subscription is restored, before checking whether a
-  second rostered subscription lapsed. A multi-subscription partial loss can therefore be
-  under-reported. The iOS client must present the returned contract, not infer provider state.
+- TabMail's Stripe product invariant is one subscription per customer. The client consumes that
+  public product contract and does not invent partial-loss semantics for unsupported duplicates.
 - RootView's other alerts can race this in-memory alert. That rare collision degrades to the shipped
   silent fallback and ordinary plan surfaces; an alert queue is disproportionate to this issue.
-- Actual deployment and authenticated live-handler behavior remain unverified per `BW-VERIFY-001`.
-- Separate audit findings are not folded into this fix: the account-deletion UI promises automatic
-  cancellation while the deletion worker handles Stripe only (Apple IAP requires separate
-  disposition), root ADR-020 still says deletion is manual with no endpoint, and the worker's old
-  additive-safety comment will become historical after this client ships.
+- The Apple-IAP account-deletion follow-up is closed by the client flow in this change: it reads
+  StoreKit's signed renewal information for the current TabMail user, opens Apple's subscription
+  manager only while renewal is on, and rechecks both signed Apple state and current account status
+  immediately before scheduling deletion. An active Apple account status with no matching StoreKit
+  row fails closed. Stripe uses the existing cancellation action, requires concrete confirmation,
+  and rechecks current account status. A positive read-only deletion-status response reconciles a
+  lost deletion response; a negative or unavailable read remains unknown and prompts an idempotent
+  retry. The client never writes provider or entitlement state.
+- The adjacent workspace record that still describes account deletion as manual with no automated
+  endpoint remains stale and requires a separate cross-repository correction.
 
 **Related:** `IOS-BILLING-001` — the sibling case where a billing-surface failure is log-only and
 leaves a control with no visible result. Same shape: the backend knows something the user needs and

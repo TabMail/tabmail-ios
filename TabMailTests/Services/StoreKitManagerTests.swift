@@ -325,3 +325,61 @@ struct StoreKitManagerStateTests {
         #expect(yearly.allSatisfy { $0.contains("yearly") })
     }
 }
+
+// MARK: - StoreKit Account-Deletion Renewal Authority Tests
+
+@Suite("StoreKit account-deletion renewal authority")
+struct StoreKitManagerAccountDeletionRenewalTests {
+    private let owner = "11111111-1111-4111-8111-111111111111"
+
+    @Test("Pure signed-status reduction fails closed and preserves renewal precedence")
+    @MainActor
+    func signedStatusReduction() {
+        let matchingRenewing = AccountDeletionStoreKitStatusEvidence.verifiedTransaction(
+            productID: "ai.tabmail.byok.monthly",
+            appAccountToken: owner.uppercased(),
+            renewal: .verified(willAutoRenew: true)
+        )
+        let matchingNotRenewing = AccountDeletionStoreKitStatusEvidence.verifiedTransaction(
+            productID: "ai.tabmail.byok.monthly",
+            appAccountToken: owner,
+            renewal: .verified(willAutoRenew: false)
+        )
+        let otherUser = AccountDeletionStoreKitStatusEvidence.verifiedTransaction(
+            productID: "ai.tabmail.byok.monthly",
+            appAccountToken: "22222222-2222-4222-8222-222222222222",
+            renewal: .verified(willAutoRenew: true)
+        )
+        let otherProduct = AccountDeletionStoreKitStatusEvidence.verifiedTransaction(
+            productID: "example.unrelated.product",
+            appAccountToken: owner,
+            renewal: .verified(willAutoRenew: true)
+        )
+        let unverifiedRenewal = AccountDeletionStoreKitStatusEvidence.verifiedTransaction(
+            productID: "ai.tabmail.byok.monthly",
+            appAccountToken: owner,
+            renewal: .unverified
+        )
+
+        #expect(state(for: []) == .noMatchingSubscription)
+        #expect(state(for: [otherUser, otherProduct]) == .noMatchingSubscription)
+        #expect(state(for: [matchingNotRenewing]) == .notRenewing)
+        #expect(state(for: [matchingRenewing]) == .renewing)
+        #expect(state(for: [.unverifiedTransaction]) == .unavailable)
+        #expect(state(for: [unverifiedRenewal]) == .unavailable)
+        #expect(state(for: [matchingNotRenewing, matchingRenewing]) == .renewing)
+        #expect(state(for: [.unverifiedTransaction, matchingRenewing]) == .renewing)
+        #expect(state(for: [matchingNotRenewing, otherUser]) == .notRenewing)
+    }
+
+    @MainActor
+    private func state(
+        for evidence: [AccountDeletionStoreKitStatusEvidence]
+    ) -> AccountDeletionAppleRenewalState {
+        StoreKitManager.accountDeletionRenewalState(
+            currentUserId: owner,
+            evidence: evidence
+        )
+    }
+
+}

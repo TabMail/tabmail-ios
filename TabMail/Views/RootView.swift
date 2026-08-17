@@ -839,7 +839,10 @@ private struct DeletionBanner: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Account deletion scheduled")
                     .font(.subheadline.bold())
-                Text("Permanently deleted on \(formattedDate). Tap Keep Account to call it off.")
+                Text(
+                    "Permanently deleted on \(formattedDate). " +
+                        "Tap Keep Account to stop the account deletion."
+                )
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

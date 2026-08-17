@@ -6,6 +6,20 @@ import StoreKit
 import Observation
 import Synchronization
 
+enum AccountDeletionStoreKitRenewalEvidence: Equatable, Sendable {
+    case unverified
+    case verified(willAutoRenew: Bool)
+}
+
+enum AccountDeletionStoreKitStatusEvidence: Equatable, Sendable {
+    case unverifiedTransaction
+    case verifiedTransaction(
+        productID: String,
+        appAccountToken: String?,
+        renewal: AccountDeletionStoreKitRenewalEvidence
+    )
+}
+
 @Observable @MainActor
 final class StoreKitManager {
     var products: [Product] = []
@@ -173,6 +187,94 @@ final class StoreKitManager {
         activePlan = bestPlan
         subscriptionOwnerUserId = ownerUserId
         print("[StoreKit] Current entitlements: \(purchased), activePlan: \(bestPlan ?? "none"), owner: \(ownerUserId?.prefix(8) ?? "none")")
+    }
+
+    /// Reads Apple's signed renewal information for the current TabMail user.
+    /// Transaction entitlements alone cannot answer this: turning auto-renew
+    /// off keeps the current transaction entitled until its paid term ends.
+    func accountDeletionRenewalState(
+        currentUserId: String
+    ) async -> AccountDeletionAppleRenewalState {
+        let canonicalUserId = currentUserId.lowercased()
+
+        if products.isEmpty {
+            await loadProducts()
+        }
+        guard let subscription = products.compactMap(\.subscription).first else {
+            return .unavailable
+        }
+
+        let statuses: [Product.SubscriptionInfo.Status]
+        do {
+            statuses = try await subscription.status
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[StoreKit] Could not read subscription renewal status: \(error)")
+            }
+            return .unavailable
+        }
+
+        let evidence = statuses.map { status in
+            guard case .verified(let transaction) = status.transaction else {
+                return AccountDeletionStoreKitStatusEvidence.unverifiedTransaction
+            }
+            let renewalEvidence: AccountDeletionStoreKitRenewalEvidence
+            switch status.renewalInfo {
+            case .verified(let renewalInfo):
+                renewalEvidence = .verified(willAutoRenew: renewalInfo.willAutoRenew)
+            case .unverified:
+                renewalEvidence = .unverified
+            }
+            return .verifiedTransaction(
+                productID: transaction.productID,
+                appAccountToken: transaction.appAccountToken?.uuidString,
+                renewal: renewalEvidence
+            )
+        }
+
+        return Self.accountDeletionRenewalState(
+            currentUserId: canonicalUserId,
+            evidence: evidence
+        )
+    }
+
+    static func accountDeletionRenewalState(
+        currentUserId: String,
+        evidence: [AccountDeletionStoreKitStatusEvidence]
+    ) -> AccountDeletionAppleRenewalState {
+        let canonicalUserId = currentUserId.lowercased()
+        var foundUnverifiedStatus = false
+        var foundRenewalOff = false
+
+        for status in evidence {
+            switch status {
+            case .unverifiedTransaction:
+                // The transaction cannot be safely ruled out as belonging to
+                // the current user, so the authority remains unavailable.
+                foundUnverifiedStatus = true
+            case .verifiedTransaction(let productID, let appAccountToken, let renewal):
+                guard Self.productIDs.contains(productID),
+                      appAccountToken?.lowercased() == canonicalUserId else {
+                    continue
+                }
+                switch renewal {
+                case .unverified:
+                    foundUnverifiedStatus = true
+                case .verified(willAutoRenew: true):
+                    return .renewing
+                case .verified(willAutoRenew: false):
+                    foundRenewalOff = true
+                }
+            }
+        }
+
+        // An unverified status could itself be the current user's renewal.
+        // Its transaction cannot safely be used to rule that out, even if no
+        // other verified row matched the user's appAccountToken.
+        if foundUnverifiedStatus {
+            return .unavailable
+        }
+        return foundRenewalOff ? .notRenewing : .noMatchingSubscription
     }
 
     /// Returns the JWS representation of the latest active entitlement, if any.
