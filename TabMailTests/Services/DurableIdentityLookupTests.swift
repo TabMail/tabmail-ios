@@ -95,6 +95,34 @@ struct DurableIdentityLookupTests {
         #expect(ref?.id == header.id)
     }
 
+    @Test("rfc822 fallback prefers the observed folder over an earlier duplicate-RFC sibling")
+    func rfc822FallbackPrefersObservedFolder() throws {
+        let (pool, dir) = try makeTestPool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let archived = makeHeader(
+            folderPath: "Archive", messageId: "old-archive-uid",
+            rfc822MessageId: "shared-rfc@example.com", isInInbox: false)
+        let inbox = makeHeader(
+            folderPath: "INBOX", messageId: "old-inbox-uid",
+            rfc822MessageId: "shared-rfc@example.com", isInInbox: true)
+        try pool.write { db in
+            // Insertion order is intentional: without production's ORDER BY, the
+            // hinted RFC index returns this Archive row's lower rowid first.
+            try archived.insert(db)
+            try inbox.insert(db)
+        }
+
+        let ref = try pool.read { db in
+            try DurableIdentityLookup.find(
+                db: db, accountId: "acc1", folderPath: "INBOX", messageId: "new-uid",
+                rfc822MessageId: "shared-rfc@example.com"
+            )
+        }
+        #expect(ref?.id == inbox.id)
+        #expect(ref?.folderPath == "INBOX")
+        #expect(ref?.isInInbox == true)
+    }
+
     // MARK: - (c) fallback NOT taken when rfc822 nil
 
     @Test("fallback is NOT taken when rfc822MessageId is nil")

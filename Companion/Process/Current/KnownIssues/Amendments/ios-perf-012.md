@@ -9,11 +9,22 @@
 
 ## Status
 
-🔓 **OPEN (2026-08-13)** — with **stale `sqlite_stat1`**, `DurableIdentityLookup.find`'s rfc822 fallback
-(step 3) degrades from an index seek to an **account-wide scan**: measured **2.47–2.69 ms** versus
-**0.003–0.099 ms** at 20,000 rows / 2 accounts, linear in per-account row count. **Stale is the shipped
-regime on a fresh install.** Pre-existing and paid today on the push-merge and inbox-compose paths.
-**No correctness impact** — the resolver returns the same answer either way; only the cost differs.
+🔓 **OPEN — TWO HOT MEMBERS MITIGATED (2026-08-15); THE CLASS REMAINS OPEN.** With stale
+`sqlite_stat1`, `DurableIdentityLookup.find`'s rfc822 fallback (step 3) and
+`AccountManager.resolveInboxEntryAITargets` degraded from an RFC seek to an **account-wide scan**.
+The 2026-08-15 campaign reproduced that on the exact current migrated schema at 200,000 rows / two
+accounts: the shared fallback took **15.307 ms median / 17.879 ms p95** for a tail hit and
+**14.998 / 20.088 ms** for a miss; the moved-inbox target took **17.027 / 21.334 ms** and
+**16.964 / 26.218 ms**. The existing v1 RFC index served the same cases in **0.004–0.006 ms**, and
+both hinted and unhinted forms were **0.003–0.006 ms** after full `ANALYZE`.
+
+This change pins those two hot statements to `messageHeader_rfc822MessageId`; it adds no index,
+migration, statistics refresh, query, write, or cache. The shared resolver also makes its previously
+planner-dependent duplicate-RFC pick deliberate: prefer the sibling in the staged row's observed
+folder, then an inbox sibling, then lowest `id`. The moved-inbox target is already destination-folder
+scoped and chooses lowest `id`. **That ordering is a correctness guard for the hint, not the performance
+mechanism.** Ten residual statement sites across nine logical query groups remain below and keep this
+class open.
 
 ## Subsystem and search terms
 
@@ -87,7 +98,10 @@ and **miss** when it does not:
 
 **Blast radius.** Bounded by staged-set size, which is small — one push typically stages one message, and
 the reader's staged set is bounded by recent pushes. So ≈2.5 ms × a small integer per push at 10k
-rows/account, ≈13 ms each at 100k. Off the main thread, on WAL reads that never contend the writer.
+rows/account, ≈13–17 ms each at 100k. The placement is **not uniformly an off-main WAL read**:
+`performMerge` phases 1/2 pay the fallback inside per-message savepoints of the merge write, extending
+single-writer occupancy, while `InboxListReader.gather` can pay it in a synchronously initiated
+`@MainActor` read. `resolveInboxEntryAITargets` remains an off-main post-drain read.
 
 ⚠️ **"Already paid on hotter paths" is a statement about the FREQUENCY OF THE CODE PATH, not about total
 cost** — the queue path is lower-frequency than the push path, but the push path's per-event volume is
@@ -131,10 +145,14 @@ defect look absent, and it cost a measurement round on `f60f41391`.
 highest, so a drain's members sit at the end of the walk. **Any probe of this class must state which end
 of the index its sample came from, and should draw from the tail.**
 
-## Why registered rather than fixed
+## Why schema/statistics machinery remains rejected
 
-Both candidate fixes are out of scope for a feature commit, and both have a cheaper alternative that is
-not obviously right:
+The 2026-08-15 campaign selected a cheaper already-shipped mechanism for the two hot statements:
+`INDEXED BY messageHeader_rfc822MessageId`. `v1.7.9` already owns this exact architecture in
+`MessageContentStore.ownersSQL`, `ChatStore.findByStableIdSQL`, and
+`AccountManager.queuedMemberIdentitySQL`; both affected statements themselves are unchanged between
+`v1.7.9` and the campaign base, so the release contains the defect and the remedy precedent. The larger
+alternatives remain wrong-layer or disproportionate:
 
 1. **A `(accountId, rfc822MessageId)` composite index** — this is a **migration**, and it is redundant with
    an index that already serves the query whenever statistics are fresh. **Adding schema to compensate for
@@ -142,10 +160,64 @@ not obviously right:
 2. **Re-arming the latch on row-count growth** — explicitly rejected by ADR-IOS-029's 2026-08-05
    amendment, whose own note measures a whole-database `ANALYZE` at up to **8.5 s at 500k headers** and
    states a per-poll `ANALYZE` *"would be a far worse defect than the one this fixes"*.
-3. **Not yet evaluated:** re-arm **once** when `messageHeader` first crosses a row-count threshold, giving
-   a fresh install a single refresh after its initial sync without incurring a per-poll cost. This is a
-   design question for ADR-IOS-029's owner, not a bug fix, and it is **the option a future session should
-   cost first.**
+3. Re-arming once at a row-count threshold was previously the first option to cost. The completed
+   whole-SQL audit found fresh statistics are not uniformly better (`UserLabelStore`: 10 ms stale vs
+   23 ms fresh), so even a one-shot refresh is a database-wide trade, not a targeted remedy.
+
+## 2026-08-15 class census and bounded disposition
+
+**Mechanical class property:** a `messageHeader` query combines selective `rfc822MessageId` equality
+(or `IN`) with a low-selectivity scope equality (`accountId` or `folderId`) that leads another index,
+allowing stale statistics to prefer a scope-prefix walk. Searches covered raw SQL, GRDB query-interface
+filters, `accountId`/`folderId` forms, and sibling selective identity columns. The two hot members above
+are mitigated. Three shipped members were already safe: `MessageContentStore.ownersSQL`,
+`ChatStore.findByStableIdSQL`, and `AccountManager.queuedMemberIdentitySQL`.
+
+The following **ten statement sites across nine logical query groups** remain unhinted and keep this
+record open. `SyncEngineDeltaSync` is one logical group but contains two distinct statements:
+
+1. `SyncEngineFullSync` optimistic Drafts/Sent dedup (`folderId` + RFC + `messageId !=`), per header
+   inside the sync write transaction.
+2. `SyncEngineDeltaSync`'s **two statements** for optimistic Sent/Drafts dedup, the same write-path
+   shape.
+3. `ReplyParentResolver.updateParentsForReplies` (`accountId` + RFC `IN` + `isReplied = 0`), byte-shape
+   equivalent to the already-hinted queued-member RFC arm.
+4. `Draft` reply/forward strategy 2 (`accountId` + RFC, `LIMIT 2`), paid on draft open.
+5. `MessageDetailViewModel.resolveMessageAsync`'s RFC fallback (`accountId` + RFC + nonempty folder),
+   paid on a message-open fallback.
+6. `InboxView.lookupMessageId` (`accountId` + RFC), paid on notification/deep-link resolution.
+7. `AccountManagerOutbox.appendToSentFolder` (`folderId` + RFC), one idempotency probe per send.
+8. `StuckMessageDiagnostics`' correlated account + RFC sibling check, debug-only.
+9. `AccountManager.logStuckOpDiagnostic`'s per-member `(messageId OR rfc822MessageId) AND accountId`
+   GRDB query, the same stale-statistics account-walk shape, debug-only.
+
+The GRDB query-interface members cannot express `INDEXED BY`; converting each to raw SQL is a larger
+semantic/test surface and is deliberately not smuggled into this bounded change. The first sites to
+cost next are the full/delta sync probes (write-transaction placement) and `ReplyParentResolver`
+(identical shape to a shipped hinted arm). This change therefore does **not** claim the class is closed
+and must not close GitHub issue #15.
+
+### Duplicate-RFC selection correction
+
+The original status said the resolver returned "the same answer either way". That was too strong.
+Same-account duplicate RFC identities are normal (for example Inbox plus Archive/All Mail siblings),
+and the old unordered `fetchOne` selected whichever row its plan reached first: account/messageId order
+with stale statistics, RFC/date order with fresh statistics, and RFC/rowid order under a bare hint.
+Consumers inspect the returned folder/inbox state for stale-by-move and AI-cache decisions, so a bare
+hint would have changed behavior invisibly. The deterministic same-folder/inbox/id ordering above is a
+deliberate narrowing, covered separately from the plan test. The target statement's retained per-member
+N+1 is accepted because the set is drain-bounded and each hinted probe is microseconds; a set-based
+rewrite would add machinery without operational benefit.
+
+### Failure semantics
+
+The v1 single-column RFC index is created blocking, recreated in v2, named by shipped queries, never
+dropped, and is not a deferred index. If a future migration nevertheless drops or renames it,
+`INDEXED BY` makes both statements throw instead of silently walking. The moved-inbox caller already
+fails closed to no AI target. NSE verification/stale detection remain conservative, and merge savepoints
+roll back for retry. `InboxListReader.gather` catches a resolver throw at its outer read and can return an
+empty inbox; that user-visible failure class already exists for its triage hint but is widened to staged
+resolution by this change, so the blocking-index existence assertion is part of the regression gate.
 
 ## On the namespace: `IOS-PERF`, not `IOS-QUEUE`
 

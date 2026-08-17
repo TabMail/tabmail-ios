@@ -124,6 +124,42 @@ struct NSEStaleStagedRowInvalidationTests {
         NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
     }
 
+    /// Minimal staged Inbox row for driving this suite's stale-by-move resolver
+    /// directly. The epoch-guard suite below has a private sibling helper that is
+    /// intentionally not in this type's lexical scope.
+    private func makeStagedForMoveCheck(
+        folderPath: String, messageId: String, rfc822: String
+    ) -> NSEDataBridge.StagedMessage {
+        NSEDataBridge.StagedMessage(
+            id: "acc1:\(messageId)",
+            accountId: "acc1",
+            accountEmail: "acc1@example.com",
+            provider: "imap_new_mail",
+            messageId: messageId,
+            rfc822MessageId: rfc822,
+            threadId: nil,
+            folderPath: folderPath,
+            subject: "Staged subject",
+            senderName: "Sender",
+            senderEmail: "sender@example.com",
+            snippet: "staged snippet",
+            date: Date().timeIntervalSince1970,
+            to: "one@example.com", cc: "", bcc: "", replyTo: nil,
+            inReplyTo: nil,
+            references: [],
+            isRead: false, isFlagged: false, hasAttachments: false,
+            isReplied: false, isForwarded: false,
+            providerLabels: [],
+            summaryBlurb: nil, summaryTodos: nil, actionTag: nil,
+            reminderDate: nil, reminderTime: nil, reminderContent: nil,
+            processedAt: Date().timeIntervalSince1970,
+            aiCompleted: true, notified: false,
+            htmlContent: nil, textContent: nil, attachmentsJSON: nil,
+            icsText: nil, hasUnresolvedCIDs: false,
+            observedUidValidity: nil
+        )
+    }
+
     // MARK: - Tests
 
     @Test("Archived-then-restaged message: staging row deleted, snapshots scrubbed, stage-memo dropped, durable header stays in Archive")
@@ -237,6 +273,42 @@ struct NSEStaleStagedRowInvalidationTests {
         // Durable header untouched, still archived under its remapped identity.
         let durable = try await pool.read { try MessageHeader.fetchOne($0, key: remappedId) }
         #expect(durable?.isInInbox == false)
+    }
+
+    @Test("Duplicate RFC siblings: the observed-folder copy prevents a false stale-by-move verdict")
+    func duplicateRfcObservedFolderCopyIsNotStaleByMove() async throws {
+        let (dir, pool, inbox, archive, previous) = try makeAppDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        resetGlobals()
+        let sharedRfc = "shared-stale-check@example.com"
+        try await pool.write { db in
+            var archived = MessageHeader(
+                messageId: "old-archive-uid", subject: "Archive sibling", from: "Sender",
+                fromAddress: "sender@example.com", to: "user@example.com", date: Date(), snippet: "",
+                folderId: archive.id, accountId: "acc1", folderPath: "Archive", isInInbox: false)
+            archived.rfc822MessageId = sharedRfc
+            try archived.insert(db)
+
+            var inboxCopy = MessageHeader(
+                messageId: "old-inbox-uid", subject: "Inbox sibling", from: "Sender",
+                fromAddress: "sender@example.com", to: "user@example.com", date: Date(), snippet: "",
+                folderId: inbox.id, accountId: "acc1", folderPath: "INBOX", isInInbox: true)
+            inboxCopy.rfc822MessageId = sharedRfc
+            try inboxCopy.insert(db)
+        }
+
+        // Both provider-id lookups miss the new UID, forcing the RFC fallback.
+        // Archive is inserted first so a bare hinted fetch chooses it by rowid and
+        // incorrectly reports the staged Inbox row as moved. Production's explicit
+        // observed-folder precedence must instead select the live Inbox sibling.
+        let staged = makeStagedForMoveCheck(
+            folderPath: "INBOX", messageId: "new-inbox-uid", rfc822: sharedRfc)
+        let stale = await NSEDataBridge.detectStaleByMoveRows([staged])
+        #expect(stale.isEmpty,
+                "an observed-folder duplicate-RFC copy exists, so the staged Inbox row is not stale-by-move")
     }
 
     @Test("A normal new message (no durable header yet) is NOT invalidated — merges normally")
