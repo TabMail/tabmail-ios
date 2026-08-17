@@ -37,6 +37,7 @@ final class InboxViewModel {
     nonisolated static let markAllAsReadWillAdmitBatchForTesting = Mutex<
         (@Sendable ([MessageHeader]) async -> Void)?
     >(nil)
+
     #endif
 
     /// Short unique tag for this VM instance — used in logs to correlate
@@ -128,6 +129,7 @@ final class InboxViewModel {
     private var firstDirtySignalAt: Double?
     @ObservationIgnored nonisolated(unsafe) private var backgroundChangeObserver: NSObjectProtocol?
     @ObservationIgnored nonisolated(unsafe) private var aiUpdateObserver: NSObjectProtocol?
+    @ObservationIgnored nonisolated(unsafe) private var headerRekeyObserver: NSObjectProtocol?
     @ObservationIgnored private var folderObservationCancellable: AnyCancellable?
 
     // MARK: - Background Update Gate (legacy — interaction freeze removed)
@@ -195,6 +197,7 @@ final class InboxViewModel {
         BackgroundSyncLogger.logInbox("[\(tag)] deinit started=\(started)")
         if let obs = backgroundChangeObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = aiUpdateObserver { NotificationCenter.default.removeObserver(obs) }
+        if let obs = headerRekeyObserver { NotificationCenter.default.removeObserver(obs) }
         folderObservationCancellable?.cancel()
         // Cancel the pending sync Task so a VM discarded mid-startSync-delay
         // doesn't fire a sync after deinit. Without this, rapid nav produces
@@ -217,6 +220,7 @@ final class InboxViewModel {
         BackgroundSyncLogger.logInbox("[\(instanceTag)] start folders=\(folders.count) loadedCount=\(loadedMessages.count)")
         startBackgroundChangeListener()
         startAIUpdateListener()
+        startHeaderRekeyListener()
         startFolderObservation()
     }
 
@@ -345,7 +349,7 @@ final class InboxViewModel {
         }?.toMessageHeader()
     }
 
-    /// Follow a provider-proven address change immediately in the active list.
+    /// Follow a committed primary-key change immediately in the active list.
     /// The durable row has already moved to `newHeaderId`; waiting for the
     /// ordinary 500ms reload leaves the visible snapshot naming the deleted old
     /// primary key, so a second gesture during that window resolves nothing and
@@ -365,17 +369,15 @@ final class InboxViewModel {
             loadedMessages[index].observedUidValidity = record.newObservedUidValidity
             changed = true
         }
-        guard changed else { return }
-
         loadedIds = Self.rekeyedHeaderIDs(loadedIds, using: records)
         snippetQueue = Self.rekeyedHeaderIDs(snippetQueue, using: records)
         snippetInFlight = Self.rekeyedHeaderIDs(snippetInFlight, using: records)
         snippetFailed = Self.rekeyedHeaderIDs(snippetFailed, using: records)
         pendingAIBatch = Self.rekeyedHeaderIDs(pendingAIBatch, using: records)
-        rebuildDisplayGroups()
+        if changed { rebuildDisplayGroups() }
     }
 
-    /// Rekey view-local identity sets with the same provider-proven mapping as
+    /// Rekey view-local identity sets with the same committed mapping as
     /// the snapshots. Used by `InboxView` for dismissed/fading rows too, so a
     /// forward move stays hidden after its primary key changes while an undone
     /// visible row remains actionable under the new key.
@@ -650,6 +652,28 @@ final class InboxViewModel {
         }
     }
 
+    /// Core rekey reception lives on the model rather than in a SwiftUI-only
+    /// modifier so the notification→pending-batch chain is one production seam
+    /// and is directly testable. The producer posts synchronously on MainActor;
+    /// `.main` therefore makes `assumeIsolated` an asserted contract, not a hop
+    /// that could reorder the rekey behind another queued gesture.
+    private func startHeaderRekeyListener() {
+        if let old = headerRekeyObserver {
+            NotificationCenter.default.removeObserver(old)
+        }
+        headerRekeyObserver = NotificationCenter.default.addObserver(
+            forName: .messageHeadersRekeyed,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let records = notification.object as? [HeaderRekeyRecord],
+                  !records.isEmpty else { return }
+            MainActor.assumeIsolated {
+                self?.applyHeaderRekeys(records)
+            }
+        }
+    }
+
     /// One throttle tick: flush 300ms from now unless a tick is already armed.
     private func scheduleAIFlushTick() {
         guard aiBatchTask == nil else { return }
@@ -721,8 +745,18 @@ final class InboxViewModel {
         let overlay = manager.snapshotOverlay()
         var changed = false
         for messageId in ids {
-            guard let idx = loadedMessages.firstIndex(where: { $0.id == messageId }),
-                  let header = freshHeaders[messageId] else { continue }
+            guard let idx = loadedMessages.firstIndex(where: { $0.id == messageId }) else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[AIBatchTrace] skipped id absent from loaded snapshot: \(messageId)")
+                }
+                continue
+            }
+            guard let header = freshHeaders[messageId] else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[AIBatchTrace] skipped id absent from durable headers: \(messageId)")
+                }
+                continue
+            }
             // Skip if message has been moved/deleted out of the displayed folders
             guard folderIds.contains(header.folderId) else { continue }
             // Full snapshot replacement from DB — overlay preserves pending user state

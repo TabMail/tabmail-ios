@@ -49,19 +49,19 @@ enum InboxErrorBanner {
 }
 
 /// Keeps the already-large InboxView modifier chain below Swift's type-check
-/// limit while applying provider-proven primary-key changes atomically to the
-/// list and its view-local identity sets.
-private struct HeaderRekeyReceiver: ViewModifier {
-    let viewModel: InboxViewModel
+/// limit while applying committed primary-key changes to view-owned bindings.
+/// The model observes the same notification directly for its loaded/pending
+/// state so that production notification delivery is unit-testable.
+struct HeaderRekeyReceiver: ViewModifier {
     @Binding var dismissedMessages: Set<String>
     @Binding var swipeFadingMessages: Set<String>
     @Binding var selectedMessageId: String?
     @Binding var pushedMessageId: String?
 
     func body(content: Content) -> some View {
-        // `publishMoveFinish` posts this notification from MainActor. Keep
-        // delivery synchronous: hopping back onto the same queue lets an
-        // already-enqueued gesture run against the deleted pre-COPYUID key.
+        // Both production publishers post this notification from MainActor.
+        // Keep delivery synchronous so model and view-owned bindings apply one
+        // committed transition before the publisher returns.
         content.onReceive(
             NotificationCenter.default.publisher(for: .messageHeadersRekeyed)
         ) { notification in
@@ -72,20 +72,49 @@ private struct HeaderRekeyReceiver: ViewModifier {
     private func handle(_ notification: Notification) {
         guard let records = notification.object as? [HeaderRekeyRecord],
               !records.isEmpty else { return }
+        var dismissed = dismissedMessages
+        var fading = swipeFadingMessages
+        var selected = selectedMessageId
+        var pushed = pushedMessageId
+        Self.apply(
+            records,
+            dismissedMessages: &dismissed,
+            swipeFadingMessages: &fading,
+            selectedMessageId: &selected,
+            pushedMessageId: &pushed)
+        dismissedMessages = dismissed
+        swipeFadingMessages = fading
+        selectedMessageId = selected
+        pushedMessageId = pushed
+    }
+
+    /// Pure transition seam for the authority split between optimistic action
+    /// state and presentation/navigation identity.
+    static func apply(
+        _ records: [HeaderRekeyRecord],
+        dismissedMessages: inout Set<String>,
+        swipeFadingMessages: inout Set<String>,
+        selectedMessageId: inout String?,
+        pushedMessageId: inout String?
+    ) {
+        // Weak sync correlation may keep presentation identity coherent, but
+        // it must not carry optimistic action state across keys. Otherwise an
+        // already-deferred gesture can leave the new row hidden even though no
+        // provider-authorized operation was recorded.
+        let actionRecords = records.filter(\.carriesProviderAuthority)
         dismissedMessages = InboxViewModel.rekeyedHeaderIDs(
-            dismissedMessages, using: records)
+            dismissedMessages, using: actionRecords)
         swipeFadingMessages = InboxViewModel.rekeyedHeaderIDs(
-            swipeFadingMessages, using: records)
+            swipeFadingMessages, using: actionRecords)
         let byOldId = Dictionary(
             records.map { ($0.oldHeaderId, $0.newHeaderId) },
             uniquingKeysWith: { first, _ in first })
-        if let selectedMessageId, let newId = byOldId[selectedMessageId] {
-            self.selectedMessageId = newId
+        if let existingSelected = selectedMessageId, let newId = byOldId[existingSelected] {
+            selectedMessageId = newId
         }
-        if let pushedMessageId, let newId = byOldId[pushedMessageId] {
-            self.pushedMessageId = newId
+        if let existingPushed = pushedMessageId, let newId = byOldId[existingPushed] {
+            pushedMessageId = newId
         }
-        viewModel.applyHeaderRekeys(records)
     }
 }
 
@@ -798,7 +827,6 @@ struct InboxView: View {
             }
         }
         .modifier(HeaderRekeyReceiver(
-            viewModel: viewModel,
             dismissedMessages: $dismissedMessages,
             swipeFadingMessages: $swipeFadingMessages,
             selectedMessageId: $selectedMessageId,

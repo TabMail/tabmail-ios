@@ -326,4 +326,57 @@ struct InboxViewModelInsertUndoneTests {
             == [newId, "unrelated"],
             "dismissed/fading sets must follow the same key so hidden moves stay hidden")
     }
+
+    @Test("Weak re-key follows navigation without carrying optimistic action state")
+    @MainActor func weakRekeyKeepsActionStateOnTheUnprovenKey() {
+        let oldId = "acc1:INBOX:weak-old"
+        let newId = "acc1:INBOX:weak-new"
+        let record = HeaderRekeyRecord(
+            oldHeaderId: oldId,
+            newHeaderId: newId,
+            newProviderMessageId: "weak-new",
+            carriesProviderAuthority: false)
+        var dismissed: Set<String> = [oldId]
+        var fading: Set<String> = [oldId]
+        var selected: String? = oldId
+        var pushed: String? = oldId
+
+        HeaderRekeyReceiver.apply(
+            [record],
+            dismissedMessages: &dismissed,
+            swipeFadingMessages: &fading,
+            selectedMessageId: &selected,
+            pushedMessageId: &pushed)
+
+        #expect(dismissed == [oldId])
+        #expect(fading == [oldId])
+        #expect(selected == newId)
+        #expect(pushed == newId)
+    }
+
+    @Test("Provider-proven re-key carries action and navigation state")
+    @MainActor func providerRekeyCarriesAllPresentationState() {
+        let oldId = "acc1:INBOX:proved-old"
+        let newId = "acc1:INBOX:proved-new"
+        let record = HeaderRekeyRecord(
+            oldHeaderId: oldId,
+            newHeaderId: newId,
+            newProviderMessageId: "proved-new")
+        var dismissed: Set<String> = [oldId]
+        var fading: Set<String> = [oldId]
+        var selected: String? = oldId
+        var pushed: String? = oldId
+
+        HeaderRekeyReceiver.apply(
+            [record],
+            dismissedMessages: &dismissed,
+            swipeFadingMessages: &fading,
+            selectedMessageId: &selected,
+            pushedMessageId: &pushed)
+
+        #expect(dismissed == [newId])
+        #expect(fading == [newId])
+        #expect(selected == newId)
+        #expect(pushed == newId)
+    }
 }

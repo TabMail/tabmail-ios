@@ -6,11 +6,30 @@
 
 ## Status
 
-🔓 **OPEN (2026-08-12)** — an AI result that WAS computed can be **silently discarded** before it
-reaches the inbox row, when the message's header id is invalidated by a **sync-path UID remap** inside
+🧪 **FIX CANDIDATE (updated 2026-08-16) — ISSUE AND DRAFT REMAIN OPEN.** The exact successful sync UID-remap
+mapping now rides `SyncMessagesResult.headerRekeys`; both production result consumers synchronously
+post it on `MainActor`, and `InboxViewModel` re-keys `pendingAIBatch` with the visible snapshot while
+the view receiver keeps presentation bindings coherent. The two former silent `flushAIBatch` misses emit
+distinct debug-gated diagnostics. This is an unmerged candidate, not a fixed disposition. The rebased
+current-main candidate must not be promoted, merged, or used to close the issue until fresh-context
+independent exact-diff reviews are complete, reconciled, and the owner gives the merge go-ahead.
+
+**Authoritative primary validation.** The exact review-fix source tree passed **20/20** focused tests on
+the iOS 26.5 simulator with zero failures, skips, or expected failures. In the combined focused run,
+rekey publication covered 6/6 executable lines, `InboxViewModel.applyHeaderRekeys` covered 20/20, its
+notification-delivery closure covered 7/7, the view-owned authority transition covered 20/20, and
+`flushAIBatch` covered 83/100.
+A separate simulator app build succeeded with zero structured warnings or errors; its raw build log
+contained exactly two instances of the permitted App Intents metadata diagnostic and no other warning
+or error tokens. The exact test build contained three instances of that same permitted diagnostic.
+The first current-main attempt is not evidence: the worktree's generated Xcode project predated a
+new source file already on `main` and failed before executing tests; regenerating from the committed
+`project.yml` corrected the tooling state before the passing run.
+
+**Original open status (2026-08-12), retained as history.** An AI result that WAS computed can be
+**silently discarded** before it reaches the inbox row when a sync-path UID remap lands inside
 `flushAIBatch`'s 300 ms throttle window. The row then shows stale AI state until the next full
-`reloadMessages`. Registered rather than fixed: AI output is derived and recomputable, and the reload
-re-composes the row from the database.
+`reloadMessages`; AI output is derived and recomputable, and that reload re-composes it from GRDB.
 
 ## Subsystem and search terms
 
@@ -22,7 +41,7 @@ spinner; `IOS-AI-004` sibling; THE ADDRESS PROBLEM
 
 ## Full detail
 
-**The mechanism, verified in the tree.** `flushAIBatch` resolves each pending id twice and drops on
+**The original mechanism, verified in the pre-candidate tree.** `flushAIBatch` resolves each pending id twice and drops on
 either miss, with **no log and no re-arm**:
 
 ```swift
@@ -30,12 +49,13 @@ guard let idx = loadedMessages.firstIndex(where: { $0.id == messageId }),
       let header = freshHeaders[messageId] else { continue }
 ```
 
-`pendingAIBatch` *is* re-keyed — `InboxViewModel.applyHeaderRekeys` updates it alongside `loadedIds`
-and the snippet queues. But that handler is driven by `.messageHeadersRekeyed`, and **that notification
-is posted from exactly ONE place in the tree: `AccountManagerQueue`'s `publishMoveFinish`, the
-`COPYUID` drain path.** The **sync-path UID remap posts nothing.** So when a move's identity is
-resolved by the sync remap rather than by the drain, `pendingAIBatch` keeps an id that no longer
-matches any row, both guards miss, and the entry is dropped without a trace.
+`pendingAIBatch` *was* already re-keyed — `InboxViewModel.applyHeaderRekeys` updated it alongside
+`loadedIds` and the snippet queues. But that handler was driven by `.messageHeadersRekeyed`, and in
+the pre-candidate tree **that notification was posted from exactly ONE place:
+`AccountManagerQueue`'s `publishMoveFinish`, the
+`COPYUID` drain path.** The **sync-path UID remap posted nothing.** So when a move's identity was
+resolved by the sync remap rather than by the drain, `pendingAIBatch` kept an id that no longer
+matched any row, both guards missed, and the entry was dropped without a trace.
 
 **Why the two paths diverge.** `publishMoveFinish` fires only when the wire named a destination
 address (`COPYUID`). When it does not — no UIDPLUS, a withheld response code, or a timed-out first
@@ -54,7 +74,7 @@ occurrence is not established from the evidence. Do not upgrade this to "confirm
 without a capture that distinguishes the ordering — which requires instrumentation that does not
 currently exist (see below).
 
-## Why registered rather than fixed
+## Why the issue remains open until promotion
 
 The state converges: `reloadMessages` re-composes every row from the database, and the AI output itself
 is **derived, recomputable content** — not authored user data, not a queued user intention. So this is
@@ -62,19 +82,44 @@ outside THE MANTRA's blocking set on every axis: no dropped intention, no starvi
 wrong-message mutation, no brick, no secret exposure. Per the owner's 2026-08-12 ruling, a non-minimal
 fix belongs in the register for a later session.
 
-## The two candidate fixes, recorded so they are not re-derived
+## The two candidate fixes, now implemented in the unmerged candidate
 
 1. **Post `.messageHeadersRekeyed` from the sync-path remap too**, so `applyHeaderRekeys` re-keys
-   `pendingAIBatch` on both paths. This is the structural fix and it also repairs `loadedIds` and the
-   snippet queues for the same case. ⚠️ Check every existing observer before widening the poster — the
+   a still-pending `pendingAIBatch` entry on both paths. This also repairs `loadedIds` and the snippet
+   queues for the same case. ⚠️ Check every existing observer before widening the poster — the
    notification currently carries drain-path semantics, and a second poster is exactly the
-   "single-writer column is a guard" shape that has bitten this codebase before.
+   "single-writer column is a guard" shape that has bitten this codebase before. **Candidate result:**
+   the census found two observers (`InboxViewModel` for model state and `HeaderRekeyReceiver` for view
+   bindings) and two production sync-result consumers; both consumers call one shared publisher. Only
+   exact successful remaps from UID-window providers ride the new carrier. RFC corroboration is not
+   widened into provider-address authority: `newObservedUidValidity` remains nil, the record is marked
+   non-authoritative for optimistic action state, and no process-local address handoff is published.
 2. **Make the drop observable** — a debug-gated log on each `continue` arm, naming which of the two
    resolutions missed. This is the cheaper change and it is a **precondition for ever confirming
    occurrence**, since the gate is currently unobservable. A warn-only path that nothing can see is
-   the failure mode this register has recorded before.
+   the failure mode this register has recorded before. **Candidate result:** the combined guard is split
+   into loaded-snapshot and durable-header misses, each with a debug-gated `[AIBatchTrace]` reason.
 
-Do the second before claiming anything further about the first.
+The candidate satisfies the observability prerequisite; it still makes no claim that the historical
+device episode crossed the drop ordering.
+
+**Accepted narrow residual (owner ruling, 2026-08-16).** If a batch has already copied and cleared
+`pendingAIBatch` and is suspended in its GRDB read when the remap arrives, that local old-id copy cannot
+be rewritten and the targeted repaint may still miss. An older in-flight reload can likewise repaint
+once from a pre-remap snapshot. Both affect derived, persisted AI presentation only and converge on a
+later reload/recompute; the owner explicitly rejected a second alias/generation system for these rare
+windows as disproportionate to the impact.
+
+## Performance and fallback audit
+
+The candidate adds no database query, schema, migration, index, retry, durable alias, or SwiftMail
+change. Inside the existing bounded sync transaction it appends one value per successful UID remap;
+publication occurs after commit and before slower FTS work. Inbox-owned `performSync()` already awaits
+sync and then reloads, so that route self-heals immediately. The reachable gap is the foreground or
+background scheduler's full-sync route, which can re-key behind a live inbox without that reload.
+Relaunch, foreground reload, and later list reload remain convergence fallbacks, not protection for the
+pending 300 ms update. Shipped `v1.6.38` contains the same double-guard drop and sync rekey without a
+notification; its move-drain rekey receiver did not yet exist.
 
 ## What the row spinner does and does NOT tell you
 
