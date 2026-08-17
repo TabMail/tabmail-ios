@@ -139,11 +139,13 @@ struct AutoSizingHTMLView: View {
     /// bound `html` changes (e.g. pull-to-refresh) so the placeholder returns
     /// while the new content renders.
     @State private var hasRevealed = false
-    /// Horizontal gutter per side, seeded at the 16pt minimum and REDUCED by the
-    /// email's own measured content inset via the `gutterAdjust` message (see
-    /// `eatGutterMarginsJS`). The 16 is never lowered as a floor — total indent
-    /// stays `max(16, emailInset)` — it just stops our gutter double-counting the
-    /// email's own indent.
+    /// Native horizontal padding per side, seeded at 16pt and REDUCED by the
+    /// email's symmetric measured CSS-layout inset via `gutterAdjust` (see
+    /// `eatGutterMarginsJS`). At the device-width baseline, native remainder +
+    /// CSS inset is 16. If `fitViewportJS` widens the layout viewport, the CSS
+    /// inset scales with the sender content while this native remainder stays in
+    /// points; preserving their alignment, not a 16pt visible floor, is the
+    /// invariant in that mode.
     @State private var leadingPad: CGFloat = 16
     @State private var trailingPad: CGFloat = 16
     init(
@@ -270,10 +272,11 @@ struct AutoSizingHTMLView: View {
             // the layout viewport — a CSS `padding: 12px` bottom would shrink
             // to 8.6 pt visually when widened (12 × 0.72 scale), producing an
             // inconsistent bubble-bottom gap across emails.
-            // Horizontal is the dynamic gutter (16pt minimum, reduced by the
-            // email's own inset via gutterAdjust). `.animation(.none)` so the
-            // one-time reduce-on-load doesn't slide (it lands while the body is
-            // still opacity:0, but a parent animation could otherwise pick it up).
+            // Horizontal padding is the native remainder after absorbing the
+            // email's symmetric CSS-layout inset via gutterAdjust. At 1x the
+            // two add to 16; after a viewport widen the CSS part scales with the
+            // sender. `.animation(.none)` keeps the one-time load adjustment
+            // from sliding (a parent animation could otherwise pick it up).
             .padding(.leading, leadingPad)
             .padding(.trailing, trailingPad)
             .animation(.none, value: leadingPad)
@@ -451,10 +454,10 @@ private struct HTMLWebView: UIViewRepresentable {
     let onUserDisclosureToggle: () -> Void
     @Binding var height: CGFloat
     @Binding var hasRevealed: Bool
-    // Dynamic horizontal gutter: starts at the 16pt minimum and is REDUCED by the
-    // email's own measured content inset (eatGutterMarginsJS → gutterAdjust) so the
-    // gutter absorbs the email's indent instead of stacking on it. Never below the
-    // value the email's own inset frees up; clamped so it can't harm other emails.
+    // Dynamic native horizontal remainder: starts at 16pt and is REDUCED by the
+    // email's symmetric measured CSS-layout inset (eatGutterMarginsJS →
+    // gutterAdjust) so the two do not stack at the 1x baseline. The CSS portion
+    // scales with sender content after a viewport widen; this native value does not.
     @Binding var leadingPad: CGFloat
     @Binding var trailingPad: CGFloat
     // Observed so SwiftUI re-invokes updateUIView on a light<->dark flip — see the
@@ -1658,10 +1661,11 @@ private struct HTMLWebView: UIViewRepresentable {
                 }
                 handleHeightMessage(validated)
             } else if message.name == "gutterAdjust" {
-                // eatGutterMarginsJS measured the email's own content inset and sent
-                // the SwiftUI padding to apply (= 16 − inset, clamped). Only ever
-                // ≤ the 16pt default, so the gutter stays a minimum. Guard equality
-                // to avoid a redundant frame resize (which would re-fit needlessly).
+                // eatGutterMarginsJS measured the email's own CSS-layout inset and
+                // sent the native SwiftUI remainder (= 16 − inset, clamped). The
+                // CSS portion scales with sender content if fitViewportJS widens;
+                // this native value intentionally does not. Guard equality to avoid
+                // a redundant frame resize (which would re-fit needlessly).
                 // The `[0, 16]` clamp is re-applied here because the JS one cannot
                 // be trusted, and a missing side keeps the current value.
                 guard let padding = RenderBridgeInput.gutterPadding(message.body,
@@ -4481,21 +4485,23 @@ function alignBodyLevelDisclosure(wrappers, leftInset, rightInset, maxCombinedIn
 }
 """
 
-/// Make the SwiftUI gutter act as a MINIMUM "indent" that ABSORBS an email's own
-/// outer horizontal inset, instead of the two STACKING (our 16pt + the email's own
+/// Make the SwiftUI gutter ABSORB an email's own outer horizontal inset at the
+/// device-width baseline, instead of the two STACKING (our 16pt + the email's own
 /// 8px cell padding ≈ 24pt, which reads as over-inset now that we no longer shrink
 /// emails).
 ///
 /// Mechanism (NO content fiddling, so it cannot clip or perturb the email layout):
 /// this script only MEASURES the email's own content inset and posts it to Swift,
 /// which then REDUCES the SwiftUI horizontal padding to `max(0, 16 − emailInset)`.
-/// Total inset = padding + emailInset = `max(16, emailInset)`:
+/// At the device-width baseline (1 CSS px = 1 native pt), total inset is
+/// `padding + emailInset = max(16, emailInset)`:
 ///   • email with no inset (full-bleed)  → pad 16 → total 16  (unchanged)
 ///   • email with 8px inset (Scholar)    → pad 8  → total 16  (absorbed)
 ///   • email indented more than 16        → pad 0  → total = its own inset
-/// The 16 constant is never lowered — it stays the floor for every email — so this
-/// CANNOT harm other emails: the clamp to `[0, 16]` means we only ever REMOVE our
-/// own double-count, never add indent or pull content.
+/// If fitViewportJS widens the layout viewport by scale `s < 1`, the CSS inset
+/// scales with the sender while native padding remains points; the visible sum
+/// is `padding + emailInset*s`, not a promised 16pt floor. The clamp to `[0, 16]`
+/// still means we only REMOVE native double-count, never add indent or pull content.
 ///
 /// Inset = the MIN inset among WIDE text leaves (width ≥ 60% of body): the main
 /// content column. Narrow elements (an injected "[CAUTION]" banner, a centered
@@ -4515,11 +4521,22 @@ private var eatGutterMarginsJS: String {
     (function() {
         \(gl)
         \(_alignBodyLevelDisclosureJS)
-        if (!document.body) return;
-        try {
-            // MUST match AutoSizingHTMLView's default .padding gutter. We only ever
-            // REDUCE the SwiftUI padding by the email's own inset (down to 0), never
-            // below — so the gutter stays the minimum indent.
+        window.__tmRealignICSDisclosures = function() {
+            if (!document.body) return null;
+            var wrappers = window.__tmICSDisclosureWrappers || [];
+            function belongsToOwnedDisclosure(el) {
+                for (var wi = 0; wi < wrappers.length; wi++) {
+                    var node = el;
+                    while (node && node !== document.body) {
+                        if (node === wrappers[wi]) return true;
+                        node = node.parentElement || node.parentNode;
+                    }
+                }
+                return false;
+            }
+            // MUST match AutoSizingHTMLView's default .padding gutter. This is a
+            // CSS-layout-coordinate absorption at the 1x baseline: after a viewport
+            // widen, CSS inset scales with sender content while native padding does not.
             var GUTTER = 16;
             var b = document.body.getBoundingClientRect();
             var bw = b.width;
@@ -4536,24 +4553,21 @@ private var eatGutterMarginsJS: String {
                     if (n.nodeType === 3 && n.textContent.replace(/\\u00a0/g, ' ').trim().length) { hasText = true; break; }
                 }
                 if (!hasText) continue;
+                // The app-owned disclosure and its sender-content descendants
+                // already carry the previously measured margin. Excluding that
+                // exact retained subtree keeps this remeasurement one-way: only
+                // sender geometry can choose the next owned-wrapper margin.
+                if (belongsToOwnedDisclosure(el)) continue;
                 var r = el.getBoundingClientRect();
                 if (r.width < WIDE || r.height <= 0) continue; // main column only
                 var li = r.left - b.left;   if (li < minLeft) { minLeft = li; cp = el; }
                 var ri = b.right - r.right; if (ri < minRight) minRight = ri;
             }
-            if (!isFinite(minLeft) || !isFinite(minRight)) { gl('no wide text content — keep 16'); return; }
-            // The invite card is app-owned and appended at body level, so it does
-            // not inherit the sender's content-column inset the way an in-body
-            // quote wrapper does. Apply the measured per-side inset only to that
-            // exact app-created wrappers before the height/fit pipeline measures
-            // layout. `bw - WIDE` preserves the same 60%-wide column floor even
-            // when hostile/off-body geometry reports an extreme positive inset.
-            alignBodyLevelDisclosure(
-                window.__tmICSDisclosureWrappers || [],
-                minLeft,
-                minRight,
-                bw - WIDE
-            );
+            if (!isFinite(minLeft) || !isFinite(minRight)) {
+                gl('no wide text content — keep 16');
+                alignBodyLevelDisclosure(wrappers, 0, 0, bw - WIDE);
+                return;
+            }
             // SYMMETRIC reduction: reduce BOTH sides by the SMALLER inset, clamped
             // [0, GUTTER]. Using the min keeps the gutter symmetric so content can
             // never end up flush on one side while padded on the other — the
@@ -4563,7 +4577,29 @@ private var eatGutterMarginsJS: String {
             // (overflow) inset → 0 → no reduction (overflowing/desktop emails are
             // handled by fitViewportJS's widen, not by the gutter).
             var x = Math.max(0, Math.min(minLeft, minRight, GUTTER));
-            var pad = GUTTER - x;
+            // The invite card is app-owned and appended at body level, so it does
+            // not inherit the sender's content-column inset the way an in-body
+            // quote wrapper does. Apply the same symmetric CSS-layout inset the
+            // native gutter absorbs, and only to the exact app-created wrappers,
+            // before the height/fit pipeline measures layout. A later viewport
+            // widen therefore scales wrapper and sender inset together. `bw - WIDE`
+            // preserves the same 60%-wide column floor even when hostile/off-body
+            // geometry reports an extreme positive inset.
+            alignBodyLevelDisclosure(
+                wrappers,
+                x,
+                x,
+                bw - WIDE
+            );
+            return { x: x, pad: GUTTER - x, minLeft: minLeft, minRight: minRight, column: cp };
+        };
+        try {
+            var measured = window.__tmRealignICSDisclosures();
+            if (!measured) return;
+            var minLeft = measured.minLeft;
+            var minRight = measured.minRight;
+            var cp = measured.column;
+            var pad = measured.pad;
             gl('emailInset L=' + Math.round(minLeft) + ' R=' + Math.round(minRight)
                 + ' → SwiftUI pad ' + pad + ' (both, ' + (cp ? cp.tagName + '.' + (cp.className || '') : '?') + ')');
             window.webkit.messageHandlers.gutterAdjust.postMessage({ l: pad, r: pad });
@@ -5742,6 +5778,23 @@ private let fitViewportJS: String = {
         function revealAfterPaint() {
             requestAnimationFrame(function() { requestAnimationFrame(reveal); });
         }
+        // eatGutterMarginsJS measures the sender column at device width so Swift
+        // can absorb its inset into the native gutter. A fit or supported reset
+        // can cross one of the sender's responsive breakpoints, so every
+        // non-idempotent terminal path settles the exact retained app-owned
+        // disclosure against its final layout. Messages without one skip the
+        // extra scan. This helper only updates those wrapper margins: it never
+        // reposts gutterAdjust, mutates sender DOM, schedules work, or re-enters
+        // fit().
+        function settleDisclosureAlignment() {
+            try {
+                var wrappers = window.__tmICSDisclosureWrappers;
+                if (wrappers && wrappers.length > 0
+                    && typeof window.__tmRealignICSDisclosures === 'function') {
+                    window.__tmRealignICSDisclosures();
+                }
+            } catch(_) {}
+        }
         // IDEMPOTENCY GUARD — this function measures the document and then
         // MUTATES it (meta widen, inline width strips, body padding zeroing).
         // Running it again on an already-widened document re-measures widened
@@ -5771,7 +5824,7 @@ private let fitViewportJS: String = {
         // changes (WebKit bug 170595).
         var vw = window.__tmDeviceWidth || window.innerWidth;
         log('enter: vw=' + vw + ' innerWidth=' + window.innerWidth + ' screenWidth=' + window.screen.width + ' devicePixelRatio=' + window.devicePixelRatio);
-        if (vw < 100) { log('skip: viewport too small'); reveal(); return false; }
+        if (vw < 100) { log('skip: viewport too small'); settleDisclosureAlignment(); reveal(); return false; }
         // Strip hardcoded widths from non-table block elements wider than
         // viewport. CSS max-width works fine on divs/p/sections, so this is
         // mostly belt-and-suspenders. Tables/cells are EXCLUDED: many email
@@ -5989,6 +6042,7 @@ private let fitViewportJS: String = {
         var OVERFLOW_SLOP = 8;
         if (maxRight <= vw + OVERFLOW_SLOP) {
             log('no overflow (maxRight=' + Math.round(maxRight) + ' within ' + OVERFLOW_SLOP + 'px slop of vw=' + vw + ') — staying at 1.0x');
+            settleDisclosureAlignment();
             // Gate is now open; post the (scale-1.0) height immediately so a
             // no-widen email applies its height without waiting on the timers.
             if (window.__tmReportHeight) window.__tmReportHeight();
@@ -6104,6 +6158,7 @@ private let fitViewportJS: String = {
             window.__tmLayoutVp = 0;
             // Reflow back to device width before reporting the (now 1.0x) height.
             void document.documentElement.offsetHeight;
+            settleDisclosureAlignment();
             if (window.__tmReportHeight) window.__tmReportHeight();
             revealAfterPaint();
             return false;
@@ -6128,6 +6183,7 @@ private let fitViewportJS: String = {
         // too-tall frame that snaps smaller on the next pass — visible
         // as a brief flicker during load.
         void document.documentElement.offsetHeight;
+        settleDisclosureAlignment();
         // Gate is open (set at the top); post the FINAL widened height now so the
         // frame snaps straight from its seed to the scaled height (1→466), never
         // through the un-widened height (the 1→881→466 flicker).

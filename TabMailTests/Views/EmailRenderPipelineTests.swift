@@ -1197,20 +1197,20 @@ struct EmailRenderPipelineTests {
         #expect(metaContent.contains("device-width"))
     }
 
-    @Test("eatGutterMarginsJS measures the email's inset and posts a reduced gutter (min-indent, no content fiddle)")
+    @Test("eatGutterMarginsJS measures the email's inset and posts symmetric native remainder (no content fiddle)")
     func eatGutterMeasuresAndPostsReducedGutter() {
         let js = _eatGutterMarginsJS
-        // The 16pt gutter is a MINIMUM that absorbs the email's own inset instead of
-        // stacking. Implementation MEASURES the inset and posts the SwiftUI padding
-        // to apply (= 16 − inset, clamped) — it must NOT touch the email layout
-        // (no body margin/pull), so it can't clip or perturb rendering.
+        // At the 1x baseline, the native remainder absorbs the email's symmetric
+        // CSS inset instead of stacking. Implementation MEASURES the inset and
+        // posts the SwiftUI padding to apply (= 16 − inset, clamped) — it must NOT
+        // touch the sender layout (no body margin/pull), so it can't clip rendering.
         #expect(js.contains("var GUTTER = 16"))                                   // matches SwiftUI default
         #expect(js.contains("var WIDE = bw * 0.6"))                               // main-column width filter
         #expect(js.contains("if (r.width < WIDE || r.height <= 0) continue"))     // wide text leaves only
         // SYMMETRIC reduction by the smaller side's inset, clamped [0,16] — never
         // lopsided (no flush-on-one-side regression), and overflow → 0 → no change.
         #expect(js.contains("var x = Math.max(0, Math.min(minLeft, minRight, GUTTER))"))
-        #expect(js.contains("var pad = GUTTER - x"))
+        #expect(js.contains("pad: GUTTER - x"))
         #expect(js.contains("{ l: pad, r: pad }"))                                // same padding both sides
         #expect(js.contains("messageHandlers.gutterAdjust.postMessage"))          // posts reduced outer gutter to Swift
         // The sender's body/layout is never pulled. Only the dedicated app-owned,
@@ -1335,35 +1335,402 @@ struct EmailRenderPipelineTests {
         #expect(_collapseICSJS.contains("ownedWrappers.push(wrapper)"))
         #expect(!_alignBodyLevelDisclosureJS.contains("querySelectorAll"))
 
-        let ctx = JSContext()!
-        ctx.evaluateScript("""
-        var ownedApplied = {};
-        var spoofedApplied = {};
-        var ownedWrapper = { style: { setProperty: function(name, value, priority) {
-            ownedApplied[name] = value + '|' + priority;
-        } } };
-        var spoofedClassWrapper = { style: { setProperty: function(name, value, priority) {
-            spoofedApplied[name] = value + '|' + priority;
-        } } };
-        \(_alignBodyLevelDisclosureJS)
-        alignBodyLevelDisclosure([ownedWrapper], 24, 12, 160);
-        """)
-        #expect(ctx.exception == nil, "alignment JS threw: \(ctx.exception?.toString() ?? "")")
-        #expect(ctx.evaluateScript("ownedApplied['margin-left']")?.toString() == "24px|important")
-        #expect(ctx.evaluateScript("ownedApplied['margin-right']")?.toString() == "12px|important")
-        #expect(ctx.evaluateScript("spoofedApplied['margin-left']").isUndefined)
+        func runPipeline(
+            leftInset: Double,
+            rightInset: Double,
+            expectedWrapperInset: Double,
+            expectedBridgePadding: Double
+        ) {
+            let ctx = JSContext()!
+            ctx.evaluateScript("""
+            var window = this;
+            var _bodyWidth = 200;
+            var _leftInset = \(leftInset);
+            var _rightInset = \(rightInset);
+            var _gutterMessage = null;
 
-        // A desktop layout that overflows one side must never pull app chrome
-        // outside the body with a negative margin.
-        ctx.evaluateScript("alignBodyLevelDisclosure([ownedWrapper], -8, 5, 160);")
-        #expect(ctx.evaluateScript("ownedApplied['margin-left']")?.toString() == "0px|important")
-        #expect(ctx.evaluateScript("ownedApplied['margin-right']")?.toString() == "5px|important")
+            function _style() {
+                return {
+                    applied: {},
+                    setProperty: function(name, value, priority) {
+                        this.applied[name] = value + '|' + priority;
+                    }
+                };
+            }
+            function _element(tag, className, rect) {
+                var node = {
+                    nodeType: 1,
+                    tagName: tag.toUpperCase(),
+                    className: className || '',
+                    childNodes: [],
+                    firstChild: null,
+                    parentNode: null,
+                    style: _style(),
+                    _rect: rect || { left: 0, right: 0, width: 0, height: 0 },
+                    getBoundingClientRect: function() { return this._rect; },
+                    addEventListener: function() {},
+                    appendChild: function(child) {
+                        if (child.parentNode) child.parentNode.removeChild(child);
+                        child.parentNode = this;
+                        this.childNodes.push(child);
+                        this.firstChild = this.childNodes.length ? this.childNodes[0] : null;
+                        return child;
+                    },
+                    insertBefore: function(child, reference) {
+                        if (child.parentNode) child.parentNode.removeChild(child);
+                        var index = this.childNodes.indexOf(reference);
+                        if (index < 0) index = this.childNodes.length;
+                        child.parentNode = this;
+                        this.childNodes.splice(index, 0, child);
+                        this.firstChild = this.childNodes.length ? this.childNodes[0] : null;
+                        return child;
+                    },
+                    removeChild: function(child) {
+                        var index = this.childNodes.indexOf(child);
+                        if (index >= 0) this.childNodes.splice(index, 1);
+                        child.parentNode = null;
+                        this.firstChild = this.childNodes.length ? this.childNodes[0] : null;
+                        return child;
+                    }
+                };
+                node.classList = {
+                    contains: function(name) {
+                        return node.className.split(/\\s+/).indexOf(name) >= 0;
+                    },
+                    toggle: function(name) {
+                        var names = node.className.split(/\\s+/).filter(Boolean);
+                        var index = names.indexOf(name);
+                        if (index >= 0) names.splice(index, 1); else names.push(name);
+                        node.className = names.join(' ');
+                    }
+                };
+                return node;
+            }
+            function _descendants(node, out) {
+                for (var i = 0; i < node.childNodes.length; i++) {
+                    var child = node.childNodes[i];
+                    if (child.nodeType !== 1) continue;
+                    out.push(child);
+                    _descendants(child, out);
+                }
+                return out;
+            }
+
+            var _body = _element('body', '', {
+                left: 0, right: _bodyWidth, width: _bodyWidth, height: 200
+            });
+            _body.getElementsByTagName = function() { return _descendants(this, []); };
+            var _mainColumn = _element('p', 'generic-main-column', {
+                left: _leftInset,
+                right: _bodyWidth - _rightInset,
+                width: _bodyWidth - _leftInset - _rightInset,
+                height: 20
+            });
+            _mainColumn.appendChild({ nodeType: 3, textContent: 'Generic content', parentNode: null });
+            var _spoofedWrapper = _element('div', 'tm-ics-wrapper', {
+                left: 0, right: _bodyWidth, width: _bodyWidth, height: 20
+            });
+            var _marker = _element('div', 'tm-ics-collapsible', {
+                left: 0, right: _bodyWidth, width: _bodyWidth, height: 20
+            });
+            _marker.appendChild(_element('div', 'generic-invite-content', {
+                left: 0, right: _bodyWidth, width: _bodyWidth, height: 20
+            }));
+            _body.appendChild(_mainColumn);
+            _body.appendChild(_spoofedWrapper);
+            _body.appendChild(_marker);
+
+            var document = {
+                body: _body,
+                createElement: function(tag) { return _element(tag, '', null); },
+                querySelectorAll: function(selector) {
+                    return selector === '.tm-ics-collapsible' ? [_marker] : [];
+                }
+            };
+            window.webkit = { messageHandlers: {
+                consoleLog: { postMessage: function() {} },
+                gutterAdjust: { postMessage: function(message) { _gutterMessage = message; } }
+            } };
+            function setTimeout() {}
+
+            \(_collapseICSJS)
+            \(_eatGutterMarginsJS)
+            """)
+
+            #expect(ctx.exception == nil, "render pipeline JS threw: \(ctx.exception?.toString() ?? "")")
+            #expect(ctx.evaluateScript("window.__tmICSDisclosureWrappers.length")?.toInt32() == 1)
+            #expect(
+                ctx.evaluateScript("parseFloat(window.__tmICSDisclosureWrappers[0].style.applied['margin-left'])")?.toDouble()
+                    == expectedWrapperInset
+            )
+            #expect(
+                ctx.evaluateScript("parseFloat(window.__tmICSDisclosureWrappers[0].style.applied['margin-right'])")?.toDouble()
+                    == expectedWrapperInset
+            )
+            #expect(ctx.evaluateScript("_gutterMessage.l")?.toDouble() == expectedBridgePadding)
+            #expect(ctx.evaluateScript("_gutterMessage.r")?.toDouble() == expectedBridgePadding)
+            // Before fitViewportJS widens the layout viewport, one CSS pixel is
+            // one native point, so the absorbed CSS inset and native remainder
+            // add to 16. Widened behavior is exercised below without pretending
+            // that CSS pixels remain native points after WebKit page scaling.
+            #expect(
+                ctx.evaluateScript("parseFloat(window.__tmICSDisclosureWrappers[0].style.applied['margin-left']) + _gutterMessage.l")?.toDouble()
+                    == 16
+            )
+            #expect(
+                ctx.evaluateScript("parseFloat(window.__tmICSDisclosureWrappers[0].style.applied['margin-right']) + _gutterMessage.r")?.toDouble()
+                    == 16
+            )
+            #expect(ctx.evaluateScript("_spoofedWrapper.style.applied['margin-left']").isUndefined)
+            #expect(ctx.evaluateScript("_spoofedWrapper.style.applied['margin-right']").isUndefined)
+        }
+
+        runPipeline(leftInset: 28, rightInset: 28, expectedWrapperInset: 16, expectedBridgePadding: 0)
+        runPipeline(leftInset: 24, rightInset: 12, expectedWrapperInset: 12, expectedBridgePadding: 4)
+        runPipeline(leftInset: -8, rightInset: 5, expectedWrapperInset: 0, expectedBridgePadding: 16)
+
+        // A widened document deliberately keeps the sender column and the
+        // app-owned wrapper in the same CSS layout coordinate system. Native
+        // padding remains points, while both CSS insets scale together. The
+        // sender inset is stateful across TWO media-query-style breakpoints:
+        // 12px at device width, 6px after the initial 400px fit, and 14px after
+        // the image-driven 515px re-fit. A fixture that returns 12px at every
+        // width blesses the old one-shot measurement and cannot see this bug.
+        // Drive the real initial-fit and image-triggered late-refit scripts so
+        // this test cannot regress to the false `CSS px == native pt` oracle.
+        let widenedContext = makeWidthPipelineContext(trueWidth: 515)
+        widenedContext.evaluateScript("""
+        var _gutterMessage = null;
+        var _gutterPostCount = 0;
+        var _ownedApplied = {};
+        var _senderWrites = [];
+        var _spoofedApplied = {};
+        var _senderText = { nodeType: 3, textContent: 'Generic content', nextSibling: null };
+        var _senderColumn = _baseEl('P', 'generic-main-column');
+        _senderColumn.firstChild = _senderText;
+        _senderColumn.parentElement = document.body;
+        var _senderBaseSetProperty = _senderColumn.style.setProperty;
+        _senderColumn.style.setProperty = function(name, value, priority) {
+            _senderWrites.push(name + '=' + value + '|' + priority);
+            _senderBaseSetProperty(name, value, priority);
+        };
+        function _senderInsetAtCurrentViewport() {
+            if (_vw >= 500) return 14;
+            if (_vw >= 400) return 6;
+            return 12;
+        }
+        _senderColumn.getBoundingClientRect = function() {
+            var inset = _senderInsetAtCurrentViewport();
+            return { left: inset, right: _vw - inset, width: _vw - (2 * inset), height: 20 };
+        };
+        var _ownedWrapper = _baseEl('DIV', 'tm-ics-wrapper');
+        var _ownedBaseSetProperty = _ownedWrapper.style.setProperty;
+        _ownedWrapper.style.setProperty = function(name, value, priority) {
+            _ownedApplied[name] = value + '|' + priority;
+            _ownedBaseSetProperty(name, value, priority);
+        };
+        _ownedWrapper.parentElement = document.body;
+        _ownedWrapper.getBoundingClientRect = function() {
+            var inset = parseFloat(_ownedApplied['margin-left']) || 0;
+            return { left: inset, right: _vw - inset, width: _vw - (2 * inset), height: 20 };
+        };
+        // Model wide invite text inside the app-owned wrapper once a fit has
+        // crossed the first breakpoint. Its geometry carries the PREVIOUS
+        // wrapper margin, so including it in the sender-column measurement
+        // would make the image refit stick at 6px instead of advancing to 14px.
+        var _ownedText = { nodeType: 3, textContent: 'Invite details', nextSibling: null };
+        var _ownedTextLeaf = _baseEl('P', 'generic-invite-content');
+        _ownedTextLeaf.firstChild = _ownedText;
+        _ownedTextLeaf.parentElement = _ownedWrapper;
+        _ownedTextLeaf.getBoundingClientRect = function() {
+            var inset = parseFloat(_ownedApplied['margin-left']) || 0;
+            var width = _vw >= 400 ? _vw - (2 * inset) : 40;
+            return { left: inset, right: inset + width, width: width, height: 20 };
+        };
+        var _spoofedWrapper = _baseEl('DIV', 'tm-ics-wrapper');
+        var _spoofedBaseSetProperty = _spoofedWrapper.style.setProperty;
+        _spoofedWrapper.style.setProperty = function(name, value, priority) {
+            _spoofedApplied[name] = value + '|' + priority;
+            _spoofedBaseSetProperty(name, value, priority);
+        };
+        _spoofedWrapper.parentElement = document.body;
+        _spoofedWrapper.getBoundingClientRect = function() {
+            return { left: 0, right: _vw, width: _vw, height: 20 };
+        };
+        window.__tmICSDisclosureWrappers = [_ownedWrapper];
+        _all.push(_senderColumn, _ownedWrapper, _ownedTextLeaf, _spoofedWrapper);
+        window.webkit.messageHandlers.gutterAdjust = {
+            postMessage: function(message) { _gutterMessage = message; _gutterPostCount++; }
+        };
+        """ + _eatGutterMarginsJS)
+        #expect(widenedContext.exception == nil,
+                "widened gutter setup threw: \(widenedContext.exception?.toString() ?? "")")
+        #expect(widenedContext.evaluateScript("parseFloat(_ownedApplied['margin-left'])")?.toDouble() == 12)
+        #expect(widenedContext.evaluateScript("parseFloat(_ownedApplied['margin-right'])")?.toDouble() == 12)
+        #expect(widenedContext.evaluateScript("_gutterMessage.l")?.toDouble() == 4)
+        #expect(widenedContext.evaluateScript("_gutterMessage.r")?.toDouble() == 4)
+
+        func visibleInset(_ ctx: JSContext, cssExpression: String) -> Double {
+            ctx.evaluateScript(
+                "_gutterMessage.l + (" + cssExpression
+                    + ") * DEVICE_W / (window.__tmLayoutVp || DEVICE_W)"
+            )?.toDouble() ?? -1
+        }
+
+        widenedContext.evaluateScript("window.__tmDeviceWidth = DEVICE_W;" + _fitViewportJS)
+        #expect(widenedContext.exception == nil,
+                "initial widened fit threw: \(widenedContext.exception?.toString() ?? "")")
+        #expect(layoutVp(widenedContext) == 400)
+        #expect(widenedContext.evaluateScript("parseFloat(_ownedApplied['margin-left'])")?.toDouble() == 6,
+                "initial fit crossed the 400px breakpoint and must remeasure the sender inset")
+        #expect(widenedContext.evaluateScript("parseFloat(_ownedApplied['margin-right'])")?.toDouble() == 6)
+        let initialWrapperInset = visibleInset(
+            widenedContext,
+            cssExpression: "parseFloat(_ownedApplied['margin-left'])"
+        )
+        let initialSenderInset = visibleInset(
+            widenedContext,
+            cssExpression: "_senderColumn.getBoundingClientRect().left"
+        )
+        #expect(abs(initialWrapperInset - initialSenderInset) < 0.000_001)
+        let expectedInitialVisibleInset = 4.0 + (6.0 * 288.0 / 400.0)
+        #expect(abs(initialWrapperInset - expectedInitialVisibleInset) < 0.000_001)
+        #expect(initialWrapperInset < 16,
+                "native remainder + scaled CSS inset is not a 16pt floor after widening")
+        #expect(widenedContext.evaluateScript("_gutterPostCount")?.toInt32() == 1,
+                "fit settlement must not repost the native gutter and create a width feedback path")
+        #expect(widenedContext.evaluateScript("Object.keys(_spoofedApplied).length")?.toInt32() == 0,
+                "a sender-spoofed class is not an app-owned disclosure")
+        #expect(widenedContext.evaluateScript("_senderWrites.length")?.toInt32() == 0,
+                "alignment must measure sender DOM without mutating it")
+
+        widenedContext.evaluateScript(_postImageWidthRecheckJS)
+        widenedContext.evaluateScript(_deferredImageLoadJS(diagnosticsEnabled: false))
+        widenedContext.evaluateScript("fireImgEvent(0, 'load'); fireImgEvent(1, 'load')")
+        #expect(refitRequests(widenedContext) == 1)
+        widenedContext.evaluateScript(viewportResetJS(deviceWidth: 288) + ";" + _fitViewportJS)
+        #expect(widenedContext.exception == nil,
+                "late widened refit threw: \(widenedContext.exception?.toString() ?? "")")
+        #expect(layoutVp(widenedContext) == 515)
+        #expect(widenedContext.evaluateScript("parseFloat(_ownedApplied['margin-left'])")?.toDouble() == 14,
+                "image refit crossed the 500px breakpoint and must remeasure the sender inset")
+        #expect(widenedContext.evaluateScript("parseFloat(_ownedApplied['margin-right'])")?.toDouble() == 14)
+        let lateWrapperInset = visibleInset(
+            widenedContext,
+            cssExpression: "parseFloat(_ownedApplied['margin-left'])"
+        )
+        let lateSenderInset = visibleInset(
+            widenedContext,
+            cssExpression: "_senderColumn.getBoundingClientRect().left"
+        )
+        #expect(abs(lateWrapperInset - lateSenderInset) < 0.000_001)
+        let expectedLateVisibleInset = 4.0 + (14.0 * 288.0 / 515.0)
+        #expect(abs(lateWrapperInset - expectedLateVisibleInset) < 0.000_001)
+        #expect(widenedContext.evaluateScript("_gutterPostCount")?.toInt32() == 1)
+        #expect(widenedContext.evaluateScript("Object.keys(_spoofedApplied).length")?.toInt32() == 0)
+        #expect(widenedContext.evaluateScript("_senderWrites.length")?.toInt32() == 0)
+
+        // A steady-state fit remains the existing idempotent no-op. It must
+        // retain the settled wrapper result without spending the native gutter
+        // bridge again or drifting any sender/app-owned geometry.
+        widenedContext.evaluateScript(_fitViewportJS)
+        #expect(widenedContext.exception == nil,
+                "idempotent fit threw: \(widenedContext.exception?.toString() ?? "")")
+        #expect(layoutVp(widenedContext) == 515)
+        #expect(widenedContext.evaluateScript("parseFloat(_ownedApplied['margin-left'])")?.toDouble() == 14)
+        #expect(widenedContext.evaluateScript("parseFloat(_ownedApplied['margin-right'])")?.toDouble() == 14)
+        #expect(widenedContext.evaluateScript("_gutterPostCount")?.toInt32() == 1)
+        #expect(widenedContext.evaluateScript("Object.keys(_spoofedApplied).length")?.toInt32() == 0)
+        #expect(widenedContext.evaluateScript("_senderWrites.length")?.toInt32() == 0)
+
+        // A supported reset can settle without widening (rotation/sheet resize)
+        // or can transiently widen and hit the fluid-runaway revert. Both final
+        // layouts are back at device width, where the sender breakpoint returns
+        // to 12px; retaining the prior 14px wrapper margin is stale.
+        widenedContext.evaluateScript("""
+        var _runaway = _baseEl('TABLE', 'fluid-runaway');
+        _runaway.parentElement = document.body;
+        _runaway.getBoundingClientRect = function() {
+            return { left: 0, right: _vw + 20, width: _vw + 20, height: 20 };
+        };
+        _all.push(_runaway);
+        """ + viewportResetJS(deviceWidth: 288) + ";" + _fitViewportJS)
+        #expect(widenedContext.exception == nil,
+                "runaway-revert refit threw: \(widenedContext.exception?.toString() ?? "")")
+        #expect(layoutVp(widenedContext) == 0)
+        #expect(widenedContext.evaluateScript("parseFloat(_ownedApplied['margin-left'])")?.toDouble() == 12,
+                "runaway revert must settle against the restored device-width breakpoint")
+        #expect(widenedContext.evaluateScript("parseFloat(_ownedApplied['margin-right'])")?.toDouble() == 12)
+
+        // Restore a widened state, then reset into a no-overflow terminal branch.
+        // This is the normal responsive-email rotation/sheet-resize lifecycle.
+        widenedContext.evaluateScript("_all.pop(); TRUE_W = 515;"
+            + viewportResetJS(deviceWidth: 288) + ";" + _fitViewportJS)
+        #expect(layoutVp(widenedContext) == 515)
+        #expect(widenedContext.evaluateScript("parseFloat(_ownedApplied['margin-left'])")?.toDouble() == 14)
+        widenedContext.evaluateScript("TRUE_W = 280;"
+            + viewportResetJS(deviceWidth: 288) + ";" + _fitViewportJS)
+        #expect(widenedContext.exception == nil,
+                "no-overflow refit threw: \(widenedContext.exception?.toString() ?? "")")
+        #expect(layoutVp(widenedContext) == 0)
+        #expect(widenedContext.evaluateScript("parseFloat(_ownedApplied['margin-left'])")?.toDouble() == 12,
+                "reset-to-no-widen must settle against the device-width breakpoint")
+        #expect(widenedContext.evaluateScript("parseFloat(_ownedApplied['margin-right'])")?.toDouble() == 12)
+        #expect(widenedContext.evaluateScript("_gutterPostCount")?.toInt32() == 1)
+        #expect(widenedContext.evaluateScript("Object.keys(_spoofedApplied).length")?.toInt32() == 0)
+        #expect(widenedContext.evaluateScript("_senderWrites.length")?.toInt32() == 0)
+
+        // With no retained app-owned invite wrappers, the initial gutter pass
+        // must still measure/post the native remainder, but fit settlement must
+        // not invoke the full-DOM remeasurement helper at all.
+        let noInviteContext = makeWidthPipelineContext(trueWidth: 515)
+        noInviteContext.evaluateScript("""
+        var _noInviteGutterPostCount = 0;
+        var _noInviteSenderText = { nodeType: 3, textContent: 'Generic content', nextSibling: null };
+        var _noInviteSender = _baseEl('P', 'generic-main-column');
+        _noInviteSender.firstChild = _noInviteSenderText;
+        _noInviteSender.parentElement = document.body;
+        _noInviteSender.getBoundingClientRect = function() {
+            return { left: 12, right: _vw - 12, width: _vw - 24, height: 20 };
+        };
+        _all.push(_noInviteSender);
+        window.__tmICSDisclosureWrappers = [];
+        window.webkit.messageHandlers.gutterAdjust = {
+            postMessage: function() { _noInviteGutterPostCount++; }
+        };
+        """ + _eatGutterMarginsJS + """
+        var _realignBeforeFit = window.__tmRealignICSDisclosures;
+        var _emptyOwnedSettleCalls = 0;
+        window.__tmRealignICSDisclosures = function() {
+            _emptyOwnedSettleCalls++;
+            return _realignBeforeFit();
+        };
+        """)
+        #expect(noInviteContext.exception == nil,
+                "no-invite gutter setup threw: \(noInviteContext.exception?.toString() ?? "")")
+        #expect(noInviteContext.evaluateScript("_noInviteGutterPostCount")?.toInt32() == 1)
+        noInviteContext.evaluateScript("window.__tmDeviceWidth = DEVICE_W;" + _fitViewportJS)
+        #expect(noInviteContext.exception == nil,
+                "no-invite fit threw: \(noInviteContext.exception?.toString() ?? "")")
+        #expect(layoutVp(noInviteContext) == 400)
+        #expect(noInviteContext.evaluateScript("_emptyOwnedSettleCalls")?.toInt32() == 0,
+                "fit settlement must skip the full-DOM scan when the exact-owned array is empty")
+        #expect(noInviteContext.evaluateScript("_noInviteGutterPostCount")?.toInt32() == 1)
 
         // Extreme finite geometry is proportionally bounded so left+right never
         // consumes more than the space outside the 60%-wide main-column floor.
-        ctx.evaluateScript("alignBodyLevelDisclosure([ownedWrapper], 1000, 1000, 40);")
-        #expect(ctx.evaluateScript("ownedApplied['margin-left']")?.toString() == "20px|important")
-        #expect(ctx.evaluateScript("ownedApplied['margin-right']")?.toString() == "20px|important")
+        let boundContext = JSContext()!
+        boundContext.evaluateScript("""
+        var applied = {};
+        var wrapper = { style: { setProperty: function(name, value, priority) {
+            applied[name] = value + '|' + priority;
+        } } };
+        \(_alignBodyLevelDisclosureJS)
+        alignBodyLevelDisclosure([wrapper], 1000, 1000, 40);
+        """)
+        #expect(boundContext.exception == nil, "alignment JS threw: \(boundContext.exception?.toString() ?? "")")
+        #expect(boundContext.evaluateScript("applied['margin-left']")?.toString() == "20px|important")
+        #expect(boundContext.evaluateScript("applied['margin-right']")?.toString() == "20px|important")
     }
 
     @Test("fixDarkModeColorsJS dims only LIGHT LOW-SATURATION text fills — preserves textless + saturated colors")
