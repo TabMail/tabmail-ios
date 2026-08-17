@@ -430,4 +430,59 @@ struct InboxViewModelAIBatchTests {
         #expect(updated?.actionTag == .reply)
         #expect(updated?.summaryBlurb == "AI-generated summary")
     }
+
+    @Test("flushAIBatch follows a committed UID remap instead of dropping the pending update")
+    @MainActor func pendingUpdateFollowsUIDRemap() async throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let oldId = try insertHeader(
+            pool, messageId: "3100", folderId: folder.id, snippet: "Pending")
+        let vm = InboxViewModel(folders: [folder])
+        vm.start()
+        vm.loadInitialPage()
+        guard vm.loadedMessages.count == 1 else {
+            Issue.record("Expected 1 message, got \(vm.loadedMessages.count)")
+            return
+        }
+
+        try writeTagAndSummary(
+            pool, headerId: oldId, tag: .reply,
+            summary: "AI result survives the key change")
+        NotificationCenter.default.post(name: .messageDataDidChange, object: oldId)
+
+        let newId = "acc1:INBOX:3101"
+        let record = HeaderRekeyRecord(
+            oldHeaderId: oldId,
+            newHeaderId: newId,
+            newProviderMessageId: "3101",
+            carriesProviderAuthority: false)
+        let applied = try await pool.write { db -> Bool in
+            guard let oldHeader = try MessageHeader.fetchOne(db, key: oldId) else {
+                return false
+            }
+            var migrated = oldHeader
+            migrated.id = newId
+            migrated.messageId = "3101"
+            migrated.observedUidValidity = nil
+            return try MessageHeaderRekey.apply(from: oldHeader, to: migrated, db: db)
+        }
+        #expect(applied)
+        guard applied else { return }
+        NotificationCenter.default.post(
+            name: .messageHeadersRekeyed, object: [record])
+
+        try await Task.sleep(for: .milliseconds(450))
+
+        #expect(!vm.loadedMessages.contains { $0.id == oldId })
+        let migrated = vm.loadedMessages.filter { $0.id == newId }
+        #expect(migrated.count == 1)
+        guard migrated.count == 1 else { return }
+        #expect(migrated[0].actionTag == .reply)
+        #expect(migrated[0].summaryBlurb == "AI result survives the key change")
+    }
+
 }

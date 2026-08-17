@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 // MARK: - Test Helpers
@@ -1046,7 +1047,7 @@ struct RunSyncUIDRemapFtsRekeyTests {
         }
 
         let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:INBOX")! }
-        let mock = MockEmailProvider()
+        let mock = MockEmailProvider(staleWindowMode: .uid)
         await mock.setFetchMessagesResult([
             makeHeaderInfo(messageId: "200", rfc822MessageId: "remap-x@example.com",
                            subject: "Remap target", date: date)
@@ -1060,6 +1061,11 @@ struct RunSyncUIDRemapFtsRekeyTests {
         #expect(result.ftsRekeys.first?.oldId == "racc:INBOX:100")
         #expect(result.ftsRekeys.first?.newId == "racc:INBOX:200")
         #expect(result.ftsRekeys.first?.newMessageId == "200")
+        #expect(result.headerRekeys == [HeaderRekeyRecord(
+            oldHeaderId: "racc:INBOX:100",
+            newHeaderId: "racc:INBOX:200",
+            newProviderMessageId: "200",
+            carriesProviderAuthority: false)])
         // The old id must NOT be removed from FTS or header-only re-indexed.
         #expect(!result.staleIds.contains("racc:INBOX:100"))
         #expect(!result.newHeaders.contains { $0.id == "racc:INBOX:200" })
@@ -1074,6 +1080,179 @@ struct RunSyncUIDRemapFtsRekeyTests {
         #expect(old == nil)
         let body = try await pool.read { try MessageBody.fetchOne($0, key: "racc:INBOX:200") }
         #expect(body?.htmlContent == "<p>kept</p>")
+    }
+
+    @Test("Committed UID remap publishes the exact active-view identity mapping")
+    func remapPublishesActiveViewMapping() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path)
+        let appDB = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prior = current
+            current = appDB
+            return prior
+        }
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let date = Date()
+        let folder = try await pool.write { db -> Folder in
+            var account = Account(
+                emailAddress: "remap-notify@example.com", displayName: "Test", provider: .imap)
+            account.id = "notify-account"
+            try account.insert(db)
+            let folder = Folder(
+                name: "INBOX", path: "INBOX", role: .inbox, accountId: account.id)
+            try folder.insert(db)
+            var header = MessageHeader(
+                messageId: "301", subject: "Pending AI update",
+                from: "sender@example.com", fromAddress: "sender@example.com",
+                to: "remap-notify@example.com", date: date, snippet: "Body",
+                folderId: folder.id, accountId: account.id, folderPath: folder.path,
+                isInInbox: true)
+            header.rfc822MessageId = "<sync-ui-rekey@example.com>"
+            header.headerComplete = true
+            header.actionTag = .reply
+            header.summaryBlurb = "AI result survives the key change"
+            try header.insert(db)
+            return folder
+        }
+
+        let published = Mutex<[HeaderRekeyRecord]>([])
+        let token = NotificationCenter.default.addObserver(
+            forName: .messageHeadersRekeyed, object: nil, queue: nil
+        ) { notification in
+            guard let records = notification.object as? [HeaderRekeyRecord] else { return }
+            published.withLock { $0.append(contentsOf: records) }
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+
+        let provider = MockEmailProvider(staleWindowMode: .uid)
+        await provider.setFetchMessagesResult([
+            makeHeaderInfo(
+                messageId: "302", rfc822MessageId: "<sync-ui-rekey@example.com>",
+                subject: "Pending AI update", date: date)
+        ])
+
+        try await SyncEngine().syncMessages(for: folder, provider: provider, limit: 50)
+
+        let records = published.withLock { $0 }
+        #expect(records == [HeaderRekeyRecord(
+            oldHeaderId: "notify-account:INBOX:301",
+            newHeaderId: "notify-account:INBOX:302",
+            newProviderMessageId: "302",
+            carriesProviderAuthority: false)])
+        let migrated = try await pool.read {
+            try MessageHeader.fetchOne($0, key: "notify-account:INBOX:302")
+        }
+        #expect(migrated?.actionTag == .reply)
+        #expect(migrated?.summaryBlurb == "AI result survives the key change")
+    }
+
+    @Test("Date-window RFC repair does not publish an actionable active-view mapping")
+    func dateWindowRepairKeepsViewCarrierEmpty() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+        try AppDatabase.runMigrations(on: pool)
+
+        let date = Date().addingTimeInterval(-600)
+        try await pool.write { db in
+            var account = Account(
+                emailAddress: "graph-remap@example.com", displayName: "T", provider: .outlook)
+            account.id = "graph-remap"
+            try account.insert(db)
+            let folder = Folder(
+                name: "INBOX", path: "INBOX", role: .inbox, accountId: account.id)
+            try folder.insert(db)
+            var header = MessageHeader(
+                messageId: "old-graph-id", subject: "Same RFC", from: "a@x", fromAddress: "a@x",
+                to: "b@x", date: date, snippet: "s", folderId: folder.id,
+                accountId: account.id, folderPath: folder.path, isInInbox: true)
+            header.rfc822MessageId = "<duplicate-rfc@example.com>"
+            header.headerComplete = true
+            try header.insert(db)
+        }
+
+        let folder = try await pool.read {
+            try Folder.fetchOne($0, key: "graph-remap:INBOX")!
+        }
+        let provider = MockEmailProvider(staleWindowMode: .date)
+        await provider.setFetchMessagesResult([
+            makeHeaderInfo(
+                messageId: "new-graph-id", rfc822MessageId: "<duplicate-rfc@example.com>",
+                subject: "Same RFC", date: date)
+        ])
+
+        let result = try await SyncEngine.runSyncMessages(
+            for: folder, provider: provider, limit: 50,
+            dbPool: PrioritizedDatabase(pool: pool))
+
+        #expect(result.ftsRekeys.count == 1, "durable/FTS repair remains unchanged")
+        #expect(result.headerRekeys.isEmpty,
+                "weak date-window correlation must not become active provider-id state")
+    }
+
+    @Test("Full sync publishes UID remap through the view model's production observer")
+    @MainActor func fullSyncPublishesThroughViewModelObserver() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path)
+        let appDB = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prior = current
+            current = appDB
+            return prior
+        }
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let date = Date().addingTimeInterval(-300)
+        let (account, folder) = try await pool.write { db -> (Account, Folder) in
+            var account = Account(
+                emailAddress: "full-remap@example.com", displayName: "T", provider: .imap)
+            account.id = "full-remap"
+            try account.insert(db)
+            let folder = Folder(
+                name: "INBOX", path: "INBOX", role: .inbox, accountId: account.id)
+            try folder.insert(db)
+            var header = MessageHeader(
+                messageId: "401", subject: "Full sync remap", from: "a@x", fromAddress: "a@x",
+                to: "b@x", date: date, snippet: "s", folderId: folder.id,
+                accountId: account.id, folderPath: folder.path, isInInbox: true)
+            header.rfc822MessageId = "<full-sync-rekey@example.com>"
+            header.headerComplete = true
+            try header.insert(db)
+            return (account, folder)
+        }
+
+        let viewModel = InboxViewModel(folders: [folder])
+        viewModel.start()
+        viewModel.loadInitialPage()
+        #expect(viewModel.loadedMessages.map(\.id) == ["full-remap:INBOX:401"])
+
+        let provider = MockEmailProvider(staleWindowMode: .uid)
+        await provider.setFetchFoldersResult([
+            FolderInfo(
+                name: "INBOX", path: "INBOX", role: .inbox, unreadCount: 0,
+                totalCount: 1, uidNext: 403, uidValidity: nil)
+        ])
+        await provider.setFetchMessagesResult([
+            makeHeaderInfo(
+                messageId: "402", rfc822MessageId: "<full-sync-rekey@example.com>",
+                subject: "Full sync remap", date: date)
+        ])
+
+        try await SyncEngine().fullSync(account: account, provider: provider)
+
+        #expect(!viewModel.loadedMessages.contains { $0.id == "full-remap:INBOX:401" })
+        #expect(viewModel.loadedMessages.filter { $0.id == "full-remap:INBOX:402" }.count == 1)
     }
 }
 

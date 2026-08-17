@@ -249,6 +249,7 @@ extension SyncEngine {
         // Helper: process sync result — FTS indexing, ReplyDetect notifications, collect migrated IDs.
         // Extracted to avoid duplication between initial sync and connection-error retry.
         @Sendable func processSyncResult(_ result: SyncMessagesResult, folder: Folder) async -> [String] {
+            await Self.publishHeaderRekeys(result.headerRekeys)
             // Yield to a privileged merge before this folder's FTS writes (rekey /
             // remove / index). SearchIndex is a separate pool with sync `@noasync`
             // writes, so the async caller yields on its behalf.
@@ -524,6 +525,8 @@ extension SyncEngine {
             print("[FullSync] syncMessages — UID migrated \(result.uidMigratedOldIds.count) messages")
         }
 
+        await Self.publishHeaderRekeys(result.headerRekeys)
+
         // ReplyDetect: notify UI immediately so tag badges update.
         ReplyParentResolver.postParentNotifications(result.replyDetectIds)
 
@@ -553,6 +556,17 @@ extension SyncEngine {
 
     // MARK: - Background Sync Helpers
 
+    /// Keep active view-local identities coherent with a committed sync re-key.
+    /// Once publication reaches MainActor, delivery is synchronous so the model
+    /// and view-owned bindings apply the same committed transition before the
+    /// publisher returns.
+    private static func publishHeaderRekeys(_ records: [HeaderRekeyRecord]) async {
+        guard !records.isEmpty else { return }
+        await MainActor.run {
+            NotificationCenter.default.post(name: .messageHeadersRekeyed, object: records)
+        }
+    }
+
     /// Result from per-folder message sync. All fields are Sendable for cross-isolation transfer.
     struct SyncMessagesResult: Sendable {
         let newHeaders: [MessageHeader]
@@ -564,6 +578,10 @@ extension SyncEngine {
         /// text + messages_vec embedding) moves to the new id IN PLACE.
         /// `newMessageId` refreshes the FTS msgId column on UID remaps.
         let ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)]
+        /// Exact committed UID-remap mappings for active view-local identities.
+        /// This is intentionally narrower than `ftsRekeys`: canonicalization
+        /// carriers without a new provider id cannot update a visible snapshot.
+        let headerRekeys: [HeaderRekeyRecord]
     }
 
     /// Canonicalize the local rows for one remote message in one folder.
@@ -1118,7 +1136,7 @@ extension SyncEngine {
         // in-flight write (DatabaseWriteQueue can't preempt SQLite), so a single long
         // folder write here is the residual cap to chunk. Remove once confirmed bounded.
         let writeStart = CFAbsoluteTimeGetCurrent()
-        let syncResult: (newHeaders: [MessageHeader], staleIds: [String], replyDetectIds: [String], uidMigratedOldIds: [String], ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)]) = try await dbPool.write { db in
+        let syncResult: (newHeaders: [MessageHeader], staleIds: [String], replyDetectIds: [String], uidMigratedOldIds: [String], ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)], headerRekeys: [HeaderRekeyRecord]) = try await dbPool.write { db in
             // ⚠ PRE-EXISTING HAZARD, deliberately NOT closed by T1.2 and tracked
             // separately: this merge pass has NO UIDVALIDITY guard. `selectStaleHeaders`
             // below classifies "the server did not return UID n" as stale, which on a
@@ -1196,7 +1214,7 @@ extension SyncEngine {
             // full sync re-drives an interrupted reaction on every cycle.
             if folderInTxn?.uidValidityResetPendingAt != nil {
                 BackgroundSyncLogger.log("[Sync] merge pass SKIPPED for \(folderId) — folder is in UIDVALIDITY quarantine; the reaction owns it")
-                return (newHeaders: [], staleIds: [], replyDetectIds: [], uidMigratedOldIds: [], ftsRekeys: [])
+                return (newHeaders: [], staleIds: [], replyDetectIds: [], uidMigratedOldIds: [], ftsRekeys: [], headerRekeys: [])
             }
             // (b) EPOCH DISAGREEMENT.
             let storedEpochInTxn = Self.knownUidValidity(
@@ -1210,7 +1228,7 @@ extension SyncEngine {
                     accountId: accountId, folderPath: folderPath,
                     storedValue: stored, observedValue: observed
                 )
-                return (newHeaders: [], staleIds: [], replyDetectIds: [], uidMigratedOldIds: [], ftsRekeys: [])
+                return (newHeaders: [], staleIds: [], replyDetectIds: [], uidMigratedOldIds: [], ftsRekeys: [], headerRekeys: [])
             }
             try Self.bootstrapFolderUidValidity(
                 db, folderId: folderId, observed: observedEpochAtFetch.map { Int($0) })
@@ -1251,6 +1269,7 @@ extension SyncEngine {
             var newHeaders: [MessageHeader] = []
             var staleIds: [String] = []
             var ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)] = []
+            var headerRekeys: [HeaderRekeyRecord] = []
             // Remove stale local messages.
             // Uses date-bounded query to load only the overlap window, not all 8000+ messages.
             // MessageAICache preserves AI state for re-inserted messages.
@@ -1441,6 +1460,19 @@ extension SyncEngine {
                 // the old FTS row ghosted forever (search hits deep-linking to
                 // a deleted header id) and the new id was invisible to search.
                 ftsRekeys.append((oldId: oldId, newId: newId, newMessageId: newMsgId))
+                // Only UID-scoped providers publish this weak mapping into an
+                // active view. Date-window providers (notably Graph) use opaque
+                // actionable ids, so RFC correlation must not immediately turn
+                // an arbitrary duplicate Message-ID match into UI action state.
+                // Their durable/FTS repair remains unchanged and a normal reload
+                // converges from GRDB.
+                if windowMode == .uid {
+                    headerRekeys.append(HeaderRekeyRecord(
+                        oldHeaderId: oldId,
+                        newHeaderId: newId,
+                        newProviderMessageId: newMsgId,
+                        carriesProviderAuthority: false))
+                }
                 uidMigratedRemoteIds.insert(newMsgId)
                 uidMigratedOldMsgIds.append(staleMsg.messageId)
             }
@@ -2109,7 +2141,7 @@ extension SyncEngine {
                 let loopMs = Int((CFAbsoluteTimeGetCurrent() - upsLoopT0) * 1000)
                 BootProfiler.mark("fullSync upsert[\(folder.name)]: ins=\(newHeaders.count) upd=\(upsUpdated) noop=\(upsNoop) dsSkip=\(upsDraftSentSkip) stale=\(staleIds.count) loop=\(loopMs)ms recon=\(Int(upsReconSeconds * 1000))ms")
             }
-            return (newHeaders, staleIds, replyDetectIds, uidMigratedOldMsgIds, ftsRekeys)
+            return (newHeaders, staleIds, replyDetectIds, uidMigratedOldMsgIds, ftsRekeys, headerRekeys)
         }
         let writeMs = Int((CFAbsoluteTimeGetCurrent() - writeStart) * 1000)
         if writeMs > 30 {
@@ -2121,7 +2153,8 @@ extension SyncEngine {
             staleIds: syncResult.staleIds,
             replyDetectIds: syncResult.replyDetectIds,
             uidMigratedOldIds: syncResult.uidMigratedOldIds,
-            ftsRekeys: syncResult.ftsRekeys
+            ftsRekeys: syncResult.ftsRekeys,
+            headerRekeys: syncResult.headerRekeys
         )
     }
 }
