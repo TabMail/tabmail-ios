@@ -1335,35 +1335,170 @@ struct EmailRenderPipelineTests {
         #expect(_collapseICSJS.contains("ownedWrappers.push(wrapper)"))
         #expect(!_alignBodyLevelDisclosureJS.contains("querySelectorAll"))
 
-        let ctx = JSContext()!
-        ctx.evaluateScript("""
-        var ownedApplied = {};
-        var spoofedApplied = {};
-        var ownedWrapper = { style: { setProperty: function(name, value, priority) {
-            ownedApplied[name] = value + '|' + priority;
-        } } };
-        var spoofedClassWrapper = { style: { setProperty: function(name, value, priority) {
-            spoofedApplied[name] = value + '|' + priority;
-        } } };
-        \(_alignBodyLevelDisclosureJS)
-        alignBodyLevelDisclosure([ownedWrapper], 24, 12, 160);
-        """)
-        #expect(ctx.exception == nil, "alignment JS threw: \(ctx.exception?.toString() ?? "")")
-        #expect(ctx.evaluateScript("ownedApplied['margin-left']")?.toString() == "24px|important")
-        #expect(ctx.evaluateScript("ownedApplied['margin-right']")?.toString() == "12px|important")
-        #expect(ctx.evaluateScript("spoofedApplied['margin-left']").isUndefined)
+        func runPipeline(
+            leftInset: Double,
+            rightInset: Double,
+            expectedWrapperInset: Double,
+            expectedBridgePadding: Double
+        ) {
+            let ctx = JSContext()!
+            ctx.evaluateScript("""
+            var window = this;
+            var _bodyWidth = 200;
+            var _leftInset = \(leftInset);
+            var _rightInset = \(rightInset);
+            var _gutterMessage = null;
 
-        // A desktop layout that overflows one side must never pull app chrome
-        // outside the body with a negative margin.
-        ctx.evaluateScript("alignBodyLevelDisclosure([ownedWrapper], -8, 5, 160);")
-        #expect(ctx.evaluateScript("ownedApplied['margin-left']")?.toString() == "0px|important")
-        #expect(ctx.evaluateScript("ownedApplied['margin-right']")?.toString() == "5px|important")
+            function _style() {
+                return {
+                    applied: {},
+                    setProperty: function(name, value, priority) {
+                        this.applied[name] = value + '|' + priority;
+                    }
+                };
+            }
+            function _element(tag, className, rect) {
+                var node = {
+                    nodeType: 1,
+                    tagName: tag.toUpperCase(),
+                    className: className || '',
+                    childNodes: [],
+                    firstChild: null,
+                    parentNode: null,
+                    style: _style(),
+                    _rect: rect || { left: 0, right: 0, width: 0, height: 0 },
+                    getBoundingClientRect: function() { return this._rect; },
+                    addEventListener: function() {},
+                    appendChild: function(child) {
+                        if (child.parentNode) child.parentNode.removeChild(child);
+                        child.parentNode = this;
+                        this.childNodes.push(child);
+                        this.firstChild = this.childNodes.length ? this.childNodes[0] : null;
+                        return child;
+                    },
+                    insertBefore: function(child, reference) {
+                        if (child.parentNode) child.parentNode.removeChild(child);
+                        var index = this.childNodes.indexOf(reference);
+                        if (index < 0) index = this.childNodes.length;
+                        child.parentNode = this;
+                        this.childNodes.splice(index, 0, child);
+                        this.firstChild = this.childNodes.length ? this.childNodes[0] : null;
+                        return child;
+                    },
+                    removeChild: function(child) {
+                        var index = this.childNodes.indexOf(child);
+                        if (index >= 0) this.childNodes.splice(index, 1);
+                        child.parentNode = null;
+                        this.firstChild = this.childNodes.length ? this.childNodes[0] : null;
+                        return child;
+                    }
+                };
+                node.classList = {
+                    contains: function(name) {
+                        return node.className.split(/\\s+/).indexOf(name) >= 0;
+                    },
+                    toggle: function(name) {
+                        var names = node.className.split(/\\s+/).filter(Boolean);
+                        var index = names.indexOf(name);
+                        if (index >= 0) names.splice(index, 1); else names.push(name);
+                        node.className = names.join(' ');
+                    }
+                };
+                return node;
+            }
+            function _descendants(node, out) {
+                for (var i = 0; i < node.childNodes.length; i++) {
+                    var child = node.childNodes[i];
+                    if (child.nodeType !== 1) continue;
+                    out.push(child);
+                    _descendants(child, out);
+                }
+                return out;
+            }
+
+            var _body = _element('body', '', {
+                left: 0, right: _bodyWidth, width: _bodyWidth, height: 200
+            });
+            _body.getElementsByTagName = function() { return _descendants(this, []); };
+            var _mainColumn = _element('p', 'generic-main-column', {
+                left: _leftInset,
+                right: _bodyWidth - _rightInset,
+                width: _bodyWidth - _leftInset - _rightInset,
+                height: 20
+            });
+            _mainColumn.appendChild({ nodeType: 3, textContent: 'Generic content', parentNode: null });
+            var _spoofedWrapper = _element('div', 'tm-ics-wrapper', {
+                left: 0, right: _bodyWidth, width: _bodyWidth, height: 20
+            });
+            var _marker = _element('div', 'tm-ics-collapsible', {
+                left: 0, right: _bodyWidth, width: _bodyWidth, height: 20
+            });
+            _marker.appendChild(_element('div', 'generic-invite-content', {
+                left: 0, right: _bodyWidth, width: _bodyWidth, height: 20
+            }));
+            _body.appendChild(_mainColumn);
+            _body.appendChild(_spoofedWrapper);
+            _body.appendChild(_marker);
+
+            var document = {
+                body: _body,
+                createElement: function(tag) { return _element(tag, '', null); },
+                querySelectorAll: function(selector) {
+                    return selector === '.tm-ics-collapsible' ? [_marker] : [];
+                }
+            };
+            window.webkit = { messageHandlers: {
+                consoleLog: { postMessage: function() {} },
+                gutterAdjust: { postMessage: function(message) { _gutterMessage = message; } }
+            } };
+            function setTimeout() {}
+
+            \(_collapseICSJS)
+            \(_eatGutterMarginsJS)
+            """)
+
+            #expect(ctx.exception == nil, "render pipeline JS threw: \(ctx.exception?.toString() ?? "")")
+            #expect(ctx.evaluateScript("window.__tmICSDisclosureWrappers.length")?.toInt32() == 1)
+            #expect(
+                ctx.evaluateScript("parseFloat(window.__tmICSDisclosureWrappers[0].style.applied['margin-left'])")?.toDouble()
+                    == expectedWrapperInset
+            )
+            #expect(
+                ctx.evaluateScript("parseFloat(window.__tmICSDisclosureWrappers[0].style.applied['margin-right'])")?.toDouble()
+                    == expectedWrapperInset
+            )
+            #expect(ctx.evaluateScript("_gutterMessage.l")?.toDouble() == expectedBridgePadding)
+            #expect(ctx.evaluateScript("_gutterMessage.r")?.toDouble() == expectedBridgePadding)
+            #expect(
+                ctx.evaluateScript("parseFloat(window.__tmICSDisclosureWrappers[0].style.applied['margin-left']) + _gutterMessage.l")?.toDouble()
+                    == 16
+            )
+            #expect(
+                ctx.evaluateScript("parseFloat(window.__tmICSDisclosureWrappers[0].style.applied['margin-right']) + _gutterMessage.r")?.toDouble()
+                    == 16
+            )
+            #expect(ctx.evaluateScript("_spoofedWrapper.style.applied['margin-left']").isUndefined)
+            #expect(ctx.evaluateScript("_spoofedWrapper.style.applied['margin-right']").isUndefined)
+        }
+
+        runPipeline(leftInset: 28, rightInset: 28, expectedWrapperInset: 16, expectedBridgePadding: 0)
+        runPipeline(leftInset: 24, rightInset: 12, expectedWrapperInset: 12, expectedBridgePadding: 4)
+        runPipeline(leftInset: -8, rightInset: 5, expectedWrapperInset: 0, expectedBridgePadding: 16)
 
         // Extreme finite geometry is proportionally bounded so left+right never
         // consumes more than the space outside the 60%-wide main-column floor.
-        ctx.evaluateScript("alignBodyLevelDisclosure([ownedWrapper], 1000, 1000, 40);")
-        #expect(ctx.evaluateScript("ownedApplied['margin-left']")?.toString() == "20px|important")
-        #expect(ctx.evaluateScript("ownedApplied['margin-right']")?.toString() == "20px|important")
+        let boundContext = JSContext()!
+        boundContext.evaluateScript("""
+        var applied = {};
+        var wrapper = { style: { setProperty: function(name, value, priority) {
+            applied[name] = value + '|' + priority;
+        } } };
+        \(_alignBodyLevelDisclosureJS)
+        alignBodyLevelDisclosure([wrapper], 1000, 1000, 40);
+        """)
+        #expect(boundContext.exception == nil, "alignment JS threw: \(boundContext.exception?.toString() ?? "")")
+        #expect(boundContext.evaluateScript("applied['margin-left']")?.toString() == "20px|important")
+        #expect(boundContext.evaluateScript("applied['margin-right']")?.toString() == "20px|important")
     }
 
     @Test("fixDarkModeColorsJS dims only LIGHT LOW-SATURATION text fills — preserves textless + saturated colors")

@@ -266,9 +266,12 @@
 > directly under `<body>`, outside the sender's indented content container, while quote wrappers
 > live inside that container. `collapseICSJS` now marks the generated wrapper `.tm-ics-wrapper`,
 > retains the exact app-created node references in the isolated content world, and
-> `eatGutterMarginsJS` applies its already-measured `minLeft`/`minRight` main-column insets only to
-> those nodes. A sender-spoofed class is not treated as ownership. Negative overflow-side insets
-> clamp to zero, and combined positive insets cannot consume the measured 60%-wide column floor.
+> `eatGutterMarginsJS` derives one symmetric absorbed inset from the smaller measured main-column
+> side, clamps it to the app's 16-point gutter, and applies that value only to those nodes. It posts
+> the remaining SwiftUI padding as `16 - inset`, so the owned wrapper margin plus native padding is
+> always 16 points per edge instead of copying the sender's raw indentation. A sender-spoofed class
+> is not treated as ownership. Negative overflow-side insets clamp to zero, and combined positive
+> insets cannot consume the measured 60%-wide column floor.
 > Regression coverage: `EmailRenderPipelineTests.disclosureTogglesTagAppliedHeight`, the real
 > production-WKWebView canary `RenderContentWorldIsolationTests.disclosureHeightTagIsAtomic`,
 > `.inviteDisclosureAlignsToEmailInset`, and

@@ -4542,18 +4542,6 @@ private var eatGutterMarginsJS: String {
                 var ri = b.right - r.right; if (ri < minRight) minRight = ri;
             }
             if (!isFinite(minLeft) || !isFinite(minRight)) { gl('no wide text content — keep 16'); return; }
-            // The invite card is app-owned and appended at body level, so it does
-            // not inherit the sender's content-column inset the way an in-body
-            // quote wrapper does. Apply the measured per-side inset only to that
-            // exact app-created wrappers before the height/fit pipeline measures
-            // layout. `bw - WIDE` preserves the same 60%-wide column floor even
-            // when hostile/off-body geometry reports an extreme positive inset.
-            alignBodyLevelDisclosure(
-                window.__tmICSDisclosureWrappers || [],
-                minLeft,
-                minRight,
-                bw - WIDE
-            );
             // SYMMETRIC reduction: reduce BOTH sides by the SMALLER inset, clamped
             // [0, GUTTER]. Using the min keeps the gutter symmetric so content can
             // never end up flush on one side while padded on the other — the
@@ -4563,6 +4551,19 @@ private var eatGutterMarginsJS: String {
             // (overflow) inset → 0 → no reduction (overflowing/desktop emails are
             // handled by fitViewportJS's widen, not by the gutter).
             var x = Math.max(0, Math.min(minLeft, minRight, GUTTER));
+            // The invite card is app-owned and appended at body level, so it does
+            // not inherit the sender's content-column inset the way an in-body
+            // quote wrapper does. Apply the same symmetric inset the SwiftUI gutter
+            // absorbs, and only to the exact app-created wrappers, before the
+            // height/fit pipeline measures layout. `bw - WIDE` preserves the same
+            // 60%-wide column floor even when hostile/off-body geometry reports an
+            // extreme positive inset.
+            alignBodyLevelDisclosure(
+                window.__tmICSDisclosureWrappers || [],
+                x,
+                x,
+                bw - WIDE
+            );
             var pad = GUTTER - x;
             gl('emailInset L=' + Math.round(minLeft) + ' R=' + Math.round(minRight)
                 + ' → SwiftUI pad ' + pad + ' (both, ' + (cp ? cp.tagName + '.' + (cp.className || '') : '?') + ')');
