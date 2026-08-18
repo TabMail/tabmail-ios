@@ -11,6 +11,11 @@
 best-effort, and self-healing. Keep the row open because a much larger multi-inbox backlog can still
 cross the standing threshold; do not change production code from the evidence recorded here.
 
+⚠️ **SUPERSEDED DISPOSITION (2026-08-18) — this record is now `accepted`, not `open`, and GitHub #12 is
+CLOSED by owner decision.** Everything above stays true and still governs; only the disposition moved.
+Read *🧾 OWNER DISPOSITION 2026-08-18* at the end of this file for the decision, the unchanged
+reopening gate, the device-measurement checklist, and the do-not-ship-yet fix.
+
 ## Subsystem and search terms
 
 `UnreadCountManager`; `recordRecentUnreadForNSE`; `nseBadgeDedupRecentIds`;
@@ -162,3 +167,89 @@ a realistically much larger unread population (start at 50,000), and the stateme
 date tie-break as cleanup: the current query defines no order among equal dates, and the independent
 audit measured `ORDER BY date DESC, id ASC` as destroying the hinted plan's benefit. A surviving code
 candidate needs an invariant/plan test, not a timing assertion.
+
+## 🧾 OWNER DISPOSITION 2026-08-18 — ACCEPTED LATENT LIMITATION; GitHub #12 CLOSED
+
+**Owner decision (2026-08-18): this record moves from `open` to ACCEPTED LATENT LIMITATION, and GitHub
+issue [#12](https://github.com/TabMail/tabmail-ios/issues/12) is CLOSED by that decision.** No
+production code changed with this disposition. `UnreadCountManager.recordRecentUnreadForNSE` still
+issues the statement quoted above, unhinted, exactly as shipped.
+
+**The reopening condition does not move.** It is the *Confirmation gate* and *Disposition* text above,
+verbatim: re-enter the implementation gate only with an exact **device** measurement taken with **at
+least two inbox-role folders**, a realistically much larger unread population (**start at 50,000**),
+and the statement itself exceeding **~100 ms**. Closing #12 removes a tracker row that could not be
+advanced without owner-only hardware; it does not relax, retire, or reinterpret that gate. **This
+record is the fence** — anyone who wants to change code here must produce the device number first.
+
+### Verification behind the decision (2026-08-18)
+
+- The statement's source is **unchanged since the record was written**. The `UnreadCountManager` blob is
+  git-identical at every record-touching commit and at `cdf11a6e5`; the file contains **zero**
+  `INDEXED BY` tokens; `SyncConfig.nseBadgeDedupRecentLimit` is still 200.
+- **No later amendment supersedes the "ship no code from this measurement" instruction.**
+- The fail-safe direction is intact: `catch { return }`, gated on
+  `UIApplication.shared.applicationState == .active`, and running **after** the authoritative badge
+  write. A skipped optimization therefore costs only a transient NSE over-count that the next absolute
+  main-app recount corrects.
+
+### Device-measurement checklist — how to cross the gate (steps 2–4 need the physical device)
+
+0. **Precondition screen (10 s).** The app-icon badge equals `SUM(folder.unreadCount)` over `role =
+   inbox` folders of ACTIVE accounts. If it is not in the tens of thousands, the ≥50,000 population
+   precondition already fails — stop. The badge is a **lower bound**: the slow statement also walks
+   inactive accounts' inboxes.
+1. Confirm **≥2 inbox-role folders** (≥2 configured accounts). At one folder the statement measured
+   0.110 ms with no sorter — exposure starts at two.
+2. Add a **temporary debug-gated probe** inside `recordRecentUnreadForNSE`: copy the `explainLogged`
+   one-shot template from `BackfillEmbeddingQueue.repopulateFromDatabase` and gate on
+   `DebugModeManager.isLoggingEnabled()`. Log in ONE pass — `EXPLAIN QUERY PLAN` of the **exact
+   production statement built by the same code** (never a retyped copy); `inboxFolderIds.count`; the
+   in-scope unread `COUNT(*)`; `SELECT idx, stat FROM sqlite_stat1 WHERE tbl = 'messageHeader'`; and the
+   first read plus **≥30 warm repetitions with median and p95**. Never conflate the first read with the
+   warm ones.
+3. Capture on device: unlock debug mode (tap the version label in Settings 10×; `@tabmail.ai` accounts
+   are allowlisted), foreground the app so `updateBadge` fires with `totalUnread > 0`, collect the log.
+4. **Validity.** The measurement is INVALID if the plan shows `SCAN … USING INDEX messageHeader_date`
+   (the small-scale flip — retake at volume), or if unread < ~50,000, or if inbox folders < 2. A present
+   `USE TEMP B-TREE FOR ORDER BY` is **NOT a finding** — it survives the winning plan (`MIS-007`
+   instance 81). State the `sqlite_stat1` regime alongside every number.
+5. **Decide.** Warm median > ~100 ms ⇒ the gate is crossed and the pre-designed fix below becomes valid.
+   Otherwise record the number in this file, leave the record accepted, and ship nothing.
+
+**Optional Mac pre-screen** (Download Container → `sqlite3`) can only rule the gate OUT. Mac timings
+understate the device by 2–4×, so a warm median well under ~25 ms means the device cannot exceed
+~100 ms. It can never cross the gate.
+
+### Pre-designed fix — ⛔ DO NOT SHIP; valid only after the gate is crossed
+
+One clause and nothing else: `FROM messageHeader INDEXED BY messageHeader_folderId_isRead_date` in
+`recordRecentUnreadForNSE`.
+
+- **Forbidden alongside it:** a per-folder rewrite, and a `date DESC, id ASC` tie-break — the tie-break
+  was independently measured as destroying the hinted plan's benefit.
+- `messageHeader_folderId_isRead_date` is a **blocking migration index**
+  (`v62_inboxQueryUnreadDateIndex`) and **must never** be moved to
+  `SyncEngineMaintenance.deferredIndexes`: `IOS-PERF-005` records that `INDEXED BY` **errors** when the
+  named index is missing. Here that failure direction is safe (the optimization is skipped), but that is
+  a property of this callsite, not a licence to defer the index.
+- Why `IOS-PERF-004`'s "leave it to the planner" does **not** transfer: the hinted index
+  `(folderId, isRead, date)` is a strict prefix-superset of the planner's `(folderId, isRead)` —
+  identical seek selectivity, no crossover population — and at one inbox folder the hint is a no-op.
+
+### Test plan for that fix — only if and when it ships
+
+- Extract the statement to a named static, e.g.
+  `UnreadCountManager.recentUnreadForNSESQL(inboxFolderCount:)`. Precedents already in the tree:
+  `MessageContentStore.ownersSQL`, `InboxListReader.durableQuerySQL`,
+  `DurableIdentityLookup.rfc822FallbackSQL`, `AccountManager.inboxEntryAITargetSQL`.
+- Plan witness in `DatabaseIndexTests` under **both** statistics regimes.
+- Two-sided `MIS-030` control: strip the hint token, assert the statement string changed, assert the plan
+  reverts to `messageHeader_folderId_isRead`.
+- Do **not** assert that the temporary B-tree disappears — it survives the winning plan, and asking that
+  question is exactly the predicate error this record already corrected once.
+- Result identity hinted vs unhinted on a seeded ≥2-inbox fixture with DISTINCT dates, or compare as
+  sets.
+- Assert the blocking-index invariant. **No timing assertion.**
+- Update this record and the `KNOWN_ISSUES.md` row with the device number at that point; re-registering a
+  GitHub tracker row is the owner's call, since #12 was closed on 2026-08-18.
