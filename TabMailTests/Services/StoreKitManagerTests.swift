@@ -480,3 +480,52 @@ struct StoreKitManagerRestoreGateTests {
         #expect(manager.shouldOpenGateForRestoredEntitlement(currentUserId: userB.uppercased()) == false)
     }
 }
+
+// MARK: - Subscription-Management Presentation Result Tests
+
+/// `StoreKitManager.presentManageSubscriptions()` itself cannot be unit tested —
+/// it needs a live `UIWindowScene` and Apple's native sheet (see `IOS-TEST-004`
+/// for the same constraint on `UIWindow()` in view tests). What IS testable, and
+/// what every caller's behaviour hangs on, is the shape of its result: the
+/// account-deletion gate refuses unless the sheet was actually presented, and the
+/// two billing surfaces treat a missing window scene differently from a thrown
+/// presentation error.
+@Suite("StoreKit subscription-management presentation result")
+struct StoreKitSubscriptionManagementPresentationTests {
+
+    private struct PresentationFailure: Error {}
+
+    @Test("Only a presented sheet reports didPresent, so both failure shapes fail closed")
+    func didPresentIsTrueOnlyForAPresentedSheet() {
+        // The account-deletion gate consumes exactly this predicate: a false
+        // here becomes `.appleManagementUnavailable` and blocks the deletion.
+        #expect(SubscriptionManagementPresentation.presented.didPresent)
+        #expect(!SubscriptionManagementPresentation.noWindowScene.didPresent)
+        #expect(!SubscriptionManagementPresentation.failed(PresentationFailure()).didPresent)
+    }
+
+    @Test("A missing window scene and a thrown presentation error stay distinct cases")
+    func theTwoFailureShapesDoNotMatchEachOther() {
+        let noScene = SubscriptionManagementPresentation.noWindowScene
+        let failure = SubscriptionManagementPresentation.failed(PresentationFailure())
+
+        // Positive controls first: without these the two negatives below could
+        // pass simply because nothing matches anything.
+        var noSceneMatchedItsOwnCase = false
+        if case .noWindowScene = noScene { noSceneMatchedItsOwnCase = true }
+        var failureMatchedItsOwnCase = false
+        if case .failed = failure { failureMatchedItsOwnCase = true }
+        #expect(noSceneMatchedItsOwnCase)
+        #expect(failureMatchedItsOwnCase)
+
+        // The asymmetry the plan picker and account dashboard rely on: they skip
+        // the post-sheet refresh only on `.noWindowScene`, and fall through to it
+        // after logging on `.failed`.
+        var noSceneMatchedFailed = false
+        if case .failed = noScene { noSceneMatchedFailed = true }
+        var failureMatchedNoWindowScene = false
+        if case .noWindowScene = failure { failureMatchedNoWindowScene = true }
+        #expect(!noSceneMatchedFailed)
+        #expect(!failureMatchedNoWindowScene)
+    }
+}

@@ -5,6 +5,28 @@
 import StoreKit
 import Observation
 import Synchronization
+import UIKit
+
+/// Outcome of presenting Apple's native subscription-management sheet.
+///
+/// Three-valued on purpose. Callers distinguish "there was no window scene to
+/// present from, so nothing was shown and nothing followed" from "the sheet was
+/// requested and StoreKit threw", because the two call for different follow-up:
+/// the billing surfaces still refresh after a throw but not after a missing
+/// scene, while account deletion refuses on both.
+enum SubscriptionManagementPresentation {
+    case presented
+    case noWindowScene
+    case failed(Error)
+
+    /// True only when Apple's sheet was actually presented. A caller that gates
+    /// a destructive flow on this — account deletion — therefore fails closed on
+    /// both the missing-scene and the thrown-error outcomes.
+    var didPresent: Bool {
+        if case .presented = self { return true }
+        return false
+    }
+}
 
 enum AccountDeletionStoreKitRenewalEvidence: Equatable, Sendable {
     case unverified
@@ -152,6 +174,30 @@ final class StoreKitManager {
         } catch {
             restoreResult = SyncEngine.isConnectionError(error) ? "Connection failed. Please check your network and try again." : "Restore failed: \(error.localizedDescription)"
             print("[StoreKit] Restore failed: \(error)")
+        }
+    }
+
+    // MARK: - Subscription Management
+
+    /// Presents Apple's native subscription-management sheet.
+    ///
+    /// The single place the app looks up a window scene for StoreKit and calls
+    /// `AppStore.showManageSubscriptions(in:)`. Each caller keeps its own refresh
+    /// policy and error copy by switching on the result, so this helper
+    /// deliberately logs nothing and surfaces nothing to the user.
+    static func presentManageSubscriptions() async -> SubscriptionManagementPresentation {
+        // `Info.plist` sets `UIApplicationSupportsMultipleScenes` to `false`, so
+        // the app has at most one `UIWindowScene` and `.first` is deterministic.
+        guard let windowScene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene }).first else {
+            return .noWindowScene
+        }
+
+        do {
+            try await AppStore.showManageSubscriptions(in: windowScene)
+            return .presented
+        } catch {
+            return .failed(error)
         }
     }
 
