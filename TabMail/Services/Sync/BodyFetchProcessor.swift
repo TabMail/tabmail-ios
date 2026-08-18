@@ -194,104 +194,6 @@ enum BodyFetchProcessor {
         let snippet: String
     }
 
-    /// The body producer's authority to enqueue AI after it makes a body durable.
-    /// Automatic ActiveBodyQueue work must stay inside the configured recent population
-    /// as ActiveAIQueue repopulation. Explicit user-visible fetches are a
-    /// direct event, like a proved move or NSE push, and may process their selected
-    /// message outside that window.
-    enum AIEnqueueScope: Sendable {
-        case automaticRecentWindow
-        case directEvent(target: AIWriteTarget)
-    }
-
-    /// The direct body pipeline is separated by network, renderer, FTS, and GRDB
-    /// awaits. A bare header id is therefore never enough authority for its final
-    /// writes: a UID turnover can seat a different message at that same address.
-    /// Re-resolve the identity captured from the user's displayed snapshot at each
-    /// GRDB mutation boundary, and require the exact live Inbox coordinates carried
-    /// by the fetch item.
-    nonisolated static func directTargetStillOwnsItem(
-        _ target: AIWriteTarget,
-        item: Item,
-        db: Database
-    ) throws -> Bool {
-        guard let current = try target.resolveLiveInboxHeader(db: db) else { return false }
-        return current.id == item.headerId
-            && current.accountId == item.accountId
-            && current.folderPath == item.folderPath
-            && current.messageId == item.messageId
-    }
-
-    /// The processed record deliberately carries only the durable header/content
-    /// keys used after FTS. The captured target still proves the full provider
-    /// identity and live-Inbox coordinates; the final handoff additionally binds
-    /// that proof to the processed header/account pair.
-    nonisolated static func directTargetStillOwnsItem(
-        _ target: AIWriteTarget,
-        item: ProcessedItem,
-        db: Database
-    ) throws -> Bool {
-        guard let current = try target.resolveLiveInboxHeader(db: db) else { return false }
-        return current.id == item.headerId && current.accountId == item.accountId
-    }
-
-    /// Final GRDB acknowledgement after FTS. Kept as one production helper so
-    /// invariant tests can prove the direct target is re-resolved at the actual
-    /// `bodyComplete`/enqueue admission boundary, rather than blessing a mirrored
-    /// predicate that the live flush might not call.
-    nonisolated static func finalizeConfirmedItems(
-        _ items: [ProcessedItem],
-        aiEnqueueScope: AIEnqueueScope,
-        db: Database
-    ) throws -> [ProcessedItem] {
-        var durable: [ProcessedItem] = []
-        for item in items {
-            if case .directEvent(let target) = aiEnqueueScope,
-               try !directTargetStillOwnsItem(target, item: item, db: db)
-            {
-                continue
-            }
-            try db.execute(
-                sql: """
-                    UPDATE messageHeader
-                    SET snippet = ?, bodyComplete = 1, missFetchCount = 0
-                    WHERE id = ? AND bodyEmptyConfirmed = 0
-                    """,
-                arguments: [item.snippet, item.headerId]
-            )
-            guard db.changesCount == 1 else { continue }
-            if case .directEvent(_) = aiEnqueueScope {
-                try ActiveAIQueue.markDirectPending(
-                    headerIds: [item.headerId], db: db)
-            }
-            durable.append(item)
-        }
-        return durable
-    }
-
-    /// Production boundary for the automatic body producer. Reuses the AI
-    /// queue's bounded selector instead of mirroring its SQL, so a cold-start
-    /// ActiveBodyQueue pass cannot turn every old incomplete inbox body into
-    /// model work after the executor-level age gate is removed.
-    struct AIEnqueueCandidate: Sendable {
-        let item: ProcessedItem
-        let candidate: ActiveAIQueue.Candidate
-    }
-
-    nonisolated static func automaticAIEnqueueCandidates(
-        from confirmedItems: [ProcessedItem], db: Database
-    ) throws -> [AIEnqueueCandidate] {
-        let inboxItems = confirmedItems.filter(\.isInInbox)
-        guard !inboxItems.isEmpty else { return [] }
-        let selected = Dictionary(uniqueKeysWithValues:
-            try ActiveAIQueue.repopulationCandidates(db: db).map { ($0.headerId, $0) })
-        return inboxItems.compactMap { item in
-            selected[item.headerId].map {
-                AIEnqueueCandidate(item: item, candidate: $0)
-            }
-        }
-    }
-
     /// Process phase: write MessageBody to GRDB, return data for batched FTS write.
     /// FTS writes are deferred to the caller for batching (avoids per-item FTS overhead).
     ///
@@ -302,8 +204,7 @@ enum BodyFetchProcessor {
     static func process(
         fetchResult: FetchResult,
         enableAI: Bool,
-        replaceExistingBody: Bool = false,
-        directTarget: AIWriteTarget? = nil
+        replaceExistingBody: Bool = false
     ) async -> (Result, ProcessedItem?) {
         let item = fetchResult.item
         let dbPool = AppDatabase.dbPool
@@ -345,28 +246,13 @@ enum BodyFetchProcessor {
         if let plainText = fetchResult.plainText, !plainText.isEmpty {
             // Has text content — write body and return data for FTS batching.
             do {
-                let persisted = try await dbPool.write { db -> Bool in
-                    if let directTarget,
-                       try !directTargetStillOwnsItem(
-                           directTarget, item: item, db: db)
-                    {
-                        return false
-                    }
+                try await dbPool.write { db in
                     try persistDisplayableBody(
                         bodyToInsert,
                         item: item,
                         replaceExistingBody: replaceExistingBody,
                         db: db)
-                    if directTarget != nil {
-                        // A confirmed-empty refresh could not carry the marker before
-                        // the fetch. Re-arm it in the same transaction that clears the
-                        // empty sentinel and makes the replacement body durable.
-                        try ActiveAIQueue.markDirectPending(
-                            headerIds: [item.headerId], db: db)
-                    }
-                    return true
                 }
-                guard persisted else { return (.retry, nil) }
             } catch {
                 // ADR-IOS-046: suspension aborts are expected + retryable (bodyComplete
                 // stays 0 → re-fetched next wake); only log genuine failures. Never
@@ -403,25 +289,13 @@ enum BodyFetchProcessor {
             // the invite. (Invites that ALSO carry a text/HTML body have non-empty
             // plainText and were already handled by the first branch.)
             do {
-                let persisted = try await dbPool.write { db -> Bool in
-                    if let directTarget,
-                       try !directTargetStillOwnsItem(
-                           directTarget, item: item, db: db)
-                    {
-                        return false
-                    }
+                try await dbPool.write { db in
                     try persistDisplayableBody(
                         bodyToInsert,
                         item: item,
                         replaceExistingBody: replaceExistingBody,
                         db: db)
-                    if directTarget != nil {
-                        try ActiveAIQueue.markDirectPending(
-                            headerIds: [item.headerId], db: db)
-                    }
-                    return true
                 }
-                guard persisted else { return (.retry, nil) }
             } catch {
                 if !error.isDatabaseSuspensionAbort {
                     print("[BodyFetch] Attachment-only MessageBody insert failed for \(item.headerId.prefix(30)): \(error)")
@@ -459,13 +333,7 @@ enum BodyFetchProcessor {
             if currentCount >= 2 {
                 // Third+ empty fetch — confirmed empty. Write empty body for UI and set flags.
                 do {
-                    let confirmed = try await dbPool.write { db -> Bool in
-                        if let directTarget,
-                           try !directTargetStillOwnsItem(
-                               directTarget, item: item, db: db)
-                        {
-                            return false
-                        }
+                    try await dbPool.write { db in
                         if replaceExistingBody {
                             try bodyToInsert.save(db)
                         } else {
@@ -476,7 +344,6 @@ enum BodyFetchProcessor {
                                 UPDATE messageHeader
                                 SET bodyEmptyConfirmed = 1,
                                     bodyComplete = 1,
-                                    aiDirectPending = 0,
                                     emptyFetchCount = emptyFetchCount + 1,
                                     summaryBlurb = 'This message has no content.',
                                     actionTag = ?,
@@ -486,9 +353,7 @@ enum BodyFetchProcessor {
                             """,
                             arguments: [ActionTag.delete.rawValue, ActionTag.delete.sortOrder, item.headerId]
                         )
-                        return true
                     }
-                    guard confirmed else { return (.retry, nil) }
                 } catch {
                     if !error.isDatabaseSuspensionAbort {
                         print("[BodyFetch] Confirmed-empty flag write failed for \(item.headerId.prefix(30)): \(error)")
@@ -504,20 +369,12 @@ enum BodyFetchProcessor {
                 // Don't write empty body or set bodyEmptyConfirmed.
                 print("[BodyFetch] First empty fetch for \(item.headerId.prefix(30)) — will confirm on next attempt")
                 do {
-                    let incremented = try await dbPool.write { db -> Bool in
-                        if let directTarget,
-                           try !directTargetStillOwnsItem(
-                               directTarget, item: item, db: db)
-                        {
-                            return false
-                        }
+                    try await dbPool.write { db in
                         try db.execute(
                             sql: "UPDATE messageHeader SET emptyFetchCount = emptyFetchCount + 1 WHERE id = ?",
                             arguments: [item.headerId]
                         )
-                        return true
                     }
-                    guard incremented else { return (.retry, nil) }
                 } catch {
                     if !error.isDatabaseSuspensionAbort {
                         print("[BodyFetch] emptyFetchCount increment failed for \(item.headerId.prefix(30)): \(error)")
@@ -574,11 +431,7 @@ enum BodyFetchProcessor {
 
     /// Flush a batch of processed items to FTS + GRDB flags in one go.
     /// Batching FTS writes avoids per-item FTS5 index maintenance overhead.
-    static func flushBatch(
-        _ items: [ProcessedItem],
-        enableAI: Bool,
-        aiEnqueueScope: AIEnqueueScope
-    ) async {
+    static func flushBatch(_ items: [ProcessedItem], enableAI: Bool) async {
         guard !items.isEmpty else { return }
         let t0 = CFAbsoluteTimeGetCurrent()
         let dbPool = AppDatabase.dbPool
@@ -615,60 +468,29 @@ enum BodyFetchProcessor {
         // ⚠ Membership is tested on the CONTENT key (that is what `updateBodies`
         // returns); the flip below binds the HEADER id. Do not collapse the two.
         let confirmedItems = items.filter { writtenToFts.contains($0.contentKey) }
-        let durableConfirmedItems: [ProcessedItem]
         do {
-            durableConfirmedItems = try await dbPool.write { db in
-                try Self.finalizeConfirmedItems(
-                    confirmedItems, aiEnqueueScope: aiEnqueueScope, db: db)
+            try await dbPool.write { db in
+                for item in confirmedItems {
+                    // Reset missFetchCount=0 on success: a prior run may have accumulated
+                    // misses against this header (e.g. IMAP flap). Now that we have real
+                    // content, the miss chain is broken — start counting fresh next time.
+                    try db.execute(
+                        sql: "UPDATE messageHeader SET snippet = ?, bodyComplete = 1, missFetchCount = 0 WHERE id = ?",
+                        arguments: [item.snippet, item.headerId]
+                    )
+                }
             }
         } catch {
             if !error.isDatabaseSuspensionAbort {
                 print("[BodyFetch] flushBatch snippet/bodyComplete write failed (\(confirmedItems.count) items): \(error)")
             }
-            durableConfirmedItems = []
         }
         let dbMs = Int((CFAbsoluteTimeGetCurrent() - tDb) * 1000)
 
         // 3. Enqueue downstream processing — only for items actually written to FTS.
-        // ActiveBodyQueue is an AUTOMATIC producer and repopulates every incomplete
-        // inbox body without a LIMIT, so it must be intersected with the bounded AI
-        // selector here. Direct user fetches keep their explicit-event authority.
-        let aiItems: [AIEnqueueCandidate]
-        if enableAI {
-            switch aiEnqueueScope {
-            case .automaticRecentWindow:
-                do {
-                    aiItems = try await dbPool.read { db in
-                        try Self.automaticAIEnqueueCandidates(
-                            from: durableConfirmedItems, db: db)
-                    }
-                } catch {
-                    // The body and its nil AI fields stay durable, so queue repopulation
-                    // can recover on a later drain/foreground. Refuse only this derived
-                    // automatic enqueue when its policy boundary cannot be read.
-                    if !error.isDatabaseSuspensionAbort {
-                        print("[BodyFetch] Automatic AI candidate selection failed: \(error)")
-                    }
-                    aiItems = []
-                }
-            case .directEvent(let target):
-                // The GRDB finalization transaction above re-resolved the original
-                // opened-message target. Only that admitted subset can enqueue.
-                aiItems = durableConfirmedItems.map {
-                    AIEnqueueCandidate(
-                        item: $0,
-                        candidate: ActiveAIQueue.Candidate(
-                            target: target, authority: .direct))
-                }
-            }
-        } else {
-            aiItems = []
-        }
-        let aiByHeaderId = Dictionary(uniqueKeysWithValues:
-            aiItems.map { ($0.item.headerId, $0.candidate) })
-        for item in durableConfirmedItems {
-            if let candidate = aiByHeaderId[item.headerId] {
-                await ActiveAIQueue.shared.enqueue(candidate)
+        for item in confirmedItems {
+            if enableAI && item.isInInbox {
+                await ActiveAIQueue.shared.enqueue(headerId: item.headerId, accountId: item.accountId)
             }
             if enableAI {
                 await ActiveEmbeddingQueue.shared.enqueue(headerId: item.headerId)
@@ -816,8 +638,7 @@ enum BodyFetchProcessor {
         item: Item,
         provider: any EmailProvider,
         enableAI: Bool,
-        replaceExistingBody: Bool = false,
-        directTarget: AIWriteTarget? = nil
+        replaceExistingBody: Bool = false
     ) async -> Result {
         let fetchResult = await fetch(item: item, provider: provider)
         switch fetchResult {
@@ -825,16 +646,9 @@ enum BodyFetchProcessor {
             let (outcome, processed) = await process(
                 fetchResult: result,
                 enableAI: enableAI,
-                replaceExistingBody: replaceExistingBody,
-                directTarget: directTarget)
+                replaceExistingBody: replaceExistingBody)
             if let processed {
-                let scope: AIEnqueueScope = if let directTarget {
-                    .directEvent(target: directTarget)
-                } else {
-                    .automaticRecentWindow
-                }
-                await flushBatch(
-                    [processed], enableAI: enableAI, aiEnqueueScope: scope)
+                await flushBatch([processed], enableAI: enableAI)
             }
             return outcome
         case .failure(let result):

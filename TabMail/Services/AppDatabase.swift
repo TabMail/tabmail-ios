@@ -1999,7 +1999,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v86 RANGE ─────────────────────
+        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v87 RANGE ─────────────────────
         //
         // `registerTimedMigration`'s DEFAULT stays `.deferred` and is NOT
         // changed. v1…v67 have never been adjudicated for `.immediate` safety,
@@ -2068,6 +2068,9 @@ final class AppDatabase: Sendable {
         //     index starts empty. Creating triggers mutates no row or key.
         //   • v86 — one `folder` role-change trigger. Creating a trigger mutates no
         //     row or key; its later UPDATE targets only a non-key header column.
+        //   • v87 — drops only v85/v86's direct-AI triggers, sparse index and two
+        //     non-key marker columns. It neither reads nor rewrites an FK-bearing
+        //     value; existing derived-work markers are intentionally discarded.
         //
         //   • v82 — `DROP`/`CREATE` of `userLabel` + `messageUserLabel`. FK-clean
         //     per statement, verified statement by statement in that migration's own
@@ -2078,16 +2081,16 @@ final class AppDatabase: Sendable {
         //     the body safe.
         //
         // ⚑ AMENDED 2026-08-06, RANGE RE-DERIVED AT R17-6 — **EVERY MIGRATION IN
-        // v68…v86 NOW RUNS `.immediate`, so this range runs ZERO whole-database
+        // v68…v87 NOW RUNS `.immediate`, so this range runs ZERO whole-database
         // foreign-key checks.** The range is an OPEN interval that moves with the
         // top of the chain, so it is re-derived rather than restated (`MIS-031` — a
         // sentence that enumerates is a cache, and this one had gone stale at `v84`
         // in five places at once). Comments excluded so this paragraph cannot
         // satisfy its own predicate (`MIS-033`, `IOS-DOC-002`):
         //   rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' \
-        //      TabMail/Services/AppDatabase.swift                            → 19
+        //      TabMail/Services/AppDatabase.swift                            → 20
         //   rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' \
-        //      TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 19
+        //      TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 20
         // Equal counts are the invariant: every migration from v68 to the top runs
         // `.immediate`, and none below v68 does. The sentence
         // that stood here said *"`v71` and `v82` stay `.deferred`, each for a
@@ -3005,7 +3008,12 @@ final class AppDatabase: Sendable {
             //          `.deferred`, **66** default ⇒ **67 of 86** end with the
             //          whole-database check and 19 do not. The 67 is unchanged
             //          because v86 joined the immediate side.
-            //          ⚠️ THIS MIGRATION IS ONE OF THE 19: reason (b) below is now a
+            //          Re-derived after v87: **87** registered, **20** explicit
+            //          `.immediate` (v68…v87, contiguous), **1** explicit
+            //          `.deferred`, **66** default ⇒ **67 of 87** end with the
+            //          whole-database check and 20 do not. The 67 is unchanged
+            //          because v87 joined the immediate side.
+            //          ⚠️ THIS MIGRATION IS ONE OF THE 20: reason (b) below is now a
             //          statement about migrations that
             //          ran on shipped devices long ago, not about this chain.
             //          Confirmed against GRDB's own
@@ -3636,6 +3644,34 @@ final class AppDatabase: Sendable {
                       AND accountId = OLD.accountId;
                 END
             """)
+        }
+
+        // v87 — retire PR #39's durable direct-AI exception machinery.
+        //
+        // v85 and v86 remain immutable because databases may already record those
+        // identifiers. This forward migration removes their runtime schema instead:
+        // derived AI work is again bounded solely by the newest
+        // `SyncConfig.maxRecentEmails` Inbox rows, with no durable bypass that can
+        // keep an old message cycling through the body and AI queues.
+        //
+        // Trigger and index names are dropped before their referenced columns.
+        // Existing true bits are intentionally discarded; they represent derived,
+        // recomputable work rather than authored content or a user intention.
+        migrator.registerTimedMigration(
+            "v87_retireDirectAIPending", foreignKeyChecks: .immediate
+        ) { db in
+            for trigger in [
+                "folder_retireDirectAIOnInboxRoleExit",
+                "messageHeader_clearDirectPendingOnInboxExit",
+                "messageHeader_clearDirectPendingCache",
+                "messageHeader_clearDirectPendingCacheOnDelete",
+                "messageHeader_restoreDirectPendingAfterInsert",
+            ] {
+                try db.execute(sql: "DROP TRIGGER IF EXISTS \(trigger)")
+            }
+            try db.execute(sql: "DROP INDEX IF EXISTS messageHeader_directAIPending")
+            try db.execute(sql: "ALTER TABLE messageHeader DROP COLUMN aiDirectPending")
+            try db.execute(sql: "ALTER TABLE messageAICache DROP COLUMN aiDirectPending")
         }
     }
 

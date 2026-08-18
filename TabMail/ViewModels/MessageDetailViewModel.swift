@@ -980,7 +980,6 @@ final class MessageDetailViewModel {
         // Re-check across the await: a concurrent path (staged-publish seed,
         // merge-commit refresh) may have set the header while we read.
         guard message == nil else { return }
-        _ = await manager.recordOpenedDirectIntent(m, in: dbPool)
         applyOverlay(to: &m)
         // Skeleton → content dissolve, same as loadBody/seedFromStagedPublish.
         withAnimation(Theme.detailContentDissolve) { message = m }
@@ -1028,12 +1027,6 @@ final class MessageDetailViewModel {
                 // by the inbox-reload/nav churn and deferred here — adopt it NOW
                 // instead of waiting on the first 2s tick.
                 if await self.adoptReadyBody(source: "poll IMMEDIATE check") {
-                    if let opened = self.message {
-                        let database = self.dbPool
-                        self.manager.enqueueWriteFromSynchronousContext { [manager = self.manager, database] in
-                            await manager.processOpenedMessage(opened, in: database)
-                        }
-                    }
                     self.loadThreadMessagesAsync()
                     if self.message != nil { return }
                     // Body adopted but the header is still missing (cancelled
@@ -1069,12 +1062,6 @@ final class MessageDetailViewModel {
                 // before the persisting server fetch below (round-3 audit) — a
                 // durable miss must fall through so hasBody/FTS/AI get a real body.
                 if await self.adoptReadyBody(source: "poll (DB, 2s cadence)", allowStagedFallback: false) {
-                    if let opened = self.message {
-                        let database = self.dbPool
-                        self.manager.enqueueWriteFromSynchronousContext { [manager = self.manager, database] in
-                            await manager.processOpenedMessage(opened, in: database)
-                        }
-                    }
                     self.loadThreadMessagesAsync()
                     return
                 }
@@ -1317,7 +1304,6 @@ final class MessageDetailViewModel {
             messageNotFound = true
             return
         }
-        _ = await manager.recordOpenedDirectIntent(msg, in: dbPool)
         // Apply overlay to a separate copy for UI state — `msg` stays
         // DB-faithful so downstream fetchBody/processOpenedMessage use the
         // real (unmoved) folderPath, not an optimistic overlay value.
@@ -1366,9 +1352,8 @@ final class MessageDetailViewModel {
                 BootProfiler.mark("detail body CACHE HIT \(rid.prefix(24))")
                 messageBody = existingBody
                 isLoading = false
-                let database = dbPool
-                manager.enqueueWriteFromSynchronousContext { [manager, database] in
-                    await manager.processOpenedMessage(msg, in: database)
+                manager.enqueueWriteFromSynchronousContext { [manager] in
+                    await manager.processOpenedMessage(msg)
                 }
                 loadThreadMessagesAsync()
                 return
@@ -1393,9 +1378,8 @@ final class MessageDetailViewModel {
             BootProfiler.mark("detail body from STAGED snapshot (phase-2 not durable yet) \(rid.prefix(24))")
             messageBody = stagedBody
             isLoading = false
-            let database = dbPool
-            manager.enqueueWriteFromSynchronousContext { [manager, database] in
-                await manager.processOpenedMessage(msg, in: database)
+            manager.enqueueWriteFromSynchronousContext { [manager] in
+                await manager.processOpenedMessage(msg)
             }
             loadThreadMessagesAsync()
             return
@@ -1984,12 +1968,8 @@ final class MessageDetailViewModel {
 
     /// Load body for a thread message on demand (when user expands a bubble)
     func loadThreadMessageBody(_ threadMsg: MessageHeader) async {
-        guard await manager.recordOpenedDirectIntent(threadMsg, in: dbPool) else { return }
         let hasBody = (try? await dbPool.read { db in try MessageBody.fetchOne(db, key: threadMsg.id) }) != nil
-        guard !hasBody else {
-            await manager.processOpenedMessage(threadMsg, in: dbPool)
-            return
-        }
+        guard !hasBody else { return }
         do {
             try await fetchBodyWithRetry(for: threadMsg)
         } catch {

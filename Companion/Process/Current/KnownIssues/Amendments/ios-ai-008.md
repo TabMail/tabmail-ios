@@ -1,13 +1,17 @@
 # IOS-AI-008
 
-- Register classification: `open`
+- Register classification: `resolved`
 - New post-freeze record (2026-08-15) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
 ## Status
 
-🔓 **OPEN — INTEGRATED FIX CANDIDATE (2026-08-15).** Post-drain sync
-prerequisites can no longer discard an already-recorded entered-inbox event.
+✅ **RESOLVED BY ROLLBACK (2026-08-17).** The uncapped entered-Inbox AI event
+promise is withdrawn. The post-drain resolver may enqueue only when the message belongs to the same
+bounded recent-Inbox population used by ordinary recovery; no durable exception survives queue loss.
+
+The sections below preserve the withdrawn PR #39 candidate as historical evidence. They do not
+describe current runtime behavior.
 
 ## Reachability and failure
 

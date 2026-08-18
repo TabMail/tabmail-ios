@@ -95,7 +95,7 @@ enum AIWriteOutcome: Sendable, Equatable { case written, dropped }
 /// same address carries the NEW epoch, so comparing the impostor's live stamp
 /// against the live folder epoch would agree and admit the wrong write — the
 /// captured stamp is what disagrees.
-struct AIWriteTarget: Sendable, Hashable {
+struct AIWriteTarget: Sendable, Equatable {
     let headerId: String
     let accountId: String
     let folderId: String
@@ -147,7 +147,6 @@ struct AIWriteTarget: Sendable, Hashable {
         accountId != DemoSeed.demoAccountId && (provider == .imap || provider == .icloud)
     }
 
-
     /// Capture once, before any await. Returns `nil` ONLY when the account row is
     /// missing (the provider cannot be determined). That arm cannot silently
     /// disable AI for a live message: `AccountManager.removeAccountRowsTxn`
@@ -155,21 +154,12 @@ struct AIWriteTarget: Sendable, Hashable {
     /// implies the header row is gone too and every write would be a no-op anyway.
     static func capture(message: MessageHeader, db: Database) throws -> AIWriteTarget? {
         guard let account = try Account.fetchOne(db, key: message.accountId) else { return nil }
-        return capture(message: message, provider: account.provider)
-    }
-
-    /// Query-bounded companion for selectors that already loaded the account set
-    /// in the same transaction. Keeping provider lookup outside the per-message
-    /// loop avoids turning the configured newest-N selector into N account reads.
-    static func capture(
-        message: MessageHeader, provider: AccountProvider
-    ) -> AIWriteTarget {
         return AIWriteTarget(
             headerId: message.id,
             accountId: message.accountId,
             folderId: message.folderId,
             messageId: message.messageId,
-            provider: provider,
+            provider: account.provider,
             observedUidValidity: message.observedUidValidity,
             rfc822MessageId: message.rfc822MessageId
         )
@@ -347,22 +337,6 @@ struct AIWriteTarget: Sendable, Hashable {
         guard capturedEpoch == liveEpoch else { return nil }
         return header
     }
-
-    /// Resolve the captured physical message and require that it is still inside
-    /// the account-owned live Inbox scope at the exact mutation boundary. A
-    /// preflight before an LLM or network await is not authority for a later write:
-    /// the row may be archived, the folder may be deleted, or its role/owner may
-    /// change while that work is in flight.
-    func resolveLiveInboxHeader(db: Database) throws -> MessageHeader? {
-        guard let header = try resolveCurrentHeader(db: db), header.isInInbox,
-              try Folder
-                .filter(Column("id") == header.folderId)
-                .filter(Column("accountId") == header.accountId)
-                .filter(Column("role") == FolderRole.inbox.rawValue)
-                .fetchCount(db) > 0
-        else { return nil }
-        return header
-    }
 }
 
 /// One database-snapshot input for the user-opened AI path. Keeping the body,
@@ -373,10 +347,10 @@ struct OpenedAIProcessingSnapshot: Sendable {
     let current: MessageHeader
     let target: AIWriteTarget
 
-    static func capture(message: MessageHeader, db: Database) throws -> Self? {
-        guard let target = try AIWriteTarget.capture(message: message, db: db),
-              let current = try target.resolveLiveInboxHeader(db: db),
-              let body = try MessageBody.fetchOne(db, key: current.id)
+    static func capture(headerId: String, db: Database) throws -> Self? {
+        guard let body = try MessageBody.fetchOne(db, key: headerId),
+              let current = try MessageHeader.fetchOne(db, key: headerId),
+              let target = try AIWriteTarget.capture(message: current, db: db)
         else { return nil }
         return Self(body: body, current: current, target: target)
     }
@@ -404,8 +378,7 @@ extension AccountManager {
         target: AIWriteTarget,
         _ mutate: (_ msg: inout MessageHeader, _ db: Database) throws -> Void
     ) throws -> AIWriteOutcome {
-        guard let resolved = try target.resolveLiveInboxHeader(db: db),
-              !resolved.bodyEmptyConfirmed else {
+        guard let resolved = try target.resolveCurrentHeader(db: db) else {
             if DebugModeManager.isLoggingEnabled() {
                 print("[AI] T4.V7 dropping guarded write for \(target.headerId) — captured identity no longer resolves")
             }
@@ -413,7 +386,6 @@ extension AccountManager {
         }
         var msg = resolved
         try mutate(&msg, db)
-        try ActiveAIQueue.clearDirectPendingIfComplete(headerId: msg.id, db: db)
         return .written
     }
 }
@@ -422,69 +394,23 @@ extension AccountManager {
 
     // MARK: - Direct Path (User-Opened Messages)
 
-    /// Durably record the display event before the detail loader chooses among
-    /// cached, staged, background-queued, or server-fetch body paths. The captured
-    /// identity is re-resolved inside this write, so a UID turnover or move cannot
-    /// turn an old tap into authority for the row now occupying that address.
-    @discardableResult
-    func recordOpenedDirectIntent(
-        _ message: MessageHeader,
-        in database: PrioritizedDatabase? = nil
-    ) async -> Bool {
-        guard message.isInInbox else { return true }
-        return await recordOpenedDirectTarget(message, in: database) != nil
-    }
-
-    /// The identity token carried through the direct body pipeline. Returning the
-    /// captured target (rather than only a Boolean) lets the post-network body and
-    /// enqueue transactions prove they still refer to the message the user opened.
-    /// `bodyEmptyConfirmed` may make the pre-fetch marker a deliberate no-op; a
-    /// successful replacement fetch re-marks atomically when it clears that state.
-    func recordOpenedDirectTarget(
-        _ message: MessageHeader,
-        in database: PrioritizedDatabase? = nil
-    ) async -> AIWriteTarget? {
-        guard message.isInInbox else { return nil }
-        let database = database ?? dbPool
-        do {
-            return try await database.write { db in
-                guard let target = try AIWriteTarget.capture(message: message, db: db),
-                      let current = try target.resolveLiveInboxHeader(db: db)
-                else { return nil }
-                try ActiveAIQueue.markDirectPending(headerIds: [current.id], db: db)
-                return target
-            }
-        } catch {
-            if !error.isDatabaseSuspensionAbort {
-                BackgroundSyncLogger.logError(
-                    "Opened-message direct intent could not be persisted for \(message.id): \(error)",
-                    source: "openedAI")
-            }
-            return nil
-        }
-    }
-
     /// Direct priority path for user-opened messages (matches TB's onMessagesDisplayed).
     /// Called when the user opens a message in MessageDetailView — bypasses the queue
     /// and processes AI immediately, mirroring how TB processes the displayed email
     /// inline rather than through the background drain loop.
-    func processOpenedMessage(
-        _ message: MessageHeader,
-        in database: PrioritizedDatabase? = nil
-    ) async {
-        // T4.V7: capture authority from the CALLER'S displayed snapshot, then
-        // resolve the current row and co-read its body in one transaction. Capturing
-        // from whichever row currently occupies `message.id` would turn a stale
-        // Summary retry or a UID-turnover race into authority for the replacement.
-        let database = database ?? dbPool
-        let opened: OpenedAIProcessingSnapshot? = try? await database.write {
-            db -> OpenedAIProcessingSnapshot? in
-            guard let snapshot = try OpenedAIProcessingSnapshot.capture(
-                message: message, db: db
+    func processOpenedMessage(_ message: MessageHeader) async {
+        // T4.V7: co-read the body AND capture the AI-write identity in ONE read.
+        // The target is captured from the CURRENT row at `message.id`, never from
+        // the caller's (possibly stale) snapshot — the caller's `observedUidValidity`
+        // could predate a resync. Zero extra round trips: the body read was already
+        // here.
+        let opened = (try? await dbPool.read { db -> OpenedAIProcessingSnapshot? in
+            guard try ActiveAIQueue.recentInboxWindowContains(
+                headerId: message.id,
+                db: db
             ) else { return nil }
-            try ActiveAIQueue.markDirectPending(headerIds: [snapshot.current.id], db: db)
-            return snapshot
-        }
+            return try OpenedAIProcessingSnapshot.capture(headerId: message.id, db: db)
+        }) ?? nil
         // body not yet fetched — fetchBody will trigger processMessage
         guard let opened, opened.current.isInInbox else { return }
         let body = opened.body
@@ -500,13 +426,10 @@ extension AccountManager {
             // T4.V7 site 8. A thrown DB error maps to `.dropped` here (the local
             // no-content shortcut has no failure-signal path) — either way NO
             // success side effect fires.
-            let outcome = (try? await database.write { db in
+            let outcome = (try? await dbPool.write { db in
                 try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
                     msg.summaryBlurb = "This message has no content."
                     msg.setActionTag(.delete)
-                    msg.bodyEmptyConfirmed = true
-                    msg.bodyComplete = true
-                    msg.cachedReply = ""
                     try msg.save(db)
                 }
             }) ?? .dropped
@@ -531,13 +454,12 @@ extension AccountManager {
         let hasSession = KeychainHelper.load(key: "tabmail_session") != nil
         guard hasSession && (!aiDisabled || deviceSyncEnabled) else { return }
 
-        guard let account = try? await database.read({ db in try Account.fetchOne(db, key: current.accountId) }) else {
+        guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: current.accountId) }) else {
             NotificationCenter.default.post(name: .aiDidFailForMessage, object: current.id)
             return
         }
         print("[AI] Priority direct path for opened message \(current.messageId)")
-        await processMessage(
-            current, body: body, account: account, target: target, in: database)
+        await processMessage(current, body: body, account: account, target: target)
     }
 
     /// Process a single message after its body is fetched (priority path for user-opened messages).
@@ -548,8 +470,7 @@ extension AccountManager {
         _ message: MessageHeader,
         body: MessageBody,
         account: Account,
-        target: AIWriteTarget,
-        in database: PrioritizedDatabase
+        target: AIWriteTarget
     ) async {
         // `processOpenedMessage` captured this body, header and write target in
         // one database snapshot. Re-reading by `message.id` here opened a
@@ -582,7 +503,7 @@ extension AccountManager {
         // "cc" needs positive evidence: the RECEIVING account's address in the
         // Cc header (claim set). All registered accounts feed the suppress set
         // only — a cross-account To/From hit prevents a claim, never makes one.
-        let allAccountEmails = (try? await database.read { db in
+        let allAccountEmails = (try? await dbPool.read { db in
             try Account.fetchAll(db).map(\.emailAddress)
         }) ?? []
         let recipientStatus = PromptVariables.classifyRecipientStatus(
@@ -611,8 +532,10 @@ extension AccountManager {
                 }
             }
 
+            let dbPool = self.dbPool
+
             // Double-check: fully processed by another path?
-            if let msg = try? await database.read({ db in try MessageHeader.fetchOne(db, key: headerId) }),
+            if let msg = try? await dbPool.read({ db in try MessageHeader.fetchOne(db, key: headerId) }),
                msg.summaryBlurb != nil, msg.summaryBlurb?.isEmpty == false,
                msg.actionTag != nil, msg.cachedReply != nil {
                 return
@@ -659,7 +582,7 @@ extension AccountManager {
                         // RE-RESOLVED row's `folderPath`/`rfc822MessageId`, not the
                         // job-start snapshot's, so a dropped write cannot leak X's
                         // result into Y's cache key either.
-                        let outcome = (try? await database.write { db in
+                        let outcome = (try? await dbPool.write { db in
                             try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
                                 msg.summaryBlurb = blurb
                                 msg.summaryTodos = summary.todos
@@ -718,8 +641,7 @@ extension AccountManager {
                         // `EmailNotificationBuilder.isImportant` — matches the NSE rule.
                         Task { @MainActor in
                             guard UIApplication.shared.applicationState != .active else { return }
-                            try? await self.postReplyNotificationIfNeeded(
-                                target: target, in: database)
+                            try? await self.postReplyNotificationIfNeeded(target: target)
                         }
 
                         print("[AI] Processed single message \(messageId)")
@@ -757,7 +679,7 @@ extension AccountManager {
                             // effect, and reporting the requested tag as if it had
                             // landed is exactly the misattribution this guards.
                             let written: (outcome: AIWriteOutcome, effective: ActionTag)? =
-                                try? await database.write { db in
+                                try? await dbPool.write { db in
                                     var effective = action
                                     let outcome = try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
                                         let resolved = (action == .reply && msg.isReplied) ? ActionTag.none : action
@@ -820,7 +742,7 @@ extension AccountManager {
                     )
                     if let reply {
                         // T4.V7 site 7.
-                        let outcome = (try? await database.write { db in
+                        let outcome = (try? await dbPool.write { db in
                             try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
                                 msg.cachedReply = reply
                                 try msg.save(db)
@@ -979,13 +901,8 @@ extension AccountManager {
     /// THIS call added (safe: it is the identifier this call created) and do NOT
     /// stamp. Stamping the impostor would suppress ITS own future notification.
     @MainActor
-    private func postReplyNotificationIfNeeded(
-        target: AIWriteTarget,
-        in database: PrioritizedDatabase
-    ) async throws {
-        guard let header = try await database.read({ db in
-            try target.resolveLiveInboxHeader(db: db)
-        }),
+    private func postReplyNotificationIfNeeded(target: AIWriteTarget) async throws {
+        guard let header = try await dbPool.read({ db in try target.resolveCurrentHeader(db: db) }),
               !header.notified else { return }
         let signal = EmailNotificationBuilder.Signal(
             senderName: header.from,
@@ -1015,7 +932,7 @@ extension AccountManager {
         try await UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: notificationId, content: content, trigger: nil))
 
-        let outcome = try await database.write { db in
+        let outcome = try await dbPool.write { db in
             try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
                 msg.notified = true
                 try msg.save(db)

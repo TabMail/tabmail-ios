@@ -1,5 +1,28 @@
 # IOS-BODY-003
 
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+## 📋 PARTIALLY RESOLVED (2026-08-17)
+
+`ActiveBodyQueue` now remembers an ordinary retry exhaustion for the remainder of the
+current drain. Its private drain-time recovery query may continue to report the honestly
+incomplete GRDB row, but admission refuses to manufacture another retry budget during that
+same drain. Once the item leaves the background queue,
+`MessageDetailViewModel.loadBody` no longer sees it as queued/in-flight and takes the
+foreground on-demand fetch path instead of polling behind a self-resurrecting background
+item.
+
+The refusal is deliberately not durable. An explicit enqueue, launch/foreground/sync
+repopulation, cancellation recovery, or UIDVALIDITY reset clears the drain-local memory and
+grants one later attempt. A different message remains admissible. A one-message RED reproduced
+12 consecutive resurrection cycles and a non-terminating drain before the fix; the same
+three-test suite is green afterward, and 73 neighboring body-queue/on-demand tests remain
+green.
+
+The original record remains `accepted`: `BackfillBodyQueue` still carries the bounded
+move-address retry behavior described below, and this change does not route provider batch
+fetches through `ProviderWorkQueue` or claim a general timeout for a provider call that never
+returns.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 > Routed from `KNOWN_ISSUES.md` line 1420 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).
 
 - Register classification: `accepted`

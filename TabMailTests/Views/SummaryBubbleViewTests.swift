@@ -57,6 +57,39 @@ struct SummaryBubbleViewTests {
         #expect(mode == .empty)
     }
 
+    @Test("inbox message outside recent window renders suppression instead of loading")
+    func oldInboxMessageRendersSuppression() {
+        let mode = SummaryBubbleView.displayMode(
+            isInInbox: true,
+            summaryBlurb: nil,
+            demoSuppressed: false,
+            recentInboxEligible: false
+        )
+        #expect(mode == .suppressed)
+    }
+
+    @Test("recent-window suppression takes precedence over stale cached content")
+    func oldInboxMessageDoesNotRenderCachedSummary() {
+        let mode = SummaryBubbleView.displayMode(
+            isInInbox: true,
+            summaryBlurb: "Old cached summary",
+            demoSuppressed: false,
+            recentInboxEligible: false
+        )
+        #expect(mode == .suppressed)
+    }
+
+    @Test("unknown recent-window state does not flash a loading bubble")
+    func unresolvedWindowStateIsHidden() {
+        let mode = SummaryBubbleView.displayMode(
+            isInInbox: true,
+            summaryBlurb: nil,
+            demoSuppressed: false,
+            recentInboxEligible: nil
+        )
+        #expect(mode == .hidden)
+    }
+
     // MARK: - Non-inbox → .hidden (regardless of content)
 
     @Test("non-inbox message with cached summary is hidden (search-opened Sent/Archive case)")

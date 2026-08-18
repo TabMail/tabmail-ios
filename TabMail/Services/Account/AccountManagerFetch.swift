@@ -102,23 +102,6 @@ extension AccountManager {
     ) async throws {
         print("[FetchBody] Opening: id=\(message.id.prefix(40)) msgId=\(message.messageId.prefix(30)) folder=\(message.folderPath)")
 
-        // A user-visible fetch is an uncapped direct event. Persist through the
-        // same identity guard as the focused-open path before even the cached-body
-        // branch; a stale UID-address snapshot must never mark the replacement row
-        // that now occupies its composite key.
-        let directTarget: AIWriteTarget?
-        if message.isInInbox {
-            guard let target = await recordOpenedDirectTarget(message) else {
-                throw ProviderError.networkError(
-                    underlying: NSError(domain: "TabMail", code: -4,
-                        userInfo: [NSLocalizedDescriptionKey: "This message changed while it was opening. Please return to the message list and try again."])
-                )
-            }
-            directTarget = target
-        } else {
-            directTarget = nil
-        }
-
         // Body already loaded — nothing to do
         let hasBody = (try? await dbPool.read { db in try MessageBody.fetchOne(db, key: message.id) != nil }) ?? false
         guard replaceExistingBody || !hasBody else { return }
@@ -163,8 +146,7 @@ extension AccountManager {
             item: item,
             provider: queue.provider,
             enableAI: true,
-            replaceExistingBody: replaceExistingBody,
-            directTarget: directTarget
+            replaceExistingBody: replaceExistingBody
         )
 
         switch result {

@@ -28,74 +28,6 @@ extension SyncEngine {
         }
     }
 
-    /// Copy cached AI payload to a reclaimed address without transferring direct
-    /// event authority. `messageAICache.key` is RFC-scoped, not header-scoped: a
-    /// different live provider row can share the source key and own its pending
-    /// bit. Only the positively selected `preSyncRows` may authorize the new row;
-    /// their aggregate decision is applied later through `markDirectPending`.
-    private static func copyAICachePayloadForReclaim(
-        from oldKey: String,
-        to newKey: String,
-        newRfc822MessageId: String?,
-        db: Database
-    ) throws {
-        guard oldKey != newKey,
-              try MessageAICache.fetchOne(db, key: newKey) == nil,
-              var copied = try MessageAICache.fetchOne(db, key: oldKey)
-        else { return }
-        copied.key = newKey
-        copied.rfc822MessageId = newRfc822MessageId
-        copied.aiDirectPending = false
-        try copied.insert(db)
-    }
-
-    /// Remove a retired address's non-pending cache only after the last live
-    /// header at that exact RFC coordinate is gone. Pending ownership is cleared
-    /// by v85's duplicate-aware header lifecycle triggers, never by reclaim code.
-    private static func deleteAICacheIfUnreferenced(
-        key: String,
-        accountId: String,
-        folderPath: String,
-        rfc822MessageId: String,
-        db: Database
-    ) throws {
-        try db.execute(sql: """
-            DELETE FROM messageAICache
-            WHERE key = ? AND aiDirectPending = 0
-              AND NOT EXISTS (
-                  SELECT 1 FROM messageHeader AS live
-                  WHERE live.accountId = ?
-                    AND live.folderPath = ?
-                    AND live.rfc822MessageId = ?
-              )
-        """, arguments: [key, accountId, folderPath, rfc822MessageId])
-    }
-
-    /// A reset-pending folder suppresses the generic delete trigger because a UID
-    /// renumber normally needs its cache mirror. Reclaim is different: a marked
-    /// selected row has been identity-proved and its authority is being moved to a
-    /// new cache coordinate. Retire only that old coordinate, and only after the
-    /// deleted row is gone and no different live marked sibling still owns it.
-    private static func clearTransferredAICacheAuthorityIfUnowned(
-        key: String,
-        accountId: String,
-        folderPath: String,
-        rfc822MessageId: String,
-        db: Database
-    ) throws {
-        try db.execute(sql: """
-            UPDATE messageAICache SET aiDirectPending = 0
-            WHERE key = ? AND aiDirectPending = 1
-              AND NOT EXISTS (
-                  SELECT 1 FROM messageHeader AS live
-                  WHERE live.aiDirectPending = 1
-                    AND live.accountId = ?
-                    AND live.folderPath = ?
-                    AND live.rfc822MessageId = ?
-              )
-        """, arguments: [key, accountId, folderPath, rfc822MessageId])
-    }
-
     /// Full-sync fetch-skip decision. Skip re-fetching a folder ONLY when CONDSTORE proves
     /// nothing changed since our last sync: HIGHESTMODSEQ (which RFC 7162 bumps on ANY
     /// add / delete / flag change) is present on BOTH sides and equal. NEVER skip the
@@ -224,7 +156,6 @@ extension SyncEngine {
                 // `lastKnownUidValidity` is nil — old-epoch mail under an unknown epoch.
                 // See `Folder.lastKnownUidValidity`'s doc comment for why that is an open
                 // hazard rather than a benign one.
-                try Self.retireDirectAIForVanishedFolder(folder, db: db)
                 try folder.delete(db)
             }
 
@@ -623,20 +554,6 @@ extension SyncEngine {
         }
     }
 
-    /// Folder rows do not cascade their orphaned headers. Clear direct-event
-    /// authority in the SAME transaction that removes the remote folder, before a
-    /// later deterministic-id recreation can re-adopt those rows. Automatic
-    /// membership remains governed by the recreated folder and configured window.
-    nonisolated static func retireDirectAIForVanishedFolder(
-        _ folder: Folder,
-        db: Database
-    ) throws {
-        try db.execute(sql: """
-            UPDATE messageHeader SET aiDirectPending = 0
-            WHERE folderId = ? AND accountId = ? AND aiDirectPending = 1
-        """, arguments: [folder.id, folder.accountId])
-    }
-
     // MARK: - Background Sync Helpers
 
     /// Keep active view-local identities coherent with a committed sync re-key.
@@ -814,33 +731,6 @@ extension SyncEngine {
 
         var survivor = rows.first(where: { $0.id == canonicalId }) ?? rows[0]
         let survivorHadObservedEpoch = survivor.observedUidValidity != nil
-        var pendingIds: Set<String> = []
-        for chunk in rows.map(\.id).chunked(into: SyncConfig.sqlChunkSize) {
-            let placeholders = chunk.map { _ in "?" }.joined(separator: ",")
-            pendingIds.formUnion(try String.fetchAll(db, sql: """
-                SELECT id FROM messageHeader
-                WHERE id IN (\(placeholders)) AND aiDirectPending = 1
-            """, arguments: StatementArguments(chunk)))
-        }
-        let survivorAlreadyPending = pendingIds.contains(survivor.id)
-        if !pendingIds.isEmpty {
-            // `rows` already passed provider-address ownership proof. OR direct
-            // authority before deleting duplicate losers; if it came from a
-            // loser, invalidate the survivor's FTS completion so body recovery
-            // re-establishes content ownership under the surviving key.
-            // Normalize the already-proved survivor's Inbox membership in the
-            // database BEFORE the raw marker statement. Merely changing the Swift
-            // value later leaves a stale `isInInbox=0` canonical row ineligible,
-            // then deletion of the marked loser destroys the only durable event.
-            if isInInbox && !survivor.isInInbox {
-                try db.execute(
-                    sql: "UPDATE messageHeader SET isInInbox = 1 WHERE id = ?",
-                    arguments: [survivor.id])
-                survivor.isInInbox = true
-            }
-            try ActiveAIQueue.markDirectPending(headerIds: [survivor.id], db: db)
-            if !survivorAlreadyPending { survivor.bodyComplete = false }
-        }
         // T2.5/T5.4: duplicate merging and re-keying do not prove that the
         // survivor belongs to this provider address space. T5.11 owns that
         // proof; until then canonicalization always clears source authority.
@@ -1975,20 +1865,6 @@ extension SyncEngine {
                         .filter(Column("isInInbox") == true)
                         .filter(Column("id") != header.id)
                         .fetchAll(db)
-                    var directPendingIds: Set<String> = []
-                    for chunk in preSyncRowsAll.map(\.id).chunked(
-                        into: SyncConfig.sqlChunkSize
-                    ) {
-                        let placeholders = chunk.map { _ in "?" }.joined(separator: ",")
-                        directPendingIds.formUnion(try String.fetchAll(db, sql: """
-                            SELECT id FROM messageHeader
-                            WHERE id IN (\(placeholders)) AND aiDirectPending = 1
-                        """, arguments: StatementArguments(chunk)))
-                    }
-                    let accountProvider = try Account.fetchOne(db, key: accountId)?.provider
-                    let providerIdsAreStable = accountProvider.map {
-                        $0 != .imap && $0 != .icloud
-                    } ?? false
                     // R15-F1 identity gate — sibling of the one in
                     // `canonicalizeLocalRows` (see its parameter doc). This
                     // reclaim exists for folderPath-drift duplicates of the SAME
@@ -2009,9 +1885,6 @@ extension SyncEngine {
                     if let incoming = normalizedIncomingRfc822 {
                         preSyncRows = preSyncRowsAll.filter { row in
                             let stored = Self.normalizedRfc822Identity(row.rfc822MessageId)
-                            if directPendingIds.contains(row.id) {
-                                return providerIdsAreStable || stored == incoming
-                            }
                             return stored == nil || stored == incoming
                         }
                         if preSyncRows.count != preSyncRowsAll.count {
@@ -2024,38 +1897,14 @@ extension SyncEngine {
                             BackgroundSyncLogger.log("[Sync] ERROR: pre-sync inbox reclaim at (accountId=\(accountId), msgId=\(info.messageId)) found \(distinctNonNil.count) distinct stored identities with a NIL incoming identity — refusing the reclaim (R15-F1)")
                             preSyncRows = []
                         } else {
-                            // A marked UID-addressed row cannot donate its direct
-                            // event to a nil-identity incoming row. Preserve it for
-                            // a later identity-corroborated pass. Stable provider
-                            // ids remain sufficient identity.
-                            preSyncRows = preSyncRowsAll.filter {
-                                providerIdsAreStable || !directPendingIds.contains($0.id)
-                            }
+                            preSyncRows = preSyncRowsAll
                         }
                     }
                     if preSyncRows.count > 1 {
                         print("[Sync] Pre-sync reclaim: \(preSyncRows.count) matching inbox rows for \(info.messageId) — merging all")
                     }
-                    // If any selected row owns direct authority, it is also the
-                    // payload/body donor. Choosing an arbitrary unmarked nil-RFC
-                    // duplicate first could graft its unrelated completed AI onto
-                    // the proved direct target, make marker admission no-op, and
-                    // then delete the actual marked donor as a tail duplicate.
-                    let orderedPreSyncRows: [MessageHeader]
-                    if let directDonor = preSyncRows.first(where: {
-                        directPendingIds.contains($0.id)
-                    }) {
-                        orderedPreSyncRows = [directDonor] + preSyncRows.filter {
-                            $0.id != directDonor.id
-                        }
-                    } else {
-                        orderedPreSyncRows = preSyncRows
-                    }
-                    if let preSync = orderedPreSyncRows.first {
+                    if let preSync = preSyncRows.first {
                     let oldId = preSync.id
-                    let carryDirectAI = orderedPreSyncRows.contains {
-                        directPendingIds.contains($0.id)
-                    }
                     // Account/message reclaim is not a folder-native PK proof.
                     header.observedUidValidity = nil
                     // Preserve locally-computed AI work — sync has no actionTag
@@ -2084,14 +1933,6 @@ extension SyncEngine {
                         try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
                         deferredBody = newBody
                     }
-                    // Keep the reclaimed row's durable identity when the incoming
-                    // envelope carries none. Do this before computing the survivor
-                    // cache key: marked stable-provider duplicates can arrive with a
-                    // nil incoming identity, and their tail cleanup must not erase
-                    // the survivor's just-preserved direct marker.
-                    if normalizedIncomingRfc822 == nil {
-                        header.rfc822MessageId = preSync.rfc822MessageId
-                    }
                     // Migrate AI cache key (folderPath changed → key changed).
                     let oldCacheKey = MessageIdentity.aiCacheKey(
                         accountId: accountId, folderPath: preSync.folderPath,
@@ -2101,33 +1942,25 @@ extension SyncEngine {
                         accountId: accountId, folderPath: folderPath,
                         rfc822MessageId: header.rfc822MessageId
                     )
-                    if let oldCacheKey, let newCacheKey {
-                        try Self.copyAICachePayloadForReclaim(
-                            from: oldCacheKey, to: newCacheKey,
-                            newRfc822MessageId: header.rfc822MessageId, db: db)
+                    if let oldCacheKey, let newCacheKey, oldCacheKey != newCacheKey,
+                       try MessageAICache.fetchOne(db, key: oldCacheKey) != nil {
+                        try db.execute(
+                            sql: "UPDATE messageAICache SET key = ? WHERE key = ?",
+                            arguments: [newCacheKey, oldCacheKey]
+                        )
                     }
-                    if carryDirectAI { header.bodyComplete = false }
+                    // Keep the reclaimed row's durable identity when the incoming
+                    // envelope carries none. `header.rfc822MessageId` came from
+                    // `info.rfc822MessageId`, which is nil whenever the envelope has
+                    // no Message-ID — so without this the reclaim NULLs an identity
+                    // the local row already held, flipping `MessageHeader.stableId`
+                    // to the bare UID and re-admitting bare-UID gestures against a
+                    // message that had a durable id a moment earlier. This is the
+                    // same assign/keep rule already applied at the `existing` merge
+                    // branch and at the orphan reclaim.
+                    if normalizedIncomingRfc822 == nil { header.rfc822MessageId = preSync.rfc822MessageId }
                     try preSync.delete(db)
-                    if let oldCacheKey,
-                       oldCacheKey != newCacheKey,
-                       let oldRfc822MessageId = preSync.rfc822MessageId,
-                       !oldRfc822MessageId.isEmpty {
-                        if directPendingIds.contains(preSync.id) {
-                            try Self.clearTransferredAICacheAuthorityIfUnowned(
-                                key: oldCacheKey, accountId: accountId,
-                                folderPath: preSync.folderPath,
-                                rfc822MessageId: oldRfc822MessageId, db: db)
-                        }
-                        try Self.deleteAICacheIfUnreferenced(
-                            key: oldCacheKey, accountId: accountId,
-                            folderPath: preSync.folderPath,
-                            rfc822MessageId: oldRfc822MessageId, db: db)
-                    }
                     try header.insert(db)
-                    if carryDirectAI {
-                        try ActiveAIQueue.markDirectPending(
-                            headerIds: [header.id], db: db)
-                    }
                     if let body = deferredBody { try body.insert(db) }
                     // R16-8 — THE RE-KEY CHANNEL, same reason as the DraftDedup block
                     // above: the body is carried to `header.id`, this block ends in
@@ -2151,29 +1984,19 @@ extension SyncEngine {
                     // (the first row won the preservation race; the tail are
                     // stale dupes). Just delete to prevent orphaned cache
                     // rows / body rows sticking around after reclaim.
-                    for extra in orderedPreSyncRows.dropFirst() {
+                    for extra in preSyncRows.dropFirst() {
                         let extraId = extra.id
-                        let oldCacheKey = MessageIdentity.aiCacheKey(
+                        if let oldCacheKey = MessageIdentity.aiCacheKey(
                             accountId: accountId, folderPath: extra.folderPath,
                             rfc822MessageId: extra.rfc822MessageId
-                        )
+                        ) {
+                            try db.execute(
+                                sql: "DELETE FROM messageAICache WHERE key = ?",
+                                arguments: [oldCacheKey]
+                            )
+                        }
                         try MessageBody.deleteOne(db, key: extraId)
                         try extra.delete(db)
-                        if let oldCacheKey,
-                           oldCacheKey != newCacheKey,
-                           let oldRfc822MessageId = extra.rfc822MessageId,
-                           !oldRfc822MessageId.isEmpty {
-                            if directPendingIds.contains(extra.id) {
-                                try Self.clearTransferredAICacheAuthorityIfUnowned(
-                                    key: oldCacheKey, accountId: accountId,
-                                    folderPath: extra.folderPath,
-                                    rfc822MessageId: oldRfc822MessageId, db: db)
-                            }
-                            try Self.deleteAICacheIfUnreferenced(
-                                key: oldCacheKey, accountId: accountId,
-                                folderPath: extra.folderPath,
-                                rfc822MessageId: oldRfc822MessageId, db: db)
-                        }
                         // R16-8 — THE REMOVAL CHANNEL. These tail duplicates are
                         // DELETED, not migrated, so their FTS entries must go with
                         // them. Third member of the same class as the two re-key

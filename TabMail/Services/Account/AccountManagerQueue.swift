@@ -125,8 +125,8 @@ extension AccountManager {
         /// on an unrelated message that happens to share that number
         /// (`DurableIdentityLookup`'s G3 rejection exists for exactly this).
         /// The rfc822 identity is what survives BOTH re-key paths, so it is
-        /// captured beside the address and the scoped post-sync resolver requires
-        /// it before admitting any address repair.
+        /// captured beside the address and both are handed to
+        /// `DurableIdentityLookup.find` later.
         struct InboxEntry: Hashable, Sendable {
             let accountId: String
             let messageId: String
@@ -689,30 +689,25 @@ extension AccountManager {
                 guard parts.count == 2 else { continue }
                 let accountId = String(parts[0])
                 let folderPath = String(parts[1])
-                if let queue = workQueues[accountId] {
-                    if let folder = try? await dbPool.read({ db in
-                        try Folder.filter(Column("accountId") == accountId && Column("path") == folderPath).fetchOne(db)
-                    }) {
-                        do {
-                            try await queue.execute(priority: .userAction) {
-                                try await self.syncEngine.syncFolderMessages(folder: folder, provider: queue.provider)
-                            }
-                            queueLog("[MoveTrace] post-drain sync — completed for \(folder.name)")
-                        } catch {
-                            queueLog("[MoveTrace] post-drain sync — failed for \(folder.name): \(error)")
-                        }
-                    } else {
-                        queueLog("[MoveTrace] post-drain sync — folder not found: \(accountId)|\(folderPath)")
+                guard let queue = workQueues[accountId] else { continue }
+                guard let folder = try? await dbPool.read({ db in
+                    try Folder.filter(Column("accountId") == accountId && Column("path") == folderPath).fetchOne(db)
+                }) else {
+                    queueLog("[MoveTrace] post-drain sync — folder not found: \(accountId)|\(folderPath)")
+                    continue
+                }
+                do {
+                    try await queue.execute(priority: .userAction) {
+                        try await self.syncEngine.syncFolderMessages(folder: folder, provider: queue.provider)
                     }
-                } else {
-                    queueLog("[MoveTrace] post-drain sync — work queue not found: \(accountId)|\(folderPath)")
+                    queueLog("[MoveTrace] post-drain sync — completed for \(folder.name)")
+                } catch {
+                    queueLog("[MoveTrace] post-drain sync — failed for \(folder.name): \(error)")
                 }
                 // ADR-IOS-008 decision 3. Deliberately AFTER the sync attempt and
-                // OUTSIDE every sync precondition and its do/catch — a missing
-                // account queue/folder can skip refresh, but must not discard the
-                // already-recorded entered-inbox event. See
-                // `enqueueAIForMembersThatEnteredInbox` for why either sync outcome
-                // is a safe place to resolve an id, and why no earlier one is.
+                // OUTSIDE its do/catch — see `enqueueAIForMembersThatEnteredInbox`
+                // for why either branch is a safe place to resolve an id, and why
+                // no earlier one is.
                 await enqueueAIForMembersThatEnteredInbox(key: key, folderPath: folderPath, context: ctx)
             }
         }
@@ -747,85 +742,39 @@ extension AccountManager {
     /// inbox-flagged folders, and the cost there is one DEDUPED job whose summary
     /// is already cached (`executeSummaryJob` returns on a cache hit and still
     /// chains the action job), never a wrong or duplicated write.
-    /// Persist the event on the optimistic source-address row before a provider
-    /// destination re-key can delete it. This is intentionally separate from the
-    /// post-rekey collector below: the pre-mark protects an unproven collision;
-    /// the collector resolves the final address used by the in-memory latency path.
-    private static func markOptimisticMembersEnteringInbox(
-        _ op: PendingOperation,
-        destinationPath: String,
-        db: Database
-    ) throws {
-        let destinationFolderId = MessageIdentity.folderId(
-            accountId: op.accountId, folderPath: destinationPath)
-        let candidateIds = op.messageIds.map { messageId in
-            MessageIdentity.headerId(
-                accountId: op.accountId, folderPath: op.folderPath, messageId: messageId)
-        }
-        var eligibleIds: [String] = []
-        for chunk in Array(Set(candidateIds)).chunked(into: SyncConfig.sqlChunkSize) {
-            for header in try MessageHeader.filter(chunk.contains(Column("id"))).fetchAll(db)
-            where header.accountId == op.accountId
-                && header.folderPath == destinationPath
-                && header.folderId == destinationFolderId
-                && header.isInInbox {
-                eligibleIds.append(header.id)
-            }
-        }
-        try ActiveAIQueue.markDirectPending(headerIds: eligibleIds, db: db)
-    }
-
-    private static func markMembersThatEnteredInbox(
-        _ op: PendingOperation,
-        destinationPath: String,
-        finishResult: MoveFinishResult,
-        db: Database
-    ) throws -> [DrainContext.InboxEntry] {
-        let accountId = op.accountId
-        let candidateIds = op.messageIds.map { messageId in
-            let oldId = MessageIdentity.headerId(
-                accountId: accountId, folderPath: op.folderPath, messageId: messageId)
-            return finishResult.destinationHeaderIdsByOldId[oldId] ?? oldId
-        }
-        var headersById: [String: MessageHeader] = [:]
-        for chunk in Array(Set(candidateIds)).chunked(into: SyncConfig.sqlChunkSize) {
-            for header in try MessageHeader
-                .filter(chunk.contains(Column("id")))
-                .fetchAll(db) {
-                headersById[header.id] = header
-            }
-        }
-        var entries: [DrainContext.InboxEntry] = []
-        var markedHeaderIds: [String] = []
-        var seen: Set<String> = []
-        for headerId in candidateIds {
-            guard seen.insert(headerId).inserted,
-                  let header = headersById[headerId],
-                  header.accountId == accountId,
-                  header.folderPath == destinationPath,
-                  header.isInInbox
-            else { continue }
-            markedHeaderIds.append(header.id)
-            entries.append(DrainContext.InboxEntry(
-                accountId: accountId,
-                messageId: header.messageId,
-                rfc822MessageId: header.rfc822MessageId))
-        }
-        try ActiveAIQueue.markDirectPending(headerIds: markedHeaderIds, db: db)
-        return entries
-    }
-
     private func recordMembersThatEnteredInbox(
-        _ entries: [DrainContext.InboxEntry],
-        opId: String,
-        accountId: String,
-        destinationPath: String,
-        context: DrainContext
-    ) {
+        _ op: PendingOperation, destinationPath: String, context: DrainContext
+    ) async {
+        let accountId = op.accountId
+        // Follow the provider-proven handoff first: when `COPYUID` landed,
+        // `finishMove` has already re-keyed this row to its destination address,
+        // so the source-shaped id no longer names it. When it did not, the alias
+        // map is empty and this returns the id unchanged — which is still the
+        // right key, because the row then keeps its source PK.
+        let candidateIds = op.messageIds.map { messageId in
+            MessageHeaderRekey.currentHeaderId(
+                afterHandoffFrom: MessageIdentity.headerId(
+                    accountId: accountId, folderPath: op.folderPath, messageId: messageId))
+        }
+        let entries: [DrainContext.InboxEntry] = (try? await dbPool.read { db in
+            var found: [DrainContext.InboxEntry] = []
+            for headerId in candidateIds {
+                guard let header = try MessageHeader.fetchOne(db, key: headerId),
+                      header.accountId == accountId,
+                      header.folderPath == destinationPath,
+                      header.isInInbox
+                else { continue }
+                found.append(DrainContext.InboxEntry(
+                    accountId: accountId,
+                    messageId: header.messageId,
+                    rfc822MessageId: header.rfc822MessageId))
+            }
+            return found
+        }) ?? []
         guard !entries.isEmpty else { return }
         let key = "\(accountId)|\(destinationPath)"
         context.enteredInbox.withLock { $0[key, default: []].append(contentsOf: entries) }
-        queueLog("[MoveTrace] entered inbox — \(entries.count) member(s) of op \(opId) landed in \(destinationPath); durable direct AI marked, enqueue deferred to post-drain")
+        queueLog("[MoveTrace] entered inbox — \(entries.count) member(s) of op \(op.id) landed in \(destinationPath), AI enqueue deferred to post-drain")
     }
 
     /// Enqueue AI for the members this drain moved into `folderPath`'s inbox.
@@ -864,10 +813,9 @@ extension AccountManager {
         // This path intentionally uses the dedicated destination-scoped,
         // RFC-first resolver below: the recorded UID may be stale after the move,
         // so `DurableIdentityLookup` cannot prove identity for this caller. A
-        // successful rekey leaves the destination row available by RFC identity.
-        // The resolver returns an identity-bound direct candidate; execution
-        // revalidates that physical target and its live Inbox scope.
-        let resolved: [ActiveAIQueue.Candidate] = (try? await dbPool.read { db in
+        // successful rekey leaves the destination row available by RFC identity;
+        // `ActiveAIQueue` later revalidates its live Inbox scope.
+        let resolved: [(headerId: String, accountId: String)] = (try? await dbPool.read { db in
             try Self.resolveInboxEntryAITargets(
                 entries: entries, folderPath: folderPath, db: db)
         }) ?? []
@@ -876,11 +824,10 @@ extension AccountManager {
             return
         }
         // Per-item `enqueue` (S + R, with A chained by the summary job) mirrors
-        // `BodyFetchProcessor.flushBatch`'s `.directEvent` arm. Its
-        // `.automaticRecentWindow` arm has a configured population boundary that a
-        // proved move event deliberately bypasses, matching TB `processMessage`.
+        // the sibling event-driven site, `BodyFetchProcessor.flushBatch`'s
+        // `enableAI && item.isInInbox` arm.
         for item in resolved {
-            await ActiveAIQueue.shared.enqueue(item)
+            await ActiveAIQueue.shared.enqueue(headerId: item.headerId, accountId: item.accountId)
         }
         queueLog("[MoveTrace] entered inbox — enqueued AI for \(resolved.count) member(s) in \(folderPath)")
     }
@@ -947,17 +894,15 @@ extension AccountManager {
     ///
     /// The destination-folder predicate already selects the intended move target;
     /// `ORDER BY id ASC LIMIT 1` deliberately makes same-folder duplicate-RFC rows
-    /// deterministic. It does NOT prefer or require `isInInbox` in this SQL:
-    /// `ActiveAIQueue.directCandidate` immediately requires the resolved row to
-    /// own a durable marker in a live account-owned Inbox, and
-    /// `readJobOutcome` repeats that scope proof after asynchronous AI work.
+    /// deterministic. It does NOT prefer or require `isInInbox`, because
+    /// `ActiveAIQueue.readJobOutcome` remains the authoritative live scope check.
     /// The bounded N+1 is retained: entries are only the members of one completed
     /// operation, and per-entry refusal/logging remains clearer than broadening this
     /// fix into a set-based identity rewrite.
     nonisolated static func resolveInboxEntryAITargets(
         entries: [DrainContext.InboxEntry], folderPath: String, db: Database
-    ) throws -> [ActiveAIQueue.Candidate] {
-        var out: [ActiveAIQueue.Candidate] = []
+    ) throws -> [(headerId: String, accountId: String)] {
+        var out: [(headerId: String, accountId: String)] = []
         for entry in entries {
             // FAIL CLOSED, and OBSERVABLY. A member with no usable rfc822
             // identity cannot be re-identified across a UID remap by anything
@@ -975,9 +920,8 @@ extension AccountManager {
             // one that entered THIS inbox. `isInInbox = 1` is deliberately NOT a
             // conjunct here: `folderPath` already pins the folder, the capture in
             // `recordMembersThatEnteredInbox` only records rows that were
-            // `isInInbox`. `ActiveAIQueue.directCandidate` is the immediate live-
-            // scope admission guard, and `readJobOutcome` independently repeats
-            // that proof after the job (`.scopeExited` on loss).
+            // `isInInbox`, and `ActiveAIQueue.readJobOutcome` independently
+            // refuses a job whose row is no longer in an inbox (`.scopeExited`).
             // A redundant conjunct in a correctness guard can mask the failure of
             // the one that matters.
             guard let id = try String.fetchOne(
@@ -988,13 +932,7 @@ extension AccountManager {
                 queueLog("[MoveTrace] entered inbox — no live row in \(folderPath) for rfc822 identity of uid=\(entry.messageId), nothing enqueued")
                 continue
             }
-            guard let candidate = try ActiveAIQueue.directCandidate(
-                headerId: id, db: db)
-            else {
-                queueLog("[MoveTrace] entered inbox — resolved row no longer owns its durable direct marker, nothing enqueued")
-                continue
-            }
-            out.append(candidate)
+            out.append((headerId: id, accountId: entry.accountId))
         }
         return out
     }
@@ -1259,36 +1197,18 @@ extension AccountManager {
             // for the four guards) closes that, and makes undo-after-drain an
             // ordinary reverse move. Sharing this transaction with the op's
             // deletion keeps the crash window exactly where it already was.
-            let finish: (result: MoveFinishResult, entries: [DrainContext.InboxEntry])
+            let finishResult: MoveFinishResult
             do {
-                finish = try await retryWrite(dbPool, label: "Queue") { db in
-                    if currentOp.type == .move,
-                       let destinationPath = currentOp.destinationPath,
-                       destinationPath != currentOp.folderPath {
-                        try Self.markOptimisticMembersEnteringInbox(
-                            currentOp, destinationPath: destinationPath, db: db)
-                    }
+                finishResult = try await retryWrite(dbPool, label: "Queue") { db in
                     let result = try MessageHeaderRekey.finishMove(
                         currentOp,
                         destinations: executed.provenDestinations,
                         addressChangesOnMove: executed.addressChangesOnMove,
                         db: db)
-                    let entries: [DrainContext.InboxEntry]
-                    if currentOp.type == .move,
-                       let destinationPath = currentOp.destinationPath,
-                       destinationPath != currentOp.folderPath {
-                        entries = try Self.markMembersThatEnteredInbox(
-                            currentOp,
-                            destinationPath: destinationPath,
-                            finishResult: result,
-                            db: db)
-                    } else {
-                        entries = []
-                    }
                     MessageHeaderRekey.publishAddressHandoffsAfterCommit(
                         result.applied, in: db)
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                    return (result, entries)
+                    return result
                 }
             } catch {
                 // 🚨 UNGATED BY DECISION (rule 12's production-observability
@@ -1304,17 +1224,12 @@ extension AccountManager {
                 // records is the FAILURE, which is what the `logError` below writes.
                 // A bare `print` could not have been the witness in any case: with
                 // no `freopen`/`dup2` in this tree, `stdout` is discarded on device.
-                print("[Queue] CRITICAL: Failed to retire completed PendingOperation \(currentOp.id) after retries — left inFlight for launch recovery")
+                print("[Queue] CRITICAL: Failed to delete completed PendingOperation \(currentOp.id) after retries — will re-execute on next drain")
                 BackgroundSyncLogger.logError(
-                    "CRITICAL: failed to retire completed PendingOperation \(currentOp.id) (type \(opType)) after retries — it remains inFlight and WILL re-execute after launch recovery, so a wire effect already applied may be applied twice: \(error)",
+                    "CRITICAL: failed to delete completed PendingOperation \(currentOp.id) (type \(opType)) after retries — it stays queued and WILL re-execute, so a wire effect already applied may be applied twice: \(error)",
                     source: "actionQueue")
-                // Preserve the pre-existing queue behavior exactly: the claim stays
-                // `.inFlight` for launch recovery, while this drain continues to its
-                // later operations. The AI marker transaction does not require a new
-                // same-drain retry or lane halt.
-                finish = (.empty, [])
+                finishResult = .empty
             }
-            let finishResult = finish.result
             await publishMoveFinish(finishResult)
             await materializeDeferredMoveSuccessors(after: currentOp, result: finishResult)
             if [.archive, .delete, .move].contains(currentOp.type), let dest = currentOp.destinationPath {
@@ -1327,12 +1242,8 @@ extension AccountManager {
                 // and `.delete` resolve their destination from the archive and
                 // trash ROLES, and a same-folder move is a no-op.
                 if currentOp.type == .move, dest != currentOp.folderPath {
-                    recordMembersThatEnteredInbox(
-                        finish.entries,
-                        opId: currentOp.id,
-                        accountId: currentOp.accountId,
-                        destinationPath: dest,
-                        context: context)
+                    await recordMembersThatEnteredInbox(
+                        currentOp, destinationPath: dest, context: context)
                 }
             }
             // Sync Drafts folder after draft save/delete so MessageHeaders reflect server state.
@@ -1947,53 +1858,24 @@ extension AccountManager {
             return op
         }()
         do {
-            let finish = try await retryWrite(dbPool, label: "Queue") { db in
-                if frozenRetiredOp.type == .move,
-                   let dest = frozenRetiredOp.destinationPath,
-                   dest != frozenRetiredOp.folderPath {
-                    try Self.markOptimisticMembersEnteringInbox(
-                        frozenRetiredOp, destinationPath: dest, db: db)
-                }
+            let finishResult = try await retryWrite(dbPool, label: "Queue") { db in
                 let result = try MessageHeaderRekey.finishMove(
                     frozenRetiredOp,
                     destinations: provenDestinations,
                     addressChangesOnMove: addressChangesOnMove,
                     db: db)
-                let entries: [DrainContext.InboxEntry]
-                if frozenRetiredOp.type == .move,
-                   let dest = frozenRetiredOp.destinationPath,
-                   dest != frozenRetiredOp.folderPath {
-                    entries = try Self.markMembersThatEnteredInbox(
-                        frozenRetiredOp,
-                        destinationPath: dest,
-                        finishResult: result,
-                        db: db)
-                } else {
-                    entries = []
-                }
                 MessageHeaderRekey.publishAddressHandoffsAfterCommit(
                     result.applied, in: db)
                 guard var fresh = try PendingOperation.fetchOne(db, key: currentOp.id) else {
-                    return (result, entries)
+                    return result
                 }
                 fresh.messageIds = remaining
                 fresh.status = PendingStatus.queued.rawValue
                 try fresh.save(db)
-                return (result, entries)
+                return result
             }
-            let finishResult = finish.0
             await publishMoveFinish(finishResult)
             await materializeDeferredMoveSuccessors(after: frozenRetiredOp, result: finishResult)
-            if frozenRetiredOp.type == .move,
-               let dest = frozenRetiredOp.destinationPath,
-               dest != frozenRetiredOp.folderPath {
-                recordMembersThatEnteredInbox(
-                    finish.1,
-                    opId: frozenRetiredOp.id,
-                    accountId: frozenRetiredOp.accountId,
-                    destinationPath: dest,
-                    context: context)
-            }
         } catch {
             // The narrowing write failed. NEVER leave the row `inFlight` (it
             // would only unstick at the next launch's crash recovery) and never

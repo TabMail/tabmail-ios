@@ -12,6 +12,7 @@ struct SummaryBubbleView: View {
     let message: MessageHeader
     @State private var expanded = false
     @State private var failed = false
+    @State private var recentInboxEligible: Bool?
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
     @Environment(\.hasTabMailSession) private var hasTabMailSession
 
@@ -39,6 +40,8 @@ struct SummaryBubbleView: View {
         case hidden
         /// Render the cached AI summary content bubble.
         case content
+        /// The message is in Inbox but outside the bounded AI population.
+        case suppressed
         /// Empty state — render loading / failed / nudge depending on environment.
         case empty
     }
@@ -49,7 +52,8 @@ struct SummaryBubbleView: View {
     static func displayMode(
         isInInbox: Bool,
         summaryBlurb: String?,
-        demoSuppressed: Bool
+        demoSuppressed: Bool,
+        recentInboxEligible: Bool? = true
     ) -> DisplayMode {
         if demoSuppressed { return .hidden }
         // AI summary is inbox-scoped on both compute (AccountManager.processOpenedMessage
@@ -57,6 +61,11 @@ struct SummaryBubbleView: View {
         // MessageHeader rows from a prior inbox stay must not surface for non-inbox views
         // (e.g. opening a Sent/Archive/Trash message via search).
         if !isInInbox { return .hidden }
+        // Window membership is the compute contract, not an invitation to retain
+        // an old cached result indefinitely. Until the fast local query resolves,
+        // render nothing rather than flashing a spinner that cannot complete.
+        guard let recentInboxEligible else { return .hidden }
+        if !recentInboxEligible { return .suppressed }
         if let blurb = summaryBlurb, !blurb.isEmpty { return .content }
         return .empty
     }
@@ -65,34 +74,55 @@ struct SummaryBubbleView: View {
         let mode = Self.displayMode(
             isInInbox: message.isInInbox,
             summaryBlurb: message.summaryBlurb,
-            demoSuppressed: DemoModeStore.shared.isActive && !DemoModeStore.shared.aiEnabled
+            demoSuppressed: DemoModeStore.shared.isActive && !DemoModeStore.shared.aiEnabled,
+            recentInboxEligible: recentInboxEligible
         )
-        switch mode {
-        case .hidden:
-            EmptyView()
-        case .content:
-            contentBubble
-        case .empty:
-            if !hasTabMailSession {
-                nudgeBubble(text: "Sign in to enable AI features")
-            } else if !AISubscriptionGate.shared.isActive {
-                nudgeBubble(text: "Subscribe to enable AI features")
-            } else if !anyAISourceEnabled {
-                // AI opt-out with no Device Sync — hide entirely
-            } else if failed {
-                failedBubble
-            } else {
-                loadingBubble
-                    .onReceive(NotificationCenter.default.publisher(for: .aiDidFailForMessage).receive(on: DispatchQueue.main).filter { $0.object as? String == message.id }) { _ in
-                        failed = true
-                    }
-                    .task {
-                        // Safety-net timeout: if no success or failure notification after 20s, assume failure.
-                        try? await Task.sleep(for: .seconds(20))
-                        if !Task.isCancelled {
+        Group {
+            switch mode {
+            case .hidden:
+                EmptyView()
+            case .content:
+                contentBubble
+            case .suppressed:
+                nudgeBubble(text: "AI work is suppressed for older messages in large inboxes")
+            case .empty:
+                if !hasTabMailSession {
+                    nudgeBubble(text: "Sign in to enable AI features")
+                } else if !AISubscriptionGate.shared.isActive {
+                    nudgeBubble(text: "Subscribe to enable AI features")
+                } else if !anyAISourceEnabled {
+                    // AI opt-out with no Device Sync — hide entirely
+                } else if failed {
+                    failedBubble
+                } else {
+                    loadingBubble
+                        .onReceive(NotificationCenter.default.publisher(for: .aiDidFailForMessage).receive(on: DispatchQueue.main).filter { $0.object as? String == message.id }) { _ in
                             failed = true
                         }
-                    }
+                        .task {
+                            // Safety-net timeout: if no success or failure notification after 20s, assume failure.
+                            try? await Task.sleep(for: .seconds(20))
+                            if !Task.isCancelled {
+                                failed = true
+                            }
+                        }
+                }
+            }
+        }
+        .task(id: message.id) {
+            recentInboxEligible = nil
+            guard message.isInInbox else { return }
+            do {
+                recentInboxEligible = try await AppDatabase.syncPool.read { db in
+                    try ActiveAIQueue.recentInboxWindowContains(
+                        headerId: message.id,
+                        db: db
+                    )
+                }
+            } catch {
+                // A local read failure must not make a message look intentionally
+                // suppressed. Preserve the ordinary retry/failure UI instead.
+                recentInboxEligible = true
             }
         }
     }

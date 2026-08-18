@@ -1797,11 +1797,6 @@ enum NSEDataBridge {
                             print("[NSEDataBridge] Merge phase 1 failed for \(msg.id): \(error) — left in staging for retry")
                         }
                     }
-                    // A push delivery is a direct event independently of whether
-                    // its body rendered or reached FTS this wake. Persist authority
-                    // in the same transaction that admits the durable header; a
-                    // body-less/unresolved push then waits safely on body recovery.
-                    try ActiveAIQueue.markDirectPending(headerIds: localIds, db: db)
                     phase1BodyEnd.withLock { $0 = CFAbsoluteTimeGetCurrent() }
                     return (localIds, localDiscoveredOldEpoch)
                 }
@@ -2322,10 +2317,6 @@ enum NSEDataBridge {
                             print("[NSEDataBridge] Per-message merge failed for \(msg.id): \(error) — left in staging for retry")
                         }
                     }
-                    // Phase 2 is the fallback header-admission path when phase 1
-                    // failed. It owes the same atomic push-event marker.
-                    try ActiveAIQueue.markDirectPending(
-                        headerIds: localHeaderAccumulator, db: db)
                     let tcEnd = try Int.fetchOne(db, sql: "SELECT total_changes()") ?? 0
                     return (ids: localMergedIds, committed: localCommitted, fts: localFtsAccumulator, headers: localHeaderAccumulator, realChanged: tcEnd > tcStart, committedIds: localCommittedMsgIds, discoveredOldEpoch: localDiscoveredOldEpoch)
                 }
@@ -3358,17 +3349,13 @@ enum NSEDataBridge {
         // IN (…)`, so it takes the HEADER id even though the membership test
         // above ran in content-key space.
         let confirmedIds: [String] = confirmedItems.map(\.item.headerId)
-        let directCandidates: [ActiveAIQueue.Candidate]
         do {
-            directCandidates = try await AppDatabase.dbPool.write { db in
+            try await AppDatabase.dbPool.write { db in
                 let placeholders = confirmedIds.map { _ in "?" }.joined(separator: ",")
                 try db.execute(
                     sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE id IN (\(placeholders))",
                     arguments: StatementArguments(confirmedIds)
                 )
-                return try confirmedIds.compactMap {
-                    try ActiveAIQueue.directCandidate(headerId: $0, db: db)
-                }
             }
         } catch {
             print("[NSEDataBridge] FTS batch: bodyComplete update failed: \(error)")
@@ -3391,7 +3378,8 @@ enum NSEDataBridge {
         // Resilience: if this detached task is dropped (app killed), the message
         // is re-discovered by `ActiveAIQueue.repopulateFromDatabase` on the next
         // foreground poll — the enqueue is an optimization, not the only path.
-        let downstreamHeaderIds = confirmedItems.map(\.item.headerId)
+        let downstream: [(headerId: String, accountId: String, isInInbox: Bool)] =
+            confirmedItems.map { ($0.item.headerId, $0.header.accountId, $0.header.isInInbox) }
         Task.detached(priority: .utility) {
             // Gate only when a REAL foreground app is running. `dbReady` is true at
             // any production merge time (the merge needs the DB) and false in unit
@@ -3408,11 +3396,11 @@ enum NSEDataBridge {
             // don't cross the detach), so a drain kicked here can't inherit the
             // merge's gate exemption — keep the explicit reset for clarity (FIX 6d).
             await PriorityGate.$inPrivilegedContext.withValue(false) {
-                for candidate in directCandidates {
-                    await ActiveAIQueue.shared.enqueue(candidate)
-                }
-                for headerId in downstreamHeaderIds {
-                    await ActiveEmbeddingQueue.shared.enqueue(headerId: headerId)
+                for item in downstream {
+                    if item.isInInbox {
+                        await ActiveAIQueue.shared.enqueue(headerId: item.headerId, accountId: item.accountId)
+                    }
+                    await ActiveEmbeddingQueue.shared.enqueue(headerId: item.headerId)
                 }
             }
         }

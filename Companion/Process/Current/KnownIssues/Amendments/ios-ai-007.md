@@ -1,13 +1,17 @@
 # IOS-AI-007
 
-- Register classification: `open`
+- Register classification: `resolved`
 - New post-freeze record (2026-08-15) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
 ## Status
 
-🔓 **OPEN — INTEGRATED FIX CANDIDATE (2026-08-15).** Proven members
-of a partial-success move enter the same durable direct-AI event as a whole-operation success.
+✅ **RESOLVED BY ROLLBACK (2026-08-17).** The durable direct-AI event class no
+longer exists. Partial-success moves retain their pre-PR #39 correctness behavior, while AI admission
+uses the same bounded recent-Inbox policy as every other producer. No special marker is created.
+
+The sections below preserve the withdrawn PR #39 candidate as historical evidence. They do not
+describe current runtime behavior.
 
 ## Reachability and failure
 

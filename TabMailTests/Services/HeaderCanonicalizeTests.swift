@@ -409,59 +409,6 @@ struct HeaderCanonicalizeTests {
         #expect(try labelIds(db, headerId: "acc1:ARCHIVE:g21").isEmpty,
                 "the loser's junction rows go with the loser — its cascade loss is INTENDED")
     }
-
-    @Test("Canonicalization carries a proved direct event from a duplicate loser")
-    func canonicalizationCarriesDirectPendingToSurvivor() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, provider: .gmail)
-        let inbox = try TestDatabase.insertFolder(db)
-        var remnant = try TestDatabase.insertMessageHeader(
-            db, messageId: "g-direct", folderId: inbox.id,
-            accountId: "acc1", folderPath: "INBOX", isInInbox: true)
-        try db.write { db in
-            try remnant.delete(db)
-            remnant.id = MessageIdentity.headerId(
-                accountId: "acc1", folderPath: "Archive", messageId: remnant.messageId)
-            remnant.bodyComplete = true
-            try remnant.insert(db)
-            try ActiveAIQueue.markDirectPending(headerIds: [remnant.id], db: db)
-        }
-        let canonical = try TestDatabase.insertMessageHeader(
-            db, messageId: "g-direct", folderId: inbox.id,
-            accountId: "acc1", folderPath: "INBOX", isInInbox: true)
-        try db.write { db in
-            try db.execute(
-                sql: "UPDATE messageHeader SET isInInbox = 0 WHERE id = ?",
-                arguments: [canonical.id])
-        }
-        #expect(try db.read {
-            try Bool.fetchOne(
-                $0, sql: "SELECT isInInbox FROM messageHeader WHERE id = ?",
-                arguments: [canonical.id])
-        } == false, "non-vacuity: the chosen survivor starts outside live Inbox scope")
-
-        let result = try db.write { db in
-            try SyncEngine.canonicalizeLocalRows(
-                accountId: "acc1", folderPath: "INBOX", folderId: inbox.id,
-                messageId: "g-direct", isInInbox: true, windowMode: .date,
-                sourceBoundEpoch: nil, incomingRfc822Identity: nil, db: db)
-        }
-        let evidence = try db.read { db -> (Int, Int, Bool) in
-            let pending = try Int.fetchOne(
-                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
-                arguments: [canonical.id]) ?? 0
-            let bodyComplete = try Int.fetchOne(
-                db, sql: "SELECT bodyComplete FROM messageHeader WHERE id = ?",
-                arguments: [canonical.id]) ?? 1
-            let oldExists = try MessageHeader.fetchOne(db, key: remnant.id) != nil
-            return (pending, bodyComplete, oldExists)
-        }
-        #expect(result.row?.id == canonical.id)
-        #expect(evidence.0 == 1, "the proved survivor inherits direct authority")
-        #expect(evidence.1 == 0,
-                "body recovery must re-establish FTS ownership at the survivor key")
-        #expect(!evidence.2)
-    }
 }
 
 // MARK: - SearchIndex.rekeyHeaders

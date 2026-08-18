@@ -10,14 +10,13 @@ import UIKit
 /// Event-driven AI processing queue for inbox messages.
 /// Decoupled from sync/backfill — receives messages after body is written to FTS.
 /// Reads body text from FTS (SearchIndex.bodyText), never fetches from provider.
-/// Matches TB's messageProcessorQueue architecture: durable state rediscovery,
-/// an in-memory drain loop, first-compute-wins, and caching. Direct events carry
-/// a durable `messageHeader.aiDirectPending` bit until their outputs land.
+/// Matches TB's messageProcessorQueue architecture: in-memory queue with bounded
+/// database rediscovery, drain loop, first-compute-wins, caching.
 ///
 /// Concurrency model (matching TB):
 /// - No limit on how many job tasks can run concurrently.
 /// - All pending jobs are dispatched immediately as fire-and-forget Tasks.
-/// - Queue dedup via QueueStorage (per physical-message target and job type).
+/// - Queue dedup via QueueStorage (per-message, per-job-type).
 /// - HTTP concurrency gated by BackendClient's internal LLM semaphore (32 slots).
 ///
 /// Processing model: Three independent job types per message:
@@ -29,15 +28,13 @@ import UIKit
 /// Architecture: jobs stay in queue until confirmed done. On dispatch, job moves
 /// to back of queue and is marked in-flight. Fire-and-forget task runs the AI call.
 /// On success: job removed from queue. On failure: job stays in queue with backoff
-/// and is retried when backoff expires. A process exit can lose the in-memory job,
-/// but not its durable missing-field state. Automatic work is rediscovered from
-/// the configured recent-inbox population; direct work is rediscovered from its
-/// explicit durable bit even when the message is older than that population.
+/// until the retry cap. Derived work may then be dropped; a later bounded database
+/// repopulation can rediscover it if the message still belongs to the recent window.
 ///
 /// Resilience contract:
-/// - Jobs remain queued until confirmed complete, structurally refused, or scope exited.
-/// - Transient failures cycle to the FIFO back with exponential backoff; this queue
-///   intentionally passes an unbounded retry ceiling and relies on durable terminal checks.
+/// - Jobs are ALWAYS in the queue until confirmed complete or max retries exceeded.
+/// - Failed jobs cycle to back of FIFO with exponential backoff, retried up to maxQueueRetries.
+/// - After max retries, job removed; repopulateFromDatabase catches on next foreground.
 /// - App crash loses in-memory queue; repopulateFromDatabase rebuilds from GRDB on next launch.
 /// - canProcessAI=false clears ephemeral queue; repopulateFromDatabase re-discovers when conditions change.
 /// Debug-gated diagnostic log for this file (global `CLAUDE.md` development
@@ -62,51 +59,11 @@ private func activeAILog(_ message: @autoclosure () -> String) {
 actor ActiveAIQueue {
     static let shared = ActiveAIQueue()
 
-    /// One message admitted by the automatic population selector or by a
-    /// durable direct-event marker. The target is captured in the SAME database
-    /// read that admitted the row, so an address reused before actor execution
-    /// cannot transfer this candidate's authority to a different message.
-    struct Candidate: Sendable, Equatable {
-        enum Authority: Sendable, Equatable {
-            case automatic
-            case direct
-        }
-
-        let target: AIWriteTarget
-        let authority: Authority
-
-        var headerId: String { target.headerId }
-        var accountId: String { target.accountId }
-        var requiresDirectMarker: Bool { authority == .direct }
-    }
-
     /// Independent job: one AI task for one message.
     struct AIJob: Hashable {
         let headerId: String
         let accountId: String
         let jobType: JobType
-        /// Every production enqueue supplies the exact target captured by its
-        /// selector/producer. `nil` is reserved for the cancellation-only test
-        /// seam, which never dispatches a real provider job.
-        let target: AIWriteTarget?
-        /// Direct jobs must still own the durable uncapped marker at execution.
-        /// Automatic jobs retain their selection authority without manufacturing
-        /// a marker, but both kinds remain bound to `target`.
-        let requiresDirectMarker: Bool
-
-        init(
-            headerId: String,
-            accountId: String,
-            jobType: JobType,
-            target: AIWriteTarget? = nil,
-            requiresDirectMarker: Bool = false
-        ) {
-            self.headerId = headerId
-            self.accountId = accountId
-            self.jobType = jobType
-            self.target = target
-            self.requiresDirectMarker = requiresDirectMarker
-        }
 
         enum JobType: String, Hashable {
             case summary
@@ -114,23 +71,13 @@ actor ActiveAIQueue {
             case reply
         }
 
-        // Captured identity is part of ephemeral job identity. An old target and a
-        // replacement at the same address must never deduplicate into one job. The
-        // automatic/direct provenance is deliberately NOT part of equality: when
-        // the same physical message gains a direct marker while its automatic job
-        // is queued, the existing identity-bound job is sufficient and must not
-        // trigger a duplicate model call.
+        // Hashable by (headerId, jobType) — accountId is context, not identity
         func hash(into hasher: inout Hasher) {
             hasher.combine(headerId)
-            hasher.combine(accountId)
             hasher.combine(jobType)
-            hasher.combine(target)
         }
         static func == (lhs: AIJob, rhs: AIJob) -> Bool {
-            lhs.headerId == rhs.headerId
-                && lhs.accountId == rhs.accountId
-                && lhs.jobType == rhs.jobType
-                && lhs.target == rhs.target
+            lhs.headerId == rhs.headerId && lhs.jobType == rhs.jobType
         }
     }
 
@@ -151,7 +98,7 @@ actor ActiveAIQueue {
     ///
     /// Why it has to exist: `.writeRefused` retires the job through
     /// `abandonWithoutCompletion`, which deliberately sets no `recentlyCompleted`
-    /// marker, and the next external work-remaining query still matches
+    /// marker, and the work-remaining query behind `repopulateOnDrain` still matches
     /// the row (its `summaryBlurb`/`actionTag`/`cachedReply` are still nil, and they
     /// never will not be). Without this memo, retiring the job turns the 30-second
     /// backoff loop into an unthrottled repopulate→dispatch→refuse spin.
@@ -225,35 +172,46 @@ actor ActiveAIQueue {
 
     // MARK: - Public API
 
-    /// Enqueue one identity-bound candidate after its body is written to FTS.
+    /// Enqueue an inbox message for AI processing after its body is written to FTS.
+    /// Called by ActiveBodyQueue (backfill) and AccountManagerFetch (user-opened, if needed).
     /// Enqueues S + R only. Action is enqueued by the summary job on completion
     /// (action depends on summary — no point queuing it before summary exists).
     /// Dispatches immediately — no debounce. Matching TB's kickDelayMs: 0.
-    func enqueue(_ candidate: Candidate) {
-        let jobs = Self.jobs(for: candidate, includeAction: false)
+    func enqueue(headerId: String, accountId: String) async {
+        // One admission rule for every producer. Direct opens, pushes and moves
+        // must not bypass the same recent-Inbox window used by repopulation;
+        // otherwise an old row can enter the retrying queue even though the
+        // executor will never process it.
+        let eligible = (try? await dbPool.read { db in
+            try Self.recentInboxWindowContains(headerId: headerId, db: db)
+        }) ?? false
+        guard eligible else {
+            activeAILog("[ActiveAI] Suppressed \(Self.logId(headerId)) outside recent Inbox window")
+            return
+        }
+        let jobs = [
+            AIJob(headerId: headerId, accountId: accountId, jobType: .summary),
+            AIJob(headerId: headerId, accountId: accountId, jobType: .reply),
+        ]
         var added = 0
         for job in jobs where !unattributableJobs.contains(job) {
             if storage.enqueue(job) { added += 1 }
         }
         guard added > 0 else { return }
-        BackgroundSyncLogger.logAIProcessing(
-            "Enqueued identity-bound \(Self.logId(candidate.headerId)) "
-                + "(\(added) jobs, total: \(storage.count))")
+        BackgroundSyncLogger.logAIProcessing("Enqueued \(Self.logId(headerId)) (\(added) jobs, total: \(storage.count))")
         scheduleDispatch()
-    }
-
-    /// Live direct handoff with the caller's original physical-message proof.
-    /// The durable marker remains the crash/relaunch authority; this token closes
-    /// only the in-process finalization→actor-enqueue→execution race.
-    func enqueueDirect(target: AIWriteTarget) {
-        enqueue(Candidate(target: target, authority: .direct))
     }
 
     /// Enqueue multiple messages at once (e.g., from repopulate).
     /// Enqueues S + R for each message. Also enqueues A if summary already exists
     /// but action is missing (crash recovery: S completed but A wasn't enqueued).
-    func enqueueBatch(_ items: [Candidate]) {
-        let allJobs = items.flatMap { Self.jobs(for: $0, includeAction: true) }
+    func enqueueBatch(_ items: [(headerId: String, accountId: String)]) {
+        var allJobs: [AIJob] = []
+        for item in items {
+            allJobs.append(AIJob(headerId: item.headerId, accountId: item.accountId, jobType: .summary))
+            allJobs.append(AIJob(headerId: item.headerId, accountId: item.accountId, jobType: .reply))
+            allJobs.append(AIJob(headerId: item.headerId, accountId: item.accountId, jobType: .action))
+        }
         let added = storage.enqueueBatch(allJobs.filter { !unattributableJobs.contains($0) })
         guard added > 0 else { return }
         activeAILog("[ActiveAI] Enqueued \(added) jobs for \(items.count) messages (total: \(storage.count))")
@@ -261,39 +219,11 @@ actor ActiveAIQueue {
         scheduleDispatch()
     }
 
-    /// Single production mapping from an admitted candidate to queue jobs. Kept
-    /// nonisolated so invariant tests can prove that target/direct provenance is
-    /// not dropped before QueueStorage without racing the shared actor.
-    nonisolated static func jobs(
-        for candidate: Candidate, includeAction: Bool
-    ) -> [AIJob] {
-        var types: [AIJob.JobType] = [.summary, .reply]
-        if includeAction { types.append(.action) }
-        return types.map { type in
-            AIJob(
-                headerId: candidate.headerId, accountId: candidate.accountId,
-                jobType: type, target: candidate.target,
-                requiresDirectMarker: candidate.requiresDirectMarker)
-        }
-    }
-
-    /// Queue-bookkeeping test seam. Production callers must use an identity-bound
-    /// `Candidate`; an unbound job is not valid message-processing authority. It
-    /// intentionally retains the production structural-refusal filter so tests of
-    /// that memo cannot pass through a weaker path.
-    func enqueueUnboundForCancellationTest(headerId: String, accountId: String) {
-        let jobs = [
-            AIJob(headerId: headerId, accountId: accountId, jobType: .summary),
-            AIJob(headerId: headerId, accountId: accountId, jobType: .reply),
-        ]
-        _ = storage.enqueueBatch(jobs.filter { !unattributableJobs.contains($0) })
-    }
-
-    /// Repopulate from GRDB on launch / foreground / AI re-enable.
+    /// Repopulate queue from GRDB on app launch / AI re-enable.
     /// Finds inbox messages that have body in FTS but are missing summary/action.
-    /// Automatic work is the owner-confirmed newest-N working-inbox population,
-    /// selected independently per inbox. Durable direct requests are unioned without
-    /// that cap, so an opened/pushed/moved old message survives queue clearing.
+    /// Only the most recent `SyncConfig.maxRecentEmails` inbox messages are considered,
+    /// matching TB's inboxManagement.maxRecentEmails cap. Older messages in large
+    /// inboxes are not AI-processed to save LLM tokens and battery.
     func repopulateFromDatabase() async {
         // Throttle: skip if cancelAllInFlight() fired < 2s ago.
         // Prevents the cancel→repopulate→dispatch cycle from creating duplicate job storms
@@ -310,12 +240,11 @@ actor ActiveAIQueue {
         rearmUnattributableJobs()
         let t0 = CFAbsoluteTimeGetCurrent()
         do {
-            // Indexed GRDB queries only — no per-message FTS probes.
+            // Single indexed SQL query — no per-message FTS probes.
             // bodyComplete flag is set when body is written to FTS, so we know
             // which messages have body text ready for AI processing.
-            let items = try await dbPool.write { db in
-                try Self.pruneDirectPending(db: db)
-                return try Self.repopulationCandidates(db: db)
+            let items = try await dbPool.read { db in
+                try Self.repopulationCandidates(db: db)
             }
 
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
@@ -331,185 +260,60 @@ actor ActiveAIQueue {
         }
     }
 
-    /// The durable selector behind launch and drain recovery.
-    ///
-    /// Automatic membership is selected FIRST: the newest
-    /// `SyncConfig.maxRecentEmails` rows in each inbox, matching the configured
-    /// working-inbox policy. Only then are body/AI fields filtered. Separately, every
-    /// `aiDirectPending` row is unioned without a rank cap. This separation is
-    /// load-bearing: a direct event may name an old message, and its in-memory enqueue
-    /// can disappear across suspension or relaunch.
+    /// The durable arbiter behind every direct-path redrive. Internal so the
+    /// UID-rekey regression can prove that a guarded drop is rediscovered by
+    /// the same production query, without launching an LLM in the test.
     nonisolated static func repopulationCandidates(
         db: Database
-    ) throws -> [Candidate] {
-        let providers = Dictionary(uniqueKeysWithValues:
-            try Account.fetchAll(db).map { ($0.id, $0.provider) })
-        let inboxes = try Row.fetchAll(db, sql: """
-            SELECT id, accountId FROM folder
-            WHERE role = ?
-            ORDER BY accountId ASC, id ASC
-        """, arguments: [FolderRole.inbox.rawValue])
-        var candidates: [Candidate] = []
-        var indexByHeaderId: [String: Int] = [:]
-        func append(_ message: MessageHeader, authority: Candidate.Authority) {
-            guard let provider = providers[message.accountId] else { return }
-            let candidate = Candidate(
-                target: AIWriteTarget.capture(message: message, provider: provider),
-                authority: authority)
-            if let index = indexByHeaderId[message.id] {
-                // A durable direct marker is the stronger provenance when a row
-                // also belongs to the automatic population.
-                if authority == .direct { candidates[index] = candidate }
-            } else {
-                indexByHeaderId[message.id] = candidates.count
-                candidates.append(candidate)
-            }
-        }
-        for inbox in inboxes {
-            let folderId: String = inbox["id"]
-            let accountId: String = inbox["accountId"]
-            let rows = try MessageHeader.fetchAll(db, sql: """
-                SELECT * FROM (
-                    SELECT *
-                    FROM messageHeader INDEXED BY messageHeader_folderId_date
-                    WHERE folderId = ? AND accountId = ? AND isInInbox = 1
+    ) throws -> [(headerId: String, accountId: String)] {
+        let rows = try Row.fetchAll(db, sql: """
+            WITH recentInbox AS (
+                SELECT id, accountId, bodyComplete, summaryBlurb, actionTag,
+                       cachedReply, date
+                FROM messageHeader
+                WHERE isInInbox = 1
+                ORDER BY date DESC, id DESC
+                LIMIT ?
+            )
+            SELECT id, accountId FROM recentInbox
+            WHERE bodyComplete = 1
+              AND (summaryBlurb IS NULL OR summaryBlurb = ''
+                   OR actionTag IS NULL OR cachedReply IS NULL)
+            ORDER BY date DESC, id DESC
+        """, arguments: [SyncConfig.maxRecentEmails])
+        return rows.map { ($0["id"] as String, $0["accountId"] as String) }
+    }
+
+    /// Stable test boundary for launch/drain recovery. Keeping the assertion at
+    /// header identity avoids coupling regression tests to queue job payloads.
+    nonisolated static func recoveryCandidateHeaderIdsForTesting(
+        db: Database
+    ) throws -> [String] {
+        try repopulationCandidates(db: db).map(\.headerId)
+    }
+
+    /// Whether a live row belongs to the exact automatic AI population.
+    ///
+    /// This deliberately shares the same ordering and limit as
+    /// `repopulationCandidates`: the newest `SyncConfig.maxRecentEmails` Inbox
+    /// rows are selected *before* cached-work filtering. It is the sole policy
+    /// seam used by direct enqueue, job execution, opened-message processing and
+    /// the summary UI. No durable exception survives outside this window.
+    nonisolated static func recentInboxWindowContains(
+        headerId: String,
+        db: Database
+    ) throws -> Bool {
+        try Bool.fetchOne(db, sql: """
+            SELECT EXISTS (
+                SELECT 1 FROM (
+                    SELECT id FROM messageHeader
+                    WHERE isInInbox = 1
                     ORDER BY date DESC, id DESC
                     LIMIT ?
-                )
-                WHERE bodyComplete = 1 AND bodyEmptyConfirmed = 0
-                  AND (summaryBlurb IS NULL OR summaryBlurb = ''
-                       OR actionTag IS NULL OR cachedReply IS NULL)
-                ORDER BY date DESC, id DESC
-            """, arguments: [folderId, accountId, SyncConfig.maxRecentEmails])
-            for row in rows { append(row, authority: .automatic) }
-        }
-
-        let directRows = try MessageHeader.fetchAll(db, sql: """
-            SELECT h.*
-            FROM messageHeader AS h INDEXED BY messageHeader_directAIPending
-            JOIN folder AS f
-              ON f.id = h.folderId AND f.accountId = h.accountId AND f.role = ?
-            WHERE h.aiDirectPending = 1 AND h.isInInbox = 1
-              AND h.bodyComplete = 1 AND h.bodyEmptyConfirmed = 0
-              AND (h.summaryBlurb IS NULL OR h.summaryBlurb = ''
-                   OR h.actionTag IS NULL OR h.cachedReply IS NULL)
-            ORDER BY h.date DESC, h.id DESC
-        """, arguments: [FolderRole.inbox.rawValue])
-        for row in directRows { append(row, authority: .direct) }
-        return candidates
-    }
-
-    /// Capture one marked direct row and its physical identity in a single read.
-    /// Used by event producers whose durable marker already committed but whose
-    /// actor enqueue occurs later.
-    nonisolated static func directCandidate(
-        headerId: String, db: Database
-    ) throws -> Candidate? {
-        guard let message = try MessageHeader.fetchOne(db, key: headerId),
-              message.isInInbox,
-              (try Int.fetchOne(
-                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
-                arguments: [headerId]) ?? 0) == 1,
-              try Folder
-                .filter(Column("id") == message.folderId)
-                .filter(Column("accountId") == message.accountId)
-                .filter(Column("role") == FolderRole.inbox.rawValue)
-                .fetchCount(db) > 0,
-              let target = try AIWriteTarget.capture(message: message, db: db)
-        else { return nil }
-        return Candidate(target: target, authority: .direct)
-    }
-
-    /// Persist uncapped direct-event authority before the ephemeral enqueue.
-    /// The column is schema-only, so every mutation is intentionally raw SQL.
-    nonisolated static func markDirectPending(
-        headerIds: [String], db: Database
-    ) throws {
-        guard !headerIds.isEmpty else { return }
-        for chunk in Array(Set(headerIds)).chunked(into: SyncConfig.sqlChunkSize) {
-            let placeholders = chunk.map { _ in "?" }.joined(separator: ",")
-            try db.execute(sql: """
-                UPDATE messageHeader SET aiDirectPending = 1
-                WHERE id IN (\(placeholders)) AND aiDirectPending = 0
-                  AND isInInbox = 1
-                  AND bodyEmptyConfirmed = 0
-                  AND EXISTS (
-                      SELECT 1 FROM folder AS f
-                      WHERE f.id = messageHeader.folderId
-                        AND f.accountId = messageHeader.accountId
-                        AND f.role = '\(FolderRole.inbox.rawValue)'
-                  )
-                  AND (summaryBlurb IS NULL OR summaryBlurb = ''
-                       OR actionTag IS NULL OR cachedReply IS NULL)
-            """, arguments: StatementArguments(chunk))
-            var cacheArguments: StatementArguments = [Date()]
-            cacheArguments += StatementArguments(chunk)
-            try db.execute(sql: """
-                INSERT INTO messageAICache (
-                    key, rfc822MessageId, aiDirectPending, updatedAt
-                )
-                SELECT accountId || ':' || folderPath || ':' || rfc822MessageId,
-                       rfc822MessageId, 1, ?
-                FROM messageHeader
-                WHERE id IN (\(placeholders)) AND aiDirectPending = 1
-                  AND rfc822MessageId IS NOT NULL AND rfc822MessageId != ''
-                ON CONFLICT(key) DO UPDATE SET
-                    aiDirectPending = 1,
-                    updatedAt = excluded.updatedAt
-                WHERE messageAICache.aiDirectPending = 0
-            """, arguments: cacheArguments)
-        }
-    }
-
-    /// Clear only when every durable output exists (or the row left Inbox).
-    /// Partial completion, cancellation, refusal, and AI-disable all retain intent.
-    nonisolated static func clearDirectPendingIfComplete(
-        headerId: String, db: Database
-    ) throws {
-        try db.execute(sql: """
-            UPDATE messageHeader SET aiDirectPending = 0
-            WHERE id = ? AND aiDirectPending = 1
-              AND (isInInbox = 0 OR bodyEmptyConfirmed = 1
-                   OR NOT EXISTS (
-                       SELECT 1 FROM folder AS f
-                       WHERE f.id = messageHeader.folderId
-                         AND f.accountId = messageHeader.accountId
-                         AND f.role = '\(FolderRole.inbox.rawValue)'
-                   )
-                   OR ((summaryBlurb IS NOT NULL AND summaryBlurb != '')
-                       AND actionTag IS NOT NULL AND cachedReply IS NOT NULL))
-        """, arguments: [headerId])
-    }
-
-    /// Launch/foreground cleanup for work completed by a direct path that did not
-    /// pass through this queue's completion callback.
-    nonisolated static let pruneDirectPendingSQL = """
-        UPDATE messageHeader SET aiDirectPending = 0
-        WHERE aiDirectPending = 1
-          AND (isInInbox = 0 OR bodyEmptyConfirmed = 1
-               OR NOT EXISTS (
-                   SELECT 1 FROM folder AS f
-                   WHERE f.id = messageHeader.folderId
-                     AND f.accountId = messageHeader.accountId
-                     AND f.role = '\(FolderRole.inbox.rawValue)'
-               )
-               OR ((summaryBlurb IS NOT NULL AND summaryBlurb != '')
-                   AND actionTag IS NOT NULL AND cachedReply IS NOT NULL))
-    """
-
-    nonisolated static func pruneDirectPending(db: Database) throws {
-        try db.execute(sql: pruneDirectPendingSQL)
-    }
-
-    /// The exact launch/drain recovery transaction: retire terminal direct intent
-    /// first, then select automatic plus surviving direct work. Exposed at the
-    /// invariant level so tests cannot pass by calling cleanup that production
-    /// drain forgot to call.
-    nonisolated static func drainRecoveryCandidates(
-        db: Database
-    ) throws -> [Candidate] {
-        try pruneDirectPending(db: db)
-        return try repopulationCandidates(db: db)
+                ) AS recentInbox
+                WHERE recentInbox.id = ?
+            )
+        """, arguments: [SyncConfig.maxRecentEmails, headerId]) ?? false
     }
 
     /// Cancel all in-flight processing tasks and reset queue state.
@@ -542,7 +346,8 @@ actor ActiveAIQueue {
     /// Forget every structurally-refused job, so the next enqueue admits it again.
     /// Called from the entry points that follow a possible sync — launch / foreground
     /// / AI re-enable (`repopulateFromDatabase`) and suspension recovery
-    /// (`cancelAllInFlight`). See `unattributableJobs`.
+    /// (`cancelAllInFlight`) — never from the drain-time self-repopulate, which is
+    /// the loop this memo exists to break. See `unattributableJobs`.
     func rearmUnattributableJobs() {
         guard !unattributableJobs.isEmpty else { return }
         BackgroundSyncLogger.logAIProcessing(
@@ -764,25 +569,13 @@ actor ActiveAIQueue {
             _ = storage.abandonWithoutCompletion(job)
             backoff.removeValue(forKey: job)
             backoffRetryCount.removeValue(forKey: job)
-            // Do not leave a stale direct event armed until a future foreground
-            // maintenance pass. Folder deletion/role loss does not cascade every
-            // header shape, and deterministic folder ids could otherwise reactivate
-            // that old event if the folder is recreated before pruning.
-            if job.requiresDirectMarker, let target = job.target {
-                try? await dbPool.write { db in
-                    // Never clear a replacement's marker by a reused address.
-                    guard let current = try target.resolveCurrentHeader(db: db) else { return }
-                    try Self.clearDirectPendingIfComplete(
-                        headerId: current.id, db: db)
-                }
-            }
             shouldRetry = false
         case .writeRefused:
             // TERMINAL for this process, and deliberately NOT a completion: like
             // `.scopeExited` it takes `abandonWithoutCompletion`, so no
             // `recentlyCompleted` marker claims work was done. The memo — not the
-            // storage — is what keeps another enqueue in this process from re-arming it,
-            // and the memo is cleared by `rearmUnattributableJobs()` on the next launch /
+            // storage — is what keeps `repopulateOnDrain` from re-arming it, and the
+            // memo is cleared by `rearmUnattributableJobs()` on the next launch /
             // foreground / AI re-enable.
             _ = storage.abandonWithoutCompletion(job)
             backoff.removeValue(forKey: job)
@@ -818,22 +611,22 @@ actor ActiveAIQueue {
             launchCandidates()
         }
 
-        // When all in-memory work is done, re-query the SAME policy selector for
-        // anything that slipped past its event path (crash between durable marker and
-        // enqueue, lost notification, etc.). Automatic membership does not paginate
-        // past the configured recent population; durable direct rows remain unioned.
+        // When all in-memory work is done, re-query GRDB for anything that slipped
+        // past the push path (crash between write and enqueue, lost notify, etc.).
+        // If the query returns rows, they're enqueued and drain continues. Only when
+        // GRDB reports zero work is the queue truly idle.
         if storage.isEmpty && storage.activeJobs == 0 {
             let repopulated = await repopulateOnDrain()
             if !repopulated {
                 cachedConfig = nil
                 if didLLMWorkSinceDrain {
-                    BackgroundSyncLogger.logAIProcessing("Queue fully drained — selected jobs processed")
+                    BackgroundSyncLogger.logAIProcessing("Queue fully drained — all jobs processed")
                     didLLMWorkSinceDrain = false
                 }
                 await ProactiveNotifyService.shared.onInboxUpdated()
 
                 // Lazy TTL touch + eviction: refresh AI cache TTL for inbox messages
-                // and purge expired entries. Runs once after selected AI work completes.
+                // and purge expired entries. Runs once after all AI work completes.
                 Task.detached {
                     SyncEngine.refreshAICacheTTLAndPurge(dbPool: AppDatabase.backgroundPool)
                 }
@@ -863,25 +656,6 @@ actor ActiveAIQueue {
         /// `WriteAdmission.structurallyRefused` at job start. No LLM call, no FTS
         /// read, no NSE lease claim — the job stopped before spending anything.
         case unattributable
-    }
-
-    /// Drain-time recovery through the same automatic-population + durable-direct
-    /// selector used on launch. Returns true only when at least one job survived
-    /// queue dedup / the process-local structural-refusal memo.
-    @discardableResult
-    private func repopulateOnDrain() async -> Bool {
-        do {
-            let items: [Candidate] = try await dbPool.write { db in
-                try Self.drainRecoveryCandidates(db: db)
-            }
-            guard !items.isEmpty else { return false }
-            BackgroundSyncLogger.logAIProcessing("[DRAIN] Recovery selector found \(items.count) messages")
-            enqueueBatch(items)
-            return storage.pendingCount > 0
-        } catch {
-            activeAILog("[ActiveAI] Drain-time repopulate failed: \(error)")
-            return false
-        }
     }
 
     /// Whether the AI result a job is about to compute could be WRITTEN BACK at all,
@@ -924,41 +698,6 @@ actor ActiveAIQueue {
         case structurallyRefused
     }
 
-    /// Terminal preflight for a selected job. Recency is intentionally absent:
-    /// `repopulationCandidates` bounds the automatic working-inbox population, while direct event
-    /// producers (user-opened body, push merge, and move into inbox) mirror TB's
-    /// uncapped `processMessage` path. Automatic ActiveBodyQueue production is
-    /// intersected with this queue's automatic selector at `BodyFetchProcessor`.
-    /// Applying the same cap again here strands a direct
-    /// old-message job in `jobCompleted`'s retry loop.
-    enum JobStartDisposition: Sendable, Equatable {
-        case execute
-        case alreadyComplete
-        case structurallyRefused
-    }
-
-    nonisolated static func jobStartDisposition(
-        message: MessageHeader,
-        jobType: AIJob.JobType,
-        admission: WriteAdmission
-    ) -> JobStartDisposition {
-        // A provider-confirmed empty body has no text that any AI job can process.
-        // This guard also retires jobs that were already in memory when the body
-        // fetch reached that terminal result; it does not manufacture AI output.
-        guard !message.bodyEmptyConfirmed else { return .alreadyComplete }
-        switch jobType {
-        case .summary:
-            guard message.summaryBlurb == nil || message.summaryBlurb?.isEmpty == true else {
-                return .alreadyComplete
-            }
-        case .action:
-            guard message.actionTag == nil else { return .alreadyComplete }
-        case .reply:
-            guard message.cachedReply == nil else { return .alreadyComplete }
-        }
-        return admission == .structurallyRefused ? .structurallyRefused : .execute
-    }
-
     /// See `WriteAdmission`. `target` MUST have been captured from the current row in
     /// this same read.
     nonisolated static func writeAdmission(_ db: Database, target: AIWriteTarget) throws -> WriteAdmission {
@@ -970,64 +709,25 @@ actor ActiveAIQueue {
         return .structurallyRefused
     }
 
-    /// The shared execution/outcome resolver for an already-selected job. This is
-    /// deliberately downstream of actor enqueue: a target selected as X must still
-    /// resolve as X here, and a direct target must still own its durable marker.
-    nonisolated static func resolveSelectedJobMessage(
-        _ job: AIJob, db: Database
-    ) throws -> MessageHeader? {
-        if let target = job.target {
-            guard let resolved = try target.resolveLiveInboxHeader(db: db),
-                  resolved.id == job.headerId
-            else { return nil }
-            if job.requiresDirectMarker,
-               (try Int.fetchOne(
-                db,
-                sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
-                arguments: [resolved.id]) ?? 0) != 1 {
-                return nil
-            }
-            return resolved
-        }
-        // Test-only unbound queue bookkeeping never reaches execution in normal
-        // operation; retain the legacy lookup so cancellation tests remain inert.
-        guard let resolved = try MessageHeader.fetchOne(db, key: job.headerId),
-              resolved.isInInbox,
-              try Folder
-                .filter(Column("id") == resolved.folderId)
-                .filter(Column("accountId") == resolved.accountId)
-                .filter(Column("role") == FolderRole.inbox.rawValue)
-                .fetchCount(db) > 0
-        else { return nil }
-        return resolved
-    }
-
     /// Re-read GRDB to decide whether the job succeeded. Ignores the executor Bool.
     private func readJobOutcome(_ job: AIJob) async -> JobOutcome {
-        let state: (message: MessageHeader, hasLiveInbox: Bool)? = try? await dbPool.read {
-            db -> (message: MessageHeader, hasLiveInbox: Bool)? in
-            guard let message = try Self.resolveSelectedJobMessage(job, db: db) else {
+        guard let state = try? await dbPool.read({ db -> (MessageHeader, Bool)? in
+            guard let message = try MessageHeader.fetchOne(db, key: job.headerId) else {
                 return nil
             }
-            let hasLiveInbox = try Folder
-                .filter(Column("id") == message.folderId)
-                .filter(Column("accountId") == message.accountId)
-                .filter(Column("role") == FolderRole.inbox.rawValue)
-                .fetchCount(db) > 0
-            return (message, hasLiveInbox)
-        }
-        guard let state else {
+            return (
+                message,
+                try Self.recentInboxWindowContains(headerId: job.headerId, db: db)
+            )
+        }) else {
             return .scopeExited // row gone
         }
-        let message = state.message
+        let (message, inRecentWindow) = state
         guard message.isInInbox else {
             return .scopeExited // archived / moved out
         }
-        guard state.hasLiveInbox else {
-            return .scopeExited // folder vanished, changed owner, or lost Inbox role
-        }
-        guard !message.bodyEmptyConfirmed else {
-            return .scopeExited // terminal empty body; no model input can ever exist
+        guard inRecentWindow else {
+            return .scopeExited // deliberately outside the bounded AI population
         }
         switch job.jobType {
         case .summary:
@@ -1037,6 +737,25 @@ actor ActiveAIQueue {
             return (message.actionTag != nil) ? .verifiedComplete : .needsRetry
         case .reply:
             return (message.cachedReply != nil) ? .verifiedComplete : .needsRetry
+        }
+    }
+
+    /// Drain-time self-repopulate: re-run the work-remaining query and enqueue any
+    /// hits. Returns true if any items were enqueued (caller skips idle-finalization).
+    /// Called only when `storage.isEmpty && activeJobs == 0`, so no in-flight overlap.
+    @discardableResult
+    private func repopulateOnDrain() async -> Bool {
+        do {
+            let items: [(headerId: String, accountId: String)] = try await dbPool.read { db in
+                try Self.repopulationCandidates(db: db)
+            }
+            guard !items.isEmpty else { return false }
+            BackgroundSyncLogger.logAIProcessing("[DRAIN] Self-repopulate enqueued \(items.count) messages")
+            enqueueBatch(items)
+            return storage.pendingCount > 0
+        } catch {
+            activeAILog("[ActiveAI] Drain-time repopulate failed: \(error)")
+            return false
         }
     }
 
@@ -1091,27 +810,39 @@ actor ActiveAIQueue {
         // back to at all (`IOS-AI-002` / `IOS-AI-003`). It has to be this read: the
         // classification is only sound for a target resolved against the row it was
         // captured from, in one transaction. Zero extra round trips.
-        let captured: (message: MessageHeader, target: AIWriteTarget, admission: WriteAdmission)? =
-            (try? await dbPool.read { db -> (message: MessageHeader, target: AIWriteTarget, admission: WriteAdmission)? in
-                guard let message = try Self.resolveSelectedJobMessage(job, db: db)
-                else { return nil }
-                let target: AIWriteTarget
-                if let selected = job.target {
-                    target = selected
-                } else if let captured = try AIWriteTarget.capture(message: message, db: db) {
-                    target = captured
-                } else {
-                    return nil
-                }
-                return (message, target, try Self.writeAdmission(db, target: target))
+        let captured: (message: MessageHeader, target: AIWriteTarget, admission: WriteAdmission, inRecentWindow: Bool)? =
+            (try? await dbPool.read { db -> (message: MessageHeader, target: AIWriteTarget, admission: WriteAdmission, inRecentWindow: Bool)? in
+                guard let message = try MessageHeader.fetchOne(db, key: job.headerId),
+                      let target = try AIWriteTarget.capture(message: message, db: db) else { return nil }
+                return (
+                    message,
+                    target,
+                    try Self.writeAdmission(db, target: target),
+                    try Self.recentInboxWindowContains(headerId: job.headerId, db: db)
+                )
             }) ?? nil
         guard let captured else { return .ordinary(retry: false) }
         let message = captured.message
         let target = captured.target
 
-        // `IOS-AI-002` / `IOS-AI-003`. If a job still needs its field but its
-        // guarded write-back CANNOT be admitted from this database state, then —
-        // because the target is re-captured every attempt — the write will
+        // The job may have aged out after it was admitted. Retire it without a
+        // model call; `readJobOutcome` uses the same policy and classifies this as
+        // a scope exit rather than retrying an intentionally suppressed job.
+        guard captured.inRecentWindow else { return .ordinary(retry: false) }
+
+        // Check if this specific job type is already done
+        switch job.jobType {
+        case .summary:
+            guard message.summaryBlurb == nil || message.summaryBlurb?.isEmpty == true else { return .ordinary(retry: false) }
+        case .action:
+            guard message.actionTag == nil else { return .ordinary(retry: false) }
+        case .reply:
+            guard message.cachedReply == nil else { return .ordinary(retry: false) }
+        }
+
+        // `IOS-AI-002` / `IOS-AI-003`. The job genuinely still needs its field, and
+        // the guarded write-back that would deliver it CANNOT be admitted from this
+        // database state — and, because the target is re-captured every attempt, will
         // not be admitted by any retry either. Everything below this line costs money
         // (the model call), battery (FTS + HTTP) or a lease slot the NSE also wants,
         // and every one of those costs would be spent on a result that is discarded at
@@ -1120,16 +851,9 @@ actor ActiveAIQueue {
         //
         // NOT a relaxation of the refusal: nothing below would have been WRITTEN
         // anyway. The only thing that changes is that it is no longer paid for.
-        switch Self.jobStartDisposition(
-            message: message, jobType: job.jobType, admission: captured.admission
-        ) {
-        case .alreadyComplete:
-            return .ordinary(retry: false)
-        case .structurallyRefused:
+        if captured.admission == .structurallyRefused {
             BackgroundSyncLogger.logAIProcessing("[JOB] \(Self.logId(job.headerId)).\(job.jobType.rawValue) skipped — write target structurally unattributable (no RFC 822 Message-ID and no proven numbering)")
             return .unattributable
-        case .execute:
-            break
         }
 
         didLLMWorkSinceDrain = true
@@ -1395,10 +1119,7 @@ actor ActiveAIQueue {
         if let existing = message.summaryBlurb, !existing.isEmpty {
             BackgroundSyncLogger.logAIProcessing("Summary cache HIT for \(Self.logId(job.headerId))")
             // Always chain A — even from cache hit
-            let actionJob = AIJob(
-                headerId: job.headerId, accountId: job.accountId,
-                jobType: .action, target: job.target,
-                requiresDirectMarker: job.requiresDirectMarker)
+            let actionJob = AIJob(headerId: job.headerId, accountId: job.accountId, jobType: .action)
             if storage.enqueue(actionJob) { scheduleDispatch() }
             return false
         }
@@ -1474,10 +1195,7 @@ actor ActiveAIQueue {
             BackgroundSyncLogger.logAIProcessing("Summary complete for \(Self.logId(job.headerId)) in \(elapsed)ms")
 
             // Always chain A after summary completes
-            let actionJob = AIJob(
-                headerId: job.headerId, accountId: job.accountId,
-                jobType: .action, target: job.target,
-                requiresDirectMarker: job.requiresDirectMarker)
+            let actionJob = AIJob(headerId: job.headerId, accountId: job.accountId, jobType: .action)
             if storage.enqueue(actionJob) { scheduleDispatch() }
         } catch {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)

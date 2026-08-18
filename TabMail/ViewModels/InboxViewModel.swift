@@ -1583,13 +1583,6 @@ final class InboxViewModel {
                 continue
             }
 
-            let processorItem = BodyFetchProcessor.Item(
-                headerId: item.headerId, accountId: item.header.accountId,
-                folderPath: item.header.folderPath, messageId: item.header.messageId,
-                isInInbox: item.header.isInInbox
-            )
-            let enableAI = item.header.isInInbox
-
             do {
                 if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Tier2 fetching msgId=\(item.header.messageId) folder=\(item.header.folderPath)") }
                 let fullMessage = try await provider.fetchMessage(id: item.header.messageId, folder: item.header.folderPath)
@@ -1604,12 +1597,16 @@ final class InboxViewModel {
                 // mirrors the queue split: inbox → AI + active embedding (as
                 // ActiveBodyQueue); other folders → backfill embedding only (as
                 // BackfillBodyQueue).
+                let processorItem = BodyFetchProcessor.Item(
+                    headerId: item.headerId, accountId: item.header.accountId,
+                    folderPath: item.header.folderPath, messageId: item.header.messageId,
+                    isInInbox: item.header.isInInbox
+                )
+                let enableAI = item.header.isInInbox
                 if case .success(let fetchResult) = await BodyFetchProcessor.renderFetched(item: processorItem, fullMessage: fullMessage) {
                     let (_, processed) = await BodyFetchProcessor.process(fetchResult: fetchResult, enableAI: enableAI)
                     if let processed {
-                        await BodyFetchProcessor.flushBatch(
-                            [processed], enableAI: enableAI,
-                            aiEnqueueScope: .automaticRecentWindow)
+                        await BodyFetchProcessor.flushBatch([processed], enableAI: enableAI)
                         snippetUpdates.append((headerId: item.headerId, snippet: processed.snippet))
                     } else {
                         // confirmed-empty / first-empty-retry — no usable snippet this pass

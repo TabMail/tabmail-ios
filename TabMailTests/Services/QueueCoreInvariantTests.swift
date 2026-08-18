@@ -360,33 +360,31 @@ struct QueueCoreInvariantTests {
     // `narrowedRetirementCarriesTheDestinationAddressTheServerNamed` fails —
     // the surviving row is still `…:INBOX:77` with `messageId == "77"`.
 
-    @Test("a member retired in a narrowing pass carries its proved inbox address into the AI event")
+    @Test("a member retired in a narrowing pass ends the drain carrying the destination address COPYUID proved")
     func narrowedRetirementCarriesTheDestinationAddressTheServerNamed() async throws {
         let fixture = try fixture(accountId: "acc-queue-005-proven")
         defer { finish(fixture) }
 
         // The optimistic half of a move already ran: the row is shown in
-        // INBOX but still keyed by, and named by, its Archive address.
+        // Archive but still keyed by, and named by, its INBOX address.
         try seedHeader(
-            fixture, messageId: "77", folderPath: "INBOX",
-            keyedFromFolderPath: "Archive", epoch: nil)
+            fixture, messageId: "77", folderPath: "Archive",
+            keyedFromFolderPath: "INBOX", epoch: nil)
 
-        var op = PendingOperation(
+        let op = PendingOperation(
             type: .move, messageIds: ["77", "88"], accountId: fixture.accountId,
-            folderPath: "Archive", destinationPath: "INBOX", observedUidValidity: 42)
-        op.status = PendingStatus.inFlight.rawValue
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
         try insertOp(op, fixture)
 
-        let context = AccountManager.DrainContext()
         await AccountManager.shared.retirePartiallyCompletedOp(
             op, provenMembers: ["77"], remaining: ["88"],
             provenDestinations: [ProvenDestinationAddress(
                 sourceProviderId: "77", destinationProviderId: "5", destinationUidValidity: 42)],
             addressChangesOnMove: true,
-            context: context)
+            context: AccountManager.DrainContext())
 
         let destinationId = MessageIdentity.headerId(
-            accountId: fixture.accountId, folderPath: "INBOX", messageId: "5")
+            accountId: fixture.accountId, folderPath: "Archive", messageId: "5")
         let rows = try await fixture.pool.read { db in
             try MessageHeader.filter(Column("accountId") == fixture.accountId).fetchAll(db)
         }
@@ -401,184 +399,11 @@ struct QueueCoreInvariantTests {
         #expect(
             rows[0].observedUidValidity == 42,
             "the destination epoch the server reported agrees with the folder, so it is stamped")
-        let directPending = try await fixture.pool.read { db in
-            try Int.fetchOne(
-                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
-                arguments: [destinationId]) ?? 0
-        }
-        #expect(directPending == 1,
-                "the narrowing transaction must durably preserve the proved inbox event")
-
-        // A partial-success retirement is still a completed move for its proven
-        // members. The same member must reach the post-drain entered-inbox event;
-        // otherwise an RFC-bearing row misses the trigger solely because another
-        // member in its bundle was unproven.
-        let entered = context.enteredInbox.withLock {
-            $0["\(fixture.accountId)|INBOX"] ?? []
-        }
-        #expect(entered.count == 1)
-        #expect(entered.first?.messageId == "5")
 
         // The unproven member is preserved, narrowed — never dropped.
         let after = try fetchOp(op.id, fixture)
         #expect(after?.messageIds == ["88"])
         #expect(after?.status == PendingStatus.queued.rawValue)
-    }
-
-    @Test("a narrowing collision marks and records only the provider-proven survivor")
-    func narrowedRetirementCollisionPreservesDirectEvent() async throws {
-        let fixture = try fixture(accountId: "acc-queue-005-collision")
-        defer { finish(fixture) }
-
-        let old = try seedHeader(
-            fixture, messageId: "77", folderPath: "INBOX",
-            keyedFromFolderPath: "Archive", epoch: nil)
-        let survivor = try seedHeader(
-            fixture, messageId: "5", folderPath: "INBOX", epoch: 42)
-        var op = PendingOperation(
-            type: .move, messageIds: ["77", "88"], accountId: fixture.accountId,
-            folderPath: "Archive", destinationPath: "INBOX", observedUidValidity: 42)
-        op.status = PendingStatus.inFlight.rawValue
-        try insertOp(op, fixture)
-
-        let context = AccountManager.DrainContext()
-        await AccountManager.shared.retirePartiallyCompletedOp(
-            op, provenMembers: ["77"], remaining: ["88"],
-            provenDestinations: [ProvenDestinationAddress(
-                sourceProviderId: "77", destinationProviderId: "5",
-                destinationUidValidity: 42)],
-            addressChangesOnMove: true, context: context)
-
-        let evidence = try await fixture.pool.read { db -> (Bool, Int, Int) in
-            let oldExists = try MessageHeader.fetchOne(db, key: old.id) != nil
-            let survivorCount = try MessageHeader
-                .filter(Column("id") == survivor.id).fetchCount(db)
-            let pending = try Int.fetchOne(
-                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
-                arguments: [survivor.id]) ?? 0
-            return (oldExists, survivorCount, pending)
-        }
-        #expect(!evidence.0, "the collision arm removed the optimistic old row")
-        #expect(evidence.1 == 1, "the provider-proven destination survivor remains")
-        #expect(evidence.2 == 1, "the direct event belongs to that survivor")
-        let entered = context.enteredInbox.withLock {
-            $0["\(fixture.accountId)|INBOX"] ?? []
-        }
-        #expect(entered.count == 1)
-        #expect(entered.first?.messageId == "5")
-        #expect(try fetchOp(op.id, fixture)?.messageIds == ["88"])
-    }
-
-    @Test("a provider-address collision cannot overrule contradictory content identity")
-    func narrowedRetirementContradictoryCollisionKeepsSourceAuthority() async throws {
-        let fixture = try fixture(accountId: "acc-queue-005-content-contradiction")
-        defer { finish(fixture) }
-
-        let old = try seedHeader(
-            fixture, messageId: "77", folderPath: "INBOX",
-            keyedFromFolderPath: "Archive", epoch: nil)
-        let survivor = try seedHeader(
-            fixture, messageId: "5", folderPath: "INBOX", epoch: 42)
-        try await fixture.pool.writeWithoutTransaction { db in
-            try db.execute(
-                sql: "UPDATE messageHeader SET rfc822MessageId = ? WHERE id = ?",
-                arguments: ["source@example.com", old.id])
-            try db.execute(
-                sql: "UPDATE messageHeader SET rfc822MessageId = ? WHERE id = ?",
-                arguments: ["survivor@example.com", survivor.id])
-        }
-        let op = PendingOperation(
-            type: .move, messageIds: ["77", "88"], accountId: fixture.accountId,
-            folderPath: "Archive", destinationPath: "INBOX", observedUidValidity: 42)
-        try insertOp(op, fixture)
-
-        let context = AccountManager.DrainContext()
-        await AccountManager.shared.retirePartiallyCompletedOp(
-            op, provenMembers: ["77"], remaining: ["88"],
-            provenDestinations: [ProvenDestinationAddress(
-                sourceProviderId: "77", destinationProviderId: "5",
-                destinationUidValidity: 42)],
-            addressChangesOnMove: true, context: context)
-
-        let evidence = try await fixture.pool.read { db -> (Bool, Int, Int) in
-            let oldExists = try MessageHeader.fetchOne(db, key: old.id) != nil
-            let oldPending = try Int.fetchOne(
-                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
-                arguments: [old.id]) ?? 0
-            let survivorPending = try Int.fetchOne(
-                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
-                arguments: [survivor.id]) ?? 0
-            return (oldExists, oldPending, survivorPending)
-        }
-        #expect(evidence.0, "positive RFC contradiction preserves the marked source row")
-        #expect(evidence.1 == 1)
-        #expect(evidence.2 == 0, "provider address alone cannot authorize survivor content")
-        let entered = context.enteredInbox.withLock {
-            $0["\(fixture.accountId)|INBOX"] ?? []
-        }
-        #expect(entered.map(\.messageId) == ["77"])
-        #expect(try fetchOp(op.id, fixture)?.messageIds == ["88"])
-    }
-
-    @Test("a post-narrowing failure rolls back partial rekey, marker, and bundle together")
-    func narrowingMarkerFailureRollsBackTheWholeTransaction() async throws {
-        let fixture = try fixture(accountId: "acc-queue-005-marker-rollback")
-        defer { finish(fixture) }
-
-        let old = try seedHeader(
-            fixture, messageId: "77", folderPath: "INBOX",
-            keyedFromFolderPath: "Archive", epoch: nil)
-        var op = PendingOperation(
-            type: .move, messageIds: ["77", "88"], accountId: fixture.accountId,
-            folderPath: "Archive", destinationPath: "INBOX", observedUidValidity: 42)
-        op.status = PendingStatus.inFlight.rawValue
-        try insertOp(op, fixture)
-        let opId = op.id
-        let destinationId = MessageIdentity.headerId(
-            accountId: fixture.accountId, folderPath: "INBOX", messageId: "5")
-        try await fixture.pool.writeWithoutTransaction { db in
-            try db.execute(sql: """
-                CREATE TEMP TRIGGER fail_operation_narrowing
-                AFTER UPDATE OF messageIdsJSON ON pendingOperation
-                WHEN NEW.id = '\(opId)'
-                  AND OLD.messageIdsJSON != NEW.messageIdsJSON
-                  AND NOT EXISTS (
-                      SELECT 1 FROM messageHeader WHERE id = '\(old.id)'
-                  )
-                  AND EXISTS (
-                      SELECT 1 FROM messageHeader
-                      WHERE id = '\(destinationId)' AND aiDirectPending = 1
-                  )
-                BEGIN
-                    SELECT RAISE(ABORT, 'injected narrowing failure');
-                END
-            """)
-        }
-
-        let context = AccountManager.DrainContext()
-        await AccountManager.shared.retirePartiallyCompletedOp(
-            op, provenMembers: ["77"], remaining: ["88"],
-            provenDestinations: [ProvenDestinationAddress(
-                sourceProviderId: "77", destinationProviderId: "5",
-                destinationUidValidity: 42)],
-            addressChangesOnMove: true, context: context)
-
-        let evidence = try await fixture.pool.read { db -> (Bool, Bool, Int, PendingOperation?) in
-            let oldExists = try MessageHeader.fetchOne(db, key: old.id) != nil
-            let destinationExists = try MessageHeader.fetchOne(db, key: destinationId) != nil
-            let pending = try Int.fetchOne(
-                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
-                arguments: [old.id]) ?? 0
-            return (oldExists, destinationExists, pending,
-                    try PendingOperation.fetchOne(db, key: opId))
-        }
-        #expect(evidence.0, "the optimistic source row must survive the aborted write")
-        #expect(!evidence.1, "the provider address rekey must roll back")
-        #expect(evidence.2 == 0, "the marker must roll back with the rekey")
-        #expect(evidence.3?.messageIds == ["77", "88"],
-                "the original durable bundle is requeued, not narrowed")
-        #expect(evidence.3?.status == PendingStatus.queued.rawValue)
-        #expect(context.enteredInbox.withLock { $0.isEmpty })
     }
 
     @Test("a narrowing pass with NO proven destination re-keys nothing and still keeps the unproven member queued")
@@ -610,13 +435,6 @@ struct QueueCoreInvariantTests {
         #expect(rows.count == 1)
         guard rows.count == 1 else { return }
         #expect(rows[0].id == seeded.id && rows[0].messageId == "77")
-        let directPending = try await fixture.pool.read { db in
-            try Int.fetchOne(
-                db, sql: "SELECT aiDirectPending FROM messageHeader WHERE id = ?",
-                arguments: [seeded.id]) ?? 0
-        }
-        #expect(directPending == 0,
-                "an unproved/non-inbox retirement must not invent direct AI authority")
 
         let after = try fetchOp(op.id, fixture)
         #expect(after?.messageIds == ["88"], "the unproven member stays queued")

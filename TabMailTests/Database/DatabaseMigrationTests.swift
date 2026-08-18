@@ -1096,3 +1096,84 @@ struct V70CrossStoreInvariantTests {
         #expect(stamp >= before.addingTimeInterval(-1))
     }
 }
+
+@Suite("v87 direct-AI retirement")
+struct V87DirectAIRetirementTests {
+    private static func makeDatabase(upTo migration: String) throws -> DatabaseQueue {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: migration)
+        return db
+    }
+
+    private static func migrate(_ db: DatabaseQueue, upTo migration: String) throws {
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: migration)
+    }
+
+    @Test("v87 retires direct-AI schema without rewriting migration history or cache data")
+    func v87RetiresDirectAIPendingSchema() throws {
+        let db = try Self.makeDatabase(upTo: "v86_retireDirectAIOnInboxRoleExit")
+
+        try db.write { connection in
+            try connection.execute(sql: """
+                INSERT INTO messageAICache
+                    (key, rfc822MessageId, updatedAt, aiDirectPending)
+                VALUES ('acc1:INBOX:rfc@example.com', 'rfc@example.com', 1, 1)
+            """)
+        }
+
+        let preHeaderColumns = try db.read {
+            try String.fetchAll($0, sql: "SELECT name FROM pragma_table_info('messageHeader')")
+        }
+        let preCacheColumns = try db.read {
+            try String.fetchAll($0, sql: "SELECT name FROM pragma_table_info('messageAICache')")
+        }
+        #expect(preHeaderColumns.contains("aiDirectPending"))
+        #expect(preCacheColumns.contains("aiDirectPending"))
+
+        try Self.migrate(db, upTo: "v87_retireDirectAIPending")
+
+        let headerColumns = try db.read {
+            try String.fetchAll($0, sql: "SELECT name FROM pragma_table_info('messageHeader')")
+        }
+        let cacheColumns = try db.read {
+            try String.fetchAll($0, sql: "SELECT name FROM pragma_table_info('messageAICache')")
+        }
+        #expect(!headerColumns.contains("aiDirectPending"))
+        #expect(!cacheColumns.contains("aiDirectPending"))
+
+        let retiredObjects = try db.read { connection in
+            try String.fetchAll(connection, sql: """
+                SELECT name FROM sqlite_master
+                WHERE name IN (
+                    'messageHeader_directAIPending',
+                    'folder_retireDirectAIOnInboxRoleExit',
+                    'messageHeader_clearDirectPendingOnInboxExit',
+                    'messageHeader_clearDirectPendingCache',
+                    'messageHeader_clearDirectPendingCacheOnDelete',
+                    'messageHeader_restoreDirectPendingAfterInsert'
+                )
+            """)
+        }
+        #expect(retiredObjects.isEmpty)
+
+        let cacheKey = try db.read {
+            try String.fetchOne(
+                $0,
+                sql: "SELECT key FROM messageAICache WHERE key = 'acc1:INBOX:rfc@example.com'"
+            )
+        }
+        #expect(cacheKey == "acc1:INBOX:rfc@example.com")
+        let applied = try db.read {
+            try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations")
+        }
+        #expect(applied.contains("v85_addDirectAIPending"))
+        #expect(applied.contains("v86_retireDirectAIOnInboxRoleExit"))
+        #expect(applied.contains("v87_retireDirectAIPending"))
+    }
+}

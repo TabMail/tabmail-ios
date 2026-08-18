@@ -81,6 +81,14 @@ actor ActiveBodyQueue {
     /// Cleared for a folder on UIDVALIDITY reset (`clearOversizedDeferred`).
     private var isolationPending: Set<String> = []
 
+    /// Bodies that consumed their retry budget during the current drain. Their
+    /// GRDB rows remain honestly incomplete, but drain-time recovery must not
+    /// immediately give the same item a fresh budget forever. A real external
+    /// enqueue/repopulation/cancellation boundary clears this memory so a later
+    /// sync or foreground cycle can try again; the on-demand reader never consults
+    /// it and can fetch immediately once the background item leaves storage.
+    private var retryExhaustedThisDrain: Set<String> = []
+
     /// Bumped by `clearOversizedDeferred` on every UIDVALIDITY reset. A batch
     /// captures this at DISPATCH (before the fetch await) and passes it to
     /// `handlePayloadTooLarge`, which skips inserting into
@@ -143,6 +151,12 @@ actor ActiveBodyQueue {
     /// can drive its passes off the REAL queue contents rather than a model of them.
     var queuedItemsForTesting: [Item] { storage.queue }
 
+    /// Test seam for the exact admission step used by drain-time database
+    /// recovery. The database selector itself has separate stateful SQL tests.
+    func admitDrainCandidatesForTesting(_ items: [Item]) -> Int {
+        admitDrainCandidates(items)
+    }
+
     /// Test-only seam: pre-set the per-folder batch cap so the disposition tests can
     /// pin that the defer decision keys on THIS batch's `items.count` and NOT on the
     /// shared cap — a concurrent fast-failing batch lowering the cap to 1 must not
@@ -157,6 +171,9 @@ actor ActiveBodyQueue {
 
     /// Test-only seam: the current reset generation (what a batch captures at dispatch).
     var resetGenerationForTesting: Int { resetGeneration }
+
+    /// Test-only seam for the drain-exhaustion regression.
+    var retryExhaustedHeaderIdsForTesting: Set<String> { retryExhaustedThisDrain }
 
     /// Test-only seam: drive an item's batch-completion disposition (what a real
     /// isolation-singleton batch applies on success/retry) without the live
@@ -190,16 +207,23 @@ actor ActiveBodyQueue {
     /// for the rest of the process lifetime, which is exactly what this gate exists
     /// to prevent — so re-run the predicate rather than trusting the word SINGLE.
     ///
-    /// The gate itself: skip a headerId already deferred as oversized so a deferred item is
-    /// never re-admitted this process lifetime. The repopulate/drain SELECTs still
-    /// return the row (`bodyComplete = 0 / bodyEmptyConfirmed = 0` is truthfully
-    /// retryable — the row is NOT lied about), but this gate keeps it out of the
-    /// queue, which is what stops the repopulate → dispatch → overflow → repopulate
-    /// hot loop. Returns true iff the item was actually enqueued.
+    /// The gate itself: skip a headerId already deferred as oversized for this
+    /// process, or ordinarily retry-exhausted for this drain. The
+    /// repopulate/drain SELECTs still return the row (`bodyComplete = 0 /
+    /// bodyEmptyConfirmed = 0` is truthfully retryable — the row is NOT lied
+    /// about), but this gate keeps it out of the immediate self-repopulation
+    /// cycle. Returns true iff the item was actually enqueued.
     @discardableResult
     func admit(_ item: Item) -> Bool {
         guard !oversizedDeferredThisSession.contains(item.headerId) else { return false }
+        guard !retryExhaustedThisDrain.contains(item.headerId) else { return false }
         return storage.enqueue(item)
+    }
+
+    private func admitDrainCandidates(_ items: [Item]) -> Int {
+        var added = 0
+        for item in items where admit(item) { added += 1 }
+        return added
     }
 
     /// Drop every oversized-deferred / isolation-pending key belonging to
@@ -238,6 +262,9 @@ actor ActiveBodyQueue {
             !MessageIdentity.headerIdBelongsToFolder($0, accountId: accountId, folderPath: folderPath)
         }
         isolationPending = isolationPending.filter {
+            !MessageIdentity.headerIdBelongsToFolder($0, accountId: accountId, folderPath: folderPath)
+        }
+        retryExhaustedThisDrain = retryExhaustedThisDrain.filter {
             !MessageIdentity.headerIdBelongsToFolder($0, accountId: accountId, folderPath: folderPath)
         }
         let removed = before - (oversizedDeferredThisSession.count + isolationPending.count)
@@ -281,6 +308,7 @@ actor ActiveBodyQueue {
             folderPath: header.folderPath, messageId: header.messageId,
             isInInbox: header.isInInbox
         )
+        retryExhaustedThisDrain.remove(item.headerId)
         guard admit(item) else { return }
         scheduleDispatch()
     }
@@ -293,6 +321,7 @@ actor ActiveBodyQueue {
                 folderPath: header.folderPath, messageId: header.messageId,
                 isInInbox: header.isInInbox
             )
+            retryExhaustedThisDrain.remove(item.headerId)
             if admit(item) { added += 1 }
         }
         guard added > 0 else { return }
@@ -300,33 +329,28 @@ actor ActiveBodyQueue {
         scheduleDispatch()
     }
 
-    /// Durable incomplete-body discovery. Direct AI authority does not need a
-    /// second predicate here: every incomplete inbox body remains eligible, so a
-    /// marked old row can reach FTS before the AI selector applies its policy.
-    nonisolated static func repopulationCandidates(db: Database) throws -> [Item] {
-        try Row.fetchAll(db, sql: """
-            SELECT id, accountId, folderPath, messageId, isInInbox
-            FROM messageHeader
-            WHERE headerComplete = 1 AND bodyComplete = 0
-              AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-            ORDER BY date DESC
-            """)
-        .map { row in
-            Item(
-                headerId: row["id"],
-                accountId: row["accountId"],
-                folderPath: row["folderPath"],
-                messageId: row["messageId"],
-                isInInbox: row["isInInbox"]
-            )
-        }
-    }
-
     func repopulateFromDatabase() async {
+        // This method is called by a real launch/foreground/sync recovery cycle,
+        // not by the drain-time safety net. Give exhausted rows one fresh budget.
+        retryExhaustedThisDrain.removeAll()
         let t0 = CFAbsoluteTimeGetCurrent()
         do {
             let items: [Item] = try await dbPool.read { db in
-                try Self.repopulationCandidates(db: db)
+                try Row.fetchAll(db, sql: """
+                    SELECT id, accountId, folderPath, messageId, isInInbox
+                    FROM messageHeader
+                    WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
+                    ORDER BY date DESC
+                    """)
+                .map { row in
+                    Item(
+                        headerId: row["id"],
+                        accountId: row["accountId"],
+                        folderPath: row["folderPath"],
+                        messageId: row["messageId"],
+                        isInInbox: row["isInInbox"]
+                    )
+                }
             }
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             guard !items.isEmpty else {
@@ -360,6 +384,7 @@ actor ActiveBodyQueue {
         debounceTask = nil
         connectivityWatchTask?.cancel()
         connectivityWatchTask = nil
+        retryExhaustedThisDrain.removeAll()
         if itemCount > 0 || taskCount > 0 {
             print("[ActiveBody] Cancelled \(taskCount) batch tasks, \(itemCount) in-flight items")
         }
@@ -581,10 +606,7 @@ actor ActiveBodyQueue {
                     // .normal-tagged (ADR-IOS-056) — see the process() call above.
                     if !processedItems.isEmpty {
                         await PriorityGate.normal {
-                            await BodyFetchProcessor.flushBatch(
-                                processedItems,
-                                enableAI: true,
-                                aiEnqueueScope: .automaticRecentWindow)
+                            await BodyFetchProcessor.flushBatch(processedItems, enableAI: true)
                         }
                     }
 
@@ -644,12 +666,18 @@ actor ActiveBodyQueue {
 
     private func batchItemDone(item: Item, shouldRetry: Bool) {
         // An item that RESOLVES (shouldRetry=false — fetched OK, confirmed gone,
-        // re-keyed, or retry-exhausted) is no longer an oversize suspect; drop it
+        // or re-keyed) is no longer an oversize suspect; drop it
         // from isolation so it isn't needlessly single-item-dispatched again. (A
         // lone oversized item defers via handlePayloadTooLarge, which clears it
         // there.) Set.remove is a no-op for non-members.
         if !shouldRetry { isolationPending.remove(item.headerId) }
+        let exhausted = shouldRetry
+            && storage.retryCount(for: item) >= SyncConfig.maxQueueRetries
         _ = storage.batchItemCompleted(item, shouldRetry: shouldRetry, maxRetries: SyncConfig.maxQueueRetries)
+        if exhausted {
+            isolationPending.remove(item.headerId)
+            retryExhaustedThisDrain.insert(item.headerId)
+        }
     }
 
     /// PayloadTooLarge disposition. Factored out of `dispatchBatch`'s catch so the
@@ -828,13 +856,24 @@ actor ActiveBodyQueue {
     private func repopulateOnDrain() async {
         do {
             let items: [Item] = try await dbPool.read { db in
-                try Self.repopulationCandidates(db: db)
+                try Row.fetchAll(db, sql: """
+                    SELECT id, accountId, folderPath, messageId, isInInbox
+                    FROM messageHeader
+                    WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
+                    ORDER BY date DESC
+                    """)
+                .map { row in
+                    Item(
+                        headerId: row["id"],
+                        accountId: row["accountId"],
+                        folderPath: row["folderPath"],
+                        messageId: row["messageId"],
+                        isInInbox: row["isInInbox"]
+                    )
+                }
             }
             guard !items.isEmpty else { return }
-            var added = 0
-            for item in items {
-                if admit(item) { added += 1 }
-            }
+            let added = admitDrainCandidates(items)
             if added > 0 {
                 print("[ActiveBody] Drain-time self-repopulate enqueued \(added) items")
                 scheduleDispatch()

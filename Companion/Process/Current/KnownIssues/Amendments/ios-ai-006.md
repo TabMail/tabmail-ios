@@ -1,18 +1,19 @@
 # IOS-AI-006
 
-- Register classification: `open`
+- Register classification: `resolved`
 - New post-freeze record (2026-08-15) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
 ## Status
 
-🔓 **OPEN — INTEGRATED FIX CANDIDATE (2026-08-15).** A selected AI
-job is no longer re-gated by global inbox age. The candidate preserves the existing configured
-newest-`SyncConfig.maxRecentEmails` automatic population in each inbox and adds durable uncapped
-authority for direct open, push, and provider-proved move events. It does not change either
-configuration value, bulk-archive policy/UI behavior, tutorial, Settings copy, or operation-queue
-failure behavior. Whole-operation retirement failure retains the existing `.inFlight` launch-recovery
-contract; partial narrowing failure retains the existing original-bundle requeue contract.
+✅ **RESOLVED BY ROLLBACK (2026-08-17).** PR #39's uncapped durable direct-AI
+exception amplified ordinary queue liveness problems to preserve hypothetical derived work. The
+owner rejected that tradeoff. Current behavior uses one bounded newest-`SyncConfig.maxRecentEmails`
+population for automatic and direct producers; older messages show a quiet suppression notice.
+Migration v87 retires the marker schema without rewriting the shipped v85/v86 migration ledger.
+
+The sections below preserve the withdrawn PR #39 candidate and its motivating failure analysis as
+historical evidence. They do not describe current runtime behavior.
 
 ## Reachability and failure
 
