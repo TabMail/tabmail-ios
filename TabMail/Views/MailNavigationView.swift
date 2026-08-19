@@ -50,6 +50,12 @@ struct MailNavigationView: View {
     /// hidden for signed-in users. Prevents the boot-time flash caused by the
     /// default-closed gate being read before the backend responds.
     @State private var hasCheckedSubscription = AISubscriptionGate.shared.hasCheckedOnce
+    /// Mirror of `AISubscriptionGate.shared.trialHasEnded` (same observation
+    /// caveat as above). Selects the subscribe banner's wording only — a fresh
+    /// account now starts on a server-granted trial and so is *active* and sees
+    /// no banner, which means a signed-in user who reaches this banner either
+    /// never had a trial or has just run out of one.
+    @State private var trialHasEnded = AISubscriptionGate.shared.trialHasEnded
     /// Emails whose server-side push consent is in `error`/`missing` state per
     /// the most recent foreground scan (or a consent-error notification tap).
     /// Populated by `.pushConsentErrorsDetected`. Empty → banner hidden.
@@ -140,6 +146,25 @@ struct MailNavigationView: View {
     /// Roles shown in the unified section, in display order
     private let unifiedRoles: [FolderRole] = [.inbox, .archive, .sent, .drafts, .trash, .spam]
 
+    /// True when the banner should speak to a user whose free trial has run out
+    /// rather than to someone who has not started one. Signed-out users always
+    /// get the generic invitation — the persisted flag describes the last
+    /// signed-in account, which is not who is looking at the sidebar.
+    private var showsTrialEndedCopy: Bool { hasTabMailSession && trialHasEnded }
+
+    /// Subscribe-banner headline. Computed outside `body` to keep the sidebar's
+    /// type-checking budget intact (ADR-IOS-044 consequence).
+    private var subscribeBannerTitle: String {
+        showsTrialEndedCopy ? "Your Free Trial Has Ended" : "Start Your Free Trial"
+    }
+
+    /// Subscribe-banner supporting line, paired with `subscribeBannerTitle`.
+    private var subscribeBannerSubtitle: String {
+        showsTrialEndedCopy
+            ? "Subscribe to continue using AI-powered features"
+            : "Subscribe to unlock AI-powered features"
+    }
+
     // Sync status values come from RootView via @Environment so they survive
     // sidebar collapse/unmount. See SyncStatusObservationModifier.
     @Environment(\.syncPhase) private var statusPhase
@@ -151,7 +176,7 @@ struct MailNavigationView: View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             List(selection: $selection) {
                 Group {
-                    // Free trial / subscription prompt.
+                    // Subscribe prompt (wording via `subscribeBannerTitle`).
                     // - Signed-out users: always show (the tap routes to sign-in).
                     // - Signed-in users: show only after whoami has authoritatively
                     //   reported subscription state at least once (persisted across
@@ -174,10 +199,10 @@ struct MailNavigationView: View {
                                         .font(.title3)
                                         .foregroundStyle(Palette.accentColor)
                                     VStack(alignment: .leading, spacing: 2) {
-                                        Text("Start Your Free Trial")
+                                        Text(subscribeBannerTitle)
                                             .font(.subheadline.weight(.semibold))
                                             .foregroundStyle(Palette.textColor)
-                                        Text("Subscribe to unlock AI-powered features")
+                                        Text(subscribeBannerSubtitle)
                                             .font(.caption)
                                             .foregroundStyle(Palette.textMuted)
                                     }
@@ -496,8 +521,11 @@ struct MailNavigationView: View {
         .onChange(of: AISubscriptionGate.shared.hasCheckedOnce, initial: true) { _, newValue in
             hasCheckedSubscription = newValue
         }
+        .onChange(of: AISubscriptionGate.shared.trialHasEnded, initial: true) { _, newValue in
+            trialHasEnded = newValue
+        }
         .task {
-            // Check if user arrived here after tapping "Start Your Free Trial" banner
+            // Check if user arrived here after tapping the subscribe banner
             guard UserDefaults.standard.bool(forKey: "pending_plan_navigation") else { return }
             UserDefaults.standard.set(false, forKey: "pending_plan_navigation")
             let aiDisabled = AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey)

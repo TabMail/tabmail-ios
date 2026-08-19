@@ -353,10 +353,15 @@ final class StoreKitManager {
     }
 
     /// User-facing display name for a backend tier string. DISPLAY-ONLY mapping —
-    /// internal ids/tier strings stay "BYOK" everywhere (KV, planQuotas, product IDs).
-    /// Site precedent: PLAN_DISPLAY (pricing.js), PLAN_TIER_DISPLAY (dashboard.js).
+    /// internal ids/tier strings stay "BYOK"/"Trial" everywhere (KV, planQuotas,
+    /// product IDs). Site precedent: PLAN_DISPLAY (pricing.js), PLAN_TIER_DISPLAY
+    /// (dashboard.js). Tiers not in the map pass through unchanged.
     nonisolated static func displayPlanName(forTier tier: String) -> String {
-        tier == "BYOK" ? "Zero" : tier
+        switch tier {
+        case AccountPlanConfig.byokTierKey: return "Zero"
+        case AccountPlanConfig.trialTierKey: return "Free Trial"
+        default: return tier
+        }
     }
 
     func monthlyProducts() -> [Product] {

@@ -19,6 +19,15 @@ struct PlanPickerView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 20) {
+                // Free-trial state from the backend. The per-product "2 weeks
+                // free" badge below is a StoreKit introductory offer and is a
+                // separate thing entirely — this banner describes the trial the
+                // account already has (or had), so the page never implies the
+                // user still needs to start one.
+                if let trialBanner = trialBannerCopy {
+                    StatusBanner(icon: trialBanner.icon, text: trialBanner.text, color: trialBanner.color)
+                }
+
                 // Pending state banners from backend
                 if let cancellation = accountInfo?.pendingCancellation, cancellation.cancelAt != nil {
                     StatusBanner(
@@ -231,6 +240,26 @@ struct PlanPickerView: View {
     }
 
     // MARK: - Helpers
+
+    /// Banner describing the account's free trial, or `nil` when there is none
+    /// to describe. Purchasing during a running trial forfeits the remaining
+    /// days (the Apple disclosure below says the same for intro offers), so the
+    /// active-trial copy states it rather than leaving the user to find out.
+    private var trialBannerCopy: (icon: String, text: String, color: Color)? {
+        switch accountInfo?.trialState() {
+        case .active(let daysRemaining):
+            let unit = daysRemaining == 1 ? "day" : "days"
+            return ("clock",
+                    "Free trial · \(daysRemaining) \(unit) left. Subscribing now starts billing immediately and ends the trial.",
+                    .blue)
+        case .ended:
+            return ("clock.badge.exclamationmark",
+                    "Your free trial has ended — subscribe to continue using AI features.",
+                    .orange)
+        default:
+            return nil
+        }
+    }
 
     /// Determine if this product is the user's current active plan.
     /// Uses backend tier for quick "is this the right tier?" check, then StoreKit for monthly/yearly distinction.

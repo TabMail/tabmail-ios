@@ -68,8 +68,11 @@ final class UsageThrottleStore: @unchecked Sendable {
             // pay-as-you-go ship, add the Pro-tier upsell here.
             return nil
         default:
-            // Unknown / no subscription — the "Start Your Free Trial" surface
-            // (MailNavigationView) covers these users.
+            // Unknown / no subscription — the sidebar subscribe surface
+            // (MailNavigationView) covers these users. A free trial also lands
+            // here deliberately: it runs on the shared queue for its whole
+            // duration, so a throttle nudge would be permanent noise. The
+            // account dashboard and plan picker carry that story instead.
             return nil
         }
     }
