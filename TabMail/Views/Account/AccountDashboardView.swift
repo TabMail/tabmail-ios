@@ -19,6 +19,9 @@ struct AccountDashboardView: View {
     @State private var instanceId = String(UUID().uuidString.prefix(6))
     /// Dedup guard for the unstructured initial load (see `.task` comment).
     @State private var loadInFlight = false
+    /// Disables the Sign Out button while `TabMailAuthService.signOut()` is
+    /// awaiting its bounded push-cleanup flush (IOS-PUSH-001).
+    @State private var isSigningOut = false
     @Environment(StoreKitManager.self) private var storeKit
     @Environment(\.scenePhase) private var scenePhase
 
@@ -239,11 +242,18 @@ struct AccountDashboardView: View {
                     // sign-out from inside demo doesn't make sense.
                     if !DemoModeStore.shared.isActive {
                         Button(role: .destructive) {
-                            TabMailAuthService.clearSession()
-                            NotificationCenter.default.post(name: .tabMailDidSignOut, object: nil)
+                            // `signOut()` can wait briefly for a removed-account
+                            // cleanup flush (IOS-PUSH-001), so it is async and
+                            // the button must not accept a second tap meanwhile.
+                            isSigningOut = true
+                            Task {
+                                await TabMailAuthService.signOut()
+                                isSigningOut = false
+                            }
                         } label: {
                             Label("Sign Out of TabMail", systemImage: "rectangle.portrait.and.arrow.right")
                         }
+                        .disabled(isSigningOut)
                         .listRowBackground(Palette.boxBg)
                     }
                 }

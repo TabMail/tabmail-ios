@@ -424,6 +424,28 @@ actor PushNotificationService {
         !PendingRemovedAccountPushCleanup.load(from: removedAccountCleanupDefaults).isEmpty
     }
 
+    /// Whether any retained record holds debt that the given Supabase subject
+    /// is the one allowed to discharge.
+    ///
+    /// Sharper than `hasPendingRemovedAccountCleanups()`, which answers "is any
+    /// record retained at all" and therefore also reports true for debt bound to
+    /// a different user, or for signed-out removals that only ever carry
+    /// `.localArtifacts`. Sign-out uses this narrower question so the ordinary
+    /// path — no debt this session can advance — stays a single UserDefaults
+    /// read with no database access and no network.
+    ///
+    /// Mirrors the per-pass guard in `drainPendingRemovedAccountCleanupsOnce`:
+    /// a record advances remote actions only while `workerUserId` equals the
+    /// live subject, and `nil` never matches. Records whose only remaining
+    /// action is `.localArtifacts` are excluded because that action needs no
+    /// session and so nothing about it is lost when the session goes away.
+    func hasRemovedAccountCleanupDebt(forCurrentUser userId: String?) -> Bool {
+        guard let userId else { return false }
+        return PendingRemovedAccountPushCleanup.load(from: removedAccountCleanupDefaults).contains {
+            $0.workerUserId == userId && !$0.actions.subtracting([.localArtifacts]).isEmpty
+        }
+    }
+
     private func drainPendingRemovedAccountCleanupsOnce(onlyEmail: String?) async {
         let snapshot = PendingRemovedAccountPushCleanup.load(from: removedAccountCleanupDefaults)
         guard !snapshot.isEmpty else { return }

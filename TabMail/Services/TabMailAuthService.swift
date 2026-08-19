@@ -74,6 +74,49 @@ final class TabMailAuthService: NSObject {
         DebugModeManager.invalidateLoggingCache()
     }
 
+    /// Ordinary user-initiated sign-out: hand off any remote push-cleanup debt
+    /// this session still owns, then clear the session and tell the UI.
+    ///
+    /// IOS-PUSH-001. Worker cleanup authenticates with `tabmail_session`, and
+    /// `drainPendingRemovedAccountCleanupsOnce` re-reads that subject on every
+    /// pass, so clearing the Keychain first *strands* the debt: the record
+    /// survives, but no later pass can advance it until the same user signs in
+    /// again. The removal flow's own drain is a detached `Task` that suspends on
+    /// an account census before it reads the subject, so an ordinary "remove the
+    /// account, then sign out" loses that race today and leaves the worker
+    /// holding device routes and an IMAP IDLE subscription that have no TTL.
+    ///
+    /// The flush is bounded and best-effort. The debt is durable and every
+    /// action is idempotent, so a failed or timed-out flush costs nothing that
+    /// the same user's next sign-in cannot recover — which is why sign-out
+    /// itself is UNCONDITIONAL: it never fails, never waits past the bound, and
+    /// never depends on the flush's outcome.
+    ///
+    /// Bounds the scope deliberately: `AppDataWiper.wipeAll` already flushes and
+    /// then blocks on undischarged debt, and both the account-deletion flow and
+    /// RootView's "account no longer available" path sign out against a subject
+    /// the server has already invalidated, where these calls would only 401.
+    static func signOut() async {
+        // The subject about to be destroyed is exactly the one allowed to
+        // discharge the debt, so the gate asks about that subject specifically.
+        let subject = getSession()?.userId
+        if await PushNotificationService.shared.hasRemovedAccountCleanupDebt(forCurrentUser: subject) {
+            let flush = Task { await PushNotificationService.shared.retryPendingRemovedAccountCleanups() }
+            _ = try? await withTimeout(seconds: PushConfig.signOutCleanupFlushTimeoutSeconds) {
+                await flush.value
+            }
+            // Cancel before the Keychain delete rather than after. An in-flight
+            // cleanup request can drive `TabMailTokenCoordinator.performRefresh`,
+            // which writes a refreshed session BACK to the Keychain and would
+            // resurrect the session this method is about to clear. Cancelling
+            // the flush task itself (not merely the `withTimeout` waiter) closes
+            // the window that a timed-out flush would otherwise leave open.
+            flush.cancel()
+        }
+        clearSession()
+        NotificationCenter.default.post(name: .tabMailDidSignOut, object: nil)
+    }
+
     // MARK: - OAuth Providers
 
     /// Sign in with an OAuth provider (Apple, Google, Microsoft)
