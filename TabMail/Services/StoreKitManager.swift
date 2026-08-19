@@ -53,10 +53,6 @@ final class StoreKitManager {
     /// If this doesn't match the currently logged-in user, the subscription belongs to a different account.
     var subscriptionOwnerUserId: String?
 
-    /// Whether the user is eligible for the introductory offer (2-week free trial).
-    /// True if the user has never redeemed an intro offer in the TabMail Plans subscription group.
-    var isEligibleForTrial = false
-
     private static let productIDs: Set<String> = [
         "ai.tabmail.byok.monthly",
         "ai.tabmail.byok.yearly",
@@ -74,7 +70,6 @@ final class StoreKitManager {
         Task {
             await loadProducts()
             await updateCurrentEntitlements()
-            await checkTrialEligibility()
         }
     }
 
@@ -135,7 +130,6 @@ final class StoreKitManager {
             let jwsRepresentation = verification.jwsRepresentation
             await transaction.finish()
             await updateCurrentEntitlements()
-            await checkTrialEligibility()
             print("[StoreKit] Purchase succeeded: \(product.id)")
             return jwsRepresentation
 
@@ -163,7 +157,6 @@ final class StoreKitManager {
         do {
             try await AppStore.sync()
             await updateCurrentEntitlements()
-            await checkTrialEligibility()
             if purchasedProductIDs.isEmpty {
                 restoreResult = "No active subscriptions found for this Apple ID."
                 print("[StoreKit] Restore completed — no entitlements found")
@@ -347,22 +340,6 @@ final class StoreKitManager {
     /// when we are certain the active entitlement belongs to someone else.
     func shouldOpenGateForRestoredEntitlement(currentUserId: String) -> Bool {
         isAppleSubscriber && !hasAccountMismatch(currentUserId: currentUserId)
-    }
-
-    // MARK: - Trial Eligibility
-
-    /// Check if the user is eligible for the introductory offer (2-week free trial).
-    /// Eligibility is per subscription group, but it must be read from a product that
-    /// actually HAS an intro offer — Zero (BYOK) has none and sorts first, so
-    /// `products.first` would wrongly report ineligible.
-    func checkTrialEligibility() async {
-        guard let product = products.first(where: { $0.subscription?.introductoryOffer != nil }),
-              let subscription = product.subscription else {
-            isEligibleForTrial = false
-            return
-        }
-        isEligibleForTrial = await subscription.isEligibleForIntroOffer
-        print("[StoreKit] Trial eligibility: \(isEligibleForTrial)")
     }
 
     // MARK: - Transaction Listener

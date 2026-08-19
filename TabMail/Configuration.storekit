@@ -66,11 +66,6 @@
           "familyShareable" : false,
           "groupNumber" : 2,
           "internalID" : "basic_monthly",
-          "introductoryOffer" : {
-            "internalID" : "basic_monthly_trial",
-            "paymentMode" : "free",
-            "subscriptionPeriod" : "P2W"
-          },
           "localizations" : [
             {
               "description" : "AI email summaries and basic chat assistance",
@@ -91,11 +86,6 @@
           "familyShareable" : false,
           "groupNumber" : 2,
           "internalID" : "basic_yearly",
-          "introductoryOffer" : {
-            "internalID" : "basic_yearly_trial",
-            "paymentMode" : "free",
-            "subscriptionPeriod" : "P2W"
-          },
           "localizations" : [
             {
               "description" : "AI email summaries and basic chat assistance",
@@ -116,11 +106,6 @@
           "familyShareable" : false,
           "groupNumber" : 1,
           "internalID" : "pro_monthly",
-          "introductoryOffer" : {
-            "internalID" : "pro_monthly_trial",
-            "paymentMode" : "free",
-            "subscriptionPeriod" : "P2W"
-          },
           "localizations" : [
             {
               "description" : "Unlimited AI processing, priority queue, web search",
@@ -141,11 +126,6 @@
           "familyShareable" : false,
           "groupNumber" : 1,
           "internalID" : "pro_yearly",
-          "introductoryOffer" : {
-            "internalID" : "pro_yearly_trial",
-            "paymentMode" : "free",
-            "subscriptionPeriod" : "P2W"
-          },
           "localizations" : [
             {
               "description" : "Unlimited AI processing, priority queue, web search",

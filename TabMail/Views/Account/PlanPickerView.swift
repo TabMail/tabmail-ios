@@ -19,11 +19,9 @@ struct PlanPickerView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 20) {
-                // Free-trial state from the backend. The per-product "2 weeks
-                // free" badge below is a StoreKit introductory offer and is a
-                // separate thing entirely — this banner describes the trial the
-                // account already has (or had), so the page never implies the
-                // user still needs to start one.
+                // Free-trial state from the backend: this banner describes the
+                // server-granted trial the account already has (or had), so the
+                // page never implies the user still needs to start one.
                 if let trialBanner = trialBannerCopy {
                     StatusBanner(icon: trialBanner.icon, text: trialBanner.text, color: trialBanner.color)
                 }
@@ -68,9 +66,7 @@ struct PlanPickerView: View {
                         // window where /whoami hasn't loaded (offline, fresh launch)
                         // so upgrade/downgrade labels stay rank-correct.
                         backendTier: accountInfo?.planTier ?? storeKit.activePlan,
-                        isPurchasing: isPurchasing,
-                        isEligibleForTrial: storeKit.isEligibleForTrial,
-                        suppressesIntroOffer: hasRunningSignupTrial
+                        isPurchasing: isPurchasing
                     ) {
                         await purchaseProduct(product)
                     }
@@ -272,23 +268,11 @@ struct PlanPickerView: View {
 
     // MARK: - Helpers
 
-    /// Whether the account is on a **running server-granted trial**. While that
-    /// is true the App Store introductory offer must not also be advertised on
-    /// this page: the two are different things, the page would be claiming the
-    /// user can start a free trial they are already on, and Apple would in fact
-    /// grant its intro offer on top. Suppression is scoped to exactly this
-    /// cohort — every other user's badge and CTA are untouched.
-    private var hasRunningSignupTrial: Bool {
-        PlanCardIntroOffer.suppressesIntroOffer(for: accountInfo)
-    }
-
     /// Banner describing the account's free trial, or `nil` when there is none
     /// to describe.
     ///
-    /// The active copy says the trial ends, and deliberately does NOT say
-    /// billing starts immediately: while App Store Connect still carries the
-    /// introductory offers, a purchase made here can begin with Apple's own free
-    /// period, so "billing starts immediately" would be a false claim. The
+    /// The active copy says the trial ends and deliberately makes no claim
+    /// about when billing starts — that is Apple's purchase sheet's story. The
     /// forfeiture of the remaining server-trial days is true either way.
     private var trialBannerCopy: (icon: String, text: String, color: Color)? {
         switch accountInfo?.trialState() {
@@ -459,13 +443,6 @@ private struct PlanCard: View {
     let hasAnyAppleSub: Bool  // User has any active subscription (Apple or backend)
     let backendTier: String?  // Current plan tier ("Pro"/"Basic"/"BYOK") — backend, or StoreKit while backend unloaded
     let isPurchasing: Bool
-    let isEligibleForTrial: Bool
-    /// Set only while the account is on a running server-granted trial. It hides
-    /// the App Store introductory-offer badge, its "free for 2 weeks" line, and
-    /// the "Start Free Trial" call to action, so the page never invites a user
-    /// to start a trial they are already on. `false` for everyone else, which
-    /// leaves `isEligibleForTrial` / `hasIntroOffer` behaving exactly as before.
-    let suppressesIntroOffer: Bool
     let onPurchase: () async -> Void
 
     private var isPro: Bool { product.id.contains("pro") }
@@ -478,22 +455,8 @@ private struct PlanCard: View {
     /// User-facing tier label ("Zero"/"Basic"/"Pro") — display-only mapping (D6).
     private var planTier: String { StoreKitManager.displayPlanName(forTier: tierKey) }
 
-    /// Whether this product carries an introductory offer (Zero has none —
-    /// `isEligibleForTrial` is group-level, so it alone would wrongly badge Zero).
-    private var hasIntroOffer: Bool { product.subscription?.introductoryOffer != nil }
-
-    private var showsTrialBadge: Bool {
-        PlanCardIntroOffer.showsTrialBadge(
-            isEligibleForTrial: isEligibleForTrial,
-            hasAnyAppleSub: hasAnyAppleSub,
-            hasIntroOffer: hasIntroOffer,
-            suppressesIntroOffer: suppressesIntroOffer
-        )
-    }
-
     private var buttonLabel: String {
-        PlanCardIntroOffer.buttonLabel(
-            showsTrialBadge: showsTrialBadge,
+        PlanCardCTA.buttonLabel(
             hasAnyAppleSub: hasAnyAppleSub,
             currentRank: StoreKitManager.tierRank(forTier: backendTier),
             cardRank: StoreKitManager.tierRank(for: product.id)
@@ -547,17 +510,6 @@ private struct PlanCard: View {
                 Spacer()
             }
 
-            // Trial badge
-            if showsTrialBadge {
-                Text("2 weeks free")
-                    .font(.caption.bold())
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(.green)
-                    .clipShape(Capsule())
-            }
-
             // Price
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
@@ -597,12 +549,6 @@ private struct PlanCard: View {
                         .font(.subheadline)
                         .foregroundStyle(Palette.textColor)
                 }
-            }
-
-            if showsTrialBadge {
-                Text("Free for 2 weeks, then \(product.displayPrice)/\(isYearly ? "year" : "month"). Cancel before the trial ends to avoid being charged.")
-                    .font(.caption)
-                    .foregroundStyle(Palette.textMuted)
             }
 
             if isCurrentPlan {
