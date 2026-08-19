@@ -1634,6 +1634,10 @@ extension AccountManager {
     @discardableResult
     nonisolated func retryOutboxMessage(_ messageId: String) -> Bool {
         do {
+            // Synchronous ON PURPOSE (IOS-PERF-010 Member 4): held synchronous for symmetry with its
+            // pair discardOutboxMessageConfirmed — an `await` widens the NavigationStore refresh-debounce
+            // window this D1 CAS closes and makes a repeat Retry feel unresponsive. Trip-wire: if this
+            // ever writes holdUntil, it moves under Member 5's deadline proof.
             let admitted: Bool = try AppDatabase.dbPool.write { db in
                 try db.execute(
                     sql: """
@@ -1669,6 +1673,11 @@ extension AccountManager {
     @discardableResult
     nonisolated func discardOutboxMessageConfirmed(_ messageId: String) -> Bool {
         do {
+            // Synchronous ON PURPOSE (IOS-PERF-010 Member 5, memory 104): PendingSendService.undo()
+            // decides and applies in ONE @MainActor run inside a holdUntil deadline. An `await` here
+            // admits a second Undo tap between decision and apply, and can overrun the
+            // outboxClaimBufferSeconds window so the drain claims the row `.sending` first — the mail
+            // ships while the user is told it was cancelled (IOS-OUTBOX-006, Outbox Rules 3 and 10).
             let outcome: (deleted: Bool, dir: String?) = try AppDatabase.dbPool.write { db in
                 guard let msg = try OutboxMessage.fetchOne(db, key: messageId),
                       msg.outboxStatus != .sending,

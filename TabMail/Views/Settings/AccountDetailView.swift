@@ -650,6 +650,12 @@ struct AccountDetailView: View {
     }
 
     private func assignRole(_ role: FolderRole, to folder: Folder) {
+        // Synchronous ON PURPOSE (IOS-PERF-010 Members 1-3, covering setFolderRole/assignRole/clearRole):
+        // gesture order IS durable order only while these do not suspend. Two unstructured
+        // `Task { await write }` from the @MainActor have no mutual ordering (DatabaseWriteQueue is FIFO
+        // by acquire arrival, not by tap order), so a rapid re-assign could persist the EARLIER intention
+        // — a never-drop violation. Converting needs a per-account serial tail (see IOS-PERF-010), not a
+        // bare async write.
         // Clear the role from any other folder first, then assign
         try? dbPool.write { db in
             try db.execute(
