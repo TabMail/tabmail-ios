@@ -146,16 +146,29 @@ index requirements are unchanged.
 
   **Member 5 — the proofs (why an `await` here reopens `IOS-OUTBOX-006`).**
   - **Proof A (the deadline).** `SyncConfig.outboxUndoHoldSeconds = 5` and
-    `SyncConfig.outboxClaimBufferSeconds = 1`, so `OutboxMessage.holdUntil = queuedAt + 6 s` while the
-    Undo button is rendered only for the first 5 s. A tap at t≈4.9 s has ≈1.1 s of budget before
-    `atomicClaim` flips the row `.sending`. The synchronous `discardOutboxMessageConfirmed` waits only
-    on GRDB's writer queue; the async `PrioritizedDatabase.write` overload additionally awaits
-    `DatabaseWriteQueue.acquire(.priority)` (whose own comment records a 3-row `merge.phase1` upsert
-    taking multiple seconds). Converting ADDS that wait INSIDE the ≈1.1 s budget → the drain claims
-    the row → the discard then refuses on `.sending` → `PendingSendService.undoFailureMessage =
-    "Try again."` with the Undo button no longer rendered and **the mail delivered**. That is the
-    `IOS-OUTBOX-006` end state (BLOCKING, non-registrable — a delivered message the user was told was
-    cancelled, which nothing recovers).
+    `SyncConfig.outboxClaimBufferSeconds = 1`, so `OutboxMessage.holdUntil` is set to `queuedAt + 6 s`,
+    where `queuedAt` is not a stored column but the `Date()` captured in
+    `AccountManager.persistQueuedSend` — **before** that function's `saveAttachments` disk write and
+    its awaited `AppDatabase.dbPool.write`. The toast's Undo window is anchored to a DIFFERENT instant:
+    it starts at `PendingSendService.present()`, which `ComposeView` calls only **after** that awaited
+    persist returns, and it renders the Undo button for the first 5 s from there. So the button's t=0
+    is `queuedAt + Δ`, where Δ is the attachment-save + DB-write time between the two anchors: a tap at
+    the visible ≈4.9 s mark has roughly `(1.1 - Δ)` s of budget before `atomicClaim` flips the row
+    `.sending` — near ≈1.1 s for a small send on an idle device, and shrinking toward zero (or below)
+    as Δ grows for a large-attachment or contended send. The synchronous
+    `discardOutboxMessageConfirmed` waits only on GRDB's writer queue; the async
+    `PrioritizedDatabase.write` overload additionally awaits `DatabaseWriteQueue.acquire(.priority)`
+    (whose own comment records a 3-row `merge.phase1` upsert taking multiple seconds). Converting ADDS
+    that wait INSIDE that already-Δ-eroded budget → the drain claims the row → the discard then refuses
+    on `.sending` → `PendingSendService.undoFailureMessage = "Try again."` with the Undo button no
+    longer rendered and **the mail delivered**. That is the `IOS-OUTBOX-006` end state (BLOCKING,
+    non-registrable — a delivered message for which the user was shown the `RootView` "Couldn't undo"
+    alert with body `PendingSendService.undoNotConfirmedMessage` ("Try again.") and the Undo button
+    already gone; nothing recovers the delivered mail). The Δ gap only sharpens this — a smaller real
+    budget is more reason to keep the write off the async queue, never less. Keeping this write
+    synchronous is therefore a deliberate design decision / accepted limitation, not an unaddressed
+    perf smell — the in-code annotation on `discardOutboxMessageConfirmed` is the durable guardrail
+    against a future pass re-flagging and converting it.
   - **Proof B (reentrancy).** `RootView` wires `PendingSendToast(onUndo: { if let snapshot =
     pendingSendService.undo() { … } })` — a synchronous decide-then-apply whose return drives a
     `fullScreenCover`. An `await` forces a `Task {}` at a Button that is NOT disabled, so a second tap

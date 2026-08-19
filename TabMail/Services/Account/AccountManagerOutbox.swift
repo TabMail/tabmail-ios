@@ -1634,10 +1634,15 @@ extension AccountManager {
     @discardableResult
     nonisolated func retryOutboxMessage(_ messageId: String) -> Bool {
         do {
-            // Synchronous ON PURPOSE (IOS-PERF-010 Member 4): held synchronous for symmetry with its
-            // pair discardOutboxMessageConfirmed — an `await` widens the NavigationStore refresh-debounce
-            // window this D1 CAS closes and makes a repeat Retry feel unresponsive. Trip-wire: if this
-            // ever writes holdUntil, it moves under Member 5's deadline proof.
+            // ⚠️ SYNCHRONOUS BY DESIGN — DO NOT CONVERT TO async. Deliberate design decision from the
+            // IOS-PERF-010 audit (Member 4), NOT an oversight. It is held synchronous for SYMMETRY with
+            // its pair discardOutboxMessageConfirmed: the two form a matched synchronous pair, and
+            // converting one half of a deliberately symmetric pair is the fix-at-one-entry-of-two shape
+            // IOS-OUTBOX-006 warns against. An `await` also widens the NavigationStore refresh-debounce
+            // window this D1 CAS closes, so a repeat Retry off the stale `.failed` snapshot is refused
+            // silently and Retry feels unresponsive. Trip-wire: if this ever starts writing holdUntil it
+            // moves under Member 5's deadline proof (Proof A) and must stay synchronous for that reason
+            // too. Keep it synchronous.
             let admitted: Bool = try AppDatabase.dbPool.write { db in
                 try db.execute(
                     sql: """
@@ -1673,11 +1678,21 @@ extension AccountManager {
     @discardableResult
     nonisolated func discardOutboxMessageConfirmed(_ messageId: String) -> Bool {
         do {
-            // Synchronous ON PURPOSE (IOS-PERF-010 Member 5, memory 104): PendingSendService.undo()
-            // decides and applies in ONE @MainActor run inside a holdUntil deadline. An `await` here
-            // admits a second Undo tap between decision and apply, and can overrun the
-            // outboxClaimBufferSeconds window so the drain claims the row `.sending` first — the mail
-            // ships while the user is told it was cancelled (IOS-OUTBOX-006, Outbox Rules 3 and 10).
+            // ⚠️ SYNCHRONOUS BY DESIGN — DO NOT CONVERT TO async. This is a deliberate, load-bearing
+            // design decision from the IOS-PERF-010 audit (Member 5, Proofs A/B/C; memory 104), NOT an
+            // oversight and NOT a perf smell to "fix". A future perf pass or linter that re-flags this
+            // synchronous @MainActor GRDB write must stop here: converting it re-introduces the
+            // IOS-OUTBOX-006 Undo-Send bug. PendingSendService.undo() reads authority and applies this
+            // discard in ONE @MainActor run inside the Undo-Send deadline
+            // (SyncConfig.outboxUndoHoldSeconds + SyncConfig.outboxClaimBufferSeconds). Adding an
+            // `await` on this write does two irreversible things:
+            //   1. It admits a second Undo tap between decision and apply (Proof B, reentrancy).
+            //   2. It can overrun the outboxClaimBufferSeconds budget, so the drain's atomicClaim flips
+            //      this row to `.sending` first; the discard then refuses on `.sending`, undo() raises
+            //      the "Couldn't undo" / "Try again." alert with the Undo button already gone — and the
+            //      mail is delivered anyway (Proof A, the deadline). That is the IOS-OUTBOX-006 end state
+            //      (Outbox Reliability Rules 3 and 10), which nothing recovers.
+            // Keep it synchronous.
             let outcome: (deleted: Bool, dir: String?) = try AppDatabase.dbPool.write { db in
                 guard let msg = try OutboxMessage.fetchOne(db, key: messageId),
                       msg.outboxStatus != .sending,
