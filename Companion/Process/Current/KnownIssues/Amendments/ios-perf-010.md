@@ -126,12 +126,107 @@ index requirements are unchanged.
 - `UndoService.push` reads are reachable only after the debug-logging gate and are not ordinary
   production work. The Device-Sync AI-cache probe remains a background-triggered 2N MainActor read
   shape and needs its own set-wise result-equivalence proof before conversion.
-- Five synchronous MainActor writes remain after this closure: the three explicit folder-role writes
-  in `AccountDetailView`, plus `AccountManagerOutbox.retryOutboxMessage` and
-  `discardOutboxMessageConfirmed`. The Outbox pair synchronously return a decision consumed by the
-  Undo-Send state machine; do not insert a suspension without re-proving its authority/never-drop
-  exits. The lower-frequency folder-role actions need the same ordered visible-state proof as this
-  field change before conversion.
+- Five synchronous MainActor writes remain after this closure, and this record now CLASSIFIES each
+  rather than restating the count (2026-08-18, HEAD `cdf11a6e5`; GitHub #13). **Record-accuracy
+  correction to the earlier wording, which used the FILE name as a type qualifier:**
+  `retryOutboxMessage(_:)` and `discardOutboxMessageConfirmed(_:)` are `nonisolated func … -> Bool`
+  **declared in the file `AccountManagerOutbox.swift`** — that file is a single `extension
+  AccountManager`, so **`AccountManagerOutbox` is NOT a type**; the declaring type is **`actor
+  AccountManager`**. Being `nonisolated`, both run on the CALLER's thread, which for the Undo-Send
+  state machine is the `@MainActor`. The five, by member:
+
+  1. `AccountDetailView.setFolderRole(_:role:)` — **inconclusive; DO NOT TOUCH.** Conversion requires
+     per-account ordered persistence (see Members 1–3 below).
+  2. `AccountDetailView.assignRole(_:to:)` (one synchronous write holding two `UPDATE`s) — **same.**
+  3. `AccountDetailView.clearRole(_:)` — **same.**
+  4. `AccountManager.retryOutboxMessage(_:)` — **inconclusive; held synchronous for symmetry with its
+     pair; DO NOT TOUCH.**
+  5. `AccountManager.discardOutboxMessageConfirmed(_:)` — **MUST STAY SYNCHRONOUS** (consciously
+     synchronous, the same disposition as `SearchView.openResult`).
+
+  **Member 5 — the proofs (why an `await` here reopens `IOS-OUTBOX-006`).**
+  - **Proof A (the deadline).** `SyncConfig.outboxUndoHoldSeconds = 5` and
+    `SyncConfig.outboxClaimBufferSeconds = 1`, so `OutboxMessage.holdUntil` is set to `queuedAt + 6 s`,
+    where `queuedAt` is not a stored column but the `Date()` captured in
+    `AccountManager.persistQueuedSend` — **before** that function's `saveAttachments` disk write and
+    its awaited `AppDatabase.dbPool.write`. The toast's Undo window is anchored to a DIFFERENT instant:
+    it starts at `PendingSendService.present()`, which `ComposeView` calls only **after** that awaited
+    persist returns, and it renders the Undo button for the first 5 s from there. So the button's t=0
+    is `queuedAt + Δ`, where Δ is the attachment-save + DB-write time between the two anchors: a tap at
+    the visible ≈4.9 s mark has roughly `(1.1 - Δ)` s of budget before `atomicClaim` flips the row
+    `.sending` — near ≈1.1 s for a small send on an idle device, and shrinking toward zero (or below)
+    as Δ grows for a large-attachment or contended send. The synchronous
+    `discardOutboxMessageConfirmed` waits only on GRDB's writer queue; the async
+    `PrioritizedDatabase.write` overload additionally awaits `DatabaseWriteQueue.acquire(.priority)`
+    (whose own comment records a 3-row `merge.phase1` upsert taking multiple seconds). Converting ADDS
+    that wait INSIDE that already-Δ-eroded budget → the drain claims the row → the discard then refuses
+    on `.sending` → `PendingSendService.undoFailureMessage = "Try again."` with the Undo button no
+    longer rendered and **the mail delivered**. That is the `IOS-OUTBOX-006` end state (BLOCKING,
+    non-registrable — a delivered message for which the user was shown the `RootView` "Couldn't undo"
+    alert with body `PendingSendService.undoNotConfirmedMessage` ("Try again.") and the Undo button
+    already gone; nothing recovers the delivered mail). The Δ gap only sharpens this — a smaller real
+    budget is more reason to keep the write off the async queue, never less. Keeping this write
+    synchronous is therefore a deliberate design decision / accepted limitation, not an unaddressed
+    perf smell — the in-code annotation on `discardOutboxMessageConfirmed` is the durable guardrail
+    against a future pass re-flagging and converting it.
+  - **Proof B (reentrancy).** `RootView` wires `PendingSendToast(onUndo: { if let snapshot =
+    pendingSendService.undo() { … } })` — a synchronous decide-then-apply whose return drives a
+    `fullScreenCover`. An `await` forces a `Task {}` at a Button that is NOT disabled, so a second tap
+    re-enters `undo()` before the first cleared `current`; the second `discardOutboxMessageConfirmed`
+    returns false (row already deleted) and sets `"Try again."` on a SUCCESSFUL undo — the mirror
+    image of the R16-9 defect.
+  - **Proof C (memory 104).** `retainedAuthorityOutcome(for:)` authorises; the discard is the write it
+    authorises; inserting a suspension between them is the read-latch-then-await-then-mutate class that
+    produced `IOS-OUTBOX-006` (`Companion/Memory/Current/104-…`; and `103-…` — `await dbPool.read` is
+    NOT a short suspension: its async overload runs a full NSE staging merge, measured 7.6 s on a
+    cold-I/O boot, and staging is pending precisely on foreground return). Also
+    `PendingSendService.present()` can replace `current` across the suspension, so
+    `dismissTask?.cancel(); current = nil` would clear the NEWER toast.
+  - The `OutboxRow` swipe caller ("Cancel Send" while `isHeld`) sits inside the same hold window, so
+    splitting sync/async variants would give one invariant two writers. Outbox Reliability Rule 3
+    (`sentAt` before delete — the double-send firewall) and Rule 10 (cannot discard a `sending`
+    message) are the rules the end state violates.
+
+  **Member 4 — the weakest, still no-touch.** Durable admission is a SQL CAS
+  (`WHERE id = ? AND status = 'failed' AND sentAt IS NULL`, `changesCount == 1`), so D1 survives an
+  async conversion, and retry does NOT rewrite `holdUntil`, so Proof A does not apply. But the doc
+  comment records `NavigationStore`'s 100 ms refresh debounce leaving a stale `.failed` snapshot
+  visible after a first Retry already queued the row — an `await` widens that window; a repeat tap off
+  the stale snapshot is then refused silently (the `Bool` result discarded) → an unresponsive-feeling
+  Retry — and its side effects are documented as "mirroring `discardOutboxMessageConfirmed`", so
+  converting one half of a deliberately symmetric pair is the fix-at-one-entry-of-two shape that
+  `IOS-OUTBOX-006` warns against. **Trip-wire for the record: if `retryOutboxMessage` ever starts
+  writing `holdUntil`, it moves under Proof A and this inconclusive classification no longer holds.**
+
+  **Members 1–3 — the folder-role writes.** What the synchronous write currently guarantees:
+  (1) atomic role reassignment (both `UPDATE`s in one transaction — survives conversion);
+  (2) **gesture order == durable order — this does NOT survive.** Two unstructured `Task { await write }`
+  dispatched from the `@MainActor` have no mutual ordering (`DatabaseWriteQueue` is FIFO by arrival at
+  `acquire`, set by the cooperative pool, not by tap order). Concrete loss: long-press → assign Trash
+  to F1, immediately reassign to F2; task B may arrive first; the final durable state is the user's
+  EARLIER intention, silently — a **NEVER DROP USER INTENTION** violation. This is exactly what
+  `AccountFieldPersistenceStore` (in `NavigationStore.swift`) spends ~200 lines solving (per-account
+  tail chaining), and roles need per-ACCOUNT keying (overlapping row sets), so the existing store's
+  keying does not transfer unchanged. (3) write-then-read coherence with the synchronous
+  `reloadFolders()` — the "failure visibly reverts" property that keeps `IOS-SETTINGS-002` classified
+  `accepted`. Honest narrowing (record this): the synchronous write buys consistency only against
+  `@MainActor`-sequenced readers — `SyncEngineBackfillWalk` etc. capture `folder.role` into memory
+  across long loops and can already act on a stale role; and the `folder_retireDirectAIOnInboxRoleExit`
+  trigger was dropped by migration v87 (PR #39 retirement), so no trigger fires on a role change at
+  HEAD. Net: conversion needs new ordering machinery for three context-menu gestures on a
+  tens-of-rows table with no measured stall. If a stall is ever measured, the fix is a per-account
+  serial tail modeled on `AccountFieldPersistenceStore`, NOT a bare `Task { await write }`.
+  `IOS-SETTINGS-002` stays `accepted`, unaffected by this record.
+
+  **HEAD re-verification (`cdf11a6e5`).** Re-counted against census revision `98dde448b`: exactly one
+  synchronous MainActor write has been REMOVED since that revision (the `AccountDetailView`
+  account-field write → async `AccountFieldPersistenceStore.persist`), **none has been added**, and
+  **five remain** — the three folder-role writes plus the two `AccountManager` Outbox decision writes
+  above. There is **no `Thread Performance Checker` evidence in-tree** for any of the five, and (per
+  `IOS-PERF-011`) "fast when uncontended does NOT refute it": the exposure is real-but-unmeasured, and
+  this census is **revision-bound, not a certification**. Cross-links: `IOS-OUTBOX-006`; memories 103
+  and 104; Outbox Reliability Rules 3 and 10; `IOS-SETTINGS-002` (`accepted`, unaffected);
+  `IOS-PERF-011`.
 
 The census is revision-bound, not a future-proof certification. No surviving member has a measured
 post-PR-24 user-visible stall; the synchronous-write subclass is justified by its unmitigated single
