@@ -109,11 +109,11 @@ struct AccountDashboardView: View {
 
                 Section {
                     // Status banners
-                    if let trial = accountInfo?.trial, trial.isTrial {
+                    if let trialBanner = trialBannerCopy {
                         StatusBanner(
-                            icon: "clock",
-                            text: "Trial active" + (trial.trialEnd.map { " until \(formatTimestamp($0))" } ?? ""),
-                            color: .blue
+                            icon: trialBanner.icon,
+                            text: trialBanner.text,
+                            color: trialBanner.color
                         )
                         .listRowInsets(EdgeInsets())
                         .listRowBackground(Color.clear)
@@ -176,8 +176,9 @@ struct AccountDashboardView: View {
                     }
                     .listRowBackground(Palette.boxBg)
 
-                    // Quota — Zero (BYOK) has no priority AI budget, so a percentage
-                    // is meaningless; show N/A instead (site dashboard precedent).
+                    // Quota — Zero (BYOK) and the free trial have no priority AI
+                    // budget, so a percentage is meaningless; show N/A instead
+                    // (site dashboard precedent). Each plan gets its own caption.
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Label("Quota Used", systemImage: "gauge")
@@ -186,8 +187,8 @@ struct AccountDashboardView: View {
                             Text(isZeroPlan ? "N/A" : String(format: "%.1f%%", accountInfo?.quotaPercentage ?? 0))
                                 .foregroundStyle(Palette.textMuted)
                         }
-                        if isZeroPlan {
-                            Text("Zero includes no priority AI budget — AI runs on your own keys, or via the slower shared queue.")
+                        if let zeroBudgetPlan {
+                            Text(zeroBudgetPlan.quotaCaption)
                                 .font(.caption2)
                                 .foregroundStyle(Palette.textMuted)
                         } else {
@@ -202,13 +203,15 @@ struct AccountDashboardView: View {
                     }
                     .listRowBackground(Palette.boxBg)
 
-                    // Change Plan / Subscribe
+                    // Change Plan / Subscribe. A free trial counts as active
+                    // access but is not a plan the user can change — that
+                    // cohort gets the Subscribe call to action.
                     NavigationLink {
                         PlanPickerView()
                     } label: {
                         Label(
-                            accountInfo?.hasSubscription == true ? "Change Plan" : "Subscribe",
-                            systemImage: accountInfo?.hasSubscription == true ? "arrow.triangle.2.circlepath" : "star"
+                            hasChangeablePlan ? "Change Plan" : "Subscribe",
+                            systemImage: hasChangeablePlan ? "arrow.triangle.2.circlepath" : "star"
                         )
                         .foregroundStyle(Palette.accentColor)
                     }
@@ -284,7 +287,7 @@ struct AccountDashboardView: View {
                 }
 
                 // Daily Quota Usage chart
-                if let maxCostCents = accountInfo?.maxMonthlyCostCents, maxCostCents > 0 {
+                if let maxCostCents = accountInfo?.dailyQuotaChartDenominator {
                     let padded = paddedDailyStats(usageStats?.dailyStats ?? [])
                     Section {
                         VStack(spacing: 2) {
@@ -432,6 +435,11 @@ struct AccountDashboardView: View {
         do {
             let info = try await backend.fetchAccountInfo()
             accountInfo = info
+            // This is an authoritative /whoami, so route it through the same
+            // single seam the foreground revalidation uses: it opens/closes the
+            // gate AND stamps the trial flag, keeping the sidebar copy in step
+            // with what the dashboard is showing instead of lagging a foreground.
+            AISubscriptionGate.shared.apply(info)
             // Keep the inbox usage-throttle banner fresh when the user opens
             // the dashboard.
             UsageThrottleStore.shared.update(from: info)
@@ -493,10 +501,49 @@ struct AccountDashboardView: View {
         }
     }
 
-    /// Zero (BYOK) plan — internal tier string stays "BYOK"; only display maps to "Zero".
-    private var isZeroPlan: Bool {
-        accountInfo?.planTier == "BYOK"
+    /// Whether the account holds a purchased plan that can be switched. A running
+    /// free trial reports active access but owns no purchase, so it takes the
+    /// Subscribe call to action rather than "Change Plan".
+    private var hasChangeablePlan: Bool {
+        guard accountInfo?.hasSubscription == true else { return false }
+        if case .active = accountInfo?.trialState() { return false }
+        return true
     }
+
+    /// Copy for the trial status banner, or `nil` when there is no trial to
+    /// describe.
+    ///
+    /// Deliberately NOT gated on `accountInfo?.trial` being non-nil: the ended
+    /// response can carry `"trial": null`, and reading the object first would
+    /// make the ended banner disappear on exactly the accounts that need it.
+    /// The `.noTrial` arm keeps today's plain "Trial active until <date>" for a
+    /// legacy Stripe/Apple card trial, which is a subscription rather than a
+    /// signup trial and must render exactly as it always has.
+    private var trialBannerCopy: (icon: String, text: String, color: Color)? {
+        switch accountInfo?.trialState() {
+        case .active(let daysRemaining):
+            let unit = daysRemaining == 1 ? "day" : "days"
+            return ("clock", "Free trial · \(daysRemaining) \(unit) left", .blue)
+        case .ended:
+            return ("clock.badge.exclamationmark",
+                    "Your free trial has ended — subscribe to continue",
+                    .orange)
+        default:
+            guard let trial = accountInfo?.trial, trial.isTrial else { return nil }
+            let suffix = trial.trialEnd.map { " until \(formatTimestamp($0))" } ?? ""
+            return ("clock", "Trial active" + suffix, .blue)
+        }
+    }
+
+    /// The account's zero-priority-budget plan, if it is on one. Internal tier
+    /// strings stay "BYOK"/"Trial"; only display maps them to "Zero"/"Free Trial".
+    /// `nil` for Basic/Pro/unknown, which do have a budget and a real percentage.
+    private var zeroBudgetPlan: ZeroBudgetPlan? {
+        ZeroBudgetPlan.forTier(accountInfo?.planTier)
+    }
+
+    /// Whether the quota reading should be "N/A" rather than a percentage.
+    private var isZeroPlan: Bool { zeroBudgetPlan != nil }
 
     private var quotaTint: Color {
         let p = accountInfo?.quotaPercentage ?? 0

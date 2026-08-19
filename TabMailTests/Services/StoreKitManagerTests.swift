@@ -216,12 +216,21 @@ struct StoreKitManagerPlanNameTests {
         #expect(StoreKitManager.planName(for: "ai.tabmail.pro.basic") == "Pro")
     }
 
-    @Test("displayPlanName maps BYOK to Zero, passes other tiers through")
+    @Test("displayPlanName maps BYOK to Zero and Trial to Free Trial, passes other tiers through")
     func displayMapping() {
         #expect(StoreKitManager.displayPlanName(forTier: "BYOK") == "Zero")
+        #expect(StoreKitManager.displayPlanName(forTier: "Trial") == "Free Trial")
         #expect(StoreKitManager.displayPlanName(forTier: "Basic") == "Basic")
         #expect(StoreKitManager.displayPlanName(forTier: "Pro") == "Pro")
         #expect(StoreKitManager.displayPlanName(forTier: "Unknown") == "Unknown")
+    }
+
+    @Test("Trial is not a purchasable tier, so it carries no upgrade rank")
+    func trialHasNoRank() {
+        // The plan picker's upgrade/downgrade direction is rank-driven; a
+        // server-granted trial owns no product and must not outrank one.
+        #expect(StoreKitManager.tierRank(forTier: "Trial") == 0)
+        #expect(StoreKitManager.tierRank(forTier: "BYOK") == 1)
     }
 }
 

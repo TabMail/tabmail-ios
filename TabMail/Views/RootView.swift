@@ -684,11 +684,9 @@ struct RootView: View {
     private static func revalidateAISubscriptionGate() async {
         do {
             let info = try await BackendClient().fetchAccountInfo()
-            if info.hasSubscription == true {
-                AISubscriptionGate.shared.openGate()
-            } else {
-                AISubscriptionGate.shared.closeGate()
-            }
+            // Single seam: opens/closes the gate AND records whether this
+            // account's free trial has ended (drives the sidebar banner copy).
+            AISubscriptionGate.shared.apply(info)
             // Feed the inbox usage-throttle banner from this same always-on
             // foreground /whoami fetch — no extra poll.
             UsageThrottleStore.shared.update(from: info)

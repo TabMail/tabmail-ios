@@ -326,11 +326,13 @@ final class StoreKitManager {
     // MARK: - Helpers
 
     /// Backend-facing tier name — must match `AccountInfo.planTier` values ("BYOK", not "Zero").
+    /// The matched substrings are PRODUCT-ID fragments, a different namespace
+    /// from the tier strings returned here; only the returns are shared.
     nonisolated static func planName(for productId: String) -> String {
-        if productId.contains("pro") { return "Pro" }
-        if productId.contains("basic") { return "Basic" }
-        if productId.contains("byok") { return "BYOK" }
-        return "Unknown"
+        if productId.contains("pro") { return AccountPlanConfig.proTierKey }
+        if productId.contains("basic") { return AccountPlanConfig.basicTierKey }
+        if productId.contains("byok") { return AccountPlanConfig.byokTierKey }
+        return AccountPlanConfig.unknownTierKey
     }
 
     /// Tier ranking for upgrade/downgrade direction: Unknown 0 < BYOK/Zero 1 < Basic 2 < Pro 3.
@@ -343,20 +345,27 @@ final class StoreKitManager {
     }
 
     /// Rank for a backend tier string ("Pro"/"Basic"/"BYOK"), nil/unknown → 0.
+    /// `Trial` is deliberately absent: it owns no product, is not purchasable,
+    /// and must never outrank one in the plan picker's direction logic.
     nonisolated static func tierRank(forTier tier: String?) -> Int {
         switch tier {
-        case "Pro": return 3
-        case "Basic": return 2
-        case "BYOK": return 1
+        case AccountPlanConfig.proTierKey: return 3
+        case AccountPlanConfig.basicTierKey: return 2
+        case AccountPlanConfig.byokTierKey: return 1
         default: return 0
         }
     }
 
     /// User-facing display name for a backend tier string. DISPLAY-ONLY mapping —
-    /// internal ids/tier strings stay "BYOK" everywhere (KV, planQuotas, product IDs).
-    /// Site precedent: PLAN_DISPLAY (pricing.js), PLAN_TIER_DISPLAY (dashboard.js).
+    /// internal ids/tier strings stay "BYOK"/"Trial" everywhere (KV, planQuotas,
+    /// product IDs). Site precedent: PLAN_DISPLAY (pricing.js), PLAN_TIER_DISPLAY
+    /// (dashboard.js). Tiers not in the map pass through unchanged.
     nonisolated static func displayPlanName(forTier tier: String) -> String {
-        tier == "BYOK" ? "Zero" : tier
+        switch tier {
+        case AccountPlanConfig.byokTierKey: return "Zero"
+        case AccountPlanConfig.trialTierKey: return "Free Trial"
+        default: return tier
+        }
     }
 
     func monthlyProducts() -> [Product] {

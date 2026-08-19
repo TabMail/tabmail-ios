@@ -19,6 +19,15 @@ struct PlanPickerView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 20) {
+                // Free-trial state from the backend. The per-product "2 weeks
+                // free" badge below is a StoreKit introductory offer and is a
+                // separate thing entirely — this banner describes the trial the
+                // account already has (or had), so the page never implies the
+                // user still needs to start one.
+                if let trialBanner = trialBannerCopy {
+                    StatusBanner(icon: trialBanner.icon, text: trialBanner.text, color: trialBanner.color)
+                }
+
                 // Pending state banners from backend
                 if let cancellation = accountInfo?.pendingCancellation, cancellation.cancelAt != nil {
                     StatusBanner(
@@ -60,7 +69,8 @@ struct PlanPickerView: View {
                         // so upgrade/downgrade labels stay rank-correct.
                         backendTier: accountInfo?.planTier ?? storeKit.activePlan,
                         isPurchasing: isPurchasing,
-                        isEligibleForTrial: storeKit.isEligibleForTrial
+                        isEligibleForTrial: storeKit.isEligibleForTrial,
+                        suppressesIntroOffer: hasRunningSignupTrial
                     ) {
                         await purchaseProduct(product)
                     }
@@ -177,7 +187,17 @@ struct PlanPickerView: View {
                             if let jws = await storeKit.latestEntitlementJWS() {
                                 Self.verifyPurchaseWithBackend(jws: jws)
                             }
-                            accountInfo = try? await backend.fetchAccountInfo()
+                            let restored = try? await backend.fetchAccountInfo()
+                            accountInfo = restored
+                            // This body races the detached `verifyPurchaseWithBackend`
+                            // write, so it may still be the pre-restore state. Route
+                            // it through the open-only seam: it can refresh the
+                            // sidebar copy and reopen the gate when the backend
+                            // already confirmed the subscription, but it must NEVER
+                            // close the gate `openGate()` just opened from local
+                            // StoreKit truth. A later authoritative whoami reconciles
+                            // if this one raced.
+                            if let restored { AISubscriptionGate.shared.refreshAfterLocalPurchase(restored) }
                         }
                     }
                 }
@@ -231,6 +251,40 @@ struct PlanPickerView: View {
     }
 
     // MARK: - Helpers
+
+    /// Whether the account is on a **running server-granted trial**. While that
+    /// is true the App Store introductory offer must not also be advertised on
+    /// this page: the two are different things, the page would be claiming the
+    /// user can start a free trial they are already on, and Apple would in fact
+    /// grant its intro offer on top. Suppression is scoped to exactly this
+    /// cohort — every other user's badge and CTA are untouched.
+    private var hasRunningSignupTrial: Bool {
+        PlanCardIntroOffer.suppressesIntroOffer(for: accountInfo)
+    }
+
+    /// Banner describing the account's free trial, or `nil` when there is none
+    /// to describe.
+    ///
+    /// The active copy says the trial ends, and deliberately does NOT say
+    /// billing starts immediately: while App Store Connect still carries the
+    /// introductory offers, a purchase made here can begin with Apple's own free
+    /// period, so "billing starts immediately" would be a false claim. The
+    /// forfeiture of the remaining server-trial days is true either way.
+    private var trialBannerCopy: (icon: String, text: String, color: Color)? {
+        switch accountInfo?.trialState() {
+        case .active(let daysRemaining):
+            let unit = daysRemaining == 1 ? "day" : "days"
+            return ("clock",
+                    "Free trial · \(daysRemaining) \(unit) left. Subscribing now ends the trial.",
+                    .blue)
+        case .ended:
+            return ("clock.badge.exclamationmark",
+                    "Your free trial has ended — subscribe to continue using AI features.",
+                    .orange)
+        default:
+            return nil
+        }
+    }
 
     /// Determine if this product is the user's current active plan.
     /// Uses backend tier for quick "is this the right tier?" check, then StoreKit for monthly/yearly distinction.
@@ -303,7 +357,15 @@ struct PlanPickerView: View {
             // Send JWS to backend to process immediately (don't wait for Apple webhook)
             Self.verifyPurchaseWithBackend(jws: jws)
             // Refresh account info to update subscription display
-            accountInfo = try? await backend.fetchAccountInfo()
+            let purchased = try? await backend.fetchAccountInfo()
+            accountInfo = purchased
+            // This body races the detached `verifyPurchaseWithBackend` write, so
+            // it may still be the pre-purchase state. Route it through the
+            // open-only seam: it can refresh the sidebar copy and reopen the gate
+            // when the backend already confirmed the subscription, but it must
+            // NEVER close the gate `openGate()` just opened from local StoreKit
+            // truth. A later authoritative whoami reconciles if this one raced.
+            if let purchased { AISubscriptionGate.shared.refreshAfterLocalPurchase(purchased) }
         } catch {
             print("[PlanPicker] Purchase failed: \(error)")
             purchaseError = "Purchase failed. Please try again."
@@ -378,6 +440,12 @@ private struct PlanCard: View {
     let backendTier: String?  // Current plan tier ("Pro"/"Basic"/"BYOK") — backend, or StoreKit while backend unloaded
     let isPurchasing: Bool
     let isEligibleForTrial: Bool
+    /// Set only while the account is on a running server-granted trial. It hides
+    /// the App Store introductory-offer badge, its "free for 2 weeks" line, and
+    /// the "Start Free Trial" call to action, so the page never invites a user
+    /// to start a trial they are already on. `false` for everyone else, which
+    /// leaves `isEligibleForTrial` / `hasIntroOffer` behaving exactly as before.
+    let suppressesIntroOffer: Bool
     let onPurchase: () async -> Void
 
     private var isPro: Bool { product.id.contains("pro") }
@@ -394,17 +462,22 @@ private struct PlanCard: View {
     /// `isEligibleForTrial` is group-level, so it alone would wrongly badge Zero).
     private var hasIntroOffer: Bool { product.subscription?.introductoryOffer != nil }
 
-    private var showsTrialBadge: Bool { isEligibleForTrial && !hasAnyAppleSub && hasIntroOffer }
+    private var showsTrialBadge: Bool {
+        PlanCardIntroOffer.showsTrialBadge(
+            isEligibleForTrial: isEligibleForTrial,
+            hasAnyAppleSub: hasAnyAppleSub,
+            hasIntroOffer: hasIntroOffer,
+            suppressesIntroOffer: suppressesIntroOffer
+        )
+    }
 
     private var buttonLabel: String {
-        if showsTrialBadge { return "Start Free Trial" }
-        guard hasAnyAppleSub else { return "Subscribe" }
-        let currentRank = StoreKitManager.tierRank(forTier: backendTier)
-        let cardRank = StoreKitManager.tierRank(for: product.id)
-        guard currentRank > 0 else { return "Switch" }
-        if cardRank > currentRank { return "Upgrade" }
-        if cardRank < currentRank { return "Downgrade" }
-        return "Switch"
+        PlanCardIntroOffer.buttonLabel(
+            showsTrialBadge: showsTrialBadge,
+            hasAnyAppleSub: hasAnyAppleSub,
+            currentRank: StoreKitManager.tierRank(forTier: backendTier),
+            cardRank: StoreKitManager.tierRank(for: product.id)
+        )
     }
 
     private var features: [String] {

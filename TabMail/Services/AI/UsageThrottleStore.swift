@@ -56,20 +56,23 @@ final class UsageThrottleStore: @unchecked Sendable {
     var banner: UsageThrottleBannerKind? {
         guard hasCheckedOnce else { return nil }
         switch planTier {
-        case "Basic":
+        case AccountPlanConfig.basicTierKey:
             // Only nudge once they've actually been throttled (exceeded budget).
             return isThrottled ? .upgradeToPro : nil
-        case "BYOK":
+        case AccountPlanConfig.byokTierKey:
             // BYOK without an own key is permanently on the slow shared queue.
             // With a key, requests route through the user's provider (fast).
             return hasOwnAPIKeys ? nil : .configureKeys
-        case "Pro":
+        case AccountPlanConfig.proTierKey:
             // No throttle banner for Pro yet. Placeholder: when Max /
             // pay-as-you-go ship, add the Pro-tier upsell here.
             return nil
         default:
-            // Unknown / no subscription — the "Start Your Free Trial" surface
-            // (MailNavigationView) covers these users.
+            // Unknown / no subscription — the sidebar subscribe surface
+            // (MailNavigationView) covers these users. A free trial also lands
+            // here deliberately: it runs on the shared queue for its whole
+            // duration, so a throttle nudge would be permanent noise. The
+            // account dashboard and plan picker carry that story instead.
             return nil
         }
     }
