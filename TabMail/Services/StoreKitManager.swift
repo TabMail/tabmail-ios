@@ -294,6 +294,15 @@ final class StoreKitManager {
         return owner != currentUserId.lowercased()
     }
 
+    /// Whether restoring purchases should open the AI gate for `currentUserId`.
+    /// True only when there is an active Apple entitlement that is NOT owned by a
+    /// different TabMail account. Fails OPEN when ownership is unknown (no
+    /// appAccountToken) so a legitimate restore is never blocked; fails CLOSED only
+    /// when we are certain the active entitlement belongs to someone else.
+    func shouldOpenGateForRestoredEntitlement(currentUserId: String) -> Bool {
+        isAppleSubscriber && !hasAccountMismatch(currentUserId: currentUserId)
+    }
+
     // MARK: - Trial Eligibility
 
     /// Check if the user is eligible for the introductory offer (2-week free trial).
