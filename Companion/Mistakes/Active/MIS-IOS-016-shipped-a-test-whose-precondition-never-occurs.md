@@ -3,7 +3,7 @@
 **Class:** testing / verification-gate integrity
 **Severity:** high (a green suite certified a path that was never executed; three separate instances
 found on one day, one of which had already survived a documented "fix")
-**First seen:** 2026-08-13 · **Recurrences:** 1 · **Status:** Active
+**First seen:** 2026-08-13 · **Recurrences:** 2 · **Status:** Active
 **Related:** `MIS-014` (a test that BLESSES the bug — asserts the wrong value) · `MIS-015`
 (mechanism-pinning instead of invariant) · `MIS-IOS-014` (a red-first proof that could not run red) ·
 `MIS-IOS-006` (a number reported but not measured) · **Rule owner:** `../CLAUDE.md` § Testing Rules
@@ -27,7 +27,7 @@ you fix the bug. A **vacuous** test asserts the *right thing* about a state that
 stays green through the bug **and** through the fix, so it never signals at all. It cannot be found by
 "does this test fail on the pre-fix code", because it fails on nothing.
 
-## What actually happened — three instances, one day, three different mechanisms
+## What actually happened — three instances in one day, three different mechanisms, plus a fourth in 2026-08
 
 **1. `InboxEndToEndInvariantTests.scrubOnlyWakeStillConverges` — the precondition never fires.**
 `E2EWorld.apply(.silentStateChangePush)` re-stages with the **same folder and spec** as `.pushArrives`,
@@ -53,6 +53,21 @@ line**, and it stayed green through two real defects in the wiring its suite hea
 standing in for a barrier.** It installs its probe after a bare `try? await Task.sleep(for:
 .seconds(3))`. Under load the initial load slipped past 3 s, so the probe counted it plus the recovery
 reload: 8 navigation callbacks instead of 4. **The same byte-identical binary both passed and failed.**
+
+**4. `StoreKitSubscriptionManagementPresentationTests.theTwoFailureShapesDoNotMatchEachOther` — the
+assertion is guaranteed by the TYPE SYSTEM (2026-08-18, issue #45, commit `0cd3465`).** It built a
+`.noWindowScene` and a `.failed(_)`, then asserted each matched its own case and neither matched the
+other's. No implementation of `SubscriptionManagementPresentation` that **compiles** can make that
+false — distinct enum cases are distinct by construction — so it could not go red for any production
+change whatsoever, and it stayed green under the very `didPresent` inversion its sibling caught (the
+authoring commit even recorded that as a *feature*). The **discriminating tell here is the comment,
+not the setup**: it claimed to pin "the asymmetry the plan picker and account dashboard rely on",
+which lives in those views' `Task` closures and is not reachable from an enum-case check at all. The
+disposition was deletion plus a real pin elsewhere — the composed-closure coordinator test
+`DeletionCoordinatorGuardTests.unpresentedSubscriptionSheetsBlockDeletion` — exactly what
+`IOS-TEST-004` prescribes for a vacuous test. **Generalised tell: when a test asserts only relations
+the compiler already enforces (case distinctness, exhaustiveness, a `let`'s immutability), ask what
+production edit would turn it red; if the honest answer is "none that compiles", it is not a test.**
 
 ## Why the usual defences did not catch it
 
