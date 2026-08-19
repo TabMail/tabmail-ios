@@ -79,15 +79,81 @@ struct SummaryBubbleViewTests {
         #expect(mode == .suppressed)
     }
 
-    @Test("unknown recent-window state does not flash a loading bubble")
-    func unresolvedWindowStateIsHidden() {
+    // MARK: - The bounded-window gate must never hide an inbox bubble
+    //
+    // The live v1.7.11 regression: the gate starts unresolved (`nil`) and an
+    // unresolved gate returned `.hidden`, so the AI summary bubble was invisible
+    // for EVERY message — inbox included. The view that resolves the gate is the
+    // one the gate had hidden, so nothing could ever resolve it. These tests pin
+    // the user-facing invariant (an inbox message's bubble is visible), not the
+    // mechanism that resolves the window query.
+    //
+    // The predecessor of the first test asserted the opposite (`== .hidden`) and
+    // shipped the regression green; it is inverted here rather than deleted.
+
+    @Test("an unresolved window gate shows the ordinary empty state, never a hidden bubble")
+    func unresolvedWindowStateRendersEmptyNotHidden() {
         let mode = SummaryBubbleView.displayMode(
             isInInbox: true,
             summaryBlurb: nil,
             demoSuppressed: false,
             recentInboxEligible: nil
         )
-        #expect(mode == .hidden)
+        #expect(mode == .empty)
+    }
+
+    @Test("an inbox message with a stored summary renders its bubble before the window gate resolves")
+    func inboxSummaryRendersWhileWindowStateUnresolved() {
+        let mode = SummaryBubbleView.displayMode(
+            isInInbox: true,
+            summaryBlurb: "Vendor confirmed Friday delivery.",
+            demoSuppressed: false,
+            recentInboxEligible: nil
+        )
+        #expect(mode == .content)
+    }
+
+    @Test("a resolved-eligible message keeps the exact pre-gate outcomes")
+    func resolvedEligibleKeepsPreGateOutcomes() {
+        // Guards the coverage the seam default used to provide implicitly. Before
+        // this fix the default was `= true`, so every test that omitted the
+        // argument pinned the eligible outcomes as a side effect; the default is
+        // now `nil`, so the eligible column needs pinning on purpose. Without
+        // this, `true` could return `.suppressed` for everything and stay green.
+        let cases: [(blurb: String?, expected: SummaryBubbleView.DisplayMode)] = [
+            (nil, .empty),
+            ("", .empty),
+            ("Vendor confirmed Friday delivery.", .content)
+        ]
+        for testCase in cases {
+            let mode = SummaryBubbleView.displayMode(
+                isInInbox: true,
+                summaryBlurb: testCase.blurb,
+                demoSuppressed: false,
+                recentInboxEligible: true
+            )
+            #expect(mode == testCase.expected, "blurb=\(String(describing: testCase.blurb))")
+        }
+    }
+
+    @Test("no window-gate state can hide an inbox message's summary bubble")
+    func inboxMessageIsNeverHiddenByTheWindowGate() {
+        let gateStates: [Bool?] = [nil, true, false]
+        let blurbs: [String?] = [nil, "", "Vendor confirmed Friday delivery."]
+        for gate in gateStates {
+            for blurb in blurbs {
+                let mode = SummaryBubbleView.displayMode(
+                    isInInbox: true,
+                    summaryBlurb: blurb,
+                    demoSuppressed: false,
+                    recentInboxEligible: gate
+                )
+                #expect(
+                    mode != .hidden,
+                    "gate=\(String(describing: gate)) blurb=\(String(describing: blurb))"
+                )
+            }
+        }
     }
 
     // MARK: - Non-inbox → .hidden (regardless of content)
