@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -28,6 +29,10 @@ struct RemovedAccountPushCleanupTests {
         func setProviderFailuresRemaining(_ value: Int) { providerFailuresRemaining = value }
         func recordedCalls() -> [String] { calls }
         func blockDeviceAccount(email: String) { blockedDeviceAccountEmail = email }
+        /// Whether the blocked call has been entered at least once. Lets a test
+        /// prove the flush genuinely reached the network without depending on
+        /// wall-clock timing.
+        func hasReachedDeviceAccountBlock() -> Bool { hasReachedBlock }
         func waitUntilDeviceAccountBlocked() async {
             if hasReachedBlock { return }
             await withCheckedContinuation { blockObservers.append($0) }
@@ -611,6 +616,351 @@ struct RemovedAccountPushCleanupTests {
             ])
             #expect(Set(restoredIMAP.keys) == ["kept-id", "removed-id"])
             #expect(restoredIMAP["removed-id"]?["host"] as? String == "removed.test")
+        }
+    }
+
+    // MARK: - IOS-PUSH-001 sign-out handoff
+
+    /// Anti-hang guard, NOT a measurement of the production timeout.
+    ///
+    /// Whether sign-out is bounded is asserted structurally (the flush provably
+    /// did not finish before sign-out returned); wall-clock is a poor instrument
+    /// for it here, because these suites share a machine with other simulator
+    /// runs and a 5s timer has been observed resuming ~30s late at a load
+    /// average near 400. This bound therefore only has to separate "finite" from
+    /// "never returns", so it is deliberately far above the production bound.
+    private var signOutHangGuard: TimeInterval { PushConfig.signOutCleanupFlushTimeoutSeconds + 120 }
+
+    /// Bounded wait for a state the drain reaches asynchronously. Returns the
+    /// condition's final value so the caller asserts on it rather than hanging
+    /// the whole test process when the property does not hold.
+    private func waitUntil(seconds: TimeInterval, _ condition: () async -> Bool) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if await condition() { return true }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        return await condition()
+    }
+
+    @Test("sign-out flushes remote cleanup debt before the session that owns it is cleared")
+    func signOutFlushesRemoteDebtWhileSessionValid() async throws {
+        try await withHarness { defaults, mock in
+            var removed = Account(
+                emailAddress: "signout-flush@example.com",
+                displayName: "Removed",
+                provider: .gmail
+            )
+            removed.id = "signout-flush-account"
+
+            let generation = await PushNotificationService.shared.prepareRemovedAccountCleanup(
+                removed,
+                caldavConfigIds: [],
+                outboxAttachmentDirNames: []
+            )
+            await PushNotificationService.shared.commitPreparedRemovedAccountCleanup(generation: generation)
+
+            // The removal happened offline, so its immediate drain leaves the
+            // worker-owned actions durable.
+            await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
+            let strandedBefore = PendingRemovedAccountPushCleanup.load(from: defaults)
+            #expect(strandedBefore.count == 1, "the offline removal must leave debt for sign-out to flush")
+            guard strandedBefore.count == 1 else { return }
+            #expect(strandedBefore[0].actions == [
+                .deviceAccount,
+                .deviceRegistration,
+                .consent,
+                .providerSubscription,
+            ])
+
+            // The network is back and the user signs out. The session is the
+            // only credential that can ever discharge this debt, so it must be
+            // spent before it is destroyed.
+            await mock.setShouldFail(false)
+            await TabMailAuthService.signOut()
+
+            #expect(PendingRemovedAccountPushCleanup.load(from: defaults).isEmpty,
+                    "sign-out must flush the debt while the owning session is still valid")
+            #expect(defaults.object(forKey: PushConfig.removedAccountCleanupKey) == nil,
+                    "the removed email must not be retained after remote cleanup completes")
+            #expect(KeychainHelper.load(key: sessionKey) == nil, "sign-out must still clear the session")
+
+            let calls = await mock.recordedCalls()
+            #expect(calls.contains("device-account:signout-flush@example.com"))
+            #expect(calls.contains("gmail-consent:signout-flush@example.com"))
+            #expect(calls.contains("provider-subscription:gmail:signout-flush@example.com:empty"))
+            #expect(calls.contains("unregister-device"))
+        }
+    }
+
+    @Test("a hung cleanup flush cannot block sign-out and cannot drop the debt")
+    func signOutIsNotBlockedByAHungFlushAndDoesNotDropDebt() async throws {
+        try await withHarness { defaults, mock in
+            var removed = Account(
+                emailAddress: "signout-hung@example.com",
+                displayName: "Removed",
+                provider: .gmail
+            )
+            removed.id = "signout-hung-account"
+
+            await mock.setShouldFail(false)
+            await mock.blockDeviceAccount(email: removed.emailAddress)
+            let generation = await PushNotificationService.shared.prepareRemovedAccountCleanup(
+                removed,
+                caldavConfigIds: [],
+                outboxAttachmentDirNames: []
+            )
+            await PushNotificationService.shared.commitPreparedRemovedAccountCleanup(generation: generation)
+
+            let started = Date()
+            await TabMailAuthService.signOut()
+            let elapsed = Date().timeIntervalSince(started)
+            let callsAtSignOut = await mock.recordedCalls()
+
+            // THE invariant, stated structurally rather than in wall-clock:
+            // the blocked cleanup call never returns, so every action the drain
+            // performs after it is proof that sign-out waited for the flush.
+            #expect(!callsAtSignOut.contains(where: { $0.hasPrefix("gmail-consent:") }),
+                    "sign-out returned only after the blocked cleanup call completed — it waited instead of bounding")
+            #expect(elapsed < signOutHangGuard,
+                    "sign-out must return at all while a cleanup call is stuck (took \(elapsed)s)")
+            #expect(KeychainHelper.load(key: sessionKey) == nil,
+                    "sign-out is unconditional — a stuck flush must not keep the session alive")
+            let retained = PendingRemovedAccountPushCleanup.load(from: defaults)
+            #expect(retained.count == 1, "a timed-out flush must never discard the debt")
+            guard retained.count == 1 else {
+                await mock.releaseDeviceAccountBlock()
+                return
+            }
+            #expect(retained[0].actions.isSuperset(of: [
+                .deviceAccount,
+                .deviceRegistration,
+                .consent,
+                .providerSubscription,
+            ]), "the unfinished remote actions must survive intact")
+
+            // Non-vacuity for the assertion above: the flush really did run and
+            // really did reach the network, so "no call after the blocked one"
+            // describes a bounded sign-out rather than a flush that never began.
+            let reachedBlock = try await waitUntil(seconds: signOutHangGuard) {
+                await mock.hasReachedDeviceAccountBlock()
+            }
+            #expect(reachedBlock, "the flush must have reached the blocked cleanup call")
+
+            // `withTimeout` cancels the flush task but cannot force an actor to
+            // return, so the drain latch's release is proved, never assumed.
+            await mock.releaseDeviceAccountBlock()
+            let releasedFlushFinished = try await waitUntil(seconds: signOutHangGuard) {
+                PendingRemovedAccountPushCleanup.load(from: defaults).isEmpty
+            }
+            #expect(releasedFlushFinished, "the released flush must run to completion rather than stall")
+
+            // Re-entrancy after the cancelled flush: a wedged `drainActive`
+            // latch would make every later retry a no-op and strand this record.
+            try installTestSession(userId: testWorkerUserId)
+            var later = Account(
+                emailAddress: "signout-hung-later@example.com",
+                displayName: "Later",
+                provider: .gmail
+            )
+            later.id = "signout-hung-later-account"
+            let laterGeneration = await PushNotificationService.shared.prepareRemovedAccountCleanup(
+                later,
+                caldavConfigIds: [],
+                outboxAttachmentDirNames: []
+            )
+            await PushNotificationService.shared.commitPreparedRemovedAccountCleanup(generation: laterGeneration)
+            await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
+            let laterDrained = try await waitUntil(seconds: signOutHangGuard) {
+                PendingRemovedAccountPushCleanup.load(from: defaults).isEmpty
+            }
+            #expect(laterDrained,
+                    "a cancelled flush must leave the drain re-entrant — a wedged latch strands this record")
+            #expect(await mock.recordedCalls().contains("device-account:signout-hung-later@example.com"),
+                    "the later drain must reach the network, not merely retire local artifacts")
+        }
+    }
+
+    @Test("sign-out with no cleanup debt performs no cleanup work at all")
+    func signOutWithNoDebtPerformsNoCleanupWork() async throws {
+        try await withHarness { defaults, mock in
+            #expect(PendingRemovedAccountPushCleanup.load(from: defaults).isEmpty)
+
+            await TabMailAuthService.signOut()
+
+            #expect(await mock.recordedCalls().isEmpty,
+                    "the ordinary sign-out path must not gain a network round-trip")
+            #expect(KeychainHelper.load(key: sessionKey) == nil)
+        }
+    }
+
+    @Test("sign-out does not advance cleanup debt bound to a different subject")
+    func signOutDoesNotAdvanceAnotherSubjectsDebt() async throws {
+        try await withHarness { defaults, mock in
+            var removed = Account(
+                emailAddress: "signout-other-subject@example.com",
+                displayName: "Removed",
+                provider: .gmail
+            )
+            removed.id = "signout-other-subject-account"
+
+            await mock.setShouldFail(false)
+            let generation = await PushNotificationService.shared.prepareRemovedAccountCleanup(
+                removed,
+                caldavConfigIds: [],
+                outboxAttachmentDirNames: []
+            )
+            await PushNotificationService.shared.commitPreparedRemovedAccountCleanup(generation: generation)
+
+            // A different subject is signed in now. Their sign-out may not spend
+            // the original user's debt, and may not retire it either.
+            try installTestSession(userId: "different-worker-user")
+            await TabMailAuthService.signOut()
+
+            #expect(await mock.recordedCalls().isEmpty,
+                    "only the subject that owns the debt may advance it remotely")
+            let retained = PendingRemovedAccountPushCleanup.load(from: defaults)
+            #expect(retained.count == 1, "another subject's sign-out must not retire the debt")
+            guard retained.count == 1 else { return }
+            #expect(retained[0].workerUserId == testWorkerUserId)
+            #expect(retained[0].actions.isSuperset(of: [
+                .deviceAccount,
+                .deviceRegistration,
+                .consent,
+                .providerSubscription,
+            ]))
+            #expect(KeychainHelper.load(key: sessionKey) == nil)
+        }
+    }
+
+    @Test("sign-out completes and notifies even when the cleanup flush fails")
+    func signOutClearsTheSessionEvenWhenTheFlushFails() async throws {
+        try await withHarness { defaults, mock in
+            var removed = Account(
+                emailAddress: "signout-offline@example.com",
+                displayName: "Removed",
+                provider: .gmail
+            )
+            removed.id = "signout-offline-account"
+
+            let generation = await PushNotificationService.shared.prepareRemovedAccountCleanup(
+                removed,
+                caldavConfigIds: [],
+                outboxAttachmentDirNames: []
+            )
+            await PushNotificationService.shared.commitPreparedRemovedAccountCleanup(generation: generation)
+            // The mock fails by default: the device is still offline at sign-out.
+
+            let posted = Mutex(false)
+            let token = NotificationCenter.default.addObserver(
+                forName: .tabMailDidSignOut,
+                object: nil,
+                queue: nil
+            ) { _ in
+                posted.withLock { $0 = true }
+            }
+            await TabMailAuthService.signOut()
+            NotificationCenter.default.removeObserver(token)
+
+            let observed = posted.withLock { $0 }
+            #expect(observed, "sign-out must post .tabMailDidSignOut regardless of the flush outcome")
+            #expect(KeychainHelper.load(key: sessionKey) == nil,
+                    "a failed flush must not leave the user signed in")
+            let retained = PendingRemovedAccountPushCleanup.load(from: defaults)
+            #expect(retained.count == 1, "a failed flush must leave the debt durable")
+            guard retained.count == 1 else { return }
+            #expect(retained[0].actions.isSuperset(of: [
+                .deviceAccount,
+                .deviceRegistration,
+                .consent,
+                .providerSubscription,
+            ]))
+            #expect(await mock.recordedCalls().contains("device-account:signout-offline@example.com"),
+                    "the flush must actually be attempted before the session goes away")
+        }
+    }
+
+    @Test("a same-user removal drain active at sign-out coalesces the flush; the debt is not dropped and the released drain resumes to completion")
+    func signOutCoalescesWithActiveSameUserRemovalDrainThenResumesToCompletion() async throws {
+        try await withHarness { defaults, mock in
+            var removed = Account(
+                emailAddress: "signout-concurrent-drain@example.com",
+                displayName: "Removed",
+                provider: .gmail
+            )
+            removed.id = "signout-concurrent-drain-account"
+
+            // The network is up, but the FIRST worker call blocks mid-drain, so
+            // `AccountManagerSetup.removeAccount`'s detached drain is provably
+            // ACTIVE — `removedAccountCleanupDrainActive` is set and the drain is
+            // suspended inside the first remote call — at the moment sign-out lands.
+            await mock.setShouldFail(false)
+            await mock.blockDeviceAccount(email: removed.emailAddress)
+            let generation = await PushNotificationService.shared.prepareRemovedAccountCleanup(
+                removed,
+                caldavConfigIds: [],
+                outboxAttachmentDirNames: []
+            )
+            await PushNotificationService.shared.commitPreparedRemovedAccountCleanup(generation: generation)
+
+            let removalDrain = Task {
+                await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
+            }
+            await mock.waitUntilDeviceAccountBlocked()
+
+            // Ordinary sign-out lands while that drain is active. Its flush call
+            // coalesces with the in-flight drain (the early-return latch path)
+            // instead of running a second drain or waiting on the first, so the
+            // bounded wait completes at once and `clearSession()` proceeds.
+            await TabMailAuthService.signOut()
+
+            // (i) Sign-out is unconditional — the session is gone.
+            #expect(KeychainHelper.load(key: sessionKey) == nil,
+                    "sign-out must clear the session even when a removal drain is mid-flight")
+
+            // (ii)+(iii) TRANSIENT never-drop, blocked window: the coalesced flush
+            // neither discharged nor dropped the debt. The still-blocked drain has
+            // persisted nothing, so the worker-owned actions are all still present
+            // at the moment sign-out returns. This assertion is what a coalescing-
+            // path that DROPPED the debt (clearing the pending records on the early
+            // return) makes go red.
+            let retained = PendingRemovedAccountPushCleanup.load(from: defaults)
+            #expect(retained.count == 1, "the coalesced flush must never drop the retained debt")
+            guard retained.count == 1 else {
+                await mock.releaseDeviceAccountBlock()
+                await removalDrain.value
+                return
+            }
+            #expect(retained[0].actions.isSuperset(of: [
+                .deviceAccount,
+                .deviceRegistration,
+                .consent,
+                .providerSubscription,
+            ]), "the concurrently-draining record's worker actions must survive intact")
+
+            // (iv) SETTLED invariant: the coalescing neither corrupted nor stranded
+            // the debt. Releasing the still-blocked SAME-user drain (the mock is
+            // already non-failing) lets it run to completion under the identity it
+            // was admitted with — its `currentWorkerUserId` was captured before
+            // sign-out — so the same-user debt is discharged BY COMPLETION, not
+            // dropped and not stranded. This is a same-user claim only: the mock
+            // ignores auth, so this pins that the coalescing preserved the debt for
+            // its owning drain to finish, NOT that production discharges every
+            // action after `clearSession()`.
+            await mock.releaseDeviceAccountBlock()
+            await removalDrain.value
+
+            #expect(PendingRemovedAccountPushCleanup.load(from: defaults).isEmpty,
+                    "the released same-user drain must discharge the coalesced debt by completion, not leave it dropped or stranded")
+            #expect(defaults.object(forKey: PushConfig.removedAccountCleanupKey) == nil,
+                    "the removed-account record must be retired once the resumed same-user drain completes")
+            let settledCalls = await mock.recordedCalls()
+            #expect(settledCalls.contains("device-account:signout-concurrent-drain@example.com"),
+                    "the resumed drain must complete the blocked device-account call")
+            #expect(settledCalls.contains("gmail-consent:signout-concurrent-drain@example.com"),
+                    "the resumed drain must reach the consent teardown")
+            #expect(settledCalls.contains("provider-subscription:gmail:signout-concurrent-drain@example.com:empty"),
+                    "the resumed drain must reach the provider-subscription teardown")
         }
     }
 }
