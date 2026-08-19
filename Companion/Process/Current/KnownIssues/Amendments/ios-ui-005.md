@@ -1,6 +1,6 @@
 # IOS-UI-005
 
-- Register classification: `open`
+- Register classification: `accepted`
 - New post-freeze record (2026-08-13) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
@@ -16,6 +16,12 @@ Swift's app-owned `previewFilename` instead.
 ⚠️ **This record exists as much to stop the finding being RE-ESCALATED as to track it.** It was first
 framed as "attacker-chosen From/Subject/Date in native SwiftUI chrome", which sounds severe and is
 misleading. See *Why the severity is near-nil* — that reasoning is the durable part.
+
+⚠️ **SUPERSEDED DISPOSITION (2026-08-18) — this record is now `accepted`, not `open`; GitHub #20 is
+CLOSED as *not planned* (`wontfix`) by owner decision, so THIS FILE IS THE SOLE FENCE.** Everything
+above stays true and still governs; only the disposition moved. Read *🧾 OWNER DISPOSITION 2026-08-18*
+at the end of this file for the decision, the reopening condition, and the five findings folded in from
+the 2026-08-18 verification.
 
 ## 2026-08-15 current-main revalidation and narrowed candidate
 
@@ -159,3 +165,147 @@ metadata becomes materially different from the attached sender-authored bytes.
 - `IOS-PRIVACY-002` — the render-family privacy record.
 - ADR-IOS-076 — the adjacent render-pipeline and app-owned view-mode decisions; its per-load nonce
   does not establish provenance for markers already persisted in sender-influenced HTML.
+
+## 🧾 OWNER DISPOSITION 2026-08-18 — ACCEPTED LIMITATION; GitHub #20 CLOSED AS NOT PLANNED
+
+**Owner decision (2026-08-18): the residual marker-provenance gap is ACCEPTED as a limitation, and
+GitHub issue [#20](https://github.com/TabMail/tabmail-ios/issues/20) is CLOSED as *not planned*
+(`wontfix`).** No production code changed with this disposition; the mechanism recorded above is exactly
+what ships.
+
+**This record is now the SOLE fence against re-escalation.** There is no tracker row left to carry the
+reasoning, so everything that stops this being refiled as *"attacker-chosen From/Subject/Date in native
+SwiftUI chrome"* lives here and nowhere else.
+
+**Reopening condition, stated positively — and stated with its DIRECTION, because the direction is the
+whole bar.** Re-escalation requires **first showing a `tm-*` marker driving a NON-COSMETIC decision IN A
+SENDER-EXPLOITABLE DIRECTION**, meaning a forged marker must do at least one of these: **cause a fetch
+or a leak that would not otherwise happen**; **weaken a privacy or security gate**; or **misroute data**
+— a message-identity resolution, a mutation target, or an account-state write landing somewhere the
+genuine marker would not have sent it.
+
+⚠️ **A privacy-conservative WITHHOLD does NOT qualify, and leg D below is the worked counter-example
+that forced this wording.** `AutoSizingHTMLView.deferredImageLoadJS`'s `hiddenByViewMode` walks an
+image's ancestors testing `el.classList.contains('tm-eml-section')` **unconditionally**, and when such
+an ancestor computes to `display: none` the enclosing `swap()` **WITHHOLDS the remote URL**. That is
+literally "a `tm-*` marker driving a fetch decision" — so the bar as first written was **already
+satisfied by this record's own §3 leg D on the day it was written**, which is exactly why it needed
+tightening. A forged marker there can only **SUPPRESS** a fetch the app would otherwise have made: it
+fails closed, costs the sender their own image loads, and hands an attacker nothing. Fetch decisions
+count only when forgery pushes them toward MORE network, MORE disclosure, or a WEAKER gate.
+
+Until a sender-exploitable consumer in that sense exists, the residual is a disagreement between two
+sets of sender-authored bytes, and the answer is this record rather than a fix. The consumer census that
+establishes the current state is in §3 below; re-run that census before claiming it has changed.
+
+**Cost if it were ever authorized**, for proportionality: the preview-header leg only, ~200–230
+production lines across 9–10 files including `NSEStagingDB` parity, with a blast radius covering the
+whole body-fetch → persistence → NSE → attachment-list → preview pipeline on all three providers. That
+is the PR #39 silhouette (durable sidecar + multi-provider plumbing + a migration story) against a
+near-nil payoff — the same visible-cost-for-security-gain class as the four owner reversals of
+2026-08-12 (`IOS-UI-002`, `IOS-UI-003`, `IOS-PRIVACY-001`, `IOS-PRIVACY-002`).
+
+### 1. The loudest leg is NOT caused by the missing namespace reservation
+
+The reply/forward quote-omission leg — what a user would actually notice — does **not** require a forged
+marker and would **not** be closed by reserving the `tm-*` namespace.
+
+The app's `.tm-eml-section { display: none !important }` rule lives in the `<head>` stylesheet.
+`EmailHTMLWrapper.unwrapFullHTMLDocument` **lifts the author's own `<style>` out of the sender document
+and emits it LATER in the cascade**, at **equal specificity and equal `!important` weight** — so the
+later rule wins. A sender's own `.tm-eml-section { display: block !important }` therefore overrides the
+app's hide rule **against a GENUINE, app-generated marker**. No forgery is involved anywhere in the
+sequence.
+
+Consequence for design: provenance machinery aimed at marker *authorship* leaves this leg exactly where
+it is. Anyone proposing the out-of-band typed envelope as "the fix for the quote mismatch" has
+mis-attributed the mechanism.
+
+### 2. The old-row impasse — four doors, none acceptable; why the mandated out-of-band fix cannot be both provenance-establishing and render-identical
+
+The fix this record mandates — carry the parsed nested envelope and section association out-of-band in an
+app-owned typed record (`emlEnvelope: EmlMarker.Envelope?` on `AttachmentInfo`/`AttachmentRef`, which
+needs **no migration** because `attachmentsJSON` is JSON-decoded TEXT) — can only ever cover bodies
+fetched **after** the change. For every `.eml` already stored there are exactly four doors, and none of
+them is open:
+
+1. **Drop the HTML parse.** Every already-stored `.eml` preview permanently loses its native header — a
+   visible regression, against the owner's standing render-hardening directive of *security only, no
+   behaviour changes*.
+2. **Keep `parseEmlSectionMetadata` as a fallback.** The forgery stays live for the entire existing
+   corpus, and it is a fallback, which this repo forbids without asking first.
+3. **Backfill by re-parsing the stored HTML.** This launders the forged envelope into the app-owned typed
+   record — strictly worse than having no typed record at all.
+4. **Force a body re-fetch.** Network cost and a behaviour change, and impossible for messages the server
+   has since expired.
+
+There is no fifth door. A future proposal must name which of these four it is taking and why its cost has
+become acceptable.
+
+### 3. Verified consumer impact at `cdf11a6e5` — the census the reopening condition is measured against
+
+- **Exactly one native READER of `tm-*` exists — `EmailFilter` — and it holds TWO literal read sites:**
+  the fast-path guard in `stripEmbeddedEmlSections`, and the token check inside `matchEmlSectionOpen`
+  that the parse and strip paths share. Stated as *one reader, two sites* deliberately, so a future
+  re-census diffs against the right integer instead of reading "one" and concluding a site went missing.
+- `EmlSectionMetadata.partSection` has **zero production reads**.
+- Nested-attachment routing is **typed** — `AttachmentInfo.parentEmlSection == attachment.section` — and
+  never consults marker text.
+- The **plain-text / FTS path emits no `tm-*` at all**, so search and every derived index are outside the
+  blast radius.
+- Outcome of a forged marker, leg by leg (the verifier's enumeration): the native preview-header
+  disagreement (**A**) is cosmetic and self-referential, because both envelopes are sender-authored bytes
+  either way; the forged section's body rendering above the genuine one (**B**) is cosmetic — sender
+  content shown inside a sheet of sender content; the reply/forward quote omission (**C**) is real but,
+  per §1, is **not UNIQUELY a forgery leg** — a GENUINE marker suffices, so reserving the namespace
+  would not close it (the *Related side effect* paragraph above stands: a forged section a sender
+  un-hides with their own CSS is dropped by `stripEmbeddedEmlSections` too, which is why the absolute
+  "not a forgery leg at all" is wrong and this qualified form replaces it); the deferred-image withhold
+  decision (**D**) fails privacy-**conservative** — it withholds, it does not leak, which is exactly why
+  the reopening bar above is written with a DIRECTION; the remaining diagnostic/observability legs
+  (**E**, **F**) are cosmetic.
+
+### 4. LEAD, not a finding — `AttachmentRef` has no `parentEmlSection`
+
+`AttachmentRef` carries no `parentEmlSection` field, so the `attachmentsJSON` an NSE stages **already**
+lacks that field until a main-app fetch replaces the record. This was noticed while sizing the typed
+envelope and is registered here as a **LEAD, not a finding**: no consequence was traced to it. It is
+recorded so a future envelope/provenance design does not rediscover it mid-implementation. Anyone acting
+on it must first establish a consumer that actually suffers from the absence.
+
+### 5. Rejected cheap non-fix — last-match-wins
+
+Making `parseEmlSectionMetadata` last-match-wins instead of first-match-wins was considered and
+**rejected**: it is unprincipled (nothing makes "last" more authentic than "first"), it changes behaviour
+for legitimate mail that genuinely carries two attachments with the same filename, and it does not close
+the second route at all — a forged marker inside `.eml` **A**'s nested body still precedes the genuine
+marker for `.eml` **B**. Do not re-propose it as a cheap win.
+
+⚠️ **NO test pins first-vs-last-match as of 2026-08-18 — and that STRENGTHENS the rejection above.** The
+nearest candidate, `IMAPProviderEmlRenderTests.parseEmlSectionMetadataMultiple`, uses two **DISTINCT**
+filenames (`first.eml` and `second.eml`), and `EmailFilter.parseEmlSectionMetadata` selects on
+`data-filename` **EQUALITY** — so a last-match-wins variant returns byte-identical results and that test
+stays **green**. A census of all eight `parseEmlSectionMetadata` call sites in `TabMailTests`
+(`IMAPProviderEmlRenderTests`, `GmailProviderEmlRenderTests`, `EmlMarkerTests`, `EmlParsingTests`) found
+**no fixture carrying two sections that share a filename**, so nothing in the suite can observe the
+change. The cheap non-fix would therefore land **SILENTLY**: no red test, no signal, a behaviour change
+to legitimate same-filename mail with nothing to catch it. Any real fix must **ADD** the pinning test
+first rather than expect an existing one to fail.
+
+⚠️ An earlier draft of this section stated that this test "asserts first-match-wins today" and
+"**blesses the current behaviour**". That is **FALSE** — corrected 2026-08-18. It was transcribed
+faithfully from the upstream verifier report, so do **not** "restore" it by re-reading that source.
+
+### If the reopening condition is ever met — the test shapes already designed
+
+No test covers a sender-forged marker as of 2026-08-18. If a non-cosmetic consumer ever appears, the red-first
+shapes are: `forgedMarkerCannotSupplyThePreviewEnvelope` per provider; a nested-forgery variant (the
+`.eml` **A** precedes `.eml` **B** route); two-sided non-vacuity on each; an old-row pinning test that
+fails if already-stored previews lose their header; and a SHA-256 render-identity characterization per
+provider to prove the corpus renders unchanged.
+
+Required reading before any such work: this record, `IOS-UI-004`, `IOS-PRIVACY-003`, `IOS-PRIVACY-002`,
+ADR-IOS-076, ADR-IOS-039,
+[`Companion/Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md`](../../../../Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md),
+and [`MIS-IOS-011`](../../../../Mistakes/Active/MIS-IOS-011-declared-a-residual-acceptable-on-an-argument-i-never-ran.md)
+— the mistake of declaring a residual acceptable on an argument never actually run.
