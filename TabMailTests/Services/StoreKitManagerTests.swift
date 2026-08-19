@@ -392,3 +392,91 @@ struct StoreKitManagerAccountDeletionRenewalTests {
     }
 
 }
+
+// MARK: - StoreKitManager Restore-Gate Ownership Tests
+
+/// Pins the invariant: **restore opens the AI gate IFF the active Apple entitlement
+/// belongs to the current user.**
+///
+/// The pre-fix restore handler decided solely on `isAppleSubscriber`, which is a
+/// device-level flag and stays `true` even when the active entitlement is owned by a
+/// DIFFERENT TabMail account — so a foreign account's subscription would open the
+/// current user's gate. `subscriptionOwnerUserId` is stored lowercased by
+/// `updateCurrentEntitlements` (`token.uuidString.lowercased()`), and the predicate
+/// fails OPEN whenever ownership is unknown so a legitimate restore is never blocked
+/// (the hard requirement — no false-close of a paying user).
+@Suite("StoreKitManager Restore-Gate Ownership")
+struct StoreKitManagerRestoreGateTests {
+
+    // Distinct lowercased owner tokens, mirroring how updateCurrentEntitlements
+    // stores them (`token.uuidString.lowercased()`).
+    private let userA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    private let userB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+    /// GREEN (the fix) with the RED-first contrast captured in one place. On the
+    /// foreign-account state the PRE-FIX decision variable (`isAppleSubscriber`) is
+    /// `true`, i.e. the old restore handler WOULD have opened the gate on user A's
+    /// subscription. The new predicate returns `false` on that same state — the
+    /// green. (The temporary-inversion RED run, which drops the `!hasAccountMismatch`
+    /// term to reproduce the pre-fix decision, is recorded in the commit message.)
+    @Test("Foreign account is blocked; pre-fix isAppleSubscriber would have opened")
+    @MainActor
+    func foreignAccountBlocked() {
+        let manager = StoreKitManager()
+        manager.isAppleSubscriber = true
+        manager.subscriptionOwnerUserId = userA
+        // RED evidence: the pre-fix restore decision was `isAppleSubscriber` alone,
+        // which is `true` here → the old gate opened for a foreign account.
+        #expect(manager.isAppleSubscriber == true)
+        // GREEN: the new predicate refuses to open user B's gate on user A's sub.
+        #expect(manager.shouldOpenGateForRestoredEntitlement(currentUserId: userB) == false)
+    }
+
+    /// GREEN two-sided: the entitlement's own account opens its gate.
+    @Test("Own account opens the gate")
+    @MainActor
+    func ownAccountOpens() {
+        let manager = StoreKitManager()
+        manager.isAppleSubscriber = true
+        manager.subscriptionOwnerUserId = userA
+        #expect(manager.shouldOpenGateForRestoredEntitlement(currentUserId: userA) == true)
+    }
+
+    /// Fail-OPEN: a subscriber whose active entitlement carries no appAccountToken
+    /// (ownership unknown) is never blocked. This is the always-safe direction the
+    /// hard requirement demands — a legitimate restore must never false-close.
+    @Test("Unknown ownership fails open for a subscriber")
+    @MainActor
+    func unknownOwnershipFailsOpen() {
+        let manager = StoreKitManager()
+        manager.isAppleSubscriber = true
+        manager.subscriptionOwnerUserId = nil
+        #expect(manager.shouldOpenGateForRestoredEntitlement(currentUserId: userA) == true)
+    }
+
+    /// A non-subscriber never opens the gate, regardless of any stale owner value.
+    @Test("Non-subscriber does not open the gate")
+    @MainActor
+    func nonSubscriberDoesNotOpen() {
+        let manager = StoreKitManager()
+        manager.isAppleSubscriber = false
+        manager.subscriptionOwnerUserId = userA
+        #expect(manager.shouldOpenGateForRestoredEntitlement(currentUserId: userA) == false)
+    }
+
+    /// Case-insensitivity, both sides. The owner token is stored lowercased by
+    /// `updateCurrentEntitlements`; the predicate lowercases the current user id, so a
+    /// legitimate user whose session id arrives upper-cased is NOT falsely blocked
+    /// (no mirror-image false-close), while a genuinely different account still is.
+    @Test("Owner stored lowercased: same user (mixed case) opens, different account blocked")
+    @MainActor
+    func caseInsensitiveOwnership() {
+        let manager = StoreKitManager()
+        manager.isAppleSubscriber = true
+        manager.subscriptionOwnerUserId = userA  // lowercased, as stored on the wire
+        // Same account, upper-cased session id → still opens (never false-closes).
+        #expect(manager.shouldOpenGateForRestoredEntitlement(currentUserId: userA.uppercased()) == true)
+        // Different account, any case → blocked.
+        #expect(manager.shouldOpenGateForRestoredEntitlement(currentUserId: userB.uppercased()) == false)
+    }
+}

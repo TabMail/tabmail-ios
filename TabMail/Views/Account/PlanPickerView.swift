@@ -183,21 +183,40 @@ struct PlanPickerView: View {
                         await storeKit.restorePurchases()
                         isRestoring = false
                         if storeKit.isAppleSubscriber {
-                            AISubscriptionGate.shared.openGate()
-                            if let jws = await storeKit.latestEntitlementJWS() {
-                                Self.verifyPurchaseWithBackend(jws: jws)
+                            // Open the current user's AI gate only when the active
+                            // Apple entitlement is NOT owned by a different TabMail
+                            // account. Fails OPEN when ownership is unknown (no
+                            // appAccountToken) and for the impossible no-session edge
+                            // on this signed-in screen, so a legitimate restore is
+                            // never blocked; fails CLOSED only when the active
+                            // entitlement provably belongs to someone else. Only the
+                            // restore path is guarded — the purchase path stamps a
+                            // fresh appAccountToken and can never mismatch.
+                            let currentUserId = TabMailAuthService.getSession()?.userId
+                            let mayOpen = currentUserId
+                                .map { storeKit.shouldOpenGateForRestoredEntitlement(currentUserId: $0) } ?? true
+                            if mayOpen {
+                                AISubscriptionGate.shared.openGate()
+                                if let jws = await storeKit.latestEntitlementJWS() {
+                                    Self.verifyPurchaseWithBackend(jws: jws)
+                                }
+                                let restored = try? await backend.fetchAccountInfo()
+                                accountInfo = restored
+                                // This body races the detached `verifyPurchaseWithBackend`
+                                // write, so it may still be the pre-restore state. Route
+                                // it through the open-only seam: it can refresh the
+                                // sidebar copy and reopen the gate when the backend
+                                // already confirmed the subscription, but it must NEVER
+                                // close the gate `openGate()` just opened from local
+                                // StoreKit truth. A later authoritative whoami reconciles
+                                // if this one raced.
+                                if let restored { AISubscriptionGate.shared.refreshAfterLocalPurchase(restored) }
+                            } else {
+                                // Active Apple entitlement belongs to a different
+                                // TabMail account — never open the current user's gate
+                                // on someone else's subscription.
+                                storeKit.restoreResult = "That subscription belongs to a different TabMail account."
                             }
-                            let restored = try? await backend.fetchAccountInfo()
-                            accountInfo = restored
-                            // This body races the detached `verifyPurchaseWithBackend`
-                            // write, so it may still be the pre-restore state. Route
-                            // it through the open-only seam: it can refresh the
-                            // sidebar copy and reopen the gate when the backend
-                            // already confirmed the subscription, but it must NEVER
-                            // close the gate `openGate()` just opened from local
-                            // StoreKit truth. A later authoritative whoami reconciles
-                            // if this one raced.
-                            if let restored { AISubscriptionGate.shared.refreshAfterLocalPurchase(restored) }
                         }
                     }
                 }
