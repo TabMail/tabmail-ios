@@ -79,9 +79,42 @@ struct AccountDeletionSubscriptionFlowTests {
         )
     }
 
+    /// A server-granted signup trial reports an ACTIVE subscription with the
+    /// provider `signup`. There is no purchase behind it — nothing renews and
+    /// there is nothing to cancel first — so falling through to the unsupported
+    /// arm would leave every trial user unable to delete their account at all.
+    @Test("A server-granted trial has nothing to cancel, so deletion is scheduled")
+    func signupTrialSchedulesDeletion() throws {
+        for provider in ["signup", " Signup ", "SIGNUP"] {
+            #expect(
+                AccountDeletionSubscriptionPolicy.nextStep(
+                    for: try accountInfo(hasSubscription: true, provider: provider),
+                    appleRenewalState: .noMatchingSubscription
+                ) == .scheduleDeletion
+            )
+        }
+    }
+
+    /// The same case built from the full running-trial wire shape rather than a
+    /// provider string alone, so the policy is exercised against the body the
+    /// backend actually sends.
+    @Test("A full running-trial account body schedules deletion")
+    func runningTrialBodySchedulesDeletion() throws {
+        let info = try WhoamiFixture.runningSignupTrial(daysLeft: 9, reference: Date())
+        #expect(info.trialState() == .active(daysRemaining: 9))
+        #expect(
+            AccountDeletionSubscriptionPolicy.nextStep(
+                for: info,
+                appleRenewalState: .noMatchingSubscription
+            ) == .scheduleDeletion
+        )
+    }
+
     @Test("An unknown active provider fails closed")
     func unknownProvider() throws {
-        let unknownProviders: [String?] = [nil, "future-provider"]
+        // "signups"/"signup-trial" are near misses, not the exact provider —
+        // the match is exact after trimming and lowercasing, never a prefix.
+        let unknownProviders: [String?] = [nil, "future-provider", "signups", "signup-trial"]
         let cancellationStates: [Int?] = [nil, futureCancellationAt()]
         for provider in unknownProviders {
             for pendingCancellationAt in cancellationStates {

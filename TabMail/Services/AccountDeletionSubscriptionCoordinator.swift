@@ -82,6 +82,15 @@ enum AccountDeletionSubscriptionPolicy {
             .lowercased()
 
         switch provider {
+        case AccountPlanConfig.signupProviderKey:
+            // A server-granted free trial reports an active subscription, but
+            // there is no purchase behind it: nothing renews, nothing charges,
+            // and there is no provider subscription to cancel first. Blocking
+            // here would leave a trial user unable to delete their account at
+            // all. Deleting mid-trial simply forfeits the remaining days; the
+            // account-side trial record is cleaned up server-side with the
+            // account itself.
+            return .scheduleDeletion
         case "stripe":
             return accountInfo.pendingCancellation?.cancelAt == nil
                 ? .cancelStripe
@@ -302,6 +311,11 @@ enum AccountDeletionSubscriptionCoordinator {
         return lastState
     }
 
+    /// The second and last place in this file that compares a provider string.
+    /// It proves a **Stripe** cancellation landed, so `"stripe"` stays the only
+    /// admitted value: widening it would let some other provider's state satisfy
+    /// a Stripe-specific proof. It is reached only from the `.cancelStripe`
+    /// branch, which a `"signup"` trial never takes.
     private static func stripeDeletionEligibilityWasConfirmed(
         maxAttempts: Int,
         fetchAccountInfo: () async throws -> AccountInfo,

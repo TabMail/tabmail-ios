@@ -109,12 +109,11 @@ struct AccountDashboardView: View {
 
                 Section {
                     // Status banners
-                    if let trial = accountInfo?.trial, trial.isTrial {
-                        let hasEnded = accountInfo?.trialState() == .ended
+                    if let trialBanner = trialBannerCopy {
                         StatusBanner(
-                            icon: hasEnded ? "clock.badge.exclamationmark" : "clock",
-                            text: trialBannerText(trial),
-                            color: hasEnded ? .orange : .blue
+                            icon: trialBanner.icon,
+                            text: trialBanner.text,
+                            color: trialBanner.color
                         )
                         .listRowInsets(EdgeInsets())
                         .listRowBackground(Color.clear)
@@ -288,7 +287,7 @@ struct AccountDashboardView: View {
                 }
 
                 // Daily Quota Usage chart
-                if let maxCostCents = accountInfo?.maxMonthlyCostCents, maxCostCents > 0 {
+                if let maxCostCents = accountInfo?.dailyQuotaChartDenominator {
                     let padded = paddedDailyStats(usageStats?.dailyStats ?? [])
                     Section {
                         VStack(spacing: 2) {
@@ -436,6 +435,11 @@ struct AccountDashboardView: View {
         do {
             let info = try await backend.fetchAccountInfo()
             accountInfo = info
+            // This is an authoritative /whoami, so route it through the same
+            // single seam the foreground revalidation uses: it opens/closes the
+            // gate AND stamps the trial flag, keeping the sidebar copy in step
+            // with what the dashboard is showing instead of lagging a foreground.
+            AISubscriptionGate.shared.apply(info)
             // Keep the inbox usage-throttle banner fresh when the user opens
             // the dashboard.
             UsageThrottleStore.shared.update(from: info)
@@ -506,18 +510,28 @@ struct AccountDashboardView: View {
         return true
     }
 
-    /// Copy for the trial status banner: days remaining while the trial runs, an
-    /// explicit ended state once the end date has passed with no subscription,
-    /// and today's plain "Trial active until <date>" when the end date is absent.
-    private func trialBannerText(_ trial: TrialInfo) -> String {
+    /// Copy for the trial status banner, or `nil` when there is no trial to
+    /// describe.
+    ///
+    /// Deliberately NOT gated on `accountInfo?.trial` being non-nil: the ended
+    /// response can carry `"trial": null`, and reading the object first would
+    /// make the ended banner disappear on exactly the accounts that need it.
+    /// The `.noTrial` arm keeps today's plain "Trial active until <date>" for a
+    /// legacy Stripe/Apple card trial, which is a subscription rather than a
+    /// signup trial and must render exactly as it always has.
+    private var trialBannerCopy: (icon: String, text: String, color: Color)? {
         switch accountInfo?.trialState() {
         case .active(let daysRemaining):
             let unit = daysRemaining == 1 ? "day" : "days"
-            return "Free trial · \(daysRemaining) \(unit) left"
+            return ("clock", "Free trial · \(daysRemaining) \(unit) left", .blue)
         case .ended:
-            return "Your free trial has ended — subscribe to continue"
+            return ("clock.badge.exclamationmark",
+                    "Your free trial has ended — subscribe to continue",
+                    .orange)
         default:
-            return "Trial active" + (trial.trialEnd.map { " until \(formatTimestamp($0))" } ?? "")
+            guard let trial = accountInfo?.trial, trial.isTrial else { return nil }
+            let suffix = trial.trialEnd.map { " until \(formatTimestamp($0))" } ?? ""
+            return ("clock", "Trial active" + suffix, .blue)
         }
     }
 

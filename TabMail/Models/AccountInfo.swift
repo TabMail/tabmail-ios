@@ -29,6 +29,19 @@ struct AccountInfo: Decodable, Sendable {
     let consent: ConsentInfo?
     let consentPath: String?
 
+    /// Whether the response carried a `trial` key **at all** — including one
+    /// whose value is an explicit JSON `null`.
+    ///
+    /// Swift's synthesized decoding collapses "key absent" and "key present but
+    /// null" into the same `nil`, but the wire distinguishes them and the
+    /// distinction is load-bearing: an account whose free trial has run out
+    /// reports no subscription **and still carries the `trial` key**, whose
+    /// value may be null. Every other no-subscription state omits the key
+    /// entirely. Without this flag an ended trial degrades to "no trial" and the
+    /// ended-trial surfaces silently disappear. Not a wire field — never encoded,
+    /// never sent — see `trialState(now:)` in `AccountPlanState.swift`.
+    let trialKeyPresent: Bool
+
     enum CodingKeys: String, CodingKey {
         case loggedIn = "logged_in"
         case hasSubscription = "has_subscription"
@@ -50,6 +63,38 @@ struct AccountInfo: Decodable, Sendable {
         case consent
         case consentPath = "consent_path"
     }
+
+    /// Hand-written because `trialKeyPresent` cannot be synthesized: it records
+    /// whether the `trial` KEY appeared, which the synthesized decoder throws
+    /// away. Every other field decodes exactly as the synthesized initializer
+    /// did (`decodeIfPresent` for the optionals, a required `logged_in`).
+    ///
+    /// ⚠️ A new stored property on this struct must be added here too — the
+    /// compiler stops filling them in once this initializer exists.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        loggedIn = try container.decode(Bool.self, forKey: .loggedIn)
+        hasSubscription = try container.decodeIfPresent(Bool.self, forKey: .hasSubscription)
+        email = try container.decodeIfPresent(String.self, forKey: .email)
+        planTier = try container.decodeIfPresent(String.self, forKey: .planTier)
+        trial = try container.decodeIfPresent(TrialInfo.self, forKey: .trial)
+        subscriptionStatus = try container.decodeIfPresent(String.self, forKey: .subscriptionStatus)
+        pendingCancellation = try container.decodeIfPresent(PendingCancellation.self, forKey: .pendingCancellation)
+        pendingDowngrade = try container.decodeIfPresent(PendingDowngrade.self, forKey: .pendingDowngrade)
+        subscriptionProvider = try container.decodeIfPresent(String.self, forKey: .subscriptionProvider)
+        quotaPercentage = try container.decodeIfPresent(Double.self, forKey: .quotaPercentage)
+        queueMode = try container.decodeIfPresent(String.self, forKey: .queueMode)
+        usedCostCents = try container.decodeIfPresent(Double.self, forKey: .usedCostCents)
+        limitCostCents = try container.decodeIfPresent(Double.self, forKey: .limitCostCents)
+        billingPeriodEnd = try container.decodeIfPresent(Double.self, forKey: .billingPeriodEnd)
+        billingPeriodStart = try container.decodeIfPresent(Double.self, forKey: .billingPeriodStart)
+        maxMonthlyCostCents = try container.decodeIfPresent(Double.self, forKey: .maxMonthlyCostCents)
+        consentRequired = try container.decodeIfPresent(Bool.self, forKey: .consentRequired)
+        consent = try container.decodeIfPresent(ConsentInfo.self, forKey: .consent)
+        consentPath = try container.decodeIfPresent(String.self, forKey: .consentPath)
+        // `contains` is true for an explicit null; `decodeIfPresent` above is not.
+        trialKeyPresent = container.contains(.trial)
+    }
 }
 
 struct ConsentInfo: Decodable, Sendable {
@@ -66,12 +111,29 @@ struct ConsentInfo: Decodable, Sendable {
 
 struct TrialInfo: Decodable, Sendable {
     let isTrial: Bool
-    /// Unix timestamp (seconds)
+    /// Unix timestamp (seconds), or `nil` when the value is absent or is not a
+    /// number we can use as one.
     let trialEnd: Int?
 
     enum CodingKeys: String, CodingKey {
         case isTrial = "is_trial"
         case trialEnd = "trial_end"
+    }
+
+    /// Decodes leniently, following `DayStats.init(from:)` below.
+    ///
+    /// `trial_end` is typed `string | number` upstream — historical webhook
+    /// writers stored ISO strings — and a synthesized decoder throws
+    /// `typeMismatch` on the string form. That throw does not fail just this
+    /// object: it fails the WHOLE `/whoami` parse, so one legacy row would take
+    /// the entire account screen down rather than degrading one field. A value
+    /// we cannot read as an epoch becomes `nil` instead, which on a
+    /// no-subscription body with the `trial` key present derives `.ended` — the
+    /// correct fail-closed answer. `is_trial` likewise tolerates absence.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        isTrial = (try? container.decode(Bool.self, forKey: .isTrial)) ?? false
+        trialEnd = try? container.decodeIfPresent(Int.self, forKey: .trialEnd)
     }
 }
 

@@ -1243,7 +1243,14 @@ final class SyncScheduler {
         do {
             let info = try await BackendClient().fetchAccountInfo()
             if info.hasSubscription == true {
-                gate.openGate()
+                // Open-only by design: this path exists to reopen a closed gate,
+                // never to close one. Routing the OPEN direction through `apply`
+                // additionally stamps the trial flag from the same authoritative
+                // body, and cannot change the open-only semantics — the negative
+                // branch still makes no call at all. With an active subscription
+                // the derivation can only report "trial not ended", which is
+                // exactly what this response says.
+                gate.apply(info)
             }
         } catch {
             print("[AISubscriptionGate] Revalidation failed: \(error)")

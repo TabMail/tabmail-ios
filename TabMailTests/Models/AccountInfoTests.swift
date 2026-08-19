@@ -60,6 +60,25 @@ struct AccountInfoTests {
         let info = try JSONDecoder().decode(AccountInfo.self, from: json.data(using: .utf8)!)
         #expect(info.trial?.isTrial == true)
         #expect(info.trial?.trialEnd == 1700000000)
+        #expect(info.trialKeyPresent == true)
+    }
+
+    /// A key that is present with an explicit `null` and a key that is absent
+    /// both decode `trial` to `nil`, so the object alone cannot tell them apart.
+    /// The backend distinguishes them — an ended trial keeps the key — so the
+    /// decoder records the presence separately.
+    @Test("An explicit null trial is distinguished from an absent trial key")
+    func distinguishesNullTrialFromAbsentKey() throws {
+        let nullTrial = #"{"logged_in": true, "has_subscription": false, "trial": null}"#
+        let noTrialKey = #"{"logged_in": true, "has_subscription": false}"#
+
+        let withNull = try JSONDecoder().decode(AccountInfo.self, from: Data(nullTrial.utf8))
+        let without = try JSONDecoder().decode(AccountInfo.self, from: Data(noTrialKey.utf8))
+
+        #expect(withNull.trial == nil)
+        #expect(without.trial == nil)
+        #expect(withNull.trialKeyPresent == true)
+        #expect(without.trialKeyPresent == false)
     }
 
     @Test("Decodes pending cancellation")
