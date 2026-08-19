@@ -1,6 +1,6 @@
 # IOS-PERF-009
 
-- Register classification: `open`
+- Register classification: `accepted`
 - New post-freeze record (2026-08-12) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
@@ -199,8 +199,11 @@ record is the fence** — anyone who wants to change code here must produce the 
    inbox` folders of ACTIVE accounts. If it is not in the tens of thousands, the ≥50,000 population
    precondition already fails — stop. The badge is a **lower bound**: the slow statement also walks
    inactive accounts' inboxes.
-1. Confirm **≥2 inbox-role folders** (≥2 configured accounts). At one folder the statement measured
-   0.110 ms with no sorter — exposure starts at two.
+1. Confirm **≥2 inbox-role folders** — typically ≥2 configured accounts, but that is a correlation, not
+   a constraint: `AccountDetailView.setFolderRole` assigns the role with a bare `UPDATE folder SET role`
+   and nothing enforces one inbox role per account, so a single account can carry two. **The operative
+   condition is the inbox-role FOLDER count**, and it stands on its own. At one folder the statement
+   measured 0.110 ms with no sorter — exposure starts at two.
 2. Add a **temporary debug-gated probe** inside `recordRecentUnreadForNSE`: copy the `explainLogged`
    one-shot template from `BackfillEmbeddingQueue.repopulateFromDatabase` and gate on
    `DebugModeManager.isLoggingEnabled()`. Log in ONE pass — `EXPLAIN QUERY PLAN` of the **exact

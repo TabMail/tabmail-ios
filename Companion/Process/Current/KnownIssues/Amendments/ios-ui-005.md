@@ -1,6 +1,6 @@
 # IOS-UI-005
 
-- Register classification: `open`
+- Register classification: `accepted`
 - New post-freeze record (2026-08-13) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
@@ -177,12 +177,26 @@ what ships.
 reasoning, so everything that stops this being refiled as *"attacker-chosen From/Subject/Date in native
 SwiftUI chrome"* lives here and nowhere else.
 
-**Reopening condition, stated positively.** Re-escalation requires **first showing a `tm-*` marker
-driving a NON-COSMETIC decision** — a fetch, a message-identity resolution, a mutation target, an
-account-state write, or a privacy/security gate. Until such a consumer exists, the residual is a
-disagreement between two sets of sender-authored bytes, and the answer is this record rather than a fix.
-The consumer census that establishes the current state is in §3 below; re-run that census before
-claiming it has changed.
+**Reopening condition, stated positively — and stated with its DIRECTION, because the direction is the
+whole bar.** Re-escalation requires **first showing a `tm-*` marker driving a NON-COSMETIC decision IN A
+SENDER-EXPLOITABLE DIRECTION**, meaning a forged marker must do at least one of these: **cause a fetch
+or a leak that would not otherwise happen**; **weaken a privacy or security gate**; or **misroute data**
+— a message-identity resolution, a mutation target, or an account-state write landing somewhere the
+genuine marker would not have sent it.
+
+⚠️ **A privacy-conservative WITHHOLD does NOT qualify, and leg D below is the worked counter-example
+that forced this wording.** `AutoSizingHTMLView.deferredImageLoadJS`'s `hiddenByViewMode` walks an
+image's ancestors testing `el.classList.contains('tm-eml-section')` **unconditionally**, and when such
+an ancestor computes to `display: none` the enclosing `swap()` **WITHHOLDS the remote URL**. That is
+literally "a `tm-*` marker driving a fetch decision" — so the bar as first written was **already
+satisfied by this record's own §3 leg D on the day it was written**, which is exactly why it needed
+tightening. A forged marker there can only **SUPPRESS** a fetch the app would otherwise have made: it
+fails closed, costs the sender their own image loads, and hands an attacker nothing. Fetch decisions
+count only when forgery pushes them toward MORE network, MORE disclosure, or a WEAKER gate.
+
+Until a sender-exploitable consumer in that sense exists, the residual is a disagreement between two
+sets of sender-authored bytes, and the answer is this record rather than a fix. The consumer census that
+establishes the current state is in §3 below; re-run that census before claiming it has changed.
 
 **Cost if it were ever authorized**, for proportionality: the preview-header leg only, ~200–230
 production lines across 9–10 files including `NSEStagingDB` parity, with a blast radius covering the
@@ -207,7 +221,7 @@ Consequence for design: provenance machinery aimed at marker *authorship* leaves
 it is. Anyone proposing the out-of-band typed envelope as "the fix for the quote mismatch" has
 mis-attributed the mechanism.
 
-### 2. The old-row trilemma — why the mandated out-of-band fix cannot be both provenance-establishing and render-identical
+### 2. The old-row impasse — four doors, none acceptable; why the mandated out-of-band fix cannot be both provenance-establishing and render-identical
 
 The fix this record mandates — carry the parsed nested envelope and section association out-of-band in an
 app-owned typed record (`emlEnvelope: EmlMarker.Envelope?` on `AttachmentInfo`/`AttachmentRef`, which
@@ -230,7 +244,10 @@ become acceptable.
 
 ### 3. Verified consumer impact at `cdf11a6e5` — the census the reopening condition is measured against
 
-- **Exactly one native string-read of `tm-*` exists**, in `EmailFilter`'s strip/parse paths.
+- **Exactly one native READER of `tm-*` exists — `EmailFilter` — and it holds TWO literal read sites:**
+  the fast-path guard in `stripEmbeddedEmlSections`, and the token check inside `matchEmlSectionOpen`
+  that the parse and strip paths share. Stated as *one reader, two sites* deliberately, so a future
+  re-census diffs against the right integer instead of reading "one" and concluding a site went missing.
 - `EmlSectionMetadata.partSection` has **zero production reads**.
 - Nested-attachment routing is **typed** — `AttachmentInfo.parentEmlSection == attachment.section` — and
   never consults marker text.
@@ -240,8 +257,12 @@ become acceptable.
   disagreement (**A**) is cosmetic and self-referential, because both envelopes are sender-authored bytes
   either way; the forged section's body rendering above the genuine one (**B**) is cosmetic — sender
   content shown inside a sheet of sender content; the reply/forward quote omission (**C**) is real but,
-  per §1, is not a forgery leg at all; the deferred-image withhold decision (**D**) fails
-  privacy-**conservative** — it withholds, it does not leak; the remaining diagnostic/observability legs
+  per §1, is **not UNIQUELY a forgery leg** — a GENUINE marker suffices, so reserving the namespace
+  would not close it (the *Related side effect* paragraph above stands: a forged section a sender
+  un-hides with their own CSS is dropped by `stripEmbeddedEmlSections` too, which is why the absolute
+  "not a forgery leg at all" is wrong and this qualified form replaces it); the deferred-image withhold
+  decision (**D**) fails privacy-**conservative** — it withholds, it does not leak, which is exactly why
+  the reopening bar above is written with a DIRECTION; the remaining diagnostic/observability legs
   (**E**, **F**) are cosmetic.
 
 ### 4. LEAD, not a finding — `AttachmentRef` has no `parentEmlSection`
@@ -260,13 +281,24 @@ for legitimate mail that genuinely carries two attachments with the same filenam
 the second route at all — a forged marker inside `.eml` **A**'s nested body still precedes the genuine
 marker for `.eml` **B**. Do not re-propose it as a cheap win.
 
-⚠️ It would also invert `IMAPProviderEmlRenderTests.parseEmlSectionMetadataMultiple`, which asserts
-first-match-wins today. That test **blesses the current behaviour**, so a real fix must expect to rewrite
-it deliberately rather than read its failure as a regression.
+⚠️ **NO test pins first-vs-last-match as of 2026-08-18 — and that STRENGTHENS the rejection above.** The
+nearest candidate, `IMAPProviderEmlRenderTests.parseEmlSectionMetadataMultiple`, uses two **DISTINCT**
+filenames (`first.eml` and `second.eml`), and `EmailFilter.parseEmlSectionMetadata` selects on
+`data-filename` **EQUALITY** — so a last-match-wins variant returns byte-identical results and that test
+stays **green**. A census of all eight `parseEmlSectionMetadata` call sites in `TabMailTests`
+(`IMAPProviderEmlRenderTests`, `GmailProviderEmlRenderTests`, `EmlMarkerTests`, `EmlParsingTests`) found
+**no fixture carrying two sections that share a filename**, so nothing in the suite can observe the
+change. The cheap non-fix would therefore land **SILENTLY**: no red test, no signal, a behaviour change
+to legitimate same-filename mail with nothing to catch it. Any real fix must **ADD** the pinning test
+first rather than expect an existing one to fail.
+
+⚠️ An earlier draft of this section stated that this test "asserts first-match-wins today" and
+"**blesses the current behaviour**". That is **FALSE** — corrected 2026-08-18. It was transcribed
+faithfully from the upstream verifier report, so do **not** "restore" it by re-reading that source.
 
 ### If the reopening condition is ever met — the test shapes already designed
 
-No test covers a sender-forged marker today. If a non-cosmetic consumer ever appears, the red-first
+No test covers a sender-forged marker as of 2026-08-18. If a non-cosmetic consumer ever appears, the red-first
 shapes are: `forgedMarkerCannotSupplyThePreviewEnvelope` per provider; a nested-forgery variant (the
 `.eml` **A** precedes `.eml` **B** route); two-sided non-vacuity on each; an old-row pinning test that
 fails if already-stored previews lose their header; and a SHA-256 render-identity characterization per
