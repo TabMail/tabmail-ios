@@ -614,4 +614,112 @@ struct AISubscriptionGateTrialTests {
         #expect(gate.trialHasEnded == false)
         #expect(UserDefaults.standard.bool(forKey: Self.lastKnownActiveKey) == false)
     }
+
+    /// RED-FIRST characterization (2026-08-19): the invariant expressed through
+    /// the PRE-FIX mechanism the two `PlanPickerView` purchase/restore sites
+    /// used. A local StoreKit purchase has already `openGate()`d; the `/whoami`
+    /// body fetched immediately after races the detached `verifyPurchaseWithBackend`
+    /// write and can still be the pre-purchase `{has_subscription:false, trial:null}`
+    /// shape. Routing THAT through `apply` runs its else-branch `closeGate`,
+    /// slamming shut the gate the user just paid to open. On the pre-fix code
+    /// this assertion FAILS (isActive == false) — kept as the permanent proof of
+    /// why the purchase sites must NOT use `apply`.
+    @Test("apply() closes a just-opened gate on a raced pre-purchase whoami — purchase sites must not use it")
+    func applyClosesJustOpenedGateOnRacedPrePurchaseWhoami() throws {
+        try withRestoredGate {
+            let now = Date()
+            let racedPrePurchase = try WhoamiFixture.expiredSignupTrial(
+                endedDaysAgo: 1, reference: now, trialIsNull: true
+            )
+            // Wire-accurate raced body: signed-in, no subscription yet, trial key
+            // present-but-null (the real ended-signup-trial → upgrading shape).
+            #expect(racedPrePurchase.hasSubscription == false)
+            #expect(racedPrePurchase.trialKeyPresent == true)
+
+            AISubscriptionGate.shared.openGate()                    // local StoreKit truth
+            AISubscriptionGate.shared.apply(racedPrePurchase, now: now)  // races backend verify
+            // Pre-fix mechanism CLOSES the just-opened gate — this is the hazard
+            // the fix removes, pinned here as a permanent contrast to the
+            // `refreshAfterLocalPurchase` path (asserted open below). Red-first
+            // evidence 2026-08-19: with `== true` here the pre-fix code failed
+            // (isActive → false) at this exact line.
+            #expect(AISubscriptionGate.shared.isActive == false)
+        }
+    }
+
+    /// THE INVARIANT (green): after a local StoreKit purchase/restore has opened
+    /// the gate, applying a raced pre-purchase `{has_subscription:false,
+    /// trial:null}` body through `refreshAfterLocalPurchase` must leave the gate
+    /// OPEN. This is the same flow as `applyClosesJustOpenedGateOnRacedPrePurchaseWhoami`
+    /// above, but through the fixed seam — the two together pin exactly why the
+    /// purchase sites switched off `apply`.
+    @Test("A local purchase keeps the AI gate open when the post-purchase whoami races backend verification")
+    func localPurchaseGateStaysOpenWhenWhoamiRacesBackendVerification() throws {
+        try withRestoredGate {
+            let now = Date()
+            let racedPrePurchase = try WhoamiFixture.expiredSignupTrial(
+                endedDaysAgo: 1, reference: now, trialIsNull: true
+            )
+            AISubscriptionGate.shared.openGate()   // local StoreKit truth
+            #expect(AISubscriptionGate.shared.isActive == true)
+            let checkedBefore = AISubscriptionGate.shared.hasCheckedOnce
+
+            AISubscriptionGate.shared.refreshAfterLocalPurchase(racedPrePurchase, now: now)
+
+            // The just-paid gate stays OPEN despite the raced pre-purchase body.
+            #expect(AISubscriptionGate.shared.isActive == true)
+            // The no-op branch does not force-stamp `hasCheckedOnce`, so it cannot
+            // by itself flip the sidebar into the subscribe/ended banner.
+            #expect(AISubscriptionGate.shared.hasCheckedOnce == checkedBefore)
+        }
+    }
+
+    /// Non-vacuous proof that the no-subscription branch is a true no-op: it is
+    /// run from a state where `apply` would VISIBLY change things (gate open,
+    /// trial-ended flag down), and every observable flag is required to stay put.
+    /// `apply(racedNoSub)` here would both close the gate and raise `trialHasEnded`;
+    /// `refreshAfterLocalPurchase` must do neither.
+    @Test("refreshAfterLocalPurchase ignores a no-subscription body — it never closes and never raises trial-ended")
+    func refreshAfterLocalPurchaseIgnoresNoSubscriptionBody() throws {
+        try withRestoredGate {
+            let now = Date()
+            let racedNoSub = try WhoamiFixture.expiredSignupTrial(
+                endedDaysAgo: 1, reference: now, trialIsNull: true   // trialState == .ended
+            )
+            // Seed a state apply(racedNoSub) would demonstrably mutate.
+            let running = try WhoamiFixture.runningSignupTrial(daysLeft: 5, reference: now)
+            AISubscriptionGate.shared.apply(running, now: now)   // isActive=true, trialHasEnded=false
+            #expect(AISubscriptionGate.shared.isActive == true)
+            #expect(AISubscriptionGate.shared.trialHasEnded == false)
+            let checkedBefore = AISubscriptionGate.shared.hasCheckedOnce
+
+            AISubscriptionGate.shared.refreshAfterLocalPurchase(racedNoSub, now: now)
+
+            #expect(AISubscriptionGate.shared.isActive == true)        // did NOT close
+            #expect(AISubscriptionGate.shared.trialHasEnded == false)  // did NOT raise ended
+            #expect(AISubscriptionGate.shared.hasCheckedOnce == checkedBefore)  // did NOT re-stamp
+        }
+    }
+
+    /// Positive case: when the body already confirms the subscription (the
+    /// backend write landed before the read), the open-only seam DOES open a
+    /// closed gate and keeps the trial-ended flag down.
+    @Test("refreshAfterLocalPurchase opens the gate when the body confirms the subscription")
+    func refreshAfterLocalPurchaseOpensOnConfirmedSubscription() throws {
+        try withRestoredGate {
+            let now = Date()
+            let confirmed = try WhoamiFixture.accountInfo(
+                hasSubscription: true,
+                planTier: AccountPlanConfig.proTierKey,
+                provider: "apple"
+            )
+            AISubscriptionGate.shared.closeGate()   // start closed to prove it opens
+            #expect(AISubscriptionGate.shared.isActive == false)
+
+            AISubscriptionGate.shared.refreshAfterLocalPurchase(confirmed, now: now)
+
+            #expect(AISubscriptionGate.shared.isActive == true)
+            #expect(AISubscriptionGate.shared.trialHasEnded == false)
+        }
+    }
 }

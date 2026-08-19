@@ -189,11 +189,15 @@ struct PlanPickerView: View {
                             }
                             let restored = try? await backend.fetchAccountInfo()
                             accountInfo = restored
-                            // Same authoritative body the gate seam wants: route
-                            // it through `apply` so the sidebar copy and the
-                            // persisted trial flag update now, not on the next
-                            // foreground.
-                            if let restored { AISubscriptionGate.shared.apply(restored) }
+                            // This body races the detached `verifyPurchaseWithBackend`
+                            // write, so it may still be the pre-restore state. Route
+                            // it through the open-only seam: it can refresh the
+                            // sidebar copy and reopen the gate when the backend
+                            // already confirmed the subscription, but it must NEVER
+                            // close the gate `openGate()` just opened from local
+                            // StoreKit truth. A later authoritative whoami reconciles
+                            // if this one raced.
+                            if let restored { AISubscriptionGate.shared.refreshAfterLocalPurchase(restored) }
                         }
                     }
                 }
@@ -355,10 +359,13 @@ struct PlanPickerView: View {
             // Refresh account info to update subscription display
             let purchased = try? await backend.fetchAccountInfo()
             accountInfo = purchased
-            // The purchase ends any running trial, so stamp the gate from this
-            // same authoritative body rather than leaving the sidebar copy and
-            // the persisted trial flag stale until the next foreground.
-            if let purchased { AISubscriptionGate.shared.apply(purchased) }
+            // This body races the detached `verifyPurchaseWithBackend` write, so
+            // it may still be the pre-purchase state. Route it through the
+            // open-only seam: it can refresh the sidebar copy and reopen the gate
+            // when the backend already confirmed the subscription, but it must
+            // NEVER close the gate `openGate()` just opened from local StoreKit
+            // truth. A later authoritative whoami reconciles if this one raced.
+            if let purchased { AISubscriptionGate.shared.refreshAfterLocalPurchase(purchased) }
         } catch {
             print("[PlanPicker] Purchase failed: \(error)")
             purchaseError = "Purchase failed. Please try again."

@@ -89,6 +89,30 @@ final class AISubscriptionGate: @unchecked Sendable {
         setTrialHasEnded(info.trialState(now: now) == .ended)
     }
 
+    /// Refresh from a `/whoami` body fetched immediately after a LOCAL StoreKit
+    /// purchase or restore has already `openGate()`d. Unlike `apply`, this seam
+    /// can only ever OPEN the gate, never close it: the body it receives races
+    /// the detached backend verification (`verifyPurchaseWithBackend`) and may
+    /// still describe the pre-purchase account (`has_subscription:false`), so
+    /// closing on it would slam shut the gate the user just paid to open. Local
+    /// StoreKit entitlement is authoritative for a just-completed purchase; the
+    /// next authoritative whoami (foreground/sign-in revalidation, once the
+    /// backend write has landed) reconciles through `apply` as usual.
+    ///
+    /// Opens the gate and stamps the trial-ended flag (always `false` in this
+    /// branch — an active subscription has no ended trial) only when the body
+    /// already confirms the subscription; otherwise it is a no-op that touches
+    /// nothing, leaving the locally-opened gate — and the last-known trial copy —
+    /// exactly as they were.
+    ///
+    /// - Parameter now: injected for tests; production callers use the default.
+    @MainActor
+    func refreshAfterLocalPurchase(_ info: AccountInfo, now: Date = Date()) {
+        guard info.hasSubscription == true else { return }
+        openGate()
+        setTrialHasEnded(info.trialState(now: now) == .ended)
+    }
+
     /// Close the gate — called when AI backend returns 402 or 403, or when
     /// whoami reports no active subscription. Idempotent re: value, but always
     /// stamps `hasCheckedOnce` (whoami has authoritatively responded, even if
