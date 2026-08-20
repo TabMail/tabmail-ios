@@ -1303,7 +1303,7 @@ actor ExchangeProvider: EmailProvider {
     ///   `msg` named `parentFolderId`. It varies per call site in this file —
     ///   `selectMessageDetailFields` and `selectFullMessageFields` name it,
     ///   `selectMessageHeaderFields` and `selectBackfillFields` do not — and
-    ///   `JSONEncoder` omits a nil optional, so on the four paths that never
+    ///   `JSONEncoder` omits a nil optional, so on every path that never
     ///   asked, the key is absent from `json` by construction. Only
     ///   `GraphParse`'s debug drift diagnostic reads this; parsing is
     ///   unaffected. Every caller below states it explicitly; the strict
