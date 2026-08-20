@@ -441,3 +441,471 @@ cells below had never been routed and are preserved byte-for-byte before trimmin
 <!-- BEGIN VERBATIM ROW 157 (pass 4b) -->
 🚨 a Swift `String` comparison does NOT reproduce SQLite **BINARY** collation and is not even a total order — compare `utf8.lexicographicallyPrecedes`; `InboxOrdering`, keyset cursor, `IOS-SCROLL-002`
 <!-- END VERBATIM ROW 157 (pass 4b) -->
+
+---
+
+# `PROJECT_MEMORY.md` cells and prose (2026-08-20 `companion-compact` pass 5)
+
+`PROJECT_MEMORY.md` was 27,851 B against its 25,000 B budget (+11%). Below are the **verbatim**
+*Topic / search terms* cells, and the preamble prose, that the index carried inline before this
+pass. Rows 164, 166 and 167 were authored after the 2026-08-13 pass and had never been compacted:
+166 and 167 alone were 2.9 KB of an always-loaded file. The index now carries a shortened,
+keyword-bearing line for each. Kept byte-for-byte — nothing was summarised, merged, or dropped.
+
+## Source line 133 — Current → `093-the-wrong-message-wire-oracle-is-blind-to-shared-message-id-defects.md`
+
+<!-- BEGIN VERBATIM ROW 133 (pass 5) -->
+⚠️ `FakeIMAPServer`'s `wrongMessageViolations` wire oracle is BLIND when target and bystander share an RFC 822 Message-ID — the C3 assertion goes vacuous; pin on the `UID STORE`/`EXPUNGE` log, never UID
+<!-- END VERBATIM ROW 133 (pass 5) -->
+
+---
+
+## Source line 144 — Current → `095-v3-provider-id-action-queue-forward-port-resume-state.md`
+
+<!-- BEGIN VERBATIM ROW 144 (pass 5) -->
+v3 provider-id action-queue forward-port — ✅ SHIPPED **v1.7.0**; branch `v3` DELETED, `main` IS that line; **R0/R3 RETIRED**; ⛔ `v2final` = never-shipped SIBLING, PROVENANCE only
+<!-- END VERBATIM ROW 144 (pass 5) -->
+
+---
+
+## Source line 145 — Current → `096-t1-3-new-gesture-fails-closed-on-unknown-uidvalidity-epoch.md`
+
+<!-- BEGIN VERBATIM ROW 145 (pass 5) -->
+T1.3 — a NEW gesture fails CLOSED on an unknown UIDVALIDITY epoch: `newGestureRefusedForUnknownEpoch` is a silent no-op (`IOS-EPOCH-001`, C3), never fail-open
+<!-- END VERBATIM ROW 145 (pass 5) -->
+
+---
+
+## Source line 148 — Current → `099-persistent-nse-log-file-watchdog-partial-delivery-audit-rounds.md`
+
+<!-- BEGIN VERBATIM ROW 148 (pass 5) -->
+Persistent NSE log + watchdog partial delivery, rounds 1–7: `NSELogStore`/`nse.log`, `PartialSignalHolder`; **idle-timer-vs-SSE**; `OneShotFlag.hasFired()`
+<!-- END VERBATIM ROW 148 (pass 5) -->
+
+---
+
+## Source line 149 — Current → `100-two-instant-wake-handoff-elapsed-means-do-it-now.md`
+
+<!-- BEGIN VERBATIM ROW 149 (pass 5) -->
+Two-instant wake handoff — "elapsed" means DO IT NOW: `AccountManager.wakeUpDelay`, `holdUntil`, `IOS-OUTBOX-005`, `UInt64(negative)` traps
+<!-- END VERBATIM ROW 149 (pass 5) -->
+
+---
+
+## Source line 150 — Current → `101-isdeletedonserver-has-four-materialisation-paths.md`
+
+<!-- BEGIN VERBATIM ROW 150 (pass 5) -->
+`isDeletedOnServer` — FOUR materialisation paths **plus a FIFTH PRESENTATION path** (`SearchView.searchAccount` sends no `NOT DELETED`), `IOS-IMAP-001`; `deepBackfillFolder` is DEAD CODE
+<!-- END VERBATIM ROW 150 (pass 5) -->
+
+---
+
+## Source line 151 — Current → `102-there-are-four-irreversible-wire-operations-not-one.md`
+
+<!-- BEGIN VERBATIM ROW 151 (pass 5) -->
+⚠️ **SIX irreversible wire operations at `967e5b3c5`, not one** — deletion family + `CalDAVProvider.splitSeries` cap `PUT`; membership = **no reached per-item recovery**, NOT the verb; census 7/3/5/2/2
+<!-- END VERBATIM ROW 151 (pass 5) -->
+
+---
+
+## Source line 152 — Current → `103-await-dbpool-read-is-not-a-short-suspension.md`
+
+<!-- BEGIN VERBATIM ROW 152 (pass 5) -->
+🚨 `await dbPool.read` is NOT a short suspension — the ASYNC overload first `await`s `NSEDataBridge.mergeIfStagingPending()` (measured 7.6 s cold boot); check-then-act across it is UNBOUNDED
+<!-- END VERBATIM ROW 152 (pass 5) -->
+
+---
+
+## Source line 153 — Current → `104-a-latch-that-authorises-a-transition-must-be-held-across-the-write.md`
+
+<!-- BEGIN VERBATIM ROW 153 (pass 5) -->
+🚨 a latch that AUTHORISES a transition must be HELD across the write — reading `isDrainingOutbox` then `await`ing proves nothing; ACQUIRE it (`IOS-OUTBOX-006`, `reconcileOutbox`)
+<!-- END VERBATIM ROW 153 (pass 5) -->
+
+---
+
+## Source line 154 — Current → `105-a-print-is-not-production-observability-on-ios.md`
+
+<!-- BEGIN VERBATIM ROW 154 (pass 5) -->
+🚨 a bare `print` is NOT production observability on iOS — `stdout` is DISCARDED on device; use `BackgroundSyncLogger.logError`; a gate inside a BRANCH CONDITION picks the branch (`MIS-019`); **a RESIDUAL RECORD is an absolute in humility's clothing**
+<!-- END VERBATIM ROW 154 (pass 5) -->
+
+---
+
+## Source line 155 — Current → `106-a-filter-after-the-limit-narrows-the-page-instead-of-selecting-it.md`
+
+<!-- BEGIN VERBATIM ROW 155 (pass 5) -->
+🚨 a filter applied AFTER a query's `LIMIT` narrows the page instead of selecting it — `InboxListReader.gather`, `hasMoreMessages` (`IOS-SCROLL-002`, `IOS-BACKFILL-001`)
+<!-- END VERBATIM ROW 155 (pass 5) -->
+
+---
+
+## Source line 156 — Current → `107-a-staging-key-that-names-an-address-must-re-prove-identity-before-reusing-payload.md`
+
+<!-- BEGIN VERBATIM ROW 156 (pass 5) -->
+🚨 a staging key that names an ADDRESS must re-prove identity before it reuses payload — `nse_processed_message`'s PK holds a UID, `stageHeader`'s `ON CONFLICT` (`IOS-NSE-005`, C3)
+<!-- END VERBATIM ROW 156 (pass 5) -->
+
+---
+
+## Source line 157 — Current → `113-a-swift-string-comparison-does-not-reproduce-sqlite-binary-collation.md`
+
+<!-- BEGIN VERBATIM ROW 157 (pass 5) -->
+🚨 a Swift `String` comparison does NOT reproduce SQLite **BINARY** collation and is not a total order — use `utf8.lexicographicallyPrecedes`; `InboxOrdering`, keyset cursor, `IOS-SCROLL-002`
+<!-- END VERBATIM ROW 157 (pass 5) -->
+
+---
+
+## Source line 158 — Current → `107-a-staging-key-that-names-an-address-must-re-prove-identity-before-reusing-payload.md`
+
+<!-- BEGIN VERBATIM ROW 158 (pass 5) -->
+🚨 **THE SAME STAGING KEY HAS FOUR WRITERS, AND "SAFE" POINTS THE OPPOSITE WAY FOR THREE** (`IOS-NSE-006`, `stagedIdentityPositivelyDiffers`) — ⚠️ **THE FAIL DIRECTION INVERTS**
+<!-- END VERBATIM ROW 158 (pass 5) -->
+
+---
+
+## Source line 159 — Current → `109-an-enum-with-no-silent-case-does-not-prevent-a-silent-path.md`
+
+<!-- BEGIN VERBATIM ROW 159 (pass 5) -->
+🚨 **AN ENUM WITH NO SILENT CASE DOES NOT PREVENT A SILENT PATH** — `ResultTapOutcome`'s "cannot reintroduce silence" comment was FALSE AND LOAD-BEARING (`case …: break` compiles)
+<!-- END VERBATIM ROW 159 (pass 5) -->
+
+---
+
+## Source line 160 — Current → `108-the-address-problem-has-two-address-spaces-graph-move-response-is-the-copyuid.md`
+
+<!-- BEGIN VERBATIM ROW 160 (pass 5) -->
+🚨 THE ADDRESS PROBLEM HAS TWO ADDRESS SPACES — Graph's `/move` response IS the `COPYUID`; `ExchangeProvider.moveMessage` discarded the new `id` (`IOS-GRAPH-002`, `MIS-006`)
+<!-- END VERBATIM ROW 160 (pass 5) -->
+
+---
+
+## Source line 161 — Current → `112-uidvalidityresetpendingat-is-a-redrive-flag-that-stays-armed-on-purpose.md`
+
+<!-- BEGIN VERBATIM ROW 161 (pass 5) -->
+🚨 `uidValidityResetPendingAt` STAYS ARMED ON PURPOSE — never demand proof of transience; `crawlWalkWriteAllowed` was the LAST consumer writing under an armed flag (`16ecafd93`)
+<!-- END VERBATIM ROW 161 (pass 5) -->
+
+---
+
+## Source line 162 — Current → `114-both-uidvalidity-redrive-owners-iterate-syncablefolders.md`
+
+<!-- BEGIN VERBATIM ROW 162 (pass 5) -->
+🚨 **BOTH UIDVALIDITY RE-DRIVE OWNERS ITERATED `syncableFolders`** (`fullSync` + `imapDeltaSync`) — an armed CUSTOM NON-FAVOURITE folder had NO re-drive: quarantined, mail purged (26 folders / 145,754 rows). Count PREDICATES
+<!-- END VERBATIM ROW 162 (pass 5) -->
+
+---
+
+## Source line 163 — Current → `115-known-issues-register-is-byte-frozen-and-has-no-append-path.md`
+
+<!-- BEGIN VERBATIM ROW 163 (pass 5) -->
+✅ **`KNOWN_ISSUES.md` APPEND PATH — RESOLVED 2026-08-12** — strip-before-compare `KNOWN-ISSUES-AMENDMENT-BEGIN`/`-END` + non-globbed `KnownIssues/Amendments/` dir; first user `IOS-IMAP-015`; the 4 `RRULE UNTIL` residuals live there
+<!-- END VERBATIM ROW 163 (pass 5) -->
+
+---
+
+## Source line 164 — Current → `116-a-path-component-is-capped-in-nfd-utf16-units-not-bytes-or-characters.md`
+
+<!-- BEGIN VERBATIM ROW 164 (pass 5) -->
+🚨 **ATTACHMENT FILENAMES REJECTED, NOT REDUCED** — `AttachmentFilename.isSafeFileComponent`, `AttachmentFilenameError`; **255 NFD UTF-16 unit** path-component cap (NOT bytes, NOT `Character`s); `CharacterSet.controlCharacters` = 24,970 scalars and BUILT-IN set operators materialise it unpredictably; `strippedFilenameScalars` = 79
+<!-- END VERBATIM ROW 164 (pass 5) -->
+
+---
+
+## Source line 166 — Current → `118-trial-ended-is-derived-never-a-new-whoami-flag.md`
+
+<!-- BEGIN VERBATIM ROW 166 (pass 5) -->
+🚨 **"TRIAL ENDED" IS DERIVED, NEVER A NEW `/whoami` FLAG** — `has_subscription:false` + the `trial` KEY present (value may be **explicit `null`**; `trialKeyPresent`, `container.contains`) ; `trial_expired`/`trial_blocked` were CUT as reinvention. `.active` REQUIRES `plan_tier == "Trial"` — a legacy Stripe/Apple **CARD trial** also carries a `trial` object and must stay a plain subscriber. `trial_end` is `string \| number` upstream so `TrialInfo` decodes LENIENTLY (a String would fail the WHOLE parse). `AccountInfo.trialState(now:)`, `TrialState.noTrial` (not `.none`), `AISubscriptionGate.apply`/`trialHasEnded` (bare `openGate`/`closeGate` must NOT write it; flag is GLOBAL not account-scoped; test restore order flag-BEFORE-isActive), `ZeroBudgetPlan` per-plan quota captions, `dailyQuotaChartDenominator` explicit-zero budget, `displayPlanName` `Trial → "Free Trial"`, signup trial, plan picker, account deletion `case "signup" → .scheduleDeletion`; ⚠️ intro-offer machinery (`PlanCardIntroOffer`/`suppressesIntroOffer`/`checkTrialEligibility`/`showsTrialBadge`) DELETED 2026-08-19 issue #55 — survivor `PlanCardCTA.buttonLabel`
+<!-- END VERBATIM ROW 166 (pass 5) -->
+
+---
+
+## Source line 167 — Current → `119-post-login-routing-waits-for-an-authoritative-whoami.md`
+
+<!-- BEGIN VERBATIM ROW 167 (pass 5) -->
+🚨 **POST-LOGIN ROUTING WAITS FOR AN AUTHORITATIVE `/whoami`** (issue #56: active subscriber sent to paywall; already-configured Gmail re-offered) — `PendingPlanNavigationLatch` is the SOLE owner of `pending_plan_navigation` (4-case `consume`: `noLatch` ≠ `clearedWithoutNavigation`; `waitForAuthoritativeGate` PRESERVES the latch; `clear` writes explicit `false` never `removeObject`), `AISubscriptionGate.lastAuthoritativeApplyAt` in-memory freshness marker (ONLY `apply` stamps; `openGate`/`closeGate`/`refreshAfterLocalPurchase` do NOT; `noteSignedOut` clears on sign-out), `MailNavigationView` consumes via `.onChange(initial: true)` not timers, NO new `fetchAccountInfo` sites (118 census + ADR-IOS-044 hold); `Account.existing(forEmail:provider:in:)` = single existing-account predicate — CASE-FOLDED (`folding(.caseInsensitive)`, NOT `lowercased()`: final-sigma) + deterministic under wild duplicates (mail row > calendarOnly, then oldest) — for login add-gate + `setupOAuthAccount` dedupe + `CalendarSetupView` (IDENTITY equality, deliberately diverges from BINARY — NOT a topic-113 ordering case; calendarOnly rows MATCH, upgrade arm clears `calendarOnly` + promotes primary; never substitute `navigationStore.accounts`); `signInGeneration`/`applyIfCurrentEpoch` epoch guard on ALL 3 fetch→apply pipelines (RootView, SyncScheduler, AccountDashboardView — stale cross-account /whoami never applies); `recordAfterAIConsent` requires AUTHORITY to disarm; signed-out `waitForAuthoritativeGate` restores inbox, latch survives
+<!-- END VERBATIM ROW 167 (pass 5) -->
+
+---
+
+## Source lines 139-139 — preamble prose
+
+<!-- BEGIN VERBATIM LINES 139-139 (pass 5) -->
+```text
+Authored after `v1.6.38`, so deliberately **not** rows in [`manifest.tsv`](Companion/Memory/manifest.tsv); provenance, source line ranges and per-fragment `sha256` in [`amendments-manifest.tsv`](Companion/Memory/amendments-manifest.tsv).
+```
+<!-- END VERBATIM LINES 139-139 (pass 5) -->
+
+---
+
+## Source lines 127-127 — preamble prose
+
+<!-- BEGIN VERBATIM LINES 127-127 (pass 5) -->
+```text
+Pre-v3-line topics absent from `v1.6.38:PROJECT_MEMORY.md`; bodies preserved byte-for-byte, provenance in [`ported-manifest.tsv`](Companion/Memory/ported-manifest.tsv).
+```
+<!-- END VERBATIM LINES 127-127 (pass 5) -->
+
+---
+
+## Source lines 119-119 — preamble prose
+
+<!-- BEGIN VERBATIM LINES 119-119 (pass 5) -->
+```text
+These files preserve source history. Read them when a current topic, ADR, plan, or shipped-release comparison points to the older design.
+```
+<!-- END VERBATIM LINES 119-119 (pass 5) -->
+
+---
+
+## Source lines 11-19 — preamble prose
+
+<!-- BEGIN VERBATIM LINES 11-19 (pass 5) -->
+```text
+**This file is a router, not an archive.** Every topic below is preserved in full under
+[`Companion/Memory/`](Companion/Memory/manifest.tsv) (`sha256` per fragment); load only the topics
+your task mechanically matches. Routing protocol — derive terms → `rg -ni` → read in full → enumerate
+in the brief → update the detail — is **normative in root [`../CLAUDE.md`](../CLAUDE.md) § *Companion
+Routing***; this file's own wording is preserved in
+[`Companion/Process/Current/project-memory-index-usage-protocol.md`](Companion/Process/Current/project-memory-index-usage-protocol.md).
+
+Current entries govern. Historical entries preserve evidence but do not override current rules or active ADRs.
+
+```
+<!-- END VERBATIM LINES 11-19 (pass 5) -->
+
+---
+
+# `PROJECT_MEMORY.md` cells (2026-08-20 `companion-compact` pass 5b)
+
+Pass 5 landed the file at 25,288 B — still 288 B over its 25,000 B budget. This sub-pass
+shortens the remaining over-length *Topic* cells of the forward-ported and post-`v1.6.38`
+tables. **Line numbers below are post-pass-5**, so a Stage 4a rebuild must undo 5b BEFORE
+pass 5. Kept byte-for-byte — nothing was summarised, merged, or dropped.
+
+⚠️ **The Current-topics table's titles were deliberately NOT touched.** `verify`'s
+*"memory routing: 91 detailed fragments, each title bound to exactly one manifest route and
+index row"* check binds each of those titles to `Companion/Memory/manifest.tsv`; shortening
+one fails with `memory index route differs from manifest`. Proven here by doing it and
+reverting.
+
+**Structural note for the next pass: this index is at its practical floor.** 119 routed
+topics each cost ~85-110 B of `[read in full](Companion/Memory/…)` path plus a status cell —
+roughly 14 KB that no compaction can remove without renaming routed files, which would
+invalidate the manifests and the 524 tracked `Companion/…` pointers `verify` checks. Against
+a 25,000 B budget that leaves about one row of slack; consider raising this file's budget
+rather than thinning its search surface further.
+
+## Source line 129 (post-pass-5) — Historical → `090-historical-intention-journal-fold-at-drain-adr-ios-058-2026-07-11-queue.md`
+
+<!-- BEGIN VERBATIM ROW 129 (pass 5b) -->
+HISTORICAL — Intention journal + fold-at-drain (ADR-IOS-058, 2026-07-11; queue/Undo mechanics superseded by ADR-IOS-060)
+<!-- END VERBATIM ROW 129 (pass 5b) -->
+
+---
+
+## Source line 131 (post-pass-5) — Current → `093-the-wrong-message-wire-oracle-is-blind-to-shared-message-id-defects.md`
+
+<!-- BEGIN VERBATIM ROW 131 (pass 5b) -->
+⚠️ `FakeIMAPServer`'s `wrongMessageViolations` wire oracle is BLIND when target and bystander share an RFC 822 Message-ID — the C3 assertion goes vacuous; pin on the `UID STORE`/`EXPUNGE` log
+<!-- END VERBATIM ROW 131 (pass 5b) -->
+
+---
+
+## Source line 141 (post-pass-5) — Historical → `094-retained-inline-no-byte-identical-routed-twin.md`
+
+<!-- BEGIN VERBATIM ROW 141 (pass 5b) -->
+Compaction drift list — a post-`v1.6.38` amendment can differ from its `Companion/Memory/` twin; check the routed twin BEFORE editing
+<!-- END VERBATIM ROW 141 (pass 5b) -->
+
+---
+
+## Source line 142 (post-pass-5) — Current → `095-v3-provider-id-action-queue-forward-port-resume-state.md`
+
+<!-- BEGIN VERBATIM ROW 142 (pass 5b) -->
+v3 provider-id action-queue forward-port — ✅ SHIPPED **v1.7.0**; branch `v3` DELETED, `main` IS that line; **R0/R3 RETIRED**; ⛔ `v2final` = never-shipped SIBLING
+<!-- END VERBATIM ROW 142 (pass 5b) -->
+
+---
+
+## Source line 143 (post-pass-5) — Current → `096-t1-3-new-gesture-fails-closed-on-unknown-uidvalidity-epoch.md`
+
+<!-- BEGIN VERBATIM ROW 143 (pass 5b) -->
+T1.3 — a NEW gesture fails CLOSED on an unknown UIDVALIDITY epoch: `newGestureRefusedForUnknownEpoch` is a silent no-op (`IOS-EPOCH-001`, C3)
+<!-- END VERBATIM ROW 143 (pass 5b) -->
+
+---
+
+## Source line 144 (post-pass-5) — Historical → `097-t4-s6-follow-up-superseded-v3-intermediate-draft-epoch-stamp.md`
+
+<!-- BEGIN VERBATIM ROW 144 (pass 5b) -->
+T4.S6 — ⛔ **SUPERSEDED v3 intermediate, never implement from it**: `v69`/`v72` draft epoch stamps; the RETRACTED bare mailbox-wide `EXPUNGE`
+<!-- END VERBATIM ROW 144 (pass 5b) -->
+
+---
+
+## Source line 145 (post-pass-5) — Current → `098-imap-external-deletion-blind-spot-amended-adr-ios-051.md`
+
+<!-- BEGIN VERBATIM ROW 145 (pass 5b) -->
+IMAP external-deletion blind spot — server-deleted messages linger forever; FIXED by **ADR-IOS-051** Ph1+2: `SyncEngineDeletionReconcile`, `handleVanishedUIDs`
+<!-- END VERBATIM ROW 145 (pass 5b) -->
+
+---
+
+## Source line 146 (post-pass-5) — Current → `099-persistent-nse-log-file-watchdog-partial-delivery-audit-rounds.md`
+
+<!-- BEGIN VERBATIM ROW 146 (pass 5b) -->
+Persistent NSE log + watchdog partial delivery, rounds 1–7: `NSELogStore`/`nse.log`, `PartialSignalHolder`; **idle-timer-vs-SSE**; `OneShotFlag.hasFired()`
+<!-- END VERBATIM ROW 146 (pass 5b) -->
+
+---
+
+## Source line 147 (post-pass-5) — Current → `100-two-instant-wake-handoff-elapsed-means-do-it-now.md`
+
+<!-- BEGIN VERBATIM ROW 147 (pass 5b) -->
+Two-instant wake handoff — "elapsed" means DO IT NOW: `AccountManager.wakeUpDelay`, `holdUntil`, `IOS-OUTBOX-005`, `UInt64(negative)` traps
+<!-- END VERBATIM ROW 147 (pass 5b) -->
+
+---
+
+## Source line 148 (post-pass-5) — Current → `101-isdeletedonserver-has-four-materialisation-paths.md`
+
+<!-- BEGIN VERBATIM ROW 148 (pass 5b) -->
+`isDeletedOnServer` — FOUR materialisation paths **plus a FIFTH PRESENTATION path** (`SearchView.searchAccount` sends no `NOT DELETED`), `IOS-IMAP-001`
+<!-- END VERBATIM ROW 148 (pass 5b) -->
+
+---
+
+## Source line 149 (post-pass-5) — Current → `102-there-are-four-irreversible-wire-operations-not-one.md`
+
+<!-- BEGIN VERBATIM ROW 149 (pass 5b) -->
+⚠️ **SIX irreversible wire operations at `967e5b3c5`, not one** — deletion family + `CalDAVProvider.splitSeries` cap `PUT`; membership = **no reached per-item recovery**, NOT the verb
+<!-- END VERBATIM ROW 149 (pass 5b) -->
+
+---
+
+## Source line 150 (post-pass-5) — Current → `103-await-dbpool-read-is-not-a-short-suspension.md`
+
+<!-- BEGIN VERBATIM ROW 150 (pass 5b) -->
+🚨 `await dbPool.read` is NOT a short suspension — the ASYNC overload first `await`s `NSEDataBridge.mergeIfStagingPending()` (7.6 s cold boot); check-then-act is UNBOUNDED
+<!-- END VERBATIM ROW 150 (pass 5b) -->
+
+---
+
+## Source line 151 (post-pass-5) — Current → `104-a-latch-that-authorises-a-transition-must-be-held-across-the-write.md`
+
+<!-- BEGIN VERBATIM ROW 151 (pass 5b) -->
+🚨 a latch that AUTHORISES a transition must be HELD across the write — reading `isDrainingOutbox` then `await`ing proves nothing (`IOS-OUTBOX-006`, `reconcileOutbox`)
+<!-- END VERBATIM ROW 151 (pass 5b) -->
+
+---
+
+## Source line 152 (post-pass-5) — Current → `105-a-print-is-not-production-observability-on-ios.md`
+
+<!-- BEGIN VERBATIM ROW 152 (pass 5b) -->
+🚨 a bare `print` is NOT production observability on iOS — `stdout` is DISCARDED on device; use `BackgroundSyncLogger.logError`; **a RESIDUAL RECORD is an absolute in humility's clothing**
+<!-- END VERBATIM ROW 152 (pass 5b) -->
+
+---
+
+## Source line 153 (post-pass-5) — Current → `106-a-filter-after-the-limit-narrows-the-page-instead-of-selecting-it.md`
+
+<!-- BEGIN VERBATIM ROW 153 (pass 5b) -->
+🚨 a filter applied AFTER a query's `LIMIT` narrows the page instead of selecting it — `InboxListReader.gather`, `hasMoreMessages` (`IOS-SCROLL-002`, `IOS-BACKFILL-001`)
+<!-- END VERBATIM ROW 153 (pass 5b) -->
+
+---
+
+## Source line 154 (post-pass-5) — Current → `107-a-staging-key-that-names-an-address-must-re-prove-identity-before-reusing-payload.md`
+
+<!-- BEGIN VERBATIM ROW 154 (pass 5b) -->
+🚨 a staging key that names an ADDRESS must re-prove identity before reusing payload — `nse_processed_message` PK holds a UID, `stageHeader` `ON CONFLICT` (`IOS-NSE-005`, C3)
+<!-- END VERBATIM ROW 154 (pass 5b) -->
+
+---
+
+## Source line 155 (post-pass-5) — Current → `113-a-swift-string-comparison-does-not-reproduce-sqlite-binary-collation.md`
+
+<!-- BEGIN VERBATIM ROW 155 (pass 5b) -->
+🚨 a Swift `String` comparison does NOT reproduce SQLite **BINARY** collation — use `utf8.lexicographicallyPrecedes`; `InboxOrdering`, keyset cursor, `IOS-SCROLL-002`
+<!-- END VERBATIM ROW 155 (pass 5b) -->
+
+---
+
+## Source line 156 (post-pass-5) — Current → `107-a-staging-key-that-names-an-address-must-re-prove-identity-before-reusing-payload.md`
+
+<!-- BEGIN VERBATIM ROW 156 (pass 5b) -->
+🚨 **THE SAME STAGING KEY HAS FOUR WRITERS, AND "SAFE" POINTS THE OPPOSITE WAY FOR THREE** (`IOS-NSE-006`, `stagedIdentityPositivelyDiffers`) — **THE FAIL DIRECTION INVERTS**
+<!-- END VERBATIM ROW 156 (pass 5b) -->
+
+---
+
+## Source line 157 (post-pass-5) — Current → `109-an-enum-with-no-silent-case-does-not-prevent-a-silent-path.md`
+
+<!-- BEGIN VERBATIM ROW 157 (pass 5b) -->
+🚨 **AN ENUM WITH NO SILENT CASE DOES NOT PREVENT A SILENT PATH** — `ResultTapOutcome`'s "cannot reintroduce silence" comment was FALSE AND LOAD-BEARING (`case …: break`)
+<!-- END VERBATIM ROW 157 (pass 5b) -->
+
+---
+
+## Source line 158 (post-pass-5) — Current → `108-the-address-problem-has-two-address-spaces-graph-move-response-is-the-copyuid.md`
+
+<!-- BEGIN VERBATIM ROW 158 (pass 5b) -->
+🚨 THE ADDRESS PROBLEM HAS TWO ADDRESS SPACES — Graph's `/move` response IS the `COPYUID`; `ExchangeProvider.moveMessage` discarded the new `id` (`IOS-GRAPH-002`, `MIS-006`)
+<!-- END VERBATIM ROW 158 (pass 5b) -->
+
+---
+
+## Source line 159 (post-pass-5) — Current → `112-uidvalidityresetpendingat-is-a-redrive-flag-that-stays-armed-on-purpose.md`
+
+<!-- BEGIN VERBATIM ROW 159 (pass 5b) -->
+🚨 `uidValidityResetPendingAt` STAYS ARMED ON PURPOSE — never demand proof of transience; `crawlWalkWriteAllowed` was the LAST consumer writing under an armed flag (`16ecafd93`)
+<!-- END VERBATIM ROW 159 (pass 5b) -->
+
+---
+
+## Source line 160 (post-pass-5) — Current → `114-both-uidvalidity-redrive-owners-iterate-syncablefolders.md`
+
+<!-- BEGIN VERBATIM ROW 160 (pass 5b) -->
+🚨 **BOTH UIDVALIDITY RE-DRIVE OWNERS ITERATED `syncableFolders`** (`fullSync` + `imapDeltaSync`) — an armed CUSTOM NON-FAVOURITE folder had NO re-drive: 26 folders / 145,754 rows. Count PREDICATES
+<!-- END VERBATIM ROW 160 (pass 5b) -->
+
+---
+
+## Source line 161 (post-pass-5) — Current → `115-known-issues-register-is-byte-frozen-and-has-no-append-path.md`
+
+<!-- BEGIN VERBATIM ROW 161 (pass 5b) -->
+✅ **`KNOWN_ISSUES.md` APPEND PATH — RESOLVED 2026-08-12** — strip-before-compare `KNOWN-ISSUES-AMENDMENT-BEGIN`/`-END` + non-globbed `KnownIssues/Amendments/`; first user `IOS-IMAP-015`
+<!-- END VERBATIM ROW 161 (pass 5b) -->
+
+---
+
+## Source line 162 (post-pass-5) — Current → `116-a-path-component-is-capped-in-nfd-utf16-units-not-bytes-or-characters.md`
+
+<!-- BEGIN VERBATIM ROW 162 (pass 5b) -->
+🚨 **ATTACHMENT FILENAMES REJECTED, NOT REDUCED** — `AttachmentFilename.isSafeFileComponent`, `AttachmentFilenameError`; **255 NFD UTF-16 unit** path-component cap (NOT bytes, NOT `Character`s)
+<!-- END VERBATIM ROW 162 (pass 5b) -->
+
+---
+
+## Source line 163 (post-pass-5) — Current → `117-swiftmail-move-post-completion-contract.md`
+
+<!-- BEGIN VERBATIM ROW 163 (pass 5b) -->
+SwiftMail PR #208 MOVE post-completion contract — typed partial completion is non-retryable; retain COPYUID and reconcile both folders
+<!-- END VERBATIM ROW 163 (pass 5b) -->
+
+---
+
+## Source line 164 (post-pass-5) — Current → `118-trial-ended-is-derived-never-a-new-whoami-flag.md`
+
+<!-- BEGIN VERBATIM ROW 164 (pass 5b) -->
+🚨 **"TRIAL ENDED" IS DERIVED, NEVER A NEW `/whoami` FLAG** — `has_subscription:false` + the `trial` KEY present (may be explicit `null`; `trialKeyPresent`); `.active` REQUIRES `plan_tier == "Trial"`, so a legacy Stripe/Apple **CARD trial** stays a plain subscriber; `AccountInfo.trialState(now:)`, `TrialState.noTrial`, `AISubscriptionGate.trialHasEnded`; intro-offer machinery DELETED (issue #55)
+<!-- END VERBATIM ROW 164 (pass 5b) -->
+
+---
+
+## Source line 165 (post-pass-5) — Current → `119-post-login-routing-waits-for-an-authoritative-whoami.md`
+
+<!-- BEGIN VERBATIM ROW 165 (pass 5b) -->
+🚨 **POST-LOGIN ROUTING WAITS FOR AN AUTHORITATIVE `/whoami`** (issue #56: active subscriber sent to paywall; configured Gmail re-offered) — `PendingPlanNavigationLatch` / `pending_plan_navigation`, `AISubscriptionGate.lastAuthoritativeApplyAt`, `Account.existing(forEmail:provider:in:)` CASE-FOLDED, `signInGeneration`/`applyIfCurrentEpoch`
+<!-- END VERBATIM ROW 165 (pass 5b) -->

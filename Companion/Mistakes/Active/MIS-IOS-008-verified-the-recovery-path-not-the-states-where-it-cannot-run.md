@@ -175,3 +175,16 @@ accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-008](Companion/Mistakes/Active/MIS-IOS-008-verified-the-recovery-path-not-the-states-where-it-cannot-run.md)** — proved a recovery path EXISTS and wrote "recoverable"; never asked from which states that path itself is blocked. The mantra's test is recoverability of the STATE, not existence of a MECHANISM, and they come apart exactly where a guard on the recovery path excludes the same rows the refusal caught. Shipped a false cost claim in `6b689890d`'s body; both round-2 reviewers found it independently (`IOS-AI-003`). A refusal retried forever is not inert — check the retry ceiling too. **Instance 2 (`IOS-AI-004`): the recovery path's CODE was fine — the blocker was an affordance owned by a DIFFERENT subsystem.** "Tapping the message is the recovery gesture" needs a **tappable row**, and the row was hidden by the then-unfixed move-visibility defect, so both motivating device episodes came from states where the gesture could not be performed. Reading the recovery path's own guards would not have caught it. New step 2b: if the recovery is a **user gesture**, name the affordance it requires and check *that* in the failing state. Also — a residual that later changes shape needs its recoverability argument **re-run, not inherited**. (×2)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-08-20, pass 5)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 19% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-008](Companion/Mistakes/Active/MIS-IOS-008-verified-the-recovery-path-not-the-states-where-it-cannot-run.md)** — called a state "recoverable" after finding a mechanism, without proving it can run there (`IOS-AI-003`/`004`). Instance 2 adds the affordance a user gesture needs. **Instance 3 imposed RFC identity on `repopulationCandidates`, though that fallback selects by state. Enumerate the recovery's actual predicates; never transfer a guard from the failing path.** Re-run the argument whenever the residual changes shape. (×3)
+```

@@ -60,3 +60,16 @@ deleted, not repaired, which is the strongest evidence the defect was specificat
 3. **The bundling is the trap.** The display gate entered inside a 40-file queue rollback and was
    reviewed under that framing. A view-layer diff inside a policy commit deserves the question:
    *would this change stand on its own if proposed separately?* Here it would not have.
+
+---
+
+## Pre-compaction index line (verbatim, 2026-08-20, pass 5)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 19% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-018](Companion/Mistakes/Active/MIS-IOS-018-extended-a-processing-bound-into-display-semantics.md)** — a PROCESSING bound (newest-100 AI window, `recentInboxWindowContains`) leaked into DISPLAY: a suppression notice replaced summary bubbles whose content already EXISTED (`7a31f1d22`/`v1.7.11`; reversed by ADR-IOS-078). **Existence beats eligibility — check "does the artifact exist?" BEFORE any policy branch in a display decision.** ***Tell: making a queue policy "legible" by hiding/replacing UI in the same commit.*** (×1)
+```

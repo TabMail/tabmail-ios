@@ -128,3 +128,16 @@ accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-004](Companion/Mistakes/Active/MIS-IOS-004-conflated-unknown-with-authoritative-stale.md)** — treated "could not determine" as "provider says done" and dropped a user intention. **The single most repeated defect in this codebase's history.** Instance (2026-08-04): the shape **outside the queue**, where nothing looks like a queue exit — a SELECT that reported no UIDNEXT arrived as `UID(0)`, so `initialCursor = -1` took the `< 1` early-out written for UIDNEXT **1** (the value that PROVES an empty mailbox) and wrote `backfillComplete = true`, permanently un-crawling the folder. The tell was one line wide: `getUidNextWithEpoch` normalised the epoch's zero and not the UIDNEXT's, same line, same `nz-number` reason. **Any terminal, non-revisiting state — `backfillComplete`, `headerComplete`, an advanced cursor, a folder dropped from `remaining` — is a queue exit in other clothes; ask the exit-2 question of each.** Instance (2026-08-04b): a Graph **404 on an address WE invalidated** read as exit 2 — three world-states (deleted / moved-and-churned / transient Graph inconsistency) collapsed into "gone, therefore done", on an id made dead by our own discarded `/move` response. **A truthful answer to the wrong question is still "we could not determine"**: Graph answered *"no message has this id"*, not *"your queued op is done"*. BLOCKING rather than registrable because the optimistic local move lands and is never rolled back, so the UI shows success and the "one ordinary gesture" recovery cannot fire; repair is date-windowed and Exchange delta is Inbox-only → `IOS-GRAPH-002`. Trap: reclassifying the 404 as merely *retryable* converts the drop into a **lane wedge** — the re-key is what makes retry terminate. (×many)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-08-20, pass 5)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 19% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-004](Companion/Mistakes/Active/MIS-IOS-004-conflated-unknown-with-authoritative-stale.md)** — treated "could not determine" as "provider says done" and dropped a user intention. **The single most repeated defect in this codebase's history.** Recurs OUTSIDE the queue, where nothing looks like a queue exit: a missing UIDNEXT arrived as `UID(0)`, took the `< 1` early-out written for UIDNEXT **1**, and wrote `backfillComplete = true`; a Graph **404 on an address WE invalidated** collapsed three world-states into "gone, therefore done" (`IOS-GRAPH-002`, BLOCKING). **Any terminal, non-revisiting state — `backfillComplete`, an advanced cursor, a folder dropped from `remaining` — is a queue exit in other clothes.** (×many)
+```

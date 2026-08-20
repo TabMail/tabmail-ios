@@ -139,3 +139,16 @@ accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-013](Companion/Mistakes/Active/MIS-IOS-013-asked-a-byte-level-question-with-a-grapheme-level-string-api.md)** — asked what a filesystem / MIME parameter / wire field will parse, and answered with a `Character`-wise `String` API: `hasSuffix` `hasPrefix` `contains` `split(separator:)` `drop(while:)` `dropLast` are extended-**grapheme**-cluster-wise, so a `Prepend` or combining **scalar** chooses what a cluster is. 4 instances / 6 sites on the attachment-filename path, always born as PAIRS (draft store and outbox store are deliberate twins): `split(separator: "/")` (`05200112d`, twin `711afc6b8`, both `7ce64e44b`); `hasSuffix(".meta")` false for `0_x\u{0605}.meta` → sidecar loaded as a data file and the SEND path emailed the sidecar's own bytes, **and the `ambiguousMetaFilename` fail-closed guard 4 lines away asked the identical question so it declined to fire on exactly its own input** (`2ecdd6370`); `contains("_")`/`drop(while:)` returned the store's `0_` prefix or cut the name at the SECOND `_` (`f5e225419`). ASCII fixtures cannot see it — the two views coincide there — and it fails silently in the safe-looking direction. 🚨 **Instance 5 was in the ORACLE, not the product: the `visibleOrder` CoreText harness assumed ONE GLYPH PER UTF-16 UNIT, so an `fi` LIGATURE made it report an in-order string as REORDERED** (`kCTLigatureAttributeName = 0` + instrument test `layoutOrderHarnessIsFaithful`); wrong since it was written, exposed only by a new label containing `fi` — the other direction would have been GREEN and wrong. **A harness that reconstructs one representation from another needs its own non-vacuity test.** **Compare over `unicodeScalars`, in ONE named function that both the classifier and its guard call.** (×5)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-08-20, pass 5)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 19% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-013](Companion/Mistakes/Active/MIS-IOS-013-asked-a-byte-level-question-with-a-grapheme-level-string-api.md)** — asked what a filesystem / MIME parameter / wire field will parse, and answered with a `Character`-wise `String` API: `hasSuffix` `hasPrefix` `contains` `split(separator:)` `drop(while:)` `dropLast` are extended-**grapheme**-cluster-wise, so a `Prepend` or combining **scalar** chooses what a cluster is. 4 instances / 6 sites on the attachment-filename path, born as PAIRS; ASCII fixtures cannot see it. 🚨 **Instance 5 was in the ORACLE, not the product** — a CoreText harness assuming one glyph per UTF-16 unit called an in-order string REORDERED on an `fi` LIGATURE. **Compare over `unicodeScalars`, in ONE named function the classifier and its guard both call.** (×5)
+```

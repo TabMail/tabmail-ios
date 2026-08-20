@@ -113,3 +113,16 @@ investigation, either re-measure it or delete it** — and prefer the number tha
    this very fix, not by the suite.
 4. **Before shipping an async render gate, state where the resolver runs when the gate is closed.** If
    the answer is "in the view the closed gate removes", it is this mistake.
+
+---
+
+## Pre-compaction index line (verbatim, 2026-08-20, pass 5)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 19% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-017](Companion/Mistakes/Active/MIS-IOS-017-gated-a-view-on-state-that-only-that-view-could-resolve.md)** — gated a view on async state whose **only resolver was that same view's lifecycle**: `recentInboxEligible: Bool?` started `nil`, `nil` rendered `.hidden` → `EmptyView`, and the resolving `.task` hung on the **transparent `Group`** wrapping it, so it was attached to `EmptyView` — which has no lifecycle. The AI summary bubble was invisible for **every message, inbox included, in the LIVE `v1.7.11`** (`7a31f1d22`; `v1.7.9` fine). 🚨 **The suite had 15 tests on that exact function and all passed**: the 1 that passed `nil` BLESSED the defect (`nil → .hidden`, `MIS-014`) and 12 omitted the argument, whose seam default was `= true` — **a state production never starts in** (the other 2 pass `false` and are correct). ***Tell: "`nil` is the conservative state — showing nothing can't be wrong", without asking which view runs the resolver once nothing is shown.*** **Unresolved must render the pre-gate outcome; a seam default must equal the production initial value.** ⚠️ this entry's own first draft said 17/14 — it counted the tests the fix added (`MIS-033`). (×1)
+```

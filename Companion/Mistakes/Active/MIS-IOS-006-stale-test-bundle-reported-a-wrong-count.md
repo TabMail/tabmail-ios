@@ -171,3 +171,16 @@ accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-006](Companion/Mistakes/Active/MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md)** — recorded a baseline from a stale `.xctest`; verify new tests ran **by name**, never by total count. A NEW test file is not in the target until `./Scripts/xcodegen.sh` runs, so it reports `** TEST SUCCEEDED **` having executed ZERO of it. A peer build holding `build.db` makes `build-for-testing` fail and `test-without-building` measure the PREVIOUS bundle — so a **red proof reported PASSING**; a name proves *selection*, only the BUILD log proves *freshness*, so gate every run on `TEST BUILD SUCCEEDED`. *Tell: green plus relief, faster than expected, with no count — or reading the verdict from the TEST log having never opened the BUILD log.* (×6)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-08-20, pass 5)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 19% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-006](Companion/Mistakes/Active/MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md)** — recorded a baseline from a stale `.xctest`; verify new tests ran **by name**, never by total count. A NEW test file is not in the target until `./Scripts/xcodegen.sh` runs, so the suite reports `** TEST SUCCEEDED **` having executed ZERO of it; a peer build holding `build.db` makes `test-without-building` measure the PREVIOUS bundle, so a **red proof reported PASSING**. Only the BUILD log proves freshness — gate every run on `TEST BUILD SUCCEEDED`. *Tell: green plus relief, faster than expected, with no count.* (×6)
+```

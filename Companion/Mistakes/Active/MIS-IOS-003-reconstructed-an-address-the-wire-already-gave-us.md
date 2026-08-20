@@ -95,3 +95,16 @@ accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-003](Companion/Mistakes/Active/MIS-IOS-003-reconstructed-an-address-the-wire-already-gave-us.md)** — designed identity machinery to rebuild the destination address `COPYUID` already returned; 4 audit rounds argued evidence when the defect was granularity. Undo is JUST a reverse move. Instance 5: the **quiet** form of the same tell — not growing machinery but a **discarded return value**: `ExchangeProvider.moveMessage` binds Graph's `/move` response to `_` though it carries the new `id`, and no `Prefer: IdType="ImmutableId"` exists in the tree, so Graph ids churn on every move and are never re-learned. It outlived the IMAP fix because the census enumerated the MECHANISM (`COPYUID`) instead of the property (*a move changes the address and we discarded what the wire told us*), and because IMAP's epoch gate makes the same defect fail CLOSED there while the non-IMAP arm has no gate and fails OPEN → `IOS-GRAPH-002` (BLOCKING). Gmail is exempt: `messages.modify` never changes the resource id. **A second guard that makes a defect benign in one arm is not a guard the other arm has.** (×5)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-08-20, pass 5)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 19% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-003](Companion/Mistakes/Active/MIS-IOS-003-reconstructed-an-address-the-wire-already-gave-us.md)** — designed identity machinery to rebuild the destination address `COPYUID` already returned; 4 audit rounds argued evidence when the defect was granularity. Undo is JUST a reverse move. Instance 5 is the **quiet** form — a **discarded return value**: `ExchangeProvider.moveMessage` binds Graph's `/move` response to `_` though it carries the new `id`, and no `Prefer: IdType="ImmutableId"` exists in the tree (`IOS-GRAPH-002`, BLOCKING; Gmail exempt). **A second guard that makes a defect benign in one arm is not a guard the other arm has.** (×5)
+```

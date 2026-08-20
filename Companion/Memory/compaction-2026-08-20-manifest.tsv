@@ -1,0 +1,73 @@
+# companion-compact manifest — tabmail-ios / Memory tree (2026-08-20 pass)
+# Source: PROJECT_MEMORY.md BEFORE this pass (27851 B, sha256 cb8f7a0849b2823306a32ac5583d0126585dd5075a560499ae74616a863ddd65)
+# CONTENT DELETED: none. Every row below is a byte-exact fragment MOVED out of the index
+# into 110-pre-compaction-index-row-abstracts.md; the index kept a shortened routing line.
+# row-N   = the pre-pass *Topic / search terms* CELL of one row (Status and [read in full] cells untouched).
+# lines-A-B = whole preamble lines, replaced by a shortened block; kept inside a ```text fence so
+#             verify_markdown_links does not re-resolve their index-relative targets (MIS-IOS-009 instance 4).
+# Stage 4a rebuild (run from tabmail-ios/):
+#   python3 - <<'EOF'
+#   import re, hashlib
+#   cur = open('PROJECT_MEMORY.md').read().split('\n')
+#   src = open('Companion/Memory/History/110-pre-compaction-index-row-abstracts.md').read()
+#   for m in re.finditer(r'<!-- BEGIN VERBATIM LINES (\d+)-(\d+) \(pass 5\) -->\n```text\n(.*?)\n```\n<!-- END VERBATIM LINES \1-\2 \(pass 5\) -->', src, re.S):
+#       a, z = int(m.group(1)), int(m.group(2))
+#       cur[a-1:a+(len(m.group(3).split(chr(10)))-(z-a+1))-1] = m.group(3).split('\n')
+#   for m in re.finditer(r'<!-- BEGIN VERBATIM ROW (\d+) \(pass 5\) -->\n(.*?)\n<!-- END VERBATIM ROW \1 \(pass 5\) -->', src, re.S):
+#       ln = int(m.group(1)); p = cur[ln-1].split(' | '); cur[ln-1] = '%s | %s | %s' % (p[0], m.group(2), p[2])
+#   b = '\n'.join(cur).encode(); print(len(b), hashlib.sha256(b).hexdigest())
+#   EOF
+fragment_id	route_target	index_line	bytes	sha256
+row-133 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	133	208	ebec778ef6b5bdab14b94286cd314b8a4176b9732daa2838c05df11fdca9f074
+row-144 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	144	184	42ad4f2d957c0926649f9f724a5f6ad7246ea73e15e778bd739d60e8745f193c
+row-145 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	145	160	67bdd1cbb728275595ca17bec87b37c3da4862ca1bbb7ca2eccc60a807b1b345
+row-148 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	148	157	79f10a511c290ded85e85823f1cfb1064d7f6e58b509428f4c171ae0a2580bcd
+row-149 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	149	141	b049d71985991d0af3a9b5e4cf0b001355093b8ef54d5211025f6e122ab5a70c
+row-150 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	150	188	344db955e41df0451b15677cd5d5734afef976105fd9d86a19fe020ec810e161
+row-151 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	151	207	0b83da84a37c94b33d26f2fc98b65b3d4e096ef89083aedeeeae103864e5f925
+row-152 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	152	194	cb430877ab823bd0f0abdae59d5e212f47884714fabd9a75dc39862cfaee78af
+row-153 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	153	183	01ee64b35fa01a54df49bbc39d775ff124ba0d3cfc062a0c5668a427098f8aeb
+row-154 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	154	255	83e093165598bb74c23725fe8901ca120e4c645cbddbf84c6306bfcb7b28864a
+row-155 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	155	173	ff8bac5ab230e0889f4a8c49d65266bf5ac6a1476ce143da5eab551d319432a6
+row-156 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	156	184	747166b4fbebada6a1f0a2793de08202e3e9cecf10b2730ab7043b9bd430172d
+row-157 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	157	195	db4aa1acffc2c525b37cea64b9c7026b9d492550c5063b4b66fd7be681fb0328
+row-158 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	158	185	87ab89510a3c8a3bd523ce18faeaea13ee406ad33d39de44870af8935e132997
+row-159 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	159	185	0c191db3b7108ca57ed78d92908481dc4200d3f5bbdb13df573ba442f86ef17e
+row-160 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	160	177	553fa145446579babd173ff0fe28f7df603ecc9942abfcbcc387c217dd77f8eb
+row-161 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	161	181	09203646862d01160ccea5f99e80129217b547ac67fd3f6df8e66377d7b81fdb
+row-162 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	162	228	f64efe7ebba1dff8502e0bb48228b3db89058c35821d04ed4941c2e5107a8c70
+row-163 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	163	237	208b4770a9267b95a46328cc4ef992edde2c955ff98ef0b580dbc6552a680541
+row-164 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	164	336	cd0e85242d16ccd982d7a8c0431db3fe3fa1b3b2f5ea99bf2847f21c1b3e3962
+row-166 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	166	1154	adedfbe57c952431a12b21cb9850fc45acc6d9cfc0290fa358c57eef371c80d9
+row-167 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	167	1546	ad11020ad614bfe29f62961bbd4e9999ed2e481498249e6f3bd61ab8fcccc0fc
+lines-139-139 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	139	237	8eedc7e5d5a29ea3d9374adc4df40e9b1092dfc4612c5c6d1826cd5b8e4366e9
+lines-127-127 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	127	168	78fb756e00a823e85c2119f0c6b49c03c2147e0bf873b5289c1aedbedf082164
+lines-119-119 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	119	137	bf05ae5eb14e7a65c94b8751b1bab2abc60917a88f92fb613bce9605c2dc37f0
+lines-11-19 (pass 5)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	11	704	927a98e08acd55c101377686002651779c4d3c9b0d23ece90e6ade48575e3b2c
+row-129 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	129	122	f31f217850e00476205a422c813577db2c9e033a856c5c1f2d820f100581a15e
+row-131 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	131	197	41e31f3b081b3a7851c8c379b79a2ff317f1b5f00b52ebb0e2767755b6dae341
+row-141 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	141	135	ff6d87b5f657a8573463155b789a5d5dd89ecec4179fddf54f7553c704c81383
+row-142 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	142	167	e3e82c3851fb618f3b7deb7629d2af753a571f41f071f36c30406e0e093aa254
+row-143 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	143	143	a78d792822a120aa3bfdc836f3a310a08b303c5ef0d4b7855361557b91ddbfdd
+row-144 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	144	144	f3884a804a5053c70c45f704ed5075b07d19de301aa91a48a20af9b084a4655b
+row-145 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	145	161	d1a695ab6ad6d2de5ecb5f67faa190028b40741db5174959f764a62e3575a247
+row-146 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	146	157	79f10a511c290ded85e85823f1cfb1064d7f6e58b509428f4c171ae0a2580bcd
+row-147 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	147	141	b049d71985991d0af3a9b5e4cf0b001355093b8ef54d5211025f6e122ab5a70c
+row-148 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	148	153	0b4822aa8a17e3db8be26a0b97250246b619a2a86435f53b5aa805f28f6dcde8
+row-149 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	149	189	fb3a2de84a0f185f96e62068876f733c329d897b16754a6ba315cdd6afcd3500
+row-150 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	150	175	9a99fc15169f719c6507e7f8c218627020ec389a10647437108fcb04cc0c0bf5
+row-151 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	151	171	0193ad498ad401b8dda4c25b109e59c7a0429e86e24a8a5e285e99dc2404a60d
+row-152 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	152	192	bf8b68714b83380bdff2b2f18315f1f869ddc4ac4ec255203dd00f4e965bb4a9
+row-153 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	153	173	ff8bac5ab230e0889f4a8c49d65266bf5ac6a1476ce143da5eab551d319432a6
+row-154 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	154	178	bf7499f89ca9c02f56e5a96b54365c86349af25f7767f374df980d05604c4ca3
+row-155 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	155	170	d6b5eaf13c7cd94c25c084c8f0ef57ba56168f3d907d92a22dd47b9125ea6dd6
+row-156 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	156	178	c5df3d2604a9d8ff9f17c09a7266f9ac1347e80305dfc03014a52b3988335464
+row-157 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	157	176	4b0f2ac94fc366fe35af973d87a90fcb7b565ed6f7dedac4342fb905fb815a5e
+row-158 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	158	177	553fa145446579babd173ff0fe28f7df603ecc9942abfcbcc387c217dd77f8eb
+row-159 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	159	181	09203646862d01160ccea5f99e80129217b547ac67fd3f6df8e66377d7b81fdb
+row-160 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	160	201	e58c9e1a59ee257345a0572d1c5c20910fab5c0158e9a1cbe139a6f85ee65513
+row-161 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	161	191	835cd5912c8f55fda11477b9d2d9d32115ad4b623ef32c3512c95ae38e786536
+row-162 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	162	197	f4e46371c8b9d25790d0daee41ecce360fde7efc3fb975c9b68e0fdc86a5e84e
+row-163 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	163	136	65a2573e1bd915312c647abf7a26132c57a7ebdb662a0579cc2917b60acbf58a
+row-164 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	164	402	808eaa05ad5280f9a2a5aea49e575c793f9398c6c7de5299a3ae576ab18edbea
+row-165 (pass 5b)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	165	345	9e6a9876cbbd9df8adb83f740bde1f95c77309a56e6f3a85618832daf91c99ef

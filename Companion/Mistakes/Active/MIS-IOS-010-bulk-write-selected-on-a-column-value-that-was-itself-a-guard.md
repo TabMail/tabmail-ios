@@ -93,3 +93,16 @@ accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-010](Companion/Mistakes/Active/MIS-IOS-010-bulk-write-selected-on-a-column-value-that-was-itself-a-guard.md)** — designed a bulk `UPDATE messageHeader SET observedUidValidity = :epoch WHERE folderId = :folderId AND observedUidValidity IS NULL` (`PLAN_FOLDER_EPOCH_BOOTSTRAP` rev F) reading `IS NULL` as *"rows we haven't reached yet"* — the term I had just argued **was** the bootstrap-only guard. It is a guard, in the opposite direction: `AccountManagerActions.optimisticMoveToFolder` writes that NULL **deliberately**, on a row whose `folderId` is the DESTINATION while `messageId` is still the SOURCE UID, until `MessageHeaderRekey.finishMove` installs the `COPYUID`-proven address. So the predicate selected **exactly** the rows the sentinel protected, converting it into a false proof → admitted, claimed by Checkpoint A, STORE issued against whatever owns that UID in the destination: **C3 on a compliant server**, from an ordinary move that hadn't drained before the upgrade. Same spelling as the sound sibling guard (`Folder.lastKnownUidValidity IS NULL` = *not yet learned*), opposite meaning (*known to be invalid*). Caught by two codex vets with **different** briefs converging on one defect; a second refutation independently killed the generalising argument (a compensated interior shift — one insertion, one later omission — leaves the 4 lowest and 4 highest sampled UIDs aligned while the interior is shifted, so end-sampling passes and stamps them wrong). **Before any bulk UPDATE, grep every WRITER of every column in the WHERE clause and say what each means by that value; a value written deliberately elsewhere is a guard, and selecting on it makes you its second writer.** (×1)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-08-20, pass 5)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 19% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-010](Companion/Mistakes/Active/MIS-IOS-010-bulk-write-selected-on-a-column-value-that-was-itself-a-guard.md)** — designed a bulk `UPDATE … WHERE folderId = :folderId AND observedUidValidity IS NULL` reading `IS NULL` as *"rows we haven't reached yet"*. It is a guard in the OPPOSITE direction: `optimisticMoveToFolder` writes that NULL **deliberately** while `folderId` is the DESTINATION and `messageId` still the SOURCE UID, until `MessageHeaderRekey.finishMove` installs the `COPYUID`-proven address — so the predicate selected **exactly** the rows the sentinel protected: **C3 on a compliant server**. **Before any bulk UPDATE, grep every WRITER of every column in the WHERE clause; a value written deliberately elsewhere is a guard, and selecting on it makes you its second writer.** (×1)
+```
