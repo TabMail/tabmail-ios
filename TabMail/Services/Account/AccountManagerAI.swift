@@ -411,6 +411,24 @@ extension AccountManager {
         // bubble's Retry on) an out-of-window Inbox message now processes it.
         // The `isInInbox` guard below STAYS: AI processing remains inbox-scoped;
         // the exemption removed the window, not the scope.
+        //
+        // ⚠️ SCOPE of the Retry clause — it holds ONCE THE BODY IS DURABLE, not in
+        // every body state (comment corrected 2026-08-20, iOS #66, matching the same
+        // correction in ADR-IOS-078, which read "in every state" until that date).
+        // `SummaryBubbleView`'s Retry button calls THIS function and nothing else, and
+        // `OpenedAIProcessingSnapshot.capture` guards on `MessageBody.fetchOne` first —
+        // so while the `MessageBody` row does not yet exist, Retry falls through the
+        // `guard let opened` below and is a no-op regardless of the window. The other
+        // body states are covered elsewhere and must not be attributed to this path:
+        // a not-yet-fetched body is covered by the open's OWN fetch (`fetchBody` →
+        // `fetchAndProcess(aiWindowExempt: true)`), a STAGED body by the NSE merge's
+        // own `windowExempt: true` enqueue, and the `ActiveBodyQueue`-owned poll arm
+        // (`loadBody` → `isQueuedOrInFlight` → `startBodyPoll` → `adoptReadyBody`) is
+        // the coordinator-DEFERRED body-arrival auto-trigger — that one gets no AI
+        // until the body lands durably and the user reopens or taps Retry. Accepted
+        // per ADR-IOS-078's residual invariant: fail-closed, non-durable, one-gesture
+        // recoverable. Do NOT widen the sweep to "fix" it — `repopulationCandidates`
+        // is window-bounded on purpose (the install-flood door).
         let opened = (try? await dbPool.read { db -> OpenedAIProcessingSnapshot? in
             try OpenedAIProcessingSnapshot.capture(headerId: message.id, db: db)
         }) ?? nil

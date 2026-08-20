@@ -267,6 +267,30 @@ struct QueueStorage<Item: Hashable> {
 
     /// Cancel all in-flight items: full reset of queue state so
     /// repopulateFromDatabase() can rebuild from GRDB.
+    ///
+    /// ⚠️ SCOPE of "can rebuild" (ADR-IOS-078 round-8 residual; comment corrected
+    /// 2026-08-20, iOS #66). This struct is SHARED by every processing queue, and
+    /// `repopulateFromDatabase()` is the OWNING ACTOR's method — its coverage is the
+    /// owner's, not this type's, and the owners do not agree. Do not read the line
+    /// above as a guarantee for the queue you happen to be in:
+    ///   • `ActiveBodyQueue.repopulateFromDatabase` is Inbox-wide and UNBOUNDED, and
+    ///     `BackfillAIQueue`'s reloads durable `pendingAIRefinement` rows, so for those
+    ///     owners the reset above really is fully rebuildable from GRDB.
+    ///   • `ActiveAIQueue.repopulateFromDatabase` runs `repopulationCandidates`, which
+    ///     is WINDOW-BOUNDED in SQL to the newest `SyncConfig.maxRecentEmails` Inbox
+    ///     rows. ADR-IOS-078's pathway regating also gave that queue WINDOW-EXEMPT
+    ///     jobs (manual open, push/NSE merge, moved-into-inbox —
+    ///     `AIJob.windowExempt`), so an exempt job on an out-of-window row is cleared
+    ///     here — queue, enqueued, inFlight, retryCount AND recentlyCompleted — and
+    ///     nothing rebuilds it. Its callers are ordinary, not exceptional
+    ///     (`SyncScheduler.cancelAllInFlightQueues` from resume recovery, the BGTask
+    ///     expiration handlers, silent push), so that exemption is best-effort within a
+    ///     foreground session.
+    /// Accepted per ADR-IOS-078's residual invariant — fail-closed, non-durable, and
+    /// repairable by one ordinary gesture (reopen/Retry re-enters the exempt direct
+    /// path). Do NOT widen `repopulationCandidates` to "fix" it: that reopens the
+    /// install-flood door the AI window exists to keep shut.
+    ///
     /// Called on foreground return to release frozen tasks' bookkeeping.
     /// Must clear recentlyCompleted — otherwise a semaphore race
     /// (frozen task holds semaphore → fresh task skips → marked "completed")

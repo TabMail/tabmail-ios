@@ -794,6 +794,19 @@ actor ActiveAIQueue {
         // past the push path (crash between write and enqueue, lost notify, etc.).
         // If the query returns rows, they're enqueued and drain continues. Only when
         // GRDB reports zero work is the queue truly idle.
+        //
+        // ⚠️ SCOPE (ADR-IOS-078 pathway regating; comment corrected 2026-08-20,
+        // iOS #66): `repopulateOnDrain` runs `repopulationCandidates`, which is
+        // WINDOW-BOUNDED in SQL to the newest `SyncConfig.maxRecentEmails` Inbox rows.
+        // The push path named above is precisely a WINDOW-EXEMPT origin
+        // (`AIJob.windowExempt`), and IMAP COPY preserves INTERNALDATE, so a message
+        // that is new to US can sort outside that window — for exactly those rows this
+        // backstop does NOT catch what slipped past. Likewise "the queue is truly idle"
+        // means "no IN-WINDOW work remains", not "no AI work remains". Accepted per
+        // ADR-IOS-078's residual invariant: fail-closed, non-durable, one-gesture
+        // recoverable (reopen/Retry re-enters the exempt direct path). Do NOT widen
+        // the sweep to "fix" it — that reopens the install-flood door the bound
+        // exists for.
         if storage.isEmpty && storage.activeJobs == 0 {
             let repopulated = await repopulateOnDrain()
             if !repopulated {

@@ -1,3 +1,18 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **⚠️ Current routing note (2026-08-20, iOS #66) — the "`repopulateFromDatabase()` recovers it" clauses below are TRUE FOR EVERY QUEUE EXCEPT `ActiveAIQueue`, whose sweep is WINDOW-BOUNDED.** The preserved body is unedited (its bytes are pinned); read this note alongside it.
+>
+> Three sentences below state boot/foreground recovery unconditionally:
+>
+> - decision 1, third bullet — *"Item is dropped from in-memory queue; `repopulateFromDatabase()` rediscovers it on next foreground."*
+> - decision 5 — *"Boot-time recovery for every queue."*
+> - rationale bullet 2 — *"Crash at any point loses only the in-memory queue — `repopulateFromDatabase()` rebuilds from durable state"*
+>
+> **What changed.** ADR-IOS-078's **pathway regating** (owner directive 2026-08-19) rescoped the newest-`SyncConfig.maxRecentEmails` Inbox window from "bounds all AI processing" to "bounds SYNC-ORIGIN admission and the repopulation sweep ONLY". `ActiveAIQueue` now also carries **WINDOW-EXEMPT** jobs — manual open, push/NSE merge and moved-into-inbox, flagged `AIJob.windowExempt`. But `ActiveAIQueue.repopulateFromDatabase` runs `ActiveAIQueue.repopulationCandidates`, which is **window-bounded in SQL**. So for exactly the out-of-window rows the exemption exists to serve, the recovery these three sentences promise **never fires**: retry exhaustion, a crash, `QueueStorage.cancelAllInFlight`, or the `canProcessAI` clear all drop such a job permanently.
+>
+> **This is a per-queue distinction, not a blanket retraction — do not flatten it.** `ActiveBodyQueue.repopulateFromDatabase` is Inbox-wide and **UNBOUNDED** (no `LIMIT`), `BackfillBodyQueue`'s is scoped but unbounded within its scope, and `BackfillAIQueue.repopulateFromDatabase` reloads **durable** `pendingAIRefinement` rows. For those owners the body's sentences hold as written. Only the AI queue's sweep carries the window.
+>
+> **Accepted, per ADR-IOS-078's residual invariant:** for an out-of-window row, exempt AI work can fail to be scheduled or be discarded before it runs — never silently wrong, never durable, always repairable by one ordinary gesture (reopen/Retry re-enters the exempt direct path). ⛔ Do **NOT** widen `repopulationCandidates` to "fix" this, and do **NOT** re-gate an exempt producer to "restore" a global bound: the AI window is the install-flood door, and it is load-bearing precisely because the BODY sweep above it is unbounded. Canonical statements: ADR-IOS-078 (§ Pathway regating) and the `IOS-AI-004` amendment.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ## ADR-IOS-027: Ever-Rolling FIFO Queues — Leave Only on Confirmed Success or Confirmed Stale
 

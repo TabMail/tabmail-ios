@@ -252,6 +252,23 @@ enum SyncConfig {
     /// Max retries per item in ActiveBodyQueue/ActiveAIQueue before dropping.
     /// Failed items move to back of FIFO, yielding to others. After max retries,
     /// item is removed from in-memory queue; repopulateFromDatabase catches it on next foreground.
+    ///
+    /// ⚠️ SCOPE of that last clause — it is TRUE of one of the two named queues and
+    /// only PARTLY true of the other (ADR-IOS-078 pathway regating; comment corrected
+    /// 2026-08-20, iOS #66). Do not flatten the distinction:
+    ///   • `ActiveBodyQueue.repopulateFromDatabase` is Inbox-wide and UNBOUNDED
+    ///     (`headerComplete = 1 AND bodyComplete = 0 AND … isInInbox = 1`, no LIMIT),
+    ///     so for the BODY queue the sentence above holds for every Inbox row.
+    ///   • `ActiveAIQueue.repopulateFromDatabase` runs `repopulationCandidates`, which
+    ///     is WINDOW-BOUNDED in SQL to the newest `SyncConfig.maxRecentEmails` Inbox
+    ///     rows. The pathway regating also gave that queue WINDOW-EXEMPT jobs (manual
+    ///     open, push/NSE merge, moved-into-inbox — `AIJob.windowExempt`), and for an
+    ///     exempt job on an OUT-OF-WINDOW row the promised recovery never fires:
+    ///     retry exhaustion drops it and no sweep brings it back.
+    /// Accepted per ADR-IOS-078's residual invariant — fail-closed, non-durable, and
+    /// repairable by one ordinary gesture (reopen/Retry re-enters the exempt direct
+    /// path). Do NOT widen the sweep to "fix" this: the AI bound is the install-flood
+    /// door, kept shut precisely because the BODY sweep above is unbounded.
     static let maxQueueRetries = 3
     /// FTS orphan prune (one-time sweep): entries paged per FTS read.
     static let ftsOrphanPruneChunk = 500
