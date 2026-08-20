@@ -84,9 +84,19 @@ within that directive's intent and are explicitly surfaced for owner veto.
 - **Window EXEMPT (arrival/user-intent bucket), carried by `AIJob.windowExempt`:**
   - *Push/NSE merge* (`NSEDataBridge`'s post-merge downstream loop): a pushed message is new mail
     the user was just notified about.
-  - *Manual open*, both body states. Body already durable/staged:
+  - *Manual open*, both body states. Body already DURABLE:
     `AccountManager.processOpenedMessage` — the window guard is removed from the co-read; the
-    `isInInbox` guard STAYS (AI processing remains inbox-scoped). Body not yet fetched: the open's
+    `isInInbox` guard STAYS (AI processing remains inbox-scoped).
+    ⚠️ **CORRECTED 2026-08-20 (iOS #66) — this clause read "Body already durable/*staged*" until
+    2026-08-20, and that attributed the coverage to the WRONG MECHANISM.**
+    `OpenedAIProcessingSnapshot.capture` reads the **durable** row only — its first guard is
+    `MessageBody.fetchOne(db, key: headerId)` — so on a STAGED body it returns nil and
+    `processOpenedMessage` returns at its `guard let opened`, a no-op regardless of the window.
+    There is no runtime consequence, because a staged body always originates from an NSE merge
+    whose post-merge downstream loop already enqueues `windowExempt: true`: the staged case is
+    covered by the *push/NSE merge* bullet above, never by this one. `IOS-AI-004` states it
+    correctly ("`processOpenedMessage`'s **cached-body** path"), so the two documents contradicted
+    each other until this correction. Body not yet fetched: the open's
     own server fetch (`AccountManager.fetchBody` → `BodyFetchProcessor.fetchAndProcess(…,
     aiWindowExempt: true)` → `flushBatch`) enqueues exempt — every `fetchBody` caller is a
     user-driven detail-view path, so this producer is user intent by construction. (The first cut
@@ -97,7 +107,11 @@ within that directive's intent and are explicitly surfaced for owner veto.
     background queue's DEFAULT (gated) `flushBatch`, and the poll's `adoptReadyBody` displays it
     without re-triggering AI — that residual is the coordinator-deferred body-arrival auto-trigger
     below, Retry-recoverable. The failure bubble's Retry is a real processing path for out-of-window
-    opens in every state.
+    opens **once the body is durable**. *(It read "in every state" until 2026-08-20, iOS #66 — false
+    for the same reason as the staged clause above: `SummaryBubbleView`'s Retry calls
+    `processOpenedMessage`, which no-ops while the `MessageBody` row does not yet exist. Retry after
+    the body lands re-enters the exempt direct path, which is what makes the poll-state residual
+    recoverable.)*
   - *Moved-into-inbox* (`AccountManager.enqueueAIForMembersThatEnteredInbox`) — **coordinator-
     ruled:** a move into the Inbox is explicit user intent on a specific message and per-gesture
     volume is tiny; gating it would recreate the "user must click the message" gap ADR-IOS-008
@@ -128,9 +142,30 @@ within that directive's intent and are explicitly surfaced for owner veto.
   window-retires. The exemption is therefore NOT unconditional; the residual is narrow, fail-closed
   (`.scopeExited` writes no `recentlyCompleted` marker, so a later exempt offer is admitted fresh)
   and one-gesture recoverable through Retry/reopen. Recorded 2026-08-19 (round-6 review).
-- **Silent push: no plumbing — coordinator-ruled.** A silent push wakes the delta sync; new mail
-  admitted through that path is by definition inside the newest-100 window, so the gate never
-  bites it and no origin flag needs to travel through the sync pipeline.
+- **Silent push: no plumbing — coordinator-ruled, then owner-CONFIRMED 2026-08-20 (iOS #68).** A
+  silent push wakes the delta sync; genuinely new mail admitted through that path is *almost always*
+  inside the newest-100 window, so the gate rarely bites it and no origin flag travels through the
+  sync pipeline.
+  ⚠️ **The absolute this bullet used to state is FALSE, and its counterexample is REACHABLE.** Until
+  2026-08-20 it read: *"new mail admitted through that path is **by definition** inside the
+  newest-100 window, so the gate never bites it"*. The window is ordered by `MessageHeader.date`,
+  and that field is **INTERNALDATE** — `IMAPProvider.mapMessageInfo` prefers the server's internal
+  date over the envelope `Date:` header — while IMAP `COPY` **preserves INTERNALDATE**. So a message
+  that another client (desktop, webmail, another device) **moves or restores into the Inbox** — out
+  of Archive, out of Trash, by a server-side filter rule — reaches this device through delta sync
+  carrying its **original** internal date, not the moment it entered the Inbox. In an Inbox holding
+  more than `SyncConfig.maxRecentEmails` messages it can therefore sort **outside** the window and
+  stay gated. This is the same decorrelation ADR-IOS-042 keys IMAP sync windows by UID for: arrival
+  order and message date are independent. The outcome is **path-dependent** — the identical message
+  arriving through the NSE merge path *is* window-exempt and does process.
+  **Owner ruling 2026-08-20, verbatim: *"this is also very rare, and mostly a budget exhaustion
+  prevention. just fix the docs to be accurate."*** So the BEHAVIOUR is confirmed as it stands and
+  **no exemption is plumbed**: a message moved into the Inbox by another client may receive **no
+  automatic summary until the user opens it**, and that is **accepted**. It satisfies the residual
+  invariant below — fail-closed, non-durable, and repairable by one ordinary gesture (opening it
+  re-enters the exempt direct path). ⛔ Do **not** "fix" this by treating a delta-sync arrival as an
+  arrival-origin event and plumbing the exemption through: that is a behaviour change, it widens the
+  door toward the install flood this ADR exists to keep shut, and it was explicitly declined.
 - **Deferred (coordinator-ruled follow-up): the body-arrival auto-trigger for the background-queue
   poll path.** When a manual open finds its body already owned by `ActiveBodyQueue`
   (`loadBody` → `isQueuedOrInFlight` → `startBodyPoll`), the body is written by the background
