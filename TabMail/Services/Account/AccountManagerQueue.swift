@@ -804,7 +804,14 @@ extension AccountManager {
     /// No AI-enabled gate: `dispatchPending` already refuses on `canProcessAI`
     /// and clears the queue, with `repopulateFromDatabase` re-discovering when
     /// conditions change. `repopulateFromDatabase` enqueues ungated for the same
-    /// reason.
+    /// reason. ⚠️ That rediscovery is WINDOW-BOUNDED (ADR-IOS-078; comment
+    /// corrected 2026-08-20, iOS #66) — `repopulationCandidates` selects only the
+    /// newest `SyncConfig.maxRecentEmails` Inbox rows, while the enqueue below is
+    /// deliberately window-EXEMPT, so for exactly the out-of-window rows this
+    /// exemption exists to serve the stated recovery does NOT fire. Accepted per
+    /// ADR-IOS-078's residual invariant: fail-closed, non-durable, one-gesture
+    /// recoverable (reopen/Retry). Do NOT widen the sweep to "fix" it, and do NOT
+    /// re-gate this producer to "restore" a global bound.
     /// `internal` (not `private`) for executable regression coverage — the same
     /// reason `resolveInboxEntryAITargets` below is: the window-exempt admission
     /// this handler performs is otherwise unreachable from a unit test.

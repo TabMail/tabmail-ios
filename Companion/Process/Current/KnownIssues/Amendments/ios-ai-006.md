@@ -16,6 +16,36 @@ empty state. See ADR-IOS-078 and the IOS-AI-004 amendment; the PROCESSING bound 
 unchanged.)
 Migration v87 retires the marker schema without rewriting the shipped v85/v86 migration ledger.
 
+⚠️ **AMENDED 2026-08-20 (iOS #66) — the two sentences above are STALE and are corrected here rather
+than deleted.** Both were true only of the 2026-08-17 rollback, and both were falsified LATER THE
+SAME DAY as the parenthetical they carry, by ADR-IOS-078's **pathway regating** (owner directive
+2026-08-19):
+
+1. *"one bounded newest-`SyncConfig.maxRecentEmails` population for automatic **and direct**
+   producers"* — **false for direct producers, which are precisely the exempted set.** The window
+   now bounds **SYNC-ORIGIN admission and the repopulation sweep ONLY**: the sync/body-pipeline
+   producer (`BodyFetchProcessor.flushBatch` fed by its gated callers) and
+   `ActiveAIQueue.repopulationCandidates`. Manual open, push/NSE merge and moved-into-inbox are
+   window-**EXEMPT** (`AIJob.windowExempt`; execution re-checks are origin-aware via
+   `ActiveAIQueue.windowRetires`). Inbox MEMBERSHIP remains an unconditional scope for every origin —
+   **window-exemption is not inbox-exemption.**
+2. *"the PROCESSING bound above is unchanged"* — **false.** It is the DISPLAY clause that was
+   replaced on 2026-08-19; the processing clause was narrowed on the same day by the regating. That
+   parenthetical asserts the opposite.
+
+What this record still resolves is untouched: PR #39's uncapped **durable** direct-AI exception is
+retired, and the exemptions above create **no durable exception state** — no marker columns, no
+triggers, no redrive. The install-flood bound the window exists for is intact.
+
+⛔ **Do not "restore" a global bound by re-gating an exempt producer.** That would silently undo the
+owner directive this amendment exists to record. Canonical statements: ADR-IOS-078 (§ Pathway
+regating) and the `IOS-AI-004` amendment.
+
+*Why this entry was skipped and is being fixed now:* its three sibling amendments (`IOS-AI-004`,
+`IOS-AI-007`, `IOS-AI-008`) and their dashboard rows were all amended on 2026-08-19 and this one,
+sitting between them, was not — a retraction whose sweep was bounded by the file set of the diff
+under review (`MIS-019` instance 40).
+
 The sections below preserve the withdrawn PR #39 candidate and its motivating failure analysis as
 historical evidence. They do not describe current runtime behavior.
 

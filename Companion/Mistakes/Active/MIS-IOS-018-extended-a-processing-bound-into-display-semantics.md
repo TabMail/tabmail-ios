@@ -26,7 +26,17 @@ question I did not ask: **does this display branch ever fire for an artifact tha
 
 `7a31f1d22` ("Restore bounded queue behavior", shipped in `v1.7.11`) implemented the owner-directed
 IOS-AI-004 bounded-processing rollback — the newest `SyncConfig.maxRecentEmails` Inbox rows are the
-only AI-eligible population. Correct, and still standing. In the same commit, `SummaryBubbleView`
+only AI-eligible population. Correct, and still standing.
+⚠️ **NARROWED 2026-08-20 (iOS #66).** That sentence was written on 2026-08-19 and was already stale
+the same day: ADR-IOS-078's **pathway regating** (owner directive, same decision train) rescoped the
+window to **SYNC-ORIGIN admission and the repopulation sweep only**. Manual open, push/NSE merge and
+moved-into-inbox are window-**EXEMPT** (`AIJob.windowExempt`), so "the only AI-eligible population"
+is no longer true of *processing* either — what still stands, and what this file is about, is that
+the bound is a PROCESSING bound and never a DISPLAY one. The display half of this record was updated
+on 2026-08-19; this processing sentence was not, which is exactly the shape `MIS-019` instance 40
+records (a retraction swept only the diff's file set). ⛔ Do not read this paragraph as licence to
+re-gate an exempt producer to "restore" a global bound — that would undo the owner directive.
+In the same commit, `SummaryBubbleView`
 gained a `recentInboxWindowContains` query and a "AI work is suppressed for older messages in large
 inboxes" notice. The notice branch ran **before** the content check, so it replaced the bubble even
 when `summaryBlurb` already held a finished summary — derived content the user already had was

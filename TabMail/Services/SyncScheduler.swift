@@ -268,7 +268,15 @@ final class SyncScheduler {
         // a suspension boundary: connections are live and in-flight AI LLM calls are
         // healthy, so cancelling them just discards calls already dispatched to the backend
         // and forces recompute (observed: foreground pushes during triage nuked the AI
-        // queue every ~30–90s). New mail still arrives via sync→enqueueBatch (dedup-safe).
+        // queue every ~30–90s). New mail still arrives via sync→enqueueBatch (dedup-safe)
+        // — but ⚠️ that recovery only ever held for IN-WINDOW work (ADR-IOS-078 round-8
+        // residual; comment corrected 2026-08-20, iOS #66). Since the pathway regating,
+        // cancelling also discards WINDOW-EXEMPT AI jobs (open, push/NSE merge,
+        // moved-into-inbox) whose rows sit outside the newest `SyncConfig.maxRecentEmails`
+        // window, and the only rebuild — `ActiveAIQueue.repopulateFromDatabase` →
+        // `repopulationCandidates` — is window-bounded in SQL, so sync→enqueueBatch does
+        // not bring those back. Accepted: the exemption is best-effort within a foreground
+        // session — fail-closed, non-durable, reopen/Retry recovers it.
         if runResumeRecovery {
             await Self.cancelAllInFlightQueues(inboxOnly: inboxOnly)
             // Connections are now fresh — allow the next continuous-foreground push to skip.

@@ -37,6 +37,14 @@ import UIKit
 /// - After max retries, job removed; repopulateFromDatabase catches on next foreground.
 /// - App crash loses in-memory queue; repopulateFromDatabase rebuilds from GRDB on next launch.
 /// - canProcessAI=false clears ephemeral queue; repopulateFromDatabase re-discovers when conditions change.
+/// - ⚠️ SCOPE of all three recoveries above (ADR-IOS-078 pathway regating; comment
+///   corrected 2026-08-20, iOS #66): they are WINDOW-BOUNDED. `repopulationCandidates`
+///   selects only the newest `SyncConfig.maxRecentEmails` Inbox rows, so a WINDOW-EXEMPT
+///   job (manual open, push/NSE merge, moved-into-inbox) on an out-of-window row is NOT
+///   re-found by any of them. Accepted per ADR-IOS-078's residual invariant: fail-closed,
+///   non-durable, and repairable by one ordinary gesture (reopen/Retry re-enters the
+///   exempt direct path). Do NOT widen the sweep to "fix" this — that reopens the
+///   install-flood door the bound exists for.
 /// Debug-gated diagnostic log for this file (global `CLAUDE.md` development
 /// rule 12). `DebugModeManager.isLoggingEnabled()` is false for every ordinary
 /// user — it requires the ten-tap unlock AND an allowed account — so in a
@@ -49,7 +57,9 @@ import UIKit
 ///
 /// Nothing here is kept ungated: every line in this file is queue tracing or a
 /// recomputable AI-derived-content failure, and an AI result that fails is
-/// re-derived by the next `repopulateFromDatabase` pass. No user intention and
+/// re-derived by the next `repopulateFromDatabase` pass (window-bounded — see the
+/// resilience contract above; an out-of-window WINDOW-EXEMPT job is instead
+/// re-derived by the user's next open/Retry). No user intention and
 /// no wire side effect is witnessed only by these.
 private func activeAILog(_ message: @autoclosure () -> String) {
     guard DebugModeManager.isLoggingEnabled() else { return }
@@ -450,7 +460,14 @@ actor ActiveAIQueue {
     /// stale connections during iOS process suspension. Without this,
     /// suspended tasks block re-processing until they eventually resume
     /// with stale connections (can take 20+ minutes of wall-clock time).
-    /// After calling this, repopulateFromDatabase() re-discovers items.
+    /// After calling this, repopulateFromDatabase() re-discovers items — but only
+    /// WINDOW-BOUNDED ones (ADR-IOS-078 round-8 residual; comment corrected
+    /// 2026-08-20, iOS #66). `repopulationCandidates` is window-bounded in SQL, and
+    /// this call clears queue/enqueued/inFlight/retryCount/recentlyCompleted outright,
+    /// so a pending or in-flight WINDOW-EXEMPT job on an out-of-window row is lost
+    /// here and not rebuilt. Its triggers are ordinary (resume recovery, BGTask
+    /// expiration, push), so the exemption is best-effort within a foreground session.
+    /// Accepted — fail-closed, non-durable, reopen/Retry re-enters the exempt path.
     func cancelAllInFlight() {
         lastCancelAt = CFAbsoluteTimeGetCurrent()
         let taskCount = inFlightTasks.count
@@ -620,6 +637,14 @@ actor ActiveAIQueue {
                 // Clear ephemeral queue — repopulateFromDatabase() re-discovers from GRDB
                 // when conditions change. Without this, items stuck in enqueued dedup set
                 // block future repopulate from re-adding them.
+                //
+                // ⚠️ SCOPE (ADR-IOS-078 pathway regating; comment corrected 2026-08-20,
+                // iOS #66): that rediscovery is WINDOW-BOUNDED — `repopulationCandidates`
+                // selects only the newest `SyncConfig.maxRecentEmails` Inbox rows — so a
+                // WINDOW-EXEMPT job (open, push/NSE merge, moved-into-inbox) on an
+                // out-of-window row is NOT re-found. Accepted per ADR-IOS-078's residual
+                // invariant: fail-closed, non-durable, one-gesture recoverable. Do NOT
+                // widen the sweep to "fix" it.
                 storage.clearAll()
                 backoff.removeAll()
                 backoffRetryCount.removeAll()

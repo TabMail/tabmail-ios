@@ -3378,6 +3378,16 @@ enum NSEDataBridge {
         // Resilience: if this detached task is dropped (app killed), the message
         // is re-discovered by `ActiveAIQueue.repopulateFromDatabase` on the next
         // foreground poll — the enqueue is an optimization, not the only path.
+        // ⚠️ ...but only WITHIN THE WINDOW (ADR-IOS-078 pathway regating; comment
+        // corrected 2026-08-20, iOS #66). `repopulationCandidates` selects only the
+        // newest `SyncConfig.maxRecentEmails` Inbox rows, while the AI enqueue below
+        // is deliberately window-EXEMPT (a pushed message is new mail the user was
+        // just notified about). A pushed message whose INTERNALDATE puts it outside
+        // that window — IMAP COPY preserves INTERNALDATE, so a message another client
+        // moved into the Inbox can be new to US and old by date — is therefore NOT
+        // re-discovered if this task is dropped. Accepted per ADR-IOS-078's residual
+        // invariant: fail-closed, non-durable, one-gesture recoverable (opening it
+        // re-enters the exempt direct path). Do NOT widen the sweep to "fix" it.
         let downstream: [(headerId: String, accountId: String, isInInbox: Bool)] =
             confirmedItems.map { ($0.item.headerId, $0.header.accountId, $0.header.isInInbox) }
         Task.detached(priority: .utility) {
