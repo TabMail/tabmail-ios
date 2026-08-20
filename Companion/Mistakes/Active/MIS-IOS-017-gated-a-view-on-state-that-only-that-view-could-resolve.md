@@ -1,8 +1,8 @@
 # MIS-IOS-017 — gated a view on async state that only that same view's lifecycle could resolve, so the unresolved state erased its own resolver
 
 **Class:** UI / lifecycle · shipped-release regression
-**Severity:** critical (user-visible feature invisible in a LIVE App Store release, `v1.7.11`; a
-9,197-test green suite certified it)
+**Severity:** critical (user-visible feature invisible in a LIVE App Store release, `v1.7.11`;
+**15 green tests over the exact broken function** certified it — see the census below)
 **First seen:** 2026-08-19 · **Recurrences:** 1 · **Status:** Active
 **Related:** `PROJECT_MEMORY.md` topic *Stuck-`isLoading` rule — async view loads must defer-clear
 their spinner flag, and `.task` must NOT hang on the conditional it flips* (the same class, one
@@ -81,6 +81,16 @@ is a different predicate over the same set and has to be evaluated per test (`MI
 17 is the count *after* this fix added its own tests — the census had counted its own recording
 (`MIS-033`). The shipped numbers are 15 / 12, measured with `grep -c` against
 `git show <shipped-ref>:TabMailTests/Views/SummaryBubbleViewTests.swift`, not against the working tree.
+
+⚠️ **A third count in this entry was wrong, and it was the easiest one to believe: the severity line
+originally read "a 9,197-test green suite certified it".** That whole-suite figure appears in **no
+test log in this investigation** — grepping every run log for it returns nothing. It was a
+plausible-looking number carried in from memory, and it survived two rounds of cross-model review
+because a suite-wide total reads as background colour rather than as a claim. The measured figures
+are 9,240 with this fix and therefore 9,237 before it (this commit adds exactly 3 tests: 15 → 18 in
+this file). **The rule: a number is a claim. If it did not come from a command run in THIS
+investigation, either re-measure it or delete it** — and prefer the number that carries the argument
+(here, the 15 tests over the broken function) over the impressive one that does not.
 
 ## The countermeasure
 
