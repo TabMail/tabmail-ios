@@ -62,6 +62,53 @@ Nothing above is retracted except the one over-claim corrected at the end of thi
 
 **Remaining, honestly stated: a cross-process TOCTOU we shrink but do not eliminate.** The notification-service extension writes the IDENTICAL Keychain item (service `ai.tabmail.ios`, access group `group.ai.tabmail`, account `tabmail_session`) from a SEPARATE PROCESS via `NSETokenManager.performRefresh` → `SharedKeychain.setSession`. `@MainActor` cannot serialize another process. The same auth-safe predicate now runs on the NSE side too, which shrinks the window to the gap between that process's read and its write — it does not close it. A genuine fix needs a Keychain-level compare-and-swap, which `SecItemUpdate` does not offer. The NSE predicate is not unit-tested: `NSETokenManager.swift` is not a member of the `TabMailTests` target (only `NSEStagingDB`, `NSEMessageMetadata`, `NSEConfig`, `NSELog`, `SharedNSEData` are), and adding it would pull `SharedKeychain` and its Security-framework dependency into the test target for a mirrored three-line predicate. Recorded as a known coverage gap rather than closed.
 
+## 🔴 THE COUNTERWEIGHT WAS FALSE; THE RESIDUAL IS SHARPER THAN RECORDED; #16 CLOSED AND THE WORKER HALF FILED (2026-08-20)
+
+Nothing above is retracted except the one counterweight sentence corrected in §1, which was **false**, and the "already in flight" claim corrected in §3, which was **unsupported**. GitHub [#16](https://github.com/TabMail/tabmail-ios/issues/16) is **CLOSED** by owner decision on this date; the residual is not withdrawn but **refiled where the state actually lives** (§3).
+
+**Search terms for this correction:** consent KV has no TTL; `putConsent` no `expirationTtl`; `consent:<provider>:<email>`; `KV_PUSH_TOKENS`; encrypted refresh token retained indefinitely; `last-classified` 7-day cursor; `consent-error-notified` 24-hour flag; TTL attached to the wrong key; ADR-004 zero-retention posture; stranded consent record; user-keyed purge did not exist; `tabmail-push-worker#1`; `tabmail-billing-worker#3`; three stranding paths; different user signs in strands A's debt.
+
+### 1. The counterweight sentence is factually wrong — the consent record has NO TTL
+
+The 2026-08-18 and 2026-08-19 sections above both say, verbatim: *"consent KV expires in 7 days and provider subscriptions self-heal"*. **The first half is false.** Verified directly in `tabmail-push-worker/src/helpers/consentStore.ts`:
+
+- `putConsent` writes `env.KV_PUSH_TOKENS.put(consentKey(provider, email), ciphertext)` with **no options argument at all** — there is no `expirationTtl`, so the record is permanent until something explicitly deletes it. The zero-downtime rotation re-write inside `getConsent` (PREV-key → PRIMARY-key re-encrypt) puts it back the same way, also with no TTL, so a record that is merely *read* stays permanent too.
+- The only two TTLs in that file belong to **different keys**: `putLastClassifiedCursor` sets **7 days** on the `last-classified:<provider>:<email>` delta cursor (matching Gmail's documented `historyId` validity window), and `markConsentErrorNotified`'s `consent-error-notified:…` flag gets **24 hours**. **Neither is the consent record.** The "7 days" in the counterweight is the delta cursor's TTL, attached to the wrong key.
+- **The `sub:` half of the sentence IS correct, and is the only half that survives.** `handleCron` in `tabmail-push-worker/src/handlers/cron.ts` enumerates every subscription every 6 hours and calls `deleteSubscription` for any whose `expiresAt` has passed, so the `sub:` record in `KV_PUSH_SUBSCRIPTIONS` does go away once the provider watch lapses (~7 d Gmail, ~3 d Outlook).
+
+### 2. The consequence, stated plainly — an indefinitely retained provider credential
+
+`ConsentRecord` is `{ refreshToken, accessToken?, expiresAt?, userId?, storedAt }`. So a stranded consent record **retains an encrypted provider OAuth refresh token indefinitely**. Not a cursor, not an APNs device token: a live credential for a mailbox the user has already removed from the device.
+
+That makes it **the sharpest retention instance in this record's residual**, and it sits *alongside* the already-known TTL-less records rather than replacing them — the device records and the `acct:<uid>:<deviceId>:<email>` per-(device, account) rows in `KV_PUSH_TOKENS`, and the `imap:sub:<userId>:<accountEmail>` `ImapSubscriptionRecord` in `KV_IMAP_SUBSCRIPTIONS` (whose live idle-proxy IDLE socket is the residual already named above) all carry no TTL either.
+
+⚠️ **Be precise about which rule this offends — do not over-claim it as an ADR-004 breach.** Root `DECISIONS.md` ADR-004 forbids storing *email content, email metadata and mailbox data*, and explicitly permits the server to store *auth metadata*; an encrypted refresh token is auth metadata, so this is not a violation of ADR-004's letter. What it offends is the zero-retention **posture** ADR-004 exists to express: an indefinitely retained provider credential for a mailbox the user removed is exactly the at-rest user state the policy is meant to prevent — and the consent surface's own sibling code assumes it does not exist. `handleCron`'s comment reads *"Cannot renew server-side (zero-retention policy = no stored OAuth tokens)"*, which is true of the subscribe path and false of the consent path **in the same worker**.
+
+**Why the error matters more than its size.** The false half was doing counterweight WORK: it is what made *"the debt stays durable and only the same user signing in again can discharge it"* read as tolerable, and it survived two amendment rounds and a full review round unchallenged. A reassuring sentence is not audited the way a claim of harm is. **A residual is only as narrow as its narrowest TRUE bound** — same defect class as the 2026-08-19 over-claim correction above, and the second instance in this record.
+
+### 3. The worker-side capability did NOT already exist — and is now filed
+
+The 2026-08-18 section says the user-keyed purge *"is in flight in the push-worker and billing-worker trees"*. **That was unsupported by either tree.** Verified at this date: `tabmail-push-worker/src/index.ts`'s route table contains **no purge route of any kind** (its `/push-consent/*/revoke`, `/unsubscribe` and `/unsubscribe-imap` routes are per-account, not user-keyed); the billing-worker tree contains **zero** references to the push worker (`push-worker`, `push.tabmail.ai`, `KV_PUSH*` all return nothing) and its only `services` binding is `ADMIN_WORKER`; there is **no service binding between the two workers**, no WIP branches, and no pre-existing issues on either repo. Nothing was in flight. The claim should never have been written without checking the trees it named.
+
+**It is filed now**, split by genuine ownership rather than by which tree noticed it:
+
+- [`TabMail/tabmail-push-worker#1`](https://github.com/TabMail/tabmail-push-worker/issues/1) — **owns the state**: `KV_PUSH_TOKENS` (`consent:`, `acct:`, device records), `KV_PUSH_SUBSCRIPTIONS` (`sub:`), `KV_IMAP_SUBSCRIPTIONS` (`imap:sub:`), and the droplet IDLE sockets those records keep alive. The purge capability has to live here because this is the only worker that can enumerate and delete them.
+- [`TabMail/tabmail-billing-worker#3`](https://github.com/TabMail/tabmail-billing-worker/issues/3) — **owns the deletion lifecycle**: `processExpiredDeletions` and the hourly cron (`"0 * * * *"`) are what know a grace period has expired, which is the only moment the permanent-deletion case can be acted on.
+
+The split is the load-bearing part: **neither worker can close the case alone**, which is exactly why this half was never an iOS change and why #16's remaining scope belongs on those repos rather than on `tabmail-ios`.
+
+### 4. There are THREE stranding paths, not two
+
+Read together, the sections above enumerate three ways the debt strands. The third is easy to miss because 2026-08-19 states it as a *consequence* of the pinning fix rather than as a list item:
+
+1. **Offline at sign-out** (2026-08-18) — the bounded flush fails exactly as the removal-time attempt did; the debt stays durable and idempotent, and only the same user signing in again discharges it.
+2. **Permanent TabMail account deletion** (2026-08-14) — after the grace-period hard delete the bound user can never authenticate again, so **no iOS-side handoff can ever reach it**.
+3. **A different user signs in** (2026-08-19) — once identity is pinned to the pass, A's remaining actions are RETAINED rather than sent under B's bearer. That is the correct outcome (retained beats a false discharge or a cross-user worker-state mutation), but it means **B's sign-in strands A's debt**, so A's absence is no longer the only cause. Recorded here as a numbered path so a future census of this record cannot miss it.
+
+A fourth case is **deliberately not one of these and must not be counted as one**: removal while already signed out records `actions = [.localArtifacts]` and stays local-only **by design**, because claiming that debt later by email would weaken the ownership binding that protects a shared-address co-owner. That is an accepted design limitation, not a failure of the flush.
+
+All three paths are now backstopped **only** by the worker-side purge filed in §3. With `consent:` proven TTL-less, *"it expires anyway"* is available for the `sub:` record and for nothing else.
+
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
 > Routed from `KNOWN_ISSUES.md` line 1445 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).
 

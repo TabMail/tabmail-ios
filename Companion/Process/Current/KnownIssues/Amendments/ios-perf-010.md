@@ -1,6 +1,6 @@
 # IOS-PERF-010
 
-- Register classification: `open`
+- Register classification: `accepted`
 - New post-freeze record (2026-08-12) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
@@ -10,6 +10,14 @@
 `SearchView` members are fixed and the complete by-state inventory is discharged below. Classification
 remains **open** only for the explicitly classified synchronous survivors and their required
 state-machine/evidence work; do not close GitHub #13 from this change.
+
+⚠️ **SUPERSEDED DISPOSITION (2026-08-20) — this record is now `accepted`, not `open`, and GitHub #13 is
+CLOSED by owner decision, referencing PR #57.** Everything above stays true and still governs; only the
+disposition moved. The instruction *"do not close GitHub #13 from this change"* was correct for the
+change it was written about (2026-08-17/18) and is spent, not withdrawn — the owner closed #13 from a
+LATER judgement that the audit is complete, not from that change. Read *🧾 OWNER DISPOSITION 2026-08-20*
+at the end of this file for the decision, the per-member classification table it does NOT relax, and the
+reopening bar.
 
 ## 2026-08-14 implementation and residual
 
@@ -108,6 +116,11 @@ than a false success. SQL remains one `UPDATE account ... WHERE id = ?`; query c
 index requirements are unchanged.
 
 **Consciously classified survivors — keep this record and GitHub #13 open.**
+
+> ⚠️ **The "keep GitHub #13 open" half of that heading is SUPERSEDED (2026-08-20): #13 is CLOSED and this
+> record is `accepted`. The "consciously classified survivors" half is NOT — every classification,
+> proof, trip-wire and DO-NOT-TOUCH instruction below is unchanged and still binding.** See
+> *🧾 OWNER DISPOSITION 2026-08-20* at the end of this file.
 
 - `SearchView.openResult` remains one indexed one-row lookup on an explicit tap. The synchronous
   overload intentionally skips the async read-through NSE merge, which has measured multi-second
@@ -340,3 +353,60 @@ pool, not by the query.
 This strengthens rather than changes the row's disposition. `IOS-PERF-011` remains the cheapest member
 to close (mechanical, no UX trade-off); this one sits behind the same `async` conversion question as
 `legacyLocalSearch`, because it feeds the same synchronous result assignment.
+
+## 🧾 OWNER DISPOSITION 2026-08-20 — AUDIT COMPLETE; ACCEPTED LIMITATION; GitHub #13 CLOSED
+
+**Owner decision (2026-08-20): the audit this record owed is COMPLETE, the record moves from `open` to
+ACCEPTED LIMITATION, and GitHub issue [#13](https://github.com/TabMail/tabmail-ios/issues/13) is CLOSED
+by that decision**, referencing PR [#57](https://github.com/TabMail/tabmail-ios/pull/57) — *"Pin the
+Undo-Send synchronous-write invariants and harden the IOS-PERF-010 guardrails"*, merged 2026-08-19. No
+production behaviour changed with this disposition. Everything recorded above stays true and still
+governs; only the disposition moved.
+
+**Nothing was fixed by this disposition, and nothing was reclassified into safety.** The five surviving
+synchronous `@MainActor` writes are exactly the five enumerated above, and they are **NOT one family**:
+
+| # | Member | Family | Classification |
+|---|---|---|---|
+| 1 | `AccountDetailView.setFolderRole(_:role:)` | folder-role (Settings) | inconclusive / **DO NOT TOUCH** |
+| 2 | `AccountDetailView.assignRole(_:to:)` | folder-role (Settings) | inconclusive / **DO NOT TOUCH** |
+| 3 | `AccountDetailView.clearRole(_:)` | folder-role (Settings) | inconclusive / **DO NOT TOUCH** |
+| 4 | `AccountManager.retryOutboxMessage(_:)` | Undo-Send / outbox | inconclusive / **DO NOT TOUCH** |
+| 5 | `AccountManager.discardOutboxMessageConfirmed(_:)` | Undo-Send / outbox | **MUST STAY SYNCHRONOUS** |
+
+⚠️ **Read the table before restating the count.** Summarising these as "the five Undo-Send writes", or
+as five members of one hazard, is wrong in both directions and has already been done once:
+
+- **Only TWO of the five are on the Undo-Send / outbox path** — members 4 and 5, both `nonisolated func`
+  declared in the file `AccountManagerOutbox.swift` on `actor AccountManager` (that file is a single
+  `extension AccountManager`, so `AccountManagerOutbox` is not a type). **The other three are folder-role
+  writes on a Settings path** and have no undo race at all.
+- **The two families have DIFFERENT hazards.** Members 4–5: Proof A's Δ-eroded undo budget and the
+  `IOS-OUTBOX-006` end state — a *delivered* message for which the user was shown "Couldn't undo" with
+  the Undo button already gone; nothing recovers the delivered mail. Members 1–3: the loss of **gesture
+  order == durable order**, i.e. a **NEVER DROP USER INTENTION** violation in which two unstructured
+  `Task { await write }` land out of tap order and the user's EARLIER intention silently wins.
+- **Only member 5 is MUST STAY SYNCHRONOUS.** The other four are **inconclusive**, which is a different
+  verdict from "safe": it means no proof was produced in either direction. Member 4 is the weakest of
+  the four — its durable admission is a SQL CAS that survives conversion and it does not rewrite
+  `holdUntil`, so Proof A does not reach it — and it is still no-touch, held synchronous for symmetry
+  with its pair.
+- **Both families already carry their exit route, so neither is unfinished audit work.** Members 1–3
+  have a documented conversion path: a **per-account serial tail modelled on
+  `AccountFieldPersistenceStore`**, never a bare `Task { await write }` (roles need per-ACCOUNT keying
+  because the row sets overlap, so that store's keying does not transfer unchanged). Member 4 carries a
+  recorded **trip-wire**: if `retryOutboxMessage` ever starts writing `holdUntil` it moves under Proof A
+  and its inconclusive classification lapses.
+- `IOS-SETTINGS-002` stays `accepted` and is unaffected, exactly as recorded above.
+
+**What closing #13 does and does not mean.** It retires a tracker row whose remaining work is no longer
+an audit — the by-state census is discharged, revision-bound at `98dde448b` and re-verified at
+`cdf11a6e5` — but a set of deliberate design decisions plus four inconclusive verdicts that need device
+evidence nobody has. **This record is now the fence.** The reopening bar is unchanged and unrelaxed by
+this disposition: a measured, user-visible stall attributable to a NAMED member. There is still **no
+`Thread Performance Checker` evidence in-tree** for any of the five, and per `IOS-PERF-011` *"fast when
+uncontended does NOT refute it"* — the exposure stays real-but-unmeasured, and the census stays
+revision-bound rather than a certification.
+
+⚠️ **Do not read `accepted` as "these five are now fine to convert."** The per-member classifications
+are the operative instruction; the disposition line is not.
