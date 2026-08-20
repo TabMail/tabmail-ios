@@ -805,7 +805,10 @@ extension AccountManager {
     /// and clears the queue, with `repopulateFromDatabase` re-discovering when
     /// conditions change. `repopulateFromDatabase` enqueues ungated for the same
     /// reason.
-    private func enqueueAIForMembersThatEnteredInbox(
+    /// `internal` (not `private`) for executable regression coverage — the same
+    /// reason `resolveInboxEntryAITargets` below is: the window-exempt admission
+    /// this handler performs is otherwise unreachable from a unit test.
+    func enqueueAIForMembersThatEnteredInbox(
         key: String, folderPath: String, context: DrainContext
     ) async {
         let entries = context.enteredInbox.withLock { $0.removeValue(forKey: key) } ?? []
@@ -825,9 +828,19 @@ extension AccountManager {
         }
         // Per-item `enqueue` (S + R, with A chained by the summary job) mirrors
         // the sibling event-driven site, `BodyFetchProcessor.flushBatch`'s
-        // `enableAI && item.isInInbox` arm.
+        // `enableAI && item.isInInbox` arm — EXCEPT the window: a move into the
+        // Inbox is explicit user intent on a specific message, so it is
+        // window-exempt (ADR-IOS-078 pathway regating, coordinator-ruled
+        // 2026-08-19); gating it would recreate the user-must-click gap
+        // ADR-IOS-008 decision 3 closed. `flushBatch`'s DEFAULT (background/sync)
+        // path stays gated — it is the sync-origin producer the install-flood
+        // bound exists for (that same function is dual-origin: the user-open body
+        // fetch passes `aiWindowExempt: true`, but that is a different caller).
+        // The executor still retires any job whose message has LEFT the Inbox
+        // (membership is unconditional; only the newest-100 rank is waived).
         for item in resolved {
-            await ActiveAIQueue.shared.enqueue(headerId: item.headerId, accountId: item.accountId)
+            await ActiveAIQueue.shared.enqueue(
+                headerId: item.headerId, accountId: item.accountId, windowExempt: true)
         }
         queueLog("[MoveTrace] entered inbox — enqueued AI for \(resolved.count) member(s) in \(folderPath)")
     }

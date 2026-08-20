@@ -404,12 +404,15 @@ extension AccountManager {
         // the caller's (possibly stale) snapshot — the caller's `observedUidValidity`
         // could predate a resync. Zero extra round trips: the body read was already
         // here.
+        //
+        // ADR-IOS-078 pathway regating (owner directive 2026-08-19): a manual
+        // open is window-EXEMPT — the `recentInboxWindowContains` guard that
+        // used to run inside this read is removed, so opening (or the failure
+        // bubble's Retry on) an out-of-window Inbox message now processes it.
+        // The `isInInbox` guard below STAYS: AI processing remains inbox-scoped;
+        // the exemption removed the window, not the scope.
         let opened = (try? await dbPool.read { db -> OpenedAIProcessingSnapshot? in
-            guard try ActiveAIQueue.recentInboxWindowContains(
-                headerId: message.id,
-                db: db
-            ) else { return nil }
-            return try OpenedAIProcessingSnapshot.capture(headerId: message.id, db: db)
+            try OpenedAIProcessingSnapshot.capture(headerId: message.id, db: db)
         }) ?? nil
         // body not yet fetched — fetchBody will trigger processMessage
         guard let opened, opened.current.isInInbox else { return }
@@ -441,6 +444,16 @@ extension AccountManager {
                 // address, but immediately let the ordinary queue rediscover
                 // the current Inbox row instead of leaving the UI spinning
                 // until an unrelated later maintenance pass.
+                //
+                // SCOPE (ADR-IOS-078): this rediscovery is WINDOW-BOUNDED —
+                // `repopulationCandidates` selects only the newest
+                // `SyncConfig.maxRecentEmails` Inbox rows — so for an
+                // OUT-OF-WINDOW row it is a no-op. Before the pathway regating
+                // this branch was unreachable for such rows (the removed window
+                // guard returned nil from the co-read first); the exemption made
+                // it reachable. Fail-closed and one-gesture recoverable: reopen
+                // or Retry re-enters this exempt path. Registered as a residual
+                // in ADR-IOS-078 / IOS-AI-004.
                 await ActiveAIQueue.shared.repopulateFromDatabase()
             }
             return

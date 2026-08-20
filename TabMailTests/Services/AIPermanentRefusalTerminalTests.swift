@@ -370,12 +370,35 @@ struct AIPermanentRefusalTerminalTests {
         let reply = ActiveAIQueue.AIJob(
             headerId: Self.headerId, accountId: Self.accountId, jobType: .reply)
 
+        // Two things make this assertion mean what it says, and BOTH were missing
+        // before (the round-6 review found this test vacuous):
+        //  1. `windowExempt: true` — the window guard sits BEFORE the memo filter
+        //     in `enqueue`, and this suite's headerId is absent from
+        //     `AppDatabase.syncPool`, so a GATED offer returns at the window guard
+        //     and leaves the queue idle without the memo ever being consulted.
+        //     Since ADR-IOS-078 the memo filter also governs every EXEMPT
+        //     admission (open / push / move), so that is the live path to pin.
+        //  2. Dispatch suppression — otherwise `dispatchPending`'s `canProcessAI`
+        //     arm clears the queue in the test environment, so `isIdle` would read
+        //     true even if the memo had failed and both jobs had been admitted.
+        await queue.setDispatchSuppressedForTesting(true)
         await queue.noteUnattributableForTesting(summary)
         await queue.noteUnattributableForTesting(reply)
-        await queue.enqueue(headerId: Self.headerId, accountId: Self.accountId)
+        await queue.enqueue(
+            headerId: Self.headerId, accountId: Self.accountId, windowExempt: true)
         let idle = await queue.isIdle
         #expect(idle,
                 "a structurally-refused job must not be re-armed by the drain-time repopulate")
+
+        // Non-vacuity control (the other side): the SAME exempt admission path, on
+        // a headerId carrying no refusal memo, DOES admit — proving the idleness
+        // above is memo-caused, not the exempt path being inert in this environment.
+        await queue.enqueue(
+            headerId: Self.headerId + "-unrefused", accountId: Self.accountId,
+            windowExempt: true)
+        let control = await queue.queuedJobsForTesting
+        #expect(!control.isEmpty,
+                "control: an exempt offer with no refusal memo must be admitted")
 
         await queue.rearmUnattributableJobs()
         let remaining = await queue.unattributableJobCountForTesting

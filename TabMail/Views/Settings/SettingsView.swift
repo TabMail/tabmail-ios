@@ -111,7 +111,7 @@ struct SettingsView: View {
                         Label("Your inbox works best as a task queue", systemImage: "archivebox")
                             .font(.subheadline)
                             .fontWeight(.medium)
-                        Text("You have \(oldMessageCount) email\(oldMessageCount == 1 ? "" : "s") older than \(SyncConfig.archiveAgeDays) days in your inbox. Archiving old emails keeps your inbox focused on what needs your attention now. AI processing is limited to your \(SyncConfig.maxRecentEmails) most recent emails.")
+                        Text("You have \(oldMessageCount) email\(oldMessageCount == 1 ? "" : "s") older than \(SyncConfig.archiveAgeDays) days in your inbox. Archiving old emails keeps your inbox focused on what needs your attention now. Emails are processed by AI automatically for your \(SyncConfig.maxRecentEmails) most recent — older ones are still processed when you open them, when they arrive, or when you move them to your inbox.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }

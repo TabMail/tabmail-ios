@@ -64,6 +64,28 @@ actor ActiveAIQueue {
         let headerId: String
         let accountId: String
         let jobType: JobType
+        /// ADR-IOS-078 pathway regating (owner directive 2026-08-19): the
+        /// newest-`SyncConfig.maxRecentEmails` window bounds SYNC-ORIGIN
+        /// admission only. Arrival/user-intent origins — push/NSE merge,
+        /// moved-into-inbox, and the user-open body fetch (`fetchBody` →
+        /// `fetchAndProcess(aiWindowExempt: true)` → `flushBatch`) — enqueue with
+        /// `windowExempt: true`, and the execution-time re-checks
+        /// (`windowRetires`) honor it end-to-end.
+        /// Context, not identity: excluded from `==`/`hash(into:)` below, so an
+        /// exempt job dedupes against its gated twin and the backoff
+        /// dictionaries treat them as one job — and on that dedupe the exemption
+        /// WINS: `enqueue` upgrades a pending gated twin in place
+        /// (`QueueStorage.replacePending`), never the reverse. In-memory only
+        /// (the queue repopulates from GRDB on launch), so no persistence
+        /// migration.
+        let windowExempt: Bool
+
+        init(headerId: String, accountId: String, jobType: JobType, windowExempt: Bool = false) {
+            self.headerId = headerId
+            self.accountId = accountId
+            self.jobType = jobType
+            self.windowExempt = windowExempt
+        }
 
         enum JobType: String, Hashable {
             case summary
@@ -79,6 +101,27 @@ actor ActiveAIQueue {
         static func == (lhs: AIJob, rhs: AIJob) -> Bool {
             lhs.headerId == rhs.headerId && lhs.jobType == rhs.jobType
         }
+    }
+
+    /// The execution-time window policy (ADR-IOS-078 pathway regating): a job
+    /// admitted under the sync-origin bound retires when it ages out of the
+    /// newest-`SyncConfig.maxRecentEmails` Inbox window; a window-exempt job
+    /// (push/NSE merge, moved-into-inbox, user-open body fetch) is never
+    /// window-retired. Used by BOTH
+    /// execution-time re-check sites (`executeJob`, `readJobOutcome`) so they
+    /// cannot drift apart. Inbox MEMBERSHIP is a separate, unconditional scope
+    /// check at both sites — window-exemption is not inbox-exemption.
+    nonisolated static func windowRetires(job: AIJob, inRecentWindow: Bool) -> Bool {
+        !inRecentWindow && !job.windowExempt
+    }
+
+    /// The action job chained after a summary job (both the LLM-completion and
+    /// the cache-hit chain sites). Inherits the parent's `windowExempt` — an
+    /// exempt summary's action must not be killed by the window the summary was
+    /// exempted from.
+    nonisolated static func chainedActionJob(after job: AIJob) -> AIJob {
+        AIJob(headerId: job.headerId, accountId: job.accountId,
+              jobType: .action, windowExempt: job.windowExempt)
     }
 
     /// Shared queue bookkeeping (FIFO, dedup, retry, concurrency).
@@ -173,33 +216,94 @@ actor ActiveAIQueue {
     // MARK: - Public API
 
     /// Enqueue an inbox message for AI processing after its body is written to FTS.
-    /// Called by ActiveBodyQueue (backfill) and AccountManagerFetch (user-opened, if needed).
+    /// Callers: `BodyFetchProcessor.flushBatch` (`enableAI && item.isInInbox` —
+    /// DUAL-origin: window-gated for its background/sync feeders, exempt when the
+    /// user-open fetch passes `aiWindowExempt: true`), `NSEDataBridge`'s
+    /// post-merge downstream loop (push/NSE merge — `windowExempt: true`), and
+    /// `AccountManager.enqueueAIForMembersThatEnteredInbox` (moved-into-inbox —
+    /// `windowExempt: true`).
     /// Enqueues S + R only. Action is enqueued by the summary job on completion
     /// (action depends on summary — no point queuing it before summary exists).
     /// Dispatches immediately — no debounce. Matching TB's kickDelayMs: 0.
-    func enqueue(headerId: String, accountId: String) async {
-        // One admission rule for every producer. Direct opens, pushes and moves
-        // must not bypass the same recent-Inbox window used by repopulation;
-        // otherwise an old row can enter the retrying queue even though the
-        // executor will never process it.
-        let eligible = (try? await dbPool.read { db in
-            try Self.recentInboxWindowContains(headerId: headerId, db: db)
-        }) ?? false
-        guard eligible else {
-            activeAILog("[ActiveAI] Suppressed \(Self.logId(headerId)) outside recent Inbox window")
-            return
+    func enqueue(headerId: String, accountId: String, windowExempt: Bool = false) async {
+        // ADR-IOS-078 pathway regating (owner directive 2026-08-19): the
+        // newest-window bound applies to SYNC-ORIGIN producers only — it exists
+        // to stop the first-install flood (`ActiveBodyQueue.repopulateFromDatabase`
+        // is Inbox-wide and unbounded). Arrival/user-intent producers pass
+        // `windowExempt: true`. Inbox scope is then held by the executor's
+        // UNCONDITIONAL `message.isInInbox` re-check — that re-check is the
+        // load-bearing guard, NOT a producer-side one. Two of the three exempt
+        // producers do also check for themselves (`flushBatch`'s
+        // `enableAI && item.isInInbox`, `NSEDataBridge`'s `item.isInInbox`), but
+        // `enqueueAIForMembersThatEnteredInbox` deliberately does NOT:
+        // `inboxEntryAITargetSQL` scopes by accountId + folderPath + RFC identity
+        // and omits the `isInInbox` column on purpose, because a redundant
+        // conjunct in a correctness guard can mask the failure of the one that
+        // matters. Before this regating the window check happened to supply an
+        // admission-time inbox filter for that producer; the exempt path removed
+        // it, and the executor's re-check is what now covers it (fail-closed at
+        // `.scopeExited`, no model call).
+        if !windowExempt {
+            let eligible = (try? await dbPool.read { db in
+                try Self.recentInboxWindowContains(headerId: headerId, db: db)
+            }) ?? false
+            guard eligible else {
+                activeAILog("[ActiveAI] Suppressed \(Self.logId(headerId)) outside recent Inbox window")
+                return
+            }
         }
         let jobs = [
-            AIJob(headerId: headerId, accountId: accountId, jobType: .summary),
-            AIJob(headerId: headerId, accountId: accountId, jobType: .reply),
+            AIJob(headerId: headerId, accountId: accountId, jobType: .summary, windowExempt: windowExempt),
+            AIJob(headerId: headerId, accountId: accountId, jobType: .reply, windowExempt: windowExempt),
         ]
         var added = 0
+        var upgraded = 0
         for job in jobs where !unattributableJobs.contains(job) {
-            if storage.enqueue(job) { added += 1 }
+            switch admitOrUpgrade(job) {
+            case .added: added += 1
+            case .upgraded: upgraded += 1
+            case .rejected: break
+            }
         }
-        guard added > 0 else { return }
-        BackgroundSyncLogger.logAIProcessing("Enqueued \(Self.logId(headerId)) (\(added) jobs, total: \(storage.count))")
+        guard added > 0 || upgraded > 0 else { return }
+        if added > 0 {
+            BackgroundSyncLogger.logAIProcessing("Enqueued \(Self.logId(headerId)) (\(added) jobs, total: \(storage.count))")
+        }
+        if upgraded > 0 {
+            BackgroundSyncLogger.logAIProcessing("Upgraded \(Self.logId(headerId)) (\(upgraded) pending job(s) now window-exempt)")
+        }
         scheduleDispatch()
+    }
+
+    /// The single admission-with-dedupe-upgrade primitive. Every enqueue that can
+    /// carry `windowExempt` — the batch `enqueue` loop above AND the action-chain
+    /// sites (`chainActionJob`) — must route through here, or the exemption is
+    /// swallowed at whichever site forgot it. `windowExempt` is excluded from job
+    /// identity, so a plain `storage.enqueue` of an exempt job silently dedupes
+    /// against a still-pending gated twin (a sync-origin job admitted in-window
+    /// that aged out, or a gated action from `enqueueBatch`) and leaves the stored
+    /// job gated — then `windowRetires` kills it at execution, dropping the arrival
+    /// event. Exemption WINS on dedupe and only ever upgrades: the reverse (a gated
+    /// offer over a pending exempt job) returns `.rejected` and never downgrades.
+    /// (Round-1 review fixed this for the S/R path; round-2 found the same class at
+    /// the chain sites — ADR-IOS-078.)
+    private enum AdmitResult { case added, upgraded, rejected }
+    private func admitOrUpgrade(_ job: AIJob) -> AdmitResult {
+        if storage.enqueue(job) { return .added }
+        if job.windowExempt, storage.replacePending(with: job) { return .upgraded }
+        return .rejected
+    }
+
+    /// Enqueue the action job chained after a summary (both the fresh-completion
+    /// and the cache-hit sites call this), applying the exemption-wins dedupe
+    /// upgrade. An exempt summary's chained action MUST be able to upgrade a gated
+    /// action twin already pending from `enqueueBatch`; a plain `storage.enqueue`
+    /// here rejected it and let the window retire the action half of every
+    /// arrival-origin job (round-2 review finding).
+    func chainActionJob(after job: AIJob) {
+        if admitOrUpgrade(Self.chainedActionJob(after: job)) != .rejected {
+            scheduleDispatch()
+        }
     }
 
     /// Enqueue multiple messages at once (e.g., from repopulate).
@@ -223,7 +327,10 @@ actor ActiveAIQueue {
     /// Finds inbox messages that have body in FTS but are missing summary/action.
     /// Only the most recent `SyncConfig.maxRecentEmails` inbox messages are considered,
     /// matching TB's inboxManagement.maxRecentEmails cap. Older messages in large
-    /// inboxes are not AI-processed to save LLM tokens and battery.
+    /// inboxes are not picked up BY THIS SWEEP, to save LLM tokens and battery — but
+    /// they are still processed on arrival/user intent (open, push/NSE merge, move
+    /// into the Inbox), which are window-EXEMPT since ADR-IOS-078. This bound is
+    /// sync-origin only; it is not a global cap.
     func repopulateFromDatabase() async {
         // Throttle: skip if cancelAllInFlight() fired < 2s ago.
         // Prevents the cancel→repopulate→dispatch cycle from creating duplicate job storms
@@ -297,11 +404,30 @@ actor ActiveAIQueue {
     /// This deliberately shares the same ordering and limit as
     /// `repopulationCandidates`: the newest `SyncConfig.maxRecentEmails` Inbox
     /// rows are selected *before* cached-work filtering. It is the sole policy
-    /// seam used by direct enqueue, job execution and opened-message processing.
-    /// No durable exception survives outside this window. The window bounds
-    /// PROCESSING only — display never consults it (owner decision 2026-08-19,
-    /// ADR-IOS-078): `SummaryBubbleView` renders whatever AI content already
-    /// exists, in every folder.
+    /// seam used by SYNC-ORIGIN admission (`enqueue` without `windowExempt`) and
+    /// by the execution-time re-checks of non-exempt jobs (`windowRetires`).
+    /// Push/NSE merge, moved-into-inbox and manual open (both the cached-body
+    /// `processOpenedMessage` arm and the body-fetch `fetchBody` arm) are
+    /// window-EXEMPT (ADR-IOS-078 pathway regating, owner directive 2026-08-19).
+    /// They stay inbox-scoped by TWO DIFFERENT mechanisms — do not conflate them:
+    ///   • QUEUE-mediated origins (user-open body fetch, push/NSE merge,
+    ///     moved-into-inbox) carry `AIJob.windowExempt` and are scoped by
+    ///     `executeJob`'s UNCONDITIONAL `message.isInInbox` re-check. That
+    ///     re-check is load-bearing there, because not every one of those
+    ///     producers self-checks (`enqueueAIForMembersThatEnteredInbox`
+    ///     deliberately does not — see the note at `enqueue`).
+    ///   • The DIRECT arm, `processOpenedMessage`'s cached-body path, builds NO
+    ///     `AIJob` and never enters the queue — it calls `processMessage`
+    ///     inline. `windowExempt`/`windowRetires`/`executeJob` never run for it,
+    ///     so its OWN `guard opened.current.isInInbox` is the ONLY inbox scope
+    ///     it has. Do not remove that guard on the theory that the executor
+    ///     re-checks; nothing downstream does.
+    /// No durable
+    /// exception survives outside this window: exempt processing is direct and
+    /// ephemeral, never marker columns or a redrive (IOS-AI-004). The window
+    /// bounds PROCESSING only — display never consults it (owner decision
+    /// 2026-08-19, ADR-IOS-078): `SummaryBubbleView` renders whatever AI content
+    /// already exists, in every folder.
     nonisolated static func recentInboxWindowContains(
         headerId: String,
         db: Database
@@ -370,6 +496,30 @@ actor ActiveAIQueue {
     /// Test-only seam — see `noteUnattributableForTesting`.
     var unattributableJobCountForTesting: Int { unattributableJobs.count }
 
+    /// Test-only seam (precedent: `ActiveBodyQueue.queuedItemsForTesting`).
+    /// Admission tests need to observe `storage` — but `dispatchPending`'s
+    /// `canProcessAI` arm CLEARS the queue in the test environment (no session),
+    /// so an admitted job is only observable with dispatch suppressed.
+    private var dispatchSuppressedForTesting = false
+    func setDispatchSuppressedForTesting(_ suppressed: Bool) {
+        dispatchSuppressedForTesting = suppressed
+    }
+
+    /// Test-only seam — the queued jobs, admission-order. See
+    /// `setDispatchSuppressedForTesting` for why observation needs suppression.
+    var queuedJobsForTesting: [AIJob] { storage.queue }
+
+    /// Test-only seam — the same clear `dispatchPending`'s `canProcessAI` arm
+    /// performs (including `cachedConfig`, so a residual config cannot let
+    /// `launchCandidates` dispatch after a "clear"), for shared-singleton tests
+    /// that must leave no residue.
+    func clearForTesting() {
+        storage.clearAll()
+        backoff.removeAll()
+        backoffRetryCount.removeAll()
+        cachedConfig = nil
+    }
+
     /// Whether the queue has no pending items and no active jobs.
     var isIdle: Bool {
         storage.isEmpty && storage.activeJobs == 0
@@ -411,6 +561,7 @@ actor ActiveAIQueue {
     /// all pending jobs are dispatched as fire-and-forget Tasks. The LLM semaphore
     /// handles actual API call concurrency (32 max).
     private func scheduleDispatch() {
+        guard !dispatchSuppressedForTesting else { return }
         Task {
             await dispatchPending()
         }
@@ -727,10 +878,10 @@ actor ActiveAIQueue {
         }
         let (message, inRecentWindow) = state
         guard message.isInInbox else {
-            return .scopeExited // archived / moved out
+            return .scopeExited // archived / moved out — unconditional, every origin
         }
-        guard inRecentWindow else {
-            return .scopeExited // deliberately outside the bounded AI population
+        guard !Self.windowRetires(job: job, inRecentWindow: inRecentWindow) else {
+            return .scopeExited // sync-origin job deliberately outside the bounded AI population
         }
         switch job.jobType {
         case .summary:
@@ -828,10 +979,20 @@ actor ActiveAIQueue {
         let message = captured.message
         let target = captured.target
 
-        // The job may have aged out after it was admitted. Retire it without a
-        // model call; `readJobOutcome` uses the same policy and classifies this as
-        // a scope exit rather than retrying an intentionally suppressed job.
-        guard captured.inRecentWindow else { return .ordinary(retry: false) }
+        // Inbox membership is the unconditional scope for EVERY origin: before
+        // the pathway regating this was implied by the window check (the window
+        // is a subset of the Inbox); a window-exempt job must not lose it.
+        guard message.isInInbox else { return .ordinary(retry: false) }
+
+        // A SYNC-ORIGIN job may have aged out after it was admitted. Retire it
+        // without a model call; `readJobOutcome` uses the same `windowRetires`
+        // policy and classifies this as a scope exit rather than retrying an
+        // intentionally suppressed job. Window-exempt jobs (push/NSE merge,
+        // moved-into-inbox, user-open body fetch) are exempt end-to-end
+        // (ADR-IOS-078).
+        guard !Self.windowRetires(job: job, inRecentWindow: captured.inRecentWindow) else {
+            return .ordinary(retry: false)
+        }
 
         // Check if this specific job type is already done
         switch job.jobType {
@@ -1122,8 +1283,7 @@ actor ActiveAIQueue {
         if let existing = message.summaryBlurb, !existing.isEmpty {
             BackgroundSyncLogger.logAIProcessing("Summary cache HIT for \(Self.logId(job.headerId))")
             // Always chain A — even from cache hit
-            let actionJob = AIJob(headerId: job.headerId, accountId: job.accountId, jobType: .action)
-            if storage.enqueue(actionJob) { scheduleDispatch() }
+            chainActionJob(after: job)
             return false
         }
 
@@ -1198,8 +1358,7 @@ actor ActiveAIQueue {
             BackgroundSyncLogger.logAIProcessing("Summary complete for \(Self.logId(job.headerId)) in \(elapsed)ms")
 
             // Always chain A after summary completes
-            let actionJob = AIJob(headerId: job.headerId, accountId: job.accountId, jobType: .action)
-            if storage.enqueue(actionJob) { scheduleDispatch() }
+            chainActionJob(after: job)
         } catch {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             activeAILog("[ActiveAI] Summary failed for \(message.messageId): \(error)")

@@ -3650,9 +3650,18 @@ final class AppDatabase: Sendable {
         //
         // v85 and v86 remain immutable because databases may already record those
         // identifiers. This forward migration removes their runtime schema instead:
-        // derived AI work is again bounded solely by the newest
-        // `SyncConfig.maxRecentEmails` Inbox rows, with no durable bypass that can
-        // keep an old message cycling through the body and AI queues.
+        // derived AI work carries no durable bypass that can keep an old message
+        // cycling through the body and AI queues.
+        //
+        // ⚠️ Do NOT read this as "bounded solely by the newest
+        // `SyncConfig.maxRecentEmails` Inbox rows" (its wording until 2026-08-19):
+        // since ADR-IOS-078 that window bounds SYNC-ORIGIN admission and the
+        // repopulation sweep only, while arrival/user-intent events (open,
+        // push/NSE merge, move into the Inbox) are window-EXEMPT. What v87
+        // retires is the DURABLE exception machinery, not the exemptions — those
+        // are deliberately ephemeral (an in-memory job flag; no marker columns,
+        // no triggers, no relaunch redrive). Re-gating an exempt producer to
+        // "restore" a global bound would contradict the owner directive.
         //
         // Trigger and index names are dropped before their referenced columns.
         // Existing true bits are intentionally discarded; they represent derived,

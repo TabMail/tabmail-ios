@@ -414,10 +414,20 @@ enum SyncConfig {
 
     // MARK: - Large Inbox Management
     // Matches TB's SETTINGS.inboxManagement. Inboxes larger than maxRecentEmails
-    // are treated as "large" — only recent messages are AI-processed.
+    // are treated as "large" — only recent messages are AI-processed AUTOMATICALLY
+    // (see the scope note on `maxRecentEmails` below).
 
-    /// Maximum recent inbox emails to AI-process (summary, action, reply).
-    /// Inboxes larger than this only have the N most recent messages processed.
+    /// Maximum recent inbox emails to AI-process AUTOMATICALLY (summary, action, reply).
+    ///
+    /// ⚠️ SCOPE (ADR-IOS-078 pathway regating, owner directive 2026-08-19) — this is
+    /// NOT a global cap on AI processing, and reading it as one is the mistake this
+    /// note exists to prevent. It bounds SYNC-ORIGIN admission and the repopulation
+    /// sweep, because `ActiveBodyQueue.repopulateFromDatabase` is Inbox-wide and
+    /// unbounded and would otherwise flood the LLM on first install. Arrival and
+    /// user-intent events are deliberately EXEMPT and DO process an older message:
+    /// opening it, receiving it by push/NSE merge, or moving it into the Inbox.
+    /// See `ActiveAIQueue.recentInboxWindowContains` for the two scoping mechanisms.
+    ///
     /// Matches TB's inboxManagement.maxRecentEmails.
     static let maxRecentEmails = 100
     /// Age threshold (days) for the archive prompt. Messages older than this

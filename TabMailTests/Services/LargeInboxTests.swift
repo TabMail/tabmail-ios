@@ -10,7 +10,9 @@ import GRDB
 /// Tests for the large inbox support feature (matching TB's inboxManagement):
 /// 1. SyncConfig constants exist and are reasonable
 /// 2. AI queue repopulate only considers the N most recent inbox messages
-/// 3. AI queue recency gate skips old messages in large inboxes
+/// 3. AI queue recency gate skips old messages in large inboxes for SYNC-ORIGIN
+///    admission and for the durable recovery sweep (since ADR-IOS-078 the gate no
+///    longer applies to arrival/user-intent offers — those are window-exempt)
 /// 4. Large inbox detection logic (total >= maxRecentEmails AND old > 0)
 /// 5. Bulk archive query selects correct messages by age cutoff
 @Suite("Large Inbox Support")
@@ -535,7 +537,7 @@ struct LargeInboxTests {
         #expect(newerCount >= SyncConfig.maxRecentEmails)
     }
 
-    @Test("production recent-window admission accepts newest 100 and suppresses oldest")
+    @Test("the production recent-window MEMBERSHIP predicate includes the newest 100 and excludes the oldest (admission outcome is origin-dependent since ADR-IOS-078: windowRetires = !inRecentWindow && !windowExempt)")
     func productionRecentWindowAdmission() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
@@ -651,7 +653,7 @@ struct LargeInboxTests {
         }
     }
 
-    @Test("old direct AI offer stays suppressed through recovery and relaunch")
+    @Test("an old direct AI offer creates no DURABLE recovery work (the sweep bucket stays window-bounded; the offer itself is exempt since ADR-IOS-078)")
     func oldDirectOfferCannotBecomeDurableRecoveryWork() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("tabmail-ai-window-\(UUID().uuidString)")
@@ -721,9 +723,12 @@ struct LargeInboxTests {
                 }
             }
 
-            // Repeated direct offers all consult the same production admission gate;
-            // recovery must reach an empty fixed point, not resurrect the row
-            // with a fresh retry budget on every drain.
+            // Recovery/sweep candidates stay window-bounded; recovery must reach
+            // an empty fixed point, not resurrect the row with a fresh retry
+            // budget on every drain. (Since ADR-IOS-078's pathway regating,
+            // direct open/push/move events process the row EPHEMERALLY via
+            // window-exempt enqueue — but they still create no durable state, so
+            // this fixed point is unchanged: nothing here may resurrect the row.)
             for _ in 0..<12 {
                 let ids = try initialQueue.read {
                     try ActiveAIQueue.recoveryCandidateHeaderIdsForTesting(db: $0)
