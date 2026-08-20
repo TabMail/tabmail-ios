@@ -16,3 +16,5 @@ StoreKit; subscription management; `AppStore.showManageSubscriptions`; `PlanPick
 ## Full detail
 
 `PlanPickerView` and `AccountDashboardView` both catch `AppStore.showManageSubscriptions(in:)` errors, print them, and expose no alert or inline status. The user remains on the same screen and can retry, use the App Store's subscription settings directly, or manage the subscription later; purchase and restore failures have separate visible states and are not part of this row. This is a missing error surface, not a billing-state mutation or charge error.
+
+> **Citation freshness (2026-08-18, issue #45):** the `AppStore.showManageSubscriptions(in:)` `catch` now lives in `StoreKitManager.presentManageSubscriptions()` and both views reach it by switching on `SubscriptionManagementPresentation.failed` — substance unchanged, still `print`-only with no user-facing surface, and this accepted limitation stands exactly as written above.

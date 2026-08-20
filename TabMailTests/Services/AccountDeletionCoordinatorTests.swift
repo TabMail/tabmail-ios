@@ -226,6 +226,76 @@ struct DeletionCoordinatorHappyTests {
 @MainActor
 @Suite("Account deletion coordinator guards")
 struct DeletionCoordinatorGuardTests {
+    private struct SheetPresentationFailure: Error {}
+
+    /// The account-deletion gate is a COMPOSITION: `AccountDeletionView`'s
+    /// `presentAppleSubscriptions()` maps a `SubscriptionManagementPresentation`
+    /// through `didPresent`, and this coordinator's
+    /// `guard await manageAppleSubscription()` consumes that `Bool`. Every other
+    /// test in this file injects a `Bool` literal and therefore never sees an
+    /// outcome, while `StoreKitSubscriptionManagementPresentationTests` sees the
+    /// outcome but never the gate — so the composition, which IS the fail-closed
+    /// property, was pinned by neither. This injects the real mapping instead of
+    /// a literal, needing no live `UIWindowScene` (see `IOS-TEST-004`).
+    @Test("Every unpresented subscription sheet blocks deletion through the real mapping")
+    func unpresentedSubscriptionSheetsBlockDeletion() async throws {
+        let activeApple = try DeletionCoordinatorFixtures.accountInfo(
+            hasSubscription: true,
+            provider: "apple"
+        )
+        let unpresented: [SubscriptionManagementPresentation] = [
+            .noWindowScene,
+            .failed(SheetPresentationFailure())
+        ]
+
+        for outcome in unpresented {
+            var gateReads = 0
+            let blocked = try await AccountDeletionSubscriptionCoordinator.prepareForDeletion(
+                fetchAccountInfo: { activeApple },
+                cancelStripe: {
+                    try DeletionCoordinatorFixtures.cancellationResponse()
+                },
+                appleRenewalState: { .renewing },
+                manageAppleSubscription: {
+                    gateReads += 1
+                    return outcome.didPresent
+                },
+                waitBeforeRetry: {},
+                progress: { _ in }
+            )
+            #expect(blocked == .appleManagementUnavailable)
+            // Non-vacuity: the outcome was really mapped, not stepped over.
+            #expect(gateReads == 1)
+        }
+
+        // Companion half. The same composition on `.presented` must NOT block at
+        // the gate. Renewal is still on afterwards, so the coordinator stops one
+        // step later on a different outcome — that difference is the evidence the
+        // gate was passed rather than never reached.
+        var renewalReads = 0
+        let pastTheGate = try await AccountDeletionSubscriptionCoordinator.prepareForDeletion(
+            maxConfirmationAttempts: 2,
+            fetchAccountInfo: { activeApple },
+            cancelStripe: {
+                try DeletionCoordinatorFixtures.cancellationResponse()
+            },
+            appleRenewalState: {
+                renewalReads += 1
+                return .renewing
+            },
+            manageAppleSubscription: {
+                SubscriptionManagementPresentation.presented.didPresent
+            },
+            waitBeforeRetry: {},
+            progress: { _ in }
+        )
+        #expect(pastTheGate == .appleConfirmationPending)
+        // Non-vacuity for the companion half: the post-gate confirmation loop is
+        // the only thing that re-reads renewal, so more than the single pre-gate
+        // read proves execution continued past the gate.
+        #expect(renewalReads > 1)
+    }
+
     @Test("Stripe stops before deletion when cancellation lacks evidence")
     func stripeMissingEvidence() async throws {
         var fetchCalls = 0

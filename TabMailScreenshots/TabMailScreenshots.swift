@@ -250,9 +250,11 @@ final class TabMailScreenshots: XCTestCase {
             } else if changePlan.waitForExistence(timeout: 3) {
                 changePlan.tap()
             }
-            // Wait for StoreKit products + trial eligibility to load
-            let trialBadge = app.staticTexts["2 weeks free"]
-            _ = trialBadge.waitForExistence(timeout: 10)
+            // Wait for StoreKit products to load — the "Most Popular" badge only
+            // renders once the plan cards exist. (The old probe was the intro-offer
+            // "2 weeks free" badge, deleted with the ASC offers — issue #55.)
+            let proBadge = app.staticTexts["Most Popular"]
+            _ = proBadge.waitForExistence(timeout: 10)
             Thread.sleep(forTimeInterval: 1)
 
             // 12. Monthly plans (default view)

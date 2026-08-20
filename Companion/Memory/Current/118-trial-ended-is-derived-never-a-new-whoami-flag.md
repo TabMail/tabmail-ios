@@ -159,6 +159,16 @@ branch. Census both when adding a provider.
 
 ### What is deliberately left alone
 
+> ⚠️ **UPDATE 2026-08-19 (issue #55):** the first bullet below is now history — the "later cleanup"
+> it defers to has happened. The App Store Connect introductory offers were removed on 2026-08-19,
+> and `checkTrialEligibility()`, `StoreKitManager.isEligibleForTrial`, `PlanCardIntroOffer`
+> (`suppressesIntroOffer` / `showsTrialBadge`), the PlanCard `hasIntroOffer` plumbing, the
+> "2 weeks free" badge and the "Start Free Trial" CTA were all **deleted**. The rank-driven
+> purchase-button logic survives as `PlanCardCTA.buttonLabel` (no-subscription → "Subscribe").
+> The suppression cohort the bullet protects no longer needs protecting: with no ASC offer,
+> there is nothing Apple could grant on top of a running signup trial. Everything else in this
+> file — the derivation, the gate seam, the banner rules — is untouched and current.
+
 - `StoreKitManager.checkTrialEligibility()` and `PlanCard.showsTrialBadge` stay. They gate on
   `product.subscription?.introductoryOffer != nil`, so removing the App Store Connect introductory
   offers extinguishes the "2 weeks free" badge and the "Start Free Trial" CTA with no app release.

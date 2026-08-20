@@ -650,6 +650,17 @@ struct AccountDetailView: View {
     }
 
     private func assignRole(_ role: FolderRole, to folder: Folder) {
+        // ⚠️ SYNCHRONOUS BY DESIGN — DO NOT CONVERT TO async. Deliberate design decision from the
+        // IOS-PERF-010 audit (Members 1–3, covering setFolderRole / assignRole / clearRole), NOT an
+        // oversight and NOT a perf smell a linter should "fix". Gesture order IS durable order ONLY
+        // while these writes do not suspend: two unstructured `Task { await write }` dispatched from the
+        // @MainActor have no mutual ordering (DatabaseWriteQueue is FIFO by acquire-arrival, set by the
+        // cooperative pool, NOT by tap order), so a rapid re-assign — assign Trash to F1, immediately
+        // reassign it to F2 — can land the tasks out of order and persist the user's EARLIER intention,
+        // silently. That is a NEVER-DROP-USER-INTENTION violation. The synchronous write also keeps
+        // write-then-read coherence with the synchronous reloadFolders() (the IOS-SETTINGS-002 "failure
+        // visibly reverts" property). Converting safely needs a per-account serial tail (modeled on
+        // AccountFieldPersistenceStore), NOT a bare async write. See IOS-PERF-010.
         // Clear the role from any other folder first, then assign
         try? dbPool.write { db in
             try db.execute(

@@ -5,6 +5,28 @@
 import StoreKit
 import Observation
 import Synchronization
+import UIKit
+
+/// Outcome of presenting Apple's native subscription-management sheet.
+///
+/// Three-valued on purpose. Callers distinguish "there was no window scene to
+/// present from, so nothing was shown and nothing followed" from "the sheet was
+/// requested and StoreKit threw", because the two call for different follow-up:
+/// the billing surfaces still refresh after a throw but not after a missing
+/// scene, while account deletion refuses on both.
+enum SubscriptionManagementPresentation {
+    case presented
+    case noWindowScene
+    case failed(Error)
+
+    /// True only when Apple's sheet was actually presented. A caller that gates
+    /// a destructive flow on this — account deletion — therefore fails closed on
+    /// both the missing-scene and the thrown-error outcomes.
+    var didPresent: Bool {
+        if case .presented = self { return true }
+        return false
+    }
+}
 
 enum AccountDeletionStoreKitRenewalEvidence: Equatable, Sendable {
     case unverified
@@ -31,10 +53,6 @@ final class StoreKitManager {
     /// If this doesn't match the currently logged-in user, the subscription belongs to a different account.
     var subscriptionOwnerUserId: String?
 
-    /// Whether the user is eligible for the introductory offer (2-week free trial).
-    /// True if the user has never redeemed an intro offer in the TabMail Plans subscription group.
-    var isEligibleForTrial = false
-
     private static let productIDs: Set<String> = [
         "ai.tabmail.byok.monthly",
         "ai.tabmail.byok.yearly",
@@ -52,7 +70,6 @@ final class StoreKitManager {
         Task {
             await loadProducts()
             await updateCurrentEntitlements()
-            await checkTrialEligibility()
         }
     }
 
@@ -113,7 +130,6 @@ final class StoreKitManager {
             let jwsRepresentation = verification.jwsRepresentation
             await transaction.finish()
             await updateCurrentEntitlements()
-            await checkTrialEligibility()
             print("[StoreKit] Purchase succeeded: \(product.id)")
             return jwsRepresentation
 
@@ -141,7 +157,6 @@ final class StoreKitManager {
         do {
             try await AppStore.sync()
             await updateCurrentEntitlements()
-            await checkTrialEligibility()
             if purchasedProductIDs.isEmpty {
                 restoreResult = "No active subscriptions found for this Apple ID."
                 print("[StoreKit] Restore completed — no entitlements found")
@@ -152,6 +167,30 @@ final class StoreKitManager {
         } catch {
             restoreResult = SyncEngine.isConnectionError(error) ? "Connection failed. Please check your network and try again." : "Restore failed: \(error.localizedDescription)"
             print("[StoreKit] Restore failed: \(error)")
+        }
+    }
+
+    // MARK: - Subscription Management
+
+    /// Presents Apple's native subscription-management sheet.
+    ///
+    /// The single place the app looks up a window scene for StoreKit and calls
+    /// `AppStore.showManageSubscriptions(in:)`. Each caller keeps its own refresh
+    /// policy and error copy by switching on the result, so this helper
+    /// deliberately logs nothing and surfaces nothing to the user.
+    static func presentManageSubscriptions() async -> SubscriptionManagementPresentation {
+        // `Info.plist` sets `UIApplicationSupportsMultipleScenes` to `false`, so
+        // the app has at most one `UIWindowScene` and `.first` is deterministic.
+        guard let windowScene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene }).first else {
+            return .noWindowScene
+        }
+
+        do {
+            try await AppStore.showManageSubscriptions(in: windowScene)
+            return .presented
+        } catch {
+            return .failed(error)
         }
     }
 
@@ -301,22 +340,6 @@ final class StoreKitManager {
     /// when we are certain the active entitlement belongs to someone else.
     func shouldOpenGateForRestoredEntitlement(currentUserId: String) -> Bool {
         isAppleSubscriber && !hasAccountMismatch(currentUserId: currentUserId)
-    }
-
-    // MARK: - Trial Eligibility
-
-    /// Check if the user is eligible for the introductory offer (2-week free trial).
-    /// Eligibility is per subscription group, but it must be read from a product that
-    /// actually HAS an intro offer — Zero (BYOK) has none and sorts first, so
-    /// `products.first` would wrongly report ineligible.
-    func checkTrialEligibility() async {
-        guard let product = products.first(where: { $0.subscription?.introductoryOffer != nil }),
-              let subscription = product.subscription else {
-            isEligibleForTrial = false
-            return
-        }
-        isEligibleForTrial = await subscription.isEligibleForIntroOffer
-        print("[StoreKit] Trial eligibility: \(isEligibleForTrial)")
     }
 
     // MARK: - Transaction Listener

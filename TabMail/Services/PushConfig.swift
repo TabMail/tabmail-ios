@@ -112,4 +112,18 @@ enum PushConfig {
     /// first scan at app boot. 10s leaves headroom without making the
     /// foreground scan feel laggy (runs in parallel across accounts anyway).
     static let consentStatusCheckTimeoutSeconds: TimeInterval = 10
+
+    /// Upper bound on how long sign-out waits for the removed-account cleanup
+    /// flush before clearing the session anyway (IOS-PUSH-001).
+    ///
+    /// The flush only runs when this session actually owns cleanup debt, which
+    /// is rare, and it is best-effort: the debt is durable and idempotent, so
+    /// exceeding the bound costs nothing that the same user's next sign-in
+    /// cannot recover. A record's drain is at most four sequential worker
+    /// round-trips (device route, consent, provider unsubscribe, legacy device
+    /// refresh), so 5s covers the warm case with headroom while keeping the
+    /// worst-case Sign Out delay short. Seconds beyond that buy little: a
+    /// network that is still failing at 5s will not recover by 8s, and the
+    /// debt survives either way.
+    static let signOutCleanupFlushTimeoutSeconds: TimeInterval = 5
 }

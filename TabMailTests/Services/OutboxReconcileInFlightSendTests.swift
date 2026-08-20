@@ -333,6 +333,206 @@ struct OutboxReconcileInFlightSendTests {
         await provider.setSendHook(nil)
     }
 
+    // MARK: - Undo-Send synchronous-write invariants (IOS-PERF-010 Member 5)
+    //
+    // These PIN WHY `discardOutboxMessageConfirmed` must stay synchronous. Each is
+    // GREEN on the current (correct, synchronous) code and asserts the user-facing
+    // end state `PendingSendService.undo()` reaches; neither inspects the
+    // `nonisolated`/`@MainActor` shape. They do NOT themselves ship mail or
+    // reproduce the IOS-OUTBOX-006 red — that red was observed during development
+    // with THROWAWAY `Task.sleep`/`holdUntil` mutations that were then removed.
+    //
+    // What the committed tests guard, and HOW each catches its regression:
+    //  • The async conversion itself is caught at COMPILE TIME — undo() calls
+    //    `discardOutboxMessageConfirmed` synchronously inside a `guard`, so adding
+    //    `async` to that write fails to build. That is the deadline test's primary
+    //    guardrail; the deadline race cannot otherwise be forced here because the
+    //    seeded `holdUntil` keeps the drain from ever claiming the row.
+    //  • Removing the synchronous `current = nil` clear from undo() reds the
+    //    reentrancy test (the second tap re-enters and stamps "Try again.") — the
+    //    Proof B regression — and also reds the deadline test's `current == nil`.
+    //  • Deferring the row delete to a fire-and-forget async write reds the
+    //    reentrancy test's synchronous-deletion assertion (`rowGone`), which has no
+    //    live drain racing the read.
+
+    /// One queued send whose generation `PendingSendService.undo()` can verify:
+    /// a `Draft` row and an `OutboxMessage` row that agree on `draftId`,
+    /// `accountId` and `instanceEpoch`, so `retainedAuthorityOutcome` returns
+    /// `.verified` and a successful undo yields a reopenable snapshot.
+    @discardableResult
+    private func seedVerifiableSend(
+        _ pool: DatabasePool, outboxId: String, draftId: String, epoch: String, holdUntil: Date
+    ) throws -> OutboxMessage {
+        let now = Date().timeIntervalSince1970
+        var draft = Draft(
+            id: draftId, accountId: Self.accountId,
+            toJSON: "[\"recipient@example.com\"]", ccJSON: "[]", bccJSON: "[]",
+            subject: "Undo me", body: "Body the user authored.",
+            replyToId: nil, isForward: false, editHistoryJSON: nil,
+            createdAt: now, updatedAt: now,
+            serverDraftId: nil, serverPushStatus: nil,
+            rfc822MessageId: nil, attachmentsDirName: nil)
+        draft.instanceEpoch = epoch
+        let draftToInsert = draft
+
+        var msg = OutboxMessage(
+            accountId: Self.accountId,
+            draft: DraftMessage(
+                to: ["recipient@example.com"], subject: "Undo me", body: "Body the user authored."))
+        msg.id = outboxId
+        msg.status = OutboxStatus.queued.rawValue
+        msg.sentAt = nil
+        msg.holdUntil = holdUntil
+        msg.draftId = draftId
+        msg.instanceEpoch = epoch
+        let msgToInsert = msg
+        try pool.write { db in
+            try draftToInsert.insert(db)
+            try msgToInsert.insert(db)
+        }
+        return msg
+    }
+
+    /// **Proof A, the deadline invariant — what this test PINS.** An Undo tap on a
+    /// verified generation, taken while the Undo button is rendered
+    /// (elapsed < `outboxUndoHoldSeconds`), completes the cancellation inside the
+    /// single synchronous `@MainActor` `undo()` run: it returns a reopenable
+    /// snapshot, raises no false failure, clears the toast, and the durable row is
+    /// gone by the time `undo()` returns.
+    ///
+    /// **The guardrail against an async conversion is COMPILE-TIME.** `undo()`
+    /// calls `discardOutboxMessageConfirmed` synchronously inside a `guard`, so
+    /// making that write `async` fails to build — the deadline race cannot slip in
+    /// silently. It also cannot be forced at runtime here: `holdUntil` is set far
+    /// beyond any claim deadline, so the live drain provably cannot claim the row
+    /// while the button is rendered. "The message was not transmitted" is therefore
+    /// a consequence of that `holdUntil`, not a deadline-race outcome, and is NOT
+    /// asserted (that would be a vacuous pin — the drain is refused regardless).
+    /// The red — mail shipped while the toast showed "Try again." — was observed
+    /// during development by temporarily wrapping the discard in a `Task.sleep`,
+    /// then removed; it is not reproduced by this committed test.
+    ///
+    /// The runtime assertions still pin the correct synchronous end state: the
+    /// reopen path, the cleared toast (reds if the synchronous `current = nil` is
+    /// removed), and a deleted row. A fire-and-forget async discard that only
+    /// defers the delete is caught deterministically by the sibling reentrancy
+    /// test's `rowGone`, which has no live drain racing the read.
+    @Test("An Undo tap inside the hold window cancels the send synchronously — reopenable, no false failure, row deleted")
+    @MainActor
+    func undoInsideHoldWindowCancelsAndNeverDeliversMail() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer {
+            PendingSendService.shared.dismiss()
+            restore(pool: pool, dir: dir, previous: previous)
+        }
+
+        let outboxId = "outbox-undo-deadline"
+        let draftId = "draft-undo-deadline"
+        let epoch = "epoch-undo-deadline"
+        try seedVerifiableSend(
+            pool, outboxId: outboxId, draftId: draftId, epoch: epoch,
+            holdUntil: Date().addingTimeInterval(3600))
+
+        let provider = MockEmailProvider()
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: Self.accountId, provider: provider
+        ) {
+            PendingSendService.shared.present(
+                outboxId: outboxId, draftId: draftId, instanceEpoch: epoch,
+                toSummary: "To: recipient@example.com")
+
+            // A live drain that is gated out by holdUntil; give it a pass so the
+            // race is real, not merely absent.
+            let drainTask = Task { await AccountManager.shared.drainOutbox() }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+
+            let snapshot = PendingSendService.shared.undo()
+
+            #expect(snapshot != nil, """
+                an in-window Undo on a verified generation must return a reopenable snapshot — the user \
+                can still act
+                """)
+            #expect(PendingSendService.shared.undoFailureMessage == nil,
+                    "a confirmed cancellation must not raise a false failure")
+            #expect(PendingSendService.shared.current == nil,
+                    "a confirmed cancellation clears the toast")
+            let rowGone = try outboxRow(pool, outboxId) == nil
+            #expect(rowGone,
+                    "the cancelled send's durable row must be deleted — gone by the time undo() returns")
+
+            await settle(pool: pool, outboxId: outboxId, tasks: [drainTask])
+            // Let the discard's fire-and-forget drain quiesce before teardown.
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
+    /// **Proof B, the reentrancy invariant — what this test PINS.** Two Undo taps
+    /// in ONE `@MainActor` turn produce exactly one confirmed discard and never set
+    /// a false failure on the successful generation. Because `undo()` clears
+    /// `current` in the same synchronous run as the discard, the second tap hits its
+    /// `guard let p = current` early return and never reaches a second
+    /// `discardOutboxMessageConfirmed`.
+    ///
+    /// This is GREEN on the current synchronous code. It reds if that synchronous
+    /// `current = nil` clear is deferred or removed: the second tap then re-enters,
+    /// discards the already-deleted row, and stamps "Try again." on a successful
+    /// undo (the R16-9 mirror) — caught here by the `undoFailureMessage == nil`
+    /// assertion. That red was observed during development by mutating the clear,
+    /// then reverted; the committed test guards against the regression rather than
+    /// reproducing it.
+    @Test("Two Undo taps in one MainActor turn discard exactly once and never raise a false failure")
+    @MainActor
+    func twoUndoTapsInOneTurnDiscardExactlyOnceNoFalseFailure() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer {
+            PendingSendService.shared.dismiss()
+            restore(pool: pool, dir: dir, previous: previous)
+        }
+
+        let outboxId = "outbox-undo-reentrancy"
+        let draftId = "draft-undo-reentrancy"
+        let epoch = "epoch-undo-reentrancy"
+        try seedVerifiableSend(
+            pool, outboxId: outboxId, draftId: draftId, epoch: epoch,
+            holdUntil: Date().addingTimeInterval(3600))
+
+        let provider = MockEmailProvider()
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: Self.accountId, provider: provider
+        ) {
+            PendingSendService.shared.present(
+                outboxId: outboxId, draftId: draftId, instanceEpoch: epoch,
+                toSummary: "To: recipient@example.com")
+
+            // Two taps back to back in ONE synchronous @MainActor run — no await
+            // between them, exactly as a double-tap on the synchronous Undo button.
+            let first = PendingSendService.shared.undo()
+            let second = PendingSendService.shared.undo()
+
+            #expect(first != nil, """
+                the first Undo confirmed the cancellation of the verified generation and returned a \
+                reopenable snapshot
+                """)
+            #expect(second == nil, """
+                the second Undo is a no-op: `current` was cleared synchronously, so it never reaches a \
+                second discard
+                """)
+            #expect(PendingSendService.shared.undoFailureMessage == nil, """
+                the reentrant second tap must NOT set a false failure on a successful undo (Proof B / \
+                the R16-9 mirror)
+                """)
+            #expect(PendingSendService.shared.current == nil,
+                    "the toast stays cleared after the confirmed cancellation")
+            let rowGone = try outboxRow(pool, outboxId) == nil
+            #expect(rowGone, "exactly one discard landed — the row is deleted once")
+            #expect(await provider.sentDrafts.count == 0,
+                    "no drain interleaves a synchronous undo; nothing is transmitted")
+
+            await settle(pool: pool, outboxId: outboxId, tasks: [])
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
     /// Wait until the row under test has left the table — which happens only
     /// after finalize (send + Sent append + atomic delete) or after a discard —
     /// then stop the drain loops.
