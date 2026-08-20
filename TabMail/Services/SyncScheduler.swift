@@ -680,13 +680,23 @@ final class SyncScheduler {
     // MARK: - Unified In-Flight Cancellation
 
     /// Cancel in-flight Tasks across all body/AI/embedding queues. Single
-    /// canonical wind-down used by:
-    /// - `syncStartup` — clear stale frozen tasks at the start of a new cycle.
-    /// - `BGAppRefresh` / `BGProcessing` expiration handlers — iOS warned us;
-    ///   stop in-flight LLM and SQLite work before suspension to avoid
-    ///   RUNNINGBOARD 0xdead10cc and to be a "nicely behaving" background app.
-    /// - `ActiveAIQueue.executeJob` per-job bgTask expiration — same idea
-    ///   scoped to a single AI job's grace window.
+    /// canonical wind-down. Complete caller set (census re-run 2026-08-20 —
+    /// `PushNotificationService` was missing from the previous list):
+    /// - `syncStartup` — clear stale frozen tasks at the start of a new cycle
+    ///   (resume-recovery step 1, gated on `runResumeRecovery`).
+    /// - `handleBackgroundSync`'s BGAppRefresh expiration handler and
+    ///   `handleBackgroundAIProcessing`'s BGProcessing expiration handler —
+    ///   iOS warned us; stop in-flight LLM and SQLite work before suspension to
+    ///   avoid RUNNINGBOARD 0xdead10cc and to be a "nicely behaving"
+    ///   background app.
+    /// - `PushNotificationService.handleSilentPush` — the silent-push deadline
+    ///   wind-down, run right after cancelling the in-flight sync Task so
+    ///   actor-owned queue Tasks (the AI heartbeat in particular) stop drumming
+    ///   on the App Group SQLite before iOS suspends.
+    ///
+    /// Not a caller, despite the near-identical name: `ActiveAIQueue.executeJob`'s
+    /// per-job bgTask expiration handler calls `ActiveAIQueue.shared.cancelAllInFlight()`
+    /// directly — same idea, but scoped to one AI job's grace window and one queue.
     ///
     /// `inboxOnly` mirrors `syncStartup`'s axis: BGAppRefresh / push paths only
     /// touch inbox-scope queues, so we skip backfill and embedding queues.
