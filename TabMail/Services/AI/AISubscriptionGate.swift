@@ -129,6 +129,27 @@ final class AISubscriptionGate: @unchecked Sendable {
         signInGeneration &+= 1
     }
 
+    /// Begin a NEW sign-in epoch. Symmetric to `noteSignedOut`: clears this
+    /// process's authoritative-apply marker and bumps `signInGeneration` so
+    /// (a) any `/whoami` fetched for a PRIOR account — including one applied
+    /// from a session that a sign-out cleanup's in-flight token refresh
+    /// RESURRECTED into the Keychain slot — belongs to an older generation and
+    /// is dropped by `applyIfCurrentEpoch`, and (b) the plan-picker latch
+    /// consumer starts from a clean marker and waits for THIS account's
+    /// authoritative response instead of inheriting the previous account's
+    /// freshness. In-memory only, like the fields it touches.
+    ///
+    /// This is defense-in-depth behind `TabMailTokenCoordinator`'s clobber
+    /// guard (which prevents the resurrection from ever overwriting a
+    /// different user's live session in the first place). It is also correct
+    /// and safe on every ordinary sign-in: the marker re-applies within one
+    /// revalidation, and until it does the latch consumer merely waits.
+    @MainActor
+    func noteSignedIn() {
+        lastAuthoritativeApplyAt = nil
+        signInGeneration &+= 1
+    }
+
     /// Apply an authoritative `/whoami` result ONLY if it was fetched in the
     /// current sign-in epoch. The guard closes the cross-account seam: a
     /// revalidation fetch started for account A can complete after A signed

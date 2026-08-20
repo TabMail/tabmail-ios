@@ -123,16 +123,74 @@ actor TabMailTokenCoordinator {
 
             let newSession = try JSONDecoder().decode(TabMailSession.self, from: data)
             let encoded = try JSONEncoder().encode(newSession)
-            do {
-                try KeychainHelper.save(encoded, for: "tabmail_session")
-            } catch {
-                AuthDiagnostics.log("CRITICAL: Keychain save failed after refresh — stale token on next launch. Error: \(error)")
-            }
+            // Clobber-guard (auth-safe). A sign-out cleanup can drive this
+            // refresh, and it runs in an UNSTRUCTURED task that `signOut()`'s
+            // `flush.cancel()` cannot reach, so it can complete after the slot
+            // has changed owner (empty after `clearSession`, or a DIFFERENT
+            // user after someone else signs in). Persist only if the slot is
+            // empty, unreadable, or still owned by THIS user; never over a
+            // different, valid user (that would overwrite an active B with A —
+            // an identity clobber). Never infer sign-out from an ambiguous
+            // read: empty/unreadable ⇒ SAVE, so a transient miss cannot strand
+            // a stale token and log the user out. Returning `.success`
+            // regardless keeps the in-flight caller's token valid for its
+            // current request (IOS-PUSH-001) — only the Keychain write is
+            // gated.
+            await Self.persistRefreshedSession(encoded: encoded, newUserId: newSession.userId)
             AuthDiagnostics.log("Token refreshed, expiresAt=\(newSession.expiresAt)")
             return .success(newSession.accessToken)
         } catch {
             AuthDiagnostics.log("Token refresh error: \(error)")
             return .transientFailure
+        }
+    }
+
+    // MARK: - Clobber guard (auth-safe session persistence)
+
+    /// Pure save-decision for a refreshed session: should it overwrite the
+    /// shared `"tabmail_session"` slot?
+    ///
+    /// SAVE when the slot is empty, unreadable/undecodable, OR owned by the
+    /// SAME user (`userId` matches). An ambiguous or missing read must never be
+    /// treated as "signed out": withholding a legitimate save would strand a
+    /// stale token and log the user out on next launch — worse than the
+    /// clobber, and the overriding priority. SKIP only when the slot decodes to
+    /// a VALID session for a DIFFERENT user; there is no legitimate case where
+    /// one account's refreshed token should overwrite another account's active
+    /// session, so a skip is only ever the clobber.
+    static func shouldPersistRefreshedSession(currentSlot: Data?, newUserId: String) -> Bool {
+        guard let currentSlot,
+              let current = try? JSONDecoder().decode(TabMailSession.self, from: currentSlot) else {
+            return true // empty or unreadable — save (never infer sign-out)
+        }
+        return current.userId == newUserId
+    }
+
+    /// Re-read the slot and persist the refreshed session iff the clobber guard
+    /// allows it.
+    ///
+    /// Runs on the MainActor deliberately: the ONLY writers of
+    /// `"tabmail_session"` are `TabMailAuthService`'s sign-in saves and
+    /// `clearSession`, all MainActor-isolated. So this read → decide → write
+    /// executes as one synchronous MainActor step that no sign-in write can
+    /// interleave, and the compare is therefore always against the CURRENT
+    /// owner — the guard is atomic against a racing sign-in. `loadCurrent` /
+    /// `save` are injected for tests; production uses the Keychain.
+    @MainActor
+    static func persistRefreshedSession(
+        encoded: Data,
+        newUserId: String,
+        loadCurrent: () -> Data? = { KeychainHelper.load(key: "tabmail_session") },
+        save: (Data) throws -> Void = { try KeychainHelper.save($0, for: "tabmail_session") }
+    ) {
+        guard shouldPersistRefreshedSession(currentSlot: loadCurrent(), newUserId: newUserId) else {
+            AuthDiagnostics.log("Token refresh: session slot now owned by a different user — withholding save (clobber-guard)")
+            return
+        }
+        do {
+            try save(encoded)
+        } catch {
+            AuthDiagnostics.log("CRITICAL: Keychain save failed after refresh — stale token on next launch. Error: \(error)")
         }
     }
 }

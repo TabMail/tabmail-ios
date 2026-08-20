@@ -212,4 +212,165 @@ struct AISubscriptionGateTests {
         #expect(gate.isActive == true)
         #expect(gate.hasCheckedOnce == true)
     }
+
+    // MARK: - Sign-in epoch: resurrection defense-in-depth (merge of #56)
+    //
+    // A sign-out cleanup's in-flight token refresh can RESURRECT the outgoing
+    // account's session into the Keychain AFTER `noteSignedOut` bumped the
+    // epoch, so a revalidation can stamp that account's stale entitlement in
+    // the SAME epoch the next user signs into — the epoch guard alone cannot
+    // tell them apart. `noteSignedIn` closes that: sign-in starts a new epoch
+    // and clears the marker, so the resurrected stamp is older-epoch (dropped)
+    // and the latch consumer waits for the NEW account's own /whoami. (The
+    // token clobber guard is the primary defense; this is defense-in-depth.)
+
+    @Test("noteSignedIn advances the epoch AND clears the freshness marker")
+    func noteSignedInAdvancesEpochAndClearsMarker() throws {
+        let gate = AISubscriptionGate.shared
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: false)) // marker set (non-vacuous)
+        #expect(gate.lastAuthoritativeApplyAt != nil)
+        let before = gate.signInGeneration
+
+        gate.noteSignedIn()
+        #expect(gate.signInGeneration == before &+ 1)
+        #expect(gate.lastAuthoritativeApplyAt == nil)
+
+        // Restore for other tests.
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+    }
+
+    @Test("A resurrected prior-account whoami is dropped once sign-in bumps the epoch")
+    func resurrectedPriorAccountApplyDroppedAfterSignIn() throws {
+        let gate = AISubscriptionGate.shared
+        gate.noteSignedOut() // account A signs out
+        // A's cleanup resurrects A's session; a revalidation for A captured
+        // THIS (post-sign-out) generation before its network await…
+        let resurrectionGeneration = gate.signInGeneration
+        gate.noteSignedIn() // …then B signs in (our defense)
+        // …and A's resurrected-session whoami (closed) lands now.
+        gate.applyIfCurrentEpoch(
+            try WhoamiFixture.accountInfo(hasSubscription: false),
+            fetchedInGeneration: resurrectionGeneration,
+            now: Date()
+        )
+        // Dropped: A's closed entitlement neither closed B's gate nor granted
+        // routing authority.
+        #expect(gate.lastAuthoritativeApplyAt == nil)
+
+        // Restore for other tests.
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+    }
+
+    @Test("Active subscriber B is NOT routed to the plan picker after a sign-out of A that resurrected A's closed whoami")
+    func activeSubscriberNotPaywalledAfterResurrection() throws {
+        let gate = AISubscriptionGate.shared
+        let suite = "AISubscriptionGateTests.e2e.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        // Account A (unentitled) is signed in with an authoritative closed gate.
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: false))
+        // A signs out.
+        gate.noteSignedOut()
+        // A's sign-out cleanup resurrects A's session; a revalidation in THIS
+        // epoch stamps A's closed marker — the merge interaction we defend.
+        let resurrectionGen = gate.signInGeneration
+        gate.applyIfCurrentEpoch(
+            try WhoamiFixture.accountInfo(hasSubscription: false),
+            fetchedInGeneration: resurrectionGen,
+            now: Date()
+        )
+        #expect(gate.lastAuthoritativeApplyAt != nil) // A's stale closed marker present (setup observable)
+        #expect(gate.isActive == false)
+
+        // B signs in: the defense bumps the epoch and clears the marker.
+        gate.noteSignedIn()
+
+        // B's AI-consent onboarding arms the latch (gate not yet authoritative for B).
+        PendingPlanNavigationLatch.recordAfterAIConsent(
+            aiEnabled: true,
+            gateIsActive: gate.isActive,
+            gateIsAuthoritative: gate.lastAuthoritativeApplyAt != nil,
+            defaults: defaults
+        )
+        #expect(PendingPlanNavigationLatch.isSet(defaults))
+
+        // B's MailNavigationView mounts and tries to consume BEFORE B's whoami:
+        // the marker was cleared by sign-in, so it WAITS — it does NOT act on
+        // A's stale closed entitlement (pre-defense this returned
+        // .navigateToPlanPicker — the paywall misroute).
+        #expect(PendingPlanNavigationLatch.consume(
+            gateHasAuthoritativeState: gate.lastAuthoritativeApplyAt != nil,
+            gateIsActive: gate.isActive,
+            aiOptedOut: false,
+            defaults: defaults
+        ) == .waitForAuthoritativeGate)
+
+        // B's own authoritative whoami (active) lands in B's epoch.
+        gate.applyIfCurrentEpoch(
+            try WhoamiFixture.accountInfo(hasSubscription: true),
+            fetchedInGeneration: gate.signInGeneration,
+            now: Date()
+        )
+        #expect(gate.isActive == true)
+
+        // Consumer fires again on the marker change: active ⇒ cleared, NO paywall.
+        #expect(PendingPlanNavigationLatch.consume(
+            gateHasAuthoritativeState: gate.lastAuthoritativeApplyAt != nil,
+            gateIsActive: gate.isActive,
+            aiOptedOut: false,
+            defaults: defaults
+        ) == .clearedWithoutNavigation)
+
+        // Restore shared gate for other tests.
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+    }
+
+    @Test("Two-sided: a genuinely-unentitled B after the same resurrection sequence STILL reaches the plan picker")
+    func unentitledUserStillReachesPickerAfterResurrection() throws {
+        let gate = AISubscriptionGate.shared
+        let suite = "AISubscriptionGateTests.e2e.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: false)) // A closed
+        gate.noteSignedOut()
+        let resurrectionGen = gate.signInGeneration
+        gate.applyIfCurrentEpoch(
+            try WhoamiFixture.accountInfo(hasSubscription: false),
+            fetchedInGeneration: resurrectionGen,
+            now: Date()
+        )
+        gate.noteSignedIn() // B signs in
+
+        PendingPlanNavigationLatch.recordAfterAIConsent(
+            aiEnabled: true,
+            gateIsActive: gate.isActive,
+            gateIsAuthoritative: gate.lastAuthoritativeApplyAt != nil,
+            defaults: defaults
+        )
+        #expect(PendingPlanNavigationLatch.consume(
+            gateHasAuthoritativeState: gate.lastAuthoritativeApplyAt != nil,
+            gateIsActive: gate.isActive,
+            aiOptedOut: false,
+            defaults: defaults
+        ) == .waitForAuthoritativeGate)
+
+        // B's own authoritative whoami reports NO subscription.
+        gate.applyIfCurrentEpoch(
+            try WhoamiFixture.accountInfo(hasSubscription: false),
+            fetchedInGeneration: gate.signInGeneration,
+            now: Date()
+        )
+        // The defense must not over-suppress: an unentitled B still navigates.
+        #expect(PendingPlanNavigationLatch.consume(
+            gateHasAuthoritativeState: gate.lastAuthoritativeApplyAt != nil,
+            gateIsActive: gate.isActive,
+            aiOptedOut: false,
+            defaults: defaults
+        ) == .navigateToPlanPicker)
+
+        // Restore shared gate for other tests.
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+    }
 }

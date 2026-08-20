@@ -643,6 +643,14 @@ struct RootView: View {
             )
         }
         .onReceive(NotificationCenter.default.publisher(for: .tabMailDidSignIn).receive(on: DispatchQueue.main)) { _ in
+            // Start a fresh sign-in epoch BEFORE the revalidation below reads
+            // it. A prior account's authoritative /whoami — including one
+            // applied from a session an in-flight sign-out cleanup refresh
+            // resurrected into the Keychain — must not vouch for this sign-in:
+            // bumping the epoch drops any older-epoch apply, and clearing the
+            // marker makes the plan-picker latch consumer wait for THIS
+            // account. Defense-in-depth behind the token clobber guard.
+            AISubscriptionGate.shared.noteSignedIn()
             withAnimation { hasTabMailSession = true }
             // Restore consent state for the signed-in user (avoids re-showing consent)
             restoreConsentStateForCurrentUser()
