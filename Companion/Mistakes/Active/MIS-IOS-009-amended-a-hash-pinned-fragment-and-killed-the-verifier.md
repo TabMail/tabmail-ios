@@ -2,7 +2,7 @@
 
 **Class:** documentation / verification
 **Severity:** high
-**First seen:** 2026-08-04 · **Recurrences:** 7 (**7: killed `verify` with a GLOB — `…/KnownIssues/ios-*.md` written into a Ruby comment, by the exact mechanism the note below this line already describes; see "Instance 7" at the end.** **6: broke again the DAY AFTER instance 5 was repaired — see "Instance 6" at the end.** 5: was fail-open for two days — `345c04a6f` edited a preserved body and `verify` aborted on its FIRST check from 2026-08-10 to 2026-08-12, silently disabling the ADR census, routing, link, pointer and budget checks. ✅ REPAIRED 2026-08-12 the prescribed way — body restored byte-for-byte from the pinned source, amendment moved into a `COMPANION-CURRENT-NOTE` wrapper, SHA **not** re-pinned. See "Instance 5 — resolution" at the end of this file**) · **Status:** Active
+**First seen:** 2026-08-04 · **Recurrences:** 8 (**8: appended a two-line citation note as BARE MARKDOWN to the GENERATED, byte-frozen `Companion/Process/Current/KnownIssues/ios-billing-001.md` (`a6f395517`), breaking `compact_known_issues.rb verify` from 2026-08-18 until `fb5d498a2` this morning — and `Companion/Memory/Current/115-known-issues-register-is-byte-frozen-and-has-no-append-path.md` ALREADY DOCUMENTED THAT EXACT HAZARD. The knowledge existed and was not reachable at the moment it was needed; see "Instance 8" at the end.** **7: killed `verify` with a GLOB — `…/KnownIssues/ios-*.md` written into a Ruby comment, by the exact mechanism the note below this line already describes; see "Instance 7" at the end.** **6: broke again the DAY AFTER instance 5 was repaired — see "Instance 6" at the end.** 5: was fail-open for two days — `345c04a6f` edited a preserved body and `verify` aborted on its FIRST check from 2026-08-10 to 2026-08-12, silently disabling the ADR census, routing, link, pointer and budget checks. ✅ REPAIRED 2026-08-12 the prescribed way — body restored byte-for-byte from the pinned source, amendment moved into a `COMPANION-CURRENT-NOTE` wrapper, SHA **not** re-pinned. See "Instance 5 — resolution" at the end of this file**) · **Status:** Active
 **Related:** [MIS-IOS-006](MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md); **MIS-023** and
 **MIS-027** in the monorepo-root tree (`rg -n 'MIS-023|MIS-027' ../MISTAKES.md`) — both are the same
 shape: reading a number instead of reading how far the run got.
@@ -463,3 +463,89 @@ rg -n 'Companion/(Memory|Decisions|Process|Rules|Mistakes)/[^ `"'"'"']*\*' -g '!
 
 A `*` anywhere inside a `Companion/…​.md`-shaped substring means the reference checker will try to
 `File.file?` a glob and abort.
+
+---
+
+## Pre-compaction index line (verbatim, 2026-08-20, pass 5)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 19% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-009](Companion/Mistakes/Active/MIS-IOS-009-amended-a-hash-pinned-fragment-and-killed-the-verifier.md)** — edited a hash-pinned fragment in place, killed `compact_companion_docs.rb verify`, and hid every later check behind its `abort`. **×6 broke it again the DAY AFTER ×5's repair**, found by an unrelated subagent's incidental `verify`, never by a gate. **`ruby … | tail` masks rc in zsh — run it UNPIPED.** ⚠️ **TWO pinning conventions decide the repair:** `{Memory,Decisions}/manifest.tsv` hash the **stripped** body and must NEVER be re-pinned; `ported-manifest.tsv` / `amendments-manifest.tsv` / `Decisions/V3/manifest.tsv` hash the **raw** file and MUST be re-pinned. ⚠️ **a GLOB in a comment aborts it too** — `Companion/…/ios-*.md` is not a file. (×7)
+```
+
+---
+
+## Instance 8 (2026-08-18, repaired 2026-08-20) — the SECOND verifier, and the routed file that already warned about it
+
+**Commit `a6f395517`** ("Cover the subscription-presentation deletion gate and drop dead imports")
+appended a two-line *citation freshness* note to
+`Companion/Process/Current/KnownIssues/ios-billing-001.md` — as **bare Markdown**, with no
+`KNOWN-ISSUES-AMENDMENT-BEGIN` / `-END` wrapper. That file is **generated and byte-frozen**: it is
+regenerated from a hash-pinned archive and byte-compared by `Scripts/compact_known_issues.rb verify`,
+which failed from that commit until `fb5d498a2` on 2026-08-20.
+
+**Content was, once again, not the problem.** The note is true and useful: it records that the
+`AppStore.showManageSubscriptions(in:)` `catch` moved into
+`StoreKitManager.presentManageSubscriptions()` and that both views now reach it through
+`SubscriptionManagementPresentation.failed`, substance unchanged. It is exactly the kind of citation
+refresh this repo asks for. It was written into the wrong kind of surface — instance 1's defect, five
+instances later, in a **different tree with a different verifier**.
+
+**What makes this instance worth its own section rather than a tally bump.**
+
+- **A second byte-frozen tree now exists, and this entry only ever named the first.** Everything above
+  is about `Companion/{Memory,Decisions}` and `compact_companion_docs.rb`. The KnownIssues register is
+  governed by a *separate* script with a *separate* archive hash, and the mechanical sweep in this
+  entry does not look at it (`Companion/Process/Current/KnownIssues/manifest.tsv` is matched by the
+  glob, but the sweep's `next unless pi && si` skips manifests without a `sha256` column). **Asking
+  "is this file hash-pinned?" of the wrong manifest returns a true answer to the wrong question.**
+- 🚨 **The knowledge existed, in this repo, in a routed file, and was not consulted.**
+  `Companion/Memory/Current/115-known-issues-register-is-byte-frozen-and-has-no-append-path.md`
+  documents the freeze, the append path, and the wrapper by name. It is `rg`-findable on
+  `known.issues`, `byte-frozen`, `AMENDMENT-BEGIN`, and `ios-billing`. The routing protocol that would
+  have surfaced it — derive terms from the files you are about to touch, `rg -ni` the companion tree,
+  read every match in full — is mandatory and was not run for a two-line documentation edit. **The
+  failure here is not ignorance of the rule; it is that a small edit does not feel like a task that
+  needs the protocol.** Instance 7 is the same shape (the countermeasure was in this file's own
+  header, read the same session, and did not fire). That is now twice, and it is the strongest
+  argument in this entry for a *gate* rather than more prose.
+- **It was found by neither verifier's owner.** `compact_companion_docs.rb verify` stayed green
+  throughout — it does not read the KnownIssues tree — so the repo's most-run verifier gave a clean
+  bill of health for two days across a broken one. **A green verifier is evidence only about the tree
+  it reads.**
+
+**The repair (`fb5d498a2`)** wrapped the existing note in the sentinels, byte-for-byte, without
+touching the generated body. The shape it had to use is *not* the shape the tree's nine other
+amendment blocks use, and that difference is recorded in
+`Companion/Memory/Current/115-known-issues-register-is-byte-frozen-and-has-no-append-path.md`:
+head-position blocks open with content directly, because the `# TITLE\n\n` above supplies the blank
+line; a **tail**-position block needs a blank line *inside* the block and none before `BEGIN`, the
+shape `KNOWN_ISSUES.md`'s own *Post-freeze amendments* block uses. Copying the nine-file majority
+shape into a tail position fails the byte comparison.
+
+### Mechanical check — updated for the second tree
+
+The sweep earlier in this file is necessary and **no longer sufficient**. Before committing any edit
+under `Companion/`, run **both** verifiers, **unpiped**:
+
+```bash
+ruby Scripts/compact_companion_docs.rb verify ; echo "rc=$?"   # Memory/Decisions trees
+ruby Scripts/compact_known_issues.rb   verify ; echo "rc=$?"   # KnownIssues register  <- added by instance 8
+```
+
+And before editing a file under `Companion/Process/Current/KnownIssues/`, treat it as generated:
+
+```bash
+# Is this file regenerated + byte-compared?  (the register's own manifest, not the Memory sweep's)
+rg -n --fixed-strings "$(basename "$REL_PATH")" Companion/Process/Current/KnownIssues/manifest.tsv
+
+# The ONLY legal amendment shape.  Head position (content follows BEGIN directly):
+#   <!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+#   > the amendment
+#   <!-- KNOWN-ISSUES-AMENDMENT-END -->
+# Tail position needs a blank line INSIDE the block and none before BEGIN — see memory topic 115.
+```

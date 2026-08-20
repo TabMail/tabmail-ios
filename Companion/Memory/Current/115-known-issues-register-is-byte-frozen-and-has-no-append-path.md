@@ -170,3 +170,46 @@ limitation (1, 3, 4) and unhandled form (2).
 
 Related: [[113-a-swift-string-comparison-does-not-reproduce-sqlite-binary-collation]] for the same shape
 of problem — a rule whose artifact does not support it.
+
+---
+
+## Amendment-block POSITION decides its byte shape — and the head-position majority is the wrong model to copy (2026-08-20)
+
+`Scripts/compact_known_issues.rb` strips the delimited block from a file's bytes before the
+byte-comparison, so the block's own surrounding whitespace is part of what must reconstruct. That
+makes **where** you put the block load-bearing, and the tree's own examples are misleading about it.
+
+Census at `fb5d498a2` — every file in the KnownIssues tree carrying a `KNOWN-ISSUES-AMENDMENT-BEGIN`:
+
+| position | count | files |
+|---|---:|---|
+| **head** (before the `> Routed from` provenance line) | 9 | `ios-settings-002`, `ios-push-001`, `ios-imap-012`, `ios-move-002`, `ios-imap-005`, `ios-log-001`, `ios-imap-009`, `ios-body-003`, `ios-cleanup-001` |
+| **tail** (after the body) | 1 | `ios-billing-001` |
+
+**All nine head-position blocks open with content on the line immediately after `BEGIN`** — no blank
+line inside the block — because the `# TITLE\n\n` above them already supplies the blank line the
+Markdown needs. Copying that shape into a **tail** position fails the byte comparison: at the end of a
+file there is no following `\n\n` to borrow, so the amendment runs straight into the preceding
+paragraph and the reconstructed bytes differ.
+
+**The only true tail-position precedent in the tree is `KNOWN_ISSUES.md` itself** (its
+*Post-freeze amendments* block, opened immediately after the last table row). Its working shape is:
+
+```
+<last line of preceding content>
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+                                        <- blank line INSIDE the block
+> the amendment
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
+```
+
+i.e. **blank line inside the block, none before `BEGIN`** — the mirror image of the head-position
+shape. `ios-billing-001.md`'s repair at `fb5d498a2` is that shape, and it is the shape to copy for any
+future tail-position amendment.
+
+**Why this is worth a routed paragraph rather than rediscovery:** the failure is silent in exactly the
+way this whole file is about. A tail block written in the head shape looks correct in the editor and in
+the diff; only `ruby Scripts/compact_known_issues.rb verify`, run **unpiped**, reports it — and the
+nine head-position examples are what an author naturally greps for and imitates. The majority shape is
+not the general shape. See `MIS-IOS-009` instance 8, which is this hazard being paid for a second time
+while this file already documented it.

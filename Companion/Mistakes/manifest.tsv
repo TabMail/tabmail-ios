@@ -7,7 +7,7 @@ MIS-IOS-005	Active	build-ops	high	2	Active/MIS-IOS-005-bare-xcodegen-broke-nse-s
 MIS-IOS-006	Active	testing	high	4	Active/MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md	I reported a test count from a bundle that never rebuilt
 MIS-IOS-007	Active	review-discipline	high	1	Active/MIS-IOS-007-read-the-first-create-table-as-the-effective-schema.md	I read the first `create(table:)` as the effective schema, after a later migration had replaced it
 MIS-IOS-008	Active	review-discipline	high	1	Active/MIS-IOS-008-verified-the-recovery-path-not-the-states-where-it-cannot-run.md	I verified that a recovery path exists, without asking where that path is itself blocked
-MIS-IOS-009	Active	documentation	high	7	Active/MIS-IOS-009-amended-a-hash-pinned-fragment-and-killed-the-verifier.md	I amended a hash-pinned Companion fragment in place, and the verifier died on line one
+MIS-IOS-009	Active	documentation	high	8	Active/MIS-IOS-009-amended-a-hash-pinned-fragment-and-killed-the-verifier.md	I amended a hash-pinned Companion fragment in place, and the verifier died on line one
 MIS-IOS-010	Active	data-integrity	critical (wrong-message mutation)	1	Active/MIS-IOS-010-bulk-write-selected-on-a-column-value-that-was-itself-a-guard.md	I designed a bulk write whose WHERE clause selected exactly the rows a guard was protecting
 MIS-IOS-011	Active	design-process	high	1	Active/MIS-IOS-011-declared-a-residual-acceptable-on-an-argument-i-never-ran.md	I declared a residual acceptable on a safety argument I never actually ran
 MIS-IOS-012	Active	census	high	1	Active/MIS-IOS-012-guarded-one-reader-on-a-caller-census-whose-grep-shape-hid-half-the-callers.md	I guarded a reader on a caller census whose grep shape hid half the callers
