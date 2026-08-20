@@ -9,7 +9,11 @@
 ✅ **RESOLVED BY ROLLBACK (2026-08-17).** PR #39's uncapped durable direct-AI
 exception amplified ordinary queue liveness problems to preserve hypothetical derived work. The
 owner rejected that tradeoff. Current behavior uses one bounded newest-`SyncConfig.maxRecentEmails`
-population for automatic and direct producers; older messages show a quiet suppression notice.
+population for automatic and direct producers. (The quiet suppression notice this sentence once
+ended with was removed on 2026-08-19: display is no longer gated at all — an existing summary
+renders in every folder, and an out-of-window Inbox message with no summary shows the ordinary
+empty state. See ADR-IOS-078 and the IOS-AI-004 amendment; the PROCESSING bound above is
+unchanged.)
 Migration v87 retires the marker schema without rewriting the shipped v85/v86 migration ledger.
 
 The sections below preserve the withdrawn PR #39 candidate and its motivating failure analysis as

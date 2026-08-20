@@ -431,7 +431,28 @@ enum BodyFetchProcessor {
 
     /// Flush a batch of processed items to FTS + GRDB flags in one go.
     /// Batching FTS writes avoids per-item FTS5 index maintenance overhead.
-    static func flushBatch(_ items: [ProcessedItem], enableAI: Bool) async {
+    ///
+    /// `aiWindowExempt` (ADR-IOS-078 pathway regating): this function is
+    /// DUAL-ORIGIN. The gated (default) bucket has TWO production callers, both
+    /// sync-origin and window-gated at `ActiveAIQueue.enqueue`, which is the
+    /// install-flood bound: `ActiveBodyQueue`'s background flush, and
+    /// `InboxViewModel`'s snippet-loader Tier-2 network fetch (list-scroll
+    /// driven — exactly the unbounded shape the flood bound exists for).
+    /// (`BackfillBodyQueue` passes `enableAI: false` and never reaches AI at
+    /// all.) The user-open priority fetch
+    /// (`fetchAndProcess` ← `AccountManagerFetch.fetchBody`) passes `true`: a
+    /// manual open is window-exempt on the arm where the body had to be fetched
+    /// from the server first (round-1 review finding — the first cut exempted
+    /// only `processOpenedMessage`'s already-cached arm).
+    ///
+    /// SCOPE — this exempts the open that performs its OWN fetch; it is NOT
+    /// "exempt in every body state". When `ActiveBodyQueue` already owns the
+    /// fetch (`MessageDetailViewModel.loadBody` sees `isQueuedOrInFlight` and
+    /// polls), the body lands via the DEFAULT gated flush above and
+    /// `startBodyPoll`'s `adoptReadyBody` displays it without re-triggering AI.
+    /// That residual is the coordinator-deferred body-arrival auto-trigger,
+    /// Retry-recoverable — see ADR-IOS-078 and the IOS-AI-004 amendment.
+    static func flushBatch(_ items: [ProcessedItem], enableAI: Bool, aiWindowExempt: Bool = false) async {
         guard !items.isEmpty else { return }
         let t0 = CFAbsoluteTimeGetCurrent()
         let dbPool = AppDatabase.dbPool
@@ -490,7 +511,9 @@ enum BodyFetchProcessor {
         // 3. Enqueue downstream processing — only for items actually written to FTS.
         for item in confirmedItems {
             if enableAI && item.isInInbox {
-                await ActiveAIQueue.shared.enqueue(headerId: item.headerId, accountId: item.accountId)
+                await ActiveAIQueue.shared.enqueue(
+                    headerId: item.headerId, accountId: item.accountId,
+                    windowExempt: aiWindowExempt)
             }
             if enableAI {
                 await ActiveEmbeddingQueue.shared.enqueue(headerId: item.headerId)
@@ -634,10 +657,16 @@ enum BodyFetchProcessor {
 
     /// Combined fetch + process for single-item callers (user-open path).
     /// Flushes FTS immediately (no batching needed for single items).
+    ///
+    /// `aiWindowExempt`: see `flushBatch`. The sole production caller is
+    /// `AccountManagerFetch.fetchBody` — every path into it is a user-driven
+    /// detail-view open — which passes `true` so the open's AI enqueue is
+    /// window-exempt (ADR-IOS-078 pathway regating).
     static func fetchAndProcess(
         item: Item,
         provider: any EmailProvider,
         enableAI: Bool,
+        aiWindowExempt: Bool = false,
         replaceExistingBody: Bool = false
     ) async -> Result {
         let fetchResult = await fetch(item: item, provider: provider)
@@ -648,7 +677,7 @@ enum BodyFetchProcessor {
                 enableAI: enableAI,
                 replaceExistingBody: replaceExistingBody)
             if let processed {
-                await flushBatch([processed], enableAI: enableAI)
+                await flushBatch([processed], enableAI: enableAI, aiWindowExempt: aiWindowExempt)
             }
             return outcome
         case .failure(let result):

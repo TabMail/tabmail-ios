@@ -10,6 +10,12 @@
 promise is withdrawn. The post-drain resolver may enqueue only when the message belongs to the same
 bounded recent-Inbox population used by ordinary recovery; no durable exception survives queue loss.
 
+*(Amended 2026-08-19, ADR-IOS-078 pathway regating: the "bounded recent-Inbox population" clause
+is superseded — the post-drain entered-Inbox enqueue is now window-EXEMPT
+(`AIJob.windowExempt`). What this record resolved STANDS, and is the load-bearing half: the
+enqueue is EPHEMERAL — no durable marker survives queue loss, a relaunch re-discovers work through
+the bounded sweep only.)*
+
 The sections below preserve the withdrawn PR #39 candidate as historical evidence. They do not
 describe current runtime behavior.
 

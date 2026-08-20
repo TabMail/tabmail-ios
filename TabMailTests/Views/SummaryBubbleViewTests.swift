@@ -6,11 +6,18 @@ import Testing
 import Foundation
 @testable import TabMail
 
-@Suite("SummaryBubbleView — display gate")
+// Owner decision (2026-08-19, ADR-IOS-078): an AI summary that already exists is
+// NEVER gated from display. The newest-100 inbox window bounds PROCESSING only
+// (IOS-AI-004); the display gate that 7a31f1d22 added to this view (and the
+// inbox-membership display gate that v1.7.9 already had) are both removed. The
+// only remaining `.hidden` outcomes are presentation states: demo-with-AI-declined,
+// and the ABSENT-summary empty state outside the Inbox (where nothing will ever
+// process the message, so a spinner would advertise work that never happens).
+@Suite("SummaryBubbleView — display decision")
 @MainActor
 struct SummaryBubbleViewTests {
 
-    // MARK: - Inbox + content → .content
+    // MARK: - An existing summary renders — in every folder
 
     @Test("inbox message with cached summary renders content")
     func inboxWithSummaryShowsContent() {
@@ -25,8 +32,8 @@ struct SummaryBubbleViewTests {
     @Test("inbox message with the no-content stub still renders content (stub is in-inbox AI-skip path)")
     func inboxWithNoContentStubShowsContent() {
         // The "no content" stub is written by AccountManager.processOpenedMessage
-        // when an opened inbox message has no body/attachments. While in the inbox
-        // it should display, mirroring TB's stub behavior.
+        // when an opened inbox message has no body/attachments. It is an existing
+        // AI artifact and displays, mirroring TB's stub behavior.
         let mode = SummaryBubbleView.displayMode(
             isInInbox: true,
             summaryBlurb: "This message has no content.",
@@ -35,7 +42,56 @@ struct SummaryBubbleViewTests {
         #expect(mode == .content)
     }
 
-    // MARK: - Inbox + no content → .empty
+    @Test("non-inbox message with cached summary renders it (search-opened Sent/Archive case)")
+    func nonInboxWithSummaryRendersContent() {
+        // The predecessor of this test asserted `== .hidden` — the inbox-membership
+        // display gate that v1.7.9 shipped. The owner decision of 2026-08-19 removes
+        // that gate too: an existing summary renders in every folder. Inverted
+        // rather than deleted, so the old policy cannot silently return.
+        let mode = SummaryBubbleView.displayMode(
+            isInInbox: false,
+            summaryBlurb: "Vendor confirmed Friday delivery.",
+            demoSuppressed: false
+        )
+        #expect(mode == .content)
+    }
+
+    @Test("non-inbox message with the no-content stub renders it")
+    func nonInboxWithNoContentStubRendersContent() {
+        // The stub stamps MessageHeader.summaryBlurb directly; it is existing AI
+        // content and follows the message out of the inbox. Inverted from the
+        // predecessor that asserted `.hidden`.
+        let mode = SummaryBubbleView.displayMode(
+            isInInbox: false,
+            summaryBlurb: "This message has no content.",
+            demoSuppressed: false
+        )
+        #expect(mode == .content)
+    }
+
+    @Test("summary existence is the only display input — no folder state hides an existing summary")
+    func existingSummaryRendersRegardlessOfFolderState() {
+        // The invariant this file exists to pin: exists ⇒ shown. The newest-100
+        // window axis is deliberately ABSENT from displayMode's signature — the
+        // processing bound has no display-side input to vary — so the remaining
+        // folder axis is exhausted here.
+        let blurbs = ["Vendor confirmed Friday delivery.", "This message has no content."]
+        for isInInbox in [true, false] {
+            for blurb in blurbs {
+                let mode = SummaryBubbleView.displayMode(
+                    isInInbox: isInInbox,
+                    summaryBlurb: blurb,
+                    demoSuppressed: false
+                )
+                #expect(
+                    mode == .content,
+                    "isInInbox=\(isInInbox) blurb=\(blurb)"
+                )
+            }
+        }
+    }
+
+    // MARK: - Absent summary: empty state in the inbox, nothing elsewhere
 
     @Test("inbox message with nil summary renders empty state")
     func inboxWithNilSummaryRendersEmpty() {
@@ -57,136 +113,12 @@ struct SummaryBubbleViewTests {
         #expect(mode == .empty)
     }
 
-    @Test("inbox message outside recent window renders suppression instead of loading")
-    func oldInboxMessageRendersSuppression() {
-        let mode = SummaryBubbleView.displayMode(
-            isInInbox: true,
-            summaryBlurb: nil,
-            demoSuppressed: false,
-            recentInboxEligible: false
-        )
-        #expect(mode == .suppressed)
-    }
-
-    @Test("recent-window suppression takes precedence over stale cached content")
-    func oldInboxMessageDoesNotRenderCachedSummary() {
-        let mode = SummaryBubbleView.displayMode(
-            isInInbox: true,
-            summaryBlurb: "Old cached summary",
-            demoSuppressed: false,
-            recentInboxEligible: false
-        )
-        #expect(mode == .suppressed)
-    }
-
-    // MARK: - The bounded-window gate must never hide an inbox bubble
-    //
-    // The live v1.7.11 regression: the gate starts unresolved (`nil`) and an
-    // unresolved gate returned `.hidden`, so the AI summary bubble was invisible
-    // for EVERY message — inbox included. The view that resolves the gate is the
-    // one the gate had hidden, so nothing could ever resolve it. These tests pin
-    // the user-facing invariant (an inbox message's bubble is visible), not the
-    // mechanism that resolves the window query.
-    //
-    // The predecessor of the first test asserted the opposite (`== .hidden`) and
-    // shipped the regression green; it is inverted here rather than deleted.
-
-    @Test("an unresolved window gate shows the ordinary empty state, never a hidden bubble")
-    func unresolvedWindowStateRendersEmptyNotHidden() {
-        let mode = SummaryBubbleView.displayMode(
-            isInInbox: true,
-            summaryBlurb: nil,
-            demoSuppressed: false,
-            recentInboxEligible: nil
-        )
-        #expect(mode == .empty)
-    }
-
-    @Test("an inbox message with a stored summary renders its bubble before the window gate resolves")
-    func inboxSummaryRendersWhileWindowStateUnresolved() {
-        let mode = SummaryBubbleView.displayMode(
-            isInInbox: true,
-            summaryBlurb: "Vendor confirmed Friday delivery.",
-            demoSuppressed: false,
-            recentInboxEligible: nil
-        )
-        #expect(mode == .content)
-    }
-
-    @Test("a resolved-eligible message keeps the exact pre-gate outcomes")
-    func resolvedEligibleKeepsPreGateOutcomes() {
-        // Guards the coverage the seam default used to provide implicitly. Before
-        // this fix the default was `= true`, so every test that omitted the
-        // argument pinned the eligible outcomes as a side effect; the default is
-        // now `nil`, so the eligible column needs pinning on purpose. Without
-        // this, `true` could return `.suppressed` for everything and stay green.
-        let cases: [(blurb: String?, expected: SummaryBubbleView.DisplayMode)] = [
-            (nil, .empty),
-            ("", .empty),
-            ("Vendor confirmed Friday delivery.", .content)
-        ]
-        for testCase in cases {
-            let mode = SummaryBubbleView.displayMode(
-                isInInbox: true,
-                summaryBlurb: testCase.blurb,
-                demoSuppressed: false,
-                recentInboxEligible: true
-            )
-            #expect(mode == testCase.expected, "blurb=\(String(describing: testCase.blurb))")
-        }
-    }
-
-    @Test("no window-gate state can hide an inbox message's summary bubble")
-    func inboxMessageIsNeverHiddenByTheWindowGate() {
-        let gateStates: [Bool?] = [nil, true, false]
-        let blurbs: [String?] = [nil, "", "Vendor confirmed Friday delivery."]
-        for gate in gateStates {
-            for blurb in blurbs {
-                let mode = SummaryBubbleView.displayMode(
-                    isInInbox: true,
-                    summaryBlurb: blurb,
-                    demoSuppressed: false,
-                    recentInboxEligible: gate
-                )
-                #expect(
-                    mode != .hidden,
-                    "gate=\(String(describing: gate)) blurb=\(String(describing: blurb))"
-                )
-            }
-        }
-    }
-
-    // MARK: - Non-inbox → .hidden (regardless of content)
-
-    @Test("non-inbox message with cached summary is hidden (search-opened Sent/Archive case)")
-    func nonInboxWithSummaryIsHidden() {
-        // This is the bug fix: a message opened via search from a non-inbox folder
-        // (Sent/Archive/Trash) must not surface a leftover cached summary, even
-        // though MessageAICache.restoreIfCached or a prior inbox-stay may have
-        // populated MessageHeader.summaryBlurb.
-        let mode = SummaryBubbleView.displayMode(
-            isInInbox: false,
-            summaryBlurb: "Vendor confirmed Friday delivery.",
-            demoSuppressed: false
-        )
-        #expect(mode == .hidden)
-    }
-
-    @Test("non-inbox message with no-content stub is hidden")
-    func nonInboxWithNoContentStubIsHidden() {
-        // The "no content" stub stamps MessageHeader.summaryBlurb directly. When
-        // such a message later moves out of inbox and is opened via search, the
-        // stub must not display.
-        let mode = SummaryBubbleView.displayMode(
-            isInInbox: false,
-            summaryBlurb: "This message has no content.",
-            demoSuppressed: false
-        )
-        #expect(mode == .hidden)
-    }
-
-    @Test("non-inbox message with nil summary is hidden")
+    @Test("non-inbox message with nil summary is hidden (empty-state presentation, not a content gate)")
     func nonInboxWithNilSummaryIsHidden() {
+        // There is no summary to display and nothing ever processes a non-inbox
+        // message (AccountManager.processOpenedMessage guards on isInInbox), so
+        // rendering the loading/failed chain would advertise work that never
+        // happens. This bounds only the absent-summary presentation.
         let mode = SummaryBubbleView.displayMode(
             isInInbox: false,
             summaryBlurb: nil,
@@ -219,10 +151,15 @@ struct SummaryBubbleViewTests {
         #expect(mode == .hidden)
     }
 
-    @Test("demo with AI declined hides bubble for non-inbox empty case")
-    func demoSuppressedHidesNonInboxEmpty() {
+    @Test("demo with AI declined hides the inbox empty state (control pair: same input without demo is .empty)")
+    func demoSuppressedHidesInboxEmpty() {
+        // Discriminating control for the demo flag on the absent-summary arm:
+        // `inboxWithNilSummaryRendersEmpty` pins this same input with
+        // demoSuppressed=false to `.empty`, so the pair fails if the demo
+        // consent branch is removed. (A non-inbox variant would be vacuous —
+        // that input is `.hidden` with or without demo.)
         let mode = SummaryBubbleView.displayMode(
-            isInInbox: false,
+            isInInbox: true,
             summaryBlurb: nil,
             demoSuppressed: true
         )
@@ -231,15 +168,16 @@ struct SummaryBubbleViewTests {
 
     // MARK: - Live MessageHeader fixture (DB roundtrip → displayMode parity)
 
-    @Test("non-inbox MessageHeader fetched from DB resolves to .hidden")
-    func nonInboxHeaderFromDBHidden() throws {
+    @Test("non-inbox MessageHeader fetched from DB renders its retained summary")
+    func nonInboxHeaderFromDBRendersContent() throws {
+        // Inverted from the predecessor that asserted `.hidden`: a message opened
+        // via search from a non-inbox folder (Sent/Archive/Trash) renders the
+        // summary its row retained — existing AI content is never window- or
+        // folder-gated (owner decision 2026-08-19).
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db, name: "Sent", path: "Sent", role: .sent)
 
-        // Insert a message in the Sent folder with a cached summaryBlurb (mimicking
-        // a row that retained the stub or had its summary restored from a prior
-        // inbox stay).
         var header = try TestDatabase.insertMessageHeader(
             db,
             messageId: "200",
@@ -251,7 +189,7 @@ struct SummaryBubbleViewTests {
         try db.write { conn in
             try conn.execute(
                 sql: "UPDATE messageHeader SET summaryBlurb = ? WHERE id = ?",
-                arguments: ["Stale summary from before move", header.id]
+                arguments: ["Summary retained from before move", header.id]
             )
         }
         header = try db.read { try MessageHeader.fetchOne($0, key: header.id) }!
@@ -261,8 +199,8 @@ struct SummaryBubbleViewTests {
             summaryBlurb: header.summaryBlurb,
             demoSuppressed: false
         )
-        #expect(mode == .hidden)
-        #expect(header.summaryBlurb == "Stale summary from before move")
+        #expect(mode == .content)
+        #expect(header.summaryBlurb == "Summary retained from before move")
     }
 
     @Test("inbox MessageHeader fetched from DB with summary resolves to .content")

@@ -71,6 +71,16 @@ actor ActiveEmbeddingQueue {
         storage.isEmpty && storage.activeJobs == 0
     }
 
+    /// Test-only seam — drop all pending/in-flight state so a test that reaches
+    /// this shared singleton as a side effect (e.g. `BodyFetchProcessor.flushBatch`
+    /// with `enableAI: true`, whose downstream loop also offers the item here)
+    /// leaves no residue for a later suite. `dispatchBatch` no-ops while
+    /// `EmbeddingService.shared` is nil (always, in unit tests), so an offered item
+    /// otherwise sits pending forever; this clears it.
+    func clearForTesting() {
+        storage.clearAll()
+    }
+
     // MARK: - Dispatch
 
     private func scheduleDispatch() {

@@ -66,6 +66,30 @@ struct QueueStorage<Item: Hashable> {
         return true
     }
 
+    /// Replace a PENDING equal item in place — same identity under `==`/`hash`,
+    /// different NON-identity context (e.g. `ActiveAIQueue.AIJob.windowExempt`,
+    /// which is deliberately excluded from job identity). The caller decides the
+    /// merge DIRECTION by only ever calling this with the value that must win.
+    /// In-flight items are not replaced, because the executor has already
+    /// captured their value by value and would not observe the swap. Do NOT read
+    /// this as "an in-flight job has already passed its admission re-checks":
+    /// `collectCandidates` inserts into `inFlight` synchronously while the
+    /// executor's re-check runs later, after a hop — so an exempt offer arriving
+    /// in that prefix is `.rejected` and, if the message has aged out, the
+    /// in-flight gated twin still window-retires. That residual is narrow,
+    /// fail-closed (`.scopeExited` sets no `recentlyCompleted` marker) and
+    /// one-gesture recoverable via Retry/reopen through the exempt
+    /// `processOpenedMessage`. FIFO position, `enqueued` membership,
+    /// `retryCount` and `recentlyCompleted` are all keyed by identity, so the
+    /// replacement disturbs none of them. Returns true iff a pending item was
+    /// replaced.
+    @discardableResult
+    mutating func replacePending(with item: Item) -> Bool {
+        guard !inFlight.contains(item), let idx = queue.firstIndex(of: item) else { return false }
+        queue[idx] = item
+        return true
+    }
+
     /// Sweep `recentlyCompleted` entries older than the TTL.
     /// Called lazily from `enqueue` — cheap when the dict is small.
     private mutating func sweepExpiredRecentlyCompleted() {

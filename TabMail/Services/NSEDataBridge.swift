@@ -3398,7 +3398,13 @@ enum NSEDataBridge {
             await PriorityGate.$inPrivilegedContext.withValue(false) {
                 for item in downstream {
                     if item.isInInbox {
-                        await ActiveAIQueue.shared.enqueue(headerId: item.headerId, accountId: item.accountId)
+                        // ADR-IOS-078 pathway regating (owner directive
+                        // 2026-08-19): a pushed message is new mail the user was
+                        // just notified about — window-exempt. Inbox scope is
+                        // this producer's own `isInInbox` check plus the
+                        // executor's unconditional membership re-check.
+                        await ActiveAIQueue.shared.enqueue(
+                            headerId: item.headerId, accountId: item.accountId, windowExempt: true)
                     }
                     await ActiveEmbeddingQueue.shared.enqueue(headerId: item.headerId)
                 }

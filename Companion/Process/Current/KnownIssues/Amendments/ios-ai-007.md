@@ -10,6 +10,13 @@
 longer exists. Partial-success moves retain their pre-PR #39 correctness behavior, while AI admission
 uses the same bounded recent-Inbox policy as every other producer. No special marker is created.
 
+*(Amended 2026-08-19, ADR-IOS-078 pathway regating: the "same bounded policy as every other
+producer" clause is superseded — moved-into-inbox admission is now window-EXEMPT
+(`enqueueAIForMembersThatEnteredInbox` enqueues with `AIJob.windowExempt`), as are push/NSE merge
+and the user-open body fetch. What this record resolved STANDS: the exemption is ephemeral — an
+in-memory job flag — and no durable marker is created; the window still bounds the sync-origin
+producers.)*
+
 The sections below preserve the withdrawn PR #39 candidate as historical evidence. They do not
 describe current runtime behavior.
 
