@@ -297,8 +297,11 @@ actor ActiveAIQueue {
     /// This deliberately shares the same ordering and limit as
     /// `repopulationCandidates`: the newest `SyncConfig.maxRecentEmails` Inbox
     /// rows are selected *before* cached-work filtering. It is the sole policy
-    /// seam used by direct enqueue, job execution, opened-message processing and
-    /// the summary UI. No durable exception survives outside this window.
+    /// seam used by direct enqueue, job execution and opened-message processing.
+    /// No durable exception survives outside this window. The window bounds
+    /// PROCESSING only — display never consults it (owner decision 2026-08-19,
+    /// ADR-IOS-078): `SummaryBubbleView` renders whatever AI content already
+    /// exists, in every folder.
     nonisolated static func recentInboxWindowContains(
         headerId: String,
         db: Database
