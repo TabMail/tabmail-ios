@@ -57,6 +57,10 @@ enum OutboxAdmissionError: LocalizedError, Equatable {
 struct InFlightOutboxCandidate: FetchableRecord, Decodable, Equatable, Sendable {
     let id: String
     let instanceEpoch: String?
+    /// The durable hold already stamped on this row. Carried so a DEDUPED send
+    /// reports the deadline the drain will actually honour — the pre-existing
+    /// row's — instead of the one the discarded new row would have had.
+    let holdUntil: Date?
 }
 
 struct DraftSendAuthority: FetchableRecord, Decodable, Equatable, Sendable {
@@ -80,7 +84,11 @@ extension AccountManager {
     /// Queue a send operation to the outbox. Persists the draft + attachments to disk,
     /// then fires off a drain attempt. Throws if persistence fails — caller MUST
     /// surface the error to the user so the message is not silently lost.
-    /// Returns the created outboxId so the caller can pass it to PendingSendService.
+    /// Returns the created outboxId AND the durable `holdUntil` stamped on that
+    /// row, so the caller can hand both to `PendingSendService.present`. The
+    /// deadline must travel with the id: it is anchored at persist START, so the
+    /// caller — which only resumes once the awaited write has returned — cannot
+    /// reconstruct it from its own clock (issue #76).
     ///
     /// `async`: the persistence runs through the ASYNC `dbPool.write` overload (in
     /// `persistQueuedSend`), so the `@MainActor` caller (`ComposeView.send`) is
@@ -106,7 +114,7 @@ extension AccountManager {
         serverDraftGmailMessageId: String? = nil,
         draftId: String,
         instanceEpoch: String
-    ) async throws -> String {
+    ) async throws -> (outboxId: String, holdUntil: Date?) {
         let result = try await Self.persistQueuedSend(
             draft: draft,
             accountId: account.id,
@@ -141,7 +149,7 @@ extension AccountManager {
             Task { await AppDatabase.checkpointForDurability() }
         }
         Task { await self.drainOutbox() }
-        return result.outboxId
+        return (result.outboxId, result.holdUntil)
     }
 
     /// In-flight outbox row id for `draftId`, or nil. The double-send firewall
@@ -158,7 +166,7 @@ extension AccountManager {
         try InFlightOutboxCandidate.fetchAll(
             db,
             sql: """
-                SELECT id, instanceEpoch
+                SELECT id, instanceEpoch, holdUntil
                 FROM outboxMessage
                 WHERE accountId = ? AND draftId = ?
                   AND status IN ('queued', 'sending')
@@ -176,7 +184,15 @@ extension AccountManager {
     ///
     /// Returns the id of the outbox row that now represents this send (the freshly
     /// inserted one, or the pre-existing in-flight one when deduped), whether it
-    /// deduped, and the resolved original-header id for the reply/forward badge.
+    /// deduped, the resolved original-header id for the reply/forward badge, and
+    /// that row's durable `holdUntil`.
+    ///
+    /// `holdUntil` is returned because it is the ONLY authoritative statement of
+    /// how long the send can still be undone, and it is anchored at persist START
+    /// — before this function's `saveAttachments` disk write and its awaited
+    /// `dbPool.write`. Any caller that offers the user an Undo affordance must
+    /// bound that affordance by THIS value rather than by its own clock, or the
+    /// affordance outlives the hold by exactly the persist latency (issue #76).
     nonisolated static func persistQueuedSend(
         draft: DraftMessage,
         accountId: String,
@@ -188,7 +204,7 @@ extension AccountManager {
         serverDraftGmailMessageId: String? = nil,
         draftId: String,
         instanceEpoch: String
-    ) async throws -> (outboxId: String, deduped: Bool, resolvedOriginalId: String?) {
+    ) async throws -> (outboxId: String, deduped: Bool, resolvedOriginalId: String?, holdUntil: Date?) {
         guard !instanceEpoch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw OutboxAdmissionError.invalidInstanceEpoch
         }
@@ -204,11 +220,17 @@ extension AccountManager {
         outbox.serverDraftGmailMessageId = serverDraftGmailMessageId
         outbox.draftId = draftId
         outbox.instanceEpoch = instanceEpoch
-        // Hold the send until `now + undoHold + claimBuffer`. UI Undo button is
-        // shown for `undoHold` (5 s); drain claim fires after +1 s claim buffer.
-        // The 1 s gap eliminates TOCTOU races between user-taps-Undo and the
-        // atomic claim transaction.
-        outbox.holdUntil = Date().addingTimeInterval(
+        // Hold the send until `queuedAt + undoHold + claimBuffer`. UI Undo button
+        // is shown for `undoHold` (5 s) MEASURED FROM THE SAME `queuedAt`; drain
+        // claim fires after the +1 s claim buffer. The 1 s gap eliminates TOCTOU
+        // races between user-taps-Undo and the atomic claim transaction.
+        //
+        // `queuedAt` is captured here, at persist START, and is NOT a stored
+        // column — which is why `holdUntil` is returned to the caller. The toast
+        // cannot re-derive this instant: it is only reached after the awaited
+        // write below returns.
+        let queuedAt = Date()
+        outbox.holdUntil = queuedAt.addingTimeInterval(
             SyncConfig.outboxUndoHoldSeconds + SyncConfig.outboxClaimBufferSeconds
         )
 
@@ -223,7 +245,7 @@ extension AccountManager {
         let inReplyTo = draft.inReplyTo
         let hadAttachments = !draft.attachments.isEmpty
         do {
-            let result = try await AppDatabase.dbPool.write { db -> (outboxId: String, deduped: Bool, resolvedOriginalId: String?) in
+            let result = try await AppDatabase.dbPool.write { db -> (outboxId: String, deduped: Bool, resolvedOriginalId: String?, holdUntil: Date?) in
                 // PORT/SUBTRACT — the v2final authority projection and bounded
                 // same-account census, strengthened to require the live Draft.
                 // Replacement or disappearance fails closed before dedup/insert.
@@ -254,18 +276,24 @@ extension AccountManager {
                     guard existing.instanceEpoch == instanceEpoch else {
                         throw OutboxAdmissionError.inFlightGenerationMismatch(draftId: draftId)
                     }
-                    return (existing.id, true, nil)
+                    // The kept row's OWN hold governs — it was stamped when THAT
+                    // send was persisted and may already have elapsed. Reporting
+                    // this send's discarded deadline would offer an Undo the
+                    // drain has long since stopped honouring.
+                    return (existing.id, true, nil, existing.holdUntil)
                 }
                 try outboxToInsert.insert(db)
                 // Optimistic isReplied/isForwarded — matches markRead/archive pattern.
                 // Server state overwrites on next sync (~90s). No rollback needed.
-                guard let originalId = replyToHeaderId else { return (outboxToInsert.id, false, nil) }
+                guard let originalId = replyToHeaderId else {
+                    return (outboxToInsert.id, false, nil, outboxToInsert.holdUntil)
+                }
                 guard let original = try resolveOriginalMessage(
                     originalId: originalId,
                     inReplyTo: inReplyTo,
                     accountId: accountId,
                     db: db
-                ) else { return (outboxToInsert.id, false, nil) }
+                ) else { return (outboxToInsert.id, false, nil, outboxToInsert.holdUntil) }
                 if isForward {
                     try db.execute(sql: "UPDATE messageHeader SET isForwarded = 1 WHERE id = ?", arguments: [original.id])
                 } else {
@@ -284,7 +312,7 @@ extension AccountManager {
                         )
                     }
                 }
-                return (outboxToInsert.id, false, original.id)
+                return (outboxToInsert.id, false, original.id, outboxToInsert.holdUntil)
             }
             // Deduped → the attachments dir we just wrote (named by the discarded
             // new outbox.id) is orphaned; clean it up. The kept (existing) row owns

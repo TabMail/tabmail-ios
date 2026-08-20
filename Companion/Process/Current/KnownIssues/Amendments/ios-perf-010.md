@@ -182,6 +182,27 @@ index requirements are unchanged.
     synchronous is therefore a deliberate design decision / accepted limitation, not an unaddressed
     perf smell — the in-code annotation on `discardOutboxMessageConfirmed` is the durable guardrail
     against a future pass re-flagging and converting it.
+
+    ⚠️ **Proof A's ARITHMETIC is superseded (2026-08-20, GitHub iOS
+    [#76](https://github.com/TabMail/tabmail-ios/issues/76)); its VERDICT is not.** The Δ-eroded
+    budget described above — *"roughly `(1.1 - Δ)` s … shrinking toward zero (or below) as Δ grows"* —
+    **was itself the bug**, not merely a sharpening of this one, and it is fixed. The toast's Undo
+    window is no longer anchored at `PendingSendService.present()`: `persistQueuedSend` now RETURNS
+    the durable `holdUntil` it stamped, `queueSend` carries it to `ComposeView`, and
+    `PendingSendService.Pending.undoDeadline` derives the button's withdrawal instant as
+    `holdUntil - outboxClaimBufferSeconds`. Δ therefore shortens the VISIBLE window (to nothing, if it
+    exceeds the whole hold) instead of pushing the button past the deadline. **Do not restate the
+    `(1.1 - Δ)` figure**: the budget at the last tappable instant is now a guaranteed full
+    `outboxClaimBufferSeconds` = **1 s**, and it can no longer reach zero or go negative.
+    **Member 5 stays MUST STAY SYNCHRONOUS, and this change strengthens rather than weakens that**:
+    the refusal never depended on the budget being *smaller* than 1 s — it depends on the async
+    `PrioritizedDatabase.write` overload additionally awaiting `DatabaseWriteQueue.acquire(.priority)`,
+    whose own comment records multi-second waits, which does not fit inside 1 s either. Proofs B and C
+    are untouched by #76 and are independently sufficient on their own. **Trip-wire, replacing the old
+    Δ one:** if anything ever makes `Pending.undoDeadline` stop deriving from the row's durable
+    `holdUntil` — a default value on `present(…, holdUntil:)`, a re-anchor at presentation, a second
+    writer of `holdUntil` — the guaranteed 1 s budget lapses and this paragraph's arithmetic must be
+    re-derived before any conversion is considered.
   - **Proof B (reentrancy).** `RootView` wires `PendingSendToast(onUndo: { if let snapshot =
     pendingSendService.undo() { … } })` — a synchronous decide-then-apply whose return drives a
     `fullScreenCover`. An `await` forces a `Task {}` at a Button that is NOT disabled, so a second tap
@@ -381,7 +402,9 @@ as five members of one hazard, is wrong in both directions and has already been 
   declared in the file `AccountManagerOutbox.swift` on `actor AccountManager` (that file is a single
   `extension AccountManager`, so `AccountManagerOutbox` is not a type). **The other three are folder-role
   writes on a Settings path** and have no undo race at all.
-- **The two families have DIFFERENT hazards.** Members 4–5: Proof A's Δ-eroded undo budget and the
+- **The two families have DIFFERENT hazards.** Members 4–5: Proof A's Δ-eroded undo budget (⚠️ **that
+  budget is no longer Δ-eroded** — see the 2026-08-20 supersession note inside Proof A itself, GitHub
+  iOS #76; it is now a guaranteed 1 s, which does not change member 5's verdict) and the
   `IOS-OUTBOX-006` end state — a *delivered* message for which the user was shown "Couldn't undo" with
   the Undo button already gone; nothing recovers the delivered mail. Members 1–3: the loss of **gesture
   order == durable order**, i.e. a **NEVER DROP USER INTENTION** violation in which two unstructured

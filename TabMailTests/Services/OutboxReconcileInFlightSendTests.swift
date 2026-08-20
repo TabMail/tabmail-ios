@@ -429,9 +429,13 @@ struct OutboxReconcileInFlightSendTests {
         let outboxId = "outbox-undo-deadline"
         let draftId = "draft-undo-deadline"
         let epoch = "epoch-undo-deadline"
+        // Far beyond any claim deadline; the SAME value is handed to the toast so
+        // its Undo affordance is bounded by the row's durable hold, not by its
+        // own clock.
+        let seededHold = Date().addingTimeInterval(3600)
         try seedVerifiableSend(
             pool, outboxId: outboxId, draftId: draftId, epoch: epoch,
-            holdUntil: Date().addingTimeInterval(3600))
+            holdUntil: seededHold)
 
         let provider = MockEmailProvider()
         try await TestProviderRegistry.withRegisteredProvider(
@@ -439,7 +443,7 @@ struct OutboxReconcileInFlightSendTests {
         ) {
             PendingSendService.shared.present(
                 outboxId: outboxId, draftId: draftId, instanceEpoch: epoch,
-                toSummary: "To: recipient@example.com")
+                toSummary: "To: recipient@example.com", holdUntil: seededHold)
 
             // A live drain that is gated out by holdUntil; give it a pass so the
             // race is real, not merely absent.
@@ -492,9 +496,13 @@ struct OutboxReconcileInFlightSendTests {
         let outboxId = "outbox-undo-reentrancy"
         let draftId = "draft-undo-reentrancy"
         let epoch = "epoch-undo-reentrancy"
+        // Far beyond any claim deadline; the SAME value is handed to the toast so
+        // its Undo affordance is bounded by the row's durable hold, not by its
+        // own clock.
+        let seededHold = Date().addingTimeInterval(3600)
         try seedVerifiableSend(
             pool, outboxId: outboxId, draftId: draftId, epoch: epoch,
-            holdUntil: Date().addingTimeInterval(3600))
+            holdUntil: seededHold)
 
         let provider = MockEmailProvider()
         try await TestProviderRegistry.withRegisteredProvider(
@@ -502,7 +510,7 @@ struct OutboxReconcileInFlightSendTests {
         ) {
             PendingSendService.shared.present(
                 outboxId: outboxId, draftId: draftId, instanceEpoch: epoch,
-                toSummary: "To: recipient@example.com")
+                toSummary: "To: recipient@example.com", holdUntil: seededHold)
 
             // Two taps back to back in ONE synchronous @MainActor run — no await
             // between them, exactly as a double-tap on the synchronous Undo button.

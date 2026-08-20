@@ -276,6 +276,79 @@ struct OutboxDoubleSendTests {
         #expect(total == 2, "expected the old .failed row + the new .queued row, got \(total)")
     }
 
+    /// 🚨 **PRODUCER SIDE of the issue-#76 contract**
+    /// (`feedback_validation_needs_a_producer_side_test`). The toast honouring
+    /// `Pending.holdUntil` is worth nothing if the value handed to it is not the
+    /// deadline the drain reads — both halves can be green while the contract is
+    /// dead. This pins the other end: the `holdUntil` `persistQueuedSend`
+    /// **reports** is the one it **stored**, on both of its exits.
+    ///
+    /// The dedup exit is the one that can be wrong quietly. It keeps a
+    /// PRE-EXISTING in-flight row, whose hold was stamped when THAT send was
+    /// persisted and may already have elapsed; reporting the discarded new row's
+    /// fresh six seconds would hand the toast a window the drain stopped honouring
+    /// long ago. The kept row's hold is backdated here precisely so "reports the
+    /// kept row's hold" is distinguishable from "reports a hold it just computed".
+    ///
+    /// Tolerance, not equality: GRDB persists a `Date` as a millisecond-precision
+    /// datetime string, so a round-tripped value is truncated, never identical.
+    @Test("persistQueuedSend reports the durable holdUntil it stored — insert and dedup alike")
+    func reportedHoldUntilIsTheStoredHoldUntil() async throws {
+        let (dir, pool, previous) = try makeOutboxTestDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        try await insertDraftAuthority(pool, id: "draft-hold-report")
+
+        // --- Exit 1: a fresh insert reports the deadline it just wrote.
+        let before = Date()
+        let inserted = try await AccountManager.persistQueuedSend(
+            draft: makeDraft(), accountId: "acc1", replyToHeaderId: nil,
+            isForward: false, serverDraftId: nil,
+            draftId: "draft-hold-report", instanceEpoch: "E1")
+        #expect(inserted.deduped == false)
+        let reportedInsert = try #require(
+            inserted.holdUntil, "a queued send must report the hold that backs its undo")
+        let storedInsert = try #require(try await pool.read { db in
+            try OutboxMessage.fetchOne(db, key: inserted.outboxId)?.holdUntil
+        })
+        #expect(abs(storedInsert.timeIntervalSince(reportedInsert)) < 0.005, """
+            the reported deadline (\(reportedInsert)) is not the stored one (\(storedInsert)); \
+            the drain reads the stored value, so any gap is a window in which the toast offers an \
+            Undo the drain will refuse
+            """)
+        // The anchor is persist START, so the deadline is ~6 s past an instant
+        // taken BEFORE the call — never 6 s past its return.
+        #expect(reportedInsert.timeIntervalSince(before)
+                <= SyncConfig.outboxUndoHoldSeconds + SyncConfig.outboxClaimBufferSeconds + 0.005,
+                "the hold must be anchored at persist start, not at persist completion")
+
+        // --- Exit 2: a deduped send reports the KEPT row's hold, backdated here
+        // so it cannot be confused with a freshly computed one.
+        let backdated = Date().addingTimeInterval(-120)
+        try await pool.write { db in
+            try db.execute(
+                sql: "UPDATE outboxMessage SET holdUntil = ? WHERE id = ?",
+                arguments: [backdated, inserted.outboxId])
+        }
+        let deduped = try await AccountManager.persistQueuedSend(
+            draft: makeDraft(), accountId: "acc1", replyToHeaderId: nil,
+            isForward: false, serverDraftId: nil,
+            draftId: "draft-hold-report", instanceEpoch: "E1")
+        #expect(deduped.deduped, "fixture check: the second send must take the dedup exit")
+        #expect(deduped.outboxId == inserted.outboxId)
+        let reportedDedup = try #require(deduped.holdUntil)
+        #expect(abs(reportedDedup.timeIntervalSince(backdated)) < 0.005, """
+            a deduped send reported \(reportedDedup) instead of the kept row's \(backdated); the \
+            discarded new row's deadline is not the one the drain will honour
+            """)
+        #expect(reportedDedup < Date(), """
+            the kept row's hold has already elapsed, so the deduped send must report an elapsed \
+            deadline — reporting a future one would offer an Undo for a row the drain can claim now
+            """)
+    }
+
     /// Reply path: the first send sets optimistic `isReplied` on the original
     /// message and returns its id; a second (double-tap) send dedups WITHOUT
     /// inserting a second row and without re-touching the original. Guards that the

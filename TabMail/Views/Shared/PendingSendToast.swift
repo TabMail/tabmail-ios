@@ -6,11 +6,18 @@ import SwiftUI
 
 /// Gmail-style toast for the undo-send buffer.
 ///
-/// - Phase 1 (0 → outboxUndoHoldSeconds): "Sending. To: …" with a left→right
-///   progress bar filling under the label; Undo button active.
-/// - Phase 2 (outboxUndoHoldSeconds → total): "✓ Message sent"; no Undo button;
-///   the 1 s claim buffer and the 1.5 s confirmation window are visually fused
-///   into a single "sent" phase lasting 2.5 s.
+/// - Phase 1 (present → `pending.undoDeadline`): "Sending. To: …" with a
+///   left→right progress bar draining under the label; Undo button active.
+/// - Phase 2 (`undoDeadline` → fade): "✓ Message sent"; no Undo button; the 1 s
+///   claim buffer and the 1.5 s confirmation window are visually fused into a
+///   single "sent" phase lasting 2.5 s.
+///
+/// ⚠️ Phase 1's END is the row's DURABLE `OutboxMessage.holdUntil` less the claim
+/// buffer — NOT `outboxUndoHoldSeconds` counted from when this toast appeared.
+/// Those two used to be assumed equal; they differ by the send's persist latency,
+/// and once that exceeds the claim buffer the button outlived the hold and a tap
+/// failed with "Couldn't undo" (issue #76). A slow persist now shortens the
+/// VISIBLE window instead — and can shorten it to nothing.
 ///
 /// Uses `TimelineView(.animation)` so phase rendering is driven by wall-clock
 /// time — no lifecycle state machine, no ScenePhase reconciliation, and
@@ -23,16 +30,17 @@ struct PendingSendToast: View {
 
     var body: some View {
         TimelineView(.animation) { context in
-            let elapsed = context.date.timeIntervalSince(pending.queuedAt)
-            let undoDeadline = SyncConfig.outboxUndoHoldSeconds
-
-            if elapsed < undoDeadline {
-                // `remaining` = fraction of undo-hold time left. Starts at 1
+            switch PendingSendToastPhase.resolve(
+                at: context.date,
+                presentedAt: pending.presentedAt,
+                undoDeadline: pending.undoDeadline
+            ) {
+            case .undoable(let progress):
+                // `progress` = fraction of the undo window left. Starts at 1
                 // (bar full) and drains to 0 (bar empty) — a visual cue that
                 // the window is closing.
-                let remaining = max(0, 1 - elapsed / undoDeadline)
-                phase1(progress: remaining)
-            } else {
+                phase1(progress: progress)
+            case .confirming:
                 phase2
             }
         }

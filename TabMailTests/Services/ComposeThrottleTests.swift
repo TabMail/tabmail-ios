@@ -281,18 +281,25 @@ struct PendingSendServiceLifecycleTests {
         value.instanceEpoch = epoch
         value.status = status.rawValue
         value.sentAt = sentAt
+        // Stamped exactly as `persistQueuedSend` stamps it, so the toast these
+        // rows are presented with is inside its hold window rather than backed by
+        // no hold at all — the state every `undo()` test below means to model.
+        value.holdUntil = Date().addingTimeInterval(
+            SyncConfig.outboxUndoHoldSeconds + SyncConfig.outboxClaimBufferSeconds)
         return value
     }
 
     @Test("Pending Send presents and replaces the exact Draft generation")
     func presentCarriesExactGeneration() {
         let svc = makeFreshService()
+        let hold = Date().addingTimeInterval(
+            SyncConfig.outboxUndoHoldSeconds + SyncConfig.outboxClaimBufferSeconds)
         svc.present(
             outboxId: "first", draftId: "draft-1", instanceEpoch: "E1",
-            toSummary: "first")
+            toSummary: "first", holdUntil: hold)
         svc.present(
             outboxId: "second", draftId: "draft-2", instanceEpoch: "E2",
-            toSummary: "second")
+            toSummary: "second", holdUntil: hold)
         #expect(svc.current?.id == "second")
         #expect(svc.current?.draftId == "draft-2")
         #expect(svc.current?.instanceEpoch == "E2")
@@ -312,7 +319,7 @@ struct PendingSendServiceLifecycleTests {
         let svc = makeFreshService()
         svc.present(
             outboxId: pending.id, draftId: replacement.id, instanceEpoch: "E1",
-            toSummary: "To: to@example.com")
+            toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
 
         #expect(svc.undo() == nil)
         #expect(try fixture.0.read {
@@ -341,7 +348,7 @@ struct PendingSendServiceLifecycleTests {
         let svc = makeFreshService()
         svc.present(
             outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
-            toSummary: "To: to@example.com")
+            toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
 
         let snapshot = try #require(svc.undo())
         #expect(snapshot.authority == .init(
@@ -376,7 +383,7 @@ struct PendingSendServiceLifecycleTests {
         let svc = makeFreshService()
         svc.present(
             outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
-            toSummary: "To: to@example.com")
+            toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
 
         #expect(svc.undo() == nil)
         #expect(try fixture.0.read {
@@ -422,7 +429,7 @@ struct PendingSendServiceLifecycleTests {
         let svc = makeFreshService()
         svc.present(
             outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
-            toSummary: "To: to@example.com")
+            toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
 
         // NON-VACUITY: while the database is readable this exact pair resolves, so
         // the refusal below is the failure firing and not an empty-fixture miss.
@@ -513,7 +520,7 @@ struct PendingSendServiceLifecycleTests {
             let service = makeFreshService()
             service.present(
                 outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
-                toSummary: "To: to@example.com")
+                toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
             try fixture.0.writeWithoutTransaction { db in
                 try db.execute(sql: "DROP TABLE draft")
             }
@@ -540,7 +547,7 @@ struct PendingSendServiceLifecycleTests {
             let service = makeFreshService()
             service.present(
                 outboxId: pending.id, draftId: replacement.id, instanceEpoch: "E1",
-                toSummary: "To: to@example.com")
+                toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
 
             let snapshot = service.undo()
             #expect(leftAnObservableEndState(service, snapshot: snapshot))
@@ -564,7 +571,7 @@ struct PendingSendServiceLifecycleTests {
             let service = makeFreshService()
             service.present(
                 outboxId: pending.id, draftId: replacement.id, instanceEpoch: "E1",
-                toSummary: "To: to@example.com")
+                toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
 
             let snapshot = service.undo()
             #expect(leftAnObservableEndState(service, snapshot: snapshot),
@@ -592,7 +599,7 @@ struct PendingSendServiceLifecycleTests {
             let service = makeFreshService()
             service.present(
                 outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
-                toSummary: "To: to@example.com")
+                toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
 
             let snapshot = service.undo()
             #expect(leftAnObservableEndState(service, snapshot: snapshot),
@@ -619,7 +626,7 @@ struct PendingSendServiceLifecycleTests {
             let service = makeFreshService()
             service.present(
                 outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
-                toSummary: "To: to@example.com")
+                toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
 
             let snapshot = service.undo()
             #expect(leftAnObservableEndState(service, snapshot: snapshot))
@@ -772,6 +779,232 @@ struct UndoWindowTimingTests {
             SyncConfig.outboxUndoHoldSeconds + SyncConfig.outboxClaimBufferSeconds + 0.01
         )
         #expect(holdUntil <= tNow)
+    }
+}
+
+// MARK: - THE INVARIANT — the Undo affordance never outlives the durable hold
+
+/// 🚨 **The invariant, as a SYSTEM PROPERTY rather than a timer wiring
+/// (`MIS-015`): the Undo affordance is never offered at an instant at or after
+/// the durable hold that backs it.** Precisely, for every instant `t` at which
+/// the toast renders an Undo button for an outbox row:
+///
+///     t + SyncConfig.outboxClaimBufferSeconds <= row.holdUntil
+///
+/// i.e. the affordance is withdrawn with the whole claim buffer still unspent,
+/// which is the margin `atomicClaim` was given to make the tap race-free.
+///
+/// **The defect this pins (issue #76).** `OutboxMessage.holdUntil` is stamped
+/// `queuedAt + undoHold + claimBuffer` where `queuedAt` is captured at persist
+/// START, inside `AccountManager.persistQueuedSend`, before its attachment write
+/// and before its awaited `dbPool.write`. The toast's window used to be counted
+/// as a flat `outboxUndoHoldSeconds` from `PendingSendService.present()`, which
+/// `ComposeView` reaches only AFTER that awaited persist returns. The two anchors
+/// therefore differ by the persist latency Δ, and for Δ > `claimBuffer` the button
+/// stayed tappable after the drain was already free to claim the row — the tap
+/// then failed with "Couldn't undo / Try again." on a message that went out.
+///
+/// **Why these tests are not a replica** (`Companion/Memory/Current/100-…`: a
+/// replica cannot go red on a defect in the original): the decision under test is
+/// the production one — `PendingSendToastPhase.resolve`, reached through a
+/// `Pending` built by the production `PendingSendService.present`. The suite never
+/// re-implements the phase rule; it only chooses the instants, which is exactly
+/// why `resolve` takes them as parameters instead of reading the clock.
+/// `PendingSendToast.body` has a single exhaustive `switch` over that enum and no
+/// other branch, so the rendered affordance and `.undoable` are the same fact.
+///
+/// **Two-sided** (`feedback_non_vacuity_must_be_two_sided`): every sweep also
+/// counts the instants at which the affordance IS offered, and asserts that count
+/// is non-zero whenever a window should exist. A fix that simply never offers Undo
+/// would satisfy the safety half and fail here.
+@Suite("Undo affordance never outlives the durable hold (issue #76)",
+       .serialized, .processGlobalState)
+@MainActor
+struct UndoAffordanceHoldInvariantTests {
+
+    private func freshService() -> PendingSendService {
+        PendingSendService.shared.dismiss()
+        return PendingSendService.shared
+    }
+
+    /// Present a toast for a send whose durable hold was stamped `persistLatency`
+    /// seconds ago — i.e. a send whose persist took that long — and return the
+    /// production `Pending` together with the durable deadline it must respect.
+    private func presentAfterPersist(
+        latency persistLatency: TimeInterval
+    ) throws -> (pending: PendingSendService.Pending, holdUntil: Date, presentedAt: Date) {
+        let service = freshService()
+        let presentedAt = Date()
+        // `persistQueuedSend` stamped this at `presentedAt - persistLatency`.
+        let holdUntil = presentedAt.addingTimeInterval(
+            SyncConfig.outboxUndoHoldSeconds + SyncConfig.outboxClaimBufferSeconds
+                - persistLatency)
+        service.present(
+            outboxId: "outbox-hold-invariant",
+            draftId: "draft-hold-invariant",
+            instanceEpoch: "E1",
+            toSummary: "To: recipient@example.com",
+            holdUntil: holdUntil)
+        let pending = try #require(service.current)
+        return (pending, holdUntil, presentedAt)
+    }
+
+    /// Sweep every 50 ms from presentation to well past the hold and count the
+    /// instants at which Undo is offered. Returns that count so the caller can
+    /// assert non-vacuity; asserts the safety half inline.
+    private func sweepAssertingSafety(
+        pending: PendingSendService.Pending,
+        holdUntil: Date,
+        presentedAt: Date
+    ) -> Int {
+        var offered = 0
+        var step: TimeInterval = 0
+        let horizon = SyncConfig.outboxUndoHoldSeconds
+            + SyncConfig.outboxClaimBufferSeconds + 2
+        while step <= horizon {
+            let instant = presentedAt.addingTimeInterval(step)
+            if case .undoable = PendingSendToastPhase.resolve(
+                at: instant, presentedAt: pending.presentedAt,
+                undoDeadline: pending.undoDeadline
+            ) {
+                offered += 1
+                #expect(instant < holdUntil, """
+                    the Undo affordance was offered \(instant.timeIntervalSince(holdUntil)) s \
+                    RELATIVE TO the durable hold — a tap here reaches a row the drain is already \
+                    free to claim, which is the "Couldn't undo" end state
+                    """)
+                #expect(
+                    instant.addingTimeInterval(SyncConfig.outboxClaimBufferSeconds) <= holdUntil,
+                    """
+                    the affordance was offered with less than the full claim buffer left \
+                    (\(holdUntil.timeIntervalSince(instant)) s to the hold); the buffer is the \
+                    margin atomicClaim was given, not slack to spend
+                    """)
+            }
+            step += 0.05
+        }
+        return offered
+    }
+
+    @Test("Undo is never offered at or after the durable hold, at any persist latency",
+          arguments: [0.0, 0.25, 1.0, 2.0, 4.0, 4.9, 5.0, 6.0, 9.0] as [TimeInterval])
+    func undoIsNeverOfferedAtOrAfterTheDurableHold(persistLatency: TimeInterval) throws {
+        let scenario = try presentAfterPersist(latency: persistLatency)
+        defer { PendingSendService.shared.dismiss() }
+
+        let offered = sweepAssertingSafety(
+            pending: scenario.pending,
+            holdUntil: scenario.holdUntil,
+            presentedAt: scenario.presentedAt)
+
+        // NON-VACUITY, the other side of the invariant. A window exists exactly
+        // while the persist finished with time left before `holdUntil - buffer`.
+        if persistLatency < SyncConfig.outboxUndoHoldSeconds {
+            #expect(offered > 0, """
+                persistLatency=\(persistLatency): an undo window should still exist here, so a \
+                sweep that never once saw `.undoable` means the safety half above passed \
+                vacuously
+                """)
+        } else {
+            #expect(offered == 0, """
+                persistLatency=\(persistLatency): the persist consumed the entire undo window, so \
+                no Undo may be offered at all
+                """)
+        }
+    }
+
+    /// The sharp, single-instant statement of the defect. Δ = 2 s ⇒ the durable
+    /// hold ends 4 s after the toast appears. The pre-fix rule rendered the button
+    /// for a flat 5 s from presentation, so t = present + 4.5 s was inside the
+    /// button's window and a full 0.5 s past the drain's claim deadline.
+    @Test("A 2 s persist shortens the VISIBLE undo window instead of outliving the hold")
+    func slowPersistShortensTheVisibleWindowNotTheHold() throws {
+        let scenario = try presentAfterPersist(latency: 2.0)
+        defer { PendingSendService.shared.dismiss() }
+        let pending = scenario.pending
+
+        let lateTap = scenario.presentedAt.addingTimeInterval(4.5)
+        // Non-vacuity for THIS instant: it really is past the durable hold, and it
+        // really is inside the flat five seconds the old rule would have allowed.
+        #expect(scenario.holdUntil < lateTap,
+                "fixture check: at present+4.5 s the durable hold must already be gone")
+        #expect(lateTap.timeIntervalSince(scenario.presentedAt) < SyncConfig.outboxUndoHoldSeconds,
+                "fixture check: present+4.5 s must be inside the pre-fix flat window")
+        #expect(PendingSendToastPhase.resolve(
+            at: lateTap, presentedAt: pending.presentedAt, undoDeadline: pending.undoDeadline
+        ) == .confirming, """
+            the affordance survived its durable hold: a tap at present+4.5 s would reach a row \
+            the drain may already have claimed
+            """)
+
+        // And the other side — the shortened window is a real window, not zero.
+        let earlyTap = scenario.presentedAt.addingTimeInterval(1.0)
+        guard case .undoable = PendingSendToastPhase.resolve(
+            at: earlyTap, presentedAt: pending.presentedAt, undoDeadline: pending.undoDeadline
+        ) else {
+            Issue.record("a 2 s persist must still leave a usable undo window at present+1 s")
+            return
+        }
+    }
+
+    /// Fail closed when the hold is ALREADY gone by the time the toast is built —
+    /// a very slow persist, or a dedup onto an older in-flight row whose hold was
+    /// stamped long before. Offering an Undo we cannot honour is the defect;
+    /// offering none is the correct, recoverable outcome (the message lands in
+    /// Sent, where the user can reach it).
+    ///
+    /// This test also stands as the live proof that `present` does not trap on a
+    /// past deadline: it computes the auto-dismiss interval from `holdUntil`, and
+    /// `UInt64(a negative Double)` is a runtime TRAP in Swift, so an unclamped
+    /// implementation kills the test host here rather than failing an assertion
+    /// (`Companion/Memory/Current/100-…`).
+    @Test("A hold that has already elapsed offers no Undo at all")
+    func elapsedHoldOffersNoUndo() throws {
+        let service = freshService()
+        defer { service.dismiss() }
+        let presentedAt = Date()
+        let holdUntil = presentedAt.addingTimeInterval(-30)
+        service.present(
+            outboxId: "outbox-elapsed-hold",
+            draftId: "draft-elapsed-hold",
+            instanceEpoch: "E1",
+            toSummary: "To: recipient@example.com",
+            holdUntil: holdUntil)
+        let pending = try #require(service.current)
+
+        #expect(pending.id == "outbox-elapsed-hold",
+                "the toast itself still appears — only its Undo affordance is withheld")
+        for offset in [0.0, 0.1, 1.0, 4.9] as [TimeInterval] {
+            #expect(PendingSendToastPhase.resolve(
+                at: presentedAt.addingTimeInterval(offset),
+                presentedAt: pending.presentedAt,
+                undoDeadline: pending.undoDeadline
+            ) == .confirming, "no Undo may be offered \(offset) s after an already-elapsed hold")
+        }
+    }
+
+    /// A legacy pre-v49 row carries no hold at all, and the drain's admission
+    /// filter reads that as "claimable immediately"
+    /// (`(holdUntil ?? .distantPast) <= Date()`). The affordance must agree with
+    /// the drain rather than invent a window.
+    @Test("A row with no durable hold offers no Undo")
+    func absentHoldOffersNoUndo() throws {
+        let service = freshService()
+        defer { service.dismiss() }
+        let presentedAt = Date()
+        service.present(
+            outboxId: "outbox-legacy-row",
+            draftId: "draft-legacy-row",
+            instanceEpoch: "E1",
+            toSummary: "To: recipient@example.com",
+            holdUntil: nil)
+        let pending = try #require(service.current)
+
+        #expect(pending.undoDeadline == .distantPast)
+        #expect(PendingSendToastPhase.resolve(
+            at: presentedAt, presentedAt: pending.presentedAt,
+            undoDeadline: pending.undoDeadline
+        ) == .confirming)
     }
 }
 

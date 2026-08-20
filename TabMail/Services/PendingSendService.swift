@@ -5,6 +5,41 @@
 import Foundation
 import GRDB
 
+/// Which face the undo-send toast must show at a given instant.
+///
+/// Deliberately a free function of three `Date`s rather than a method that reads
+/// the clock, so BOTH halves of the decision are evaluable at instants a test
+/// chooses — the same reason `AccountManager.wakeUpDelay(for:at:)` takes `at:`
+/// (`Companion/Memory/Current/100-…`). A decision that reads `Date()` internally
+/// can only ever be pinned by a replica of itself, and a replica cannot go red on
+/// a defect in the original.
+enum PendingSendToastPhase: Equatable, Sendable {
+    /// The Undo affordance is offered. `progress` drains 1 → 0 across the
+    /// visible window.
+    case undoable(progress: Double)
+    /// "✓ Message sent" — no Undo affordance.
+    case confirming
+
+    /// 🚨 THE INVARIANT THIS FUNCTION EXISTS TO HOLD: `.undoable` is returned
+    /// ONLY for an instant strictly before `undoDeadline`, and `undoDeadline` is
+    /// derived from the row's DURABLE `OutboxMessage.holdUntil` — never from when
+    /// the toast happened to appear. The affordance therefore cannot outlive the
+    /// hold that backs it, whatever the persist latency was.
+    static func resolve(
+        at instant: Date,
+        presentedAt: Date,
+        undoDeadline: Date
+    ) -> PendingSendToastPhase {
+        guard instant < undoDeadline else { return .confirming }
+        // Drain the bar across whatever window actually remains. A slow persist
+        // shortens the VISIBLE window; it never moves the deadline.
+        let window = undoDeadline.timeIntervalSince(presentedAt)
+        guard window > 0 else { return .confirming }
+        let remaining = undoDeadline.timeIntervalSince(instant) / window
+        return .undoable(progress: max(0, min(1, remaining)))
+    }
+}
+
 /// Tracks the single in-flight "undo send" toast. The user taps Send; this
 /// service shows a Gmail-style toast ("Sending … Undo") for `outboxUndoHoldSeconds`,
 /// then flips to "✓ Message sent" for a brief confirmation, then fades.
@@ -28,7 +63,29 @@ final class PendingSendService {
         let draftId: String
         let instanceEpoch: String
         let toSummary: String    // "To: user@example.com"
-        let queuedAt: Date       // view computes phase deadlines from this
+        /// When THIS TOAST appeared. Presentation only — the progress bar's span.
+        ///
+        /// ⚠️ Deliberately NOT called `queuedAt`. The send's `queuedAt` is a
+        /// different instant, captured inside `AccountManager.persistQueuedSend`
+        /// before its disk write and its awaited `dbPool.write`; this one is that
+        /// instant plus the whole persist latency. Two variables with one name is
+        /// exactly how the undo affordance came to outlive its hold (issue #76).
+        let presentedAt: Date
+        /// The DURABLE deadline this toast's Undo is backed by — the
+        /// `OutboxMessage.holdUntil` of the row this toast represents. `nil` is a
+        /// legacy pre-v49 row with no hold, which the drain treats as claimable
+        /// immediately (`(holdUntil ?? .distantPast) <= Date()`).
+        let holdUntil: Date?
+
+        /// The last instant at which the Undo affordance may be offered: the
+        /// durable hold, less the claim buffer the drain's `atomicClaim` needs.
+        /// A `nil` hold yields `.distantPast`, so no Undo is ever offered for a
+        /// row the drain may already claim — fail closed, never offer an undo we
+        /// cannot honour.
+        var undoDeadline: Date {
+            guard let holdUntil else { return .distantPast }
+            return holdUntil.addingTimeInterval(-SyncConfig.outboxClaimBufferSeconds)
+        }
     }
 
     struct RetainedDraftAuthority: Sendable, Equatable {
@@ -65,23 +122,42 @@ final class PendingSendService {
     /// Show the undo-send toast for the given outboxId. Replaces any
     /// previously-displayed pending (the prior message continues draining on
     /// its own schedule).
-    func present(outboxId: String, draftId: String, instanceEpoch: String, toSummary: String) {
+    ///
+    /// `holdUntil` is the durable `OutboxMessage.holdUntil` of the row this toast
+    /// represents, as returned by `AccountManager.queueSend`. It is REQUIRED, with
+    /// no default, because a default would silently reinstate the defect it exists
+    /// to close: the Undo affordance must be bounded by the deadline the drain
+    /// honours, not by this method's own clock.
+    func present(
+        outboxId: String,
+        draftId: String,
+        instanceEpoch: String,
+        toSummary: String,
+        holdUntil: Date?
+    ) {
         dismissTask?.cancel()
         undoFailureMessage = nil
+        let now = Date()
         current = Pending(
             id: outboxId,
             draftId: draftId,
             instanceEpoch: instanceEpoch,
             toSummary: toSummary,
-            queuedAt: Date())
+            presentedAt: now,
+            holdUntil: holdUntil)
 
-        // One auto-dismiss Task at the full visible window:
-        //   phase 1 (undo):    0 → outboxUndoHoldSeconds
-        //   claim buffer:      → + outboxClaimBufferSeconds  (drain claims here)
+        // One auto-dismiss Task at the full visible window, anchored on the
+        // DURABLE hold rather than on this instant:
+        //   phase 1 (undo):    now → holdUntil - outboxClaimBufferSeconds
+        //   claim buffer:      → holdUntil                (drain claims here)
         //   phase 2 (✓):       → + outboxPostSendConfirmSeconds
         //   fade
-        let total = SyncConfig.outboxUndoHoldSeconds
-                  + SyncConfig.outboxClaimBufferSeconds
+        //
+        // 🚨 `max(0, …)` is load-bearing, not defensive dressing: `holdUntil` can
+        // already be in the past here (a long persist, or a dedup onto an older
+        // in-flight row), and `UInt64(a negative Double)` is a runtime TRAP in
+        // Swift — not a saturating conversion (`Companion/Memory/Current/100-…`).
+        let total = max(0, (holdUntil ?? now).timeIntervalSince(now))
                   + SyncConfig.outboxPostSendConfirmSeconds
         dismissTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(total * 1_000_000_000))
@@ -93,8 +169,10 @@ final class PendingSendService {
         }
     }
 
-    /// User tapped Undo. Only reachable while the toast is in phase 1
-    /// (the Undo button is rendered only while `elapsed < outboxUndoHoldSeconds`).
+    /// User tapped Undo. Only reachable while the toast is in phase 1 — the Undo
+    /// button is rendered only while `PendingSendToastPhase.resolve` answers
+    /// `.undoable`, i.e. strictly before `Pending.undoDeadline`, which is the
+    /// row's durable `holdUntil` less the drain's claim buffer.
     ///
     /// Read exact retained authority first, then attempt confirmed cancellation.
     /// A refused cancellation leaves the toast in place. Reopen requires both the
