@@ -21,9 +21,31 @@ import Foundation
 /// Mirror of `GmailParse` for Graph's shape (`from.emailAddress.address`,
 /// `toRecipients[]`, `receivedDateTime`, `$delta` pagination, etc.).
 enum GraphParse {
+    /// True when a caller that ASKED Graph for `parentFolderId` did not get it
+    /// back. That — and only that — is evidence of schema drift; a caller whose
+    /// `$select` omits the field is describing its own request, not the server.
+    ///
+    /// The firing condition lives here, once, so it can be tested on both
+    /// sides. Its sole consumer is the `#if DEBUG` diagnostic in `parseMessage`.
+    static func parentFolderIdDriftDetected(
+        parentFolderId: String?,
+        expectsParentFolderId: Bool
+    ) -> Bool {
+        expectsParentFolderId && parentFolderId == nil
+    }
+
     /// Parse a Graph `/me/messages/{id}` JSON response into canonical `MessageMetadata`.
     /// Returns nil if `receivedDateTime` is missing/unparseable (fetch-failure semantics).
-    static func parseMessage(_ json: [String: Any]) -> MessageMetadata? {
+    ///
+    /// - Parameter expectsParentFolderId: whether the URL that produced `json`
+    ///   named `parentFolderId` in its `$select`. Only the drift diagnostic
+    ///   below reads it; parsing is identical either way. It defaults to the
+    ///   strict value so a caller that forgets gets a false alarm (visible,
+    ///   fixable) rather than a missed drift (silent, undetectable).
+    static func parseMessage(
+        _ json: [String: Any],
+        expectsParentFolderId: Bool = true
+    ) -> MessageMetadata? {
         guard let id = json["id"] as? String else { return nil }
         guard let receivedStr = json["receivedDateTime"] as? String,
               let date = Date.fromISO8601(receivedStr) else {
@@ -50,23 +72,29 @@ enum GraphParse {
         // sync stores in `MessageHeader.folderPath`. Propagating it here lets
         // NSE construct a header `id` that matches what sync will produce
         // for the same message (prevents pre-sync vs sync duplicate rows).
-        // We $select the field in every messageMetadata / messageFull URL —
-        // absence in the response is a signal that Graph's schema drifted
-        // and downstream folderPath logic will misbehave. The NSE-side
+        // The `messageMetadata` / `messageFull` URLs in `GraphAPI` $select the
+        // field, so absence there is a signal that Graph's schema drifted and
+        // downstream folderPath logic will misbehave. Callers whose `$select`
+        // omits it — main-app header and backfill fetches, which know their
+        // own folder context — say so via `expectsParentFolderId: false`, and
+        // their absent field is not evidence of anything. The NSE-side
         // fetchSingleMessage checks for nil and refuses to stage; the
         // main-app sync path ignores folderPath here and stores its own.
         let parentFolderId = json["parentFolderId"] as? String
-        if parentFolderId == nil {
-            // Surfacing this in console makes a silent Graph schema change
-            // discoverable before users start reporting duplicate rows. Debug
-            // builds only: on device `stdout` is discarded, so this was never a
-            // production channel. `#if DEBUG` rather than `DebugModeManager`
-            // because `Shared/` also compiles into the NSE, where that type
-            // does not exist.
-            #if DEBUG
+        // Surfacing this in console makes a silent Graph schema change
+        // discoverable before users start reporting duplicate rows. Debug
+        // builds only: on device `stdout` is discarded, so this was never a
+        // production channel. `#if DEBUG` rather than `DebugModeManager`
+        // because `Shared/` also compiles into the NSE, where that type
+        // does not exist.
+        #if DEBUG
+        if parentFolderIdDriftDetected(
+            parentFolderId: parentFolderId,
+            expectsParentFolderId: expectsParentFolderId
+        ) {
             print("[GraphParse] messageMetadata \(id): missing parentFolderId in response — check $select")
-            #endif
         }
+        #endif
 
         return MessageMetadata(
             providerMessageId: id,

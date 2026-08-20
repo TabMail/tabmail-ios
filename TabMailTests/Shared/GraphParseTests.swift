@@ -136,11 +136,12 @@ struct GraphParseTests {
 
     @Test("parseMessage returns folderPath=nil when parentFolderId is missing (regression guard)")
     func missingParentFolderId() {
-        // Graph's $select guarantees parentFolderId is in every response.
-        // If the field is absent (schema drift / partial payload), parse
-        // MUST surface nil rather than substituting a default. The NSE
-        // client checks for nil and refuses to stage — otherwise we would
-        // reinstate the duplicate-row bug (Outlook folderPath=="INBOX"
+        // The URLs that $select parentFolderId (GraphAPI.messageMetadata /
+        // messageFull, and ExchangeProvider's detail + full fetches) expect it
+        // in every response. If the field is absent (schema drift / partial
+        // payload), parse MUST surface nil rather than substituting a default.
+        // The NSE client checks for nil and refuses to stage — otherwise we
+        // would reinstate the duplicate-row bug (Outlook folderPath=="INBOX"
         // NSE header vs folderPath=<AQMk...> sync header).
         let json: [String: Any] = [
             "id": "AQMk-msg",
@@ -150,6 +151,94 @@ struct GraphParseTests {
         let m = GraphParse.parseMessage(json)
         #expect(m != nil)
         #expect(m?.folderPath == nil)
+    }
+
+    // MARK: - parentFolderId drift detector
+
+    /// `GraphParse.parseMessage` warns "missing parentFolderId — check $select"
+    /// when the field is absent. That is only evidence of Graph schema drift if
+    /// the caller's `$select` actually named the field. It does not on the
+    /// main-app header/backfill paths, where `JSONEncoder` also drops the nil
+    /// optional, so the key was ALWAYS absent and the warning always fired —
+    /// 94 lines in one ~2.5-minute device session, which is what made the real
+    /// signal undetectable.
+    ///
+    /// Both directions are asserted: silencing the detector outright would pass
+    /// the first test and fail the second.
+    @Test("Drift detector stays silent when the caller never $selected parentFolderId")
+    func driftDetectorSilentWhenFieldWasNotRequested() {
+        #expect(
+            GraphParse.parentFolderIdDriftDetected(
+                parentFolderId: nil, expectsParentFolderId: false) == false)
+    }
+
+    @Test("Drift detector fires when a $selecting caller gets no parentFolderId back")
+    func driftDetectorFiresWhenRequestedButAbsent() {
+        #expect(
+            GraphParse.parentFolderIdDriftDetected(
+                parentFolderId: nil, expectsParentFolderId: true) == true)
+    }
+
+    @Test("Drift detector stays silent when a $selecting caller does get the field")
+    func driftDetectorSilentWhenRequestedAndPresent() {
+        #expect(
+            GraphParse.parentFolderIdDriftDetected(
+                parentFolderId: "AQMkADAwATE2MTQwLTk2YTQtNjViMy0wMAItMDAKAC4AAAMD",
+                expectsParentFolderId: true) == false)
+    }
+
+    /// The flag only gates the diagnostic — parsing is identical either way.
+    @Test("expectsParentFolderId does not change what parseMessage produces")
+    func expectationFlagDoesNotAlterParsing() {
+        let json: [String: Any] = [
+            "id": "AQMk-msg",
+            "receivedDateTime": "2023-11-14T22:13:20Z",
+            // no parentFolderId — the shape every header/backfill fetch produces
+        ]
+        let strict = GraphParse.parseMessage(json, expectsParentFolderId: true)
+        let relaxed = GraphParse.parseMessage(json, expectsParentFolderId: false)
+        #expect(strict?.providerMessageId == relaxed?.providerMessageId)
+        #expect(strict?.folderPath == nil)
+        #expect(relaxed?.folderPath == nil)
+    }
+
+    /// Pins the premise behind every `expectsParentFolderId:` literal in
+    /// `ExchangeProvider`. If a field list ever gains or loses
+    /// `parentFolderId`, this goes red and the call sites composed from it must
+    /// be revisited — the literals are only correct while this holds.
+    @Test("GraphAPI $select lists: only the metadata and full lists name parentFolderId")
+    func selectListMembershipMatchesTheCallSiteLiterals() {
+        #expect(GraphAPI.headerOnlyFields.contains("parentFolderId") == false)
+        #expect(GraphAPI.backfillSelectFields.contains("parentFolderId") == false)
+        #expect(GraphAPI.metadataSelectFields.contains("parentFolderId"))
+        #expect(GraphAPI.fullSelectFields.contains("parentFolderId"))
+    }
+
+    /// The other half of why the warning fired unconditionally on the sync
+    /// path: `ExchangeProvider.parseGraphMessage` re-serializes the decoded
+    /// `GraphMessage` with `JSONEncoder`, which omits a nil optional. So on a
+    /// header/backfill fetch the key is absent from the parser's input BY
+    /// CONSTRUCTION — never because Graph withheld it.
+    @Test("JSONEncoder omits parentFolderId when GraphMessage decoded it as nil")
+    func encoderOmitsNilParentFolderId() throws {
+        let headerOnlyResponse = """
+        {
+            "id": "AQMk-msg",
+            "subject": "Quarterly",
+            "receivedDateTime": "2023-11-14T22:13:20Z",
+            "isRead": false,
+            "hasAttachments": false
+        }
+        """
+        let msg = try JSONDecoder().decode(
+            GraphMessage.self, from: Data(headerOnlyResponse.utf8))
+        #expect(msg.parentFolderId == nil)
+
+        let reencoded = try JSONEncoder().encode(msg)
+        let object = try JSONSerialization.jsonObject(with: reencoded)
+        let json = try #require(object as? [String: Any])
+        #expect(json.keys.contains("parentFolderId") == false)
+        #expect(json["id"] as? String == "AQMk-msg")
     }
 
     // Note: parseDeltaPage / extractBody / extractAttachmentRefs were removed
