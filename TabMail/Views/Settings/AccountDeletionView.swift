@@ -2,9 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import StoreKit
 import SwiftUI
-import UIKit
 
 struct AccountDeletionView: View {
     /// Length of the server-side deletion grace period, mirrored from
@@ -328,21 +326,13 @@ private extension AccountDeletionView {
     }
 
     private func presentAppleSubscriptions() async -> Bool {
-        guard let windowScene = UIApplication.shared.connectedScenes
-            .compactMap({ $0 as? UIWindowScene })
-            .first else {
-            return false
+        let outcome = await StoreKitManager.presentManageSubscriptions()
+        if case .failed(let error) = outcome, DebugModeManager.isLoggingEnabled() {
+            print("[AccountDeletion] Failed to open Apple subscriptions: \(error)")
         }
-
-        do {
-            try await AppStore.showManageSubscriptions(in: windowScene)
-            return true
-        } catch {
-            if DebugModeManager.isLoggingEnabled() {
-                print("[AccountDeletion] Failed to open Apple subscriptions: \(error)")
-            }
-            return false
-        }
+        // Fails closed on both a missing window scene and a thrown presentation
+        // error: the deletion gate must not proceed on an unpresented sheet.
+        return outcome.didPresent
     }
 
     /// Clears TabMail session and stops AI processing while preserving all local data.

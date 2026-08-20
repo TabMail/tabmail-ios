@@ -4,7 +4,6 @@
 
 import SwiftUI
 import Charts
-import StoreKit
 
 struct AccountDashboardView: View {
     @State private var accountInfo: AccountInfo?
@@ -224,11 +223,12 @@ struct AccountDashboardView: View {
                     if accountInfo?.subscriptionProvider == "apple" {
                         Button {
                             Task {
-                                guard let windowScene = UIApplication.shared.connectedScenes
-                                    .compactMap({ $0 as? UIWindowScene }).first else { return }
-                                do {
-                                    try await AppStore.showManageSubscriptions(in: windowScene)
-                                } catch {
+                                switch await StoreKitManager.presentManageSubscriptions() {
+                                case .noWindowScene:
+                                    return
+                                case .presented:
+                                    break
+                                case .failed(let error):
                                     print("[Dashboard] Failed to open subscription management: \(error)")
                                 }
                                 // Refresh entitlements + account info after sheet closes

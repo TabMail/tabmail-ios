@@ -480,3 +480,33 @@ struct StoreKitManagerRestoreGateTests {
         #expect(manager.shouldOpenGateForRestoredEntitlement(currentUserId: userB.uppercased()) == false)
     }
 }
+
+// MARK: - Subscription-Management Presentation Result Tests
+
+/// `StoreKitManager.presentManageSubscriptions()` itself cannot be unit tested —
+/// it needs a live `UIWindowScene` and Apple's native sheet (see `IOS-TEST-004`
+/// for the same constraint on `UIWindow()` in view tests). What IS testable is
+/// the single predicate its result exposes, `didPresent`, which is exactly what
+/// the account-deletion gate consumes.
+///
+/// Scope, stated so it is not over-read: this suite pins the predicate in
+/// isolation only. Its composition with the deletion gate is pinned separately,
+/// and without a live scene, by
+/// `DeletionCoordinatorGuardTests.unpresentedSubscriptionSheetsBlockDeletion`.
+/// The two billing surfaces' refresh asymmetry — skip the post-sheet refresh on
+/// `.noWindowScene`, fall through to it after logging on `.failed` — lives in
+/// those views' `Task` closures and is pinned by no test here.
+@Suite("StoreKit subscription-management presentation result")
+struct StoreKitSubscriptionManagementPresentationTests {
+
+    private struct PresentationFailure: Error {}
+
+    @Test("Only a presented sheet reports didPresent, so both failure shapes fail closed")
+    func didPresentIsTrueOnlyForAPresentedSheet() {
+        // The account-deletion gate consumes exactly this predicate: a false
+        // here becomes `.appleManagementUnavailable` and blocks the deletion.
+        #expect(SubscriptionManagementPresentation.presented.didPresent)
+        #expect(!SubscriptionManagementPresentation.noWindowScene.didPresent)
+        #expect(!SubscriptionManagementPresentation.failed(PresentationFailure()).didPresent)
+    }
+}
