@@ -442,6 +442,10 @@ struct AccountDashboardView: View {
             return
         }
 
+        // Capture the sign-in epoch BEFORE the network await so a response
+        // that lands after a sign-out cannot be applied for the next account
+        // (see `AISubscriptionGate.applyIfCurrentEpoch`).
+        let generation = AISubscriptionGate.shared.signInGeneration
         do {
             let info = try await backend.fetchAccountInfo()
             accountInfo = info
@@ -449,7 +453,7 @@ struct AccountDashboardView: View {
             // single seam the foreground revalidation uses: it opens/closes the
             // gate AND stamps the trial flag, keeping the sidebar copy in step
             // with what the dashboard is showing instead of lagging a foreground.
-            AISubscriptionGate.shared.apply(info)
+            AISubscriptionGate.shared.applyIfCurrentEpoch(info, fetchedInGeneration: generation)
             // Keep the inbox usage-throttle banner fresh when the user opens
             // the dashboard.
             UsageThrottleStore.shared.update(from: info)

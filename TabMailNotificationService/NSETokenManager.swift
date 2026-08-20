@@ -20,11 +20,48 @@ enum NSETokenManager {
               let data = sessionJSON.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
+        return userId(inSessionJSON: json)
+    }
+
+    /// Extract the Supabase subject from a decoded session object. Shared by
+    /// `supabaseUserId()` and the clobber guard so both read identity the same
+    /// way (the NSE handles the session as untyped JSON, not `TabMailSession`).
+    static func userId(inSessionJSON json: [String: Any]) -> String? {
         if let user = json["user"] as? [String: Any], let id = user["id"] as? String {
             return id
         }
         // Fallback — older session shapes stash the id at top level.
         return json["sub"] as? String
+    }
+
+    /// NSE-side mirror of `TabMailTokenCoordinator.shouldPersistRefreshedSession`,
+    /// with the identical auth-safe polarity.
+    ///
+    /// The NSE writes the SAME Keychain item as the main app (service
+    /// `ai.tabmail.ios`, access group `group.ai.tabmail`, account
+    /// `tabmail_session`), so an NSE refresh of A's session that completes
+    /// after the user signed out and signed in as B would otherwise overwrite
+    /// B with A — the main app would then operate under A's identity.
+    ///
+    /// SAVE when the slot is empty, unreadable, or still owned by the SAME
+    /// user; SKIP only when the slot holds a VALID session for a DIFFERENT
+    /// user. An unidentifiable NEW session also SAVES: withholding on ambiguity
+    /// could strand a stale token and log the user out, which is strictly worse
+    /// than the clobber and is the overriding priority.
+    ///
+    /// ⚠️ This SHRINKS the cross-process race, it does not close it: two
+    /// processes can still interleave between this read and the write. A true
+    /// fix needs a Keychain compare-and-swap, which `SecItemUpdate` does not
+    /// provide. Registered as the residual on `IOS-PUSH-001`.
+    static func shouldPersistRefreshedSession(currentSlotJSON: String?, newUserId: String?) -> Bool {
+        guard let newUserId else { return true }
+        guard let currentSlotJSON,
+              let data = currentSlotJSON.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let currentUserId = userId(inSessionJSON: json) else {
+            return true // empty or unreadable — save (never infer sign-out)
+        }
+        return currentUserId == newUserId
     }
 
     /// Get a valid Supabase access token, refreshing if expired.
@@ -80,11 +117,22 @@ enum NSETokenManager {
             return nil
         }
 
-        // Write the full new session back to shared keychain so both NSE and main app benefit
+        // Write the full new session back to shared keychain so both NSE and
+        // main app benefit — unless the slot has meanwhile changed owner, in
+        // which case writing would clobber the live user (see the guard).
+        // The refreshed token is returned either way so THIS invocation's
+        // request still completes (IOS-PUSH-001: never drop the work in hand).
         if let sessionString = String(data: data, encoding: .utf8) {
-            SharedKeychain.setSession(sessionString)
-            let newExpiry = json["expires_at"] as? Int ?? 0
-            NSELog.step("NSE token: refreshed OK, new expiresAt=\(newExpiry)")
+            if shouldPersistRefreshedSession(
+                currentSlotJSON: SharedKeychain.getSession(),
+                newUserId: userId(inSessionJSON: json)
+            ) {
+                SharedKeychain.setSession(sessionString)
+                let newExpiry = json["expires_at"] as? Int ?? 0
+                NSELog.step("NSE token: refreshed OK, new expiresAt=\(newExpiry)")
+            } else {
+                NSELog.step("NSE token: slot now owned by a different user — withholding save (clobber-guard)")
+            }
         }
 
         return newAccessToken

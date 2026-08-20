@@ -1240,6 +1240,10 @@ final class SyncScheduler {
     private static func revalidateAISubscriptionGate() async {
         let gate = AISubscriptionGate.shared
         guard !gate.isActive else { return }
+        // Capture the sign-in epoch BEFORE the network await: a response that
+        // lands after a sign-out belongs to the previous account and must not
+        // open the gate — or stamp routing authority — for the next one.
+        let generation = gate.signInGeneration
         do {
             let info = try await BackendClient().fetchAccountInfo()
             if info.hasSubscription == true {
@@ -1250,7 +1254,7 @@ final class SyncScheduler {
                 // branch still makes no call at all. With an active subscription
                 // the derivation can only report "trial not ended", which is
                 // exactly what this response says.
-                gate.apply(info)
+                gate.applyIfCurrentEpoch(info, fetchedInGeneration: generation)
             }
         } catch {
             print("[AISubscriptionGate] Revalidation failed: \(error)")

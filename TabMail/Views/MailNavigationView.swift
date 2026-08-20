@@ -135,8 +135,11 @@ struct MailNavigationView: View {
     init(initialSelection: MailboxSelection? = .unified(.inbox)) {
         self.initialSelection = initialSelection
         // If a plan navigation is pending (e.g. from "Start Free Trial" banner),
-        // start with nil selection to avoid flashing inbox before navigating to plan.
-        if UserDefaults.standard.bool(forKey: "pending_plan_navigation") {
+        // start with nil selection to avoid flashing inbox before navigating to
+        // plan. If the latch is then consumed WITHOUT navigating (active
+        // entitlement), `consumePendingPlanNavigation` restores
+        // `initialSelection`.
+        if PendingPlanNavigationLatch.isSet() {
             _selection = State(initialValue: nil)
         } else {
             _selection = State(initialValue: initialSelection)
@@ -165,6 +168,43 @@ struct MailNavigationView: View {
             : "Subscribe to unlock AI-powered features"
     }
 
+    /// Entitlement-aware consumption of the `pending_plan_navigation` latch.
+    /// Invoked from the `.onChange(of: lastAuthoritativeApplyAt, initial:
+    /// true)` observer in `body`, so it runs at mount and after every
+    /// authoritative `/whoami` — never on a timer. The decision itself lives
+    /// in `PendingPlanNavigationLatch.consume`; this method only performs
+    /// the navigation side effects.
+    private func consumePendingPlanNavigation() {
+        let gate = AISubscriptionGate.shared
+        let aiOptedOut = AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey)
+        switch PendingPlanNavigationLatch.consume(
+            gateHasAuthoritativeState: gate.lastAuthoritativeApplyAt != nil,
+            gateIsActive: gate.isActive,
+            aiOptedOut: aiOptedOut
+        ) {
+        case .navigateToPlanPicker:
+            selection = .planPicker
+        case .clearedWithoutNavigation:
+            // The latch had suppressed `initialSelection` in `init` to avoid
+            // an inbox flash before plan navigation; no navigation is
+            // happening, so restore it — unless the user has already
+            // navigated somewhere themselves.
+            if selection == nil { selection = initialSelection }
+        case .waitForAuthoritativeGate:
+            // Signed in: keep waiting — the post-sign-in / foreground
+            // revalidation is in flight and will re-fire this observer.
+            // Signed OUT, no authoritative /whoami can ever arrive
+            // (`fetchAccountInfo` throws unauthorized without a session), so
+            // waiting would suppress the inbox for the whole session, every
+            // session, e.g. after tapping the subscribe banner and then
+            // cancelling sign-in. Show the inbox; the latch stays armed and
+            // is consumed by the entitlement-aware path after a sign-in.
+            if !hasTabMailSession, selection == nil { selection = initialSelection }
+        case .noLatch:
+            break
+        }
+    }
+
     // Sync status values come from RootView via @Environment so they survive
     // sidebar collapse/unmount. See SyncStatusObservationModifier.
     @Environment(\.syncPhase) private var statusPhase
@@ -190,7 +230,12 @@ struct MailNavigationView: View {
                                 if hasTabMailSession {
                                     selection = .planPicker
                                 } else {
-                                    UserDefaults.standard.set(true, forKey: "pending_plan_navigation")
+                                    // Signed out — entitlement unknowable here.
+                                    // Arm the latch; the entitlement-aware
+                                    // consumer (`consumePendingPlanNavigation`)
+                                    // decides after sign-in's authoritative
+                                    // /whoami lands.
+                                    PendingPlanNavigationLatch.set()
                                     showSignInSheet = true
                                 }
                             } label: {
@@ -524,15 +569,15 @@ struct MailNavigationView: View {
         .onChange(of: AISubscriptionGate.shared.trialHasEnded, initial: true) { _, newValue in
             trialHasEnded = newValue
         }
-        .task {
-            // Check if user arrived here after tapping the subscribe banner
-            guard UserDefaults.standard.bool(forKey: "pending_plan_navigation") else { return }
-            UserDefaults.standard.set(false, forKey: "pending_plan_navigation")
-            let aiDisabled = AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey)
-            guard !aiDisabled else { return }
-            // Brief yield to let the view mount before navigating
-            try? await Task.sleep(for: .milliseconds(100))
-            selection = .planPicker
+        .onChange(of: AISubscriptionGate.shared.lastAuthoritativeApplyAt, initial: true) { _, _ in
+            // Consume the plan-picker latch (set by the signed-out subscribe
+            // banner or the AI-consent screen) — entitlement-aware, and
+            // event-driven off the gate's authoritative-apply marker instead
+            // of the old mount-time `.task` + 100 ms sleep, which navigated
+            // on the hydrated default and sent active subscribers to the
+            // paywall (issue #56). `initial: true` covers a /whoami applied
+            // before this view mounted; later applies re-fire the change.
+            consumePendingPlanNavigation()
         }
         .onReceive(NotificationCenter.default.publisher(for: .emailPillTapped).receive(on: DispatchQueue.main)) { notification in
             // Fallback handler: ensures email navigation works even when InboxView

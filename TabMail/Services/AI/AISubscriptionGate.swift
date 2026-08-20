@@ -67,6 +67,32 @@ final class AISubscriptionGate: @unchecked Sendable {
     /// information, and guessing "not ended" there would flip correct copy back).
     private(set) var trialHasEnded: Bool
 
+    /// Timestamp of the most recent authoritative `/whoami` applied in THIS
+    /// process. In-memory only, deliberately NOT persisted: `isActive` /
+    /// `hasCheckedOnce` hydrate from UserDefaults so returning users see
+    /// last-known UI without a flash, but a ROUTING decision (the
+    /// `pending_plan_navigation` latch — see `PendingPlanNavigationLatch`)
+    /// must never fire on that hydrated default, because it can describe a
+    /// previous session or a previous account. Consumers wait until this is
+    /// non-nil before acting on `isActive`.
+    ///
+    /// Only `apply(_:now:)` writes it: the bare `openGate`/`closeGate`
+    /// calls from AI 402/403 paths and the post-purchase
+    /// `refreshAfterLocalPurchase` do not carry full whoami authority for
+    /// routing. Cleared by `noteSignedOut()` so a subsequent sign-in cannot
+    /// inherit the previous account's freshness.
+    private(set) var lastAuthoritativeApplyAt: Date?
+
+    /// Monotonic sign-in epoch for this process. Bumped by `noteSignedOut()`.
+    /// A `/whoami` fetch belongs to the epoch in which it STARTED; a response
+    /// that lands after the user signed out (and possibly after someone else
+    /// signed in) must not be applied — the bearer token it carried, and the
+    /// entitlement it describes, belong to the previous account. Callers of
+    /// the async fetch→apply pipelines capture this value BEFORE the network
+    /// await and hand it to `applyIfCurrentEpoch`. In-memory only, like
+    /// `lastAuthoritativeApplyAt`.
+    private(set) var signInGeneration: Int = 0
+
     private init() {
         let defaults = UserDefaults.standard
         self.isActive = defaults.bool(forKey: Self.lastKnownActiveKey)
@@ -87,6 +113,104 @@ final class AISubscriptionGate: @unchecked Sendable {
             closeGate()
         }
         setTrialHasEnded(info.trialState(now: now) == .ended)
+        lastAuthoritativeApplyAt = now
+    }
+
+    /// Forget this process's authoritative-whoami freshness marker. Called on
+    /// sign-out: whatever `/whoami` said about the outgoing account must not
+    /// vouch for the next one, or a latch consumer could route the new user
+    /// on the old user's entitlement. Leaves `isActive` / `hasCheckedOnce` /
+    /// `trialHasEnded` untouched — last-known UI state deliberately follows
+    /// the most recently signed-in account (see the trial-derivation memory
+    /// topic's "GLOBAL, not account-scoped" decision).
+    @MainActor
+    func noteSignedOut() {
+        lastAuthoritativeApplyAt = nil
+        signInGeneration &+= 1
+        // No identity owns the current epoch any more, so the next sign-in —
+        // even by the same user — is a genuine identity change and must bump.
+        lastSignedInUserId = nil
+    }
+
+    /// The Supabase subject the current sign-in epoch belongs to. Lets the
+    /// authoritative call site (the session write) and the notification
+    /// backstop ask the same question — "is this a NEW identity?" — so the
+    /// second call is a no-op rather than a second invalidation.
+    private var lastSignedInUserId: String?
+
+    /// Begin a NEW sign-in epoch. Symmetric to `noteSignedOut`: clears this
+    /// process's authoritative-apply marker and bumps `signInGeneration` so
+    /// (a) any `/whoami` fetched for a PRIOR account — including one applied
+    /// from a session that a sign-out cleanup's in-flight token refresh
+    /// RESURRECTED into the Keychain slot — belongs to an older generation and
+    /// is dropped by `applyIfCurrentEpoch`, and (b) the plan-picker latch
+    /// consumer starts from a clean marker and waits for THIS account's
+    /// authoritative response instead of inheriting the previous account's
+    /// freshness. In-memory only, like the fields it touches.
+    ///
+    /// This is defense-in-depth behind `TabMailTokenCoordinator`'s clobber
+    /// guard (which prevents the resurrection from ever overwriting a
+    /// different user's live session in the first place). It is also correct
+    /// and safe on every ordinary sign-in: the marker re-applies within one
+    /// revalidation, and until it does the latch consumer merely waits.
+    /// Call this at the SESSION WRITE, not on `.tabMailDidSignIn`. The write
+    /// is where identity actually changes; the notification is posted by UI
+    /// callers only after `syncStripeCustomer` (a network round-trip) and
+    /// further plumbing, and a prior account's `/whoami` landing in that gap
+    /// would still pass the un-bumped epoch and stamp the marker.
+    ///
+    /// Bumps ONLY on an actual identity change. The session-write sites also
+    /// fire when the SAME user re-authenticates (web auth, id-token, OTP);
+    /// invalidating there would discard a known-good authoritative entitlement
+    /// and widen the "unknown" window for nothing, leaving the latch consumer
+    /// waiting on a `/whoami` it did not need.
+    ///
+    /// ⚠️ Deliberate asymmetry with `TabMailTokenCoordinator`'s clobber guard:
+    /// there, an unreadable slot means SAVE (withholding could log the user
+    /// out — the worse harm). Here, an unknown identity means BUMP, because
+    /// the worse harm is vouching for a new account with the old account's
+    /// entitlement. Same "fail safe" instinct, opposite directions, because
+    /// the harms differ. Do not "harmonize" them.
+    /// - Parameters:
+    ///   - userId: the subject of the session just written.
+    ///   - previousUserId: the subject the session slot held BEFORE that write,
+    ///     used only when this process has not yet recorded an epoch owner (a
+    ///     session restored from the Keychain at launch never called this). It
+    ///     is what makes a same-user re-authentication after a cold start
+    ///     preserve the marker instead of gratuitously invalidating it. The
+    ///     notification backstop passes `nil` and relies on the recorded owner.
+    @MainActor
+    func noteSignedIn(userId: String?, previousUserId: String? = nil) {
+        let established = lastSignedInUserId ?? previousUserId
+        guard userId != established else {
+            // Same identity — preserve the authoritative marker and the epoch.
+            // Still record the owner so the backstop becomes a no-op.
+            lastSignedInUserId = userId
+            return
+        }
+        lastSignedInUserId = userId
+        lastAuthoritativeApplyAt = nil
+        signInGeneration &+= 1
+    }
+
+    /// Apply an authoritative `/whoami` result ONLY if it was fetched in the
+    /// current sign-in epoch. The guard closes the cross-account seam: a
+    /// revalidation fetch started for account A can complete after A signed
+    /// out (and after account B signed in); applying it would stamp
+    /// `lastAuthoritativeApplyAt` — and set `isActive` — from A's
+    /// entitlement, which the plan-picker latch consumer would then treat as
+    /// authoritative for B (routing an active B to the paywall, or silently
+    /// clearing an unentitled B's latch). Delegates to `apply(_:now:)`, which
+    /// remains the single authoritative seam.
+    ///
+    /// - Parameters:
+    ///   - generation: the value of `signInGeneration` read BEFORE the fetch
+    ///     began.
+    ///   - now: injected for tests; production callers use the default.
+    @MainActor
+    func applyIfCurrentEpoch(_ info: AccountInfo, fetchedInGeneration generation: Int, now: Date = Date()) {
+        guard generation == signInGeneration else { return }
+        apply(info, now: now)
     }
 
     /// Refresh from a `/whoami` body fetched immediately after a LOCAL StoreKit

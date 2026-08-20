@@ -241,10 +241,13 @@ struct CalendarSetupView: View {
                 let tokens = try await manager.oauthService.authenticateGoogle()
                 let userInfo = try await manager.oauthService.fetchGoogleUserInfo(accessToken: tokens.accessToken)
 
-                // Check if existing Gmail account already has calendar
-                let existingAccount = try await AppDatabase.dbPool.read { db in
-                    try Account.filter(Column("emailAddress") == userInfo.email && Column("provider") == AccountProvider.gmail.rawValue).fetchOne(db)
-                }
+                // Check if existing Gmail account already has calendar —
+                // case-insensitively via the shared predicate: the BINARY
+                // `emailAddress ==` this replaced missed case-variant
+                // addresses from the identity provider and inserted a
+                // duplicate calendar-only row for an already-configured
+                // account (issue #56 class).
+                let existingAccount = try await manager.existingAccount(forEmail: userInfo.email, provider: .gmail)
                 if existingAccount != nil {
                     // Calendar already available via existing account
                     dismiss()
@@ -276,9 +279,9 @@ struct CalendarSetupView: View {
                 let tokens = try await manager.oauthService.authenticateMicrosoft()
                 let userInfo = try await manager.oauthService.fetchMicrosoftUserInfo(accessToken: tokens.accessToken)
 
-                let existingAccount = try await AppDatabase.dbPool.read { db in
-                    try Account.filter(Column("emailAddress") == userInfo.email && Column("provider") == AccountProvider.outlook.rawValue).fetchOne(db)
-                }
+                // Same case-insensitive shared-predicate check as the Gmail
+                // arm (issue #56 class).
+                let existingAccount = try await manager.existingAccount(forEmail: userInfo.email, provider: .outlook)
                 if existingAccount != nil {
                     dismiss()
                     return

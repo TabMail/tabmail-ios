@@ -535,6 +535,57 @@ actor PushNotificationService {
         let client = removedAccountCleanupClient
         let cleanupDeviceId = removedAccountCleanupDefaults.string(forKey: PushConfig.deviceIdKey) ?? deviceId
 
+        // Pin the bearer for the WHOLE admitted pass. Every action below was
+        // admitted for `currentWorkerUserId`; re-deriving a token per action
+        // would let a mid-pass sign-in send the remainder under a DIFFERENT
+        // subject, which IOS-PUSH-001 forbids: the worker's `user_mismatch`
+        // would then be misread as proof the debt is settled, discharging an
+        // action that was never performed. If no bearer is available for the
+        // admitted subject — or the slot changed owner while we were obtaining
+        // one — perform NO remote action and RETAIN the debt.
+        guard let pinnedUserId = currentWorkerUserId,
+              let pinnedToken = await currentRemovedAccountCleanupToken(),
+              currentRemovedAccountCleanupUserId() == pinnedUserId else {
+            print("[Push] Removed-account cleanup deferred: no pinned identity for the admitted subject")
+            mergeRemovedAccountCleanupOutcomes(outcomes)
+            return
+        }
+
+        selected = await PushCleanupIdentity.$pinnedAuthToken.withValue(pinnedToken) {
+            await performPinnedRemovedAccountCleanupActions(
+                selected: selected,
+                client: client,
+                cleanupDeviceId: cleanupDeviceId,
+                activeAccounts: activeAccounts,
+                pinnedUserId: pinnedUserId
+            )
+        }
+
+        for record in selected {
+            outcomes[record.generation] = record.actions
+        }
+        mergeRemovedAccountCleanupOutcomes(outcomes)
+    }
+
+    /// Perform the admitted pass's remote actions under the PINNED identity.
+    ///
+    /// Split out of `drainPendingRemovedAccountCleanupsOnce` solely so the whole
+    /// action sequence can be bound inside one
+    /// `PushCleanupIdentity.$pinnedAuthToken.withValue`. The action logic is
+    /// unchanged; what changed is that every `client` call inside now resolves
+    /// its bearer from that task-local instead of from the ambient Keychain
+    /// slot, so a sign-in landing mid-pass cannot switch the subject the
+    /// remaining actions are sent under.
+    ///
+    /// Returns the records with their remaining (undischarged) actions.
+    private func performPinnedRemovedAccountCleanupActions(
+        selected: [PendingRemovedAccountPushCleanup],
+        client: any RemovedAccountPushCleaning,
+        cleanupDeviceId: String,
+        activeAccounts: [Account],
+        pinnedUserId: String
+    ) async -> [PendingRemovedAccountPushCleanup] {
+        var selected = selected
         for index in selected.indices {
             if selected[index].actions.contains(.deviceAccount) {
                 do {
@@ -622,7 +673,8 @@ actor PushNotificationService {
                 try await refreshDeviceRegistrationForRemovedAccountCleanup(
                     activeEmails: activeAccounts.map(\.emailAddress),
                     client: client,
-                    deviceId: cleanupDeviceId
+                    deviceId: cleanupDeviceId,
+                    pinnedUserId: pinnedUserId
                 )
                 for index in selected.indices {
                     selected[index].actions.remove(.deviceRegistration)
@@ -631,11 +683,17 @@ actor PushNotificationService {
                 print("[Push] Removed-account legacy device cleanup deferred: \(error)")
             }
         }
+        return selected
+    }
 
-        for record in selected {
-            outcomes[record.generation] = record.actions
+    /// Resolve a bearer for a removed-account cleanup pass. Mirrors
+    /// `PushClient.currentAuthToken`'s result mapping; kept here because that
+    /// one is private to the client and this must run BEFORE the pin is bound.
+    private func currentRemovedAccountCleanupToken() async -> String? {
+        switch await TabMailTokenCoordinator.shared.validToken() {
+        case .success(let token): return token
+        case .permanentFailure, .transientFailure, .noSession: return nil
         }
-        mergeRemovedAccountCleanupOutcomes(outcomes)
     }
 
     private func cleanupRemovedAccountLocalArtifacts(_ record: PendingRemovedAccountPushCleanup) {
@@ -693,10 +751,16 @@ actor PushNotificationService {
         return statusCode == 403 && errorCode == "user_mismatch"
     }
 
+    /// - Parameter pinnedUserId: the subject the pass was ADMITTED for. This
+    ///   used to re-read `tabmail_session` here, which meant a sign-in landing
+    ///   mid-pass re-registered the device under the NEW user while discharging
+    ///   the OLD user's `.deviceRegistration` debt — a cross-user state
+    ///   mutation and a false discharge. Identity now follows the work.
     private func refreshDeviceRegistrationForRemovedAccountCleanup(
         activeEmails: [String],
         client: any RemovedAccountPushCleaning,
-        deviceId: String
+        deviceId: String,
+        pinnedUserId: String
     ) async throws {
         guard !activeEmails.isEmpty else {
             try await client.unregisterDevice(deviceId: deviceId)
@@ -704,10 +768,6 @@ actor PushNotificationService {
             return
         }
 
-        guard let sessionData = KeychainHelper.load(key: "tabmail_session"),
-              let session = try? JSONDecoder().decode(TabMailSession.self, from: sessionData) else {
-            throw PushError.noAuthToken
-        }
         guard let token = removedAccountCleanupDefaults.string(forKey: PushConfig.lastDeviceTokenKey) else {
             // No APNs token means this install could not have registered a
             // legacy device record. Retire the stale local email snapshot too.
@@ -718,7 +778,7 @@ actor PushNotificationService {
         try await client.registerDevice(
             deviceToken: token,
             deviceId: deviceId,
-            userId: session.userId,
+            userId: pinnedUserId,
             accountEmails: activeEmails,
             apnsSandbox: PushConfig.isAPNsSandbox
         )
