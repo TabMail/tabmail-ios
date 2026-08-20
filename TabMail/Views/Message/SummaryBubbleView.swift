@@ -49,11 +49,15 @@ struct SummaryBubbleView: View {
     /// Pure decision for which structural branch to render. Inputs are the only
     /// state that drives the gate; environment-driven sub-branches are decided
     /// in `body` from this view's environment values.
+    ///
+    /// `recentInboxEligible` defaults to `nil` — the value production actually
+    /// starts from — so a caller that omits it exercises the pre-resolution
+    /// state rather than a state the running app never begins in.
     static func displayMode(
         isInInbox: Bool,
         summaryBlurb: String?,
         demoSuppressed: Bool,
-        recentInboxEligible: Bool? = true
+        recentInboxEligible: Bool? = nil
     ) -> DisplayMode {
         if demoSuppressed { return .hidden }
         // AI summary is inbox-scoped on both compute (AccountManager.processOpenedMessage
@@ -61,13 +65,21 @@ struct SummaryBubbleView: View {
         // MessageHeader rows from a prior inbox stay must not surface for non-inbox views
         // (e.g. opening a Sent/Archive/Trash message via search).
         if !isInInbox { return .hidden }
-        // Window membership is the compute contract, not an invitation to retain
-        // an old cached result indefinitely. Until the fast local query resolves,
-        // render nothing rather than flashing a spinner that cannot complete.
-        guard let recentInboxEligible else { return .hidden }
-        if !recentInboxEligible { return .suppressed }
+        // Only a RESOLVED negative suppresses. `nil` means "the local window query
+        // has not answered yet", which is an absence of evidence and must never
+        // hide an inbox message's bubble: an unresolved gate that renders nothing
+        // also erases the view whose lifecycle resolves it, so the bubble stays
+        // hidden forever. Unresolved therefore renders the ordinary pre-gate
+        // outcome, and the gate only ever downgrades it once it answers.
+        if recentInboxEligible == false { return .suppressed }
         if let blurb = summaryBlurb, !blurb.isEmpty { return .content }
         return .empty
+    }
+
+    /// Signed in and subscribed, but every AI source disabled — the `.empty`
+    /// state's chain below renders nothing at all in that configuration.
+    private var aiDisabledWhileSubscribed: Bool {
+        hasTabMailSession && AISubscriptionGate.shared.isActive && !anyAISourceEnabled
     }
 
     var body: some View {
@@ -77,52 +89,75 @@ struct SummaryBubbleView: View {
             demoSuppressed: DemoModeStore.shared.isActive && !DemoModeStore.shared.aiEnabled,
             recentInboxEligible: recentInboxEligible
         )
-        Group {
-            switch mode {
-            case .hidden:
-                EmptyView()
-            case .content:
-                contentBubble
-            case .suppressed:
-                nudgeBubble(text: "AI work is suppressed for older messages in large inboxes")
-            case .empty:
-                if !hasTabMailSession {
-                    nudgeBubble(text: "Sign in to enable AI features")
-                } else if !AISubscriptionGate.shared.isActive {
-                    nudgeBubble(text: "Subscribe to enable AI features")
-                } else if !anyAISourceEnabled {
-                    // AI opt-out with no Device Sync — hide entirely
-                } else if failed {
-                    failedBubble
-                } else {
-                    loadingBubble
-                        .onReceive(NotificationCenter.default.publisher(for: .aiDidFailForMessage).receive(on: DispatchQueue.main).filter { $0.object as? String == message.id }) { _ in
-                            failed = true
-                        }
-                        .task {
-                            // Safety-net timeout: if no success or failure notification after 20s, assume failure.
-                            try? await Task.sleep(for: .seconds(20))
-                            if !Task.isCancelled {
+        // A bubble that renders nothing stays a bare `EmptyView` so it contributes
+        // no layout — the call site pads around this view, and a zero-height
+        // container would open a visible gap.
+        //
+        // `.hidden` (not in Inbox, or demo with AI declined) is an outcome the
+        // window gate cannot change. The opt-out arm is different and the choice
+        // is deliberate: a resolved `false` *could* render the suppression notice
+        // there, but a user who has switched every AI source off is shown nothing
+        // at all — as they were before the bounded-window work — rather than a
+        // notice about AI scheduling. The gate is simply never resolved in that
+        // configuration, which is harmless precisely because the notice is the
+        // only thing it could produce.
+        if mode == .hidden || (mode == .empty && aiDisabledWhileSubscribed) {
+            EmptyView()
+        } else {
+            // The eligibility task MUST hang on a container that keeps its identity
+            // across the branch flips the task itself causes. `Group` is a
+            // transparent pass-through: its modifiers are applied to each member,
+            // so the task would be cancelled and restarted every time the resolved
+            // gate changed the rendered arm — and on an `EmptyView` arm it would
+            // never run at all. A `VStack` is a real view whose lifecycle is
+            // independent of which arm is inside it.
+            VStack(spacing: 0) {
+                switch mode {
+                case .hidden:
+                    EmptyView()
+                case .content:
+                    contentBubble
+                case .suppressed:
+                    nudgeBubble(text: "AI work is suppressed for older messages in large inboxes")
+                case .empty:
+                    if !hasTabMailSession {
+                        nudgeBubble(text: "Sign in to enable AI features")
+                    } else if !AISubscriptionGate.shared.isActive {
+                        nudgeBubble(text: "Subscribe to enable AI features")
+                    } else if !anyAISourceEnabled {
+                        // AI opt-out with no Device Sync — hide entirely
+                    } else if failed {
+                        failedBubble
+                    } else {
+                        loadingBubble
+                            .onReceive(NotificationCenter.default.publisher(for: .aiDidFailForMessage).receive(on: DispatchQueue.main).filter { $0.object as? String == message.id }) { _ in
                                 failed = true
                             }
-                        }
+                            .task {
+                                // Safety-net timeout: if no success or failure notification after 20s, assume failure.
+                                try? await Task.sleep(for: .seconds(20))
+                                if !Task.isCancelled {
+                                    failed = true
+                                }
+                            }
+                    }
                 }
             }
-        }
-        .task(id: message.id) {
-            recentInboxEligible = nil
-            guard message.isInInbox else { return }
-            do {
-                recentInboxEligible = try await AppDatabase.syncPool.read { db in
-                    try ActiveAIQueue.recentInboxWindowContains(
-                        headerId: message.id,
-                        db: db
-                    )
+            .task(id: message.id) {
+                recentInboxEligible = nil
+                guard message.isInInbox else { return }
+                do {
+                    recentInboxEligible = try await AppDatabase.syncPool.read { db in
+                        try ActiveAIQueue.recentInboxWindowContains(
+                            headerId: message.id,
+                            db: db
+                        )
+                    }
+                } catch {
+                    // A local read failure must not make a message look intentionally
+                    // suppressed. Preserve the ordinary retry/failure UI instead.
+                    recentInboxEligible = true
                 }
-            } catch {
-                // A local read failure must not make a message look intentionally
-                // suppressed. Preserve the ordinary retry/failure UI instead.
-                recentInboxEligible = true
             }
         }
     }

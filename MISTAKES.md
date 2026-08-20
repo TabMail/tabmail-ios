@@ -12,6 +12,8 @@ MIS-IOS-005 · record a test baseline → MIS-IOS-006 · **write the word "recov
 just made fail closed → MIS-IOS-008** · **edit anything under `Companion/` → MIS-IOS-009** ·
 **write `hasSuffix`/`contains`/`split` on a filename, path component, MIME parameter or wire field →
 MIS-IOS-013. · **make a guard read a transient in-memory global, or quote a log to settle an ordering → MIS-IOS-015.**
+· **gate a view on async state, hang `.task`/`.onAppear` on a `Group` or on a conditional the task
+flips, or give a test seam a default that differs from production's initial value → MIS-IOS-017.**
 
 ## Data integrity — the irreversible ones
 
@@ -29,6 +31,8 @@ MIS-IOS-013. · **make a guard read a transient in-memory global, or quote a log
 
 - **[MIS-IOS-015](Companion/Mistakes/Active/MIS-IOS-015-made-a-guard-depend-on-a-transient-globals-lifetime-across-an-async-hop.md)** — made a fail-open guard read a **transient in-memory global** across an async hop: `InboxView`'s `.messageDismissedFromDetail` receiver carries `.receive(on: DispatchQueue.main)`, so it runs a turn LATER than the `post` and nothing orders it against the optimistic overlay's `release` — losing the race returns `nil` → `false` → the exact dismissal the guard existed to prevent. Fixed by carrying the destination folder id in the notification `userInfo`. ***Tell: "registered before the enqueue, released after the write, so it is definitely still live" — and quoting a LOG to settle an ordering without asking what the OTHER ordering would look like in that same log.*** (×1)
 - **[MIS-IOS-016](Companion/Mistakes/Active/MIS-IOS-016-shipped-a-test-whose-precondition-never-occurs.md)** — shipped a test whose **PRECONDITION never occurs**: green forever without ever exercising the path it names. ⚠️ **Distinct from `MIS-014`** — a blessing test goes red when you fix the bug; a **VACUOUS** test stays green through bug AND fix, so **red-first cannot find it**. Three instances in one day: a re-staged row differing only in an unprojected column (`prevCount=0`, measured **50/50**), an assertion against an implementation that IS the assertion, and a bare `Task.sleep(3s)` as a load barrier. ⚠️ **a fast `waitUntil` return proves its condition was true on ENTRY.** ***Tell: I can name what the test asserts, but not the observable proving the SETUP took effect.*** (×1)
+
+- **[MIS-IOS-017](Companion/Mistakes/Active/MIS-IOS-017-gated-a-view-on-state-that-only-that-view-could-resolve.md)** — gated a view on async state whose **only resolver was that same view's lifecycle**: `recentInboxEligible: Bool?` started `nil`, `nil` rendered `.hidden` → `EmptyView`, and the resolving `.task` hung on the **transparent `Group`** wrapping it, so it was attached to `EmptyView` — which has no lifecycle. The AI summary bubble was invisible for **every message, inbox included, in the LIVE `v1.7.11`** (`7a31f1d22`; `v1.7.9` fine). 🚨 **The suite had 15 tests on that exact function and all passed**: the 1 that passed `nil` BLESSED the defect (`nil → .hidden`, `MIS-014`) and 12 omitted the argument, whose seam default was `= true` — **a state production never starts in** (the other 2 pass `false` and are correct). ***Tell: "`nil` is the conservative state — showing nothing can't be wrong", without asking which view runs the resolver once nothing is shown.*** **Unresolved must render the pre-gate outcome; a seam default must equal the production initial value.** ⚠️ this entry's own first draft said 17/14 — it counted the tests the fix added (`MIS-033`). (×1)
 
 ## Build & test ops
 
