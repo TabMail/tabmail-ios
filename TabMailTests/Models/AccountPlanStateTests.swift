@@ -223,9 +223,6 @@ struct AccountInfoTrialStateTests {
                 reference: now
             )
             #expect(info.trialState(now: now) == .noTrial)
-            // And the paywall must not suppress Apple's introductory offer for
-            // them — that suppression is scoped to running signup trials.
-            #expect(PlanCardIntroOffer.suppressesIntroOffer(for: info, now: now) == false)
         }
     }
 
@@ -356,104 +353,47 @@ struct DailyQuotaChartTests {
     }
 }
 
-@Suite("Plan picker introductory offer")
-struct PlanCardIntroOfferTests {
+@Suite("Plan card call to action")
+struct PlanCardCTATests {
 
-    /// While App Store Connect still carries the introductory offers, a user on
-    /// a running signup trial would otherwise see "2 weeks free" and a "Start
-    /// Free Trial" button on the same page as a banner saying their trial is
-    /// running — and Apple would genuinely grant the offer on top.
-    @Test("A running signup trial hides the intro offer and asks for a subscription")
-    func runningSignupTrialSuppressesIntroOffer() throws {
-        let now = Date()
-        let info = try WhoamiFixture.runningSignupTrial(daysLeft: 9, reference: now)
-        let suppressed = PlanCardIntroOffer.suppressesIntroOffer(for: info, now: now)
-        #expect(suppressed == true)
-
-        // Eligible group, product carries an offer, no Apple subscription: the
-        // exact combination that shows the badge for everyone else.
-        let showsBadge = PlanCardIntroOffer.showsTrialBadge(
-            isEligibleForTrial: true,
-            hasAnyAppleSub: false,
-            hasIntroOffer: true,
-            suppressesIntroOffer: suppressed
-        )
-        #expect(showsBadge == false)
+    /// The StoreKit intro-offer trial badge is gone (issue #55): a user with no
+    /// Apple subscription is asked to subscribe — never to "Start Free Trial" —
+    /// and existing subscribers keep the rank-driven direction labels.
+    @Test("Non-subscribers are asked to subscribe; subscribers get rank-driven labels")
+    func ctaLabelsAreRankDriven() {
+        // No Apple subscription: always the plain subscribe invitation,
+        // regardless of the ranks involved.
         #expect(
-            PlanCardIntroOffer.buttonLabel(
-                showsTrialBadge: showsBadge,
-                hasAnyAppleSub: false,
-                currentRank: 0,
-                cardRank: 2
+            PlanCardCTA.buttonLabel(
+                hasAnyAppleSub: false, currentRank: 0, cardRank: 2
             ) == "Subscribe"
         )
-    }
-
-    @Test("Every other account keeps today's intro-offer badge and call to action")
-    func nonTrialAccountsAreUnchanged() throws {
-        let now = Date()
-        let controls: [AccountInfo?] = [
-            nil,
-            try WhoamiFixture.signedInWithoutSubscription(),
-            try WhoamiFixture.expiredSignupTrial(endedDaysAgo: 2, reference: now),
-            try WhoamiFixture.cardTrial(provider: "apple", planTier: "Pro", daysLeft: 5, reference: now)
-        ]
-        for info in controls {
-            let suppressed = PlanCardIntroOffer.suppressesIntroOffer(for: info, now: now)
-            #expect(suppressed == false)
-            let showsBadge = PlanCardIntroOffer.showsTrialBadge(
-                isEligibleForTrial: true,
-                hasAnyAppleSub: false,
-                hasIntroOffer: true,
-                suppressesIntroOffer: suppressed
-            )
-            #expect(showsBadge == true)
-            #expect(
-                PlanCardIntroOffer.buttonLabel(
-                    showsTrialBadge: showsBadge,
-                    hasAnyAppleSub: false,
-                    currentRank: 0,
-                    cardRank: 2
-                ) == "Start Free Trial"
-            )
-        }
-    }
-
-    @Test("Suppression does not disturb the rank-driven upgrade direction")
-    func rankDirectionIsUnchanged() {
-        // No badge, an existing Apple subscriber: labels come from the ranks,
-        // exactly as before.
         #expect(
-            PlanCardIntroOffer.buttonLabel(
-                showsTrialBadge: false, hasAnyAppleSub: true, currentRank: 2, cardRank: 3
+            PlanCardCTA.buttonLabel(
+                hasAnyAppleSub: false, currentRank: 2, cardRank: 3
+            ) == "Subscribe"
+        )
+
+        // An existing Apple subscriber: labels come from the ranks.
+        #expect(
+            PlanCardCTA.buttonLabel(
+                hasAnyAppleSub: true, currentRank: 2, cardRank: 3
             ) == "Upgrade"
         )
         #expect(
-            PlanCardIntroOffer.buttonLabel(
-                showsTrialBadge: false, hasAnyAppleSub: true, currentRank: 3, cardRank: 1
+            PlanCardCTA.buttonLabel(
+                hasAnyAppleSub: true, currentRank: 3, cardRank: 1
             ) == "Downgrade"
         )
         #expect(
-            PlanCardIntroOffer.buttonLabel(
-                showsTrialBadge: false, hasAnyAppleSub: true, currentRank: 2, cardRank: 2
+            PlanCardCTA.buttonLabel(
+                hasAnyAppleSub: true, currentRank: 2, cardRank: 2
             ) == "Switch"
         )
         #expect(
-            PlanCardIntroOffer.buttonLabel(
-                showsTrialBadge: false, hasAnyAppleSub: true, currentRank: 0, cardRank: 2
+            PlanCardCTA.buttonLabel(
+                hasAnyAppleSub: true, currentRank: 0, cardRank: 2
             ) == "Switch"
-        )
-    }
-
-    @Test("A product with no introductory offer never shows the badge")
-    func productWithoutOfferNeverBadges() {
-        #expect(
-            PlanCardIntroOffer.showsTrialBadge(
-                isEligibleForTrial: true,
-                hasAnyAppleSub: false,
-                hasIntroOffer: false,
-                suppressesIntroOffer: false
-            ) == false
         )
     }
 }

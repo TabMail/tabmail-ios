@@ -78,7 +78,7 @@ queues, optimistic UI, retries, reconciliation, Undo, Outbox, drafts, or notific
 | ADR-IOS-037 | Active | NSE/Main-App AI Ownership Lease (Cross-Process Coordination) | [read in full](Companion/Decisions/Active/adr-ios-037.md) |
 | ADR-IOS-038 | Active | Demo Mode — Custom JWT + Local Mock Provider + Pre-Baked AI Cache | [read in full](Companion/Decisions/Active/adr-ios-038.md) |
 | ADR-IOS-039 | Active | Idempotent HTML Render Fit + Scroll-Phase Height Freeze | [read in full](Companion/Decisions/Active/adr-ios-039.md) |
-| ADR-IOS-040 | Active | Zero (BYOK) Plan in the IAP Plan Picker — Three-Tier, Display-Only Naming | [read in full](Companion/Decisions/Active/adr-ios-040.md) |
+| ADR-IOS-040 | Active; point 4 (intro-offer trial gating: `checkTrialEligibility`, PlanCard trial badge) deleted 2026-08-19 with issue #55 — ASC offers removed, server signup trial is the only trial | Zero (BYOK) Plan in the IAP Plan Picker — Three-Tier, Display-Only Naming | [read in full](Companion/Decisions/Active/adr-ios-040.md) |
 | ADR-IOS-041 | Active | GRDB Database Suspension — 0xdead10cc Defense | [read in full](Companion/Decisions/Active/adr-ios-041.md) |
 | ADR-IOS-042 | Active | Stale-Detection Overlap Window Is Measured in the Fetch's Ordering Dimension (UID for IMAP, date for Gmail/Exchange) | [read in full](Companion/Decisions/Active/adr-ios-042.md) |
 | ADR-IOS-043 | Active | Outgoing Thread Binding — One Header Builder, Gmail Carries `threadId` | [read in full](Companion/Decisions/Active/adr-ios-043.md) |

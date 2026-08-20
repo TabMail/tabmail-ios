@@ -111,48 +111,22 @@ extension AccountInfo {
     }
 }
 
-/// The plan picker's App Store introductory-offer copy, as pure functions so the
-/// decision can be tested without building a `Product` or a SwiftUI view.
+/// The plan picker's purchase-button copy, as a pure function so the decision
+/// can be tested without building a `Product` or a SwiftUI view.
 ///
-/// The introductory offer ("2 weeks free" / "Start Free Trial") is a StoreKit
-/// concept and is entirely separate from the server-granted signup trial. They
-/// must never be advertised at the same time: the page would be inviting a user
-/// to start a trial they are already on, and Apple would genuinely grant its
-/// offer on top of the running one.
-enum PlanCardIntroOffer {
-    /// Whether the plan picker must suppress the App Store introductory offer
-    /// for this account — true only while a server-granted trial is RUNNING.
-    /// An ended trial does not suppress it: that user has no trial and the
-    /// offer, if any, is a genuine one to advertise.
-    static func suppressesIntroOffer(for info: AccountInfo?, now: Date = Date()) -> Bool {
-        if case .active = info?.trialState(now: now) { return true }
-        return false
-    }
-
-    /// Whether this card advertises the App Store introductory offer.
-    ///
-    /// `isEligibleForTrial` is group-level and `hasIntroOffer` is per-product —
-    /// both pre-existing conditions, unchanged. `suppressesIntroOffer` is the
-    /// only new one and is set for exactly one cohort: an account on a running
-    /// server-granted trial.
-    static func showsTrialBadge(
-        isEligibleForTrial: Bool,
-        hasAnyAppleSub: Bool,
-        hasIntroOffer: Bool,
-        suppressesIntroOffer: Bool
-    ) -> Bool {
-        isEligibleForTrial && !hasAnyAppleSub && hasIntroOffer && !suppressesIntroOffer
-    }
-
-    /// Purchase button text. Rank-driven upgrade/downgrade direction is
-    /// unchanged; ranks are passed in so this stays free of StoreKit.
+/// The card never advertises a StoreKit introductory offer: the App Store
+/// Connect offers were removed when the server-granted signup trial launched
+/// (2026-08-19), and the client-side trial-badge machinery that read them was
+/// deleted with them (issue #55). The free trial a user sees today is the
+/// server-granted one, described by the whoami-driven banner — not by the card.
+enum PlanCardCTA {
+    /// Purchase button text. Rank-driven upgrade/downgrade direction; ranks are
+    /// passed in so this stays free of StoreKit.
     static func buttonLabel(
-        showsTrialBadge: Bool,
         hasAnyAppleSub: Bool,
         currentRank: Int,
         cardRank: Int
     ) -> String {
-        if showsTrialBadge { return "Start Free Trial" }
         guard hasAnyAppleSub else { return "Subscribe" }
         guard currentRank > 0 else { return "Switch" }
         if cardRank > currentRank { return "Upgrade" }
