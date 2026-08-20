@@ -133,3 +133,51 @@ pure-logic level (`PendingPlanNavigationLatchTests`, `AISubscriptionGateTests`,
 - **No retroactive cleanup of duplicate rows the pre-fix bug already minted** — a merge migration
   would have to re-home messages keyed by accountId (high risk, low reach). The predicate's
   deterministic preference makes existing duplicates inert going forward.
+
+## 2026-08-19 — merging `main` exposed the epoch's real boundary: bind to the STATE CHANGE, not to a notification
+
+Merging `origin/main` into this branch combined the latch/epoch machinery above with main's async
+`TabMailAuthService.signOut()` (the IOS-PUSH-001 sign-out cleanup handoff). Neither line had the
+defect alone; the combination did. A sign-out's cleanup flush drives a token refresh in an
+**unstructured** `Task`, which `signOut()`'s `flush.cancel()` cannot reach, so it completes after
+`clearSession()` and writes the OUTGOING account's session back into the shared Keychain slot. That
+resurrected session then answers a `/whoami` for the account the user just left.
+
+**Search terms:** epoch bump timing; `noteSignedIn`; sign-in generation; `applyIfCurrentEpoch`;
+session write vs notification; `.tabMailDidSignIn` too late; `syncStripeCustomer` suspension;
+conditional bump; same-user re-auth preserves marker; `lastSignedInUserId`; identity pinned to work.
+
+**The correction that matters beyond this bug.** The first fix bumped the epoch on the
+`.tabMailDidSignIn` receiver. That is the wrong boundary and looked right: the notification is
+posted by UI callers (`RootView`, `MailNavigationView`, `TabMailSignInPrompt`) only AFTER the
+session has been written and after `syncStripeCustomer` — a network round-trip — has returned. A
+prior account's in-flight `/whoami` landing inside that gap still carried the un-bumped generation,
+passed `applyIfCurrentEpoch`, stamped `lastAuthoritativeApplyAt`, and let the latch consumer route
+on the OLD account's entitlement. Two-sided: an unentitled A + active B paywalls B; an active A +
+unentitled B silently clears B's latch and denies the picker. The epoch now advances at the three
+`KeychainHelper.save(encoded, for: sessionKey)` sites in `TabMailAuthService`, synchronously and
+before any suspension; the notification receiver is kept only as an idempotent backstop. **The
+general rule this instance teaches: invalidate on the STATE CHANGE itself, never on a downstream
+notification that merely announces it.** The same principle produced the sibling fix in
+`IOS-PUSH-001` (pin the bearer to the admitted cleanup pass instead of re-deriving it per action
+from ambient state) — both are "bind identity to the work, not to whatever is ambient later".
+
+**The bump is CONDITIONAL, and that is not an optimization.** Those three save sites also fire when
+the SAME user re-authenticates (web auth, id-token, OTP). An unconditional bump would discard a
+known-good authoritative entitlement and widen the "unknown" window for nothing, leaving the
+consumer waiting on a `/whoami` it did not need. `noteSignedIn(userId:previousUserId:)` bumps only
+when the incoming subject differs from the established one (`lastSignedInUserId`, falling back to
+the slot's prior subject so a same-user re-auth after a cold start is still recognised). An unknown
+prior identity BUMPS. ⚠️ Note the deliberate asymmetry with the token coordinator's clobber guard,
+where an unreadable slot means SAVE: there, withholding could log the user out; here, vouching for
+a new account with the old account's entitlement is the worse harm. Same instinct, opposite
+directions, because the harms differ — do not harmonize them.
+
+**Why this fix cannot break authentication (census, 2026-08-19).** `signInGeneration` is declared in
+`AISubscriptionGate`, bumped only by `noteSignedOut`/`noteSignedIn`, compared only in
+`applyIfCurrentEpoch`, and read at exactly three sites — `SyncScheduler`, `AccountDashboardView`,
+`RootView` — each capturing it immediately before a `/whoami` fetch. It appears ZERO times in
+`TabMailTokenCoordinator`, `TabMailAuthService`, `PushClient`, and `BackendClient`. It therefore
+gates only whoami→gate stamping and sits on no auth, token, or network path; an over-eager bump
+cannot fail a backend call. Its worst case is that one `/whoami` result is dropped, the gate stays
+unknown, and the consumer DEFERS — latch retained, no navigation — until a fresh result lands.

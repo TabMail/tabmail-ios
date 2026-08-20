@@ -4,6 +4,35 @@
 
 import Foundation
 
+/// Identity pinned to a single removed-account cleanup pass.
+///
+/// `drainPendingRemovedAccountCleanupsOnce` admits a pass against ONE Supabase
+/// subject and then performs several awaited network actions. Without pinning,
+/// each action independently re-derives a bearer from the ambient Keychain
+/// slot, so a sign-in landing mid-pass sends the REMAINDER of user A's cleanup
+/// under user B's identity. Two harms follow, both of which IOS-PUSH-001
+/// forbids: the worker's `user_mismatch` refusal is read as proof that A's debt
+/// is settled and the action is discharged without ever being performed (a
+/// dropped user intention), or B-scoped worker state is mutated on A's behalf.
+///
+/// Pinning binds identity to the WORK rather than to ambient state — the same
+/// principle as the token coordinator's clobber guard.
+///
+/// It also restores the validity of `isTerminalRemovedAccountOwnershipRefusal`:
+/// once the bearer cannot change mid-pass, a `user_mismatch` again genuinely
+/// proves the admitted subject lacks ownership of the shared singleton, which
+/// is what makes that refusal terminal. Do not "re-fix" that as a bug.
+///
+/// ⚠️ Task-locals propagate into actor methods called from the binding scope
+/// (an actor hop stays in the SAME task) but are NOT inherited by
+/// `Task.detached`. The drain's action loop contains no detached task; a test
+/// asserts the pinned value actually arrives at the client rather than
+/// assuming propagation, because a task-local that silently fails to propagate
+/// is a fail-dangerous seam.
+enum PushCleanupIdentity {
+    @TaskLocal static var pinnedAuthToken: String?
+}
+
 /// HTTP client for the push notification worker API (push[-dev].tabmail.ai).
 /// Separate from BackendClient because the base URL differs.
 /// Auth: Supabase JWT (via TabMailTokenCoordinator) for all endpoints.
@@ -31,6 +60,9 @@ actor PushClient {
     // MARK: - Auth
 
     private func currentAuthToken() async -> String? {
+        // A pinned bearer wins over the ambient session: this pass was admitted
+        // under that identity and must complete under it or not at all.
+        if let pinned = PushCleanupIdentity.pinnedAuthToken { return pinned }
         switch await TabMailTokenCoordinator.shared.validToken() {
         case .success(let token): return token
         case .permanentFailure, .transientFailure, .noSession: return nil

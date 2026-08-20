@@ -14,6 +14,14 @@ struct RemovedAccountPushCleanupTests {
 
     actor MockCleanupClient: RemovedAccountPushCleaning {
         private(set) var calls: [String] = []
+        /// The identity pinned to the cleanup pass, as observed from INSIDE the
+        /// client on every action. The mock does not go through `PushClient`,
+        /// so this is a direct read of the task-local — which is exactly what
+        /// makes it a propagation proof rather than an assumption: if the drain
+        /// stopped binding the pin, every entry here would be `nil`.
+        private(set) var observedBearers: [String?] = []
+        /// The `userId` each `registerDevice` body carried.
+        private(set) var registeredUserIds: [String] = []
         private var shouldFail = true
         private var ownershipRefusal = false
         private var genericForbidden = false
@@ -28,6 +36,9 @@ struct RemovedAccountPushCleanupTests {
         func setGenericForbidden(_ value: Bool) { genericForbidden = value }
         func setProviderFailuresRemaining(_ value: Int) { providerFailuresRemaining = value }
         func recordedCalls() -> [String] { calls }
+        func recordedBearers() -> [String?] { observedBearers }
+        func recordedRegisteredUserIds() -> [String] { registeredUserIds }
+        private func noteBearer() { observedBearers.append(PushCleanupIdentity.pinnedAuthToken) }
         func blockDeviceAccount(email: String) { blockedDeviceAccountEmail = email }
         /// Whether the blocked call has been entered at least once. Lets a test
         /// prove the flush genuinely reached the network without depending on
@@ -60,6 +71,7 @@ struct RemovedAccountPushCleanupTests {
         }
 
         func unregisterDeviceAccount(deviceId: String, accountEmail: String) async throws {
+            noteBearer()
             calls.append("device-account:\(accountEmail)")
             if blockedDeviceAccountEmail == accountEmail {
                 hasReachedBlock = true
@@ -77,26 +89,33 @@ struct RemovedAccountPushCleanupTests {
             accountEmails: [String],
             apnsSandbox: Bool
         ) async throws {
+            noteBearer()
+            registeredUserIds.append(userId)
             try record("register-device:\(accountEmails.sorted().joined(separator: ","))")
         }
 
         func unregisterDevice(deviceId: String) async throws {
+            noteBearer()
             try record("unregister-device")
         }
 
         func unsubscribeIMAP(userEmail: String) async throws {
+            noteBearer()
             try record("imap:\(userEmail)")
         }
 
         func deleteGmailConsent(userEmail: String) async throws {
+            noteBearer()
             try recordOwnershipCleanup("gmail-consent:\(userEmail)")
         }
 
         func deleteOutlookConsent(userEmail: String) async throws {
+            noteBearer()
             try recordOwnershipCleanup("outlook-consent:\(userEmail)")
         }
 
         func unsubscribe(provider: String, userEmail: String, accessToken: String) async throws {
+            noteBearer()
             let call = "provider-subscription:\(provider):\(userEmail):\(accessToken.isEmpty ? "empty" : "set")"
             calls.append(call)
             if providerFailuresRemaining > 0 {
@@ -116,9 +135,9 @@ struct RemovedAccountPushCleanupTests {
     private let sessionKey = "tabmail_session"
     private let testWorkerUserId = "cleanup-test-user"
 
-    private func installTestSession(userId: String) throws {
+    private func installTestSession(userId: String, accessToken: String = "test-access") throws {
         let data = try JSONSerialization.data(withJSONObject: [
-            "access_token": "test-access",
+            "access_token": accessToken,
             "refresh_token": "test-refresh",
             "expires_at": 4_102_444_800,
             "user": ["id": userId, "email": "session@example.com"],
@@ -961,6 +980,93 @@ struct RemovedAccountPushCleanupTests {
                     "the resumed drain must reach the consent teardown")
             #expect(settledCalls.contains("provider-subscription:gmail:signout-concurrent-drain@example.com:empty"),
                     "the resumed drain must reach the provider-subscription teardown")
+        }
+    }
+
+    // MARK: - Identity is pinned to the WORK, not to ambient state
+    //
+    // The drain admits a pass against ONE subject and then performs several
+    // awaited network actions. Each production `PushClient` call used to
+    // re-derive its bearer from the ambient Keychain slot, so a sign-in landing
+    // mid-pass sent the REMAINDER of A's cleanup under B's identity — either
+    // discharging A's debt without performing it (the worker's `user_mismatch`
+    // read as proof of settlement) or mutating B-scoped worker state.
+
+    @Test("a sign-in landing mid-pass cannot switch the bearer: every action stays pinned to the admitted subject")
+    func midPassSignInCannotSwitchTheCleanupBearer() async throws {
+        // A second, still-active account with a DIFFERENT email keeps the
+        // legacy device-registration action live (and unsuppressed), so the
+        // `registerDevice` subject assertion below is not vacuous.
+        var stillActive = Account(
+            emailAddress: "still-here@example.com",
+            displayName: "Active",
+            provider: .gmail
+        )
+        stillActive.id = "still-here-account"
+
+        try await withHarness(activeAccount: stillActive) { defaults, mock in
+            // An APNs token must exist or legacy device refresh short-circuits
+            // before ever calling `registerDevice`.
+            defaults.set("apns-device-token", forKey: PushConfig.lastDeviceTokenKey)
+
+            var removed = Account(
+                emailAddress: "pinned-identity@example.com",
+                displayName: "Removed",
+                provider: .gmail
+            )
+            removed.id = "pinned-identity-account"
+
+            await mock.setShouldFail(false)
+            await mock.blockDeviceAccount(email: removed.emailAddress)
+            let generation = await PushNotificationService.shared.prepareRemovedAccountCleanup(
+                removed,
+                caldavConfigIds: [],
+                outboxAttachmentDirNames: []
+            )
+            await PushNotificationService.shared.commitPreparedRemovedAccountCleanup(generation: generation)
+
+            let drain = Task {
+                await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
+            }
+            await mock.waitUntilDeviceAccountBlocked()
+
+            // Account B signs in while A's pass is suspended inside its FIRST
+            // remote call. The ambient session slot now holds B's subject and
+            // B's bearer — everything a per-action token read would pick up.
+            try installTestSession(userId: "other-user", accessToken: "test-access-B")
+            // Two-sided setup guard: prove the switch actually happened, so a
+            // green result cannot come from the scenario never occurring.
+            let liveSubject = await MainActor.run { TabMailAuthService.getSession()?.userId }
+            #expect(liveSubject == "other-user",
+                    "setup must genuinely switch the live session, or this test proves nothing")
+
+            await mock.releaseDeviceAccountBlock()
+            await drain.value
+
+            let bearers = await mock.recordedBearers()
+            #expect(!bearers.isEmpty, "the pass must actually have performed remote actions")
+
+            // (i) PROPAGATION. A task-local that silently fails to reach the
+            // client would be a fail-dangerous seam, so assert it arrived
+            // rather than assuming actor calls inherit it.
+            #expect(bearers.allSatisfy { $0 != nil },
+                    "the pinned bearer must propagate into every client call")
+
+            // (ii) IDENTITY. Every action — including those that ran AFTER B
+            // signed in — went out under the ADMITTED subject's bearer.
+            #expect(bearers.allSatisfy { $0 == "test-access" },
+                    "every action must use the admitted subject's bearer, never the live session's")
+            #expect(!bearers.contains("test-access-B"),
+                    "no action may be sent under the newly signed-in user's bearer")
+
+            // (iii) The legacy device re-registration named the ADMITTED
+            // subject too — it used to re-read the ambient session here, which
+            // is a cross-user worker-state mutation.
+            let registeredIds = await mock.recordedRegisteredUserIds()
+            #expect(!registeredIds.isEmpty,
+                    "the legacy device registration must run, or (iii) proves nothing")
+            #expect(registeredIds.allSatisfy { $0 == testWorkerUserId },
+                    "device re-registration must name the admitted subject, not the newly signed-in one")
         }
     }
 }

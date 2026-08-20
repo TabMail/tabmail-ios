@@ -184,8 +184,16 @@ final class TabMailAuthService: NSObject {
         let session = try JSONDecoder().decode(TabMailSession.self, from: data)
 
         // Persist in Keychain
+        // Read the outgoing subject BEFORE overwriting it: the entitlement
+        // epoch must advance here, at the identity change, not on the later
+        // `.tabMailDidSignIn` notification (that is posted by UI callers only
+        // after `syncStripeCustomer` below and further plumbing, and a prior
+        // account's `/whoami` landing in that gap would still pass the
+        // un-bumped epoch and vouch for the new account).
+        let previousUserId = Self.getSession()?.userId
         let encoded = try JSONEncoder().encode(session)
         try KeychainHelper.save(encoded, for: Self.sessionKey)
+        AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
         // Session identity changed — re-evaluate the debug-logging gate.
         DebugModeManager.invalidateLoggingCache()
 
@@ -280,8 +288,11 @@ final class TabMailAuthService: NSObject {
         let session = try JSONDecoder().decode(TabMailSession.self, from: data)
 
         // Persist in Keychain
+        // Epoch advances at the identity change — see `signInWithIdToken`.
+        let previousUserId = Self.getSession()?.userId
         let encoded = try JSONEncoder().encode(session)
         try KeychainHelper.save(encoded, for: Self.sessionKey)
+        AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
         // Session identity changed — re-evaluate the debug-logging gate.
         DebugModeManager.invalidateLoggingCache()
 
@@ -375,8 +386,11 @@ final class TabMailAuthService: NSObject {
         let session = try JSONDecoder().decode(TabMailSession.self, from: data)
 
         // Persist in Keychain (survives app restarts)
+        // Epoch advances at the identity change — see `signInWithIdToken`.
+        let previousUserId = Self.getSession()?.userId
         let encoded = try JSONEncoder().encode(session)
         try KeychainHelper.save(encoded, for: Self.sessionKey)
+        AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
         // Session identity changed — re-evaluate the debug-logging gate.
         DebugModeManager.invalidateLoggingCache()
 

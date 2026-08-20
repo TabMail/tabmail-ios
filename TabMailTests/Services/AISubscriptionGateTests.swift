@@ -231,7 +231,7 @@ struct AISubscriptionGateTests {
         #expect(gate.lastAuthoritativeApplyAt != nil)
         let before = gate.signInGeneration
 
-        gate.noteSignedIn()
+        gate.noteSignedIn(userId: "user-B-\(UUID().uuidString)")
         #expect(gate.signInGeneration == before &+ 1)
         #expect(gate.lastAuthoritativeApplyAt == nil)
 
@@ -246,7 +246,7 @@ struct AISubscriptionGateTests {
         // A's cleanup resurrects A's session; a revalidation for A captured
         // THIS (post-sign-out) generation before its network await…
         let resurrectionGeneration = gate.signInGeneration
-        gate.noteSignedIn() // …then B signs in (our defense)
+        gate.noteSignedIn(userId: "user-B-\(UUID().uuidString)") // …then B signs in (our defense)
         // …and A's resurrected-session whoami (closed) lands now.
         gate.applyIfCurrentEpoch(
             try WhoamiFixture.accountInfo(hasSubscription: false),
@@ -284,7 +284,7 @@ struct AISubscriptionGateTests {
         #expect(gate.isActive == false)
 
         // B signs in: the defense bumps the epoch and clears the marker.
-        gate.noteSignedIn()
+        gate.noteSignedIn(userId: "user-B-\(UUID().uuidString)")
 
         // B's AI-consent onboarding arms the latch (gate not yet authoritative for B).
         PendingPlanNavigationLatch.recordAfterAIConsent(
@@ -341,7 +341,7 @@ struct AISubscriptionGateTests {
             fetchedInGeneration: resurrectionGen,
             now: Date()
         )
-        gate.noteSignedIn() // B signs in
+        gate.noteSignedIn(userId: "user-B-\(UUID().uuidString)") // B signs in
 
         PendingPlanNavigationLatch.recordAfterAIConsent(
             aiEnabled: true,
@@ -371,6 +371,153 @@ struct AISubscriptionGateTests {
         ) == .navigateToPlanPicker)
 
         // Restore shared gate for other tests.
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+    }
+
+    // MARK: - Sign-in epoch: the bump is CONDITIONAL on an identity change
+    //
+    // The three session-write sites also fire when the SAME user
+    // re-authenticates (web auth, id-token, OTP). Bumping there would discard a
+    // known-good authoritative entitlement and leave the latch consumer waiting
+    // on a `/whoami` it did not need. The epoch must track IDENTITY CHANGES,
+    // not session writes.
+
+    @Test("Same-user re-authentication does NOT bump the epoch and PRESERVES the authoritative marker")
+    func sameUserReauthPreservesEpochAndMarker() throws {
+        let gate = AISubscriptionGate.shared
+        let subject = "user-A-\(UUID().uuidString)"
+
+        // A signs in, then a /whoami stamps an authoritative marker.
+        gate.noteSignedIn(userId: subject)
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+        #expect(gate.lastAuthoritativeApplyAt != nil) // known-good state exists (non-vacuous)
+        let generationAfterSignIn = gate.signInGeneration
+        let markerAfterSignIn = gate.lastAuthoritativeApplyAt
+
+        // A re-authenticates — a NEW session write, but the SAME identity.
+        gate.noteSignedIn(userId: subject)
+
+        // Nothing was invalidated: same epoch, same marker instant.
+        #expect(gate.signInGeneration == generationAfterSignIn)
+        #expect(gate.lastAuthoritativeApplyAt == markerAfterSignIn)
+
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+    }
+
+    @Test("Cold-start same-user re-auth preserves the marker via previousUserId")
+    func coldStartSameUserReauthPreservesMarker() throws {
+        let gate = AISubscriptionGate.shared
+        let subject = "user-A-\(UUID().uuidString)"
+
+        // Simulate a process that RESTORED A's session from the Keychain at
+        // launch: the gate has no recorded epoch owner, but the slot does.
+        gate.noteSignedOut() // clears the recorded owner
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+        let generationBefore = gate.signInGeneration
+        let markerBefore = gate.lastAuthoritativeApplyAt
+        #expect(markerBefore != nil)
+
+        // A re-authenticates. The gate has no memory, so the slot's prior
+        // subject is what proves this is the same identity.
+        gate.noteSignedIn(userId: subject, previousUserId: subject)
+
+        #expect(gate.signInGeneration == generationBefore)
+        #expect(gate.lastAuthoritativeApplyAt == markerBefore)
+
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+    }
+
+    @Test("A DIFFERENT user signing in bumps the epoch and clears the marker")
+    func differentUserSignInBumpsAndClearsMarker() throws {
+        let gate = AISubscriptionGate.shared
+        let userA = "user-A-\(UUID().uuidString)"
+        let userB = "user-B-\(UUID().uuidString)"
+
+        gate.noteSignedIn(userId: userA)
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+        #expect(gate.lastAuthoritativeApplyAt != nil)
+        let generationBefore = gate.signInGeneration
+
+        gate.noteSignedIn(userId: userB, previousUserId: userA)
+
+        #expect(gate.signInGeneration == generationBefore &+ 1)
+        #expect(gate.lastAuthoritativeApplyAt == nil)
+
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+    }
+
+    @Test("An empty or unreadable prior slot is treated as an identity change and BUMPS")
+    func unknownPriorIdentityBumps() throws {
+        let gate = AISubscriptionGate.shared
+
+        // Both "first ever sign-in" (empty slot) and "slot did not decode"
+        // surface here as a nil prior subject. The safe direction is to
+        // INVALIDATE — the opposite of the token clobber guard, deliberately.
+        gate.noteSignedOut()
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+        #expect(gate.lastAuthoritativeApplyAt != nil)
+        let generationBefore = gate.signInGeneration
+
+        gate.noteSignedIn(userId: "user-A-\(UUID().uuidString)", previousUserId: nil)
+
+        #expect(gate.signInGeneration == generationBefore &+ 1)
+        #expect(gate.lastAuthoritativeApplyAt == nil)
+
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+    }
+
+    @Test("The notification backstop is idempotent — it cannot undo the write-time preservation")
+    func notificationBackstopIsIdempotent() throws {
+        let gate = AISubscriptionGate.shared
+        let subject = "user-A-\(UUID().uuidString)"
+
+        // The session write opened the epoch for A and a /whoami stamped it.
+        gate.noteSignedIn(userId: subject)
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+        let generationAfterWrite = gate.signInGeneration
+        let markerAfterWrite = gate.lastAuthoritativeApplyAt
+        #expect(markerAfterWrite != nil)
+
+        // `.tabMailDidSignIn` fires later; RootView's backstop passes the live
+        // subject. It must NOT invalidate what the write already established.
+        gate.noteSignedIn(userId: subject)
+
+        #expect(gate.signInGeneration == generationAfterWrite)
+        #expect(gate.lastAuthoritativeApplyAt == markerAfterWrite)
+
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+    }
+
+    @Test("A prior account's whoami landing in the write→notification gap is dropped")
+    func priorAccountWhoamiInWriteToNotificationGapIsDropped() throws {
+        let gate = AISubscriptionGate.shared
+        let userA = "user-A-\(UUID().uuidString)"
+        let userB = "user-B-\(UUID().uuidString)"
+
+        // A is signed in and unentitled; its revalidation is in flight and
+        // captured the epoch BEFORE its network await.
+        gate.noteSignedIn(userId: userA)
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: false))
+        let aInFlightGeneration = gate.signInGeneration
+
+        // B's session is WRITTEN. This is the moment identity changes — and
+        // the moment the epoch must advance. `.tabMailDidSignIn` has NOT been
+        // posted yet: `syncStripeCustomer` (a network round-trip) and the UI
+        // plumbing that posts it are still ahead.
+        gate.noteSignedIn(userId: userB, previousUserId: userA)
+
+        // A's closed whoami lands INSIDE that gap.
+        gate.applyIfCurrentEpoch(
+            try WhoamiFixture.accountInfo(hasSubscription: false),
+            fetchedInGeneration: aInFlightGeneration,
+            now: Date()
+        )
+
+        // Dropped — A's entitlement never vouches for B. (With the bump at the
+        // notification instead of the write, this apply would have been in the
+        // CURRENT epoch and would have stamped the marker.)
+        #expect(gate.lastAuthoritativeApplyAt == nil)
+
         gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
     }
 }

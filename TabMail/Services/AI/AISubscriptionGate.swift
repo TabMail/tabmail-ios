@@ -127,7 +127,16 @@ final class AISubscriptionGate: @unchecked Sendable {
     func noteSignedOut() {
         lastAuthoritativeApplyAt = nil
         signInGeneration &+= 1
+        // No identity owns the current epoch any more, so the next sign-in —
+        // even by the same user — is a genuine identity change and must bump.
+        lastSignedInUserId = nil
     }
+
+    /// The Supabase subject the current sign-in epoch belongs to. Lets the
+    /// authoritative call site (the session write) and the notification
+    /// backstop ask the same question — "is this a NEW identity?" — so the
+    /// second call is a no-op rather than a second invalidation.
+    private var lastSignedInUserId: String?
 
     /// Begin a NEW sign-in epoch. Symmetric to `noteSignedOut`: clears this
     /// process's authoritative-apply marker and bumps `signInGeneration` so
@@ -144,8 +153,42 @@ final class AISubscriptionGate: @unchecked Sendable {
     /// different user's live session in the first place). It is also correct
     /// and safe on every ordinary sign-in: the marker re-applies within one
     /// revalidation, and until it does the latch consumer merely waits.
+    /// Call this at the SESSION WRITE, not on `.tabMailDidSignIn`. The write
+    /// is where identity actually changes; the notification is posted by UI
+    /// callers only after `syncStripeCustomer` (a network round-trip) and
+    /// further plumbing, and a prior account's `/whoami` landing in that gap
+    /// would still pass the un-bumped epoch and stamp the marker.
+    ///
+    /// Bumps ONLY on an actual identity change. The session-write sites also
+    /// fire when the SAME user re-authenticates (web auth, id-token, OTP);
+    /// invalidating there would discard a known-good authoritative entitlement
+    /// and widen the "unknown" window for nothing, leaving the latch consumer
+    /// waiting on a `/whoami` it did not need.
+    ///
+    /// ⚠️ Deliberate asymmetry with `TabMailTokenCoordinator`'s clobber guard:
+    /// there, an unreadable slot means SAVE (withholding could log the user
+    /// out — the worse harm). Here, an unknown identity means BUMP, because
+    /// the worse harm is vouching for a new account with the old account's
+    /// entitlement. Same "fail safe" instinct, opposite directions, because
+    /// the harms differ. Do not "harmonize" them.
+    /// - Parameters:
+    ///   - userId: the subject of the session just written.
+    ///   - previousUserId: the subject the session slot held BEFORE that write,
+    ///     used only when this process has not yet recorded an epoch owner (a
+    ///     session restored from the Keychain at launch never called this). It
+    ///     is what makes a same-user re-authentication after a cold start
+    ///     preserve the marker instead of gratuitously invalidating it. The
+    ///     notification backstop passes `nil` and relies on the recorded owner.
     @MainActor
-    func noteSignedIn() {
+    func noteSignedIn(userId: String?, previousUserId: String? = nil) {
+        let established = lastSignedInUserId ?? previousUserId
+        guard userId != established else {
+            // Same identity — preserve the authoritative marker and the epoch.
+            // Still record the owner so the backstop becomes a no-op.
+            lastSignedInUserId = userId
+            return
+        }
+        lastSignedInUserId = userId
         lastAuthoritativeApplyAt = nil
         signInGeneration &+= 1
     }

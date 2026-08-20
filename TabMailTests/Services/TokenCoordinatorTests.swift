@@ -243,3 +243,59 @@ struct TokenCoordinatorClobberGuardTests {
         #expect(saved == [refreshed])
     }
 }
+
+/// Refresh deduplication must never hand one user another user's bearer.
+///
+/// `validToken`/`forceRefresh` used to await ANY in-flight refresh task. The
+/// dedup exists only to stop two callers burning the same rotated refresh
+/// token — a per-token, therefore per-subject, hazard. Sharing across subjects
+/// returns `.success(A_accessToken)` to B, so B makes backend requests as A and
+/// a `/whoami` fetched that way describes A while carrying B's epoch. This is
+/// the same harm class as the session-slot clobber.
+@Suite("TabMailTokenCoordinator refresh-join ownership")
+struct TokenCoordinatorRefreshJoinTests {
+    @Test("Same subject → JOIN (deduplication is preserved where it is actually needed)")
+    func sameSubjectJoins() {
+        #expect(TabMailTokenCoordinator.canJoinInFlightRefresh(
+            inFlightUserId: "user-A",
+            requestingUserId: "user-A"
+        ))
+    }
+
+    @Test("Different subject → REFUSE to join (never hand B a bearer minted for A)")
+    func differentSubjectRefusesToJoin() {
+        #expect(!TabMailTokenCoordinator.canJoinInFlightRefresh(
+            inFlightUserId: "user-A",
+            requestingUserId: "user-B"
+        ))
+    }
+
+    @Test("Untagged in-flight refresh → REFUSE to join (an unprovable owner is not a matching owner)")
+    func untaggedRefreshRefusesToJoin() {
+        #expect(!TabMailTokenCoordinator.canJoinInFlightRefresh(
+            inFlightUserId: nil,
+            requestingUserId: "user-A"
+        ))
+    }
+
+    /// Refusing to join is ALWAYS auth-safe, which is why this guard cannot
+    /// break login: the refusing caller simply starts its own refresh with its
+    /// own refresh token. Two subjects necessarily hold two different refresh
+    /// tokens — each is read from that subject's own session blob — so
+    /// declining to share cannot produce the Supabase rotation conflict the
+    /// dedup exists to prevent. Within one subject, joining still happens.
+    @Test("The join decision depends ONLY on subject identity, never on token values")
+    func joinDecisionIsPurelyAboutIdentity() {
+        // Same subject joins regardless of how different the rest of the
+        // session looks; a different subject never joins even if everything
+        // else about the request is identical.
+        #expect(TabMailTokenCoordinator.canJoinInFlightRefresh(
+            inFlightUserId: "shared-subject",
+            requestingUserId: "shared-subject"
+        ))
+        #expect(!TabMailTokenCoordinator.canJoinInFlightRefresh(
+            inFlightUserId: "shared-subject",
+            requestingUserId: "shared-subject-2"
+        ))
+    }
+}
