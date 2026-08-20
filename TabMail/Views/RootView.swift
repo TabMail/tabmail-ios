@@ -139,9 +139,18 @@ struct RootView: View {
                 // to avoid a flash of LoginView when accounts exist but haven't loaded yet.
                 SplashView()
             } else if !hasTabMailSession {
-                // No email accounts AND no session → onboarding login
+                // No email accounts AND no session → onboarding login.
+                // Post the SAME notification the sheet-presented login paths
+                // post: the `.tabMailDidSignIn` receiver below flips
+                // `hasTabMailSession`, restores per-user consent state,
+                // connects Device Sync, and — critically — revalidates
+                // `AISubscriptionGate` via `/whoami`. Pre-fix (issue #56)
+                // this branch flipped the flag inline and skipped all of
+                // that, so the onboarding path never asked the backend for
+                // entitlement and routed active subscribers to the paywall
+                // on the gate's hydrated default.
                 TabMailLoginView {
-                    withAnimation { hasTabMailSession = true }
+                    NotificationCenter.default.post(name: .tabMailDidSignIn, object: nil)
                 }
             } else if !hasCompletedConsentGate {
                 if isCheckingConsent {
@@ -165,12 +174,20 @@ struct RootView: View {
                     // we moved it here so demo mode can write to its own flag
                     // instead.
                     AIService.writeOptOutFlag(!aiEnabled)
-                    if !aiEnabled {
-                        UserDefaults.standard.set(false, forKey: "pending_plan_navigation")
-                    } else if !AISubscriptionGate.shared.isActive {
-                        // AI enabled but no subscription — go to plan page
-                        UserDefaults.standard.set(true, forKey: "pending_plan_navigation")
-                    }
+                    // Arm or disarm the plan-picker latch. Every arm writes
+                    // an explicit value — the pre-fix code fell through both
+                    // arms for an active subscriber with AI enabled, leaving
+                    // a stale `true` armed (issue #56). The authority bit
+                    // keeps a UserDefaults-hydrated `isActive` from counting
+                    // as "already subscribed" for a user whose /whoami has
+                    // not landed yet. The entitlement-aware consumer in
+                    // MailNavigationView is the second layer; see
+                    // PendingPlanNavigationLatch.
+                    PendingPlanNavigationLatch.recordAfterAIConsent(
+                        aiEnabled: aiEnabled,
+                        gateIsActive: AISubscriptionGate.shared.isActive,
+                        gateIsAuthoritative: AISubscriptionGate.shared.lastAuthoritativeApplyAt != nil
+                    )
                     withAnimation { hasSeenAIConsent = true }
                 }
             } else if !hasSeenPushConsent {
@@ -582,6 +599,10 @@ struct RootView: View {
             }
             // Save consent gate state for the current user before clearing (per-account)
             saveConsentStateForCurrentUser()
+            // The outgoing account's `/whoami` must not vouch for the next
+            // sign-in: forget this process's authoritative-apply marker so
+            // the plan-picker latch consumer waits for a fresh response.
+            AISubscriptionGate.shared.noteSignedOut()
             withAnimation {
                 hasTabMailSession = false
                 hasCompletedConsentGate = false
@@ -682,11 +703,15 @@ struct RootView: View {
     /// Revalidate AI subscription gate via whoami.
     /// Opens the gate if subscription is active, closes it if not.
     private static func revalidateAISubscriptionGate() async {
+        // Capture the sign-in epoch BEFORE the network await: if the user
+        // signs out while this fetch is in flight, the response describes
+        // the OLD account and must not be applied (see `applyIfCurrentEpoch`).
+        let generation = AISubscriptionGate.shared.signInGeneration
         do {
             let info = try await BackendClient().fetchAccountInfo()
             // Single seam: opens/closes the gate AND records whether this
             // account's free trial has ended (drives the sidebar banner copy).
-            AISubscriptionGate.shared.apply(info)
+            AISubscriptionGate.shared.applyIfCurrentEpoch(info, fetchedInGeneration: generation)
             // Feed the inbox usage-throttle banner from this same always-on
             // foreground /whoami fetch — no extra poll.
             UsageThrottleStore.shared.update(from: info)

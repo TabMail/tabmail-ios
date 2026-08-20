@@ -56,6 +56,20 @@ extension AccountManager {
         )
     }
 
+    // MARK: - Existing-Account Lookup
+
+    /// Case-insensitive "is this address already configured?" check — the
+    /// shared predicate behind both the login-screen add gate
+    /// (`TabMailLoginView` decides whether to stage `PendingAccountAdd`)
+    /// and `setupOAuthAccount`'s duplicate detection. See
+    /// `Account.existing(forEmail:provider:in:)` for why it must be
+    /// case-insensitive and must see `calendarOnly` rows.
+    func existingAccount(forEmail email: String, provider: AccountProvider) async throws -> Account? {
+        try await dbPool.read { db in
+            try Account.existing(forEmail: email, provider: provider, in: db)
+        }
+    }
+
     // MARK: - Shared OAuth Account Setup
 
     /// Common setup for Gmail and Outlook accounts. Handles duplicate detection,
@@ -66,19 +80,42 @@ extension AccountManager {
         provider: AccountProvider,
         tokens: OAuthTokens
     ) async throws -> Account {
-        // Guard: if an account with the same email+provider already exists,
+        // Guard: if an account with the same email+provider already exists
+        // (case-insensitively — SQLite's BINARY collation would treat a
+        // differently-cased address as a new row and create a duplicate),
         // update its tokens and reconnect instead of creating a duplicate.
-        let providerRaw = provider.rawValue
-        if let existing = try await dbPool.read({ db in
-            try Account.filter(Column("emailAddress") == email && Column("provider") == providerRaw).fetchOne(db)
-        }) {
+        if let existing = try await existingAccount(forEmail: email, provider: provider) {
             try KeychainHelper.save(tokens.accessToken, for: KeychainHelper.accessTokenKey(accountId: existing.id))
             if let refresh = tokens.refreshToken {
                 try KeychainHelper.save(refresh, for: KeychainHelper.refreshTokenKey(accountId: existing.id))
             }
             await disconnectAccount(existing)
-            try await connectAccount(existing)
-            return existing
+            guard existing.calendarOnly else {
+                // Fully-configured mail account — token refresh + reconnect.
+                try await connectAccount(existing)
+                return existing
+            }
+            // The matched row is calendar-first (created by
+            // `CalendarSetupView` with `calendarOnly = true`). The user has
+            // now explicitly gone through the MAIL add flow for the same
+            // address, so upgrade the row to a full mail account by
+            // clearing `calendarOnly` — a conscious decision (issue #56):
+            // without it the account can never appear in the sidebar
+            // (`Account.sidebarRequest` filters `calendarOnly`), so the app
+            // would keep asking the user to add the account they just
+            // connected. Promote to primary if no primary exists, exactly
+            // as a fresh insert would.
+            let matched = existing
+            let upgraded = try await dbPool.write { db -> Account in
+                let hasPrimary = try Account.filter(Column("isPrimary") == true && Column("isActive") == true).fetchCount(db) > 0
+                var row = matched
+                row.calendarOnly = false
+                if !hasPrimary { row.isPrimary = true }
+                try row.update(db)
+                return row
+            }
+            try await activateMailAccount(upgraded)
+            return upgraded
         }
 
         let account = Account(
@@ -102,13 +139,25 @@ extension AccountManager {
             if !hasPrimary { toInsert.isPrimary = true }
             try toInsert.insert(db)
         }
+
+        try await activateMailAccount(account)
+        return account
+    }
+
+    /// Post-persist activation shared by a freshly-inserted mail account and
+    /// a calendar-only row just upgraded to a full mail account (both arms of
+    /// `setupOAuthAccount`). Extracted verbatim from the insert arm's tail:
+    /// UI refresh notification, orphaned-demo purge, provider connect,
+    /// background initial sync, push subscription, NSE explainer + account
+    /// map mirror, and the push-consent rescan.
+    private func activateMailAccount(_ account: Account) async throws {
         NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
 
         // Once a real account is added (not demo),
         // purge any orphaned demo rows. The login-screen demo button hides
         // automatically via `navigationStore.hasAnyAccount` once the new
         // account row commits and `.backgroundDataDidChange` propagates.
-        if acct.id != DemoSeed.demoAccountId {
+        if account.id != DemoSeed.demoAccountId {
             await DemoModeService.purgeOrphanedDemoData()
         }
 
@@ -156,8 +205,6 @@ extension AccountManager {
         Task { @MainActor in
             await PushNotificationService.shared.checkPushConsentStatusForForeground()
         }
-
-        return account
     }
 
     // MARK: - IMAP Account Setup

@@ -351,16 +351,24 @@ struct TabMailLoginView: View {
         // Phase 2: Exchange id_token for Supabase session.
         let _ = try await authService.signInWithIdToken(provider: .google, idToken: idToken)
 
-        // Phase 3: Stage the account-add for `AddAccountGmailOutlookView`.
-        // The mail-scope OAuth runs only when the user taps Connect.
-        // If user-info fetch fails the gate is skipped — user will
-        // land on AddAccountGeneralView and can add manually.
+        // Phase 3: Stage the account-add for `AddAccountGmailOutlookView` —
+        // but only when no account row (any casing, calendar-only included)
+        // already covers this address: offering to add an account the user
+        // has already configured is the issue-#56 mis-detection. The
+        // mail-scope OAuth runs only when the user taps Connect.
+        // If user-info fetch (or the existing-account read) fails the gate
+        // is skipped — user will land on AddAccountGeneralView and can add
+        // manually.
         do {
             let userInfo = try await getOAuthService().fetchGoogleUserInfo(accessToken: identityTokens.accessToken)
-            PendingAccountAdd.shared.pending = .init(
-                provider: .gmail,
-                email: userInfo.email
-            )
+            if try await AccountManager.shared.existingAccount(forEmail: userInfo.email, provider: .gmail) == nil {
+                PendingAccountAdd.shared.pending = .init(
+                    provider: .gmail,
+                    email: userInfo.email
+                )
+            } else if DebugModeManager.isLoggingEnabled() {
+                print("[Login] Gmail account already configured for \(userInfo.email) — skipping the add-account gate")
+            }
         } catch {
             print("[Login] Gmail userInfo fetch failed (user will see AddAccountGeneralView): \(error)")
         }
@@ -382,13 +390,18 @@ struct TabMailLoginView: View {
         // Phase 2: Exchange id_token for Supabase session.
         let _ = try await authService.signInWithIdToken(provider: .microsoft, idToken: idToken)
 
-        // Phase 3: Stage the account-add for the consent gate.
+        // Phase 3: Stage the account-add for the consent gate — same
+        // existing-account guard as the Google arm (issue #56).
         do {
             let userInfo = try await getOAuthService().fetchMicrosoftUserInfo(accessToken: identityTokens.accessToken)
-            PendingAccountAdd.shared.pending = .init(
-                provider: .outlook,
-                email: userInfo.email
-            )
+            if try await AccountManager.shared.existingAccount(forEmail: userInfo.email, provider: .outlook) == nil {
+                PendingAccountAdd.shared.pending = .init(
+                    provider: .outlook,
+                    email: userInfo.email
+                )
+            } else if DebugModeManager.isLoggingEnabled() {
+                print("[Login] Outlook account already configured for \(userInfo.email) — skipping the add-account gate")
+            }
         } catch {
             print("[Login] Outlook userInfo fetch failed (user will see AddAccountGeneralView): \(error)")
         }

@@ -67,6 +67,32 @@ final class AISubscriptionGate: @unchecked Sendable {
     /// information, and guessing "not ended" there would flip correct copy back).
     private(set) var trialHasEnded: Bool
 
+    /// Timestamp of the most recent authoritative `/whoami` applied in THIS
+    /// process. In-memory only, deliberately NOT persisted: `isActive` /
+    /// `hasCheckedOnce` hydrate from UserDefaults so returning users see
+    /// last-known UI without a flash, but a ROUTING decision (the
+    /// `pending_plan_navigation` latch — see `PendingPlanNavigationLatch`)
+    /// must never fire on that hydrated default, because it can describe a
+    /// previous session or a previous account. Consumers wait until this is
+    /// non-nil before acting on `isActive`.
+    ///
+    /// Only `apply(_:now:)` writes it: the bare `openGate`/`closeGate`
+    /// calls from AI 402/403 paths and the post-purchase
+    /// `refreshAfterLocalPurchase` do not carry full whoami authority for
+    /// routing. Cleared by `noteSignedOut()` so a subsequent sign-in cannot
+    /// inherit the previous account's freshness.
+    private(set) var lastAuthoritativeApplyAt: Date?
+
+    /// Monotonic sign-in epoch for this process. Bumped by `noteSignedOut()`.
+    /// A `/whoami` fetch belongs to the epoch in which it STARTED; a response
+    /// that lands after the user signed out (and possibly after someone else
+    /// signed in) must not be applied — the bearer token it carried, and the
+    /// entitlement it describes, belong to the previous account. Callers of
+    /// the async fetch→apply pipelines capture this value BEFORE the network
+    /// await and hand it to `applyIfCurrentEpoch`. In-memory only, like
+    /// `lastAuthoritativeApplyAt`.
+    private(set) var signInGeneration: Int = 0
+
     private init() {
         let defaults = UserDefaults.standard
         self.isActive = defaults.bool(forKey: Self.lastKnownActiveKey)
@@ -87,6 +113,40 @@ final class AISubscriptionGate: @unchecked Sendable {
             closeGate()
         }
         setTrialHasEnded(info.trialState(now: now) == .ended)
+        lastAuthoritativeApplyAt = now
+    }
+
+    /// Forget this process's authoritative-whoami freshness marker. Called on
+    /// sign-out: whatever `/whoami` said about the outgoing account must not
+    /// vouch for the next one, or a latch consumer could route the new user
+    /// on the old user's entitlement. Leaves `isActive` / `hasCheckedOnce` /
+    /// `trialHasEnded` untouched — last-known UI state deliberately follows
+    /// the most recently signed-in account (see the trial-derivation memory
+    /// topic's "GLOBAL, not account-scoped" decision).
+    @MainActor
+    func noteSignedOut() {
+        lastAuthoritativeApplyAt = nil
+        signInGeneration &+= 1
+    }
+
+    /// Apply an authoritative `/whoami` result ONLY if it was fetched in the
+    /// current sign-in epoch. The guard closes the cross-account seam: a
+    /// revalidation fetch started for account A can complete after A signed
+    /// out (and after account B signed in); applying it would stamp
+    /// `lastAuthoritativeApplyAt` — and set `isActive` — from A's
+    /// entitlement, which the plan-picker latch consumer would then treat as
+    /// authoritative for B (routing an active B to the paywall, or silently
+    /// clearing an unentitled B's latch). Delegates to `apply(_:now:)`, which
+    /// remains the single authoritative seam.
+    ///
+    /// - Parameters:
+    ///   - generation: the value of `signInGeneration` read BEFORE the fetch
+    ///     began.
+    ///   - now: injected for tests; production callers use the default.
+    @MainActor
+    func applyIfCurrentEpoch(_ info: AccountInfo, fetchedInGeneration generation: Int, now: Date = Date()) {
+        guard generation == signInGeneration else { return }
+        apply(info, now: now)
     }
 
     /// Refresh from a `/whoami` body fetched immediately after a LOCAL StoreKit
