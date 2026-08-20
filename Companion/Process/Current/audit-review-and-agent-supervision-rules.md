@@ -77,7 +77,17 @@ this text lived in `tabmail-ios/CLAUDE.md`.
      94f7ee2f9c04979d1bb77d879d69fde5410027a9ff88359618597a42f17a7837; the manifest's hash is
      re-pinned on amendment (that manifest hashes RAW file bytes — verified against `git show HEAD:`
      — unlike `Companion/{Memory,Decisions}/manifest.tsv`, which hash a STRIPPED body and must
-     NEVER be re-pinned). Everything ABOVE the marker is still byte-identical to the extraction. -->
+     NEVER be re-pinned).
+     ⚠️ This block closed with "Everything ABOVE the marker is still byte-identical to the
+     extraction" until 2026-08-20. That absolute was FALSE, and the invariant that actually holds
+     is narrower: EVERY LINE ORIGINATING IN THE EXTRACTION (revision 115eb85d2, the raw sha256
+     above) is byte-identical, wherever in this file it now sits — and nothing more is claimed.
+     Post-extraction amendments may be inserted ABOVE this marker as well as below it, so the
+     marker's POSITION does not partition extracted content from added content: it marks where the
+     appended RULES begin, not the boundary of the provenance claim. Establish any individual
+     line's origin by diffing against `git show 115eb85d2:<this file>`, never by which side of the
+     marker it falls on. Stated as an invariant on purpose — it stays true as further amendments
+     land, above or below, without needing to be restated. -->
 
 **A14. A REVIEWER THAT REFUSES DID NOT REVIEW — the leg is ABSENT, and the round is simply a one-model round.** (Owner, 2026-08-12.) Codex over-refuses on security-adjacent code — auth, crypto, parsing untrusted input, anything that pattern-matches as offensive security — and answers with `ERROR: This content was flagged for possible cybersecurity risk`. **A refusal is not a finding and not a clean pass.** Never report "Codex flagged a security problem" when Codex actually declined; never count the leg as clean; never let it block the gate.
 
