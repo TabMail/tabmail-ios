@@ -5,12 +5,13 @@
 import Foundation
 
 // =============================================================================
-// KEEP — PHASE-B SCAFFOLDING (Outlook NSE). DO NOT DELETE AS "DEAD CODE".
+// KEEP — LIVE SHARED OUTLOOK PARSER SURFACE. DO NOT DELETE AS "DEAD CODE".
 // =============================================================================
-// `parseMessage` is used today by main-app `ExchangeProvider`. The other
-// methods (`parseDeltaPage`, `extractBody`, `extractAttachmentRefs`) exist
-// because `GraphAPI.deltaWalk` + `GraphAPI.messageFull` will consume them
-// when `OutlookNSEClient` lands. Do not trim to "just what's called today".
+// `parseMessage`, `extractBody`, and the attachment extractors are live through
+// `OutlookNSEClient`'s production calls to `GraphAPI.messageMetadata` and
+// `GraphAPI.messageFull`; `ExchangeProvider` also uses `parseMessage`. The
+// delta parser is owned by `GraphAPI.deltaWalk`, whose production caller census
+// is separate. Do not trim this shared surface from a main-app-only census.
 //
 // Round-3 audit (commit a49f6cd) removed those methods for that reason;
 // they've been restored. Same KEEP policy as `Shared/API/GraphAPI.swift`.
@@ -21,9 +22,29 @@ import Foundation
 /// Mirror of `GmailParse` for Graph's shape (`from.emailAddress.address`,
 /// `toRecipients[]`, `receivedDateTime`, `$delta` pagination, etc.).
 enum GraphParse {
+    /// True when a caller that ASKED Graph for `parentFolderId` did not get it
+    /// back. That — and only that — is evidence of schema drift; a caller whose
+    /// `$select` omits the field is describing its own request, not the server.
+    ///
+    /// The firing condition lives here, once, so it can be tested on both
+    /// sides. Its sole consumer is the `#if DEBUG` diagnostic in `parseMessage`.
+    static func parentFolderIdDriftDetected(
+        parentFolderId: String?,
+        selection: GraphMessageSelection
+    ) -> Bool {
+        selection.contains("parentFolderId") && parentFolderId == nil
+    }
+
     /// Parse a Graph `/me/messages/{id}` JSON response into canonical `MessageMetadata`.
     /// Returns nil if `receivedDateTime` is missing/unparseable (fetch-failure semantics).
-    static func parseMessage(_ json: [String: Any]) -> MessageMetadata? {
+    ///
+    /// - Parameter selection: the field selection the caller says produced
+    ///   `json`. There is no default Boolean premise; production request/parse
+    ///   handoffs are pinned by provider integration tests.
+    static func parseMessage(
+        _ json: [String: Any],
+        selection: GraphMessageSelection
+    ) -> MessageMetadata? {
         guard let id = json["id"] as? String else { return nil }
         guard let receivedStr = json["receivedDateTime"] as? String,
               let date = Date.fromISO8601(receivedStr) else {
@@ -50,23 +71,30 @@ enum GraphParse {
         // sync stores in `MessageHeader.folderPath`. Propagating it here lets
         // NSE construct a header `id` that matches what sync will produce
         // for the same message (prevents pre-sync vs sync duplicate rows).
-        // We $select the field in every messageMetadata / messageFull URL —
-        // absence in the response is a signal that Graph's schema drifted
-        // and downstream folderPath logic will misbehave. The NSE-side
-        // fetchSingleMessage checks for nil and refuses to stage; the
-        // main-app sync path ignores folderPath here and stores its own.
+        // The `messageMetadata` / `messageFull` URLs in `GraphAPI` and the
+        // main-app `fetchMessage` / `fetchMessageDetails` routes $select the
+        // field, so absence there is a signal that Graph's schema drifted.
+        // The five main-app known-folder routes — `fetchMessages`,
+        // `fetchSingleBackfill`, `search`, `fetchMessageHeaders`, and
+        // `fetchOlderMessages` — omit it because they already know their folder
+        // context. Their absent field is not evidence of anything. NSE
+        // `fetchSingleMessage` refuses to stage without the selected field;
+        // the main-app list/backfill routes store their own folder context.
         let parentFolderId = json["parentFolderId"] as? String
-        if parentFolderId == nil {
-            // Surfacing this in console makes a silent Graph schema change
-            // discoverable before users start reporting duplicate rows. Debug
-            // builds only: on device `stdout` is discarded, so this was never a
-            // production channel. `#if DEBUG` rather than `DebugModeManager`
-            // because `Shared/` also compiles into the NSE, where that type
-            // does not exist.
-            #if DEBUG
+        // Surfacing this in console makes a silent Graph schema change
+        // discoverable before users start reporting duplicate rows. Debug
+        // builds only: on device `stdout` is discarded, so this was never a
+        // production channel. `#if DEBUG` rather than `DebugModeManager`
+        // because `Shared/` also compiles into the NSE, where that type
+        // does not exist.
+        #if DEBUG
+        if parentFolderIdDriftDetected(
+            parentFolderId: parentFolderId,
+            selection: selection
+        ) {
             print("[GraphParse] messageMetadata \(id): missing parentFolderId in response — check $select")
-            #endif
         }
+        #endif
 
         return MessageMetadata(
             providerMessageId: id,

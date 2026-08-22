@@ -197,19 +197,25 @@ struct ExchangeCategoryParseTests {
         ExchangeProvider(userEmail: "test@example.com", accessToken: { _ in "dummy-token" })
     }
 
-    private func parse(categories: [String]) async throws -> MessageHeaderInfo {
-        let json: [String: Any] = [
+    private func parse(
+        categories: [String]?,
+        selection: GraphMessageSelection = GraphAPI.headerOnlySelection
+    ) async throws -> MessageHeaderInfo {
+        var json: [String: Any] = [
             "id": "graph-parse-1",
             "subject": "Parsed",
-            "receivedDateTime": "2026-01-14T12:00:00Z",
+            "receivedDateTime": "2020-01-14T12:00:00Z",
             "isRead": false,
             "hasAttachments": false,
-            "internetMessageId": "<parse@example.com>",
-            "categories": categories,
+            "internetMessageId": "<parse@example.com>"
         ]
+        if let categories {
+            json["categories"] = categories
+        }
         let data = try JSONSerialization.data(withJSONObject: json)
         let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
-        return try #require(await makeProvider().parseGraphMessage(msg))
+        return try #require(await makeProvider().parseGraphMessage(
+            msg, selection: selection))
     }
 
     @Test("A real Graph category surfaces as a user label")
@@ -239,19 +245,46 @@ struct ExchangeCategoryParseTests {
         #expect(header.userLabelIds.isEmpty)
     }
 
-    /// Every `parseGraphMessage` caller fetches a `$select` derived from
-    /// `GraphAPI.headerOnlyFields`, which names `categories`, so the set really
-    /// is exact. This pins the field list, not the flag: a `$select` that lost
-    /// `categories` would make the `true` a lie that a future reconcile turns
-    /// into wholesale label erasure.
-    @Test("Every Graph header $select still carries categories, so the set is authoritative")
+    /// Production routes all share selections that name `categories`, and the
+    /// parser derives authority from that exact request shape.
+    @Test("Every production Graph message selection carries categories")
     func headerSelectCarriesCategoriesSoTheSetIsAuthoritative() async throws {
-        #expect(GraphAPI.headerOnlyFields.contains("categories"))
-        #expect(GraphAPI.metadataSelectFields.contains("categories"))
-        #expect(GraphAPI.backfillSelectFields.contains("categories"))
-        #expect(GraphAPI.fullSelectFields.contains("categories"))
+        for route in ExchangeGraphMessageRequest.allCases {
+            #expect(route.selection.contains("categories"))
+        }
+        #expect(GraphAPI.metadataSelection.contains("categories"))
+        #expect(GraphAPI.fullSelection.contains("categories"))
 
         let header = try await parse(categories: ["Receipts"])
+        #expect(header.userLabelIdsAreAuthoritative)
+    }
+
+    /// Authority is a two-axis claim: request selection AND decoded presence.
+    /// These four combinations make either one-factor mutant fail.
+    @Test("Category authority requires selection and a decoded field")
+    func categoryAuthorityRequiresBothEvidenceAxes() async throws {
+        let selection = GraphMessageSelection(fields: ["id", "receivedDateTime"])
+        let selectedPresent = try await parse(categories: ["Receipts"])
+        let selectedMissing = try await parse(categories: nil)
+        let omittedPresent = try await parse(
+            categories: ["fixture-value-not-selected-on-the-real-wire"],
+            selection: selection)
+        let omittedMissing = try await parse(categories: nil, selection: selection)
+
+        #expect(selectedPresent.userLabelIdsAreAuthoritative)
+        #expect(selectedPresent.userLabelIds == ["Receipts"])
+        #expect(selectedMissing.userLabelIdsAreAuthoritative == false)
+        #expect(selectedMissing.userLabelIds.isEmpty)
+        #expect(omittedPresent.userLabelIdsAreAuthoritative == false)
+        #expect(omittedPresent.userLabelIds == ["fixture-value-not-selected-on-the-real-wire"])
+        #expect(omittedMissing.userLabelIdsAreAuthoritative == false)
+        #expect(omittedMissing.userLabelIds.isEmpty)
+    }
+
+    @Test("A decoded empty category array remains authoritative")
+    func decodedEmptyCategoriesAreAuthoritative() async throws {
+        let header = try await parse(categories: [])
+        #expect(header.userLabelIds.isEmpty)
         #expect(header.userLabelIdsAreAuthoritative)
     }
 }
@@ -421,7 +454,8 @@ struct OutlookUserLabelMenuTests {
             GraphMessage.self, from: JSONSerialization.data(withJSONObject: echoedJSON))
         let provider = ExchangeProvider(
             userEmail: "labels-roundtrip@example.com", accessToken: { _ in "dummy-token" })
-        let parsed = try #require(await provider.parseGraphMessage(msg))
+        let parsed = try #require(await provider.parseGraphMessage(
+            msg, selection: GraphAPI.headerOnlySelection))
 
         // The sync arms' own insert shape, applied to what the server echoed.
         try await f.pool.write { db in

@@ -1,3 +1,16 @@
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **AMENDMENT (2026-08-21, issue #71) — the zero-reader disposition remains, but Exchange no
+> longer hardcodes this future guard to `true`.** The preserved census and IMAP trip-wire below
+> still govern: there is no production consumer today, and any future reconcile must set IMAP
+> authority in the same change. The Exchange producer now derives authority from two independent
+> facts — `categories` was selected and the response actually decoded that field — preserving the
+> distinction between missing and authoritatively empty. Tests cover both evidence axes and all
+> current production parser routes without claiming that the enum alone enforces the census.
+> A fixed-string census over production and test Swift sources at this candidate is 16 hits:
+> one declaration, two production writes, one production doc comment, one test doc comment, and
+> eleven test assertions. There are still zero production reads; this count excludes this Markdown
+> amendment, so the observer does not become a member of its own measured population.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-LABEL-003
 
 > Routed from `KNOWN_ISSUES.md` line 625 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).

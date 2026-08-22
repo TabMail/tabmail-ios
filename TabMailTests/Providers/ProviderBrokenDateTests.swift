@@ -161,7 +161,8 @@ struct ExchangeProviderBrokenDateTests {
         """
         let msg = try decodeGraphMessage(json)
         let provider = makeProvider()
-        let result = await provider.parseGraphMessage(msg)
+        let result = await provider.parseGraphMessage(
+            msg, selection: GraphAPI.headerOnlySelection)
         #expect(result != nil)
         #expect(result?.messageId == "msg-1")
     }
@@ -178,7 +179,8 @@ struct ExchangeProviderBrokenDateTests {
         """
         let msg = try decodeGraphMessage(json)
         let provider = makeProvider()
-        let result = await provider.parseGraphMessage(msg)
+        let result = await provider.parseGraphMessage(
+            msg, selection: GraphAPI.headerOnlySelection)
         #expect(result == nil)
     }
 
@@ -193,7 +195,8 @@ struct ExchangeProviderBrokenDateTests {
         """
         let msg = try decodeGraphMessage(json)
         let provider = makeProvider()
-        let result = await provider.parseGraphMessage(msg)
+        let result = await provider.parseGraphMessage(
+            msg, selection: GraphAPI.headerOnlySelection)
         #expect(result == nil)
     }
 
@@ -208,7 +211,8 @@ struct ExchangeProviderBrokenDateTests {
         """
         let msg = try decodeGraphMessage(json)
         let provider = makeProvider()
-        let result = await provider.parseGraphMessage(msg)
+        let result = await provider.parseGraphMessage(
+            msg, selection: GraphAPI.headerOnlySelection)
         #expect(result == nil)
     }
 }
