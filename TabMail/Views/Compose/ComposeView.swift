@@ -60,6 +60,27 @@ final class ComposeAttachmentCarryGate {
 /// dependency so the reopen / save / send / close fail-closed invariants can be
 /// pinned without the live compose UI (Testing Rule 12).
 enum ComposeDraftGuards {
+    struct SuggestionState: Equatable {
+        var messageBody: String
+        var showingSuggestion: Bool
+        var currentSuggestion: String?
+    }
+
+    /// The single state transition behind every explicit "Use Suggestion"
+    /// gesture. Explicit Save uses the same transition before taking its durable
+    /// draft snapshot, so the text on screen and the text persisted cannot drift.
+    static func acceptingVisibleSuggestion(_ state: SuggestionState) -> SuggestionState {
+        guard state.showingSuggestion,
+              let suggestion = state.currentSuggestion,
+              !suggestion.isEmpty else {
+            return state
+        }
+        return SuggestionState(
+            messageBody: suggestion,
+            showingSuggestion: false,
+            currentSuggestion: suggestion)
+    }
+
     enum AttachmentSnapshotProducer: CaseIterable, Sendable {
         case send
         case explicitSave
@@ -489,8 +510,9 @@ enum ComposeDraftGuards {
     ///
     /// The comment that licensed the collapse claimed *"the caller that set
     /// `skipDraftAutoSave` owns the save"*. There is exactly one such caller
-    /// (`ComposeView`, `skipDraftAutoSave: showingSuggestion`) and it owns the
-    /// save in NONE of its three modes for this purpose: `applyInlineEdit` calls
+    /// (`ComposeView`, `skipDraftAutoSave: showingSuggestion`) and it owns NO
+    /// automatic save in any of its three modes for this purpose:
+    /// `applyInlineEdit` calls
     /// `persistCachedReply` only `if replyTo != nil && !isForward`, so new-message
     /// and forward have no durable writer at all, and `persistCachedReply` writes
     /// `messageHeader.cachedReply` — not the `Draft` row the toast's tap resolves.
@@ -499,8 +521,10 @@ enum ComposeDraftGuards {
     ///
     /// ⚠️ THE MIRROR IMAGE IS NOT TO AUTO-SAVE THE SUGGESTION (`MIS-005`). The
     /// suggestion bubble is ephemeral by design and adopting it requires an
-    /// explicit user gesture; persisting it here to make the toast true would be
-    /// the inverse error. `.none` is the honest answer, and it is the same
+    /// explicit user gesture. Explicit Save is now such a gesture, but it is a
+    /// separate later disposition — persisting during the agent edit merely to
+    /// make the toast true would be the inverse error. `.none` is the honest
+    /// answer, and it is the same
     /// never-drop clause-2 reasoning `autoSaveExitLeftDurableDraft` applies to
     /// `.composeUnavailable`: an absence of evidence is not a positive result.
     ///
@@ -1393,7 +1417,8 @@ struct ComposeView: View {
                         composeAttachments: $attachments,
                         composeAttachmentCarryGate: attachmentCarryGate,
                         composeMutationAllowed: draftReadState != .error,
-                        // Bubble showing → suggestion is ephemeral; no Draft row.
+                        // Bubble showing → suggestion stays out of agent auto-save;
+                        // only Use Suggestion or explicit Save adopts it as body text.
                         // Reply mode additionally persists edits to cachedReply.
                         skipDraftAutoSave: showingSuggestion,
                         isExpanded: $chatExpanded,
@@ -1527,17 +1552,16 @@ struct ComposeView: View {
                 isPresented: $showErrorDiscardEditsPrompt,
                 onDiscard: { dismiss() }))
             .alert("Empty Body", isPresented: $showEmptyBodyPrompt) {
-                if showingSuggestion, currentSuggestion != nil {
+                if showingSuggestion, let currentSuggestion, !currentSuggestion.isEmpty {
                     Button("Use Suggestion & Send") {
-                        messageBody = currentSuggestion ?? ""
-                        showingSuggestion = false
+                        acceptVisibleSuggestionIfOffered()
                         Task { await send() }
                     }
                 }
                 Button("Send Anyway") { Task { await send() } }
                 Button("Cancel", role: .cancel) { }
             } message: {
-                if showingSuggestion, currentSuggestion != nil {
+                if showingSuggestion, let currentSuggestion, !currentSuggestion.isEmpty {
                     Text("The message body is empty. You have an AI suggestion that hasn't been accepted.")
                 } else {
                     Text("The message body is empty. Send anyway?")
@@ -1817,8 +1841,7 @@ struct ComposeView: View {
 
                 Button {
                     withAnimation(.easeInOut(duration: 0.35)) {
-                        messageBody = text
-                        showingSuggestion = false
+                        acceptVisibleSuggestionIfOffered()
                     }
                 } label: {
                     Text("Use Suggestion")
@@ -2432,6 +2455,20 @@ struct ComposeView: View {
         bccInput = ""
     }
 
+    /// Apply exactly the suggestion the UI is actively offering, using the same
+    /// state transition for the bubble, Send prompt, and explicit Save. Dismissed
+    /// suggestions deliberately remain cached but hidden and therefore cannot
+    /// replace authored body text later.
+    private func acceptVisibleSuggestionIfOffered() {
+        let accepted = ComposeDraftGuards.acceptingVisibleSuggestion(.init(
+            messageBody: messageBody,
+            showingSuggestion: showingSuggestion,
+            currentSuggestion: currentSuggestion))
+        messageBody = accepted.messageBody
+        showingSuggestion = accepted.showingSuggestion
+        currentSuggestion = accepted.currentSuggestion
+    }
+
     /// PORT — v2final `ComposeView.closeCompose` + `applyCloseDecision`, routed
     /// through `ComposeDraftGuards.hasContent` / `.closeAction` instead of the
     /// inline emptiness test this forward-port carried.
@@ -2466,8 +2503,14 @@ struct ComposeView: View {
         // Cancel keeps the compose open without wedging Close on a slow provider.
         let attachmentPreparationIsUnsettled = attachmentCarryGate.outstanding > 0
             || attachmentCarryGate.hasUnacknowledgedFailure
+        let offeredSuggestion = ComposeDraftGuards.SuggestionState(
+            messageBody: messageBody,
+            showingSuggestion: showingSuggestion,
+            currentSuggestion: currentSuggestion)
+        let acceptedSuggestion = ComposeDraftGuards.acceptingVisibleSuggestion(offeredSuggestion)
+        let hasVisibleSuggestion = acceptedSuggestion != offeredSuggestion
         let hasContent = ComposeDraftGuards.hasContent(
-            subject: subject, body: messageBody,
+            subject: subject, body: acceptedSuggestion.messageBody,
             to: toTokens, cc: ccTokens, bcc: bccTokens,
             toInput: toInput, ccInput: ccInput, bccInput: bccInput,
             hasAttachments: !attachments.isEmpty || attachmentLoadFailed || attachmentPreparationIsUnsettled)
@@ -2475,6 +2518,7 @@ struct ComposeView: View {
             || toTokens != initialToTokens || ccTokens != initialCcTokens || bccTokens != initialBccTokens
             || attachmentsFingerprint(attachments) != initialAttachmentsFingerprint
             || attachmentPreparationIsUnsettled
+            || hasVisibleSuggestion
         switch ComposeDraftGuards.closeAction(
             readState: draftReadState, hasContent: hasContent, hasChanges: hasChanges
         ) {
@@ -2562,6 +2606,10 @@ struct ComposeView: View {
             return
         }
         defer { agentSendFence.releaseExclusiveDisposition() }
+        // Tapping Save is an explicit adoption gesture. Apply the exact visible
+        // suggestion after claiming the disposition fence and before the first
+        // suspension, so an agent edit cannot overtake the persisted snapshot.
+        acceptVisibleSuggestionIfOffered()
         withAnimation(.easeIn(duration: 0.15)) { isSavingDraft = true }
         defer { isSavingDraft = false }
         // F3: commit any pending in-progress recipient so it is PERSISTED (not

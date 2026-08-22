@@ -8,16 +8,13 @@
 
 ## How to use this index
 
-**This file is a router, not an archive.** Every topic is preserved in full under
-[`Companion/Memory/`](Companion/Memory/manifest.tsv) (`sha256` per fragment); load only what your task
-mechanically matches. The routing protocol is **normative in root [`../CLAUDE.md`](../CLAUDE.md) §
-*Companion Routing***; this file's own wording is preserved in
-[`project-memory-index-usage-protocol.md`](Companion/Process/Current/project-memory-index-usage-protocol.md).
-Current entries govern; Historical entries preserve evidence but never override current rules or ADRs.
+Root [`../CLAUDE.md`](../CLAUDE.md) is normative; the [full pre-pass iOS routing preamble is preserved](Companion/Memory/History/121-project-memory-index-usage-preamble-before-pass-6.md).
 
 ## Current topics
 
 Search the topic text below as subsystem keywords. Each link is mandatory when its row matches the task.
+
+**Save Draft adopts the visible AI suggestion synchronously:** [Topic 049](Companion/Memory/Current/049-compose-ai-suggestion-chat-pill-edits-suggestion-in-place-when-bubble-is.md).
 
 | Topic / search terms | Detail |
 |---|---|
