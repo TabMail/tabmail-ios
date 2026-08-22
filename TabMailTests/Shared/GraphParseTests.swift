@@ -7,8 +7,9 @@ import Foundation
 @testable import TabMail
 
 /// Validates `Shared/Parse/GraphParse` — the Microsoft Graph (Outlook) JSON
-/// parser shared between main-app ExchangeProvider and the future
-/// OutlookNSEClient. Same acceptance bar as `GmailParseTests`.
+/// parser shared between main-app ExchangeProvider and the live
+/// OutlookNSEClient reached by NotificationService. Same acceptance bar as
+/// `GmailParseTests`.
 @Suite("Shared/Parse GraphParse")
 struct GraphParseTests {
 
@@ -17,7 +18,7 @@ struct GraphParseTests {
     @Test("parseMessage returns nil when receivedDateTime is missing")
     func missingReceivedDateTime() {
         let json: [String: Any] = ["id": "m1", "subject": "hi"]
-        #expect(GraphParse.parseMessage(json) == nil)
+        #expect(GraphParse.parseMessage(json, selection: GraphAPI.headerOnlySelection) == nil)
     }
 
     @Test("parseMessage returns nil when receivedDateTime is unparseable")
@@ -27,7 +28,7 @@ struct GraphParseTests {
             "subject": "hi",
             "receivedDateTime": "not-a-date"
         ]
-        #expect(GraphParse.parseMessage(json) == nil)
+        #expect(GraphParse.parseMessage(json, selection: GraphAPI.headerOnlySelection) == nil)
     }
 
     @Test("parseMessage extracts core fields from valid JSON")
@@ -49,7 +50,7 @@ struct GraphParseTests {
             "bodyPreview": "preview",
             "categories": ["work", "urgent"]
         ]
-        let m = GraphParse.parseMessage(json)
+        let m = GraphParse.parseMessage(json, selection: GraphAPI.headerOnlySelection)
         #expect(m?.providerMessageId == "AQMk")
         #expect(m?.subject == "Quarterly")
         #expect(m?.from.name == "Alice")
@@ -70,7 +71,7 @@ struct GraphParseTests {
             "id": "m1",
             "receivedDateTime": "2023-11-14T22:13:20.123Z",
         ]
-        let m = GraphParse.parseMessage(json)
+        let m = GraphParse.parseMessage(json, selection: GraphAPI.headerOnlySelection)
         #expect(m != nil)
     }
 
@@ -80,7 +81,7 @@ struct GraphParseTests {
             "id": "m1",
             "receivedDateTime": "2023-11-14T22:13:20Z",
         ]
-        let m = GraphParse.parseMessage(json)
+        let m = GraphParse.parseMessage(json, selection: GraphAPI.headerOnlySelection)
         #expect(m?.from.name == "")
         #expect(m?.from.email == "")
     }
@@ -91,7 +92,7 @@ struct GraphParseTests {
             "id": "m1",
             "receivedDateTime": "2023-11-14T22:13:20Z",
         ]
-        let m = GraphParse.parseMessage(json)
+        let m = GraphParse.parseMessage(json, selection: GraphAPI.headerOnlySelection)
         #expect(m?.inReplyTo == nil)
         #expect(m?.references == [])
     }
@@ -103,7 +104,7 @@ struct GraphParseTests {
             "receivedDateTime": "2023-11-14T22:13:20Z",
             "flag": ["flagStatus": "flagged"]
         ]
-        let m = GraphParse.parseMessage(json)
+        let m = GraphParse.parseMessage(json, selection: GraphAPI.headerOnlySelection)
         #expect(m?.isFlagged == true)
     }
 
@@ -114,7 +115,7 @@ struct GraphParseTests {
             "receivedDateTime": "2023-11-14T22:13:20Z",
             "flag": ["flagStatus": "notFlagged"]
         ]
-        let m = GraphParse.parseMessage(json)
+        let m = GraphParse.parseMessage(json, selection: GraphAPI.headerOnlySelection)
         #expect(m?.isFlagged == false)
     }
 
@@ -127,7 +128,7 @@ struct GraphParseTests {
             "receivedDateTime": "2023-11-14T22:13:20Z",
             "parentFolderId": "AQMkADAwATE2MTQwLTk2YTQtNjViMy0wMAItMDAKAC4AAAMD",
         ]
-        let m = GraphParse.parseMessage(json)
+        let m = GraphParse.parseMessage(json, selection: GraphAPI.metadataSelection)
         // Must match exactly what main-app sync uses for `MessageHeader.folderPath`.
         // NSE depends on this to construct a composite id that sync will hit
         // via its existing-row lookup.
@@ -148,7 +149,7 @@ struct GraphParseTests {
             "receivedDateTime": "2023-11-14T22:13:20Z",
             // no parentFolderId
         ]
-        let m = GraphParse.parseMessage(json)
+        let m = GraphParse.parseMessage(json, selection: GraphAPI.metadataSelection)
         #expect(m != nil)
         #expect(m?.folderPath == nil)
     }
@@ -169,14 +170,14 @@ struct GraphParseTests {
     func driftDetectorSilentWhenFieldWasNotRequested() {
         #expect(
             GraphParse.parentFolderIdDriftDetected(
-                parentFolderId: nil, expectsParentFolderId: false) == false)
+                parentFolderId: nil, selection: GraphAPI.headerOnlySelection) == false)
     }
 
     @Test("Drift detector fires when a $selecting caller gets no parentFolderId back")
     func driftDetectorFiresWhenRequestedButAbsent() {
         #expect(
             GraphParse.parentFolderIdDriftDetected(
-                parentFolderId: nil, expectsParentFolderId: true) == true)
+                parentFolderId: nil, selection: GraphAPI.metadataSelection) == true)
     }
 
     @Test("Drift detector stays silent when a $selecting caller does get the field")
@@ -184,34 +185,71 @@ struct GraphParseTests {
         #expect(
             GraphParse.parentFolderIdDriftDetected(
                 parentFolderId: "AQMkADAwATE2MTQwLTk2YTQtNjViMy0wMAItMDAKAC4AAAMD",
-                expectsParentFolderId: true) == false)
+                selection: GraphAPI.metadataSelection) == false)
     }
 
-    /// The flag only gates the diagnostic — parsing is identical either way.
-    @Test("expectsParentFolderId does not change what parseMessage produces")
-    func expectationFlagDoesNotAlterParsing() {
+    /// The selection only gates the diagnostic — parsing is identical either way.
+    /// Both parses are required before comparing fields so two nil results cannot
+    /// satisfy the equality vacuously.
+    @Test("Request selection does not change what parseMessage produces")
+    func requestSelectionDoesNotAlterParsing() throws {
         let json: [String: Any] = [
             "id": "AQMk-msg",
             "receivedDateTime": "2023-11-14T22:13:20Z",
             // no parentFolderId — the shape every header/backfill fetch produces
         ]
-        let strict = GraphParse.parseMessage(json, expectsParentFolderId: true)
-        let relaxed = GraphParse.parseMessage(json, expectsParentFolderId: false)
-        #expect(strict?.providerMessageId == relaxed?.providerMessageId)
-        #expect(strict?.folderPath == nil)
-        #expect(relaxed?.folderPath == nil)
+        let strict = try #require(
+            GraphParse.parseMessage(json, selection: GraphAPI.metadataSelection))
+        let relaxed = try #require(
+            GraphParse.parseMessage(json, selection: GraphAPI.headerOnlySelection))
+        #expect(strict.providerMessageId == relaxed.providerMessageId)
+        #expect(strict.folderPath == nil)
+        #expect(relaxed.folderPath == nil)
     }
 
-    /// Pins the premise behind every `expectsParentFolderId:` literal in
-    /// `ExchangeProvider`. If a field list ever gains or loses
-    /// `parentFolderId`, this goes red and the call sites composed from it must
-    /// be revisited — the literals are only correct while this holds.
-    @Test("GraphAPI $select lists: only the metadata and full lists name parentFolderId")
-    func selectListMembershipMatchesTheCallSiteLiterals() {
-        #expect(GraphAPI.headerOnlyFields.contains("parentFolderId") == false)
-        #expect(GraphAPI.backfillSelectFields.contains("parentFolderId") == false)
-        #expect(GraphAPI.metadataSelectFields.contains("parentFolderId"))
-        #expect(GraphAPI.fullSelectFields.contains("parentFolderId"))
+    /// Pins the exact production parser-route census. Each route uses this same
+    /// typed selection for URL construction and parsing, so changing a field
+    /// list cannot leave a stale Boolean behind.
+    @Test("Exchange parser routes derive parentFolderId expectation from their request selection")
+    func exchangeRouteSelectionsMatchTheirRequestShapes() throws {
+        let expected: [ExchangeGraphMessageRequest: Bool] = [
+            .fetchMessages: false,
+            .fetchMessage: true,
+            .fetchSingleBackfill: false,
+            .search: false,
+            .fetchMessageHeaders: false,
+            .fetchOlderMessages: false,
+            .fetchMessageDetails: true
+        ]
+
+        #expect(ExchangeGraphMessageRequest.allCases.count == expected.count)
+        for route in ExchangeGraphMessageRequest.allCases {
+            let expectsParentFolderId = try #require(expected[route] as Bool?)
+            #expect(route.selection.contains("parentFolderId") == expectsParentFolderId)
+        }
+
+        #expect(expected.values.filter { $0 }.count == 2)
+        #expect(expected.values.filter { !$0 }.count == 5)
+    }
+
+    @Test("Direct GraphAPI parser routes select parentFolderId")
+    func directGraphAPIRoutesAreStrict() {
+        #expect(GraphAPI.metadataSelection.contains("parentFolderId"))
+        #expect(GraphAPI.fullSelection.contains("parentFolderId"))
+    }
+
+    /// This literal is the local wire-format oracle for `$select=` plus comma
+    /// joining. `GraphAPIPathEncodingTests` derive expected URLs from the
+    /// production selections to isolate path encoding; Exchange provider
+    /// integration tests use independent literal field-list oracles.
+    @Test("Selection membership is exact and two-sided")
+    func selectionMembershipMutants() {
+        let withoutParent = GraphMessageSelection(fields: ["id", "parentFolderIdSuffix"])
+        let withParent = withoutParent.appending("parentFolderId")
+
+        #expect(withoutParent.contains("parentFolderId") == false)
+        #expect(withParent.contains("parentFolderId"))
+        #expect(withParent.queryParameter == "$select=id,parentFolderIdSuffix,parentFolderId")
     }
 
     /// The other half of why the warning fired unconditionally on the sync
@@ -241,9 +279,11 @@ struct GraphParseTests {
         #expect(json["id"] as? String == "AQMk-msg")
     }
 
-    // Note: parseDeltaPage / extractBody / extractAttachmentRefs were removed
-    // in round-3 dead-code cleanup. They'll be re-added (with tests) when
-    // OutlookNSEClient actually consumes them.
+    // Production census: extractBody / extractAttachmentRefs and the inline
+    // image extractor are live through OutlookNSEClient -> GraphAPI.messageFull.
+    // GraphParse.parseDeltaPage is an internal helper reached only through
+    // GraphAPI.deltaWalk, itself called only by GraphAPI.inboxDelta; that path
+    // currently has neither a production caller nor a test.
 
     // MARK: - extractInlineImageRefs
 

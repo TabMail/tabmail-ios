@@ -639,3 +639,200 @@ struct ExchangeProviderDraftDeleteHTTPTests {
         #expect(http.recordedCalls().isEmpty)
     }
 }
+
+@Suite("ExchangeProvider — request selection wiring")
+struct ExchangeProviderSelectionWiringTests {
+    private static let graphBase = "https://graph.microsoft.com/v1.0/me"
+
+    // Literal wire oracles, deliberately independent of production selections.
+    // An extra field on a lean header/backfill route is a behavior change and
+    // must fail this test rather than updating its own expectation transitively.
+    private static let headerFields =
+        "id,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,"
+        + "receivedDateTime,isRead,flag,hasAttachments,internetMessageId,"
+        + "conversationId,categories,bodyPreview"
+    private static let metadataFields = "\(headerFields),parentFolderId"
+    private static let backfillFields = "\(headerFields),body"
+    private static let fullFields = "\(headerFields),body,parentFolderId"
+
+    private func provider(_ http: FakeHTTP.Scenario) -> ExchangeProvider {
+        ExchangeProvider(
+            userEmail: "selection-wiring@example.com",
+            accessToken: { _ in "fake-graph-token" },
+            session: http.session
+        )
+    }
+
+    private func messageJSON(
+        id: String,
+        category: String,
+        parentFolderId: String? = nil
+    ) -> String {
+        let parentField = parentFolderId.map { ", \"parentFolderId\": \"\($0)\"" } ?? ""
+        return """
+        {
+          "id": "\(id)",
+          "receivedDateTime": "2020-01-14T12:00:00Z",
+          "hasAttachments": false,
+          "body": {"contentType": "text", "content": "body"},
+          "categories": ["\(category)"]\(parentField)
+        }
+        """
+    }
+
+    private func pageJSON(id: String, category: String) -> String {
+        "{\"value\":[\(messageJSON(id: id, category: category))]}"
+    }
+
+    private func registerRouteResponses(_ http: FakeHTTP.Scenario) {
+        http.register(
+            path: "/mailFolders/fetch-route/messages?",
+            response: .json(raw: pageJSON(id: "fetch-route", category: "category-fetch"))
+        )
+        http.register(
+            path: "/mailFolders/search-route/messages?",
+            response: .json(raw: pageJSON(id: "search-route", category: "category-search"))
+        )
+        http.register(
+            path: "/mailFolders/older-route/messages?",
+            response: .json(raw: pageJSON(id: "older-route", category: "category-older"))
+        )
+        http.register(
+            path: "/messages/full-route?",
+            response: .json(raw: messageJSON(
+                id: "full-route", category: "category-full", parentFolderId: "folder-full"))
+        )
+        http.register(
+            path: "/messages/full-route/attachments",
+            response: .json(raw: "{\"value\":[]}")
+        )
+        http.register(
+            path: "/messages/backfill-route?",
+            response: .json(raw: messageJSON(
+                id: "backfill-route", category: "category-backfill"))
+        )
+        http.register(
+            path: "/messages/headers-route?",
+            response: .json(raw: messageJSON(
+                id: "headers-route", category: "category-headers"))
+        )
+        http.register(
+            path: "/messages/details-route?",
+            response: .json(raw: messageJSON(
+                id: "details-route", category: "category-details",
+                parentFolderId: "folder-details"))
+        )
+    }
+
+    private func exerciseEveryRoute(
+        _ exchange: ExchangeProvider
+    ) async throws -> [ExchangeGraphMessageRequest: MessageHeaderInfo] {
+        var parsed: [ExchangeGraphMessageRequest: MessageHeaderInfo] = [:]
+
+        let fetched = try await exchange.fetchMessages(
+            folder: "fetch-route", limit: 10, offset: 0)
+        let fetchedHeader = try #require(fetched.first)
+        parsed[.fetchMessages] = fetchedHeader
+
+        let offsetFetched = try await exchange.fetchMessages(
+            folder: "fetch-route", limit: 5, offset: 3)
+        let offsetHeader = try #require(offsetFetched.first)
+        #expect(offsetHeader.userLabelIds == ["category-fetch"])
+        #expect(offsetHeader.userLabelIdsAreAuthoritative)
+
+        let full = try await exchange.fetchMessage(id: "full-route", folder: "ignored")
+        parsed[.fetchMessage] = full.header
+
+        let backfill = await exchange.fetchBackfillBatch(ids: ["backfill-route"], concurrency: 1)
+        var backfillResults: [BackfillResult] = []
+        for await result in backfill {
+            backfillResults.append(result)
+        }
+        #expect(backfillResults.count == 1)
+        let backfillResult = try #require(backfillResults.first)
+        #expect(backfillResult.error == nil)
+        let backfillHeader = try #require(backfillResult.header)
+        parsed[.fetchSingleBackfill] = backfillHeader
+
+        let searched = try await exchange.search(
+            query: "route", folder: "search-route", after: nil, before: nil)
+        let searchedHeader = try #require(searched.first)
+        parsed[.search] = searchedHeader
+
+        let headers = try await exchange.fetchMessageHeaders(
+            ids: ["headers-route"], batchSize: 50, interBatchDelay: 0)
+        let listedHeader = try #require(headers.first)
+        parsed[.fetchMessageHeaders] = listedHeader
+
+        let older = try await exchange.fetchOlderMessages(
+            folder: "older-route", before: Date(timeIntervalSince1970: 1_600_000_000),
+            limit: 10)
+        let olderHeader = try #require(older.first)
+        parsed[.fetchOlderMessages] = olderHeader
+
+        let details = try await exchange.fetchMessageDetails(ids: ["details-route"])
+        #expect(details.count == 1)
+        let detail = try #require(details.first)
+        #expect(detail.parentFolderId == "folder-details")
+        parsed[.fetchMessageDetails] = detail.header
+
+        return parsed
+    }
+
+    private func normalizedURL(_ raw: String) throws -> String {
+        try #require(URL(string: raw)).absoluteString
+    }
+
+    private func expectExactURLs(in http: FakeHTTP.Scenario) throws {
+        let h = Self.headerFields
+        let expected = try [
+            normalizedURL(
+                "\(Self.graphBase)/mailFolders/fetch-route/messages?$select=\(h)"
+                    + "&$top=10&$orderby=receivedDateTime desc"),
+            normalizedURL(
+                "\(Self.graphBase)/mailFolders/fetch-route/messages?$select=\(h)"
+                    + "&$top=5&$orderby=receivedDateTime desc&$skip=3"),
+            normalizedURL("\(Self.graphBase)/messages/full-route?$select=\(Self.fullFields)"),
+            normalizedURL("\(Self.graphBase)/messages/full-route/attachments"),
+            normalizedURL("\(Self.graphBase)/messages/backfill-route?$select=\(Self.backfillFields)"),
+            normalizedURL(
+                "\(Self.graphBase)/mailFolders/search-route/messages?$select=\(h)"
+                    + "&$search=\"route\"&$top=20"),
+            normalizedURL("\(Self.graphBase)/messages/headers-route?$select=\(h)"),
+            normalizedURL(
+                "\(Self.graphBase)/mailFolders/older-route/messages?$select=\(h)"
+                    + "&$filter=receivedDateTime lt 2020-09-13T12:26:40Z"
+                    + "&$top=10&$orderby=receivedDateTime desc"),
+            normalizedURL(
+                "\(Self.graphBase)/messages/details-route?$select=\(Self.metadataFields)")
+        ]
+        #expect(http.recordedCalls().map { $0.url } == expected)
+    }
+
+    @Test("Every parser route uses its exact request selection and parses its response")
+    func everyRouteUsesItsAssignedSelection() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+
+        registerRouteResponses(http)
+        let parsed = try await exerciseEveryRoute(provider(http))
+        let expectedCategories: [ExchangeGraphMessageRequest: String] = [
+            .fetchMessages: "category-fetch",
+            .fetchMessage: "category-full",
+            .fetchSingleBackfill: "category-backfill",
+            .search: "category-search",
+            .fetchMessageHeaders: "category-headers",
+            .fetchOlderMessages: "category-older",
+            .fetchMessageDetails: "category-details"
+        ]
+
+        #expect(parsed.count == ExchangeGraphMessageRequest.allCases.count)
+        for route in ExchangeGraphMessageRequest.allCases {
+            let header = try #require(parsed[route])
+            let category = try #require(expectedCategories[route])
+            #expect(header.userLabelIds == [category])
+            #expect(header.userLabelIdsAreAuthoritative)
+        }
+        try expectExactURLs(in: http)
+    }
+}

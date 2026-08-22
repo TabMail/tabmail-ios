@@ -1,3 +1,15 @@
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **AMENDMENT (2026-08-21, issue #71) — Exchange category authority now keeps request and
+> response evidence separate.** The preserved body below records the earlier hardcoded-`true`
+> producer and the resulting future-reconcile hazard. `ExchangeProvider.parseGraphMessage` now
+> marks the set authoritative only when the request selection named `categories` **and** the
+> decoded `GraphMessage.categories` is non-nil. A selected-but-absent field fails closed, while a
+> decoded empty array remains an authoritative empty set. The seven current Exchange parser routes
+> carry an enumerated selection into both URL construction and parsing; integration tests serve a
+> distinct non-empty category through every route, assert the parsed authority/result, and compare
+> the complete URL sequence against literal lean/full field-list oracles. This is test-enforced
+> call-site wiring, not a claim that Swift's type system makes drift impossible.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-LABEL-002
 
 > Routed from `KNOWN_ISSUES.md` line 315 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).

@@ -74,7 +74,7 @@ struct GraphAPIPathEncodingTests {
 
         let url = try soleRecordedURL(scenario)
         #expect(url == "\(Self.base)/messages/\(Self.hostileIdEncoded)"
-                + "?$select=\(GraphAPI.metadataSelectFields)")
+                + "?\(GraphAPI.metadataSelection.queryParameter)")
         // The id cannot reach the query, the fragment, or a second path segment.
         #expect(!url.contains("/messages/AA/BB"))
         #expect(url.split(separator: "?").count == 2)
@@ -92,7 +92,7 @@ struct GraphAPIPathEncodingTests {
 
         let url = try soleRecordedURL(scenario)
         #expect(url == "\(Self.base)/messages/\(Self.ordinaryId)"
-                + "?$select=\(GraphAPI.metadataSelectFields)")
+                + "?\(GraphAPI.metadataSelection.queryParameter)")
         // No percent escape anywhere: neither `-._~` in the id nor `$` and `,`
         // in the query string may be touched. Encoding the whole URL instead of
         // the segment would break exactly this.
@@ -114,7 +114,7 @@ struct GraphAPIPathEncodingTests {
 
         let url = try soleRecordedURL(scenario)
         #expect(url == "\(Self.base)/messages/\(Self.hostileIdEncoded)"
-                + "?$select=\(GraphAPI.fullSelectFields)&$expand=attachments")
+                + "?\(GraphAPI.fullSelection.queryParameter)&$expand=attachments")
         #expect(!url.contains("/messages/AA/BB"))
         #expect(url.split(separator: "?").count == 2)
         #expect(!url.contains("#"))
@@ -131,7 +131,7 @@ struct GraphAPIPathEncodingTests {
 
         let url = try soleRecordedURL(scenario)
         #expect(url == "\(Self.base)/messages/\(Self.ordinaryId)"
-                + "?$select=\(GraphAPI.fullSelectFields)&$expand=attachments")
+                + "?\(GraphAPI.fullSelection.queryParameter)&$expand=attachments")
         #expect(!url.contains("%"))
         #expect(url.hasSuffix("&$expand=attachments"))
     }

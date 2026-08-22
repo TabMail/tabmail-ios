@@ -740,8 +740,10 @@ extension SyncEngine {
                             // Insert user label associations. ⚠️ This said "(Exchange: empty
                             // for now)" until round 18 and was FALSE at this candidate:
                             // `ExchangeProvider.parseGraphMessage` maps `msg.categories` into
-                            // `userLabelIds` (filtered only for legacy `tm_*`) and stamps
-                            // `userLabelIdsAreAuthoritative: true`. A stale comment that
+                            // `userLabelIds` (filtered only for legacy `tm_*`). Its label set
+                            // is authoritative only when the request selected `categories`
+                            // AND decoding observed the field; this insertion path does not
+                            // consume that future reconciliation guard. A stale comment that
                             // CONFIRMS a hypothesis is the expensive kind — this one nearly
                             // produced a false HIGH in the round-18 audit.
                             for labelId in info.userLabelIds {

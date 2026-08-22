@@ -4,6 +4,35 @@
 
 import Foundation
 
+/// Every Exchange request whose decoded payload reaches `parseGraphMessage`.
+///
+/// The currently registered parser-route census. Each registered production
+/// function carries one member's selection into URL construction and response
+/// parsing. The enum and integration tests pin those current cases and their
+/// convention; they cannot detect a new call site that bypasses the registry.
+enum ExchangeGraphMessageRequest: CaseIterable, Hashable, Sendable {
+    case fetchMessages
+    case fetchMessage
+    case fetchSingleBackfill
+    case search
+    case fetchMessageHeaders
+    case fetchOlderMessages
+    case fetchMessageDetails
+
+    var selection: GraphMessageSelection {
+        switch self {
+        case .fetchMessages, .search, .fetchMessageHeaders, .fetchOlderMessages:
+            GraphAPI.headerOnlySelection
+        case .fetchSingleBackfill:
+            GraphAPI.backfillSelection
+        case .fetchMessage:
+            GraphAPI.fullSelection
+        case .fetchMessageDetails:
+            GraphAPI.metadataSelection
+        }
+    }
+}
+
 /// Microsoft Graph API-based provider for Exchange/Outlook accounts.
 /// Mirrors `GmailProvider` actor pattern — same `accessToken` closure, same retry logic.
 /// Uses Microsoft Graph Mail REST API for all operations.
@@ -132,16 +161,16 @@ actor ExchangeProvider: EmailProvider {
     func fetchMessagesWithObservedEpoch(
         folder: String, limit: Int, offset: Int
     ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage) {
-        let fields = selectMessageHeaderFields
+        let selection = ExchangeGraphMessageRequest.fetchMessages.selection
         let encodedFolder = try Self.encodedGraphPathSegment(folder, context: "Graph folder id")
-        var path = "/mailFolders/\(encodedFolder)/messages?\(fields)&\(topParam(limit))&\(orderByReceived)"
+        var path = "/mailFolders/\(encodedFolder)/messages?"
+            + "\(selection.queryParameter)&\(topParam(limit))&\(orderByReceived)"
         if offset > 0 {
             path += "&$skip=\(offset)"
         }
         let data = try await request(path: path)
         let response = try JSONDecoder().decode(GraphMessageListResponse.self, from: data)
-        // `selectMessageHeaderFields` does not name `parentFolderId`.
-        let parsed = parseGraphPage(response.value, expectsParentFolderId: false)
+        let parsed = parseGraphPage(response.value, selection: selection)
         return (parsed.messages, nil, FetchCoverage(
             serverRecordCount: response.value.count,
             // `@odata.nextLink` is Graph's own "there is more"; a page shorter
@@ -156,12 +185,12 @@ actor ExchangeProvider: EmailProvider {
     /// as gone and deletes the local row. See `FetchCoverage`.
     private func parseGraphPage(
         _ page: [GraphMessage],
-        expectsParentFolderId: Bool
+        selection: GraphMessageSelection
     ) -> (messages: [MessageHeaderInfo], unmaterialisedIds: Set<String>) {
         var messages: [MessageHeaderInfo] = []
         var unmaterialised = Set<String>()
         for raw in page {
-            if let header = parseGraphMessage(raw, expectsParentFolderId: expectsParentFolderId) {
+            if let header = parseGraphMessage(raw, selection: selection) {
                 messages.append(header)
             } else {
                 unmaterialised.insert(raw.id)
@@ -171,12 +200,12 @@ actor ExchangeProvider: EmailProvider {
     }
 
     func fetchMessage(id: String, folder: String) async throws -> FullMessageInfo {
+        let selection = ExchangeGraphMessageRequest.fetchMessage.selection
         let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
-        let data = try await request(path: "/messages/\(encodedId)?\(selectFullMessageFields)")
+        let data = try await request(path: "/messages/\(encodedId)?\(selection.queryParameter)")
         let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
 
-        // `selectFullMessageFields` names `parentFolderId`.
-        guard let header = parseGraphMessage(msg, expectsParentFolderId: true) else {
+        guard let header = parseGraphMessage(msg, selection: selection) else {
             throw ProviderError.messageNotFound
         }
 
@@ -460,11 +489,11 @@ actor ExchangeProvider: EmailProvider {
     /// Uses header fields + body in a single $select.
     private func fetchSingleBackfill(id: String) async -> BackfillResult {
         do {
+            let selection = ExchangeGraphMessageRequest.fetchSingleBackfill.selection
             let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
-            let data = try await request(path: "/messages/\(encodedId)?\(selectBackfillFields)")
+            let data = try await request(path: "/messages/\(encodedId)?\(selection.queryParameter)")
             let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
-            // `selectBackfillFields` does not name `parentFolderId`.
-            let header = parseGraphMessage(msg, expectsParentFolderId: false)
+            let header = parseGraphMessage(msg, selection: selection)
             let htmlBody = msg.body?.contentType == "html" ? msg.body?.content : nil
             let textBody = msg.body?.contentType == "text" ? msg.body?.content : nil
             return BackfillResult(id: id, header: header, htmlBody: htmlBody, textBody: textBody, error: nil)
@@ -530,7 +559,8 @@ actor ExchangeProvider: EmailProvider {
     }
 
     func search(query: String, folder: String, after: Date?, before: Date?, from: String? = nil, to: String? = nil) async throws -> [MessageHeaderInfo] {
-        let queryParts = ["\(selectMessageHeaderFields)", "$search=\"\(query)\"", topParam(20)]
+        let selection = ExchangeGraphMessageRequest.search.selection
+        let queryParts = [selection.queryParameter, "$search=\"\(query)\"", topParam(20)]
 
         // Scope to folder via Graph API mailFolders endpoint when folder ID is available
         let basePath: String
@@ -542,8 +572,7 @@ actor ExchangeProvider: EmailProvider {
         }
         let data = try await request(path: "\(basePath)?\(queryParts.joined(separator: "&"))")
         let response = try JSONDecoder().decode(GraphMessageListResponse.self, from: data)
-        // `selectMessageHeaderFields` does not name `parentFolderId`.
-        var results = response.value.compactMap { parseGraphMessage($0, expectsParentFolderId: false) }
+        var results = response.value.compactMap { parseGraphMessage($0, selection: selection) }
 
         // Client-side date filtering since Graph $search doesn't support $filter
         if let after {
@@ -976,15 +1005,15 @@ actor ExchangeProvider: EmailProvider {
 
     /// FETCH phase: fetch message headers for specific IDs.
     func fetchMessageHeaders(ids: [String], batchSize: Int = 50, interBatchDelay: TimeInterval = 0.5) async throws -> [MessageHeaderInfo] {
+        let selection = ExchangeGraphMessageRequest.fetchMessageHeaders.selection
         var allHeaders: [MessageHeaderInfo] = []
         for (i, id) in ids.enumerated() {
             try Task.checkCancellation()
             do {
                 let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
-                let data = try await request(path: "/messages/\(encodedId)?\(selectMessageHeaderFields)")
+                let data = try await request(path: "/messages/\(encodedId)?\(selection.queryParameter)")
                 let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
-                // `selectMessageHeaderFields` does not name `parentFolderId`.
-                if let header = parseGraphMessage(msg, expectsParentFolderId: false) {
+                if let header = parseGraphMessage(msg, selection: selection) {
                     allHeaders.append(header)
                 }
             } catch {
@@ -1035,13 +1064,14 @@ actor ExchangeProvider: EmailProvider {
     func fetchOlderMessagesWithCoverage(
         folder: String, before: Date, limit: Int
     ) async throws -> (messages: [MessageHeaderInfo], coverage: FetchCoverage) {
+        let selection = ExchangeGraphMessageRequest.fetchOlderMessages.selection
         let filter = "receivedDateTime lt \(iso8601DateTime(before))"
         let encodedFolder = try Self.encodedGraphPathSegment(folder, context: "Graph folder id")
-        let path = "/mailFolders/\(encodedFolder)/messages?\(selectMessageHeaderFields)&$filter=\(filter)&\(topParam(limit))&\(orderByReceived)"
+        let path = "/mailFolders/\(encodedFolder)/messages?"
+            + "\(selection.queryParameter)&$filter=\(filter)&\(topParam(limit))&\(orderByReceived)"
         let data = try await request(path: path)
         let response = try JSONDecoder().decode(GraphMessageListResponse.self, from: data)
-        // `selectMessageHeaderFields` does not name `parentFolderId`.
-        let parsed = parseGraphPage(response.value, expectsParentFolderId: false)
+        let parsed = parseGraphPage(response.value, selection: selection)
         return (parsed.messages, FetchCoverage(
             serverRecordCount: response.value.count,
             spansEntireFolder: response.value.count < limit && response.odataNextLink == nil,
@@ -1118,15 +1148,14 @@ actor ExchangeProvider: EmailProvider {
 
     /// Fetch message details including parent folder for delta sync folder assignment.
     func fetchMessageDetails(ids: [String]) async throws -> [ExchangeMessageDetail] {
+        let selection = ExchangeGraphMessageRequest.fetchMessageDetails.selection
         var results: [ExchangeMessageDetail] = []
         for id in ids {
             do {
                 let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
-                let data = try await request(path: "/messages/\(encodedId)?\(selectMessageDetailFields)")
+                let data = try await request(path: "/messages/\(encodedId)?\(selection.queryParameter)")
                 let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
-                // `selectMessageDetailFields` names `parentFolderId` — this
-                // path reads it below, so absence here IS drift.
-                if let header = parseGraphMessage(msg, expectsParentFolderId: true) {
+                if let header = parseGraphMessage(msg, selection: selection) {
                     results.append(ExchangeMessageDetail(header: header, parentFolderId: msg.parentFolderId ?? ""))
                 }
             } catch {
@@ -1299,25 +1328,19 @@ actor ExchangeProvider: EmailProvider {
     /// Main-app-specific resolution (ActionTag via category map, conversationId
     /// as threadId, comma-joined recipient strings) applied at the boundary.
     ///
-    /// - Parameter expectsParentFolderId: whether the `$select` that produced
-    ///   `msg` named `parentFolderId`. It varies per call site in this file —
-    ///   `selectMessageDetailFields` and `selectFullMessageFields` name it,
-    ///   `selectMessageHeaderFields` and `selectBackfillFields` do not — and
-    ///   `JSONEncoder` omits a nil optional, so on every path that never
-    ///   asked, the key is absent from `json` by construction. Only
-    ///   `GraphParse`'s debug drift diagnostic reads this; parsing is
-    ///   unaffected. Every caller below states it explicitly; the strict
-    ///   default is for a caller added later that does not.
+    /// - Parameter selection: the exact field selection used by the request
+    ///   that produced `msg`. There is no default: a parser caller must carry
+    ///   its request shape through this boundary, and `GraphParse` derives the
+    ///   `parentFolderId` expectation from that shape.
     internal func parseGraphMessage(
         _ msg: GraphMessage,
-        expectsParentFolderId: Bool = true
+        selection: GraphMessageSelection
     ) -> MessageHeaderInfo? {
         // Round-trip through JSON so the shared parser is the single source of
         // truth. Cheap — we already decoded once on the way in.
         guard let encoded = try? JSONEncoder().encode(msg),
               let json = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any],
-              let metadata = GraphParse.parseMessage(
-                  json, expectsParentFolderId: expectsParentFolderId) else {
+              let metadata = GraphParse.parseMessage(json, selection: selection) else {
             if DebugModeManager.isLoggingEnabled() { print("[Exchange] Missing/invalid receivedDateTime for message \(msg.id) — treating as fetch failure, will retry") }
             return nil
         }
@@ -1348,11 +1371,10 @@ actor ExchangeProvider: EmailProvider {
             isForwarded: false,
             actionTag: nil,
             // A Graph message `category` IS Outlook's user label. The data was
-            // already on the wire and already decoded — `categories` is named in
-            // `GraphAPI.headerOnlyFields`, from which `metadataSelectFields`,
-            // `backfillSelectFields` and `fullSelectFields` all derive, and
-            // `GraphMessage.categories` has always been parsed. Only this mapping
-            // was missing.
+            // already on the wire and already decoded — the four parser-bound
+            // selections exposed by `GraphAPI` name `categories`, and
+            // `GraphMessage.categories` has always been parsed. Only this
+            // mapping was missing.
             //
             // `tm_*` is filtered through the SAME predicate `stripLegacyCategories`
             // uses to DELETE those categories from the server (ADR-IOS-036 keeps
@@ -1369,28 +1391,13 @@ actor ExchangeProvider: EmailProvider {
             // a duplicate row for one category.
             userLabelIds: (msg.categories ?? [])
                 .filter { !Self.isLegacyActionTagCategory($0) },
-            // AUTHORITATIVE — justified per construction site, and there is
-            // exactly one: this is the sole `MessageHeaderInfo` this file builds.
-            // Every one of its callers fetches through a `$select` derived from
-            // `GraphAPI.headerOnlyFields`, which names `categories`:
-            // `fetchMessages`, `fetchOlderMessages`, `search` and
-            // `fetchMessageHeaders` (`selectMessageHeaderFields`), `fetchMessage`
-            // (`selectFullMessageFields`), `fetchSingleBackfill`
-            // (`selectBackfillFields`) and `fetchMessageDetails`
-            // (`selectMessageDetailFields`) — seven call sites, all of them.
-            // Graph returns the complete `categories` array whenever it is
-            // selected, so the set really is exact. The lean `$select`s in this
-            // file — `$select=id` in `listBackfillMessageIds` and
-            // `listMessageIdsPage`, `$select=id,body` in `fetchSingleTextBody`,
-            // `$select=categories` in `mutateCategories` — decode into other
-            // types or read one field and never reach here.
-            //
-            // ⚠️ IF YOU ADD A `parseGraphMessage` CALLER, IT MUST SELECT
-            // `categories`. Read this flag's doc comment on `MessageHeaderInfo`:
-            // it is currently unconsumed on v3, but a reconcile added later
-            // REPLACES local membership with this set, so `true` on a path that
-            // fetched no categories would erase every label the user has.
-            userLabelIdsAreAuthoritative: true
+            // Authority needs BOTH halves of the evidence: the request selected
+            // `categories`, and decoding observed the field. `nil` means the
+            // response did not carry the selected field and must fail closed;
+            // `[]` means Graph carried an authoritative empty set. Keep that
+            // distinction even though both display as zero local label ids.
+            userLabelIdsAreAuthoritative:
+                selection.contains("categories") && msg.categories != nil
         )
     }
 
@@ -1461,31 +1468,6 @@ actor ExchangeProvider: EmailProvider {
         "$select=id,displayName,unreadItemCount,totalItemCount,childFolderCount"
     }
 
-    // Compose all `$select=...` lists from `GraphAPI`'s single source of
-    // truth. Keeps NSE's `GraphAPI.messageMetadata` + `messageFull` URLs and
-    // main-app's inline fetches in lockstep — adding a field in GraphAPI
-    // propagates to every caller. Prior art: these were hardcoded here and
-    // drifted silently from the NSE-side URL; see the class of bug the
-    // 2026-04-19 IMAP fix was written to prevent.
-
-    private var selectMessageHeaderFields: String {
-        "$select=\(GraphAPI.headerOnlyFields)"
-    }
-
-    /// Header fields + parentFolderId for delta sync folder assignment.
-    private var selectMessageDetailFields: String {
-        "$select=\(GraphAPI.metadataSelectFields)"
-    }
-
-    /// Header fields + body for unified backfill (headers AND body in one API call).
-    private var selectBackfillFields: String {
-        "$select=\(GraphAPI.backfillSelectFields)"
-    }
-
-    private var selectFullMessageFields: String {
-        "$select=\(GraphAPI.fullSelectFields)"
-    }
-
     private func topParam(_ n: Int) -> String { "$top=\(n)" }
 
     private var orderByReceived: String { "$orderby=receivedDateTime desc" }
@@ -1542,7 +1524,8 @@ private struct GraphMessageRef: Decodable {
 // Codable (not just Decodable) so ExchangeProvider.parseGraphMessage can
 // re-serialize and hand off to Shared/Parse/GraphParse.parseMessage.
 // One JSON round-trip per message — small, and lets the shared parser be
-// the single source of truth for both main-app and any future NSE Outlook.
+// the single source of truth for main-app ExchangeProvider and the live
+// Outlook NSE path through GraphAPI.messageMetadata / messageFull.
 struct GraphMessage: Codable {
     let id: String
     let subject: String?

@@ -4,24 +4,49 @@
 
 import Foundation
 
+/// The exact Microsoft Graph message fields requested by one HTTP call.
+///
+/// Production call sites carry this value from request construction into
+/// response parsing. Exact-URL and parsed-result integration tests pin that
+/// handoff; the type itself cannot prove that an arbitrary caller passed the
+/// selection that produced a payload.
+/// Membership is token-based rather than substring-based because Graph field
+/// names are discrete comma-separated identifiers.
+struct GraphMessageSelection: Sendable {
+    let fields: [String]
+
+    var fieldList: String {
+        fields.joined(separator: ",")
+    }
+
+    var queryParameter: String {
+        "$select=\(fieldList)"
+    }
+
+    func contains(_ field: String) -> Bool {
+        fields.contains(field)
+    }
+
+    func appending(_ fields: String...) -> GraphMessageSelection {
+        GraphMessageSelection(fields: self.fields + fields)
+    }
+}
+
 // =============================================================================
-// KEEP — PHASE-B SCAFFOLDING (Outlook NSE). DO NOT DELETE AS "DEAD CODE".
+// KEEP — LIVE SHARED OUTLOOK NSE SURFACE. DO NOT DELETE AS "DEAD CODE".
 // =============================================================================
-// Shared Microsoft Graph REST surface consumed by both the main-app
-// `ExchangeProvider` AND the (not-yet-implemented) `OutlookNSEClient`. The main
-// app currently still uses its own inline `request(path:)`; piecewise migration
-// will route it through these functions, same pattern as Gmail did in commits
-// 2b2249a / a281ce9.
+// `OutlookNSEClient` calls `messageMetadata` and `messageFull` in production.
+// The main-app `ExchangeProvider` still owns its inline `request(path:)`, while
+// sharing this file's field selections and strict path-segment encoder.
 //
 // Round-3 dead-code audit (commit d1437c3) deleted this file because it had
-// "zero callers" in main-app code. That was wrong — callers don't exist yet
-// because the NSE side hasn't been built. Infra lands first so the NSE is a
-// thin orchestrator, not a re-implementation. This shared provider API layer
-// is intentional architecture (LOCKED 2026-04-12).
+// "zero callers" in main-app code. That was wrong: the consumer is the NSE
+// target, which is why a main-app-only census missed it. This shared provider
+// API layer is intentional architecture (LOCKED 2026-04-12).
 //
 // This banner exists to prevent the same mistake. If you're tempted to delete
-// methods here because they have no callers today, check whether a phase-B
-// NSE consumer will need them before removing.
+// a method here, census every target separately: the surface mixes live NSE
+// entry points with narrower helpers that may not have a production caller.
 // =============================================================================
 
 /// Pure Microsoft Graph REST API calls for Outlook/Exchange accounts.
@@ -43,24 +68,25 @@ enum GraphAPI {
     /// Core header fields (no body, no parentFolderId). Baseline for
     /// paginated header-list fetches where the client already knows the
     /// folder context.
-    static let headerOnlyFields =
-        "id,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,"
-        + "receivedDateTime,isRead,flag,hasAttachments,internetMessageId,"
-        + "conversationId,categories,bodyPreview"
+    static let headerOnlySelection = GraphMessageSelection(fields: [
+        "id", "subject", "from", "toRecipients", "ccRecipients", "bccRecipients", "replyTo",
+        "receivedDateTime", "isRead", "flag", "hasAttachments", "internetMessageId",
+        "conversationId", "categories", "bodyPreview"
+    ])
 
     /// Header fields + `parentFolderId`. Used for single-message metadata
     /// fetches (NSE push + main-app delta sync that needs to assign the
     /// message to its server-side folder).
-    static let metadataSelectFields = "\(headerOnlyFields),parentFolderId"
+    static let metadataSelection = headerOnlySelection.appending("parentFolderId")
 
     /// Header fields + `body` (no `parentFolderId`). Used by unified
     /// backfill that grabs headers and body in one API round-trip within
     /// a known folder context.
-    static let backfillSelectFields = "\(headerOnlyFields),body"
+    static let backfillSelection = headerOnlySelection.appending("body")
 
     /// Everything — headers + body + `parentFolderId`. Used for single-
     /// message full fetches (main-app `fetchMessage`, NSE `messageFull`).
-    static let fullSelectFields = "\(headerOnlyFields),body,parentFolderId"
+    static let fullSelection = headerOnlySelection.appending("body", "parentFolderId")
 
     // MARK: - Path-segment encoding (single source of truth for BOTH targets)
 
@@ -166,10 +192,11 @@ enum GraphAPI {
         guard let encodedId = encodedGraphPathSegment(id) else {
             throw HTTPError.invalidURL("Graph message id")
         }
-        let url = "\(baseURL)/messages/\(encodedId)?$select=\(metadataSelectFields)"
+        let selection = metadataSelection
+        let url = "\(baseURL)/messages/\(encodedId)?\(selection.queryParameter)"
         let data = try await http.get(url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let metadata = GraphParse.parseMessage(json) else {
+              let metadata = GraphParse.parseMessage(json, selection: selection) else {
             throw HTTPError.networkError(statusCode: 0)
         }
         return metadata
@@ -189,10 +216,11 @@ enum GraphAPI {
         guard let encodedId = encodedGraphPathSegment(id) else {
             throw HTTPError.invalidURL("Graph message id")
         }
-        let url = "\(baseURL)/messages/\(encodedId)?$select=\(fullSelectFields)&$expand=attachments"
+        let selection = fullSelection
+        let url = "\(baseURL)/messages/\(encodedId)?\(selection.queryParameter)&$expand=attachments"
         let data = try await http.get(url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let metadata = GraphParse.parseMessage(json) else {
+              let metadata = GraphParse.parseMessage(json, selection: selection) else {
             throw HTTPError.networkError(statusCode: 0)
         }
         let (rawHtml, rawText) = GraphParse.extractBody(from: json)
@@ -249,10 +277,12 @@ enum GraphAPI {
     // business mutating the user's mailbox: it enriches a delivered
     // notification, and every provider mutation in this app goes through the
     // durable `PendingOperation` queue in the main app, which the extension
-    // process cannot drain. The KEEP banner at the top of this file asks whether
-    // a phase-B NSE consumer will need a method before removing it — for these
-    // two the answer is no, permanently, and their absence is now what makes
-    // "read-only" true rather than merely intended.
+    // process cannot drain. The live NSE consumers call `messageMetadata` and
+    // `messageFull`; neither needs mailbox mutation. `inboxDelta` and its
+    // `deltaWalk` helper currently have no production caller, but that narrower
+    // negative case does not make the live read surface dead. The absence of
+    // mutation methods is what makes this shared API read-only rather than
+    // merely intended.
     //
     // If a Graph mutation is ever genuinely needed from shared code, it must be
     // reintroduced with `encodedGraphPathSegment` applied to every id, as the
