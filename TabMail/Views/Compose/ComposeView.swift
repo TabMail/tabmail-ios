@@ -3578,8 +3578,9 @@ struct ComposeView: View {
         sendWasAdmitted = true
 
         // Report success to the agent tool (if any) before dismissing. Fires
-        // at outbox-persistence granularity, not SMTP — this is the
-        // trade-off for the 5-second undo window. `.onDisappear` will fire
+        // at outbox-persistence granularity, not SMTP — this is the trade-off
+        // for the durable, persist-latency-shortened Undo window.
+        // `.onDisappear` will fire
         // `.cancelled` after dismiss, but
         // `ComposeOutcomeState.tryResolve` makes that a no-op.
         onAgentOutcome?(.sent)

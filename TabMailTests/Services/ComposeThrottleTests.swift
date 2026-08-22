@@ -2,10 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import Testing
 import Foundation
 import GRDB
 import SwiftMail
+import SwiftUI
+import Testing
+import UIKit
 @testable import TabMail
 
 // Tests for the compose-throttle feature:
@@ -180,9 +182,9 @@ struct OutboxThrottleConfigTests {
         #expect(SyncConfig.outboxClaimBufferSeconds == 1)
     }
 
-    @Test("outboxPostSendConfirmSeconds is 1.5")
-    func postSendConfirmIs1_5() {
-        #expect(SyncConfig.outboxPostSendConfirmSeconds == 1.5)
+    @Test("outboxQueuedAcknowledgementSeconds is 1.5")
+    func queuedAcknowledgementIs1_5() {
+        #expect(SyncConfig.outboxQueuedAcknowledgementSeconds == 1.5)
     }
 
     @Test("outboxMinSendGapSeconds is 3 (serial drain rate limit)")
@@ -282,8 +284,9 @@ struct PendingSendServiceLifecycleTests {
         value.status = status.rawValue
         value.sentAt = sentAt
         // Stamped exactly as `persistQueuedSend` stamps it, so the toast these
-        // rows are presented with is inside its hold window rather than backed by
-        // no hold at all — the state every `undo()` test below means to model.
+        // rows are presented with is before its buffered cancellation deadline
+        // rather than backed by no hold at all — the state every `undo()` test
+        // below means to model.
         value.holdUntil = Date().addingTimeInterval(
             SyncConfig.outboxUndoHoldSeconds + SyncConfig.outboxClaimBufferSeconds)
         return value
@@ -405,7 +408,8 @@ struct PendingSendServiceLifecycleTests {
     ///
     /// Asserted AT THE STORE, as end state, not as a classifier's return value: the
     /// `OutboxMessage` row is still there and the toast is still up, so Undo remains
-    /// available inside the hold window. Any reimplementation that keeps those two
+    /// available while the buffered cancellation deadline remains. Any
+    /// reimplementation that keeps those two
     /// facts passes; any that cancels on an unknown fails.
     ///
     /// TWO-SIDED, so this cannot pass by simply never cancelling: the proven-mismatch
@@ -441,11 +445,13 @@ struct PendingSendServiceLifecycleTests {
         }
 
         #expect(svc.undo() == nil)
-        // (a) the durable send survives — it is still queued and still cancellable.
+        // (a) the durable Send intention survives. No cancellation was accepted
+        // or promised, so its ordinary queued/send path remains authoritative.
         #expect(try fixture.0.read {
             try OutboxMessage.fetchOne($0, key: pending.id)
         } != nil)
-        // (b) the toast survives, so the user can tap Undo again in the hold window.
+        // (b) the toast survives, so the user can tap Undo again before the
+        // buffered cancellation deadline in this fixture.
         #expect(svc.current?.id == pending.id)
         // (c) and the tap is not a dead one: the user is told it did not take.
         #expect(svc.undoFailureMessage != nil)
@@ -802,7 +808,7 @@ struct UndoWindowTimingTests {
 /// `ComposeView` reaches only AFTER that awaited persist returns. The two anchors
 /// therefore differ by the persist latency Δ, and for Δ > `claimBuffer` the button
 /// stayed tappable after the drain was already free to claim the row — the tap
-/// then failed with "Couldn't undo / Try again." on a message that went out.
+/// then raised a cancellation-not-confirmed alert on a message that went out.
 ///
 /// **Why these tests are not a replica** (`Companion/Memory/Current/100-…`: a
 /// replica cannot go red on a defect in the original): the decision under test is
@@ -932,7 +938,7 @@ struct UndoAffordanceHoldInvariantTests {
                 "fixture check: present+4.5 s must be inside the pre-fix flat window")
         #expect(PendingSendToastPhase.resolve(
             at: lateTap, presentedAt: pending.presentedAt, undoDeadline: pending.undoDeadline
-        ) == .confirming, """
+        ) == .queuedAcknowledgement, """
             the affordance survived its durable hold: a tap at present+4.5 s would reach a row \
             the drain may already have claimed
             """)
@@ -950,8 +956,8 @@ struct UndoAffordanceHoldInvariantTests {
     /// Fail closed when the hold is ALREADY gone by the time the toast is built —
     /// a very slow persist, or a dedup onto an older in-flight row whose hold was
     /// stamped long before. Offering an Undo we cannot honour is the defect;
-    /// offering none is the correct, recoverable outcome (the message lands in
-    /// Sent, where the user can reach it).
+    /// offering none is the correct fail-closed outcome: no cancellation was
+    /// offered or accepted, and the original durable Send remains in force.
     ///
     /// This test also stands as the live proof that `present` does not trap on a
     /// past deadline: it computes the auto-dismiss interval from `holdUntil`, and
@@ -979,7 +985,8 @@ struct UndoAffordanceHoldInvariantTests {
                 at: presentedAt.addingTimeInterval(offset),
                 presentedAt: pending.presentedAt,
                 undoDeadline: pending.undoDeadline
-            ) == .confirming, "no Undo may be offered \(offset) s after an already-elapsed hold")
+            ) == .queuedAcknowledgement,
+                "no Undo may be offered \(offset) s after an already-elapsed hold")
         }
     }
 
@@ -1004,7 +1011,348 @@ struct UndoAffordanceHoldInvariantTests {
         #expect(PendingSendToastPhase.resolve(
             at: presentedAt, presentedAt: pending.presentedAt,
             undoDeadline: pending.undoDeadline
-        ) == .confirming)
+        ) == .queuedAcknowledgement)
+    }
+}
+
+// MARK: - Outbox list cancellation uses the same buffered boundary
+
+@MainActor
+private final class HostedOutboxDeadlineHarness {
+    private(set) var instant: Date
+    private(set) var requestedDelays: [UInt64] = []
+    private(set) var renderedActions: [OutboxCancellationAction?] = []
+    private var releasedAt: Date?
+
+    init(instant: Date) {
+        self.instant = instant
+    }
+
+    func clock() -> Date {
+        instant
+    }
+
+    func sleep(nanoseconds: UInt64) async throws {
+        requestedDelays.append(nanoseconds)
+        while releasedAt == nil {
+            try Task.checkCancellation()
+            await Task.yield()
+        }
+        guard let releasedAt else { return }
+        instant = releasedAt
+    }
+
+    func release(at instant: Date) {
+        releasedAt = instant
+    }
+
+    func record(_ state: OutboxHeldState) {
+        renderedActions.append(state.action)
+    }
+}
+
+/// Pins the exact production view-driver and parent-owned feedback controller.
+/// `OutboxRowDeadlineRefreshDriver` owns the one-shot `invalidationAt` task and
+/// the hosted-row test exercises its render connection rather than a replica of
+/// its policy. Gesture tests cover both the safe Cancel→Discard downgrade and the
+/// refusal directions. A refusal is never a dead swipe.
+@Suite("Outbox list cancellation shares the durable buffered deadline",
+       .serialized, .processGlobalState)
+@MainActor
+struct OutboxListCancellationInvariantTests {
+
+    private func waitUntil(
+        timeout: Duration = .seconds(2),
+        _ condition: @escaping @MainActor () -> Bool
+    ) async {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !condition(), clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    @Test("The production row driver invalidates Cancel Send at the exact buffered deadline")
+    func rowDriverHasExactTwoSidedBufferedBoundary() {
+        let holdUntil = Date().addingTimeInterval(60)
+        let deadline = OutboxCancellationPolicy.undoDeadline(for: holdUntil)
+        let justBefore = deadline.addingTimeInterval(-0.001)
+        let atBoundary = deadline
+        let insideBuffer = deadline.addingTimeInterval(
+            SyncConfig.outboxClaimBufferSeconds / 2)
+
+        let before = OutboxHeldState.resolve(
+            status: .queued, sentAt: nil, holdUntil: holdUntil, at: justBefore)
+        let boundary = OutboxHeldState.resolve(
+            status: .queued, sentAt: nil, holdUntil: holdUntil, at: atBoundary)
+        let buffered = OutboxHeldState.resolve(
+            status: .queued, sentAt: nil, holdUntil: holdUntil, at: insideBuffer)
+
+        #expect(before.action == .cancelSend,
+                "non-vacuity: a queued row must be cancellable before the boundary")
+        #expect(before.invalidationAt == deadline,
+                "OutboxRow must schedule a one-shot invalidation at the exact deadline")
+        #expect(OutboxDeadlineScheduler.nanoseconds(until: deadline, at: justBefore) > 0,
+                "the exact timer must have a real positive interval before the deadline")
+        #expect(boundary.action == .discard,
+                "the exact deadline must withdraw the Cancel Send promise")
+        #expect(boundary.invalidationAt == nil,
+                "after invalidation there must be no stale deadline to schedule again")
+        #expect(OutboxDeadlineScheduler.nanoseconds(until: deadline, at: atBoundary) == 0,
+                "the exact boundary is an immediate invalidation, not a 1 Hz approximation")
+        #expect(buffered.action == .discard,
+                "a raw holdUntil check would wrongly keep calling this Cancel Send")
+        #expect(insideBuffer < holdUntil,
+                "fixture: the downgrade instant is still inside the raw durable hold")
+    }
+
+    @Test("The hosted production row refreshes Cancel Send through its exact deadline task")
+    func hostedRowConnectsDeadlineTaskToRenderedAction() async throws {
+        let instant = Date()
+        let deadline = instant.addingTimeInterval(0.125)
+        let holdUntil = deadline.addingTimeInterval(SyncConfig.outboxClaimBufferSeconds)
+        let harness = HostedOutboxDeadlineHarness(instant: instant)
+        let controller = OutboxActionController()
+        let message = makeMessage(
+            id: "hosted-deadline-row",
+            holdUntil: holdUntil,
+            to: ["to@example.com"])
+        let row = OutboxRow(
+            message: message,
+            actionController: controller,
+            deadlineClock: { harness.clock() },
+            deadlineSleep: { try await harness.sleep(nanoseconds: $0) },
+            didRenderHeldState: { harness.record($0) })
+
+        let scene = try #require(UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first)
+        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
+        let host = UIHostingController(rootView: row)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 180)
+        window.rootViewController = host
+        window.isHidden = false
+        window.makeKeyAndVisible()
+        window.layoutIfNeeded()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+            previousKeyWindow?.makeKeyAndVisible()
+        }
+
+        await waitUntil {
+            harness.renderedActions.contains(.cancelSend)
+                && harness.requestedDelays.count == 1
+        }
+        #expect(harness.renderedActions.contains(.cancelSend),
+                "non-vacuity: the exact production row must first render Cancel Send")
+        #expect(harness.requestedDelays.count == 1,
+                "the row's production task must start exactly one deadline wait")
+        guard harness.requestedDelays.count == 1 else { return }
+        #expect(harness.requestedDelays[0] > 100_000_000
+                    && harness.requestedDelays[0] < 150_000_000,
+                "the hosted row must schedule the 125 ms deadline, not a 1 s timer tick")
+
+        harness.release(at: deadline)
+        await waitUntil {
+            harness.renderedActions.contains(.discard)
+        }
+
+        #expect(harness.renderedActions.contains(.discard),
+                "the deadline task must invalidate local state and re-render Discard")
+        #expect(harness.renderedActions.first == .cancelSend,
+                "the hosted production connection must exercise the pre-boundary render")
+        #expect(harness.renderedActions.last == .discard,
+                "the same hosted row must resolve again at the released boundary")
+        // Let UIKit finish the host's appearance transition before teardown;
+        // the assertion path itself is already complete.
+        try? await Task.sleep(for: .milliseconds(100))
+    }
+
+    @Test("A Cancel Send rendered before the deadline still executes after its safe Discard downgrade")
+    func staleRenderedCancellationAcceptsSafeDowngrade() {
+        let holdUntil = Date().addingTimeInterval(60)
+        let deadline = OutboxCancellationPolicy.undoDeadline(for: holdUntil)
+        let controller = OutboxActionController()
+        var discardCalls = 0
+
+        controller.attemptDestructive(
+            presentedAction: .cancelSend,
+            status: .queued,
+            sentAt: nil,
+            holdUntil: holdUntil,
+            at: deadline,
+            discardConfirmed: {
+                discardCalls += 1
+                return true
+            }
+        )
+
+        #expect(discardCalls == 1,
+                "non-vacuity: the same confirmed delete must honour the downgraded gesture")
+        #expect(controller.failure == nil,
+                "a safe downgrade must not manufacture a false refusal")
+    }
+
+    @Test("An atomic-claim race refusal is propagated into visible feedback")
+    func confirmedDiscardRefusalProducesVisibleFeedback() {
+        let holdUntil = Date().addingTimeInterval(60)
+        let beforeDeadline = OutboxCancellationPolicy.undoDeadline(for: holdUntil)
+            .addingTimeInterval(-0.5)
+        let controller = OutboxActionController()
+        var discardCalls = 0
+
+        controller.attemptDestructive(
+            presentedAction: .cancelSend,
+            status: .queued,
+            sentAt: nil,
+            holdUntil: holdUntil,
+            at: beforeDeadline,
+            discardConfirmed: {
+                discardCalls += 1
+                return false
+            }
+        )
+
+        #expect(discardCalls == 1,
+                "non-vacuity: the row was eligible and the confirmed discard really ran")
+        #expect(controller.failure == .destructiveNotConfirmed,
+                "a drain claim between policy check and DB write must never become a dead swipe")
+        #expect(controller.failure?.message.isEmpty == false,
+                "the production alert body must carry truthful visible feedback")
+    }
+
+    @Test("No destructive executor runs when current durable state offers no safe action")
+    func noSafeCurrentActionRefusesBeforeExecutor() {
+        let controller = OutboxActionController()
+        var discardCalls = 0
+
+        controller.attemptDestructive(
+            presentedAction: .cancelSend,
+            status: .sending,
+            sentAt: nil,
+            holdUntil: .distantFuture,
+            at: Date(),
+            discardConfirmed: {
+                discardCalls += 1
+                return true
+            })
+
+        #expect(discardCalls == 0,
+                "a sending row may already have left the provider")
+        #expect(controller.failure == .destructiveNotConfirmed)
+    }
+
+    @Test("A confirmed cancellation clears prior failure state")
+    func confirmedCancellationHasNoFalseFailure() {
+        let holdUntil = Date().addingTimeInterval(60)
+        let beforeDeadline = OutboxCancellationPolicy.undoDeadline(for: holdUntil)
+            .addingTimeInterval(-0.5)
+        let controller = OutboxActionController()
+
+        controller.attemptDestructive(
+            presentedAction: .cancelSend,
+            status: .queued,
+            sentAt: nil,
+            holdUntil: holdUntil,
+            at: beforeDeadline,
+            discardConfirmed: { false }
+        )
+        #expect(controller.failure != nil,
+                "fixture: establish visible failure before proving success clears it")
+
+        controller.attemptDestructive(
+            presentedAction: .cancelSend,
+            status: .queued,
+            sentAt: nil,
+            holdUntil: holdUntil,
+            at: beforeDeadline,
+            discardConfirmed: { true }
+        )
+        #expect(controller.failure == nil,
+                "a committed delete must not leave a false refusal alert")
+    }
+
+    @Test("Parent-owned failure state outlives any one ForEach row")
+    func rowRemovalCannotRemoveControllerFailureState() {
+        let controller = OutboxActionController()
+        var rowExists = true
+
+        controller.attemptDestructive(
+            presentedAction: .discard,
+            status: .failed,
+            sentAt: nil,
+            holdUntil: nil,
+            at: Date(),
+            discardConfirmed: {
+                rowExists = false
+                return false
+            })
+
+        #expect(rowExists == false,
+                "fixture: model the NavigationStore refresh removing OutboxRow")
+        #expect(controller.failure == .destructiveNotConfirmed,
+                "OutboxView's controller must outlive any one ForEach row")
+        #expect(controller.failure?.title.isEmpty == false,
+                "the surviving parent state must carry visible presentation content")
+    }
+
+    @Test("Retry refusal is visible and a confirmed Retry clears it")
+    func retryFeedbackIsTwoSided() {
+        let controller = OutboxActionController()
+        var retryCalls = 0
+
+        controller.attemptRetry {
+            retryCalls += 1
+            return false
+        }
+        #expect(retryCalls == 1, "non-vacuity: the production executor was attempted")
+        #expect(controller.failure == .retryNotConfirmed)
+        #expect(controller.failure?.message.contains("Retry") == true,
+                "the parent alert must explain the exact refused gesture")
+
+        controller.attemptRetry {
+            retryCalls += 1
+            return true
+        }
+        #expect(retryCalls == 2)
+        #expect(controller.failure == nil,
+                "a committed Retry must not leave a false refusal alert")
+    }
+
+    @Test("Failed-unsent rows retain actions, while sentAt and sending rows expose nothing")
+    func policyCarriesEveryExecutorGuard() {
+        let now = Date()
+        let failedUnsent = OutboxHeldState.resolve(
+            status: .failed, sentAt: nil, holdUntil: nil, at: now
+        )
+        #expect(failedUnsent.action == .discard)
+        #expect(failedUnsent.retryAvailable,
+                "non-vacuity: the exact state admitted by Retry must expose it")
+        let sending = OutboxHeldState.resolve(
+            status: .sending, sentAt: nil, holdUntil: .distantFuture, at: now
+        )
+        #expect(sending.action == nil, "a sending row may already have left the provider")
+        #expect(!sending.retryAvailable)
+        for status in [OutboxStatus.queued, .sending, .failed] {
+            let sent = OutboxHeldState.resolve(
+                status: status, sentAt: now, holdUntil: .distantFuture, at: now
+            )
+            #expect(sent.action == nil,
+                    "sentAt is the destructive double-send firewall under every stale status")
+            #expect(!sent.retryAvailable,
+                    "sentAt must also suppress Retry under every stale status")
+        }
+    }
+
+    @Test("Deadline conversion clamps both elapsed and far-future intervals")
+    func deadlineNanosecondsCannotTrapAtEitherBound() {
+        #expect(OutboxDeadlineScheduler.nanoseconds(for: -1) == 0)
+        let upper = OutboxDeadlineScheduler.nanoseconds(for: .infinity)
+        #expect(upper > 0, "non-vacuity: a far-future deadline still schedules")
+        #expect(upper < UInt64.max,
+                "the upper clamp must stay inside UInt64's convertible range")
     }
 }
 
@@ -1205,7 +1553,7 @@ struct AtomicClaimRaceTests {
 
 // MARK: - Draft survives discard (undo-reopen guarantee)
 
-/// Replicates `discardOutboxMessage`'s core behavior: delete the outbox row
+/// Replicates `discardOutboxMessageConfirmed`'s core behavior: delete the outbox row
 /// (only if `.queued`, not `.sending`), leave the DraftStore row intact.
 /// This guards the undo-reopen contract.
 private func runDiscardForTest(_ db: DatabaseQueue, outboxId: String) throws -> Bool {

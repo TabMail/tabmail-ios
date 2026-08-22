@@ -8,9 +8,9 @@ import SwiftUI
 ///
 /// - Phase 1 (present → `pending.undoDeadline`): "Sending. To: …" with a
 ///   left→right progress bar draining under the label; Undo button active.
-/// - Phase 2 (`undoDeadline` → fade): "✓ Message sent"; no Undo button; the 1 s
-///   claim buffer and the 1.5 s confirmation window are visually fused into a
-///   single "sent" phase lasting 2.5 s.
+/// - Phase 2 (`undoDeadline` → fade): "✓ Message queued"; no Undo button.
+///   This is only durable Outbox-admission acknowledgement. The 1 s claim buffer
+///   begins before SMTP is even eligible, so this phase must never claim delivery.
 ///
 /// ⚠️ Phase 1's END is the row's DURABLE `OutboxMessage.holdUntil` less the claim
 /// buffer — NOT `outboxUndoHoldSeconds` counted from when this toast appeared.
@@ -40,7 +40,7 @@ struct PendingSendToast: View {
                 // (bar full) and drains to 0 (bar empty) — a visual cue that
                 // the window is closing.
                 phase1(progress: progress)
-            case .confirming:
+            case .queuedAcknowledgement:
                 phase2
             }
         }
@@ -89,14 +89,14 @@ struct PendingSendToast: View {
         .padding(.horizontal, 16)
     }
 
-    // MARK: - Phase 2: confirmation
+    // MARK: - Phase 2: durable-admission acknowledgement
 
     private var phase2: some View {
         HStack(spacing: 8) {
             Image(systemName: "checkmark.circle.fill")
                 .foregroundStyle(Palette.archive)
                 .font(.subheadline)
-            Text("Message sent")
+            Text("Message queued")
                 .font(.subheadline)
                 .foregroundStyle(.white)
                 .lineLimit(1)

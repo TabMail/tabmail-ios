@@ -307,7 +307,7 @@ struct OutboxRetryEscalationTests {
 @Suite("Outbox Discard Guard")
 struct OutboxDiscardGuardTests {
 
-    /// Replicate discardOutboxMessage DB logic: atomic fetch+check+delete.
+    /// Replicate discardOutboxMessageConfirmed DB logic: atomic fetch+check+delete.
     private func simulateDiscard(_ db: DatabaseQueue, id: String) throws -> Bool {
         try db.write { dbConn in
             guard let msg = try OutboxMessage.fetchOne(dbConn, key: id) else { return false }

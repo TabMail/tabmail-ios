@@ -1711,15 +1711,15 @@ extension AccountManager {
             // oversight and NOT a perf smell to "fix". A future perf pass or linter that re-flags this
             // synchronous @MainActor GRDB write must stop here: converting it re-introduces the
             // IOS-OUTBOX-006 Undo-Send bug. PendingSendService.undo() reads authority and applies this
-            // discard in ONE @MainActor run inside the Undo-Send deadline
-            // (SyncConfig.outboxUndoHoldSeconds + SyncConfig.outboxClaimBufferSeconds). Adding an
+            // discard in ONE @MainActor run before the durable hold's buffered
+            // cancellation deadline. Adding an
             // `await` on this write does two irreversible things:
             //   1. It admits a second Undo tap between decision and apply (Proof B, reentrancy).
             //   2. It can overrun the outboxClaimBufferSeconds budget, so the drain's atomicClaim flips
             //      this row to `.sending` first; the discard then refuses on `.sending`, undo() raises
-            //      the "Couldn't undo" / "Try again." alert with the Undo button already gone — and the
-            //      mail is delivered anyway (Proof A, the deadline). That is the IOS-OUTBOX-006 end state
-            //      (Outbox Reliability Rules 3 and 10), which nothing recovers.
+            //      a truthful "cancellation wasn't confirmed" alert after the Undo button is gone — and
+            //      the mail is delivered anyway (Proof A, the deadline). That is the IOS-OUTBOX-006 end
+            //      state (Outbox Reliability Rules 3 and 10), which nothing recovers.
             // Keep it synchronous.
             let outcome: (deleted: Bool, dir: String?) = try AppDatabase.dbPool.write { db in
                 guard let msg = try OutboxMessage.fetchOne(db, key: messageId),
@@ -1743,11 +1743,6 @@ extension AccountManager {
             print("[Outbox] ERROR: Failed to cancel \(messageId): \(error)")
             return false
         }
-    }
-
-    /// Void wrapper for callers that do not need confirmation.
-    nonisolated func discardOutboxMessage(_ messageId: String) {
-        _ = discardOutboxMessageConfirmed(messageId)
     }
 
     #if DEBUG

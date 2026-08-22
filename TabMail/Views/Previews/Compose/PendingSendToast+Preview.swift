@@ -12,7 +12,7 @@ import SwiftUI
 // waiting 5+ seconds, exactly as a real send with negligible persist latency.
 //
 // Phase 1 (elapsed < 5 s): "Sending. To: …" with progress bar + Undo.
-// Phase 2 (elapsed ≥ 5 s): "✓ Message sent" (no Undo).
+// Phase 2 (elapsed ≥ 5 s): "✓ Message queued" (no Undo; SMTP not implied).
 
 @MainActor
 private func previewToast(
@@ -57,7 +57,7 @@ private func previewToast(
     }
 }
 
-#Preview("Phase 2 — '✓ Message sent' (6 s elapsed)") {
+#Preview("Phase 2 — '✓ Message queued' (6 s elapsed)") {
     ZStack {
         Color.gray.opacity(0.1).ignoresSafeArea()
         previewToast(elapsed: 6)

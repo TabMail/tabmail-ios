@@ -63,6 +63,29 @@ predicate drives the row's countdown text and its tick timer). So the durable ho
 the contract in shipped behaviour, and the toast was the outlier — not a design question, a
 consistency defect.
 
+**Class closure after exact-diff review.** That sibling was evidence for the contract but was not
+itself safe: it used raw `holdUntil`, spent the claim buffer, and discarded the confirmed-delete
+result. The final #76 candidate centralizes the executor predicates in
+`OutboxCancellationPolicy` (`status`, `sentAt`, and the buffered deadline). `OutboxHeldState` is the
+production row driver: while it resolves Cancel Send it returns the exact deadline as
+`invalidationAt`. `OutboxRowDeadlineRefreshDriver` owns the production connection from that render
+state through a stable `.task(id:)`, one-shot wait, boundary-version invalidation, fresh state
+resolution, and the next render instead of waiting for the unrelated 1 Hz countdown. A hosted
+`OutboxRow` test injects only the clock, sleeper, and render observer, so deleting or disconnecting
+that connection fails while the same production row is on screen. Both toast and row therefore
+withdraw Cancel Send at `holdUntil - outboxClaimBufferSeconds`.
+
+At gesture time `OutboxActionController` re-resolves the current action and calls
+`discardOutboxMessageConfirmed`. A presented Cancel Send that has downgraded to Discard is still
+honoured: the durable hold prevents `atomicClaim` until `holdUntil`, and both labels execute the same
+confirmed delete. Refusal occurs only when current state exposes no safe destructive action or the
+executor rejects. The controller is owned by `OutboxView`, not the row, so refusal state outlives any
+one acted-on `ForEach` row; the sibling Retry result routes through the same parent-owned state.
+That ownership does not extend beyond the enclosing `OutboxView`: navigation may dismiss it when the
+outbox empties, which remains a separate, pre-existing presentation-lifetime limitation.
+Failed-unsent rows retain Discard, sent/sending rows expose nothing, and the unused void discard
+wrapper is deleted.
+
 > **When a contract is ambiguous, look for a sibling affordance over the same durable state before
 > designing anything.** If one exists, the ambiguity is usually already resolved somewhere in the
 > tree, and the fix is consistency with shipped behaviour rather than a new invention. This is the
@@ -88,7 +111,10 @@ consistency defect.
   can already be in the past at `present(...)`, and `UInt64(a negative Double)` is a runtime **trap**
   in Swift — the companion hazard already recorded in topic `100`.
 - Pinned by `UndoAffordanceHoldInvariantTests` (four invariant tests, one a nine-argument latency
-  sweep) plus the producer-side `reportedHoldUntilIsTheStoredHoldUntil` in `OutboxDoubleSendTests`.
+  sweep), `OutboxListCancellationInvariantTests` (a hosted production-row render across the exact
+  invalidation task, safe downgrade, row-independent controller state, Retry refusal, executor-guard
+  parity),
+  and the producer-side `reportedHoldUntilIsTheStoredHoldUntil` in `OutboxDoubleSendTests`.
   `KNOWN_ISSUES.md` `IOS-PERF-010`'s Proof A is superseded in place, not deleted: its Δ-eroded
   arithmetic no longer holds, while its *must stay synchronous* verdict on
   `discardOutboxMessageConfirmed` is unchanged and now rests on a guaranteed 1 s budget.

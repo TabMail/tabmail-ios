@@ -349,7 +349,7 @@ struct OutboxReconcileInFlightSendTests {
     //    guardrail; the deadline race cannot otherwise be forced here because the
     //    seeded `holdUntil` keeps the drain from ever claiming the row.
     //  • Removing the synchronous `current = nil` clear from undo() reds the
-    //    reentrancy test (the second tap re-enters and stamps "Try again.") — the
+    //    reentrancy test (the second tap re-enters and records a refusal) — the
     //    Proof B regression — and also reds the deadline test's `current == nil`.
     //  • Deferring the row delete to a fire-and-forget async write reds the
     //    reentrancy test's synchronous-deletion assertion (`rowGone`), which has no
@@ -394,8 +394,8 @@ struct OutboxReconcileInFlightSendTests {
     }
 
     /// **Proof A, the deadline invariant — what this test PINS.** An Undo tap on a
-    /// verified generation, taken while the Undo button is rendered
-    /// (elapsed < `outboxUndoHoldSeconds`), completes the cancellation inside the
+    /// verified generation, taken while the production toast resolves before its
+    /// durable buffered deadline, completes the cancellation inside the
     /// single synchronous `@MainActor` `undo()` run: it returns a reopenable
     /// snapshot, raises no false failure, clears the toast, and the durable row is
     /// gone by the time `undo()` returns.
@@ -408,7 +408,7 @@ struct OutboxReconcileInFlightSendTests {
     /// while the button is rendered. "The message was not transmitted" is therefore
     /// a consequence of that `holdUntil`, not a deadline-race outcome, and is NOT
     /// asserted (that would be a vacuous pin — the drain is refused regardless).
-    /// The red — mail shipped while the toast showed "Try again." — was observed
+    /// The red — mail shipped while the toast reported an unconfirmed Undo — was observed
     /// during development by temporarily wrapping the discard in a `Task.sleep`,
     /// then removed; it is not reproduced by this committed test.
     ///
@@ -417,7 +417,7 @@ struct OutboxReconcileInFlightSendTests {
     /// removed), and a deleted row. A fire-and-forget async discard that only
     /// defers the delete is caught deterministically by the sibling reentrancy
     /// test's `rowGone`, which has no live drain racing the read.
-    @Test("An Undo tap inside the hold window cancels the send synchronously — reopenable, no false failure, row deleted")
+    @Test("An Undo tap before the buffered deadline cancels synchronously — reopenable, no false failure, row deleted")
     @MainActor
     func undoInsideHoldWindowCancelsAndNeverDeliversMail() async throws {
         let (pool, dir, previous) = try makeTestDB()
@@ -479,7 +479,7 @@ struct OutboxReconcileInFlightSendTests {
     ///
     /// This is GREEN on the current synchronous code. It reds if that synchronous
     /// `current = nil` clear is deferred or removed: the second tap then re-enters,
-    /// discards the already-deleted row, and stamps "Try again." on a successful
+    /// discards the already-deleted row, and stamps a refusal on a successful
     /// undo (the R16-9 mirror) — caught here by the `undoFailureMessage == nil`
     /// assertion. That red was observed during development by mutating the clear,
     /// then reverted; the committed test guards against the regression rather than

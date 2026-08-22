@@ -2,7 +2,7 @@
 
 **Class:** review-discipline / fail-closed design
 **Severity:** high (a false "recoverable" claim shipped in a commit body, and it was the load-bearing justification for the fix's accepted cost)
-**First seen:** 2026-08 · **Recurrences:** 3 · **Status:** Active
+**First seen:** 2026-08 · **Recurrences:** 4 · **Status:** Active
 **Related:** `MIS-IOS-007` (the same session, the same guard — a premise that felt checked because real code was read) · **Rule owner:** `tabmail-ios/CLAUDE.md` § *THE MANTRA*
 
 ## The tell
@@ -154,7 +154,23 @@ requirement on the fallback without checking whether the fallback used identity 
 countermeasure is: **enumerate the recovery mechanism's predicates mechanically; do not transfer a
 predicate from the failing path merely because both paths target the same user-visible state.**
 
-### Pre-compaction index line (verbatim, 2026-08-15)
+---
+
+## Instance 4 — 2026-08-21, issue #76: called a Send recoverable because it could reach Sent
+
+The current-memory explanation for fail-closed Undo presentation said withholding Undo was
+recoverable because the original Send would remain queued and eventually appear in Sent. That
+asserted recovery for the wrong intention: delivery is the original **Send** path, not recovery of
+an **Undo** intention. The safe invariant is narrower and mechanical: no Undo intention or promise
+was accepted while the original Send remained durably queued and retryable. Once Undo is accepted,
+the product owes a confirmed discard and must surface a refusal rather than relabel successful
+delivery as recovery.
+
+This recurrence adds an intention-identity question to the negative pass: **which user intention is
+the named mechanism completing?** A durable fallback for intention A cannot establish
+recoverability for refused intention B merely because both operate on the same row.
+
+## Pre-compaction index line (verbatim, 2026-08-15)
 
 The Instance 3 recurrence initially pushed the mandatory index over its 12 KB budget. Its full index
 text is preserved byte-for-byte here before the startup-context pointer was shortened:

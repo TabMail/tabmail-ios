@@ -5,6 +5,82 @@
 import Foundation
 import GRDB
 
+/// The destructive action an Outbox row may truthfully offer at an instant.
+enum OutboxCancellationAction: Equatable, Sendable {
+    case cancelSend
+    case discard
+
+    var label: String {
+        switch self {
+        case .cancelSend: "Cancel Send"
+        case .discard: "Discard"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .cancelSend: "xmark.circle"
+        case .discard: "trash"
+        }
+    }
+}
+
+/// Converts wall-clock deadline intervals to the nanoseconds accepted by
+/// `Task.sleep` without trapping at either numeric boundary.
+enum OutboxDeadlineScheduler {
+    private static let nanosecondsPerSecond: TimeInterval = 1_000_000_000
+    /// `Double(UInt64.max)` rounds up to 2^64 and is not itself convertible.
+    /// `nextDown` is the largest representable Double strictly below that trap.
+    private static let maxConvertibleNanoseconds = Double(UInt64.max).nextDown
+
+    static func nanoseconds(for interval: TimeInterval) -> UInt64 {
+        guard !interval.isNaN else { return 0 }
+        let nanoseconds = max(0, interval) * nanosecondsPerSecond
+        return UInt64(min(nanoseconds, maxConvertibleNanoseconds))
+    }
+
+    static func nanoseconds(until deadline: Date, at instant: Date) -> UInt64 {
+        nanoseconds(for: deadline.timeIntervalSince(instant))
+    }
+}
+
+/// One policy shared by every UI affordance over the Outbox send hold.
+enum OutboxCancellationPolicy {
+    /// The last instant at which cancellation may be offered. The full claim
+    /// buffer remains after this deadline for the synchronous confirmed discard
+    /// to commit before the drain becomes eligible to claim the row.
+    static func undoDeadline(for holdUntil: Date?) -> Date {
+        guard let holdUntil else { return .distantPast }
+        return holdUntil.addingTimeInterval(-SyncConfig.outboxClaimBufferSeconds)
+    }
+
+    /// Resolve from durable row state at a caller-supplied instant. A queued row
+    /// loses its cancellation affordance at the SAME buffered deadline as the
+    /// compose toast. After that boundary a queued row may still offer the
+    /// lower-guarantee Discard action so an offline/stuck send retains user
+    /// agency, but it must not still call that action "Cancel Send". Failed rows
+    /// remain discardable and sending rows offer no destructive action.
+    static func action(
+        status: OutboxStatus,
+        sentAt: Date?,
+        holdUntil: Date?,
+        at instant: Date
+    ) -> OutboxCancellationAction? {
+        // `sentAt` is the double-send firewall. Regardless of a stale status,
+        // once provider success is stamped this row belongs only to Sent-append
+        // recovery and no destructive send affordance can truthfully execute.
+        guard sentAt == nil else { return nil }
+        switch status {
+        case .queued:
+            return instant < undoDeadline(for: holdUntil) ? .cancelSend : .discard
+        case .sending:
+            return nil
+        case .failed:
+            return .discard
+        }
+    }
+}
+
 /// Which face the undo-send toast must show at a given instant.
 ///
 /// Deliberately a free function of three `Date`s rather than a method that reads
@@ -17,8 +93,9 @@ enum PendingSendToastPhase: Equatable, Sendable {
     /// The Undo affordance is offered. `progress` drains 1 → 0 across the
     /// visible window.
     case undoable(progress: Double)
-    /// "✓ Message sent" — no Undo affordance.
-    case confirming
+    /// "✓ Message queued" — durable admission acknowledged, with no claim
+    /// that SMTP has completed.
+    case queuedAcknowledgement
 
     /// 🚨 THE INVARIANT THIS FUNCTION EXISTS TO HOLD: `.undoable` is returned
     /// ONLY for an instant strictly before `undoDeadline`, and `undoDeadline` is
@@ -30,19 +107,21 @@ enum PendingSendToastPhase: Equatable, Sendable {
         presentedAt: Date,
         undoDeadline: Date
     ) -> PendingSendToastPhase {
-        guard instant < undoDeadline else { return .confirming }
+        guard instant < undoDeadline else { return .queuedAcknowledgement }
         // Drain the bar across whatever window actually remains. A slow persist
         // shortens the VISIBLE window; it never moves the deadline.
         let window = undoDeadline.timeIntervalSince(presentedAt)
-        guard window > 0 else { return .confirming }
+        guard window > 0 else { return .queuedAcknowledgement }
         let remaining = undoDeadline.timeIntervalSince(instant) / window
         return .undoable(progress: max(0, min(1, remaining)))
     }
 }
 
 /// Tracks the single in-flight "undo send" toast. The user taps Send; this
-/// service shows a Gmail-style toast ("Sending … Undo") for `outboxUndoHoldSeconds`,
-/// then flips to "✓ Message sent" for a brief confirmation, then fades.
+/// service offers Undo only until the durable row's buffered cancellation
+/// deadline, then acknowledges "✓ Message queued" briefly before fading.
+/// That acknowledgement means the Send intention is durably admitted; it is not
+/// evidence that SMTP has completed.
 ///
 /// Design:
 /// - Only one pending toast at a time (the most recent send). A second
@@ -83,8 +162,7 @@ final class PendingSendService {
         /// row the drain may already claim — fail closed, never offer an undo we
         /// cannot honour.
         var undoDeadline: Date {
-            guard let holdUntil else { return .distantPast }
-            return holdUntil.addingTimeInterval(-SyncConfig.outboxClaimBufferSeconds)
+            OutboxCancellationPolicy.undoDeadline(for: holdUntil)
         }
     }
 
@@ -146,11 +224,11 @@ final class PendingSendService {
             presentedAt: now,
             holdUntil: holdUntil)
 
-        // One auto-dismiss Task at the full visible window, anchored on the
+        // One auto-dismiss Task whose remaining visible window is anchored on the
         // DURABLE hold rather than on this instant:
-        //   phase 1 (undo):    now → holdUntil - outboxClaimBufferSeconds
-        //   claim buffer:      → holdUntil                (drain claims here)
-        //   phase 2 (✓):       → + outboxPostSendConfirmSeconds
+        //   phase 1 (undo):     now → holdUntil - outboxClaimBufferSeconds
+        //   phase 2 (✓ queued): deadline → holdUntil + queued acknowledgement
+        //                       (it includes the claim buffer before SMTP starts)
         //   fade
         //
         // 🚨 `max(0, …)` is load-bearing, not defensive dressing: `holdUntil` can
@@ -158,9 +236,10 @@ final class PendingSendService {
         // in-flight row), and `UInt64(a negative Double)` is a runtime TRAP in
         // Swift — not a saturating conversion (`Companion/Memory/Current/100-…`).
         let total = max(0, (holdUntil ?? now).timeIntervalSince(now))
-                  + SyncConfig.outboxPostSendConfirmSeconds
+                  + SyncConfig.outboxQueuedAcknowledgementSeconds
         dismissTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(total * 1_000_000_000))
+            try? await Task.sleep(
+                nanoseconds: OutboxDeadlineScheduler.nanoseconds(for: total))
             guard !Task.isCancelled else { return }
             // PendingSendService is @MainActor, so the Task body is already
             // MainActor-isolated — no MainActor.run wrapper needed.
@@ -239,7 +318,8 @@ final class PendingSendService {
     ///   `rg --pcre2 -c '^(?!\s*(///|//)).*undoFailureMessage = Self\.undoNotConfirmedMessage'` It says only what was
     /// observed — like `undoFailureMessage`'s own contract, it claims nothing about
     /// what happened to the message, because at this point we do not know.
-    private static let undoNotConfirmedMessage = "Try again."
+    private static let undoNotConfirmedMessage =
+        "The cancellation wasn't confirmed. The message may already be sending."
 
     /// The three answers a retained-authority read can give, kept apart because two
     /// of them used to arrive as the same `nil`.
@@ -251,10 +331,11 @@ final class PendingSendService {
     /// only), and `send()` mints no Drafts-folder header to supply a key, so a
     /// manually-composed message's authored text is stranded and eventually evicted.
     /// No sync repairs local-only authored content, and retyping is not recovery.
-    /// Declining leaves the send pending and still cancellable — the user can tap
-    /// Undo again inside the hold window, and in the worst case the message is
-    /// *sent*, which puts the content in Sent where they can reach it. One direction
-    /// loses the content; the other keeps it.
+    /// Declining preserves the original durable Send intention exactly; it does
+    /// not turn an unconfirmed cancellation request into deletion. No Undo
+    /// intention or cancellation promise was accepted, and the queued send stays
+    /// on its ordinary durable/retryable Outbox path. One direction silently drops
+    /// authored content; the other truthfully leaves the original Send in force.
     ///
     /// ⚠ THE MIRROR IMAGE, stated because the symmetrical fix would be worse than
     /// the bug: `.mismatchOrAbsent` must STILL cancel. Refusing to cancel on every

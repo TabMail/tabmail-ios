@@ -632,7 +632,7 @@ struct OutboxDrainIntegrationTests {
         msg.status = OutboxStatus.sending.rawValue
         try db.write { try msg.insert($0) }
 
-        // Simulate discardOutboxMessage logic: refuse to discard if sending
+        // Simulate discardOutboxMessageConfirmed logic: refuse to discard if sending
         let discarded = try db.write { dbConn -> Bool in
             guard let fetched = try OutboxMessage.fetchOne(dbConn, key: msg.id) else { return false }
             guard fetched.outboxStatus != .sending else { return false }
