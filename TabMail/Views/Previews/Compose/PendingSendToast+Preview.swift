@@ -6,12 +6,13 @@
 import SwiftUI
 
 // Previews for the undo-send toast.
-// The toast is TimelineView-driven and renders its phase from
-// `Date().timeIntervalSince(pending.queuedAt)`. We fake `queuedAt` at
-// various offsets so the canvas shows each phase without waiting 5+ seconds.
+// The toast is TimelineView-driven and renders its phase from the row's DURABLE
+// `holdUntil` (via `Pending.undoDeadline`), not from when it was presented. We
+// backdate both anchors by `elapsed` so the canvas shows each phase without
+// waiting 5+ seconds, exactly as a real send with negligible persist latency.
 //
 // Phase 1 (elapsed < 5 s): "Sending. To: …" with progress bar + Undo.
-// Phase 2 (elapsed ≥ 5 s): "✓ Message sent" (no Undo).
+// Phase 2 (elapsed ≥ 5 s): "✓ Message queued" (no Undo; SMTP not implied).
 
 @MainActor
 private func previewToast(
@@ -24,7 +25,9 @@ private func previewToast(
         draftId: "preview-draft-id",
         instanceEpoch: "preview-instance-epoch",
         toSummary: toSummary,
-        queuedAt: queuedAt
+        presentedAt: queuedAt,
+        holdUntil: queuedAt.addingTimeInterval(
+            SyncConfig.outboxUndoHoldSeconds + SyncConfig.outboxClaimBufferSeconds)
     )
     return PendingSendToast(
         pending: pending,
@@ -54,7 +57,7 @@ private func previewToast(
     }
 }
 
-#Preview("Phase 2 — '✓ Message sent' (6 s elapsed)") {
+#Preview("Phase 2 — '✓ Message queued' (6 s elapsed)") {
     ZStack {
         Color.gray.opacity(0.1).ignoresSafeArea()
         previewToast(elapsed: 6)

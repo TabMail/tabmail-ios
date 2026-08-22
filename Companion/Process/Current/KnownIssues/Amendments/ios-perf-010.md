@@ -173,20 +173,58 @@ index requirements are unchanged.
     `PrioritizedDatabase.write` overload additionally awaits `DatabaseWriteQueue.acquire(.priority)`
     (whose own comment records a 3-row `merge.phase1` upsert taking multiple seconds). Converting ADDS
     that wait INSIDE that already-Δ-eroded budget → the drain claims the row → the discard then refuses
-    on `.sending` → `PendingSendService.undoFailureMessage = "Try again."` with the Undo button no
-    longer rendered and **the mail delivered**. That is the `IOS-OUTBOX-006` end state (BLOCKING,
-    non-registrable — a delivered message for which the user was shown the `RootView` "Couldn't undo"
-    alert with body `PendingSendService.undoNotConfirmedMessage` ("Try again.") and the Undo button
-    already gone; nothing recovers the delivered mail). The Δ gap only sharpens this — a smaller real
+    on `.sending` → `PendingSendService.undoFailureMessage` reports that cancellation was not confirmed,
+    with the Undo button no longer rendered and **the mail delivered**. That is the
+    `IOS-OUTBOX-006` end state (BLOCKING, non-registrable — a delivered message for which the user was
+    shown the `RootView` "Couldn't undo" alert after the Undo button was already gone; nothing recovers
+    the delivered mail). The Δ gap only sharpens this — a smaller real
     budget is more reason to keep the write off the async queue, never less. Keeping this write
     synchronous is therefore a deliberate design decision / accepted limitation, not an unaddressed
     perf smell — the in-code annotation on `discardOutboxMessageConfirmed` is the durable guardrail
     against a future pass re-flagging and converting it.
+
+    ⚠️ **Proof A's ARITHMETIC is superseded (2026-08-20, GitHub iOS
+    [#76](https://github.com/TabMail/tabmail-ios/issues/76)); its VERDICT is not.** The Δ-eroded
+    budget described above — *"roughly `(1.1 - Δ)` s … shrinking toward zero (or below) as Δ grows"* —
+    **was itself the bug**, not merely a sharpening of this one, and it is fixed. The toast's Undo
+    window is no longer anchored at `PendingSendService.present()`: `persistQueuedSend` now RETURNS
+    the durable `holdUntil` it stamped, `queueSend` carries it to `ComposeView`, and
+    `PendingSendService.Pending.undoDeadline` derives the button's withdrawal instant as
+    `holdUntil - outboxClaimBufferSeconds`. Δ therefore shortens the VISIBLE window (to nothing, if it
+    exceeds the whole hold) instead of pushing the button past the deadline. **Do not restate the
+    `(1.1 - Δ)` figure**: the budget at the last tappable instant is now a guaranteed full
+    `outboxClaimBufferSeconds` = **1 s**, and it can no longer reach zero or go negative.
+    **Member 5 stays MUST STAY SYNCHRONOUS, and this change strengthens rather than weakens that**:
+    the refusal never depended on the budget being *smaller* than 1 s — it depends on the async
+    `PrioritizedDatabase.write` overload additionally awaiting `DatabaseWriteQueue.acquire(.priority)`,
+    whose own comment records multi-second waits, which does not fit inside 1 s either. Proofs B and C
+    are untouched by #76 and are independently sufficient on their own. **Trip-wire, replacing the old
+    Δ one:** if anything ever makes `Pending.undoDeadline` stop deriving from the row's durable
+    `holdUntil` — a default value on `present(…, holdUntil:)`, a re-anchor at presentation, a second
+    writer of `holdUntil` — the guaranteed 1 s budget lapses and this paragraph's arithmetic must be
+    re-derived before any conversion is considered.
+
+    **Class closure added after exact-diff review.** `OutboxRow` was a sibling affordance over the
+    same durable hold, but it gated "Cancel Send" on raw `holdUntil` and discarded the confirmed
+    delete result. The final #76 candidate routes both toast and Outbox row through
+    `OutboxCancellationPolicy`'s buffered deadline and executor guards. `OutboxHeldState` gives the
+    production row an exact one-shot `invalidationAt`; `OutboxRowDeadlineRefreshDriver` owns the
+    stable task, one-shot wait, boundary invalidation, fresh resolution, and next render independently
+    of the 1 Hz countdown. The hosted production-row test turns red if that connection is removed or
+    disconnected. At gesture
+    time, a presented Cancel Send that now resolves to Discard still attempts the same synchronous
+    confirmed delete; refusal is truthful only when no safe current action exists or the executor
+    rejects. Parent-owned `OutboxActionController` keeps failure state alive across removal of any
+    one `ForEach` row and also surfaces the sibling Retry refusal. It does not outlive the enclosing
+    `OutboxView`; outbox-empty navigation dismissal remains a separate, pre-existing presentation
+    limitation. Failed-unsent rows retain Discard, `sentAt` or sending rows expose nothing, and the
+    unused void discard wrapper is deleted.
   - **Proof B (reentrancy).** `RootView` wires `PendingSendToast(onUndo: { if let snapshot =
     pendingSendService.undo() { … } })` — a synchronous decide-then-apply whose return drives a
     `fullScreenCover`. An `await` forces a `Task {}` at a Button that is NOT disabled, so a second tap
     re-enters `undo()` before the first cleared `current`; the second `discardOutboxMessageConfirmed`
-    returns false (row already deleted) and sets `"Try again."` on a SUCCESSFUL undo — the mirror
+    returns false (row already deleted) and sets a cancellation-not-confirmed alert on a SUCCESSFUL
+    undo — the mirror
     image of the R16-9 defect.
   - **Proof C (memory 104).** `retainedAuthorityOutcome(for:)` authorises; the discard is the write it
     authorises; inserting a suspension between them is the read-latch-then-await-then-mutate class that
@@ -195,20 +233,21 @@ index requirements are unchanged.
     cold-I/O boot, and staging is pending precisely on foreground return). Also
     `PendingSendService.present()` can replace `current` across the suspension, so
     `dismissTask?.cancel(); current = nil` would clear the NEWER toast.
-  - The `OutboxRow` swipe caller ("Cancel Send" while `isHeld`) sits inside the same hold window, so
-    splitting sync/async variants would give one invariant two writers. Outbox Reliability Rule 3
-    (`sentAt` before delete — the double-send firewall) and Rule 10 (cannot discard a `sending`
-    message) are the rules the end state violates.
+  - The `OutboxRow` swipe caller shares the same buffered deadline and synchronous confirmed-write
+    path through `OutboxCancellationPolicy` / `OutboxActionController`; splitting sync/async
+    variants would again give one invariant two writers. Outbox Reliability Rule 3 (`sentAt` before
+    delete — the double-send firewall) and Rule 10 (cannot discard a `sending` message) are the rules
+    the end state violates.
 
   **Member 4 — the weakest, still no-touch.** Durable admission is a SQL CAS
   (`WHERE id = ? AND status = 'failed' AND sentAt IS NULL`, `changesCount == 1`), so D1 survives an
-  async conversion, and retry does NOT rewrite `holdUntil`, so Proof A does not apply. But the doc
+  async conversion, and retry does NOT rewrite `holdUntil`, so Proof A does not apply. The doc
   comment records `NavigationStore`'s 100 ms refresh debounce leaving a stale `.failed` snapshot
-  visible after a first Retry already queued the row — an `await` widens that window; a repeat tap off
-  the stale snapshot is then refused silently (the `Bool` result discarded) → an unresponsive-feeling
-  Retry — and its side effects are documented as "mirroring `discardOutboxMessageConfirmed`", so
-  converting one half of a deliberately symmetric pair is the fix-at-one-entry-of-two shape that
-  `IOS-OUTBOX-006` warns against. **Trip-wire for the record: if `retryOutboxMessage` ever starts
+  visible after a first Retry already queued the row; an `await` widens that window. The repeat tap is
+  now refused **visibly** by parent-owned `OutboxActionController`, so it no longer feels like a dead
+  gesture, but its side effects remain documented as "mirroring `discardOutboxMessageConfirmed`".
+  Converting one half of a deliberately symmetric pair is still the fix-at-one-entry-of-two shape
+  that `IOS-OUTBOX-006` warns against. **Trip-wire for the record: if `retryOutboxMessage` ever starts
   writing `holdUntil`, it moves under Proof A and this inconclusive classification no longer holds.**
 
   **Members 1–3 — the folder-role writes.** What the synchronous write currently guarantees:
@@ -381,7 +420,9 @@ as five members of one hazard, is wrong in both directions and has already been 
   declared in the file `AccountManagerOutbox.swift` on `actor AccountManager` (that file is a single
   `extension AccountManager`, so `AccountManagerOutbox` is not a type). **The other three are folder-role
   writes on a Settings path** and have no undo race at all.
-- **The two families have DIFFERENT hazards.** Members 4–5: Proof A's Δ-eroded undo budget and the
+- **The two families have DIFFERENT hazards.** Members 4–5: Proof A's Δ-eroded undo budget (⚠️ **that
+  budget is no longer Δ-eroded** — see the 2026-08-20 supersession note inside Proof A itself, GitHub
+  iOS #76; it is now a guaranteed 1 s, which does not change member 5's verdict) and the
   `IOS-OUTBOX-006` end state — a *delivered* message for which the user was shown "Couldn't undo" with
   the Undo button already gone; nothing recovers the delivered mail. Members 1–3: the loss of **gesture
   order == durable order**, i.e. a **NEVER DROP USER INTENTION** violation in which two unstructured

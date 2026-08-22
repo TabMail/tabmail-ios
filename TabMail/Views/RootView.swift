@@ -41,11 +41,10 @@ struct RootView: View {
     @State private var isCheckingConsent = false
 
     // MARK: - Undo-send toast state
-    /// Snapshot of the cancelled send's contents. PendingSendService.undo()
-    /// deletes the Draft row + discards the outbox row; this snapshot is what
-    /// RootView uses to present a fresh ComposeView with prefill args so the
-    /// user's content is restored. Because the Draft is gone, the reopened
-    /// compose's close-action runs through the normal save-draft prompt.
+    /// Exact authority for the retained Draft generation behind a confirmed
+    /// cancellation. PendingSendService.undo() discards only the Outbox row;
+    /// RootView hands this authority to UndoReopenCompose so it can bind to that
+    /// retained Draft without accepting a replacement owner or generation.
     @State private var reopenSnapshot: PendingSendService.ReopenSnapshot?
     private var pendingSendService: PendingSendService { PendingSendService.shared }
 
@@ -299,10 +298,10 @@ struct RootView: View {
         } message: {
             Text(demoStartError ?? "")
         }
-        // Undo-send could not be decided. `PendingSendService.undo()` left both the
-        // Outbox row and the toast in place (a thrown read is not a verdict), so the
-        // send is still pending and still cancellable — this says only that, and
-        // claims nothing about what happened to the message.
+        // Undo-send was not confirmed. `PendingSendService.undo()` made no
+        // cancellation change and left the toast in place. The durable Send may
+        // still be queued or may already be sending, so this alert says only that
+        // the Undo attempt did not take; it never promises the message was stopped.
         .alert("Couldn't undo", isPresented: Binding(
             get: { pendingSendService.undoFailureMessage != nil },
             set: { if !$0 { pendingSendService.dismissUndoFailure() } }
@@ -314,10 +313,10 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .demoModeDidExit)) { _ in
             demoSeedingComplete = false
         }
-        // Undo-Send reopen: present a fresh ComposeView with prefill args.
-        // The Draft row has been deleted (see PendingSendService.undo) so the
-        // compose isn't bound to an existing draft — close → save prompt fires
-        // normally through saveDraftAndDismiss.
+        // Undo-Send reopen: the Outbox cancellation was confirmed and the Draft
+        // row remains durable. UndoReopenCompose resolves the snapshot's exact
+        // owner/generation authority and binds the fresh ComposeView to that row;
+        // ADR-IOS-065 owns its retained-draft close/save semantics.
         .fullScreenCover(item: $reopenSnapshot) { snapshot in
             UndoReopenCompose(snapshot: snapshot)
         }

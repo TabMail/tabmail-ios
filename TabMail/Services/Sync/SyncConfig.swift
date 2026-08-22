@@ -633,21 +633,33 @@ enum SyncConfig {
 
     // MARK: - Outbox Send Throttle
 
-    /// Duration (seconds) of the UI Undo window. During this window, the toast
-    /// shows an Undo button; the user can tap to cancel the send.
+    /// Nominal Undo budget (seconds) stamped from durable queue admission START.
+    /// Persist latency consumes this budget, so the toast's visible Undo window
+    /// can be shorter (including absent); it never starts a fresh five seconds.
     static let outboxUndoHoldSeconds: TimeInterval = 5
 
     /// Safety buffer (seconds) between the UI Undo deadline and the drain's
     /// hold deadline. OutboxMessage.holdUntil = queuedAt + outboxUndoHoldSeconds
-    /// + outboxClaimBufferSeconds, but the Undo button is only rendered for
-    /// outboxUndoHoldSeconds. This gap eliminates TOCTOU races between
-    /// user-taps-Undo and drain's atomic claim.
+    /// + outboxClaimBufferSeconds, and the Undo button is withdrawn at
+    /// `holdUntil - outboxClaimBufferSeconds`. This gap eliminates TOCTOU races
+    /// between user-taps-Undo and drain's atomic claim.
+    ///
+    /// ⚠️ The button's deadline is derived by SUBTRACTING this buffer from the
+    /// durable `holdUntil` — it is NOT `outboxUndoHoldSeconds` counted from
+    /// whenever the toast appeared. Those two coincide only when the persist
+    /// costs nothing; `queuedAt` is captured at persist START while the toast is
+    /// presented after the awaited write returns, so counting from the toast puts
+    /// the button `Δ` seconds past the deadline, where `Δ` is the persist latency
+    /// (issue #76). A slow persist must shorten the VISIBLE undo window, never
+    /// the durable hold and never past it.
     static let outboxClaimBufferSeconds: TimeInterval = 1
 
-    /// Duration (seconds) of the "Message sent ✓" confirmation phase shown
-    /// after the Undo window closes. Total visible toast time =
-    /// outboxUndoHoldSeconds + outboxClaimBufferSeconds + outboxPostSendConfirmSeconds.
-    static let outboxPostSendConfirmSeconds: TimeInterval = 1.5
+    /// Extra duration (seconds) for the "Message queued ✓" acknowledgement
+    /// beyond the durable hold. The phase begins at the buffered Undo deadline
+    /// and includes the claim buffer; it acknowledges durable Outbox admission,
+    /// NOT SMTP completion. Total visible time is the hold time REMAINING when
+    /// presentation begins plus this duration; persist latency may shorten it.
+    static let outboxQueuedAcknowledgementSeconds: TimeInterval = 1.5
 
     /// Minimum gap (seconds) between successive sends in the serial drain loop.
     /// Task.sleep between iterations — no per-account tracking needed.

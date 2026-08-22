@@ -298,7 +298,7 @@ struct OutboxParallelDrainTests {
         #expect(beforeDiscard.count == 1)
         #expect(beforeDiscard[0].subject == "Still queued")
 
-        // Simulate discardOutboxMessage: atomic fetch + delete
+        // Simulate discardOutboxMessageConfirmed: atomic fetch + delete
         let discarded = try db.write { dbConn -> Bool in
             guard let msg = try OutboxMessage.fetchOne(dbConn, key: failedMsg.id) else { return false }
             guard msg.outboxStatus != .sending else { return false }
@@ -308,7 +308,7 @@ struct OutboxParallelDrainTests {
         #expect(discarded == true)
 
         // After discard: drain query still finds the queued message
-        // (in the new code, discardOutboxMessage triggers drainOutbox)
+        // (in production, a confirmed discard triggers drainOutbox)
         let afterDiscard = try db.read {
             try OutboxMessage
                 .filter(Column("status") == OutboxStatus.queued.rawValue)

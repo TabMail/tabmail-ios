@@ -1,3 +1,6 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note:** Issue #76 deleted the unused void `discardOutboxMessage` wrapper. The live mutating surface is `discardOutboxMessageConfirmed`, whose committed deletion still triggers `drainOutbox`; read Decision item 4's preserved historical symbol name through that amendment.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ## ADR-IOS-019: Outbox — Persistent Offline Send Queue
 

@@ -11,8 +11,9 @@ import GRDB
 // What to look for:
 //   - Held rows show "Sending in Xs" with an hourglass icon, counting down
 //     each second (the Timer publisher in OutboxRow drives the redraw).
-//   - Swipe left: label should read "Cancel Send" while held, "Discard"
-//     after hold expires or for non-held rows.
+//   - Swipe left: label should read "Cancel Send" only before the buffered
+//     cancellation deadline (`holdUntil - outboxClaimBufferSeconds`), then
+//     "Discard" through the final claim-buffer interval and for non-held rows.
 
 /// Seed a held OutboxMessage with holdUntil at `secondsFromNow` in the future.
 private func seedHeld(

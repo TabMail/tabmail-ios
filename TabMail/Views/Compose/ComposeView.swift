@@ -3517,9 +3517,9 @@ struct ComposeView: View {
 
         // Queue to outbox (persists to GRDB + disk, then drains async).
         // If persistence fails, show error — do NOT dismiss or the message is lost.
-        let outboxId: String
+        let queued: (outboxId: String, holdUntil: Date?)
         do {
-            outboxId = try await AccountManager.shared.queueSend(
+            queued = try await AccountManager.shared.queueSend(
                 draft: snapshot.outbound,
                 from: snapshot.account,
                 // The RESOLVED parent, not the raw parameter: `persistQueuedSend`
@@ -3564,17 +3564,23 @@ struct ComposeView: View {
             let tail = snapshot.to.count > 2 ? " +\(snapshot.to.count - 2)" : ""
             toSummary = "To: \(head)\(tail)"
         }
+        // `holdUntil` travels with the id: it is anchored at persist START, so by
+        // the time this line runs the whole persist latency has already elapsed
+        // against it. Bounding the Undo affordance by anything else — including
+        // `Date()` right here — is what let the button outlive the hold (#76).
         PendingSendService.shared.present(
-            outboxId: outboxId,
+            outboxId: queued.outboxId,
             draftId: snapshot.draftId,
             instanceEpoch: snapshot.instanceEpoch,
-            toSummary: toSummary
+            toSummary: toSummary,
+            holdUntil: queued.holdUntil
         )
         sendWasAdmitted = true
 
         // Report success to the agent tool (if any) before dismissing. Fires
-        // at outbox-persistence granularity, not SMTP — this is the
-        // trade-off for the 5-second undo window. `.onDisappear` will fire
+        // at outbox-persistence granularity, not SMTP — this is the trade-off
+        // for the durable, persist-latency-shortened Undo window.
+        // `.onDisappear` will fire
         // `.cancelled` after dismiss, but
         // `ComposeOutcomeState.tryResolve` makes that a no-op.
         onAgentOutcome?(.sent)
