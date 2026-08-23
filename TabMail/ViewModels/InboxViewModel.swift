@@ -2206,8 +2206,9 @@ final class InboxViewModel {
     }
 
     /// Delete a draft message from the Drafts folder using the draft-specific deletion path.
-    /// Provider-native identities only. An actual IMAP header has no source-bound
-    /// UIDVALIDITY and therefore fails closed; the next sync preserves truth.
+    /// Provider-native identities only. A synced IMAP header is addressable only
+    /// when it carries the source-bound UIDVALIDITY observed with its numeric UID;
+    /// missing or stale coordinates fail closed and the next sync preserves truth.
     ///
     /// Returns whether the draft was actually acted upon. `false` (fail-closed /
     /// failed durable write) means the caller MUST NOT leave the row hidden — it
@@ -2325,7 +2326,15 @@ final class InboxViewModel {
             identity = .outlook(graphId: message.messageId)
         case .demo:
             identity = .demo(localId: message.messageId)
-        case .imap, .unknown:
+        case .imap:
+            guard let uid = Int(message.messageId), uid > 0,
+                  let uidValidity = message.observedUidValidity,
+                  uidValidity > 0 else { return false }
+            identity = .imap(
+                folder: message.folderPath,
+                uidValidity: uidValidity,
+                uid: uid)
+        case .unknown:
             return false
         }
 

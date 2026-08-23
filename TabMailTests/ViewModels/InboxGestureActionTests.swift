@@ -1850,6 +1850,109 @@ struct InboxGestureActionTests {
         return h
     }
 
+    private func makeIMAPDraftDeleteDB(
+        accountId: String,
+        uidValidity: Int
+    ) throws -> (
+        pool: DatabasePool, drafts: Folder, dir: URL, previous: AppDatabase?
+    ) {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(
+            at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: dir.appendingPathComponent("test.sqlite").path,
+            configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let old = current
+            current = appDb
+            return old
+        }
+        try pool.writeWithoutTransaction { db in
+            var account = Account(
+                emailAddress: "imap-drafts@example.com",
+                displayName: "IMAP Drafts",
+                provider: .imap)
+            account.id = accountId
+            try account.insert(db)
+        }
+        var drafts = Folder(
+            name: "Drafts", path: "Drafts", role: .drafts,
+            accountId: accountId)
+        drafts.lastKnownUidValidity = uidValidity
+        try pool.writeWithoutTransaction { db in
+            let folder = drafts
+            try folder.insert(db)
+        }
+        return (pool, drafts, dir, previous)
+    }
+
+    private func makeIMAPDraftsHeader(
+        accountId: String,
+        uid: Int,
+        observedUidValidity: Int?
+    ) -> MessageHeader {
+        var header = MessageHeader(
+            messageId: String(uid), subject: "IMAP draft", from: "Test",
+            fromAddress: "test@example.com", to: "recipient@example.com",
+            date: Date(), snippet: "snip",
+            folderId: "\(accountId):Drafts", accountId: accountId,
+            folderPath: "Drafts", isInInbox: false)
+        header.headerComplete = true
+        header.isRead = true
+        header.observedUidValidity = observedUidValidity
+        return header
+    }
+
+    private func makeIMAPMessage(
+        uid: Int,
+        rfc822MessageId: String
+    ) -> FakeIMAPServer.Message {
+        FakeIMAPServer.makeMessage(uid: uid, rfc822Text: """
+        From: Sender <sender@example.com>\r
+        To: Recipient <recipient@example.com>\r
+        Subject: draft\r
+        Message-ID: <\(rfc822MessageId)>\r
+        Content-Type: text/plain\r
+        \r
+        body\r
+
+        """)
+    }
+
+    private func withRegisteredIMAPProvider<T>(
+        accountId: String,
+        server: FakeIMAPServer,
+        pool: DatabasePool,
+        _ body: (IMAPProvider) async throws -> T
+    ) async throws -> T {
+        try server.start()
+        let provider = IMAPProvider(
+            host: "127.0.0.1", port: server.port,
+            username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        do {
+            try await provider.connect()
+            await AccountManager.shared.registerProviderForTesting(
+                accountId: accountId, provider: provider)
+            let result = try await body(provider)
+            try await EscapedDrainTransport.awaitPendingQueueSettled(pool: pool)
+            await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
+            try? await provider.disconnect()
+            server.stop()
+            return result
+        } catch {
+            try? await EscapedDrainTransport.awaitPendingQueueSettled(pool: pool)
+            await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
+            try? await provider.disconnect()
+            server.stop()
+            throw error
+        }
+    }
+
     /// A local draft row already pushed to Gmail, so its only provider address
     /// is the RESOURCE id it carries.
     private func makePushedGmailDraft(id: String, epoch: String, resourceId: String) -> Draft {
@@ -2028,6 +2131,131 @@ struct InboxGestureActionTests {
             let survivingDecoy = try await pool.read { db in try Draft.fetchOne(db, key: decoyId) }
             #expect(survivingDecoy?.serverDraftId == "r-gmail-decoy", "an unrelated same-account draft was consumed by another row's delete")
         }
+    }
+
+    @Test("A synced IMAP Drafts row deletes exactly its source-bound UID")
+    func syncedIMAPDraftsRowDeletesExactUid() async throws {
+        let accountId = "imap-draft-gesture-live"
+        let epoch = 922_001
+        let targetUid = 1_225
+        let bystanderUid = 1_226
+        let targetRFC = "target-\(UUID().uuidString)@example.com"
+        let bystanderRFC = "bystander-\(UUID().uuidString)@example.com"
+        let fixture = try makeIMAPDraftDeleteDB(
+            accountId: accountId, uidValidity: epoch)
+        defer {
+            restoreTestDB(
+                previous: fixture.previous, pool: fixture.pool, dir: fixture.dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        let header = makeIMAPDraftsHeader(
+            accountId: accountId, uid: targetUid,
+            observedUidValidity: epoch)
+        try await fixture.pool.writeWithoutTransaction { db in
+            let row = header
+            try row.insert(db)
+        }
+
+        let server = FakeIMAPServer(mailboxes: [
+            "Drafts": [
+                makeIMAPMessage(uid: targetUid, rfc822MessageId: targetRFC),
+                makeIMAPMessage(uid: bystanderUid, rfc822MessageId: bystanderRFC),
+            ],
+        ])
+        server.setUidValidity(epoch, for: "Drafts")
+        server.expectMutation(rfc822MessageId: targetRFC)
+
+        try await withRegisteredIMAPProvider(
+            accountId: accountId, server: server, pool: fixture.pool
+        ) { _ in
+            let vm = InboxViewModel(folders: [fixture.drafts])
+            let acted = await vm.delete(header.id)
+
+            #expect(acted == true,
+                    "a source-bound IMAP Drafts row was refused even though its UID and UIDVALIDITY still match the selected mailbox")
+        }
+
+        let localHeader = try await fixture.pool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        }
+        #expect(localHeader == nil,
+                "the admitted IMAP draft delete left the tapped row visible")
+        #expect(server.snapshotMessagesWithFlags(in: "Drafts").map(\.message.uid) == [bystanderUid],
+                "the delete did not remove exactly the tapped UID")
+        #expect(server.wrongMessageViolations().isEmpty,
+                "the provider mutated a message other than the source-bound target")
+        #expect(try await fixture.pool.read {
+            try PendingOperation.fetchCount($0)
+        } == 0, "the completed draft delete left a pending operation behind")
+    }
+
+    @Test("IMAP Drafts rows with missing or stale source epochs fail closed")
+    func unprovenIMAPDraftsRowsRemainRetryable() async throws {
+        let accountId = "imap-draft-gesture-unproven"
+        let liveEpoch = 922_101
+        let missingEpochUid = 1_227
+        let staleEpochUid = 1_228
+        let fixture = try makeIMAPDraftDeleteDB(
+            accountId: accountId, uidValidity: liveEpoch)
+        defer {
+            restoreTestDB(
+                previous: fixture.previous, pool: fixture.pool, dir: fixture.dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        let missingEpoch = makeIMAPDraftsHeader(
+            accountId: accountId, uid: missingEpochUid,
+            observedUidValidity: nil)
+        let staleEpoch = makeIMAPDraftsHeader(
+            accountId: accountId, uid: staleEpochUid,
+            observedUidValidity: liveEpoch - 1)
+        try await fixture.pool.writeWithoutTransaction { db in
+            let missing = missingEpoch
+            let stale = staleEpoch
+            try missing.insert(db)
+            try stale.insert(db)
+        }
+
+        let server = FakeIMAPServer(mailboxes: [
+            "Drafts": [
+                makeIMAPMessage(
+                    uid: missingEpochUid,
+                    rfc822MessageId: "missing-epoch@example.com"),
+                makeIMAPMessage(
+                    uid: staleEpochUid,
+                    rfc822MessageId: "stale-epoch@example.com"),
+            ],
+        ])
+        server.setUidValidity(liveEpoch, for: "Drafts")
+
+        try await withRegisteredIMAPProvider(
+            accountId: accountId, server: server, pool: fixture.pool
+        ) { _ in
+            let commandsBefore = server.recordedCommands()
+            let vm = InboxViewModel(folders: [fixture.drafts])
+
+            #expect(await vm.delete(missingEpoch.id) == false,
+                    "an IMAP row without a source-bound epoch was treated as mutation authority")
+            #expect(await vm.delete(staleEpoch.id) == false,
+                    "an IMAP row from a stale UIDVALIDITY epoch was treated as the current mailbox occupant")
+            #expect(server.recordedCommands() == commandsBefore,
+                    "a refused IMAP draft delete reached the server")
+        }
+
+        let survivingIds = try await fixture.pool.read { db in
+            try MessageHeader
+                .filter(keys: [missingEpoch.id, staleEpoch.id])
+                .fetchAll(db)
+                .map(\.id)
+        }
+        #expect(Set(survivingIds) == [missingEpoch.id, staleEpoch.id],
+                "a refused IMAP draft delete removed a retryable row")
+        #expect(try await fixture.pool.read {
+            try PendingOperation.fetchCount($0)
+        } == 0, "a refused IMAP draft delete admitted a durable operation")
     }
 }
 
