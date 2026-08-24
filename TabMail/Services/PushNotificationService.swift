@@ -591,7 +591,8 @@ actor PushNotificationService {
                 do {
                     try await client.unregisterDeviceAccount(
                         deviceId: cleanupDeviceId,
-                        accountEmail: selected[index].email
+                        accountEmail: selected[index].email,
+                        accountIncarnation: selected[index].accountId
                     )
                     selected[index].actions.remove(.deviceAccount)
                 } catch {
@@ -894,6 +895,7 @@ actor PushNotificationService {
                 deviceId: deviceId,
                 userId: session.userId,
                 accountEmail: account.emailAddress,
+                accountIncarnation: account.id,
                 provider: providerTag,
                 apnsSandbox: PushConfig.isAPNsSandbox,
                 nseCapable: nseCapable

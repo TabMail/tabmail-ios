@@ -491,6 +491,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     ) async -> UNNotificationPresentationOptions {
         let userInfo = notification.request.content.userInfo
         let provider = userInfo["provider"] as? String
+        guard NSEDataBridge.notificationAccountMatches(userInfo) else { return [] }
         if DebugModeManager.isLoggingEnabled() {
             print("[NotificationDelegate] willPresent notification: \(notification.request.identifier) provider=\(provider ?? "nil")")
         }
@@ -550,14 +551,17 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        let userInfo = response.notification.request.content.userInfo
-        if DebugModeManager.isLoggingEnabled() {
-            print("[NotificationDelegate] didReceive notification: \(response.notification.request.identifier)")
-        }
-
         // ObjC completion handler — inherently thread-safe one-shot callback,
         // but not marked @Sendable. Safe to send to main queue.
         nonisolated(unsafe) let finish = completionHandler
+        let userInfo = response.notification.request.content.userInfo
+        guard NSEDataBridge.notificationAccountMatches(userInfo) else {
+            DispatchQueue.main.async { finish() }
+            return
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            print("[NotificationDelegate] didReceive notification: \(response.notification.request.identifier)")
+        }
 
         // Handle notification actions (archive, mark read, delete) from NSE notifications
         let actionId = response.actionIdentifier
@@ -918,7 +922,8 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // Copy to Sendable dict — [AnyHashable: Any] is not Sendable across isolation
         let info: [String: String] = [
             "provider": userInfo["provider"] as? String ?? "",
-            "accountEmail": userInfo["accountEmail"] as? String ?? ""
+            "accountEmail": userInfo["accountEmail"] as? String ?? "",
+            "accountIncarnation": userInfo["accountIncarnation"] as? String ?? ""
         ]
         BackgroundSyncLogger.log("didReceiveRemoteNotification: provider=\(info["provider"] ?? "?") email=\(info["accountEmail"] ?? "?") appState=\(stateStr)")
 
@@ -931,6 +936,12 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         let nonHealthProviders: Set<String> = ["imap_reconnect", "consent_error"]
         let provider = info["provider"] ?? ""
         let accountEmail = info["accountEmail"] ?? ""
+        guard NSEDataBridge.accountIncarnationMatches(
+            info["accountIncarnation"],
+            accountEmail: accountEmail
+        ) else {
+            return .noData
+        }
         if !nonHealthProviders.contains(provider), !accountEmail.isEmpty {
             PushHealthStore.recordPush(accountEmail: accountEmail)
         }

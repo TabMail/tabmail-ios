@@ -125,6 +125,7 @@ actor PushClient {
         deviceId: String,
         userId: String,
         accountEmail: String,
+        accountIncarnation: String,
         provider: String,
         apnsSandbox: Bool,
         nseCapable: Bool
@@ -138,6 +139,7 @@ actor PushClient {
             "deviceId": deviceId,
             "userId": userId,
             "accountEmail": accountEmail,
+            "accountIncarnation": accountIncarnation,
             "provider": provider,
             "apnsSandbox": apnsSandbox,
         ]
@@ -153,7 +155,11 @@ actor PushClient {
     }
 
     /// Remove a single (device, account) registration.
-    func unregisterDeviceAccount(deviceId: String, accountEmail: String) async throws {
+    func unregisterDeviceAccount(
+        deviceId: String,
+        accountEmail: String,
+        accountIncarnation: String
+    ) async throws {
         guard let token = await currentAuthToken() else {
             throw PushError.noAuthToken
         }
@@ -161,6 +167,7 @@ actor PushClient {
         components.queryItems = [
             URLQueryItem(name: "deviceId", value: deviceId),
             URLQueryItem(name: "accountEmail", value: accountEmail),
+            URLQueryItem(name: "accountIncarnation", value: accountIncarnation),
         ]
         var request = URLRequest(url: components.url!)
         request.httpMethod = "DELETE"
@@ -538,7 +545,11 @@ extension PushClient: PushConsentChecking {}
 /// account. Keeping this separate from the full client makes the durable retry
 /// path failure-injectable without teaching tests about URLSession or auth.
 protocol RemovedAccountPushCleaning: Sendable {
-    func unregisterDeviceAccount(deviceId: String, accountEmail: String) async throws
+    func unregisterDeviceAccount(
+        deviceId: String,
+        accountEmail: String,
+        accountIncarnation: String
+    ) async throws
     func registerDevice(
         deviceToken: String,
         deviceId: String,

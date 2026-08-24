@@ -10,6 +10,118 @@ import GRDB
 @Suite("NSE Data Bridge — Mirroring, Settings, and Merge", .serialized, .processGlobalState)
 struct NSEDataBridgeTests {
 
+    @Test("account incarnation is required for account pushes but not other notifications")
+    func accountIncarnationFence() throws {
+        let name = "NSEDataBridgeTests.incarnation.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let map = ["account@example.com": "current-account"]
+        defaults.set(
+            String(data: try JSONEncoder().encode(map), encoding: .utf8),
+            forKey: "nse.accountMap"
+        )
+
+        #expect(!NSEDataBridge.accountIncarnationMatches(
+            nil,
+            accountEmail: "account@example.com",
+            defaults: defaults
+        ))
+        #expect(!NSEDataBridge.accountIncarnationMatches(
+            "",
+            accountEmail: "account@example.com",
+            defaults: defaults
+        ))
+        #expect(NSEDataBridge.accountIncarnationMatches(
+            nil,
+            accountEmail: "",
+            defaults: defaults
+        ))
+        #expect(NSEDataBridge.accountIncarnationMatches(
+            "current-account",
+            accountEmail: "Account@Example.COM",
+            defaults: defaults
+        ))
+        #expect(!NSEDataBridge.accountIncarnationMatches(
+            "removed-account",
+            accountEmail: "account@example.com",
+            defaults: defaults
+        ))
+
+        #expect(NSEDataBridge.notificationAccountMatches([
+            "provider": "gmail",
+            "accountEmail": "Account@Example.COM",
+            "accountIncarnation": "current-account",
+        ], defaults: defaults))
+        #expect(!NSEDataBridge.notificationAccountMatches([
+            "provider": "gmail",
+            "accountEmail": "account@example.com",
+        ], defaults: defaults))
+        #expect(NSEDataBridge.notificationAccountMatches([
+            "provider": "task_alarm",
+        ], defaults: defaults))
+        #expect(!NSEDataBridge.notificationAccountMatches([
+            "provider": "gmail",
+            "messageId": "stale-message",
+            "accountEmail": "account@example.com",
+            "accountIncarnation": "removed-account",
+        ], defaults: defaults))
+        #expect(!NSEDataBridge.notificationAccountMatches([
+            "tabmail.rejectedAccountPush": true,
+        ], defaults: defaults))
+    }
+
+    @Test("account-map mirroring normalizes mixed-case OAuth, iCloud, and IMAP addresses")
+    func accountMapNormalizesEmailKeys() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("NSEDataBridgeTests.account-map.\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration
+        )
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previousDatabase = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let previous = current
+            current = appDatabase
+            return previous
+        }
+        defer {
+            AppDatabase.shared.withLock { $0 = previousDatabase }
+            TestDatabaseTeardown.retire(pool: pool, directory: directory)
+        }
+
+        let accounts = [
+            ("gmail-account", "Person@GMAIL.com", AccountProvider.gmail),
+            ("icloud-account", "Person@iCloud.COM", AccountProvider.imap),
+            ("imap-account", "Person@Mail.Example.COM", AccountProvider.imap),
+        ]
+        try pool.write { db in
+            for (id, email, provider) in accounts {
+                var account = Account(emailAddress: email, displayName: "Test", provider: provider)
+                account.id = id
+                try account.insert(db)
+            }
+        }
+
+        let name = "NSEDataBridgeTests.account-map-defaults.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        NSEDataBridge.mirrorAccountMap(defaults: defaults)
+
+        for (id, email, _) in accounts {
+            #expect(NSEDataBridge.accountIncarnationMatches(
+                id,
+                accountEmail: email.uppercased(),
+                defaults: defaults
+            ))
+        }
+        let json = try #require(defaults.string(forKey: "nse.accountMap"))
+        let map = try JSONDecoder().decode([String: String].self, from: Data(json.utf8))
+        #expect(Set(map.keys) == Set(accounts.map { $0.1.lowercased() }))
+    }
+
     // MARK: - Helpers
 
     private let appGroupId = "group.ai.tabmail"

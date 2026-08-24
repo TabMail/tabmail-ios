@@ -41,6 +41,41 @@ enum MergeSurfaceProbe {
 enum NSEDataBridge {
     private static let appGroupId = "group.ai.tabmail"
     private static var suite: UserDefaults? { UserDefaults(suiteName: appGroupId) }
+    private static let rejectedAccountPushMarkerKey = "tabmail.rejectedAccountPush"
+
+    /// Account-scoped pushes name the local Account.id and may affect app state
+    /// only while the shared account mirror still maps that email to the same
+    /// row. Notifications with no account scope (such as task alarms) are
+    /// unaffected.
+    static func accountIncarnationMatches(
+        _ accountIncarnation: String?,
+        accountEmail: String,
+        defaults customDefaults: UserDefaults? = nil
+    ) -> Bool {
+        guard !accountEmail.isEmpty else { return true }
+        guard let accountIncarnation, !accountIncarnation.isEmpty else { return false }
+        let source = customDefaults ?? suite
+        guard let json = source?.string(forKey: "nse.accountMap"),
+              let data = json.data(using: .utf8),
+              let map = try? JSONDecoder().decode([String: String].self, from: data) else {
+            return false
+        }
+        return map[accountEmail.lowercased()] == accountIncarnation
+    }
+
+    /// Reject both a raw stale-incarnation payload and the inert marker emitted
+    /// after the NSE has stripped that payload's actionable metadata.
+    static func notificationAccountMatches(
+        _ userInfo: [AnyHashable: Any],
+        defaults customDefaults: UserDefaults? = nil
+    ) -> Bool {
+        if userInfo[rejectedAccountPushMarkerKey] as? Bool == true { return false }
+        return accountIncarnationMatches(
+            userInfo["accountIncarnation"] as? String,
+            accountEmail: userInfo["accountEmail"] as? String ?? "",
+            defaults: customDefaults
+        )
+    }
 
     /// Cached read connection to the NSE staging DB for the read-path "is there
     /// anything to merge?" check. We deliberately do NOT use a cross-process dirty
@@ -329,7 +364,7 @@ enum NSEDataBridge {
         mirrorDebugLogging()
     }
 
-    /// Mirror account email→accountId mapping.
+    /// Mirror lowercase account email→accountId mapping to match worker routing.
     /// Call on account add/remove.
     static func mirrorAccountMap(defaults override: UserDefaults? = nil) {
         guard let target = override ?? suite else { return }
@@ -340,7 +375,7 @@ enum NSEDataBridge {
             var map: [String: String] = [:]
             for row in accounts {
                 if let email: String = row["emailAddress"], let id: String = row["id"] {
-                    map[email] = id
+                    map[email.lowercased()] = id
                 }
             }
             let data = try JSONEncoder().encode(map)

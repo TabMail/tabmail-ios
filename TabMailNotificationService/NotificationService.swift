@@ -140,6 +140,24 @@ final class NotificationService: UNNotificationServiceExtension {
 
         NSELog.step("NSE ━━━ STARTED ━━━ id=\(request.identifier)")
 
+        let accountEmail = request.content.userInfo["accountEmail"] as? String ?? ""
+        let accountIncarnation = request.content.userInfo["accountIncarnation"] as? String
+        guard NSEState.accountIncarnationMatches(accountIncarnation, for: accountEmail) else {
+            NSELog.step("NSE refused a push for a replaced account")
+            content.title = "TabMail"
+            content.body = "Open TabMail to view your inbox"
+            content.userInfo = [NSEState.rejectedAccountPushMarkerKey: true]
+            content.categoryIdentifier = ""
+            content.threadIdentifier = ""
+            content.targetContentIdentifier = nil
+            content.badge = nil
+            content.attachments = []
+            content.interruptionLevel = .passive
+            content.sound = nil
+            contentHandler(content)
+            return
+        }
+
         // Opportunistic delivered-notification cleanup. Detached so it never
         // blocks the 30s NSE budget.
         Task.detached(priority: .utility) {
@@ -151,7 +169,7 @@ final class NotificationService: UNNotificationServiceExtension {
         // account, releasing any stale `imap_reconnect` warning notifications
         // on the next sweep.
         let providerStr = request.content.userInfo["provider"] as? String ?? ""
-        let accountEmailStr = request.content.userInfo["accountEmail"] as? String ?? ""
+        let accountEmailStr = accountEmail
         let nonHealthProviders: Set<String> = ["imap_reconnect", "consent_error"]
         if !nonHealthProviders.contains(providerStr), !accountEmailStr.isEmpty {
             PushHealthStore.recordPush(accountEmail: accountEmailStr)

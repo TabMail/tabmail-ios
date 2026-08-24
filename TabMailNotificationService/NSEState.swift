@@ -6,6 +6,7 @@ import Foundation
 
 enum NSEState {
     private static var suite: SendableUserDefaults { SharedNSEData.suite }
+    static let rejectedAccountPushMarkerKey = "tabmail.rejectedAccountPush"
 
     // MARK: - Reads (main app writes)
 
@@ -13,7 +14,13 @@ enum NSEState {
         guard let json = suite.string(forKey: SharedNSEData.accountMapKey),
               let data = json.data(using: .utf8),
               let map = try? JSONDecoder().decode([String: String].self, from: data) else { return nil }
-        return map[email]
+        return map[email.lowercased()]
+    }
+
+    static func accountIncarnationMatches(_ accountIncarnation: String?, for email: String) -> Bool {
+        guard !email.isEmpty else { return true }
+        guard let accountIncarnation, !accountIncarnation.isEmpty else { return false }
+        return findAccountId(for: email) == accountIncarnation
     }
 
     /// All registered account email addresses (keys of the email→accountId map

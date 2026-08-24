@@ -22,6 +22,7 @@ struct RemovedAccountPushCleanupTests {
         private(set) var observedBearers: [String?] = []
         /// The `userId` each `registerDevice` body carried.
         private(set) var registeredUserIds: [String] = []
+        private(set) var deviceAccountIncarnations: [String] = []
         private var shouldFail = true
         private var ownershipRefusal = false
         private var genericForbidden = false
@@ -38,6 +39,7 @@ struct RemovedAccountPushCleanupTests {
         func recordedCalls() -> [String] { calls }
         func recordedBearers() -> [String?] { observedBearers }
         func recordedRegisteredUserIds() -> [String] { registeredUserIds }
+        func recordedDeviceAccountIncarnations() -> [String] { deviceAccountIncarnations }
         private func noteBearer() { observedBearers.append(PushCleanupIdentity.pinnedAuthToken) }
         func blockDeviceAccount(email: String) { blockedDeviceAccountEmail = email }
         /// Whether the blocked call has been entered at least once. Lets a test
@@ -70,9 +72,14 @@ struct RemovedAccountPushCleanupTests {
             if shouldFail { throw InjectedFailure.offline }
         }
 
-        func unregisterDeviceAccount(deviceId: String, accountEmail: String) async throws {
+        func unregisterDeviceAccount(
+            deviceId: String,
+            accountEmail: String,
+            accountIncarnation: String
+        ) async throws {
             noteBearer()
             calls.append("device-account:\(accountEmail)")
+            deviceAccountIncarnations.append(accountIncarnation)
             if blockedDeviceAccountEmail == accountEmail {
                 hasReachedBlock = true
                 for observer in blockObservers { observer.resume() }
@@ -277,6 +284,7 @@ struct RemovedAccountPushCleanupTests {
                     "the removed email must not be retained after remote cleanup completes")
             let calls = await mock.recordedCalls()
             #expect(calls.contains("device-account:removed@example.com"))
+            #expect(await mock.recordedDeviceAccountIncarnations().contains("removed-account"))
             #expect(calls.contains("gmail-consent:removed@example.com"))
             #expect(calls.contains("unregister-device"))
             #expect(calls.contains("provider-subscription:gmail:removed@example.com:empty"),
