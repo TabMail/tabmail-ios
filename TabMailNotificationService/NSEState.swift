@@ -4,23 +4,36 @@
 
 import Foundation
 
+#if TABMAIL_TESTS
+@testable import TabMail
+#endif
+
 enum NSEState {
     private static var suite: SendableUserDefaults { SharedNSEData.suite }
     static let rejectedAccountPushMarkerKey = "tabmail.rejectedAccountPush"
 
     // MARK: - Reads (main app writes)
 
-    static func findAccountId(for email: String) -> String? {
-        guard let json = suite.string(forKey: SharedNSEData.accountMapKey),
+    static func findAccountId(for email: String, defaults: UserDefaults? = nil) -> String? {
+        let source = defaults.map { SendableUserDefaults(defaults: $0) } ?? suite
+        guard let json = source.string(forKey: SharedNSEData.accountMapKey),
               let data = json.data(using: .utf8),
               let map = try? JSONDecoder().decode([String: String].self, from: data) else { return nil }
         return map[email.lowercased()]
     }
 
-    static func accountIncarnationMatches(_ accountIncarnation: String?, for email: String) -> Bool {
-        guard !email.isEmpty else { return true }
-        guard let accountIncarnation, !accountIncarnation.isEmpty else { return false }
-        return findAccountId(for: email) == accountIncarnation
+    static func accountIncarnationMatches(
+        _ accountIncarnation: String?,
+        for email: String,
+        provider: String? = nil,
+        defaults: UserDefaults? = nil
+    ) -> Bool {
+        AccountPushIncarnationPolicy.matches(
+            provider: provider,
+            accountEmail: email,
+            accountIncarnation: accountIncarnation,
+            accountId: { findAccountId(for: $0, defaults: defaults) }
+        )
     }
 
     /// All registered account email addresses (keys of the email→accountId map

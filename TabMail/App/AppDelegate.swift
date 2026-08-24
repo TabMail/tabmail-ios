@@ -938,7 +938,8 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         let accountEmail = info["accountEmail"] ?? ""
         guard NSEDataBridge.accountIncarnationMatches(
             info["accountIncarnation"],
-            accountEmail: accountEmail
+            accountEmail: accountEmail,
+            provider: provider
         ) else {
             return .noData
         }

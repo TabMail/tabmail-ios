@@ -139,6 +139,10 @@ targets:
       - path: TabMailNotificationService/NSEConfig.swift
       - path: TabMailNotificationService/NSELog.swift
       - path: TabMailNotificationService/SharedNSEData.swift
+      # Compile the actual extension-side account-incarnation lookup into the
+      # test target. Testing only NSEDataBridge would leave the production NSE
+      # admission boundary unexercised.
+      - path: TabMailNotificationService/NSEState.swift
     settings:
       GENERATE_INFOPLIST_FILE: YES
       # Set ONLY here. The NSE files above that name `Shared` types —

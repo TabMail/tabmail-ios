@@ -36,6 +36,12 @@ struct NSEDataBridgeTests {
             accountEmail: "",
             defaults: defaults
         ))
+        #expect(!NSEDataBridge.accountIncarnationMatches(
+            "current-account",
+            accountEmail: "",
+            provider: "gmail",
+            defaults: defaults
+        ))
         #expect(NSEDataBridge.accountIncarnationMatches(
             "current-account",
             accountEmail: "Account@Example.COM",
@@ -56,6 +62,10 @@ struct NSEDataBridgeTests {
             "provider": "gmail",
             "accountEmail": "account@example.com",
         ], defaults: defaults))
+        #expect(!NSEDataBridge.notificationAccountMatches([
+            "provider": "gmail",
+            "accountIncarnation": "current-account",
+        ], defaults: defaults))
         #expect(NSEDataBridge.notificationAccountMatches([
             "provider": "task_alarm",
         ], defaults: defaults))
@@ -68,6 +78,33 @@ struct NSEDataBridgeTests {
         #expect(!NSEDataBridge.notificationAccountMatches([
             "tabmail.rejectedAccountPush": true,
         ], defaults: defaults))
+
+        // Exercise the exact lookup compiled into the extension, not an app-
+        // side copy of its logic.
+        #expect(NSEState.accountIncarnationMatches(
+            "current-account",
+            for: "Account@Example.COM",
+            provider: "gmail",
+            defaults: defaults
+        ))
+        #expect(!NSEState.accountIncarnationMatches(
+            "removed-account",
+            for: "account@example.com",
+            provider: "gmail",
+            defaults: defaults
+        ))
+        #expect(!NSEState.accountIncarnationMatches(
+            "current-account",
+            for: "",
+            provider: "outlook",
+            defaults: defaults
+        ))
+        #expect(NSEState.accountIncarnationMatches(
+            nil,
+            for: "",
+            provider: "task_alarm",
+            defaults: defaults
+        ))
     }
 
     @Test("account-map mirroring normalizes mixed-case OAuth, iCloud, and IMAP addresses")

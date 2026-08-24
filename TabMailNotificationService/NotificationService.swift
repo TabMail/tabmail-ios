@@ -142,7 +142,12 @@ final class NotificationService: UNNotificationServiceExtension {
 
         let accountEmail = request.content.userInfo["accountEmail"] as? String ?? ""
         let accountIncarnation = request.content.userInfo["accountIncarnation"] as? String
-        guard NSEState.accountIncarnationMatches(accountIncarnation, for: accountEmail) else {
+        let accountProvider = request.content.userInfo["provider"] as? String
+        guard NSEState.accountIncarnationMatches(
+            accountIncarnation,
+            for: accountEmail,
+            provider: accountProvider
+        ) else {
             NSELog.step("NSE refused a push for a replaced account")
             content.title = "TabMail"
             content.body = "Open TabMail to view your inbox"

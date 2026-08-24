@@ -50,17 +50,26 @@ enum NSEDataBridge {
     static func accountIncarnationMatches(
         _ accountIncarnation: String?,
         accountEmail: String,
+        provider: String? = nil,
         defaults customDefaults: UserDefaults? = nil
     ) -> Bool {
-        guard !accountEmail.isEmpty else { return true }
-        guard let accountIncarnation, !accountIncarnation.isEmpty else { return false }
         let source = customDefaults ?? suite
         guard let json = source?.string(forKey: "nse.accountMap"),
               let data = json.data(using: .utf8),
               let map = try? JSONDecoder().decode([String: String].self, from: data) else {
-            return false
+            return AccountPushIncarnationPolicy.matches(
+                provider: provider,
+                accountEmail: accountEmail,
+                accountIncarnation: accountIncarnation,
+                accountId: { _ in nil }
+            )
         }
-        return map[accountEmail.lowercased()] == accountIncarnation
+        return AccountPushIncarnationPolicy.matches(
+            provider: provider,
+            accountEmail: accountEmail,
+            accountIncarnation: accountIncarnation,
+            accountId: { map[$0] }
+        )
     }
 
     /// Reject both a raw stale-incarnation payload and the inert marker emitted
@@ -73,6 +82,7 @@ enum NSEDataBridge {
         return accountIncarnationMatches(
             userInfo["accountIncarnation"] as? String,
             accountEmail: userInfo["accountEmail"] as? String ?? "",
+            provider: userInfo["provider"] as? String,
             defaults: customDefaults
         )
     }
