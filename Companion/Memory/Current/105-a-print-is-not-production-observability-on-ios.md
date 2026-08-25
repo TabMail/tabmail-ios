@@ -1,3 +1,19 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Owner-directed current policy (2026-08-24, GitHub #84): the §4 production-banner decision
+> below is superseded.** Inbox and folder-list diagnostic banners are hidden whenever runtime
+> Debug Mode logging is disabled. `InboxErrorBanner.text(for:loggingEnabled:)` remains the single
+> presentation decision: it returns `nil` for every error while logging is disabled, returns the
+> exact diagnostic text while logging is enabled, and returns `nil` for a nil error in either
+> state. The existing `InboxView` call site stays centralized; do not put a second gate around it.
+>
+> This is a presentation-policy change, not a new error classification. Do not widen or narrow
+> `SyncEngine.isTransientError`, `SyncEngine.isConnectionError`, either `InboxViewModel.error`
+> writer, or sync/pagination behavior to implement it. Shipped v1.6.38 already had the same
+> user-visible gate; issue #84 restores that visibility while retaining the pure helper and focused
+> tests introduced later. The preserved historical analysis below explains the policy that was
+> replaced; it is not current implementation guidance.
+<!-- COMPANION-CURRENT-NOTE-END -->
+
 ## A bare `print` is NOT production observability on iOS, and a debug gate in a BRANCH CONDITION is not a log gate (2026-08-04)
 
 Two failure modes of global `CLAUDE.md` **rule 12** ("diagnostic logs must be a no-op in

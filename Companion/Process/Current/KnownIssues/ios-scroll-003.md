@@ -1,3 +1,17 @@
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **⚠️ OWNER-DIRECTED AMENDMENT (2026-08-24, GitHub #84): the sentences below that say
+> non-connection pagination errors render in production are superseded.** The row remains CLOSED AS
+> A DECISION, and its preserved body is unedited. `InboxErrorBanner` now returns no banner for any
+> `InboxViewModel.error` while runtime Debug Mode logging is disabled and returns the exact stored
+> diagnostic only while logging is enabled. The existing `SyncEngine.isConnectionError` guard and
+> both `InboxViewModel.error` writers are unchanged.
+>
+> Consequently, pagination connection failures retain the silent, zero-residue behavior adjudicated
+> below, while non-connection pagination failures also have no banner outside Debug Mode by the
+> newer presentation policy. The recovery proof, frequency statement, refusal to misuse
+> `lastSyncFailed`, and reopen trigger for newly written residue remain unchanged. Do not interpret
+> this amendment as authority to alter transient/connection classification or sync state.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-SCROLL-003
 
 > Routed from `KNOWN_ISSUES.md` line 904 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).
