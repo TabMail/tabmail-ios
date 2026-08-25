@@ -143,22 +143,16 @@ final class NotificationService: UNNotificationServiceExtension {
         let accountEmail = request.content.userInfo["accountEmail"] as? String ?? ""
         let accountIncarnation = request.content.userInfo["accountIncarnation"] as? String
         let accountProvider = request.content.userInfo["provider"] as? String
-        guard NSEState.accountIncarnationMatches(
+        if let refusal = NSEState.accountPushRefusal(
             accountIncarnation,
             for: accountEmail,
             provider: accountProvider
-        ) else {
-            NSELog.step("NSE refused a push for a replaced account")
-            content.title = "TabMail"
-            content.body = "Open TabMail to view your inbox"
-            content.userInfo = [NSEState.rejectedAccountPushMarkerKey: true]
-            content.categoryIdentifier = ""
-            content.threadIdentifier = ""
-            content.targetContentIdentifier = nil
-            content.badge = nil
-            content.attachments = []
-            content.interruptionLevel = .passive
-            content.sound = nil
+        ) {
+            // Name the refusal reason. An absent incarnation is NOT a refusal
+            // reason at all, so this can no longer report "replaced account"
+            // for a payload that merely omitted the field.
+            NSELog.step("NSE refused a push: \(refusal.rawValue)")
+            neutralizeRefusedAccountPush(content)
             contentHandler(content)
             return
         }

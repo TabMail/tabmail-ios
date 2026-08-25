@@ -25,3 +25,24 @@ func applyPassiveSettings(
     c.interruptionLevel = .passive
     c.sound = nil
 }
+
+/// Strip a push the account-incarnation rule refused down to an inert
+/// placeholder: passive delivery (via `applyPassiveSettings`), no action
+/// buttons, no routing identifiers, no attachments, no badge — plus the marker
+/// the main app reads so a tap on the stripped notification is refused too.
+///
+/// Shared with the main app's admission check rather than hand-rolled at the
+/// NSE call site, so "what a refused push looks like" has one definition.
+func neutralizeRefusedAccountPush(_ c: UNMutableNotificationContent) {
+    applyPassiveSettings(
+        c,
+        overrideTitle: "TabMail",
+        overrideBody: "Open TabMail to view your inbox"
+    )
+    c.userInfo = [AccountPushIncarnationPolicy.refusedPushMarkerKey: true]
+    c.categoryIdentifier = ""
+    c.threadIdentifier = ""
+    c.targetContentIdentifier = nil
+    c.badge = nil
+    c.attachments = []
+}

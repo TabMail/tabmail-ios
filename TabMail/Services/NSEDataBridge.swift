@@ -41,7 +41,6 @@ enum MergeSurfaceProbe {
 enum NSEDataBridge {
     private static let appGroupId = "group.ai.tabmail"
     private static var suite: UserDefaults? { UserDefaults(suiteName: appGroupId) }
-    private static let rejectedAccountPushMarkerKey = "tabmail.rejectedAccountPush"
 
     /// Account-scoped pushes name the local Account.id and may affect app state
     /// only while the shared account mirror still maps that email to the same
@@ -78,7 +77,7 @@ enum NSEDataBridge {
         _ userInfo: [AnyHashable: Any],
         defaults customDefaults: UserDefaults? = nil
     ) -> Bool {
-        if userInfo[rejectedAccountPushMarkerKey] as? Bool == true { return false }
+        if userInfo[AccountPushIncarnationPolicy.refusedPushMarkerKey] as? Bool == true { return false }
         return accountIncarnationMatches(
             userInfo["accountIncarnation"] as? String,
             accountEmail: userInfo["accountEmail"] as? String ?? "",

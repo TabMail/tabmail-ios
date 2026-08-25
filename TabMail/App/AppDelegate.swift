@@ -489,11 +489,26 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        let userInfo = notification.request.content.userInfo
+        await Self.foregroundPresentationOptions(
+            for: notification.request.content.userInfo,
+            identifier: notification.request.identifier
+        )
+    }
+
+    /// The real body of `willPresent`, split out because `UNNotification` has
+    /// no public initializer: this seam is the only place a test can prove the
+    /// account-incarnation guard still sits AHEAD of the suppress-and-sync
+    /// branch. `defaults: nil` resolves to the production App Group suite, so
+    /// the seam's unset state is exactly production behavior.
+    static func foregroundPresentationOptions(
+        for userInfo: [AnyHashable: Any],
+        identifier: String,
+        defaults: UserDefaults? = nil
+    ) async -> UNNotificationPresentationOptions {
         let provider = userInfo["provider"] as? String
-        guard NSEDataBridge.notificationAccountMatches(userInfo) else { return [] }
+        guard NSEDataBridge.notificationAccountMatches(userInfo, defaults: defaults) else { return [] }
         if DebugModeManager.isLoggingEnabled() {
-            print("[NotificationDelegate] willPresent notification: \(notification.request.identifier) provider=\(provider ?? "nil")")
+            print("[NotificationDelegate] willPresent notification: \(identifier) provider=\(provider ?? "nil")")
         }
 
         // NSE email/task pushes: suppress in foreground, trigger sync instead.
@@ -551,49 +566,111 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
+        Self.handleNotificationResponse(
+            actionId: response.actionIdentifier,
+            userInfo: response.notification.request.content.userInfo,
+            identifier: response.notification.request.identifier,
+            completionHandler: completionHandler
+        )
+    }
+
+    /// Where a notification tap is routed, decided BEFORE any effect runs.
+    ///
+    /// This exists as a pure value so the ORDER of the account-incarnation
+    /// guard relative to the durable action branches is testable — the delegate
+    /// callback itself cannot be driven (`UNNotificationResponse` has no public
+    /// initializer) and its action branch parks on the database-readiness gate.
+    enum NotificationTapRoute: Equatable, Sendable {
+        /// One of the three durable action buttons, with a complete target.
+        case durableAction(actionId: String, messageId: String, accountId: String)
+        /// An action button whose payload named no target — nothing to queue.
+        case incompleteAction
+        /// Refused by the account-incarnation rule. Only presentation and
+        /// navigation reach this case; no durable intention is attached to it.
+        case refusedAccount
+        /// Consent-error / deep-link / reminder handling, which is effectful
+        /// and stays in `handleNotificationResponse`.
+        case passthrough
+    }
+
+    /// Route a tap.
+    ///
+    /// 🚨 THE ACTION BRANCH IS DELIBERATELY RESOLVED BEFORE THE
+    /// ACCOUNT-INCARNATION GUARD, AND MUST STAY THERE. MARK_READ / ARCHIVE /
+    /// DELETE are durable user intentions; iOS dismisses the notification the
+    /// moment the button is tapped, so a tap refused here would be discarded
+    /// with no queue row, no error, and nothing left on screen to retry from —
+    /// NEVER DROP USER INTENTION. The action path has its own per-target
+    /// admission (`admittedOrdinaryActionTargets`, plus the router's identity
+    /// checks) which refuses an unproven target VISIBLY instead of silently,
+    /// and a durable op for an account that no longer exists finds no inbox
+    /// folder and is refused there. Presentation and navigation carry no
+    /// intention, so refusing those drops nothing.
+    ///
+    /// MARK_READ wires through AccountManager.markRead so the local
+    /// MessageHeader.isRead + folder.unreadCount flip optimistically, the
+    /// optimistic overlay registers, the addressed row is ADMITTED (or
+    /// refused) by `admittedOrdinaryActionTargets`, the delivered
+    /// notification clears, and drainPendingQueue auto-kicks.
+    /// Direct PendingOperation INSERT bypasses all of that and leaves the
+    /// local row stale for up to 30s past drain (recentlyCompleted guard).
+    ///
+    /// ⚠️ THIS SAID "sibling rfc822 rows expand" UNTIL 2026-08-06. That
+    /// behaviour is GONE — `AccountManager.expandWithSiblingsByRfc822`
+    /// survives only as a removal note in `SyncEngineEpochVerify` — and the
+    /// sentence was worse than merely stale: it advertised the remedy
+    /// ADR-IOS-068/D4 PROHIBITS (selecting mutation targets by RFC 822
+    /// Message-ID), so a reader repairing this path would have reached for
+    /// it. `IOS-IMAP-011` owns the removal. What runs today does the
+    /// OPPOSITE of expanding: `admittedOrdinaryActionTargets` NARROWS the
+    /// gesture to the rows whose address it can prove — on IMAP, a folder
+    /// with no pending epoch reset, a live `lastKnownUidValidity`, and per
+    /// row `observedUidValidity == liveEpoch` with a `messageId` that is
+    /// exactly its own UID — dropping the unproven members and returning nil
+    /// if none survive, so the op carries one coherent epoch. Non-IMAP
+    /// providers admit any non-empty stable id and record no epoch.
+    static func tapRoute(
+        actionId: String,
+        userInfo: [AnyHashable: Any],
+        defaults: UserDefaults? = nil
+    ) -> NotificationTapRoute {
+        if ["MARK_READ", "ARCHIVE", "DELETE"].contains(actionId) {
+            guard let messageId = userInfo["messageId"] as? String,
+                  let accountId = userInfo["accountId"] as? String else {
+                return .incompleteAction
+            }
+            return .durableAction(actionId: actionId, messageId: messageId, accountId: accountId)
+        }
+        guard NSEDataBridge.notificationAccountMatches(userInfo, defaults: defaults) else {
+            return .refusedAccount
+        }
+        return .passthrough
+    }
+
+    /// The real body of `didReceive`, split out because `UNNotificationResponse`
+    /// has no public initializer: this seam is the only place a test can prove
+    /// WHERE the account-incarnation guard sits relative to the durable action
+    /// branches. `defaults: nil` resolves to the production App Group suite, so
+    /// the seam's unset state is exactly production behavior.
+    static func handleNotificationResponse(
+        actionId: String,
+        userInfo: [AnyHashable: Any],
+        identifier: String,
+        defaults: UserDefaults? = nil,
+        completionHandler: @escaping () -> Void
+    ) {
         // ObjC completion handler — inherently thread-safe one-shot callback,
         // but not marked @Sendable. Safe to send to main queue.
         nonisolated(unsafe) let finish = completionHandler
-        let userInfo = response.notification.request.content.userInfo
-        guard NSEDataBridge.notificationAccountMatches(userInfo) else {
-            DispatchQueue.main.async { finish() }
-            return
-        }
         if DebugModeManager.isLoggingEnabled() {
-            print("[NotificationDelegate] didReceive notification: \(response.notification.request.identifier)")
+            print("[NotificationDelegate] didReceive notification: \(identifier)")
         }
 
-        // Handle notification actions (archive, mark read, delete) from NSE notifications
-        let actionId = response.actionIdentifier
-
-        // MARK_READ wires through AccountManager.markRead so the local
-        // MessageHeader.isRead + folder.unreadCount flip optimistically, the
-        // optimistic overlay registers, the addressed row is ADMITTED (or
-        // refused) by `admittedOrdinaryActionTargets`, the delivered
-        // notification clears, and drainPendingQueue auto-kicks.
-        // Direct PendingOperation INSERT bypasses all of that and leaves the
-        // local row stale for up to 30s past drain (recentlyCompleted guard).
-        //
-        // ⚠️ THIS SAID "sibling rfc822 rows expand" UNTIL 2026-08-06. That
-        // behaviour is GONE — `AccountManager.expandWithSiblingsByRfc822`
-        // survives only as a removal note in `SyncEngineEpochVerify` — and the
-        // sentence was worse than merely stale: it advertised the remedy
-        // ADR-IOS-068/D4 PROHIBITS (selecting mutation targets by RFC 822
-        // Message-ID), so a reader repairing this path would have reached for
-        // it. `IOS-IMAP-011` owns the removal. What runs today does the
-        // OPPOSITE of expanding: `admittedOrdinaryActionTargets` NARROWS the
-        // gesture to the rows whose address it can prove — on IMAP, a folder
-        // with no pending epoch reset, a live `lastKnownUidValidity`, and per
-        // row `observedUidValidity == liveEpoch` with a `messageId` that is
-        // exactly its own UID — dropping the unproven members and returning nil
-        // if none survive, so the op carries one coherent epoch. Non-IMAP
-        // providers admit any non-empty stable id and record no epoch.
-        if actionId == "MARK_READ" {
-            guard let messageId = userInfo["messageId"] as? String,
-                  let accountId = userInfo["accountId"] as? String else {
-                finish()
-                return
-            }
+        switch Self.tapRoute(actionId: actionId, userInfo: userInfo, defaults: defaults) {
+        case .incompleteAction:
+            finish()
+            return
+        case .durableAction(let actionId, let messageId, let accountId):
             Task { @MainActor in
                 // Notification actions run the app in the BACKGROUND (no
                 // .foreground option) — databases may still be suspended from
@@ -608,26 +685,11 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 finish()
             }
             return
-        }
-
-        if actionId == "ARCHIVE" || actionId == "DELETE" {
-            guard let messageId = userInfo["messageId"] as? String,
-                  let accountId = userInfo["accountId"] as? String else {
-                finish()
-                return
-            }
-            Task { @MainActor in
-                // Background notification action — same resume rationale as
-                // MARK_READ above (ADR-IOS-041).
-                DatabaseSuspension.shared.beginBackgroundWork("notification-action")
-                defer { DatabaseSuspension.shared.endBackgroundWork("notification-action") }
-                // Can fire during the one-time migration window — wait for
-                // the DB before touching it (AppStartup).
-                await AppStartup.shared.awaitLaunchReady(background: true)
-                await NotificationActionRouter.execute(actionId: actionId, messageId: messageId, accountId: accountId)
-                finish()
-            }
+        case .refusedAccount:
+            DispatchQueue.main.async { finish() }
             return
+        case .passthrough:
+            break
         }
 
         // Handle consent-error notification tap — posted by the push worker
@@ -930,24 +992,38 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // Opportunistic delivered-notification cleanup.
         Task { await NotificationCleanupService.sweepExpired() }
 
-        // Mirror NSE: stamp PushHealthStore for non-error pushes so any stale
-        // imap_reconnect warning notifications for this account get released
-        // by the next sweep.
-        let nonHealthProviders: Set<String> = ["imap_reconnect", "consent_error"]
+        guard Self.admitSilentPush(info) else { return .noData }
+
+        return await PushNotificationService.shared.handleSilentPush(provider: info["provider"], accountEmail: info["accountEmail"])
+    }
+
+    /// Silent-push admission plus the push-health stamp it gates, split out so a
+    /// test can prove the account-incarnation guard runs BEFORE the stamp — the
+    /// delegate method itself needs a live `UIApplication` and cannot be driven.
+    /// `defaults: nil` resolves to the production App Group suite, so the seam's
+    /// unset state is exactly production behavior.
+    static func admitSilentPush(
+        _ info: [String: String],
+        defaults: UserDefaults? = nil
+    ) -> Bool {
         let provider = info["provider"] ?? ""
         let accountEmail = info["accountEmail"] ?? ""
         guard NSEDataBridge.accountIncarnationMatches(
             info["accountIncarnation"],
             accountEmail: accountEmail,
-            provider: provider
+            provider: provider,
+            defaults: defaults
         ) else {
-            return .noData
+            return false
         }
+        // Mirror NSE: stamp PushHealthStore for non-error pushes so any stale
+        // imap_reconnect warning notifications for this account get released
+        // by the next sweep.
+        let nonHealthProviders: Set<String> = ["imap_reconnect", "consent_error"]
         if !nonHealthProviders.contains(provider), !accountEmail.isEmpty {
             PushHealthStore.recordPush(accountEmail: accountEmail)
         }
-
-        return await PushNotificationService.shared.handleSilentPush(provider: info["provider"], accountEmail: info["accountEmail"])
+        return true
     }
 }
 

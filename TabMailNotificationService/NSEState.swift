@@ -10,7 +10,6 @@ import Foundation
 
 enum NSEState {
     private static var suite: SendableUserDefaults { SharedNSEData.suite }
-    static let rejectedAccountPushMarkerKey = "tabmail.rejectedAccountPush"
 
     // MARK: - Reads (main app writes)
 
@@ -22,13 +21,16 @@ enum NSEState {
         return map[email.lowercased()]
     }
 
-    static func accountIncarnationMatches(
+    /// Extension-side account-push admission. `nil` means admit; a non-nil
+    /// `Refusal` names why the push was refused, so the log line cannot
+    /// misattribute one refusal reason as the other.
+    static func accountPushRefusal(
         _ accountIncarnation: String?,
         for email: String,
         provider: String? = nil,
         defaults: UserDefaults? = nil
-    ) -> Bool {
-        AccountPushIncarnationPolicy.matches(
+    ) -> AccountPushIncarnationPolicy.Refusal? {
+        AccountPushIncarnationPolicy.refusal(
             provider: provider,
             accountEmail: email,
             accountIncarnation: accountIncarnation,

@@ -10,7 +10,10 @@ import GRDB
 @Suite("NSE Data Bridge — Mirroring, Settings, and Merge", .serialized, .processGlobalState)
 struct NSEDataBridgeTests {
 
-    @Test("account incarnation is required for account pushes but not other notifications")
+    @Test("""
+    an ABSENT account incarnation is unknown, never proven-stale: it is admitted, \
+    while a PRESENT value that disagrees with the local account row is refused
+    """)
     func accountIncarnationFence() throws {
         let name = "NSEDataBridgeTests.incarnation.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: name))
@@ -21,14 +24,25 @@ struct NSEDataBridgeTests {
             forKey: "nse.accountMap"
         )
 
-        #expect(!NSEDataBridge.accountIncarnationMatches(
+        // No deployed server emits `accountIncarnation`. Treating its absence as
+        // a proven mismatch refuses EVERY account push — "we could not
+        // determine" is never authoritative.
+        #expect(NSEDataBridge.accountIncarnationMatches(
             nil,
             accountEmail: "account@example.com",
             defaults: defaults
         ))
-        #expect(!NSEDataBridge.accountIncarnationMatches(
+        #expect(NSEDataBridge.accountIncarnationMatches(
             "",
             accountEmail: "account@example.com",
+            defaults: defaults
+        ))
+        // An account we have never mirrored is still only UNKNOWN when the
+        // payload said nothing about which incarnation it was routed from.
+        #expect(NSEDataBridge.accountIncarnationMatches(
+            nil,
+            accountEmail: "unknown@example.com",
+            provider: "gmail",
             defaults: defaults
         ))
         #expect(NSEDataBridge.accountIncarnationMatches(
@@ -47,9 +61,17 @@ struct NSEDataBridgeTests {
             accountEmail: "Account@Example.COM",
             defaults: defaults
         ))
+        // The replacement guarantee this rule exists for: the registration the
+        // push was routed from still names the OLD row, so a replaced account
+        // arrives present-and-unequal and is refused.
         #expect(!NSEDataBridge.accountIncarnationMatches(
             "removed-account",
             accountEmail: "account@example.com",
+            defaults: defaults
+        ))
+        #expect(!NSEDataBridge.accountIncarnationMatches(
+            "removed-account",
+            accountEmail: "unknown@example.com",
             defaults: defaults
         ))
 
@@ -58,7 +80,7 @@ struct NSEDataBridgeTests {
             "accountEmail": "Account@Example.COM",
             "accountIncarnation": "current-account",
         ], defaults: defaults))
-        #expect(!NSEDataBridge.notificationAccountMatches([
+        #expect(NSEDataBridge.notificationAccountMatches([
             "provider": "gmail",
             "accountEmail": "account@example.com",
         ], defaults: defaults))
@@ -76,35 +98,42 @@ struct NSEDataBridgeTests {
             "accountIncarnation": "removed-account",
         ], defaults: defaults))
         #expect(!NSEDataBridge.notificationAccountMatches([
-            "tabmail.rejectedAccountPush": true,
+            AccountPushIncarnationPolicy.refusedPushMarkerKey: true,
         ], defaults: defaults))
 
         // Exercise the exact lookup compiled into the extension, not an app-
-        // side copy of its logic.
-        #expect(NSEState.accountIncarnationMatches(
+        // side copy of its logic — and pin the REASON, so the extension's log
+        // line can no longer report an absent field as a replaced account.
+        #expect(NSEState.accountPushRefusal(
             "current-account",
             for: "Account@Example.COM",
             provider: "gmail",
             defaults: defaults
-        ))
-        #expect(!NSEState.accountIncarnationMatches(
+        ) == nil)
+        #expect(NSEState.accountPushRefusal(
+            nil,
+            for: "account@example.com",
+            provider: "gmail",
+            defaults: defaults
+        ) == nil)
+        #expect(NSEState.accountPushRefusal(
             "removed-account",
             for: "account@example.com",
             provider: "gmail",
             defaults: defaults
-        ))
-        #expect(!NSEState.accountIncarnationMatches(
+        ) == .replacedAccount)
+        #expect(NSEState.accountPushRefusal(
             "current-account",
             for: "",
             provider: "outlook",
             defaults: defaults
-        ))
-        #expect(NSEState.accountIncarnationMatches(
+        ) == .unscopedAccountPayload)
+        #expect(NSEState.accountPushRefusal(
             nil,
             for: "",
             provider: "task_alarm",
             defaults: defaults
-        ))
+        ) == nil)
     }
 
     @Test("account-map mirroring normalizes mixed-case OAuth, iCloud, and IMAP addresses")
