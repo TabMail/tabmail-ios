@@ -17,12 +17,11 @@ four-valued `subscription_outcome`; the client presents only exact `expired_duri
 the user to the existing plan picker. All other, missing, and future string outcomes remain silent.
 
 **Reachability boundary, re-verified 2026-08-15.** The earlier claim that the field existed only in
-unpushed worker commits is stale: current `tabmail-billing-worker` `origin/main` at `d0b9f12` returns
-the field and its focused contract tests pass 19/19. Current iOS `origin/main` at `98dde448b` and the
-released `v1.7.9` tag both drop it. This proves the source-contract path and shipped-client gap. It
-does **not** prove that the authenticated handler carrying that worker commit is deployed: worker
-record `BW-VERIFY-001` says cancellation/deletion have never run against live Stripe, and only
-unauthenticated 401 probes exist. Do not cite this record as live-endpoint verification.
+unpushed backend commits is stale: the backend's current main returns the field and its focused
+contract tests pass 19/19. Current iOS `origin/main` at `98dde448b` and the released `v1.7.9` tag both
+drop it. This proves the source-contract path and shipped-client gap. It does **not** prove that the
+authenticated handler carrying that backend change is deployed — the backend keeps its own
+verification record, tracked privately. Do not cite this record as live-endpoint verification.
 
 ## Subsystem and search terms
 
@@ -32,8 +31,7 @@ Stripe `cancel_at_period_end`; discarded response body; silent success
 
 ## Full detail
 
-**What the backend now returns.** `handleCancelDeletion` in
-`tabmail-billing-worker/src/handlers/accountDeletion.ts` responds
+**What the backend now returns.** The account-deletion cancel handler responds
 `{ status: 'restored', subscription_outcome: <outcome> }`, where outcome is one of:
 
 | value | meaning |
@@ -55,7 +53,7 @@ loses their paid subscription, with no signal at the moment they would act on it
 **How often that can happen.** The exposure is the fraction of the 30-day grace window that falls
 after the subscription's period end. Averaged over where in the billing cycle the deletion is
 requested, the undo still restores the subscription for roughly **50% of the window on a monthly
-plan** and **~95.9% on an annual plan**. ⚠️ These two figures were derived by the billing-worker
+plan** and **~95.9% on an annual plan**. ⚠️ These two figures were derived by the backend
 audit agent and are recorded here as reported; they were **not** independently re-derived, though
 they are internally consistent with `1 − (15 / cycle_days)`. Treat them as an order-of-magnitude
 statement, not a measurement.
@@ -105,12 +103,11 @@ the intended two-sided reasons; exact production commit `814fcd26e` then passed 
 with the predicate getter and all five test bodies fully covered. The owner approved the resulting
 alert and existing plan-picker route on 2026-08-16.
 
-**Attribution correction.** The old unpushed SHAs named here were backup-history references, not
-current `origin/main`. The current worker history containing the outcome is pushed: `14a76f8`
-introduced the classified no-op result; `42166f1` added the cancelled-subscription roster and exact
-loss detection; later commits on current main narrow the roster and record the live-verification
-boundary. The client gap and candidate fix are solely in `tabmail-ios`; no worker change or deploy
-is part of this issue.
+**Attribution correction.** The old unpushed SHAs named here were backup-history references, not the
+backend's current main. The current backend history containing the outcome is pushed: it introduced
+the classified no-op result, then added the cancelled-subscription roster and exact loss detection;
+later commits narrow the roster and record the live-verification boundary. The client gap and
+candidate fix are solely in `tabmail-ios`; no backend change or deploy is part of this issue.
 
 ## Accepted residuals and adjacent findings
 
