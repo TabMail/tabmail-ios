@@ -368,7 +368,7 @@ final class StoreKitManager {
     }
 
     /// Tier ranking for upgrade/downgrade direction: Unknown 0 < BYOK/Zero 1 < Basic 2 < Pro 3.
-    /// Matches the worker-side ranks (billing-worker planInfo, apple-webhook PRODUCT_MAP).
+    /// Matches the worker-side ranks in the billing and Apple-webhook services.
     nonisolated static func tierRank(for productId: String) -> Int {
         if productId.contains("pro") { return 3 }
         if productId.contains("basic") { return 2 }

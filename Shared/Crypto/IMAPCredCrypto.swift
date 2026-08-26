@@ -7,15 +7,15 @@ import CryptoKit
 
 // =============================================================================
 // IMAPCredCrypto — AES-GCM encryption of IMAP credentials for transmission
-// to the IMAP IDLE droplet via the push-worker.
+// to the IMAP IDLE proxy via the push-worker.
 //
 // Contract:
 //   • iOS encrypts a JSON-serialized `{host, port?, username, password, security?}`
 //     blob with AES-GCM using a 32-byte symmetric key pre-shared between iOS
-//     and the droplet (`IMAP_CRED_ENCRYPTION_KEY`).
+//     and the IDLE proxy (`IMAP_CRED_ENCRYPTION_KEY`).
 //   • iOS POSTs the ciphertext to the push-worker; the worker is a dumb
 //     forwarder — it NEVER holds the decryption key, NEVER persists creds.
-//   • The droplet decrypts just-in-time, performs ImapFlow LOGIN, and zeros
+//   • The IDLE proxy decrypts just-in-time, performs an IMAP LOGIN, and zeros
 //     the plaintext buffer immediately after.
 //
 // Ciphertext format (matches the push-worker's credential-encryption module):
@@ -26,15 +26,14 @@ import CryptoKit
 //                 automatically via `combined`.
 //
 // Version prefix `v1:` leaves room for future format migrations. The worker
-// + droplet check for the prefix before attempting decryption.
+// + IDLE proxy check for the prefix before attempting decryption.
 //
 // Key selection: always read `IMAP_CRED_ENCRYPTION_KEY_PROD`. Per the
 // global CLAUDE.md rules #9 and #10 (one shared backend entitlement store, one Stripe env),
-// all shared infrastructure — push-worker, droplet, KV — is prod-only.
+// all shared infrastructure — push-worker, IDLE proxy, entitlement store — is prod-only.
 // A dev/prod split on this key would mean a Debug iOS build can't talk
-// to the prod droplet, which is the only droplet that exists. The
-// xcconfig still ships a _DEV variant for future isolation, but the
-// runtime always picks _PROD.
+// to the prod IDLE proxy. The xcconfig still ships a _DEV variant for
+// future isolation, but the runtime always picks _PROD.
 //
 // Shared across main-app + NSE targets via the `Shared/` glob. The NSE's
 // silent-reconnect flow needs to encrypt too.
@@ -53,7 +52,7 @@ enum IMAPCredCryptoError: Error {
     case sealFailed
 }
 
-/// IMAP credential plaintext shape. Matches the droplet's `/start-idle`
+/// IMAP credential plaintext shape. Matches the IDLE proxy's `/start-idle`
 /// body schema (minus `userId`/`accountEmail` which stay on the outer
 /// envelope). Keeping them in sync by hand is fine — there are five
 /// fields and both sides have a schema guard.
@@ -98,7 +97,7 @@ enum IMAPCredCrypto {
 
         // Pack: iv ‖ ciphertext ‖ authTag (16 bytes). CryptoKit's `combined`
         // already concatenates all three in that order, which matches the
-        // worker + droplet's decrypt expectation.
+        // worker + IDLE proxy's decrypt expectation.
         guard let combined = sealed.combined else {
             throw IMAPCredCryptoError.sealFailed
         }
@@ -111,7 +110,7 @@ enum IMAPCredCrypto {
     /// same in main app + NSE because Info.plist is per-bundle and both
     /// bundles get the same xcconfig substitution.
     private static func loadKey() throws -> SymmetricKey {
-        // Always use the PROD key — the push-worker and droplet are
+        // Always use the PROD key — the push-worker and IDLE proxy are
         // prod-only (see file-level comment).
         let plistKey = "IMAP_CRED_ENCRYPTION_KEY_PROD"
 

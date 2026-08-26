@@ -340,19 +340,19 @@ actor PushClient {
         print("[PushClient] Subscribed \(provider) push for \(userEmail)")
     }
 
-    /// Subscribe an IMAP account for push via the DigitalOcean IDLE proxy.
+    /// Subscribe an IMAP account for push via the IMAP IDLE proxy.
     ///
     /// End-to-end credential path:
     ///   iOS → AES-GCM encrypts `{host, port, username, password, security}`
-    ///         with `IMAP_CRED_ENCRYPTION_KEY` (pre-shared iOS ↔ droplet).
+    ///         with `IMAP_CRED_ENCRYPTION_KEY` (pre-shared iOS ↔ proxy).
     ///   iOS → POSTs `{userId, userEmail, credsCiphertext}` to push-worker.
-    ///   Worker → forwards ciphertext to droplet `/start-idle` (never
+    ///   Worker → forwards ciphertext to the proxy's `/start-idle` (never
     ///            holds the key, never persists creds).
-    ///   Droplet → decrypts just-in-time, ImapFlow LOGIN, zeros plaintext
+    ///   Proxy  → decrypts just-in-time, IMAP LOGIN, zeros plaintext
     ///            immediately after LOGIN returns OK.
     ///
     /// The worker stores only a credless subscription record
-    /// `{userId, accountEmail, dropletId, subscribedAt}`. The privacy
+    /// `{userId, accountEmail, proxy instance id, subscribedAt}`. The privacy
     /// policy §3 invariant "no host/port/username/password at rest" is
     /// preserved end-to-end.
     func subscribeIMAP(
@@ -397,10 +397,10 @@ actor PushClient {
             print("[PushClient] subscribeIMAP failed for \(userEmail): HTTP \(code)")
             throw PushError.requestFailed(statusCode: code)
         }
-        print("[PushClient] Subscribed IMAP push for \(userEmail) via DO IDLE proxy")
+        print("[PushClient] Subscribed IMAP push for \(userEmail) via IDLE proxy")
     }
 
-    /// Unsubscribe an IMAP account from the DigitalOcean IDLE proxy.
+    /// Unsubscribe an IMAP account from the IMAP IDLE proxy.
     /// Server deletes stored credentials and tells the proxy to disconnect IDLE.
     func unsubscribeIMAP(userEmail: String) async throws {
         var request = try await authRequest(path: "/unsubscribe-imap", method: "POST")

@@ -119,7 +119,7 @@ enum NSEIMAPConnection {
 
         // Try bracketed form first, then bare — same quirk handling the
         // main-app `searchByMessageId` uses. Normalization strips stray
-        // whitespace / existing brackets in case the droplet's Message-ID
+        // whitespace / existing brackets in case the IDLE proxy's Message-ID
         // header parser returned something slightly off.
         let normalized = normalizeMessageId(rfc822MessageId)
         guard let uidSet = await searchMessageId(server: server, normalized: normalized),
