@@ -29,7 +29,7 @@ import CryptoKit
 // + droplet check for the prefix before attempting decryption.
 //
 // Key selection: always read `IMAP_CRED_ENCRYPTION_KEY_PROD`. Per the
-// global CLAUDE.md rules (single KV_ENTITLEMENTS, single Stripe env),
+// global CLAUDE.md rules #9 and #10 (one shared backend entitlement store, one Stripe env),
 // all shared infrastructure — push-worker, droplet, KV — is prod-only.
 // A dev/prod split on this key would mean a Debug iOS build can't talk
 // to the prod droplet, which is the only droplet that exists. The
