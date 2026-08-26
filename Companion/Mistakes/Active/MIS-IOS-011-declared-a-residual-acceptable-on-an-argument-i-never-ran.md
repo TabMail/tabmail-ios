@@ -3,7 +3,7 @@
 **Class:** design-process | review
 **Severity:** high (would have shipped an unbounded wrong-content display, inside the very fix that
 existed to prevent wrong content)
-**First seen:** 2026-08 · **Recurrences:** 1 · **Status:** Active
+**First seen:** 2026-08 · **Recurrences:** 2 · **Status:** Active
 **Related:** `MIS-IOS-008` (verified the recovery path, not the states where it cannot run),
 `MIS-IOS-010` (a clause doing two safety jobs is a claim, not an observation) ·
 **Rule owner:** `CLAUDE.md` § THE MANTRA
@@ -69,6 +69,42 @@ And when a finding says *X is persisted before the guard runs*, enumerate **ever
 of the guarded operation before classifying — rows, index entries, and files on disk. A guard that
 covers two of three durable outputs is not a guard, and the missing one is invisible precisely
 because the other two are the ones the code reads back.
+
+---
+
+## Recurrence ×2 — 2026-08-26, the scheduled-task removal branch (ADR-IOS-079 §5)
+
+**Same tell, different surface, and this time the recovering event was even written down by name.**
+The branch that deletes iOS scheduled-task support removed `KBTaskParser`, so `ReminderBuilder`
+stopped contributing `t:` hashes to the `freshHashes` set it hands
+`DisabledRemindersStore.gcStaleEntries`. The store's contract is that an **absent entry means
+ENABLED**, and GC deletes any entry that is not fresh and is older than 90 days — so every synced
+`t:` disable would be collected, permanently, by the platform that can no longer compute the
+namespace.
+
+The ADR clause registered this as safe in one sentence: *"its local 90-day GC may drop one; because
+merges never delete on absence, the desktop keeps its own entry and re-seeds iOS on the next
+broadcast. The user's choice is not lost."*
+
+That reads like the countermeasure was followed — the recovering event **is** named (a desktop
+broadcast). It is the same failure anyway, because naming a recovering event and checking that it
+can RUN are different acts (`MIS-IOS-008`). Device Sync is a **peer-only relay with no server-side
+retention**. If the desktop that made the choice is gone — reinstall, dead machine, new laptop —
+the phone is the surviving copy, there is no peer left to re-seed from, and a replacement desktop
+recovers the synced `[Task]` line with its disable silently reverted. The task then executes.
+
+**What generalises beyond this instance:** a *removal* branch is a first-class producer of this
+mistake. Deleting a producer does not only delete its outputs — it silently changes the meaning of
+every consumer that reads *absence* of those outputs. Enumerate what still consumes the deleted
+producer's namespace before writing the acceptance clause, and for a convergence/re-seed argument
+ask **"does the peer I am relying on still exist in the scenario I am accepting?"** rather than
+"does the merge rule preserve it?".
+
+**Fix:** `gcStaleEntries` skips `t:`-prefixed hashes unconditionally — the invariant is *GC only
+collects hash namespaces this device can re-derive*. Deliberately wasteful (iOS retains them
+forever) rather than a conditional policy that would try to decide when a `t:` entry is really
+stale using information this platform does not have.
+Pinned two-sided by `DisabledRemindersCRDTTests.nonDerivableTaskHashesSurviveGC`.
 
 ---
 

@@ -50,10 +50,29 @@ engine while the management surface stayed hidden was the worst of both states.
    `taskCache`, and one carrying an arbitrary unknown field, both decode with every acted-on field
    intact, against a no-extra-fields baseline control; and the outgoing payload names no task field
    at all.
-5. **The `disabledReminders` field is untouched.** It still carries `t:`-prefixed task
-   enable/disable state across devices. iOS no longer contributes those hashes to its freshness set,
-   so its local 90-day GC may drop one; because merges never delete on absence, the desktop keeps
-   its own entry and re-seeds iOS on the next broadcast. The user's choice is not lost.
+5. **The `disabledReminders` field is untouched, and iOS's GC now refuses to collect `t:` hashes.**
+   The field still carries `t:`-prefixed task enable/disable state across devices, and iOS no longer
+   contributes those hashes to its freshness set. **The original wording of this clause — "its local
+   90-day GC may drop one; the desktop keeps its own entry and re-seeds iOS, so the user's choice is
+   not lost" — was WRONG, and is corrected here rather than deleted.** The re-seed argument silently
+   assumes a surviving peer still holds the entry. Device Sync is a peer relay that retains nothing,
+   so when the desktop that made the choice is gone and the phone is the surviving copy, GC deleting
+   the entry destroys the only remaining record: an absent entry means ENABLED, so a replacement
+   desktop recovers the synced task with its disable silently reverted and the task can execute.
+   That is a lost durable user intention, and it is caused by this removal.
+
+   **The invariant that fixes it: GC only collects hash namespaces this device can re-derive.**
+   `DisabledRemindersStore.gcStaleEntries` skips every `t:`-prefixed hash unconditionally, because a
+   platform that cannot compute a namespace cannot read that namespace's absence from `freshHashes`
+   as evidence of staleness — only as evidence that it cannot compute it. iOS therefore retains `t:`
+   entries forever. That is deliberately wasteful and deliberately unconditional: the entries are
+   tiny, Thunderbird still derives `t:` hashes into its own freshness set and still collects them on
+   its side, and any cleverer rule (a TTL variant, an allowlist, a second conditional policy) would
+   be a mechanism trying to decide when a `t:` entry is "really" stale using information this
+   platform does not have. `DisabledRemindersCRDTTests.nonDerivableTaskHashesSurviveGC` pins the
+   property two-sided — a `t:` entry absent from `freshHashes` and past the GC age survives with its
+   `enabled` value intact, while `m:`/`k:` entries in exactly the same state are still collected — so
+   the guard cannot silently degrade into "GC is off".
 6. **The `nse_pending_task_result` staging table stays.** It is a `CREATE TABLE IF NOT EXISTS` in
    the notification-extension staging bootstrap that both processes open, and test fixtures assert
    it. Only the producer and the consumer are removed. No cleanup or migration is written for
@@ -79,5 +98,9 @@ engine while the management surface stayed hidden was the worst of both states.
 - The `task.enabled` and `task.advance_minutes` settings are gone from the agent's settable list;
   asking for them now returns "unknown setting". No prompt or schema outside the deleted tool
   enumerated them.
+- **iOS's disabled-reminder map now grows monotonically in the `t:` namespace** — no `t:` entry is
+  ever collected on this platform again. Accepted: each entry is a short hash plus a flag and a
+  timestamp in a `UserDefaults`-backed JSON map, and Thunderbird still collects them, so the map
+  converges downward on the next merge from a peer that does derive the namespace.
 - Notification-tap deep links for task results are gone. A stale delivered notification tapped after
   upgrade routes to the inbox instead, which is the existing fallback.
