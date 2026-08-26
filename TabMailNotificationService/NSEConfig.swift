@@ -22,7 +22,6 @@ enum NSEConfig {
     /// attempts covers the transient-blip case a retry can actually fix.
     static let summaryMaxAttempts = 3
     static let actionTimeoutSeconds: TimeInterval = 12
-    static let taskTimeoutSeconds: TimeInterval = 24
     static let followUpTimeoutSeconds: TimeInterval = 5
     static let fanOutTimeoutSeconds: TimeInterval = 5
     static let actionVoteCount = 1

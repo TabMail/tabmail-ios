@@ -639,20 +639,4 @@ enum NSEStagingDB {
         }
     }
 
-    /// Persist a task result for main app to consume.
-    static func persistTaskResult(
-        db: DatabaseQueue,
-        taskName: String, taskInstruction: String, result: String
-    ) {
-        do {
-            try db.write { db in
-                try db.execute(sql: """
-                    INSERT INTO nse_pending_task_result (taskName, taskInstruction, result, timestamp)
-                    VALUES (?, ?, ?, ?)
-                    """, arguments: [taskName, taskInstruction, result, Date().timeIntervalSince1970])
-            }
-        } catch {
-            NSELog.error("persistTaskResult failed: \(error)")
-        }
-    }
 }

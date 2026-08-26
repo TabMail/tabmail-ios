@@ -1491,17 +1491,6 @@ actor PushNotificationService {
         // on every push (which would perpetually push BGAppRefresh forward).
         await SyncScheduler.shared.scheduleBackgroundSyncIfNeeded()
 
-        // Task alarm push — evaluate tasks, then do delta sync if time permits
-        if provider == "task_alarm" {
-            print("[Push] Task alarm wake — evaluating tasks")
-            BackgroundSyncLogger.log("SilentPush TASK_ALARM — evaluating tasks then delta sync")
-            BackgroundSyncLogger.logPush("TASK_ALARM — evaluating tasks then delta sync")
-            await NSEDataBridge.mergeNSEStagingData()
-            await TaskEvaluationService.shared.evaluate()
-            await SyncScheduler.shared.backgroundPoll()
-            return .newData
-        }
-
         // NSE follow-up push — NSE already did summary + action. Do heavy work now.
         if provider == "nse_followup" {
             print("[Push] NSE follow-up — merging staging data + heavy AI work")

@@ -98,14 +98,6 @@ actor ToolRegistry {
             KBDelTool(),
             ReminderAddTool(),
             ReminderDelTool(),
-            // MARK: Scheduled Tasks — DISABLED on iOS (platform limitation)
-            // Task tools require client-side execution (GRDB, FTS, multi-round LLM↔tool loop)
-            // which cannot run reliably in background on iOS. Silent pushes are throttled overnight,
-            // and NSE runs in a separate process without database access.
-            // Scheduled tasks remain Thunderbird-only.
-            // TaskAddTool(),
-            // TaskDelTool(),
-            // TaskEditTool(),
             ContactSearchTool(),
             ContactAddTool(),
             ContactEditTool(),

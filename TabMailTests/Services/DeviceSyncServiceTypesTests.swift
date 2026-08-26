@@ -12,13 +12,12 @@ struct SyncFieldExtendedTests {
     @Test("All SyncField cases are present")
     func allCasesPresent() {
         let cases = SyncField.allCases
-        #expect(cases.count == 6)
+        #expect(cases.count == 5)
         #expect(cases.contains(.composition))
         #expect(cases.contains(.action))
         #expect(cases.contains(.kb))
         #expect(cases.contains(.templates))
         #expect(cases.contains(.disabledReminders))
-        #expect(cases.contains(.taskCache))
     }
 
     @Test("promptFields has exactly 4 elements")
@@ -26,10 +25,9 @@ struct SyncFieldExtendedTests {
         #expect(SyncField.promptFields.count == 4)
     }
 
-    @Test("promptFields excludes disabledReminders and taskCache")
+    @Test("promptFields excludes disabledReminders")
     func promptFieldsExcludesNonPromptFields() {
         #expect(!SyncField.promptFields.contains(.disabledReminders))
-        #expect(!SyncField.promptFields.contains(.taskCache))
     }
 
     @Test("promptFields includes all prompt-related cases")
@@ -54,7 +52,6 @@ struct SyncFieldExtendedTests {
         #expect(SyncField.kb.displayName == "Knowledge Base")
         #expect(SyncField.templates.displayName == "Templates")
         #expect(SyncField.disabledReminders.displayName == "Disabled Reminders")
-        #expect(SyncField.taskCache.displayName == "Task Cache")
     }
 
     @Test("Specific icon values match expected SF Symbol names")
@@ -64,7 +61,6 @@ struct SyncFieldExtendedTests {
         #expect(SyncField.kb.icon == "book")
         #expect(SyncField.templates.icon == "doc.on.doc")
         #expect(SyncField.disabledReminders.icon == "bell.slash")
-        #expect(SyncField.taskCache.icon == "clock.arrow.2.circlepath")
     }
 
     @Test("icon values are all unique")

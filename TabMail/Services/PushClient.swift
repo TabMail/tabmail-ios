@@ -286,32 +286,6 @@ actor PushClient {
         print("[PushClient] Device unregistered")
     }
 
-    // MARK: - Task Alarm Registration
-
-    /// Register task alarm wake times with the push worker.
-    /// The worker sends silent pushes at these absolute UTC times to wake the app.
-    func registerAlarms(
-        deviceToken: String,
-        wakeTimes: [String],
-        apnsSandbox: Bool
-    ) async throws {
-        var request = try await authRequest(path: "/alarms", method: "POST")
-        let body: [String: Any] = [
-            "deviceToken": deviceToken,
-            "wakeTimes": wakeTimes,
-            "apnsSandbox": apnsSandbox,
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        let (_, response) = try await session.data(for: request)
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard 200..<300 ~= code else {
-            print("[PushClient] registerAlarms failed: HTTP \(code)")
-            throw PushError.requestFailed(statusCode: code)
-        }
-        print("[PushClient] Registered \(wakeTimes.count) alarm wake times")
-    }
-
     // MARK: - Push Subscriptions
 
     /// Subscribe an account for push (Gmail watch / Outlook Graph subscription).

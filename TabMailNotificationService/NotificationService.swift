@@ -168,8 +168,6 @@ final class NotificationService: UNNotificationServiceExtension {
             "provider": request.content.userInfo["provider"] as? String ?? "",
             "accountEmail": request.content.userInfo["accountEmail"] as? String ?? "",
             "historyId": historyIdStr,
-            "taskName": request.content.userInfo["taskName"] as? String ?? "",
-            "taskInstruction": request.content.userInfo["taskInstruction"] as? String ?? "",
             // Worker classifier now emits one visible push per arrived message
             // with `messageId` in the payload. When present, NSE uses it directly
             // and skips its own Gmail history.list call (saves ~1-3s of the 30s
@@ -329,7 +327,7 @@ final class NotificationService: UNNotificationServiceExtension {
         // watchdog (we finished before it fired, so it must not deliver a late
         // passive), STOP the heartbeat, THEN release the lease (heartbeat down
         // first so no 1Hz refresh races the release write). All idempotent —
-        // no-ops for the task_alarm / imap_reconnect / no-claim paths, and no-ops
+        // no-ops for the imap_reconnect / no-claim paths, and no-ops
         // if the watchdog or the iOS expiration handler already ran. This is the
         // "lease all the time" guarantee: the main app never has to wait out a
         // stale lease after a clean NSE exit. The lease releases AFTER step-7
@@ -342,15 +340,6 @@ final class NotificationService: UNNotificationServiceExtension {
         }
 
         // ── Route by type ──
-        if provider == "task_alarm" {
-            NSELog.step("NSE route: task_alarm")
-            await handleTaskAlarm(c: c, info: info, db: db, deliveredFlag: deliveredFlag)
-            // Task result lands in NSE staging DB — main app will merge it on
-            // its next natural wake (foreground, BGAppRefresh, BGProcessingTask)
-            // via mergeNSEStagingData. The previous follow-up silent push was
-            // best-effort (~40% delivery) and is no longer needed.
-            deliver(c); return
-        }
         if provider == "imap_reconnect" {
             // `final:"true"` is set by the push-worker's retry-ladder cron
             // on the 5th (give-up) tick. The payload already carries the
@@ -1020,56 +1009,6 @@ final class NotificationService: UNNotificationServiceExtension {
         // mergeNSEStagingData. The previous follow-up silent push to /nse-done
         // was best-effort (~40% delivery) and added a flaky failure mode.
         deliver(c)
-    }
-
-    // MARK: - Task Alarm
-
-    private static func handleTaskAlarm(
-        c: UNMutableNotificationContent,
-        info: [String: String],
-        db: DatabaseQueue?,
-        deliveredFlag: OneShotFlag
-    ) async {
-        let taskName = info["taskName"] ?? "Scheduled Task"
-        let rawInstruction = info["taskInstruction"]
-        guard let instruction = (rawInstruction?.isEmpty == true ? nil : rawInstruction)
-                ?? NSEState.findTaskInstruction(for: taskName), !instruction.isEmpty else {
-            c.title = taskName; c.body = "Open app to run this task"
-            c.interruptionLevel = .active; c.sound = .default; return
-        }
-        let now = Date()
-        let timeStr = DateFormatter.localizedString(from: now, dateStyle: .none, timeStyle: .short)
-        let dateStr = DateFormatter.localizedString(from: now, dateStyle: .full, timeStyle: .none)
-        let userMessage = "It is now \(timeStr), \(dateStr). I previously scheduled this task: \"\(instruction)\" Execute and respond."
-
-        let resp = await BackendNSEClient.sendCompletions(
-            promptAlias: "system_prompt_chat",
-            variables: BackendNSEClient.Vars([
-                "user_name": NSEState.getUserName() ?? "User",
-                "kb": NSEState.getKBText() ?? "",
-                "user_message": userMessage,
-            ]),
-            authToken: await NSETokenManager.validAccessToken(), timeout: NSEConfig.taskTimeoutSeconds
-        )
-        // Zombie guard — same rationale as process()'s checkpoints: the
-        // completions call is deadline-bounded, but the process can still be
-        // suspended mid-await and zombie-resumed after the watchdog delivered.
-        // Guard BEFORE mutating `c` and before the persistTaskResult write —
-        // a stale INSERT would hand the main app a task result from a run the
-        // exit path already concluded. Returning without touching `c` is safe:
-        // the caller's deliver(c) no-ops on the fired OneShotFlag.
-        if deliveredFlag.hasFired() {
-            NSELog.step("NSE zombie: exit path already delivered — abandoning without persist")
-            return
-        }
-        if let resp {
-            c.title = taskName; c.body = String(resp.assistant.prefix(4096))
-            c.interruptionLevel = .active; c.sound = .default
-            if let db { NSEStagingDB.persistTaskResult(db: db, taskName: taskName, taskInstruction: instruction, result: resp.assistant) }
-        } else {
-            c.title = taskName; c.body = "Could not complete. Open app to retry."
-            c.interruptionLevel = .active; c.sound = .default
-        }
     }
 
     // MARK: - IMAP Reconnect

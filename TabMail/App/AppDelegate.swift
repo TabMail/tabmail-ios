@@ -17,7 +17,6 @@ enum PendingDeepLink: Sendable {
     /// can disambiguate a provider id that collides across accounts (IMAP UIDs).
     case message(id: String, accountId: String?)
     case inbox
-    case taskResult(taskHash: String)
 }
 
 /// Thread-safe storage for deep links that arrive before the UI is ready.
@@ -495,9 +494,9 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
             print("[NotificationDelegate] willPresent notification: \(notification.request.identifier) provider=\(provider ?? "nil")")
         }
 
-        // NSE email/task pushes: suppress in foreground, trigger sync instead.
+        // NSE email pushes: suppress in foreground, trigger sync instead.
         // Fan-out chain stops naturally — app's sync discovers all new messages.
-        if let provider, ["gmail", "outlook", "imap_new_mail", "task_alarm"].contains(provider) {
+        if let provider, ["gmail", "outlook", "imap_new_mail"].contains(provider) {
             Task { @MainActor in
                 // A push can arrive during the one-time migration window; wait
                 // for the DB before touching it (AppStartup / PLAN_HANG_FIX).
@@ -674,12 +673,9 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 
             let messageId = userInfo["messageId"] as? String
             let source = userInfo["source"] as? String
-            let taskHash = userInfo["sessionId"] as? String
             let reminderAccountId = userInfo["accountId"] as? String
             let deepLink: PendingDeepLink
-            if source == "task", let taskHash {
-                deepLink = .taskResult(taskHash: taskHash)
-            } else if let messageId, !messageId.isEmpty, source == "message" {
+            if let messageId, !messageId.isEmpty, source == "message" {
                 deepLink = .message(id: messageId, accountId: reminderAccountId)
             } else {
                 deepLink = .inbox
@@ -697,12 +693,6 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                         name: .proactiveNotificationTapped,
                         object: nil,
                         userInfo: info
-                    )
-                case .taskResult(let taskHash):
-                    NotificationCenter.default.post(
-                        name: .proactiveNotificationTapped,
-                        object: nil,
-                        userInfo: ["taskHash": taskHash, "expandChat": true]
                     )
                 case .inbox:
                     NotificationCenter.default.post(

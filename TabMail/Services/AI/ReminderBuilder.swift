@@ -6,9 +6,9 @@ import Foundation
 import GRDB
 import Synchronization
 
-/// A unified reminder from either message summaries, KB entries, or task entries.
+/// A unified reminder from either message summaries or KB entries.
 struct Reminder: Sendable {
-    let type: String       // "reminder" or "task"
+    let type: String       // always "reminder"
     let content: String
     let dueDate: String?   // "YYYY-MM-DD"
     let dueTime: String?   // "HH:MM"
@@ -21,7 +21,7 @@ struct Reminder: Sendable {
     let uniqueId: String?
     let subject: String?
     let from: String?
-    // Task-only fields:
+    // Schedule fields — no producer on this platform; always nil.
     let instruction: String?
     let scheduleDays: String?
     let scheduleDate: String?   // "YYYY/MM/DD" — for one-off tasks
@@ -46,7 +46,6 @@ enum ReminderBuilder {
     /// Invalidate all reminder caches (parser + list). Proactively rebuilds in background.
     /// Safe to call from any thread/actor — only does Mutex.withLock (O(1)) + Task creation.
     static func invalidateCache() {
-        KBTaskParser.invalidateCache()
         KBReminderParser.invalidateCache()
         cachedList.withLock { $0 = nil }
         // DETACHED on purpose: this is a background cache refresh, so it must NOT
@@ -107,7 +106,7 @@ enum ReminderBuilder {
     /// The full build — GRDB query, KB parse, hashing, sort, GC. Called only on cache miss.
     ///
     /// Demo isolation (ADR-IOS-038): while demo mode is active, message
-    /// reminders are scoped to the demo account and KB reminders/tasks come
+    /// reminders are scoped to the demo account and KB reminders come
     /// from the DEMO prompt overlay (kbTextSnapshot is demo-aware) — both
     /// directions: real reminders never surface in demo, demo reminders never
     /// surface for the user. The cache is invalidated on demo entry/exit via
@@ -144,25 +143,6 @@ enum ReminderBuilder {
             )
         }
 
-        // Parse task entries from KB
-        let taskParsed = KBTaskParser.parse(kbText)
-        let taskReminders = taskParsed.map { task -> Reminder in
-            let hash = KBTaskParser.taskHash(task)
-            return Reminder(
-                type: "task",
-                content: task.instruction,
-                dueDate: nil, dueTime: nil,
-                source: "kb",
-                hash: hash,
-                enabled: !disabledHashes.contains(hash),
-                action: nil, messageId: nil, uniqueId: nil, subject: nil, from: nil,
-                instruction: task.instruction, scheduleDays: task.scheduleDays,
-                scheduleDate: task.scheduleDate, scheduleTime: task.scheduleTime, timezone: task.timezone,
-                rawLine: task.rawLine
-            )
-        }
-        print("[ReminderBuilder] Parsed \(taskParsed.count) task entries")
-
         // Add hash + enabled to message reminders, migrating old hashes if needed
         let taggedMessageReminders = messageReminders.map { r -> Reminder in
             let hash = DisabledRemindersStore.hashReminder(source: "message", content: r.content, uniqueId: r.uniqueId, rfc822MessageId: r.rfc822MessageId)
@@ -196,7 +176,7 @@ enum ReminderBuilder {
             )
         }
 
-        var allReminders = taggedMessageReminders + kbReminders + taskReminders
+        var allReminders = taggedMessageReminders + kbReminders
 
         // One-time: auto-disable overdue reminders on first launch (v1.0.1).
         // Prevents a flood of overdue notifications for users with large inboxes.
@@ -222,12 +202,8 @@ enum ReminderBuilder {
         let freshHashes = Set(allReminders.map(\.hash))
         DisabledRemindersStore.gcStaleEntries(freshHashes: freshHashes)
 
-        // Sort: regular reminders first (due-dated ascending, then undated), then tasks at end
+        // Sort: due-dated reminders ascending, then undated
         allReminders.sort { a, b in
-            // Tasks sort after regular reminders
-            if a.type == "task" && b.type != "task" { return false }
-            if a.type != "task" && b.type == "task" { return true }
-
             // Items with due dates come first
             if a.dueDate != nil && b.dueDate == nil { return true }
             if a.dueDate == nil && b.dueDate != nil { return false }
@@ -248,13 +224,12 @@ enum ReminderBuilder {
         }
 
         let disabledCount = allReminders.filter { !$0.enabled }.count
-        var messageCount = 0, kbCount = 0, taskCount = 0
+        var messageCount = 0, kbCount = 0
         for r in allReminders {
-            if r.type == "task" { taskCount += 1 }
-            else if r.source == "message" { messageCount += 1 }
+            if r.source == "message" { messageCount += 1 }
             else if r.source == "kb" { kbCount += 1 }
         }
-        print("[ReminderBuilder] Built reminder list: \(allReminders.count) total (\(messageCount) message + \(kbCount) KB + \(taskCount) task, \(disabledCount) disabled)")
+        print("[ReminderBuilder] Built reminder list: \(allReminders.count) total (\(messageCount) message + \(kbCount) KB, \(disabledCount) disabled)")
 
         return allReminders
     }
@@ -276,25 +251,17 @@ enum ReminderBuilder {
                 "source": r.source,
                 "type": r.type,
             ]
-            if r.type == "task" {
-                // Task-specific fields
-                if let inst = r.instruction { dict["instruction"] = inst }
-                if let sd = r.scheduleDays { dict["schedule"] = "\(sd) \(r.scheduleTime ?? "")" }
-                if let tz = r.timezone { dict["timezone"] = tz }
-            } else {
-                // Reminder-specific fields
-                if let d = r.dueDate { dict["dueDate"] = d }
-                if let t = r.dueTime { dict["dueTime"] = t }
-                if let s = r.subject { dict["subject"] = s }
-                if let f = r.from { dict["from"] = f }
-                if let a = r.action { dict["action"] = a }
-                // Translate IDs to numeric (matching TB's processToolResultTBtoLLM)
-                if let u = r.uniqueId {
-                    dict["uniqueId"] = await translator.toNumericId(u)
-                }
-                if let m = r.messageId {
-                    dict["messageId"] = await translator.toNumericId(m)
-                }
+            if let d = r.dueDate { dict["dueDate"] = d }
+            if let t = r.dueTime { dict["dueTime"] = t }
+            if let s = r.subject { dict["subject"] = s }
+            if let f = r.from { dict["from"] = f }
+            if let a = r.action { dict["action"] = a }
+            // Translate IDs to numeric (matching TB's processToolResultTBtoLLM)
+            if let u = r.uniqueId {
+                dict["uniqueId"] = await translator.toNumericId(u)
+            }
+            if let m = r.messageId {
+                dict["messageId"] = await translator.toNumericId(m)
             }
             items.append(dict)
         }
@@ -346,9 +313,7 @@ enum ReminderBuilder {
                 return cached
             }
         }
-        let allRemindersRaw = await buildReminderList()
-        // Filter out task entries — they're background tasks, not chat-display reminders
-        let allReminders = allRemindersRaw.filter { $0.type != "task" }
+        let allReminders = await buildReminderList()
         guard !allReminders.isEmpty else { return [] }
 
         let calendar = Calendar.current

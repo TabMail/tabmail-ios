@@ -462,16 +462,15 @@ struct SyncFieldTimestampKeyTests {
         }
     }
 
-    @Test("promptFields count is allCases minus 2")
+    @Test("promptFields count is allCases minus 1")
     func promptFieldsCountRelation() {
-        #expect(SyncField.promptFields.count == SyncField.allCases.count - 2)
+        #expect(SyncField.promptFields.count == SyncField.allCases.count - 1)
     }
 
-    @Test("disabledReminders and taskCache are the non-prompt fields")
+    @Test("disabledReminders is the only non-prompt field")
     func nonPromptFields() {
         let nonPrompt = Set(SyncField.allCases).subtracting(SyncField.promptFields)
-        #expect(nonPrompt.count == 2)
+        #expect(nonPrompt.count == 1)
         #expect(nonPrompt.contains(.disabledReminders))
-        #expect(nonPrompt.contains(.taskCache))
     }
 }

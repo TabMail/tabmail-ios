@@ -478,124 +478,16 @@ struct FormatRemindersJSONTests {
     }
 }
 
-// MARK: - Task Integration Tests
+// MARK: - Cache Integration Tests
 
-@Suite("ReminderBuilder Task Integration")
-struct ReminderBuilderTaskIntegrationTests {
-
-    private func makeReminder(type: String = "reminder", content: String, dueDate: String? = nil,
-                              source: String = "kb", hash: String, enabled: Bool = true) -> Reminder {
-        Reminder(
-            type: type, content: content, dueDate: dueDate, dueTime: nil,
-            source: source, hash: hash, enabled: enabled,
-            action: nil, messageId: nil, uniqueId: nil, subject: nil, from: nil,
-            instruction: type == "task" ? content : nil,
-            scheduleDays: type == "task" ? "daily" : nil,
-            scheduleDate: nil,
-            scheduleTime: type == "task" ? "09:00" : nil,
-            timezone: nil, rawLine: nil
-        )
-    }
-
-    @Test("Reminder struct with type='task' has correct isOneOff for recurring")
-    func taskReminderRecurring() {
-        let r = Reminder(
-            type: "task", content: "Morning check", dueDate: nil, dueTime: nil,
-            source: "kb", hash: "t:abc", enabled: true,
-            action: nil, messageId: nil, uniqueId: nil, subject: nil, from: nil,
-            instruction: "Morning check", scheduleDays: "weekdays",
-            scheduleDate: nil, scheduleTime: "09:00", timezone: "America/Vancouver", rawLine: "- [Task] Schedule weekdays 09:00, Morning check"
-        )
-        #expect(r.type == "task")
-        #expect(r.isOneOff == false)
-        #expect(r.instruction == "Morning check")
-        #expect(r.scheduleDays == "weekdays")
-    }
-
-    @Test("Reminder struct with type='task' has correct isOneOff for one-off")
-    func taskReminderOneOff() {
-        let r = Reminder(
-            type: "task", content: "Follow up", dueDate: nil, dueTime: nil,
-            source: "kb", hash: "t:xyz", enabled: true,
-            action: nil, messageId: nil, uniqueId: nil, subject: nil, from: nil,
-            instruction: "Follow up", scheduleDays: nil,
-            scheduleDate: "2026/04/15", scheduleTime: "15:00", timezone: nil, rawLine: ""
-        )
-        #expect(r.isOneOff == true)
-    }
-
-    @Test("Sorting: tasks sort after regular reminders")
-    func tasksSortAfterReminders() {
-        var items = [
-            makeReminder(type: "task", content: "Task A", hash: "t:a"),
-            makeReminder(content: "Reminder B", dueDate: "2026-04-10", hash: "k:b"),
-            makeReminder(type: "task", content: "Task C", hash: "t:c"),
-            makeReminder(content: "Reminder D", hash: "k:d"),
-        ]
-        items.sort { a, b in
-            if a.type == "task" && b.type != "task" { return false }
-            if a.type != "task" && b.type == "task" { return true }
-            if a.dueDate != nil && b.dueDate == nil { return true }
-            if a.dueDate == nil && b.dueDate != nil { return false }
-            if let aDate = a.dueDate, let bDate = b.dueDate {
-                return aDate < bDate
-            }
-            return false
-        }
-        // Reminders should come first
-        #expect(items[0].type == "reminder")
-        #expect(items[1].type == "reminder")
-        // Tasks should be at the end
-        #expect(items[2].type == "task")
-        #expect(items[3].type == "task")
-    }
-
-    @Test("Sorting: due-dated reminders before undated reminders, both before tasks")
-    func sortingOrder() {
-        var items = [
-            makeReminder(type: "task", content: "Task", hash: "t:1"),
-            makeReminder(content: "Undated reminder", hash: "k:2"),
-            makeReminder(content: "Dated reminder", dueDate: "2026-04-08", hash: "k:3"),
-        ]
-        items.sort { a, b in
-            if a.type == "task" && b.type != "task" { return false }
-            if a.type != "task" && b.type == "task" { return true }
-            if a.dueDate != nil && b.dueDate == nil { return true }
-            if a.dueDate == nil && b.dueDate != nil { return false }
-            if let aDate = a.dueDate, let bDate = b.dueDate {
-                return aDate < bDate
-            }
-            return false
-        }
-        #expect(items[0].content == "Dated reminder")
-        #expect(items[1].content == "Undated reminder")
-        #expect(items[2].content == "Task")
-    }
+@Suite("ReminderBuilder Cache Integration")
+struct ReminderBuilderCacheIntegrationTests {
 
     @Test("invalidateCache clears both parser and list caches with explicit lazy rebuild")
     func invalidateCacheClearsAll() async {
         ReminderBuilder.invalidateCache()
         ReminderBuilder.invalidateCache()
         _ = await ReminderBuilder.buildReminderList(includeDisabled: true)
-    }
-
-    @Test("formatRemindersJSON includes task fields when present")
-    func formatTaskInJSON() async {
-        let r = Reminder(
-            type: "task", content: "Check emails", dueDate: nil, dueTime: nil,
-            source: "kb", hash: "t:abc", enabled: true,
-            action: nil, messageId: nil, uniqueId: nil, subject: nil, from: nil,
-            instruction: "Check emails", scheduleDays: "weekdays",
-            scheduleDate: nil, scheduleTime: "09:00", timezone: "America/Vancouver", rawLine: ""
-        )
-        let json = await ReminderBuilder.formatRemindersJSON([r])
-        let data = json.data(using: .utf8)!
-        let parsed = try! JSONSerialization.jsonObject(with: data) as! [[String: Any]]
-        #expect(parsed.count == 1)
-        guard parsed.count == 1 else { return }
-        let item = parsed[0]
-        #expect(item["content"] as? String == "Check emails")
-        #expect(item["source"] as? String == "kb")
     }
 }
 
