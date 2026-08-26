@@ -4,458 +4,232 @@
 
 import Foundation
 
-/// Persistent diagnostic log for background sync events (BGAppRefreshTask, BGProcessingTask, silent push).
-/// Modeled after `AuthDiagnostics` — writes timestamped entries to a file in Application Support
-/// so they survive app restarts and can be viewed in the Debug menu.
+/// Diagnostic log writers for the main app's background and queue subsystems.
+///
+/// Every function here writes to the ONE app log file — see `AppLogStore`, which
+/// owns the file, the serial I/O queue, the byte cap and the readers. This type
+/// is now only the set of named entry points and, more importantly, the record of
+/// **which channels are debug-gated and which are always-on**.
+///
+/// That split is a registered decision (`IOS-LOG-002`), not an accident:
+/// `log`, `logError` and `logChatError` persist in production because a failure
+/// that only reproduces in the field has to leave a trace, while every channel
+/// added for investigation is a no-op unless debug mode is unlocked by an allowed
+/// user (global `CLAUDE.md` rule 12). Consolidating the files changed neither set.
+///
+/// MOST writers also `print` for immediate Xcode-console visibility, on the
+/// caller's thread; `logBackfill` and `logBoot` deliberately do NOT, because
+/// their callers already echo to the console themselves. Every writer that DOES
+/// have a console sink and is debug-gated gates the `print` too — a debug-gated
+/// channel must be a no-op in production on BOTH channels, not just on disk.
 enum BackgroundSyncLogger {
-    /// Hard cap on log file size before tail-trim kicks in.
-    private static let maxBytes = 16 * 1024 * 1024
-    /// Bytes to retain after a tail-trim. Trim happens at most once per (maxBytes - keepBytes) of growth.
-    private static let keepBytes = 8 * 1024 * 1024
-    private static let fileName = "background_sync.log"
 
-    /// Shared serial queue for ALL persistent log file I/O.
-    ///
-    /// Even though appends are now O(entry size) (`FileHandle.seekToEnd` + write),
-    /// disk I/O on MainActor during rapid SwiftUI renders (e.g. `InboxViewModel.init`
-    /// during fast nav) can still produce visible stalls. Serializing on a background
-    /// `utility`-QoS queue keeps log I/O off MainActor. Timestamps are captured at
-    /// call time so on-disk ordering still reflects real call ordering even though
-    /// writes are async. `print()` stays on the caller's thread for immediate
-    /// Xcode-console visibility.
-    private static let ioQueue = DispatchQueue(label: "tabmail.logger.io", qos: .utility)
+    // MARK: - Background sync (always-on)
 
-    /// Shared write helper — appends via `FileHandle.seekToEnd`, periodic byte-cap trim, all on ioQueue.
-    private static func appendAsync(to url: URL, entry: String) {
-        ioQueue.async {
-            guard let data = entry.data(using: .utf8) else { return }
-            if !FileManager.default.fileExists(atPath: url.path) {
-                try? Data().write(to: url)
-            }
-            if let handle = try? FileHandle(forWritingTo: url) {
-                do {
-                    try handle.seekToEnd()
-                    try handle.write(contentsOf: data)
-                } catch {
-                    // Drop on write error; next append will retry.
-                }
-                try? handle.close()
-            }
-            if let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int,
-               size > maxBytes {
-                trimTail(url: url)
-            }
-        }
-    }
-
-    /// Atomically replace `url` with its last `keepBytes`, advanced past the first
-    /// partial line so we never split a log entry. Caller must run this on `ioQueue`.
-    private static func trimTail(url: URL) {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return }
-        defer { try? handle.close() }
-        guard let size = try? handle.seekToEnd(), size > UInt64(keepBytes) else { return }
-        let offset = size - UInt64(keepBytes)
-        do { try handle.seek(toOffset: offset) } catch { return }
-        guard var data = try? handle.readToEnd() else { return }
-        if let newline = data.firstIndex(of: 0x0A) {
-            data = data.subdata(in: (newline + 1)..<data.count)
-        }
-        try? data.write(to: url, options: .atomic)
-    }
-
-    /// Drain all pending async writes before returning. Call this from `read*`
-    /// methods so a log-then-read roundtrip (tests, debug-menu view) sees the
-    /// just-written entry rather than racing the async flush.
-    private static func flushPendingWrites() {
-        ioQueue.sync { /* serial queue → .sync drains everything queued */ }
-    }
-
-    private static var fileURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TabMail", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(fileName)
-    }
-
-    /// Append a background sync event. Thread-safe via atomic file writes.
+    /// Append a background sync event (BGAppRefreshTask, BGProcessingTask, silent push).
     static func log(_ message: String) {
-        let entry = "[\(Date().iso8601String())] \(message)\n"
         print("[BGSyncLog] \(message)")
-        appendAsync(to: fileURL, entry: entry)
+        AppLogStore.append(message, channel: .sync)
     }
 
-    /// Read the full log. Returns empty message if no log exists.
-    /// Flushes any pending async writes first so a log-then-read roundtrip is consistent.
-    static func readLog() -> String {
-        flushPendingWrites()
-        return (try? String(contentsOf: fileURL, encoding: .utf8)) ?? "(no background sync log)"
-    }
-
-    /// Clear the log file.
-    static func clearLog() {
-        try? "".write(to: fileURL, atomically: true, encoding: .utf8)
-    }
-
-    // MARK: - Error Log
-
-    private static let errorFileName = "error.log"
-
-    private static var errorFileURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TabMail", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(errorFileName)
-    }
+    // MARK: - Errors (always-on)
 
     /// Log an error with source context. Captures sync errors, NIO errors, API errors, etc.
     static func logError(_ message: String, source: String) {
-        let entry = "[\(Date().iso8601String())] [\(source)] \(message)\n"
         print("[ErrorLog:\(source)] \(message)")
-        appendAsync(to: errorFileURL, entry: entry)
+        AppLogStore.append("[\(source)] \(message)", channel: .error)
     }
 
-    static func readErrorLog() -> String {
-        flushPendingWrites()
-        return (try? String(contentsOf: errorFileURL, encoding: .utf8)) ?? "(no errors logged)"
-    }
+    // MARK: - Chat errors (always-on)
 
-    static func clearErrorLog() {
-        try? "".write(to: errorFileURL, atomically: true, encoding: .utf8)
-    }
-
-    // MARK: - Chat Error Log
-
-    private static let chatErrorFileName = "chat_error.log"
-
-    private static var chatErrorFileURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TabMail", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(chatErrorFileName)
-    }
-
-    /// Log a chat/AI error with context. Captures tool failures, empty responses, connection errors, etc.
+    /// Log a chat/AI error with context. Captures tool failures, empty responses, connection errors.
+    ///
+    /// **BOTH spans this writes are outside our control, and both are bounded and
+    /// escaped here — in the façade — rather than at each call site:**
+    ///
+    /// * `userMessage` is literal user-typed chat input (`AIChat` passes
+    ///   `userText` straight through); and
+    /// * `message` carries REMOTE text at most production call sites. `AIChat`
+    ///   interpolates the backend's own `response.error` string
+    ///   (`"Server error: \(error)"`, `"Server error (resume): \(error)"`) and
+    ///   `DynamicIslandChatButton` interpolates `error.localizedDescription`
+    ///   (`"Chat error: …"`, `"Connection lost (resumable): …"`,
+    ///   `"Resume failed: …"`). Stated with its negative case, because "every"
+    ///   was wrong and a reader would have checked it: `BackendClient`'s
+    ///   `"SSE stream ended without final event …"` interpolates nothing at all.
+    ///   That one is safe TODAY by accident of its argument, not by contract —
+    ///   which is exactly why the bound-and-escape lives HERE and not at the
+    ///   call sites that happen to need it.
+    ///
+    /// The app log is now a LINE-ORIENTED sink shared by every channel, so an
+    /// unescaped newline in EITHER span is a forgery rather than a formatting
+    /// nit: a value carrying `"\n[x] [AUTH] …"` produces a second PHYSICAL line
+    /// that `AppLogStore.entryTag` parses as a genuine AUTH entry — it surfaces
+    /// in `read(channel: .auth)`, it truncates the real entry in
+    /// `read(channel: .chatError)`, and `clear(channel: .chatError)` leaves the
+    /// forged remainder behind. Before consolidation that forgery was confined to
+    /// `chat_error.log` and harmless; the shared file is what makes it
+    /// cross-channel. Escaping only `userMessage` closed one of the two doors.
+    ///
+    /// The `\n  User message: ` separator BETWEEN the two spans is deliberate and
+    /// stays a literal: `AppLogStore.read(channel:)` attributes a continuation
+    /// line upward to this entry, so escaping the newline we write ourselves
+    /// would destroy the two-line shape the reader needs. Escape the spans, never
+    /// the separator you write yourself.
     static func logChatError(_ message: String, userMessage: String? = nil) {
-        var entry = "[\(Date().iso8601String())] \(message)"
+        // ⚠️ BOUND BEFORE ESCAPE, AND BOUND BY UNICODE SCALAR — both halves matter.
+        //
+        // Escaping collapses a multi-line span into ONE physical line, which is
+        // the point, and it also removes the newlines `AppLogStore.trimTail`
+        // depends on. `trimTail` keeps the last `keepBytes` and then advances past
+        // the first newline in that tail, so an entry whose only newline is its
+        // own terminal one leaves NOTHING to retain. That outcome is now owned by
+        // the STORE, not by this façade: `AppLogStore.append` bounds every channel
+        // at `maxEntryScalars`, and `trimTail` refuses to write an empty file, so
+        // such a trim is abandoned and the log is left untrimmed rather than
+        // erased. Bounding each span here is the tightest of the three guards,
+        // not the only one standing between this writer and a whole-file erase.
+        //
+        // The ceiling is over `unicodeScalars`, not `Characters`. `prefix(100)`
+        // counts extended grapheme CLUSTERS, and a single cluster can carry an
+        // unbounded run of combining marks, so one pasted grapheme passes a
+        // Character cap intact (`MIS-IOS-013` — a SIZE question asked with a
+        // grapheme-level `String` API). Slicing SCALARS cannot split a UTF-8
+        // sequence, and it runs BEFORE escaping so it can never slice a generated
+        // `\uXXXX` in half.
+        //
+        // 4000 scalars is a ceiling, not a budget: every call site writes a short
+        // developer line plus one error string, so ordinary text never reaches it,
+        // while the escaped worst case (six characters per escaped scalar) still
+        // stays three orders of magnitude below `AppLogStore.keepBytes`.
+        var entry = DebugModeManager.escapedForLogLine(
+            String(String.UnicodeScalarView(message.unicodeScalars.prefix(4000))))
         if let userMessage {
-            entry += "\n  User message: \(userMessage.prefix(100))"
+            // ORDER: cap FIRST, escape SECOND. `prefix(100)` carries the INTENT —
+            // roughly a hundred characters of the user's own text is what the log
+            // needs — and escaping afterwards can only expand what survived (one
+            // control scalar becomes six characters, `\u000a`), so the
+            // cap can never slice an escape sequence in half. Escaping first would
+            // also let a message of 100 newlines spend the whole budget on escape
+            // sequences and preserve ~16 characters of actual evidence.
+            //
+            // The scalar cap after it is the HARD ceiling that a single grapheme
+            // cannot defeat, for the reason spelled out above: `prefix(100)` alone
+            // bounds neither scalars nor bytes.
+            let capped = String(userMessage.prefix(100))
+            let bounded = String(String.UnicodeScalarView(capped.unicodeScalars.prefix(400)))
+            entry += "\n  User message: \(DebugModeManager.escapedForLogLine(bounded))"
         }
-        entry += "\n"
         print("[ChatErrorLog] \(message)")
-        appendAsync(to: chatErrorFileURL, entry: entry)
+        AppLogStore.append(entry, channel: .chatError)
     }
 
-    static func readChatErrorLog() -> String {
-        flushPendingWrites()
-        return (try? String(contentsOf: chatErrorFileURL, encoding: .utf8)) ?? "(no chat errors logged)"
-    }
-
-    static func clearChatErrorLog() {
-        try? "".write(to: chatErrorFileURL, atomically: true, encoding: .utf8)
-    }
-
-    // MARK: - BG App Refresh Log
-
-    private static let bgAppRefreshFileName = "bg_app_refresh.log"
-
-    private static var bgAppRefreshFileURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TabMail", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(bgAppRefreshFileName)
-    }
+    // MARK: - BG App Refresh (debug-gated)
 
     /// Log a BGAppRefreshTask lifecycle event (schedule, start, expire, complete, silent push).
-    /// Only writes to disk when debug mode is unlocked by an allowed user.
     static func logBGAppRefresh(_ message: String) {
         guard DebugModeManager.isLoggingEnabled() else { return }
-        let entry = "[\(Date().iso8601String())] \(message)\n"
         print("[BGAppRefreshLog] \(message)")
-        appendAsync(to: bgAppRefreshFileURL, entry: entry)
+        AppLogStore.append(message, channel: .bgAppRefresh)
     }
 
-    static func readBGAppRefreshLog() -> String {
-        flushPendingWrites()
-        return (try? String(contentsOf: bgAppRefreshFileURL, encoding: .utf8)) ?? "(no BG App Refresh log)"
-    }
-
-    static func clearBGAppRefreshLog() {
-        try? "".write(to: bgAppRefreshFileURL, atomically: true, encoding: .utf8)
-    }
-
-    // MARK: - BG Processing Log
-
-    private static let bgProcessingFileName = "bg_processing.log"
-
-    private static var bgProcessingFileURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TabMail", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(bgProcessingFileName)
-    }
+    // MARK: - BG Processing (debug-gated)
 
     /// Log a BGProcessingTask lifecycle event (schedule, start, phase progress, expire, complete).
-    /// Only writes to disk when debug mode is unlocked by an allowed user.
     static func logBGProcessing(_ message: String) {
         guard DebugModeManager.isLoggingEnabled() else { return }
-        let entry = "[\(Date().iso8601String())] \(message)\n"
         print("[BGProcessingLog] \(message)")
-        appendAsync(to: bgProcessingFileURL, entry: entry)
+        AppLogStore.append(message, channel: .bgProcessing)
     }
 
-    static func readBGProcessingLog() -> String {
-        flushPendingWrites()
-        return (try? String(contentsOf: bgProcessingFileURL, encoding: .utf8)) ?? "(no BG Processing log)"
-    }
-
-    static func clearBGProcessingLog() {
-        try? "".write(to: bgProcessingFileURL, atomically: true, encoding: .utf8)
-    }
-
-    // MARK: - AI Processing Log
-
-    private static let aiProcessingFileName = "ai_processing.log"
-
-    private static var aiProcessingFileURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TabMail", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(aiProcessingFileName)
-    }
+    // MARK: - AI Processing (debug-gated)
 
     /// Log an AI processing queue event (enqueue, dispatch, dequeue, complete, retry, context).
-    /// Only writes to disk when debug mode is unlocked by an allowed user.
     static func logAIProcessing(_ message: String) {
         guard DebugModeManager.isLoggingEnabled() else { return }
-        let entry = "[\(Date().iso8601String())] \(message)\n"
         print("[AIProcessingLog] \(message)")
-        appendAsync(to: aiProcessingFileURL, entry: entry)
+        AppLogStore.append(message, channel: .aiProcessing)
     }
 
-    static func readAIProcessingLog() -> String {
-        flushPendingWrites()
-        return (try? String(contentsOf: aiProcessingFileURL, encoding: .utf8)) ?? "(no AI processing log)"
-    }
-
-    static func clearAIProcessingLog() {
-        try? "".write(to: aiProcessingFileURL, atomically: true, encoding: .utf8)
-    }
-
-    // MARK: - Push Notification Log
-
-    private static let pushFileName = "push.log"
-
-    private static var pushFileURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TabMail", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(pushFileName)
-    }
+    // MARK: - Push notifications (debug-gated)
 
     /// Log a push notification event (registration, subscription, silent push processing).
-    /// Only writes to disk when debug mode is unlocked by an allowed user.
     static func logPush(_ message: String) {
         guard DebugModeManager.isLoggingEnabled() else { return }
-        let entry = "[\(Date().iso8601String())] \(message)\n"
         print("[PushLog] \(message)")
-        appendAsync(to: pushFileURL, entry: entry)
+        AppLogStore.append(message, channel: .push)
     }
 
-    static func readPushLog() -> String {
-        flushPendingWrites()
-        return (try? String(contentsOf: pushFileURL, encoding: .utf8)) ?? "(no push notification log)"
-    }
-
-    static func clearPushLog() {
-        try? "".write(to: pushFileURL, atomically: true, encoding: .utf8)
-    }
-
-    // MARK: - Backfill AI Refinement Log
-
-    private static let backfillAIFileName = "backfill_ai.log"
-
-    private static var backfillAIFileURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TabMail", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(backfillAIFileName)
-    }
+    // MARK: - Backfill AI refinement (debug-gated)
 
     /// Log a BackfillAIQueue event (enqueue, claim, success, skip, retry, drop, repopulate).
-    /// Only writes to disk when debug mode is unlocked by an allowed user.
     static func logBackfillAI(_ message: String) {
         guard DebugModeManager.isLoggingEnabled() else { return }
-        let entry = "[\(Date().iso8601String())] \(message)\n"
         print("[BackfillAILog] \(message)")
-        appendAsync(to: backfillAIFileURL, entry: entry)
+        AppLogStore.append(message, channel: .backfillAI)
     }
 
-    static func readBackfillAILog() -> String {
-        flushPendingWrites()
-        return (try? String(contentsOf: backfillAIFileURL, encoding: .utf8)) ?? "(no backfill AI log)"
-    }
-
-    static func clearBackfillAILog() {
-        try? "".write(to: backfillAIFileURL, atomically: true, encoding: .utf8)
-    }
-
-    // MARK: - Backfill Log (header walk + body queue)
-
-    private static let backfillFileName = "backfill.log"
-
-    private static var backfillFileURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TabMail", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(backfillFileName)
-    }
+    // MARK: - Backfill header walk + body queue (debug-gated)
 
     /// Log a backfill lifecycle event (worker start/exit, cycle start, pause reason,
     /// folder complete, connection backoff, body-queue batch/miss/confirm-gone outcomes).
-    /// The header/body backfill previously logged via `print()` only, which made
-    /// exported debug logs useless for diagnosing stalls — this is the file channel.
-    /// Only writes to disk when debug mode is unlocked by an allowed user.
+    /// Deliberately does NOT `print` — the header/body backfill already echoes to the
+    /// console elsewhere, and this is the file channel that makes an exported log
+    /// useful for diagnosing stalls.
     static func logBackfill(_ message: String) {
         guard DebugModeManager.isLoggingEnabled() else { return }
-        let entry = "[\(Date().iso8601String())] \(message)\n"
-        appendAsync(to: backfillFileURL, entry: entry)
+        AppLogStore.append(message, channel: .backfill)
     }
 
-    static func readBackfillLog() -> String {
-        flushPendingWrites()
-        return (try? String(contentsOf: backfillFileURL, encoding: .utf8)) ?? "(no backfill log)"
-    }
-
-    static func clearBackfillLog() {
-        try? "".write(to: backfillFileURL, atomically: true, encoding: .utf8)
-    }
-
-    // MARK: - Inbox ViewModel Log
-
-    private static let inboxFileName = "inbox.log"
-
-    private static var inboxFileURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TabMail", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(inboxFileName)
-    }
+    // MARK: - Inbox view model (debug-gated)
 
     /// Log an InboxViewModel lifecycle or reload event.
     /// Covers: folder-set transitions, observer registration, reload counts, partial-set heals,
-    /// ValueObservation emissions. Only writes when debug mode is unlocked.
+    /// ValueObservation emissions.
     static func logInbox(_ message: String) {
         guard DebugModeManager.isLoggingEnabled() else { return }
-        let entry = "[\(Date().iso8601String())] \(message)\n"
         print("[InboxLog] \(message)")
-        appendAsync(to: inboxFileURL, entry: entry)
+        AppLogStore.append(message, channel: .inbox)
     }
 
-    static func readInboxLog() -> String {
-        flushPendingWrites()
-        return (try? String(contentsOf: inboxFileURL, encoding: .utf8)) ?? "(no inbox log)"
-    }
+    // MARK: - Boot profile (debug-gated)
 
-    static func clearInboxLog() {
-        try? "".write(to: inboxFileURL, atomically: true, encoding: .utf8)
-    }
-
-    // MARK: - Boot Profile Log
-
-    private static let bootFileName = "boot.log"
-
-    private static var bootFileURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TabMail", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(bootFileName)
-    }
-
-    /// Append a `BootProfiler` timeline line to the DOWNLOADABLE boot log. Gated on
-    /// DebugModeManager so it captures on-device / TestFlight, where no Xcode console
-    /// is attached and BootProfiler's `print` goes nowhere observable — this file
-    /// channel is the only way to read a cold-launch timeline there. Called from
-    /// `BootProfiler.mark`; does not print (BootProfiler handles the console echo) —
-    /// this is the file channel.
+    /// Append a `BootProfiler` timeline line. Gated on DebugModeManager so it
+    /// captures on-device / TestFlight, where no Xcode console is attached and
+    /// BootProfiler's `print` goes nowhere observable — this file channel is the
+    /// only way to read a cold-launch timeline there. Called from
+    /// `BootProfiler.mark`; does not print (BootProfiler handles the console echo).
     static func logBoot(_ line: String) {
         guard DebugModeManager.isLoggingEnabled() else { return }
-        appendAsync(to: bootFileURL, entry: line + "\n")
+        AppLogStore.append(line, channel: .boot)
     }
 
-    static func readBootLog() -> String {
-        flushPendingWrites()
-        return (try? String(contentsOf: bootFileURL, encoding: .utf8)) ?? "(no boot log)"
-    }
+    // MARK: - Body render / HTML double-escape (debug-gated)
 
-    static func clearBootLog() {
-        try? "".write(to: bootFileURL, atomically: true, encoding: .utf8)
-    }
-
-    // MARK: - Body Render / HTML double-escape Log
-
-    /// Dedicated diagnostic channel for the rare "HTML body shows literal `&amp;` /
-    /// `&nbsp;` / visible tags" bug. The symptom is `EmailFilter.plainTextToHTML`
-    /// escaping content that was ALREADY HTML. The clean fix makes `BodyRenderer`
-    /// the single conversion authority, so the storage factory no longer re-converts
-    /// — but we keep this channel to catch any double-escaped body that still reaches
-    /// storage (e.g. a sender that put HTML in a text/plain part with no html
-    /// alternative), via `diagnoseStoredBody`.
-    private static let bodyRenderFileName = "body_render.log"
-
-    private static var bodyRenderFileURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TabMail", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(bodyRenderFileName)
-    }
-
-    /// Append a body-render diagnostic line. Only writes when debug mode is
-    /// unlocked by an allowed user (CLAUDE.md rule 12). Prefer `diagnoseStoredBody`
-    /// at call sites — it gates on the dangerous condition before formatting.
+    /// Append a body-render diagnostic line for the rare "HTML body shows literal
+    /// `&amp;` / `&nbsp;` / visible tags" bug. The symptom is
+    /// `EmailFilter.plainTextToHTML` escaping content that was ALREADY HTML. The
+    /// clean fix makes `BodyRenderer` the single conversion authority, so the
+    /// storage factory no longer re-converts — but we keep this channel to catch
+    /// any double-escaped body that still reaches storage (e.g. a sender that put
+    /// HTML in a text/plain part with no html alternative), via `diagnoseStoredBody`.
+    /// Prefer `diagnoseStoredBody` at call sites — it gates on the dangerous
+    /// condition before formatting.
     static func logBodyRender(_ message: String) {
         guard DebugModeManager.isLoggingEnabled() else { return }
-        let entry = "[\(Date().iso8601String())] \(message)\n"
         print("[BodyRenderLog] \(message)")
-        appendAsync(to: bodyRenderFileURL, entry: entry)
+        AppLogStore.append(message, channel: .bodyRender)
     }
 
-    static func readBodyRenderLog() -> String {
-        flushPendingWrites()
-        return (try? String(contentsOf: bodyRenderFileURL, encoding: .utf8)) ?? "(no body render log)"
-    }
+    // MARK: - Stuck message diagnostics (debug-gated)
 
-    static func clearBodyRenderLog() {
-        try? "".write(to: bodyRenderFileURL, atomically: true, encoding: .utf8)
-    }
-
-    // MARK: - Stuck Message Diagnostics Log
-
-    /// Dedicated channel for `StuckMessageDiagnostics` — the read-only scan for
+    /// Append a line from `StuckMessageDiagnostics` — the read-only scan for
     /// "searchable but can't open / no snippet / not in its folder" rows. Only
-    /// written by the Debug-menu scan; debug-gated per CLAUDE.md rule 12.
-    private static let stuckDiagFileName = "stuck_messages.log"
-
-    private static var stuckDiagFileURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TabMail", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(stuckDiagFileName)
-    }
-
+    /// written by the Debug-menu scan.
     static func logStuckDiag(_ message: String) {
         guard DebugModeManager.isLoggingEnabled() else { return }
-        let entry = "[\(Date().iso8601String())] \(message)\n"
         print("[StuckDiag] \(message)")
-        appendAsync(to: stuckDiagFileURL, entry: entry)
-    }
-
-    static func readStuckDiagLog() -> String {
-        flushPendingWrites()
-        return (try? String(contentsOf: stuckDiagFileURL, encoding: .utf8)) ?? "(no stuck-message diagnostics — run the scan from the Debug menu)"
-    }
-
-    static func clearStuckDiagLog() {
-        try? "".write(to: stuckDiagFileURL, atomically: true, encoding: .utf8)
+        AppLogStore.append(message, channel: .stuckDiag)
     }
 
     // MARK: - Body double-escape detector (pure / ungated — unit-testable)
@@ -471,10 +245,10 @@ enum BackgroundSyncLogger {
             || html.contains("&amp;quot;") || html.contains("&amp;#")
     }
 
-    /// Inspect a body about to be STORED and log to `body_render.log` only if it is
-    /// already double-escaped. Path-agnostic — catches the bug no matter which route
-    /// produced the body. Debug-mode-gated; a no-op (allocates nothing) in production
-    /// / when locked.
+    /// Inspect a body about to be STORED and log to the body-render channel only if
+    /// it is already double-escaped. Path-agnostic — catches the bug no matter which
+    /// route produced the body. Debug-mode-gated; a no-op (allocates nothing) in
+    /// production / when locked.
     static func diagnoseStoredBody(source: String, headerId: String, htmlContent: String?) {
         guard DebugModeManager.isLoggingEnabled() else { return }
         guard let html = htmlContent, htmlLooksDoubleEscaped(html) else { return }

@@ -745,7 +745,9 @@ enum BodyFetchProcessor {
         // (NOT re-derived from htmlContent, which would round-trip plain→HTML→plain).
         var body = MessageBody.create(contentKey: contentKey, htmlBody: rendered.htmlContent)
         // Diagnostic (debug-gated, no-op in prod): flag if a double-escaped body ever
-        // reaches storage. Captured in body_render.log (DebugMenu › Logs).
+        // reaches storage. Captured on the `.bodyRender` channel of the single
+        // tabmail.log (`AppLogStore.read(channel: .bodyRender)`), exported by
+        // DebugMenu › Logs › "App Logs".
         BackgroundSyncLogger.diagnoseStoredBody(source: "BodyFetch", headerId: headerId, htmlContent: body.htmlContent)
         if !fullMessage.attachments.isEmpty {
             body.attachmentsJSON = String(data: (try? JSONEncoder().encode(fullMessage.attachments)) ?? Data(), encoding: .utf8)

@@ -23,15 +23,18 @@ import Synchronization
 /// `processStart` / `lastMark` statics are never initialized (no sysctl, no Mutex
 /// alloc), so it's effectively free. When UNLOCKED (debug build, or
 /// TestFlight/Release with debug mode unlocked in Settings) it prints to the
-/// console AND appends to the downloadable **boot.log** (`BackgroundSyncLogger`),
-/// so a cold-launch timeline can be captured on-device and shared from the debug
-/// menu — not just read from the Xcode console. (Was `#if DEBUG`-only; switched to
+/// console AND appends to the single downloadable **`tabmail.log`** via
+/// `BackgroundSyncLogger.logBoot` (`AppLogStore`, `.boot` channel — read back
+/// with `AppLogStore.read(channel: .boot)`), so a cold-launch timeline can be
+/// captured on-device and shared from the debug menu — not just read from the
+/// Xcode console. (Was `#if DEBUG`-only; switched to
 /// the runtime gate 2026-06-29 to enable on-device/OOO boot capture, as the old
 /// doc comment anticipated. Rule 12: a runtime debug gate is the sanctioned
 /// alternative to `#if DEBUG`.)
 ///
-/// To read a launch: filter on `BootProfile` (console) or download "Boot Profile
-/// Logs" from Settings → Debug. The biggest `Δ` between consecutive marks is the
+/// To read a launch: filter on `BootProfile` (console) or share "App Logs" from
+/// Settings → Debug and filter to the `[BOOT]` tag (`AppLogStore.read(channel:
+/// .boot)`). The biggest `Δ` between consecutive marks is the
 /// next thing to make instant; compare the first mark's `+total` (pre-main)
 /// against the `first paint` mark to see how much is framework load vs. our work.
 enum BootProfiler {

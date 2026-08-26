@@ -22,7 +22,8 @@ import GRDB
 ///     stored UID is stale for the folder it now claims to live in.
 ///
 /// This scan only READS the DB + FTS and writes a human-readable report to the
-/// `stuck_messages` log channel (shareable from the Debug menu). It mutates nothing.
+/// `.stuckDiag` channel of the shared app log, persisted with the `[STUCK]` tag
+/// and shareable from the Debug menu's "Stuck Message Report". It mutates nothing.
 /// Debug-gated per CLAUDE.md rule 12; only reachable from the hidden Debug menu.
 enum StuckMessageDiagnostics {
     /// Bounded per-class sample size — display-only, full data stays in the DB.
@@ -49,7 +50,9 @@ enum StuckMessageDiagnostics {
     static func run() async {
         guard DebugModeManager.isLoggingEnabled() else { return }
         let pool = AppDatabase.rawPool
-        BackgroundSyncLogger.clearStuckDiagLog()
+        // Clear only THIS channel — the report is meant to be one scan's output,
+        // and the log file it shares now holds every other subsystem's history.
+        AppLogStore.clear(channel: .stuckDiag)
         BackgroundSyncLogger.logStuckDiag("==== Stuck-message scan START ====")
 
         // --- Aggregate counts (read-only) ---------------------------------
