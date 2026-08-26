@@ -468,7 +468,7 @@ final class NotificationService: UNNotificationServiceExtension {
                     NSELog.step("NSE step2: IMAP disabled")
                     deliverPassive(c: c, deliver: deliver); return
                 }
-                // IMAP pushes from the droplet always include the RFC 5322
+                // IMAP pushes from the IDLE proxy always include the RFC 5322
                 // Message-ID in the payload. Without it the NSE
                 // has no way to locate the new message — fall through to a
                 // passive notification.
@@ -1075,7 +1075,7 @@ final class NotificationService: UNNotificationServiceExtension {
     // MARK: - IMAP Reconnect
     //
     // Triggered by the push-worker's visible-passive `imap_reconnect` push
-    // (fired on droplet IDLE drop, retire fanout, or retry-ladder tick).
+    // (fired on proxy IDLE drop, retire fanout, or retry-ladder tick).
     // The push-worker owns retry state authoritatively — NSE is dumb:
     //
     //   • Default alert in the APNs payload is ALREADY the neutral
@@ -1207,8 +1207,8 @@ final class NotificationService: UNNotificationServiceExtension {
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             if !(200..<300).contains(code) {
                 // Log the status + a body snippet so we can tell the failure
-                // mode apart: push-worker 401/403 (JWT invalid), 502 (droplet
-                // unreachable), 503 (no droplet / capacity), etc. Body is
+                // mode apart: push-worker 401/403 (JWT invalid), 502 (proxy
+                // unreachable), 503 (no proxy capacity), etc. Body is
                 // truncated to 200 bytes — it's opaque JSON from the worker,
                 // never contains credentials.
                 let bodyPreview = String(data: data.prefix(200), encoding: .utf8) ?? "<binary>"

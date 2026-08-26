@@ -6,7 +6,7 @@ import SwiftUI
 
 struct AccountDeletionView: View {
     /// Length of the server-side deletion grace period, mirrored from
-    /// `GRACE_PERIOD_DAYS` in the billing worker's `handlers/accountDeletion.ts`.
+    /// the backend's grace-period configuration for account deletion.
     /// Used for copy only, and only *before* the request is made — once the
     /// server responds, the authoritative date arrives in
     /// `DeletionResponse.deletion_date` and is what we actually show.

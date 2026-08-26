@@ -9,7 +9,7 @@ enum PushConfig {
     /// Always production — Gmail Pub/Sub delivers to a single endpoint (push.tabmail.ai),
     /// so device registrations must be in the same KV that the prod webhook handler reads.
     /// The apnsSandbox flag handles APNs environment routing (sandbox vs production).
-    /// Same rationale as CLAUDE.md rules #9 (single KV_ENTITLEMENTS) and #10 (single Stripe).
+    /// Same rationale as CLAUDE.md rules #9 (one shared backend entitlement store) and #10 (single Stripe).
     static let baseURL = "https://push.tabmail.ai"
 
     /// Whether to use APNs sandbox or production — derived from the build's

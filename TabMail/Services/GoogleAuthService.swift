@@ -23,8 +23,8 @@ enum OAuthConfig {
     }
     static let microsoftScopes = "Mail.ReadWrite Mail.Send Calendars.ReadWrite offline_access User.Read openid profile email"
     // Metadata-scope OAuth for Outlook runs web-hosted (mirror of Gmail) —
-    // the worker owns the Entra registration (`MS_METADATA_CLIENT_ID` +
-    // `MS_METADATA_CLIENT_SECRET`) and exchanges code → tokens server-side.
+    // the worker owns the Entra app registration and its client
+    // credentials, and exchanges code → tokens server-side.
     // iOS only opens the worker-provided startUrl in ASWebAuthenticationSession
     // and parses the final `?status=ok|error` redirect. No iOS-side Microsoft
     // client ID needed.

@@ -41,7 +41,7 @@ public enum NSEProviderSupport {
     ///   outlook → `OutlookNSEClient` + `NSEAuthSource.refreshMicrosoft`
     ///            (shipped; worker classifier wired up server-side).
     ///   imap   → NEEDS `IMAPNSEClient` + `Shared/API/IMAPCommands.swift`
-    ///            impl + DO IDLE proxy server (not yet built).
+    ///            impl + IDLE proxy server (not yet built).
     public static let readyProviders: Set<String> = [
         gmail,
         outlook,

@@ -788,7 +788,7 @@ actor PushNotificationService {
     // MARK: - Account Subscription
 
     /// Subscribe a single account for push notifications.
-    /// Gmail/Outlook → Pub/Sub / Graph subscription. IMAP → DO IDLE proxy
+    /// Gmail/Outlook → Pub/Sub / Graph subscription. IMAP → IDLE proxy
     /// subscription (server endpoint stubbed; client implementation is complete).
     /// When `updateDeviceRegistration` is true (default), also re-registers the device
     /// to update the email list. Set to false when called in a batch loop.
@@ -821,7 +821,7 @@ actor PushNotificationService {
                 BackgroundSyncLogger.logPush("Subscribed \(account.emailAddress) (\(account.provider.rawValue))")
             case .imap, .icloud:
                 // iCloud uses IMAP via app-password (imap.mail.me.com:993) — same
-                // DO IDLE proxy path as generic IMAP. CalDAV is calendar-only, no
+                // IDLE proxy path as generic IMAP. CalDAV is calendar-only, no
                 // mailbox, so it's excluded below.
                 let nseEnabled = UserDefaults.standard.object(forKey: PushConfig.pushNotificationsEnabledKey) as? Bool ?? false
                 guard nseEnabled else {
@@ -841,7 +841,7 @@ actor PushNotificationService {
                     username: account.imapUsername ?? account.emailAddress,
                     password: password
                 )
-                BackgroundSyncLogger.logPush("Subscribed IMAP \(account.emailAddress) via DO IDLE proxy")
+                BackgroundSyncLogger.logPush("Subscribed IMAP \(account.emailAddress) via IDLE proxy")
             case .caldav:
                 return  // calendar-only, no mailbox to IDLE on
             }
@@ -884,7 +884,7 @@ actor PushNotificationService {
         // current value and the worker upserts idempotently.
         let visualOn = await visualAlertsEnabled()
         // iCloud routes through the IMAP IDLE proxy (app-password IMAP) — the
-        // droplet emits /imap-new-mail tagged provider="imap", so the device
+        // proxy emits /imap-new-mail tagged provider="imap", so the device
         // registration must match to receive visible push.
         let providerTag = (account.provider == .icloud) ? "imap" : account.provider.rawValue
         let nseCapable = nseEnabled && NSEProviderSupport.isReady(providerTag) && visualOn
@@ -926,7 +926,7 @@ actor PushNotificationService {
         }
     }
 
-    /// Subscribe all active accounts (Gmail/Outlook + IMAP via DO IDLE proxy),
+    /// Subscribe all active accounts (Gmail/Outlook + IMAP via IDLE proxy),
     /// then re-register device once. Account subscriptions run in parallel —
     /// each is an independent worker round-trip with no shared state.
     func subscribeAllAccounts() async {
