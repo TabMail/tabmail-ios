@@ -53,7 +53,6 @@ enum SharedNSEData {
     static let schemaVersionKey = "nse.schemaVersion"
     static let imapPushEnabledKey = "nse.imapPushEnabled"
     static let lastHistoryIdsKey = "nse.lastHistoryIds"
-    static let taskSchedulesKey = "nse.taskSchedules"
     static let filteringApprovedKey = "nse.filteringApproved"
     static let deviceSyncEnabledKey = "nse.deviceSyncEnabled"
     static let syncBaseURLKey = "nse.syncBaseURL"

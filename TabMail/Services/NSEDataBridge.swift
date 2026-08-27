@@ -1369,7 +1369,7 @@ enum NSEDataBridge {
 
         // Explicit do/catch on the staging read — log on failure, continue
         // with an empty `processed`. The helper sub-paths
-        // (`mergeInboxRemovals`, `consumePendingTaskResults`, orphan reap)
+        // (`mergeInboxRemovals`, orphan reap)
         // read different tables and may still succeed; failed rows in
         // `nse_processed_message` simply stay in staging and retry next wake.
         // `var` — the STALE-BY-MOVE check below reassigns it to exclude stale
@@ -2552,9 +2552,6 @@ enum NSEDataBridge {
         // 2. Process inbox removals — messages archived/deleted/moved while app was sleeping
         if mergeInboxRemovals(from: nseDB) { didMutate = true; endOfMergeChanged = true }
 
-        // Consume pending task results
-        if consumePendingTaskResults(from: nseDB) { didMutate = true; endOfMergeChanged = true }
-
         // Whenever the merge changed state, RECOMPUTE inbox unread counts (the merge
         // writes messageHeader but does NOT maintain folder.unreadCount). The merge
         // only ever touches inbox folders, so a blanket inbox recount is correct and
@@ -2809,74 +2806,6 @@ enum NSEDataBridge {
         }
 
         return deletedTotal > 0
-    }
-
-    // MARK: - Task Results
-
-    /// Persist all NSE-staged task results into main-GRDB chatTurn.
-    /// Returns true if any task results were persisted.
-    /// Per-result success tracking: failed rows stay in staging and retry
-    /// next wake; only committed results are cleared.
-    private static func consumePendingTaskResults(from nseDB: DatabaseQueue) -> Bool {
-        let results: [(id: Int, taskName: String, result: String, timestamp: Double)]
-        do {
-            results = try nseDB.read { db in
-                try Row.fetchAll(db, sql: "SELECT * FROM nse_pending_task_result").map { row in
-                    (id: row["id"] as Int, taskName: row["taskName"] as String,
-                     result: row["result"] as String, timestamp: row["timestamp"] as Double)
-                }
-            }
-        } catch {
-            print("[NSEDataBridge] Task result read failed: \(error)")
-            return false
-        }
-
-        guard !results.isEmpty else { return false }
-
-        var successfullyConsumedIds: [Int] = []
-
-        for result in results {
-            // Each result already runs in its own dbPool.write — no savepoint
-            // plumbing needed. Just track per-result success for the staging
-            // delete below.
-            do {
-                try AppDatabase.dbPool.write { db in
-                    // Deterministic id + INSERT OR IGNORE (data-integrity fix).
-                    // A background `task_alarm` merge (`actor PushNotificationService`,
-                    // off the main actor) can run CONCURRENTLY with a foreground
-                    // merge; both read THIS staging row before either deletes it.
-                    // A fresh `UUID()` would write TWO identical task-result turns
-                    // into chat history (this is the only non-idempotent write in
-                    // the merge). A stable id from the (AUTOINCREMENT, never-reused)
-                    // staging-row id + firing timestamp makes the second writer's
-                    // insert a no-op, so exactly one turn lands. The staging DB and
-                    // chatTurn DB are wiped together on uninstall, so the row id
-                    // can't collide with a turn from a prior install.
-                    try db.execute(sql: """
-                        INSERT OR IGNORE INTO chatTurn (id, timestamp, role, content, type, chars)
-                        VALUES (?, ?, 'assistant', ?, 'task', ?)
-                        """, arguments: [
-                            "nse-task-\(result.id)-\(result.timestamp)",
-                            result.timestamp,
-                            result.result,
-                            result.result.count
-                        ])
-                }
-                successfullyConsumedIds.append(result.id)
-                print("[NSEDataBridge] Persisted task result: \(result.taskName)")
-            } catch {
-                print("[NSEDataBridge] Failed to persist task result \(result.taskName): \(error) — left in staging for retry")
-            }
-        }
-
-        // Delete only the staging rows whose chatTurn committed.
-        try? nseDB.write { db in
-            for id in successfullyConsumedIds {
-                try db.execute(sql: "DELETE FROM nse_pending_task_result WHERE id = ?", arguments: [id])
-            }
-        }
-
-        return !successfullyConsumedIds.isEmpty
     }
 
     // MARK: - User-label filtering (merge-path parity)

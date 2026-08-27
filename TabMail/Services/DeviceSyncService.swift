@@ -365,7 +365,6 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         static let kb = "device_sync_ts:kb"
         static let templates = "device_sync_ts:templates"
         static let disabledReminders = "device_sync_ts:disabledReminders"
-        static let taskCache = "device_sync_ts:taskCache"
 
         static func key(for field: SyncField) -> String {
             switch field {
@@ -374,7 +373,6 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             case .kb: return kb
             case .templates: return templates
             case .disabledReminders: return disabledReminders
-            case .taskCache: return taskCache
             }
         }
     }
@@ -494,9 +492,6 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             case .disabledReminders:
                 state.disabledReminders = DisabledRemindersStore.getDisabledMap()
                 state.disabledRemindersUpdatedAt = readTimestamp(for: .disabledReminders)
-            case .taskCache:
-                state.taskCache = Self.readTaskCacheFromDefaults()
-                state.taskCacheUpdatedAt = readTimestamp(for: .taskCache)
             }
         }
 
@@ -525,13 +520,11 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             kb: store.rawKB,
             templates: store.templates,
             disabledReminders: DisabledRemindersStore.getDisabledMap(),
-            taskCache: Self.readTaskCacheFromDefaults(),
             compositionUpdatedAt: readTimestamp(for: .composition),
             actionUpdatedAt: readTimestamp(for: .action),
             kbUpdatedAt: readTimestamp(for: .kb),
             templatesUpdatedAt: readTimestamp(for: .templates),
-            disabledRemindersUpdatedAt: readTimestamp(for: .disabledReminders),
-            taskCacheUpdatedAt: readTimestamp(for: .taskCache)
+            disabledRemindersUpdatedAt: readTimestamp(for: .disabledReminders)
         )
         sendPromptState(state, via: ws)
         print("[DeviceSync] Broadcast all fields on connect")
@@ -668,9 +661,6 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 case "disabledReminders":
                     state.disabledReminders = DisabledRemindersStore.getDisabledMap()
                     state.disabledRemindersUpdatedAt = readTimestamp(for: .disabledReminders)
-                case "taskCache":
-                    state.taskCache = Self.readTaskCacheFromDefaults()
-                    state.taskCacheUpdatedAt = readTimestamp(for: .taskCache)
                 default: break
                 }
             }
@@ -884,19 +874,6 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             }
         }
 
-        // --- TaskCache: per-key CRDT merge — skip if epoch-zero ---
-        if let incomingTaskCache = incoming.taskCache, !incomingTaskCache.isEmpty {
-            let incomingTs = incoming.taskCacheUpdatedAt ?? incoming.updatedAt ?? Self.epochZero
-            if incomingTs == Self.epochZero {
-                print("[DeviceSync] Skipping taskCache merge — epoch-zero timestamp (virgin device)")
-            } else {
-                Task {
-                    await TaskExecutionCache.shared.mergeIncoming(incomingTaskCache)
-                    // Note: mergeIncoming does NOT broadcast (prevents echo)
-                }
-            }
-        }
-
         // Apply text field results (skip internal history — we record below)
         if mergedComposition != nil || mergedAction != nil || mergedKB != nil {
             store.applySync(
@@ -941,12 +918,6 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         store.saveHistory(history)
 
         print("[DeviceSync] Applied sync: \(changedFieldNames.joined(separator: ", "))")
-
-        // If KB changed, re-register task alarms with push worker
-        // (a synced [Task] entry needs alarm registration on this device too)
-        if changedFieldNames.contains("kb") {
-            Task { await TaskEvaluationService.shared.registerAlarmsWithPushWorker() }
-        }
     }
 
     // MARK: - AI Cache Probe (Phase 5 — placeholder handlers)
@@ -1081,25 +1052,14 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
-    /// Read task cache directly from UserDefaults (same storage key as TaskExecutionCache actor).
-    /// Used for synchronous broadcast paths where we can't await the actor.
-    private static func readTaskCacheFromDefaults() -> [String: TaskExecutionCache.CacheEntry]? {
-        guard let data = UserDefaults.standard.data(forKey: "task_execution_cache"),
-              let map = try? JSONDecoder().decode([String: TaskExecutionCache.CacheEntry].self, from: data),
-              !map.isEmpty else {
-            return nil
-        }
-        return map
-    }
-
 }
 
 // MARK: - Sync Data Types
 
 enum SyncField: String, CaseIterable {
-    case composition, action, kb, templates, disabledReminders, taskCache
+    case composition, action, kb, templates, disabledReminders
 
-    /// Prompt-only fields (excludes disabledReminders, taskCache). Used for history/backup/UI that only cares about prompt settings.
+    /// Prompt-only fields (excludes disabledReminders). Used for history/backup/UI that only cares about prompt settings.
     static let promptFields: [SyncField] = [.composition, .action, .kb, .templates]
 
     var displayName: String {
@@ -1109,7 +1069,6 @@ enum SyncField: String, CaseIterable {
         case .kb: return "Knowledge Base"
         case .templates: return "Templates"
         case .disabledReminders: return "Disabled Reminders"
-        case .taskCache: return "Task Cache"
         }
     }
 
@@ -1120,7 +1079,6 @@ enum SyncField: String, CaseIterable {
         case .kb: return "book"
         case .templates: return "doc.on.doc"
         case .disabledReminders: return "bell.slash"
-        case .taskCache: return "clock.arrow.2.circlepath"
         }
     }
 }
@@ -1132,25 +1090,21 @@ struct PromptStateData: Codable {
     var templates: [ReplyTemplate]?
     /// CRDT map: `{hash: {enabled: Bool, ts: ISO8601}}`. Decoded from either v2 map or legacy `[String]` array.
     var disabledReminders: [String: DisabledRemindersStore.DisabledEntry]?
-    /// CRDT map: `{taskHash_date: CacheEntry}`. Per-key timestamp merge (newer ts wins).
-    var taskCache: [String: TaskExecutionCache.CacheEntry]?
     var updatedAt: String? // DEPRECATED — use per-field timestamps below
     var compositionUpdatedAt: String?
     var actionUpdatedAt: String?
     var kbUpdatedAt: String?
     var templatesUpdatedAt: String?
     var disabledRemindersUpdatedAt: String?
-    var taskCacheUpdatedAt: String?
 
     enum CodingKeys: String, CodingKey {
-        case composition, action, kb, templates, disabledReminders, taskCache
+        case composition, action, kb, templates, disabledReminders
         case updatedAt = "updatedAt"
         case compositionUpdatedAt = "composition_updated_at"
         case actionUpdatedAt = "action_updated_at"
         case kbUpdatedAt = "kb_updated_at"
         case templatesUpdatedAt = "templates_updated_at"
         case disabledRemindersUpdatedAt = "disabledReminders_updated_at"
-        case taskCacheUpdatedAt = "taskCache_updated_at"
     }
 
     init(
@@ -1159,28 +1113,24 @@ struct PromptStateData: Codable {
         kb: String? = nil,
         templates: [ReplyTemplate]? = nil,
         disabledReminders: [String: DisabledRemindersStore.DisabledEntry]? = nil,
-        taskCache: [String: TaskExecutionCache.CacheEntry]? = nil,
         updatedAt: String? = nil,
         compositionUpdatedAt: String? = nil,
         actionUpdatedAt: String? = nil,
         kbUpdatedAt: String? = nil,
         templatesUpdatedAt: String? = nil,
-        disabledRemindersUpdatedAt: String? = nil,
-        taskCacheUpdatedAt: String? = nil
+        disabledRemindersUpdatedAt: String? = nil
     ) {
         self.composition = composition
         self.action = action
         self.kb = kb
         self.templates = templates
         self.disabledReminders = disabledReminders
-        self.taskCache = taskCache
         self.updatedAt = updatedAt
         self.compositionUpdatedAt = compositionUpdatedAt
         self.actionUpdatedAt = actionUpdatedAt
         self.kbUpdatedAt = kbUpdatedAt
         self.templatesUpdatedAt = templatesUpdatedAt
         self.disabledRemindersUpdatedAt = disabledRemindersUpdatedAt
-        self.taskCacheUpdatedAt = taskCacheUpdatedAt
     }
 
     init(from decoder: Decoder) throws {
@@ -1195,7 +1145,6 @@ struct PromptStateData: Codable {
         kbUpdatedAt = try container.decodeIfPresent(String.self, forKey: .kbUpdatedAt)
         templatesUpdatedAt = try container.decodeIfPresent(String.self, forKey: .templatesUpdatedAt)
         disabledRemindersUpdatedAt = try container.decodeIfPresent(String.self, forKey: .disabledRemindersUpdatedAt)
-        taskCacheUpdatedAt = try container.decodeIfPresent(String.self, forKey: .taskCacheUpdatedAt)
 
         // Decode disabledReminders: try v2 map first, fall back to legacy [String] array
         if let mapValue = try? container.decodeIfPresent([String: DisabledRemindersStore.DisabledEntry].self, forKey: .disabledReminders) {
@@ -1211,9 +1160,6 @@ struct PromptStateData: Codable {
         } else {
             disabledReminders = nil
         }
-
-        // Decode taskCache
-        taskCache = try container.decodeIfPresent([String: TaskExecutionCache.CacheEntry].self, forKey: .taskCache)
     }
 }
 

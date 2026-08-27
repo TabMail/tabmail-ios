@@ -190,9 +190,12 @@ fix gates at shared chokepoints, not per-tool patches:
 - In-flight refinements that complete DURING demo are dropped at their
   save sites (`KBRefinementService`, `AIPromptLearning`) — else the real
   refined KB/action text would be spliced into the demo overlay (visible
-  in a recording). `registerAlarmsWithPushWorker` +
-  `TaskEvaluationService.evaluate` are demo-guarded (empty demo KB would
-  GC real task execution state / clobber alarm registrations).
+  in a recording). *(Historical: `registerAlarmsWithPushWorker` +
+  `TaskEvaluationService.evaluate` were demo-guarded for the same reason —
+  an empty demo KB would GC real task execution state / clobber wake
+  registrations. Both symbols were deleted with the scheduled-task feature;
+  see ADR-IOS-079. The guard pattern they illustrate still applies to any
+  future KB-reading background job.)*
 - `DisabledRemindersStore` RMW ops capture `activeKeyV2` once (read+write
   same key even if the mode flips mid-operation).
 - `DemoSeed.wipe` also deletes `draft` rows (demo compose autosaves).

@@ -10,7 +10,7 @@ import Foundation
 ///
 /// Stamped by two proof sources:
 /// 1. **Strong** — receipt of a non-error push (`imap_new_mail`/`gmail`/
-///    `outlook`/`task_alarm`) at NSE `didReceive` and the main-app silent-
+///    `outlook`) at NSE `didReceive` and the main-app silent-
 ///    push handler. Proves the IMAP/Gmail → push-worker → APNs → iOS
 ///    pipeline works end-to-end for this account.
 /// 2. **Weaker** — successful NSE silent re-subscribe (`/subscribe-imap`

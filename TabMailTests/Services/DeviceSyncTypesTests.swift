@@ -11,9 +11,9 @@ import Foundation
 @Suite("SyncField Enum")
 struct SyncFieldTests {
 
-    @Test("CaseIterable returns all 6 cases")
+    @Test("CaseIterable returns all 5 cases")
     func allCases() {
-        #expect(SyncField.allCases.count == 6)
+        #expect(SyncField.allCases.count == 5)
     }
 
     @Test("All expected cases exist")
@@ -24,7 +24,6 @@ struct SyncFieldTests {
         #expect(cases.contains(.kb))
         #expect(cases.contains(.templates))
         #expect(cases.contains(.disabledReminders))
-        #expect(cases.contains(.taskCache))
     }
 
     @Test("rawValue matches expected strings")
@@ -34,7 +33,6 @@ struct SyncFieldTests {
         #expect(SyncField.kb.rawValue == "kb")
         #expect(SyncField.templates.rawValue == "templates")
         #expect(SyncField.disabledReminders.rawValue == "disabledReminders")
-        #expect(SyncField.taskCache.rawValue == "taskCache")
     }
 
     @Test("init(rawValue:) round-trips all cases")
@@ -50,7 +48,7 @@ struct SyncFieldTests {
         #expect(SyncField(rawValue: "nonexistent") == nil)
     }
 
-    @Test("promptFields excludes disabledReminders and taskCache")
+    @Test("promptFields excludes disabledReminders")
     func promptFields() {
         let promptFields = SyncField.promptFields
         #expect(promptFields.count == 4)
@@ -59,7 +57,6 @@ struct SyncFieldTests {
         #expect(promptFields.contains(.kb))
         #expect(promptFields.contains(.templates))
         #expect(!promptFields.contains(.disabledReminders))
-        #expect(!promptFields.contains(.taskCache))
     }
 
     @Test("displayName returns non-empty strings for all cases")
@@ -363,5 +360,134 @@ struct AICacheResultTests {
         #expect(decoded.summary?.reminderContent == "Christmas follow-up")
         #expect(decoded.action == "none")
         #expect(decoded.reply == nil)
+    }
+}
+
+
+// MARK: - Unknown-field tolerance (ADR-IOS-079)
+
+/// This client decodes only the keys its `CodingKeys` lists. A peer running a
+/// different feature set — notably the desktop client, which still schedules
+/// tasks and still broadcasts a `taskCache` field this platform no longer has —
+/// will send keys this client knows nothing about. Those keys must be ignored:
+/// never throw, never disturb the fields this client does act on. A regression
+/// here does not degrade one field, it drops the peer's entire payload.
+@Suite("PromptStateData unknown-field tolerance")
+struct PromptStateDataUnknownFieldTests {
+
+    /// Built to match what the desktop client actually puts on the wire: every
+    /// field this client acts on, alongside a populated `taskCache` and its
+    /// per-field timestamp, which this client no longer declares.
+    private static func decodeDesktopPayload(extraFields: String) throws -> PromptStateData {
+        let json = """
+        {
+            "composition": "Compose rules",
+            "action": "Action rules",
+            "kb": "- [Task] Schedule mon 09:00, summarize overnight mail\\n- a note",
+            "templates": [{
+                "id": "t1",
+                "name": "Greeting",
+                "enabled": true,
+                "instructions": ["Be friendly"],
+                "exampleReply": "Hello!",
+                "createdAt": "2024-01-01T00:00:00Z",
+                "updatedAt": "2024-01-01T00:00:00Z",
+                "deleted": false
+            }],
+            "disabledReminders": {
+                "t:abc123": {"enabled": false, "ts": "2024-01-01T06:00:00Z"},
+                "r:def456": {"enabled": true,  "ts": "2024-01-01T07:00:00Z"}
+            },
+            "composition_updated_at": "2024-01-01T01:00:00Z",
+            "action_updated_at": "2024-01-01T02:00:00Z",
+            "kb_updated_at": "2024-01-01T03:00:00Z",
+            "templates_updated_at": "2024-01-01T04:00:00Z",
+            "disabledReminders_updated_at": "2024-01-01T05:00:00Z"\(extraFields)
+        }
+        """
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(PromptStateData.self, from: Data(json.utf8))
+    }
+
+    /// Every field this client acts on, asserted on one decoded payload. Reused
+    /// by each case below so "survives intact" means the same thing every time.
+    private static func expectLiveFieldsIntact(_ d: PromptStateData) {
+        #expect(d.composition == "Compose rules")
+        #expect(d.action == "Action rules")
+        #expect(d.kb == "- [Task] Schedule mon 09:00, summarize overnight mail\n- a note")
+        #expect(d.templates?.count == 1)
+        #expect(d.templates?.first?.name == "Greeting")
+        #expect(d.templates?.first?.instructions == ["Be friendly"])
+        #expect(d.disabledReminders?.count == 2)
+        #expect(d.disabledReminders?["t:abc123"]?.enabled == false)
+        #expect(d.disabledReminders?["r:def456"]?.enabled == true)
+        #expect(d.compositionUpdatedAt == "2024-01-01T01:00:00Z")
+        #expect(d.actionUpdatedAt == "2024-01-01T02:00:00Z")
+        #expect(d.kbUpdatedAt == "2024-01-01T03:00:00Z")
+        #expect(d.templatesUpdatedAt == "2024-01-01T04:00:00Z")
+        #expect(d.disabledRemindersUpdatedAt == "2024-01-01T05:00:00Z")
+    }
+
+    @Test("A desktop payload carrying taskCache decodes, live fields intact")
+    func desktopPayloadWithTaskCacheDecodes() throws {
+        let decoded = try Self.decodeDesktopPayload(extraFields: """
+        ,
+            "taskCache": {
+                "abc123_2024-01-01": {
+                    "content": "Task output",
+                    "sessionId": "task:abc123",
+                    "ts": "2024-01-01T09:00:00Z"
+                }
+            },
+            "taskCache_updated_at": "2024-01-01T09:00:00Z"
+        """)
+        Self.expectLiveFieldsIntact(decoded)
+    }
+
+    /// The invariant is "an undeclared key is ignored", not "taskCache is
+    /// ignored" — a peer on a newer build may send fields that do not exist
+    /// yet. Same payload, a field name this client has never heard of.
+    @Test("An arbitrary undeclared field is ignored the same way")
+    func arbitraryUnknownFieldIgnored() throws {
+        let decoded = try Self.decodeDesktopPayload(extraFields: """
+        ,
+            "someFutureField": {"nested": ["arbitrary", 1, true, null]},
+            "someFutureField_updated_at": "2024-01-01T10:00:00Z"
+        """)
+        Self.expectLiveFieldsIntact(decoded)
+    }
+
+    /// Control: the same payload with no extra keys decodes identically. If
+    /// this ever diverges from the two cases above, they were not measuring
+    /// tolerance — they were passing for some unrelated reason.
+    @Test("The same payload without extra fields decodes identically")
+    func baselinePayloadDecodes() throws {
+        Self.expectLiveFieldsIntact(try Self.decodeDesktopPayload(extraFields: ""))
+    }
+
+    /// Outbound half of the contract: this client must not name a task field at
+    /// all. The desktop client's merge gate is keyed on the field being
+    /// undefined, so an omitted key skips its merge, whereas an empty map would
+    /// read as a value and could clear entries this client knows nothing about.
+    @Test("This client's outgoing payload names no task field")
+    func outgoingPayloadNamesNoTaskField() throws {
+        let outgoing = PromptStateData(
+            composition: "Compose rules",
+            kb: "Knowledge base",
+            compositionUpdatedAt: "2024-01-01T01:00:00Z",
+            kbUpdatedAt: "2024-01-01T03:00:00Z"
+        )
+        let data = try JSONEncoder().encode(outgoing)
+        let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        #expect(object["taskCache"] == nil)
+        #expect(object["taskCache_updated_at"] == nil)
+        #expect(!object.keys.contains { $0.lowercased().contains("task") })
+        // Non-vacuity: the encoder really did emit this payload's live fields,
+        // so the absences above are omissions and not an empty encode.
+        #expect(object["composition"] as? String == "Compose rules")
+        #expect(object["kb"] as? String == "Knowledge base")
+        #expect(object["kb_updated_at"] as? String == "2024-01-01T03:00:00Z")
     }
 }

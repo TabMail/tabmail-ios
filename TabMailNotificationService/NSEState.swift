@@ -112,11 +112,6 @@ enum NSEState {
         return map[accountId]
     }
 
-    static func findTaskInstruction(for taskName: String) -> String? {
-        guard let tasks = suite.array(forKey: SharedNSEData.taskSchedulesKey) as? [[String: Any]] else { return nil }
-        return tasks.first { ($0["name"] as? String) == taskName }?["instruction"] as? String
-    }
-
     // MARK: - Badge (temporary incremental approximation)
     //
     // The NSE cannot read main GRDB (app-private container), so it maintains

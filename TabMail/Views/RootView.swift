@@ -681,18 +681,10 @@ struct RootView: View {
                 DeviceSyncService.shared.reconnectIfNeeded()
                 // Check for overdue reminders that may have been missed while backgrounded
                 Task { await ProactiveNotifyService.shared.onForegroundReturn() }
-                // Start task evaluation loop (fires every 5 min while in foreground)
-                // Also registers wake times with push worker for background execution
-                Task {
-                    await TaskEvaluationService.shared.startTimer()
-                    await TaskEvaluationService.shared.registerAlarmsWithPushWorker()
-                }
                 // Revalidate AI subscription gate if closed (user may have subscribed externally)
                 Task { await Self.revalidateAISubscriptionGate() }
             case .background:
                 syncScheduler.stopPolling()
-                // Stop task evaluation loop (saves resources in background)
-                Task { await TaskEvaluationService.shared.stopTimer() }
                 // Give in-flight backfill ~30s to finish its current chunk
                 syncScheduler.requestBackgroundGracePeriod()
                 syncScheduler.scheduleBackgroundSync()

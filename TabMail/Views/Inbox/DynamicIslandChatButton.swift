@@ -1158,7 +1158,7 @@ struct DynamicIslandChat: View {
                 let displayText = turn.renderedContent ?? turn.userMessage ?? turn.content
                 return ChatMessage(role: .user, content: displayText, timestamp: Date(timeIntervalSince1970: turn.timestamp / 1000))
             case "assistant":
-                guard turn.type == "normal" || turn.type == "task_result" else { return nil }
+                guard turn.type == "normal" else { return nil }
                 let displayText = turn.renderedContent ?? turn.content
                 return ChatMessage(role: .agent, content: displayText, timestamp: Date(timeIntervalSince1970: turn.timestamp / 1000))
             default:

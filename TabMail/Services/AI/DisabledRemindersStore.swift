@@ -31,6 +31,11 @@ enum DisabledRemindersStore {
     /// GC age threshold — entries not in fresh set and older than this are removed.
     private static let gcAgeDays = 90
 
+    /// Hash namespace this device can no longer derive — see `gcStaleEntries`.
+    /// Scheduled tasks are not parsed or executed here (ADR-IOS-079), so no `t:`
+    /// hash can ever be produced locally.
+    private static let nonDerivableHashPrefix = "t:"
+
     // MARK: - Test-Only Defaults Injection
 
     /// `UserDefaults` is documented thread-safe; the wrapper just makes it `Sendable`
@@ -229,6 +234,23 @@ enum DisabledRemindersStore {
 
     /// Time-based GC: remove entries NOT in fresh set AND older than gcAgeDays.
     /// Replaces the old aggressive `syncState()` which immediately removed orphans.
+    ///
+    /// **Invariant: GC only collects hash namespaces this device can re-derive.**
+    /// An absent entry means ENABLED, so deleting one asserts "the user never disabled
+    /// this". That inference is sound only for a prefix this device can still PRODUCE
+    /// into `freshHashes`; for any other prefix, "not fresh" means "not computable
+    /// here", never "no longer exists".
+    ///
+    /// `t:` (scheduled-task) hashes are exactly that case. Tasks are not parsed on this
+    /// platform, so a `t:` hash can never enter `freshHashes` and every such entry would
+    /// otherwise age out. That state only ever arrives from a peer, and the transport
+    /// keeps no copy — if this device holds the surviving one, collecting it discards
+    /// the user's disable permanently and the task defaults back to enabled elsewhere.
+    /// Deleting this guard reintroduces that loss.
+    ///
+    /// The guard is deliberately unconditional: `t:` entries are retained forever here.
+    /// They are tiny, and the platform that does derive them still collects them on its
+    /// own side, so nothing is gained by trying to decide when one is "really" stale.
     static func gcStaleEntries(freshHashes: Set<String>) {
         let key = activeKeyV2  // captured once — see getDisabledMap(key:)
         var map = getDisabledMap(key: key)
@@ -238,6 +260,7 @@ enum DisabledRemindersStore {
         var removed = 0
 
         for (hash, entry) in map {
+            guard !hash.hasPrefix(nonDerivableHashPrefix) else { continue }
             if !freshHashes.contains(hash) {
                 if let entryDate = Date.fromISO8601(entry.ts),
                    now.timeIntervalSince(entryDate) > Double(gcAgeDays * 86400) {

@@ -8,9 +8,9 @@ struct RemindersSettingsView: View {
     @State private var reminders: [Reminder] = []
     @State private var isLoading = true
 
-    private var kbReminders: [Reminder] { reminders.filter { $0.source == "kb" && $0.type != "task" } }
+    private var kbReminders: [Reminder] { reminders.filter { $0.source == "kb" } }
     private var emailReminders: [Reminder] { reminders.filter { $0.source == "message" } }
-    private var displayedReminders: [Reminder] { reminders.filter { $0.type != "task" } }
+    private var displayedReminders: [Reminder] { reminders }
 
     var body: some View {
         Form {
@@ -180,17 +180,10 @@ private struct ReminderRow: View {
             .controlSize(.small)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(reminder.type == "task" ? (reminder.instruction ?? reminder.content) : reminder.content)
+                Text(reminder.content)
                     .font(.subheadline)
 
-                // Task: show schedule instead of due date
-                if reminder.type == "task" {
-                    if let days = reminder.scheduleDays, let time = reminder.scheduleTime {
-                        Text("\(days) at \(time)")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                } else if let due = dueDateLabel(for: reminder) {
+                if let due = dueDateLabel(for: reminder) {
                     Text(due.text)
                         .font(.caption2)
                         .foregroundStyle(due.urgency.color)

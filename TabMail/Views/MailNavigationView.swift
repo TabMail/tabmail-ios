@@ -17,7 +17,6 @@ enum MailboxSelection: Hashable {
     case planPicker
     case prompts
     case settings
-    case scheduledTasks
     case reminders
     case calendar
     case contacts
@@ -419,18 +418,6 @@ struct MailNavigationView: View {
                         }
 
                         if hasTabMailSession {
-                            // MARK: Scheduled Tasks — HIDDEN on iOS (platform limitation)
-                            // Scheduled tasks require client-side tool execution (GRDB, FTS, multi-round
-                            // LLM↔tool loop) which cannot run reliably in the background on iOS.
-                            // Silent pushes are throttled/dropped overnight by iOS, and the NSE runs in a
-                            // separate process without access to the main app's database or actors.
-                            // Scheduled tasks remain a Thunderbird-only feature (persistent desktop process).
-                            // The code is preserved (not deleted) for potential future use if server-side
-                            // tool execution becomes available.
-                            // NavigationLink(value: MailboxSelection.scheduledTasks) {
-                            //     Label("Scheduled Tasks", systemImage: "calendar.badge.clock")
-                            // }
-
                             NavigationLink(value: MailboxSelection.reminders) {
                                 Label("Reminders", systemImage: "bell")
                             }
@@ -722,10 +709,6 @@ struct MailNavigationView: View {
                     var info: [AnyHashable: Any] = ["messageId": id]
                     if let accountId { info["accountId"] = accountId }
                     handleNotificationDeepLink(info)
-                case .taskResult(let taskHash):
-                    // Navigate to inbox — InboxView handles expanding chat pill via notification
-                    selection = .unified(.inbox)
-                    print("[MailNav] Cold-start deep link: navigating to inbox for task result \(taskHash)")
                 case .inbox:
                     selection = .unified(.inbox)
                     print("[MailNav] Cold-start deep link: navigating to inbox")
@@ -960,8 +943,6 @@ private struct SettingsContentColumn: View {
             TabMailSettingsView()
         case .settings:
             SettingsView()
-        case .scheduledTasks:
-            ScheduledTasksSettingsView()
         case .reminders:
             RemindersSettingsView()
         case .calendar:
@@ -997,7 +978,7 @@ private struct InboxColumnResolver: View {
         case .folder(let folder):
             let fresh = navigationStore.folders.first { $0.id == folder.id } ?? folder
             return (fresh.name, [fresh])
-        case .account, .planPicker, .prompts, .settings, .scheduledTasks, .reminders, .calendar, .contacts, .debug, .outbox, .outboxForAccount:
+        case .account, .planPicker, .prompts, .settings, .reminders, .calendar, .contacts, .debug, .outbox, .outboxForAccount:
             return ("", [])
         }
     }

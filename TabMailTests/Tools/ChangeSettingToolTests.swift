@@ -221,36 +221,6 @@ struct ChangeSettingToolTests {
         #expect(result.contains("ok"))
     }
 
-    @Test("task.enabled is a valid setting")
-    func taskEnabledIsValid() async throws {
-        let tool = ChangeSettingTool()
-        let result = try await tool.execute(arguments: [
-            "setting": .string("task.enabled"),
-            "value": .bool(true),
-        ])
-        #expect(result.contains("ok"))
-    }
-
-    @Test("task.advance_minutes is a valid setting")
-    func taskAdvanceMinutesIsValid() async throws {
-        let tool = ChangeSettingTool()
-        let result = try await tool.execute(arguments: [
-            "setting": .string("task.advance_minutes"),
-            "value": .int(5),
-        ])
-        #expect(result.contains("ok"))
-    }
-
-    @Test("task.advance_minutes out of range returns error")
-    func taskAdvanceMinutesOutOfRange() async throws {
-        let tool = ChangeSettingTool()
-        let result = try await tool.execute(arguments: [
-            "setting": .string("task.advance_minutes"),
-            "value": .int(999),
-        ])
-        #expect(result.contains("between"))
-    }
-
     @Test("grace_minutes is NOT a valid iOS setting")
     func graceMinutesNotValid() async throws {
         let tool = ChangeSettingTool()

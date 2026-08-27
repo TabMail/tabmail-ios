@@ -210,6 +210,48 @@ struct DisabledRemindersCRDTTests {
         }
     }
 
+    // INVARIANT (ADR-IOS-079): GC only collects hash namespaces this device can
+    // re-derive. An absent entry means ENABLED, so collecting one asserts the user
+    // never disabled it — sound only for a prefix this device can still put into
+    // `freshHashes`. Scheduled tasks are not parsed here, so a `t:` hash can never
+    // be fresh; its disable state arrives only from a peer over a relay that keeps
+    // no copy, and dropping it loses the user's choice for good.
+    //
+    // Stated as the system property, not the mechanism: a `t:` entry that is absent
+    // from `freshHashes` AND older than the GC age still survives the pass, and is
+    // still reported as disabled. Two-sided on purpose — the same pass must keep
+    // collecting genuinely stale `m:`/`k:` entries, so a guard that simply switched
+    // GC off could not pass this test.
+    @Test("Task-hash disable state survives GC while stale message/KB entries are still collected")
+    func nonDerivableTaskHashesSurviveGC() {
+        Self.withIsolatedDefaults { defaults in
+            Self.seedMap([
+                "t:1abc": .init(enabled: false, ts: Self.isoDate(daysAgo: 400)),
+                "t:2def": .init(enabled: true, ts: Self.isoDate(daysAgo: 400)),
+                "m:stale@example.com": .init(enabled: false, ts: Self.isoDate(daysAgo: 400)),
+                "k:9zz": .init(enabled: false, ts: Self.isoDate(daysAgo: 400)),
+            ], into: defaults)
+
+            // The freshness set this platform can actually build: message and KB
+            // hashes only, and none of the seeded ones are still live.
+            DisabledRemindersStore.gcStaleEntries(freshHashes: ["m:other@example.com", "k:1aa"])
+
+            let map = DisabledRemindersStore.getDisabledMap()
+
+            // The user's intention survives — and survives as DISABLED, since an
+            // entry that came back enabled would read downstream as "never disabled".
+            #expect(map["t:1abc"]?.enabled == false)
+            #expect(DisabledRemindersStore.getDisabledHashes().contains("t:1abc"))
+            // The re-enable tombstone is the same durable intention, kept whole.
+            #expect(map["t:2def"]?.enabled == true)
+
+            // Non-vacuity: GC still ran and still collected what it can re-derive.
+            #expect(map["m:stale@example.com"] == nil)
+            #expect(map["k:9zz"] == nil)
+            #expect(map.count == 2)
+        }
+    }
+
     // MARK: - getDisabledHashes
 
     @Test("Returns only hashes where enabled is false")

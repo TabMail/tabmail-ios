@@ -51,13 +51,6 @@ struct ChangeSettingTool: AgentTool, Sendable {
             number: ProactiveNotifyService.advanceMinutesKey,
             min: 5, max: 120
         ),
-        "task.enabled": SettingDef(
-            boolean: "task.enabled"
-        ),
-        "task.advance_minutes": SettingDef(
-            number: "task.advance_minutes",
-            min: 1, max: 30
-        ),
         "calendar.default_event_duration_minutes": SettingDef(
             number: CalendarProviderDispatch.defaultEventDurationKey,
             min: 5, max: 12 * 60
