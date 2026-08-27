@@ -21,16 +21,18 @@ enum NSEState {
         return map[email.lowercased()]
     }
 
-    /// Extension-side account-push admission. `nil` means admit; a non-nil
-    /// `Refusal` names why the push was refused, so the log line cannot
-    /// misattribute one refusal reason as the other.
-    static func accountPushRefusal(
+    /// Extension-side account-push admission. Only `.superseded` refuses; a
+    /// `.current` verdict carries the account id the extension must then act on
+    /// for the rest of the run, so the identity that was checked is the identity
+    /// that is used. `findAccountId` returns nil for an unreadable mirror, which
+    /// the policy reads as UNDETERMINED — never as a replaced account.
+    static func accountPushVerdict(
         _ accountIncarnation: String?,
         for email: String,
         provider: String? = nil,
         defaults: UserDefaults? = nil
-    ) -> AccountPushIncarnationPolicy.Refusal? {
-        AccountPushIncarnationPolicy.refusal(
+    ) -> AccountPushIncarnationPolicy.Verdict {
+        AccountPushIncarnationPolicy.verdict(
             provider: provider,
             accountEmail: email,
             accountIncarnation: accountIncarnation,

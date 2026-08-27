@@ -46,44 +46,56 @@ enum NSEDataBridge {
     /// only while the shared account mirror still maps that email to the same
     /// row. Notifications with no account scope (such as task alarms) are
     /// unaffected.
-    static func accountIncarnationMatches(
+    ///
+    /// Returns the THREE-valued verdict, not a Bool. A Bool here is exactly how
+    /// "the mirror could not answer" used to arrive at the call sites wearing
+    /// the same face as "the provider told us this account was replaced" — see
+    /// `AccountPushIncarnationPolicy`.
+    static func accountPushVerdict(
         _ accountIncarnation: String?,
         accountEmail: String,
         provider: String? = nil,
         defaults customDefaults: UserDefaults? = nil
-    ) -> Bool {
+    ) -> AccountPushIncarnationPolicy.Verdict {
         let source = customDefaults ?? suite
-        guard let json = source?.string(forKey: "nse.accountMap"),
-              let data = json.data(using: .utf8),
-              let map = try? JSONDecoder().decode([String: String].self, from: data) else {
-            return AccountPushIncarnationPolicy.matches(
-                provider: provider,
-                accountEmail: accountEmail,
-                accountIncarnation: accountIncarnation,
-                accountId: { _ in nil }
-            )
+        // An unreadable / undecodable mirror resolves NOTHING. The policy turns
+        // a nil lookup into `.undetermined(.mirrorUnavailable)`, never into a
+        // refusal, so a missing App Group suite cannot strip a valid push.
+        let map: [String: String]?
+        if let json = source?.string(forKey: "nse.accountMap"),
+           let data = json.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([String: String].self, from: data) {
+            map = decoded
+        } else {
+            map = nil
         }
-        return AccountPushIncarnationPolicy.matches(
+        return AccountPushIncarnationPolicy.verdict(
             provider: provider,
             accountEmail: accountEmail,
             accountIncarnation: accountIncarnation,
-            accountId: { map[$0] }
+            accountId: { map?[$0] }
         )
     }
 
-    /// Reject both a raw stale-incarnation payload and the inert marker emitted
-    /// after the NSE has stripped that payload's actionable metadata.
-    static func notificationAccountMatches(
+    /// Whether this notification is PROVEN to belong to a superseded account —
+    /// either because the mirror says so now, or because the NSE already proved
+    /// it and stripped the payload down to its marker.
+    ///
+    /// This is the only question a refusal site may ask. It is deliberately not
+    /// the negation of an "admitted" predicate: an undetermined verdict answers
+    /// `false` here and is admitted, because refusing it would terminally
+    /// discard a valid notification with nothing left to retry from.
+    static func notificationIsSuperseded(
         _ userInfo: [AnyHashable: Any],
         defaults customDefaults: UserDefaults? = nil
     ) -> Bool {
-        if userInfo[AccountPushIncarnationPolicy.refusedPushMarkerKey] as? Bool == true { return false }
-        return accountIncarnationMatches(
+        if userInfo[AccountPushIncarnationPolicy.refusedPushMarkerKey] as? Bool == true { return true }
+        return accountPushVerdict(
             userInfo["accountIncarnation"] as? String,
             accountEmail: userInfo["accountEmail"] as? String ?? "",
             provider: userInfo["provider"] as? String,
             defaults: customDefaults
-        )
+        ).isSuperseded
     }
 
     /// Cached read connection to the NSE staging DB for the read-path "is there

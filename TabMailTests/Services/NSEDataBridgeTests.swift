@@ -10,9 +10,20 @@ import GRDB
 @Suite("NSE Data Bridge — Mirroring, Settings, and Merge", .serialized, .processGlobalState)
 struct NSEDataBridgeTests {
 
+    /// CORRECTED 2026-08-27. This test used to require BOTH folds that the
+    /// three-valued verdict removes: that an ABSENT incarnation is a MATCH (it
+    /// asserted `accountIncarnationMatches(nil, …)` is true, in its own words
+    /// because "no deployed server emits accountIncarnation"), and that a
+    /// present incarnation for an address the mirror does not carry is a
+    /// REFUSAL (`!accountIncarnationMatches("removed-account", accountEmail:
+    /// "unknown@example.com", …)`). The first admitted a push routed from an
+    /// incarnation that no longer exists; the second terminally stripped a
+    /// VALID notification whenever the mirror could not answer. Both are now
+    /// UNDETERMINED — neither a refusal nor a binding.
     @Test("""
-    an ABSENT account incarnation is unknown, never proven-stale: it is admitted, \
-    while a PRESENT value that disagrees with the local account row is refused
+    a verdict is authoritative only when the account mirror actually answered: \
+    an unread mirror, an absent incarnation and an unscoped payload are all \
+    UNDETERMINED, and only a mirror that names a different row is superseded
     """)
     func accountIncarnationFence() throws {
         let name = "NSEDataBridgeTests.incarnation.\(UUID().uuidString)"
@@ -24,116 +35,187 @@ struct NSEDataBridgeTests {
             forKey: "nse.accountMap"
         )
 
-        // No deployed server emits `accountIncarnation`. Treating its absence as
-        // a proven mismatch refuses EVERY account push — "we could not
-        // determine" is never authoritative.
-        #expect(NSEDataBridge.accountIncarnationMatches(
-            nil,
-            accountEmail: "account@example.com",
-            defaults: defaults
-        ))
-        #expect(NSEDataBridge.accountIncarnationMatches(
-            "",
-            accountEmail: "account@example.com",
-            defaults: defaults
-        ))
-        // An account we have never mirrored is still only UNKNOWN when the
-        // payload said nothing about which incarnation it was routed from.
-        #expect(NSEDataBridge.accountIncarnationMatches(
-            nil,
-            accountEmail: "unknown@example.com",
-            provider: "gmail",
-            defaults: defaults
-        ))
-        #expect(NSEDataBridge.accountIncarnationMatches(
-            nil,
-            accountEmail: "",
-            defaults: defaults
-        ))
-        #expect(!NSEDataBridge.accountIncarnationMatches(
-            "current-account",
-            accountEmail: "",
-            provider: "gmail",
-            defaults: defaults
-        ))
-        #expect(NSEDataBridge.accountIncarnationMatches(
+        // ── PROVEN CURRENT: the only verdict that binds an identity, and it
+        // binds the id the mirror actually named. Case-insensitive, because
+        // `mirrorAccountMap` writes lowercase keys.
+        #expect(NSEDataBridge.accountPushVerdict(
             "current-account",
             accountEmail: "Account@Example.COM",
             defaults: defaults
-        ))
-        // The replacement guarantee this rule exists for: the registration the
-        // push was routed from still names the OLD row, so a replaced account
-        // arrives present-and-unequal and is refused.
-        #expect(!NSEDataBridge.accountIncarnationMatches(
+        ) == .current(accountId: "current-account"))
+
+        // ── PROVEN SUPERSEDED: the mirror answered for this address and named
+        // a different row. The replacement guarantee this rule exists for.
+        #expect(NSEDataBridge.accountPushVerdict(
             "removed-account",
             accountEmail: "account@example.com",
             defaults: defaults
-        ))
-        #expect(!NSEDataBridge.accountIncarnationMatches(
+        ) == .superseded)
+
+        // ── UNDETERMINED, and none of these may refuse or bind.
+        //
+        // (1) The payload never carried the field. Every deployed push today.
+        #expect(NSEDataBridge.accountPushVerdict(
+            nil,
+            accountEmail: "account@example.com",
+            defaults: defaults
+        ) == .undetermined(.incarnationAbsent))
+        #expect(NSEDataBridge.accountPushVerdict(
+            "",
+            accountEmail: "account@example.com",
+            defaults: defaults
+        ) == .undetermined(.incarnationAbsent))
+
+        // (2) The mirror does not carry this address — not yet mirrored, a
+        // casing gap left by an upgrade, or the briefly-empty map an
+        // interrupted account-removal commit leaves behind. THIS IS THE FOLD
+        // THAT STRIPPED VALID NOTIFICATIONS: it used to read as "replaced".
+        #expect(NSEDataBridge.accountPushVerdict(
             "removed-account",
             accountEmail: "unknown@example.com",
             defaults: defaults
-        ))
+        ) == .undetermined(.mirrorUnavailable))
 
-        #expect(NSEDataBridge.notificationAccountMatches([
+        // (3) A known account provider with no address to scope the question
+        // by. Malformed is not proof of supersession.
+        #expect(NSEDataBridge.accountPushVerdict(
+            "current-account",
+            accountEmail: "",
+            provider: "gmail",
+            defaults: defaults
+        ) == .undetermined(.unscopedAccountPayload))
+
+        // (4) Not an account-scoped push at all.
+        #expect(NSEDataBridge.accountPushVerdict(
+            nil,
+            accountEmail: "",
+            defaults: defaults
+        ) == .undetermined(.notAccountScoped))
+
+        // ── THE SYSTEM PROPERTY: a notification is terminally refused ONLY on
+        // proof. Every undetermined shape above answers `false` here, so none
+        // of them can strip a valid push or suppress its delivery.
+        for undetermined in [
+            ["provider": "gmail", "accountEmail": "account@example.com"] as [AnyHashable: Any],
+            ["provider": "gmail", "accountEmail": "account@example.com", "accountIncarnation": ""],
+            ["provider": "gmail", "accountEmail": "unknown@example.com", "accountIncarnation": "removed-account"],
+            ["provider": "gmail", "accountIncarnation": "current-account"],
+            ["provider": "task_alarm"],
+        ] {
+            #expect(
+                !NSEDataBridge.notificationIsSuperseded(undetermined, defaults: defaults),
+                "an undetermined verdict must never terminally refuse a notification"
+            )
+        }
+
+        // Opposite polarity: the genuinely valid and the genuinely superseded
+        // still come out where they did, so the loop above is not measuring a
+        // predicate that answers `false` for everything.
+        #expect(!NSEDataBridge.notificationIsSuperseded([
             "provider": "gmail",
             "accountEmail": "Account@Example.COM",
             "accountIncarnation": "current-account",
         ], defaults: defaults))
-        #expect(NSEDataBridge.notificationAccountMatches([
-            "provider": "gmail",
-            "accountEmail": "account@example.com",
-        ], defaults: defaults))
-        #expect(!NSEDataBridge.notificationAccountMatches([
-            "provider": "gmail",
-            "accountIncarnation": "current-account",
-        ], defaults: defaults))
-        #expect(NSEDataBridge.notificationAccountMatches([
-            "provider": "task_alarm",
-        ], defaults: defaults))
-        #expect(!NSEDataBridge.notificationAccountMatches([
+        #expect(NSEDataBridge.notificationIsSuperseded([
             "provider": "gmail",
             "messageId": "stale-message",
             "accountEmail": "account@example.com",
             "accountIncarnation": "removed-account",
         ], defaults: defaults))
-        #expect(!NSEDataBridge.notificationAccountMatches([
+        #expect(NSEDataBridge.notificationIsSuperseded([
             AccountPushIncarnationPolicy.refusedPushMarkerKey: true,
         ], defaults: defaults))
 
+        // ── AN UNREADABLE MIRROR IS UNDETERMINED, NOT A REFUSAL. Three ways
+        // the read can fail, none of them evidence about the account.
+        let missingName = "NSEDataBridgeTests.incarnation.missing.\(UUID().uuidString)"
+        let missingMirror = try #require(UserDefaults(suiteName: missingName))
+        defer { missingMirror.removePersistentDomain(forName: missingName) }
+        #expect(NSEDataBridge.accountPushVerdict(
+            "current-account",
+            accountEmail: "account@example.com",
+            defaults: missingMirror
+        ) == .undetermined(.mirrorUnavailable))
+
+        missingMirror.set("{not json", forKey: "nse.accountMap")
+        #expect(NSEDataBridge.accountPushVerdict(
+            "current-account",
+            accountEmail: "account@example.com",
+            defaults: missingMirror
+        ) == .undetermined(.mirrorUnavailable))
+
+        missingMirror.set("{}", forKey: "nse.accountMap")
+        #expect(NSEDataBridge.accountPushVerdict(
+            "current-account",
+            accountEmail: "account@example.com",
+            defaults: missingMirror
+        ) == .undetermined(.mirrorUnavailable))
+        #expect(
+            !NSEDataBridge.notificationIsSuperseded([
+                "provider": "gmail",
+                "accountEmail": "account@example.com",
+                "accountIncarnation": "current-account",
+            ], defaults: missingMirror),
+            "a valid notification must never be discarded because the mirror could not be read"
+        )
+
         // Exercise the exact lookup compiled into the extension, not an app-
-        // side copy of its logic — and pin the REASON, so the extension's log
-        // line can no longer report an absent field as a replaced account.
-        #expect(NSEState.accountPushRefusal(
+        // side copy of its logic — the extension's admission boundary is where
+        // a refusal becomes TERMINAL, so it must agree case for case.
+        #expect(NSEState.accountPushVerdict(
             "current-account",
             for: "Account@Example.COM",
             provider: "gmail",
             defaults: defaults
-        ) == nil)
-        #expect(NSEState.accountPushRefusal(
-            nil,
-            for: "account@example.com",
-            provider: "gmail",
-            defaults: defaults
-        ) == nil)
-        #expect(NSEState.accountPushRefusal(
+        ) == .current(accountId: "current-account"))
+        #expect(NSEState.accountPushVerdict(
             "removed-account",
             for: "account@example.com",
             provider: "gmail",
             defaults: defaults
-        ) == .replacedAccount)
-        #expect(NSEState.accountPushRefusal(
+        ) == .superseded)
+        #expect(NSEState.accountPushVerdict(
+            nil,
+            for: "account@example.com",
+            provider: "gmail",
+            defaults: defaults
+        ) == .undetermined(.incarnationAbsent))
+        #expect(NSEState.accountPushVerdict(
+            "removed-account",
+            for: "unknown@example.com",
+            provider: "gmail",
+            defaults: defaults
+        ) == .undetermined(.mirrorUnavailable))
+        #expect(NSEState.accountPushVerdict(
             "current-account",
             for: "",
             provider: "outlook",
             defaults: defaults
-        ) == .unscopedAccountPayload)
-        #expect(NSEState.accountPushRefusal(
+        ) == .undetermined(.unscopedAccountPayload))
+        #expect(NSEState.accountPushVerdict(
             nil,
             for: "",
             provider: "task_alarm",
             defaults: defaults
-        ) == nil)
+        ) == .undetermined(.notAccountScoped))
+
+        // ── BINDING: only a proven verdict yields an identity to act on.
+        #expect(NSEState.accountPushVerdict(
+            "current-account",
+            for: "account@example.com",
+            provider: "gmail",
+            defaults: defaults
+        ).boundAccountId == "current-account")
+        for unbindable in [
+            NSEState.accountPushVerdict(nil, for: "account@example.com", provider: "gmail", defaults: defaults),
+            NSEState.accountPushVerdict("removed-account", for: "unknown@example.com", provider: "gmail", defaults: defaults),
+            NSEState.accountPushVerdict("removed-account", for: "account@example.com", provider: "gmail", defaults: defaults),
+        ] {
+            #expect(
+                unbindable.boundAccountId == nil,
+                "only a proven-current verdict may supply an identity to act on"
+            )
+        }
     }
 
     @Test("account-map mirroring normalizes mixed-case OAuth, iCloud, and IMAP addresses")
@@ -177,11 +259,11 @@ struct NSEDataBridgeTests {
         NSEDataBridge.mirrorAccountMap(defaults: defaults)
 
         for (id, email, _) in accounts {
-            #expect(NSEDataBridge.accountIncarnationMatches(
+            #expect(NSEDataBridge.accountPushVerdict(
                 id,
                 accountEmail: email.uppercased(),
                 defaults: defaults
-            ))
+            ) == .current(accountId: id))
         }
         let json = try #require(defaults.string(forKey: "nse.accountMap"))
         let map = try JSONDecoder().decode([String: String].self, from: Data(json.utf8))

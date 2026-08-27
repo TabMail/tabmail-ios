@@ -14,12 +14,16 @@ import UserNotifications
 ///
 /// The invariants pinned here:
 ///
-/// 1. **A user's action tap is NEVER discarded by the incarnation rule.**
-///    MARK_READ / ARCHIVE / DELETE are durable intentions and iOS dismisses the
-///    notification the instant the button is tapped, so a refusal on that path
+/// 1. **A user's action tap is never discarded on a verdict we could not
+///    reach, and never admitted on one we could.** MARK_READ / ARCHIVE /
+///    DELETE are durable intentions and iOS dismisses the notification the
+///    instant the button is tapped, so a refusal on an UNDETERMINED verdict
 ///    would destroy the intention with no queue row, no error, and nothing left
-///    on screen to retry from. `NotificationDelegate.tapRoute` must resolve the
-///    action branch BEFORE consulting the rule.
+///    on screen to retry from. A PROVEN verdict is the opposite case: admitting
+///    a payload whose identity is contradicted or superseded mutates a message
+///    the user was never shown, and C3 has no recovery.
+/// 1b. **A built notification names exactly one identity**, so the account
+///    acted upon is the account that was checked.
 /// 2. **Presentation and navigation ARE still gated**, in the foreground
 ///    (`willPresent`), on a plain tap (`didReceive`) and on a silent push
 ///    (`didReceiveRemoteNotification`) — and on the silent-push path the
@@ -85,13 +89,23 @@ struct NotificationAccountGuardCallSiteTests {
         InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
     }
 
-    // MARK: - (1) The action path is never gated by the incarnation rule
+    // MARK: - (1) The action path is gated by PROOF, never by uncertainty
 
+    /// CORRECTED 2026-08-27. This test used to be named
+    /// `refusedIncarnationActionTapStillProducesItsDurableOperation` and used to
+    /// require the OPPOSITE of what it requires now: it built a payload whose
+    /// two identity claims contradict each other (`accountIncarnation:
+    /// "replaced-account"` beside `accountId: "acc1"`), asserted as its premise
+    /// that the incarnation rule refuses it, and then asserted that the ARCHIVE
+    /// went through anyway and MOVED THE CURRENT ACCOUNT'S ROW — one `.move`
+    /// PendingOperation on `acc1`, with the header ending up in Archive. That is
+    /// the C3 hazard stated as a requirement: a push admitted for one
+    /// incarnation mutating another incarnation's message.
     @Test("""
-    a notification ARCHIVE tap whose payload the incarnation rule REFUSES still \
-    reaches the durable queue: exactly one .move PendingOperation, source INBOX
+    a notification ARCHIVE tap whose payload names two DIFFERENT identities \
+    mutates neither: no PendingOperation, and the addressed row never moves
     """)
-    func refusedIncarnationActionTapStillProducesItsDurableOperation() async throws {
+    func contradictoryActionTapMutatesNothing() async throws {
         let (defaults, name) = try makeAccountMirror()
         defer { defaults.removePersistentDomain(forName: name) }
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
@@ -99,7 +113,7 @@ struct NotificationAccountGuardCallSiteTests {
 
         let durable: MessageHeader = {
             var h = MessageHeader(
-                messageId: "m-refused-incarnation", subject: "Subj", from: "Sender",
+                messageId: "m-contradictory", subject: "Subj", from: "Sender",
                 fromAddress: "sender@example.com", to: "notify@example.com", date: Date(),
                 snippet: "snip", folderId: inbox.id, accountId: "acc1", folderPath: inbox.path,
                 isInInbox: true
@@ -110,75 +124,169 @@ struct NotificationAccountGuardCallSiteTests {
         try await pool.writeWithoutTransaction { db in try durable.insert(db) }
         let id = durable.id
 
-        // The payload the rule REFUSES: a present incarnation that disagrees
-        // with the mirrored account row.
+        // The contradiction: routed from an incarnation that is gone, yet
+        // naming the CURRENT row as the thing to mutate.
         let userInfo: [AnyHashable: Any] = [
             "provider": "gmail",
             "accountEmail": "notify@example.com",
             "accountIncarnation": "replaced-account",
-            "messageId": "m-refused-incarnation",
+            "messageId": "m-contradictory",
             "accountId": "acc1",
         ]
         #expect(
-            !NSEDataBridge.notificationAccountMatches(userInfo, defaults: defaults),
-            "premise: this payload IS refused by the account-incarnation rule"
+            NSEDataBridge.notificationIsSuperseded(userInfo, defaults: defaults),
+            "premise: this payload IS proven superseded, not merely undetermined"
         )
 
-        // Production's two steps, in production's order: route the tap, then run
-        // the router. `handleNotificationResponse` cannot be driven directly here
-        // because its action arm parks on `AppStartup.awaitLaunchReady`, which
-        // would replace `AppDatabase.shared` with the real app database.
         let route = NotificationDelegate.tapRoute(
             actionId: "ARCHIVE",
             userInfo: userInfo,
             defaults: defaults
         )
         #expect(
-            route == .durableAction(actionId: "ARCHIVE", messageId: "m-refused-incarnation", accountId: "acc1"),
-            "NEVER DROP USER INTENTION: the action branch must resolve ahead of the incarnation rule"
+            route == .refusedAccount,
+            "C3: an action may never mutate an account the push was not admitted for"
         )
-        guard case .durableAction(let actionId, let messageId, let accountId) = route else { return }
-        await NotificationActionRouter.execute(actionId: actionId, messageId: messageId, accountId: accountId)
+
+        // Drive the whole delegate seam, not just the router, so a future
+        // regression that re-adds an action arm ahead of the check is caught.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            NotificationDelegate.handleNotificationResponse(
+                actionId: "ARCHIVE",
+                userInfo: userInfo,
+                identifier: "contradictory-archive",
+                defaults: defaults
+            ) {
+                continuation.resume()
+            }
+        }
 
         let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
-        #expect(ops.count == 1, "the tap must survive as durable intention")
-        guard ops.count == 1 else { return }
-        #expect(ops[0].type == .move)
-        #expect(ops[0].folderPath == inbox.path)
-        #expect(ops[0].destinationPath == archive.path)
-        #expect(ops[0].messageIds == ["m-refused-incarnation"])
-
+        #expect(ops.isEmpty, "a refused tap must leave no durable operation behind")
         let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
-        #expect(final?.folderId == archive.id)
+        #expect(final?.folderId == inbox.id, "the addressed row must not have moved")
+
+        // ── OPPOSITE POLARITY, same harness: the SAME tap on a payload whose
+        // single identity the mirror confirms still archives. Without this the
+        // assertions above would be satisfied by a route that refuses
+        // everything.
+        var consistent = userInfo
+        consistent["accountIncarnation"] = "acc1"
+        let admitted = NotificationDelegate.tapRoute(
+            actionId: "ARCHIVE",
+            userInfo: consistent,
+            defaults: defaults
+        )
+        #expect(
+            admitted == .durableAction(actionId: "ARCHIVE", messageId: "m-contradictory", accountId: "acc1"),
+            "a genuinely valid notification must still be actionable"
+        )
+        guard case .durableAction(let actionId, let messageId, let accountId) = admitted else { return }
+        await NotificationActionRouter.execute(actionId: actionId, messageId: messageId, accountId: accountId)
+
+        let admittedOps = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(admittedOps.count == 1, "the valid tap must survive as durable intention")
+        guard admittedOps.count == 1 else { return }
+        #expect(admittedOps[0].type == .move)
+        #expect(admittedOps[0].folderPath == inbox.path)
+        #expect(admittedOps[0].destinationPath == archive.path)
+        #expect(admittedOps[0].messageIds == ["m-contradictory"])
+        let moved = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(moved?.folderId == archive.id)
     }
 
-    @Test("every action button routes durably regardless of what the incarnation rule says")
-    func everyActionButtonRoutesDurablyUnderEveryIncarnationVerdict() throws {
+    /// CORRECTED 2026-08-27. This test used to be named
+    /// `everyActionButtonRoutesDurablyUnderEveryIncarnationVerdict` and used to
+    /// require that all three action buttons route durably under a `("stale",
+    /// "replaced-account")` payload as well as under absent and matching ones —
+    /// "the durable route must be identical in all three". It made the C3
+    /// hazard a property of every action button at once.
+    @Test("""
+    every action button routes durably under an UNDETERMINED verdict and \
+    refuses under a PROVEN one — never the reverse
+    """)
+    func everyActionButtonSeparatesUndeterminedFromProven() throws {
         let (defaults, name) = try makeAccountMirror()
         defer { defaults.removePersistentDomain(forName: name) }
 
-        // Absent (what every deployed server actually sends), stale, and
-        // matching — the durable route must be identical in all three.
-        let payloads: [(label: String, incarnation: String?)] = [
-            ("absent", nil),
-            ("stale", "replaced-account"),
-            ("matching", "acc1"),
-        ]
         for actionId in ["MARK_READ", "ARCHIVE", "DELETE"] {
-            for payload in payloads {
-                var userInfo: [AnyHashable: Any] = [
+            // ── UNDETERMINED must still route durably. NEVER DROP USER
+            // INTENTION: iOS dismisses the notification on tap, so a refusal on
+            // a verdict we could not reach destroys the intention outright.
+            //
+            // `absent` is what every deployed push sends today; `unmirrored` is
+            // an address the map cannot answer for (a casing gap, a
+            // not-yet-mirrored account, an interrupted removal commit).
+            let undetermined: [(label: String, userInfo: [AnyHashable: Any])] = [
+                ("absent incarnation", [
                     "provider": "gmail",
                     "accountEmail": "notify@example.com",
                     "messageId": "m-\(actionId)",
                     "accountId": "acc1",
-                ]
-                if let incarnation = payload.incarnation { userInfo["accountIncarnation"] = incarnation }
+                ]),
+                ("unmirrored address", [
+                    "provider": "gmail",
+                    "accountEmail": "not-mirrored@example.com",
+                    "accountIncarnation": "acc1",
+                    "messageId": "m-\(actionId)",
+                    "accountId": "acc1",
+                ]),
+                ("no address at all", [
+                    "provider": "gmail",
+                    "messageId": "m-\(actionId)",
+                    "accountId": "acc1",
+                ]),
+            ]
+            for case (let label, let userInfo) in undetermined {
                 #expect(
                     NotificationDelegate.tapRoute(actionId: actionId, userInfo: userInfo, defaults: defaults)
                         == .durableAction(actionId: actionId, messageId: "m-\(actionId)", accountId: "acc1"),
-                    "\(actionId) with a \(payload.label) incarnation must still route durably"
+                    "\(actionId) under an undetermined verdict (\(label)) must still route durably"
                 )
             }
+
+            // ── PROVEN must refuse. Two independent proofs, neither needing the
+            // other: the payload contradicts itself, and the mirror names a
+            // different row for the address the payload claims.
+            let proven: [(label: String, userInfo: [AnyHashable: Any])] = [
+                ("self-contradictory", [
+                    "provider": "gmail",
+                    "accountEmail": "notify@example.com",
+                    "accountIncarnation": "replaced-account",
+                    "messageId": "m-\(actionId)",
+                    "accountId": "acc1",
+                ]),
+                ("account replaced after delivery", [
+                    "provider": "gmail",
+                    "accountEmail": "notify@example.com",
+                    "accountIncarnation": "acc0",
+                    "messageId": "m-\(actionId)",
+                    "accountId": "acc0",
+                ]),
+            ]
+            for case (let label, let userInfo) in proven {
+                #expect(
+                    NotificationDelegate.tapRoute(actionId: actionId, userInfo: userInfo, defaults: defaults)
+                        == .refusedAccount,
+                    "\(actionId) on a proven-superseded payload (\(label)) must be refused"
+                )
+            }
+
+            // ── And the ordinary valid case still routes.
+            #expect(
+                NotificationDelegate.tapRoute(
+                    actionId: actionId,
+                    userInfo: [
+                        "provider": "gmail",
+                        "accountEmail": "notify@example.com",
+                        "accountIncarnation": "acc1",
+                        "messageId": "m-\(actionId)",
+                        "accountId": "acc1",
+                    ],
+                    defaults: defaults
+                ) == .durableAction(actionId: actionId, messageId: "m-\(actionId)", accountId: "acc1"),
+                "\(actionId) on a proven-current payload must route durably"
+            )
         }
 
         // Non-vacuity: an action payload with no target is still refused — the
@@ -190,6 +298,61 @@ struct NotificationAccountGuardCallSiteTests {
                 defaults: defaults
             ) == .incompleteAction
         )
+    }
+
+    // MARK: - (1b) The binding: one identity per notification
+
+    @Test("""
+    a built notification names exactly ONE identity, so the account acted upon \
+    is always the account that was checked
+    """)
+    func aBuiltNotificationCarriesOneIdentityOnly() throws {
+        let (defaults, name) = try makeAccountMirror()
+        defer { defaults.removePersistentDomain(forName: name) }
+
+        // The incoming push claims the incarnation it was routed from. The
+        // extension resolves and processes some account; whichever one it is,
+        // the notification it hands back must name that one and only that one.
+        let content = UNMutableNotificationContent()
+        content.userInfo = [
+            "provider": "gmail",
+            "accountEmail": "notify@example.com",
+            "accountIncarnation": "routed-from-account",
+        ]
+        EmailNotificationBuilder.fill(
+            content,
+            signal: .init(senderName: "Sender", subject: "Subject"),
+            accountId: "acc1",
+            messageId: "m-bound"
+        )
+        #expect(content.userInfo["accountId"] as? String == "acc1")
+        #expect(
+            content.userInfo["accountIncarnation"] as? String == "acc1",
+            "the incoming incarnation claim must be OVERWRITTEN by the identity the content was built from"
+        )
+
+        // The consequence: this notification is actionable, and it is actionable
+        // against exactly the account it was built from.
+        #expect(
+            NotificationDelegate.tapRoute(
+                actionId: "ARCHIVE",
+                userInfo: content.userInfo,
+                defaults: defaults
+            ) == .durableAction(actionId: "ARCHIVE", messageId: "m-bound", accountId: "acc1")
+        )
+
+        // Opposite polarity: had the two claims been allowed to disagree — which
+        // is exactly what a notification built before this rule looks like —
+        // every action path refuses it.
+        var split = content.userInfo
+        split["accountIncarnation"] = "routed-from-account"
+        for actionId in ["MARK_READ", "ARCHIVE", "DELETE", UNNotificationDefaultActionIdentifier] {
+            #expect(
+                NotificationDelegate.tapRoute(actionId: actionId, userInfo: split, defaults: defaults)
+                    == .refusedAccount,
+                "\(actionId) must refuse a notification that names two identities"
+            )
+        }
     }
 
     // MARK: - (2) Presentation and navigation ARE still gated
@@ -336,6 +499,153 @@ struct NotificationAccountGuardCallSiteTests {
         )
     }
 
+    // MARK: - (2b) An unreadable mirror never discards a valid notification
+
+    @Test("""
+    a valid notification is never discarded because the account mirror could \
+    not be read — at presentation, at a plain tap and on an action
+    """)
+    func anUnreadableMirrorNeverDiscardsAValidNotification() async throws {
+        // Three ways the mirror read fails, none of them evidence about the
+        // account: no value at all, undecodable JSON, and a decodable map that
+        // does not carry this address (a casing gap left by an upgrade, an
+        // account not yet mirrored, or the briefly-empty map an interrupted
+        // account-removal commit leaves behind).
+        let email = "mirror-\(UUID().uuidString.lowercased())@example.com"
+        let unreadable: [(label: String, json: String?)] = [
+            ("absent", nil),
+            ("undecodable", "{not json"),
+            ("address not carried", "{\"other@example.com\":\"acc9\"}"),
+        ]
+
+        for (label, json) in unreadable {
+            let name = "NotificationAccountGuardCallSiteTests.unreadable.\(UUID().uuidString)"
+            let defaults = try #require(UserDefaults(suiteName: name))
+            defer { defaults.removePersistentDomain(forName: name) }
+            if let json { defaults.set(json, forKey: "nse.accountMap") }
+
+            // `imap_reconnect` is account-scoped but NOT in the suppress-and-sync
+            // set, so an admitted presentation is distinguishable from a refusal.
+            let presentable: [AnyHashable: Any] = [
+                "provider": "imap_reconnect",
+                "accountEmail": email,
+                "accountIncarnation": "acc-unreadable",
+            ]
+            let options = await NotificationDelegate.foregroundPresentationOptions(
+                for: presentable,
+                identifier: "unreadable-present-\(label)",
+                defaults: defaults
+            )
+            #expect(
+                options == [.banner, .sound, .list],
+                "a \(label) mirror must not suppress a valid notification's banner"
+            )
+
+            let tappable: [AnyHashable: Any] = [
+                "provider": "gmail",
+                "accountEmail": email,
+                "accountIncarnation": "acc-unreadable",
+                "messageId": "m-unreadable",
+                "accountId": "acc-unreadable",
+            ]
+            #expect(
+                NotificationDelegate.tapRoute(
+                    actionId: UNNotificationDefaultActionIdentifier,
+                    userInfo: tappable,
+                    defaults: defaults
+                ) == .passthrough,
+                "a \(label) mirror must not refuse a plain tap"
+            )
+            for actionId in ["MARK_READ", "ARCHIVE", "DELETE"] {
+                #expect(
+                    NotificationDelegate.tapRoute(actionId: actionId, userInfo: tappable, defaults: defaults)
+                        == .durableAction(actionId: actionId, messageId: "m-unreadable", accountId: "acc-unreadable"),
+                    "a \(label) mirror must not destroy a durable \(actionId) intention"
+                )
+            }
+        }
+
+        // ── OPPOSITE POLARITY: with a mirror that CAN answer and names a
+        // different row, every one of those same four sites refuses. Without
+        // this the loop above would be satisfied by a guard that admits
+        // everything.
+        let (mirror, name) = try makeAccountMirror([email: "acc-current"])
+        defer { mirror.removePersistentDomain(forName: name) }
+        let superseded: [AnyHashable: Any] = [
+            "provider": "imap_reconnect",
+            "accountEmail": email,
+            "accountIncarnation": "acc-unreadable",
+        ]
+        let refusedOptions = await NotificationDelegate.foregroundPresentationOptions(
+            for: superseded,
+            identifier: "superseded-present",
+            defaults: mirror
+        )
+        #expect(refusedOptions == [])
+        let supersededTap: [AnyHashable: Any] = [
+            "provider": "gmail",
+            "accountEmail": email,
+            "accountIncarnation": "acc-unreadable",
+            "messageId": "m-unreadable",
+            "accountId": "acc-unreadable",
+        ]
+        #expect(
+            NotificationDelegate.tapRoute(
+                actionId: UNNotificationDefaultActionIdentifier,
+                userInfo: supersededTap,
+                defaults: mirror
+            ) == .refusedAccount
+        )
+        for actionId in ["MARK_READ", "ARCHIVE", "DELETE"] {
+            #expect(
+                NotificationDelegate.tapRoute(actionId: actionId, userInfo: supersededTap, defaults: mirror)
+                    == .refusedAccount
+            )
+        }
+    }
+
+    /// The silent-push half of the property above. Split out only because
+    /// `AppDelegate` is `@MainActor` while the presentation seam is nonisolated,
+    /// so one function cannot drive both.
+    @MainActor
+    @Test("an unreadable account mirror never turns a valid silent push into .noData")
+    func anUnreadableMirrorNeverRefusesAValidSilentPush() throws {
+        for (label, json) in [
+            ("absent", String?.none),
+            ("undecodable", "{not json"),
+            ("address not carried", "{\"other@example.com\":\"acc9\"}"),
+        ] {
+            // Lowercased + unique: `PushHealthStore` is process-global, so each
+            // case needs its own address to stay independent.
+            let email = "silent-mirror-\(UUID().uuidString.lowercased())@example.com"
+            let name = "NotificationAccountGuardCallSiteTests.silent.\(UUID().uuidString)"
+            let defaults = try #require(UserDefaults(suiteName: name))
+            defer { defaults.removePersistentDomain(forName: name) }
+            if let json { defaults.set(json, forKey: "nse.accountMap") }
+
+            #expect(
+                AppDelegate.admitSilentPush(
+                    ["provider": "gmail", "accountEmail": email, "accountIncarnation": "acc-unreadable"],
+                    defaults: defaults
+                ),
+                "a \(label) mirror must not turn a valid silent push into .noData"
+            )
+        }
+
+        // Opposite polarity: a mirror that CAN answer and names a different row
+        // still refuses, so the loop above is not measuring an always-true
+        // predicate.
+        let email = "silent-superseded-\(UUID().uuidString.lowercased())@example.com"
+        let (mirror, name) = try makeAccountMirror([email: "acc-current"])
+        defer { mirror.removePersistentDomain(forName: name) }
+        #expect(
+            !AppDelegate.admitSilentPush(
+                ["provider": "gmail", "accountEmail": email, "accountIncarnation": "acc-unreadable"],
+                defaults: mirror
+            )
+        )
+    }
+
     // MARK: - (3) The refused-push shape and its marker round-trip
 
     @Test("a refused push is stripped to an inert placeholder the main app refuses again")
@@ -343,15 +653,16 @@ struct NotificationAccountGuardCallSiteTests {
         let (defaults, name) = try makeAccountMirror()
         defer { defaults.removePersistentDomain(forName: name) }
 
-        // The extension-side verdict, with its reason — the log line can no
-        // longer call an absent field a replaced account.
+        // The extension-side verdict. Stripping is TERMINAL — the marker below
+        // makes the main app refuse the same payload again without re-deriving
+        // anything — so it may only ever follow a PROVEN verdict.
         #expect(
-            NSEState.accountPushRefusal(
+            NSEState.accountPushVerdict(
                 "replaced-account",
                 for: "notify@example.com",
                 provider: "gmail",
                 defaults: defaults
-            ) == .replacedAccount
+            ) == .superseded
         )
 
         let content = UNMutableNotificationContent()
@@ -385,7 +696,7 @@ struct NotificationAccountGuardCallSiteTests {
 
         // The marker is what closes the loop: a tap on the stripped
         // notification is refused by the main app without re-deriving anything.
-        #expect(!NSEDataBridge.notificationAccountMatches(content.userInfo, defaults: defaults))
+        #expect(NSEDataBridge.notificationIsSuperseded(content.userInfo, defaults: defaults))
         #expect(
             NotificationDelegate.tapRoute(
                 actionId: UNNotificationDefaultActionIdentifier,
@@ -402,13 +713,21 @@ struct NotificationAccountGuardCallSiteTests {
     /// pinned by reading the source: the check must be there, it must strip the
     /// content through the shared helper, and it must return BEFORE the
     /// extension does any work on behalf of the refused account.
-    @Test("the extension entry point refuses before it stamps push health or sweeps")
+    @Test("the extension entry point strips only on PROOF, and binds what it checked")
     func extensionEntryPointRefusesBeforeDoingAnyWorkForTheAccount() throws {
         let source = try projectSource("TabMailNotificationService/NotificationService.swift")
 
-        let guardSite = try #require(
-            source.range(of: "if let refusal = NSEState.accountPushRefusal("),
+        let verdictSite = try #require(
+            source.range(of: "let accountVerdict = NSEState.accountPushVerdict("),
             "the extension entry point no longer consults the account-incarnation rule"
+        )
+        let guardSite = try #require(
+            source.range(of: "if accountVerdict.isSuperseded {", range: verdictSite.upperBound..<source.endIndex),
+            """
+            the extension must strip ONLY on a proven supersession — a guard that \
+            refuses anything other than `.superseded` folds an undetermined \
+            verdict back into a terminal discard
+            """
         )
         let refusalArm = try #require(
             source.range(of: "return", range: guardSite.upperBound..<source.endIndex)
@@ -432,6 +751,30 @@ struct NotificationAccountGuardCallSiteTests {
                 "\(laterWork) runs for a push the incarnation rule refuses"
             )
         }
+
+        // BINDING: the identity the admission proved is carried into processing
+        // rather than re-read. Without this the extension can validate
+        // incarnation A here and process B at step 1, stamping a notification
+        // whose two identity claims disagree.
+        let bindSite = try #require(
+            source.range(of: "\"boundAccountId\": accountVerdict.boundAccountId ?? \"\"", range: refusalArm.upperBound..<source.endIndex),
+            "the proven identity is no longer carried forward from the admission check"
+        )
+        let stepOne = try #require(
+            source.range(of: "let boundAccountId = info[\"boundAccountId\"] ?? \"\"", range: bindSite.upperBound..<source.endIndex),
+            "step 1 no longer consumes the bound identity"
+        )
+        let stepOneResolve = try #require(
+            source.range(of: "NSEState.findAccountId(for: accountEmail)", range: stepOne.upperBound..<source.endIndex)
+        )
+        let resolution = String(source[stepOne.lowerBound..<stepOneResolve.upperBound])
+        #expect(
+            resolution.contains("boundAccountId.isEmpty"),
+            """
+            step 1 must re-read the mirror ONLY when nothing was proved — an \
+            unconditional re-read is the contradiction this binding removes
+            """
+        )
     }
 
     /// Reads a file from the checkout this test was compiled from.

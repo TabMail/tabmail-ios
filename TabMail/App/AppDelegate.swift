@@ -506,7 +506,11 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         defaults: UserDefaults? = nil
     ) async -> UNNotificationPresentationOptions {
         let provider = userInfo["provider"] as? String
-        guard NSEDataBridge.notificationAccountMatches(userInfo, defaults: defaults) else { return [] }
+        // Presentation is recoverable — a banner not shown is recovered by an
+        // ordinary sync or by opening the app — but suppressing one is still a
+        // user-visible loss, so only a PROVEN supersession suppresses. An
+        // unreadable mirror presents the notification normally.
+        guard !NSEDataBridge.notificationIsSuperseded(userInfo, defaults: defaults) else { return [] }
         if DebugModeManager.isLoggingEnabled() {
             print("[NotificationDelegate] willPresent notification: \(identifier) provider=\(provider ?? "nil")")
         }
@@ -595,12 +599,17 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 
     /// Route a tap.
     ///
-    /// 🚨 THE ACTION BRANCH IS DELIBERATELY RESOLVED BEFORE THE
-    /// ACCOUNT-INCARNATION GUARD, AND MUST STAY THERE. MARK_READ / ARCHIVE /
-    /// DELETE are durable user intentions; iOS dismisses the notification the
-    /// moment the button is tapped, so a tap refused here would be discarded
-    /// with no queue row, no error, and nothing left on screen to retry from —
-    /// NEVER DROP USER INTENTION. The action path has its own per-target
+    /// 🚨 THE ACTION BRANCH IS RESOLVED AHEAD OF AN **UNDETERMINED** VERDICT,
+    /// AND MUST STAY THERE — BUT NEVER AHEAD OF A **PROVEN** ONE. MARK_READ /
+    /// ARCHIVE / DELETE are durable user intentions; iOS dismisses the
+    /// notification the moment the button is tapped, so a tap refused on a
+    /// verdict we could not reach would be discarded with no queue row, no
+    /// error, and nothing left on screen to retry from — NEVER DROP USER
+    /// INTENTION. A verdict we DID reach is the opposite case: acting on a
+    /// payload whose identity is contradicted or provably superseded mutates a
+    /// message the user was never shown, and C3 has no recovery. So the two
+    /// proven refusals below run FIRST, and only an undetermined verdict falls
+    /// through to the durable route. The action path also has its own per-target
     /// admission (`admittedOrdinaryActionTargets`, plus the router's identity
     /// checks) which refuses an unproven target VISIBLY instead of silently,
     /// and a durable op for an account that no longer exists finds no inbox
@@ -639,9 +648,28 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                   let accountId = userInfo["accountId"] as? String else {
                 return .incompleteAction
             }
+            // (a) SELF-CONTRADICTION — provable from the payload alone, with no
+            // mirror and no I/O. `EmailNotificationBuilder.fill` stamps
+            // `accountIncarnation` equal to the `accountId` it built from, so
+            // two disagreeing identities mean the notification is NOT bound to
+            // the account this tap would mutate. Refusing costs the user one
+            // ordinary gesture in the app; admitting mutates a message they
+            // never saw.
+            if let claimedIncarnation = userInfo["accountIncarnation"] as? String,
+               !claimedIncarnation.isEmpty,
+               claimedIncarnation != accountId {
+                return .refusedAccount
+            }
+            // (b) PROVEN SUPERSESSION — the mirror answered for this address and
+            // named a different row, so the account was removed and re-added
+            // after this notification was delivered. An undetermined verdict is
+            // NOT a refusal here and falls through to the durable route.
+            if NSEDataBridge.notificationIsSuperseded(userInfo, defaults: defaults) {
+                return .refusedAccount
+            }
             return .durableAction(actionId: actionId, messageId: messageId, accountId: accountId)
         }
-        guard NSEDataBridge.notificationAccountMatches(userInfo, defaults: defaults) else {
+        guard !NSEDataBridge.notificationIsSuperseded(userInfo, defaults: defaults) else {
             return .refusedAccount
         }
         return .passthrough
@@ -1008,12 +1036,17 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     ) -> Bool {
         let provider = info["provider"] ?? ""
         let accountEmail = info["accountEmail"] ?? ""
-        guard NSEDataBridge.accountIncarnationMatches(
+        // A silent push returning `.noData` is a MISSED SYNC, not a lost
+        // intention, and the next foreground/BGAppRefresh pass recovers it. Only
+        // a proven supersession refuses; an undetermined verdict syncs, because
+        // returning `.noData` for every push whose mirror we could not read
+        // would stall background sync with nothing to retry from.
+        guard !NSEDataBridge.accountPushVerdict(
             info["accountIncarnation"],
             accountEmail: accountEmail,
             provider: provider,
             defaults: defaults
-        ) else {
+        ).isSuperseded else {
             return false
         }
         // Mirror NSE: stamp PushHealthStore for non-error pushes so any stale

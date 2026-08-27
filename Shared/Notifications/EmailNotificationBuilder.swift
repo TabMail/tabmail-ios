@@ -167,6 +167,23 @@ enum EmailNotificationBuilder {
         var info = c.userInfo
         info["messageId"] = messageId
         info["accountId"] = accountId
+        // 🚨 BINDING — THE NOTIFICATION NAMES EXACTLY ONE IDENTITY.
+        //
+        // `c.userInfo` starts as the INCOMING APNs payload on the NSE path, so
+        // whatever incarnation the push was routed from is sitting in it. This
+        // content was built from `accountId` and nothing else, so `accountId` is
+        // the identity that must be stamped — the incoming claim is OVERWRITTEN,
+        // never merged. A notification carrying `accountIncarnation = A`
+        // alongside `accountId = B` is precisely the contradiction that let an
+        // action button mutate B's message on a push admitted for A: the tap
+        // path routes on `accountId` and never looked at the other field.
+        //
+        // Overwriting is what makes `NotificationDelegate.tapRoute`'s
+        // contradiction check meaningful, and what makes a later supersession
+        // provable: once delivered, this notification states which incarnation
+        // it belongs to, so a tap after the account is replaced resolves the
+        // address to a different row and is refused on every path.
+        info["accountIncarnation"] = accountId
         c.userInfo = info
 
         if let rc = s.reminderContent, !rc.isEmpty {

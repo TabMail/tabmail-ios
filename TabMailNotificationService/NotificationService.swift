@@ -143,15 +143,18 @@ final class NotificationService: UNNotificationServiceExtension {
         let accountEmail = request.content.userInfo["accountEmail"] as? String ?? ""
         let accountIncarnation = request.content.userInfo["accountIncarnation"] as? String
         let accountProvider = request.content.userInfo["provider"] as? String
-        if let refusal = NSEState.accountPushRefusal(
+        let accountVerdict = NSEState.accountPushVerdict(
             accountIncarnation,
             for: accountEmail,
             provider: accountProvider
-        ) {
-            // Name the refusal reason. An absent incarnation is NOT a refusal
-            // reason at all, so this can no longer report "replaced account"
-            // for a payload that merely omitted the field.
-            NSELog.step("NSE refused a push: \(refusal.rawValue)")
+        )
+        if accountVerdict.isSuperseded {
+            // ONLY a PROVEN supersession strips a push. Stripping is terminal —
+            // the marker it stamps makes the main app refuse the same payload
+            // again — so it may never be reached from a verdict we could not
+            // determine. An unreadable mirror, an absent incarnation and an
+            // unscoped payload all fall through and are delivered normally.
+            NSELog.step("NSE refused a push: \(accountVerdict.reasonDescription)")
             neutralizeRefusedAccountPush(content)
             contentHandler(content)
             return
@@ -184,6 +187,14 @@ final class NotificationService: UNNotificationServiceExtension {
         let info: [String: String] = [
             "provider": request.content.userInfo["provider"] as? String ?? "",
             "accountEmail": request.content.userInfo["accountEmail"] as? String ?? "",
+            // BINDING — the identity the admission check above actually proved,
+            // carried forward so step 1 does not re-read a mirror that can
+            // change mid-run. Without it the extension could validate
+            // incarnation A here and then process B, stamping a notification
+            // whose two identity claims disagree. Empty when the verdict was
+            // undetermined: nothing was proved, so nothing may be bound, and
+            // step 1 resolves the address itself.
+            "boundAccountId": accountVerdict.boundAccountId ?? "",
             "historyId": historyIdStr,
             "taskName": request.content.userInfo["taskName"] as? String ?? "",
             "taskInstruction": request.content.userInfo["taskInstruction"] as? String ?? "",
@@ -384,7 +395,16 @@ final class NotificationService: UNNotificationServiceExtension {
         }
 
         // ── Step 1: Account lookup + (OAuth-only) token ──
-        guard let accountId = NSEState.findAccountId(for: accountEmail) else {
+        // Prefer the identity `didReceive` PROVED over a second mirror read.
+        // One read, carried through: the account this run processes is the
+        // account the admission check validated. The fallback read runs only
+        // when the verdict was undetermined — there was no checked identity to
+        // carry, so there is nothing here to contradict.
+        let boundAccountId = info["boundAccountId"] ?? ""
+        guard let accountId = boundAccountId.isEmpty
+            ? NSEState.findAccountId(for: accountEmail)
+            : boundAccountId
+        else {
             NSELog.step("NSE FAIL: no accountId for \(accountEmail)")
             deliverPassive(
                 c: c,
