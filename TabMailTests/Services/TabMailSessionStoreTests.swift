@@ -155,6 +155,39 @@ struct TabMailSessionStoreTests {
     }
 
     @MainActor
+    @Test("old-location activation failure preserves the exact historical source for retry")
+    func oldLocationActivationFailurePreservesHistoricalSource() throws {
+        let harness = makeHarness()
+        let legacy = sessionData(user: "A", token: "historical-exact")
+        let historicalReference = harness.backend.insertHistorical(
+            account: TabMailSessionStore.pointerAccount,
+            data: legacy
+        )
+        harness.backend.failNextAdd(
+            account: TabMailSessionStore.pointerAccount,
+            status: errSecInteractionNotAllowed
+        )
+
+        #expect(throws: TabMailSessionStore.StoreError.self) {
+            try harness.store.migrateLegacySession(validate: isSession)
+        }
+        let survivingSource = try #require(harness.backend.item(reference: historicalReference))
+        #expect(survivingSource.persistentReference == historicalReference)
+        #expect(survivingSource.data == legacy)
+        #expect(harness.backend.item(
+            account: TabMailSessionStore.pointerAccount,
+            accessGroup: TabMailSessionStore.accessGroup
+        ) == nil)
+        #expect(harness.backend.sharedPointerGeneration() == nil)
+
+        try harness.relaunchedStore().migrateLegacySession(validate: isSession)
+        let active = try #require(harness.store.loadActiveSession())
+        #expect(active.data == legacy)
+        #expect(active.generation != nil)
+        #expect(harness.backend.item(reference: historicalReference) == nil)
+    }
+
+    @MainActor
     @Test(
         "shared namespace is authoritative over historical identity",
         arguments: LegacyAuthorityScenario.allCases
@@ -274,21 +307,32 @@ struct TabMailSessionStoreTests {
     func cleanupPendingOutranksLaterDatabaseHeuristic() throws {
         let harness = makeHarness()
         _ = try harness.store.installNewSession(sessionData(user: "stale"))
-        harness.store.markCleanupPending()
         harness.backend.failNextEnumeration(status: errSecInteractionNotAllowed)
 
-        #expect(throws: TabMailSessionStore.StoreError.self) {
-            try harness.store.deleteAllSessionStorage()
-        }
-        // A database may be created later in this failed launch. The durable
-        // App-Group bit, not that heuristic, controls the next launch.
-        let databaseNowExists = true
-        #expect(databaseNowExists)
+        let firstLaunch = TabMailApp.prepareSessionStorageForLaunch(
+            sessionStore: harness.store,
+            launchDefaults: harness.launchDefaults,
+            databaseExists: { false }
+        )
+        #expect(!firstLaunch.hadLaunchedBefore)
+        #expect(!firstLaunch.databaseExists)
         #expect(harness.store.isCleanupPending)
         #expect(harness.store.loadActiveSession() == nil)
+        #expect(harness.backend.sessionNamespaceItems().isEmpty == false)
 
-        try harness.store.deleteAllSessionStorage()
-        harness.store.clearCleanupPending()
+        var secondDatabaseProbeSawResidue: Bool?
+        let secondLaunch = TabMailApp.prepareSessionStorageForLaunch(
+            sessionStore: harness.relaunchedStore(),
+            launchDefaults: harness.launchDefaults,
+            databaseExists: {
+                secondDatabaseProbeSawResidue = !harness.backend.sessionNamespaceItems().isEmpty
+                return true
+            }
+        )
+
+        #expect(secondLaunch.hadLaunchedBefore)
+        #expect(secondLaunch.databaseExists)
+        #expect(secondDatabaseProbeSawResidue == false)
         #expect(!harness.store.isCleanupPending)
         #expect(harness.backend.sessionNamespaceItems().isEmpty)
     }
@@ -400,6 +444,9 @@ struct TabMailSessionStoreTests {
         let defaultsName = "TabMailSessionStoreTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: defaultsName)!
         defaults.removePersistentDomain(forName: defaultsName)
+        let launchDefaultsName = "TabMailSessionStoreLaunchTests.\(UUID().uuidString)"
+        let launchDefaults = UserDefaults(suiteName: launchDefaultsName)!
+        launchDefaults.removePersistentDomain(forName: launchDefaultsName)
         let generations = TestGenerationSequence()
         let store = TabMailSessionStore(
             backend: backend,
@@ -410,6 +457,7 @@ struct TabMailSessionStoreTests {
             store: store,
             backend: backend,
             cleanupDefaults: defaults,
+            launchDefaults: launchDefaults,
             generations: generations
         )
     }
@@ -740,6 +788,7 @@ private struct SessionStoreHarness {
     let store: TabMailSessionStore
     let backend: MemorySessionKeychainBackend
     let cleanupDefaults: UserDefaults
+    let launchDefaults: UserDefaults
     let generations: TestGenerationSequence
 
     func relaunchedStore() -> TabMailSessionStore {
@@ -769,7 +818,7 @@ private final class MemorySessionKeychainBackend: @unchecked Sendable, TabMailSe
     private var items: [Data: TabMailSessionKeychainItem] = [:]
     private var nextReference = 0
     private var nextReadFailure: OSStatus?
-    private var nextAddFailure: OSStatus?
+    private var nextAddFailure: (account: String?, status: OSStatus)?
     private var nextEnumerationFailure: OSStatus?
     private var failedDeletes: Set<Data> = []
 
@@ -788,9 +837,10 @@ private final class MemorySessionKeychainBackend: @unchecked Sendable, TabMailSe
 
     func addShared(account: String, data: Data) -> TabMailSessionWriteResult {
         lock.withLock {
-            if let status = nextAddFailure {
+            if let failure = nextAddFailure,
+               failure.account == nil || failure.account == account {
                 nextAddFailure = nil
-                return .failed(status)
+                return .failed(failure.status)
             }
             guard !items.values.contains(where: {
                 $0.account == account && $0.accessGroup == TabMailSessionStore.accessGroup
@@ -861,7 +911,11 @@ private final class MemorySessionKeychainBackend: @unchecked Sendable, TabMailSe
     }
 
     func failNextAdd(status: OSStatus) {
-        lock.withLock { nextAddFailure = status }
+        lock.withLock { nextAddFailure = (nil, status) }
+    }
+
+    func failNextAdd(account: String, status: OSStatus) {
+        lock.withLock { nextAddFailure = (account, status) }
     }
 
     func failNextEnumeration(status: OSStatus) {
@@ -884,6 +938,10 @@ private final class MemorySessionKeychainBackend: @unchecked Sendable, TabMailSe
         lock.withLock {
             items.values.first(where: { $0.account == account && $0.accessGroup == accessGroup })
         }
+    }
+
+    func item(reference: Data) -> TabMailSessionKeychainItem? {
+        lock.withLock { items[reference] }
     }
 
     func hasHistoricalPointer() -> Bool {
