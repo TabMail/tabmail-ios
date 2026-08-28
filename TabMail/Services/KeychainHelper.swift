@@ -191,6 +191,7 @@ extension KeychainHelper {
             for item in items {
                 guard let account = item[kSecAttrAccount as String] as? String,
                       let data = item[kSecValueData as String] as? Data else { continue }
+                guard !TabMailSessionStore.isSessionAccount(account) else { continue }
 
                 // Check if item already exists in shared access group
                 let checkQuery: [String: Any] = [
@@ -223,15 +224,29 @@ extension KeychainHelper {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccessGroup as String: accessGroup,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
         ]
-        let attributes: [String: Any] = [
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
-        ]
-        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if status == errSecSuccess {
-            print("[Keychain] Migrated all items to AfterFirstUnlock + shared access group")
+        var sharedItems: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &sharedItems)
+        if status == errSecSuccess, let items = sharedItems as? [[String: Any]] {
+            for item in items {
+                guard let account = item[kSecAttrAccount as String] as? String,
+                      !TabMailSessionStore.isSessionAccount(account) else { continue }
+                let exactQuery: [String: Any] = [
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrService as String: service,
+                    kSecAttrAccount as String: account,
+                    kSecAttrAccessGroup as String: accessGroup,
+                ]
+                let attributes: [String: Any] = [
+                    kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+                ]
+                _ = SecItemUpdate(exactQuery as CFDictionary, attributes as CFDictionary)
+            }
+            print("[Keychain] Migrated non-session items to AfterFirstUnlock + shared access group")
         } else if status != errSecItemNotFound {
-            print("[Keychain] Accessibility migration status: \(status)")
+            print("[Keychain] Accessibility migration enumeration status: \(status)")
         }
     }
 }

@@ -263,7 +263,7 @@ actor PushNotificationService {
     /// was within `deviceRegistrationCacheTTLSeconds`. Pass `force: true` to bypass cache
     /// (e.g., when APNs token changes).
     func registerDeviceWithWorker(tokenHex: String? = nil, force: Bool = false) async {
-        guard let sessionData = KeychainHelper.load(key: "tabmail_session"), let session = try? JSONDecoder().decode(TabMailSession.self, from: sessionData) else {
+        guard let session = TabMailAuthService.getSession() else {
             print("[Push] No session — skipping device registration")
             return
         }
@@ -736,8 +736,7 @@ actor PushNotificationService {
     }
 
     private func currentRemovedAccountCleanupUserId() -> String? {
-        guard let data = KeychainHelper.load(key: "tabmail_session"),
-              let session = try? JSONDecoder().decode(TabMailSession.self, from: data) else {
+        guard let session = TabMailAuthService.getSession() else {
             return nil
         }
         return session.userId
@@ -803,7 +802,7 @@ actor PushNotificationService {
             print("[Push] Demo mode active — skipping subscribe \(account.emailAddress)")
             return
         }
-        guard let sessionData = KeychainHelper.load(key: "tabmail_session"), let session = try? JSONDecoder().decode(TabMailSession.self, from: sessionData) else {
+        guard let session = TabMailAuthService.getSession() else {
             print("[Push] No session — cannot subscribe \(account.emailAddress)")
             return
         }
@@ -869,8 +868,7 @@ actor PushNotificationService {
     /// run on a bare token change (`reregisterAllDeviceAccounts`) without
     /// re-doing a full subscribe. CalDAV has no mailbox → callers skip it.
     private func registerDeviceAccountRecord(for account: Account) async {
-        guard let sessionData = KeychainHelper.load(key: "tabmail_session"),
-              let session = try? JSONDecoder().decode(TabMailSession.self, from: sessionData),
+        guard let session = TabMailAuthService.getSession(),
               let deviceToken = UserDefaults.standard.string(forKey: PushConfig.lastDeviceTokenKey),
               let deviceId = UserDefaults.standard.string(forKey: PushConfig.deviceIdKey) else { return }
 
@@ -1372,7 +1370,7 @@ actor PushNotificationService {
         log += "1. APNs token: \(token.prefix(16))...\n"
 
         // 2. Session
-        guard let sessionData = KeychainHelper.load(key: "tabmail_session"), let session = try? JSONDecoder().decode(TabMailSession.self, from: sessionData) else {
+        guard let session = TabMailAuthService.getSession() else {
             log += "2. Session: MISSING (not signed in)\n"
             return log
         }

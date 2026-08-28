@@ -301,27 +301,29 @@ struct TabMailLoginView: View {
         errorMessage = nil
         Task {
             do {
-                switch provider {
-                case .google:
-                    try await signInGoogle()
-                case .microsoft:
-                    try await signInMicrosoft()
-                case .apple:
-                    let session = try await authService.signInWithProvider(provider)
-                    // If the Apple ID's email is on an iCloud-managed
-                    // domain (or an Apple private relay), stage the
-                    // iCloud consent gate so the user is asked to set
-                    // up iCloud Mail/Calendar before the inbox loads
-                    // — instead of seeing the prompt only as a sheet
-                    // over an empty inbox after onboarding.
-                    if ICloudConfig.isAppleDomain(session.userEmail),
-                       !UserDefaults.standard.bool(forKey: "icloud_setup_prompted") {
-                        PendingAccountAdd.shared.pending = .init(
-                            provider: .icloud,
-                            email: session.userEmail
-                        )
+                try await Self.startProviderSignIn(provider) { provider in
+                    switch provider {
+                    case .google:
+                        try await signInGoogle()
+                    case .microsoft:
+                        try await signInMicrosoft()
+                    case .apple:
+                        let session = try await authService.signInWithProvider(provider)
+                        // If the Apple ID's email is on an iCloud-managed
+                        // domain (or an Apple private relay), stage the
+                        // iCloud consent gate so the user is asked to set
+                        // up iCloud Mail/Calendar before the inbox loads
+                        // — instead of seeing the prompt only as a sheet
+                        // over an empty inbox after onboarding.
+                        if ICloudConfig.isAppleDomain(session.userEmail),
+                           !UserDefaults.standard.bool(forKey: "icloud_setup_prompted") {
+                            PendingAccountAdd.shared.pending = .init(
+                                provider: .icloud,
+                                email: session.userEmail
+                            )
+                        }
+                        onSignedIn()
                     }
-                    onSignedIn()
                 }
             } catch is CancellationError {
                 // User cancelled
@@ -332,6 +334,18 @@ struct TabMailLoginView: View {
             }
             activeProvider = nil
         }
+    }
+
+    /// The single UI boundary before any provider SDK or web-auth session starts.
+    /// The injected operation is also the narrow test witness for all three buttons.
+    @MainActor
+    static func startProviderSignIn(
+        _ provider: TabMailProvider,
+        sessionStore: TabMailSessionStore = .shared,
+        operation: (TabMailProvider) async throws -> Void
+    ) async throws {
+        try TabMailAuthService.requireSignInStorageReady(sessionStore: sessionStore)
+        try await operation(provider)
     }
 
     /// Split Google sign-in: first OAuth requests identity scopes only

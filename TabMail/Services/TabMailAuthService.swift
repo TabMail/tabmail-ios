@@ -52,26 +52,58 @@ enum TabMailProvider: String {
 
 @MainActor
 final class TabMailAuthService: NSObject {
-    private static let sessionKey = "tabmail_session"
     private static let supabaseURL = "https://auth.tabmail.ai"
     private static let supabaseAnonKey = "sb_publishable_1mtT87g-94P0yxFgM19Itw_P3ih9PUD"
     private static let callbackURL = "https://tabmail.ai/auth/ios-callback"
     private static let billingURL = "https://billing.tabmail.ai"
     private var currentSession: ASWebAuthenticationSession?
 
-    static func hasSession() -> Bool {
-        KeychainHelper.load(key: sessionKey) != nil
+    nonisolated static func hasSession(sessionStore: TabMailSessionStore = .shared) -> Bool {
+        getSession(sessionStore: sessionStore) != nil
     }
 
-    static func getSession() -> TabMailSession? {
-        guard let data = KeychainHelper.load(key: sessionKey) else { return nil }
-        return try? JSONDecoder().decode(TabMailSession.self, from: data)
+    nonisolated static func getSession(sessionStore: TabMailSessionStore = .shared) -> TabMailSession? {
+        guard let record = sessionStore.loadActiveSession() else { return nil }
+        return try? JSONDecoder().decode(TabMailSession.self, from: record.data)
     }
 
-    static func clearSession() {
-        KeychainHelper.delete(key: sessionKey)
-        // Session identity changed — re-evaluate the debug-logging gate.
-        DebugModeManager.invalidateLoggingCache()
+    enum SessionCompletionMode {
+        case deactivate
+        case deleteAll
+    }
+
+    /// The sole app-side completion point for local session removal and the
+    /// sole production emitter of `.tabMailDidSignOut`.
+    @discardableResult
+    static func completeSession(
+        mode: SessionCompletionMode,
+        notify: Bool = true,
+        sessionStore: TabMailSessionStore = .shared
+    ) -> Bool {
+        do {
+            switch mode {
+            case .deactivate:
+                try sessionStore.deactivate()
+            case .deleteAll:
+                try sessionStore.deleteAllSessionStorage()
+            }
+            DebugModeManager.invalidateLoggingCache()
+            if notify {
+                NotificationCenter.default.post(name: .tabMailDidSignOut, object: nil)
+            }
+            return true
+        } catch {
+            AuthDiagnostics.log("Local session cleanup failed; sign-out remains retryable (\(error))")
+            return false
+        }
+    }
+
+    static func requireSignInStorageReady(
+        sessionStore: TabMailSessionStore = .shared
+    ) throws {
+        guard !sessionStore.isCleanupPending else {
+            throw TabMailAuthError.localSessionCleanupPending
+        }
     }
 
     /// Ordinary user-initiated sign-out: hand off any remote push-cleanup debt
@@ -96,7 +128,8 @@ final class TabMailAuthService: NSObject {
     /// then blocks on undischarged debt, and both the account-deletion flow and
     /// RootView's "account no longer available" path sign out against a subject
     /// the server has already invalidated, where these calls would only 401.
-    static func signOut() async {
+    @discardableResult
+    static func signOut() async -> Bool {
         // The subject about to be destroyed is exactly the one allowed to
         // discharge the debt, so the gate asks about that subject specifically.
         let subject = getSession()?.userId
@@ -113,8 +146,7 @@ final class TabMailAuthService: NSObject {
             // the window that a timed-out flush would otherwise leave open.
             flush.cancel()
         }
-        clearSession()
-        NotificationCenter.default.post(name: .tabMailDidSignOut, object: nil)
+        return completeSession(mode: .deactivate)
     }
 
     // MARK: - OAuth Providers
@@ -192,7 +224,7 @@ final class TabMailAuthService: NSObject {
         // un-bumped epoch and vouch for the new account).
         let previousUserId = Self.getSession()?.userId
         let encoded = try JSONEncoder().encode(session)
-        try KeychainHelper.save(encoded, for: Self.sessionKey)
+        _ = try TabMailSessionStore.shared.installNewSession(encoded)
         AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
         // Session identity changed — re-evaluate the debug-logging gate.
         DebugModeManager.invalidateLoggingCache()
@@ -208,6 +240,7 @@ final class TabMailAuthService: NSObject {
 
     /// Send a one-time code to the given email address
     func sendEmailOTP(email: String) async throws {
+        try Self.requireSignInStorageReady()
         let url = URL(string: "\(Self.supabaseURL)/auth/v1/otp")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -253,6 +286,7 @@ final class TabMailAuthService: NSObject {
 
     /// Verify the OTP code and return a session
     func verifyEmailOTP(email: String, code: String) async throws -> TabMailSession {
+        try Self.requireSignInStorageReady()
         let url = URL(string: "\(Self.supabaseURL)/auth/v1/verify")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -291,7 +325,7 @@ final class TabMailAuthService: NSObject {
         // Epoch advances at the identity change — see `signInWithIdToken`.
         let previousUserId = Self.getSession()?.userId
         let encoded = try JSONEncoder().encode(session)
-        try KeychainHelper.save(encoded, for: Self.sessionKey)
+        _ = try TabMailSessionStore.shared.installNewSession(encoded)
         AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
         // Session identity changed — re-evaluate the debug-logging gate.
         DebugModeManager.invalidateLoggingCache()
@@ -389,7 +423,7 @@ final class TabMailAuthService: NSObject {
         // Epoch advances at the identity change — see `signInWithIdToken`.
         let previousUserId = Self.getSession()?.userId
         let encoded = try JSONEncoder().encode(session)
-        try KeychainHelper.save(encoded, for: Self.sessionKey)
+        _ = try TabMailSessionStore.shared.installNewSession(encoded)
         AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
         // Session identity changed — re-evaluate the debug-logging gate.
         DebugModeManager.invalidateLoggingCache()
@@ -432,6 +466,7 @@ enum TabMailAuthError: LocalizedError {
     case invalidResponse
     case emailNotRegistered
     case invalidOTP
+    case localSessionCleanupPending
     case otpFailed(String)
 
     var errorDescription: String? {
@@ -442,6 +477,7 @@ enum TabMailAuthError: LocalizedError {
         case .invalidResponse: return "Invalid response from server."
         case .emailNotRegistered: return "This email is not registered. Sign-up is currently invite-only."
         case .invalidOTP: return "Invalid or expired code. Please try again."
+        case .localSessionCleanupPending: return "TabMail is still finishing secure local cleanup. Please try again."
         case .otpFailed(let msg): return msg
         }
     }

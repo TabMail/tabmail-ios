@@ -263,12 +263,14 @@ enum AppDataWiper {
             }
         }
 
-        // 8. Clear TabMail session (Keychain) and sign out → returns to login screen
-        TabMailAuthService.clearSession()
+        // 8. Strong session-namespace cleanup. The completion API is the only
+        // sign-out emitter and reports no success while Keychain residue remains.
+        guard TabMailAuthService.completeSession(mode: .deleteAll) else {
+            throw WipeError.localCleanupIncomplete(
+                underlying: TabMailSessionStore.StoreError.verificationFailed
+            )
+        }
 
         print("[AppDataWiper] Local data wiped — true factory reset")
-
-        // Navigate to login screen
-        NotificationCenter.default.post(name: .tabMailDidSignOut, object: nil)
     }
 }

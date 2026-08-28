@@ -132,9 +132,9 @@ struct RemovedAccountPushCleanupTests {
         }
     }
 
-    private let sessionKey = "tabmail_session"
     private let testWorkerUserId = "cleanup-test-user"
 
+    @MainActor
     private func installTestSession(userId: String, accessToken: String = "test-access") throws {
         let data = try JSONSerialization.data(withJSONObject: [
             "access_token": accessToken,
@@ -142,14 +142,14 @@ struct RemovedAccountPushCleanupTests {
             "expires_at": 4_102_444_800,
             "user": ["id": userId, "email": "session@example.com"],
         ])
-        try KeychainHelper.save(data, for: sessionKey)
+        _ = try TabMailSessionStore.shared.installNewSession(data)
     }
 
+    @MainActor
     private func restoreSession(_ data: Data?) throws {
+        _ = TabMailAuthService.completeSession(mode: .deactivate, notify: false)
         if let data {
-            try KeychainHelper.save(data, for: sessionKey)
-        } else {
-            KeychainHelper.delete(key: sessionKey)
+            _ = try TabMailSessionStore.shared.installNewSession(data)
         }
     }
 
@@ -182,8 +182,8 @@ struct RemovedAccountPushCleanupTests {
         let suiteName = "RemovedAccountPushCleanupTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.set("test-device", forKey: PushConfig.deviceIdKey)
-        let previousSession = KeychainHelper.load(key: sessionKey)
-        try installTestSession(userId: testWorkerUserId)
+        let previousSession = TabMailSessionStore.shared.loadActiveSession()?.data
+        try await installTestSession(userId: testWorkerUserId)
         let mock = MockCleanupClient()
         await PushNotificationService.shared._setRemovedAccountCleanupDependenciesForTesting(
             client: mock,
@@ -198,7 +198,7 @@ struct RemovedAccountPushCleanupTests {
                 defaults: nil
             )
             defaults.removePersistentDomain(forName: suiteName)
-            try restoreSession(previousSession)
+            try await restoreSession(previousSession)
             AppDatabase.shared.withLock { $0 = previousDatabase }
             TestDatabaseTeardown.retire(pool: pool, directory: directory)
             throw error
@@ -209,7 +209,7 @@ struct RemovedAccountPushCleanupTests {
             defaults: nil
         )
         defaults.removePersistentDomain(forName: suiteName)
-        try restoreSession(previousSession)
+        try await restoreSession(previousSession)
         AppDatabase.shared.withLock { $0 = previousDatabase }
         TestDatabaseTeardown.retire(pool: pool, directory: directory)
     }
@@ -263,14 +263,14 @@ struct RemovedAccountPushCleanupTests {
             ])
 
             let callsBeforeUserSwitch = await mock.recordedCalls()
-            try installTestSession(userId: "different-worker-user")
+            try await installTestSession(userId: "different-worker-user")
             await mock.setShouldFail(false)
             await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
             #expect(PendingRemovedAccountPushCleanup.load(from: defaults).count == 1)
             #expect(await mock.recordedCalls() == callsBeforeUserSwitch,
                     "a different JWT subject must not advance the original user's debt")
 
-            try installTestSession(userId: testWorkerUserId)
+            try await installTestSession(userId: testWorkerUserId)
             await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
             #expect(PendingRemovedAccountPushCleanup.load(from: defaults).isEmpty)
             #expect(defaults.object(forKey: PushConfig.removedAccountCleanupKey) == nil,
@@ -375,7 +375,7 @@ struct RemovedAccountPushCleanupTests {
     @Test("signed-out removal persists local cleanup only")
     func signedOutRemovalDoesNotCreateUndischargeableRemoteDebt() async throws {
         try await withHarness { defaults, mock in
-            KeychainHelper.delete(key: sessionKey)
+            _ = await TabMailAuthService.completeSession(mode: .deactivate, notify: false)
             var removed = Account(
                 emailAddress: "signed-out@example.com",
                 displayName: "Signed out",
@@ -702,7 +702,7 @@ struct RemovedAccountPushCleanupTests {
                     "sign-out must flush the debt while the owning session is still valid")
             #expect(defaults.object(forKey: PushConfig.removedAccountCleanupKey) == nil,
                     "the removed email must not be retained after remote cleanup completes")
-            #expect(KeychainHelper.load(key: sessionKey) == nil, "sign-out must still clear the session")
+            #expect(!TabMailAuthService.hasSession(), "sign-out must still clear the session")
 
             let calls = await mock.recordedCalls()
             #expect(calls.contains("device-account:signout-flush@example.com"))
@@ -743,7 +743,7 @@ struct RemovedAccountPushCleanupTests {
                     "sign-out returned only after the blocked cleanup call completed — it waited instead of bounding")
             #expect(elapsed < signOutHangGuard,
                     "sign-out must return at all while a cleanup call is stuck (took \(elapsed)s)")
-            #expect(KeychainHelper.load(key: sessionKey) == nil,
+            #expect(!TabMailAuthService.hasSession(),
                     "sign-out is unconditional — a stuck flush must not keep the session alive")
             let retained = PendingRemovedAccountPushCleanup.load(from: defaults)
             #expect(retained.count == 1, "a timed-out flush must never discard the debt")
@@ -776,7 +776,7 @@ struct RemovedAccountPushCleanupTests {
 
             // Re-entrancy after the cancelled flush: a wedged `drainActive`
             // latch would make every later retry a no-op and strand this record.
-            try installTestSession(userId: testWorkerUserId)
+            try await installTestSession(userId: testWorkerUserId)
             var later = Account(
                 emailAddress: "signout-hung-later@example.com",
                 displayName: "Later",
@@ -809,7 +809,7 @@ struct RemovedAccountPushCleanupTests {
 
             #expect(await mock.recordedCalls().isEmpty,
                     "the ordinary sign-out path must not gain a network round-trip")
-            #expect(KeychainHelper.load(key: sessionKey) == nil)
+            #expect(!TabMailAuthService.hasSession())
         }
     }
 
@@ -833,7 +833,7 @@ struct RemovedAccountPushCleanupTests {
 
             // A different subject is signed in now. Their sign-out may not spend
             // the original user's debt, and may not retire it either.
-            try installTestSession(userId: "different-worker-user")
+            try await installTestSession(userId: "different-worker-user")
             await TabMailAuthService.signOut()
 
             #expect(await mock.recordedCalls().isEmpty,
@@ -848,7 +848,7 @@ struct RemovedAccountPushCleanupTests {
                 .consent,
                 .providerSubscription,
             ]))
-            #expect(KeychainHelper.load(key: sessionKey) == nil)
+            #expect(!TabMailAuthService.hasSession())
         }
     }
 
@@ -883,7 +883,7 @@ struct RemovedAccountPushCleanupTests {
 
             let observed = posted.withLock { $0 }
             #expect(observed, "sign-out must post .tabMailDidSignOut regardless of the flush outcome")
-            #expect(KeychainHelper.load(key: sessionKey) == nil,
+            #expect(!TabMailAuthService.hasSession(),
                     "a failed flush must not leave the user signed in")
             let retained = PendingRemovedAccountPushCleanup.load(from: defaults)
             #expect(retained.count == 1, "a failed flush must leave the debt durable")
@@ -934,7 +934,7 @@ struct RemovedAccountPushCleanupTests {
             await TabMailAuthService.signOut()
 
             // (i) Sign-out is unconditional — the session is gone.
-            #expect(KeychainHelper.load(key: sessionKey) == nil,
+            #expect(!TabMailAuthService.hasSession(),
                     "sign-out must clear the session even when a removal drain is mid-flight")
 
             // (ii)+(iii) TRANSIENT never-drop, blocked window: the coalesced flush
@@ -1033,7 +1033,7 @@ struct RemovedAccountPushCleanupTests {
             // Account B signs in while A's pass is suspended inside its FIRST
             // remote call. The ambient session slot now holds B's subject and
             // B's bearer — everything a per-action token read would pick up.
-            try installTestSession(userId: "other-user", accessToken: "test-access-B")
+            try await installTestSession(userId: "other-user", accessToken: "test-access-B")
             // Two-sided setup guard: prove the switch actually happened, so a
             // green result cannot come from the scenario never occurring.
             let liveSubject = await MainActor.run { TabMailAuthService.getSession()?.userId }

@@ -21,10 +21,6 @@ enum SharedKeychain {
         load(key: "password:\(accountId)")
     }
 
-    static func getSession() -> String? {
-        load(key: "tabmail_session")
-    }
-
     static func getDeviceToken() -> String? {
         // Device token stored in UserDefaults by PushNotificationService, mirrored to shared
         SharedNSEData.suite.string(forKey: "nse.deviceToken")
@@ -32,10 +28,6 @@ enum SharedKeychain {
 
     static func setAccessToken(_ token: String, for accountId: String) {
         save(key: "accessToken:\(accountId)", value: token)
-    }
-
-    static func setSession(_ sessionJSON: String) {
-        save(key: "tabmail_session", value: sessionJSON)
     }
 
     // MARK: - Private

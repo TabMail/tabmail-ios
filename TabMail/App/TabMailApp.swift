@@ -29,6 +29,18 @@ struct TabMailApp: App {
         // First app-code mark — its `+Nms` is the pre-main (dyld / runtime /
         // static-init) cost, usually the biggest single chunk of a cold launch.
         BootProfiler.mark("TabMailApp.init enter")
+        let sessionStore = TabMailSessionStore.shared
+
+        // A failed fresh-install wipe is durable and outranks every heuristic.
+        // Resolve it before consulting UserDefaults or the database: creating a
+        // database during the failed launch must not turn the next launch into
+        // a false "returning user" that adopts surviving credentials.
+        if sessionStore.isCleanupPending,
+           TabMailAuthService.completeSession(mode: .deleteAll, notify: false) {
+            sessionStore.clearCleanupPending()
+            DebugModeManager.invalidateLoggingCache()
+        }
+
         // Detect fresh install: UserDefaults is cleared on reinstall, Keychain is not.
         // If this is a fresh install but Keychain has stale data, clear it.
         // GUARD: also check for existing GRDB database file. If the database exists,
@@ -36,22 +48,37 @@ struct TabMailApp: App {
         // backup restore, etc.) and we must NOT clear the Keychain session.
         let hasLaunchedKey = "hasLaunchedBefore"
         let hadLaunchedBefore = UserDefaults.standard.bool(forKey: hasLaunchedKey)
-        let hadSession = TabMailAuthService.hasSession()
         let dbPath = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("TabMail/tabmail.sqlite").path
         let dbExists = FileManager.default.fileExists(atPath: dbPath)
-        AuthDiagnostics.log("Launch: hasLaunchedBefore=\(hadLaunchedBefore), session=\(hadSession), dbExists=\(dbExists)")
+        AuthDiagnostics.log("Launch: hasLaunchedBefore=\(hadLaunchedBefore), dbExists=\(dbExists)")
         if !hadLaunchedBefore {
             if dbExists {
                 // Database exists — this is NOT a fresh install. UserDefaults was cleared
                 // spuriously (TestFlight, backup restore, etc.). Do NOT nuke the session.
                 AuthDiagnostics.log("UserDefaults reset but database exists — skipping session clear (false fresh-install)")
             } else {
-                // Truly fresh install — clear stale Keychain data
+                // Truly fresh install. Persist the gate BEFORE destructive work;
+                // both app and NSE fail closed until a verified zero-item cleanup.
                 AuthDiagnostics.log("Fresh install detected — clearing stale Keychain data")
-                TabMailAuthService.clearSession()
+                sessionStore.markCleanupPending()
+                if TabMailAuthService.completeSession(mode: .deleteAll, notify: false) {
+                    sessionStore.clearCleanupPending()
+                    DebugModeManager.invalidateLoggingCache()
+                }
             }
             UserDefaults.standard.set(true, forKey: hasLaunchedKey)
+        }
+
+        if !sessionStore.isCleanupPending {
+            do {
+                try sessionStore.migrateLegacySession {
+                    (try? JSONDecoder().decode(TabMailSession.self, from: $0)) != nil
+                }
+            } catch {
+                AuthDiagnostics.log("Local session migration remains retryable (\(error))")
+            }
+            sessionStore.sweepInactiveGenerations()
         }
         let hasSessionAfter = TabMailAuthService.hasSession()
         AuthDiagnostics.log("Post-init: session=\(hasSessionAfter)")
