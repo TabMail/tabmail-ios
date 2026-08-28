@@ -178,6 +178,24 @@ struct AppLogStoreTests {
         try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted()
     }
 
+    private func productionSwiftFiles() -> [URL] {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // Services
+            .deletingLastPathComponent()   // TabMailTests
+            .deletingLastPathComponent()   // repository root
+        return ["TabMail", "Shared", "TabMailNotificationService"].flatMap { sourceRoot -> [URL] in
+            let directory = root.appendingPathComponent(sourceRoot)
+            guard let enumerator = FileManager.default.enumerator(
+                at: directory,
+                includingPropertiesForKeys: nil
+            ) else { return [] }
+            return enumerator.compactMap { entry -> URL? in
+                guard let url = entry as? URL, url.pathExtension == "swift" else { return nil }
+                return url
+            }
+        }
+    }
+
     // MARK: - The single-file invariant
 
     @Test("Every channel writes to ONE file")
@@ -210,14 +228,13 @@ struct AppLogStoreTests {
                 // ⚠️ Scope, stated precisely because the earlier wording claimed
                 // more than this can deliver: every write here goes through
                 // `AppLogStore.append`, so what is proven is that the STORE does
-                // not fan out per channel. It does NOT prove that
+                // not fan out per channel. It does NOT by itself prove that
                 // `device_sync.log` cannot reappear beside `tabmail.log` — the
                 // shipped `DeviceSyncLogger` path was a hardcoded real
                 // Application Support URL, not one derived from
                 // `AppLogStore.fileURL`, so a writer that reintroduced it would
                 // write outside this override's directory and be invisible here.
-                // `facadeWritersShareOneFile` covers the façades, and carries
-                // the same caveat.
+                // `legacyLogNamesAreMigrationOnly` covers that production path.
                 let names = try fileNames(in: url.deletingLastPathComponent())
                 #expect(names == [url.lastPathComponent],
                         "a sibling log file was created: \(names)")
@@ -225,7 +242,7 @@ struct AppLogStoreTests {
         }
     }
 
-    @Test("The named writers all land in the same file, and open no second one")
+    @Test("The named writers land in the shared override and open no sibling there")
     func facadeWritersShareOneFile() throws {
         try withTempLog { url in
             try withDebugLogging(true) {
@@ -249,18 +266,37 @@ struct AppLogStoreTests {
                 // after the façades have run is what makes that dual write
                 // visible.
                 //
-                // ⚠️ What this cannot see: a writer whose second file is a
+                // What this cannot see: a writer whose second file is a
                 // HARDCODED absolute path (the shape the shipped
                 // `DeviceSyncLogger` actually had — real Application Support,
                 // not derived from `AppLogStore.fileURL`) lands outside this
-                // override's directory and is invisible to any enumeration a
-                // test may safely perform. Covered here: a sibling written
-                // relative to the log's own directory.
+                // override's directory. `legacyLogNamesAreMigrationOnly` covers
+                // that exact production regression; this runtime test covers a
+                // sibling written relative to the log's own directory.
                 let names = try fileNames(in: url.deletingLastPathComponent())
                 #expect(names == [url.lastPathComponent],
                         "a façade opened a second log file: \(names)")
             }
         }
+    }
+
+    @Test("Legacy log filenames appear only in the one-shot migration")
+    func legacyLogNamesAreMigrationOnly() throws {
+        let migrationPathSuffix = "/TabMail/Services/StartupMigrations.swift"
+        var violations: [String] = []
+
+        for file in productionSwiftFiles() where !file.path.hasSuffix(migrationPathSuffix) {
+            let source = try String(contentsOf: file, encoding: .utf8)
+            let names = StartupMigrations.legacyLogFileNames.filter {
+                source.contains("\"\($0)\"")
+            }
+            if !names.isEmpty {
+                violations.append("\(file.lastPathComponent): \(names.joined(separator: ", "))")
+            }
+        }
+
+        #expect(violations.isEmpty,
+                "a retired per-subsystem log path was reintroduced: \(violations)")
     }
 
     @Test("Entries from different channels interleave in append order")
@@ -780,7 +816,7 @@ struct AppLogStoreTests {
 
     // MARK: - The gate covers the console too (global CLAUDE.md rule 12)
 
-    @Test("Every debug-gated writer gates its print as well as its file write")
+    @Test("Every direct console sink in a debug-gated writer follows its guard")
     func gatedWritersGateTheirPrintToo() throws {
         // Rule 12 is "a no-op in production", not "writes no file in production".
         // Every behavioural test in this file reads the FILE, so moving a
@@ -1284,13 +1320,12 @@ struct AppLogStoreTests {
                 // The oldest is gone — the trim actually ran, so this test is
                 // not silently measuring an untrimmed file.
                 #expect(!contents.contains("entry_0_"))
-                // Every surviving line is a complete physical LINE: the trim
+                // Every surviving line from this test is a complete physical
+                // LINE: the trim
                 // advances past the first partial line rather than slicing one in
-                // half. The oracle is "parses as SOME channel", not "== SYNC": a
-                // partial line has no valid `[ts] [TAG] ` head and returns nil,
-                // which is exactly the defect being guarded, while an always-on
-                // entry that escaped an earlier test into the redirected file
-                // parses fine and must not flake this.
+                // half. Scope the oracle to our `entry_` markers: an escaped
+                // always-on `logChatError` task can legitimately add an untagged
+                // continuation line to the redirected file.
                 //
                 // ⚠️ LINE, not logical ENTRY — the distinction is real and the
                 // stronger claim would be false. `logChatError` deliberately emits
@@ -1302,7 +1337,8 @@ struct AppLogStoreTests {
                 // export shows the orphan, and `clear(channel:)` removes it for
                 // whichever channel is cleared (pinned by
                 // `clearRemovesLeadingOrphanForAnyChannel`).
-                for line in contents.split(separator: "\n", omittingEmptySubsequences: true) {
+                for line in contents.split(separator: "\n", omittingEmptySubsequences: true)
+                    where line.contains("entry_") {
                     #expect(AppLogStore.entryTag(of: line) != nil,
                             "trim left a partial line: \(line)")
                 }
