@@ -104,12 +104,11 @@ final class DebugModeManager {
         guard unlocked else { return false }
         return loggingAllowedCache.withLock { cache in
             if let cached = cache { return cached }
-            // Read session directly from Keychain (thread-safe) to avoid MainActor
-            // hop. Cached because SecItemCopyMatching is a synchronous XPC to
-            // securityd — far too costly to run on every log call.
+            // Read through the shared session store without a MainActor hop.
+            // Cached because the store's Keychain lookup is a synchronous XPC
+            // to securityd — far too costly to run on every log call.
             let allowed: Bool
-            if let data = KeychainHelper.load(key: "tabmail_session"),
-               let session = try? JSONDecoder().decode(TabMailSession.self, from: data) {
+            if let session = TabMailAuthService.getSession() {
                 allowed = isEmailAllowed(session.userEmail)
             } else {
                 allowed = false

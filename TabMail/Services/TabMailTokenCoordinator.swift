@@ -15,6 +15,8 @@ import Foundation
 actor TabMailTokenCoordinator {
     static let shared = TabMailTokenCoordinator()
 
+    typealias DataForRequest = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+
     enum RefreshResult: Sendable {
         case success(String)       // valid access token
         case permanentFailure      // 400/401/403 — refresh token revoked, re-auth needed
@@ -24,6 +26,18 @@ actor TabMailTokenCoordinator {
 
     private static let supabaseURL = "https://auth.tabmail.ai"
     private static let supabaseAnonKey = "sb_publishable_1mtT87g-94P0yxFgM19Itw_P3ih9PUD"
+    private let dataForRequest: DataForRequest
+    private let sessionStore: TabMailSessionStore
+
+    init(
+        sessionStore: TabMailSessionStore = .shared,
+        dataForRequest: @escaping DataForRequest = { request in
+            try await sharedEphemeralSession.data(for: request)
+        }
+    ) {
+        self.sessionStore = sessionStore
+        self.dataForRequest = dataForRequest
+    }
 
     /// In-flight refresh task. Subsequent callers await this instead of starting a new refresh.
     private var inFlightRefresh: Task<RefreshResult, Never>?
@@ -56,9 +70,8 @@ actor TabMailTokenCoordinator {
     /// Get a valid access token, refreshing if needed.
     /// Deduplicates concurrent refresh attempts — only one HTTP refresh call is made.
     func validToken() async -> RefreshResult {
-        // Read current session from Keychain
-        guard let data = KeychainHelper.load(key: "tabmail_session"),
-              let session = try? JSONDecoder().decode(TabMailSession.self, from: data) else {
+        guard var record = sessionStore.loadActiveSession(),
+              var session = try? JSONDecoder().decode(TabMailSession.self, from: record.data) else {
             return .noSession
         }
 
@@ -66,6 +79,19 @@ actor TabMailTokenCoordinator {
         let now = Int(Date().timeIntervalSince1970)
         if session.expiresAt > now + 60 {
             return .success(session.accessToken)
+        }
+
+        // A legacy token may be used while still valid, but its rotating refresh
+        // token is never spent until copy-and-activation succeeds locally.
+        if record.generation == nil {
+            await retryLegacyMigration()
+            guard let migrated = sessionStore.loadActiveSession(),
+                  let migratedSession = try? JSONDecoder().decode(TabMailSession.self, from: migrated.data),
+                  migrated.generation != nil else {
+                return .transientFailure
+            }
+            record = migrated
+            session = migratedSession
         }
 
         // Token expired — deduplicate the refresh, but ONLY with a caller that
@@ -80,10 +106,16 @@ actor TabMailTokenCoordinator {
         }
 
         let refreshToken = session.refreshToken
+        let generation = record.generation!
         print("[TabMailToken] Token expired (expiresAt=\(session.expiresAt) now=\(now)), starting refresh...")
 
         let task = Task<RefreshResult, Never> {
-            await Self.performRefresh(refreshToken: refreshToken)
+            await Self.performRefresh(
+                refreshToken: refreshToken,
+                generation: generation,
+                sessionStore: sessionStore,
+                dataForRequest: dataForRequest
+            )
         }
         inFlightRefresh = task
         inFlightRefreshUserId = session.userId
@@ -103,10 +135,20 @@ actor TabMailTokenCoordinator {
     /// Force-refresh the token regardless of expiry.
     /// Used after `updateUserMetadata()` to ensure the JWT carries updated `user_metadata` claims.
     func forceRefresh() async -> RefreshResult {
-        // Read current session for its refresh token
-        guard let data = KeychainHelper.load(key: "tabmail_session"),
-              let session = try? JSONDecoder().decode(TabMailSession.self, from: data) else {
+        guard var record = sessionStore.loadActiveSession(),
+              var session = try? JSONDecoder().decode(TabMailSession.self, from: record.data) else {
             return .noSession
+        }
+
+        if record.generation == nil {
+            await retryLegacyMigration()
+            guard let migrated = sessionStore.loadActiveSession(),
+                  let migratedSession = try? JSONDecoder().decode(TabMailSession.self, from: migrated.data),
+                  migrated.generation != nil else {
+                return .transientFailure
+            }
+            record = migrated
+            session = migratedSession
         }
 
         // Deduplicate if a refresh is already in-flight — same-subject only.
@@ -125,8 +167,14 @@ actor TabMailTokenCoordinator {
         print("[TabMailToken] Force-refreshing token to pick up updated user_metadata")
 
         let refreshToken = session.refreshToken
+        let generation = record.generation!
         let task = Task<RefreshResult, Never> {
-            await Self.performRefresh(refreshToken: refreshToken)
+            await Self.performRefresh(
+                refreshToken: refreshToken,
+                generation: generation,
+                sessionStore: sessionStore,
+                dataForRequest: dataForRequest
+            )
         }
         inFlightRefresh = task
         inFlightRefreshUserId = session.userId
@@ -140,7 +188,12 @@ actor TabMailTokenCoordinator {
     }
 
     /// Perform the actual HTTP refresh call to Supabase.
-    private static func performRefresh(refreshToken: String) async -> RefreshResult {
+    private static func performRefresh(
+        refreshToken: String,
+        generation: String,
+        sessionStore: TabMailSessionStore,
+        dataForRequest: DataForRequest
+    ) async -> RefreshResult {
         guard let url = URL(string: "\(supabaseURL)/auth/v1/token?grant_type=refresh_token") else {
             return .transientFailure
         }
@@ -153,7 +206,7 @@ actor TabMailTokenCoordinator {
         request.httpBody = try? JSONSerialization.data(withJSONObject: ["refresh_token": refreshToken])
 
         do {
-            let (data, response) = try await sharedEphemeralSession.data(for: request)
+            let (data, response) = try await dataForRequest(request)
             guard let httpResponse = response as? HTTPURLResponse else {
                 return .transientFailure
             }
@@ -173,20 +226,13 @@ actor TabMailTokenCoordinator {
 
             let newSession = try JSONDecoder().decode(TabMailSession.self, from: data)
             let encoded = try JSONEncoder().encode(newSession)
-            // Clobber-guard (auth-safe). A sign-out cleanup can drive this
-            // refresh, and it runs in an UNSTRUCTURED task that `signOut()`'s
-            // `flush.cancel()` cannot reach, so it can complete after the slot
-            // has changed owner (empty after `clearSession`, or a DIFFERENT
-            // user after someone else signs in). Persist only if the slot is
-            // empty, unreadable, or still owned by THIS user; never over a
-            // different, valid user (that would overwrite an active B with A —
-            // an identity clobber). Never infer sign-out from an ambiguous
-            // read: empty/unreadable ⇒ SAVE, so a transient miss cannot strand
-            // a stale token and log the user out. Returning `.success`
-            // regardless keeps the in-flight caller's token valid for its
-            // current request (IOS-PUSH-001) — only the Keychain write is
-            // gated.
-            await Self.persistRefreshedSession(encoded: encoded, newUserId: newSession.userId)
+            // Update exactly the generation captured before the request. A
+            // sign-out or later login can delete that slot, but a late response
+            // can never recreate it or touch the active pointer.
+            let persistence = sessionStore.updateCapturedGeneration(generation, data: encoded)
+            if case .failed(let status) = persistence {
+                AuthDiagnostics.log("Token refresh persistence failed (OSStatus \(status)); current invocation may continue")
+            }
             AuthDiagnostics.log("Token refreshed, expiresAt=\(newSession.expiresAt)")
             return .success(newSession.accessToken)
         } catch {
@@ -195,64 +241,14 @@ actor TabMailTokenCoordinator {
         }
     }
 
-    // MARK: - Clobber guard (auth-safe session persistence)
-
-    /// Pure save-decision for a refreshed session: should it overwrite the
-    /// shared `"tabmail_session"` slot?
-    ///
-    /// SAVE when the slot is empty, unreadable/undecodable, OR owned by the
-    /// SAME user (`userId` matches). An ambiguous or missing read must never be
-    /// treated as "signed out": withholding a legitimate save would strand a
-    /// stale token and log the user out on next launch — worse than the
-    /// clobber, and the overriding priority. SKIP only when the slot decodes to
-    /// a VALID session for a DIFFERENT user; there is no legitimate case where
-    /// one account's refreshed token should overwrite another account's active
-    /// session, so a skip is only ever the clobber.
-    static func shouldPersistRefreshedSession(currentSlot: Data?, newUserId: String) -> Bool {
-        guard let currentSlot,
-              let current = try? JSONDecoder().decode(TabMailSession.self, from: currentSlot) else {
-            return true // empty or unreadable — save (never infer sign-out)
-        }
-        return current.userId == newUserId
-    }
-
-    /// Re-read the slot and persist the refreshed session iff the clobber guard
-    /// allows it.
-    ///
-    /// Runs on the MainActor deliberately: the in-process writers of
-    /// `"tabmail_session"` are `TabMailAuthService`'s sign-in saves and
-    /// `clearSession`, all MainActor-isolated. So this read → decide → write
-    /// executes as one synchronous MainActor step that no IN-PROCESS sign-in
-    /// write can interleave, and the compare is therefore always against the
-    /// owner this process last saw. `loadCurrent` / `save` are injected for
-    /// tests; production uses the Keychain.
-    ///
-    /// ⚠️ **This is NOT atomic against the notification-service extension.**
-    /// `NSETokenManager.performRefresh` writes the identical Keychain item
-    /// (service `ai.tabmail.ios`, access group `group.ai.tabmail`, account
-    /// `tabmail_session`) from a SEPARATE PROCESS, and `@MainActor` cannot
-    /// serialize another process. The NSE runs the same auth-safe predicate,
-    /// which shrinks the race to the window between its read and its write —
-    /// it does not eliminate it. A cross-process guarantee would need a
-    /// Keychain-level compare-and-swap, which `SecItemUpdate` does not offer.
-    /// Registered as the residual on `IOS-PUSH-001`. An earlier revision of
-    /// this comment claimed the MainActor made the guard atomic against ALL
-    /// writers; that claim was false and is corrected here.
     @MainActor
-    static func persistRefreshedSession(
-        encoded: Data,
-        newUserId: String,
-        loadCurrent: () -> Data? = { KeychainHelper.load(key: "tabmail_session") },
-        save: (Data) throws -> Void = { try KeychainHelper.save($0, for: "tabmail_session") }
-    ) {
-        guard shouldPersistRefreshedSession(currentSlot: loadCurrent(), newUserId: newUserId) else {
-            AuthDiagnostics.log("Token refresh: session slot now owned by a different user — withholding save (clobber-guard)")
-            return
-        }
+    private func retryLegacyMigration() {
         do {
-            try save(encoded)
+            try sessionStore.migrateLegacySession {
+                (try? JSONDecoder().decode(TabMailSession.self, from: $0)) != nil
+            }
         } catch {
-            AuthDiagnostics.log("CRITICAL: Keychain save failed after refresh — stale token on next launch. Error: \(error)")
+            AuthDiagnostics.log("Legacy session migration before refresh remains retryable (\(error))")
         }
     }
 }

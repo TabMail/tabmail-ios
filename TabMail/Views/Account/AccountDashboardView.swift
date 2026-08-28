@@ -250,7 +250,9 @@ struct AccountDashboardView: View {
                             // the button must not accept a second tap meanwhile.
                             isSigningOut = true
                             Task {
-                                await TabMailAuthService.signOut()
+                                if !(await TabMailAuthService.signOut()) {
+                                    errorMessage = "Couldn’t finish signing out locally. Please try again."
+                                }
                                 isSigningOut = false
                             }
                         } label: {
@@ -707,4 +709,3 @@ private struct AccountMismatchBanner: View {
         }
     }
 }
-

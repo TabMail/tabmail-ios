@@ -187,8 +187,6 @@ struct DebugModeManagerTests {
 struct DebugModeLoggingGateTests {
 
     private let unlockedKey = "debug_mode_unlocked"
-    private let sessionKey = "tabmail_session"
-
     /// Encode a session blob the way the auth flow stores it (Supabase shape),
     /// so `isLoggingEnabled()` can decode it back from the keychain.
     private func sessionData(email: String) throws -> Data {
@@ -201,13 +199,12 @@ struct DebugModeLoggingGateTests {
     /// Run `body` with the real keychain session + unlock flag backed up and
     /// restored afterward, so a signed-in simulator is never disturbed.
     private func withPreservedState(_ body: () throws -> Void) rethrows {
-        let savedSession = KeychainHelper.load(key: sessionKey)
+        let savedSession = TabMailSessionStore.shared.loadActiveSession()?.data
         let savedUnlock = UserDefaults.standard.object(forKey: unlockedKey)
         defer {
+            _ = TabMailAuthService.completeSession(mode: .deactivate, notify: false)
             if let savedSession {
-                try? KeychainHelper.save(savedSession, for: sessionKey)
-            } else {
-                KeychainHelper.delete(key: sessionKey)
+                _ = try? TabMailSessionStore.shared.installNewSession(savedSession)
             }
             if let savedUnlock {
                 UserDefaults.standard.set(savedUnlock, forKey: unlockedKey)
@@ -219,11 +216,16 @@ struct DebugModeLoggingGateTests {
         try body()
     }
 
+    private func installSession(email: String) throws {
+        _ = TabMailAuthService.completeSession(mode: .deactivate, notify: false)
+        _ = try TabMailSessionStore.shared.installNewSession(sessionData(email: email))
+    }
+
     @Test("Returns false when debug mode is locked, regardless of session")
     func lockedShortCircuitsToFalse() throws {
         try withPreservedState {
             UserDefaults.standard.set(false, forKey: unlockedKey)
-            try KeychainHelper.save(sessionData(email: "qa@tabmail.ai"), for: sessionKey)
+            try installSession(email: "qa@tabmail.ai")
             DebugModeManager.invalidateLoggingCache()
             #expect(DebugModeManager.isLoggingEnabled() == false)
         }
@@ -233,7 +235,7 @@ struct DebugModeLoggingGateTests {
     func unlockedAllowedUserIsTrue() throws {
         try withPreservedState {
             UserDefaults.standard.set(true, forKey: unlockedKey)
-            try KeychainHelper.save(sessionData(email: "qa@tabmail.ai"), for: sessionKey)
+            try installSession(email: "qa@tabmail.ai")
             DebugModeManager.invalidateLoggingCache()
             #expect(DebugModeManager.isLoggingEnabled() == true)
             // Stable across repeated (now-cached) reads.
@@ -245,7 +247,7 @@ struct DebugModeLoggingGateTests {
     func unlockedDisallowedUserIsFalse() throws {
         try withPreservedState {
             UserDefaults.standard.set(true, forKey: unlockedKey)
-            try KeychainHelper.save(sessionData(email: "qa@example.com"), for: sessionKey)
+            try installSession(email: "qa@example.com")
             DebugModeManager.invalidateLoggingCache()
             #expect(DebugModeManager.isLoggingEnabled() == false)
         }
@@ -255,13 +257,13 @@ struct DebugModeLoggingGateTests {
     func logoutInvalidatesCache() throws {
         try withPreservedState {
             UserDefaults.standard.set(true, forKey: unlockedKey)
-            try KeychainHelper.save(sessionData(email: "qa@tabmail.ai"), for: sessionKey)
+            try installSession(email: "qa@tabmail.ai")
             DebugModeManager.invalidateLoggingCache()
             #expect(DebugModeManager.isLoggingEnabled() == true) // cache now holds `true`
 
             // Logout must drop the memoized `true`; otherwise the gate stays
             // on for the next (signed-out) user.
-            TabMailAuthService.clearSession()
+            TabMailAuthService.completeSession(mode: .deactivate, notify: false)
             #expect(DebugModeManager.isLoggingEnabled() == false)
         }
     }
@@ -271,13 +273,13 @@ struct DebugModeLoggingGateTests {
         try withPreservedState {
             UserDefaults.standard.set(true, forKey: unlockedKey)
 
-            try KeychainHelper.save(sessionData(email: "qa@example.com"), for: sessionKey)
+            try installSession(email: "qa@example.com")
             DebugModeManager.invalidateLoggingCache()
             #expect(DebugModeManager.isLoggingEnabled() == false) // cache holds `false`
 
             // Simulate logging in as an allowed user (save + invalidate, as the
             // auth save sites now do).
-            try KeychainHelper.save(sessionData(email: "qa@tabmail.ai"), for: sessionKey)
+            try installSession(email: "qa@tabmail.ai")
             DebugModeManager.invalidateLoggingCache()
             #expect(DebugModeManager.isLoggingEnabled() == true)
         }

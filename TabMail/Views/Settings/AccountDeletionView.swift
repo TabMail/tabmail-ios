@@ -210,6 +210,14 @@ struct AccountDeletionView: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal)
 
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
+
             Button {
                 dismiss()
             } label: {
@@ -289,7 +297,10 @@ private extension AccountDeletionView {
                 .map { $0.formatted(date: .long, time: .omitted) }
 
             // Scoped cleanup: clear TabMail account data, preserve email accounts & messages
-            await scopedTabMailCleanup()
+            let localSignOutCompleted = await scopedTabMailCleanup()
+            if !localSignOutCompleted {
+                errorMessage = "Deletion is scheduled, but local sign-out could not finish. Please tap Done and try signing out again."
+            }
 
             // Show confirmation instead of dismissing immediately
             withAnimation {
@@ -336,22 +347,24 @@ private extension AccountDeletionView {
     }
 
     /// Clears TabMail session and stops AI processing while preserving all local data.
-    private func scopedTabMailCleanup() async {
+    private func scopedTabMailCleanup() async -> Bool {
         // 1. Cancel all in-flight AI tasks (prevents stale JWTs from hitting backend)
         await AccountManager.shared.cancelAllAIProcessing()
 
-        // 2. Clear TabMail session (Keychain)
-        TabMailAuthService.clearSession()
+        // 2. Deactivate the local session. This is the only operation that may
+        // emit sign-out success; a Keychain failure leaves the signed-in state.
+        guard TabMailAuthService.completeSession(mode: .deactivate) else {
+            return false
+        }
 
-        // 3. Disconnect Device Sync
+        // 3. Disconnect Device Sync after local deactivation is confirmed.
         DeviceSyncService.shared.disconnect()
 
         if DebugModeManager.isLoggingEnabled() {
             print("[AccountDeletion] Scoped cleanup complete — email accounts and messages preserved")
         }
 
-        // 4. Signal sign-out → RootView stays in inbox (email accounts still exist)
-        NotificationCenter.default.post(name: .tabMailDidSignOut, object: nil)
+        return true
     }
 
 }

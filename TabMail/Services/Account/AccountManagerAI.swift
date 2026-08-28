@@ -482,7 +482,7 @@ extension AccountManager {
 
         let aiDisabled = AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey)
         let deviceSyncEnabled = UserDefaults.standard.object(forKey: "device_sync_auto_enabled") as? Bool ?? true
-        let hasSession = KeychainHelper.load(key: "tabmail_session") != nil
+        let hasSession = TabMailAuthService.hasSession()
         guard hasSession && (!aiDisabled || deviceSyncEnabled) else { return }
 
         guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: current.accountId) }) else {

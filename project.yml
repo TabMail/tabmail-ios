@@ -139,6 +139,7 @@ targets:
       - path: TabMailNotificationService/NSEConfig.swift
       - path: TabMailNotificationService/NSELog.swift
       - path: TabMailNotificationService/SharedNSEData.swift
+      - path: TabMailNotificationService/NSETokenManager.swift
     settings:
       GENERATE_INFOPLIST_FILE: YES
       # Set ONLY here. The NSE files above that name `Shared` types —

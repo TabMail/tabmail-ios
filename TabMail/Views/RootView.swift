@@ -628,8 +628,11 @@ struct RootView: View {
         }
         .alert("Account No Longer Available", isPresented: $showAccountGoneAlert) {
             Button("OK") {
-                TabMailAuthService.clearSession()
-                NotificationCenter.default.post(name: .tabMailDidSignOut, object: nil)
+                if !TabMailAuthService.completeSession(mode: .deactivate) {
+                    // Keep the account-gone state visible and retryable. Never
+                    // claim sign-out while the authoritative pointer remains.
+                    DispatchQueue.main.async { showAccountGoneAlert = true }
+                }
             }
         } message: {
             Text("Your TabMail account no longer exists. You have been signed out. Your email accounts and messages remain on this device.")
