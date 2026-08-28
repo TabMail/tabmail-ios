@@ -1,6 +1,11 @@
 # IOS-PUSH-001
 
 <!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **Current authority (2026-08-28):** the app/NSE session-resurrection and cross-login-clobber
+> residual described in the chronology below is closed by merged iOS PR #95. The permanent
+> account-deletion server purge is also shipped. Ordinary sign-out still does not release APNs state
+> or add a client/server handshake. See the final update at the end of this amendment.
+
 ## 🟡 NARROWED — SAME-SESSION REMOVAL FIXED; SIGN-OUT HANDOFF REMAINS OPEN (2026-08-14)
 
 Worker-owned provider ownership/subscription, dispatch, legacy-device, consent, and IMAP cleanup now persist as compact idempotent debt across offline removal/relaunch while the original TabMail session remains available; stale local identity and credentials are fenced at the authoritative commit.
@@ -108,6 +113,64 @@ Read together, the sections above enumerate three ways the debt strands. The thi
 A fourth case is **deliberately not one of these and must not be counted as one**: removal while already signed out records `actions = [.localArtifacts]` and stays local-only **by design**, because claiming that debt later by email would weaken the ownership binding that protects a shared-address co-owner. That is an accepted design limitation, not a failure of the flush.
 
 All three paths are now backstopped **only** by the server-side purge tracked in §3. With the counterweight disproved, *"it expires anyway"* is available for the provider subscription and for nothing else.
+
+## 🟢 FINAL UPDATE — LOCAL CREDENTIAL FINALITY AND PERMANENT-DELETION PURGE SHIPPED (2026-08-28)
+
+The sections above remain the chronological audit record. This section is the current authority for
+the two residuals they left open.
+
+### 1. The app/NSE Keychain race is closed without a sign-out handshake
+
+iOS PR #95 merged at `96d21167add5f3ded0e8488c07127bc97dfd1599`. The app and Notification
+Service Extension now share one session-specific Keychain store with immutable generation records
+and one active pointer. A refresh captures its generation before network work and can update only
+that exact existing generation. It cannot add a deleted generation, recreate the pointer, reactivate
+an inactive login, or overwrite the next login. A current in-flight invocation may still finish
+with the bearer it already obtained; only its authority for later work is revoked.
+
+Deletion and migration use typed Keychain outcomes rather than treating failure as absence. Sign-out
+success is emitted only after verified pointer deactivation. Strong cleanup verifies the whole
+session namespace empty. Historical no-access-group sessions migrate by exact persistent reference
+only after the new pointer and generation bytes are verified, so an activation failure preserves the
+sole source for retry and does not force authentication or provider consent again. A durable App
+Group cleanup-pending bit is resolved before the database fresh-install heuristic and blocks app/NSE
+session use plus provider launch until verified cleanup succeeds.
+
+The tests compile the real app coordinator and NSE token manager, hold their actual refresh
+responses across sign-out/account switch, and exercise the production launch decision across two
+launches. Seeded schedules reuse the existing module `SplitMix64`; there is no second state model or
+same-user generation latch. The final candidate passed 194 relevant tests/199 runs, 9,279 full-suite
+tests with 9,369 passing parameter runs plus one expected issue, both simulator builds, and two
+consecutive fresh-context Codex-clean reviews on identical bytes.
+
+This closes the older claims that resurrection into an empty flat slot remains possible, that the
+NSE cross-process TOCTOU is unresolved, and that `NSETokenManager` lacks executable coverage. It
+does not add a server call, APNs-token release, account-incarnation protocol, payment check, or
+re-consent flow.
+
+### 2. Permanent TabMail deletion now has a server-owned purge
+
+The server now stores each classification credential per TabMail user and exposes a narrow purge to
+the permanent account-deletion lifecycle. Permanent deletion requires successful cleanup, and a
+bounded later sweep catches registrations created by a still-valid token after the first purge.
+Dev and production migrations were applied and independently verified; the old singleton credential
+copies were deleted and verified absent. Runtime never falls back to the legacy credential store.
+
+This resolves the permanent-deletion half that was moved out of iOS #16. It does not claim every
+eventually consistent server inventory problem disappeared; the broader strong-resource-inventory
+and provider/droplet lifecycle limits remain in their own private infrastructure trackers.
+
+### 3. Ordinary sign-out policy remains intentionally small
+
+Ordinary sign-out does not unregister the APNs token, release device ownership, call a server purge,
+or perform a new client/server handshake. A later authoritative device claim already evicts a
+displaced owner. The existing bounded flush for already-persisted removed-account cleanup debt may
+spend the outgoing session before local teardown, but it is not a general token-release protocol and
+sign-out does not depend on remote success. Local credential finality is enforced by the generation
+store regardless of whether that bounded cleanup succeeds.
+
+The original iOS issue remains closed. Future work belongs to the surviving server issue trackers;
+do not revive the superseded local sign-out/token-release branch from this historical record.
 
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
 > Routed from `KNOWN_ISSUES.md` line 1445 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).
