@@ -40,6 +40,7 @@ struct CancelDeletionResponseDecodableTests {
         let response = try JSONDecoder().decode(BillingClient.CancelDeletionResponse.self, from: Data(json.utf8))
         #expect(response.status == "restored")
         #expect(response.error == nil)
+        #expect(response.request_id == nil)
         #expect(response.subscription_outcome == nil)
         #expect(!response.subscriptionLapsedDuringGrace)
     }
@@ -50,6 +51,7 @@ struct CancelDeletionResponseDecodableTests {
         let response = try JSONDecoder().decode(BillingClient.CancelDeletionResponse.self, from: Data(json.utf8))
         #expect(response.status == nil)
         #expect(response.error == "no pending deletion")
+        #expect(response.request_id == nil)
         #expect(response.subscription_outcome == nil)
         #expect(!response.subscriptionLapsedDuringGrace)
     }
@@ -109,10 +111,12 @@ struct DeletionStatusResponseDecodableTests {
 
     @Test("Decodes pending=true with date")
     func decodesPendingTrue() throws {
-        let json = #"{"pending":true,"deletion_date":"2026-03-21"}"#
+        let requestId = "11111111-1111-4111-8111-111111111111"
+        let json = #"{"pending":true,"deletion_date":"2026-03-21","request_id":"\#(requestId)"}"#
         let response = try JSONDecoder().decode(BillingClient.DeletionStatusResponse.self, from: Data(json.utf8))
         #expect(response.pending == true)
         #expect(response.deletion_date == "2026-03-21")
+        #expect(response.request_id == requestId)
     }
 
     @Test("Decodes pending=false without date")
@@ -121,5 +125,117 @@ struct DeletionStatusResponseDecodableTests {
         let response = try JSONDecoder().decode(BillingClient.DeletionStatusResponse.self, from: Data(json.utf8))
         #expect(response.pending == false)
         #expect(response.deletion_date == nil)
+        #expect(response.request_id == nil)
+    }
+}
+
+@Suite("Exact account deletion cancellation", .serialized)
+@MainActor
+struct ExactAccountDeletionCancellationTests {
+    private let requestId = "11111111-1111-4111-8111-111111111111"
+
+    @Test("Uses the exact path and request-id JSON body")
+    func exactPathAndBody() throws {
+        let request = try BillingClient.makeCancelAccountDeletionRequest(
+            baseURL: try #require(URL(string: "https://billing.example.com")),
+            token: "test-token",
+            requestId: requestId
+        )
+
+        #expect(request.url?.path == "/account/cancel-deletion/exact")
+        #expect(request.httpMethod == "POST")
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
+        #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
+
+        let data = try #require(request.httpBody)
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: String])
+        #expect(object == ["request_id": requestId])
+    }
+
+    @Test("A matching restored receipt clears the banner and preserves its additive outcome")
+    func matchingReceiptClearsBanner() async {
+        var callCount = 0
+        let result = await BillingClient.matchingCancelAccountDeletionReceipt(requestId: requestId) { receivedId in
+            callCount += 1
+            #expect(receivedId == requestId)
+            let json = """
+            {"status":"restored","request_id":"\(requestId)","subscription_outcome":"expired_during_grace"}
+            """
+            let data = Data(json.utf8)
+            return try BillingClient.decodeCancelAccountDeletionResponse(statusCode: 200, data: data)
+        }
+
+        #expect(callCount == 1)
+        #expect(result?.status == "restored")
+        #expect(result?.request_id == requestId)
+        #expect(result?.subscriptionLapsedDuringGrace == true)
+    }
+
+    @Test("Missing and invalid request ids retain the banner without a cancellation call")
+    func missingAndInvalidRequestIdsRetainBanner() async {
+        for candidate in [nil, "not-a-uuid"] as [String?] {
+            var callCount = 0
+            let result = await BillingClient.matchingCancelAccountDeletionReceipt(requestId: candidate) { _ in
+                callCount += 1
+                return try BillingClient.decodeCancelAccountDeletionResponse(
+                    statusCode: 200,
+                    data: Data(#"{"status":"restored"}"#.utf8)
+                )
+            }
+            #expect(callCount == 0)
+            #expect(result == nil)
+        }
+    }
+
+    @Test("Every non-2xx response retains the banner")
+    func nonSuccessResponsesRetainBanner() async {
+        for statusCode in [404, 409, 500] {
+            let result = await BillingClient.matchingCancelAccountDeletionReceipt(requestId: requestId) { _ in
+                try BillingClient.decodeCancelAccountDeletionResponse(
+                    statusCode: statusCode,
+                    data: Data(#"{"error":"not_restored"}"#.utf8)
+                )
+            }
+            #expect(result == nil, "HTTP \(statusCode) must retain the banner")
+        }
+    }
+
+    @Test("Malformed or incomplete success payloads retain the banner")
+    func malformedPayloadsRetainBanner() async {
+        let payloads = [
+            #"{"status":123,"request_id":"11111111-1111-4111-8111-111111111111"}"#,
+            #"{"status":"restored"}"#,
+            #"{"status":"unexpected","request_id":"11111111-1111-4111-8111-111111111111"}"#
+        ]
+
+        for payload in payloads {
+            let result = await BillingClient.matchingCancelAccountDeletionReceipt(requestId: requestId) { _ in
+                try BillingClient.decodeCancelAccountDeletionResponse(
+                    statusCode: 200,
+                    data: Data(payload.utf8)
+                )
+            }
+            #expect(result == nil)
+        }
+    }
+
+    @Test("A restored receipt for a different request retains the banner")
+    func mismatchedReceiptRetainsBanner() async {
+        let otherRequestId = "22222222-2222-4222-8222-222222222222"
+        let result = await BillingClient.matchingCancelAccountDeletionReceipt(requestId: requestId) { _ in
+            try BillingClient.decodeCancelAccountDeletionResponse(
+                statusCode: 200,
+                data: Data(#"{"status":"restored","request_id":"\#(otherRequestId)"}"#.utf8)
+            )
+        }
+        #expect(result == nil)
+    }
+
+    @Test("A network failure retains the banner")
+    func networkFailureRetainsBanner() async {
+        let result = await BillingClient.matchingCancelAccountDeletionReceipt(requestId: requestId) { _ in
+            throw URLError(.notConnectedToInternet)
+        }
+        #expect(result == nil)
     }
 }
