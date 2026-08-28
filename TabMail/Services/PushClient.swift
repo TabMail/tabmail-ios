@@ -157,12 +157,11 @@ actor PushClient {
         guard let token = await currentAuthToken() else {
             throw PushError.noAuthToken
         }
-        var components = URLComponents(url: baseURL.appending(path: "/register-account-device"), resolvingAgainstBaseURL: false)!
-        components.queryItems = [
-            URLQueryItem(name: "deviceId", value: deviceId),
-            URLQueryItem(name: "accountEmail", value: accountEmail),
-        ]
-        var request = URLRequest(url: components.url!)
+        let url = Self.unregisterDeviceAccountURL(
+            baseURL: baseURL,
+            deviceId: deviceId,
+            accountEmail: accountEmail)
+        var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
@@ -173,6 +172,21 @@ actor PushClient {
             throw Self.deletionError(data: data, statusCode: code)
         }
         print("[PushClient] Unregistered \(accountEmail)")
+    }
+
+    nonisolated static func unregisterDeviceAccountURL(
+        baseURL: URL,
+        deviceId: String,
+        accountEmail: String
+    ) -> URL {
+        var components = URLComponents(url: baseURL.appending(path: "/register-account-device"), resolvingAgainstBaseURL: false)!
+        components.queryItems = [
+            URLQueryItem(name: "deviceId", value: deviceId),
+            URLQueryItem(name: "accountEmail", value: accountEmail),
+        ]
+        components.percentEncodedQuery = components.percentEncodedQuery?
+            .replacingOccurrences(of: "+", with: "%2B")
+        return components.url!
     }
 
     // MARK: - Push-Consent (server-side inbox-add classifier)
