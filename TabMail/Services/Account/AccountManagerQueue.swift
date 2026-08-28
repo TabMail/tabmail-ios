@@ -68,7 +68,9 @@ struct ExecutedOperation: Sendable {
 ///
 /// ⚠️ BUT A `print` COULD NEVER HAVE DELIVERED THAT EXCEPTION, so each site now
 /// also writes `BackgroundSyncLogger.logError` — ungated at the write,
-/// file-backed (`error.log`), exported by `DebugLogView`. There is no
+/// file-backed (the single `tabmail.log` via `AppLogStore`, on the `.error`
+/// channel; recoverable with `AppLogStore.read(channel: .error)`), and exported
+/// by `DebugLogView`'s "App Logs" share. There is no
 /// `freopen`/`dup2` anywhere in this tree (`rg -g '*.swift' 'freopen|dup2'`
 /// returns nothing), so on a device `stdout` goes nowhere and the
 /// "production observability" the exception buys from a bare `print` is zero.

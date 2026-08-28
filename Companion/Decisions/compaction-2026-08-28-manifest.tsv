@@ -1,0 +1,6 @@
+# companion-compact manifest — tabmail-ios / Decisions tree (2026-08-28 pass)
+# Source: DECISIONS.md at 8577bcb9c BEFORE this pass (26422 B, sha256 b4f21821c3c1ea2e1bd6067af4f1044045cd19265f02b7b3b07f9664a1da2ca2)
+# CONTENT DELETED: none. Every row is a byte-exact catalog bullet moved into the route target; DECISIONS.md retains a short searchable link.
+fragment_id	route_target	index_line	bytes	sha256
+ADR-IOS-078	Companion/Decisions/V3/pre-compaction-index-lines-078-079.md	150	1037	c68b8f1cb8d7f7f773cfd8b5994b9de5a6671d6d6a10c7fc3cc27f628286e8ed
+ADR-IOS-079	Companion/Decisions/V3/pre-compaction-index-lines-078-079.md	151	1689	0124a5c820d1441b1bd7df43de9ca02bc673148987b3b09a52bfe4c81dd88f44

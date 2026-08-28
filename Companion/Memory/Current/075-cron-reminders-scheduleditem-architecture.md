@@ -1,11 +1,12 @@
-
-### Cron Reminders (ScheduledItem Architecture)
-
-> ⚠️ **Historical for iOS.** This describes the feature under its earlier `Cron` naming; it was
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note:** ⚠️ **Historical for iOS.** This describes the feature under its earlier `Cron` naming; it was
 > later renamed `Task`, and **every symbol named below (`KBCronParser`, `CronScheduler`,
 > `CronExecutionCache`, `cronCache`, `cron_add`) is absent from the tree.** The iOS side of the
 > feature was then deleted outright — see ADR-IOS-079. Thunderbird still runs it. Read this for
 > the shared design shape only; do not treat any iOS claim here as live.
+<!-- COMPANION-CURRENT-NOTE-END -->
+
+### Cron Reminders (ScheduledItem Architecture)
 
 - **Crons are a subclass of reminders** in the architecture. Both flow through the same unified builder (`ReminderBuilder` / `reminderBuilder.js`), the same disable/enable store (`DisabledRemindersStore` with `c:` hash prefix for crons), and the same Device Sync fields.
 - **`[Cron]` KB format**: `[Cron] Schedule <days> <HH:MM> [<timezone>], <instruction>` — stored in KB text, synced via Device Sync KB field, programmatically protected from LLM rewriting on the backend (`splitKbEntries` + `isProtectedEntry`)

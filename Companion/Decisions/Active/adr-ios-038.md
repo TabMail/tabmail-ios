@@ -1,3 +1,9 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note:** The preserved demo-mode design below names
+> `registerAlarmsWithPushWorker` and `TaskEvaluationService.evaluate`. Both symbols were deleted
+> with the scheduled-task feature; see ADR-IOS-079. Their guard pattern still applies to any future
+> KB-reading background job: demo data must not overwrite real execution state or registrations.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 
 ## ADR-IOS-038: Demo Mode — Custom JWT + Local Mock Provider + Pre-Baked AI Cache
@@ -190,12 +196,9 @@ fix gates at shared chokepoints, not per-tool patches:
 - In-flight refinements that complete DURING demo are dropped at their
   save sites (`KBRefinementService`, `AIPromptLearning`) — else the real
   refined KB/action text would be spliced into the demo overlay (visible
-  in a recording). *(Historical: `registerAlarmsWithPushWorker` +
-  `TaskEvaluationService.evaluate` were demo-guarded for the same reason —
-  an empty demo KB would GC real task execution state / clobber wake
-  registrations. Both symbols were deleted with the scheduled-task feature;
-  see ADR-IOS-079. The guard pattern they illustrate still applies to any
-  future KB-reading background job.)*
+  in a recording). `registerAlarmsWithPushWorker` +
+  `TaskEvaluationService.evaluate` are demo-guarded (empty demo KB would
+  GC real task execution state / clobber alarm registrations).
 - `DisabledRemindersStore` RMW ops capture `activeKeyV2` once (read+write
   same key even if the mode flips mid-operation).
 - `DemoSeed.wipe` also deletes `draft` rows (demo compose autosaves).

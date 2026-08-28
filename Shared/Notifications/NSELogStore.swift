@@ -138,7 +138,7 @@ enum NSELogStore {
     /// first newline, if it has grown past `effectiveMaxBytes`. Runs at most
     /// once per NSE process (gated by `trimmedThisProcess`) on the SAME
     /// `FileHandle` used for subsequent appends — never an atomic external
-    /// replace (`BackgroundSyncLogger.trimTail`'s approach), which would
+    /// replace (`AppLogStore.trimTail`'s approach), which would
     /// orphan the cached handle onto a since-deleted inode. Caller must hold
     /// `state`'s lock.
     private static func trimIfNeeded(handle: FileHandle) {

@@ -94,12 +94,31 @@ final class DebugModeManager {
     /// `invalidateLoggingCache()` from the auth session save/clear sites.
     nonisolated private static let loggingAllowedCache = Mutex<Bool?>(nil)
 
+    /// Test-only override for `isLoggingEnabled()`, bypassing the UserDefaults
+    /// unlock flag and the Keychain-derived identity check.
+    ///
+    /// `nil` — the default — means "derive it exactly as production does", so
+    /// the seam's resting value is the production initial value rather than a
+    /// convenient one (`MIS-IOS-017`). It exists because the always-on vs
+    /// debug-gated split across `AppLogStore`'s channels is a registered
+    /// decision (`IOS-LOG-002`) that a test must be able to check from BOTH
+    /// sides: gated channels silent when locked, AND writing when unlocked. In
+    /// the test host the real gate is always false (no unlock flag, no session),
+    /// so without this the unlocked half would be untestable and the assertion
+    /// one-sided.
+    #if DEBUG
+    nonisolated static let loggingEnabledOverrideForTesting = Mutex<Bool?>(nil)
+    #endif
+
     /// Whether debug logging should be active (unlocked AND allowed user).
     /// Called from BackgroundSyncLogger to gate file I/O in production.
     /// Static nonisolated so it can be called from any thread without MainActor hop.
     /// Reads UserDefaults (thread-safe) + a cached Keychain-derived flag, so the
     /// per-log-call hot path never blocks on a synchronous Keychain XPC.
     static nonisolated func isLoggingEnabled() -> Bool {
+        #if DEBUG
+        if let override = loggingEnabledOverrideForTesting.withLock({ $0 }) { return override }
+        #endif
         let unlocked = UserDefaults.standard.bool(forKey: "debug_mode_unlocked")
         guard unlocked else { return false }
         return loggingAllowedCache.withLock { cache in

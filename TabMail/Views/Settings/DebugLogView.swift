@@ -105,7 +105,7 @@ struct DebugMenuView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                LogShareButton(title: "Stuck Message Report", filename: "stuck_messages.txt", readLog: { BackgroundSyncLogger.readStuckDiagLog() }, clearLog: { BackgroundSyncLogger.clearStuckDiagLog() })
+                LogShareButton(title: "Stuck Message Report", filename: "stuck_messages.txt", readLog: { AppLogStore.read(channel: .stuckDiag) }, clearLog: { AppLogStore.clear(channel: .stuckDiag) })
                 Text("Read-only scan for messages that are searchable but can't open / have no snippet / aren't in their folder. Nothing is modified. Run the scan, then share the report.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -160,36 +160,15 @@ struct DebugMenuView: View {
             }
 
             Section("Logs") {
-                LogShareButton(title: "Sync Logs", filename: "sync_logs.txt", readLog: { BackgroundSyncLogger.readLog() }, clearLog: { BackgroundSyncLogger.clearLog() })
-                LogShareButton(title: "Error Logs", filename: "error_logs.txt", readLog: { BackgroundSyncLogger.readErrorLog() }, clearLog: { BackgroundSyncLogger.clearErrorLog() })
-                LogShareButton(title: "Chat Error Logs", filename: "chat_error_logs.txt", readLog: { BackgroundSyncLogger.readChatErrorLog() }, clearLog: { BackgroundSyncLogger.clearChatErrorLog() })
-                LogShareButton(title: "Device Sync Logs", filename: "device_sync_logs.txt", readLog: { DeviceSyncLogger.readLog() }, clearLog: { DeviceSyncLogger.clearLog() })
-                LogShareButton(title: "BG App Refresh Logs", filename: "bgapprefresh_logs.txt", readLog: { BackgroundSyncLogger.readBGAppRefreshLog() }, clearLog: { BackgroundSyncLogger.clearBGAppRefreshLog() })
-                LogShareButton(title: "BG Processing Logs", filename: "bgprocessing_logs.txt", readLog: { BackgroundSyncLogger.readBGProcessingLog() }, clearLog: { BackgroundSyncLogger.clearBGProcessingLog() })
-                LogShareButton(title: "AI Processing Logs", filename: "ai_logs.txt", readLog: { BackgroundSyncLogger.readAIProcessingLog() }, clearLog: { BackgroundSyncLogger.clearAIProcessingLog() })
-                LogShareButton(title: "Backfill AI Refinement Logs", filename: "backfill_ai_logs.txt", readLog: { BackgroundSyncLogger.readBackfillAILog() }, clearLog: { BackgroundSyncLogger.clearBackfillAILog() })
-                LogShareButton(title: "Backfill Logs", filename: "backfill_logs.txt", readLog: { BackgroundSyncLogger.readBackfillLog() }, clearLog: { BackgroundSyncLogger.clearBackfillLog() })
-                LogShareButton(title: "Push Notification Logs", filename: "push_logs.txt", readLog: { BackgroundSyncLogger.readPushLog() }, clearLog: { BackgroundSyncLogger.clearPushLog() })
-                LogShareButton(title: "Inbox Logs", filename: "inbox_logs.txt", readLog: { BackgroundSyncLogger.readInboxLog() }, clearLog: { BackgroundSyncLogger.clearInboxLog() })
-                LogShareButton(title: "Body Render Logs", filename: "body_render_logs.txt", readLog: { BackgroundSyncLogger.readBodyRenderLog() }, clearLog: { BackgroundSyncLogger.clearBodyRenderLog() })
-                LogShareButton(title: "Boot Profile Logs", filename: "boot_logs.txt", readLog: { BackgroundSyncLogger.readBootLog() }, clearLog: { BackgroundSyncLogger.clearBootLog() })
+                LogShareButton(title: "App Logs", filename: "tabmail_logs.txt", readLog: { AppLogStore.read() }, clearLog: { AppLogStore.clear() })
                 LogShareButton(title: "NSE Logs", filename: "nse_logs.txt", readLog: { NSELogStore.read() }, clearLog: { NSELogStore.clear() })
 
+                Text("One file per process: App Logs is every main-app subsystem interleaved in the order entries were written, each entry tagged with its channel (SYNC, ERROR, AI, BACKFILL, …). NSE Logs is the notification extension's own file — a separate process with its own container.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 Button(role: .destructive) {
-                    BackgroundSyncLogger.clearLog()
-                    BackgroundSyncLogger.clearErrorLog()
-                    BackgroundSyncLogger.clearChatErrorLog()
-                    DeviceSyncLogger.clearLog()
-                    BackgroundSyncLogger.clearBGAppRefreshLog()
-                    BackgroundSyncLogger.clearBGProcessingLog()
-                    BackgroundSyncLogger.clearAIProcessingLog()
-                    BackgroundSyncLogger.clearBackfillAILog()
-                    BackgroundSyncLogger.clearBackfillLog()
-                    BackgroundSyncLogger.clearPushLog()
-                    BackgroundSyncLogger.clearInboxLog()
-                    BackgroundSyncLogger.clearBodyRenderLog()
-                    BackgroundSyncLogger.clearStuckDiagLog()
-                    BackgroundSyncLogger.clearBootLog()
+                    AppLogStore.clear()
                     NSELogStore.clear()
                 } label: {
                     Label("Clear All Logs", systemImage: "trash")

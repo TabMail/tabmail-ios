@@ -4,43 +4,60 @@
 
 import Foundation
 
-/// Persistent diagnostic log for auth-related events.
-/// Writes timestamped entries to a file in Application Support so they survive
-/// app restarts and can be retrieved after an unexpected logout.
-/// Surface via Settings > Maintenance > "Auth Diagnostics" row.
+/// Diagnostic log writer for auth-related events (launch session state, token
+/// refresh outcomes, Keychain save failures).
+///
+/// Writes to the single app log via `AppLogStore` on the `.auth` channel, so it
+/// survives app restarts and can be retrieved after an unexpected logout —
+/// which is the entire reason this channel is persistent and always-on.
+///
+/// Consolidating onto the shared file gave this channel a UI ROUTE it never
+/// had — **not** a reader. ⚠️ It always had one: `v1.7.14`'s `AuthDiagnostics`
+/// declares `readLog()`. What it lacked was any surface that CALLED it; the doc
+/// comment named a "Settings > Maintenance" row that does not exist in the tree,
+/// and `auth_diagnostics.log` was the only one of the fifteen log files with no
+/// share button anywhere. So its entries were written and UNREACHABLE, not
+/// unreadable. They are now part of the App Logs share.
+///
+/// The symmetric half, recorded because an earlier draft stated only the
+/// widening: those entries also gained a DESTROYER. They previously sat outside
+/// every clear surface in the app; they are now inside `tabmail.log`, which
+/// "Clear All Logs" wipes — so "clear the logs, reproduce, share" now destroys
+/// the auth history that predates the repro. Kept deliberately (owner decision,
+/// 2026-08-25); do not re-add an exclusion without re-opening `IOS-LOG-002`.
+///
+/// The write is dispatched off-main by `AppLogStore`; the previous
+/// implementation did a synchronous read-modify-write on the caller's thread,
+/// including from `TabMailApp.init` on MainActor.
 enum AuthDiagnostics {
-    private static let maxEntries = 50
-    private static let fileName = "auth_diagnostics.log"
-
-    private static var fileURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TabMail", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(fileName)
-    }
-
-    /// Append a diagnostic event. Thread-safe via file coordination.
+    /// Append an auth diagnostic event.
+    ///
+    /// **ASYNCHRONOUS, and that is a deliberate durability trade** — the exact
+    /// opposite of the call `NSELogStore` makes, so it is stated here in the
+    /// same terms.
+    ///
+    /// Until `v1.7.14` this did a synchronous atomic read-modify-write of
+    /// `auth_diagnostics.log` on the caller's thread, including from
+    /// `TabMailApp.init` — i.e. file I/O on MainActor on the launch path. It now
+    /// hands the entry to `AppLogStore.ioQueue` (`.utility`) and returns
+    /// immediately.
+    ///
+    /// **The cost:** an entry enqueued and not yet flushed is lost if the
+    /// process dies first — a crash, a jetsam kill, a force-quit. The entries
+    /// most likely to be lost are the ones written last, which on the auth path
+    /// is precisely the sequence before an unexpected logout, the thing this
+    /// channel exists to explain.
+    ///
+    /// **Why it is still the right call here, where it is the wrong one for the
+    /// NSE:** the main app is not hard-killed on a budget the way the NSE is
+    /// (0xdead10cc suspension, watchdog, ~30 s OS budget), so the window is a
+    /// scheduling gap rather than a guaranteed truncation; and blocking
+    /// MainActor at launch is a cost every user pays on every launch, while the
+    /// lost tail line costs only the rare crash. If a future change makes the
+    /// tail line load-bearing, the fix is a synchronous FLUSH at a known-risky
+    /// point, not a return to synchronous appends.
     static func log(_ message: String) {
-        let timestamp = Date().iso8601String()
-        let entry = "[\(timestamp)] \(message)\n"
-
-        // Also print for Xcode console
         print("[AuthDiag] \(message)")
-
-        let url = fileURL
-        if var existing = try? String(contentsOf: url, encoding: .utf8) {
-            existing += entry
-            // Trim to last N entries
-            let lines = existing.components(separatedBy: "\n").filter { !$0.isEmpty }
-            let trimmed = lines.suffix(maxEntries).joined(separator: "\n") + "\n"
-            try? trimmed.write(to: url, atomically: true, encoding: .utf8)
-        } else {
-            try? entry.write(to: url, atomically: true, encoding: .utf8)
-        }
-    }
-
-    /// Read the full diagnostic log. Returns empty string if no log exists.
-    static func readLog() -> String {
-        (try? String(contentsOf: fileURL, encoding: .utf8)) ?? "(no diagnostic log)"
+        AppLogStore.append(message, channel: .auth)
     }
 }
