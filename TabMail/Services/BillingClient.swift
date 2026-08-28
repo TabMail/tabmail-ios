@@ -46,6 +46,14 @@ struct BillingCancellationResponse: Decodable, Sendable {
     }
 }
 
+private struct ExactDeletionCancellationRequest: Encodable {
+    let requestId: String
+
+    enum CodingKeys: String, CodingKey {
+        case requestId = "request_id"
+    }
+}
+
 /// Client for billing worker account deletion endpoints (billing.tabmail.ai).
 actor BillingClient {
     typealias CancellationResponse = BillingCancellationResponse
@@ -74,6 +82,8 @@ actor BillingClient {
     struct CancelDeletionResponse: Decodable {
         let status: String?      // "restored"
         let error: String?
+        // swiftlint:disable:next identifier_name
+        let request_id: String?
         // Match the worker's additive wire key without changing decoder policy.
         // swiftlint:disable:next identifier_name
         let subscription_outcome: String?
@@ -92,6 +102,8 @@ actor BillingClient {
         // Match the established wire-facing member name used by current callers.
         // swiftlint:disable:next identifier_name
         let deletion_date: String?
+        // swiftlint:disable:next identifier_name
+        let request_id: String?
     }
 
     // MARK: - Endpoints
@@ -116,6 +128,32 @@ actor BillingClient {
             throw BackendError.requestFailed(statusCode: statusCode)
         }
         return try JSONDecoder().decode(CancellationResponse.self, from: data)
+    }
+
+    nonisolated static func makeCancelAccountDeletionRequest(
+        baseURL: URL,
+        token: String,
+        requestId: String
+    ) throws -> URLRequest {
+        var request = URLRequest(url: baseURL.appending(path: "/account/cancel-deletion/exact"))
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            ExactDeletionCancellationRequest(requestId: requestId)
+        )
+        request.timeoutInterval = 30
+        return request
+    }
+
+    nonisolated static func decodeCancelAccountDeletionResponse(
+        statusCode: Int,
+        data: Data
+    ) throws -> CancelDeletionResponse {
+        guard 200..<300 ~= statusCode else {
+            throw BackendError.requestFailed(statusCode: statusCode)
+        }
+        return try JSONDecoder().decode(CancelDeletionResponse.self, from: data)
     }
 
     func cancelSubscription() async throws -> CancellationResponse {
@@ -155,25 +193,25 @@ actor BillingClient {
         return try JSONDecoder().decode(DeletionResponse.self, from: data)
     }
 
-    func cancelAccountDeletion() async throws -> CancelDeletionResponse {
+    func cancelAccountDeletion(requestId: String) async throws -> CancelDeletionResponse {
         guard let token = await currentAuthToken() else {
             throw BackendError.unauthorized
         }
 
-        var request = URLRequest(url: baseURL.appending(path: "/account/cancel-deletion"))
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 30
+        let request = try Self.makeCancelAccountDeletionRequest(
+            baseURL: baseURL,
+            token: token,
+            requestId: requestId
+        )
 
         let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse,
-              200..<300 ~= httpResponse.statusCode else {
-            throw BackendError.requestFailed(
-                statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0
-            )
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw BackendError.requestFailed(statusCode: 0)
         }
-        return try JSONDecoder().decode(CancelDeletionResponse.self, from: data)
+        return try Self.decodeCancelAccountDeletionResponse(
+            statusCode: httpResponse.statusCode,
+            data: data
+        )
     }
 
     func checkDeletionStatus() async throws -> DeletionStatusResponse {
@@ -194,5 +232,24 @@ actor BillingClient {
             )
         }
         return try JSONDecoder().decode(DeletionStatusResponse.self, from: data)
+    }
+
+    @MainActor
+    static func matchingCancelAccountDeletionReceipt(
+        requestId: String?,
+        cancel: (String) async throws -> CancelDeletionResponse
+    ) async -> CancelDeletionResponse? {
+        guard let requestId, UUID(uuidString: requestId) != nil else { return nil }
+
+        do {
+            let response = try await cancel(requestId)
+            guard response.status == "restored", response.request_id == requestId else {
+                return nil
+            }
+            return response
+        } catch {
+            print("[RootView] Cancel deletion failed: \(error)")
+            return nil
+        }
     }
 }

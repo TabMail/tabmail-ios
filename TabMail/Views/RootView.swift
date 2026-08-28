@@ -33,6 +33,7 @@ struct RootView: View {
     @State private var isStartupComplete: Bool
     /// Pending account deletion state (checked on every launch)
     @State private var pendingDeletionDate: String?
+    @State private var pendingDeletionRequestId: String?
     /// iCloud setup prompt state (Feature 2 — post-Apple sign-in)
     @State private var showAccountGoneAlert = false
     @State private var showSignedOutAlert = false
@@ -577,12 +578,14 @@ struct RootView: View {
         .task(id: hasTabMailSession) {
             guard hasTabMailSession, !ScreenshotMode.isActive else {
                 pendingDeletionDate = nil
+                pendingDeletionRequestId = nil
                 return
             }
             // Non-fatal: a failed check just leaves the banner hidden.
             do {
                 let status = try await BillingClient().checkDeletionStatus()
                 pendingDeletionDate = status.pending ? status.deletion_date : nil
+                pendingDeletionRequestId = status.pending ? status.request_id : nil
             } catch {
                 print("[RootView] Deletion status check failed: \(error)")
             }
@@ -608,6 +611,7 @@ struct RootView: View {
                 // AI consent (hasSeenAIConsent) is device-level — not cleared on sign-out.
                 // Apple 5.1.2(i) disclosure is about app behavior, not account identity.
                 pendingDeletionDate = nil
+                pendingDeletionRequestId = nil
             }
             showSignedOutAlert = true
         }
@@ -822,21 +826,18 @@ struct RootView: View {
     }
 
     private func cancelDeletion() async -> Bool {
-        do {
-            let response = try await BillingClient().cancelAccountDeletion()
-            pendingDeletionDate = nil
-            showSubscriptionLapsedAlert = response.subscriptionLapsedDuringGrace
-            print("[RootView] Account deletion cancelled")
-            return true
-        } catch BackendError.requestFailed(let statusCode) where statusCode == 409 || statusCode == 404 {
-            // 409 = cron already processed; 404 = no pending deletion (cancelled elsewhere)
-            pendingDeletionDate = nil
-            print("[RootView] Cancel deletion: already resolved (status \(statusCode)) — dismissing banner")
-            return true
-        } catch {
-            print("[RootView] Cancel deletion failed: \(error)")
-            return false
-        }
+        guard let response = await BillingClient.matchingCancelAccountDeletionReceipt(
+            requestId: pendingDeletionRequestId,
+            cancel: { requestId in
+                try await BillingClient().cancelAccountDeletion(requestId: requestId)
+            }
+        ) else { return false }
+
+        pendingDeletionDate = nil
+        pendingDeletionRequestId = nil
+        showSubscriptionLapsedAlert = response.subscriptionLapsedDuringGrace
+        print("[RootView] Account deletion cancelled")
+        return true
     }
 }
 
