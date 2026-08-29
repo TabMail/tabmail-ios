@@ -369,10 +369,10 @@ struct DatabaseIndexTests {
                 "the un-hinted form must still exhibit the regression, or the assertions above prove nothing: \(pre)")
     }
 
-    /// IOS-PERF-012 — both hot durable-identity lookups must seek the stable RFC
-    /// id even in the statistics-poor state left by the production migration
-    /// chain. A wall-clock threshold would be device-dependent; the account walk
-    /// is the invariant that caused the measured 15–26 ms tail.
+    /// IOS-PERF-012 — all seven production statements must seek the stable RFC id
+    /// even in the statistics-poor state left by the production migration chain.
+    /// A wall-clock threshold would be device-dependent; the account-or-folder
+    /// walks are the invariant behind this stale-statistics class.
     @Test("IOS-PERF-012 — durable identity lookups seek the RFC id with stale and fresh statistics")
     func durableIdentityLookupsSeekRfcIdAcrossStatisticsRegimes() throws {
         let db = try TestDatabase.make()

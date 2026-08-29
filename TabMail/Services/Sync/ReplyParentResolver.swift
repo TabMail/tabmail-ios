@@ -54,10 +54,10 @@ enum ReplyParentResolver {
         // One SELECT for all candidate parents in this account that aren't
         // already marked. The `isReplied = 0` filter avoids no-op writes and
         // prevents re-firing the tag-clear PendingOperation on already-marked
-        // rows. Index-backed: with production statistics SQLite serves this with
-        // `messageHeader_rfc822MessageId_date` (`rfc822MessageId=?`), the composite
-        // that leads on `rfc822MessageId`; the narrower `messageHeader_rfc822MessageId`
-        // also exists and leads on the same column.
+        // rows. Index-backed: the production statement's explicit `INDEXED BY`
+        // forces `messageHeader_rfc822MessageId` (`rfc822MessageId=?`) regardless
+        // of statistics; the planner cannot substitute the date, account, or
+        // folder indexes.
         //
         // ⚠️ CORRECTED 2026-08-05: this previously read "Index-backed via
         // `messageHeader_rfc822MessageId` (AppDatabase.swift:349)". That line number
