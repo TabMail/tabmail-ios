@@ -520,10 +520,8 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         // original message. See `KNOWN_ISSUES.md` `IOS-DRAFT-009`.
         //
         // This comment edit changes NO executable line in this file.
-        let candidates = try MessageHeader
-            .filter(Column("accountId") == accountId && Column("rfc822MessageId") == normalized)
-            .limit(2)
-            .fetchAll(db)
+        let candidates = try MessageHeader.fetchAll(
+            db, sql: Self.replyTargetLookupSQL, arguments: [accountId, normalized])
         guard candidates.count == 1 else {
             if candidates.count > 1, DebugModeManager.isLoggingEnabled() {
                 print("[Draft] T5.8 Strategy 2 refused for \(draftKey.prefix(40)) — \(candidates.count)+ rows share this account's RFC identity; no single physical copy is proven")
@@ -532,6 +530,14 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         }
         return candidates[0]
     }
+
+    /// Strategy 2's exact-one candidate lookup, named so plan coverage executes
+    /// the production statement rather than a test-only copy.
+    static let replyTargetLookupSQL = """
+        SELECT * FROM messageHeader
+        WHERE accountId = ? AND rfc822MessageId = ?
+        LIMIT 2
+        """
 
     /// PORT — `v2final:Draft.ReplyQuote`.
     ///

@@ -8,6 +8,15 @@ import Synchronization
 
 extension SyncEngine {
 
+    /// The one optimistic-placeholder dedup statement shared by full sync,
+    /// Gmail delta sync, and Exchange delta sync. Named so plan and consumer
+    /// coverage execute the same SQL as production.
+    nonisolated static let optimisticDedupSQL = """
+        SELECT * FROM messageHeader
+        WHERE folderId = ? AND rfc822MessageId = ? AND messageId <> ?
+        LIMIT 1
+        """
+
     // MARK: - Full-sync MODSEQ fetch-skip (Fix B task 4)
 
     /// Per-folder counter of full syncs since the last deep pass. Forces a DEEP
@@ -1763,9 +1772,9 @@ extension SyncEngine {
                 // to prevent duplicate rows.
                 if (folder.role == .drafts || folder.role == .sent),
                    let rfc822 = header.rfc822MessageId, !rfc822.isEmpty,
-                   let optimistic = try MessageHeader
-                    .filter(Column("folderId") == folderId && Column("rfc822MessageId") == rfc822 && Column("messageId") != header.messageId)
-                   .fetchOne(db) {
+                   let optimistic = try MessageHeader.fetchOne(
+                    db, sql: Self.optimisticDedupSQL,
+                    arguments: [folderId, rfc822, header.messageId]) {
                     let oldId = optimistic.id
                     // RFC-only placeholder adoption is not native ownership.
                     header.observedUidValidity = nil

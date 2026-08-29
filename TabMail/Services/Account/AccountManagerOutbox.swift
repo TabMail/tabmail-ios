@@ -807,6 +807,14 @@ extension AccountManager {
 
     // MARK: - Optimistic Sent Header
 
+    /// The existence probe used before inserting an optimistic Sent header,
+    /// named so plan coverage executes production SQL.
+    nonisolated static let optimisticSentDedupSQL = """
+        SELECT * FROM messageHeader
+        WHERE folderId = ? AND rfc822MessageId = ?
+        LIMIT 1
+        """
+
     /// Insert a placeholder MessageHeader into the Sent folder so the message appears
     /// immediately in the UI after send succeeds. Uses rfc822MessageId (the pre-generated
     /// Message-ID) for dedup — when sync brings in the real IMAP UID, the placeholder is
@@ -827,9 +835,8 @@ extension AccountManager {
                 let rfc822 = EmailFilter.normalizeMessageId(messageId)
 
                 // Don't insert if a header with this rfc822MessageId already exists (idempotent)
-                if try MessageHeader
-                    .filter(Column("folderId") == folderId && Column("rfc822MessageId") == rfc822)
-                    .fetchOne(db) != nil {
+                if try MessageHeader.fetchOne(
+                    db, sql: Self.optimisticSentDedupSQL, arguments: [folderId, rfc822]) != nil {
                     return nil
                 }
 

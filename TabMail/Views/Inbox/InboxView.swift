@@ -1005,21 +1005,34 @@ struct InboxView: View {
     /// Look up a message's current GRDB PK by accountId + stableId.
     private func lookupMessageId(accountId: String, stableId: String) async throws -> String? {
         try await AppDatabase.dbPool.read { db in
-            // Try rfc822MessageId first (IMAP stableId)
-            let normalized = EmailFilter.normalizeMessageId(stableId)
-            if let header = try MessageHeader
-                .filter(Column("accountId") == accountId && Column("rfc822MessageId") == normalized)
-                .fetchOne(db) {
-                return header.id
-            }
-            // Try messageId (Gmail/Exchange)
-            if let header = try MessageHeader
-                .filter(Column("accountId") == accountId && Column("messageId") == stableId)
-                .fetchOne(db) {
-                return header.id
-            }
-            return nil
+            try Self.resolveMessageIdByStableId(accountId: accountId, stableId: stableId, db: db)
         }
+    }
+
+    /// The RFC arm of the agent-toast lookup, named so plan coverage executes
+    /// production SQL. The provider-messageId fallback remains separately expressed.
+    nonisolated static let stableIdRfcLookupSQL = """
+        SELECT * FROM messageHeader
+        WHERE accountId = ? AND rfc822MessageId = ?
+        LIMIT 1
+        """
+
+    nonisolated static func resolveMessageIdByStableId(
+        accountId: String, stableId: String, db: Database
+    ) throws -> String? {
+        // Try rfc822MessageId first (IMAP stableId)
+        let normalized = EmailFilter.normalizeMessageId(stableId)
+        if let header = try MessageHeader.fetchOne(
+            db, sql: Self.stableIdRfcLookupSQL, arguments: [accountId, normalized]) {
+            return header.id
+        }
+        // Try messageId (Gmail/Exchange)
+        if let header = try MessageHeader
+            .filter(Column("accountId") == accountId && Column("messageId") == stableId)
+            .fetchOne(db) {
+            return header.id
+        }
+        return nil
     }
 
     private func dismissAgentToast() {
