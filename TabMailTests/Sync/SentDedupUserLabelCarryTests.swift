@@ -70,11 +70,10 @@ struct SentDedupUserLabelCarryTests {
         try pool.read { db in try MessageHeader.fetchOne(db, key: headerId) != nil }
     }
 
-    /// Seeds the account, its Sent folder, the optimistic Sent header the app
-    /// wrote at send time, and the user label the user applied to it before the
-    /// server copy arrived. Returns the optimistic header's id and the
-    /// account-prefixed `UserLabel.id` surrogate (D10 / `IOS-LABEL-001` — the
-    /// junction FK is never the bare provider value).
+    /// Seeds two same-RFC optimistic Sent headers. The higher-id decoy is inserted
+    /// first, so insertion order disagrees with the production `id ASC` selection.
+    /// Each row owns a distinct body and label, making both the selected row and
+    /// every carried consumer-visible value observable after replacement.
     private static func seed(
         accountId: String,
         provider: AccountProvider,
@@ -84,7 +83,13 @@ struct SentDedupUserLabelCarryTests {
         rfc822Raw: String,
         providerLabelId: String,
         pool: DatabasePool
-    ) throws -> (account: Account, optimisticHeaderId: String, userLabelId: String) {
+    ) throws -> (
+        account: Account,
+        selectedHeaderId: String,
+        selectedLabelId: String,
+        decoyHeaderId: String,
+        decoyLabelId: String
+    ) {
         var account = Account(
             emailAddress: "\(accountId)@example.com",
             displayName: "R18 sent-dedup fixture",
@@ -95,41 +100,73 @@ struct SentDedupUserLabelCarryTests {
         let toInsert = account
 
         let folderId = "\(accountId):\(sentPath)"
-        let optimisticHeaderId = MessageIdentity.headerId(
+        let selectedHeaderId = MessageIdentity.headerId(
             accountId: accountId, folderPath: sentPath, messageId: optimisticMessageId)
-        let label = UserLabel(
+        let decoyMessageId = "\(optimisticMessageId)-z"
+        let decoyHeaderId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: sentPath, messageId: decoyMessageId)
+        let selectedLabel = UserLabel(
             accountId: accountId, providerLabelId: providerLabelId,
             name: providerLabelId, isSystem: false)
+        let decoyProviderLabelId = "\(providerLabelId)_Decoy"
+        let decoyLabel = UserLabel(
+            accountId: accountId, providerLabelId: decoyProviderLabelId,
+            name: decoyProviderLabelId, isSystem: false)
 
         try pool.write { db in
             try toInsert.insert(db)
 
             var folder = Folder(name: sentPath, path: sentPath, role: .sent, accountId: accountId)
-            folder.totalCount = 1
+            folder.totalCount = 2
             try folder.insert(db)
 
-            var header = MessageHeader(
-                messageId: optimisticMessageId,
-                subject: "R18 carry fixture",
+            var decoy = MessageHeader(
+                messageId: decoyMessageId,
+                subject: "R18 decoy fixture",
                 from: "R18 Fixture",
                 fromAddress: "\(accountId)@example.com",
                 to: "recipient@example.com",
                 date: Date(timeIntervalSince1970: 1_700_000_000),
-                snippet: "r18 carry fixture",
+                snippet: "r18 decoy fixture",
                 folderId: folderId,
                 accountId: accountId,
                 folderPath: sentPath,
                 isInInbox: false
             )
-            header.rfc822MessageId = EmailFilter.normalizeMessageId(rfc822Raw)
-            header.headerComplete = true
-            try header.insert(db)
+            decoy.rfc822MessageId = EmailFilter.normalizeMessageId(rfc822Raw)
+            decoy.headerComplete = true
+            try decoy.insert(db)
+            try MessageBody(
+                contentKey: ContentKey(rawValue: decoyHeaderId),
+                htmlContent: "<p>decoy sent body</p>").insert(db)
 
-            try label.insert(db)
-            try MessageUserLabel(messageId: optimisticHeaderId, userLabelId: label.id).insert(db)
+            var selected = MessageHeader(
+                messageId: optimisticMessageId,
+                subject: "R18 selected fixture",
+                from: "R18 Fixture",
+                fromAddress: "\(accountId)@example.com",
+                to: "recipient@example.com",
+                date: Date(timeIntervalSince1970: 1_700_000_000),
+                snippet: "r18 selected fixture",
+                folderId: folderId,
+                accountId: accountId,
+                folderPath: sentPath,
+                isInInbox: false
+            )
+            selected.rfc822MessageId = EmailFilter.normalizeMessageId(rfc822Raw)
+            selected.headerComplete = true
+            try selected.insert(db)
+            try MessageBody(
+                contentKey: ContentKey(rawValue: selectedHeaderId),
+                htmlContent: "<p>selected sent body</p>").insert(db)
+
+            try decoyLabel.insert(db)
+            try selectedLabel.insert(db)
+            try MessageUserLabel(messageId: decoyHeaderId, userLabelId: decoyLabel.id).insert(db)
+            try MessageUserLabel(messageId: selectedHeaderId, userLabelId: selectedLabel.id).insert(db)
         }
 
-        return (account, optimisticHeaderId, label.id)
+        return (account, selectedHeaderId, selectedLabel.id, decoyHeaderId, decoyLabel.id)
     }
 
     // MARK: - Gmail
@@ -166,8 +203,10 @@ struct SentDedupUserLabelCarryTests {
 
         // MIS-030 — anchor the fixture cardinality BEFORE the act, so a later
         // "1 label" reading cannot be satisfied by a fixture that never had one.
-        #expect(try Self.labelIds(forHeader: seeded.optimisticHeaderId, pool: pool) == [seeded.userLabelId],
-                "precondition: the user's label must be on the optimistic header before the sync")
+        #expect(try Self.labelIds(forHeader: seeded.selectedHeaderId, pool: pool) == [seeded.selectedLabelId],
+                "precondition: the selected label must be on the lower-id optimistic header")
+        #expect(try Self.labelIds(forHeader: seeded.decoyHeaderId, pool: pool) == [seeded.decoyLabelId],
+                "precondition: the decoy label must be on the higher-id optimistic header")
 
         let scenario = FakeHTTP.Scenario()
         defer { scenario.close() }
@@ -215,12 +254,22 @@ struct SentDedupUserLabelCarryTests {
             accountId: accountId, folderPath: sentPath, messageId: serverMessageId)
         #expect(try Self.headerExists(newHeaderId, pool: pool),
                 "the real server header must have been inserted")
-        #expect(try Self.headerExists(seeded.optimisticHeaderId, pool: pool) == false,
-                "the optimistic header must have been replaced — otherwise no dedup ran and this test proves nothing")
+        #expect(try Self.headerExists(seeded.selectedHeaderId, pool: pool) == false,
+                "the lowest-id optimistic header must be the one replaced")
+        #expect(try Self.headerExists(seeded.decoyHeaderId, pool: pool),
+                "the higher-id decoy must survive untouched")
+        #expect(try await pool.read { try MessageBody.fetchOne($0, key: ContentKey(rawValue: newHeaderId)) }?.htmlContent
+                == "<p>selected sent body</p>",
+                "the selected optimistic body's bytes must move to the server address")
+        #expect(try await pool.read { try MessageBody.fetchOne($0, key: ContentKey(rawValue: seeded.decoyHeaderId)) }?.htmlContent
+                == "<p>decoy sent body</p>",
+                "the surviving decoy must keep its own body")
 
         // Gmail's catalog never loaded, so the incoming set really is empty.
-        #expect(try Self.labelIds(forHeader: newHeaderId, pool: pool) == [seeded.userLabelId],
+        #expect(try Self.labelIds(forHeader: newHeaderId, pool: pool) == [seeded.selectedLabelId],
                 "the user's label must survive the replacement even though the incoming label set is empty")
+        #expect(try Self.labelIds(forHeader: seeded.decoyHeaderId, pool: pool) == [seeded.decoyLabelId],
+                "the survivor's label membership must remain on the survivor")
     }
 
     // MARK: - Exchange
@@ -260,8 +309,10 @@ struct SentDedupUserLabelCarryTests {
             pool: pool
         )
 
-        #expect(try Self.labelIds(forHeader: seeded.optimisticHeaderId, pool: pool) == [seeded.userLabelId],
-                "precondition: the user's label must be on the optimistic header before the sync")
+        #expect(try Self.labelIds(forHeader: seeded.selectedHeaderId, pool: pool) == [seeded.selectedLabelId],
+                "precondition: the selected label must be on the lower-id optimistic header")
+        #expect(try Self.labelIds(forHeader: seeded.decoyHeaderId, pool: pool) == [seeded.decoyLabelId],
+                "precondition: the decoy label must be on the higher-id optimistic header")
 
         let scenario = FakeHTTP.Scenario()
         defer { scenario.close() }
@@ -298,13 +349,23 @@ struct SentDedupUserLabelCarryTests {
             accountId: accountId, folderPath: sentPath, messageId: serverMessageId)
         #expect(try Self.headerExists(newHeaderId, pool: pool),
                 "the real server header must have been inserted")
-        #expect(try Self.headerExists(seeded.optimisticHeaderId, pool: pool) == false,
-                "the optimistic header must have been replaced — otherwise no dedup ran and this test proves nothing")
+        #expect(try Self.headerExists(seeded.selectedHeaderId, pool: pool) == false,
+                "the lowest-id optimistic header must be the one replaced")
+        #expect(try Self.headerExists(seeded.decoyHeaderId, pool: pool),
+                "the higher-id decoy must survive untouched")
+        #expect(try await pool.read { try MessageBody.fetchOne($0, key: ContentKey(rawValue: newHeaderId)) }?.htmlContent
+                == "<p>selected sent body</p>",
+                "the selected optimistic body's bytes must move to the server address")
+        #expect(try await pool.read { try MessageBody.fetchOne($0, key: ContentKey(rawValue: seeded.decoyHeaderId)) }?.htmlContent
+                == "<p>decoy sent body</p>",
+                "the surviving decoy must keep its own body")
 
         let incomingLabelId = UserLabel(
             accountId: accountId, providerLabelId: "Work", name: "Work", isSystem: false).id
         #expect(try Self.labelIds(forHeader: newHeaderId, pool: pool)
-                    == [seeded.userLabelId, incomingLabelId].sorted(),
+                    == [seeded.selectedLabelId, incomingLabelId].sorted(),
                 "the carried label AND the incoming category must both be on the replacement header")
+        #expect(try Self.labelIds(forHeader: seeded.decoyHeaderId, pool: pool) == [seeded.decoyLabelId],
+                "the survivor's label membership must remain on the survivor")
     }
 }

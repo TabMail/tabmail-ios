@@ -534,7 +534,7 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// Strategy 2's exact-one candidate lookup, named so plan coverage executes
     /// the production statement rather than a test-only copy.
     static let replyTargetLookupSQL = """
-        SELECT * FROM messageHeader
+        SELECT * FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
         WHERE accountId = ? AND rfc822MessageId = ?
         LIMIT 2
         """

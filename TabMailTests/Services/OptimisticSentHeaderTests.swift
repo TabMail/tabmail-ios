@@ -1588,3 +1588,131 @@ struct BodyMigrationFKSafetyTests {
         #expect(body == nil)
     }
 }
+
+/// Drives the production post-provider-send owner rather than an insertion
+/// simulator. A matching row makes the optimistic write idempotent; a probe
+/// failure is non-fatal because the provider send has already succeeded.
+@Suite("Optimistic Sent — production post-send RFC probe", .serialized, .processGlobalState)
+struct OptimisticSentProductionProbeTests {
+    private func makePool(accountId: String) throws -> (
+        pool: DatabasePool, directory: URL, previous: AppDatabase?
+    ) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration)
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prior = current
+            current = appDatabase
+            return prior
+        }
+        try pool.writeWithoutTransaction { db in
+            var account = Account(
+                emailAddress: "\(accountId)@example.com", displayName: "Sender", provider: .imap)
+            account.id = accountId
+            try account.insert(db)
+            try Folder(name: "Sent", path: "Sent", role: .sent, accountId: accountId).insert(db)
+        }
+        return (pool, directory, previous)
+    }
+
+    private func restore(_ fixture: (pool: DatabasePool, directory: URL, previous: AppDatabase?)) {
+        InstalledTestDatabaseLifetime.finish(
+            previous: fixture.previous, pool: fixture.pool, directory: fixture.directory)
+    }
+
+    private func seedClaimedSend(
+        pool: DatabasePool, accountId: String, outboxId: String, messageId: String
+    ) throws -> OutboxMessage {
+        let draft = DraftMessage(
+            to: ["recipient@example.com"], subject: "Production probe", body: "Body")
+        var message = OutboxMessage(accountId: accountId, draft: draft)
+        message.id = outboxId
+        message.status = OutboxStatus.sending.rawValue
+        message.sentMessageId = messageId
+        try pool.write { try message.insert($0) }
+        return message
+    }
+
+    @Test("post-send optimistic insertion is idempotent when the RFC header already exists")
+    func existingRfcHeaderSkipsTheOptimisticInsert() async throws {
+        let accountId = "perf012-idempotent"
+        let fixture = try makePool(accountId: accountId)
+        defer { restore(fixture) }
+        let messageId = "<perf012-idempotent@example.com>"
+        try await fixture.pool.write { db in
+            var existing = MessageHeader(
+                messageId: "server-copy", subject: "Already present", from: "Sender",
+                fromAddress: "\(accountId)@example.com", to: "recipient@example.com",
+                date: Date(), snippet: "existing", folderId: "\(accountId):Sent",
+                accountId: accountId, folderPath: "Sent", isInInbox: false)
+            existing.rfc822MessageId = EmailFilter.normalizeMessageId(messageId)
+            try existing.insert(db)
+        }
+        let claimed = try seedClaimedSend(
+            pool: fixture.pool, accountId: accountId,
+            outboxId: "outbox-perf012-idempotent", messageId: messageId)
+        let provider = MockEmailProvider()
+
+        await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: provider
+        ) {
+            await AccountManager.shared.sendClaimedOutboxMessageForTesting(
+                claimed, messageId: messageId)
+        }
+
+        #expect(await provider.sentDrafts.count == 1)
+        #expect(await provider.appendedToSent.count == 1)
+        let state = try await fixture.pool.read { db -> (headers: [MessageHeader], outbox: OutboxMessage?) in
+            let headers = try MessageHeader
+                .filter(Column("folderId") == "\(accountId):Sent")
+                .fetchAll(db)
+            return (headers, try OutboxMessage.fetchOne(db, key: claimed.id))
+        }
+        #expect(state.headers.map(\.id) == ["\(accountId):Sent:server-copy"],
+                "the production existence probe must not add a second optimistic row")
+        #expect(state.outbox == nil, "the successful provider send and append still finalize")
+    }
+
+    @Test("an RFC probe failure after provider send is non-fatal and finalization continues")
+    func missingRfcIndexDoesNotUndoTheProviderSend() async throws {
+        let accountId = "perf012-probe-failure"
+        let fixture = try makePool(accountId: accountId)
+        defer { restore(fixture) }
+        let messageId = "<perf012-probe-failure@example.com>"
+        let claimed = try seedClaimedSend(
+            pool: fixture.pool, accountId: accountId,
+            outboxId: "outbox-perf012-probe-failure", messageId: messageId)
+        try await fixture.pool.write { db in
+            try db.execute(sql: "DROP INDEX messageHeader_rfc822MessageId")
+        }
+        let provider = MockEmailProvider()
+
+        await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: provider
+        ) {
+            await AccountManager.shared.sendClaimedOutboxMessageForTesting(
+                claimed, messageId: messageId)
+        }
+
+        #expect(await provider.sentDrafts.count == 1,
+                "the provider send completed before the local RFC probe failed")
+        #expect(await provider.appendedToSent.count == 1,
+                "the swallowed local probe failure must not block the Sent append")
+        let state = try await fixture.pool.read { db -> (headerCount: Int, outbox: OutboxMessage?) in
+            let count = try MessageHeader
+                .filter(Column("folderId") == "\(accountId):Sent")
+                .fetchCount(db)
+            return (count, try OutboxMessage.fetchOne(db, key: claimed.id))
+        }
+        #expect(state.headerCount == 0,
+                "a failed optimistic insertion leaves sync to materialize the Sent header")
+        #expect(state.outbox == nil,
+                "provider-send success remains finalizable despite the non-fatal local probe failure")
+    }
+}

@@ -1500,6 +1500,65 @@ struct RunSyncDedupReclaimFtsRoutingTests {
         #expect(!result.ftsRekeys.contains { $0.oldId == droppedIds[0] },
                 "and the deleted duplicate must not be re-keyed onto the survivor's address")
     }
+
+    /// IOS-PERF-012 group 1 — this probe is destructive: the selected row is
+    /// deleted and its body is carried onto the server-assigned address. The
+    /// fixture makes insertion order disagree with id order so an order-blind
+    /// statement cannot accidentally satisfy the assertion.
+    @Test("Same-folder duplicate RFC placeholders: the lowest-id row is the one collapsed")
+    func draftDedupPicksTheLowestIdDuplicateDeterministically() async throws {
+        let (pool, dir) = try makePool()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+        let rfc = "draft-perf012-duplicate@example.com"
+        let selectedId = MessageIdentity.headerId(
+            accountId: "racc", folderPath: "Drafts", messageId: "draft-local-a")
+        let decoyId = MessageIdentity.headerId(
+            accountId: "racc", folderPath: "Drafts", messageId: "draft-local-z")
+        try await pool.write { db in
+            var acc = Account(emailAddress: "d@example.com", displayName: "T", provider: .imap)
+            acc.id = "racc"
+            try acc.insert(db)
+            try Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "racc").insert(db)
+            _ = try Self.insertHeader(
+                db, messageId: "draft-local-z", folderPath: "Drafts",
+                folderId: "racc:Drafts", rfc822: rfc, isInInbox: false)
+            try MessageBody(
+                contentKey: ContentKey(rawValue: decoyId),
+                htmlContent: "<p>decoy draft</p>").insert(db)
+            _ = try Self.insertHeader(
+                db, messageId: "draft-local-a", folderPath: "Drafts",
+                folderId: "racc:Drafts", rfc822: rfc, isInInbox: false)
+            try MessageBody(
+                contentKey: ContentKey(rawValue: selectedId),
+                htmlContent: "<p>selected draft</p>").insert(db)
+        }
+
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:Drafts")! }
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult([
+            makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: Self.syncDate)
+        ])
+
+        let result = try await SyncEngine.runSyncMessages(
+            for: folder, provider: mock, limit: 1, dbPool: PrioritizedDatabase(pool: pool))
+
+        #expect(try await pool.read { try MessageHeader.fetchOne($0, key: "racc:Drafts:42") } != nil,
+                "setup: the server-addressed row must exist")
+        #expect(try await pool.read { try MessageHeader.fetchOne($0, key: selectedId) } == nil,
+                "the lowest-id duplicate is the row the destructive dedup must collapse")
+        #expect(try await pool.read { try MessageHeader.fetchOne($0, key: decoyId) } != nil,
+                "the higher-id duplicate must survive untouched")
+        #expect(try await pool.read { try MessageBody.fetchOne($0, key: "racc:Drafts:42") }?.htmlContent
+                == "<p>selected draft</p>",
+                "the selected row's authored body must land on the server address")
+        #expect(try await pool.read { try MessageBody.fetchOne($0, key: decoyId) }?.htmlContent
+                == "<p>decoy draft</p>",
+                "the surviving duplicate must retain its own body")
+        #expect(result.ftsRekeys.contains { $0.oldId == selectedId && $0.newId == "racc:Drafts:42" },
+                "the selected row's FTS entry must move with its body")
+        #expect(!result.ftsRekeys.contains { $0.oldId == decoyId },
+                "the survivor's FTS entry must not be re-keyed")
+    }
 }
 
 // MARK: - FIX A: bounded newRemoteIds membership (SyncEngine.newRemoteIds)

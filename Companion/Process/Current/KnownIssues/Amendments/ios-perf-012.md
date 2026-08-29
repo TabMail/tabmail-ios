@@ -9,22 +9,24 @@
 
 ## Status
 
-🔓 **OPEN — TWO HOT MEMBERS MITIGATED (2026-08-15); THE CLASS REMAINS OPEN.** With stale
+🔓 **OPEN — PRODUCT-PATH MEMBERS MITIGATED (2026-08-29); TWO DEBUG-ONLY GROUPS REMAIN.** With stale
 `sqlite_stat1`, `DurableIdentityLookup.find`'s rfc822 fallback (step 3) and
 `AccountManager.resolveInboxEntryAITargets` degraded from an RFC seek to an **account-wide scan**.
 The 2026-08-15 campaign reproduced that on the exact current migrated schema at 200,000 rows / two
 accounts: the shared fallback took **15.307 ms median / 17.879 ms p95** for a tail hit and
 **14.998 / 20.088 ms** for a miss; the moved-inbox target took **17.027 / 21.334 ms** and
 **16.964 / 26.218 ms**. The existing v1 RFC index served the same cases in **0.004–0.006 ms**, and
-both hinted and unhinted forms were **0.003–0.006 ms** after full `ANALYZE`.
+both hinted and unhinted forms were **0.003–0.006 ms** after full `ANALYZE`. Those two hot members
+were mitigated on 2026-08-15.
 
-This change pins those two hot statements to `messageHeader_rfc822MessageId`; it adds no index,
-migration, statistics refresh, query, write, or cache. The shared resolver also makes its previously
+The 2026-08-15 change pinned those statements to `messageHeader_rfc822MessageId`; it added no index,
+migration, statistics refresh, query, write, or cache. The shared resolver also made its previously
 planner-dependent duplicate-RFC pick deliberate: prefer the sibling in the staged row's observed
 folder, then an inbox sibling, then lowest `id`. The moved-inbox target is already destination-folder
 scoped and chooses lowest `id`. **That ordering is a correctness guard for the hint, not the performance
-mechanism.** Ten residual statement sites across nine logical query groups remain below and keep this
-class open.
+mechanism.** On 2026-08-29 the five remaining production SQL shapes were mitigated, one unreachable
+production RFC fallback was deleted, and only the two debug-only groups in the original census remain.
+The wider audit gaps recorded at the end of this row are also unchanged, so the class remains open.
 
 ## Subsystem and search terms
 
@@ -173,20 +175,31 @@ filters, `accountId`/`folderId` forms, and sibling selective identity columns. T
 are mitigated. Three shipped members were already safe: `MessageContentStore.ownersSQL`,
 `ChatStore.findByStableIdSQL`, and `AccountManager.queuedMemberIdentitySQL`.
 
-The following **ten statement sites across nine logical query groups** remain unhinted and keep this
-record open. `SyncEngineDeltaSync` is one logical group but contains two distinct statements:
+At the time of this census, the following **ten statement sites across nine logical query groups**
+remained unhinted. `SyncEngineDeltaSync` was one logical group but contained two distinct statements:
 
 1. `SyncEngineFullSync` optimistic Drafts/Sent dedup (`folderId` + RFC + `messageId !=`), per header
    inside the sync write transaction.
 2. `SyncEngineDeltaSync`'s **two statements** for optimistic Sent/Drafts dedup, the same write-path
    shape.
-3. `ReplyParentResolver.updateParentsForReplies` (`accountId` + RFC `IN` + `isReplied = 0`), byte-shape
+3. `ReplyParentResolver.markParentsReplied` (`accountId` + RFC `IN` + `isReplied = 0`), byte-shape
    equivalent to the already-hinted queued-member RFC arm.
-4. `Draft` reply/forward strategy 2 (`accountId` + RFC, `LIMIT 2`), paid on draft open.
+   ⚠️ **CORRECTED 2026-08-29:** this previously named
+   `ReplyParentResolver.updateParentsForReplies`, a symbol that does not exist. The owning function is
+   `markParentsReplied`; the statement is now exposed by `parentLookupSQL(count:)`.
+4. `Draft` reply/forward strategy 2 (`accountId` + RFC, `LIMIT 2`), paid during persisted-draft loading
+   and fresh reply/forward prepopulation.
+   ⚠️ **CORRECTED 2026-08-29:** this previously said only "paid on draft open", omitting the fresh
+   reply/forward prepopulation caller that uses the same resolver.
 5. `MessageDetailViewModel.resolveMessageAsync`'s RFC fallback (`accountId` + RFC + nonempty folder),
    paid on a message-open fallback.
-6. `InboxView.lookupMessageId` (`accountId` + RFC), paid on notification/deep-link resolution.
-7. `AccountManagerOutbox.appendToSentFolder` (`folderId` + RFC), one idempotency probe per send.
+6. `InboxView.lookupMessageId` (`accountId` + RFC), paid on agent-toast resolution.
+7. `AccountManager.insertOptimisticSentHeader`, in `AccountManagerOutbox.swift` (`folderId` + RFC), one
+   idempotency probe per send.
+   ⚠️ **CORRECTED 2026-08-29:** this previously named
+   `AccountManagerOutbox.appendToSentFolder`. `AccountManagerOutbox` is a file, not a type, and
+   `appendToSentFolder` is a provider operation that does not query `messageHeader`; the probe belongs
+   to `AccountManager.insertOptimisticSentHeader`.
 8. `StuckMessageDiagnostics`' correlated account + RFC sibling check, debug-only.
 9. `AccountManager.logStuckOpDiagnostic`'s per-member `(messageId OR rfc822MessageId) AND accountId`
    GRDB query, the same stale-statistics account-walk shape, debug-only.
@@ -218,6 +231,66 @@ fails closed to no AI target. NSE verification/stale detection remain conservati
 roll back for retry. `InboxListReader.gather` catches a resolver throw at its outer read and can return an
 empty inbox; that user-visible failure class already exists for its triage hint but is widened to staged
 resolution by this change, so the blocking-index existence assertion is part of the regression gate.
+
+## Amendment 2026-08-29 — five production shapes mitigated; unreachable detail arm removed
+
+The five remaining production SQL shapes now name the already-shipped
+`messageHeader_rfc822MessageId` index. No index, migration, statistics refresh, query cache, or new
+lookup abstraction was added.
+
+| Original group | Production SQL owner | Stale unhinted plan | Selection semantics |
+|---|---|---|---|
+| 1, 2a, 2b | `SyncEngine.optimisticDedupSQL`, shared by full, Gmail delta, and Exchange delta sync | `messageHeader_folderId_uidInt (folderId=?)` | `ORDER BY id ASC` |
+| 3 | `ReplyParentResolver.parentLookupSQL(count:)` | `messageHeader_accountId_messageId (accountId=?)` | unordered set |
+| 4 | `Draft.replyTargetLookupSQL` | `messageHeader_accountId_messageId (accountId=?)` | unordered zero/one/multiple cardinality check |
+| 6 | `InboxView.stableIdRfcLookupSQL` | `messageHeader_accountId_messageId (accountId=?)` | `ORDER BY id ASC` |
+| 7 | `AccountManager.optimisticSentDedupSQL` | `messageHeader_folderId_uidInt (folderId=?)` | unordered existence check |
+
+The shared sync statement is one constant used by all three call sites, not three retyped fixes. Its
+selection is destructive: the selected optimistic row is deleted, its body is moved to the incoming
+server address, and the Gmail/Exchange paths carry its user-label junctions. `id ASC` is therefore a
+total, statistics-independent selection rule rather than an incidental consequence of whichever index
+the planner chose. A placeholder-name preference was rejected because it would duplicate minting rules
+and change which row wins, rather than make the existing arbitrary choice deterministic.
+
+The agent-toast payload carries `(accountId, stableId)` but no observed folder. It therefore uses
+`id ASC` alone as its total order among duplicate RFC siblings. Its separate provider-`messageId`
+fallback is unchanged and remains unhinted because `(accountId, messageId)` already matches the leading
+columns of `messageHeader_accountId_messageId`.
+
+The other three statements deliberately remain unordered. Reply-parent resolution consumes every row
+as a set; Draft strategy 2 accepts exactly one candidate and refuses zero or multiple; optimistic-Sent
+insertion asks only whether a match exists. Adding ordering to any of them would invent semantics and
+work that their consumers do not use.
+
+Original group 5 was not hinted. `MessageDetailViewModel.resolveMessageAsync`'s RFC arm was unreachable
+from current producers: detail opens carry a durable primary key or a provider-messageId composite, and
+the existing local ladder already resolves those through primary-key, cross-folder provider id, staged
+snapshot, server sync, and poll recovery. The RFC arm was therefore deleted instead of retaining and
+ordering a second identity mechanism. Coverage pins every live producer shape: existing primary-key,
+staged and poll cases plus explicit cross-folder and server-fallback cases.
+
+Plan coverage executes the production constants/builders themselves under both statistics regimes. The
+stale witness is guarded as **no `sqlite_stat1` row for any full `messageHeader` index**, not an empty
+`sqlite_stat1`, because migration-time analysis of an empty table still records partial indexes. Each
+positive assertion has a two-sided control that removes exactly the production hint and verifies the
+original low-selectivity account or folder walk returns.
+
+Consumer coverage drives real full sync, Gmail delta, and Exchange delta paths with insertion order
+opposed to `id ASC`; it observes which row is deleted, which body and labels move, which sibling
+survives, and which FTS address is re-keyed. Reply-parent set/tag behavior, Draft zero/one/multiple and
+caller refusal behavior, agent-toast id order and provider fallback, and optimistic-Sent post-send
+idempotency/non-fatal probe failure are covered through their actual consumers.
+
+If the named index is dropped or renamed, the three sync dedup call sites, ReplyParent, and Draft throw
+and roll back/refuse on their existing paths. Agent-toast resolution fails closed to no open. The
+optimistic-Sent probe is intentionally different: provider send has already succeeded, so its existing
+outer catch treats local optimistic-header failure as non-fatal; Sent append/finalization continue and
+ordinary sync later materializes the header.
+
+This amendment does **not** close the record. The debug-only groups 8 and 9 remain unhinted. The audit
+gaps declared below also remain: `memory.db`, `bodyAssetIndex.sqlite`, `nse_staging.sqlite`, and roughly
+30 of 41 loop-pool-acquisition sites; `fts.db` and `memory.db` are still never analyzed.
 
 ## On the namespace: `IOS-PERF`, not `IOS-QUEUE`
 

@@ -135,7 +135,7 @@ enum ReplyParentResolver {
         // recompute in Swift rather than rely on a SQL column.
         return """
             SELECT id, messageId, rfc822MessageId, folderPath, accountId, actionTag
-            FROM messageHeader
+            FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
             WHERE accountId = ?
               AND rfc822MessageId IN (\(placeholders))
               AND isReplied = 0

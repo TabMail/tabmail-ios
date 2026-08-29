@@ -810,7 +810,7 @@ extension AccountManager {
     /// The existence probe used before inserting an optimistic Sent header,
     /// named so plan coverage executes production SQL.
     nonisolated static let optimisticSentDedupSQL = """
-        SELECT * FROM messageHeader
+        SELECT * FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
         WHERE folderId = ? AND rfc822MessageId = ?
         LIMIT 1
         """

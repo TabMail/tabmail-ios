@@ -1012,8 +1012,9 @@ struct InboxView: View {
     /// The RFC arm of the agent-toast lookup, named so plan coverage executes
     /// production SQL. The provider-messageId fallback remains separately expressed.
     nonisolated static let stableIdRfcLookupSQL = """
-        SELECT * FROM messageHeader
+        SELECT * FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
         WHERE accountId = ? AND rfc822MessageId = ?
+        ORDER BY id ASC
         LIMIT 1
         """
 

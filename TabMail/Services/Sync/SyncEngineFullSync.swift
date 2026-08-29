@@ -12,8 +12,9 @@ extension SyncEngine {
     /// Gmail delta sync, and Exchange delta sync. Named so plan and consumer
     /// coverage execute the same SQL as production.
     nonisolated static let optimisticDedupSQL = """
-        SELECT * FROM messageHeader
+        SELECT * FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
         WHERE folderId = ? AND rfc822MessageId = ? AND messageId <> ?
+        ORDER BY id ASC
         LIMIT 1
         """
 

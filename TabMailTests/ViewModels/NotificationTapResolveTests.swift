@@ -541,3 +541,55 @@ struct NotificationTapResolveTests {
         #expect(!MessageDetailViewModel.shouldPopForUnresolvedTap(postedId: nil, selectedId: nil))
     }
 }
+
+@Suite("IOS-PERF-012 — agent-toast stable-id resolve")
+struct AgentToastStableIdResolveTests {
+
+    @Test("duplicate RFC siblings resolve by id ASC, independent of inbox state and insertion order")
+    func duplicateRfcSiblingsResolveById() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db, name: "Alpha", path: "Alpha", role: .custom)
+        try TestDatabase.insertFolder(db, name: "Zulu", path: "Zulu", role: .custom)
+        let stableId = "<agent-toast-shared@example.com>"
+
+        // Insert the higher-id Inbox-visible decoy first and give it the lower
+        // provider messageId. The stale account/messageId plan therefore reaches
+        // it first, while the required total order selects the Alpha row.
+        try TestDatabase.insertMessageHeader(
+            db, messageId: "aaa", folderId: "acc1:Zulu", folderPath: "Zulu",
+            isInInbox: true, rfc822MessageId: EmailFilter.normalizeMessageId(stableId))
+        try TestDatabase.insertMessageHeader(
+            db, messageId: "zzz", folderId: "acc1:Alpha", folderPath: "Alpha",
+            isInInbox: false, rfc822MessageId: EmailFilter.normalizeMessageId(stableId))
+
+        let resolved = try db.read {
+            try InboxView.resolveMessageIdByStableId(
+                accountId: "acc1", stableId: stableId, db: $0)
+        }
+
+        #expect(resolved == "acc1:Alpha:zzz",
+                "the agent toast has no observed folder; duplicate RFC siblings therefore use id ASC as their total order")
+    }
+
+    @Test("provider-messageId fallback remains unchanged when the RFC arm misses")
+    func providerMessageIdFallbackRemainsAvailable() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        try TestDatabase.insertMessageHeader(
+            db, messageId: "provider-stable-1", rfc822MessageId: nil)
+
+        let resolved = try db.read {
+            try InboxView.resolveMessageIdByStableId(
+                accountId: "acc1", stableId: "provider-stable-1", db: $0)
+        }
+        let missing = try db.read {
+            try InboxView.resolveMessageIdByStableId(
+                accountId: "acc1", stableId: "provider-stable-missing", db: $0)
+        }
+
+        #expect(resolved == "acc1:INBOX:provider-stable-1")
+        #expect(missing == nil)
+    }
+}
