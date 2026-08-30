@@ -369,38 +369,42 @@ struct DatabaseIndexTests {
                 "the un-hinted form must still exhibit the regression, or the assertions above prove nothing: \(pre)")
     }
 
-    /// IOS-PERF-012 — both hot durable-identity lookups must seek the stable RFC
-    /// id even in the statistics-poor state left by the production migration
-    /// chain. A wall-clock threshold would be device-dependent; the account walk
-    /// is the invariant that caused the measured 15–26 ms tail.
+    /// IOS-PERF-012 — all seven production statements must seek the stable RFC id
+    /// even in the statistics-poor state left by the production migration chain.
+    /// A wall-clock threshold would be device-dependent; the account-or-folder
+    /// walks are the invariant behind this stale-statistics class.
     @Test("IOS-PERF-012 — durable identity lookups seek the RFC id with stale and fresh statistics")
     func durableIdentityLookupsSeekRfcIdAcrossStatisticsRegimes() throws {
         let db = try TestDatabase.make()
-        let fullIndexStatRows = try db.read { dbConn in
-            try Row.fetchAll(dbConn, sql: """
-                SELECT idx FROM sqlite_stat1
-                WHERE idx IN (
-                    'messageHeader_rfc822MessageId',
-                    'messageHeader_rfc822MessageId_date',
-                    'messageHeader_accountId_messageId'
-                )
-                """)
-        }
-        #expect(fullIndexStatRows.isEmpty,
-                "the stale-plan witness requires migration-left statistics with no rows for the three competing full indexes")
-        let productionStatements = [
-            ("durable fallback", DurableIdentityLookup.rfc822FallbackSQL),
-            ("moved-inbox AI target", AccountManager.inboxEntryAITargetSQL),
+        #expect(try Self.fullIndexStatRows(db).isEmpty,
+                "the stale-plan witness requires migration-left statistics with no stat row for any FULL index on messageHeader")
+        // (label, production SQL, the low-selectivity index the UNHINTED form takes
+        // in this regime). The measured competing index differs by query scope.
+        let productionStatements: [(String, String, String)] = [
+            ("durable fallback", DurableIdentityLookup.rfc822FallbackSQL,
+             "messageHeader_accountId_messageId"),
+            ("moved-inbox AI target", AccountManager.inboxEntryAITargetSQL,
+             "messageHeader_accountId_messageId"),
+            ("optimistic dedup", SyncEngine.optimisticDedupSQL,
+             "messageHeader_folderId_uidInt"),
+            ("reply parent lookup", ReplyParentResolver.parentLookupSQL(count: 3),
+             "messageHeader_accountId_messageId"),
+            ("reply target lookup", Draft.replyTargetLookupSQL,
+             "messageHeader_accountId_messageId"),
+            ("agent-toast stable-id lookup", InboxView.stableIdRfcLookupSQL,
+             "messageHeader_accountId_messageId"),
+            ("optimistic sent existence probe", AccountManager.optimisticSentDedupSQL,
+             "messageHeader_folderId_uidInt"),
         ]
 
-        for (label, production) in productionStatements {
+        for (label, production, staleIndex) in productionStatements {
             let stalePlan = try plan(db, production)
             #expect(stalePlan.contains("USING INDEX messageHeader_rfc822MessageId"),
                     "\(label) must seek the RFC index with migration-left statistics: \(stalePlan)")
             #expect(stalePlan.contains("rfc822MessageId=?"),
                     "\(label) must seek the RFC value, not merely scan its index: \(stalePlan)")
-            #expect(!stalePlan.contains("messageHeader_accountId_messageId"),
-                    "\(label) walked the account with migration-left statistics: \(stalePlan)")
+            #expect(!stalePlan.contains(staleIndex),
+                    "\(label) took \(staleIndex) with migration-left statistics: \(stalePlan)")
 
             // TWO-SIDED (MIS-030): remove exactly the production hint. If this
             // control stops reproducing the account walk, the positive assertion
@@ -410,8 +414,10 @@ struct DatabaseIndexTests {
             #expect(unhinted != production,
                     "\(label) production SQL no longer carries the hint this test pins")
             let unhintedPlan = try plan(db, unhinted)
-            #expect(unhintedPlan.contains("messageHeader_accountId_messageId"),
-                    "\(label) unhinted control no longer reproduces the stale-statistics account walk: \(unhintedPlan)")
+            #expect(unhintedPlan.contains(staleIndex),
+                    "\(label) unhinted control no longer reproduces the stale-statistics \(staleIndex) walk: \(unhintedPlan)")
+            #expect(!unhintedPlan.contains("USING INDEX messageHeader_rfc822MessageId"),
+                    "\(label) unhinted control already seeks the RFC index, so the hint pins nothing: \(unhintedPlan)")
         }
 
         // Populate through the shared helper, then refresh real planner statistics
@@ -430,15 +436,29 @@ struct DatabaseIndexTests {
                 rfc822MessageId: "<b-\(i)@example.com>")
         }
         try db.write { try $0.execute(sql: "ANALYZE") }
+        #expect(try !Self.fullIndexStatRows(db).isEmpty,
+                "the fresh-statistics half is vacuous unless ANALYZE actually wrote full-index stat rows")
 
-        for (label, production) in productionStatements {
+        for (label, production, staleIndex) in productionStatements {
             let freshPlan = try plan(db, production)
             #expect(freshPlan.contains("USING INDEX messageHeader_rfc822MessageId"),
                     "\(label) must keep seeking the RFC index with fresh statistics: \(freshPlan)")
             #expect(freshPlan.contains("rfc822MessageId=?"),
                     "\(label) must keep seeking the RFC value with fresh statistics: \(freshPlan)")
-            #expect(!freshPlan.contains("messageHeader_accountId_messageId"),
-                    "\(label) walked the account with fresh statistics: \(freshPlan)")
+            #expect(!freshPlan.contains(staleIndex),
+                    "\(label) took \(staleIndex) with fresh statistics: \(freshPlan)")
+        }
+    }
+
+    /// The stale-statistics regime is "no stat row for a FULL index", not an
+    /// empty sqlite_stat1: ANALYZE on an empty table still records partial indexes.
+    private static func fullIndexStatRows(_ db: DatabaseQueue) throws -> [Row] {
+        try db.read { dbConn in
+            try Row.fetchAll(dbConn, sql: """
+                SELECT s.idx AS idx FROM sqlite_stat1 s
+                JOIN sqlite_master m ON m.name = s.idx AND m.type = 'index'
+                WHERE s.tbl = 'messageHeader' AND m.sql NOT LIKE '% WHERE %'
+                """)
         }
     }
 

@@ -693,15 +693,21 @@ extension SyncEngine {
     ///      BY\s+messageHeader_unreadSweep' TabMail/ Shared/
     ///      TabMailNotificationService/` → **no output, exit 1**.
     ///   2. **Non-vacuity, so a broken regex cannot pass as a clean result.**
-    ///      The same command without the index name returns exactly the **seven**
-    ///      live hints — `messageHeader_folderId_messageId` (`MessageContentStore`),
-    ///      `messageHeader_rfc822MessageId` (`MessageContentStore`, `ChatStore`,
-    ///      `AccountManager`'s computed queued-member hint,
-    ///      `DurableIdentityLookup.rfc822FallbackSQL`, and
-    ///      `AccountManager.inboxEntryAITargetSQL`), and
+    ///      The same command without the index name returns exactly **12 hint
+    ///      occurrences** — `messageHeader_folderId_messageId`
+    ///      (`MessageContentStore.ownersSQL`), `messageHeader_rfc822MessageId`
+    ///      (`MessageContentStore.ownersSQL`, `ChatStore.findByStableIdSQL`,
+    ///      `AccountManager.queuedMemberIdentitySQL`,
+    ///      `DurableIdentityLookup.rfc822FallbackSQL`,
+    ///      `AccountManager.inboxEntryAITargetSQL`,
+    ///      `SyncEngine.optimisticDedupSQL`,
+    ///      `ReplyParentResolver.parentLookupSQL`, `Draft.replyTargetLookupSQL`,
+    ///      `InboxView.stableIdRfcLookupSQL`, and
+    ///      `AccountManager.optimisticSentDedupSQL`), and
     ///      `messageHeader_triage_display` (`InboxListReader`). Every named index is
     ///      built by a SHIPPED migration (`v64`, `v1`, `v38`), none deferred. Check
-    ///      1 is meaningful only when check 2 is non-empty.
+    ///      1 is meaningful only when check 2 is non-empty. Re-count occurrences
+    ///      rather than carrying this integer forward when another hint lands.
     ///
     /// CONVERGENCE (Data Integrity rule 5). `v83`'s body is now empty, so the two
     /// populations diverge for exactly as long as it takes this pass to run: a

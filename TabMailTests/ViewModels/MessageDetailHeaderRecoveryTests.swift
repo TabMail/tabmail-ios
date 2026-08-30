@@ -18,7 +18,7 @@ import Testing
 /// nothing ever set `message`, and the skeleton (gated on the HEADER) pulsed
 /// forever even once the body landed. `startBodyPoll` is the designated
 /// un-cancelled recovery task; it now resolves the header the same way the
-/// cancelled `loadBody` would have (PK → cross-folder → rfc822 → staged
+/// cancelled `loadBody` would have (PK → cross-folder → staged
 /// fallback via `resolveMessageAsync`).
 ///
 /// Ids use a distinctive `hdrrec-` prefix: suites run concurrently and other
@@ -174,5 +174,75 @@ struct MessageDetailHeaderRecoveryTests {
         try? await Task.sleep(for: .milliseconds(300))
         #expect(vm.message == nil, "recovery must not run while a tap resolve is pending")
         #expect(vm.messageId == tapId, "messageId must stay the unresolved sentinel")
+    }
+
+    @MainActor
+    @Test("cross-folder provider id resolves the moved durable copy without RFC identity search")
+    func crossFolderProviderIdResolvesMovedCopy() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanup(pool, dir, previous) }
+        NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+
+        let movedId = "acc1:Archive:hdrrec-cross-folder"
+        try await pool.write { db in
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1").insert(db)
+            try Folder(name: "Archive", path: "Archive", role: .archive, accountId: "acc1").insert(db)
+            var moved = MessageHeader(
+                messageId: "hdrrec-cross-folder", subject: "Moved durable copy", from: "Sender",
+                fromAddress: "sender@example.com", to: "acc1@example.com", date: Date(),
+                snippet: "moved", folderId: "acc1:Archive", accountId: "acc1",
+                folderPath: "Archive", isInInbox: false)
+            moved.rfc822MessageId = "unrelated-rfc@example.com"
+            try moved.insert(db)
+            try MessageBody(
+                contentKey: ContentKey(rawValue: movedId),
+                htmlContent: "<p>moved body</p>").insert(db)
+        }
+
+        let vm = MessageDetailViewModel(
+            messageId: "acc1:INBOX:hdrrec-cross-folder",
+            dbPool: pool,
+            fetchBodyOverride: { _ in })
+        await vm.loadBody()
+
+        #expect(vm.message?.id == movedId)
+        #expect(vm.message?.folderPath == "Archive")
+        #expect(vm.messageBody?.htmlContent == "<p>moved body</p>")
+    }
+
+    @MainActor
+    @Test("server fallback syncs the composite folder, then resolves the provider id")
+    func serverFallbackSyncsThenResolves() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanup(pool, dir, previous) }
+        NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+        try await pool.write { db in
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1").insert(db)
+        }
+
+        let provider = MockEmailProvider(staleWindowMode: .uid)
+        await provider.setFetchMessagesResult([
+            MessageHeaderInfo(
+                messageId: "hdrrec-server", rfc822MessageId: "hdrrec-server@example.com",
+                inReplyTo: nil, references: [], threadId: nil,
+                subject: "Recovered from server", from: "Sender",
+                fromAddress: "sender@example.com", to: "acc1@example.com", cc: "", bcc: "",
+                replyTo: nil, date: Date(), snippet: "server", isRead: false,
+                isFlagged: false, hasAttachments: false, isReplied: false,
+                isForwarded: false, actionTag: nil)
+        ])
+
+        await TestProviderRegistry.withRegisteredProvider(
+            accountId: "acc1", provider: provider
+        ) {
+            let vm = MessageDetailViewModel(
+                messageId: "acc1:INBOX:hdrrec-server",
+                dbPool: pool,
+                fetchBodyOverride: { _ in })
+            await vm.loadBody()
+
+            #expect(vm.message?.id == "acc1:INBOX:hdrrec-server")
+            #expect(vm.message?.subject == "Recovered from server")
+        }
     }
 }

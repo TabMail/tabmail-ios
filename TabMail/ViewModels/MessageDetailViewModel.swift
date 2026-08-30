@@ -286,7 +286,7 @@ final class MessageDetailViewModel {
         // under I/O pressure (page faults queue behind whatever the disk is
         // doing — measured ~4.3s MAIN THREAD STALL under an in-flight merge
         // fsync, boot_logs 6). Durable resolution is loadBody's async chain
-        // (PK → cross-folder/rfc822 → server-sync fallback), which populates
+        // (PK → cross-folder → server-sync fallback), which populates
         // `message` moments later; the view shows the loading skeleton until
         // then. `markReadOnOpenIfNeeded` has its own async resolve fallback,
         // and the optimistic overlay (`applyOverlay` on every resolve) keeps
@@ -970,7 +970,7 @@ final class MessageDetailViewModel {
     /// nothing sets `message`, and the detail view's skeleton (gated on the
     /// HEADER) pulses forever (boot_logs 8, +4026513/+4058827). Resolve the
     /// same way the cancelled `loadBody` would have (PK → cross-folder →
-    /// rfc822 → staged fallback via `resolveMessageAsync`), then seed for
+    /// staged fallback via `resolveMessageAsync`), then seed for
     /// display. Body-only recovery stays `adoptReadyBody`'s job — its
     /// header-untouched contract is load-bearing for `refreshAfterMergeCommit`.
     @MainActor
@@ -1915,8 +1915,8 @@ final class MessageDetailViewModel {
         guard let msg = await resolveMessageAsync(compositeId: messageId) else { return }
         guard !msg.isRead else { return }
         // C3 — this resolve is the one the opening gesture's proof was discarded
-        // before. `resolveMessageAsync` walks PK → cross-folder → rfc822, all of
-        // which answer "what is at (or near) this address now", never "is this the
+        // before. `resolveMessageAsync` walks PK → cross-folder, both of which
+        // answer "what is at (or near) this address now", never "is this the
         // message that was proved". Refuse rather than mutate; the message stays
         // unread and reopening it heals.
         guard markReadPermitted(for: msg) else { return }
@@ -2010,7 +2010,6 @@ final class MessageDetailViewModel {
     /// Multi-strategy local message lookup. Tries:
     /// 1. Direct composite ID lookup (fastest)
     /// 2. Cross-folder search by messageId + accountId (finds moved messages)
-    /// 3. Search by rfc822MessageId (handles UID changes after IMAP MOVE)
     /// ADR-IOS-049: a message that is staged (NSE) but not yet durable in GRDB —
     /// e.g. a notification tapped seconds after the push, or an instant-inserted
     /// inbox row opened before its merge write lands — has no GRDB header yet.
@@ -2050,7 +2049,7 @@ final class MessageDetailViewModel {
         guard !Task.isCancelled else { return nil }
         // `dbPool.pool` (raw), NOT `dbPool.read`: same reason as loadBody's header read —
         // `dbPool.read` would block on `mergeIfStagingPending()`. Raw-read the durable copy
-        // (PK → cross-folder → rfc822), then fall through to `stagedRowFallback` below for a
+        // (PK → cross-folder), then fall through to `stagedRowFallback` below for a
         // not-yet-merged (staged) message. Keeps notif-tap resolution off the merge path;
         // a UID-remap that lands only in the pending merge self-heals via the merge-commit
         // catch-up. `.pool` honors a `_dbPoolOverride` test pool.
@@ -2066,14 +2065,6 @@ final class MessageDetailViewModel {
                 .filter(Column("messageId") == msgId && Column("accountId") == accountId && Column("folderId") != "")
                 .fetchOne(db) {
                 if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] resolveMessageAsync — found via cross-folder: \(msg.id)") }
-                return msg
-            }
-
-            let normalizedMsgId = EmailFilter.normalizeMessageId(msgId)
-            if let msg = try MessageHeader
-                .filter(Column("rfc822MessageId") == normalizedMsgId && Column("accountId") == accountId && Column("folderId") != "")
-                .fetchOne(db) {
-                if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] resolveMessageAsync — found via rfc822MessageId: \(msg.id)") }
                 return msg
             }
 

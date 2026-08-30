@@ -637,7 +637,7 @@ struct ReplyParentResolverTests {
     func batchMultipleParents() throws {
         let db = try TestDatabase.make()
         let p1 = try insertParent(db, rfc822: "a@x")
-        let p2 = try insertParent(db, rfc822: "b@x")
+        let p2 = try insertParent(db, rfc822: "b@x", actionTag: .reply)
         let p3 = try insertParent(db, rfc822: "c@x")
 
         let updated = try db.write { db in
@@ -659,5 +659,15 @@ struct ReplyParentResolverTests {
             let after = try db.read { try MessageHeader.fetchOne($0, key: parent.id) }
             #expect(after?.isReplied == true, "parent \(parent.rfc822MessageId ?? "?") should be replied")
         }
+        let taggedAfter = try db.read { try MessageHeader.fetchOne($0, key: p2.id) }
+        #expect(taggedAfter?.actionTag == ActionTag.none,
+                "the set consumer must still clear .reply on the matching tagged parent")
+        let setTagOps = try db.read { db in
+            try PendingOperation
+                .filter(Column("type") == OperationType.setTag.rawValue)
+                .fetchAll(db)
+        }
+        #expect(setTagOps.count == 1)
+        #expect(setTagOps.first?.messageIds.contains(p2.stableId) == true)
     }
 }

@@ -54,10 +54,10 @@ enum ReplyParentResolver {
         // One SELECT for all candidate parents in this account that aren't
         // already marked. The `isReplied = 0` filter avoids no-op writes and
         // prevents re-firing the tag-clear PendingOperation on already-marked
-        // rows. Index-backed: with production statistics SQLite serves this with
-        // `messageHeader_rfc822MessageId_date` (`rfc822MessageId=?`), the composite
-        // that leads on `rfc822MessageId`; the narrower `messageHeader_rfc822MessageId`
-        // also exists and leads on the same column.
+        // rows. Index-backed: the production statement's explicit `INDEXED BY`
+        // forces `messageHeader_rfc822MessageId` (`rfc822MessageId=?`) regardless
+        // of statistics; the planner cannot substitute the date, account, or
+        // folder indexes.
         //
         // ⚠️ CORRECTED 2026-08-05: this previously read "Index-backed via
         // `messageHeader_rfc822MessageId` (AppDatabase.swift:349)". That line number
@@ -65,17 +65,7 @@ enum ReplyParentResolver {
         // alike — not an index declaration. Cite indexes by NAME; a `file:line`
         // anchor into a file as edited as `AppDatabase.swift` rots on the next
         // migration (MIS-009).
-        let placeholders = Array(repeating: "?", count: normalized.count).joined(separator: ",")
-        // stableId is a Swift-side computed property on MessageHeader (rfc822 if
-        // messageId is a numeric UID, else messageId) — fetch the inputs and
-        // recompute in Swift rather than rely on a SQL column.
-        let sql = """
-            SELECT id, messageId, rfc822MessageId, folderPath, accountId, actionTag
-            FROM messageHeader
-            WHERE accountId = ?
-              AND rfc822MessageId IN (\(placeholders))
-              AND isReplied = 0
-            """
+        let sql = parentLookupSQL(count: normalized.count)
         var args: [any DatabaseValueConvertible] = [accountId]
         for value in normalized { args.append(value) }
         let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
@@ -134,6 +124,22 @@ enum ReplyParentResolver {
         }
 
         return updated
+    }
+
+    /// The set lookup executed by `markParentsReplied`, named so plan coverage
+    /// cannot drift from production's predicates or projection.
+    static func parentLookupSQL(count: Int) -> String {
+        let placeholders = Array(repeating: "?", count: count).joined(separator: ",")
+        // stableId is a Swift-side computed property on MessageHeader (rfc822 if
+        // messageId is a numeric UID, else messageId) — fetch the inputs and
+        // recompute in Swift rather than rely on a SQL column.
+        return """
+            SELECT id, messageId, rfc822MessageId, folderPath, accountId, actionTag
+            FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
+            WHERE accountId = ?
+              AND rfc822MessageId IN (\(placeholders))
+              AND isReplied = 0
+            """
     }
 
     /// One-shot historic backfill: flip `isReplied` (and clear stale `.reply`

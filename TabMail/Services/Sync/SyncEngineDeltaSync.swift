@@ -305,9 +305,9 @@ extension SyncEngine {
                                 var carriedUserLabelIds: [String] = []
                                 if folder.role == .sent,
                                    let rfc822 = header.rfc822MessageId, !rfc822.isEmpty,
-                                   let optimistic = try MessageHeader
-                                    .filter(Column("folderId") == folder.id && Column("rfc822MessageId") == rfc822 && Column("messageId") != header.messageId)
-                                    .fetchOne(db) {
+                                   let optimistic = try MessageHeader.fetchOne(
+                                    db, sql: Self.optimisticDedupSQL,
+                                    arguments: [folder.id, rfc822, header.messageId]) {
                                     let oldId = optimistic.id
                                     // 🚨 CARRY THE USER-APPLIED LABEL MEMBERSHIP ACROSS THE
                                     // REPLACEMENT. `messageUserLabel.messageId` declares
@@ -703,9 +703,9 @@ extension SyncEngine {
                             var carriedUserLabelIds: [String] = []
                             if folder.role == .sent,
                                let rfc822 = header.rfc822MessageId, !rfc822.isEmpty,
-                               let optimistic = try MessageHeader
-                                .filter(Column("folderId") == folder.id && Column("rfc822MessageId") == rfc822 && Column("messageId") != header.messageId)
-                                .fetchOne(db) {
+                               let optimistic = try MessageHeader.fetchOne(
+                                db, sql: Self.optimisticDedupSQL,
+                                arguments: [folder.id, rfc822, header.messageId]) {
                                 let oldId = optimistic.id
                                 // 🚨 CARRY THE USER-APPLIED LABEL MEMBERSHIP — see the identical
                                 // block on the Gmail delta path above for the full reasoning.
