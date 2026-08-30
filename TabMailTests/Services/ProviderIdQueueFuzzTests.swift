@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 /// T0.8 — the provider-id durable action queue's ADVERSARIAL fuzz suite
@@ -166,6 +167,11 @@ struct ProviderIdQueueFuzzTests {
         /// the reference's `0..<300` / 10ms.
         static let drainPollAttempts = 300
         static let drainPollIntervalMs = 10
+
+        /// Bounded transcript carried by a diagnostic. Commands are synthetic
+        /// FakeIMAPServer traffic, but keeping the tail small makes a rare
+        /// failure readable and keeps one slow round from flooding the log.
+        static let diagnosticCommandTailCount = 40
 
         private static func parseSeed(_ raw: String) -> UInt64? {
             if raw.hasPrefix("0x") || raw.hasPrefix("0X") {
@@ -335,6 +341,102 @@ struct ProviderIdQueueFuzzTests {
         let archive: Folder
     }
 
+    /// Sanitized durable-queue state captured only after a bounded drain has
+    /// failed to converge. Every identity in this suite is synthetic.
+    private struct PendingOperationDiagnostic: Sendable, CustomStringConvertible {
+        let type: OperationType
+        let status: String
+        let retryCount: Int
+        let everAttempted: Bool
+        let messageIds: [String]
+        let sourceFolder: String
+        let destinationFolder: String?
+
+        init(_ operation: PendingOperation) {
+            type = operation.type
+            status = operation.status
+            retryCount = operation.retryCount
+            everAttempted = operation.everAttempted
+            messageIds = operation.messageIds
+            sourceFolder = operation.folderPath
+            destinationFolder = operation.destinationPath
+        }
+
+        var description: String {
+            "type=\(type.rawValue) status=\(status) retryCount=\(retryCount) "
+                + "everAttempted=\(everAttempted) ids=\(messageIds) "
+                + "source=\(sourceFolder) destination=\(destinationFolder ?? "nil")"
+        }
+    }
+
+    private struct DrainTimeoutDiagnostic: Sendable, CustomStringConvertible {
+        let operations: [PendingOperationDiagnostic]
+        let isQuiescent: Bool
+        let commandTail: [String]
+
+        var description: String {
+            let operationDump = operations.isEmpty
+                ? "  <no durable operations>"
+                : operations.map { "  - \($0)" }.joined(separator: "\n")
+            let commandDump = commandTail.isEmpty
+                ? "  <no fake-server commands>"
+                : commandTail.map { "  - \($0)" }.joined(separator: "\n")
+            return """
+            Provider-id queue fuzzer drain timed out: quiescent=\(isQuiescent), operations=\(operations.count)
+            Queue snapshot:
+            \(operationDump)
+            Final \(FuzzConfig.diagnosticCommandTailCount) fake-server commands (or fewer):
+            \(commandDump)
+            """
+        }
+    }
+
+    private enum HarnessDiagnostic: Error, CustomStringConvertible {
+        case drainTimeout(DrainTimeoutDiagnostic)
+
+        var description: String {
+            switch self {
+            case .drainTimeout(let diagnostic): diagnostic.description
+            }
+        }
+    }
+
+    private struct CapturedIssue: Sendable {
+        let message: String
+        let sourceLocation: Testing.SourceLocation
+    }
+
+    /// Intercepts the ledger's one generic issue so the fuzzer can publish one
+    /// enriched issue rather than a generic issue plus a second diagnostic.
+    private final class IssueRecorder: Sendable {
+        private let storage = Mutex<[CapturedIssue]>([])
+
+        var issues: [CapturedIssue] { storage.withLock { $0 } }
+
+        var sink: IntentionLedger.IssueSink {
+            { message, sourceLocation in
+                self.storage.withLock {
+                    $0.append(CapturedIssue(message: message, sourceLocation: sourceLocation))
+                }
+            }
+        }
+    }
+
+    private final class ArchiveAdmissionTrace: Sendable {
+        private let storage = Mutex<RoleMoveDisposition?>(nil)
+
+        var disposition: RoleMoveDisposition? { storage.withLock { $0 } }
+
+        func record(_ disposition: RoleMoveDisposition?) {
+            storage.withLock { $0 = disposition }
+        }
+    }
+
+    private struct RoundSettlement {
+        let outcomes: [(label: String, outcome: IntentionLedger.Outcome)]
+        let reportedDiagnostic: Bool
+    }
+
     /// Mirrors `…/UIDValidityPipelineFuzzTests.swift:135-169`, adapted to the
     /// `v3` fixture idiom already used by every action-driving suite here
     /// (`AccountManagerQueueDrainTests.makeTestDB`).
@@ -421,10 +523,10 @@ struct ProviderIdQueueFuzzTests {
         return header
     }
 
-    /// **VERBATIM port** of `v2final:TabMailTests/Services/
-    /// UIDValidityPipelineFuzzTests.swift:249-259` — the only deviation is that
-    /// the two loop constants moved into `FuzzConfig` (repo rule: no hardcoded
-    /// numeric values), with the reference's own values.
+    /// The loop and empty/quiescent predicate are ported verbatim from
+    /// `v2final:TabMailTests/Services/UIDValidityPipelineFuzzTests.swift:249-259`.
+    /// The two loop constants live in `FuzzConfig`, and this fuzzer adds a
+    /// typed, bounded diagnostic when that unchanged loop expires.
     ///
     /// 🔒 T0.5 ACCEPTANCE CONDITION — do not hand-adapt this. The barrier
     /// samples BOTH halves of its predicate FIRST and only asks for a drain
@@ -437,16 +539,157 @@ struct ProviderIdQueueFuzzTests {
     /// is queue-emptiness, which a redrive can only advance. If this ever
     /// flakes, root-cause it — do NOT widen the bound, raise a timeout, or add
     /// retries.
-    private func drainProviderQueue(pool: DatabasePool) async throws {
-        for _ in 0..<FuzzConfig.drainPollAttempts {
+    private func drainProviderQueue(
+        pool: DatabasePool,
+        recordedCommands: @Sendable () -> [String],
+        attempts: Int = FuzzConfig.drainPollAttempts,
+        intervalMilliseconds: Int = FuzzConfig.drainPollIntervalMs
+    ) async throws {
+        for _ in 0..<attempts {
             let isEmpty = try await pool.read { db in try PendingOperation.fetchCount(db) == 0 }
             let isQuiescent = await AccountManager.shared.pendingQueueIsQuiescentForTesting()
             if isEmpty && isQuiescent { return }
             if isQuiescent && !isEmpty {
                 await AccountManager.shared.drainPendingQueue()
             }
-            try await Task.sleep(for: .milliseconds(FuzzConfig.drainPollIntervalMs))
+            if intervalMilliseconds > 0 {
+                try await Task.sleep(for: .milliseconds(intervalMilliseconds))
+            } else {
+                await Task.yield()
+            }
         }
+
+        let operations = try await pool.read { db in
+            try PendingOperation.fetchAll(db).map(PendingOperationDiagnostic.init)
+        }
+        let isQuiescent = await AccountManager.shared.pendingQueueIsQuiescentForTesting()
+        throw HarnessDiagnostic.drainTimeout(DrainTimeoutDiagnostic(
+            operations: operations,
+            isQuiescent: isQuiescent,
+            commandTail: Array(recordedCommands().suffix(FuzzConfig.diagnosticCommandTailCount))
+        ))
+    }
+
+    private nonisolated static func recordIssue(
+        _ message: String,
+        at sourceLocation: Testing.SourceLocation
+    ) {
+        Issue.record(Comment(rawValue: message), sourceLocation: sourceLocation)
+    }
+
+    /// Provider registration, escaped-drain containment, chaos-hook removal,
+    /// and disconnect are one awaited lifetime. The first body/cleanup error is
+    /// preserved so a drain diagnostic is never replaced by teardown noise.
+    private func withProviderLifetime(
+        accountId: String,
+        provider: any EmailProvider,
+        imapProvider: IMAPProvider?,
+        pool: DatabasePool,
+        _ body: () async throws -> Void
+    ) async throws {
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: provider
+        ) {
+            var firstError: (any Error)?
+            do {
+                try await body()
+            } catch {
+                firstError = error
+            }
+
+            do {
+                try await EscapedDrainTransport.awaitPendingQueueSettled(pool: pool)
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+
+            if let imapProvider {
+                await imapProvider.setActionConnectionTestHookForTesting(nil)
+                await imapProvider.setFolderConnectionTestHookForTesting(nil)
+                await imapProvider.setCreateFolderConnectionCreationTestHookForTesting(nil)
+            }
+            do {
+                try await provider.disconnect()
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+
+            if let firstError { throw firstError }
+        }
+    }
+
+    private func queueEvidence(
+        pool: DatabasePool,
+        server: FakeIMAPServer,
+        archiveFolder: Folder,
+        ids: RoundIdentities,
+        admission: RoleMoveDisposition?
+    ) async -> String {
+        let operations = (try? await pool.read { db in
+            try PendingOperation.fetchAll(db).map(PendingOperationDiagnostic.init)
+        }) ?? []
+        let operationDump = operations.isEmpty
+            ? "<empty>"
+            : operations.map(\.description).joined(separator: " | ")
+        let brackets = CharacterSet(charactersIn: "<>")
+        let sourceContainsArchive = server.messageIDs(in: "INBOX").contains {
+            $0.trimmingCharacters(in: brackets) == ids.archiveRfc
+        }
+        let destinationContainsArchive = server.messageIDs(in: archiveFolder.path).contains {
+            $0.trimmingCharacters(in: brackets) == ids.archiveRfc
+        }
+        let commands = Array(
+            server.recordedCommands().suffix(FuzzConfig.diagnosticCommandTailCount)
+        )
+        return """
+        admission=\(admission?.rawValue ?? "missing") queue=[\(operationDump)] \
+        archiveSourcePresent=\(sourceContainsArchive) \
+        archiveDestinationPresent=\(destinationContainsArchive) \
+        finalCommands=\(commands)
+        """
+    }
+
+    /// The admission receipt is evaluated before the ledger. If archive was
+    /// not durably admitted, the generic post-admission oracle is inapplicable
+    /// and the exact existing disposition is the single published diagnostic.
+    /// Otherwise the ledger's generic issue is captured and enriched once.
+    private func settleRound(
+        ledger: IntentionLedger,
+        ledgerIssues: IssueRecorder,
+        admission: RoleMoveDisposition?,
+        pool: DatabasePool,
+        server: FakeIMAPServer,
+        archiveFolder: Folder,
+        ids: RoundIdentities,
+        reportedIds: Set<String>,
+        sourceLocation: Testing.SourceLocation = #_sourceLocation,
+        issueSink: @escaping IntentionLedger.IssueSink = Self.recordIssue
+    ) async -> RoundSettlement {
+        guard admission == .durablyAdmitted else {
+            let evidence = await queueEvidence(
+                pool: pool, server: server, archiveFolder: archiveFolder,
+                ids: ids, admission: admission)
+            issueSink(
+                "Provider-id queue fuzzer archive admission was not durable: \(evidence)",
+                sourceLocation)
+            return RoundSettlement(outcomes: [], reportedDiagnostic: true)
+        }
+
+        let outcomes = await ledger.settle(
+            pool: pool, reportedIds: reportedIds, sourceLocation: sourceLocation)
+        let captured = ledgerIssues.issues
+        guard !captured.isEmpty else {
+            return RoundSettlement(outcomes: outcomes, reportedDiagnostic: false)
+        }
+
+        let evidence = await queueEvidence(
+            pool: pool, server: server, archiveFolder: archiveFolder,
+            ids: ids, admission: admission)
+        let generic = captured.map(\.message).joined(separator: "\n")
+        issueSink(
+            "Provider-id queue fuzzer converged but the intention ledger failed:\n\(generic)\n\(evidence)",
+            captured[0].sourceLocation)
+        return RoundSettlement(outcomes: outcomes, reportedDiagnostic: true)
     }
 
     // MARK: - Step execution
@@ -459,6 +702,7 @@ struct ProviderIdQueueFuzzTests {
         archiveFolder: Folder,
         server: FakeIMAPServer, provider: IMAPProvider,
         ledger: IntentionLedger, ids: RoundIdentities, headers: RoundHeaders,
+        archiveAdmission: ArchiveAdmissionTrace,
         rng: SeededDraw, round: Int
     ) async {
         switch step {
@@ -500,7 +744,8 @@ struct ProviderIdQueueFuzzTests {
             )
 
         case .archive:
-            await AccountManager.shared.archive([headers.archive])
+            let admission = await AccountManager.shared.archive([headers.archive])
+            archiveAdmission.record(admission.disposition(for: headers.archive.id))
             let destination = archiveFolder.path
             ledger.record(
                 label: "[round \(round)] archive (move → \(destination))",
@@ -649,7 +894,9 @@ struct ProviderIdQueueFuzzTests {
             await provider.setFolderConnectionTestHookForTesting { [chaos] _ in await chaos.point() }
             await provider.setCreateFolderConnectionCreationTestHookForTesting { [chaos] in await chaos.point() }
 
-            let ledger = IntentionLedger()
+            let ledgerIssues = IssueRecorder()
+            let ledger = IntentionLedger(escalate: ledgerIssues.sink)
+            let archiveAdmission = ArchiveAdmissionTrace()
 
             let markReadHeader = makeHeader(folder: fixture.inbox, uid: ids.markReadUid, rfc822MessageId: ids.markReadRfc, subject: "Mark read")
             var markUnreadHeader = makeHeader(folder: fixture.inbox, uid: ids.markUnreadUid, rfc822MessageId: ids.markUnreadRfc, subject: "Mark unread")
@@ -665,75 +912,411 @@ struct ProviderIdQueueFuzzTests {
                 markFlagged: markFlaggedHeader, archive: archiveHeader
             )
 
-            await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
+            try await withProviderLifetime(
+                accountId: accountId, provider: provider,
+                imapProvider: provider, pool: fixture.pool
+            ) {
+                let steps = Self.planSteps(&rng, count: FuzzConfig.stepsPerRound)
+                var spawned: [Task<Void, Never>] = []
+                for step in steps {
+                    // Adversarial layer (c): seeded START SPREAD — without it every
+                    // step fires at t=0 and the fast ones complete before any step
+                    // with a real-latency runway reaches its interesting window.
+                    let startDelayMs = rng.pick(FuzzConfig.startSpreadMs)
+                    spawned.append(Task { [archiveFolder = fixture.archive] in
+                        if startDelayMs > 0 {
+                            try? await Task.sleep(for: .milliseconds(startDelayMs))
+                        } else {
+                            await Task.yield()
+                        }
+                        await self.performStep(
+                            step, archiveFolder: archiveFolder,
+                            server: server, provider: provider,
+                            ledger: ledger, ids: ids, headers: headers,
+                            archiveAdmission: archiveAdmission,
+                            rng: draw, round: round
+                        )
+                    })
+                }
+                for task in spawned { await task.value }
 
-            let steps = Self.planSteps(&rng, count: FuzzConfig.stepsPerRound)
-            var spawned: [Task<Void, Never>] = []
-            for step in steps {
-                // Adversarial layer (c): seeded START SPREAD — without it every
-                // step fires at t=0 and the fast ones complete before any step
-                // with a real-latency runway reaches its interesting window.
-                let startDelayMs = rng.pick(FuzzConfig.startSpreadMs)
-                spawned.append(Task { [archiveFolder = fixture.archive] in
-                    if startDelayMs > 0 {
-                        try? await Task.sleep(for: .milliseconds(startDelayMs))
-                    } else {
-                        await Task.yield()
-                    }
-                    await self.performStep(
-                        step, archiveFolder: archiveFolder,
-                        server: server, provider: provider,
-                        ledger: ledger, ids: ids, headers: headers,
-                        rng: draw, round: round
-                    )
-                })
+                // Convergence. Two bounded barrier passes, mirroring the
+                // reference's drain → backstop → drain ordering (`:737-745`): a
+                // teardown step racing the first drain can leave an op requeued
+                // behind `DrainContext.failedAccounts`, which is per-drain state,
+                // so the second pass is what lets that account run again.
+                try await drainProviderQueue(
+                    pool: fixture.pool, recordedCommands: server.recordedCommands)
+                try await drainProviderQueue(
+                    pool: fixture.pool, recordedCommands: server.recordedCommands)
+
+                // ---- Invariant (b): the intention ledger accounts for everything.
+                // Empty `reportedIds`: `v3` has no production refusal channel until
+                // T4.V8, so nothing can honestly be reported as refused.
+                let settlement = await settleRound(
+                    ledger: ledger, ledgerIssues: ledgerIssues,
+                    admission: archiveAdmission.disposition,
+                    pool: fixture.pool, server: server,
+                    archiveFolder: fixture.archive, ids: ids,
+                    reportedIds: [], sourceLocation: #_sourceLocation)
+                if settlement.reportedDiagnostic { return }
+                let outcomes = settlement.outcomes
+                #expect(
+                    outcomes.count == ledger.recordedCount,
+                    "\(seedHex) round \(round): setup sanity — settle() must return one outcome per recorded intention"
+                )
+                #expect(
+                    outcomes.count == ids.gestureRfcs.count,
+                    "\(seedHex) round \(round): setup sanity — every single-shot gesture must have fired exactly once (got \(outcomes.count))"
+                )
+
+                // ---- Invariant (a): the wire oracle is clean. The ONE hard
+                // invariant — never mutate the wrong message.
+                let violations = server.wrongMessageViolations()
+                #expect(
+                    violations.isEmpty,
+                    "\(seedHex) round \(round): wire oracle: \(violations.count) wrong-message violation(s):\n\(violations.map(\.description).joined(separator: "\n"))"
+                )
+
+                // ---- Invariant (c): end-state convergence. Read as "the round
+                // settled", NEVER as evidence that anything was dropped — see the
+                // type's ⛔ block.
+                let remainingOps = try await fixture.pool.read { db in try PendingOperation.fetchCount(db) }
+                #expect(
+                    remainingOps == 0,
+                    "\(seedHex) round \(round): \(remainingOps) durable op(s) still queued after two bounded drain passes — the round never converged"
+                )
             }
-            for task in spawned { await task.value }
-
-            // Convergence. Two bounded barrier passes, mirroring the
-            // reference's drain → backstop → drain ordering (`:737-745`): a
-            // teardown step racing the first drain can leave an op requeued
-            // behind `DrainContext.failedAccounts`, which is per-drain state,
-            // so the second pass is what lets that account run again.
-            try await drainProviderQueue(pool: fixture.pool)
-            try await drainProviderQueue(pool: fixture.pool)
-
-            // ---- Invariant (b): the intention ledger accounts for everything.
-            // Empty `reportedIds`: `v3` has no production refusal channel until
-            // T4.V8, so nothing can honestly be reported as refused.
-            let outcomes = await ledger.settle(pool: fixture.pool, reportedIds: [])
-            #expect(
-                outcomes.count == ledger.recordedCount,
-                "\(seedHex) round \(round): setup sanity — settle() must return one outcome per recorded intention"
-            )
-            #expect(
-                outcomes.count == ids.gestureRfcs.count,
-                "\(seedHex) round \(round): setup sanity — every single-shot gesture must have fired exactly once (got \(outcomes.count))"
-            )
-
-            // ---- Invariant (a): the wire oracle is clean. The ONE hard
-            // invariant — never mutate the wrong message.
-            let violations = server.wrongMessageViolations()
-            #expect(
-                violations.isEmpty,
-                "\(seedHex) round \(round): wire oracle: \(violations.count) wrong-message violation(s):\n\(violations.map(\.description).joined(separator: "\n"))"
-            )
-
-            // ---- Invariant (c): end-state convergence. Read as "the round
-            // settled", NEVER as evidence that anything was dropped — see the
-            // type's ⛔ block.
-            let remainingOps = try await fixture.pool.read { db in try PendingOperation.fetchCount(db) }
-            #expect(
-                remainingOps == 0,
-                "\(seedHex) round \(round): \(remainingOps) durable op(s) still queued after two bounded drain passes — the round never converged"
-            )
-
-            await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
-            await provider.setActionConnectionTestHookForTesting(nil)
-            await provider.setFolderConnectionTestHookForTesting(nil)
-            await provider.setCreateFolderConnectionCreationTestHookForTesting(nil)
-            try? await provider.disconnect()
         }
+    }
+
+    // MARK: - Diagnostic contract tests
+
+    private func diagnosticIdentities(uidBase: Int) -> RoundIdentities {
+        RoundIdentities(
+            markReadRfc: "diagnostic-read-\(UUID().uuidString)@example.com",
+            markReadUid: uidBase + 1,
+            markUnreadRfc: "diagnostic-unread-\(UUID().uuidString)@example.com",
+            markUnreadUid: uidBase + 2,
+            markFlaggedRfc: "diagnostic-flag-\(UUID().uuidString)@example.com",
+            markFlaggedUid: uidBase + 3,
+            archiveRfc: "diagnostic-archive-\(UUID().uuidString)@example.com",
+            archiveUid: uidBase + 4,
+            bystanderRfcs: [], bystanderUids: [])
+    }
+
+    private func installObservableHooks(on provider: IMAPProvider) async {
+        await provider.setActionConnectionTestHookForTesting {}
+        await provider.setFolderConnectionTestHookForTesting { _ in }
+        await provider.setCreateFolderConnectionCreationTestHookForTesting {}
+    }
+
+    private func assertIMAPTeardown(
+        accountId: String,
+        provider: IMAPProvider,
+        server: FakeIMAPServer,
+        sourceLocation: Testing.SourceLocation = #_sourceLocation
+    ) async {
+        #expect(
+            await AccountManager.shared.providers[accountId] == nil,
+            "provider scope returned before unregister completed",
+            sourceLocation: sourceLocation)
+        #expect(
+            await provider.actionConnectionTestHook == nil,
+            "action-connection chaos hook survived teardown",
+            sourceLocation: sourceLocation)
+        #expect(
+            await provider.folderConnectionTestHook == nil,
+            "folder-connection chaos hook survived teardown",
+            sourceLocation: sourceLocation)
+        #expect(
+            await provider.createFolderConnectionCreationTestHook == nil,
+            "folder-creation chaos hook survived teardown",
+            sourceLocation: sourceLocation)
+        #expect(
+            server.liveSessionCount() == 0,
+            "provider disconnect returned with a live fake-server session",
+            sourceLocation: sourceLocation)
+    }
+
+    @Test("Drain exhaustion reports queue state and a final-40 command tail, then tears down safely")
+    func drainTimeoutIsDistinctAndTeardownSafe() async throws {
+        let accountId = "queuefuzz-timeout-\(UUID().uuidString)"
+        let ids = diagnosticIdentities(uidBase: 31_000)
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [FakeIMAPServer.makeMessage(
+                uid: ids.markReadUid,
+                rfc822Text: rfc822(messageId: ids.markReadRfc, subject: "Timeout"))],
+            "Archive": [],
+        ])
+        try server.start()
+        defer { server.stop() }
+
+        let fixture = try makeFixture(accountId: accountId)
+        defer { restore(fixture) }
+        let provider = IMAPProvider(
+            host: "127.0.0.1", port: server.port,
+            username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        try await provider.connect()
+        await installObservableHooks(on: provider)
+
+        // Positive control: the fake-server transcript is genuinely longer
+        // than the retained suffix.
+        for _ in 0...FuzzConfig.diagnosticCommandTailCount {
+            _ = try await provider.fetchMessages(folder: "INBOX", limit: 1, offset: 0)
+        }
+        #expect(server.recordedCommands().count > FuzzConfig.diagnosticCommandTailCount)
+
+        var operation = PendingOperation(
+            type: .markRead, messageIds: [String(ids.markReadUid)],
+            accountId: accountId, folderPath: fixture.inbox.path,
+            observedUidValidity: fixture.inbox.lastKnownUidValidity)
+        operation.retryCount = 2
+        let insertedOperation = operation
+        try await fixture.pool.writeWithoutTransaction { db in try insertedOperation.insert(db) }
+        server.killConnectionOnNextCommand(containing: "UID STORE")
+
+        let transcriptAtDiagnostic = Mutex<[String]?>(nil)
+        var captured: DrainTimeoutDiagnostic?
+        do {
+            try await withProviderLifetime(
+                accountId: accountId, provider: provider,
+                imapProvider: provider, pool: fixture.pool
+            ) {
+                try await drainProviderQueue(
+                    pool: fixture.pool,
+                    recordedCommands: {
+                        let transcript = server.recordedCommands()
+                        transcriptAtDiagnostic.withLock { $0 = transcript }
+                        return transcript
+                    },
+                    attempts: 1, intervalMilliseconds: 0)
+            }
+            Issue.record("expected a typed drain-timeout diagnostic")
+        } catch HarnessDiagnostic.drainTimeout(let diagnostic) {
+            captured = diagnostic
+        }
+
+        let diagnostic = try #require(captured)
+        #expect(diagnostic.operations.count == 1)
+        #expect(diagnostic.operations[0].type == .markRead)
+        #expect(diagnostic.operations[0].status == PendingStatus.queued.rawValue)
+        #expect(diagnostic.operations[0].retryCount == 3)
+        #expect(diagnostic.operations[0].everAttempted)
+        #expect(diagnostic.operations[0].messageIds == [String(ids.markReadUid)])
+        #expect(diagnostic.commandTail.count == FuzzConfig.diagnosticCommandTailCount)
+        let operationalTranscript = try #require(
+            transcriptAtDiagnostic.withLock { $0 },
+            "fixture never asked the fake server for the timeout transcript")
+        #expect(
+            diagnostic.commandTail
+                == Array(operationalTranscript.suffix(FuzzConfig.diagnosticCommandTailCount)))
+
+        let unattempted = try await fixture.pool.read { db in
+            try PendingOperation.filter(Column("everAttempted") == false).fetchCount(db)
+        }
+        #expect(unattempted == 0, "fixture never entered the drain claim path")
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting())
+        await assertIMAPTeardown(accountId: accountId, provider: provider, server: server)
+    }
+
+    @Test("A real retainedForRetry archive bypasses ledger settlement and reports its exact admission")
+    func retainedArchiveGetsAnAdmissionDiagnostic() async throws {
+        let accountId = "queuefuzz-admission-\(UUID().uuidString)"
+        let ids = diagnosticIdentities(uidBase: 32_000)
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [FakeIMAPServer.makeMessage(
+                uid: ids.archiveUid,
+                rfc822Text: rfc822(messageId: ids.archiveRfc, subject: "Retained"))],
+            "Archive": [],
+        ])
+        try server.start()
+        defer { server.stop() }
+
+        let fixture = try makeFixture(accountId: accountId)
+        defer { restore(fixture) }
+        try await fixture.pool.writeWithoutTransaction { db in
+            _ = try Folder.deleteOne(db, key: fixture.archive.id)
+        }
+        let archiveHeader = makeHeader(
+            folder: fixture.inbox, uid: ids.archiveUid,
+            rfc822MessageId: ids.archiveRfc, subject: "Retained")
+        try await fixture.pool.writeWithoutTransaction { db in try archiveHeader.insert(db) }
+
+        let provider = IMAPProvider(
+            host: "127.0.0.1", port: server.port,
+            username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        try await provider.connect()
+        await installObservableHooks(on: provider)
+
+        let ledgerIssues = IssueRecorder()
+        let ledger = IntentionLedger(escalate: ledgerIssues.sink)
+        let trace = ArchiveAdmissionTrace()
+        let published = IssueRecorder()
+        var settlement: RoundSettlement?
+        try await withProviderLifetime(
+            accountId: accountId, provider: provider,
+            imapProvider: provider, pool: fixture.pool
+        ) {
+            let admission = await AccountManager.shared.archive([archiveHeader])
+            trace.record(admission.disposition(for: archiveHeader.id))
+            ledger.record(
+                label: "retained archive", durableIdentity: archiveHeader.messageId,
+                reportIdentity: archiveHeader.id, endStateAchieved: { _ in false })
+            settlement = await settleRound(
+                ledger: ledger, ledgerIssues: ledgerIssues,
+                admission: trace.disposition, pool: fixture.pool, server: server,
+                archiveFolder: fixture.archive, ids: ids, reportedIds: [],
+                issueSink: published.sink)
+        }
+
+        #expect(trace.disposition == .retainedForRetry)
+        #expect(try await fixture.pool.read { db in try PendingOperation.fetchCount(db) } == 0)
+        #expect(server.recordedCommands().allSatisfy { command in
+            let upper = command.uppercased()
+            return !upper.contains("UID COPY") && !upper.contains("UID STORE")
+        })
+        #expect(ledgerIssues.issues.isEmpty, "ledger settlement ran despite non-durable admission")
+        #expect(settlement?.reportedDiagnostic == true)
+        #expect(settlement?.outcomes.isEmpty == true)
+        #expect(published.issues.count == 1)
+        #expect(published.issues[0].message.contains(RoleMoveDisposition.retainedForRetry.rawValue))
+        #expect(try await fixture.pool.read { db in
+            try PendingOperation.filter(Column("everAttempted") == false).fetchCount(db)
+        } == 0, "retained admission intentionally starts no escaped drain")
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting())
+        await assertIMAPTeardown(accountId: accountId, provider: provider, server: server)
+    }
+
+    @Test("A converged admitted round emits one enriched ledger issue at the captured source location")
+    func ledgerFailureIsEnrichedExactlyOnce() async throws {
+        let accountId = "queuefuzz-ledger-\(UUID().uuidString)"
+        let ids = diagnosticIdentities(uidBase: 33_000)
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [FakeIMAPServer.makeMessage(
+                uid: ids.archiveUid,
+                rfc822Text: rfc822(messageId: ids.archiveRfc, subject: "Ledger"))],
+            "Archive": [],
+        ])
+        try server.start()
+        defer { server.stop() }
+
+        let fixture = try makeFixture(accountId: accountId)
+        defer { restore(fixture) }
+        let archiveHeader = makeHeader(
+            folder: fixture.inbox, uid: ids.archiveUid,
+            rfc822MessageId: ids.archiveRfc, subject: "Ledger")
+        try await fixture.pool.writeWithoutTransaction { db in try archiveHeader.insert(db) }
+
+        let provider = IMAPProvider(
+            host: "127.0.0.1", port: server.port,
+            username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        try await provider.connect()
+        await installObservableHooks(on: provider)
+
+        let ledgerIssues = IssueRecorder()
+        let ledger = IntentionLedger(escalate: ledgerIssues.sink)
+        let published = IssueRecorder()
+        let expectedLocation: Testing.SourceLocation = #_sourceLocation
+        var settlement: RoundSettlement?
+        try await withProviderLifetime(
+            accountId: accountId, provider: provider,
+            imapProvider: provider, pool: fixture.pool
+        ) {
+            let admission = await AccountManager.shared.archive([archiveHeader])
+            let disposition = admission.disposition(for: archiveHeader.id)
+            #expect(disposition == .durablyAdmitted, "fixture never admitted the archive")
+            try await drainProviderQueue(
+                pool: fixture.pool, recordedCommands: server.recordedCommands)
+            try await drainProviderQueue(
+                pool: fixture.pool, recordedCommands: server.recordedCommands)
+            #expect(try await fixture.pool.read { db in
+                try PendingOperation.fetchCount(db)
+            } == 0, "fixture did not genuinely converge")
+
+            // Inject the exact post-admission anomaly the diagnostic path must
+            // preserve; admission and drain themselves remain real.
+            ledger.record(
+                label: "injected unaccounted archive",
+                durableIdentity: archiveHeader.messageId,
+                reportIdentity: archiveHeader.id,
+                endStateAchieved: { _ in false })
+            settlement = await settleRound(
+                ledger: ledger, ledgerIssues: ledgerIssues,
+                admission: disposition, pool: fixture.pool, server: server,
+                archiveFolder: fixture.archive, ids: ids, reportedIds: [],
+                sourceLocation: expectedLocation, issueSink: published.sink)
+        }
+
+        let result = try #require(settlement)
+        #expect(result.reportedDiagnostic)
+        #expect(result.outcomes.count == 1)
+        #expect(result.outcomes[0].outcome.isFailure)
+        #expect(ledgerIssues.issues.count == 1, "ledger must emit one captured generic issue")
+        #expect(published.issues.count == 1, "generic + enriched issues must not both be published")
+        let issue = published.issues[0]
+        #expect(issue.sourceLocation.fileID == expectedLocation.fileID)
+        #expect(issue.sourceLocation.line == expectedLocation.line)
+        #expect(issue.message.contains("durablyAdmitted"))
+        #expect(issue.message.contains("archiveSourcePresent=false"))
+        #expect(issue.message.contains("archiveDestinationPresent=true"))
+        #expect(issue.message.contains("finalCommands="))
+
+        let unattempted = try await fixture.pool.read { db in
+            try PendingOperation.filter(Column("everAttempted") == false).fetchCount(db)
+        }
+        #expect(unattempted == 0)
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting())
+        await assertIMAPTeardown(accountId: accountId, provider: provider, server: server)
+    }
+
+    @Test(
+        "Either epoch-reset drain diagnostic still leaves its provider lifetime settled",
+        arguments: [1, 2])
+    func epochResetDrainDiagnosticIsTeardownSafe(diagnosticDrain: Int) async throws {
+        let accountId = "queuefuzz-epoch-exit-\(diagnosticDrain)-\(UUID().uuidString)"
+        let fixture = try makeFixture(accountId: accountId)
+        defer { restore(fixture) }
+        let provider = MockEmailProvider()
+        await provider.setMoveThrows(ProviderError.notConnected)
+
+        do {
+            try await withProviderLifetime(
+                accountId: accountId, provider: provider,
+                imapProvider: nil, pool: fixture.pool
+            ) {
+                for index in 1...2 {
+                    if index == diagnosticDrain {
+                        let operation = PendingOperation(
+                            type: .move,
+                            messageIds: [String(34_000 + diagnosticDrain)],
+                            accountId: accountId, folderPath: fixture.inbox.path,
+                            destinationPath: fixture.archive.path,
+                            observedUidValidity: fixture.inbox.lastKnownUidValidity)
+                        try await fixture.pool.writeWithoutTransaction { db in
+                            try operation.insert(db)
+                        }
+                    }
+                    try await drainProviderQueue(
+                        pool: fixture.pool,
+                        recordedCommands: { ["epoch-reset-drain-\(index)"] },
+                        attempts: 1, intervalMilliseconds: 0)
+                }
+            }
+            Issue.record("expected drain \(diagnosticDrain) to emit a timeout diagnostic")
+        } catch HarnessDiagnostic.drainTimeout {
+            // Expected: the lifetime wrapper must still finish every teardown.
+        }
+
+        #expect(await AccountManager.shared.providers[accountId] == nil)
+        #expect(await provider.callLog.contains("disconnect"))
+        #expect(try await fixture.pool.read { db in
+            try PendingOperation.filter(Column("everAttempted") == false).fetchCount(db)
+        } == 0)
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting())
     }
 
     // MARK: - T0.7 epoch-reset extension
@@ -893,59 +1476,62 @@ struct ProviderIdQueueFuzzTests {
             username: server.username, password: server.password,
             smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
         try await provider.connect()
-        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
-        try await drainProviderQueue(pool: fixture.pool)
+        try await withProviderLifetime(
+            accountId: accountId, provider: provider,
+            imapProvider: nil, pool: fixture.pool
+        ) {
+            try await drainProviderQueue(
+                pool: fixture.pool, recordedCommands: server.recordedCommands)
 
-        // A fresh gesture made after the reset but from a captured E1 row is
-        // refused by the producer before local mutation/admission.
-        await AccountManager.shared.markFlagged([producerRefusal], flagged: true)
-        try await drainProviderQueue(pool: fixture.pool)
+            // A fresh gesture made after the reset but from a captured E1 row is
+            // refused by the producer before local mutation/admission.
+            await AccountManager.shared.markFlagged([producerRefusal], flagged: true)
+            try await drainProviderQueue(
+                pool: fixture.pool, recordedCommands: server.recordedCommands)
 
-        // Intention records are deliberately created AFTER the reset boundary.
-        // Their witness reads the fake-server authority under its lock.
-        let ledger = IntentionLedger()
-        for (label, header, mailbox) in [
-            ("checkpoint A", checkpointA, "INBOX"),
-            ("checkpoint B", checkpointB, "Archive"),
-            ("producer refusal", producerRefusal, "INBOX"),
-        ] {
-            ledger.record(
-                label: "\(label) seed=0x\(String(seed, radix: 16))",
-                durableIdentity: Self.durableIdentity(of: header),
-                idResetDrop: .init(
-                    epochAtGesture: oldEpoch,
-                    epochAtSettle: { _ in server.uidValidity(for: mailbox) }),
-                endStateAchieved: { _ in false })
+            // Intention records are deliberately created AFTER the reset boundary.
+            // Their witness reads the fake-server authority under its lock.
+            let ledger = IntentionLedger()
+            for (label, header, mailbox) in [
+                ("checkpoint A", checkpointA, "INBOX"),
+                ("checkpoint B", checkpointB, "Archive"),
+                ("producer refusal", producerRefusal, "INBOX"),
+            ] {
+                ledger.record(
+                    label: "\(label) seed=0x\(String(seed, radix: 16))",
+                    durableIdentity: Self.durableIdentity(of: header),
+                    idResetDrop: .init(
+                        epochAtGesture: oldEpoch,
+                        epochAtSettle: { _ in server.uidValidity(for: mailbox) }),
+                    endStateAchieved: { _ in false })
+            }
+            let outcomes = await ledger.settle(pool: fixture.pool, reportedIds: [])
+            #expect(outcomes.count == 3)
+            #expect(outcomes.allSatisfy { $0.outcome == .acceptedIdResetDrop })
+
+            let mutationCommands = server.recordedCommands().filter { command in
+                let upper = command.uppercased()
+                return upper.contains("UID STORE") || upper.contains("UID MOVE")
+                    || upper.contains("UID COPY") || upper.contains("UID EXPUNGE")
+                    || upper.hasPrefix("STORE ") || upper == "EXPUNGE"
+                    || upper.hasPrefix("EXPUNGE ")
+            }
+            #expect(mutationCommands.isEmpty)
+            #expect(server.wrongMessageViolations().isEmpty)
+            #expect(
+                !server.recordedCommands().contains {
+                    let upper = $0.uppercased()
+                    return upper.contains("SELECT") && upper.contains("INBOX")
+                },
+                "checkpoint A and producer refusal must terminate before selecting INBOX")
+            for decoy in decoys {
+                #expect(server.messageIDs(in: decoy.mailbox).contains {
+                    $0.trimmingCharacters(in: CharacterSet(charactersIn: "<>")) == decoy.rfc
+                })
+                #expect(server.flags(in: decoy.mailbox, uid: decoy.uid) == decoy.flags)
+            }
+            let remaining = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }
+            #expect(remaining.isEmpty, "the queue must converge with no split children")
         }
-        let outcomes = await ledger.settle(pool: fixture.pool, reportedIds: [])
-        #expect(outcomes.count == 3)
-        #expect(outcomes.allSatisfy { $0.outcome == .acceptedIdResetDrop })
-
-        let mutationCommands = server.recordedCommands().filter { command in
-            let upper = command.uppercased()
-            return upper.contains("UID STORE") || upper.contains("UID MOVE")
-                || upper.contains("UID COPY") || upper.contains("UID EXPUNGE")
-                || upper.hasPrefix("STORE ") || upper == "EXPUNGE"
-                || upper.hasPrefix("EXPUNGE ")
-        }
-        #expect(mutationCommands.isEmpty)
-        #expect(server.wrongMessageViolations().isEmpty)
-        #expect(
-            !server.recordedCommands().contains {
-                let upper = $0.uppercased()
-                return upper.contains("SELECT") && upper.contains("INBOX")
-            },
-            "checkpoint A and producer refusal must terminate before selecting INBOX")
-        for decoy in decoys {
-            #expect(server.messageIDs(in: decoy.mailbox).contains {
-                $0.trimmingCharacters(in: CharacterSet(charactersIn: "<>")) == decoy.rfc
-            })
-            #expect(server.flags(in: decoy.mailbox, uid: decoy.uid) == decoy.flags)
-        }
-        let remaining = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }
-        #expect(remaining.isEmpty, "the queue must converge with no split children")
-
-        await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
-        try? await provider.disconnect()
     }
 }
