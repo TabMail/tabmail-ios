@@ -160,12 +160,13 @@ final class IntentionLedger: Sendable {
     /// Where `settle()` escalates a never-drop violation. Defaults to
     /// `Issue.record`, which is what every real consumer wants.
     ///
-    /// It is injectable for exactly one reason: this ledger's own tests have to
-    /// prove that a violation ESCALATES, and the only other way to observe a
-    /// recorded issue is `withKnownIssue`, which would enrol a self-test in the
-    /// suite's known-issue tally. That tally is a load-bearing signal on this
-    /// branch — each entry is an open hazard that flips to a hard failure when
-    /// its fix lands — so a self-test must not join it.
+    /// It is injectable for two test-harness reasons: this ledger's own tests
+    /// have to prove that a violation ESCALATES without joining the suite's
+    /// known-issue tally, and a fuzzer may need to capture the generic ledger
+    /// issue long enough to emit one richer issue with its admission, queue,
+    /// server-state and bounded-transcript evidence. The sink never changes
+    /// settlement or suppresses a production failure; it only lets the owning
+    /// harness choose the single diagnostic that Swift Testing publishes.
     typealias IssueSink = @Sendable (String, Testing.SourceLocation) -> Void
 
     private let escalate: IssueSink
