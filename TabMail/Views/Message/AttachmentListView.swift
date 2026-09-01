@@ -54,6 +54,39 @@ enum EmlAttachmentPreviewLoader {
         }
         return Payload(html: html, nestedAttachments: nested)
     }
+
+    /// Acquire the global preview freeze only while the retained presentation
+    /// task is still live. Keeping the cancellation check and acquisition in
+    /// one synchronous MainActor operation closes the post-load teardown race.
+    @MainActor
+    static func beginPreviewFreeze() throws {
+        try Task.checkCancellation()
+        PreviewFreezeGate.shared.begin()
+    }
+}
+
+/// View-lifecycle owner for the one in-flight `.eml` presentation task. The
+/// SwiftUI disappearance hook and tests use the same cancellation boundary.
+@MainActor
+final class EmlAttachmentPreviewTaskCoordinator {
+    private var task: Task<Void, Never>?
+
+    @discardableResult
+    func start(
+        _ operation: @escaping @MainActor () async -> Void
+    ) -> Task<Void, Never> {
+        cancel()
+        let next = Task { @MainActor in
+            await operation()
+        }
+        task = next
+        return next
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+    }
 }
 
 struct AttachmentListView: View {
@@ -69,7 +102,7 @@ struct AttachmentListView: View {
     @State private var downloadedFiles: [String: URL] = [:]
     @State private var emlPreview: EmlPreviewState?
     @State private var error: String?
-    @State private var emlDownloadTask: Task<Void, Never>?
+    @State private var emlDownloadCoordinator = EmlAttachmentPreviewTaskCoordinator()
 
     private let manager = AccountManager.shared
 
@@ -202,8 +235,7 @@ struct AttachmentListView: View {
             }
         }
         .onDisappear {
-            emlDownloadTask?.cancel()
-            emlDownloadTask = nil
+            emlDownloadCoordinator.cancel()
             // Safety net: if the view tears down with the .eml sheet still
             // presented, release the gate so the app doesn't stay frozen. The
             // QuickLook path is imperative (AttachmentQuickLook owns its own gate
@@ -221,10 +253,9 @@ struct AttachmentListView: View {
     }
 
     private func downloadAndPreviewEml(_ attachment: AttachmentInfo) {
-        emlDownloadTask?.cancel()
         downloadingSection = attachment.section
         error = nil
-        emlDownloadTask = Task {
+        emlDownloadCoordinator.start {
             do {
                 let payload = try await EmlAttachmentPreviewLoader.load(
                     attachment: attachment
@@ -235,7 +266,7 @@ struct AttachmentListView: View {
                         encoding: attachment.encoding
                     )
                 }
-                PreviewFreezeGate.shared.begin()
+                try EmlAttachmentPreviewLoader.beginPreviewFreeze()
                 emlPreview = EmlPreviewState(
                     html: payload.html,
                     filename: attachment.filename,
@@ -250,7 +281,6 @@ struct AttachmentListView: View {
                     : error.localizedDescription
             }
             downloadingSection = nil
-            emlDownloadTask = nil
         }
     }
 

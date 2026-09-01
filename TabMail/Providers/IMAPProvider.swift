@@ -3562,7 +3562,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
         // buildFullMessageInfo returns nil when mapMessageInfo can't parse the header
         // (e.g., date parse failure). Treat as a fetch failure so the caller retries.
-        guard let full = buildFullMessageInfo(info: info, message: message) else {
+        guard let full = buildFullMessageInfo(
+            info: info,
+            message: message,
+            observedUidValidity: observedUidValidity
+        ) else {
             throw ProviderError.messageNotFound
         }
         return full
@@ -3571,7 +3575,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// Build FullMessageInfo from BODYSTRUCTURE info + fetched message data.
     /// Extracted from fetchMessageOnConnection so batch fetch can reuse it.
     /// Returns nil if the header can't be parsed — caller should treat as fetch failure.
-    private func buildFullMessageInfo(info: MessageInfo, message: Message) -> FullMessageInfo? {
+    private func buildFullMessageInfo(
+        info: MessageInfo,
+        message: Message,
+        observedUidValidity: Int?
+    ) -> FullMessageInfo? {
         guard let header = mapMessageInfo(info) else { return nil }
         let renderIngredientSections = Set(
             IMAPFetchMapping.requiredBodyPartIndices(in: info.parts)
@@ -3709,6 +3717,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
         return FullMessageInfo(
             header: header,
+            observedUidValidity: observedUidValidity,
             htmlBody: htmlBody,
             textBody: textBody,
             attachments: attachments,
@@ -3838,7 +3847,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 let message = Message(header: entry.info, parts: parts)
                 // Skip entries where the header can't be parsed (date parse failure).
                 // Caller sees the entry missing from results and treats as fetch failure.
-                guard let fullInfo = self.buildFullMessageInfo(info: entry.info, message: message) else {
+                guard let fullInfo = self.buildFullMessageInfo(
+                    info: entry.info,
+                    message: message,
+                    observedUidValidity: partialFetchObservedUidValidity
+                ) else {
                     failedCount += 1
                     continue
                 }
@@ -5260,13 +5273,25 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     /// Fetch a single attachment's data by MIME section.
-    func fetchAttachment(messageId: String, folder: String, section: String, encoding: String?) async throws -> Data {
+    func fetchAttachment(
+        messageId: String,
+        folder: String,
+        section: String,
+        encoding: String?,
+        expectedObservedUidValidity: Int?,
+        expectedRfc822MessageId: String?
+    ) async throws -> Data {
         // Compound path: attachment nested inside a file-uploaded `.eml`.
         // Re-fetch parent `.eml` bytes, parse, return the nth nested payload.
         // One extra IMAP fetch per tap — the parse happens in-process.
         if let nested = EmlParsing.parseNestedSection(section) {
             let parentBytes = try await fetchAttachment(
-                messageId: messageId, folder: folder, section: nested.parent, encoding: encoding
+                messageId: messageId,
+                folder: folder,
+                section: nested.parent,
+                encoding: encoding,
+                expectedObservedUidValidity: expectedObservedUidValidity,
+                expectedRfc822MessageId: expectedRfc822MessageId
             )
             guard let bytes = EmlParsing.nestedBytes(rawBytes: parentBytes, index: nested.index) else {
                 throw ProviderError.messageNotFound
@@ -5277,14 +5302,24 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         return try await withActionConnection(folder: folder) { server in
             // T5.3 PORT — `v2final:…:IMAPProvider.fetchAttachment` tracks this
             // re-SELECT on the action connection.
-            _ = try await self.selectMailboxTracked(server, folder: folder)
+            let selection = try await self.selectMailboxTracked(server, folder: folder)
 
             let results = try self.nativeUIDSet([messageId])
             guard let uid = results.toArray().first else { throw ProviderError.messageNotFound }
 
             let mimeSection = Section(section)
-            guard let info = try await server.fetchMessageInfo(for: uid),
-                  let metadata = info.parts.first(where: { $0.section == mimeSection }) else {
+            guard let info = try await server.fetchMessageInfo(for: uid) else {
+                throw ProviderError.messageNotFound
+            }
+            try Self.requireAttachmentFetchIdentity(
+                messageId: messageId,
+                folder: folder,
+                expectedObservedUidValidity: expectedObservedUidValidity,
+                liveUidValidity: selection.uidValidity.value,
+                expectedRfc822MessageId: expectedRfc822MessageId,
+                fetchedRfc822MessageId: IMAPFetchMapping.rfc822MessageId(from: info)
+            )
+            guard let metadata = info.parts.first(where: { $0.section == mimeSection }) else {
                 throw ProviderError.messageNotFound
             }
             let rawData = try await IMAPFetchMapping.concatenateEncodedPart(
@@ -5304,6 +5339,48 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 encoding: encoding ?? metadata.encoding
             )
             return rawData.decoded(for: part)
+        }
+    }
+
+    /// Bind an attachment read to the row that initiated it. A mailbox-local
+    /// UID is safe only while its UIDVALIDITY agrees; when either side lacks an
+    /// epoch, matching RFC Message-ID is the fallback positive identity proof.
+    private static func requireAttachmentFetchIdentity(
+        messageId: String,
+        folder: String,
+        expectedObservedUidValidity: Int?,
+        liveUidValidity: UInt32,
+        expectedRfc822MessageId: String?,
+        fetchedRfc822MessageId: String?
+    ) throws {
+        let expectedEpoch = expectedObservedUidValidity.flatMap(UInt32.init(exactly:))
+            .flatMap { $0 == 0 ? nil : $0 }
+        let liveEpoch = liveUidValidity == 0 ? nil : liveUidValidity
+
+        if let expectedEpoch, let liveEpoch {
+            guard expectedEpoch == liveEpoch else {
+                throw ProviderError.uidValidityChanged(
+                    folderPath: folder,
+                    stored: expectedEpoch,
+                    live: liveEpoch
+                )
+            }
+            guard !BodyAddressGate.identityContradicts(
+                stored: expectedRfc822MessageId,
+                fetched: fetchedRfc822MessageId
+            ) else {
+                throw ProviderError.actionIdentityResolutionFailed(messageId)
+            }
+            return
+        }
+
+        guard let expectedRfc822MessageId,
+              let fetchedRfc822MessageId,
+              !expectedRfc822MessageId.isEmpty,
+              !fetchedRfc822MessageId.isEmpty,
+              EmailFilter.normalizeMessageId(expectedRfc822MessageId)
+                == EmailFilter.normalizeMessageId(fetchedRfc822MessageId) else {
+            throw ProviderError.actionIdentityResolutionFailed(messageId)
         }
     }
 

@@ -213,7 +213,9 @@ struct IMAPSelectEpochMirrorTests {
         // `try?` — see this test's doc comment.
         server.setUidValidity(Int(Self.e10), for: "INBOX")
         _ = try? await provider.fetchAttachment(
-            messageId: "1", folder: "INBOX", section: "1", encoding: nil)
+            messageId: "1", folder: "INBOX", section: "1", encoding: nil,
+            expectedObservedUidValidity: Int(Self.e10),
+            expectedRfc822MessageId: Self.rfc)
         #expect(provider.lastObservedUidValidity(folderPath: "INBOX") == Self.e10,
                 "the attachment fetch's re-SELECT observed \(Self.e10) and the mirror must say so, not \(Self.e9)")
     }

@@ -185,8 +185,15 @@ struct IMAPChunkedBodyFetchTests {
 
     @Test("NSE orchestration admits once, chunks required parts, and fails passive before wire IO")
     func aggregateBudgetAndFetchAreOneOperation() async throws {
+        let oversizedRenderPayload = Data(
+            repeating: Character("r").asciiValue!,
+            count: IMAPFetchMapping.bodyPartChunkSize + 17
+        )
         let parts = [
-            MessagePart(sectionString: "1", contentType: "text/plain", size: 6),
+            MessagePart(
+                sectionString: "1", contentType: "text/plain",
+                size: oversizedRenderPayload.count
+            ),
             MessagePart(
                 sectionString: "2", contentType: "application/pdf",
                 disposition: "attachment", filename: "large.pdf", size: 100_000
@@ -196,12 +203,13 @@ struct IMAPChunkedBodyFetchTests {
                 disposition: "inline", contentId: "logo@example.com", size: 4
             ),
         ]
-        let payloads = ["1": Data("render".utf8), "3": Data("logo".utf8)]
+        let payloads = ["1": oversizedRenderPayload, "3": Data("logo".utf8)]
         var requests: [(section: String, offset: Int, count: Int)] = []
+        let admittedBudget = oversizedRenderPayload.count + 4
 
         let fetchedOptional = try await IMAPFetchMapping.fetchRequiredBodyPartsWithinAggregateBudget(
             in: parts,
-            byteBudget: 10
+            byteBudget: admittedBudget
         ) { part, offset, count in
             let section = part.section.description
             requests.append((section, offset, count))
@@ -216,15 +224,28 @@ struct IMAPChunkedBodyFetchTests {
         #expect(fetched[0].data == payloads["1"])
         #expect(fetched[1].data == nil)
         #expect(fetched[2].data == payloads["3"])
-        #expect(requests.map(\.section) == ["1", "1", "3", "3"])
-        #expect(requests.map(\.offset) == [0, 6, 0, 4])
-        #expect(requests.map(\.count) == [6, 1, 4, 1])
+        #expect(requests.map(\.section) == ["1", "1", "1", "3", "3"])
+        #expect(requests.map(\.offset) == [
+            0,
+            IMAPFetchMapping.bodyPartChunkSize,
+            oversizedRenderPayload.count,
+            0,
+            4,
+        ])
+        #expect(requests.map(\.count) == [
+            IMAPFetchMapping.bodyPartChunkSize,
+            17,
+            1,
+            4,
+            1,
+        ])
+        #expect(requests.allSatisfy { $0.count <= IMAPFetchMapping.bodyPartChunkSize })
         #expect(!requests.contains { $0.section == "2" })
 
         requests.removeAll()
         let overBudget = try await IMAPFetchMapping.fetchRequiredBodyPartsWithinAggregateBudget(
             in: parts,
-            byteBudget: 9
+            byteBudget: admittedBudget - 1
         ) { part, offset, count in
             requests.append((part.section.description, offset, count))
             return Data()
@@ -290,6 +311,7 @@ struct IMAPChunkedBodyFetchTests {
 
         let result = try await provider.fetchMessagesBatch(ids: ["501"], folder: "INBOX")
         let fetched = try #require(result["501"])
+        #expect(fetched.observedUidValidity == 1)
         #expect(fetched.textBody?.utf8.count == fixture.text.count)
         #expect(fetched.attachments.first?.size == fixture.attachmentAdvertisedSize)
 

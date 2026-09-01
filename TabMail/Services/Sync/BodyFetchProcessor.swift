@@ -187,7 +187,11 @@ enum BodyFetchProcessor {
             }
 
             let fetchAttachment = buildAttachmentFetcher(
-                accountId: item.accountId, messageId: item.messageId, folderPath: item.folderPath
+                accountId: item.accountId,
+                messageId: item.messageId,
+                folderPath: item.folderPath,
+                expectedObservedUidValidity: fullMessage.observedUidValidity,
+                expectedRfc822MessageId: fullMessage.header.rfc822MessageId
             )
             let (renderedBody, plainText, hasUnresolvedICS) = await renderBody(
                 headerId: item.headerId,
@@ -732,7 +736,11 @@ enum BodyFetchProcessor {
         let t0 = CFAbsoluteTimeGetCurrent()
 
         let fetchAttachment = buildAttachmentFetcher(
-            accountId: item.accountId, messageId: item.messageId, folderPath: item.folderPath
+            accountId: item.accountId,
+            messageId: item.messageId,
+            folderPath: item.folderPath,
+            expectedObservedUidValidity: fullMessage.observedUidValidity,
+            expectedRfc822MessageId: fullMessage.header.rfc822MessageId
         )
         let (renderedBody, plainText, hasUnresolvedICS) = await renderBody(
             headerId: item.headerId,
@@ -863,7 +871,11 @@ enum BodyFetchProcessor {
     // MARK: - Helpers
 
     private static func buildAttachmentFetcher(
-        accountId: String, messageId: String, folderPath: String
+        accountId: String,
+        messageId: String,
+        folderPath: String,
+        expectedObservedUidValidity: Int?,
+        expectedRfc822MessageId: String?
     ) -> @Sendable (String, String?) async throws -> Data {
         return { section, encoding in
             let queue = await AccountManager.shared.workQueues[accountId]
@@ -872,7 +884,14 @@ enum BodyFetchProcessor {
 
             return try await queue.execute(priority: .bodyFetch) {
                 if let imap = provider as? IMAPProvider {
-                    return try await imap.fetchAttachment(messageId: messageId, folder: folderPath, section: section, encoding: encoding)
+                    return try await imap.fetchAttachment(
+                        messageId: messageId,
+                        folder: folderPath,
+                        section: section,
+                        encoding: encoding,
+                        expectedObservedUidValidity: expectedObservedUidValidity,
+                        expectedRfc822MessageId: expectedRfc822MessageId
+                    )
                 } else if let gmail = provider as? GmailProvider {
                     return try await gmail.fetchAttachment(messageId: messageId, attachmentId: section)
                 } else if let exchange = provider as? ExchangeProvider {

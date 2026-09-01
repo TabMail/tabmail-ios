@@ -234,7 +234,14 @@ extension AccountManager {
             do {
                 return try await queue.execute(priority: .userAction) {
                     if let imapProvider = provider as? IMAPProvider {
-                        return try await imapProvider.fetchAttachment(messageId: message.messageId, folder: message.folderPath, section: section, encoding: encoding)
+                        return try await imapProvider.fetchAttachment(
+                            messageId: message.messageId,
+                            folder: message.folderPath,
+                            section: section,
+                            encoding: encoding,
+                            expectedObservedUidValidity: message.observedUidValidity,
+                            expectedRfc822MessageId: message.rfc822MessageId
+                        )
                     } else if let gmailProvider = provider as? GmailProvider {
                         return try await gmailProvider.fetchAttachment(messageId: message.messageId, attachmentId: section)
                     } else if let exchangeProvider = provider as? ExchangeProvider {

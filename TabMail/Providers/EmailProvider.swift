@@ -192,6 +192,10 @@ struct InlineImage: Sendable {
 
 struct FullMessageInfo: Sendable {
     let header: MessageHeaderInfo
+    /// UIDVALIDITY from the exact IMAP SELECT that supplied this message's
+    /// BODYSTRUCTURE and render parts. Nil for providers without mailbox-local
+    /// UID epochs, or when the server omitted UIDVALIDITY.
+    let observedUidValidity: Int?
     let htmlBody: String?
     let textBody: String?
     let attachments: [AttachmentInfo]
@@ -205,8 +209,9 @@ struct FullMessageInfo: Sendable {
     /// while `attachments` remains complete BODYSTRUCTURE metadata for taps.
     let renderIngredientSections: Set<String>?
 
-    init(header: MessageHeaderInfo, htmlBody: String?, textBody: String?, attachments: [AttachmentInfo] = [], inlineImages: [InlineImage] = [], icsData: Data? = nil, renderIngredientSections: Set<String>? = nil) {
+    init(header: MessageHeaderInfo, observedUidValidity: Int? = nil, htmlBody: String?, textBody: String?, attachments: [AttachmentInfo] = [], inlineImages: [InlineImage] = [], icsData: Data? = nil, renderIngredientSections: Set<String>? = nil) {
         self.header = header
+        self.observedUidValidity = observedUidValidity
         self.htmlBody = htmlBody
         self.textBody = textBody
         self.attachments = attachments
