@@ -606,34 +606,13 @@ struct OversizedQuarantineResetReleaseTests {
     }
 }
 
-// MARK: - The quarantine's UI consequence: wake lock vs. completion banner
+// MARK: - The quarantine's UI consequence: truthful completion
 
-/// Removing the illegal `bodyEmptyConfirmed = 1` stamp made the quarantined row stay
-/// honestly incomplete, which is correct — and which means
-/// `BackfillProgress.pendingBodyCount` (`headerComplete = 1 AND bodyComplete = 0 AND
-/// bodyEmptyConfirmed = 0`) never reaches 0 for an account holding one oversized
-/// message, so `BackfillProgress.isFullyComplete` is false forever for that account.
-///
-/// `FastSyncView` had TWO consumers keyed off that single durable-completeness fact:
-/// the "Sync Complete" banner AND `keepScreenAwake(while: !isAllComplete)`. The second
-/// one is a battery-draining defect — the device screen was pinned awake indefinitely.
-///
-/// The split asserted here:
-///   - the WAKE LOCK is a question about the app's CURRENT activity, so it moved to
-///     `FastSyncView.keepScreenAwakeWhileWorking` — the header walk plus the two body
-///     queues' `isIdle`;
-///   - the BANNER is a TRUTH CLAIM about the mailbox, so it stays on
-///     `isFullyComplete`. Telling the user "Sync Complete" while a body is genuinely
-///     missing would be a second defect, not a fix.
-///
-/// The idle inputs here come from the REAL queue actors after a REAL quarantine, not
-/// from hand-fed booleans, so these tests pin the causal chain
-/// (quarantine → queue idle → lock released) rather than the predicate's arithmetic.
-/// The suite is deliberately TWO-SIDED: a broken predicate that ALWAYS released would
-/// satisfy the release cases alone, so every release case has a held counterpart driven
-/// off a queue that still holds admitted work.
-@Suite("Fast Sync keep-awake follows runnable queue state, not durable completeness")
-struct FastSyncKeepAwakeTests {
+/// Fast Sync now keeps the screen awake for the whole view lifetime, independent
+/// of queue or durable-completion state. The completion banner remains a separate
+/// truth claim and must still withhold "Sync Complete" for an unfinished body.
+@Suite("Fast Sync completion banner remains truthful")
+struct FastSyncCompletionBannerTests {
 
     /// A progress snapshot for an account whose header walk is done and whose ONLY
     /// remaining work is `pendingBodyCount` quarantined oversized bodies. Dates derive
@@ -650,78 +629,6 @@ struct FastSyncKeepAwakeTests {
         )
         p.pendingBodyCount = pendingBodyCount
         return p
-    }
-
-    @Test("A quarantined oversized message leaves both body queues idle, so the keep-awake lock is RELEASED even though pendingBodyCount is still non-zero")
-    func quarantinedOversizedReleasesTheWakeLock() async {
-        let active = ActiveBodyQueue()
-        let backfill = BackfillBodyQueue()
-        let activeOversized = activeItem("acc1:INBOX:1")
-        let backfillOversized = backfillItem("acc1:Archive:1")
-        #expect(await active.admit(activeOversized) == true)
-        #expect(await backfill.admit(backfillOversized) == true)
-
-        // The real quarantine disposition — not a model of it.
-        await active.handlePayloadTooLarge(items: [activeOversized], folderPath: "INBOX")
-        await backfill.handlePayloadTooLarge(items: [backfillOversized], folderPath: "Archive")
-
-        let activeIdle = await active.isIdle
-        let backfillIdle = await backfill.isIdle
-        #expect(activeIdle, "a quarantined item is removed from the queue, so the queue has no runnable work")
-        #expect(backfillIdle)
-
-        // The account is genuinely NOT fully complete — the count still sees the row.
-        let progress = progressWithPendingBodies(1)
-        #expect(progress.pendingBodyCount == 1, "the quarantined row is still counted; the fix must not hide it")
-        #expect(!progress.isFullyComplete, "durable completeness is honestly withheld")
-
-        // …and the wake lock is nonetheless released, because it no longer asks that
-        // question. This exact pairing IS the defect: pre-fix these two lines could not
-        // both hold.
-        #expect(FastSyncView.keepScreenAwakeWhileWorking(
-            accountHeadersDone: [progress.headersDone],
-            activeBodyIdle: activeIdle,
-            backfillBodyIdle: backfillIdle
-        ) == false, "an oversized-only remainder must not pin the screen awake")
-    }
-
-    @Test("The keep-awake lock is HELD while the ACTIVE body queue still holds admitted work")
-    func heldWhileActiveQueueHasWork() async {
-        let active = ActiveBodyQueue()
-        #expect(await active.admit(activeItem("acc1:INBOX:2")) == true)
-        let activeIdle = await active.isIdle
-        #expect(activeIdle == false, "an admitted, un-quarantined item leaves the queue runnable")
-
-        #expect(FastSyncView.keepScreenAwakeWhileWorking(
-            accountHeadersDone: [true],
-            activeBodyIdle: activeIdle,
-            backfillBodyIdle: true
-        ) == true, "the screen stays awake while bodies are actually being fetched")
-    }
-
-    @Test("The keep-awake lock is HELD while the BACKFILL body queue still holds admitted work")
-    func heldWhileBackfillQueueHasWork() async {
-        let backfill = BackfillBodyQueue()
-        #expect(await backfill.admit(backfillItem("acc1:Archive:2")) == true)
-        let backfillIdle = await backfill.isIdle
-        #expect(backfillIdle == false)
-
-        #expect(FastSyncView.keepScreenAwakeWhileWorking(
-            accountHeadersDone: [true],
-            activeBodyIdle: true,
-            backfillBodyIdle: backfillIdle
-        ) == true)
-    }
-
-    @Test("The keep-awake lock is HELD while any account's header walk is unfinished, including an account with no progress entry yet")
-    func heldWhileAnyHeaderWalkUnfinished() {
-        // `FastSyncView.holdAwake` maps a MISSING progress entry to `false`
-        // (`…?.headersDone == true`), so a not-yet-reporting account holds the lock.
-        #expect(FastSyncView.keepScreenAwakeWhileWorking(
-            accountHeadersDone: [true, false],
-            activeBodyIdle: true,
-            backfillBodyIdle: true
-        ) == true)
     }
 
     @Test("DECISION: the Sync Complete banner stays gated on isFullyComplete — one quarantined oversized body withholds it rather than claiming a complete mailbox")

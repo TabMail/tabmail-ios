@@ -82,7 +82,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | Manual Tag Teaching (Long-Press Context Menu) | [read in full](Companion/Memory/Current/062-manual-tag-teaching-long-press-context-menu.md) |
 | Tool Registry (Scaffold) | [read in full](Companion/Memory/Current/063-tool-registry-scaffold.md) |
 | Agent Chat (ADR-IOS-022, ADR-IOS-023) | [read in full](Companion/Memory/Current/064-agent-chat-adr-ios-022-adr-ios-023.md) |
-| Screen Keep-Awake (chat pill) | [read in full](Companion/Memory/Current/065-screen-keep-awake-chat-pill.md) |
+| Screen Keep-Awake (chat pill + Fast Sync full-view hold) | [read in full](Companion/Memory/Current/065-screen-keep-awake-chat-pill.md) |
 | Agent Compose FIFO Queue (ADR-IOS-030) | [read in full](Companion/Memory/Current/066-agent-compose-fifo-queue-adr-ios-030.md) |
 | Outgoing Threading — reply/forward stay in-thread on every provider (ADR-IOS-043, 2026-06-23) | [read in full](Companion/Memory/Current/067-outgoing-threading-reply-forward-stay-in-thread-on-every-provider-adr-io.md) |
 | Incoming Thread Detection — `ThreadDetection.findRelatedMessages` has NO subject-based fallback (by design) | [read in full](Companion/Memory/Current/068-incoming-thread-detection-threaddetection-findrelatedmessages-has-no-sub.md) |

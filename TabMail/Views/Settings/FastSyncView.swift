@@ -12,25 +12,6 @@ struct FastSyncView: View {
     @State private var refreshTick = 0
     private let refreshTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
-    // MARK: - Keep-awake state
-
-    /// Polled snapshots of each body queue's idle state (`ActiveBodyQueue.isIdle` /
-    /// `BackfillBodyQueue.isIdle` — queue empty AND no active batch). Start `false`
-    /// so the screen holds awake until the first poll confirms idle (fail-safe: an
-    /// un-polled screen never sleeps mid-fetch). The keep-awake lock follows the
-    /// queues' RUNNABLE state directly. A deterministic partial-fetch protocol
-    /// failure is persisted as terminal-unindexed and no longer remains runnable.
-    ///
-    /// Deliberately NO repopulation on poll and no admission latch: re-running both
-    /// full work-remaining scans every poll tick
-    /// (`BackfillBodyQueue.repopulateFromDatabase` is a ~200K-row scan) would drain
-    /// CPU/DB — the opposite of this screen's battery goal — and the
-    /// "repopulation-not-yet-run → lock releases" edge is acceptable (the device
-    /// sleeps; bodies fetch on the next foreground, no data loss). `SyncScheduler`
-    /// owns (re)populating the queues on wake.
-    @State private var activeBodyIdle = false
-    @State private var backfillBodyIdle = false
-
     /// True when all accounts have progress AND all are fully complete.
     ///
     /// `BackfillProgress.isFullyComplete` means the header walk ended and no body
@@ -39,50 +20,6 @@ struct FastSyncView: View {
     private var isAllComplete: Bool {
         let values = Array(state.backfillProgressByAccount.values)
         return !values.isEmpty && values.allSatisfy(\.isFullyComplete)
-    }
-
-    /// Keep-awake predicate. The device stays awake while there is RUNNABLE body
-    /// work, NOT while durable completeness is < 100%.
-    ///
-    /// This predicate follows the header walk plus the two body queues' idle
-    /// state. It releases when all runnable work drains, including when a row has
-    /// transitioned to the explicit terminal-unindexed state. Pure and
-    /// `nonisolated` so it is
-    /// assertable without driving SwiftUI. Holds awake when:
-    ///  - any account's header walk is not done (`headersDone != true`, including a
-    ///    missing progress entry — mapped to `false` by the caller), OR
-    ///  - either body queue is non-idle (queued / in-flight / active batch).
-    nonisolated static func keepScreenAwakeWhileWorking(
-        accountHeadersDone: [Bool],
-        activeBodyIdle: Bool,
-        backfillBodyIdle: Bool
-    ) -> Bool {
-        if accountHeadersDone.contains(false) { return true }
-        if !activeBodyIdle { return true }
-        if !backfillBodyIdle { return true }
-        return false
-    }
-
-    /// Live keep-awake value — maps the current SwiftUI state into the pure
-    /// predicate. `state.backfillProgressByAccount[$0.id]?.headersDone == true`
-    /// preserves the `?.headersDone != true` semantics (a missing progress entry ⇒
-    /// not-done ⇒ hold awake).
-    private var holdAwake: Bool {
-        Self.keepScreenAwakeWhileWorking(
-            accountHeadersDone: navigationStore.accounts.map {
-                state.backfillProgressByAccount[$0.id]?.headersDone == true
-            },
-            activeBodyIdle: activeBodyIdle,
-            backfillBodyIdle: backfillBodyIdle
-        )
-    }
-
-    /// Poll both body queues' idle state into `@State` for the keep-awake predicate.
-    /// No repopulation here — `SyncScheduler` owns (re)populating the queues on
-    /// foreground/wake; this screen only OBSERVES their runnable state.
-    private func refreshBodyQueueIdleState() async {
-        activeBodyIdle = await ActiveBodyQueue.shared.isIdle
-        backfillBodyIdle = await BackfillBodyQueue.shared.isIdle
     }
 
     private func formatETA(_ seconds: Double) -> String {
@@ -239,7 +176,7 @@ struct FastSyncView: View {
                 }
             }
         }
-        .keepScreenAwake(while: holdAwake)
+        .keepScreenAwake(while: true)
         .onAppear {
             Task { await manager.setFastSyncMode(true) }
             Task {
@@ -251,8 +188,6 @@ struct FastSyncView: View {
                     await manager.syncEngine.startBackfill(account: account)
                 }
             }
-            // Poll queue idle state for the keep-awake predicate.
-            Task { await refreshBodyQueueIdleState() }
         }
         .onDisappear { Task { await manager.setFastSyncMode(false) } }
         .onReceive(refreshTimer) { _ in
@@ -263,9 +198,6 @@ struct FastSyncView: View {
                     await manager.syncEngine.updateBackfillProgressForAccount(account)
                 }
             }
-            // Re-poll queue idle state so the keep-awake lock releases once the walk
-            // is done and the runnable queues drain.
-            Task { await refreshBodyQueueIdleState() }
         }
     }
 }
