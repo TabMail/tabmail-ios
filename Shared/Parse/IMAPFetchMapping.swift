@@ -5,6 +5,13 @@
 import Foundation
 import SwiftMail
 
+enum IMAPPartialFetchAssemblyError: Error, Equatable, Sendable {
+    case invalidExpectedSize(Int)
+    case invalidChunkSize(Int)
+    case chunkExceedsRequest(requested: Int, received: Int)
+    case prematureEnd(expected: Int, received: Int)
+}
+
 /// Pure helpers shared between the NSE's one-shot IMAP fetch and the main-app
 /// IMAP pipeline. Extracted into Shared/ so they compile into BOTH the TabMail
 /// and TabMailNotificationService targets, and are reachable from TabMailTests.
@@ -30,6 +37,119 @@ enum IMAPFetchMapping {
     /// made the limit a constructor parameter, so the fork is now a pure
     /// upstream mirror and the value lives here at the call sites instead.
     static let responseBufferLimit = 4 * 1024 * 1024
+
+    /// One MiB keeps each literal comfortably below the ordinary four-MiB
+    /// response parser limit while avoiding excessive command overhead.
+    static let bodyPartChunkSize = 1024 * 1024
+
+    /// BODYSTRUCTURE is enough for normal attachment rows. Background body
+    /// work downloads only render ingredients: visible text, calendar data, and
+    /// CID images. File attachments are fetched on demand.
+    static func isRequiredBodyPart(_ part: MessagePart) -> Bool {
+        let contentType = part.contentType.lowercased()
+        let disposition = part.disposition?.lowercased()
+        if contentType.hasPrefix("text/calendar") { return true }
+        if (contentType.hasPrefix("text/plain") || contentType.hasPrefix("text/html"))
+            && !isNormalAttachment(part) {
+            return true
+        }
+        return contentType.hasPrefix("image/")
+            && part.contentId != nil
+            && disposition != "attachment"
+    }
+
+    /// BODYSTRUCTURE flattens the children of `message/rfc822` parts into the
+    /// same array. A child text or CID part therefore has no disposition of its
+    /// own that reveals it belongs to an attached message. Exclude descendants
+    /// of normal attached messages component-wise; explicitly inline embedded
+    /// messages may still contribute render ingredients.
+    static func requiredBodyPartIndices(in parts: [MessagePart]) -> [Int] {
+        let attachedMessageSections = parts.compactMap { part -> [Int]? in
+            guard part.contentType.lowercased().hasPrefix("message/rfc822"),
+                  isNormalAttachment(part) else { return nil }
+            return part.section.components
+        }
+        return parts.indices.filter { index in
+            let components = parts[index].section.components
+            let belongsToAttachedMessage = attachedMessageSections.contains { parent in
+                components.count > parent.count
+                    && Array(components.prefix(parent.count)) == parent
+            }
+            return !belongsToAttachedMessage && isRequiredBodyPart(parts[index])
+        }
+    }
+
+    private static func isNormalAttachment(_ part: MessagePart) -> Bool {
+        let disposition = part.disposition?.lowercased()
+        let hasFilename = !(part.filename?.isEmpty ?? true)
+        return disposition == "attachment" || (hasFilename && disposition != "inline")
+    }
+
+    /// Concatenate transfer-encoded bytes first; callers decode once afterwards.
+    /// Decoding each chunk independently would corrupt base64 and quoted-printable
+    /// sequences that straddle a chunk boundary.
+    static func concatenateEncodedPart(
+        expectedSize: Int?,
+        chunkSize: Int = bodyPartChunkSize,
+        fetchChunk: (_ offset: Int, _ count: Int) async throws -> Data
+    ) async throws -> Data {
+        guard chunkSize > 0 else {
+            throw IMAPPartialFetchAssemblyError.invalidChunkSize(chunkSize)
+        }
+        if let expectedSize, expectedSize < 0 {
+            throw IMAPPartialFetchAssemblyError.invalidExpectedSize(expectedSize)
+        }
+        if expectedSize == 0 { return Data() }
+
+        var result = Data()
+        if let expectedSize { result.reserveCapacity(min(expectedSize, chunkSize)) }
+        var offset = 0
+
+        while true {
+            if let expectedSize, offset >= expectedSize { break }
+            let requested = expectedSize.map { min(chunkSize, $0 - offset) } ?? chunkSize
+            let chunk = try await fetchChunk(offset, requested)
+            guard chunk.count <= requested else {
+                throw IMAPPartialFetchAssemblyError.chunkExceedsRequest(
+                    requested: requested, received: chunk.count
+                )
+            }
+
+            if chunk.isEmpty {
+                try validatePartialEnd(expectedSize: expectedSize, received: offset)
+                break
+            }
+
+            result.append(chunk)
+            offset += chunk.count
+            // RFC partial FETCH count is a maximum. A short non-empty response
+            // still advances the origin; it is not proof of end-of-section.
+            // Known BODYSTRUCTURE sizes terminate at the loop guard. Unknown-
+            // size callers terminate only when the server returns an empty range.
+        }
+        return result
+    }
+
+    private static func validatePartialEnd(expectedSize: Int?, received: Int) throws {
+        guard let expectedSize, received != expectedSize else { return }
+        throw IMAPPartialFetchAssemblyError.prematureEnd(
+            expected: expectedSize,
+            received: received
+        )
+    }
+
+    static func isDeterministicPartialFetchFailure(_ error: Error) -> Bool {
+        if let partialError = error as? PartialFetchError {
+            switch partialError {
+                case .messageNotFound, .invalidRange:
+                    return false
+                default:
+                    return true
+            }
+        }
+        return error is IMAPPartialFetchAssemblyError
+            || String(describing: error).contains("PayloadTooLargeError")
+    }
 
     /// Build the `messageId` string used as `MessageHeader.messageId`.
     ///
@@ -135,7 +255,7 @@ enum IMAPFetchMapping {
                 filename: filename,
                 contentType: part.contentType,
                 section: part.section.description,
-                size: part.data?.count ?? 0,
+                size: part.size ?? part.data?.count ?? 0,
                 encoding: part.encoding
             )
         }
@@ -144,8 +264,8 @@ enum IMAPFetchMapping {
         // Server-parsed `message/rfc822` parts already have their children
         // visible at the top level (BODYSTRUCTURE exposes them at numeric
         // sub-sections like `2.1`, caught above). File-uploaded `.eml`s are
-        // opaque blobs server-side — the nested attachments only exist
-        // after we parse the bytes ourselves. `encoding` on each nested
+        // opaque blobs server-side, and their nested attachments are available
+        // only when a caller supplied the parent bytes on demand. `encoding` on each nested
         // entry is set to the PARENT's transfer encoding so tap-time
         // resolution can re-fetch parent bytes with the right encoding.
         for part in message.parts where EmlParsing.isEmlFilename(part.filename)
@@ -230,7 +350,8 @@ enum IMAPFetchMapping {
             $0.contentType.lowercased().hasPrefix("message/rfc822") ? $0.section.components : nil
         }
         return info.parts.compactMap { part in
-            guard part.contentType.lowercased().hasPrefix("text/html") else { return nil }
+            guard isRequiredBodyPart(part),
+                  part.contentType.lowercased().hasPrefix("text/html") else { return nil }
             let comp = part.section.components
             let nested = rfc822Sections.contains { rfc in
                 comp.count > rfc.count && Array(comp.prefix(rfc.count)) == rfc

@@ -18,10 +18,8 @@ struct FastSyncView: View {
     /// `BackfillBodyQueue.isIdle` — queue empty AND no active batch). Start `false`
     /// so the screen holds awake until the first poll confirms idle (fail-safe: an
     /// un-polled screen never sleeps mid-fetch). The keep-awake lock follows the
-    /// queues' RUNNABLE state directly — an oversized-only-incomplete account no
-    /// longer pins the device awake, because `handlePayloadTooLarge` takes the
-    /// quarantined item out of the queue (`QueueStorage.removeFromQueue`) and
-    /// `admit` never re-admits it, so the queues go idle.
+    /// queues' RUNNABLE state directly. A deterministic partial-fetch protocol
+    /// failure is persisted as terminal-unindexed and no longer remains runnable.
     ///
     /// Deliberately NO repopulation on poll and no admission latch: re-running both
     /// full work-remaining scans every poll tick
@@ -35,11 +33,9 @@ struct FastSyncView: View {
 
     /// True when all accounts have progress AND all are fully complete.
     ///
-    /// This is a TRUTH CLAIM about the mailbox and deliberately stays gated on
-    /// `BackfillProgress.isFullyComplete` (`pendingBodyCount == 0`): an account
-    /// holding a quarantined oversized body genuinely does not have every body
-    /// indexed, so the "Sync Complete" label stays withheld rather than lying.
-    /// Only the wake lock moved to the runnable-state predicate below.
+    /// `BackfillProgress.isFullyComplete` means the header walk ended and no body
+    /// remains runnable. A separate `unindexedBodyCount` keeps terminal failures
+    /// visible, so completion never implies that every body reached FTS.
     private var isAllComplete: Bool {
         let values = Array(state.backfillProgressByAccount.values)
         return !values.isEmpty && values.allSatisfy(\.isFullyComplete)
@@ -48,17 +44,10 @@ struct FastSyncView: View {
     /// Keep-awake predicate. The device stays awake while there is RUNNABLE body
     /// work, NOT while durable completeness is < 100%.
     ///
-    /// `ActiveBodyQueue.handlePayloadTooLarge` / `BackfillBodyQueue
-    /// .handlePayloadTooLarge` leave an oversized (`PayloadTooLargeError`) row
-    /// honestly `bodyComplete = 0 / bodyEmptyConfirmed = 0` — the body demonstrably
-    /// exists, it merely did not fit — so `BackfillProgress.pendingBodyCount` keeps
-    /// counting it and never reaches 0 for that account. The old
-    /// `keepScreenAwake(while: !isAllComplete)` gate therefore pinned the wake lock
-    /// indefinitely on any account holding a single oversized message. This
-    /// predicate instead follows the header walk plus the two body queues' idle
-    /// state, releasing once the walk is complete and the queues drain — the
-    /// quarantined rows are `removeFromQueue`'d and never re-admitted, so an
-    /// oversized-only remainder goes idle. Pure and `nonisolated` so it is
+    /// This predicate follows the header walk plus the two body queues' idle
+    /// state. It releases when all runnable work drains, including when a row has
+    /// transitioned to the explicit terminal-unindexed state. Pure and
+    /// `nonisolated` so it is
     /// assertable without driving SwiftUI. Holds awake when:
     ///  - any account's header walk is not done (`headersDone != true`, including a
     ///    missing progress entry — mapped to `false` by the caller), OR
@@ -90,9 +79,7 @@ struct FastSyncView: View {
 
     /// Poll both body queues' idle state into `@State` for the keep-awake predicate.
     /// No repopulation here — `SyncScheduler` owns (re)populating the queues on
-    /// foreground/wake; this screen only OBSERVES their runnable state so the wake
-    /// lock releases once the header walk is done and the queues drain (the
-    /// quarantined oversized rows having been removed from the queue).
+    /// foreground/wake; this screen only OBSERVES their runnable state.
     private func refreshBodyQueueIdleState() async {
         activeBodyIdle = await ActiveBodyQueue.shared.isIdle
         backfillBodyIdle = await BackfillBodyQueue.shared.isIdle
@@ -141,13 +128,14 @@ struct FastSyncView: View {
                     if !allProgress.isEmpty {
                         let totalEmails = allProgress.reduce(0) { $0 + $1.totalEmails }
                         let totalIndexed = allProgress.reduce(0) { $0 + $1.ftsIndexed }
+                        let totalUnindexed = allProgress.reduce(0) { $0 + $1.unindexedBodyCount }
                         let totalUidScope = allProgress.reduce(0) { $0 + $1.uidTotal }
                         let totalUidWalked = allProgress.reduce(0) { $0 + $1.uidWalked }
                         let allHeadersDone = allProgress.allSatisfy(\.headersDone)
                         // Show UID progress only while actively walking (not 100% AND not all done).
                         // Once UIDs hit 100% or headers are done, switch to FTS indexing view.
                         let showUidWalk = !allHeadersDone && totalUidScope > 0 && totalUidWalked < totalUidScope
-                        let fraction: Double = showUidWalk
+                        let fraction: Double = isAllComplete ? 1.0 : showUidWalk
                             ? min(1.0, Double(totalUidWalked) / Double(totalUidScope))
                             : (totalEmails > 0 ? min(1.0, Double(totalIndexed) / Double(totalEmails)) : 0.0)
 
@@ -158,6 +146,10 @@ struct FastSyncView: View {
                                 if showUidWalk {
                                     let pct = Int(Double(totalUidWalked) / Double(totalUidScope) * 100)
                                     Text("\(totalUidWalked.formatted()) / \(totalUidScope.formatted()) UIDs walked (\(pct)%)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                } else if isAllComplete && totalUnindexed > 0 {
+                                    Text(BodyIndexingProgressText.completion(unindexedCount: totalUnindexed))
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 } else if totalEmails > 0 {
@@ -211,7 +203,13 @@ struct FastSyncView: View {
 
                     // Completion state
                     if isAllComplete {
-                        Label("Sync Complete", systemImage: "checkmark.circle.fill")
+                        let totalUnindexed = state.backfillProgressByAccount.values.reduce(0) {
+                            $0 + $1.unindexedBodyCount
+                        }
+                        Label(
+                            BodyIndexingProgressText.completion(unindexedCount: totalUnindexed),
+                            systemImage: "checkmark.circle.fill"
+                        )
                             .font(.headline)
                             .foregroundStyle(.green)
                     }
@@ -263,7 +261,7 @@ struct FastSyncView: View {
                 }
             }
             // Re-poll queue idle state so the keep-awake lock releases once the walk
-            // is done and the queues drain (quarantined oversized rows removed).
+            // is done and the runnable queues drain.
             Task { await refreshBodyQueueIdleState() }
         }
     }
@@ -291,7 +289,9 @@ private struct FastSyncAccountCard: View {
             }
             if let progress {
                 if progress.isFullyComplete {
-                    Text("\(progress.totalEmails.formatted()) messages indexed")
+                    Text(progress.unindexedBodyCount > 0
+                         ? BodyIndexingProgressText.completion(unindexedCount: progress.unindexedBodyCount)
+                         : "\(progress.totalEmails.formatted()) messages indexed")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 } else {

@@ -31,6 +31,70 @@ enum BodyFetchProcessor {
         case payloadTooLarge
     }
 
+    /// Retire a deterministic background-indexing failure without claiming the
+    /// body was empty or indexed. Returns false when the row moved or could not
+    /// be corroborated, in which case the queue must retry instead of stamping a
+    /// stale address.
+    static func markBodyUnindexed(
+        item: Item,
+        reason: BodyIndexingFailureReason
+    ) async -> Bool {
+        do {
+            let refusal = try await AppDatabase.dbPool.write {
+                db -> BodyAddressGate.Refusal? in
+                guard let header = try MessageHeader.fetchOne(db, key: item.headerId),
+                      let account = try Account.fetchOne(db, key: item.accountId) else {
+                    return .verificationUnavailable
+                }
+                guard header.folderPath == item.folderPath,
+                      header.messageId == item.messageId else {
+                    return .fetchProvenanceMismatch
+                }
+                if let refusal = BodyAddressGate.refusal(
+                    id: header.id,
+                    accountId: item.accountId,
+                    folderPath: header.folderPath,
+                    messageId: header.messageId,
+                    provider: account.provider,
+                    storedRfc822MessageId: header.rfc822MessageId,
+                    fetchedRfc822MessageId: nil
+                ) {
+                    return refusal
+                }
+                try db.execute(
+                    sql: """
+                        UPDATE messageHeader
+                        SET bodyIndexingFailureReason = ?,
+                            bodyComplete = 0,
+                            bodyEmptyConfirmed = 0
+                        WHERE id = ? AND accountId = ? AND folderPath = ? AND messageId = ?
+                          AND headerComplete = 1
+                          AND bodyComplete = 0
+                          AND bodyEmptyConfirmed = 0
+                          AND bodyIndexingFailureReason IS NULL
+                        """,
+                    arguments: [
+                        reason.rawValue, item.headerId, item.accountId,
+                        item.folderPath, item.messageId,
+                    ]
+                )
+                return db.changesCount == 1 ? nil : .verificationUnavailable
+            }
+            if let refusal {
+                BackgroundSyncLogger.log(
+                    "[BodyFetch] REFUSED terminal-unindexed write — \(refusal.logDescription); retrying"
+                )
+                return false
+            }
+            return true
+        } catch {
+            if !error.isDatabaseSuspensionAbort {
+                print("[BodyFetch] Failed to record terminal-unindexed state: \(error)")
+            }
+            return false
+        }
+    }
+
     /// Fetch phase: provider.fetchMessage + render body. Provider-bound (network I/O).
     /// Returns the rendered MessageBody and extracted plain text, or an error result.
     struct FetchResult: Sendable {
@@ -344,6 +408,7 @@ enum BodyFetchProcessor {
                                 UPDATE messageHeader
                                 SET bodyEmptyConfirmed = 1,
                                     bodyComplete = 1,
+                                    bodyIndexingFailureReason = NULL,
                                     emptyFetchCount = emptyFetchCount + 1,
                                     summaryBlurb = 'This message has no content.',
                                     actionTag = ?,
@@ -417,6 +482,7 @@ enum BodyFetchProcessor {
                     END,
                     bodyComplete = 0,
                     bodyEmptyConfirmed = 0,
+                    bodyIndexingFailureReason = NULL,
                     emptyFetchCount = 0,
                     embeddingComplete = 0
                 WHERE id = ?
@@ -496,7 +562,7 @@ enum BodyFetchProcessor {
                     // misses against this header (e.g. IMAP flap). Now that we have real
                     // content, the miss chain is broken — start counting fresh next time.
                     try db.execute(
-                        sql: "UPDATE messageHeader SET snippet = ?, bodyComplete = 1, missFetchCount = 0 WHERE id = ?",
+                        sql: "UPDATE messageHeader SET snippet = ?, bodyComplete = 1, bodyIndexingFailureReason = NULL, missFetchCount = 0 WHERE id = ?",
                         arguments: [item.snippet, item.headerId]
                     )
                 }

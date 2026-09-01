@@ -2460,7 +2460,17 @@ final class FakeIMAPServer: @unchecked Sendable {
                         "BODY[\(section)]",
                         "BODY.PEEK[\(section)]"
                     ]
-                    if patterns.contains(where: { itemsStr.contains($0) }) {
+                    if let partial = patterns.compactMap({
+                        partialRange(in: itemsStr, after: $0)
+                    }).first {
+                        let start = min(partial.offset, bytes.count)
+                        let end = min(start + partial.count, bytes.count)
+                        let slice = bytes.subdata(in: start..<end)
+                        let str = String(data: slice, encoding: .utf8) ?? ""
+                        fetchItems.append(
+                            "BODY[\(section)]<\(partial.offset)> {\(slice.count)}\r\n\(str)"
+                        )
+                    } else if patterns.contains(where: { itemsStr.contains($0) }) {
                         let str = String(data: bytes, encoding: .utf8) ?? ""
                         fetchItems.append("BODY[\(section)] {\(bytes.count)}\r\n\(str)")
                     }
@@ -2472,6 +2482,23 @@ final class FakeIMAPServer: @unchecked Sendable {
 
         response += "\(tag) OK \(uidMode ? "UID " : "")FETCH completed\r\n"
         return response
+    }
+
+    /// Parse the request suffix in `BODY.PEEK[section]<offset.count>`.
+    /// The response echoes only `<offset>` per RFC 3501 §7.4.2.
+    private func partialRange(
+        in fetchItems: String,
+        after token: String
+    ) -> (offset: Int, count: Int)? {
+        guard let tokenRange = fetchItems.range(of: token) else { return nil }
+        let suffix = fetchItems[tokenRange.upperBound...]
+        guard suffix.first == "<", let close = suffix.firstIndex(of: ">") else { return nil }
+        let valueStart = suffix.index(after: suffix.startIndex)
+        let fields = suffix[valueStart..<close].split(separator: ".", omittingEmptySubsequences: false)
+        guard fields.count == 2,
+              let offset = Int(fields[0]), offset >= 0,
+              let count = Int(fields[1]), count > 0 else { return nil }
+        return (offset, count)
     }
 
     private func parseSequenceSet(_ seqStr: String, uidMode: Bool, messages: [Message]) -> [Message] {

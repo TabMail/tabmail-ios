@@ -35,6 +35,10 @@ struct BackfillProgress {
     /// counts a different population than what we store (see `isFullyComplete`).
     var pendingBodyCount: Int = 0
 
+    /// Bodies retired from automatic indexing with a truthful terminal reason.
+    /// These rows are not indexed and are not counted as pending work.
+    var unindexedBodyCount: Int = 0
+
     // EMA rate tracking — messages per second.
     var lastIndexedCount: Int = 0
     var lastRateUpdate: Date = .distantPast
@@ -46,6 +50,7 @@ struct BackfillProgress {
     /// UID walk progress is more accurate during backfill because UIDNEXT gives
     /// a known total scope, unlike FTS where the denominator keeps growing.
     var fractionComplete: Double {
+        if isFullyComplete { return 1.0 }
         if !headersDone && uidTotal > 0 {
             return min(1.0, Double(uidWalked) / Double(uidTotal))
         }
@@ -63,7 +68,8 @@ struct BackfillProgress {
     /// it's the dedup'd `messagesTotal` vs. our per-label rows. It can permanently
     /// exceed what we can ever store, so an `ftsIndexed >= totalEmails` gate would
     /// never be satisfiable and "Sync Complete" would never fire. `pendingBodyCount`
-    /// is local and self-terminating (empty/404/oversized bodies confirm-empty),
+    /// is local and self-terminating (empty/404 bodies confirm-empty; deterministic
+    /// protocol failures enter the separate terminal-unindexed state),
     /// so it reaches 0 once the body queues have nothing fetchable left.
     var isFullyComplete: Bool {
         headersDone && totalEmails > 0 && pendingBodyCount == 0
@@ -92,6 +98,14 @@ struct BackfillProgress {
             lastIndexedCount = ftsIndexed
             lastRateUpdate = now
         }
+    }
+}
+
+enum BodyIndexingProgressText {
+    static func completion(unindexedCount: Int) -> String {
+        guard unindexedCount > 0 else { return "Sync complete" }
+        let noun = unindexedCount == 1 ? "message" : "messages"
+        return "Sync complete with \(unindexedCount.formatted()) \(noun) not indexed"
     }
 }
 
@@ -1163,7 +1177,8 @@ actor AccountManager {
     func updateBackfillProgress(accountId: String, email: String, headersDone: Bool,
                                 isPaused: Bool, totalEmails: Int = 0, ftsIndexed: Int = 0,
                                 uidTotal: Int = 0, uidWalked: Int = 0,
-                                pendingBodyCount: Int = 0) {
+                                pendingBodyCount: Int = 0,
+                                unindexedBodyCount: Int = 0) {
         if var existing = _backfillBacking[accountId] {
             existing.headersDone = headersDone
             existing.isPaused = isPaused
@@ -1172,6 +1187,7 @@ actor AccountManager {
             existing.uidTotal = uidTotal
             existing.uidWalked = uidWalked
             existing.pendingBodyCount = pendingBodyCount
+            existing.unindexedBodyCount = unindexedBodyCount
             existing.updateRate()
             _backfillBacking[accountId] = existing
         } else {
@@ -1183,6 +1199,7 @@ actor AccountManager {
             progress.uidTotal = uidTotal
             progress.uidWalked = uidWalked
             progress.pendingBodyCount = pendingBodyCount
+            progress.unindexedBodyCount = unindexedBodyCount
             progress.lastIndexedCount = ftsIndexed
             progress.lastRateUpdate = Date()
             _backfillBacking[accountId] = progress

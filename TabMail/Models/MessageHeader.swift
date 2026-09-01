@@ -5,6 +5,10 @@
 import Foundation
 import GRDB
 
+enum BodyIndexingFailureReason: String, Sendable {
+    case partialFetchUnsupported = "partial_fetch_unsupported"
+}
+
 /// TabMail action tags. Raw values are plain action names ("delete", "archive", etc.).
 /// Action tags are local-only (ADR-IOS-036) — `MessageHeader.actionTag`,
 /// `MessageAICache.actionTag`, and Device Sync probe state. We no longer
@@ -175,6 +179,15 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     /// Reset by Smart Reindex to give previously-empty messages a fresh chance.
     var bodyEmptyConfirmed: Bool = false
 
+    /// Stable terminal reason explaining why this body could not be indexed.
+    ///
+    /// Unlike `bodyEmptyConfirmed`, this does NOT claim the server returned no
+    /// content, and unlike `bodyComplete`, it does NOT claim the body reached FTS.
+    /// A non-nil value retires the row from automatic body queues while keeping
+    /// the missing index entry truthful and visible in sync progress. Smart
+    /// Reindex clears it so a server/app upgrade gets another attempt.
+    var bodyIndexingFailureReason: String?
+
     /// How many times a body fetch returned empty (no text, no attachments).
     /// Used to guard against false empties from partial IMAP responses.
     /// bodyEmptyConfirmed is only set when emptyFetchCount >= 3.
@@ -279,6 +292,7 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
         self.hasAttachments = false
         self.isReplied = false
         self.isForwarded = false
+        self.bodyIndexingFailureReason = nil
     }
 }
 

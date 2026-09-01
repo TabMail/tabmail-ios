@@ -31,7 +31,7 @@ struct IMAPProviderMockNestedEmlTests {
     /// `.eml` filename and `BASE64` transfer encoding. `BODY[<section>]`
     /// returns base64-encoded bytes that decode to a multipart RFC 822
     /// containing a nested PDF.
-    @Test("fetchMessage + fetchAttachment round-trip for file-uploaded .eml with base64 transfer")
+    @Test("Background skips an opaque .eml; on-demand fetch preserves nested attachment access")
     func fileUploadedEmlBase64EndToEnd() async throws {
         let topHtml = "<p>TOP BODY</p>"
         let topHtmlBytes = Data(topHtml.utf8)
@@ -147,38 +147,44 @@ struct IMAPProviderMockNestedEmlTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        // === Part 1: fetchMessage surfaces marker + nested PDF ===
+        // === Part 1: background body fetch leaves the opaque .eml metadata-only ===
 
         let info = try await provider.fetchMessage(id: "77", folder: "INBOX")
         let html = try #require(info.htmlBody)
-        #expect(html.contains("class=\"tm-eml-section\""))
-        #expect(html.contains("data-filename=\"carrier.eml\""))
-        #expect(html.contains("data-subject=\"IMAP NESTED SUBJECT\""))
-        #expect(html.contains("NESTED BODY"))
+        #expect(html.contains("TOP BODY"))
+        #expect(!html.contains("tm-eml-section"))
+        #expect(!html.contains("NESTED BODY"))
+        #expect(info.attachments.allSatisfy { $0.filename != "imap-nested.pdf" })
 
-        let nested = info.attachments.first { $0.filename == "imap-nested.pdf" }
-        let pdfAtt = try #require(nested)
-        #expect(pdfAtt.parentEmlSection == "2")
+        let carrier = try #require(info.attachments.first { $0.filename == "carrier.eml" })
+        #expect(carrier.section == "2")
+        #expect(carrier.encoding?.lowercased() == "base64")
+
+        // === Part 2: tapping the .eml fetches and decodes its parent bytes ===
+
+        let fetchedParent = try await provider.fetchAttachment(
+            messageId: "77", folder: "INBOX",
+            section: carrier.section, encoding: carrier.encoding
+        )
+        #expect(fetchedParent == innerBytes)
+        let parsed = try #require(EmlParsing.parse(rawBytes: fetchedParent))
+        let nested = try #require(parsed.nested.first { $0.filename == "imap-nested.pdf" })
+
+        // === Part 3: an attachment selected inside that preview resolves through
+        // === the compound section and the same bounded parent-fetch path.      ===
+
         let expectedCompound = EmlParsing.nestedSection(parent: "2", index: 0)
-        #expect(pdfAtt.section == expectedCompound)
-        // The critical invariant: encoding is the PARENT's transfer encoding,
-        // not the nested attachment's. Tap-time dispatch uses this to
-        // base64-decode the parent correctly before EMLParser sees the bytes.
-        #expect(pdfAtt.encoding?.lowercased() == "base64")
-
-        // === Part 2: fetchAttachment compound path — parent's base64 ===
-        // === encoding is carried through the recursive call            ===
-
         let fetchedBytes = try await provider.fetchAttachment(
             messageId: "77", folder: "INBOX",
-            section: pdfAtt.section, encoding: pdfAtt.encoding
+            section: expectedCompound, encoding: carrier.encoding
         )
         let fetchedString = String(data: fetchedBytes, encoding: .utf8) ?? ""
+        #expect(nested.filename == "imap-nested.pdf")
         #expect(fetchedString.contains("%%SYNTHETIC-IMAP-PDF%%"))
     }
 
-    @Test("fetchMessage emits marker for nested message/rfc822 part with BODYSTRUCTURE recursion")
-    func nestedRfc822EmitsMarker() async throws {
+    @Test("Background excludes attached message/rfc822 descendants but keeps parent metadata")
+    func nestedRfc822RemainsMetadataOnly() async throws {
         // Top-level body (section 1) — text/html.
         let topHtml = "<p>TOP BODY TEXT</p>"
         let topHtmlBytes = Data(topHtml.utf8)
@@ -292,11 +298,13 @@ struct IMAPProviderMockNestedEmlTests {
             return
         }
 
-        // The whole point — htmlBody contains the top body AND the marker for
-        // the nested rfc822 part.
+        // The top-level render body is present, while the attached message and
+        // its flattened descendants remain metadata-only until explicitly opened.
         let html = try #require(info.htmlBody)
         #expect(html.contains("TOP BODY TEXT"))
-        #expect(html.contains("class=\"tm-eml-section\""))
-        #expect(html.contains("INNER BODY TEXT"))
+        #expect(html.contains("tm-eml-section"))
+        #expect(!html.contains("INNER BODY TEXT"))
+        let attachedMessage = try #require(info.attachments.first { $0.filename == "inner.eml" })
+        #expect(attachedMessage.section == "2")
     }
 }

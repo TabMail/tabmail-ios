@@ -1402,14 +1402,29 @@ struct PlannerStatisticsRefreshTests {
         return Fixture(pool: pool, directory: directory, path: path)
     }
 
-    /// The row count `ANALYZE` last recorded for `table`, read out of `sqlite_stat1`.
-    /// `nil` when statistics have never been computed (the table does not exist yet)
-    /// or when they do not cover this table.
+    /// The row count `ANALYZE` last recorded for `table`. Prefer the table row or
+    /// a non-partial index; the migration-time empty-table fixture can contain
+    /// only a partial-index statistic, so fall back to it when no full statistic
+    /// exists. Once a real `ANALYZE` creates full statistics, their population is
+    /// the table count and must win over the intentionally smaller partial index.
     private func recordedRowCount(_ pool: DatabasePool, table: String) throws -> Int? {
         try pool.read { db in
             guard try db.tableExists("sqlite_stat1") else { return nil }
             let stat = try String.fetchOne(
-                db, sql: "SELECT stat FROM sqlite_stat1 WHERE tbl = ? LIMIT 1", arguments: [table])
+                db,
+                sql: """
+                    SELECT s.stat
+                    FROM sqlite_stat1 AS s
+                    LEFT JOIN pragma_index_list(?) AS i ON i.name = s.idx
+                    WHERE s.tbl = ?
+                    ORDER BY CASE
+                        WHEN s.idx IS NULL OR i.partial = 0 THEN 0
+                        ELSE 1
+                    END, s.idx
+                    LIMIT 1
+                    """,
+                arguments: [table, table]
+            )
             guard let leading = stat?.split(separator: " ").first else { return nil }
             return Int(leading)
         }

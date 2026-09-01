@@ -1053,6 +1053,10 @@ struct V70CrossStoreInvariantTests {
         #expect(untagged?.actionTagSetAt == nil, "no tag means nothing to stamp")
 
         // The going-forward side: v81 relaxes history, not the invariant.
+        // Bring the fixture to the current schema before inserting the current
+        // MessageHeader model; later nullable columns do not change v81's stamp
+        // semantics, but PersistableRecord correctly includes them in INSERTs.
+        try afterMigrator.migrate(db)
         var fresh = MessageHeader(
             messageId: "81-post-upgrade", subject: "s", from: "Sender",
             fromAddress: "sender@example.com", to: "recipient@example.com",

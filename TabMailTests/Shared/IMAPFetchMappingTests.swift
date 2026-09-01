@@ -79,6 +79,20 @@ struct IMAPFetchMappingTests {
         #expect(!IMAPFetchMapping.hasTopLevelHTMLBodyPart(info: info))
     }
 
+    @Test("hasTopLevelHTMLBodyPart: false for an attached HTML file")
+    func attachedHTMLIsNotDisplayBody() {
+        var info = makeInfo()
+        info.parts = [
+            MessagePart(
+                sectionString: "1",
+                contentType: "text/html",
+                disposition: "attachment",
+                filename: "document.html"
+            )
+        ]
+        #expect(!IMAPFetchMapping.hasTopLevelHTMLBodyPart(info: info))
+    }
+
     @Test("hasTopLevelHTMLBodyPart: false when html exists ONLY inside an attached .eml")
     func htmlOnlyNestedInRfc822IsNotTopLevel() {
         // A plain-text message with an attached .eml whose body is HTML. The HTML

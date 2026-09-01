@@ -294,6 +294,7 @@ struct SettingsView: View {
                 let allProgress = Array(state.backfillProgressByAccount.values)
                 let totalEmails = allProgress.reduce(0) { $0 + $1.totalEmails }
                 let totalIndexed = allProgress.reduce(0) { $0 + $1.ftsIndexed }
+                let totalUnindexed = allProgress.reduce(0) { $0 + $1.unindexedBodyCount }
                 let isComplete = !allProgress.isEmpty && allProgress.allSatisfy(\.isFullyComplete)
 
                 if !allProgress.isEmpty {
@@ -301,7 +302,7 @@ struct SettingsView: View {
                     let totalUidWalked = allProgress.reduce(0) { $0 + $1.uidWalked }
                     let allHeadersDone = allProgress.allSatisfy(\.headersDone)
                     // During header walk: show UID progress. After: show FTS indexing.
-                    let fraction: Double = (!allHeadersDone && totalUidScope > 0)
+                    let fraction: Double = isComplete ? 1.0 : (!allHeadersDone && totalUidScope > 0)
                         ? min(1.0, Double(totalUidWalked) / Double(totalUidScope))
                         : (totalEmails > 0 ? min(1.0, Double(totalIndexed) / Double(totalEmails)) : 0.0)
                     VStack(alignment: .leading, spacing: 6) {
@@ -311,6 +312,10 @@ struct SettingsView: View {
                             if !allHeadersDone && totalUidScope > 0 {
                                 let pct = Int(Double(totalUidWalked) / Double(totalUidScope) * 100)
                                 Text("\(totalUidWalked.formatted()) / \(totalUidScope.formatted()) UIDs (\(pct)%)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            } else if isComplete && totalUnindexed > 0 {
+                                Text(BodyIndexingProgressText.completion(unindexedCount: totalUnindexed))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             } else if totalEmails > 0 {

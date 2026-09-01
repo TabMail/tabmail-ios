@@ -1999,7 +1999,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v87 RANGE ─────────────────────
+        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v88 RANGE ─────────────────────
         //
         // `registerTimedMigration`'s DEFAULT stays `.deferred` and is NOT
         // changed. v1…v67 have never been adjudicated for `.immediate` safety,
@@ -2071,6 +2071,8 @@ final class AppDatabase: Sendable {
         //   • v87 — drops only v85/v86's direct-AI triggers, sparse index and two
         //     non-key marker columns. It neither reads nor rewrites an FK-bearing
         //     value; existing derived-work markers are intentionally discarded.
+        //   • v88 — adds one nullable non-key messageHeader column and a partial
+        //     index. Neither statement writes a parent or child key.
         //
         //   • v82 — `DROP`/`CREATE` of `userLabel` + `messageUserLabel`. FK-clean
         //     per statement, verified statement by statement in that migration's own
@@ -2081,16 +2083,16 @@ final class AppDatabase: Sendable {
         //     the body safe.
         //
         // ⚑ AMENDED 2026-08-06, RANGE RE-DERIVED AT R17-6 — **EVERY MIGRATION IN
-        // v68…v87 NOW RUNS `.immediate`, so this range runs ZERO whole-database
+        // v68…v88 NOW RUNS `.immediate`, so this range runs ZERO whole-database
         // foreign-key checks.** The range is an OPEN interval that moves with the
         // top of the chain, so it is re-derived rather than restated (`MIS-031` — a
         // sentence that enumerates is a cache, and this one had gone stale at `v84`
         // in five places at once). Comments excluded so this paragraph cannot
         // satisfy its own predicate (`MIS-033`, `IOS-DOC-002`):
         //   rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' \
-        //      TabMail/Services/AppDatabase.swift                            → 20
+        //      TabMail/Services/AppDatabase.swift                            → 21
         //   rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' \
-        //      TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 20
+        //      TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 21
         // Equal counts are the invariant: every migration from v68 to the top runs
         // `.immediate`, and none below v68 does. The sentence
         // that stood here said *"`v71` and `v82` stay `.deferred`, each for a
@@ -3013,7 +3015,12 @@ final class AppDatabase: Sendable {
             //          `.deferred`, **66** default ⇒ **67 of 87** end with the
             //          whole-database check and 20 do not. The 67 is unchanged
             //          because v87 joined the immediate side.
-            //          ⚠️ THIS MIGRATION IS ONE OF THE 20: reason (b) below is now a
+            //          Re-derived after v88: **88** registered, **21** explicit
+            //          `.immediate` (v68…v88, contiguous), **1** explicit
+            //          `.deferred`, **66** default ⇒ **67 of 88** end with the
+            //          whole-database check and 21 do not. The 67 is unchanged
+            //          because v88 joined the immediate side.
+            //          ⚠️ THIS MIGRATION IS ONE OF THE 21: reason (b) below is now a
             //          statement about migrations that
             //          ran on shipped devices long ago, not about this chain.
             //          Confirmed against GRDB's own
@@ -3681,6 +3688,34 @@ final class AppDatabase: Sendable {
             try db.execute(sql: "DROP INDEX IF EXISTS messageHeader_directAIPending")
             try db.execute(sql: "ALTER TABLE messageHeader DROP COLUMN aiDirectPending")
             try db.execute(sql: "ALTER TABLE messageAICache DROP COLUMN aiDirectPending")
+        }
+
+        // v88 — record terminal body-indexing failures without misclassifying
+        // real server content as empty or indexed.
+        //
+        // The partial-fetch path can prove that a server ignored or malformed a
+        // requested BODY.PEEK range. Retrying that deterministic protocol failure
+        // forever leaves Fast Sync permanently active. This nullable reason is a
+        // separate truth state: bodyComplete remains false, bodyEmptyConfirmed
+        // remains false, and automatic queues exclude the row until Smart Reindex
+        // explicitly clears the reason.
+        migrator.registerTimedMigration(
+            "v88_addBodyIndexingFailureReason", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "messageHeader") { t in
+                t.add(column: "bodyIndexingFailureReason", .text)
+            }
+            // Match the queue predicate exactly. At steady state this index is
+            // empty; on upgrade it contains only genuinely pending rows rather
+            // than duplicating the entire large messageHeader table.
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_bodyIndexingQueue
+                ON messageHeader(isInInbox, date)
+                WHERE headerComplete = 1
+                  AND bodyComplete = 0
+                  AND bodyEmptyConfirmed = 0
+                  AND bodyIndexingFailureReason IS NULL
+                """)
         }
     }
 

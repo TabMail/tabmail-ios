@@ -172,6 +172,7 @@ extension SyncEngine {
                 try String.fetchAll(db, sql: """
                     SELECT id FROM messageHeader
                     WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0
+                      AND bodyIndexingFailureReason IS NULL
                     LIMIT 5000
                     """)
             }
@@ -291,12 +292,14 @@ extension SyncEngine {
                     return try String.fetchAll(db, sql: """
                         SELECT id FROM messageHeader
                         WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0
+                          AND bodyIndexingFailureReason IS NULL
                           AND id LIKE ?
                         """, arguments: ["\(prefix)%"])
                 }
                 return try String.fetchAll(db, sql: """
                     SELECT id FROM messageHeader
                     WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0
+                      AND bodyIndexingFailureReason IS NULL
                     """)
             }
             var healed = 0

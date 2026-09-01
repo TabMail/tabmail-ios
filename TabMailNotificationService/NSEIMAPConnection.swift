@@ -15,9 +15,9 @@ import SwiftMail
 /// Memory notes:
 ///   • SwiftMail pulls in SwiftNIO + NIOSSL. Static-link overhead ~2–4 MB
 ///     per architecture. Per-live-connection RSS ~1–2 MB steady-state.
-///   • We SELECT a single mailbox (INBOX) and issue a single UID SEARCH +
-///     UID FETCH. No BODYSTRUCTURE walking beyond what SwiftMail does
-///     internally for `fetchMessage(from:)`.
+///   • We SELECT a single mailbox (INBOX), issue one UID SEARCH and one
+///     BODYSTRUCTURE fetch, then fetch only render-required MIME parts in
+///     bounded chunks. Normal attachment payloads are never loaded here.
 ///
 /// Safety notes:
 ///   • No credentials are ever logged. We redact email/username in the
@@ -144,7 +144,22 @@ enum NSEIMAPConnection {
 
         let message: Message
         do {
-            message = try await server.fetchMessage(from: info)
+            var parts = info.parts
+            for index in IMAPFetchMapping.requiredBodyPartIndices(in: parts) {
+                let section = parts[index].section
+                let expectedSize = parts[index].size
+                parts[index].data = try await IMAPFetchMapping.concatenateEncodedPart(
+                    expectedSize: expectedSize
+                ) { offset, count in
+                    try await server.fetchPart(
+                        section: section,
+                        of: uid,
+                        offset: offset,
+                        count: count
+                    )
+                }
+            }
+            message = Message(header: info, parts: parts)
         } catch {
             NSELog.step("NSE IMAP FETCH message failed: \(String(describing: error))")
             return nil

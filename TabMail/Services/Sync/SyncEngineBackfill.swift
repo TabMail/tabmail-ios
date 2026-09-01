@@ -174,9 +174,17 @@ extension SyncEngine {
                     Column("backfillPageToken").set(to: nil as String?)
                 )
         }
-        // Reset bodyEmptyConfirmed — gives previously-empty messages a fresh chance
+        // Reset body terminal states — gives previously-empty and previously
+        // server-incompatible messages a fresh chance after an app/server update.
         try? await AppDatabase.backgroundPool.write { db in
-            try db.execute(sql: "UPDATE messageHeader SET bodyEmptyConfirmed = 0, emptyFetchCount = 0, bodyComplete = 0 WHERE bodyEmptyConfirmed = 1")
+            try db.execute(sql: """
+                UPDATE messageHeader
+                SET bodyEmptyConfirmed = 0,
+                    bodyIndexingFailureReason = NULL,
+                    emptyFetchCount = 0,
+                    bodyComplete = 0
+                WHERE bodyEmptyConfirmed = 1 OR bodyIndexingFailureReason IS NOT NULL
+                """)
         }
         // Reset cc/bcc backfill flag so existing messages get cc/bcc populated
         UserDefaults.standard.set(false, forKey: "ccBccBackfillDone")
@@ -325,7 +333,7 @@ extension SyncEngine {
         let headersDone = incompleteFolders == 0
 
         // GRDB is sole authority for body status flags
-        let (grdbTotal, grdbIndexed, pendingBody) = (try? await dbPool.read { db -> (Int, Int, Int) in
+        let (grdbTotal, grdbIndexed, pendingBody, unindexedBody) = (try? await dbPool.read { db -> (Int, Int, Int, Int) in
             let total = try MessageHeader.filter(Column("accountId") == accountId).fetchCount(db)
             let indexed = try MessageHeader.filter(
                 Column("accountId") == accountId &&
@@ -339,10 +347,15 @@ extension SyncEngine {
                 Column("accountId") == accountId &&
                 Column("headerComplete") == true &&
                 Column("bodyComplete") == false &&
-                Column("bodyEmptyConfirmed") == false
+                Column("bodyEmptyConfirmed") == false &&
+                Column("bodyIndexingFailureReason") == nil
             ).fetchCount(db)
-            return (total, indexed, pending)
-        }) ?? (0, 0, 1)   // pending=1 on read failure → never false-complete
+            let unindexed = try MessageHeader.filter(
+                Column("accountId") == accountId &&
+                Column("bodyIndexingFailureReason") != nil
+            ).fetchCount(db)
+            return (total, indexed, pending, unindexed)
+        }) ?? (0, 0, 1, 0)   // pending=1 on read failure → never false-complete
 
         // Gmail/Exchange: uidTotal is 0 (no IMAP UIDs). Use the server-reported
         // total as the denominator ONLY WHILE STILL CRAWLING, so the bar reflects
@@ -382,7 +395,8 @@ extension SyncEngine {
                 headersDone: headersDone, isPaused: false,
                 totalEmails: totalEmails, ftsIndexed: ftsIndexed,
                 uidTotal: uidTotal, uidWalked: uidWalked,
-                pendingBodyCount: pendingBody
+                pendingBodyCount: pendingBody,
+                unindexedBodyCount: unindexedBody
             )
     }
 
