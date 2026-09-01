@@ -3529,7 +3529,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let uids = results.toArray()
         guard let uid = uids.first else { throw ProviderError.messageNotFound }
 
-        let info = try await server.fetchMessageInfo(for: uid)
+        let info = try await server.fetchMessageInfo(
+            for: uid,
+            options: IMAPFetchMapping.bodyFetchMetadataOptions
+        )
         guard let info else { throw ProviderError.messageNotFound }
 
         var parts = info.parts
@@ -3779,7 +3782,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             let tStruct = CFAbsoluteTimeGetCurrent()
             var uidSet = UIDSet()
             for (_, uid) in uidPairs { uidSet.insert(UID(uid)) }
-            let infos = try await server.fetchMessageInfosBulk(using: uidSet)
+            let infos = try await server.fetchMessageInfosBulk(
+                using: uidSet,
+                options: IMAPFetchMapping.bodyFetchMetadataOptions
+            )
             let structMs = Int((CFAbsoluteTimeGetCurrent() - tStruct) * 1000)
             if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch BODYSTRUCTURE: \(infos.count)/\(uidPairs.count) returned in \(structMs)ms") }
 
@@ -5308,7 +5314,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             guard let uid = results.toArray().first else { throw ProviderError.messageNotFound }
 
             let mimeSection = Section(section)
-            guard let info = try await server.fetchMessageInfo(for: uid) else {
+            guard let info = try await server.fetchMessageInfo(
+                for: uid,
+                options: IMAPFetchMapping.bodyFetchMetadataOptions
+            ) else {
                 throw ProviderError.messageNotFound
             }
             try Self.requireAttachmentFetchIdentity(

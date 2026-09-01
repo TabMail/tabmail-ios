@@ -17,13 +17,19 @@ struct IMAPChunkedBodyFetchTests {
         )
     }
 
-    private func multipartMessage(uid: Int = 501) -> (
+    private func multipartMessage(
+        uid: Int = 501,
+        headerPaddingBytes: Int = 0
+    ) -> (
         message: FakeIMAPServer.Message,
         text: Data,
         attachmentAdvertisedSize: Int
     ) {
         let text = Data(repeating: Character("a").asciiValue!, count: 1024 * 1024 + 17)
         let attachmentSize = 34 * 1024 * 1024
+        let paddingHeader = headerPaddingBytes > 0
+            ? "X-Oversized-Padding: \(String(repeating: "h", count: headerPaddingBytes))\r\n"
+            : ""
         let header = """
         From: Sender <sender@example.com>\r
         To: Recipient <recipient@example.com>\r
@@ -31,6 +37,7 @@ struct IMAPChunkedBodyFetchTests {
         Date: Thu, 02 Oct 2025 01:50:00 +0000\r
         Message-ID: <bounded-batch@example.com>\r
         Content-Type: multipart/mixed; boundary="bounded"\r
+        \(paddingHeader)
         \r
 
         """
@@ -51,6 +58,47 @@ struct IMAPChunkedBodyFetchTests {
             partBodies: ["1": text, "2": Data("not downloaded".utf8)]
         )
         return (message, text, attachmentSize)
+    }
+
+    @Test("Body metadata fetch omits an oversized raw header before chunking")
+    func bodyMetadataDoesNotFetchRawHeader() async throws {
+        let fixture = multipartMessage(
+            headerPaddingBytes: IMAPFetchMapping.responseBufferLimit + 1024
+        )
+        let server = FakeIMAPServer(messages: [fixture.message])
+        try server.start()
+        defer { server.stop() }
+
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let fetched = try await provider.fetchMessagesBatch(ids: ["501"], folder: "INBOX")
+        #expect(fetched["501"]?.textBody?.utf8.count == fixture.text.count)
+
+        let single = try await provider.fetchMessage(id: "501", folder: "INBOX")
+        #expect(single.textBody?.utf8.count == fixture.text.count)
+
+        let onDemand = try await provider.fetchAttachment(
+            messageId: "501",
+            folder: "INBOX",
+            section: "1",
+            encoding: nil,
+            expectedObservedUidValidity: 1,
+            expectedRfc822MessageId: "bounded-batch@example.com"
+        )
+        #expect(onDemand == fixture.text)
+
+        let commands = server.recordedCommands()
+        #expect(commands.contains { $0.contains("BODYSTRUCTURE") })
+        #expect(!commands.contains { command in
+            command.contains("BODY.PEEK[HEADER]") || command.contains("BODY[HEADER]")
+        })
+        #expect(IMAPFetchMapping.bodyFetchMetadataOptions.contains(.envelope))
+        #expect(IMAPFetchMapping.bodyFetchMetadataOptions.contains(.internalDate))
+        #expect(IMAPFetchMapping.bodyFetchMetadataOptions.contains(.flags))
+        #expect(IMAPFetchMapping.bodyFetchMetadataOptions.contains(.bodyStructure))
+        #expect(!IMAPFetchMapping.bodyFetchMetadataOptions.contains(.fullHeader))
     }
 
     @Test("Background selection downloads render ingredients but not normal attachments")

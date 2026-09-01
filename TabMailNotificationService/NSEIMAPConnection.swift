@@ -132,7 +132,10 @@ enum NSEIMAPConnection {
         // Fetch the one message the push pointed us at.
         let info: MessageInfo?
         do {
-            info = try await server.fetchMessageInfo(for: uid)
+            info = try await server.fetchMessageInfo(
+                for: uid,
+                options: IMAPFetchMapping.bodyFetchMetadataOptions
+            )
         } catch {
             NSELog.step("NSE IMAP FETCH info failed: \(String(describing: error))")
             return nil

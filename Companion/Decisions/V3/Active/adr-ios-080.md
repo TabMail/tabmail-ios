@@ -21,6 +21,9 @@ rows empty or complete would lie about server content that was never fetched.
    body literals and responses larger than the requested count while draining the wire safely.
 2. **The app fetches required parts in one-MiB chunks.** Transfer-encoded bytes are concatenated
    before base64 or quoted-printable decoding, because encoded units can straddle a chunk boundary.
+   The metadata preflight explicitly requests ENVELOPE, INTERNALDATE, FLAGS and BODYSTRUCTURE; it
+   does not use SwiftMail's default full-header option because `BODY.PEEK[HEADER]` is itself an
+   unbounded literal and existing stored headers remain authoritative for non-ENVELOPE fields.
    A BODYSTRUCTURE size is a planning hint, not truncation authority: after reaching it, the app
    probes one byte at the advertised endpoint and accepts completion only when the server returns
    an empty range. Where size is unavailable, a short nonempty response is not treated as EOF and
@@ -74,8 +77,9 @@ server's current protocol behaviour.
 **Tests / evidence.** SwiftMail wire tests reconstruct a body larger than 32 MiB under a four-MiB
 parser buffer and cover ignored/malformed ranges, wrong identity/section/origin, oversized and
 duplicate literals, UID ordering, and unsolicited FETCH updates. iOS tests cover encoded-boundary
-assembly, understated and unknown BODYSTRUCTURE sizes, payload selection on the provider's wire hot
-path, on-demand `.eml` fetching, NSE admission/state transitions, identity-safe terminal writes,
+assembly, oversized raw-header exclusion, understated and unknown BODYSTRUCTURE sizes, payload
+selection on the provider's wire hot path, on-demand `.eml` fetching, NSE admission/state
+transitions, identity-safe terminal writes,
 queue convergence, migration/default state, queue exclusion, Smart Reindex recovery, and exact
 completion wording.
 

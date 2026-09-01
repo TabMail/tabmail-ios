@@ -43,6 +43,16 @@ enum IMAPFetchMapping {
     /// response parser limit while avoiding excessive command overhead.
     static let bodyPartChunkSize = 1024 * 1024
 
+    /// Metadata required to render/index a message body without requesting the
+    /// unbounded raw `BODY.PEEK[HEADER]` literal included by SwiftMail's
+    /// `.default` options. ENVELOPE carries the identity/address fields used by
+    /// body processing; BODYSTRUCTURE supplies the MIME tree and attachment
+    /// metadata. Existing stored headers remain authoritative for fields such
+    /// as References that are not part of ENVELOPE.
+    static let bodyFetchMetadataOptions: FetchMessageInfoOptions = [
+        .envelope, .internalDate, .flags, .bodyStructure,
+    ]
+
     /// BODYSTRUCTURE is enough for normal attachment rows. Background body
     /// work downloads only render ingredients: visible text, calendar data, and
     /// CID images. File attachments are fetched on demand.
