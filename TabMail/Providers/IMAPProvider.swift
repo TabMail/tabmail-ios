@@ -3648,24 +3648,23 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             }
         }
 
-        // Extract CID inline images — data is already fetched by SwiftMail.
-        // Use decodedData() to handle content transfer encoding (base64, quoted-printable)
-        // before we re-encode as data: URI in AccountManagerFetch.
-        let inlineImages: [InlineImage] = message.cids.prefix(SyncConfig.maxInlineImages).compactMap { part in
-            guard let rawId = part.contentId, let data = part.decodedData() else { return nil }
-            // Strip angle brackets + whitespace: "< image001@host >" → "image001@host"
-            let contentId = rawId.trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !contentId.isEmpty else { return nil }
-            return InlineImage(contentId: contentId, contentType: part.contentType, data: data)
+        let inlineImages = IMAPFetchMapping.extractInlineImages(
+            message: message,
+            maxInlineImages: SyncConfig.maxInlineImages,
+            eligibleSections: renderIngredientSections
+        ).map { image in
+            InlineImage(
+                contentId: image.contentId,
+                contentType: image.contentType,
+                data: image.data
+            )
         }
 
         // Extract ICS calendar data from already-fetched parts (avoids re-fetch in renderBody)
-        let icsData: Data? = message.parts.first(where: {
-            renderIngredientSections.contains($0.section.description)
-                && $0.contentType.lowercased().contains("text/calendar")
-        })?.decodedData()
+        let icsData = IMAPFetchMapping.extractICSData(
+            message: message,
+            eligibleSections: renderIngredientSections
+        )
 
         // Log body part structure for debugging embedded .eml rendering.
         //

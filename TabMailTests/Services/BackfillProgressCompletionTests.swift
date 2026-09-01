@@ -96,6 +96,10 @@ struct BackfillProgressCompletionTests {
         #expect(p.fractionComplete == 1.0)
         #expect(BodyIndexingProgressText.completion(unindexedCount: 2)
                 == "Sync complete with 2 messages not indexed")
+        #expect(BodyIndexingProgressText.terminalCompletion(
+            isComplete: p.isFullyComplete,
+            unindexedCount: p.unindexedBodyCount
+        ) == "Sync complete with 2 messages not indexed")
     }
 
     @Test("Terminal completion text handles singular and clean completion")
@@ -103,6 +107,14 @@ struct BackfillProgressCompletionTests {
         #expect(BodyIndexingProgressText.completion(unindexedCount: 0) == "Sync complete")
         #expect(BodyIndexingProgressText.completion(unindexedCount: 1)
                 == "Sync complete with 1 message not indexed")
+        #expect(BodyIndexingProgressText.terminalCompletion(
+            isComplete: false,
+            unindexedCount: 1
+        ) == nil)
+        #expect(BodyIndexingProgressText.terminalCompletion(
+            isComplete: true,
+            unindexedCount: 0
+        ) == nil)
     }
 
     @Test("Display fraction is unchanged (still ftsIndexed / totalEmails)")

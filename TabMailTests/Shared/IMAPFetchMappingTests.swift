@@ -443,4 +443,52 @@ struct IMAPFetchMappingTests {
         let keywords = IMAPFetchMapping.customKeywords(from: info)
         #expect(keywords == ["tm_reply", "$Important"])
     }
+
+    @Test("Metadata-only CIDs do not consume the fetched inline-image cap")
+    func inlineImageCapAppliesAfterEligibilityAndDataFiltering() {
+        let message = makeMessage(parts: [
+            MessagePart(
+                sectionString: "2.1",
+                contentType: "image/png",
+                disposition: "inline",
+                contentId: "nested@example.com"
+            ),
+            MessagePart(
+                sectionString: "3",
+                contentType: "image/png",
+                disposition: "inline",
+                contentId: "outer@example.com",
+                data: Data("outer".utf8)
+            ),
+        ])
+
+        let images = IMAPFetchMapping.extractInlineImages(
+            message: message,
+            maxInlineImages: 1,
+            eligibleSections: ["3"]
+        )
+        #expect(images.count == 1)
+        #expect(images.first?.contentId == "outer@example.com")
+        #expect(images.first?.data == Data("outer".utf8))
+    }
+
+    @Test("A skipped nested calendar cannot hide a fetched top-level invite")
+    func calendarExtractionChoosesFirstFetchedEligiblePart() {
+        let topLevelICS = Data("BEGIN:VCALENDAR\r\nEND:VCALENDAR".utf8)
+        let message = makeMessage(parts: [
+            MessagePart(sectionString: "2.1", contentType: "text/calendar", size: 900),
+            MessagePart(
+                sectionString: "3",
+                contentType: "text/calendar",
+                size: topLevelICS.count,
+                data: topLevelICS
+            ),
+        ])
+
+        #expect(IMAPFetchMapping.extractICSData(
+            message: message,
+            eligibleSections: ["3"]
+        ) == topLevelICS)
+        #expect(IMAPFetchMapping.extractICSData(message: message) == topLevelICS)
+    }
 }

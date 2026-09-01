@@ -314,8 +314,11 @@ struct SettingsView: View {
                                 Text("\(totalUidWalked.formatted()) / \(totalUidScope.formatted()) UIDs (\(pct)%)")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
-                            } else if isComplete && totalUnindexed > 0 {
-                                Text(BodyIndexingProgressText.completion(unindexedCount: totalUnindexed))
+                            } else if let terminalText = BodyIndexingProgressText.terminalCompletion(
+                                isComplete: isComplete,
+                                unindexedCount: totalUnindexed
+                            ) {
+                                Text(terminalText)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             } else if totalEmails > 0 {

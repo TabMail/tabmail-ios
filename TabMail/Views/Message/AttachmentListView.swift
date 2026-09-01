@@ -28,6 +28,11 @@ enum EmlAttachmentPreviewLoader {
         fetch: @Sendable () async throws -> Data
     ) async throws -> Payload {
         let bytes = try await fetch()
+        // Provider cancellation is cooperative and a socket read may still
+        // return bytes after the view that initiated it has disappeared. Stop
+        // before parsing/presentation so a torn-down caller cannot acquire the
+        // global PreviewFreezeGate with no live sheet left to release it.
+        try Task.checkCancellation()
         guard let parsed = EmlParsing.parse(rawBytes: bytes) else {
             throw LoadError.invalidMessage
         }
@@ -64,6 +69,7 @@ struct AttachmentListView: View {
     @State private var downloadedFiles: [String: URL] = [:]
     @State private var emlPreview: EmlPreviewState?
     @State private var error: String?
+    @State private var emlDownloadTask: Task<Void, Never>?
 
     private let manager = AccountManager.shared
 
@@ -196,6 +202,8 @@ struct AttachmentListView: View {
             }
         }
         .onDisappear {
+            emlDownloadTask?.cancel()
+            emlDownloadTask = nil
             // Safety net: if the view tears down with the .eml sheet still
             // presented, release the gate so the app doesn't stay frozen. The
             // QuickLook path is imperative (AttachmentQuickLook owns its own gate
@@ -213,9 +221,10 @@ struct AttachmentListView: View {
     }
 
     private func downloadAndPreviewEml(_ attachment: AttachmentInfo) {
+        emlDownloadTask?.cancel()
         downloadingSection = attachment.section
         error = nil
-        Task {
+        emlDownloadTask = Task {
             do {
                 let payload = try await EmlAttachmentPreviewLoader.load(
                     attachment: attachment
@@ -232,12 +241,16 @@ struct AttachmentListView: View {
                     filename: attachment.filename,
                     nestedAttachments: payload.nestedAttachments
                 )
+            } catch is CancellationError {
+                // Navigation teardown owns cancellation; it is not a user-
+                // visible download failure and must never acquire the gate.
             } catch {
                 self.error = SyncEngine.isConnectionError(error)
                     ? "Download failed. Check your connection and try again."
                     : error.localizedDescription
             }
             downloadingSection = nil
+            emlDownloadTask = nil
         }
     }
 

@@ -107,6 +107,14 @@ enum BodyIndexingProgressText {
         let noun = unindexedCount == 1 ? "message" : "messages"
         return "Sync complete with \(unindexedCount.formatted()) \(noun) not indexed"
     }
+
+    /// Shared presentation decision for aggregate and per-account sync views.
+    /// Returning nil keeps in-progress/index-count branches separate while
+    /// ensuring every completed-with-omissions surface uses the exact wording.
+    static func terminalCompletion(isComplete: Bool, unindexedCount: Int) -> String? {
+        guard isComplete, unindexedCount > 0 else { return nil }
+        return completion(unindexedCount: unindexedCount)
+    }
 }
 
 /// Deduplicates concurrent OAuth refresh calls for a single account.

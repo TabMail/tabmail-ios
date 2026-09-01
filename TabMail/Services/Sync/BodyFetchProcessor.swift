@@ -52,7 +52,9 @@ enum BodyFetchProcessor {
                       header.messageId == item.messageId else {
                     return .fetchProvenanceMismatch
                 }
-                let epochMatches = observedUidValidity != nil
+                let hasComparableEpochs = observedUidValidity != nil
+                    && header.observedUidValidity != nil
+                let epochMatches = hasComparableEpochs
                     && header.observedUidValidity == observedUidValidity
                 let identityMatches: Bool = {
                     guard let stored = header.rfc822MessageId,
@@ -64,7 +66,10 @@ enum BodyFetchProcessor {
                 // A folder-local UID is not identity. Terminalization is
                 // irreversible automatic state, so require positive proof from
                 // the exact failed fetch: its SELECT epoch or returned Message-ID.
-                guard epochMatches || identityMatches else {
+                // Message-ID is fallback proof only when one side lacks epoch
+                // evidence. An explicit epoch contradiction is stronger than a
+                // matching, potentially duplicated Message-ID.
+                guard epochMatches || (!hasComparableEpochs && identityMatches) else {
                     return .verificationUnavailable
                 }
                 if let refusal = BodyAddressGate.refusal(

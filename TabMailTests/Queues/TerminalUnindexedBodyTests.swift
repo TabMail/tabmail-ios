@@ -67,6 +67,7 @@ struct TerminalUnindexedBodyTests {
             accountId: account.id
         )
         folder.lastKnownUidValidity = 7
+        folder.backfillComplete = true
         var header = MessageHeader(
             messageId: "42",
             subject: "Bounded fetch unsupported",
@@ -134,6 +135,65 @@ struct TerminalUnindexedBodyTests {
         #expect(stored.bodyIndexingFailureReason
                 == BodyIndexingFailureReason.partialFetchUnsupported.rawValue)
         #expect(state.1 == 0)
+    }
+
+    @Test("Terminal rows stay excluded after queue restart and progress recomputation")
+    func terminalStateConvergesAcrossRestartAndProgress() async throws {
+        let fixture = try makeSwappedDatabase()
+        defer { fixture.restore() }
+        let header = fixture.header
+        let item = BodyFetchProcessor.Item(
+            headerId: header.id,
+            accountId: header.accountId,
+            folderPath: header.folderPath,
+            messageId: header.messageId,
+            isInInbox: false
+        )
+        #expect(await BodyFetchProcessor.markBodyUnindexed(
+            item: item,
+            reason: .partialFetchUnsupported,
+            observedUidValidity: 7,
+            fetchedRfc822MessageId: nil
+        ))
+
+        // Exercise both production restart selectors with the same terminal
+        // row in their respective populations. If either drops its terminal
+        // predicate, repopulation leaves storage non-empty immediately.
+        try await fixture.pool.write { database in
+            try database.execute(
+                sql: "UPDATE messageHeader SET isInInbox = 1 WHERE id = ?",
+                arguments: [header.id]
+            )
+        }
+        let activeQueue = ActiveBodyQueue()
+        await activeQueue.repopulateFromDatabase()
+        #expect(await activeQueue.isIdle)
+
+        try await fixture.pool.write { database in
+            try database.execute(
+                sql: "UPDATE messageHeader SET isInInbox = 0 WHERE id = ?",
+                arguments: [header.id]
+            )
+        }
+        let backfillQueue = BackfillBodyQueue()
+        await backfillQueue.repopulateFromDatabase()
+        #expect(await backfillQueue.isIdle)
+
+        let storedAccount = try await fixture.pool.read { database in
+            try Account.fetchOne(database, key: header.accountId)
+        }
+        let account = try #require(storedAccount)
+        let engine = SyncEngine()
+        await engine.updateBackfillProgressForAccount(account)
+        let progress = await MainActor.run {
+            AccountManagerState.shared.backfillProgressByAccount[header.accountId]
+        }
+        #expect(progress?.pendingBodyCount == 0)
+        #expect(progress?.unindexedBodyCount == 1)
+        #expect(progress?.isFullyComplete == true)
+        await MainActor.run {
+            AccountManagerState.shared.backfillProgressByAccount[header.accountId] = nil
+        }
     }
 
     @Test("Smart Reindex clears the terminal reason for a fresh attempt")
@@ -225,6 +285,35 @@ struct TerminalUnindexedBodyTests {
 
         let stored = try await fixture.pool.read { db in
             try MessageHeader.fetchOne(db, key: header.id)
+        }
+        #expect(stored?.bodyIndexingFailureReason == nil)
+    }
+
+    @Test("A matching Message-ID cannot override contradictory UIDVALIDITY evidence")
+    func epochContradictionOutranksMatchingMessageIdentity() async throws {
+        let fixture = try makeSwappedDatabase()
+        defer { fixture.restore() }
+        var updatedHeader = fixture.header
+        updatedHeader.rfc822MessageId = "stable@example.com"
+        let header = updatedHeader
+        try await fixture.pool.write { database in try header.update(database) }
+        let item = BodyFetchProcessor.Item(
+            headerId: header.id,
+            accountId: header.accountId,
+            folderPath: header.folderPath,
+            messageId: header.messageId,
+            isInInbox: false
+        )
+
+        #expect(!(await BodyFetchProcessor.markBodyUnindexed(
+            item: item,
+            reason: .partialFetchUnsupported,
+            observedUidValidity: 8,
+            fetchedRfc822MessageId: "stable@example.com"
+        )))
+
+        let stored = try await fixture.pool.read { database in
+            try MessageHeader.fetchOne(database, key: header.id)
         }
         #expect(stored?.bodyIndexingFailureReason == nil)
     }

@@ -19,7 +19,66 @@ import Foundation
 @Suite("IMAPProvider — nested rfc822 end-to-end", .serialized)
 struct IMAPProviderMockNestedEmlTests {
 
+    private actor SuspendedEmlFetch {
+        private var continuation: CheckedContinuation<Data, Never>?
+
+        func fetch() async -> Data {
+            await withCheckedContinuation { continuation = $0 }
+        }
+
+        func waitUntilStarted() async {
+            while continuation == nil { await Task.yield() }
+        }
+
+        func finish(with data: Data) {
+            continuation?.resume(returning: data)
+            continuation = nil
+        }
+    }
+
     // MARK: - File-uploaded .eml (filename-based, octet-stream, base64 transfer)
+
+    @Test("A cancelled .eml fetch cannot freeze previews after its view disappears")
+    @MainActor
+    func cancelledEmlFetchDoesNotAcquirePreviewFreeze() async {
+        PreviewFreezeGate.shared.end()
+        defer { PreviewFreezeGate.shared.end() }
+        let suspendedFetch = SuspendedEmlFetch()
+        let attachment = AttachmentInfo(
+            filename: "attached.eml",
+            contentType: "message/rfc822",
+            section: "2",
+            size: 128,
+            encoding: nil
+        )
+        let bytes = Data("""
+        From: Sender <sender@example.com>\r
+        To: Recipient <recipient@example.com>\r
+        Subject: Cancelled preview\r
+        \r
+        Body
+        """.utf8)
+
+        let presentationTask = Task { @MainActor in
+            let payload = try await EmlAttachmentPreviewLoader.load(attachment: attachment) {
+                await suspendedFetch.fetch()
+            }
+            PreviewFreezeGate.shared.begin()
+            return payload
+        }
+        await suspendedFetch.waitUntilStarted()
+        presentationTask.cancel()
+        await suspendedFetch.finish(with: bytes)
+
+        do {
+            _ = try await presentationTask.value
+            Issue.record("A fetch completing after cancellation must not reach presentation")
+        } catch is CancellationError {
+            #expect(!PreviewFreezeGate.shared.isFrozen)
+        } catch {
+            Issue.record("Unexpected cancellation result: \(error)")
+        }
+    }
 
     /// Regression test for the "messageNotFound" bug where tapping a nested
     /// attachment inside a file-uploaded `.eml` would throw because the

@@ -183,6 +183,67 @@ struct IMAPChunkedBodyFetchTests {
         #expect(!IMAPFetchMapping.requiredBodyPartsFitAggregateBudget(in: [], byteBudget: -1))
     }
 
+    @Test("NSE orchestration admits once, chunks required parts, and fails passive before wire IO")
+    func aggregateBudgetAndFetchAreOneOperation() async throws {
+        let parts = [
+            MessagePart(sectionString: "1", contentType: "text/plain", size: 6),
+            MessagePart(
+                sectionString: "2", contentType: "application/pdf",
+                disposition: "attachment", filename: "large.pdf", size: 100_000
+            ),
+            MessagePart(
+                sectionString: "3", contentType: "image/png",
+                disposition: "inline", contentId: "logo@example.com", size: 4
+            ),
+        ]
+        let payloads = ["1": Data("render".utf8), "3": Data("logo".utf8)]
+        var requests: [(section: String, offset: Int, count: Int)] = []
+
+        let fetchedOptional = try await IMAPFetchMapping.fetchRequiredBodyPartsWithinAggregateBudget(
+            in: parts,
+            byteBudget: 10
+        ) { part, offset, count in
+            let section = part.section.description
+            requests.append((section, offset, count))
+            guard let payload = payloads[section] else {
+                Issue.record("Unexpected section requested: \(section)")
+                return Data()
+            }
+            let end = min(offset + count, payload.count)
+            return payload.subdata(in: offset..<end)
+        }
+        let fetched = try #require(fetchedOptional)
+        #expect(fetched[0].data == payloads["1"])
+        #expect(fetched[1].data == nil)
+        #expect(fetched[2].data == payloads["3"])
+        #expect(requests.map(\.section) == ["1", "1", "3", "3"])
+        #expect(requests.map(\.offset) == [0, 6, 0, 4])
+        #expect(requests.map(\.count) == [6, 1, 4, 1])
+        #expect(!requests.contains { $0.section == "2" })
+
+        requests.removeAll()
+        let overBudget = try await IMAPFetchMapping.fetchRequiredBodyPartsWithinAggregateBudget(
+            in: parts,
+            byteBudget: 9
+        ) { part, offset, count in
+            requests.append((part.section.description, offset, count))
+            return Data()
+        }
+        #expect(overBudget == nil)
+        #expect(requests.isEmpty)
+
+        let unknown = [MessagePart(sectionString: "1", contentType: "text/plain", size: nil)]
+        let unknownSize = try await IMAPFetchMapping.fetchRequiredBodyPartsWithinAggregateBudget(
+            in: unknown,
+            byteBudget: 10
+        ) { part, offset, count in
+            requests.append((part.section.description, offset, count))
+            return Data()
+        }
+        #expect(unknownSize == nil)
+        #expect(requests.isEmpty)
+    }
+
     @Test("An empty response before the BODYSTRUCTURE size is terminal")
     func rejectsPrematureEnd() async {
         await #expect(throws: IMAPPartialFetchAssemblyError.prematureEnd(expected: 10, received: 3)) {
@@ -278,7 +339,9 @@ struct IMAPChunkedBodyFetchTests {
         } catch ProviderError.bodyIndexingUnsupported {
             Issue.record("A transient tagged NO must remain retryable")
         } catch {
-            #expect(true)
+            #expect(transientServer.consumedInjectedFailureCount() == 1)
+            #expect(!IMAPFetchMapping.isDeterministicPartialFetchFailure(error))
+            #expect(String(describing: error).contains("Injected test failure"))
         }
     }
 }

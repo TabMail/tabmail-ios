@@ -148,8 +148,11 @@ struct FastSyncView: View {
                                     Text("\(totalUidWalked.formatted()) / \(totalUidScope.formatted()) UIDs walked (\(pct)%)")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
-                                } else if isAllComplete && totalUnindexed > 0 {
-                                    Text(BodyIndexingProgressText.completion(unindexedCount: totalUnindexed))
+                                } else if let terminalText = BodyIndexingProgressText.terminalCompletion(
+                                    isComplete: isAllComplete,
+                                    unindexedCount: totalUnindexed
+                                ) {
+                                    Text(terminalText)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 } else if totalEmails > 0 {
@@ -289,9 +292,10 @@ private struct FastSyncAccountCard: View {
             }
             if let progress {
                 if progress.isFullyComplete {
-                    Text(progress.unindexedBodyCount > 0
-                         ? BodyIndexingProgressText.completion(unindexedCount: progress.unindexedBodyCount)
-                         : "\(progress.totalEmails.formatted()) messages indexed")
+                    Text(BodyIndexingProgressText.terminalCompletion(
+                        isComplete: progress.isFullyComplete,
+                        unindexedCount: progress.unindexedBodyCount
+                    ) ?? "\(progress.totalEmails.formatted()) messages indexed")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 } else {

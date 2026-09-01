@@ -99,6 +99,31 @@ enum IMAPFetchMapping {
         return true
     }
 
+    /// Admission plus bounded fetch orchestration for the NSE. Keeping the
+    /// aggregate check and chunk loop in one shared, injectable operation
+    /// prevents the extension from admitting with one policy and then fetching
+    /// through an unbounded path. `nil` means passive-delivery fallback and
+    /// guarantees `fetchChunk` was never called.
+    static func fetchRequiredBodyPartsWithinAggregateBudget(
+        in parts: [MessagePart],
+        byteBudget: Int,
+        fetchChunk: (_ part: MessagePart, _ offset: Int, _ count: Int) async throws -> Data
+    ) async throws -> [MessagePart]? {
+        guard requiredBodyPartsFitAggregateBudget(in: parts, byteBudget: byteBudget) else {
+            return nil
+        }
+        var fetchedParts = parts
+        for index in requiredBodyPartIndices(in: fetchedParts) {
+            let part = fetchedParts[index]
+            fetchedParts[index].data = try await concatenateEncodedPart(
+                expectedSize: part.size
+            ) { offset, count in
+                try await fetchChunk(part, offset, count)
+            }
+        }
+        return fetchedParts
+    }
+
     private static func isNormalAttachment(_ part: MessagePart) -> Bool {
         let disposition = part.disposition?.lowercased()
         let hasFilename = !(part.filename?.isEmpty ?? true)
@@ -322,31 +347,44 @@ enum IMAPFetchMapping {
         return out
     }
 
-    /// Inline image extraction from a fetched message. Mirrors
-    /// `IMAPProvider.buildFullMessageInfo`'s CID loop — uses
-    /// `message.cids.prefix(maxInlineImages)` with `decodedData()` to
-    /// handle base64/quoted-printable transfer encoding before the
-    /// renderer re-encodes as a `data:` URI. Strips angle brackets +
-    /// whitespace from the Content-ID.
-    static func extractInlineImages(message: Message, maxInlineImages: Int) -> [InlineImageRef] {
-        message.cids.prefix(maxInlineImages).compactMap { part in
+    /// Inline image extraction shared by the app and NSE. Metadata-only or
+    /// ineligible CIDs are filtered before applying the cap so an attachment
+    /// cannot consume a slot needed by a fetched render ingredient.
+    static func extractInlineImages(
+        message: Message,
+        maxInlineImages: Int,
+        eligibleSections: Set<String>? = nil
+    ) -> [InlineImageRef] {
+        Array(message.cids.lazy.compactMap { part -> InlineImageRef? in
+            if let eligibleSections,
+               !eligibleSections.contains(part.section.description) {
+                return nil
+            }
             guard let rawId = part.contentId, let data = part.decodedData() else { return nil }
             let contentId = rawId.trimmingCharacters(in: .whitespacesAndNewlines)
                 .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !contentId.isEmpty else { return nil }
             return InlineImageRef(contentId: contentId, contentType: part.contentType, data: data)
-        }
+        }.prefix(max(0, maxInlineImages)))
     }
 
     /// First `text/calendar` part's decoded bytes, if any. Mirrors
     /// `IMAPProvider.buildFullMessageInfo`'s ICS-data extraction — lets
     /// the renderer skip calling `attachmentFetcher` for invite bodies
     /// when we already have the bytes in memory from the batch fetch.
-    static func extractICSData(message: Message) -> Data? {
-        message.parts.first(where: {
-            $0.contentType.lowercased().contains("text/calendar")
-        })?.decodedData()
+    static func extractICSData(
+        message: Message,
+        eligibleSections: Set<String>? = nil
+    ) -> Data? {
+        message.parts.lazy.compactMap { part -> Data? in
+            guard part.contentType.lowercased().contains("text/calendar") else { return nil }
+            if let eligibleSections,
+               !eligibleSections.contains(part.section.description) {
+                return nil
+            }
+            return part.decodedData()
+        }.first
     }
 
     /// Convert a fetched IMAP `(info, message)` pair into the canonical

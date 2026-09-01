@@ -42,9 +42,10 @@ rows empty or complete would lie about server content that was never fetched.
    indexed nor empty, but is no longer runnable by automatic body queues. Only deterministic partial
    protocol/assembly failures take this path; transient connection and database failures remain
    retryable. The write is guarded by the row's full provider address plus positive identity proof
-   from the failed fetch: either its exact SELECT UIDVALIDITY epoch matches the stored row or the
-   fetched RFC 5322 Message-ID matches. A move, re-key, or reused UID therefore cannot attach the
-   outcome to another message.
+   from the failed fetch: its exact SELECT UIDVALIDITY epoch must match the stored row whenever both
+   epochs exist; only when epoch evidence is unavailable may a matching fetched RFC 5322 Message-ID
+   serve as fallback proof. A move, re-key, or reused UID therefore cannot attach the outcome to
+   another message, and a duplicate Message-ID cannot override an explicit epoch contradiction.
 6. **Completion reports runnable work and truthful omissions separately.** `pendingBodyCount`
    excludes terminal-unindexed rows; `unindexedBodyCount` reports them. Once the header walk and all
    runnable body work finish, the UI says `Sync complete with N messages not indexed` and displays a
