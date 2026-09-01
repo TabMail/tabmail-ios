@@ -3529,10 +3529,22 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let uids = results.toArray()
         guard let uid = uids.first else { throw ProviderError.messageNotFound }
 
-        let info = try await server.fetchMessageInfo(
-            for: uid,
-            options: IMAPFetchMapping.bodyFetchMetadataOptions
-        )
+        let info: MessageInfo?
+        do {
+            info = try await server.fetchMessageInfo(
+                for: uid,
+                options: IMAPFetchMapping.bodyFetchMetadataOptions
+            )
+        } catch {
+            if IMAPFetchMapping.isResponseBufferOverflow(error) {
+                throw ProviderError.bodyIndexingUnsupported(
+                    messageId: id,
+                    observedUidValidity: observedUidValidity,
+                    fetchedRfc822MessageId: nil
+                )
+            }
+            throw error
+        }
         guard let info else { throw ProviderError.messageNotFound }
 
         var parts = info.parts
@@ -3761,6 +3773,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch START: \(uidPairs.count) UIDs in \(folder)") }
 
         var partialFetchMessageId: String?
+        var metadataFetchMessageId: String?
         var partialFetchObservedUidValidity: Int?
         var partialFetchRfc822MessageId: String?
         do {
@@ -3782,10 +3795,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             let tStruct = CFAbsoluteTimeGetCurrent()
             var uidSet = UIDSet()
             for (_, uid) in uidPairs { uidSet.insert(UID(uid)) }
+            metadataFetchMessageId = uidPairs.count == 1 ? uidPairs[0].id : nil
             let infos = try await server.fetchMessageInfosBulk(
                 using: uidSet,
                 options: IMAPFetchMapping.bodyFetchMetadataOptions
             )
+            metadataFetchMessageId = nil
             let structMs = Int((CFAbsoluteTimeGetCurrent() - tStruct) * 1000)
             if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch BODYSTRUCTURE: \(infos.count)/\(uidPairs.count) returned in \(structMs)ms") }
 
@@ -3903,6 +3918,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             return results
             }
         } catch {
+            if let messageId = metadataFetchMessageId,
+               IMAPFetchMapping.isResponseBufferOverflow(error) {
+                throw ProviderError.bodyIndexingUnsupported(
+                    messageId: messageId,
+                    observedUidValidity: partialFetchObservedUidValidity,
+                    fetchedRfc822MessageId: nil
+                )
+            }
             if let messageId = partialFetchMessageId,
                IMAPFetchMapping.isDeterministicPartialFetchFailure(error) {
                 throw ProviderError.bodyIndexingUnsupported(

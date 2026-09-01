@@ -218,7 +218,11 @@ enum IMAPFetchMapping {
             }
         }
         return error is IMAPPartialFetchAssemblyError
-            || String(describing: error).contains("PayloadTooLargeError")
+            || isResponseBufferOverflow(error)
+    }
+
+    static func isResponseBufferOverflow(_ error: Error) -> Bool {
+        String(describing: error).contains("PayloadTooLargeError")
     }
 
     /// Build the `messageId` string used as `MessageHeader.messageId`.

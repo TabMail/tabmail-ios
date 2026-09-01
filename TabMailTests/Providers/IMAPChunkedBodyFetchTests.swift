@@ -60,6 +60,98 @@ struct IMAPChunkedBodyFetchTests {
         return (message, text, attachmentSize)
     }
 
+    private func oversizedMetadataMessage(uid: Int) -> FakeIMAPServer.Message {
+        let oversizedSubject = String(
+            repeating: "s",
+            count: IMAPFetchMapping.responseBufferLimit + 1024
+        )
+        return FakeIMAPServer.makeMultipartMessage(
+            uid: uid,
+            subject: oversizedSubject,
+            from: "Sender <sender@example.com>",
+            to: "Recipient <recipient@example.com>",
+            date: "Thu, 02 Oct 2025 01:50:00 +0000",
+            internalDate: "02-Oct-2025 01:50:00 +0000",
+            messageID: "<oversized-metadata-\(uid)@example.com>",
+            rawHeader: "Date: Thu, 02 Oct 2025 01:50:00 +0000\r\n\r\n",
+            fullMessage: Data("Synthetic fixture".utf8),
+            bodystructure: "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 1 1)",
+            partBodies: ["1": Data("x".utf8)]
+        )
+    }
+
+    @Test("Singleton batch metadata overflow is attributed as terminal without an RFC 822 id")
+    func singletonBatchMetadataOverflowIsTerminal() async throws {
+        let server = FakeIMAPServer(messages: [oversizedMetadataMessage(uid: 601)])
+        try server.start()
+        defer { server.stop() }
+
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        do {
+            _ = try await provider.fetchMessagesBatch(ids: ["601"], folder: "INBOX")
+            Issue.record("Oversized singleton metadata must not remain indefinitely retryable")
+        } catch ProviderError.bodyIndexingUnsupported(
+            let id, let observedUidValidity, let fetchedRfc822MessageId
+        ) {
+            #expect(id == "601")
+            #expect(observedUidValidity == 1)
+            #expect(fetchedRfc822MessageId == nil)
+        } catch {
+            Issue.record("Unexpected singleton metadata error: \(error)")
+        }
+    }
+
+    @Test("Single-message metadata overflow is attributed as terminal without an RFC 822 id")
+    func singleFetchMetadataOverflowIsTerminal() async throws {
+        let server = FakeIMAPServer(messages: [oversizedMetadataMessage(uid: 602)])
+        try server.start()
+        defer { server.stop() }
+
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        do {
+            _ = try await provider.fetchMessage(id: "602", folder: "INBOX")
+            Issue.record("Oversized single-message metadata must not remain indefinitely retryable")
+        } catch ProviderError.bodyIndexingUnsupported(
+            let id, let observedUidValidity, let fetchedRfc822MessageId
+        ) {
+            #expect(id == "602")
+            #expect(observedUidValidity == 1)
+            #expect(fetchedRfc822MessageId == nil)
+        } catch {
+            Issue.record("Unexpected single-message metadata error: \(error)")
+        }
+    }
+
+    @Test("Multi-UID metadata overflow remains unattributed and retryable")
+    func multiUIDMetadataOverflowIsNotMisattributed() async throws {
+        let ordinary = multipartMessage(uid: 604).message
+        let server = FakeIMAPServer(messages: [
+            oversizedMetadataMessage(uid: 603),
+            ordinary,
+        ])
+        try server.start()
+        defer { server.stop() }
+
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        do {
+            _ = try await provider.fetchMessagesBatch(ids: ["603", "604"], folder: "INBOX")
+            Issue.record("The synthetic multi-UID metadata response should exceed the parser limit")
+        } catch ProviderError.bodyIndexingUnsupported {
+            Issue.record("A multi-UID metadata overflow cannot be attributed to one member")
+        } catch {
+            #expect(String(describing: error).contains("PayloadTooLargeError"))
+        }
+    }
+
     @Test("Body metadata fetch omits an oversized raw header before chunking")
     func bodyMetadataDoesNotFetchRawHeader() async throws {
         let fixture = multipartMessage(
