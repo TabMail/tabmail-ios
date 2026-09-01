@@ -37,7 +37,9 @@ enum BodyFetchProcessor {
     /// stale address.
     static func markBodyUnindexed(
         item: Item,
-        reason: BodyIndexingFailureReason
+        reason: BodyIndexingFailureReason,
+        observedUidValidity: Int?,
+        fetchedRfc822MessageId: String?
     ) async -> Bool {
         do {
             let refusal = try await AppDatabase.dbPool.write {
@@ -50,6 +52,21 @@ enum BodyFetchProcessor {
                       header.messageId == item.messageId else {
                     return .fetchProvenanceMismatch
                 }
+                let epochMatches = observedUidValidity != nil
+                    && header.observedUidValidity == observedUidValidity
+                let identityMatches: Bool = {
+                    guard let stored = header.rfc822MessageId,
+                          let fetched = fetchedRfc822MessageId,
+                          !stored.isEmpty, !fetched.isEmpty else { return false }
+                    return EmailFilter.normalizeMessageId(stored)
+                        == EmailFilter.normalizeMessageId(fetched)
+                }()
+                // A folder-local UID is not identity. Terminalization is
+                // irreversible automatic state, so require positive proof from
+                // the exact failed fetch: its SELECT epoch or returned Message-ID.
+                guard epochMatches || identityMatches else {
+                    return .verificationUnavailable
+                }
                 if let refusal = BodyAddressGate.refusal(
                     id: header.id,
                     accountId: item.accountId,
@@ -57,7 +74,7 @@ enum BodyFetchProcessor {
                     messageId: header.messageId,
                     provider: account.provider,
                     storedRfc822MessageId: header.rfc822MessageId,
-                    fetchedRfc822MessageId: nil
+                    fetchedRfc822MessageId: fetchedRfc822MessageId
                 ) {
                     return refusal
                 }
@@ -193,6 +210,18 @@ enum BodyFetchProcessor {
                 fetchedRfc822MessageId: fullMessage.header.rfc822MessageId
             ))
         } catch {
+            if let providerError = error as? ProviderError,
+               case .bodyIndexingUnsupported(
+                    _, let observedUidValidity, let fetchedRfc822MessageId
+               ) = providerError {
+                _ = await markBodyUnindexed(
+                    item: item,
+                    reason: .partialFetchUnsupported,
+                    observedUidValidity: observedUidValidity,
+                    fetchedRfc822MessageId: fetchedRfc822MessageId
+                )
+                return .failure(.retry)
+            }
             let desc = "\(error)"
             if desc.contains("PayloadTooLargeError") {
                 // Data-integrity rule 1 ("NEVER mark unfetched content as fetched"):
@@ -763,10 +792,14 @@ enum BodyFetchProcessor {
         fetchAttachment: (@Sendable (String, String?) async throws -> Data)? = nil
     ) async -> (body: MessageBody, plainText: String?, hasUnresolvedICS: Bool) {
         // Convert main-app FullMessageInfo → shared RawBodyIngredients.
-        let sharedAttachments = fullMessage.attachments.map {
-            AttachmentRef(
-                filename: $0.filename, contentType: $0.contentType,
-                section: $0.section, size: $0.size, encoding: $0.encoding
+        let sharedAttachments = fullMessage.attachments.compactMap { attachment -> AttachmentRef? in
+            if let allowed = fullMessage.renderIngredientSections,
+               !allowed.contains(attachment.section) {
+                return nil
+            }
+            return AttachmentRef(
+                filename: attachment.filename, contentType: attachment.contentType,
+                section: attachment.section, size: attachment.size, encoding: attachment.encoding
             )
         }
         let sharedInlineImages = fullMessage.inlineImages.map {

@@ -6,14 +6,58 @@ import SwiftUI
 import QuickLook
 import UIKit
 
+enum EmlAttachmentPreviewLoader {
+    struct Payload: Sendable {
+        let html: String
+        let nestedAttachments: [AttachmentInfo]
+    }
+
+    enum LoadError: LocalizedError {
+        case invalidMessage
+
+        var errorDescription: String? {
+            "The attached email could not be opened."
+        }
+    }
+
+    /// The tap-time path for metadata-only `.eml` attachments. The caller
+    /// supplies the provider fetch so tests can drive the exact same loader
+    /// against a wire server without rendering SwiftUI.
+    static func load(
+        attachment: AttachmentInfo,
+        fetch: @Sendable () async throws -> Data
+    ) async throws -> Payload {
+        let bytes = try await fetch()
+        guard let parsed = EmlParsing.parse(rawBytes: bytes) else {
+            throw LoadError.invalidMessage
+        }
+        let html = EmlMarker.build(
+            filename: attachment.filename,
+            partSection: attachment.section,
+            envelope: parsed.envelope,
+            bodyHtml: parsed.bodyHtml
+        )
+        let nested = parsed.nested.enumerated().map { index, metadata in
+            AttachmentInfo(
+                filename: metadata.filename,
+                contentType: metadata.contentType,
+                section: EmlParsing.nestedSection(parent: attachment.section, index: index),
+                size: metadata.size,
+                encoding: attachment.encoding,
+                parentEmlSection: attachment.section
+            )
+        }
+        return Payload(html: html, nestedAttachments: nested)
+    }
+}
+
 struct AttachmentListView: View {
     let message: MessageHeader
     let attachments: [AttachmentInfo]
-    /// Rendered HTML of the parent message (MessageBody.htmlContent). Used to power
-    /// `.eml` attachment previews — the embedded email is already inside this string
-    /// as a `<div class="tm-eml-section" data-filename="…">` marker, so the preview
-    /// sheet just re-renders it with preview-mode CSS. `nil` means .eml taps fall
-    /// back to the old QuickLook flow (which shows a file, not a rendered email).
+    /// Retained for source compatibility with existing call sites. `.eml` payloads
+    /// are metadata-only during background indexing and are always fetched through
+    /// the bounded attachment path when tapped; parent HTML is never treated as the
+    /// attached message's bytes.
     let bodyHtml: String?
 
     @State private var downloadingSection: String?
@@ -63,20 +107,8 @@ struct AttachmentListView: View {
                     Button {
                         if attachment.contentType.lowercased().contains("text/calendar") {
                             downloadAndImportICS(attachment)
-                        } else if isEmlAttachment(attachment), let html = bodyHtml {
-                            // .eml has no QuickLook renderer — use our own sheet that
-                            // re-renders the already-stored body HTML with preview-mode
-                            // CSS showing only this attachment's section. Pass along
-                            // the nested attachments (filtered by parentEmlSection
-                            // matching this .eml's section) so the preview sheet can
-                            // surface them as a mini attachment strip.
-                            PreviewFreezeGate.shared.begin()
-                            let nested = attachments.filter { $0.parentEmlSection == attachment.section }
-                            emlPreview = EmlPreviewState(
-                                html: html,
-                                filename: attachment.filename,
-                                nestedAttachments: nested
-                            )
+                        } else if isEmlAttachment(attachment) {
+                            downloadAndPreviewEml(attachment)
                         } else if let existing = downloadedFiles[attachment.section] {
                             // Imperative QuickLook — detached from this re-rendering
                             // List row (see AttachmentQuickLook). It raises the
@@ -177,6 +209,35 @@ struct AttachmentListView: View {
             if old != nil && new == nil {
                 PreviewFreezeGate.shared.end()
             }
+        }
+    }
+
+    private func downloadAndPreviewEml(_ attachment: AttachmentInfo) {
+        downloadingSection = attachment.section
+        error = nil
+        Task {
+            do {
+                let payload = try await EmlAttachmentPreviewLoader.load(
+                    attachment: attachment
+                ) {
+                    try await manager.fetchAttachment(
+                        for: message,
+                        section: attachment.section,
+                        encoding: attachment.encoding
+                    )
+                }
+                PreviewFreezeGate.shared.begin()
+                emlPreview = EmlPreviewState(
+                    html: payload.html,
+                    filename: attachment.filename,
+                    nestedAttachments: payload.nestedAttachments
+                )
+            } catch {
+                self.error = SyncEngine.isConnectionError(error)
+                    ? "Download failed. Check your connection and try again."
+                    : error.localizedDescription
+            }
+            downloadingSection = nil
         }
     }
 

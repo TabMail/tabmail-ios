@@ -28,6 +28,27 @@ struct NSEDataBridgeTests {
         }
     }
 
+    @Test("Confirmed NSE body indexing clears an earlier terminal reason")
+    func confirmedBodyClearsTerminalReason() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "nse-terminal-clear")
+        try db.write { connection in
+            try connection.execute(
+                sql: "UPDATE messageHeader SET bodyIndexingFailureReason = ? WHERE id = ?",
+                arguments: [BodyIndexingFailureReason.partialFetchUnsupported.rawValue, header.id]
+            )
+            try NSEDataBridge.markConfirmedBodiesComplete([header.id], in: connection)
+        }
+
+        let stored = try db.read { connection in
+            try MessageHeader.fetchOne(connection, key: header.id)
+        }
+        #expect(stored?.bodyComplete == true)
+        #expect(stored?.bodyIndexingFailureReason == nil)
+    }
+
     // MARK: - Backend URL mirrors from BackendConfig toggle
 
     @Test("mirrorBackendConfig uses BackendConfig.apiBaseURL, not hardcoded URL")

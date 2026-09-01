@@ -106,6 +106,14 @@ extension AccountManager {
         let hasBody = (try? await dbPool.read { db in try MessageBody.fetchOne(db, key: message.id) != nil }) ?? false
         guard replaceExistingBody || !hasBody else { return }
 
+        if await bodyIndexingFailureReason(forHeaderId: message.id) != nil {
+            throw ProviderError.bodyIndexingUnsupported(
+                messageId: message.messageId,
+                observedUidValidity: nil,
+                fetchedRfc822MessageId: nil
+            )
+        }
+
         // Address not corroborated: this UID names a DIFFERENT message on the wire right now,
         // and `BodyFetchProcessor.process` would refuse the write anyway. Skip the round trip.
         //
@@ -164,11 +172,32 @@ extension AccountManager {
                     userInfo: [NSLocalizedDescriptionKey: "This message is too large to display."])
             )
         case .retry:
+            if await bodyIndexingFailureReason(forHeaderId: message.id) != nil {
+                throw ProviderError.bodyIndexingUnsupported(
+                    messageId: message.messageId,
+                    observedUidValidity: nil,
+                    fetchedRfc822MessageId: nil
+                )
+            }
             throw ProviderError.networkError(
                 underlying: NSError(domain: "TabMail", code: -2,
                     userInfo: [NSLocalizedDescriptionKey: "Failed to load message. Please try again."])
             )
         }
+    }
+
+    /// Durable terminal body state used by the detail loader and its poll.
+    /// Read by primary key each time so a row terminalized while already open
+    /// stops the next poll tick without another network request.
+    func bodyIndexingFailureReason(forHeaderId headerId: String) async -> BodyIndexingFailureReason? {
+        let raw = try? await dbPool.pool.read { db in
+            try String.fetchOne(
+                db,
+                sql: "SELECT bodyIndexingFailureReason FROM messageHeader WHERE id = ?",
+                arguments: [headerId]
+            )
+        }
+        return raw.flatMap(BodyIndexingFailureReason.init(rawValue:))
     }
 
     /// Download a single attachment's data.

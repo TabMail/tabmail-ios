@@ -199,14 +199,20 @@ struct FullMessageInfo: Sendable {
     /// Pre-fetched ICS calendar data (from pipelined batch fetch).
     /// When present, renderBody skips the separate fetchAttachment call.
     let icsData: Data?
+    /// IMAP MIME sections allowed to contribute render-time attachment data.
+    /// `nil` for providers whose attachment identifiers are not MIME sections.
+    /// The background renderer filters its calendar fallback through this set,
+    /// while `attachments` remains complete BODYSTRUCTURE metadata for taps.
+    let renderIngredientSections: Set<String>?
 
-    init(header: MessageHeaderInfo, htmlBody: String?, textBody: String?, attachments: [AttachmentInfo] = [], inlineImages: [InlineImage] = [], icsData: Data? = nil) {
+    init(header: MessageHeaderInfo, htmlBody: String?, textBody: String?, attachments: [AttachmentInfo] = [], inlineImages: [InlineImage] = [], icsData: Data? = nil, renderIngredientSections: Set<String>? = nil) {
         self.header = header
         self.htmlBody = htmlBody
         self.textBody = textBody
         self.attachments = attachments
         self.inlineImages = inlineImages
         self.icsData = icsData
+        self.renderIngredientSections = renderIngredientSections
     }
 }
 
@@ -730,7 +736,11 @@ enum ProviderError: LocalizedError {
     /// to index this message without an unbounded response. Deterministic for
     /// the current server/app combination: background queues terminalize this
     /// message truthfully instead of retrying forever.
-    case bodyIndexingUnsupported(messageId: String)
+    case bodyIndexingUnsupported(
+        messageId: String,
+        observedUidValidity: Int?,
+        fetchedRfc822MessageId: String?
+    )
     /// The row's provider address is not corroborated — a move is in flight, so
     /// `(folderPath, messageId)` may name a DIFFERENT message on the wire. Thrown by
     /// `AccountManager.fetchAttachment`; see `BodyAddressGate`. TRANSIENT in the DATABASE — it

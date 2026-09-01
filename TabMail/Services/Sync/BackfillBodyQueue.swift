@@ -571,7 +571,11 @@ actor BackfillBodyQueue {
                 } catch {
                     let desc = "\(error)"
                     if let providerError = error as? ProviderError,
-                       case .bodyIndexingUnsupported(let messageId) = providerError,
+                       case .bodyIndexingUnsupported(
+                            let messageId,
+                            let observedUidValidity,
+                            let fetchedRfc822MessageId
+                       ) = providerError,
                        let failedItem = items.first(where: { $0.messageId == messageId }) {
                         let processorItem = BodyFetchProcessor.Item(
                             headerId: failedItem.headerId,
@@ -582,7 +586,9 @@ actor BackfillBodyQueue {
                         )
                         let terminalized = await BodyFetchProcessor.markBodyUnindexed(
                             item: processorItem,
-                            reason: .partialFetchUnsupported
+                            reason: .partialFetchUnsupported,
+                            observedUidValidity: observedUidValidity,
+                            fetchedRfc822MessageId: fetchedRfc822MessageId
                         )
                         print("[BackfillBody] Partial fetch unsupported — \(terminalized ? "recorded terminal-unindexed state" : "row changed; retrying")")
                         self.batchItemDone(item: failedItem, shouldRetry: !terminalized)

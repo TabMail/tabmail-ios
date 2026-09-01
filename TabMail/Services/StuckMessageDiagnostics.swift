@@ -29,6 +29,15 @@ enum StuckMessageDiagnostics {
     /// Bounded per-class sample size — display-only, full data stays in the DB.
     private static let sampleLimit = 40
 
+    struct BodyStatusCounts: Equatable, Sendable {
+        let lockedEmpty: Int
+        let failing: Int
+        let pending: Int
+        let terminalUnindexed: Int
+
+        var runnable: Int { failing + pending }
+    }
+
     private struct Row: Sendable {
         let id: String
         let folderId: String
@@ -45,6 +54,7 @@ enum StuckMessageDiagnostics {
         let folderExists: Bool
         let hasHealthySibling: Bool
         let emptyFetchCount: Int
+        let bodyIndexingFailureReason: String?
     }
 
     static func run() async {
@@ -68,16 +78,14 @@ enum StuckMessageDiagnostics {
         let pkMismatchBodyless = await count(pool, "m.id <> m.accountId || ':' || m.folderPath || ':' || m.messageId AND m.bodyComplete = 0")
         // Bodyless breakdown.
         let bodyless = await count(pool, "m.bodyComplete = 0")
-        let bodylessLocked = await count(pool, "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 1")
-        let bodylessFailing = await count(pool, "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 0 AND m.emptyFetchCount > 0")
-        let bodylessPending = await count(pool, "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 0 AND m.emptyFetchCount = 0")
+        let bodyStatuses = await bodyStatusCounts(in: pool)
         // Missing rfc822 among the not-browsable set → UID-remap can never recover.
         let notBrowsableNoRfc = await count(pool, "f.id IS NULL AND (m.rfc822MessageId IS NULL OR m.rfc822MessageId = '')")
 
         BackgroundSyncLogger.logStuckDiag("total messageHeader rows: \(total)")
         BackgroundSyncLogger.logStuckDiag("NOT-browsable (folderId matches no folder): \(notBrowsable)  [empty=\(notBrowsableEmpty), orphan=\(notBrowsableOrphan), bodyless=\(notBrowsableBodyless), missing-rfc822=\(notBrowsableNoRfc)]")
         BackgroundSyncLogger.logStuckDiag("PK/folder mismatch (optimistic-move remnant): \(pkMismatch)  [bodyless=\(pkMismatchBodyless)]")
-        BackgroundSyncLogger.logStuckDiag("bodyless (bodyComplete=0): \(bodyless)  [lockedEmpty=\(bodylessLocked), failing=\(bodylessFailing), pending=\(bodylessPending)]")
+        BackgroundSyncLogger.logStuckDiag("bodyless (bodyComplete=0): \(bodyless)  [lockedEmpty=\(bodyStatuses.lockedEmpty), failing=\(bodyStatuses.failing), pending=\(bodyStatuses.pending), terminalUnindexed=\(bodyStatuses.terminalUnindexed)]")
 
         // --- Per-provider breakdown of not-browsable -----------------------
         let byProvider = await group(pool,
@@ -108,7 +116,8 @@ enum StuckMessageDiagnostics {
 
         // --- Interpretation hint (ranked by MAGNITUDE, not check order) ----
         let buckets: [(Int, String)] = [
-            (bodyless, "bodyless body-text backlog (\(bodyless)) — searchable by header, no snippet until body is fetched/indexed. Cured by re-walk (Smart Reindex re-fetches); NOT corruption. Heaviest in custom folders (fetched last)."),
+            (bodyStatuses.runnable, "runnable body-text backlog (\(bodyStatuses.runnable)) — searchable by header, no snippet until body is fetched/indexed. Smart Reindex re-walks it; terminal-unindexed rows are counted separately."),
+            (bodyStatuses.terminalUnindexed, "terminal-unindexed bodies (\(bodyStatuses.terminalUnindexed)) — sync is complete, but these servers could not provide bounded body ranges. Smart Reindex explicitly retries them."),
             (pkMismatch, "PK/folder mismatch (\(pkMismatch)) — optimistic move; benign where messageId is move-stable (Gmail), a stale-UID hazard on IMAP."),
             (notBrowsable, "NOT-browsable orphaned folderId (\(notBrowsable)) — searchable but in no browsable folder; needs orphan-cleanup/relocate. Smart Reindex does not touch folderId."),
         ]
@@ -124,6 +133,30 @@ enum StuckMessageDiagnostics {
         (try? await pool.read { db in
             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageHeader m LEFT JOIN folder f ON m.folderId = f.id WHERE \(whereSQL)") ?? 0
         }) ?? 0
+    }
+
+    static func bodyStatusCounts(in pool: DatabasePool) async -> BodyStatusCounts {
+        (try? await pool.read { db -> BodyStatusCounts in
+            let row = try GRDB.Row.fetchOne(db, sql: """
+                SELECT
+                  SUM(CASE WHEN bodyComplete = 0 AND bodyEmptyConfirmed = 1 THEN 1 ELSE 0 END) AS lockedEmpty,
+                  SUM(CASE WHEN bodyComplete = 0 AND bodyEmptyConfirmed = 0
+                                AND bodyIndexingFailureReason IS NULL
+                                AND emptyFetchCount > 0 THEN 1 ELSE 0 END) AS failing,
+                  SUM(CASE WHEN bodyComplete = 0 AND bodyEmptyConfirmed = 0
+                                AND bodyIndexingFailureReason IS NULL
+                                AND emptyFetchCount = 0 THEN 1 ELSE 0 END) AS pending,
+                  SUM(CASE WHEN bodyComplete = 0 AND bodyIndexingFailureReason IS NOT NULL
+                           THEN 1 ELSE 0 END) AS terminalUnindexed
+                FROM messageHeader
+                """)
+            return BodyStatusCounts(
+                lockedEmpty: (row?["lockedEmpty"] as Int?) ?? 0,
+                failing: (row?["failing"] as Int?) ?? 0,
+                pending: (row?["pending"] as Int?) ?? 0,
+                terminalUnindexed: (row?["terminalUnindexed"] as Int?) ?? 0
+            )
+        }) ?? BodyStatusCounts(lockedEmpty: 0, failing: 0, pending: 0, terminalUnindexed: 0)
     }
 
     private static func group(_ pool: DatabasePool, sql: String) async -> [(String, Int)] {
@@ -208,7 +241,9 @@ enum StuckMessageDiagnostics {
                    CAST(m.date AS TEXT) AS dateText,
                    (m.rfc822MessageId IS NOT NULL AND m.rfc822MessageId <> '') AS hasRfc,
                    m.bodyComplete AS bodyComplete, m.bodyEmptyConfirmed AS bodyEmpty,
-                   m.emptyFetchCount AS emptyCnt, m.isInInbox AS isInbox,
+                   m.emptyFetchCount AS emptyCnt,
+                   m.bodyIndexingFailureReason AS bodyFailureReason,
+                   m.isInInbox AS isInbox,
                    (f.id IS NOT NULL) AS folderExists, COALESCE(f.role, '-') AS folderRole,
                    COALESCE(a.provider, '?') AS provider,
                    EXISTS(SELECT 1 FROM messageHeader s JOIN folder sf ON s.folderId = sf.id
@@ -238,7 +273,8 @@ enum StuckMessageDiagnostics {
                     isInInbox: ((r["isInbox"] as Int?) ?? 0) != 0,
                     folderExists: ((r["folderExists"] as Int?) ?? 0) != 0,
                     hasHealthySibling: ((r["sibling"] as Int?) ?? 0) != 0,
-                    emptyFetchCount: (r["emptyCnt"] as Int?) ?? 0
+                    emptyFetchCount: (r["emptyCnt"] as Int?) ?? 0,
+                    bodyIndexingFailureReason: r["bodyFailureReason"] as String?
                 )
             }
         }) ?? []
@@ -263,7 +299,7 @@ enum StuckMessageDiagnostics {
             let inFTS = missingFromFTS.contains(ContentKey(rawValue: r.id)) ? "n" : "Y"
             // Display-only: id/messageId/subject are abbreviated, full data stays in DB.
             BackgroundSyncLogger.logStuckDiag(
-                "  id=\(r.id) prov=\(r.provider) folderId=\(r.folderId.isEmpty ? "''" : r.folderId) path=\(r.folderPath) msgId=\(r.messageId) rfc822=\(r.hasRfc822 ? "Y" : "n") body=\(r.bodyComplete ? "Y" : "n") emptyConf=\(r.bodyEmptyConfirmed ? "Y" : "n") emptyCnt=\(r.emptyFetchCount) inbox=\(r.isInInbox ? "Y" : "n") folderExists=\(r.folderExists ? "Y" : "n") role=\(r.folderRole) sibling=\(r.hasHealthySibling ? "Y" : "n") inFTS=\(inFTS) date=\(r.dateStr) subj=\"\(r.subject)\""
+                "  id=\(r.id) prov=\(r.provider) folderId=\(r.folderId.isEmpty ? "''" : r.folderId) path=\(r.folderPath) msgId=\(r.messageId) rfc822=\(r.hasRfc822 ? "Y" : "n") body=\(r.bodyComplete ? "Y" : "n") emptyConf=\(r.bodyEmptyConfirmed ? "Y" : "n") emptyCnt=\(r.emptyFetchCount) bodyFailure=\(r.bodyIndexingFailureReason ?? "none") inbox=\(r.isInInbox ? "Y" : "n") folderExists=\(r.folderExists ? "Y" : "n") role=\(r.folderRole) sibling=\(r.hasHealthySibling ? "Y" : "n") inFTS=\(inFTS) date=\(r.dateStr) subj=\"\(r.subject)\""
             )
         }
     }

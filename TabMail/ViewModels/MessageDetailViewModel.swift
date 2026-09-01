@@ -1007,6 +1007,7 @@ final class MessageDetailViewModel {
     func startBodyPoll() {
         bodyPollTask?.cancel()
         bodyPollTask = Task { [weak self] in
+            if let self, await self.stopForTerminalBodyFailure() { return }
             // IMMEDIATE cache check, BEFORE the first 2s sleep. On the
             // notification-tap deep-link path the body is usually ALREADY in the DB
             // (the deep-link's own NSE merge wrote it) — loadBody just got cancelled
@@ -1038,6 +1039,7 @@ final class MessageDetailViewModel {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))
                 guard !Task.isCancelled, let self else { return }
+                if await self.stopForTerminalBodyFailure() { return }
                 if self.message == nil { await self.recoverHeaderIfMissing() }
                 guard self.messageBody == nil else {
                     // Body already landed (entry fast-path above, merge-commit
@@ -1146,6 +1148,33 @@ final class MessageDetailViewModel {
                 }
             }
         }
+    }
+
+    /// Stop an open detail view once the durable row says automatic bounded
+    /// body retrieval is unsupported. This is checked both before polling and
+    /// on every tick, covering a row terminalized by the background queue while
+    /// the view is already open. Smart Reindex clears the reason for a new try.
+    @MainActor
+    @discardableResult
+    func stopForTerminalBodyFailure() async -> Bool {
+        let headerId = resolvedId
+        let rawReason = try? await dbPool.pool.read { db in
+            try String.fetchOne(
+                db,
+                sql: "SELECT bodyIndexingFailureReason FROM messageHeader WHERE id = ?",
+                arguments: [headerId]
+            )
+        }
+        guard rawReason.flatMap(BodyIndexingFailureReason.init(rawValue:)) != nil else {
+            return false
+        }
+        isLoading = false
+        error = ProviderError.bodyIndexingUnsupported(
+            messageId: message?.messageId ?? "",
+            observedUidValidity: nil,
+            fetchedRfc822MessageId: nil
+        ).localizedDescription
+        return true
     }
 
     /// Explicit user Retry from the Not-Found screen. `loadBody()` alone is a
@@ -1384,6 +1413,7 @@ final class MessageDetailViewModel {
             loadThreadMessagesAsync()
             return
         }
+        if await stopForTerminalBodyFailure() { return }
         // Address-corroboration pre-gate (`BodyAddressGate`). `optimisticMoveToFolder`
         // leaves the row at (destination folder, SOURCE UID) with a nil epoch until the
         // drain's `finishMove` re-keys it — and on IMAP that address names a DIFFERENT
@@ -1456,7 +1486,9 @@ final class MessageDetailViewModel {
         // or any transient failure. A reconnect or background path may still
         // write the body to DB later.
         if messageBody == nil {
-            startBodyPoll()
+            if !(await stopForTerminalBodyFailure()) {
+                startBodyPoll()
+            }
         }
     }
 

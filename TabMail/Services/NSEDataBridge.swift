@@ -3280,11 +3280,7 @@ enum NSEDataBridge {
         let confirmedIds: [String] = confirmedItems.map(\.item.headerId)
         do {
             try await AppDatabase.dbPool.write { db in
-                let placeholders = confirmedIds.map { _ in "?" }.joined(separator: ",")
-                try db.execute(
-                    sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE id IN (\(placeholders))",
-                    arguments: StatementArguments(confirmedIds)
-                )
+                try markConfirmedBodiesComplete(confirmedIds, in: db)
             }
         } catch {
             print("[NSEDataBridge] FTS batch: bodyComplete update failed: \(error)")
@@ -3353,6 +3349,23 @@ enum NSEDataBridge {
         if confirmedItems.count > 1 {
             print("[NSEDataBridge] FTS batch: wrote \(confirmedItems.count) headers + bodies in one pass")
         }
+    }
+
+    /// Commit the successful NSE body-indexing outcome as one state transition.
+    /// A foreground Smart Reindex may have left a durable terminal reason on
+    /// the row before a later NSE fetch succeeds; success must clear that reason
+    /// at the same time it records `bodyComplete`.
+    static func markConfirmedBodiesComplete(_ headerIds: [String], in db: Database) throws {
+        guard !headerIds.isEmpty else { return }
+        let placeholders = headerIds.map { _ in "?" }.joined(separator: ",")
+        try db.execute(
+            sql: """
+                UPDATE messageHeader
+                SET bodyComplete = 1, bodyIndexingFailureReason = NULL
+                WHERE id IN (\(placeholders))
+                """,
+            arguments: StatementArguments(headerIds)
+        )
     }
 
     /// When NSE delivered an active (reminder) notification, mark the same

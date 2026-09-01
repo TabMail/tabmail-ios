@@ -289,6 +289,66 @@ struct OnDemandBodyFetchErrorTests {
         // Verify the state is correct for poll to work
         #expect(vm.message != nil, "Message header should be set for poll to work")
     }
+
+    @Test("A terminal row stops loadBody before any server fetch")
+    @MainActor
+    func terminalRowStopsInitialFetch() async throws {
+        let (pool, _) = try makeTestPool()
+        let header = try await insertFixtures(pool, messageId: "odf_terminal_initial_\(UUID().uuidString)")
+        try await pool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET bodyIndexingFailureReason = ? WHERE id = ?",
+                arguments: [BodyIndexingFailureReason.partialFetchUnsupported.rawValue, header.id]
+            )
+        }
+        var fetchBodyCalled = false
+        let vm = MessageDetailViewModel(
+            messageId: header.id,
+            dbPool: pool,
+            fetchBodyOverride: { _ in fetchBodyCalled = true }
+        )
+
+        await vm.loadBody()
+
+        #expect(!fetchBodyCalled)
+        #expect(vm.messageBody == nil)
+        #expect(vm.isLoading == false)
+        #expect(vm.error == ProviderError.bodyIndexingUnsupported(
+            messageId: "", observedUidValidity: nil, fetchedRfc822MessageId: nil
+        ).localizedDescription)
+    }
+
+    @Test("An open body poll stops when the row becomes terminal")
+    @MainActor
+    func terminalTransitionStopsPollBeforeRetry() async throws {
+        let (pool, _) = try makeTestPool()
+        let header = try await insertFixtures(pool, messageId: "odf_terminal_poll_\(UUID().uuidString)")
+        var fetchBodyCalled = false
+        let vm = MessageDetailViewModel(
+            messageId: header.id,
+            dbPool: pool,
+            fetchBodyOverride: { _ in fetchBodyCalled = true }
+        )
+        vm._testSeedMessage(header)
+        vm.startBodyPoll()
+        try await Task.sleep(for: .milliseconds(100))
+        try await pool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET bodyIndexingFailureReason = ? WHERE id = ?",
+                arguments: [BodyIndexingFailureReason.partialFetchUnsupported.rawValue, header.id]
+            )
+        }
+
+        var waited = 0
+        while vm.error == nil && waited < 30 {
+            try await Task.sleep(for: .milliseconds(100))
+            waited += 1
+        }
+
+        #expect(vm.error != nil)
+        #expect(vm.isLoading == false)
+        #expect(!fetchBodyCalled)
+    }
 }
 
 // MARK: - Suite 4: Mark-read-on-open (independent of loadBody)

@@ -9,6 +9,31 @@ import Testing
 
 @Suite("Terminal-unindexed body state", .serialized, .processGlobalState)
 struct TerminalUnindexedBodyTests {
+    private func bodyHeader(
+        messageId: String,
+        folderId: String,
+        folderPath: String,
+        isInInbox: Bool,
+        subject: String
+    ) -> MessageHeader {
+        var header = MessageHeader(
+            messageId: messageId,
+            subject: subject,
+            from: "sender@example.com",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "",
+            folderId: folderId,
+            accountId: "terminal-account",
+            folderPath: folderPath,
+            isInInbox: isInInbox
+        )
+        header.headerComplete = true
+        header.observedUidValidity = 7
+        return header
+    }
+
     private func makeSwappedDatabase() throws -> (
         header: MessageHeader,
         pool: DatabasePool,
@@ -87,7 +112,9 @@ struct TerminalUnindexedBodyTests {
 
         #expect(await BodyFetchProcessor.markBodyUnindexed(
             item: item,
-            reason: .partialFetchUnsupported
+            reason: .partialFetchUnsupported,
+            observedUidValidity: 7,
+            fetchedRfc822MessageId: nil
         ))
 
         let state = try await pool.read { db in
@@ -125,7 +152,9 @@ struct TerminalUnindexedBodyTests {
         )
         #expect(await BodyFetchProcessor.markBodyUnindexed(
             item: item,
-            reason: .partialFetchUnsupported
+            reason: .partialFetchUnsupported,
+            observedUidValidity: 7,
+            fetchedRfc822MessageId: nil
         ))
 
         let engine = SyncEngine()
@@ -162,7 +191,9 @@ struct TerminalUnindexedBodyTests {
 
         #expect(!(await BodyFetchProcessor.markBodyUnindexed(
             item: item,
-            reason: .partialFetchUnsupported
+            reason: .partialFetchUnsupported,
+            observedUidValidity: 7,
+            fetchedRfc822MessageId: nil
         )))
 
         let stored = try await pool.read { db in
@@ -170,5 +201,192 @@ struct TerminalUnindexedBodyTests {
         }
         #expect(stored?.bodyComplete == true)
         #expect(stored?.bodyIndexingFailureReason == nil)
+    }
+
+    @Test("A failure observed after UIDVALIDITY turnover cannot retire the old row")
+    func epochTurnoverRefusesTerminalization() async throws {
+        let fixture = try makeSwappedDatabase()
+        defer { fixture.restore() }
+        let header = fixture.header
+        let item = BodyFetchProcessor.Item(
+            headerId: header.id,
+            accountId: header.accountId,
+            folderPath: header.folderPath,
+            messageId: header.messageId,
+            isInInbox: false
+        )
+
+        #expect(!(await BodyFetchProcessor.markBodyUnindexed(
+            item: item,
+            reason: .partialFetchUnsupported,
+            observedUidValidity: 8,
+            fetchedRfc822MessageId: nil
+        )))
+
+        let stored = try await fixture.pool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        }
+        #expect(stored?.bodyIndexingFailureReason == nil)
+    }
+
+    @Test("Matching fetched Message-ID proves identity when SELECT omits UIDVALIDITY")
+    func messageIdentityCanProveTerminalization() async throws {
+        let fixture = try makeSwappedDatabase()
+        defer { fixture.restore() }
+        var updatedHeader = fixture.header
+        updatedHeader.rfc822MessageId = "<stable@example.com>"
+        let header = updatedHeader
+        try await fixture.pool.write { db in try header.update(db) }
+        let item = BodyFetchProcessor.Item(
+            headerId: header.id,
+            accountId: header.accountId,
+            folderPath: header.folderPath,
+            messageId: header.messageId,
+            isInInbox: false
+        )
+
+        #expect(await BodyFetchProcessor.markBodyUnindexed(
+            item: item,
+            reason: .partialFetchUnsupported,
+            observedUidValidity: nil,
+            fetchedRfc822MessageId: "stable@example.com"
+        ))
+    }
+
+    @Test("Stuck diagnostics separate runnable and terminal bodyless rows")
+    func diagnosticsClassifyBodyStatesWithoutOverlap() async throws {
+        let fixture = try makeSwappedDatabase()
+        defer { fixture.restore() }
+        let id = fixture.header.id
+
+        var counts = await StuckMessageDiagnostics.bodyStatusCounts(in: fixture.pool)
+        #expect(counts == .init(lockedEmpty: 0, failing: 0, pending: 1, terminalUnindexed: 0))
+
+        try await fixture.pool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET emptyFetchCount = 2 WHERE id = ?",
+                arguments: [id]
+            )
+        }
+        counts = await StuckMessageDiagnostics.bodyStatusCounts(in: fixture.pool)
+        #expect(counts == .init(lockedEmpty: 0, failing: 1, pending: 0, terminalUnindexed: 0))
+
+        try await fixture.pool.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE messageHeader
+                    SET emptyFetchCount = 0, bodyIndexingFailureReason = ?
+                    WHERE id = ?
+                    """,
+                arguments: [BodyIndexingFailureReason.partialFetchUnsupported.rawValue, id]
+            )
+        }
+        counts = await StuckMessageDiagnostics.bodyStatusCounts(in: fixture.pool)
+        #expect(counts == .init(lockedEmpty: 0, failing: 0, pending: 0, terminalUnindexed: 1))
+        #expect(counts.runnable == 0)
+    }
+
+    @Test("Active inbox queue converges after a bounded-fetch refusal")
+    func activeQueueConvergesAndLeavesSiblingRetryable() async throws {
+        let fixture = try makeSwappedDatabase()
+        defer { fixture.restore() }
+        let target = bodyHeader(
+            messageId: "42", folderId: "terminal-account:INBOX",
+            folderPath: "INBOX", isInInbox: true,
+            subject: "Bounded fetch unsupported"
+        )
+        let sibling = bodyHeader(
+            messageId: "43", folderId: "terminal-account:INBOX",
+            folderPath: "INBOX", isInInbox: true,
+            subject: "Retryable sibling"
+        )
+        let originalHeaderId = fixture.header.id
+        try await fixture.pool.write { db in
+            var inbox = Folder(
+                name: "INBOX", path: "INBOX", role: .inbox,
+                accountId: target.accountId
+            )
+            inbox.lastKnownUidValidity = 7
+            try inbox.insert(db)
+            _ = try MessageHeader.deleteOne(db, key: originalHeaderId)
+            try target.insert(db)
+            try sibling.insert(db)
+        }
+
+        let provider = MockEmailProvider(staleWindowMode: .uid)
+        await provider.setFetchMessageThrows(ProviderError.bodyIndexingUnsupported(
+            messageId: target.messageId,
+            observedUidValidity: 7,
+            fetchedRfc822MessageId: nil
+        ))
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: target.accountId, provider: provider
+        )
+        let queue = ActiveBodyQueue()
+        await queue.enqueueBatch([target, sibling])
+        await queue.awaitDrain()
+        await AccountManager.shared.unregisterProviderForTesting(accountId: target.accountId)
+
+        let state = try await fixture.pool.read { db in
+            (
+                try MessageHeader.fetchOne(db, key: target.id),
+                try MessageHeader.fetchOne(db, key: sibling.id)
+            )
+        }
+        #expect(state.0?.bodyIndexingFailureReason
+                == BodyIndexingFailureReason.partialFetchUnsupported.rawValue)
+        #expect(state.1?.bodyIndexingFailureReason == nil)
+        #expect(state.1?.bodyComplete == false)
+        #expect(await queue.isIdle)
+    }
+
+    @Test("Backfill non-inbox queue converges after a bounded-fetch refusal")
+    func backfillQueueConvergesAndLeavesSiblingRetryable() async throws {
+        let fixture = try makeSwappedDatabase()
+        defer { fixture.restore() }
+        let target = fixture.header
+        let sibling = bodyHeader(
+            messageId: "43", folderId: target.folderId,
+            folderPath: target.folderPath, isInInbox: false,
+            subject: "Retryable sibling"
+        )
+        try await fixture.pool.write { db in try sibling.insert(db) }
+
+        let provider = MockEmailProvider(staleWindowMode: .uid)
+        await provider.setFetchMessageThrows(ProviderError.bodyIndexingUnsupported(
+            messageId: target.messageId,
+            observedUidValidity: 7,
+            fetchedRfc822MessageId: nil
+        ))
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: target.accountId, provider: provider
+        )
+        let queue = BackfillBodyQueue()
+        await queue.enqueue([
+            .init(
+                headerId: target.id, accountId: target.accountId,
+                folderPath: target.folderPath, messageId: target.messageId,
+                isInInbox: false
+            ),
+            .init(
+                headerId: sibling.id, accountId: sibling.accountId,
+                folderPath: sibling.folderPath, messageId: sibling.messageId,
+                isInInbox: false
+            ),
+        ])
+        await queue.awaitDrain()
+        await AccountManager.shared.unregisterProviderForTesting(accountId: target.accountId)
+
+        let state = try await fixture.pool.read { db in
+            (
+                try MessageHeader.fetchOne(db, key: target.id),
+                try MessageHeader.fetchOne(db, key: sibling.id)
+            )
+        }
+        #expect(state.0?.bodyIndexingFailureReason
+                == BodyIndexingFailureReason.partialFetchUnsupported.rawValue)
+        #expect(state.1?.bodyIndexingFailureReason == nil)
+        #expect(state.1?.bodyComplete == false)
+        #expect(await queue.isIdle)
     }
 }

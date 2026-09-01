@@ -162,13 +162,16 @@ struct IMAPProviderMockNestedEmlTests {
 
         // === Part 2: tapping the .eml fetches and decodes its parent bytes ===
 
-        let fetchedParent = try await provider.fetchAttachment(
-            messageId: "77", folder: "INBOX",
-            section: carrier.section, encoding: carrier.encoding
+        let preview = try await EmlAttachmentPreviewLoader.load(attachment: carrier) {
+            try await provider.fetchAttachment(
+                messageId: "77", folder: "INBOX",
+                section: carrier.section, encoding: carrier.encoding
+            )
+        }
+        #expect(preview.html.contains("NESTED BODY"))
+        let nested = try #require(
+            preview.nestedAttachments.first { $0.filename == "imap-nested.pdf" }
         )
-        #expect(fetchedParent == innerBytes)
-        let parsed = try #require(EmlParsing.parse(rawBytes: fetchedParent))
-        let nested = try #require(parsed.nested.first { $0.filename == "imap-nested.pdf" })
 
         // === Part 3: an attachment selected inside that preview resolves through
         // === the compound section and the same bounded parent-fetch path.      ===
@@ -306,5 +309,19 @@ struct IMAPProviderMockNestedEmlTests {
         #expect(!html.contains("INNER BODY TEXT"))
         let attachedMessage = try #require(info.attachments.first { $0.filename == "inner.eml" })
         #expect(attachedMessage.section == "2")
+
+        let preview = try await EmlAttachmentPreviewLoader.load(attachment: attachedMessage) {
+            try await provider.fetchAttachment(
+                messageId: "42", folder: "INBOX",
+                section: attachedMessage.section, encoding: attachedMessage.encoding
+            )
+        }
+        #expect(preview.html.contains("INNER BODY TEXT"))
+        #expect(server.recordedCommands().contains {
+            $0.contains("BODY.PEEK[2]<0.\(innerRfc822Bytes.count)>")
+        })
+        #expect(server.recordedCommands().contains {
+            $0.contains("BODY.PEEK[2]<\(innerRfc822Bytes.count).1>")
+        })
     }
 }

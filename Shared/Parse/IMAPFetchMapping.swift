@@ -10,6 +10,7 @@ enum IMAPPartialFetchAssemblyError: Error, Equatable, Sendable {
     case invalidChunkSize(Int)
     case chunkExceedsRequest(requested: Int, received: Int)
     case prematureEnd(expected: Int, received: Int)
+    case contentBeyondExpectedSize(expected: Int)
 }
 
 /// Pure helpers shared between the NSE's one-shot IMAP fetch and the main-app
@@ -79,6 +80,25 @@ enum IMAPFetchMapping {
         }
     }
 
+    /// Whether every background-render part has a known BODYSTRUCTURE size and
+    /// their encoded-octet total fits a caller's aggregate memory budget.
+    /// The NSE uses this before allocating any body literal: one-MiB wire chunks
+    /// bound the parser, but retaining and rendering all chunks still needs a
+    /// separate whole-message bound inside its fixed process budget.
+    static func requiredBodyPartsFitAggregateBudget(
+        in parts: [MessagePart],
+        byteBudget: Int
+    ) -> Bool {
+        guard byteBudget >= 0 else { return false }
+        var total = 0
+        for index in requiredBodyPartIndices(in: parts) {
+            guard let size = parts[index].size, size >= 0,
+                  size <= byteBudget - total else { return false }
+            total += size
+        }
+        return true
+    }
+
     private static func isNormalAttachment(_ part: MessagePart) -> Bool {
         let disposition = part.disposition?.lowercased()
         let hasFilename = !(part.filename?.isEmpty ?? true)
@@ -99,14 +119,29 @@ enum IMAPFetchMapping {
         if let expectedSize, expectedSize < 0 {
             throw IMAPPartialFetchAssemblyError.invalidExpectedSize(expectedSize)
         }
-        if expectedSize == 0 { return Data() }
-
         var result = Data()
         if let expectedSize { result.reserveCapacity(min(expectedSize, chunkSize)) }
         var offset = 0
 
         while true {
-            if let expectedSize, offset >= expectedSize { break }
+            if let expectedSize, offset >= expectedSize {
+                // BODYSTRUCTURE is useful planning metadata, not authority for
+                // truncation. Prove EOF with one bounded request at its claimed
+                // endpoint so an understated (including zero) size cannot be
+                // cached as a complete/empty body.
+                let extra = try await fetchChunk(offset, 1)
+                guard extra.count <= 1 else {
+                    throw IMAPPartialFetchAssemblyError.chunkExceedsRequest(
+                        requested: 1, received: extra.count
+                    )
+                }
+                guard extra.isEmpty else {
+                    throw IMAPPartialFetchAssemblyError.contentBeyondExpectedSize(
+                        expected: expectedSize
+                    )
+                }
+                break
+            }
             let requested = expectedSize.map { min(chunkSize, $0 - offset) } ?? chunkSize
             let chunk = try await fetchChunk(offset, requested)
             guard chunk.count <= requested else {

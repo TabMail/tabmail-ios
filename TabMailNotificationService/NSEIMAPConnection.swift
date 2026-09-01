@@ -145,6 +145,19 @@ enum NSEIMAPConnection {
         let message: Message
         do {
             var parts = info.parts
+            // Chunking bounds each wire response; it does not bound the encoded
+            // bytes retained across all parts or the decode/render copies that
+            // follow. Reuse the ordinary four-MiB response ceiling as the NSE's
+            // aggregate encoded-body admission budget, leaving the fixed 24-MB
+            // process envelope unchanged. Unknown sizes fail closed to passive
+            // notification delivery before any body literal is requested.
+            guard IMAPFetchMapping.requiredBodyPartsFitAggregateBudget(
+                in: parts,
+                byteBudget: IMAPFetchMapping.responseBufferLimit
+            ) else {
+                NSELog.step("NSE IMAP body exceeds bounded memory admission; using passive delivery")
+                return nil
+            }
             for index in IMAPFetchMapping.requiredBodyPartIndices(in: parts) {
                 let section = parts[index].section
                 let expectedSize = parts[index].size
