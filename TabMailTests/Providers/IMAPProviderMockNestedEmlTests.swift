@@ -518,6 +518,26 @@ struct IMAPProviderMockNestedEmlTests {
                 Issue.record("Unexpected turnover refusal for section \(section): \(error)")
             }
         }
+
+        // Epoch agreement alone must not override contradictory RFC identity.
+        // Refuse before requesting any normal attachment payload.
+        server.setUidValidity(41, for: "INBOX")
+        do {
+            _ = try await provider.fetchAttachment(
+                messageId: "9",
+                folder: "INBOX",
+                section: "2",
+                encoding: nil,
+                expectedObservedUidValidity: 41,
+                expectedRfc822MessageId: originalId
+            )
+            Issue.record("Matching UIDVALIDITY accepted a contradictory Message-ID")
+        } catch ProviderError.actionIdentityResolutionFailed(let messageId) {
+            #expect(messageId == "9")
+        } catch {
+            Issue.record("Unexpected matching-epoch identity refusal: \(error)")
+        }
+
         do {
             _ = try await provider.fetchAttachment(
                 messageId: "9",
