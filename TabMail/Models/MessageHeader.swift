@@ -206,9 +206,25 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     /// retry. That retry is the user's escape hatch, and it is the reason the ⚠️ above
     /// still holds: this is an observation, not a verdict.
     ///
-    /// Cleared on a UIDVALIDITY reset (the address changed, so the observation is
-    /// void), by Smart Reindex, and — exactly, in one statement — by the migration
-    /// that ships a raised parser bound.
+    /// CLEARED — the full set, because a flag that outlives its truth is worse than no
+    /// flag at all:
+    ///  • by ANY successful body write, which is positive evidence refuting the
+    ///    observation. All four: `BodyFetchProcessor.flushBatch` (both the body branch
+    ///    and the confirmed-empty branch), `NSEDataBridge.flushNSEBatchToFTS`, and
+    ///    `SyncEngine.applySnippetUpdates`. This is load-bearing, not tidiness:
+    ///    `BodyAssetMaintenance` evicts the `messageBody` row while deliberately leaving
+    ///    `bodyComplete = 1`, and the detail view's cache-miss fetch is the only
+    ///    recovery — a stale flag would delete that recovery and brick a message this
+    ///    build has already fetched once.
+    ///  • on a UIDVALIDITY reset (the address changed, so the observation is void).
+    ///  • by Smart Reindex (`SyncEngine.resetCrawlState`), the user's explicit
+    ///    try-everything-again gesture.
+    ///  • exactly, in one statement, by the migration that ships a raised parser bound —
+    ///    which is the whole re-fetch mechanism for this population once upstream is
+    ///    fixed.
+    ///
+    /// The mark itself carries `AND bodyComplete = 0` for the same reason: a row that
+    /// already has a body can never acquire this flag.
     var bodyMetadataOversized: Bool = false
 
     /// How many times a body fetch returned empty (no text, no attachments).

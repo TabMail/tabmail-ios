@@ -162,6 +162,14 @@ extension SyncEngine {
     ///
     /// Fix: re-index the header. Body queue's next dispatch will succeed.
     /// No `bodyComplete` reset needed (already 0). Runs once per startup.
+    ///
+    /// ⚠️ This scope DELIBERATELY omits `bodyMetadataOversized`, unlike the four body
+    /// -queue admission queries. It re-indexes HEADERS, and an oversized row's header is
+    /// perfectly healthy — dropping it here would make a quarantined message
+    /// unsearchable by subject and sender, which is a strictly larger loss than the
+    /// missing body. The two predicates diverged when that flag shipped; do not
+    /// re-merge them. Pinned by `OversizedDurableFlagConfinementTests
+    /// .ftsSelfHealStillSeesFlaggedRows`.
     func selfHealBackfillFTSMembership() async {
         do {
             // Same pattern as `selfHealFTSBodyMembership`: fetch only IDs first,

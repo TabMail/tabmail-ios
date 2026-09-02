@@ -344,6 +344,7 @@ enum BodyFetchProcessor {
                                 UPDATE messageHeader
                                 SET bodyEmptyConfirmed = 1,
                                     bodyComplete = 1,
+                                    bodyMetadataOversized = 0,
                                     emptyFetchCount = emptyFetchCount + 1,
                                     summaryBlurb = 'This message has no content.',
                                     actionTag = ?,
@@ -495,8 +496,20 @@ enum BodyFetchProcessor {
                     // Reset missFetchCount=0 on success: a prior run may have accumulated
                     // misses against this header (e.g. IMAP flap). Now that we have real
                     // content, the miss chain is broken — start counting fresh next time.
+                    // `bodyMetadataOversized = 0`: a body we just fetched is positive
+                    // proof that refutes the recorded overflow observation. Cleared
+                    // HERE, at the success write, not at each reader — the flag is
+                    // read by the body-queue admission queries, by backfill progress
+                    // and by the detail view, and a stale one makes an evicted body
+                    // unopenable and lets Smart Reindex un-complete a healthy row.
+                    // Rides the existing UPDATE exactly as `missFetchCount = 0` does.
                     try db.execute(
-                        sql: "UPDATE messageHeader SET snippet = ?, bodyComplete = 1, missFetchCount = 0 WHERE id = ?",
+                        sql: """
+                            UPDATE messageHeader
+                            SET snippet = ?, bodyComplete = 1, missFetchCount = 0,
+                                bodyMetadataOversized = 0
+                            WHERE id = ?
+                            """,
                         arguments: [item.snippet, item.headerId]
                     )
                 }

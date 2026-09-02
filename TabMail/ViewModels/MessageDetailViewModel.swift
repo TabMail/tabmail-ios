@@ -1415,7 +1415,17 @@ final class MessageDetailViewModel {
         // attempt, not a verdict that content is unobtainable, so pull-to-refresh
         // (`refetchBody`) still performs a genuine retry — that is the user's escape
         // hatch, and it is why this returns rather than latching anything.
-        if msg.bodyMetadataOversized {
+        // `&& !msg.bodyComplete` is a FAIL-SAFE, not the primary defence. Every success
+        // write clears the flag, so a row with a body should never reach here carrying
+        // one — but `bodyComplete = 1` means a body demonstrably existed, and the cache
+        // deleters (`BodyAssetMaintenance.dropMessage`, `wipeAll(.inlineImage)`,
+        // `SyncEngine.runEvictStaleBodies` / `runPruneIfOverBudget`) delete
+        // the `messageBody` row while deliberately leaving `bodyComplete = 1`, relying
+        // on THIS function's cache-miss fetch as their only recovery. Refusing that
+        // fetch on a stale flag would make an already-fetched message permanently
+        // unopenable, so a future writer of `bodyComplete = 1` that forgets to clear the
+        // flag costs a wasted round trip here rather than a broken message.
+        if msg.bodyMetadataOversized && !msg.bodyComplete {
             if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] Body quarantined (oversized metadata FETCH) — reporting load failure without a fetch for \(rid.prefix(40))") }
             BootProfiler.mark("detail body OVERSIZED-QUARANTINED → report failure \(rid.prefix(24))")
             error = "Unable to load this message's content."

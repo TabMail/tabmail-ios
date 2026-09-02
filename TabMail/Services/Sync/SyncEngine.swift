@@ -859,7 +859,10 @@ actor SyncEngine {
                     try MessageHeader.filter(Column("id") == headerId)
                         .updateAll(db,
                                    Column("snippet").set(to: snippet),
-                                   Column("bodyComplete").set(to: true))
+                                   Column("bodyComplete").set(to: true),
+                                   // A written body refutes a recorded parser-overflow
+                                   // observation — see `MessageHeader.bodyMetadataOversized`.
+                                   Column("bodyMetadataOversized").set(to: false))
                 }
             }
         } catch {

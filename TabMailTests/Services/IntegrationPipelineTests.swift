@@ -426,7 +426,14 @@ struct MigrationIndexVerificationTests {
         #expect(columns[3] == "isInInbox")
     }
 
-    @Test("v40 bodyRepopulate index has correct column order for repopulate query")
+    /// ⚠️ This pins the v40 index, which is NO LONGER the one the repopulate queries
+    /// use. Those gained a fifth equality column (`bodyMetadataOversized`) and are now
+    /// served by `messageHeader_bodyRepopulateV2`, built off the launch path by
+    /// `SyncEngine.createDeferredIndexes` and pinned by
+    /// `OversizedDurableFlagIndexTests`. The v40 index is kept (ADR-IOS-029 — never
+    /// drop an existing index) and so is this test, but it is a shape assertion about a
+    /// legacy index, not evidence about current query plans.
+    @Test("v40 bodyRepopulate index still has its original five columns (superseded by bodyRepopulateV2)")
     func bodyRepopulateIndexColumns() throws {
         let db = try TestDatabase.make()
 

@@ -255,8 +255,17 @@ actor BackfillBodyQueue {
             print("[BackfillBody] Durably flagging oversized \(headerId.prefix(30))")
         }
         enqueueDurableWrite(label: "flag \(headerId.prefix(30))") { db in
+            // ⚠️ `AND bodyComplete = 0` is the write-side half of "a proven body always
+            // wins". This write is DISPATCHED, so a user pull-to-refresh can succeed
+            // between the overflow and this statement; without the guard the mark would
+            // land on a row that now has a body, and the stale flag would make that body
+            // unopenable once the cache evicts it. The read side clears the flag at every
+            // success write — see `MessageHeader.bodyMetadataOversized`.
             try db.execute(
-                sql: "UPDATE messageHeader SET bodyMetadataOversized = 1 WHERE id = ?",
+                sql: """
+                    UPDATE messageHeader SET bodyMetadataOversized = 1
+                    WHERE id = ? AND bodyComplete = 0
+                    """,
                 arguments: [headerId]
             )
         }

@@ -1999,7 +1999,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v87 RANGE ─────────────────────
+        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v88 RANGE ─────────────────────
         //
         // `registerTimedMigration`'s DEFAULT stays `.deferred` and is NOT
         // changed. v1…v67 have never been adjudicated for `.immediate` safety,
@@ -2071,6 +2071,12 @@ final class AppDatabase: Sendable {
         //   • v87 — drops only v85/v86's direct-AI triggers, sparse index and two
         //     non-key marker columns. It neither reads nor rewrites an FK-bearing
         //     value; existing derived-work markers are intentionally discarded.
+        //   • v88 — one `ALTER TABLE messageHeader ADD COLUMN`
+        //     (`bodyMetadataOversized`). Same argument as the `ADD COLUMN` bullet
+        //     above: `messageHeader` IS a parent, but adding a column writes no key
+        //     of either kind. Its index is NOT built here — it is deferred to
+        //     `SyncEngine.createDeferredIndexes` off the launch path
+        //     (ADR-IOS-029, 2026-08-05 amendment), so the body is one statement.
         //
         //   • v82 — `DROP`/`CREATE` of `userLabel` + `messageUserLabel`. FK-clean
         //     per statement, verified statement by statement in that migration's own
@@ -2081,16 +2087,16 @@ final class AppDatabase: Sendable {
         //     the body safe.
         //
         // ⚑ AMENDED 2026-08-06, RANGE RE-DERIVED AT R17-6 — **EVERY MIGRATION IN
-        // v68…v87 NOW RUNS `.immediate`, so this range runs ZERO whole-database
+        // v68…v88 NOW RUNS `.immediate`, so this range runs ZERO whole-database
         // foreign-key checks.** The range is an OPEN interval that moves with the
         // top of the chain, so it is re-derived rather than restated (`MIS-031` — a
         // sentence that enumerates is a cache, and this one had gone stale at `v84`
         // in five places at once). Comments excluded so this paragraph cannot
         // satisfy its own predicate (`MIS-033`, `IOS-DOC-002`):
         //   rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' \
-        //      TabMail/Services/AppDatabase.swift                            → 20
+        //      TabMail/Services/AppDatabase.swift                            → 21
         //   rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' \
-        //      TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 20
+        //      TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 21
         // Equal counts are the invariant: every migration from v68 to the top runs
         // `.immediate`, and none below v68 does. The sentence
         // that stood here said *"`v71` and `v82` stay `.deferred`, each for a
@@ -3712,6 +3718,28 @@ final class AppDatabase: Sendable {
         // Per ADR-IOS-029 the v40 index is NOT dropped (other queries use it); a new
         // one is added alongside, which is the same thing v40 itself did to v22's
         // `idx_messageHeader_bodyStatus`.
+        //
+        // ⛔ THE INDEX IS NOT BUILT HERE. It lives in
+        // `SyncEngine.deferredIndexes` as `messageHeader_bodyRepopulateV2`.
+        // ADR-IOS-029's amendment is explicit — *"startup migrations should really have
+        // only things that are absolutely necessary and blocking"* — and this index
+        // passes that ADR's own eligibility test: its absence degrades PERFORMANCE AND
+        // NOTHING ELSE. Measured without it, the four admission queries still plan
+        // `SEARCH ... USING INDEX messageHeader_bodyRepopulate` on four of the five
+        // equality columns, still date-ordered, still no temp B-tree — identical rows in
+        // identical order, with the fifth conjunct filtered per row. Nothing names it in
+        // an `INDEXED BY` clause and no write depends on it.
+        //
+        // The precedent is exact: `v83_markAllAsReadUnreadSweepIndex` has an
+        // INTENTIONALLY EMPTY body because the owner had its `CREATE INDEX` moved out
+        // after `MigrationTimingLedger` attributed 5,050 ms of blocking launch to it.
+        // This index is LARGER than that one — measured at 360k rows on a Mac, 192 ms /
+        // 1,589 pages against v83's 138 ms / 1,311 pages — and Mac timings understate
+        // device by 2-4x. Building it here would re-add to the launch path exactly what
+        // that amendment removed.
+        //
+        // The ADD COLUMN below stays blocking: a column is correctness, not performance,
+        // and code compiled against it must never meet a database without it.
         migrator.registerTimedMigration(
             "v88_addBodyMetadataOversized", foreignKeyChecks: .immediate
         ) { db in
@@ -3720,11 +3748,6 @@ final class AppDatabase: Sendable {
                     .notNull()
                     .defaults(to: false)
             }
-            try db.execute(sql: """
-                CREATE INDEX IF NOT EXISTS messageHeader_bodyRepopulateV2
-                ON messageHeader(isInInbox, headerComplete, bodyComplete,
-                                 bodyEmptyConfirmed, bodyMetadataOversized, date)
-                """)
         }
     }
 

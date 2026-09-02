@@ -3281,8 +3281,15 @@ enum NSEDataBridge {
         do {
             try await AppDatabase.dbPool.write { db in
                 let placeholders = confirmedIds.map { _ in "?" }.joined(separator: ",")
+                // `bodyMetadataOversized = 0` rides along: the NSE just produced a
+                // body for these headers, which refutes any recorded parser-overflow
+                // observation against them. Cleared at every success write, not at
+                // each reader — see `MessageHeader.bodyMetadataOversized`.
                 try db.execute(
-                    sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE id IN (\(placeholders))",
+                    sql: """
+                        UPDATE messageHeader SET bodyComplete = 1, bodyMetadataOversized = 0
+                        WHERE id IN (\(placeholders))
+                        """,
                     arguments: StatementArguments(confirmedIds)
                 )
             }

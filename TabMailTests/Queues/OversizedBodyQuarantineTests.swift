@@ -313,10 +313,28 @@ struct OversizedBodyQuarantineDatabaseTests {
         let afterRelaunch = ActiveBodyQueue()
         #expect(await afterRelaunch.oversizedDeferredThisSession.isEmpty,
                 "precondition — a fresh queue's in-memory quarantine is empty, which is exactly why the pre-fix build re-fetched")
-        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false,
-                "the durable flag, not process memory, must keep the row out of background admission")
+
+        // Drive the REAL launch-path repopulate, not a replica of its predicate: a
+        // test that re-typed the SQL would stay green against a build whose production
+        // query had lost the oversized conjunct.
+        await afterRelaunch.repopulateFromDatabase()
+        #expect(await afterRelaunch.queuedItemsForTesting.contains { $0.headerId == header.id } == false,
+                "the durable flag, not process memory, must keep the row out of the launch repopulate")
+
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false)
         #expect(try await isPendingBodyIgnoringOversizedFlag(headerId: header.id),
                 "and it is still an ordinary pending-body row underneath — nothing was marked complete or empty")
+
+        // Two-sided, and the forward path the owner asked for on 2026-09-01: once an
+        // upstream parser fix lands, clearing the flag is the whole re-fetch mechanism.
+        try await AppDatabase.dbPool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET bodyMetadataOversized = 0 WHERE id = ?",
+                           arguments: [header.id])
+        }
+        let afterUpstreamFix = ActiveBodyQueue()
+        await afterUpstreamFix.repopulateFromDatabase()
+        #expect(await afterUpstreamFix.queuedItemsForTesting.contains { $0.headerId == header.id },
+                "clearing the flag must be sufficient to re-admit the row — nothing else about it was mutated")
     }
 
     @Test("BackfillBodyQueue: the oversized quarantine survives a relaunch")
@@ -333,8 +351,20 @@ struct OversizedBodyQuarantineDatabaseTests {
 
         let afterRelaunch = BackfillBodyQueue()
         #expect(await afterRelaunch.oversizedDeferredThisSession.isEmpty)
+        await afterRelaunch.repopulateFromDatabase()
+        #expect(await afterRelaunch.queuedItemsForTesting.contains { $0.headerId == header.id } == false,
+                "the durable flag must keep the row out of the real launch repopulate")
         #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false)
         #expect(try await isPendingBodyIgnoringOversizedFlag(headerId: header.id))
+
+        try await AppDatabase.dbPool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET bodyMetadataOversized = 0 WHERE id = ?",
+                           arguments: [header.id])
+        }
+        let afterUpstreamFix = BackfillBodyQueue()
+        await afterUpstreamFix.repopulateFromDatabase()
+        #expect(await afterUpstreamFix.queuedItemsForTesting.contains { $0.headerId == header.id },
+                "clearing the flag must be sufficient to re-admit the row")
     }
 
     /// A multi-item overflow does not say WHICH item was too large. Flagging there
@@ -417,6 +447,279 @@ struct OversizedBodyQuarantineDatabaseTests {
         #expect(try await isEligibleForLaterBodyFetch(headerId: header.id),
                 "the reset releases the durable quarantine as well as the in-memory one")
     }
+
+    // MARK: The same three durable properties on the ACTIVE queue
+
+    /// The three tests above ran only on `BackfillBodyQueue`. Both queues carry their
+    /// OWN copy of `markOversizedDurably` / `clearOversizedDurably` / the generation
+    /// guard, so a defect in either copy is invisible to a suite that exercises one.
+    /// (`feedback_half_port_drops_the_guard`: the half that is never driven is exactly
+    /// where the guard goes missing.) The inbox fixture is the only difference.
+    @Test("ActiveBodyQueue: a multi-item overflow durably flags NOTHING")
+    func activeMultiItemOverflowFlagsNothing() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        var sibling = MessageHeader(
+            messageId: "4243", subject: "An ordinary message",
+            from: "sender@example.com", fromAddress: "sender@example.com",
+            to: "recipient@example.com", date: Date(), snippet: "",
+            folderId: MessageIdentity.folderId(accountId: "acc1", folderPath: header.folderPath),
+            accountId: "acc1", folderPath: header.folderPath, isInInbox: true
+        )
+        sibling.headerComplete = true
+        let siblingRow = sibling
+        try await AppDatabase.dbPool.write { db in try siblingRow.insert(db) }
+
+        let queue = ActiveBodyQueue()
+        let items = [activeItem(header.id, folderPath: header.folderPath),
+                     activeItem(sibling.id, folderPath: header.folderPath)]
+        await queue.handlePayloadTooLarge(items: items, folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+
+        for id in [header.id, sibling.id] {
+            #expect(try await isEligibleForLaterBodyFetch(headerId: id),
+                    "neither item may be durably flagged from an unattributed batch failure")
+        }
+        #expect(await queue.isolationPendingForTesting.count == 2)
+    }
+
+    @Test("ActiveBodyQueue: a stale generation skips the durable write, not just the in-memory insert")
+    func activeStaleGenerationSkipsTheDurableWrite() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        let queue = ActiveBodyQueue()
+        let captured = await queue.resetGenerationForTesting
+        await queue.clearOversizedDeferred(accountId: "acc1", folderPath: header.folderPath)
+
+        let item = activeItem(header.id, folderPath: header.folderPath)
+        await queue.handlePayloadTooLarge(
+            items: [item], folderPath: header.folderPath, capturedGeneration: captured
+        )
+        await queue.awaitDurableWritesForTesting()
+
+        #expect(await queue.oversizedDeferredThisSession.isEmpty,
+                "precondition — the in-memory insert is skipped as stale")
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id),
+                "the durable write must be skipped too — a stale flag would starve a new-epoch message reusing this UID")
+    }
+
+    @Test("ActiveBodyQueue: a UIDVALIDITY reset clears the DURABLE flag, not only the in-memory set")
+    func activeUidValidityResetClearsTheDurableFlag() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        let queue = ActiveBodyQueue()
+        let item = activeItem(header.id, folderPath: header.folderPath)
+        await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false,
+                "precondition — the row is durably flagged")
+
+        await queue.clearOversizedDeferred(accountId: "acc1", folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id),
+                "the reset releases the durable quarantine as well as the in-memory one")
+    }
+
+    // MARK: The mark and the release cannot land out of order
+
+    /// Both durable writes are dispatched off the actor (they must not block the queue
+    /// on a `.background` pool write), so their ORDER is a property of the serializing
+    /// chain, not of the actor. If they could interleave, a UIDVALIDITY reset arriving
+    /// right after an overflow could be overtaken by the mark it is meant to release —
+    /// leaving a new-epoch message quarantined by an observation about a message that
+    /// no longer exists at that address, with no further event to clear it.
+    ///
+    /// Asserted as the observable end state after BOTH orders, with no drain in
+    /// between, which is the only condition under which a race can express itself.
+    @Test("ActiveBodyQueue: a release issued after a mark wins, with no intervening drain")
+    func activeReleaseAfterMarkWins() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        let queue = ActiveBodyQueue()
+        let item = activeItem(header.id, folderPath: header.folderPath)
+        await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        // No drain here — this is the point of the test.
+        await queue.clearOversizedDeferred(accountId: "acc1", folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id),
+                "the LAST issued write is the release, so the row must end up admissible")
+        try await Self.settleAndExpectStable(headerId: header.id, eligible: true) {
+            try await isEligibleForLaterBodyFetch(headerId: $0)
+        }
+    }
+
+    @Test("ActiveBodyQueue: a mark issued after a release wins, with no intervening drain")
+    func activeMarkAfterReleaseWins() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        let queue = ActiveBodyQueue()
+        await queue.clearOversizedDeferred(accountId: "acc1", folderPath: header.folderPath)
+        let item = activeItem(header.id, folderPath: header.folderPath)
+        await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false,
+                "the LAST issued write is the mark, so the row must end up quarantined — the mirror image of the case above")
+        try await Self.settleAndExpectStable(headerId: header.id, eligible: false) {
+            try await isEligibleForLaterBodyFetch(headerId: $0)
+        }
+    }
+
+    /// ⚠️ WITHOUT THIS THE ORDERING TESTS ARE HALF-BLIND, and that was MEASURED, not
+    /// assumed. `awaitDurableWritesForTesting()` awaits the LAST chain task. When the
+    /// chain is intact that transitively awaits every predecessor — but a build whose
+    /// chaining was removed leaves the earlier write still in flight, and the
+    /// direction whose LAST write is not the one under assertion then reads the right
+    /// value for the wrong reason — the earlier write simply had not landed yet — and
+    /// passes. Removing `await previous?.value` from `enqueueDurableWrite` left both
+    /// directions GREEN until this settle window was added.
+    ///
+    /// So: after the drain, give any straggler a bounded window and re-read. Against a
+    /// correctly chained build nothing is outstanding, so the value cannot change and
+    /// this cannot flake; against an unchained one the late write lands inside the
+    /// window and flips it.
+    ///
+    /// ✅ BOTH directions are now provably red, each against the mutant that delays the
+    /// write it is blind to: chain removed + 60 ms on the MARK fails
+    /// `activeReleaseAfterMarkWins`; chain removed + 60 ms on the CLEAR fails
+    /// `activeMarkAfterReleaseWins`. Neither direction is a decorative control.
+    private static func settleAndExpectStable(
+        headerId: String,
+        eligible: Bool,
+        _ read: (String) async throws -> Bool
+    ) async throws {
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(try await read(headerId) == eligible,
+                "a durable write was still in flight after the drain — the writes are not serialized behind one chain")
+    }
+
+    @Test("BackfillBodyQueue: a release issued after a mark wins, with no intervening drain")
+    func backfillReleaseAfterMarkWins() async throws {
+        let (header, restore) = try makeSwappedDB(folderPath: "Archive", isInInbox: false)
+        defer { restore() }
+
+        let queue = BackfillBodyQueue()
+        let item = backfillItem(header.id, folderPath: header.folderPath)
+        await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        await queue.clearOversizedDeferred(accountId: "acc1", folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id))
+        try await Self.settleAndExpectStable(headerId: header.id, eligible: true) {
+            try await isEligibleForLaterBodyFetch(headerId: $0)
+        }
+    }
+
+    @Test("BackfillBodyQueue: a mark issued after a release wins, with no intervening drain")
+    func backfillMarkAfterReleaseWins() async throws {
+        let (header, restore) = try makeSwappedDB(folderPath: "Archive", isInInbox: false)
+        defer { restore() }
+
+        let queue = BackfillBodyQueue()
+        await queue.clearOversizedDeferred(accountId: "acc1", folderPath: header.folderPath)
+        let item = backfillItem(header.id, folderPath: header.folderPath)
+        await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false)
+        try await Self.settleAndExpectStable(headerId: header.id, eligible: false) {
+            try await isEligibleForLaterBodyFetch(headerId: $0)
+        }
+    }
+
+    // MARK: A successful fetch retracts the observation
+
+    /// 🚨 THE STALE-FLAG INVARIANT. The flag records ONE failed wire attempt against one
+    /// address; the parser bound is fragmentation-dependent, so the very next attempt on
+    /// a different connection can succeed. If a success left the flag standing, the row
+    /// would carry a permanent lie — and `BodyAssetMaintenance` (which evicts the
+    /// `messageBody` row while deliberately leaving `bodyComplete = 1`, relying on the
+    /// detail view's cache-miss fetch as the sole recovery) would turn that lie into a
+    /// permanently unopenable message that this build had already fetched once.
+    ///
+    /// Driven through the REAL success write (`BodyFetchProcessor.flushBatch`), not a
+    /// replica of its UPDATE.
+    @Test("A successful body write retracts the oversized observation")
+    func successfulBodyWriteClearsTheFlag() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        let queue = ActiveBodyQueue()
+        let item = activeItem(header.id, folderPath: header.folderPath)
+        await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false,
+                "precondition — the row is durably flagged")
+
+        // flushBatch only writes the header once the FTS row is confirmed present.
+        let record = FTSHeaderRecord(
+            contentKey: ContentKey(rawValue: header.id),
+            headerId: header.id, messageId: header.messageId, subject: header.subject,
+            from: "\(header.from) <\(header.fromAddress)>", to: header.to,
+            dateMs: Int64(header.date.timeIntervalSince1970 * 1000)
+        )
+        try await SearchIndex.shared.removeMessages(contentKeys: [ContentKey(rawValue: header.id)])
+        _ = try await SearchIndex.shared.indexHeaders([record])
+        defer {
+            let key = ContentKey(rawValue: header.id)
+            Task { try? await SearchIndex.shared.removeMessages(contentKeys: [key]) }
+        }
+
+        await BodyFetchProcessor.flushBatch([
+            BodyFetchProcessor.ProcessedItem(
+                contentKey: ContentKey(rawValue: header.id),
+                headerId: header.id, accountId: header.accountId, isInInbox: true,
+                body: "the body did arrive on a differently fragmented connection",
+                snippet: "it arrived")
+        ], enableAI: false)
+
+        let row = try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        }
+        #expect(row?.bodyComplete == true, "precondition — the success write landed")
+        #expect(row?.bodyMetadataOversized == false,
+                "a written body refutes the overflow observation; leaving it set would brick this row on the next cache eviction")
+    }
+
+    // MARK: Smart Reindex, through the real method
+
+    /// Smart Reindex is the user-invoked "try everything again" gesture, and — until an
+    /// upstream parser fix ships — it is the one gesture that releases a whole account's
+    /// quarantine. Driven through the PRODUCTION method, not a copy of its `UPDATE`:
+    /// a replica cannot go red when production's statement regresses, and this
+    /// statement has a known silent-failure mode (the flag must appear in the `WHERE`
+    /// as well as the `SET`, since a flagged row has `bodyEmptyConfirmed = 0`).
+    ///
+    /// The property asserted is the end state a user would observe: the row is no
+    /// longer quarantined AND the launch repopulate admits it again.
+    @Test("Smart Reindex releases the quarantine, through the real resetCrawlState()")
+    func smartReindexReleasesTheQuarantineThroughTheRealMethod() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        let queue = ActiveBodyQueue()
+        let item = activeItem(header.id, folderPath: header.folderPath)
+        await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false,
+                "precondition — the row is durably flagged")
+
+        await SyncEngine().resetCrawlState()
+
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id),
+                "the user's try-everything-again gesture must release the quarantine")
+        let afterReindex = ActiveBodyQueue()
+        await afterReindex.repopulateFromDatabase()
+        #expect(await afterReindex.queuedItemsForTesting.contains { $0.headerId == header.id },
+                "and the row must actually come back into the queue, not merely lose a column value")
+    }
 }
 
 // MARK: - Property (ii): the quarantine terminates the drain/repopulate cycle
@@ -436,7 +739,14 @@ struct OversizedBodyQuarantineDatabaseTests {
 ///
 /// These tests drive the modelled drain/repopulate cycle off the queue's REAL contents
 /// and assert convergence with an explicit pass and overflow budget.
-@Suite("Oversized body quarantine terminates the drain/repopulate cycle")
+/// `.serialized, .processGlobalState`: every `handlePayloadTooLarge` /
+/// `clearOversizedDeferred` below dispatches a DURABLE write off the actor, and that
+/// write targets the process-global `AppDatabase.shared`. Without the trait the sink
+/// database is not guaranteed installed (an escaped write can trip `rawPool`'s
+/// force-unwrap and kill the whole test process), and without the drain at each test's
+/// end the write can land inside a LATER suite's swapped database. Each affected test
+/// therefore ends with `awaitDurableWritesForTesting()` on every queue it touched.
+@Suite("Oversized body quarantine terminates the drain/repopulate cycle", .serialized, .processGlobalState)
 struct OversizedBodyQuarantineConvergenceTests {
 
     @Test("ActiveBodyQueue: an oversized message reaches a quiescent queue within a bounded number of drain/repopulate passes")
@@ -495,6 +805,9 @@ struct OversizedBodyQuarantineConvergenceTests {
         #expect(snapshot.activeJobs == 0, "activeJobs is never touched — a stray decrement would drive it negative")
         #expect(snapshot.recentlyCompletedCount == 1,
                 "exactly ONE completion — the sibling that genuinely fetched. The quarantined message is deferred, NOT completed")
+
+        // Durable writes escape the actor — settle them inside this test's scope.
+        await queue.awaitDurableWritesForTesting()
     }
 
     @Test("BackfillBodyQueue: an oversized message reaches a quiescent queue within a bounded number of drain/repopulate passes")
@@ -544,6 +857,9 @@ struct OversizedBodyQuarantineConvergenceTests {
         #expect(snapshot.activeJobs == 0)
         #expect(snapshot.recentlyCompletedCount == 1,
                 "exactly ONE completion — the sibling that genuinely fetched")
+
+        // Durable writes escape the actor — settle them inside this test's scope.
+        await queue.awaitDurableWritesForTesting()
     }
 
     @Test("An isolation-pending item is dispatched alone while ordinary items coalesce per folder")
@@ -597,6 +913,9 @@ struct OversizedBodyQuarantineConvergenceTests {
         let snapshot = await queue.storageSnapshotForTesting
         #expect(snapshot.queueCount == 2, "both stay in the queue, retryable")
         #expect(snapshot.recentlyCompletedCount == 0, "and neither is falsely completed")
+
+        // Durable writes escape the actor — settle them inside this test's scope.
+        await queue.awaitDurableWritesForTesting()
     }
 
     @Test("BackfillBodyQueue: a multi-item PayloadTooLarge quarantines nothing and completes nothing, even when the per-folder cap is already 1")
@@ -615,6 +934,9 @@ struct OversizedBodyQuarantineConvergenceTests {
         let snapshot = await queue.storageSnapshotForTesting
         #expect(snapshot.queueCount == 2, "both stay in the queue, retryable")
         #expect(snapshot.recentlyCompletedCount == 0)
+
+        // Durable writes escape the actor — settle them inside this test's scope.
+        await queue.awaitDurableWritesForTesting()
     }
 
     @Test("A per-(account,folder) batch cap keeps one account's isolation singleton reachable while other accounts saturate the same folder name")
@@ -656,7 +978,14 @@ struct OversizedBodyQuarantineConvergenceTests {
 /// The generation guard is the other half: a batch already awaiting a network response
 /// when the reset lands must not resume afterwards and re-insert its stale OLD-epoch
 /// headerId, which would silently undo the clear.
-@Suite("A UIDVALIDITY reset releases the folder's oversized quarantine")
+/// `.serialized, .processGlobalState`: every `handlePayloadTooLarge` /
+/// `clearOversizedDeferred` below dispatches a DURABLE write off the actor, and that
+/// write targets the process-global `AppDatabase.shared`. Without the trait the sink
+/// database is not guaranteed installed (an escaped write can trip `rawPool`'s
+/// force-unwrap and kill the whole test process), and without the drain at each test's
+/// end the write can land inside a LATER suite's swapped database. Each affected test
+/// therefore ends with `awaitDurableWritesForTesting()` on every queue it touched.
+@Suite("A UIDVALIDITY reset releases the folder's oversized quarantine", .serialized, .processGlobalState)
 struct OversizedQuarantineResetReleaseTests {
 
     @Test("ActiveBodyQueue: clearOversizedDeferred re-admits the reset-renumbered UID and leaves other folders quarantined")
@@ -679,6 +1008,9 @@ struct OversizedQuarantineResetReleaseTests {
         #expect(await queue.oversizedDeferredThisSession.contains(archiveItem.headerId),
                 "a folder the reset did not touch keeps its quarantine")
         #expect(await queue.admit(archiveItem) == false)
+
+        // Durable writes escape the actor — settle them inside this test's scope.
+        await queue.awaitDurableWritesForTesting()
     }
 
     @Test("BackfillBodyQueue: clearOversizedDeferred re-admits the reset-renumbered UID and leaves other folders quarantined")
@@ -697,6 +1029,9 @@ struct OversizedQuarantineResetReleaseTests {
         #expect(await queue.oversizedDeferredThisSession.contains(archiveItem.headerId) == false)
         #expect(await queue.admit(archiveItem) == true)
         #expect(await queue.oversizedDeferredThisSession.contains(sentItem.headerId))
+
+        // Durable writes escape the actor — settle them inside this test's scope.
+        await queue.awaitDurableWritesForTesting()
     }
 
     @Test("clearOversizedDeferred also drops the folder's isolation-pending keys, and never a nested colon-delimited sibling folder's")
@@ -721,6 +1056,9 @@ struct OversizedQuarantineResetReleaseTests {
                 "isolation-pending keys for the reset folder are dropped too — they name the same discarded numbering")
         #expect(await queue.oversizedDeferredThisSession.contains(nestedSibling.headerId),
                 "a nested ':'-delimited child folder is a DIFFERENT folder and keeps its quarantine")
+
+        // Durable writes escape the actor — settle them inside this test's scope.
+        await queue.awaitDurableWritesForTesting()
     }
 
     @Test("ActiveBodyQueue: a UIDVALIDITY reset landing inside a batch's fetch window cannot re-quarantine the renumbered UID")
@@ -743,6 +1081,9 @@ struct OversizedQuarantineResetReleaseTests {
                 "the item is released RETRYABLE, so its next fetch resolves whatever message now lives at that UID")
         #expect(snapshot.recentlyCompletedCount == 0,
                 "and it is not falsely completed either")
+
+        // Durable writes escape the actor — settle them inside this test's scope.
+        await queue.awaitDurableWritesForTesting()
     }
 
     @Test("BackfillBodyQueue: a UIDVALIDITY reset landing inside a batch's fetch window cannot re-quarantine the renumbered UID")
@@ -763,6 +1104,9 @@ struct OversizedQuarantineResetReleaseTests {
         #expect(await queue.oversizedDeferredThisSession.isEmpty, "stale single-item quarantine skipped")
         #expect(await queue.isolationPendingForTesting.isEmpty, "stale multi-item isolation skipped")
         #expect(await queue.storageSnapshotForTesting.recentlyCompletedCount == 0, "nothing falsely completed")
+
+        // Durable writes escape the actor — settle them inside this test's scope.
+        await queue.awaitDurableWritesForTesting()
     }
 
     @Test("A batch whose captured generation still matches quarantines normally")
@@ -781,6 +1125,10 @@ struct OversizedQuarantineResetReleaseTests {
         let backfillCaptured = await backfill.resetGenerationForTesting
         await backfill.handlePayloadTooLarge(items: [backfillTarget], folderPath: "Archive", capturedGeneration: backfillCaptured)
         #expect(await backfill.oversizedDeferredThisSession.contains(backfillTarget.headerId))
+
+        // Durable writes escape the actor — settle them inside this test's scope.
+        await active.awaitDurableWritesForTesting()
+        await backfill.awaitDurableWritesForTesting()
     }
 }
 
@@ -815,7 +1163,14 @@ struct OversizedQuarantineResetReleaseTests {
 /// The suite is deliberately TWO-SIDED: a broken predicate that ALWAYS released would
 /// satisfy the release cases alone, so every release case has a held counterpart driven
 /// off a queue that still holds admitted work.
-@Suite("Fast Sync keep-awake follows runnable queue state, not durable completeness")
+/// `.serialized, .processGlobalState`: every `handlePayloadTooLarge` /
+/// `clearOversizedDeferred` below dispatches a DURABLE write off the actor, and that
+/// write targets the process-global `AppDatabase.shared`. Without the trait the sink
+/// database is not guaranteed installed (an escaped write can trip `rawPool`'s
+/// force-unwrap and kill the whole test process), and without the drain at each test's
+/// end the write can land inside a LATER suite's swapped database. Each affected test
+/// therefore ends with `awaitDurableWritesForTesting()` on every queue it touched.
+@Suite("Fast Sync keep-awake follows runnable queue state, not durable completeness", .serialized, .processGlobalState)
 struct FastSyncKeepAwakeTests {
 
     /// A progress snapshot with an explicit `pendingBodyCount`, hand-built so these
@@ -873,6 +1228,10 @@ struct FastSyncKeepAwakeTests {
             activeBodyIdle: activeIdle,
             backfillBodyIdle: backfillIdle
         ) == false, "an oversized-only remainder must not pin the screen awake")
+
+        // Durable writes escape the actor — settle them inside this test's scope.
+        await active.awaitDurableWritesForTesting()
+        await backfill.awaitDurableWritesForTesting()
     }
 
     @Test("The keep-awake lock is HELD while the ACTIVE body queue still holds admitted work")

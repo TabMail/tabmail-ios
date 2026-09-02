@@ -10,8 +10,14 @@ import GRDB
 // MARK: - Shared SQL
 
 /// The four BODY-FETCH ADMISSION queries, verbatim from production. These are the only
-/// queries that carry `bodyMetadataOversized = 0`, and the only ones the partial index
-/// serves.
+/// queries that carry `bodyMetadataOversized = 0`, and the only ones
+/// `messageHeader_bodyRepopulateV2` serves.
+///
+/// ⚠️ Transcribed SQL is a WEAK oracle — it cannot fail when production changes. These
+/// copies exist only to gate the PLAN SHAPE, which needs a literal statement to hand to
+/// `EXPLAIN QUERY PLAN`. The behavioural claim (a flagged row leaves background
+/// admission) is pinned against the REAL queues in
+/// `OversizedBodyQuarantineDatabaseTests`, which calls `repopulateFromDatabase()`.
 private enum AdmissionSQL {
     static let activeRepopulate = """
         SELECT id, accountId, folderPath, messageId, isInInbox
@@ -72,12 +78,23 @@ struct OversizedDurableFlagIndexTests {
 
     private static let indexName = "messageHeader_bodyRepopulateV2"
 
+    /// The index is NOT built by the migration — it lives in
+    /// `SyncEngine.deferredIndexes` (in `SyncEngineMaintenance.swift`) so it stays off the blocking launch path
+    /// (ADR-IOS-029). Tests reach it through the PRODUCTION DDL rather than re-typing the
+    /// `CREATE INDEX`, exactly as `createDeferredIndexes`' own doc comment requires: a
+    /// re-typed copy is a test that passes against a statement the app does not run.
+    private static func makeDBWithDeferredIndexes() throws -> DatabaseQueue {
+        let db = try TestDatabase.make()
+        try db.write { try SyncEngine.createDeferredIndexes($0) }
+        return db
+    }
+
     /// OPTIMAL here has a precise meaning: all five equality predicates are satisfied by
     /// the index SEEK (not filtered row-by-row afterwards), and `date` is supplied in
     /// order so nothing is sorted in memory.
     @Test("Every admission query seeks on all five equality columns")
     func admissionQueriesSeekOnEveryEqualityColumn() throws {
-        let db = try TestDatabase.make()
+        let db = try Self.makeDBWithDeferredIndexes()
         for q in AdmissionSQL.all {
             let plan = try queryPlan(db, q.sql)
             #expect(plan.contains(Self.indexName),
@@ -97,7 +114,7 @@ struct OversizedDurableFlagIndexTests {
     /// sort in memory on every drain — the expensive failure this column order avoids.
     @Test("The index also satisfies ORDER BY date DESC — no temporary B-tree sort")
     func admissionQueriesNeedNoTempBTree() throws {
-        let db = try TestDatabase.make()
+        let db = try Self.makeDBWithDeferredIndexes()
         for q in AdmissionSQL.all {
             let plan = try queryPlan(db, q.sql)
             #expect(!plan.uppercased().contains("TEMP B-TREE"),
@@ -115,7 +132,7 @@ struct OversizedDurableFlagIndexTests {
     /// difference this migration buys, so that is what the control measures.
     @Test("Negative control: without the extended index the fifth predicate drops out of the seek")
     func withoutTheIndexTheFifthPredicateLeavesTheSeek() throws {
-        let db = try TestDatabase.make()
+        let db = try Self.makeDBWithDeferredIndexes()
         let before = try queryPlan(db, AdmissionSQL.backfillRepopulate)
         #expect(before.contains("bodyMetadataOversized=?"), "precondition — plan was: \(before)")
 
@@ -134,7 +151,7 @@ struct OversizedDurableFlagIndexTests {
     /// prefix and silently reintroduce the in-memory sort.
     @Test("The index puts every equality column before date")
     func indexColumnOrderPutsDateLast() throws {
-        let db = try TestDatabase.make()
+        let db = try Self.makeDBWithDeferredIndexes()
         let ddl: String? = try db.read { conn in
             try String.fetchOne(conn, sql: """
                 SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?
@@ -182,10 +199,19 @@ struct OversizedDurableFlagIndexTests {
 
 // MARK: -
 
-@Suite("Migration v88 adds the oversized flag and its partial index")
+@Suite("Migration v88 adds the oversized flag; its index is deferred off the launch path")
 struct OversizedDurableFlagMigrationTests {
 
-    @Test("The column exists, defaults to 0, and the partial index is created")
+    /// ⛔ THE MIGRATION MUST NOT BUILD THE INDEX. ADR-IOS-029's amendment keeps startup
+    /// migrations to what is "absolutely necessary and blocking", and this index fails
+    /// that test: without it the admission queries still seek on four of five equality
+    /// columns in date order with no temp B-tree, so its absence degrades PERFORMANCE
+    /// AND NOTHING ELSE. The precedent is `v83_markAllAsReadUnreadSweepIndex`, whose
+    /// body is intentionally empty for the same reason after 5,050 ms of blocking launch
+    /// was attributed to it. This test is what stops a future edit from moving the
+    /// `CREATE INDEX` back into the migration, where it is invisible until a user with a
+    /// large mailbox upgrades.
+    @Test("The column exists and defaults to 0, and the migration does NOT build the index")
     func migrationShape() throws {
         let db = try TestDatabase.make()
 
@@ -195,11 +221,22 @@ struct OversizedDurableFlagMigrationTests {
         }
         #expect(columns.contains("bodyMetadataOversized"))
 
-        let indexes = try db.read { conn in
+        let afterMigrations = try db.read { conn in
             try Row.fetchAll(conn, sql: "PRAGMA index_list(messageHeader)")
                 .compactMap { $0["name"] as String? }
         }
-        #expect(indexes.contains("messageHeader_bodyRepopulateV2"))
+        #expect(!afterMigrations.contains("messageHeader_bodyRepopulateV2"),
+                "the migration chain must leave this index unbuilt — it belongs to the deferred pass")
+
+        // …and the deferred pass DOES build it, from the production DDL. Two-sided: an
+        // index that no mechanism ever creates would satisfy the assertion above alone.
+        try db.write { try SyncEngine.createDeferredIndexes($0) }
+        let afterDeferred = try db.read { conn in
+            try Row.fetchAll(conn, sql: "PRAGMA index_list(messageHeader)")
+                .compactMap { $0["name"] as String? }
+        }
+        #expect(afterDeferred.contains("messageHeader_bodyRepopulateV2"),
+                "the deferred pass is what builds it")
 
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
@@ -213,15 +250,18 @@ struct OversizedDurableFlagMigrationTests {
         #expect(flag == false, "an ordinary new row must not be born quarantined")
     }
 
-    @Test("Re-running the migration chain is a no-op")
+    @Test("Re-running the migration chain, and the deferred pass, are both no-ops")
     func migrationIsIdempotent() throws {
         let db = try TestDatabase.make()
         try AppDatabase.runMigrations(on: db)   // must not throw
+        try db.write { try SyncEngine.createDeferredIndexes($0) }
+        try db.write { try SyncEngine.createDeferredIndexes($0) }   // must not throw
         let indexes = try db.read { conn in
             try Row.fetchAll(conn, sql: "PRAGMA index_list(messageHeader)")
                 .compactMap { $0["name"] as String? }
         }
-        #expect(indexes.filter { $0 == "messageHeader_bodyRepopulateV2" }.count == 1)
+        #expect(indexes.filter { $0 == "messageHeader_bodyRepopulateV2" }.count == 1,
+                "CREATE INDEX IF NOT EXISTS — the pass re-arms on every launch and must converge")
         #expect(indexes.contains("messageHeader_bodyRepopulate"),
                 "ADR-IOS-029: the v40 index it extends is never dropped")
     }
@@ -374,17 +414,20 @@ struct OversizedDurableFlagConfinementTests {
         #expect(stored.missFetchCount == 0)
     }
 
-    /// Smart Reindex is the user-invoked "try everything again" gesture, so it must
-    /// release this quarantine. Its statement needs the flag in BOTH halves: a flagged
-    /// row has `bodyEmptyConfirmed = 0`, so the original `WHERE` does not select it and
-    /// adding the column to the `SET` alone would silently skip exactly the rows the
-    /// user invoked the gesture for.
-    @Test("Smart Reindex clears the flag — and needs BOTH halves of its statement to do so")
-    func smartReindexClearsTheFlag() throws {
+    /// NEGATIVE CONTROL for the half-port. Smart Reindex's statement needs the flag in
+    /// BOTH halves: a flagged row has `bodyEmptyConfirmed = 0`, so the ORIGINAL `WHERE`
+    /// does not select it, and adding the column to the `SET` alone is completely inert
+    /// against exactly the rows the user invoked the gesture for. This pins that the
+    /// half-port is inert; the positive side — that the REAL
+    /// `SyncEngine.resetCrawlState()` releases the quarantine — is asserted against the
+    /// production method in `OversizedBodyQuarantineDatabaseTests
+    /// .smartReindexReleasesTheQuarantineThroughTheRealMethod`, because a second
+    /// hand-copied replica here could not go red if production's statement regressed.
+    @Test("NEGATIVE CONTROL: a SET-only Smart Reindex statement is inert against a flagged row")
+    func setOnlySmartReindexStatementIsInert() throws {
         let db = try TestDatabase.make()
         let id = try seed(db)
 
-        // The half-done version: SET only, original WHERE.
         try db.write { conn in
             try conn.execute(sql: """
                 UPDATE messageHeader
@@ -393,20 +436,8 @@ struct OversizedDurableFlagConfinementTests {
                 WHERE bodyEmptyConfirmed = 1
                 """)
         }
-        var stored = try #require(try db.read { try MessageHeader.fetchOne($0, key: id) })
+        let stored = try #require(try db.read { try MessageHeader.fetchOne($0, key: id) })
         #expect(stored.bodyMetadataOversized,
                 "SET without WHERE is INERT — this is the half-port that would ship silently")
-
-        // Production's statement, both halves.
-        try db.write { conn in
-            try conn.execute(sql: """
-                UPDATE messageHeader
-                SET bodyEmptyConfirmed = 0, emptyFetchCount = 0, bodyComplete = 0,
-                    bodyMetadataOversized = 0
-                WHERE bodyEmptyConfirmed = 1 OR bodyMetadataOversized = 1
-                """)
-        }
-        stored = try #require(try db.read { try MessageHeader.fetchOne($0, key: id) })
-        #expect(stored.bodyMetadataOversized == false, "Smart Reindex must release the quarantine")
     }
 }

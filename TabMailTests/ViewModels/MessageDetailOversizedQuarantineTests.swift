@@ -42,6 +42,7 @@ struct MessageDetailOversizedQuarantineTests {
     @MainActor
     private func makeVM(
         oversized: Bool,
+        bodyComplete: Bool = false,
         probe: FetchProbe
     ) throws -> (MessageDetailViewModel, DatabasePool, URL) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -76,6 +77,7 @@ struct MessageDetailOversizedQuarantineTests {
             header.isRead = true  // avoid the markRead path touching AccountManager
             header.headerComplete = true
             header.bodyMetadataOversized = oversized
+            header.bodyComplete = bodyComplete
             try header.insert(db)
         }
 
@@ -174,5 +176,53 @@ struct MessageDetailOversizedQuarantineTests {
 
         #expect(probe.attempts == 1,
                 "an explicit user retry must reach the wire — the parser bound is fragmentation-dependent, so the same message can succeed on a different connection")
+    }
+
+    /// 🚨 THE EVICTION-RECOVERY INVARIANT — the regression the round-1 audit caught.
+    ///
+    /// `BodyAssetMaintenance` (`dropMessage`, `wipeAll(.inlineImage)`, `runEvictStaleBodies`,
+    /// `runPruneIfOverBudget`) deletes the `messageBody` row while deliberately LEAVING
+    /// `bodyComplete = 1`, because the detail view's cache-miss fetch is the designed —
+    /// and only — recovery. A short-circuit keyed on the flag alone deletes that
+    /// recovery, and a message this build has ALREADY fetched successfully becomes
+    /// permanently unopenable: strictly worse than the bug being fixed.
+    ///
+    /// The property asserted is the recovery itself, not the guard's shape: a row the
+    /// build has proven it CAN fetch must still reach the wire when its cache is gone,
+    /// whatever stale flag it happens to carry.
+    @Test("A proven-fetchable row whose body cache was evicted still fetches, even carrying a stale flag")
+    @MainActor
+    func evictedBodyStillFetchesDespiteStaleFlag() async throws {
+        let probe = FetchProbe()
+        // bodyComplete = 1 with NO `messageBody` row is exactly the post-eviction shape.
+        let (vm, pool, dir) = try makeVM(oversized: true, bodyComplete: true, probe: probe)
+        defer { cleanup(pool, dir) }
+
+        let key = vm.messageId
+        let cached = try await pool.read { db in
+            try MessageBody.fetchOne(db, key: key)
+        }
+        #expect(cached == nil, "precondition — the fixture is the evicted shape, so only a fetch can produce content")
+
+        await vm.loadBody()
+
+        #expect(probe.attempts == 1,
+                "eviction's designed recovery must survive the quarantine — otherwise a message we already fetched once is bricked forever")
+    }
+
+    /// The same shape from the other side, so the test above cannot pass because
+    /// `bodyComplete` alone disabled the short-circuit for everyone.
+    @Test("CONTROL: a flagged row that was never fetched is still quarantined")
+    @MainActor
+    func neverFetchedFlaggedRowStaysQuarantined() async throws {
+        let probe = FetchProbe()
+        let (vm, pool, dir) = try makeVM(oversized: true, bodyComplete: false, probe: probe)
+        defer { cleanup(pool, dir) }
+
+        await vm.loadBody()
+
+        #expect(probe.attempts == 0,
+                "the quarantine still applies to the population it was built for")
+        #expect(vm.error != nil)
     }
 }

@@ -106,12 +106,18 @@ struct PayloadTooLargeRetryabilityTests {
         return (header, restore)
     }
 
-    /// "Still eligible for a later body fetch" IS membership in the body queues'
-    /// candidate set. This is the predicate shared by
-    /// `ActiveBodyQueue.repopulateFromDatabase`,
-    /// `BackfillBodyQueue.repopulateFromDatabase` and the FTS self-heal scope in
-    /// `SyncEngineFTS` — a row excluded from it is reachable by no background body
-    /// fetch at all.
+    /// "Not retired": the row is still `headerComplete` with no body and no
+    /// confirmed-empty stamp, which is what keeps it visible to
+    /// `SyncEngineFTS.selfHealBackfillFTSMembership` and reachable by a retry.
+    ///
+    /// ⚠️ This is deliberately NOT the body queues' admission predicate any more. Both
+    /// `repopulateFromDatabase`s (and both `repopulateOnDrain`s) additionally require
+    /// `bodyMetadataOversized = 0`; the FTS self-heal scope does not, because a
+    /// quarantined row's HEADER is healthy and must stay searchable. These tests are
+    /// about what `BodyFetchProcessor` does to the ROW on a `PayloadTooLargeError`, so
+    /// the un-flagged shape above is the right question here — the admission side is
+    /// pinned against the real production queries in
+    /// `OversizedBodyQuarantineDatabaseTests`.
     private func isEligibleForLaterBodyFetch(headerId: String) async throws -> Bool {
         let found: Int = try await AppDatabase.dbPool.read { db in
             try Int.fetchOne(db, sql: """
