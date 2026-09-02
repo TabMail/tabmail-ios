@@ -110,10 +110,17 @@ actor ActiveBodyQueue {
     ///
     /// ⚑ THIS IS A BOUNDED, VISIBLE, RETRYABLE QUARANTINE — NOT A DISCARD. The DB
     /// row is left honestly `bodyComplete = 0 / bodyEmptyConfirmed = 0`, so it stays
-    /// in every work-remaining query, stays visible to `StuckMessageDiagnostics`, and
-    /// stays fetchable by the on-demand user-open path (`BodyFetchProcessor
-    /// .fetchAndProcess`, which never consults this set). Only the BACKGROUND
-    /// pre-fetch is suppressed, and only until one of its three releases fires:
+    /// visible to `StuckMessageDiagnostics`, keeps its FTS-indexed header, and stays
+    /// fetchable by an explicit user retry (`MessageDetailViewModel.refetchBody` →
+    /// `BodyFetchProcessor.fetchAndProcess`, which never consults this set).
+    ///
+    /// ⚠️ What the durable flag DOES suppress, beyond the background pre-fetch, since
+    /// the owner decision of 2026-09-01: backfill progress counts a flagged row as
+    /// resolved (so "Sync Complete" can fire), and simply OPENING the message reports
+    /// "unable to load" without a wire attempt. Both are documented in full on
+    /// `MessageHeader.bodyMetadataOversized`. The in-memory set below is unchanged by
+    /// that decision — it still governs only the background pre-fetch, and only until
+    /// one of its three releases fires:
     ///   1. ⛔ NO LONGER RELAUNCH. The set still starts empty, but the durable
     ///      `messageHeader.bodyMetadataOversized` flag written beside every insert
     ///      below now keeps the row out of the admission queries across launches.

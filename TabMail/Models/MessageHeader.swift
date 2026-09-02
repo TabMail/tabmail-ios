@@ -184,15 +184,27 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     /// overflow on a lossy link and parse fine on WiFi. It is therefore NOT a claim
     /// that the body is unfetchable, and it must never be treated as one.
     ///
-    /// Consumed by exactly one kind of reader: the four body-fetch admission queries
-    /// (`Active`/`BackfillBodyQueue.repopulateFromDatabase` and `.repopulateOnDrain`).
-    /// The row stays fully retryable everywhere else — the on-demand user-open path
-    /// still fetches it, `bodyComplete` stays 0, and the header stays FTS-indexed and
-    /// searchable by subject and sender.
+    /// Read by three kinds of consumer:
+    ///  1. The four body-fetch admission queries
+    ///     (`Active`/`BackfillBodyQueue.repopulateFromDatabase` and `.repopulateOnDrain`)
+    ///     — a flagged row is not offered to the background queues.
+    ///  2. Backfill progress (`SyncEngineBackfill.updateBackfillProgressForAccount`)
+    ///     — a flagged row is counted as RESOLVED, not as pending. This is what lets
+    ///     `BackfillProgress.isFullyComplete` become true, the sync banner clear, and
+    ///     Fast Sync stop keeping the device awake, on an account holding one of these
+    ///     messages. Owner decision 2026-09-01: while the parser bound is what it is,
+    ///     these bodies are simply not fetchable, and nagging the user forever about
+    ///     work that cannot be done is the worse product outcome.
+    ///  3. The user-open path (`MessageDetailViewModel.loadBody`) — a flagged row
+    ///     reports "unable to load" immediately, in exactly the state a fetch that just
+    ///     failed would leave behind, instead of spending a full connection on an
+    ///     attempt this build cannot complete.
     ///
-    /// ⛔ Do NOT add it to `BackfillProgress.pendingBodyCount` or to the FTS
-    /// membership self-heal. See the ACCEPTED LIMITATIONS note at the write site in
-    /// `BackfillBodyQueue.handlePayloadTooLarge`.
+    /// The row is NOT retired: `bodyComplete` stays 0, the header stays FTS-indexed and
+    /// searchable by subject and sender, the FTS membership self-heal still sees it, and
+    /// pull-to-refresh (`MessageDetailViewModel.refetchBody`) still performs a genuine
+    /// retry. That retry is the user's escape hatch, and it is the reason the ⚠️ above
+    /// still holds: this is an observation, not a verdict.
     ///
     /// Cleared on a UIDVALIDITY reset (the address changed, so the observation is
     /// void), by Smart Reindex, and — exactly, in one statement — by the migration
@@ -303,6 +315,54 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
         self.hasAttachments = false
         self.isReplied = false
         self.isForwarded = false
+    }
+}
+
+// MARK: - Backfill-progress predicates
+
+extension MessageHeader {
+
+    /// Rows that still owe a body fetch for `accountId` — the numerator of
+    /// "work remaining" that `BackfillProgress.pendingBodyCount` publishes and
+    /// `isFullyComplete` gates on.
+    ///
+    /// ⚠️ **This exists as a shared symbol so the test tree can assert the REAL
+    /// predicate.** It used to be an inline `filter(…)` chain inside
+    /// `SyncEngineBackfill.updateBackfillProgressForAccount`, and every test of it was
+    /// a hand-copied replica — which cannot go red when production changes, and would
+    /// have blessed a regression here (`feedback_tests_that_bless_the_bug`). Being a
+    /// query-interface chain it is also invisible to every SQL-text grep
+    /// (`feedback_census_inherits_its_search_shape`), so a name is the only way a
+    /// future census finds it.
+    ///
+    /// `bodyMetadataOversized = 0` is part of the predicate: a message whose metadata
+    /// FETCH overflows the IMAP response parser cannot be fetched by this build, and
+    /// counting it as outstanding leaves the sync banner up forever. See the flag's own
+    /// documentation for the owner decision behind that.
+    static func pendingBodyRequest(accountId: String) -> QueryInterfaceRequest<MessageHeader> {
+        MessageHeader.filter(
+            Column("accountId") == accountId &&
+            Column("headerComplete") == true &&
+            Column("bodyComplete") == false &&
+            Column("bodyEmptyConfirmed") == false &&
+            Column("bodyMetadataOversized") == false
+        )
+    }
+
+    /// Rows whose body question is SETTLED for `accountId` — fetched, confirmed empty,
+    /// or unfetchable by this build. The complement of `pendingBodyRequest` among
+    /// header-complete rows, and the numerator behind the "N / M indexed" readouts.
+    ///
+    /// ⚠️ Keep the two in lockstep. If a disposition counts as settled here but still
+    /// counts as pending there, the progress bar parks below 100% beside a green
+    /// completion check — the same nag in a different widget.
+    static func bodySettledRequest(accountId: String) -> QueryInterfaceRequest<MessageHeader> {
+        MessageHeader.filter(
+            Column("accountId") == accountId &&
+            (Column("bodyComplete") == true
+                || Column("bodyEmptyConfirmed") == true
+                || Column("bodyMetadataOversized") == true)
+        )
     }
 }
 

@@ -85,10 +85,17 @@ actor BackfillBodyQueue {
     ///
     /// ⚑ THIS IS A BOUNDED, VISIBLE, RETRYABLE QUARANTINE — NOT A DISCARD. The DB
     /// row is left honestly `bodyComplete = 0 / bodyEmptyConfirmed = 0`, so it stays
-    /// in every work-remaining query, stays visible to `StuckMessageDiagnostics`, and
-    /// stays fetchable by the on-demand user-open path (`BodyFetchProcessor
-    /// .fetchAndProcess`, which never consults this set). Only the BACKGROUND
-    /// pre-fetch is suppressed, and only until one of its three releases fires:
+    /// visible to `StuckMessageDiagnostics`, keeps its FTS-indexed header, and stays
+    /// fetchable by an explicit user retry (`MessageDetailViewModel.refetchBody` →
+    /// `BodyFetchProcessor.fetchAndProcess`, which never consults this set).
+    ///
+    /// ⚠️ What the durable flag DOES suppress, beyond the background pre-fetch, since
+    /// the owner decision of 2026-09-01: backfill progress counts a flagged row as
+    /// resolved (so "Sync Complete" can fire), and simply OPENING the message reports
+    /// "unable to load" without a wire attempt. Both are documented in full on
+    /// `MessageHeader.bodyMetadataOversized`. The in-memory set below is unchanged by
+    /// that decision — it still governs only the background pre-fetch, and only until
+    /// one of its three releases fires:
     ///   1. ⛔ NO LONGER RELAUNCH. The set still starts empty, but the durable
     ///      `messageHeader.bodyMetadataOversized` flag written beside every insert
     ///      below now keeps the row out of the admission queries across launches.
@@ -223,23 +230,24 @@ actor BackfillBodyQueue {
     /// `messageHeader.bodyMetadataOversized = 1` so the deferral survives a relaunch.
     ///
     /// ⚑ ACCEPTED LIMITATIONS OF THIS FLAG (owner-blessed; do not "fix" them without
-    /// asking, because two of them are deliberate non-changes):
+    /// asking):
     ///   1. The body stays unindexed and unsearchable BY CONTENT until a raised
     ///      parser bound ships upstream. The header stays FTS-indexed, so the message
     ///      is still findable by subject and sender.
-    ///   2. ⛔ The "Sync Complete" banner still withholds completion for an account
-    ///      holding one of these rows, because `BackfillProgress.pendingBodyCount`
-    ///      deliberately does NOT carry this flag. That is a TRUTH CLAIM about the
-    ///      mailbox: a body really is missing. Adding the conjunct there to make the
-    ///      banner green would be a second defect, not a fix. The battery cost that
-    ///      used to ride on it is already gone — the keep-awake lock moved to
-    ///      `FastSyncView.keepScreenAwakeWhileWorking`, which asks about queue
-    ///      activity instead.
+    ///   2. Backfill progress counts a flagged row as RESOLVED
+    ///      (`SyncEngineBackfill.updateBackfillProgressForAccount`), so "Sync Complete"
+    ///      fires on an account that still has an unfetchable body. Owner decision
+    ///      2026-09-01, reversing the earlier stance recorded here: withholding
+    ///      completion is a truth claim the user cannot act on, and the cost of it —
+    ///      a banner that never clears and a progress bar parked one short of 100% —
+    ///      is worse product behaviour than rounding an unfetchable message up to
+    ///      done. Revisit when the parser bound is raised upstream.
     ///   3. ⛔ `SyncEngineFTS.selfHealBackfillFTSMembership` deliberately does NOT
-    ///      carry it either: it re-indexes HEADERS, and this row's header is healthy.
+    ///      carry this flag: it re-indexes HEADERS, and this row's header is healthy.
     ///      Excluding it would drop a good message out of subject/sender search.
-    ///   4. The detail view still retries every 2s while an affected message is open
-    ///      (`MessageDetailViewModel.startBodyPoll`). Pre-existing; tracked separately.
+    ///   4. Opening an affected message reports "unable to load" immediately without a
+    ///      wire attempt (`MessageDetailViewModel.loadBody`). The user's retry is
+    ///      pull-to-refresh, which still performs a genuine fetch.
     ///
     /// Dispatch and ordering guarantees are documented on `enqueueDurableWrite`.
     private func markOversizedDurably(_ headerId: String) {

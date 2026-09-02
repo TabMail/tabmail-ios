@@ -340,20 +340,22 @@ extension SyncEngine {
         // GRDB is sole authority for body status flags
         let (grdbTotal, grdbIndexed, pendingBody) = (try? await dbPool.read { db -> (Int, Int, Int) in
             let total = try MessageHeader.filter(Column("accountId") == accountId).fetchCount(db)
-            let indexed = try MessageHeader.filter(
-                Column("accountId") == accountId &&
-                (Column("bodyComplete") == true || Column("bodyEmptyConfirmed") == true)
-            ).fetchCount(db)
-            // Body-eligible headers still awaiting fetch — same criteria the body
-            // queues use (BackfillBodyQueue/ActiveBodyQueue: headerComplete=1,
-            // no body yet, not confirmed-empty). Completion gates on this reaching
-            // 0, not on an exact count match against a server-reported total.
-            let pending = try MessageHeader.filter(
-                Column("accountId") == accountId &&
-                Column("headerComplete") == true &&
-                Column("bodyComplete") == false &&
-                Column("bodyEmptyConfirmed") == false
-            ).fetchCount(db)
+            // Both predicates live on `MessageHeader` as named requests rather than
+            // inline `filter(…)` chains — see `bodySettledRequest` /
+            // `pendingBodyRequest` for what they contain and why they are named. A
+            // chain here is invisible to every SQL-text census and unreachable from
+            // the test tree, and both properties cost real defects before.
+            //
+            // `bodyMetadataOversized` counts as SETTLED, not pending: those bodies
+            // are unfetchable by this build, and leaving them in work-remaining
+            // means `pendingBodyCount` never reaches 0, `isFullyComplete` is false
+            // forever, and the sync banner never clears. Owner decision 2026-09-01.
+            // If a future fix makes these bodies fetchable again, the two requests
+            // and the body-queue admission queries drop the flag together.
+            let indexed = try MessageHeader.bodySettledRequest(accountId: accountId).fetchCount(db)
+            // Completion gates on this reaching 0, not on an exact count match
+            // against a server-reported total.
+            let pending = try MessageHeader.pendingBodyRequest(accountId: accountId).fetchCount(db)
             return (total, indexed, pending)
         }) ?? (0, 0, 1)   // pending=1 on read failure → never false-complete
 

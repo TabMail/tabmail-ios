@@ -108,6 +108,16 @@ final class MessageDetailViewModel {
     /// (e.g., lock contention caused a timeout, but a later retry wrote the body).
     	@ObservationIgnored nonisolated(unsafe) private var bodyPollTask: Task<Void, Never>?
 
+    /// Test seam: has a body poll been started on this view model?
+    ///
+    /// Internal (not `private`) because `@testable import` cannot reach `private`
+    /// members, and "no poll was started" is otherwise unobservable — the poll's own
+    /// retry calls `manager.fetchBody` directly, NOT the injectable
+    /// `fetchBodyOverride`, so an unwanted poll would simply reach for the network
+    /// instead of failing a test. The oversized-metadata quarantine in `loadBody`
+    /// depends on not starting one.
+    var hasStartedBodyPollForTesting: Bool { bodyPollTask != nil }
+
     /// True while pull-to-refresh is fetching a replacement. The previous body
     /// remains readable; concurrent adoption waits so the refresh has one stable
     /// visible baseline.
@@ -1381,6 +1391,35 @@ final class MessageDetailViewModel {
             manager.enqueueWriteFromSynchronousContext { [manager] in
                 await manager.processOpenedMessage(msg)
             }
+            loadThreadMessagesAsync()
+            return
+        }
+        // Oversized-metadata quarantine (`bodyMetadataOversized`, stop-gap for the
+        // IMAP response-parser overflow). The metadata FETCH for this message
+        // overflowed the parser's read buffer on a previous attempt, so the body
+        // could not be retrieved and the body queues have stopped offering it.
+        //
+        // Present the SAME state a fetch that just failed would leave behind —
+        // `error` set, not loading, no body — instead of attempting a fetch that
+        // this build cannot complete. Owner decision 2026-09-01: showing "unable to
+        // load" immediately is the honest, cheap answer; a real attempt here costs a
+        // full TCP+TLS+LOGIN+SELECT (the parser overflow marks the folder connection
+        // unhealthy, so the retry cannot reuse it) and ends in this same state.
+        //
+        // Deliberately NO `startBodyPoll()`: nothing is fetching this body in the
+        // background — the flag is precisely what removed it from both queues — so a
+        // 2s poll would spin forever against a row that cannot change.
+        //
+        // Placed AFTER the durable-body and NSE-staged lookups above on purpose: if
+        // bytes exist by any route, show them. The flag records one failed wire
+        // attempt, not a verdict that content is unobtainable, so pull-to-refresh
+        // (`refetchBody`) still performs a genuine retry — that is the user's escape
+        // hatch, and it is why this returns rather than latching anything.
+        if msg.bodyMetadataOversized {
+            if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] Body quarantined (oversized metadata FETCH) — reporting load failure without a fetch for \(rid.prefix(40))") }
+            BootProfiler.mark("detail body OVERSIZED-QUARANTINED → report failure \(rid.prefix(24))")
+            error = "Unable to load this message's content."
+            isLoading = false
             loadThreadMessagesAsync()
             return
         }

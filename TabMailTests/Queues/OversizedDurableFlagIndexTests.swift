@@ -266,11 +266,10 @@ struct OversizedDurableFlagMigrationTests {
 
 // MARK: -
 
-/// The flag is consumed by body-fetch ADMISSION and by nothing else. Three deliberate
-/// NON-changes are pinned here because each is a plausible "cleanup" that would
-/// reintroduce a defect, and a deliberate omission that nothing asserts is indistinguishable
-/// from an oversight.
-@Suite("The durable oversized flag is confined to background body-fetch admission")
+/// Where the flag reaches, and — just as importantly — where it deliberately does NOT.
+/// Each non-change pinned here is a plausible "cleanup" that would reintroduce a defect,
+/// and a deliberate omission that nothing asserts is indistinguishable from an oversight.
+@Suite("The durable oversized flag reaches admission and progress, and stops there")
 struct OversizedDurableFlagConfinementTests {
 
     private func seed(_ db: DatabaseQueue) throws -> String {
@@ -286,28 +285,60 @@ struct OversizedDurableFlagConfinementTests {
         return h.id
     }
 
-    /// `BackfillProgress.pendingBodyCount` is a TRUTH CLAIM about the mailbox, and the
-    /// body really is missing. Excluding the row would make the app announce
-    /// "Sync Complete" over a message it never fetched — a second defect, not a fix.
-    /// The battery cost that used to ride on this has already been separated out:
-    /// `FastSyncView.keepScreenAwakeWhileWorking` asks about queue activity instead.
-    @Test("pendingBodyCount still counts a flagged row, so the Sync Complete banner stays honest")
-    func pendingBodyCountStillCountsFlaggedRows() throws {
+    /// INVARIANT (owner decision 2026-09-01): a message this build cannot fetch must not
+    /// hold the account's sync open forever. `BackfillProgress.isFullyComplete` gates on
+    /// `pendingBodyCount == 0`, so a flagged row left in that count means the sync banner
+    /// never clears, the progress bar parks one short of 100%, and Fast Sync keeps the
+    /// device awake — indefinitely, over work that cannot be done. The user still learns
+    /// the truth about the individual message: opening it reports "unable to load".
+    ///
+    /// This test previously asserted the OPPOSITE, on the reasoning that `pendingBodyCount`
+    /// is a truth claim about the mailbox. That reasoning was sound and was overruled on
+    /// product grounds; the reversal is recorded rather than erased so nobody re-derives
+    /// the old position from the old comment.
+    @Test("pendingBodyCount excludes a flagged row, so an unfetchable body cannot hold sync open forever")
+    func pendingBodyCountExcludesFlaggedRows() throws {
         let db = try TestDatabase.make()
         _ = try seed(db)
 
-        // Verbatim shape of SyncEngineBackfill's pendingBody count — a GRDB
-        // query-interface chain, which is why no SQL-text search finds it.
+        // THE PRODUCTION REQUEST ITSELF, not a hand-copied replica — a replica of a
+        // predicate cannot go red when the predicate changes, which is exactly how a
+        // test blesses the regression it was written to prevent.
         let pending = try db.read { conn in
-            try MessageHeader.filter(
-                Column("accountId") == "acc1" &&
-                Column("headerComplete") == true &&
-                Column("bodyComplete") == false &&
-                Column("bodyEmptyConfirmed") == false
-            ).fetchCount(conn)
+            try MessageHeader.pendingBodyRequest(accountId: "acc1").fetchCount(conn)
         }
-        #expect(pending == 1,
-                "a flagged row must STILL count as pending — the banner must not claim completion over a missing body")
+        #expect(pending == 0,
+                "a flagged row must NOT count as pending — otherwise pendingBodyCount never reaches 0 and the banner never clears")
+
+        // Non-vacuity, from the other side: the SAME row without the flag IS pending, so
+        // the zero above comes from the conjunct and not from an empty fixture.
+        try db.write { conn in
+            try conn.execute(sql: "UPDATE messageHeader SET bodyMetadataOversized = 0")
+        }
+        let pendingUnflagged = try db.read { conn in
+            try MessageHeader.pendingBodyRequest(accountId: "acc1").fetchCount(conn)
+        }
+        #expect(pendingUnflagged == 1,
+                "control: an identical unflagged row is still pending, so the fixture is real")
+    }
+
+    /// Companion to the above: the row must ALSO be counted as resolved by the
+    /// `indexed` numerator, or the progress bar reads "9,999 / 10,000 indexed (99%)"
+    /// beside a green completion check — the same nag in a different widget.
+    @Test("A flagged row counts as resolved in the indexed numerator, so the bar and the check agree")
+    func indexedNumeratorCountsFlaggedRows() throws {
+        let db = try TestDatabase.make()
+        _ = try seed(db)
+
+        // Again the production request, for the same reason.
+        let indexed = try db.read { conn in
+            try MessageHeader.bodySettledRequest(accountId: "acc1").fetchCount(conn)
+        }
+        let total = try db.read { conn in
+            try MessageHeader.filter(Column("accountId") == "acc1").fetchCount(conn)
+        }
+        #expect(indexed == total,
+                "indexed must reach total once the only outstanding row is unfetchable")
     }
 
     /// `selfHealBackfillFTSMembership` re-indexes HEADERS. The flagged row's header is

@@ -141,8 +141,15 @@ struct OversizedBodyQuarantineDatabaseTests {
     /// The same predicate MINUS the oversized flag. Pairing the two is what makes the
     /// quarantine assertions two-sided: it proves the row left background admission
     /// BECAUSE of the flag, and not because it was marked complete, marked empty, or
-    /// deleted — i.e. that it is still an ordinary pending-body row underneath, and so
-    /// still reachable by the on-demand user-open path, which consults none of this.
+    /// deleted — i.e. that it is still an ordinary pending-body row underneath, which is
+    /// what keeps the quarantine reversible (a UIDVALIDITY reset, Smart Reindex, or the
+    /// migration that ships a raised parser bound clears the flag and the row is
+    /// immediately eligible again).
+    ///
+    /// ⚠️ This is NOT a claim that the row is still reachable on demand. Since the owner
+    /// decision of 2026-09-01 the user-open path (`MessageDetailViewModel.loadBody`)
+    /// reads the flag too and reports "unable to load" without a wire attempt; the
+    /// remaining live retry is pull-to-refresh (`refetchBody`).
     private func isPendingBodyIgnoringOversizedFlag(headerId: String) async throws -> Bool {
         let found: Int = try await AppDatabase.dbPool.read { db in
             try Int.fetchOne(db, sql: """
@@ -156,7 +163,7 @@ struct OversizedBodyQuarantineDatabaseTests {
 
     // MARK: Side 1 — oversized must never be recorded as fetched
 
-    @Test("ActiveBodyQueue: an oversized single-item batch leaves the row bodyComplete=0/bodyEmptyConfirmed=0, durably flagged out of background admission, and still fetchable on demand")
+    @Test("ActiveBodyQueue: an oversized single-item batch leaves the row bodyComplete=0/bodyEmptyConfirmed=0, durably flagged out of background admission, and an ordinary pending-body row underneath")
     func activeOversizedNeverMarksRowFetched() async throws {
         let (header, restore) = try makeSwappedDB()
         defer { restore() }
@@ -187,7 +194,7 @@ struct OversizedBodyQuarantineDatabaseTests {
         #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false,
                 "the durable flag must take the row OUT of background admission — that is the fix; an in-memory-only quarantine re-fetched it every launch")
         #expect(try await isPendingBodyIgnoringOversizedFlag(headerId: header.id),
-                "…and ONLY the flag may exclude it: underneath it is still an ordinary pending-body row, so the on-demand user-open path can still fetch it")
+                "…and ONLY the flag may exclude it: underneath it is still an ordinary pending-body row, so clearing the flag restores eligibility with no other repair")
         #expect(stored.bodyMetadataOversized, "the flag is the durable half of the quarantine")
 
         // ...and the quarantine really is the in-memory one, not a completion.
@@ -197,7 +204,7 @@ struct OversizedBodyQuarantineDatabaseTests {
         #expect(snapshot.activeJobs == 0, "the defer must not touch activeJobs — this queue tracks activeBatchCount instead")
     }
 
-    @Test("BackfillBodyQueue: an oversized single-item batch leaves the row bodyComplete=0/bodyEmptyConfirmed=0, durably flagged out of background admission, and still fetchable on demand")
+    @Test("BackfillBodyQueue: an oversized single-item batch leaves the row bodyComplete=0/bodyEmptyConfirmed=0, durably flagged out of background admission, and an ordinary pending-body row underneath")
     func backfillOversizedNeverMarksRowFetched() async throws {
         let (header, restore) = try makeSwappedDB(folderPath: "Archive", isInInbox: false)
         defer { restore() }
@@ -225,7 +232,7 @@ struct OversizedBodyQuarantineDatabaseTests {
         #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false,
                 "the durable flag must take the row OUT of background admission")
         #expect(try await isPendingBodyIgnoringOversizedFlag(headerId: header.id),
-                "…and ONLY the flag may exclude it — the row stays on-demand fetchable")
+                "…and ONLY the flag may exclude it — clearing it restores eligibility with no other repair")
         #expect(stored.bodyMetadataOversized)
 
         #expect(await queue.oversizedDeferredThisSession.contains(header.id))
@@ -780,10 +787,9 @@ struct OversizedQuarantineResetReleaseTests {
 // MARK: - The quarantine's UI consequence: wake lock vs. completion banner
 
 /// Removing the illegal `bodyEmptyConfirmed = 1` stamp made the quarantined row stay
-/// honestly incomplete, which is correct — and which means
-/// `BackfillProgress.pendingBodyCount` (`headerComplete = 1 AND bodyComplete = 0 AND
-/// bodyEmptyConfirmed = 0`) never reaches 0 for an account holding one oversized
-/// message, so `BackfillProgress.isFullyComplete` is false forever for that account.
+/// honestly incomplete, which is correct. `BackfillProgress.pendingBodyCount` then never
+/// reached 0 for an account holding one oversized message, so
+/// `BackfillProgress.isFullyComplete` was false forever for that account.
 ///
 /// `FastSyncView` had TWO consumers keyed off that single durable-completeness fact:
 /// the "Sync Complete" banner AND `keepScreenAwake(while: !isAllComplete)`. The second
@@ -792,10 +798,16 @@ struct OversizedQuarantineResetReleaseTests {
 /// The split asserted here:
 ///   - the WAKE LOCK is a question about the app's CURRENT activity, so it moved to
 ///     `FastSyncView.keepScreenAwakeWhileWorking` — the header walk plus the two body
-///     queues' `isIdle`;
-///   - the BANNER is a TRUTH CLAIM about the mailbox, so it stays on
-///     `isFullyComplete`. Telling the user "Sync Complete" while a body is genuinely
-///     missing would be a second defect, not a fix.
+///     queues' `isIdle`. That split is independent of everything below and still holds.
+///   - the BANNER was, at that time, deliberately LEFT on `isFullyComplete` with the
+///     quarantined row still counted, on the reasoning that "Sync Complete" over a
+///     genuinely missing body would be a second defect. ⚠️ **Owner decision 2026-09-01
+///     reversed that**: the flagged row is now excluded from `pendingBodyCount`
+///     (`SyncEngineBackfill.updateBackfillProgressForAccount`), because a banner that
+///     can never clear over work the build cannot perform is the worse product
+///     outcome. The honesty moved to where the user can act on it — opening the
+///     message reports "unable to load". The old reasoning is kept here rather than
+///     erased so nobody re-derives it from a silent deletion.
 ///
 /// The idle inputs here come from the REAL queue actors after a REAL quarantine, not
 /// from hand-fed booleans, so these tests pin the causal chain
@@ -806,9 +818,12 @@ struct OversizedQuarantineResetReleaseTests {
 @Suite("Fast Sync keep-awake follows runnable queue state, not durable completeness")
 struct FastSyncKeepAwakeTests {
 
-    /// A progress snapshot for an account whose header walk is done and whose ONLY
-    /// remaining work is `pendingBodyCount` quarantined oversized bodies. Dates derive
-    /// from `Date()`; the address is a placeholder domain.
+    /// A progress snapshot with an explicit `pendingBodyCount`, hand-built so these
+    /// tests exercise the PREDICATE arithmetic directly. The production count that
+    /// feeds it now excludes flagged rows — that exclusion is pinned separately in
+    /// `OversizedDurableFlagConfinementTests.pendingBodyCountExcludesFlaggedRows`, which
+    /// runs the real query shape against a real flagged row. Dates derive from `Date()`;
+    /// the address is a placeholder domain.
     private func progressWithPendingBodies(_ pendingBodyCount: Int) -> BackfillProgress {
         var p = BackfillProgress(
             accountId: "acc1",
@@ -841,10 +856,14 @@ struct FastSyncKeepAwakeTests {
         #expect(activeIdle, "a quarantined item is removed from the queue, so the queue has no runnable work")
         #expect(backfillIdle)
 
-        // The account is genuinely NOT fully complete — the count still sees the row.
+        // Hold `pendingBodyCount` non-zero ON PURPOSE here. Production now excludes the
+        // flagged row from that count, so this snapshot no longer describes the oversized
+        // case — but the wake lock must be independent of durable completeness for EVERY
+        // reason a body can still be pending (a body genuinely mid-fetch elsewhere, a
+        // count read that failed closed at 1). Pinning the harder input keeps this test
+        // testing the split rather than the banner decision, which is pinned elsewhere.
         let progress = progressWithPendingBodies(1)
-        #expect(progress.pendingBodyCount == 1, "the quarantined row is still counted; the fix must not hide it")
-        #expect(!progress.isFullyComplete, "durable completeness is honestly withheld")
+        #expect(!progress.isFullyComplete, "the snapshot is deliberately incomplete-by-count")
 
         // …and the wake lock is nonetheless released, because it no longer asks that
         // question. This exact pairing IS the defect: pre-fix these two lines could not
@@ -895,12 +914,15 @@ struct FastSyncKeepAwakeTests {
         ) == true)
     }
 
-    @Test("DECISION: the Sync Complete banner stays gated on isFullyComplete — one quarantined oversized body withholds it rather than claiming a complete mailbox")
-    func syncCompleteBannerStaysTruthful() {
-        // Withheld while a body is genuinely missing…
+    /// The banner's GATE is unchanged — it is still `pendingBodyCount == 0`. What the
+    /// owner's 2026-09-01 decision changed is the count that feeds it, one layer down.
+    /// Both halves stay pinned here so a future change to the gate itself is visible.
+    @Test("The Sync Complete banner is gated on pendingBodyCount reaching 0, in both directions")
+    func syncCompleteBannerGate() {
+        // Withheld while anything is genuinely pending…
         #expect(!progressWithPendingBodies(1).isFullyComplete)
-        // …and still reachable once nothing is pending, so the banner is not simply
-        // dead (a gate that never fired would pass the first case alone).
+        // …and reachable once nothing is, so the gate is not simply dead (a gate that
+        // never fired would pass the first case alone).
         #expect(progressWithPendingBodies(0).isFullyComplete)
     }
 }
