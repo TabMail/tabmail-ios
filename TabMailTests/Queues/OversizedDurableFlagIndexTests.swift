@@ -54,8 +54,8 @@ private func queryPlan(_ db: DatabaseQueue, _ sql: String) throws -> String {
 
 // MARK: -
 
-/// The owner's acceptance criterion for this change, in his words: *"just making sure
-/// that the query with this new index is tested optimal."* This is a PLAN-SHAPE gate,
+/// The acceptance criterion for this change is that the admission query is provably
+/// optimal under the new index. That makes this a PLAN-SHAPE gate,
 /// not a timing benchmark — simulator timings understate device by 2-4x, so a duration
 /// assertion would prove nothing.
 ///
