@@ -1,7 +1,21 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note (2026-09-01):** the two statements below are current authority; their
+> frozen predecessor wording remains in the preserved body underneath.
+
+- **`pendingBodyCount`'s predicate gained a fourth conjunct**: `headerComplete=1 AND bodyComplete=0
+  AND bodyEmptyConfirmed=0 AND bodyMetadataOversized=0`. It is no longer transcribed anywhere — the
+  definition is the named symbol `MessageHeader.pendingBodyRequest`, and the body queues' half is
+  `ActiveBodyQueue.admissionSQL` / `BackfillBodyQueue.admissionSQL`.
+- ⚠️ **"Self-terminating" is TWO mechanisms, not one.** Empty and 404 bodies terminate by CONFIRMING
+  EMPTY (`bodyEmptyConfirmed=1` after three attempts). An OVERSIZED body must not — the content
+  demonstrably exists, so confirming it empty is a data-integrity-rule-1 violation that leaves the
+  message searchable-but-unopenable (shipped once; that is the bug the quarantine fixed). It
+  terminates by being QUARANTINED (`bodyMetadataOversized=1`) instead. The preserved line below
+  reads "empty/404/oversized bodies confirm-empty"; do not restore that conflation.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ### Backfill / Fast Sync Completion — gate on `pendingBodyCount`, NEVER a server total
-- **`BackfillProgress.isFullyComplete` gates on `headersDone && totalEmails > 0 && pendingBodyCount == 0`** (`AccountManager.swift`). `pendingBodyCount` = body-eligible headers still awaiting fetch (`headerComplete=1 AND bodyComplete=0 AND bodyEmptyConfirmed=0 AND bodyMetadataOversized=0`), the same criteria `BackfillBodyQueue`/`ActiveBodyQueue` select on — the definition is the named symbol `MessageHeader.pendingBodyRequest`, and the queues' is `Active`/`BackfillBodyQueue.admissionSQL`. It is local and self-terminating, so it reaches 0 once the body queues have nothing fetchable left.
-  - ⚠️ **"Self-terminating" is TWO mechanisms, not one.** Empty and 404 bodies terminate by CONFIRMING EMPTY (`bodyEmptyConfirmed=1` after three attempts). An OVERSIZED body must not — the content demonstrably exists, so confirming it empty is a data-integrity-rule-1 violation that leaves the message searchable-but-unopenable (shipped once; that is the bug the quarantine fixed). It terminates by being QUARANTINED (`bodyMetadataOversized=1`) instead. This line read "empty/404/oversized bodies confirm-empty" until 2026-09-01; do not restore that conflation.
+- **`BackfillProgress.isFullyComplete` gates on `headersDone && totalEmails > 0 && pendingBodyCount == 0`** (`AccountManager.swift`). `pendingBodyCount` = body-eligible headers still awaiting fetch (`headerComplete=1 AND bodyComplete=0 AND bodyEmptyConfirmed=0`), the same criteria `BackfillBodyQueue`/`ActiveBodyQueue` select on. It is local and self-terminating (empty/404/oversized bodies confirm-empty), so it reaches 0 once the body queues have nothing fetchable left.
 - **DO NOT gate completion on `ftsIndexed >= totalEmails`.** For Gmail/Exchange, `totalEmails` is a *server-reported* count that counts a **different population** than the mail headers we store, and can permanently exceed it → completion becomes unsatisfiable:
   - **Exchange**: `serverMessageTotal = SUM(folder.totalCount)` = sum of Graph `totalItemCount` across ALL folders, incl. Deleted Items, Junk, and hidden/system folders (`includeHiddenFolders=true` in `ExchangeProvider.fetchFolders`), plus non-mail items that `parseGraphMessage` drops (`compactMap` → nil). One row per message (folders don't overlap).
   - **Gmail**: `getMessagesTotal()` = `profile.messagesTotal`, **deduplicated** across labels (and includes Spam/Trash/Chat). But `grdbTotal` counts per-`(label, message)` rows (`MessageHeader.id` is keyed by `folderPath`), so the units don't match — Gmail "worked" only by accident when label memberships inflated `grdbTotal` past `messagesTotal`.

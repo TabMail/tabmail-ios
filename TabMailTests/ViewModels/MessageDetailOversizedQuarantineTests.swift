@@ -89,9 +89,13 @@ struct MessageDetailOversizedQuarantineTests {
             try header.insert(db)
         }
 
-        let headerId = try pool.read { db in
-            try MessageHeader.fetchOne(db, sql: "SELECT * FROM messageHeader WHERE messageId = '100'")!.id
-        }
+        // `#require`, not `!`: a trap here kills the test HOST, and Swift Testing cannot
+        // catch a `fatalError` — one nil would bury the results of thousands of unrelated
+        // tests behind a crash that names nothing. Nil is unreachable (the insert above is
+        // in the same function), which is exactly when the cheap safe form costs nothing.
+        let headerId = try #require(try pool.read { db in
+            try MessageHeader.fetchOne(db, sql: "SELECT * FROM messageHeader WHERE messageId = '100'")
+        }).id
 
         let vm = MessageDetailViewModel(
             messageId: headerId,
@@ -175,9 +179,12 @@ struct MessageDetailOversizedQuarantineTests {
     func pullToRefreshStillRetries() async throws {
         let probe = FetchProbe()
         let (vm, pool, dir) = try makeVM(oversized: true, probe: probe)
-        // The poll `refetchBody` starts is REAL: its 2s tick calls `manager.fetchBody`
-        // on the live AccountManager, not the injected override. Stop it before the
-        // fixture DB is retired, or it outlives this test.
+        // Stop the poll `refetchBody` leaves behind before the fixture DB is retired, or
+        // it outlives this test. (This comment used to say the poll bypasses the injected
+        // override and reaches the live `AccountManager`; it no longer does — the poll
+        // routes its fetch through `_fetchBodyOverride` too, which is what makes an
+        // escaped poll harmless rather than a session opened inside an unrelated suite.
+        // Cancelling is still required: an escaped poll would read a retired pool.)
         defer { vm.cancelBodyPollForTesting(); cleanup(pool, dir) }
 
         await vm.loadBody()
@@ -261,6 +268,64 @@ struct MessageDetailOversizedQuarantineTests {
                 "…and an ordinary poll failure is logged and retried, never surfaced as a load failure")
     }
 
+    /// 🚨 THE STATE THE FLAG STRUCTURALLY CANNOT COVER, and the reason
+    /// `BodyFetchRefusal.endsPolling` exists.
+    ///
+    /// Both `bodyComplete` terms in this design are deliberate:
+    /// `BodyFetchProcessor.markBodyMetadataOversized` guards `AND bodyComplete = 0` so a
+    /// completed row cannot be handed a stale flag, and `MessageHeader.isBodyQuarantined`
+    /// carries `&& !bodyComplete` so an evicted-but-fetched row keeps its only recovery.
+    /// Together they make ONE row invisible at every site: fetched once, `messageBody`
+    /// later deleted by `BodyAssetMaintenance` (which leaves `bodyComplete = 1` by design),
+    /// and whose re-fetch now overflows — the parser's bound is fragmentation-dependent, so
+    /// a body that parsed once can overflow later. No writer records it and no reader gates
+    /// on it, so before this the poll retried it every 2 seconds for the life of the view
+    /// model, each attempt a full TCP + TLS + LOGIN + SELECT.
+    ///
+    /// The property is about the REFUSAL CLASS, not the flag: `loadBody` must not leave a
+    /// poll behind a failure nothing in the background will retract.
+    @Test("An overflow with no durable flag still stops the poll from starting")
+    @MainActor
+    func overflowRefusalPreventsThePollEvenWithoutTheFlag() async throws {
+        let probe = FetchProbe()
+        // UNFLAGGED and bodyComplete — the post-eviction shape. Neither gate can see it.
+        let (vm, pool, dir) = try makeVM(oversized: false, bodyComplete: true, probe: probe)
+        defer { vm.cancelBodyPollForTesting(); cleanup(pool, dir) }
+        vm._fetchBodyOverride = { _ in
+            probe.record()
+            throw BodyFetchRefusal.error(
+                BodyFetchRefusal.payloadTooLarge, BodyFetchRefusal.payloadTooLargeMessage)
+        }
+
+        await vm.loadBody()
+
+        #expect(probe.attempts == 1, "fixture check: nothing gated this row, so the fetch must have been attempted")
+        #expect(vm.hasStartedBodyPollForTesting == false,
+                "a poll behind an overflow repeats a full connection every 2s and can never succeed — pull-to-refresh is the retry, not the poll")
+        #expect(vm.error != nil, "the user must still see the failure")
+    }
+
+    /// CONTROL. Without it the assertion above is satisfied by a `loadBody` that stopped
+    /// starting polls at all, which would delete the safety net for every transient failure
+    /// the poll exists to cover.
+    @Test("CONTROL: an ordinary failure on the identical row DOES leave the poll running")
+    @MainActor
+    func ordinaryFailureStillLeavesThePollRunning() async throws {
+        let probe = FetchProbe()
+        let (vm, pool, dir) = try makeVM(oversized: false, bodyComplete: true, probe: probe)
+        defer { vm.cancelBodyPollForTesting(); cleanup(pool, dir) }
+        vm._fetchBodyOverride = { _ in
+            probe.record()
+            throw ProviderError.messageNotFound
+        }
+
+        await vm.loadBody()
+
+        #expect(probe.attempts == 1)
+        #expect(vm.hasStartedBodyPollForTesting,
+                "the ONLY difference from the case above is the refusal class — a reconnect or a background write can still resolve this one")
+    }
+
     /// The poll reads the flag FRESH from the database each tick rather than trusting the
     /// header it was started with — and this is the fixture that can tell the difference.
     /// Both existing poll tests seed a header that is ALREADY in its final state, so a
@@ -288,7 +353,11 @@ struct MessageDetailOversizedQuarantineTests {
         // Let at least one ordinary tick run, so the fixture provably reached the wire
         // before the flag existed. Without this the test could pass on a poll that never
         // started at all.
-        try await Task.sleep(for: .seconds(3))
+        //
+        // 5s, not 3s, for a 2s tick: the first tick is preceded by `recoverHeaderIfMissing()`
+        // and `adoptReadyBody`, so 3s was ~1.5x slack and could go FALSE-RED on a loaded
+        // machine — the same 2.5x budget the sibling poll tests use. (Found by audit.)
+        try await Task.sleep(for: .seconds(5))
         #expect(probe.attempts >= 1, "fixture check: the unflagged poll must be running and fetching")
 
         // Now flag it, exactly as a background queue would — through the production writer,
@@ -306,6 +375,83 @@ struct MessageDetailOversizedQuarantineTests {
         try await Task.sleep(for: .seconds(5))
         #expect(probe.attempts == after,
                 "…and it must actually STOP: a poll that reported the failure but kept fetching still pays the connection every 2s")
+    }
+
+    /// 🚨 THE POLL'S OWN `endsPolling` ARM — the second consumer of
+    /// `BodyFetchRefusal.endsPolling`, and the one no other test can reach.
+    ///
+    /// `bodyPollStopsItselfOnAFlaggedRow` short-circuits at the poll's fresh-read
+    /// quarantine gate, so its `catch` never runs;
+    /// `overflowRefusalPreventsThePollEvenWithoutTheFlag` exercises `loadBody`'s tail, which
+    /// decides whether to START a poll. Neither covers an ALREADY-RUNNING poll whose fetch
+    /// throws an overflow — the post-eviction row (`bodyComplete = 1`, `messageBody` gone,
+    /// re-fetch overflows) that both `bodyComplete` terms in this design deliberately hide
+    /// from the flag's writer and from `isBodyQuarantined`. That row reaches the fresh-read
+    /// gate, passes it, fetches, and overflows, every 2 seconds, forever.
+    ///
+    /// The invariant: a running poll ends on a refusal nothing in the background will
+    /// retract, and says so.
+    @Test("A running poll ends on an overflow the durable flag cannot see")
+    @MainActor
+    func runningPollEndsOnAnOverflowRefusal() async throws {
+        let probe = FetchProbe()
+        // The post-eviction shape: unflagged AND complete, so the poll's fresh-read gate
+        // cannot fire and the classification in the catch is the only thing left.
+        let (vm, pool, dir) = try makeVM(oversized: false, bodyComplete: true, probe: probe)
+        defer { vm.cancelBodyPollForTesting(); cleanup(pool, dir) }
+        vm._fetchBodyOverride = { _ in
+            probe.record()
+            throw BodyFetchRefusal.error(
+                BodyFetchRefusal.payloadTooLarge, BodyFetchRefusal.payloadTooLargeMessage)
+        }
+
+        let key = vm.messageId
+        vm._testSeedMessage(try #require(try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: key)
+        }))
+        vm.startBodyPoll()
+
+        // 2s tick; 5s is the same 2.5x budget the sibling poll tests use.
+        try await Task.sleep(for: .seconds(5))
+        #expect(probe.attempts >= 1, "fixture check: the poll must have reached the fetch at least once")
+        #expect(vm.error != nil,
+                "a poll that gives up silently leaves the user on a spinner that can never resolve")
+        #expect(vm.isLoading == false, "a spinner would promise progress that cannot come")
+
+        let after = probe.attempts
+        try await Task.sleep(for: .seconds(5))
+        #expect(probe.attempts == after,
+                "…and it must STOP: every further tick is a full TCP + TLS + LOGIN + SELECT for a body this attempt already proved will not parse")
+    }
+
+    /// CONTROL for the test above, and it is what stops `endsPolling` from being widened.
+    /// The poll IS the safety net for transient failure — a reconnect or a background write
+    /// can still land the body — so an ordinary error must leave it ticking. Without this,
+    /// a build that ended the poll on ANY throw would pass the test above while deleting
+    /// the recovery path for every connection blip.
+    @Test("CONTROL: a running poll survives an ordinary failure on the identical row")
+    @MainActor
+    func runningPollSurvivesAnOrdinaryFailure() async throws {
+        let probe = FetchProbe()
+        let (vm, pool, dir) = try makeVM(oversized: false, bodyComplete: true, probe: probe)
+        defer { vm.cancelBodyPollForTesting(); cleanup(pool, dir) }
+        vm._fetchBodyOverride = { _ in
+            probe.record()
+            throw ProviderError.messageNotFound
+        }
+
+        let key = vm.messageId
+        vm._testSeedMessage(try #require(try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: key)
+        }))
+        vm.startBodyPoll()
+
+        try await Task.sleep(for: .seconds(5))
+        let after = probe.attempts
+        #expect(after >= 1, "fixture check: the poll must have reached the fetch")
+        try await Task.sleep(for: .seconds(5))
+        #expect(probe.attempts > after,
+                "the ONLY difference from the case above is the refusal class — this one is exactly what the poll exists to retry")
     }
 
     /// 🚨 THE EVICTION-RECOVERY INVARIANT — the regression the round-1 audit caught.

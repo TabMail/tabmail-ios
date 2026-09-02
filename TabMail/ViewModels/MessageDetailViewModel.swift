@@ -119,6 +119,13 @@ final class MessageDetailViewModel {
     /// (Its retry now goes through `_fetchBodyOverride` like every other fetch site, so an
     /// injected probe counts the poll's attempts too — but that is a wire oracle, not an
     /// answer to "was one started at all".)
+    ///
+    /// ⚠️ NOT `#if DEBUG`-gated, and that is a decision rather than an oversight. The same
+    /// change gates `InboxViewModel.runSnippetBatchForTesting` (drives a network tier) and
+    /// `StuckMessageDiagnostics.countForTesting` (interpolates a caller string into SQL) —
+    /// the gate follows the HAZARD, not the `ForTesting` suffix. This seam and
+    /// `cancelBodyPollForTesting` take no input, reach no network, and have no production
+    /// caller, which puts them with the ~24 ungated seams already in the tree.
     var hasStartedBodyPollForTesting: Bool { bodyPollTask != nil }
 
     /// Test seam: stop a poll a test deliberately started.
@@ -1113,12 +1120,22 @@ final class MessageDetailViewModel {
                 guard let msg = self.message else { continue }
                 // Oversized-metadata quarantine — a UI-STATE check, not the network
                 // guard. `AccountManagerFetch.fetchBody` refuses a quarantined row at the
-                // funnel, so nothing here can reach the wire; what the funnel cannot do is
-                // end this poll or say anything to the user, because the catch below only
-                // logs and continues. Left in place deliberately: without it a quarantined
-                // message polls every 2s forever and never shows the failure. This mirrors
-                // the address gate's split, whose funnel comment states the rule — "the
-                // caller-side check now only decides which UI state to show".
+                // funnel, so nothing here can reach the wire. This mirrors the address
+                // gate's split, whose funnel comment states the rule — "the caller-side
+                // check now only decides which UI state to show".
+                //
+                // ⚠️ This comment used to justify the gate with "what the funnel cannot do
+                // is end this poll or say anything to the user, because the catch below
+                // only logs and continues". That stopped being true in the same branch: the
+                // catch's FIRST statement is now `if BodyFetchRefusal.endsPolling(error)`,
+                // which reaches the identical end state. Two things still make this gate
+                // worth its per-tick read, and they are the reasons to keep it:
+                //   - it ends the poll one tick EARLIER, without an attempt; and
+                //   - it pre-empts the funnel's ADDRESS gate, which is evaluated FIRST.
+                //     For a quarantined row whose move is in flight the funnel returns
+                //     `addressInFlight`, which `endsPolling` deliberately EXCLUDES (a move
+                //     completing is a real state change worth waiting for) — so without
+                //     this gate such a row keeps polling until the move settles.
                 //
                 // `loadBody`'s own branch cannot serve here: all three paths that start
                 // this poll (`startBodyPoll(); return` on a cancelled header read, a

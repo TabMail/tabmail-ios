@@ -272,6 +272,13 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     ///    clear it is `AccountManagerOutbox`'s optimistic-Sent insert, and it cannot strand
     ///    anything: the row it writes is a brand-new `sent-<UUID>` that has never been
     ///    fetched, so the flag is 0 there by construction.
+    ///    ⚠️ "The one remaining writer" counts RUNTIME writers. A full census also finds
+    ///    two MIGRATIONS that set `bodyComplete = 1` — `v31_addHasBodyInFTS` and
+    ///    `v57_repairOptimisticSentBodyComplete` — and neither is an exception: on a fresh
+    ///    database both run BEFORE `v88_addBodyMetadataOversized`, so the column does not
+    ///    yet exist, and on an existing database both have already run and a registered
+    ///    migration is frozen. Named because an absolute with no negative case is the
+    ///    shape that walks the next reader past a real one. (Found by audit.)
     ///    ⚠️ A `rg 'bodyMetadataOversized = 0'` census finds only THREE of them:
     ///    `applySnippetUpdates` writes it as a GRDB `updateAll` chain
     ///    (`Column("bodyMetadataOversized").set(to: false)`) and is invisible to every
@@ -296,9 +303,21 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     ///    genuine retry and then re-quarantines it. Self-healing and strictly better than
     ///    the pre-flag behaviour (the banner never cleared at all), but it is not the
     ///    immediate release the bullet above reads like on its own.
+    ///    ⚠️ AND IT IS OUTSIDE THE SERIALIZED WRITE CHAIN. `resetCrawlState` writes through
+    ///    `AppDatabase.backgroundPool` directly, so — unlike the UIDVALIDITY reset's clear,
+    ///    which shares `enqueueDurableWrite` with all four marks — a mark dispatched
+    ///    microseconds before the user taps Smart Reindex can commit AFTER this clear and
+    ///    re-quarantine the row. (The five success-write clears need no such ordering: the
+    ///    mark's own `AND bodyComplete = 0` makes a mark-after-success a no-op.) Left as a
+    ///    fail-closed edge per THE MANTRA — the recovery is one more ordinary gesture, and
+    ///    routing `resetCrawlState` through a queue actor's chain would be a larger change
+    ///    for a narrower window. (Found by audit.)
     ///  • exactly, in one statement, by the migration that ships a raised parser bound —
-    ///    which is the whole re-fetch mechanism for this population once upstream is
-    ///    fixed.
+    ///    which is the whole re-fetch mechanism for this population. ⚠️ That bound is
+    ///    `IMAPFetchMapping.responseBufferLimit`, a FIRST-PARTY constant in this repo, not
+    ///    an upstream dependency (upstream PR #179 already made it a constructor
+    ///    parameter). Nothing external gates the release; it is a decision here about how
+    ///    many bytes a single IMAP response may buffer. (Found by audit.)
     ///
     /// WRITTEN by one symbol only — `BodyFetchProcessor.markBodyMetadataOversized` —
     /// which carries BOTH guards (`AND bodyComplete = 0`, so a row that already has a body

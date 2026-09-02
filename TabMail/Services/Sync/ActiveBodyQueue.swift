@@ -354,16 +354,33 @@ actor ActiveBodyQueue {
     /// ⚑ ACCEPTED LIMITATIONS OF THIS FLAG (owner-blessed; do not "fix" them without
     /// asking):
     ///
-    /// ⚠️ THIS BLOCK IS DUPLICATED VERBATIM ON `BackfillBodyQueue.markOversizedDurably`.
-    /// The two queue actors keep byte-identical copies of it and of
-    /// `clearOversizedDurably`/`enqueueDurableWrite` on purpose — a shared helper
-    /// would need an `await` inside `handlePayloadTooLarge`'s synchronous critical
-    /// section, or unchecked-`Sendable` state mutated under two isolations. Edit both
-    /// copies or neither; a guard added to one and forgotten in the other is exactly
-    /// the defect that made `BodyFetchProcessor.markBodyMetadataOversized` one symbol.
-    ///   1. The body stays unindexed and unsearchable BY CONTENT until a raised
-    ///      parser bound ships upstream. The header stays FTS-indexed, so the message
-    ///      is still findable by subject and sender.
+    /// ⚠️ THIS ENUMERATION IS DUPLICATED VERBATIM ON `BackfillBodyQueue.markOversizedDurably`.
+    /// Edit both copies or neither. The SQL is NOT duplicated: the mark and the
+    /// UIDVALIDITY clear are single symbols (`BodyFetchProcessor.markBodyMetadataOversized`
+    /// / `.clearBodyMetadataOversized`), so a guard cannot be added to one queue and
+    /// forgotten in the other.
+    ///
+    /// What legitimately stays per-queue is the write CHAIN (`durableWriteChain` /
+    /// `enqueueDurableWrite`). An earlier version of this comment gave a WRONG reason for
+    /// that — "a shared helper would need an `await` inside `handlePayloadTooLarge`'s
+    /// synchronous critical section, or unchecked-`Sendable` state mutated under two
+    /// isolations". That is false: a `Mutex<Task<Void, Never>?>` is `Sendable` and
+    /// `withLock` is synchronous, so a shared enqueue is expressible. The real reasons are
+    /// (a) ISOLATION — the chain is per-INSTANCE state and suites construct their own
+    /// `ActiveBodyQueue()` against their own temp pools, so one process-wide chain would make one
+    /// suite's `awaitDurableWritesForTesting()` await another suite's in-flight writes; and
+    /// (b) the two queues write through different priority tiers (`AppDatabase.syncPool` vs
+    /// `.backgroundPool`), so one chain would serialize a foreground mark behind a
+    /// background one. (Found by audit.)
+    ///   1. The body stays unindexed and unsearchable BY CONTENT until the parser bound
+    ///      is raised. The header stays FTS-indexed, so the message is still findable by
+    ///      subject and sender. ⚠️ That bound is FIRST-PARTY, not an upstream dependency —
+    ///      earlier wording here said "until a raised parser bound ships upstream", which
+    ///      is wrong: it is `IMAPFetchMapping.responseBufferLimit`, a constant in this
+    ///      repo passed to `IMAPServer(host:port:useTLS:responseBufferLimit:)` by both IMAP
+    ///      entry points. Upstream PR #179 already made it a constructor parameter, so the
+    ///      SwiftMail fork is a pure mirror and raising the value needs no upstream work.
+    ///      (Found by audit.)
     ///   2. Backfill progress counts a flagged row as RESOLVED
     ///      (`SyncEngineBackfill.updateBackfillProgressForAccount`), so "Sync Complete"
     ///      fires on an account that still has an unfetchable body. Owner decision
@@ -371,15 +388,20 @@ actor ActiveBodyQueue {
     ///      completion is a truth claim the user cannot act on, and the cost of it —
     ///      a banner that never clears and a progress bar parked one short of 100% —
     ///      is worse product behaviour than rounding an unfetchable message up to
-    ///      done. Revisit when the parser bound is raised upstream.
+    ///      done. Revisit when the parser bound is raised (see item 1).
     ///   3. ⛔ `SyncEngineFTS.selfHealBackfillFTSMembership` deliberately does NOT
     ///      carry this flag: it re-indexes HEADERS, and this row's header is healthy.
     ///      Excluding it would drop a good message out of subject/sender search.
-    ///   4. Opening an affected message reports "unable to load" immediately without a
+    ///   4. Opening an affected message reports a load failure immediately without a
     ///      wire attempt (`MessageDetailViewModel.loadBody`), and the body poll that
     ///      view model leaves behind stops itself the same way rather than retrying
     ///      every 2s forever. The user's retry is pull-to-refresh, which still performs
     ///      a genuine fetch — and whose own trailing poll then stops itself too.
+    ///      The sentence a RELEASE user reads is `MessageCardView`'s generic "Unable to
+    ///      load message. Pull to retry.", not `BodyFetchRefusal`'s specific text —
+    ///      that view renders `viewModel.error` only under `DebugModeManager
+    ///      .isLoggingEnabled()`. Convenient here, since the shipped string names the one
+    ///      path that is exempt at the funnel. (Found by audit.)
     ///   5. The inbox snippet loader refuses the row at its network tier and blacklists
     ///      it for the session (`InboxViewModel.loadSnippetBatch`), so an affected row
     ///      shows no snippet preview. The blacklist is cleared on every reload, which
@@ -395,6 +417,20 @@ actor ActiveBodyQueue {
     ///      callers, and the enumeration must be exhaustive to be worth reading.
     ///      (Found by audit.)
     ///
+    ///   7. ⚠️ THE ONE ARCHITECTURALLY CONSEQUENTIAL PROPERTY, stated plainly because the
+    ///      rest of this enumeration reads as if the flag named a permanent fact about a
+    ///      message. It does not. The parser bound is on unread AGGREGATE bytes measured
+    ///      after the decode loop stops, so the trigger is FRAGMENTATION-dependent: an
+    ///      ordinary, perfectly fetchable message on a lossy link can roll into this
+    ///      state. This is a ONE-STRIKE latch on a non-deterministic signal, unlike the
+    ///      codebase's prior art for the same shape (`emptyFetchCount >= 3` before
+    ///      `bodyEmptyConfirmed`), and once latched there is NO automatic release — only
+    ///      pull-to-refresh, a UIDVALIDITY reset, Smart Reindex, or a future migration
+    ///      that raises the bound. A strike counter is deliberately NOT built: that is a
+    ///      new column and more mechanism for a case the pull-to-refresh escape hatch
+    ///      already recovers in one gesture. Recorded so the trade is visible rather than
+    ///      implied. (Found by audit.)
+    ///
     /// The read-side predicate shared by items 4, 5 and 6 is `MessageHeader
     /// .isBodyQuarantined`; the four background queries are the SQL half of the same
     /// question (`ActiveBodyQueue.admissionSQL` / `BackfillBodyQueue.admissionSQL`).
@@ -402,10 +438,14 @@ actor ActiveBodyQueue {
     ///
     /// Dispatch and ordering guarantees are documented on `enqueueDurableWrite`.
     /// Internal, not private: `BodyFetchProcessor.markOversizedDurably` routes the two
-    /// non-queue writers (the user-open path and the snippet loader's tier 2) through here
-    /// so that ALL FOUR marks share this one serialized chain with the UIDVALIDITY reset's
-    /// clear. See that function for why an unchained mark is a correctness problem rather
-    /// than a tidiness one.
+    /// non-queue writers (the user-open path and the snippet loader's tier 2) through here,
+    /// so every mark shares a serialized chain with the clear issued on that SAME chain.
+    /// ⚠️ Not "all four marks share this one chain" — `BackfillBodyQueue.handlePayloadTooLarge`
+    /// marks through Backfill's own chain. The invariant holds because the UIDVALIDITY reset
+    /// clears on BOTH (`AccountManagerUidValidityReset` calls `clearOversizedDeferred` on each
+    /// singleton), so each mark is ordered against the clear it could race. See
+    /// `BodyFetchProcessor.markOversizedDurably` for why an unchained mark is a correctness
+    /// problem rather than a tidiness one.
     func markOversizedDurably(_ headerId: String) {
         if DebugModeManager.isLoggingEnabled() {
             print("[ActiveBody] Durably flagging oversized \(headerId.prefix(30))")
@@ -418,35 +458,15 @@ actor ActiveBodyQueue {
         }
     }
 
-    /// Durable half of `clearOversizedDeferred`. A UIDVALIDITY reset means the
-    /// folder's UIDs no longer address the same messages, so a per-row observation
-    /// about "the message at this address" is void and must not outlive it.
-    ///
-    /// Scoped by the `(accountId, folderPath)` COLUMNS in SQL, while the in-memory half
-    /// above filters header-id STRINGS through `MessageIdentity.headerIdBelongsToFolder`.
-    ///
-    /// ⚠️ Those two are not the same predicate, and an earlier version of this comment
-    /// claimed the SQL form "cannot drift from `MessageIdentity`'s parsing". It can:
-    /// `optimisticMoveToFolder` leaves a row whose id was minted under the SOURCE folder
-    /// while its columns already name the DESTINATION, so for that row the string filter
-    /// and the column filter disagree about which folder it belongs to.
-    ///
-    /// Kept as-is because the disagreement is benign in BOTH directions, and the columns
-    /// are the better half: a UIDVALIDITY reset is a statement about the folder the row is
-    /// IN. If the durable clear releases a mid-move row the in-memory half kept, the row
-    /// is merely re-offered to the queues — the worst case is one wasted fetch. If it
-    /// keeps one the in-memory half released, the row stays quarantined until the next
-    /// reset, a success write, or Smart Reindex, exactly as any other flagged row does.
+    /// Durable half of `clearOversizedDeferred`, dispatched onto this queue's chain.
+    /// The statement itself, its `(accountId, folderPath)` COLUMN scoping, and why that
+    /// deliberately differs from the in-memory half's header-id STRING filter, all live on
+    /// `BodyFetchProcessor.clearBodyMetadataOversized` — one symbol, so the predicate
+    /// cannot be tightened on one queue and left alone on the other.
     private func clearOversizedDurably(accountId: String, folderPath: String) {
         enqueueDurableWrite(label: "clear \(folderPath)") { db in
-            try db.execute(
-                sql: """
-                    UPDATE messageHeader SET bodyMetadataOversized = 0
-                    WHERE accountId = ? AND folderPath = ?
-                      AND bodyMetadataOversized = 1
-                    """,
-                arguments: [accountId, folderPath]
-            )
+            try BodyFetchProcessor.clearBodyMetadataOversized(
+                db, accountId: accountId, folderPath: folderPath)
         }
     }
 
@@ -512,6 +532,11 @@ actor ActiveBodyQueue {
     /// Test seam: await every durable flag write dispatched so far.
     /// The writes are deliberately fire-and-forget in production; a test that asserts
     /// on the row must be able to wait for them without polling.
+    ///
+    /// ⚠️ Not `#if DEBUG`-gated on purpose: the gate follows the HAZARD, not the
+    /// `ForTesting` suffix. `StuckMessageDiagnostics.countForTesting` is gated because it
+    /// interpolates a caller string into SQL; this takes no input and has no production
+    /// caller.
     func awaitDurableWritesForTesting() async {
         await durableWriteChain?.value
     }

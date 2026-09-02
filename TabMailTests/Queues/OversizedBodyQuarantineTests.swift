@@ -923,6 +923,60 @@ struct OversizedBodyQuarantineDatabaseTests {
         #expect(settled.bodyMetadataOversized, "control: a row whose key matches its columns is still flagged")
     }
 
+    /// 🚨 THE ORDERING PROPERTY the source calls "a CORRECTNESS requirement, not tidiness".
+    ///
+    /// `BodyFetchProcessor.markOversizedDurably` deliberately routes the two NON-queue
+    /// writers (the user-open funnel and the snippet loader's tier 2) onto
+    /// `ActiveBodyQueue.shared`'s serialized chain — the same chain the UIDVALIDITY reset's
+    /// clear uses. Ordering between a mark and a clear is defined only for writers that
+    /// SHARE that chain: a mark that wrote directly could commit after a reset's clear and
+    /// re-quarantine a row whose address no longer refers to the message that overflowed.
+    ///
+    /// The observable form of "they share the chain" is that dispatch order survives to the
+    /// database: mark first, clear second, and the row ends up RELEASED. Nothing else in the
+    /// suite pins this — the existing tests drain the chain and assert the mark landed,
+    /// which a chain-bypassing implementation also satisfies. (Found by audit.)
+    @Test("A non-queue mark and the reset's clear commit in dispatch order, because they share one chain")
+    func nonQueueMarkIsOrderedAgainstTheResetClear() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        // Enqueued, not awaited to completion: `markOversizedDurably` returns once the
+        // write is ON the chain, which is exactly the window this test is about.
+        await BodyFetchProcessor.markOversizedDurably(headerId: header.id)
+        await ActiveBodyQueue.shared.clearOversizedDeferred(accountId: "acc1", folderPath: "INBOX")
+        await ActiveBodyQueue.shared.awaitDurableWritesForTesting()
+
+        let afterReset = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        })
+        #expect(afterReset.bodyMetadataOversized == false,
+                "a UIDVALIDITY reset dispatched after a mark must win — the reset is newer evidence, and an observation about an address the reset invalidated must not survive it")
+        // Same settle window the queue-writer ordering tests use, and for the same measured
+        // reason: `awaitDurableWritesForTesting()` awaits the LAST chain task, so on a build
+        // whose chaining was removed this would read the right value for the wrong reason —
+        // the mark simply had not landed yet. Against a correctly chained build nothing is
+        // outstanding, so this cannot flake.
+        try await Self.settleAndExpectStable(headerId: header.id, eligible: true) {
+            try await isEligibleForLaterBodyFetch(headerId: $0)
+        }
+
+        // NON-VACUITY, and it is what stops this passing on a build that never marks at
+        // all: the identical mark with no clear behind it DOES leave the row quarantined.
+        await BodyFetchProcessor.markOversizedDurably(headerId: header.id)
+        await ActiveBodyQueue.shared.awaitDurableWritesForTesting()
+        let afterMark = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        })
+        #expect(afterMark.bodyMetadataOversized,
+                "control: the same call, with nothing dispatched behind it, records the observation")
+
+        // Leave the shared queue's session state as it was found — this suite's other
+        // tests construct their own instances, but `.shared` is process-wide.
+        await ActiveBodyQueue.shared.clearOversizedDeferred(accountId: "acc1", folderPath: "INBOX")
+        await ActiveBodyQueue.shared.awaitDurableWritesForTesting()
+    }
+
     @Test("The snippet-tier body write clears the quarantine, like every other success write")
     func applySnippetUpdatesClearsTheFlag() async throws {
         let (header, restore) = try makeSwappedDB()
@@ -954,21 +1008,29 @@ struct OversizedBodyQuarantineDatabaseTests {
     /// `emptyFetchCount > 0` is the overlap the FAILING bucket must subtract; a quarantined
     /// row with `emptyFetchCount = 0` is the overlap the PENDING bucket must subtract.
     ///
-    /// ⚠️ Measured: with only the `emptyFetchCount = 2` row, deleting
-    /// `AND m.bodyMetadataOversized = 0` from `bodylessPendingPredicate` left this test
-    /// GREEN — that row fails `emptyFetchCount = 0` either way, so the mutation was
-    /// invisible to it. The second row is what makes the pending half non-vacuous.
-    @Test("The bodyless diagnostic buckets stay an exact partition for a quarantined row with strikes and one without")
+    /// ⚠️ MEASURED TWICE, and the second time is why every bucket is now occupied.
+    /// (1) With only the `emptyFetchCount = 2` row, deleting `AND m.bodyMetadataOversized = 0`
+    /// from `bodylessPendingPredicate` left this test GREEN — that row fails
+    /// `emptyFetchCount = 0` either way, so the mutation was invisible to it.
+    /// (2) With two rows that were BOTH quarantined, three of the four buckets were pinned
+    /// only at zero, so deleting `AND m.bodyEmptyConfirmed = 0` or
+    /// `AND m.bodyMetadataOversized = 1` from `bodylessQuarantinedPredicate` was still
+    /// invisible. A partition assertion over an empty bucket proves nothing about that
+    /// bucket. (Found by audit.)
+    @Test("The bodyless diagnostic buckets stay an exact partition with every bucket occupied")
     func bodylessDiagnosticBucketsArePartition() async throws {
         let (header, restore) = try makeSwappedDB(emptyFetchCount: 2)
         defer { restore() }
 
-        // Second row: quarantined, never empty. Same folder and account, so it shares the
-        // `folder` join the production scan does.
-        let clean: MessageHeader = {
+        // Additional rows, all in the same account+folder so they share the `folder` join
+        // the production scan does. One per bucket, so NO bucket is pinned only at zero —
+        // an all-quarantined fixture left the `bodyEmptyConfirmed = 0` and
+        // `bodyMetadataOversized = 1` conjuncts of the QUARANTINED predicate invisible.
+        // (Found by audit.)
+        func row(_ messageId: String, emptyFetchCount: Int = 0, confirmedEmpty: Bool = false) -> MessageHeader {
             var h = MessageHeader(
-                messageId: "4243",
-                subject: "A second message whose body overflows the buffer",
+                messageId: messageId,
+                subject: "A message in the bodyless backlog",
                 from: "sender@example.com",
                 fromAddress: "sender@example.com",
                 to: "recipient@example.com",
@@ -980,14 +1042,30 @@ struct OversizedBodyQuarantineDatabaseTests {
                 isInInbox: true
             )
             h.headerComplete = true
+            h.emptyFetchCount = emptyFetchCount
+            h.bodyEmptyConfirmed = confirmedEmpty
             return h
-        }()
-        // Both rows are flagged through the production writer, not by raw SQL, so the
-        // fixture cannot drift from what the writer would actually record.
+        }
+        // QUARANTINED, no strikes — the overlap the PENDING bucket must subtract.
+        let clean = row("4243")
+        // LOCKED, and ALSO flagged: `bodylessLockedPredicate` does not exclude the flag,
+        // while `bodylessQuarantinedPredicate` excludes confirmed-empty. So this row must
+        // land in exactly ONE bucket, and it is what makes that conjunct falsifiable.
+        let lockedRow = row("4244", emptyFetchCount: 3, confirmedEmpty: true)
+        // FAILING, unflagged — the overlap the FAILING bucket must subtract.
+        let failingRow = row("4245", emptyFetchCount: 1)
+        // PENDING, unflagged — ordinary work remaining.
+        let pendingRow = row("4246")
+        // Every flag is written through the production writer, not by raw SQL, so the
+        // fixture cannot drift from what that writer would actually record.
         try await AppDatabase.dbPool.write { db in
             try clean.insert(db)
+            try lockedRow.insert(db)
+            try failingRow.insert(db)
+            try pendingRow.insert(db)
             try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: header.id)
             try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: clean.id)
+            try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: lockedRow.id)
         }
 
         // `rawPool`, not `dbPool`: `StuckMessageDiagnostics.count` takes the bare
@@ -1003,8 +1081,7 @@ struct OversizedBodyQuarantineDatabaseTests {
         let pending = await StuckMessageDiagnostics.countForTesting(
             pool, StuckMessageDiagnostics.bodylessPendingPredicate)
 
-        #expect(bodyless == 2, "fixture check: exactly two bodyless rows")
-        #expect(quarantined == 2, "fixture check: both are quarantined")
+        #expect(bodyless == 5, "fixture check: exactly five bodyless rows")
         // The INVARIANT: the buckets partition `bodyless`. Double-counting a quarantined
         // row reports work still queued that no queue will ever offer again, which is the
         // exact misreading this scan exists to prevent. Stated as a sum, not as four
@@ -1012,9 +1089,13 @@ struct OversizedBodyQuarantineDatabaseTests {
         #expect(
             locked + quarantined + failing + pending == bodyless,
             "the four buckets must partition bodyless — got \(locked)+\(quarantined)+\(failing)+\(pending) vs \(bodyless)")
-        #expect(failing == 0, "the quarantined row with emptyFetchCount > 0 must not ALSO be counted as failing")
-        #expect(pending == 0, "nor may the quarantined row with emptyFetchCount == 0 be counted as pending")
-        #expect(locked == 0, "neither row is confirmed-empty")
+        // …and NON-VACUITY, one row per bucket. Without these the sum above is satisfied
+        // by a build where three buckets are permanently empty, which is how the previous
+        // version of this fixture hid two live mutations.
+        #expect(locked == 1, "the confirmed-empty row belongs to LOCKED — and only there, though it also carries the flag")
+        #expect(quarantined == 2, "both flagged, not-confirmed-empty rows belong to QUARANTINED, regardless of strikes")
+        #expect(failing == 1, "the unflagged row with strikes is FAILING; the flagged one with strikes must not join it")
+        #expect(pending == 1, "the unflagged row with no strikes is PENDING; the flagged one with no strikes must not join it")
     }
 
     @Test("The body-fetch funnel refuses a quarantined row, so every caller is covered without its own gate")
@@ -1687,6 +1768,101 @@ struct FastSyncKeepAwakeTests {
             activeBodyIdle: true,
             backfillBodyIdle: true
         ) == true)
+    }
+
+    /// 🚨 THE JOIN BETWEEN THE TWO HALVES, and the whole user-visible point of the change.
+    ///
+    /// `pendingBodyCountExcludesFlaggedRows` pins `MessageHeader.pendingBodyRequest`, and
+    /// `syncCompleteBannerGate` below pins `BackfillProgress.isFullyComplete`'s arithmetic
+    /// on hand-built values — but nothing drove the function that CONNECTS them. Re-inlining
+    /// the old `filter(…)` chain inside `updateBackfillProgressForAccount` restores the
+    /// never-clearing "Sync Complete" banner with both of those tests, and the rest of the
+    /// suite, still green. That is exactly the shape `pendingBodyRequest`'s own doc says the
+    /// hoist exists to prevent. (Found by audit.)
+    ///
+    /// Two-sided in one fixture: the same two rows are measured with the flag set and with
+    /// it cleared, so an implementation that reported 0 unconditionally — or that never
+    /// reached 0 — fails one side or the other.
+    @Test("End to end: a quarantined row lets an account reach Sync Complete, and an identical unflagged row does not")
+    func quarantinedRowLetsTheAccountReachSyncComplete() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        // Built through immediately-invoked closures so both land as `let`: a `var`
+        // captured by the `@Sendable` write closure below is a concurrency error.
+        let account: Account = {
+            var a = Account(emailAddress: "oversize@example.com", displayName: "Oversize", provider: .imap)
+            a.id = "acc1"
+            return a
+        }()
+        // `backfillComplete` is what makes `headersDone` true, which also keeps this test
+        // off the `uidTotal == 0 && !headersDone` branch that would ask a provider for a
+        // server total. No provider is registered, and none should be needed.
+        let folder: Folder = {
+            var f = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+            f.backfillComplete = true
+            f.lastKnownUidNext = 3
+            return f
+        }()
+
+        func header(_ messageId: String, complete: Bool, oversized: Bool) -> MessageHeader {
+            var h = MessageHeader(
+                messageId: messageId, subject: "s",
+                from: "sender@example.com", fromAddress: "sender@example.com",
+                to: "recipient@example.com", date: Date(), snippet: "",
+                folderId: MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX"),
+                accountId: "acc1", folderPath: "INBOX", isInInbox: true
+            )
+            h.headerComplete = true
+            h.bodyComplete = complete
+            h.bodyMetadataOversized = oversized
+            return h
+        }
+        let flagged = header("1", complete: false, oversized: true)
+        let settled = header("2", complete: true, oversized: false)
+        try await pool.write { db in
+            try account.insert(db)
+            try folder.insert(db)
+            try flagged.insert(db)
+            try settled.insert(db)
+        }
+
+        let engine = await AccountManager.shared.syncEngine
+        await engine.updateBackfillProgressForAccount(account)
+        // `_backfillBacking`, not `backfillProgressByAccount`: the published dictionary is
+        // throttled to one write per second, so reading it would make this test's result a
+        // function of how fast the suite before it ran.
+        let complete = await AccountManager.shared._backfillBacking["acc1"]
+        #expect(complete?.pendingBodyCount == 0,
+                "an unfetchable body must not be counted as work remaining — otherwise this count never reaches 0")
+        #expect(complete?.isFullyComplete == true,
+                "…and therefore the account reaches Sync Complete. Owner decision 2026-09-01: a banner that never clears is worse product behaviour than rounding an unfetchable message up to done")
+
+        // THE CONTROL. The identical two rows with the flag cleared MUST still be counted,
+        // or the first assertion is satisfied by a build that stopped counting anything.
+        try await AppDatabase.dbPool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET bodyMetadataOversized = 0 WHERE id = ?",
+                           arguments: [flagged.id])
+        }
+        await engine.updateBackfillProgressForAccount(account)
+        let incomplete = await AccountManager.shared._backfillBacking["acc1"]
+        #expect(incomplete?.pendingBodyCount == 1,
+                "a bodyless row with no quarantine is ordinary work remaining")
+        #expect(incomplete?.isFullyComplete == false,
+                "…and the banner must stay up for it")
+
+        await AccountManager.shared.clearBackfillProgress(accountId: "acc1")
     }
 
     /// The banner's GATE is unchanged — it is still `pendingBodyCount == 0`. What the

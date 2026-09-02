@@ -327,9 +327,28 @@ extension AccountManager {
         // calls RELEASE a deferral, they never delete user data. Both are non-throwing,
         // so there is no failure to abort on; the worst case of a release that turns out
         // to be premature is one extra fetch attempt that fails identically and
-        // re-quarantines. Their own generation guard closes the converse race — a batch
-        // that captured the pre-clear generation cannot re-quarantine a renumbered UID
-        // after the clear.
+        // re-quarantines. Their own generation guard closes the converse race FOR THE QUEUE
+        // BATCH PATHS — a batch that captured the pre-clear generation cannot re-quarantine a
+        // renumbered UID after the clear.
+        //
+        // ⚠️ ACCEPTED RESIDUAL, and it is deliberately not covered: the two NON-queue writers
+        // routed through `BodyFetchProcessor.markOversizedDurably` (the user-open funnel and
+        // `InboxViewModel.loadSnippetBatch`'s tier 2) capture no generation, because they hold
+        // no batch. A metadata FETCH already on the wire when this reset starts can surface its
+        // overflow AFTER the clear is enqueued and after step 6's resync has re-inserted a row
+        // reusing that UID; the mark then commits last and passes both of
+        // `markBodyMetadataOversized`'s guards against a message that never overflowed, which
+        // durably quarantines a perfectly fetchable body.
+        //
+        // Left fail-closed per THE MANTRA rather than threading a captured generation through
+        // the fetch path: it needs an in-flight overflow concurrent with a same-folder
+        // UIDVALIDITY reset AND UID reuse landing on the same id; it drops no user intention
+        // and mutates no wrong message (the write is scoped to that one row's flag); the header
+        // stays FTS-indexed and searchable throughout; and the recovery is ONE ordinary gesture
+        // — pull-to-refresh is exempt at the funnel, and its success write clears the flag.
+        // The next reset and Smart Reindex also release it. Registered in
+        // `Companion/Process/Current/KnownIssues/Amendments/`; status `open` pending the owner's
+        // decision, not silently accepted. (Found by audit.)
         await ActiveBodyQueue.shared.clearOversizedDeferred(accountId: accountId, folderPath: folderPath)
         await BackfillBodyQueue.shared.clearOversizedDeferred(accountId: accountId, folderPath: folderPath)
 

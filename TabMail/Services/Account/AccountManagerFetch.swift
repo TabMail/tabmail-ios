@@ -39,8 +39,22 @@ enum BodyFetchRefusal {
     static let retryableMessage = "Failed to load message. Please try again."
     static let addressInFlightMessage =
         "This message is still being moved. Go back to the message list and open it again in a moment."
-    /// Shared by the funnel's refusal, `loadBody`'s quarantine branch and the poll's, so
-    /// the same condition cannot present three different sentences.
+    /// Shared TEXT for the funnel's refusal, `loadBody`'s quarantine branch and the
+    /// poll's — not a shared rendered string, and on the detail surface not a shipped
+    /// one either. Two qualifications, both established by audit:
+    ///
+    /// 1. `error(_:_:)` wraps the message in `ProviderError.networkError`, whose
+    ///    `errorDescription` is `"Network error: \(underlying.localizedDescription)"`. So
+    ///    a refusal that reaches the user through a caller's `error.localizedDescription`
+    ///    carries that prefix, while the two branches that assign this constant directly
+    ///    do not. The prefix is inherited — codes −1/−2/−3 have always been wrapped this
+    ///    way — and is left alone rather than unwrapped at one call site, which would
+    ///    trade a visible inconsistency for an invisible one.
+    /// 2. `MessageCardView` renders `viewModel.error` only under
+    ///    `DebugModeManager.isLoggingEnabled()`; a Release user sees its generic
+    ///    "Unable to load message. Pull to retry." instead — which names the one path
+    ///    that is exempt at the funnel. These constants are therefore the DEBUG-surface
+    ///    text on that screen. Do not reword them expecting a user-visible change.
     static let quarantinedMessage = "Unable to load this message's content."
 
     static func error(_ code: Int, _ message: String) -> ProviderError {
@@ -185,7 +199,12 @@ extension AccountManager {
         // converges here; the caller-side check now only decides which UI state to show.
         // (Found by audit.)
         if await bodyFetchIsBlockedByPendingAddress(for: message) {
-            print("[MoveTrace] fetchBody — address not corroborated (move in flight), skipping fetch for \(message.id.prefix(40))")
+            // Debug-gated (rule 12), like its sibling at the top of this function.
+            // Pre-existing and ungated until this change: gating one and leaving the other
+            // makes the function read as compliant while it still logs in Release.
+            if DebugModeManager.isLoggingEnabled() {
+                print("[MoveTrace] fetchBody — address not corroborated (move in flight), skipping fetch for \(message.id.prefix(40))")
+            }
             throw BodyFetchRefusal.error(
                 BodyFetchRefusal.addressInFlight, BodyFetchRefusal.addressInFlightMessage)
         }

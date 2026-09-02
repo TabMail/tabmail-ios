@@ -159,6 +159,13 @@ struct PayloadTooLargeRetryabilityTests {
         )
         #expect(result == .payloadTooLarge)
 
+        // The mark is DISPATCHED onto `ActiveBodyQueue`'s serialized durable-write chain,
+        // not written inline. Without this drain the read below can beat the write, so a
+        // NEGATIVE assertion would be satisfied by timing rather than by the guard it
+        // names — green for the wrong reason under exactly the mutation it must catch.
+        // (Found by audit.)
+        await ActiveBodyQueue.shared.awaitDurableWritesForTesting()
+
         let row = try await AppDatabase.dbPool.read { db in
             try MessageHeader.fetchOne(db, key: header.id)
         }
@@ -239,6 +246,13 @@ struct PayloadTooLargeRetryabilityTests {
             item: makeItem(header), provider: provider, enableAI: false
         )
 
+        // The mark is DISPATCHED onto `ActiveBodyQueue`'s serialized durable-write chain,
+        // not written inline. Without this drain the read below can beat the write, so a
+        // NEGATIVE assertion would be satisfied by timing rather than by the guard it
+        // names — green for the wrong reason under exactly the mutation it must catch.
+        // (Found by audit.)
+        await ActiveBodyQueue.shared.awaitDurableWritesForTesting()
+
         let stored = try #require(try await AppDatabase.dbPool.read { db in
             try MessageHeader.fetchOne(db, key: header.id)
         })
@@ -263,6 +277,13 @@ struct PayloadTooLargeRetryabilityTests {
         _ = await BodyFetchProcessor.fetchAndProcess(
             item: makeItem(header), provider: provider, enableAI: false
         )
+
+        // The mark is DISPATCHED onto `ActiveBodyQueue`'s serialized durable-write chain,
+        // not written inline. Without this drain the read below can beat the write, so a
+        // NEGATIVE assertion would be satisfied by timing rather than by the guard it
+        // names — green for the wrong reason under exactly the mutation it must catch.
+        // (Found by audit.)
+        await ActiveBodyQueue.shared.awaitDurableWritesForTesting()
 
         let stored = try #require(try await AppDatabase.dbPool.read { db in
             try MessageHeader.fetchOne(db, key: header.id)

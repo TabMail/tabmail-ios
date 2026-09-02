@@ -31,21 +31,6 @@ enum BodyFetchProcessor {
         case payloadTooLarge
     }
 
-    /// Records a parser-overflow observation on the user-open path, so the flag's
-    /// population is every row that overflowed and not merely the rows a background queue
-    /// happened to reach first. Same statement and same guard as the two queues'
-    /// `markOversizedDurably`; see `MessageHeader.bodyMetadataOversized` for the full
-    /// contract and the CLEARED enumeration.
-    ///
-    /// `AND bodyComplete = 0`: a row that already has a body must never acquire the flag.
-    /// A pull-to-refresh can land a body between this overflow and this write, and a
-    /// stale flag on a completed row is the shape the detail view's fail-safe has to
-    /// absorb — do not mint one deliberately.
-    ///
-    /// Failure is swallowed on purpose. This is an optimisation of a path that is already
-    /// failing: without the flag the caller still reports the error, and the poll behind
-    /// it still runs — just unbounded. Turning a missed write into a second user-visible
-    /// failure would trade a slow path for a broken one.
     /// The ONE durable oversized mark. Both body queues and the single-item fetch path
     /// route here, so neither guard below can be added to one copy and forgotten in
     /// another — which is precisely the defect that made `admissionSQL` a shared symbol.
@@ -81,10 +66,42 @@ enum BodyFetchProcessor {
             arguments: [headerId])
     }
 
-    /// Undispatched wrapper for callers that observe the overflow on their own thread and
-    /// have no serialized write chain of their own: `fetch`'s `PayloadTooLargeError`
-    /// branch and `InboxViewModel.loadSnippetBatch`'s tier-2 catch. The two queues call
-    /// `markBodyMetadataOversized` through their own `enqueueDurableWrite` instead.
+    /// The ONE durable oversized CLEAR for a UIDVALIDITY turnover — the inverse of the
+    /// mark above, and one symbol for the same reason: both queues issue it, and this
+    /// statement was duplicated VERBATIM on each of them, which is exactly the "a guard
+    /// added to one copy and forgotten in the other" hazard that made `admissionSQL` and
+    /// `markBodyMetadataOversized` shared symbols in the first place. (Found by audit.)
+    ///
+    /// A reset means the folder's UIDs no longer address the same messages, so a per-row
+    /// observation about "the message at this address" is void and must not outlive it.
+    ///
+    /// Scoped by the `(accountId, folderPath)` COLUMNS, while the queues' in-memory half
+    /// filters header-id STRINGS through `MessageIdentity.headerIdBelongsToFolder`.
+    ///
+    /// ⚠️ Those two are not the same predicate, and an earlier comment claimed the SQL form
+    /// "cannot drift from `MessageIdentity`'s parsing". It can: `optimisticMoveToFolder`
+    /// leaves a row whose id was minted under the SOURCE folder while its columns already
+    /// name the DESTINATION, so for that row the string filter and the column filter
+    /// disagree about which folder it belongs to.
+    ///
+    /// Kept as-is because the disagreement is benign in BOTH directions, and the columns
+    /// are the better half: a UIDVALIDITY reset is a statement about the folder the row is
+    /// IN. If this clear releases a mid-move row the in-memory half kept, the row is merely
+    /// re-offered to the queues — worst case one wasted fetch. If it keeps one the
+    /// in-memory half released, the row stays quarantined until the next reset, a success
+    /// write, or Smart Reindex, exactly as any other flagged row does.
+    nonisolated static func clearBodyMetadataOversized(
+        _ db: Database, accountId: String, folderPath: String
+    ) throws {
+        try db.execute(
+            sql: """
+                UPDATE messageHeader SET bodyMetadataOversized = 0
+                WHERE accountId = ? AND folderPath = ?
+                  AND bodyMetadataOversized = 1
+                """,
+            arguments: [accountId, folderPath])
+    }
+
     /// Record an observed overflow durably, from a path that is NOT one of the body queues:
     /// `BodyFetchProcessor.fetch` (the user-open funnel) and `InboxViewModel.loadSnippetBatch`
     /// tier 2.
