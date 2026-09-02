@@ -149,7 +149,7 @@ extension AccountManager {
     /// `setupOAuthAccount`). Extracted verbatim from the insert arm's tail:
     /// UI refresh notification, orphaned-demo purge, provider connect,
     /// background initial sync, push subscription, NSE explainer + account
-    /// map mirror, and the push-consent rescan.
+    /// identity mirror, and the push-consent rescan.
     private func activateMailAccount(_ account: Account) async throws {
         NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
 
@@ -195,8 +195,8 @@ extension AccountManager {
             )
         }
 
-        // Mirror account map to shared UserDefaults for NSE
-        NSEDataBridge.mirrorAccountMap()
+        // Mirror account identity to shared UserDefaults for NSE
+        NSEDataBridge.mirrorAccountIdentity()
 
         // Rerun the foreground consent-status scan so the banner reflects
         // the freshly-added account. Without this trigger, the banner only
@@ -256,6 +256,13 @@ extension AccountManager {
             try toInsert.insert(db)
         }
         NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
+
+        // The extension resolves a push through the shared identity mirrors and
+        // cannot read this database, so refresh them as soon as the row commits.
+        // Without it a newly added account stays unresolvable until the next
+        // launch-time mirror pass, and an IMAP reconnect push arriving in that
+        // window is dropped before it can re-subscribe.
+        NSEDataBridge.mirrorAccountIdentity()
 
         // Once a real account is added (not demo),
         // purge any orphaned demo rows. The login-screen demo button hides
@@ -331,6 +338,13 @@ extension AccountManager {
             try toInsert.insert(db)
         }
         NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
+
+        // The extension resolves a push through the shared identity mirrors and
+        // cannot read this database, so refresh them as soon as the row commits.
+        // Without it a newly added account stays unresolvable until the next
+        // launch-time mirror pass, and an IMAP reconnect push arriving in that
+        // window is dropped before it can re-subscribe.
+        NSEDataBridge.mirrorAccountIdentity()
 
         // Once a real account is added (not demo),
         // purge any orphaned demo rows. The login-screen demo button hides
@@ -508,6 +522,14 @@ extension AccountManager {
                     print("[AccountManager] CalDAV rollback failed to delete synthetic account \(rollbackId): \(error)")
                 }
             }
+            // The rollback DELETES an `account` row, so it is a mirrored-identity
+            // write like any other. The insert above deliberately does not
+            // refresh (a calendar-only row supplies no connection info), but a
+            // concurrent convergence pass can have mirrored the doomed row in
+            // between, and since this change that pass runs on every foreground
+            // return rather than once per launch. Re-derive so the address does
+            // not keep naming a deleted account id until the next pass.
+            NSEDataBridge.mirrorAccountIdentity()
             throw setupError
         }
 
@@ -573,10 +595,51 @@ extension AccountManager {
             await push.cancelPreparedRemovedAccountCleanup(generation: cleanupGeneration)
             // The DB row is still authoritative. Re-derive both maps rather
             // than restoring a possibly stale captured Account snapshot.
-            NSEDataBridge.mirrorAccountMap()
-            NSEDataBridge.mirrorIMAPAccounts()
+            NSEDataBridge.mirrorAccountIdentity()
             throw error
         }
+
+        // Converge the mirrors now that the delete has committed. This is NOT a
+        // second attempt at the pre-commit clearing above — that clearing is
+        // what closes the commit-to-mirror window, and it stays. This pass
+        // repairs the collateral damage the clearing can do:
+        // `removeAccountFromMirrors` drops any `nse.accountMap` entry whose KEY
+        // matches the removed address, not only the one whose VALUE is the
+        // removed id, so removing one of two accounts that share an address
+        // takes the SURVIVOR's entry with it — and `mirrorAccountMap`'s
+        // mail-over-calendar precedence means the shared key normally belongs
+        // to the survivor. Without this, the survivor is unresolvable to the
+        // extension (`findAccountId` misses, `handleIMAPReconnect` returns
+        // without re-subscribing) until the next foreground return.
+        //
+        // The precondition is the COMMIT above and nothing else: both halves
+        // read only the `account` table, `removeAccountRowsTxn` performs an
+        // unconditional `Account.deleteOne` inside that one transaction (its
+        // last statement is a CONDITIONAL primary-account promotion, which
+        // writes `isPrimary` — not a mirrored column — and cannot resurrect the
+        // deleted row), and nothing later in this method writes that table — so
+        // from here on, every point is equally safe and a re-derivation cannot
+        // name the removed account.
+        // ⚠️ Do NOT read the credential delete in `disconnectAccount` as part
+        // of this precondition; it is irrelevant to what the pass derives. It
+        // is placed as early as the commit allows on purpose: below
+        // `disconnectAccount` it would hold the SURVIVOR unresolvable across a
+        // network teardown (`provider.disconnect()`) and a SyncEngine hop that
+        // can queue behind a running sync — which is the very outage this pass
+        // exists to prevent. The cost paid for the early slot is that this actor
+        // blocks on two synchronous `account`-table reads before the runtime
+        // fence in `disconnectAccount` has run — and the cost that matters is
+        // ACQUIRING each reader, not running the query: `IOS-PERF-001`'s
+        // evidence is that the waits bottom out in `GRDB.Pool.get`, and at this
+        // slot the removed account's own sync is still live and contending for
+        // the same pool. Do NOT price that contention off GRDB's default pool of
+        // five: `AppDatabase.makeConfiguration` sets `maximumReaderCount = 64`,
+        // raised from 10 after a repro caught MainActor blocked 6.7s, against an
+        // observed burst ceiling of ~15 — so `Pool.get` essentially never blocks
+        // here. The early slot is cheap, not merely worth it. Quoting the library
+        // default as if it were the configured value argues for moving this call
+        // below the teardown, which the paragraph above forbids.
+        NSEDataBridge.mirrorAccountIdentity()
 
         NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
 
@@ -584,6 +647,7 @@ extension AccountManager {
         // account, removes every runtime route, invalidates OAuth/queue state,
         // and deletes credentials before that method reaches its first await.
         await disconnectAccount(account, deletingCredentials: cleanupInventory.0)
+
         await push.commitPreparedRemovedAccountCleanup(
             generation: cleanupGeneration,
             capturedOAuthAccessToken: upstreamAccessToken

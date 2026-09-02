@@ -101,11 +101,14 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Current tracker census (2026-09-02): 5 `open` records, all of them amendment rows —
-> `IOS-BODY-006`, `IOS-COMPOSE-002`, `IOS-IMAP-015`, `IOS-IMAP-016`, `IOS-PERF-012`.**
+> **Current tracker census (2026-09-02): 6 `open` records, all of them amendment rows —
+> `IOS-BODY-006`, `IOS-COMPOSE-002`, `IOS-IMAP-015`, `IOS-IMAP-016`, `IOS-NSE-008`,
+> `IOS-PERF-012`.**
 > `IOS-BODY-006` was filed on 2026-09-02 with the oversized-metadata body quarantine and is
 > `open` rather than `accepted` precisely because its two consequential properties still need
-> the owner's decision.
+> the owner's decision. `IOS-NSE-008` was filed the same day with the NSE identity-mirror refresh and is
+> `open` rather than `accepted` because it carries an owner decision (accept the residuals,
+> or close the window), not a fix in flight.
 >
 > *Superseded, preserved:* **Current tracker census (2026-08-20): 4 `open` records, all of them amendment rows —
 > `IOS-COMPOSE-002`, `IOS-IMAP-015`, `IOS-IMAP-016`, `IOS-PERF-012`. No base-register row has an open
@@ -228,6 +231,12 @@ regenerated from it; their detail files live in
 | ID | Class | Executive statement |
 |---|---|---|
 | [IOS-BODY-006](Companion/Process/Current/KnownIssues/Amendments/ios-body-006.md) | `open` | 📋 **OPEN — AWAITING THE OWNER'S DECISION (2026-09-02).** The oversized-metadata body quarantine (`messageHeader.bodyMetadataOversized`) stops an unbounded re-fetch storm and makes "Sync Complete" reachable again, at two costs that are deliberate but **not yet blessed**. (A) It is a **ONE-STRIKE LATCH on a signal that is not deterministic** — the parser bound is on unread AGGREGATE bytes measured after the decode loop stops, so the trigger is fragmentation-dependent and an ordinary, fetchable message on a lossy link can roll into it. The codebase's prior art for the same shape is a counter (`emptyFetchCount >= 3` before `bodyEmptyConfirmed`); a counter was NOT built here because a new column is more mechanism than one gesture of recovery warrants. (B) The two **non-queue** writers routed through `BodyFetchProcessor.markOversizedDurably` capture no `resetGeneration`, so an overflow already on the wire when a same-folder UIDVALIDITY reset lands can quarantine a re-inserted row that reused the UID and never overflowed. Neither drops a user intention, mutates a wrong message, or deletes anything; the header stays FTS-indexed and searchable, and **pull-to-refresh is exempt at the funnel** and clears the flag on success. Six further accepted limitations are enumerated in the source on `BodyFetchProcessor.markBodyMetadataOversized`, the single writer both queues call. Retired entirely by raising `IMAPFetchMapping.responseBufferLimit` — a **first-party** constant — plus the one-statement clearing migration |
+
+### NSE (1)
+
+| ID | Class | Executive statement |
+|---|---|---|
+| [IOS-NSE-008](Companion/Process/Current/KnownIssues/Amendments/ios-nse-008.md) | `open` | 🔓 **OPEN (2026-09-02)** — three residuals in the App Group identity mirrors the notification service extension resolves pushes through. **(A)** A re-derivation whose database read straddles a concurrent account removal can briefly restore the removed account's entries; removal itself is safe (`removeAccountFromMirrors` edits both mirrors *before* the authoritative delete), so this window is opened only by a *concurrent* reader, i.e. the foreground convergence pass — widest across `AppDataWiper.wipeAll`, whose pre-delete mirror clearing is a per-account loop followed by a multi-table transaction. Bounded by the credential delete in `disconnectAccount` one hop later, with no cross-account access; the visible residue is a stale notification for the removed address. ⚠️ **The "gone at the next foreground return" bound fails for the LAST mail account** — `RootView` gates `startForegroundPolling()` on `!navigationStore.accounts.isEmpty`, so with zero accounts the entries survive to the next cold launch. **(B)** An edit to a mirrored column of an existing account (`AccountEditableField` covers the address and the IMAP username) converges only at the next re-derivation, deliberately — a per-writer refresh census goes stale silently the next time a mirrored column is added. **(C)** Two MAIL rows at one address — reachable because `addIMAPAccount` runs no duplicate check and `Account.existing` is provider-scoped — contend for the single map slot by scan order, **deterministically and permanently**, and there is no correct precedence to apply: whichever row wins, pushes for the other provider dead-end. Resolving it means changing the model (id in the payload, or `(address, provider)` keying) or preventing the duplicate at account setup, not picking a winner in the mirror. Filed `open`, **not** `accepted`: no owner decision has been taken. Remedies are enumerated in the routed record |
 
 ## GitHub live trackers (updated 2026-08-20)
 

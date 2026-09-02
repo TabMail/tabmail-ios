@@ -141,10 +141,17 @@ enum AppDataWiper {
                 await push.cancelPreparedRemovedAccountCleanup(generation: generation)
             }
             // This method is MainActor-isolated, while mirror derivation uses
-            // synchronous GRDB reads. Keep rollback work off the UI executor.
-            await Task.detached(priority: .utility) {
-                NSEDataBridge.mirrorAccountMap()
-                NSEDataBridge.mirrorIMAPAccounts()
+            // synchronous GRDB reads. Keep rollback work off the UI executor —
+            // and at `.medium`, the ADR-IOS-031 floor for a background task that
+            // takes a reader on the main pool, because MainActor is blocked
+            // awaiting `.value` here. (Not one of `IOS-PERF-001`'s registered
+            // `.utility` residuals: this block postdates that census, having
+            // arrived on 2026-08-14 against a 2026-08-04/05 census. The bump
+            // has no production effect today — this file records that `wipeAll`
+            // has no callers — so it is the correct tier for the site rather
+            // than a measured win.)
+            await Task.detached(priority: .medium) {
+                NSEDataBridge.mirrorAccountIdentity()
             }.value
             throw error
         }

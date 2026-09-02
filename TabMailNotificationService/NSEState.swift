@@ -56,8 +56,32 @@ enum NSEState {
 
     /// Minimal IMAP connection info the NSE needs to open a one-shot socket
     /// for `imap_new_mail` / `imap_reconnect` processing. Password lives in
-    /// shared Keychain — `SharedKeychain.getPassword(for: accountId)`. Main
-    /// app writes this on account add/remove via `NSEDataBridge.mirrorIMAPAccounts()`.
+    /// shared Keychain — `SharedKeychain.getPassword(for: accountId)`.
+    ///
+    /// The main app re-derives this at every *mail* account-add site and on
+    /// every foreground return, via `NSEDataBridge.mirrorAccountIdentity()`.
+    /// Several `Account` inserts deliberately do not, and they are safe for one
+    /// shared reason rather than by name: none of them can produce a row that
+    /// `mirrorIMAPAccounts` would emit, because that half admits only
+    /// `provider IN ('imap','icloud')` WITH a non-empty `imapHost`.
+    /// `AccountManager.addCalDAVAccount` and both `CalendarSetupView` arms write
+    /// `calendarOnly` rows on non-IMAP providers; `DemoSeed`, `ScreenshotMode`
+    /// and the preview fixtures write rows with no `imapHost`. (`mirrorAccountMap`
+    /// does still hold calendar-only addresses — the extension needs them for
+    /// its suppress set — which is why that half gives a mail row precedence
+    /// over a calendar row at the same address.) Account *removal* runs BOTH
+    /// mechanisms in order: `NSEDataBridge.removeAccountFromMirrors()` edits
+    /// both mirrors in place before the row is deleted (so process death cannot
+    /// leave a committed deletion resolvable), and a re-derivation follows once
+    /// that delete commits (so the survivor of a shared address, whose key the
+    /// clearing takes with it, is restored). An
+    /// account-field *edit* has no refresh at its write site and converges on
+    /// the next foreground return, so a mirrored column can be one edit stale
+    /// for as long as the app stays in the foreground (`IOS-NSE-008` residual
+    /// B). That bound has no last-account edge: the fields are editable only
+    /// through the sidebar, which lists active non-calendar accounts, so an
+    /// account that can be edited is by construction one that keeps the
+    /// foreground pass's account gate open.
     struct IMAPAccountInfo: Sendable {
         let host: String
         let port: Int
