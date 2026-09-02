@@ -63,6 +63,14 @@ private func backfillItem(
 /// `.serialized, .processGlobalState`: the pre-fix write went to the process-wide
 /// `AppDatabase.shared` (via `AppDatabase.syncPool` / `.backgroundPool`), so the seeded
 /// row must live in THAT database for the assertion to be capable of failing.
+/// The funnel's overflow predicate is a description-substring test
+/// (`"\(error)".contains("PayloadTooLargeError")`), so a stub only has to reproduce the
+/// description — `PayloadTooLargeError` itself lives in swift-nio-imap and is not
+/// constructible here.
+private struct StubFunnelPayloadTooLargeError: Error, CustomStringConvertible {
+    var description: String { "PayloadTooLargeError: body exceeds the fixed NIO buffer" }
+}
+
 @Suite("Oversized bodies are quarantined, never marked fetched (data-integrity rule 1)", .serialized, .processGlobalState)
 struct OversizedBodyQuarantineDatabaseTests {
 
@@ -1262,6 +1270,92 @@ struct OversizedBodyQuarantineDatabaseTests {
     ///
     /// The poll side already has this twin (`bodyPollHonoursAFlagSetWhileItIsRunning`);
     /// the funnel did not. (Found by audit.)
+    /// 🚨 **THE FUNNEL'S OUTCOME → REFUSAL-CLASS MAPPING, which nothing else reaches.**
+    /// `fetchBody`'s tail turns a `BodyFetchProcessor` outcome into a refusal:
+    /// `.payloadTooLarge` becomes a TERMINAL class and `.retry` a retryable one, and
+    /// `MessageDetailViewModel.loadBody` and the 2s body poll both branch on exactly that
+    /// distinction via `BodyFetchRefusal.endsPolling`.
+    ///
+    /// Both halves were tested and the join was not. `bodyFetchRefusalEndsPollingOnlyFor
+    /// TerminalClasses` walks six classes but CONSTRUCTS each refusal by hand; every
+    /// `MessageDetailViewModel` test injects `_fetchBodyOverride`; and all six other test
+    /// call sites of `fetchBody` in the suite exit BEFORE this tail — at the address gate,
+    /// at the quarantine gate, or at `createIMAPProvider`'s missing-`imapHost` guard. So
+    /// **swapping the two arms left all 9,403 tests green** while restoring the exact
+    /// headline defect this branch exists to remove: an oversized body would classify as
+    /// retryable, `loadBody` would start the poll, and the row would be re-fetched every
+    /// two seconds forever — each tick a full TCP + TLS + LOGIN + SELECT plus a folder
+    /// connection teardown. The eviction case (ADR-IOS-050) makes the poll's own
+    /// quarantine gate no help there: an evicted row reads `bodyComplete = 1`, so
+    /// `isBodyQuarantined` is false.
+    ///
+    /// Registering a provider is what lets this test reach the tail at all — it populates
+    /// `providers`, so `connectAccount` is never called and the host-less fixture account
+    /// is not consulted.
+    ///
+    /// ⚠️ Asserts the CLASSIFICATION, never the integer code. Pinning `-1`/`-2` would be a
+    /// mechanism-pinning test, which inherits a wrong spec's error and stays green on a
+    /// broken system (Testing Rule 12). (Found by audit.)
+    @Test("The funnel maps an overflow to a poll-ending refusal and an ordinary failure to a retryable one")
+    func funnelMapsOutcomesToTheRightRefusalClass() async throws {
+        let (overflowRow, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        // A SECOND row for the control leg: the overflow leg durably flags its own row, so
+        // reusing it would make the control's refusal a quarantine rather than a retry.
+        var seed = MessageHeader(
+            messageId: "4243",
+            subject: "A message that fails for an ordinary reason",
+            from: "sender@example.com",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "",
+            folderId: MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX"),
+            accountId: "acc1",
+            folderPath: "INBOX",
+            isInInbox: true
+        )
+        seed.headerComplete = true
+        // `let` BEFORE the write: both closures below run concurrently and cannot capture a `var`.
+        let ordinaryRow = seed
+        try await AppDatabase.dbPool.write { db in try ordinaryRow.insert(db) }
+
+        let provider = MockEmailProvider()
+        var overflowEndsPolling: Bool?
+        var ordinaryEndsPolling: Bool?
+
+        await TestProviderRegistry.withRegisteredProvider(accountId: "acc1", provider: provider) {
+            // LEG A — a genuine parser overflow must END the poll.
+            await provider.setFetchMessageThrows(StubFunnelPayloadTooLargeError())
+            do {
+                try await AccountManager.shared.fetchBody(for: overflowRow)
+                Issue.record("an overflow must not resolve as a successful body fetch")
+            } catch {
+                overflowEndsPolling = BodyFetchRefusal.endsPolling(error)
+            }
+
+            // LEG B — THE CONTROL, in the same run, through the same funnel. Without it a
+            // build that ended the poll on every failure would satisfy leg A while parking
+            // the user on a terminal error after one transient blip.
+            await provider.setFetchMessageThrows(ProviderError.messageNotFound)
+            do {
+                try await AccountManager.shared.fetchBody(for: ordinaryRow)
+                Issue.record("a messageNotFound must not resolve as a successful body fetch")
+            } catch {
+                ordinaryEndsPolling = BodyFetchRefusal.endsPolling(error)
+            }
+        }
+        // The mark from leg A rides the shared durable-write chain; drain it so the
+        // teardown cannot race a pending write against the swapped-out pool.
+        await ActiveBodyQueue.shared.awaitDurableWritesForTesting()
+
+        #expect(overflowEndsPolling == true,
+                "an overflow refusal minted BY THE FUNNEL must end the poll — otherwise the row is re-fetched every 2s forever, each attempt tearing down the folder connection")
+        #expect(ordinaryEndsPolling == false,
+                "an ordinary failure minted BY THE FUNNEL must stay retryable — ending the poll here would park the user on a terminal error after one transient blip")
+    }
+
     @Test("The funnel gates on the FRESH row, not the caller's stale copy of it")
     func funnelGatesOnTheFreshRowNotTheCallersStaleCopy() async throws {
         let (header, restore) = try makeSwappedDB()
