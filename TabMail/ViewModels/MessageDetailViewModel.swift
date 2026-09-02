@@ -1111,28 +1111,29 @@ final class MessageDetailViewModel {
                 guard !self.isRefetchingBody else { continue }
                 // 2. Re-attempt server fetch (connection may have recovered)
                 guard let msg = self.message else { continue }
-                // Oversized-metadata quarantine — the same refusal `loadBody` applies at
-                // its `bodyMetadataOversized` branch, applied here because that branch is
-                // UNREACHABLE on the three paths that start this poll: all three
-                // (`startBodyPoll(); return` on a cancelled header read, a cancelled
-                // resolve, and a cancelled body cache-check) return BEFORE it. Without
-                // this, a quarantined row opened on any of those paths retries forever on
-                // a 2s cadence, each attempt paying a full TCP+TLS+LOGIN+SELECT because
-                // the parser overflow marks the folder connection unhealthy.
+                // Oversized-metadata quarantine — a UI-STATE check, not the network
+                // guard. `AccountManagerFetch.fetchBody` refuses a quarantined row at the
+                // funnel, so nothing here can reach the wire; what the funnel cannot do is
+                // end this poll or say anything to the user, because the catch below only
+                // logs and continues. Left in place deliberately: without it a quarantined
+                // message polls every 2s forever and never shows the failure. This mirrors
+                // the address gate's split, whose funnel comment states the rule — "the
+                // caller-side check now only decides which UI state to show".
+                //
+                // `loadBody`'s own branch cannot serve here: all three paths that start
+                // this poll (`startBodyPoll(); return` on a cancelled header read, a
+                // cancelled resolve, and a cancelled body cache-check) return BEFORE it.
                 //
                 // Read the flag FRESH rather than trusting `msg`: the body queues can mark
                 // this row WHILE the poll is running, and `self.message` is only re-read
-                // when it is nil. One extra raw read per fetch tick — the tick is about to
-                // do a full IMAP round trip, so the read is free by comparison. A nil read
-                // (row re-keyed out from under us) falls through to the fetch exactly as
-                // before. `dbPool.pool` honors a `_dbPoolOverride` test pool, and matches
-                // the post-fetch reads below.
+                // when it is nil. A nil read (row re-keyed out from under us) falls through
+                // exactly as before. `dbPool.pool` honors a `_dbPoolOverride` test pool.
                 //
                 // Ends the poll (`return`, not `continue`): nothing is fetching this body
                 // in the background — the flag is what removed it from both queues — so
                 // there is no state change to wait for. The header-recovery half of the
                 // poll's job is complete too, since we just read the row. Pull-to-refresh
-                // remains the user's genuine retry.
+                // remains the user's genuine retry, and it is exempt at the funnel.
                 let latestForQuarantine = try? await self.dbPool.pool.read({ db in try MessageHeader.fetchOne(db, key: rid) })
                 if let latestForQuarantine, latestForQuarantine.isBodyQuarantined {
                     guard !self.isRefetchingBody else { continue }

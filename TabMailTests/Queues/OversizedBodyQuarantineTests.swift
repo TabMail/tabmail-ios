@@ -855,6 +855,160 @@ struct OversizedBodyQuarantineDatabaseTests {
         #expect(await afterReindex.queuedItemsForTesting.contains { $0.headerId == header.id },
                 "and the row must actually come back into the queue, not merely lose a column value")
     }
+
+    // MARK: - Round-3 audit findings
+
+    @Test("An overflow observed inside an optimistic-move window is not recorded against the row it cannot be about")
+    func midMoveOverflowIsNotRecordedAgainstThatRow() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        // Reproduce the `optimisticMoveToFolder` window exactly: the row's COLUMNS are
+        // rewritten to the destination while its PRIMARY KEY still encodes the SOURCE
+        // folder and UID. In that window the bytes fetched at the columns' address belong
+        // to a DIFFERENT message, so an overflow observed there is not evidence about the
+        // message this row's key names.
+        let destination: Folder = {
+            var f = Folder(name: "Archive", path: "Archive", role: .archive, accountId: "acc1")
+            f.lastKnownUidValidity = 1000
+            return f
+        }()
+        try await AppDatabase.dbPool.write { db in
+            try destination.insert(db)
+            try db.execute(
+                sql: "UPDATE messageHeader SET folderPath = ?, folderId = ? WHERE id = ?",
+                arguments: ["Archive",
+                            MessageIdentity.folderId(accountId: "acc1", folderPath: "Archive"),
+                            header.id])
+        }
+        #expect(
+            BodyAddressGate.addressIsInFlight(
+                id: header.id, accountId: "acc1", folderPath: "Archive", messageId: header.messageId),
+            "fixture check: the row must actually be mid-move, or this test proves nothing")
+
+        await BodyFetchProcessor.markOversizedDurably(headerId: header.id)
+
+        let moved = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        })
+        // The INVARIANT: a durable quarantine may only record an observation that is
+        // about the row it is written to. Marking here is permanent — the flag rides the
+        // re-key — so a fetchable message would be excluded from both admission queries,
+        // counted as settled, and refused by every read gate, forever.
+        #expect(
+            moved.bodyMetadataOversized == false,
+            "an overflow seen at the destination address must not be recorded against a row still keyed to the source")
+
+        // Positive control on the SAME statement, so the refusal above cannot be vacuous:
+        // once key and columns agree, the identical call does flag the row.
+        try await AppDatabase.dbPool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET folderPath = ?, folderId = ? WHERE id = ?",
+                arguments: [header.folderPath,
+                            MessageIdentity.folderId(accountId: "acc1", folderPath: header.folderPath),
+                            header.id])
+        }
+        await BodyFetchProcessor.markOversizedDurably(headerId: header.id)
+        let settled = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        })
+        #expect(settled.bodyMetadataOversized, "control: a row whose key matches its columns is still flagged")
+    }
+
+    @Test("The snippet-tier body write clears the quarantine, like every other success write")
+    func applySnippetUpdatesClearsTheFlag() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+        try await AppDatabase.dbPool.write { db in
+            try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: header.id)
+        }
+        #expect(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)?.bodyMetadataOversized == true
+        }, "fixture check: the row starts quarantined")
+
+        await SyncEngine().applySnippetUpdates([(headerId: header.id, snippet: "a body arrived")])
+
+        let stored = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        })
+        // The INVARIANT: any successful body write is positive evidence refuting the
+        // observation, so it must retract it. This writer is a GRDB `updateAll` chain and
+        // is invisible to an `rg 'bodyMetadataOversized = 0'` census — the reason it needs
+        // its own pin rather than relying on that census.
+        #expect(stored.bodyComplete, "fixture check: the snippet write completes the body")
+        #expect(
+            stored.bodyMetadataOversized == false,
+            "a success write must retract the quarantine, or eviction later strands a body this build already fetched")
+    }
+
+    @Test("The bodyless diagnostic buckets stay an exact partition when a quarantined row also carries empty strikes")
+    func bodylessDiagnosticBucketsArePartition() async throws {
+        let (header, restore) = try makeSwappedDB(emptyFetchCount: 2)
+        defer { restore() }
+        // The overlap case the ordering exists for: quarantined AND previously empty.
+        try await AppDatabase.dbPool.write { db in
+            try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: header.id)
+        }
+
+        // `rawPool`, not `dbPool`: `StuckMessageDiagnostics.count` takes the bare
+        // `DatabasePool` the production scan uses, not the prioritized wrapper.
+        let pool = AppDatabase.rawPool
+        let bodyless = await StuckMessageDiagnostics.countForTesting(pool, "m.bodyComplete = 0")
+        let locked = await StuckMessageDiagnostics.countForTesting(
+            pool, StuckMessageDiagnostics.bodylessLockedPredicate)
+        let quarantined = await StuckMessageDiagnostics.countForTesting(
+            pool, StuckMessageDiagnostics.bodylessQuarantinedPredicate)
+        let failing = await StuckMessageDiagnostics.countForTesting(
+            pool, StuckMessageDiagnostics.bodylessFailingPredicate)
+        let pending = await StuckMessageDiagnostics.countForTesting(
+            pool, StuckMessageDiagnostics.bodylessPendingPredicate)
+
+        #expect(bodyless == 1, "fixture check: exactly one bodyless row")
+        #expect(quarantined == 1, "fixture check: it is the quarantined one")
+        // The INVARIANT: the buckets partition `bodyless`. Double-counting a quarantined
+        // row as "pending" reports work still queued that no queue will ever offer again,
+        // which is the exact misreading this scan exists to prevent.
+        #expect(
+            locked + quarantined + failing + pending == bodyless,
+            "the four buckets must partition bodyless — got \(locked)+\(quarantined)+\(failing)+\(pending) vs \(bodyless)")
+        #expect(failing == 0, "a quarantined row must not ALSO be counted as failing, despite emptyFetchCount > 0")
+        #expect(pending == 0, "nor as pending")
+    }
+
+    @Test("The body-fetch funnel refuses a quarantined row, so every caller is covered without its own gate")
+    func funnelRefusesQuarantinedRow() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+        try await AppDatabase.dbPool.write { db in
+            try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: header.id)
+        }
+        let quarantined = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        })
+        #expect(quarantined.isBodyQuarantined, "fixture check: the row is quarantined")
+
+        // The INVARIANT: the refusal is at the FUNNEL, so a caller that never heard of the
+        // flag cannot spend a connection on it. `MessageDetailViewModel.loadThreadMessageBody`
+        // (expanding a collapsed thread bubble) is exactly such a caller — it had no gate
+        // and swallowed the failure into a debug print.
+        //
+        // Asserting the SPECIFIC refusal is what makes this non-vacuous: without the gate
+        // the call proceeds past it and fails differently (provider resolution), so a
+        // bare "it threw" would stay green on the unfixed code.
+        var refusal: NSError?
+        do {
+            try await AccountManager.shared.fetchBody(for: quarantined)
+            Issue.record("the funnel must refuse a quarantined row before any provider work")
+        } catch let ProviderError.networkError(underlying) {
+            refusal = underlying as NSError
+        } catch {
+            Issue.record("expected the funnel's typed refusal, got \(error)")
+        }
+        let ns = try #require(refusal, "the funnel must refuse with its own error, not fall through")
+        #expect(ns.domain == "TabMail", "the refusal must be the funnel's, not a provider failure")
+        #expect(ns.code == -4, "…and specifically the oversized-quarantine refusal")
+    }
+
 }
 
 // MARK: - Property (ii): the quarantine terminates the drain/repopulate cycle

@@ -152,6 +152,17 @@ extension SyncEngine {
         }
     }
 
+    /// The candidate scope, hoisted so the divergence documented on
+    /// `selfHealBackfillFTSMembership` has a pin that can actually fail. A transcribed
+    /// copy in a test asserts nothing about production: it stays green while the two
+    /// drift, which is precisely the regression that note warns against. Same reasoning
+    /// as `ActiveBodyQueue.admissionSQL`.
+    nonisolated static let backfillFTSSelfHealCandidateSQL = """
+        SELECT id FROM messageHeader
+        WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0
+        LIMIT 5000
+        """
+
     /// Sister of `selfHealFTSBodyMembership` for the backfill queue's scope:
     /// headers where `headerComplete=1` (so backfill will pick them up) but
     /// the FTS index has no row. Without this, `updateBodies` silently defers,
@@ -170,16 +181,6 @@ extension SyncEngine {
     /// missing body. The two predicates diverged when that flag shipped; do not
     /// re-merge them. Pinned by `OversizedDurableFlagConfinementTests
     /// .ftsSelfHealStillSeesFlaggedRows`.
-    /// The candidate scope, hoisted so the divergence documented above has a pin that can
-    /// actually fail. A transcribed copy in a test asserts nothing about production: it
-    /// stays green while the two drift, which is precisely the regression the note warns
-    /// against. Same reasoning as `ActiveBodyQueue.admissionSQL`.
-    nonisolated static let backfillFTSSelfHealCandidateSQL = """
-        SELECT id FROM messageHeader
-        WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0
-        LIMIT 5000
-        """
-
     func selfHealBackfillFTSMembership() async {
         do {
             // Same pattern as `selfHealFTSBodyMembership`: fetch only IDs first,

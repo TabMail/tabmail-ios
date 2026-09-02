@@ -310,7 +310,10 @@ extension AccountManager {
         // `accountId:folderPath:UID`, a mutable ADDRESS. A UIDVALIDITY turnover
         // renumbers the mailbox, so step 6's resync inserts fresh-epoch rows that MAY
         // reuse a deferred header's UID; the stale key then makes `admit()` reject a
-        // message that was never oversized, starving it of its body until relaunch.
+        // message that was never oversized, starving it of its body. ⚠️ "until relaunch"
+        // is no longer the bound: the DURABLE flag survives a relaunch, so an
+        // uninvalidated deferral would strand the body indefinitely — which is exactly
+        // why this invalidation point matters more now, not less.
         // The renumber is precisely the moment the deferral stops being about the
         // message it was recorded for, so it is the correct invalidation point.
         //

@@ -171,7 +171,12 @@ actor ActiveBodyQueue {
     ///      the bound actually changes, instead of a retry every launch forever;
     ///   2. a UIDVALIDITY reset for the folder — `clearOversizedDeferred`;
     ///   3. a UID remap / cross-folder move — that mints a NEW headerId which is not
-    ///      in this set, so `admit` takes it.
+    ///      in this set, so `admit` takes it. ⚠️ IN-MEMORY HALF ONLY: the durable flag
+    ///      is copied onto the new row (`MessageHeaderRekey.apply` carries the whole
+    ///      row), so a re-key does NOT release the quarantine. `admit` never consults
+    ///      the durable flag, but `admissionSQL` does, so the row is still refused at
+    ///      admission. The write-side guard against a MISATTRIBUTED mark is in
+    ///      `BodyFetchProcessor.markBodyMetadataOversized`, not here.
     /// NOT cleared per drain cycle: re-attempting every cycle is exactly the hot loop
     /// this set exists to stop, and a fresh fragmentation roll is not worth a
     /// connection teardown per attempt. `private(set)` so tests can assert membership.
@@ -268,10 +273,19 @@ actor ActiveBodyQueue {
     ///
     /// The gate itself: skip a headerId already deferred as oversized for this
     /// process, or ordinarily retry-exhausted for this drain. The
-    /// repopulate/drain SELECTs still return the row (`bodyComplete = 0 /
-    /// bodyEmptyConfirmed = 0` is truthfully retryable — the row is NOT lied
-    /// about), but this gate keeps it out of the immediate self-repopulation
-    /// cycle. Returns true iff the item was actually enqueued.
+    /// repopulate/drain SELECTs still return an ordinarily retry-exhausted row
+    /// (`bodyComplete = 0 / bodyEmptyConfirmed = 0` is truthfully retryable — the
+    /// row is NOT lied about), and this gate keeps it out of the immediate
+    /// self-repopulation cycle.
+    ///
+    /// ⚠️ An OVERSIZED-deferred row is different, and this comment used to conflate
+    /// them: once the dispatched durable write commits, `admissionSQL`'s
+    /// `AND bodyMetadataOversized = 0` stops returning it at all. So for that
+    /// population the SQL predicate — not this in-memory set — is what ends the
+    /// repopulate → dispatch → overflow → repopulate cycle, and it is the only half
+    /// that survives a relaunch. This set still covers the window BEFORE that write
+    /// commits, and the live enqueue producers the SELECTs never see.
+    /// Returns true iff the item was actually enqueued.
     @discardableResult
     func admit(_ item: Item) -> Bool {
         guard !oversizedDeferredThisSession.contains(item.headerId) else { return false }
@@ -373,19 +387,10 @@ actor ActiveBodyQueue {
             print("[ActiveBody] Durably flagging oversized \(headerId.prefix(30))")
         }
         enqueueDurableWrite(label: "flag \(headerId.prefix(30))") { db in
-            // ⚠️ `AND bodyComplete = 0` is the write-side half of "a proven body always
-            // wins". This write is DISPATCHED, so a user pull-to-refresh can succeed
-            // between the overflow and this statement; without the guard the mark would
-            // land on a row that now has a body, and the stale flag would make that body
-            // unopenable once the cache evicts it. The read side clears the flag at every
-            // success write — see `MessageHeader.bodyMetadataOversized`.
-            try db.execute(
-                sql: """
-                    UPDATE messageHeader SET bodyMetadataOversized = 1
-                    WHERE id = ? AND bodyComplete = 0
-                    """,
-                arguments: [headerId]
-            )
+            // Both guards — "a proven body always wins" and "the observation must be
+            // ABOUT this row" — live in the shared writer, so they cannot be added to
+            // one queue and forgotten in the other.
+            try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: headerId)
         }
     }
 

@@ -350,10 +350,11 @@ struct FlushBatchBodyCompleteTests {
 
         // These headers should still appear in the repopulate query (eligible for retry)
         let repopItems: [Row] = try db.read { dbConn in
-            try Row.fetchAll(dbConn, sql: """
-                SELECT id FROM messageHeader
-                WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                """)
+            // The production query itself. A hand-copied replica stops BEING the
+            // admission predicate the moment production gains a clause — it just
+            // gained `AND bodyMetadataOversized = 0`, and this assertion would have
+            // gone on describing a queue that no longer asks this question.
+            try Row.fetchAll(dbConn, sql: ActiveBodyQueue.admissionSQL)
         }
         let ids = repopItems.map { $0["id"] as String }
         #expect(ids.contains(h1.id), "h1 should be retryable")

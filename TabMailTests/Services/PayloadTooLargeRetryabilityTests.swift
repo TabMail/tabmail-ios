@@ -144,7 +144,7 @@ struct PayloadTooLargeRetryabilityTests {
     /// branch executed `UPDATE messageHeader SET bodyEmptyConfirmed = 1` before
     /// returning `.failure(.payloadTooLarge)`, so `bodyEmptyConfirmed` came back
     /// `true` and the eligibility check came back `false`.
-    @Test("Payload-too-large fetch leaves the message unfetched and still eligible for a later body fetch")
+    @Test("Payload-too-large fetch leaves the message unfetched, un-retired, and not confirmed empty")
     func payloadTooLargeLeavesMessageRetryable() async throws {
         let (header, restore) = try makeTestDB()
         defer { restore() }
@@ -153,7 +153,7 @@ struct PayloadTooLargeRetryabilityTests {
         await provider.setFetchMessageThrows(StubPayloadTooLargeError())
 
         // The production entry point for this branch: the user-open path calls
-        // `fetchAndProcess` (see `AccountManager.fetchBodyIfNeeded`).
+        // `fetchAndProcess` (see `AccountManagerFetch.fetchBody`).
         let result = await BodyFetchProcessor.fetchAndProcess(
             item: makeItem(header), provider: provider, enableAI: false
         )
@@ -176,7 +176,7 @@ struct PayloadTooLargeRetryabilityTests {
 
         // ...and therefore the message is still reachable by a later fetch.
         let eligible = try await isEligibleForLaterBodyFetch(headerId: header.id)
-        #expect(eligible, "the message must stay in the body queues' candidate set so a later attempt can fetch it")
+        #expect(eligible, "the row must stay honestly incomplete — headerComplete, bodyless, not confirmed empty — so nothing has been retired; admission is separately gated on the oversized flag")
     }
 
     /// 🚨 THE USER-OPEN PATH RECORDS ITS OBSERVATION TOO.

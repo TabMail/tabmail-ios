@@ -124,6 +124,44 @@ extension AccountManager {
             )
         }
 
+        // Oversized-metadata quarantine: the last observed attempt at this message's
+        // metadata FETCH overflowed the parser. A retry costs a full TCP + TLS + LOGIN +
+        // SELECT, because `IMAPProvider.withFolderConnection` classifies
+        // `PayloadTooLargeError` as unhealthy and tears the folder connection down — a cost
+        // also paid by whatever else was using that connection. Refuse before the wire.
+        //
+        // ⚠️ **At the funnel, for the same reason the address gate above is.** Caller-side
+        // gates alone were not enough: `MessageDetailViewModel.loadBody` checks the flag,
+        // but `startBodyPoll` reaches this function directly on a 2s cadence, and
+        // `loadThreadMessageBody` — a collapsed thread bubble the user expands — had no
+        // check at all and paid the round trip on every tap, swallowing the failure into a
+        // debug print. The caller-side checks now only decide which UI state to show.
+        // (Found by audit.)
+        //
+        // Read FRESH rather than trusting the caller's `message`: a body queue can flag the
+        // row while a detail view is open, and callers hold headers of varying age.
+        //
+        // `replaceExistingBody` is the deliberate escape hatch, and it is load-bearing:
+        // pull-to-refresh is the ONE path that must still reach the wire. An overflow is an
+        // observation about a single wire attempt — the parser's bound is on unread
+        // aggregate bytes measured after the decode loop stops, so it is
+        // fragmentation-dependent, not size-deterministic — never a verdict that the body is
+        // unfetchable. Without this exemption the flag would be unfalsifiable by the user.
+        if !replaceExistingBody {
+            let quarantined: Bool = (try? await dbPool.read { db in
+                try MessageHeader.fetchOne(db, key: message.id)?.isBodyQuarantined ?? false
+            }) ?? false
+            if quarantined {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[FetchBody] Refused — body quarantined (oversized metadata FETCH) for \(message.id.prefix(40))")
+                }
+                throw ProviderError.networkError(
+                    underlying: NSError(domain: "TabMail", code: -4,
+                        userInfo: [NSLocalizedDescriptionKey: "Unable to load this message's content."])
+                )
+            }
+        }
+
         // Ensure provider exists
         if providers[message.accountId] == nil {
             guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: message.accountId) }) else {

@@ -454,8 +454,9 @@ struct OversizedDurableFlagConfinementTests {
     // the flag with a direct `UPDATE`, so it only ever asserted that a statement which
     // touches one column leaves the others alone. The real claim — that the PRODUCTION
     // mark (`markOversizedDurably`) retires nothing — is asserted against both queues in
-    // `OversizedBodyQuarantineDatabaseTests.markingNeverRetiresTheRow*`, where the flag
-    // is set by the code under test.
+    // `OversizedBodyQuarantineDatabaseTests.activeOversizedNeverMarksRowFetched` and
+    // `.backfillOversizedNeverMarksRowFetched`, where the flag is set by the code
+    // under test.
 
     /// NEGATIVE CONTROL for the half-port. Smart Reindex's statement needs the flag in
     /// BOTH halves: a flagged row has `bodyEmptyConfirmed = 0`, so the ORIGINAL `WHERE`

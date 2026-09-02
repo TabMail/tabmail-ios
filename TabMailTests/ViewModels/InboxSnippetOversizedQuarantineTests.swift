@@ -26,6 +26,15 @@ import GRDB
 /// `.serialized, .processGlobalState`: the loader's tier-0 read goes to the process-wide
 /// `AppDatabase.rawPool`, so the fixture must live in THAT database or the assertions
 /// cannot fail.
+/// The production predicate for this error is a description-substring test
+/// (`"\(error)".contains("PayloadTooLargeError")`) in `IMAPProvider.withFolderConnection`,
+/// both body queues, `BodyFetchProcessor.fetch` and now the snippet loader's catch — so a
+/// stub only has to reproduce the description. `PayloadTooLargeError` itself lives in
+/// swift-nio-imap and is not constructible here.
+private struct StubSnippetPayloadTooLargeError: Error, CustomStringConvertible {
+    var description: String { "PayloadTooLargeError: body exceeds the fixed NIO buffer" }
+}
+
 @Suite("The inbox snippet loader honours the oversized-metadata quarantine", .serialized, .processGlobalState)
 struct InboxSnippetOversizedQuarantineTests {
 
@@ -121,5 +130,64 @@ struct InboxSnippetOversizedQuarantineTests {
 
         #expect(!blacklisted.contains(flaggedId),
                 "eviction's designed recovery must survive the quarantine — a stale flag may cost a wasted round trip, never a permanently unreachable body")
+    }
+
+    /// The initiator that OBSERVES an overflow must record it, not merely remember it for
+    /// this process. Tier 2 calls the same `provider.fetchMessage` the body queues do, and
+    /// on a scrolling user it is frequently the first path to reach a deep-history message:
+    /// `BackfillBodyQueue.admissionSQL` orders `date DESC`, so such a row can wait a long
+    /// time for a queue to reach it. Without this the flagged population would be "the rows
+    /// a background queue happened to reach first" — the exact property
+    /// `MessageHeader.bodyMetadataOversized`'s doc claims it is NOT. And `snippetFailed`
+    /// alone does not survive `resetSnippetState()`, which `reloadMessages` calls on every
+    /// `.inboxDataDidChange`, so the same doomed fetch repeats on every reload.
+    @Test("An overflow observed by the snippet loader is recorded durably, not just blacklisted for the session")
+    @MainActor
+    func snippetLoaderRecordsTheOverflowItObserves() async throws {
+        let (_, cleanId, folder, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        let provider = MockEmailProvider()
+        await provider.setFetchMessageThrows(StubSnippetPayloadTooLargeError())
+
+        await TestProviderRegistry.withRegisteredProvider(accountId: "acc1", provider: provider) {
+            let vm = InboxViewModel(folders: [folder])
+            _ = await vm.runSnippetBatchForTesting([cleanId])
+        }
+
+        let stored = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: cleanId)
+        })
+        #expect(
+            stored.bodyMetadataOversized,
+            "the tier that saw the overflow must record it — otherwise the flagged population is whatever a background queue reached first")
+        // Recording an observation is not retiring a row.
+        #expect(stored.bodyComplete == false, "recording the observation must not mark the body complete")
+        #expect(stored.bodyEmptyConfirmed == false, "an oversized body is not a confirmed-empty body")
+    }
+
+    /// THE CONTROL. Without it the assertion above is satisfied by a loader that flags on
+    /// any tier-2 failure at all, which would durably quarantine rows over an ordinary
+    /// transient error — a far worse bug than the one being fixed.
+    @Test("A non-overflow tier-2 failure records nothing durable")
+    @MainActor
+    func ordinaryTierTwoFailureIsNotRecordedAsOversized() async throws {
+        let (_, cleanId, folder, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        let provider = MockEmailProvider()
+        await provider.setFetchMessageThrows(ProviderError.messageNotFound)
+
+        await TestProviderRegistry.withRegisteredProvider(accountId: "acc1", provider: provider) {
+            let vm = InboxViewModel(folders: [folder])
+            _ = await vm.runSnippetBatchForTesting([cleanId])
+        }
+
+        let stored = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: cleanId)
+        })
+        #expect(
+            stored.bodyMetadataOversized == false,
+            "only a parser overflow may set this flag — a messageNotFound must never durably quarantine a row")
     }
 }

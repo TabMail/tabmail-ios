@@ -217,10 +217,19 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     ///     folder connection unhealthy, so no attempt can reuse it). It reports the same
     ///     load-failed state and ends.
     ///  5. The inbox snippet loader's network tier (`InboxViewModel.loadSnippetBatch`) —
-    ///     tier 2 calls the very `provider.fetchMessage` that overflowed. A flagged row
-    ///     is blacklisted for the session instead. It matters that this one is gated at
-    ///     all: `reloadMessages` clears that blacklist and re-queues the visible window,
-    ///     so an ungated row would be retried on every single reload.
+    ///     tier 2 calls `provider.fetchMessage` DIRECTLY, bypassing the funnel below, so
+    ///     it needs its own gate. A flagged row is blacklisted for the session instead.
+    ///     It matters that this one is gated at all: `reloadMessages` clears that
+    ///     blacklist and re-queues the visible window, so an ungated row would be retried
+    ///     on every single reload. Tier 2 is also a WRITER — see below.
+    ///
+    /// ⚠️ Consumers 3–4 are UI-STATE checks, not the network guard. The authoritative
+    /// refusal lives at the funnel, `AccountManagerFetch.fetchBody`, beside the address
+    /// gate whose comment states the rule. Gating callers alone was not enough:
+    /// `MessageDetailViewModel.loadThreadMessageBody` — a collapsed thread bubble the user
+    /// expands — reaches the funnel directly and had no check at all. Any FUTURE caller of
+    /// `fetchBody` is covered for free; only a path that skips the funnel (consumer 5)
+    /// needs its own. Pull-to-refresh is exempt at the funnel via `replaceExistingBody`.
     ///
     /// The row is NOT retired: `bodyComplete` stays 0, the header stays FTS-indexed and
     /// searchable by subject and sender, the FTS membership self-heal still sees it, and
@@ -256,8 +265,16 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     ///    which is the whole re-fetch mechanism for this population once upstream is
     ///    fixed.
     ///
-    /// The mark itself carries `AND bodyComplete = 0` for the same reason: a row that
-    /// already has a body can never acquire this flag.
+    /// WRITTEN by one symbol only — `BodyFetchProcessor.markBodyMetadataOversized` —
+    /// which carries BOTH guards (`AND bodyComplete = 0`, so a row that already has a body
+    /// can never acquire the flag; and the re-minted-key comparison, so an overflow
+    /// observed inside an `optimisticMoveToFolder` window is not recorded against the
+    /// message the row's key names). Four call sites reach it: both queues'
+    /// `markOversizedDurably` (through their serialized `enqueueDurableWrite`),
+    /// `BodyFetchProcessor.fetch`'s `PayloadTooLargeError` branch, and
+    /// `InboxViewModel.loadSnippetBatch`'s tier-2 catch. It is ONE symbol on purpose: the
+    /// guards were previously transcribed three times, which is how a guard gets added to
+    /// one copy and forgotten in another.
     var bodyMetadataOversized: Bool = false
 
     /// THE READ-SIDE INVARIANT, in one place: is this row's body quarantined right now?

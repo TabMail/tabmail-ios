@@ -69,15 +69,15 @@ enum StuckMessageDiagnostics {
         let pkMismatchBodyless = await count(pool, "m.id <> m.accountId || ':' || m.folderPath || ':' || m.messageId AND m.bodyComplete = 0")
         // Bodyless breakdown.
         let bodyless = await count(pool, "m.bodyComplete = 0")
-        let bodylessLocked = await count(pool, "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 1")
+        let bodylessLocked = await count(pool, bodylessLockedPredicate)
         // Quarantined by the oversized-metadata stop-gap: NOT "pending" — no queue will
         // ever offer these rows again on this build, so counting them with the rows that
         // are merely waiting their turn is the exact misreading this scan exists to
         // prevent. Split out BEFORE `failing`/`pending` so the four buckets stay an exact
         // partition of `bodyless` (a quarantined row can also carry emptyFetchCount > 0).
-        let bodylessQuarantined = await count(pool, "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 0 AND m.bodyMetadataOversized = 1")
-        let bodylessFailing = await count(pool, "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 0 AND m.bodyMetadataOversized = 0 AND m.emptyFetchCount > 0")
-        let bodylessPending = await count(pool, "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 0 AND m.bodyMetadataOversized = 0 AND m.emptyFetchCount = 0")
+        let bodylessQuarantined = await count(pool, bodylessQuarantinedPredicate)
+        let bodylessFailing = await count(pool, bodylessFailingPredicate)
+        let bodylessPending = await count(pool, bodylessPendingPredicate)
         // Missing rfc822 among the not-browsable set → UID-remap can never recover.
         let notBrowsableNoRfc = await count(pool, "f.id IS NULL AND (m.rfc822MessageId IS NULL OR m.rfc822MessageId = '')")
 
@@ -126,6 +126,28 @@ enum StuckMessageDiagnostics {
     }
 
     // MARK: - Helpers (all read-only)
+
+    // The four bodyless buckets, hoisted so the "exact partition" claim above can be
+    // asserted against the PRODUCTION predicates. A transcribed copy in a test proves
+    // nothing about this scan: it stays green while the two drift, which is the same
+    // reasoning that made `ActiveBodyQueue.admissionSQL` a shared symbol. Ordering is
+    // load-bearing — a quarantined row can also carry `emptyFetchCount > 0`, so the
+    // oversized bucket must be subtracted from the other two, not layered beside them.
+    static let bodylessLockedPredicate =
+        "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 1"
+    static let bodylessQuarantinedPredicate =
+        "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 0 AND m.bodyMetadataOversized = 1"
+    static let bodylessFailingPredicate =
+        "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 0 AND m.bodyMetadataOversized = 0 AND m.emptyFetchCount > 0"
+    static let bodylessPendingPredicate =
+        "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 0 AND m.bodyMetadataOversized = 0 AND m.emptyFetchCount = 0"
+
+    /// Test seam: `count` is private and takes a pool, which is exactly what a partition
+    /// assertion needs. Exposed rather than duplicated so the test exercises the real
+    /// counting path (including its `m` alias) and not a re-implementation of it.
+    static func countForTesting(_ pool: DatabasePool, _ whereSQL: String) async -> Int {
+        await count(pool, whereSQL)
+    }
 
     private static func count(_ pool: DatabasePool, _ whereSQL: String) async -> Int {
         (try? await pool.read { db in

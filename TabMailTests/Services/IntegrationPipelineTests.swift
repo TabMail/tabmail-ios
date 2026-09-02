@@ -340,10 +340,11 @@ struct EndToEndPipelineTests {
 
         // 7. Verify excluded from repopulate query
         let repopIds: [String] = try await db.read { dbConn in
-            try Row.fetchAll(dbConn, sql: """
-                SELECT id FROM messageHeader
-                WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                """).map { $0["id"] as String }
+            // The production query itself. A hand-copied replica stops BEING the
+            // admission predicate the moment production gains a clause — it just
+            // gained `AND bodyMetadataOversized = 0`, and this assertion would have
+            // gone on describing a queue that no longer asks this question.
+            try Row.fetchAll(dbConn, sql: ActiveBodyQueue.admissionSQL).map { $0["id"] as String }
         }
         let found = repopIds.contains(header.id)
         #expect(!found, "Completed message should be excluded from repopulate")

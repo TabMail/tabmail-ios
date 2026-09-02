@@ -46,18 +46,52 @@ enum BodyFetchProcessor {
     /// failing: without the flag the caller still reports the error, and the poll behind
     /// it still runs — just unbounded. Turning a missed write into a second user-visible
     /// failure would trade a slow path for a broken one.
-    private static func markOversizedDurably(headerId: String) async {
+    /// The ONE durable oversized mark. Both body queues and the single-item fetch path
+    /// route here, so neither guard below can be added to one copy and forgotten in
+    /// another — which is precisely the defect that made `admissionSQL` a shared symbol.
+    ///
+    /// **Guard 1, `AND bodyComplete = 0` — a proven body always wins.** The mark is
+    /// DISPATCHED, so a user pull-to-refresh can succeed between the overflow and this
+    /// statement. Without the guard it lands on a row that now HAS a body, and the stale
+    /// flag makes that body unopenable once `BodyAssetMaintenance` evicts the cached
+    /// asset — eviction deliberately leaves `bodyComplete = 1` (ADR-IOS-050), so the
+    /// detail view's cache-miss fetch is the only recovery and the flag would delete it.
+    ///
+    /// **Guard 2, the re-minted-key comparison — the observation must be ABOUT this row.**
+    /// Inside the `optimisticMoveToFolder` window a row's PRIMARY KEY and its columns name
+    /// DIFFERENT messages: the key still carries the SOURCE folder and UID while the
+    /// columns already claim the destination. The overflow was observed at the COLUMNS'
+    /// address, so it is not evidence about the message the key names. Marking anyway is
+    /// durable and rides the re-key (`MessageHeaderRekey.apply` copies the whole row), so
+    /// a perfectly fetchable message is excluded from both admission queries, counted as
+    /// settled by `MessageHeader.bodySettledRequest`, and refused by every read-side gate
+    /// — permanently. This is the predicate `BodyAddressGate.addressIsInFlight` applies in
+    /// Swift, expressed against the row's own columns: re-mint the key WHOLE and compare,
+    /// never `hasPrefix`, so a `:` in the folder path or the messageId is just data on
+    /// both sides. `StuckMessageDiagnostics`'s `pkMismatch` counts the same shape.
+    /// It fails safe — the caller keeps its session-scoped deferral, and the row is
+    /// re-attempted after `finishMove` re-keys it. (Found by audit.)
+    nonisolated static func markBodyMetadataOversized(_ db: Database, headerId: String) throws {
+        try db.execute(
+            sql: """
+                UPDATE messageHeader SET bodyMetadataOversized = 1
+                WHERE id = ? AND bodyComplete = 0
+                  AND id = accountId || ':' || folderPath || ':' || messageId
+                """,
+            arguments: [headerId])
+    }
+
+    /// Undispatched wrapper for callers that observe the overflow on their own thread and
+    /// have no serialized write chain of their own: `fetch`'s `PayloadTooLargeError`
+    /// branch and `InboxViewModel.loadSnippetBatch`'s tier-2 catch. The two queues call
+    /// `markBodyMetadataOversized` through their own `enqueueDurableWrite` instead.
+    static func markOversizedDurably(headerId: String) async {
         do {
             try await AppDatabase.dbPool.write { db in
-                try db.execute(
-                    sql: """
-                        UPDATE messageHeader SET bodyMetadataOversized = 1
-                        WHERE id = ? AND bodyComplete = 0
-                        """,
-                    arguments: [headerId])
+                try markBodyMetadataOversized(db, headerId: headerId)
             }
         } catch {
-            if !error.isDatabaseSuspensionAbort {
+            if !error.isDatabaseSuspensionAbort, DebugModeManager.isLoggingEnabled() {
                 print("[BodyFetch] Oversized flag write failed for \(headerId.prefix(30)): \(error)")
             }
         }
@@ -184,7 +218,7 @@ enum BodyFetchProcessor {
                 // fetches.
                 //
                 // Reachable only from the single-item user-open path (`fetchAndProcess`
-                // ← `AccountManagerFetch.fetchBodyIfNeeded`). The batched queues never
+                // ← `AccountManagerFetch.fetchBody`). The batched queues never
                 // reach here — they use `fetchMessagesBatch` + `renderFetched` and own
                 // their separate oversize handling.
                 //

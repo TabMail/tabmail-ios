@@ -1648,6 +1648,28 @@ final class InboxViewModel {
                 }
             } catch {
                 if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Failed for \(item.headerId): \(error)") }
+                // RECORD the overflow durably — do not merely remember it in
+                // `snippetFailed`. Tier 2 calls the same `provider.fetchMessage` the body
+                // queues do, and on a scrolling user it is often the FIRST path to observe
+                // an oversized message: deep-history mail can sit far down
+                // `BackfillBodyQueue.admissionSQL`'s `date DESC` order for a long time.
+                // Without this the flagged population would be "the rows a background queue
+                // happened to reach first" — exactly the property
+                // `MessageHeader.bodyMetadataOversized` claims it is NOT.
+                //
+                // `snippetFailed` alone is not enough: `reloadMessages` calls
+                // `resetSnippetState()` on every `.inboxDataDidChange` (throttled ~500ms
+                // during sync) and then re-queues the visible window, so the same doomed
+                // fetch — a full TCP + TLS + LOGIN + SELECT plus a folder-connection
+                // teardown — repeats on every reload while the row is on screen.
+                //
+                // Description-substring test is this codebase's established predicate for
+                // this error (`IMAPProvider.withFolderConnection`, both queues,
+                // `BodyFetchProcessor.fetch`); `SyncEngine.isConnectionError` deliberately
+                // does not match it. The shared writer carries both guards. (Found by audit.)
+                if "\(error)".contains("PayloadTooLargeError") {
+                    await BodyFetchProcessor.markOversizedDurably(headerId: item.headerId)
+                }
                 // Only blacklist on non-connection errors (e.g., messageNotFound).
                 // Connection errors are transient — leave retryable for next scroll/appearance.
                 if !SyncEngine.isConnectionError(error) {

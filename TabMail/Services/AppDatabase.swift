@@ -2243,7 +2243,7 @@ final class AppDatabase: Sendable {
             // present" needs no flag — the `messageBody` row's existence IS that
             // state, and every reader already computes it live
             // (`MessageDetailViewModel.loadThreadMessageBody`,
-            // `AccountManager.fetchBodyIfNeeded`) and fetches on cache-miss.
+            // `AccountManagerFetch.fetchBody`) and fetches on cache-miss.
             // `v2final`'s `repairPayloadTooLargeEmptyBodies` DOES pair a body delete
             // with `bodyComplete = 0`, but only for bodies that were never VALIDLY
             // fetched (`bodyEmptyConfirmed = 1 AND emptyFetchCount < 3`) — the
