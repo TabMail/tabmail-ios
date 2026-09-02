@@ -244,14 +244,9 @@ extension SyncEngine {
 
         print("[FullSync] \(account.emailAddress) syncing \(syncableFolders.count) folders: \(syncableFolders.map(\.name).joined(separator: ", "))")
 
-        // Capture actor state — single actor hop
-        let mgr = AccountManager.shared
-        // Snapshot recentlyCompleted — replaces per-folder recentActions. Prune
-        // first: the reads below are presence checks (`!= nil`) that don't consult
-        // per-entry expiry, so an unpruned map would treat expired entries as
-        // still protected forever.
-        await mgr.pruneRecentlyCompleted()
-        let recentlyCompletedSnapshot = await mgr.recentlyCompleted
+        // `recentlyCompleted` is deliberately NOT snapshotted here. It is read once
+        // per folder, inside the loop below, immediately before that folder's pass.
+        // See the note at that read for why a run-start snapshot is unsound.
 
         // Heavy per-folder sync — run off main thread.
         // All network + DB operations (provider.fetchMessages, dbPool.read/write) are
@@ -338,11 +333,34 @@ extension SyncEngine {
                     )
                     continue
                 }
+                // Read the protection set PER FOLDER, never once per run.
+                //
+                // `recordRecentlyCompleted` runs when a queued op COMPLETES
+                // (`AccountManagerQueue`, immediately before the `PendingOp` is
+                // deleted). An op admitted AFTER a run-start snapshot but completed
+                // BEFORE this folder's pass is therefore invisible to BOTH guards at
+                // once: it is no longer pending, so `isPendingDestructive` misses it,
+                // and its protection entry postdates the snapshot, so
+                // `isRecentlyCompleted` misses it too. Meanwhile `finishMove` has
+                // already re-keyed the local row to the destination while the source
+                // folder's remote listing still carries the source address — so the
+                // stale-check reads it as remote-only and the upsert loop RE-INSERTS
+                // it: a header-only, snippet-less, unfetchable ghost of a message the
+                // user just moved, which then survives until the stale-delete's own
+                // protection lapses (issue #106).
+                //
+                // The exposure window is this loop's duration, NOT
+                // `recentlyCompletedTTLSeconds` — so a folder late in the loop is more
+                // exposed than an early one, and raising the TTL cannot fix it. The
+                // single-folder entry point below already reads immediately before use
+                // and is unaffected. Cost is one actor hop per folder.
+                await AccountManager.shared.pruneRecentlyCompleted()
+                let recentlyCompleted = await AccountManager.shared.recentlyCompleted
                 let ft0 = CFAbsoluteTimeGetCurrent()
                 do {
                     let result = try await Self.runSyncMessages(
                         for: folder, provider: provider, limit: SyncConfig.syncMessageLimit,
-                        dbPool: pool, recentlyCompleted: recentlyCompletedSnapshot
+                        dbPool: pool, recentlyCompleted: recentlyCompleted
                     )
                     print("[FullSync] \(account.emailAddress) \(folder.name): \(Int((CFAbsoluteTimeGetCurrent() - ft0) * 1000))ms")
                     allMigratedIds.append(contentsOf: await processSyncResult(result, folder: folder))
@@ -357,9 +375,14 @@ extension SyncEngine {
                         // next checkout creates a fresh one.
                         print("[FullSync] Connection error for \(folder.name): \(error) — retrying")
                         do {
+                            // Re-read again rather than reuse the value from before the
+                            // failed attempt: a dead connection plus retry spans real
+                            // time, which is exactly the window an op completes in.
+                            await AccountManager.shared.pruneRecentlyCompleted()
+                            let retryRecentlyCompleted = await AccountManager.shared.recentlyCompleted
                             let retryResult = try await Self.runSyncMessages(
                                 for: folder, provider: provider, limit: SyncConfig.syncMessageLimit,
-                                dbPool: pool, recentlyCompleted: recentlyCompletedSnapshot
+                                dbPool: pool, recentlyCompleted: retryRecentlyCompleted
                             )
                             allMigratedIds.append(contentsOf: await processSyncResult(retryResult, folder: folder))
                         } catch {

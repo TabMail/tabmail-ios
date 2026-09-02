@@ -250,6 +250,12 @@ actor MockEmailProvider: EmailProvider {
     /// database mid-fetch, which is the only way to exercise a guard that must run AFTER the
     /// network returns but BEFORE the result is rendered or written.
     var fetchMessageHook: (@Sendable () async -> Void)?
+    /// Awaited from INSIDE `fetchMessages(folder:limit:offset:)`, AFTER the call is logged and
+    /// BEFORE the listing is returned, and handed the folder path being listed. `fetchMessage`'s
+    /// hook cannot stand in for this one: that is the per-MESSAGE body fetch, while a full sync's
+    /// folder LOOP is driven by this listing call. A test that needs to act between two folders'
+    /// passes — the window in which a queued operation completes mid-sync — has no other seam.
+    var fetchMessagesHook: (@Sendable (String) async -> Void)?
     var moveHook: (@Sendable () async -> Void)?
     /// Awaited from INSIDE `send(draft:)`, AFTER the draft is recorded, so a
     /// test can act while the SMTP transaction is genuinely on the wire: the
@@ -289,6 +295,7 @@ actor MockEmailProvider: EmailProvider {
 
     func fetchMessages(folder: String, limit: Int, offset: Int) async throws -> [MessageHeaderInfo] {
         callLog.append("fetchMessages(folder:\(folder),limit:\(limit),offset:\(offset))")
+        if let fetchMessagesHook { await fetchMessagesHook(folder) }
         if let error = fetchMessagesThrows { throw error }
         return fetchMessagesResult
     }
@@ -423,6 +430,10 @@ actor MockEmailProvider: EmailProvider {
 
     func setFetchMessageHook(_ hook: (@Sendable () async -> Void)?) {
         fetchMessageHook = hook
+    }
+
+    func setFetchMessagesHook(_ hook: (@Sendable (String) async -> Void)?) {
+        fetchMessagesHook = hook
     }
 
     func setMoveHook(_ hook: (@Sendable () async -> Void)?) {
