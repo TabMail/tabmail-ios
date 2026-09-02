@@ -3682,6 +3682,50 @@ final class AppDatabase: Sendable {
             try db.execute(sql: "ALTER TABLE messageHeader DROP COLUMN aiDirectPending")
             try db.execute(sql: "ALTER TABLE messageAICache DROP COLUMN aiDirectPending")
         }
+
+        // v88: durable quarantine for a message whose metadata FETCH overflows the
+        // IMAP response parser's buffer.
+        //
+        // The pre-existing quarantine (`oversizedDeferredThisSession`) is an
+        // in-memory Set rebuilt empty on every launch, so every launch re-fetched
+        // every oversized message and failed again. Each failure is expensive, not
+        // merely wasted: `withFolderConnection` classifies `PayloadTooLargeError` as
+        // unhealthy, so the connection is torn down and the next attempt pays a full
+        // TCP + TLS + LOGIN + SELECT. This column makes the quarantine survive a
+        // relaunch.
+        //
+        // Index: the admission queries gain a fifth equality predicate, so the index
+        // that already serves them needs to cover it. `messageHeader_bodyRepopulate`
+        // (v40) is `(isInInbox, headerComplete, bodyComplete, bodyEmptyConfirmed,
+        // date)` — created precisely for this query, with `date` last so the seek and
+        // the ORDER BY are served by one index and no temp B-tree is needed. Adding
+        // `bodyMetadataOversized` before `date` extends that shape by one equality
+        // column and preserves both properties.
+        //
+        // ⚠️ MEASURED, not assumed. EXPLAIN QUERY PLAN over the four shapes:
+        //   - existing index alone → SEARCH on 4 of the 5 equality columns, the fifth
+        //     filtered per row;
+        //   - a PARTIAL `(isInInbox, date) WHERE <the four flags>` index → NEVER
+        //     CHOSEN; the planner keeps preferring `messageHeader_bodyRepopulate`, so
+        //     it would be pure write amplification;
+        //   - this extended index → SEARCH on all 5 equality columns, date ordered.
+        // Per ADR-IOS-029 the v40 index is NOT dropped (other queries use it); a new
+        // one is added alongside, which is the same thing v40 itself did to v22's
+        // `idx_messageHeader_bodyStatus`.
+        migrator.registerTimedMigration(
+            "v88_addBodyMetadataOversized", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "messageHeader") { t in
+                t.add(column: "bodyMetadataOversized", .boolean)
+                    .notNull()
+                    .defaults(to: false)
+            }
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_bodyRepopulateV2
+                ON messageHeader(isInInbox, headerComplete, bodyComplete,
+                                 bodyEmptyConfirmed, bodyMetadataOversized, date)
+                """)
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static

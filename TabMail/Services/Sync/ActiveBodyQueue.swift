@@ -99,8 +99,14 @@ actor ActiveBodyQueue {
     /// wrongly rejecting a new-epoch message reusing that UID until relaunch.
     private var resetGeneration = 0
 
-    /// Process-lifetime set of headerIds deferred because their body overflowed the
-    /// fixed NIO buffer (`PayloadTooLargeError` — size-deterministic per binary).
+    /// Process-lifetime set of headerIds deferred because their metadata FETCH
+    /// overflowed the IMAP response parser's buffer (`PayloadTooLargeError`).
+    ///
+    /// ⚠️ CORRECTION: this was documented as "size-deterministic per binary". It is
+    /// NOT. The bound is on unread AGGREGATE bytes measured after the decode loop
+    /// stops, so it depends on how the response happened to fragment on the wire —
+    /// the same message can overflow on a lossy link and parse fine on WiFi. Nothing
+    /// here may treat an overflow as a verdict that the body is unfetchable.
     ///
     /// ⚑ THIS IS A BOUNDED, VISIBLE, RETRYABLE QUARANTINE — NOT A DISCARD. The DB
     /// row is left honestly `bodyComplete = 0 / bodyEmptyConfirmed = 0`, so it stays
@@ -108,14 +114,26 @@ actor ActiveBodyQueue {
     /// stays fetchable by the on-demand user-open path (`BodyFetchProcessor
     /// .fetchAndProcess`, which never consults this set). Only the BACKGROUND
     /// pre-fetch is suppressed, and only until one of its three releases fires:
-    ///   1. process relaunch — the set starts empty, so a new binary (whose NIO
-    ///      buffer may be larger) gets one fresh attempt per item;
+    ///   1. ⛔ NO LONGER RELAUNCH. The set still starts empty, but the durable
+    ///      `messageHeader.bodyMetadataOversized` flag written beside every insert
+    ///      below now keeps the row out of the admission queries across launches.
+    ///      Relaunch-as-release was the re-fetch loop: every launch re-fetched every
+    ///      oversized message and failed again, and each failure tears the connection
+    ///      down (`withFolderConnection` treats `PayloadTooLargeError` as unhealthy),
+    ///      so the next attempt pays a full TCP + TLS + LOGIN + SELECT.
+    ///      Its PURPOSE — "a new binary whose parser buffer is larger deserves a
+    ///      fresh attempt" — is preserved and made exact: the migration that ships
+    ///      the raised bound clears the flag in ONE statement
+    ///      (`UPDATE messageHeader SET bodyMetadataOversized = 0
+    ///        WHERE bodyMetadataOversized = 1`), which is possible only because every
+    ///      row carrying the flag was written by this code. One targeted retry when
+    ///      the bound actually changes, instead of a retry every launch forever;
     ///   2. a UIDVALIDITY reset for the folder — `clearOversizedDeferred`;
     ///   3. a UID remap / cross-folder move — that mints a NEW headerId which is not
     ///      in this set, so `admit` takes it.
-    /// NOT cleared per drain cycle: a size-deterministic oversize cannot become
-    /// fetchable mid-process, so re-attempting it every cycle is exactly the hot loop
-    /// this set exists to stop. `private(set)` so tests can assert membership.
+    /// NOT cleared per drain cycle: re-attempting every cycle is exactly the hot loop
+    /// this set exists to stop, and a fresh fragmentation roll is not worth a
+    /// connection teardown per attempt. `private(set)` so tests can assert membership.
     private(set) var oversizedDeferredThisSession: Set<String> = []
 
     // .normal-tier (ADR-IOS-056): higher than deep backfill (.background) but
@@ -267,10 +285,97 @@ actor ActiveBodyQueue {
         retryExhaustedThisDrain = retryExhaustedThisDrain.filter {
             !MessageIdentity.headerIdBelongsToFolder($0, accountId: accountId, folderPath: folderPath)
         }
+        // Durable half — dispatched, so the synchronous section above is unaffected.
+        clearOversizedDurably(accountId: accountId, folderPath: folderPath)
         let removed = before - (oversizedDeferredThisSession.count + isolationPending.count)
         if removed > 0, DebugModeManager.isLoggingEnabled() {
             print("[ActiveBody] Cleared \(removed) oversized-deferred/isolation key(s) for \(folderPath) after UIDVALIDITY reset")
         }
+    }
+
+    /// Durable half of the oversized quarantine — writes
+    /// `messageHeader.bodyMetadataOversized = 1` so the deferral survives a relaunch.
+    ///
+    /// Dispatch and ordering guarantees are documented on `enqueueDurableWrite`.
+    private func markOversizedDurably(_ headerId: String) {
+        if DebugModeManager.isLoggingEnabled() {
+            print("[ActiveBody] Durably flagging oversized \(headerId.prefix(30))")
+        }
+        enqueueDurableWrite(label: "flag \(headerId.prefix(30))") { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET bodyMetadataOversized = 1 WHERE id = ?",
+                arguments: [headerId]
+            )
+        }
+    }
+
+    /// Durable half of `clearOversizedDeferred`. A UIDVALIDITY reset means the
+    /// folder's UIDs no longer address the same messages, so a per-row observation
+    /// about "the message at this address" is void and must not outlive it.
+    ///
+    /// Scoped by `(accountId, folderPath)` in SQL rather than by re-deriving the
+    /// header-id shape, so it cannot drift from `MessageIdentity`'s parsing.
+    private func clearOversizedDurably(accountId: String, folderPath: String) {
+        enqueueDurableWrite(label: "clear \(folderPath)") { db in
+            try db.execute(
+                sql: """
+                    UPDATE messageHeader SET bodyMetadataOversized = 0
+                    WHERE accountId = ? AND folderPath = ?
+                      AND bodyMetadataOversized = 1
+                    """,
+                arguments: [accountId, folderPath]
+            )
+        }
+    }
+
+    /// Serialized tail of dispatched durable flag writes.
+    ///
+    /// ⛔ THE SERIALIZATION IS A CORRECTNESS REQUIREMENT, NOT A CONVENIENCE. A mark and
+    /// a clear can be dispatched microseconds apart — a UIDVALIDITY reset landing right
+    /// after an oversized batch is exactly the case the synchronous `resetGeneration`
+    /// guard exists for. If the two writes could reorder, the clear could execute
+    /// FIRST and the mark would then re-flag a row whose address no longer refers to
+    /// the same message — reintroducing, through async dispatch, the stale-quarantine
+    /// bug the generation guard prevents in memory. Chaining every write behind its
+    /// predecessor makes the durable order match the dispatch order.
+    private var durableWriteChain: Task<Void, Never>?
+
+    /// Dispatches one durable flag write.
+    ///
+    /// ⚠️ DISPATCHED, NOT AWAITED, AND THAT IS LOAD-BEARING.
+    /// `handlePayloadTooLarge` and `clearOversizedDeferred` are both documented as
+    /// running synchronously on the actor so no producer can slip an enqueue between
+    /// their set mutation and their queue mutation. Awaiting a database write inline
+    /// would open exactly that window.
+    ///
+    /// ⛔ `Task`, never `Task.detached`: a detached task drops the write-priority tier
+    /// task-locals this pool relies on.
+    ///
+    /// If a write fails the row simply keeps its in-memory disposition for this
+    /// session and is reconsidered on the next launch — it degrades to the previous
+    /// behaviour rather than to a wrong one, so there is nothing to compensate for.
+    private func enqueueDurableWrite(
+        label: String,
+        _ op: @escaping @Sendable (Database) throws -> Void
+    ) {
+        let previous = durableWriteChain
+        durableWriteChain = Task { [self] in
+            await previous?.value
+            do {
+                try await dbPool.write { db in try op(db) }
+            } catch {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ActiveBody] Durable oversized write failed (\(label)): \(error)")
+                }
+            }
+        }
+    }
+
+    /// Test seam: await every durable flag write dispatched so far.
+    /// The writes are deliberately fire-and-forget in production; a test that asserts
+    /// on the row must be able to wait for them without polling.
+    func awaitDurableWritesForTesting() async {
+        await durableWriteChain?.value
     }
 
     /// Dispatch grouping key. `isolationHeaderId` is non-nil only for a forced
@@ -340,6 +445,7 @@ actor ActiveBodyQueue {
                     SELECT id, accountId, folderPath, messageId, isInInbox
                     FROM messageHeader
                     WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
+                      AND bodyMetadataOversized = 0
                     ORDER BY date DESC
                     """)
                 .map { row in
@@ -687,10 +793,10 @@ actor ActiveBodyQueue {
     /// can slip an enqueue in between the set insert and the queue removal.
     ///
     ///  - `items.count == 1` (a genuinely isolated oversized message): DEFER without
-    ///    completion. `PayloadTooLargeError` is size-deterministic (the NIO buffer is
-    ///    fixed per binary), so it cannot become fetchable this process lifetime.
-    ///    Insert the headerId into the process-lifetime
-    ///    `oversizedDeferredThisSession` set, then `storage.removeFromQueue`
+    ///    completion. Insert the headerId into the process-lifetime
+    ///    `oversizedDeferredThisSession` set, durably flag the row via
+    ///    `markOversizedDurably` so the deferral survives a relaunch, then
+    ///    `storage.removeFromQueue`
     ///    DIRECTLY. We do NOT mark `bodyEmptyConfirmed` (Data Integrity rule 1: an
     ///    oversized body is the OPPOSITE of "content confirmed gone" — the body
     ///    demonstrably exists, it merely did not fit — so the row stays honestly
@@ -731,6 +837,10 @@ actor ActiveBodyQueue {
             oversizedDeferredThisSession.insert(item.headerId)
             isolationPending.remove(item.headerId)   // resolved as the oversized one
             storage.removeFromQueue(item)
+            // Durable half of the same disposition. Dispatched, never awaited — see
+            // `markOversizedDurably`; the critical section above must stay
+            // synchronous.
+            markOversizedDurably(item.headerId)
         } else {
             // One (or a few) of these is oversized, but the batch error doesn't say
             // which. Isolate each so a later dispatch tests it ALONE — reaching the
@@ -860,6 +970,7 @@ actor ActiveBodyQueue {
                     SELECT id, accountId, folderPath, messageId, isInInbox
                     FROM messageHeader
                     WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
+                      AND bodyMetadataOversized = 0
                     ORDER BY date DESC
                     """)
                 .map { row in

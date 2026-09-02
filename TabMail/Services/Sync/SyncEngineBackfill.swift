@@ -174,9 +174,22 @@ extension SyncEngine {
                     Column("backfillPageToken").set(to: nil as String?)
                 )
         }
-        // Reset bodyEmptyConfirmed — gives previously-empty messages a fresh chance
+        // Reset bodyEmptyConfirmed — gives previously-empty messages a fresh chance,
+        // and bodyMetadataOversized so a row whose metadata FETCH overflowed the
+        // parser buffer is re-attempted too (the overflow is fragmentation-dependent,
+        // so a fresh attempt can genuinely succeed).
+        //
+        // ⚠️ BOTH HALVES OR THIS IS INERT. `bodyMetadataOversized` must be in the
+        // WHERE as well as the SET: a flagged row has `bodyEmptyConfirmed = 0`, so
+        // the original predicate does not select it and adding it to the SET alone
+        // would silently skip exactly the rows Smart Reindex is invoked for.
         try? await AppDatabase.backgroundPool.write { db in
-            try db.execute(sql: "UPDATE messageHeader SET bodyEmptyConfirmed = 0, emptyFetchCount = 0, bodyComplete = 0 WHERE bodyEmptyConfirmed = 1")
+            try db.execute(sql: """
+                UPDATE messageHeader
+                SET bodyEmptyConfirmed = 0, emptyFetchCount = 0, bodyComplete = 0,
+                    bodyMetadataOversized = 0
+                WHERE bodyEmptyConfirmed = 1 OR bodyMetadataOversized = 1
+                """)
         }
         // Reset cc/bcc backfill flag so existing messages get cc/bcc populated
         UserDefaults.standard.set(false, forKey: "ccBccBackfillDone")

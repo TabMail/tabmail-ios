@@ -175,6 +175,30 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     /// Reset by Smart Reindex to give previously-empty messages a fresh chance.
     var bodyEmptyConfirmed: Bool = false
 
+    /// The metadata FETCH for this message overflowed the IMAP response parser's
+    /// buffer (`PayloadTooLargeError`), so its body could not be retrieved.
+    ///
+    /// ⚠️ This records an OBSERVATION ABOUT ONE WIRE ATTEMPT, not a verdict about the
+    /// message. The parser's bound is on unread aggregate bytes measured after the
+    /// decode loop stops, so it is FRAGMENTATION-DEPENDENT: the same message can
+    /// overflow on a lossy link and parse fine on WiFi. It is therefore NOT a claim
+    /// that the body is unfetchable, and it must never be treated as one.
+    ///
+    /// Consumed by exactly one kind of reader: the four body-fetch admission queries
+    /// (`Active`/`BackfillBodyQueue.repopulateFromDatabase` and `.repopulateOnDrain`).
+    /// The row stays fully retryable everywhere else — the on-demand user-open path
+    /// still fetches it, `bodyComplete` stays 0, and the header stays FTS-indexed and
+    /// searchable by subject and sender.
+    ///
+    /// ⛔ Do NOT add it to `BackfillProgress.pendingBodyCount` or to the FTS
+    /// membership self-heal. See the ACCEPTED LIMITATIONS note at the write site in
+    /// `BackfillBodyQueue.handlePayloadTooLarge`.
+    ///
+    /// Cleared on a UIDVALIDITY reset (the address changed, so the observation is
+    /// void), by Smart Reindex, and — exactly, in one statement — by the migration
+    /// that ships a raised parser bound.
+    var bodyMetadataOversized: Bool = false
+
     /// How many times a body fetch returned empty (no text, no attachments).
     /// Used to guard against false empties from partial IMAP responses.
     /// bodyEmptyConfirmed is only set when emptyFetchCount >= 3.

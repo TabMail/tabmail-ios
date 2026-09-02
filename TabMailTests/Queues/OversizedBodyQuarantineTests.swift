@@ -39,8 +39,10 @@ private func backfillItem(
 /// Data-integrity rule 1 ("NEVER mark unfetched content as fetched") permits exactly
 /// one exception: a *verified permanent* error where the content is confirmed GONE.
 /// A `PayloadTooLargeError` is the opposite — the body demonstrably EXISTS and merely
-/// overflowed the fixed per-binary NIO buffer — so neither body queue may retire the
-/// row with `bodyEmptyConfirmed`.
+/// overflowed the response parser's buffer — so neither body queue may retire the
+/// row with `bodyEmptyConfirmed`. (The overflow is also NOT size-deterministic: the
+/// bound is on unread aggregate bytes after the decode loop stops, so it depends on
+/// wire fragmentation. Nothing may treat it as a verdict that the body is unfetchable.)
 ///
 /// Both queues previously did: their `dispatchBatch` catch narrowed the per-folder cap
 /// to 1 and then wrote `UPDATE messageHeader SET bodyEmptyConfirmed = 1` (under a
@@ -114,16 +116,39 @@ struct OversizedBodyQuarantineDatabaseTests {
         return (header, restore)
     }
 
-    /// "Still reachable by a later body fetch" IS membership in the body queues'
-    /// candidate set — the predicate shared verbatim by
+    /// "Still reachable by a later BACKGROUND body fetch" IS membership in the body
+    /// queues' candidate set — the predicate shared verbatim by
     /// `ActiveBodyQueue.repopulateFromDatabase`, `BackfillBodyQueue
-    /// .repopulateFromDatabase`, both `repopulateOnDrain`s and the FTS self-heal scope.
+    /// .repopulateFromDatabase` and both `repopulateOnDrain`s.
     /// A row excluded from it is reachable by no background body fetch at all.
+    ///
+    /// ⚠️ `bodyMetadataOversized = 0` is part of it, and the FTS self-heal scope is
+    /// NOT: `SyncEngineFTS.selfHealBackfillFTSMembership` deliberately omits the
+    /// oversized conjunct because it re-indexes HEADERS, and an oversized row's header
+    /// is healthy. The two predicates diverged when the durable flag shipped; do not
+    /// re-merge them.
     private func isEligibleForLaterBodyFetch(headerId: String) async throws -> Bool {
         let found: Int = try await AppDatabase.dbPool.read { db in
             try Int.fetchOne(db, sql: """
                 SELECT COUNT(*) FROM messageHeader
-                WHERE id = ? AND headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0
+                WHERE id = ? AND headerComplete = 1 AND bodyComplete = 0
+                  AND bodyEmptyConfirmed = 0 AND bodyMetadataOversized = 0
+                """, arguments: [headerId]) ?? 0
+        }
+        return found == 1
+    }
+
+    /// The same predicate MINUS the oversized flag. Pairing the two is what makes the
+    /// quarantine assertions two-sided: it proves the row left background admission
+    /// BECAUSE of the flag, and not because it was marked complete, marked empty, or
+    /// deleted — i.e. that it is still an ordinary pending-body row underneath, and so
+    /// still reachable by the on-demand user-open path, which consults none of this.
+    private func isPendingBodyIgnoringOversizedFlag(headerId: String) async throws -> Bool {
+        let found: Int = try await AppDatabase.dbPool.read { db in
+            try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM messageHeader
+                WHERE id = ? AND headerComplete = 1 AND bodyComplete = 0
+                  AND bodyEmptyConfirmed = 0
                 """, arguments: [headerId]) ?? 0
         }
         return found == 1
@@ -131,7 +156,7 @@ struct OversizedBodyQuarantineDatabaseTests {
 
     // MARK: Side 1 — oversized must never be recorded as fetched
 
-    @Test("ActiveBodyQueue: an oversized single-item batch leaves the row bodyComplete=0/bodyEmptyConfirmed=0 and still eligible for a later body fetch")
+    @Test("ActiveBodyQueue: an oversized single-item batch leaves the row bodyComplete=0/bodyEmptyConfirmed=0, durably flagged out of background admission, and still fetchable on demand")
     func activeOversizedNeverMarksRowFetched() async throws {
         let (header, restore) = try makeSwappedDB()
         defer { restore() }
@@ -145,6 +170,9 @@ struct OversizedBodyQuarantineDatabaseTests {
         #expect(await queue.admit(item) == true)
 
         await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        // The durable half is dispatched, not awaited, so the row assertions below must
+        // wait for it — otherwise they race and pass or fail by timing.
+        await queue.awaitDurableWritesForTesting()
 
         let row = try await AppDatabase.dbPool.read { db in
             try MessageHeader.fetchOne(db, key: header.id)
@@ -156,8 +184,11 @@ struct OversizedBodyQuarantineDatabaseTests {
         )
         #expect(stored.bodyComplete == false, "nothing was indexed, so the body is not complete")
         #expect(stored.emptyFetchCount == 0, "a too-large response is not an empty response — it must not spend a strike from the empty-confirmation budget")
-        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id),
-                "the row must stay in the body queues' candidate set — the quarantine is in memory, not in the database")
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false,
+                "the durable flag must take the row OUT of background admission — that is the fix; an in-memory-only quarantine re-fetched it every launch")
+        #expect(try await isPendingBodyIgnoringOversizedFlag(headerId: header.id),
+                "…and ONLY the flag may exclude it: underneath it is still an ordinary pending-body row, so the on-demand user-open path can still fetch it")
+        #expect(stored.bodyMetadataOversized, "the flag is the durable half of the quarantine")
 
         // ...and the quarantine really is the in-memory one, not a completion.
         #expect(await queue.oversizedDeferredThisSession.contains(header.id))
@@ -166,7 +197,7 @@ struct OversizedBodyQuarantineDatabaseTests {
         #expect(snapshot.activeJobs == 0, "the defer must not touch activeJobs — this queue tracks activeBatchCount instead")
     }
 
-    @Test("BackfillBodyQueue: an oversized single-item batch leaves the row bodyComplete=0/bodyEmptyConfirmed=0 and still eligible for a later body fetch")
+    @Test("BackfillBodyQueue: an oversized single-item batch leaves the row bodyComplete=0/bodyEmptyConfirmed=0, durably flagged out of background admission, and still fetchable on demand")
     func backfillOversizedNeverMarksRowFetched() async throws {
         let (header, restore) = try makeSwappedDB(folderPath: "Archive", isInInbox: false)
         defer { restore() }
@@ -177,6 +208,9 @@ struct OversizedBodyQuarantineDatabaseTests {
         #expect(await queue.admit(item) == true)
 
         await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        // The durable half is dispatched, not awaited, so the row assertions below must
+        // wait for it — otherwise they race and pass or fail by timing.
+        await queue.awaitDurableWritesForTesting()
 
         let row = try await AppDatabase.dbPool.read { db in
             try MessageHeader.fetchOne(db, key: header.id)
@@ -188,7 +222,11 @@ struct OversizedBodyQuarantineDatabaseTests {
         )
         #expect(stored.bodyComplete == false)
         #expect(stored.emptyFetchCount == 0)
-        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id))
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false,
+                "the durable flag must take the row OUT of background admission")
+        #expect(try await isPendingBodyIgnoringOversizedFlag(headerId: header.id),
+                "…and ONLY the flag may exclude it — the row stays on-demand fetchable")
+        #expect(stored.bodyMetadataOversized)
 
         #expect(await queue.oversizedDeferredThisSession.contains(header.id))
         let snapshot = await queue.storageSnapshotForTesting
@@ -237,7 +275,140 @@ struct OversizedBodyQuarantineDatabaseTests {
         #expect(stored.bodyEmptyConfirmed,
                 "the permanent-empty path must still work — otherwise the oversized assertions above are vacuous")
         #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false,
-                "a confirmed-empty message is correctly retired from the body queues — the SAME predicate the oversized row must stay inside")
+                "a confirmed-empty message is correctly retired from the body queues — by bodyEmptyConfirmed, a different clause than the oversized flag")
+    }
+
+    // MARK: Side 3 — the quarantine must survive the process that made it
+
+    /// THE HEADLINE INVARIANT. The pre-fix quarantine lived only in
+    /// `oversizedDeferredThisSession`, an in-memory Set rebuilt empty on every launch,
+    /// so every launch re-fetched every oversized message and failed again — each
+    /// failure tearing down the connection and forcing a full TCP+TLS+LOGIN+SELECT on
+    /// the next attempt.
+    ///
+    /// Asserted as a SYSTEM PROPERTY, not a mechanism: a queue that has just been
+    /// constructed (in-memory set provably empty — i.e. the relaunch condition) must
+    /// still not see the row as admissible. Pre-fix this fails, because the only thing
+    /// excluding the row was the set that a relaunch clears.
+    @Test("ActiveBodyQueue: the oversized quarantine survives a relaunch — a fresh queue with an empty in-memory set still does not re-admit the row")
+    func activeOversizedQuarantineSurvivesRelaunch() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        let queue = ActiveBodyQueue()
+        await queue.setFolderMaxBatchForTesting(1, folderPath: header.folderPath)
+        let item = activeItem(header.id, folderPath: header.folderPath)
+        #expect(await queue.admit(item) == true)
+        await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+
+        // The relaunch: a brand-new actor, so nothing survives in memory.
+        let afterRelaunch = ActiveBodyQueue()
+        #expect(await afterRelaunch.oversizedDeferredThisSession.isEmpty,
+                "precondition — a fresh queue's in-memory quarantine is empty, which is exactly why the pre-fix build re-fetched")
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false,
+                "the durable flag, not process memory, must keep the row out of background admission")
+        #expect(try await isPendingBodyIgnoringOversizedFlag(headerId: header.id),
+                "and it is still an ordinary pending-body row underneath — nothing was marked complete or empty")
+    }
+
+    @Test("BackfillBodyQueue: the oversized quarantine survives a relaunch")
+    func backfillOversizedQuarantineSurvivesRelaunch() async throws {
+        let (header, restore) = try makeSwappedDB(folderPath: "Archive", isInInbox: false)
+        defer { restore() }
+
+        let queue = BackfillBodyQueue()
+        await queue.setFolderMaxBatchForTesting(1, folderPath: header.folderPath)
+        let item = backfillItem(header.id, folderPath: header.folderPath)
+        #expect(await queue.admit(item) == true)
+        await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+
+        let afterRelaunch = BackfillBodyQueue()
+        #expect(await afterRelaunch.oversizedDeferredThisSession.isEmpty)
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false)
+        #expect(try await isPendingBodyIgnoringOversizedFlag(headerId: header.id))
+    }
+
+    /// A multi-item overflow does not say WHICH item was too large. Flagging there
+    /// would durably quarantine healthy siblings — a permanent version of the bug the
+    /// isolation branch exists to avoid.
+    @Test("A multi-item overflow durably flags NOTHING — the batch error does not identify the oversized item")
+    func multiItemOverflowFlagsNothing() async throws {
+        let (header, restore) = try makeSwappedDB(folderPath: "Archive", isInInbox: false)
+        defer { restore() }
+
+        // A healthy sibling sharing the batch.
+        var sibling = MessageHeader(
+            messageId: "4243", subject: "An ordinary message",
+            from: "sender@example.com", fromAddress: "sender@example.com",
+            to: "recipient@example.com", date: Date(), snippet: "",
+            folderId: MessageIdentity.folderId(accountId: "acc1", folderPath: header.folderPath),
+            accountId: "acc1", folderPath: header.folderPath, isInInbox: false
+        )
+        sibling.headerComplete = true
+        let siblingRow = sibling
+        try await AppDatabase.dbPool.write { db in try siblingRow.insert(db) }
+
+        let queue = BackfillBodyQueue()
+        let items = [backfillItem(header.id, folderPath: header.folderPath),
+                     backfillItem(sibling.id, folderPath: header.folderPath)]
+        await queue.handlePayloadTooLarge(items: items, folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+
+        for id in [header.id, sibling.id] {
+            #expect(try await isEligibleForLaterBodyFetch(headerId: id),
+                    "neither item may be durably flagged from an unattributed batch failure")
+        }
+        #expect(await queue.isolationPendingForTesting.count == 2,
+                "both are isolated instead, so a later single-item dispatch can attribute the overflow")
+    }
+
+    /// The generation guard already refuses the in-memory insert when a UIDVALIDITY
+    /// reset raced the fetch window. The durable write must obey the SAME guard —
+    /// otherwise the flag outlives the address it describes, which is the stale
+    /// quarantine the guard exists to prevent, made permanent.
+    @Test("A stale generation skips the durable write, not just the in-memory insert")
+    func staleGenerationSkipsTheDurableWrite() async throws {
+        let (header, restore) = try makeSwappedDB(folderPath: "Archive", isInInbox: false)
+        defer { restore() }
+
+        let queue = BackfillBodyQueue()
+        let captured = await queue.resetGenerationForTesting
+        // A UIDVALIDITY reset lands mid-flight: this bumps resetGeneration.
+        await queue.clearOversizedDeferred(accountId: "acc1", folderPath: header.folderPath)
+
+        let item = backfillItem(header.id, folderPath: header.folderPath)
+        await queue.handlePayloadTooLarge(
+            items: [item], folderPath: header.folderPath, capturedGeneration: captured
+        )
+        await queue.awaitDurableWritesForTesting()
+
+        #expect(await queue.oversizedDeferredThisSession.isEmpty,
+                "precondition — the in-memory insert is skipped as stale")
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id),
+                "the durable write must be skipped too — a stale flag would starve a new-epoch message reusing this UID")
+    }
+
+    /// A UIDVALIDITY reset means the folder's UIDs no longer address the same
+    /// messages, so a per-address observation is void and must not outlive it.
+    @Test("A UIDVALIDITY reset clears the DURABLE flag, not only the in-memory set")
+    func uidValidityResetClearsTheDurableFlag() async throws {
+        let (header, restore) = try makeSwappedDB(folderPath: "Archive", isInInbox: false)
+        defer { restore() }
+
+        let queue = BackfillBodyQueue()
+        let item = backfillItem(header.id, folderPath: header.folderPath)
+        await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false,
+                "precondition — the row is durably flagged")
+
+        await queue.clearOversizedDeferred(accountId: "acc1", folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id),
+                "the reset releases the durable quarantine as well as the in-memory one")
     }
 }
 

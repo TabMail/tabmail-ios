@@ -23,6 +23,7 @@ struct BackfillBodyRepopulateOnDrainTests {
                 SELECT id, accountId, folderPath, messageId, isInInbox
                 FROM messageHeader
                 WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 0
+                  AND bodyMetadataOversized = 0
                 ORDER BY date DESC
                 """)
         }
