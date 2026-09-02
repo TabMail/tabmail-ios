@@ -87,6 +87,14 @@ struct OversizedBodyQuarantineDatabaseTests {
         }
         var account = Account(emailAddress: "oversize@example.com", displayName: "Oversize", provider: .imap)
         account.id = "acc1"
+        // 🚨 LOAD-BEARING, and it is the whole reason the funnel tests below cannot reach
+        // the network: `AccountManager.createIMAPProvider` opens with
+        // `guard let host = account.imapHost`, so a host-less account makes `connectAccount`
+        // throw `authenticationFailed` before a provider is built or registered. Give this
+        // fixture a host and those tests start attempting real connections from the unit
+        // suite. Asserted, not assumed. (Found by audit.)
+        #expect(account.imapHost == nil,
+                "fixture precondition: the account must have no imapHost, or the funnel tests will attempt a live connection")
         var folder = Folder(name: folderPath, path: folderPath, role: isInInbox ? .inbox : .archive, accountId: "acc1")
         folder.lastKnownUidValidity = 1000
         var header = MessageHeader(
@@ -1305,9 +1313,20 @@ struct OversizedBodyQuarantineDatabaseTests {
         })
         #expect(quarantined.isBodyQuarantined, "fixture check: the row is quarantined")
 
-        // No provider is registered, so this call cannot reach the wire and must fail for
-        // SOME reason. The assertion is about WHICH reason: anything other than the
-        // quarantine refusal means the gate let it past, which is the property under test.
+        // This call cannot reach the wire and must fail for SOME reason. The assertion is
+        // about WHICH reason: anything other than the quarantine refusal means the gate let
+        // it past, which is the property under test.
+        //
+        // ⚠️ WHAT ACTUALLY KEEPS IT OFF THE WIRE is `makeSwappedDB`'s account having no
+        // `imapHost`, NOT the absence of a registered provider. An earlier version of this
+        // comment said the latter, which is backwards: the quarantine gate sits BEFORE the
+        // provider block in `fetchBody`, so `providers[accountId] == nil` is what causes
+        // `connectAccount` to be CALLED. It is `createIMAPProvider`'s
+        // `guard let host = account.imapHost else { throw .authenticationFailed }` that
+        // throws first — before any `IMAPProvider` is constructed, registered in the
+        // process-wide `AccountManager.shared`, or asked to `connect()`. `makeSwappedDB`
+        // asserts that precondition so a future edit adding host/port here fails loudly
+        // instead of silently opening a live connection from a unit test. (Found by audit.)
         var refusalCode: Int?
         do {
             try await AccountManager.shared.fetchBody(for: quarantined, replaceExistingBody: true)

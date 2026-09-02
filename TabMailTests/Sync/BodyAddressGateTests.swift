@@ -777,9 +777,13 @@ struct BodyAddressGateTests {
     /// the user to check their network for a refusal that has nothing to do with it.
     /// (`feedback_validation_needs_a_producer_side_test`: both halves green, contract dead.)
     ///
-    /// Non-vacuity is two-sided IN THE SAME RUN: no provider is registered for either call, so both
-    /// must fail. The assertion is about WHICH failure. A gate that refused everything would fail
-    /// the settled half; a gate that refused nothing would fail the mid-move half.
+    /// Non-vacuity is two-sided IN THE SAME RUN: both calls must fail, so the assertion is about
+    /// WHICH failure. A gate that refused everything would fail the settled half; a gate that
+    /// refused nothing would fail the mid-move half. What keeps the settled half off the wire is
+    /// that `Self.fixture`'s account carries no `imapHost`, so `AccountManager.createIMAPProvider`
+    /// throws `authenticationFailed` before any provider is constructed or registered — NOT the
+    /// absence of a registered provider, which is what causes `connectAccount` to be called in the
+    /// first place. Asserted below rather than assumed. (Found by audit.)
     @Test("The body funnel throws the typed pending-move case in the mid-move window, and only there")
     func funnelThrowsTypedPendingMoveInTheMidMoveWindow() async throws {
         let accountId = "gate-funnel-typed"
@@ -819,8 +823,11 @@ struct BodyAddressGateTests {
             pendingMoveId == moved.id,
             "the funnel must throw the TYPED pending-move case carrying this row's id, not a wrapped NSError; got \(unexpected.map { "\($0)" } ?? "no throw")")
 
-        // (2) SETTLED — the control, same fixture, same missing provider. This one must fail for
-        //     some OTHER reason: reaching provider resolution is proof the gate let it past.
+        // (2) SETTLED — the control, same fixture. This one must fail for some OTHER reason:
+        //     reaching provider resolution is proof the gate let it past.
+        let acct = try #require(try await pool.read { db in try Account.fetchOne(db, key: accountId) })
+        #expect(acct.imapHost == nil,
+                "fixture precondition: without this the settled control would attempt a live connection")
         let settled = try Self.makeHeader(
             accountId: accountId, folderPath: "Archive", uid: "77",
             rfc822: "settled@example.com", observedUidValidity: 202, pool: pool)

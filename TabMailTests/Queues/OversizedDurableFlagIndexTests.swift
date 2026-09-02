@@ -331,6 +331,90 @@ struct OversizedDurableFlagConfinementTests {
     /// is a truth claim about the mailbox. That reasoning was sound and was overruled on
     /// product grounds; the reversal is recorded rather than erased so nobody re-derives
     /// the old position from the old comment.
+    /// 🚨 **THE `headerComplete` CONJUNCT, from both sides.** Every other fixture that
+    /// measures either request sets `headerComplete = 1` — `seed` does it, the partition
+    /// test does it on all ten of its rows and says so in its own doc, and
+    /// `OversizedBodyQuarantineTests`' Fast Sync fixture does it on both. So the term was
+    /// satisfied by construction everywhere, and BOTH of the following edits left the
+    /// entire suite green:
+    ///
+    ///   - deleting `Column("headerComplete") == true` from `pendingBodyRequest`; and
+    ///   - "restoring symmetry" by ADDING it to `bodySettledRequest`, which deliberately
+    ///     omits it.
+    ///
+    /// Neither is hypothetical. `headerComplete = 0` rows are durably reachable:
+    /// `NSEDataBridge` stages headers with `headerComplete = false` and flips the flag in a
+    /// SEPARATE statement (ADR-IOS-047's two-phase merge — it carries both a
+    /// `… AND headerComplete = 0` count and a post-transaction
+    /// `UPDATE … SET headerComplete = 1 … AND headerComplete = 0`), so an extension wake
+    /// terminated between the staging write and the flush leaves such a row behind.
+    ///
+    /// The consequences are mirror images, and both are the failure this branch exists to
+    /// remove. Deleting the term from `pendingBodyRequest` puts a staged row into
+    /// `pendingBodyCount`, so `BackfillProgress.isFullyComplete` is never true: the banner
+    /// never clears and Fast Sync holds the screen awake indefinitely. Adding it to
+    /// `bodySettledRequest` drops staged-but-settled rows from `ftsIndexed` while
+    /// `totalEmails` still counts every row for the account, so the "N / M indexed" readout
+    /// sits permanently below its denominator.
+    ///
+    /// Two-sided in one test: each assertion is paired with a header-complete control of the
+    /// same shape, so neither can be satisfied by an empty result. (Found by audit.)
+    @Test("The headerComplete conjunct is pinned on both requests — present on pending, absent from settled")
+    func headerCompleteConjunctIsPinnedOnBothRequests() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+
+        // A STAGED row: header not yet flipped, no disposition settled. `insertMessageHeader`
+        // does not touch `headerComplete` and the model defaults it to false, so this row is
+        // staged simply by NOT running the `UPDATE` every other fixture here runs.
+        let staged = try TestDatabase.insertMessageHeader(
+            db, messageId: "staged", folderId: "acc1:Archive",
+            folderPath: "Archive", isInInbox: false)
+        // A STAGED-BUT-SETTLED row: still not header-complete, but its body did land.
+        let stagedSettled = try TestDatabase.insertMessageHeader(
+            db, messageId: "staged-settled", folderId: "acc1:Archive",
+            folderPath: "Archive", isInInbox: false)
+        // The CONTROLS, header-complete, one of each shape.
+        let pendingControl = try TestDatabase.insertMessageHeader(
+            db, messageId: "pending-control", folderId: "acc1:Archive",
+            folderPath: "Archive", isInInbox: false)
+        let settledControl = try TestDatabase.insertMessageHeader(
+            db, messageId: "settled-control", folderId: "acc1:Archive",
+            folderPath: "Archive", isInInbox: false)
+        try db.write { conn in
+            try conn.execute(sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE id = ?",
+                             arguments: [stagedSettled.id])
+            try conn.execute(sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id = ?",
+                             arguments: [pendingControl.id])
+            try conn.execute(sql: "UPDATE messageHeader SET headerComplete = 1, bodyComplete = 1 WHERE id = ?",
+                             arguments: [settledControl.id])
+        }
+
+        let pending = try db.read { conn in
+            try MessageHeader.pendingBodyRequest(accountId: "acc1").fetchAll(conn).map(\.id)
+        }
+        let settled = try db.read { conn in
+            try MessageHeader.bodySettledRequest(accountId: "acc1").fetchAll(conn).map(\.id)
+        }
+
+        // PENDING keeps the conjunct: a row whose header has not landed is outside the body
+        // question entirely, and counting it holds the sync banner open forever.
+        #expect(!pending.contains(staged.id),
+                "a staged (headerComplete = 0) row must NOT be pending — it would make BackfillProgress.isFullyComplete unreachable and hold Fast Sync's wake lock open")
+        #expect(pending.contains(pendingControl.id),
+                "control: an otherwise identical header-complete row IS pending, so the assertion above is not satisfied by an empty result")
+
+        // SETTLED deliberately omits it: dropping staged-but-settled rows from the numerator
+        // while the denominator still counts them parks "N / M indexed" below M forever.
+        #expect(settled.contains(stagedSettled.id),
+                "a staged row whose body DID land must still count as settled — adding headerComplete here would strand the indexed numerator below its denominator")
+        #expect(settled.contains(settledControl.id),
+                "control: the header-complete twin is settled too, so the assertion above is about the conjunct and not about bodyComplete")
+        #expect(!settled.contains(staged.id),
+                "a row with no settled disposition is not settled, whatever its headerComplete value")
+    }
+
     @Test("pendingBodyCount excludes a flagged row, so an unfetchable body cannot hold sync open forever")
     func pendingBodyCountExcludesFlaggedRows() throws {
         let db = try TestDatabase.make()
