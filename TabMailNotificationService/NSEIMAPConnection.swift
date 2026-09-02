@@ -15,9 +15,9 @@ import SwiftMail
 /// Memory notes:
 ///   • SwiftMail pulls in SwiftNIO + NIOSSL. Static-link overhead ~2–4 MB
 ///     per architecture. Per-live-connection RSS ~1–2 MB steady-state.
-///   • We SELECT a single mailbox (INBOX) and issue a single UID SEARCH +
-///     UID FETCH. No BODYSTRUCTURE walking beyond what SwiftMail does
-///     internally for `fetchMessage(from:)`.
+///   • We SELECT a single mailbox (INBOX), issue one UID SEARCH and one
+///     BODYSTRUCTURE fetch, then fetch only render-required MIME parts in
+///     bounded chunks. Normal attachment payloads are never loaded here.
 ///
 /// Safety notes:
 ///   • No credentials are ever logged. We redact email/username in the
@@ -132,7 +132,10 @@ enum NSEIMAPConnection {
         // Fetch the one message the push pointed us at.
         let info: MessageInfo?
         do {
-            info = try await server.fetchMessageInfo(for: uid)
+            info = try await server.fetchMessageInfo(
+                for: uid,
+                options: IMAPFetchMapping.bodyFetchMetadataOptions
+            )
         } catch {
             NSELog.step("NSE IMAP FETCH info failed: \(String(describing: error))")
             return nil
@@ -144,7 +147,28 @@ enum NSEIMAPConnection {
 
         let message: Message
         do {
-            message = try await server.fetchMessage(from: info)
+            // Chunking bounds each wire response; it does not bound the encoded
+            // bytes retained across all parts or the decode/render copies that
+            // follow. Reuse the ordinary four-MiB response ceiling as the NSE's
+            // aggregate encoded-body admission budget, leaving the fixed 24-MB
+            // process envelope unchanged. Unknown sizes fail closed to passive
+            // notification delivery before any body literal is requested.
+            guard let parts = try await IMAPFetchMapping.fetchRequiredBodyPartsWithinAggregateBudget(
+                in: info.parts,
+                byteBudget: IMAPFetchMapping.responseBufferLimit,
+                fetchChunk: { part, offset, count in
+                    try await server.fetchPart(
+                        section: part.section,
+                        of: uid,
+                        offset: offset,
+                        count: count
+                    )
+                }
+            ) else {
+                NSELog.step("NSE IMAP body exceeds bounded memory admission; using passive delivery")
+                return nil
+            }
+            message = Message(header: info, parts: parts)
         } catch {
             NSELog.step("NSE IMAP FETCH message failed: \(String(describing: error))")
             return nil

@@ -31,6 +31,92 @@ enum BodyFetchProcessor {
         case payloadTooLarge
     }
 
+    /// Retire a deterministic background-indexing failure without claiming the
+    /// body was empty or indexed. Returns false when the row moved or could not
+    /// be corroborated, in which case the queue must retry instead of stamping a
+    /// stale address.
+    static func markBodyUnindexed(
+        item: Item,
+        reason: BodyIndexingFailureReason,
+        observedUidValidity: Int?,
+        fetchedRfc822MessageId: String?
+    ) async -> Bool {
+        do {
+            let refusal = try await AppDatabase.dbPool.write {
+                db -> BodyAddressGate.Refusal? in
+                guard let header = try MessageHeader.fetchOne(db, key: item.headerId),
+                      let account = try Account.fetchOne(db, key: item.accountId) else {
+                    return .verificationUnavailable
+                }
+                guard header.folderPath == item.folderPath,
+                      header.messageId == item.messageId else {
+                    return .fetchProvenanceMismatch
+                }
+                let hasComparableEpochs = observedUidValidity != nil
+                    && header.observedUidValidity != nil
+                let epochMatches = hasComparableEpochs
+                    && header.observedUidValidity == observedUidValidity
+                let identityMatches: Bool = {
+                    guard let stored = header.rfc822MessageId,
+                          let fetched = fetchedRfc822MessageId,
+                          !stored.isEmpty, !fetched.isEmpty else { return false }
+                    return EmailFilter.normalizeMessageId(stored)
+                        == EmailFilter.normalizeMessageId(fetched)
+                }()
+                // A folder-local UID is not identity. Terminalization is
+                // irreversible automatic state, so require positive proof from
+                // the exact failed fetch: its SELECT epoch or returned Message-ID.
+                // Message-ID is fallback proof only when one side lacks epoch
+                // evidence. An explicit epoch contradiction is stronger than a
+                // matching, potentially duplicated Message-ID.
+                guard epochMatches || (!hasComparableEpochs && identityMatches) else {
+                    return .verificationUnavailable
+                }
+                if let refusal = BodyAddressGate.refusal(
+                    id: header.id,
+                    accountId: item.accountId,
+                    folderPath: header.folderPath,
+                    messageId: header.messageId,
+                    provider: account.provider,
+                    storedRfc822MessageId: header.rfc822MessageId,
+                    fetchedRfc822MessageId: fetchedRfc822MessageId
+                ) {
+                    return refusal
+                }
+                try db.execute(
+                    sql: """
+                        UPDATE messageHeader
+                        SET bodyIndexingFailureReason = ?,
+                            bodyComplete = 0,
+                            bodyEmptyConfirmed = 0
+                        WHERE id = ? AND accountId = ? AND folderPath = ? AND messageId = ?
+                          AND headerComplete = 1
+                          AND bodyComplete = 0
+                          AND bodyEmptyConfirmed = 0
+                          AND bodyIndexingFailureReason IS NULL
+                        """,
+                    arguments: [
+                        reason.rawValue, item.headerId, item.accountId,
+                        item.folderPath, item.messageId,
+                    ]
+                )
+                return db.changesCount == 1 ? nil : .verificationUnavailable
+            }
+            if let refusal {
+                BackgroundSyncLogger.log(
+                    "[BodyFetch] REFUSED terminal-unindexed write — \(refusal.logDescription); retrying"
+                )
+                return false
+            }
+            return true
+        } catch {
+            if !error.isDatabaseSuspensionAbort {
+                print("[BodyFetch] Failed to record terminal-unindexed state: \(error)")
+            }
+            return false
+        }
+    }
+
     /// Fetch phase: provider.fetchMessage + render body. Provider-bound (network I/O).
     /// Returns the rendered MessageBody and extracted plain text, or an error result.
     struct FetchResult: Sendable {
@@ -101,7 +187,11 @@ enum BodyFetchProcessor {
             }
 
             let fetchAttachment = buildAttachmentFetcher(
-                accountId: item.accountId, messageId: item.messageId, folderPath: item.folderPath
+                accountId: item.accountId,
+                messageId: item.messageId,
+                folderPath: item.folderPath,
+                expectedObservedUidValidity: fullMessage.observedUidValidity,
+                expectedRfc822MessageId: fullMessage.header.rfc822MessageId
             )
             let (renderedBody, plainText, hasUnresolvedICS) = await renderBody(
                 headerId: item.headerId,
@@ -129,6 +219,18 @@ enum BodyFetchProcessor {
                 fetchedRfc822MessageId: fullMessage.header.rfc822MessageId
             ))
         } catch {
+            if let providerError = error as? ProviderError,
+               case .bodyIndexingUnsupported(
+                    _, let observedUidValidity, let fetchedRfc822MessageId
+               ) = providerError {
+                _ = await markBodyUnindexed(
+                    item: item,
+                    reason: .partialFetchUnsupported,
+                    observedUidValidity: observedUidValidity,
+                    fetchedRfc822MessageId: fetchedRfc822MessageId
+                )
+                return .failure(.retry)
+            }
             let desc = "\(error)"
             if desc.contains("PayloadTooLargeError") {
                 // Data-integrity rule 1 ("NEVER mark unfetched content as fetched"):
@@ -344,6 +446,7 @@ enum BodyFetchProcessor {
                                 UPDATE messageHeader
                                 SET bodyEmptyConfirmed = 1,
                                     bodyComplete = 1,
+                                    bodyIndexingFailureReason = NULL,
                                     emptyFetchCount = emptyFetchCount + 1,
                                     summaryBlurb = 'This message has no content.',
                                     actionTag = ?,
@@ -417,6 +520,7 @@ enum BodyFetchProcessor {
                     END,
                     bodyComplete = 0,
                     bodyEmptyConfirmed = 0,
+                    bodyIndexingFailureReason = NULL,
                     emptyFetchCount = 0,
                     embeddingComplete = 0
                 WHERE id = ?
@@ -496,7 +600,7 @@ enum BodyFetchProcessor {
                     // misses against this header (e.g. IMAP flap). Now that we have real
                     // content, the miss chain is broken — start counting fresh next time.
                     try db.execute(
-                        sql: "UPDATE messageHeader SET snippet = ?, bodyComplete = 1, missFetchCount = 0 WHERE id = ?",
+                        sql: "UPDATE messageHeader SET snippet = ?, bodyComplete = 1, bodyIndexingFailureReason = NULL, missFetchCount = 0 WHERE id = ?",
                         arguments: [item.snippet, item.headerId]
                     )
                 }
@@ -632,7 +736,11 @@ enum BodyFetchProcessor {
         let t0 = CFAbsoluteTimeGetCurrent()
 
         let fetchAttachment = buildAttachmentFetcher(
-            accountId: item.accountId, messageId: item.messageId, folderPath: item.folderPath
+            accountId: item.accountId,
+            messageId: item.messageId,
+            folderPath: item.folderPath,
+            expectedObservedUidValidity: fullMessage.observedUidValidity,
+            expectedRfc822MessageId: fullMessage.header.rfc822MessageId
         )
         let (renderedBody, plainText, hasUnresolvedICS) = await renderBody(
             headerId: item.headerId,
@@ -697,10 +805,14 @@ enum BodyFetchProcessor {
         fetchAttachment: (@Sendable (String, String?) async throws -> Data)? = nil
     ) async -> (body: MessageBody, plainText: String?, hasUnresolvedICS: Bool) {
         // Convert main-app FullMessageInfo → shared RawBodyIngredients.
-        let sharedAttachments = fullMessage.attachments.map {
-            AttachmentRef(
-                filename: $0.filename, contentType: $0.contentType,
-                section: $0.section, size: $0.size, encoding: $0.encoding
+        let sharedAttachments = fullMessage.attachments.compactMap { attachment -> AttachmentRef? in
+            if let allowed = fullMessage.renderIngredientSections,
+               !allowed.contains(attachment.section) {
+                return nil
+            }
+            return AttachmentRef(
+                filename: attachment.filename, contentType: attachment.contentType,
+                section: attachment.section, size: attachment.size, encoding: attachment.encoding
             )
         }
         let sharedInlineImages = fullMessage.inlineImages.map {
@@ -759,7 +871,11 @@ enum BodyFetchProcessor {
     // MARK: - Helpers
 
     private static func buildAttachmentFetcher(
-        accountId: String, messageId: String, folderPath: String
+        accountId: String,
+        messageId: String,
+        folderPath: String,
+        expectedObservedUidValidity: Int?,
+        expectedRfc822MessageId: String?
     ) -> @Sendable (String, String?) async throws -> Data {
         return { section, encoding in
             let queue = await AccountManager.shared.workQueues[accountId]
@@ -768,7 +884,14 @@ enum BodyFetchProcessor {
 
             return try await queue.execute(priority: .bodyFetch) {
                 if let imap = provider as? IMAPProvider {
-                    return try await imap.fetchAttachment(messageId: messageId, folder: folderPath, section: section, encoding: encoding)
+                    return try await imap.fetchAttachment(
+                        messageId: messageId,
+                        folder: folderPath,
+                        section: section,
+                        encoding: encoding,
+                        expectedObservedUidValidity: expectedObservedUidValidity,
+                        expectedRfc822MessageId: expectedRfc822MessageId
+                    )
                 } else if let gmail = provider as? GmailProvider {
                     return try await gmail.fetchAttachment(messageId: messageId, attachmentId: section)
                 } else if let exchange = provider as? ExchangeProvider {

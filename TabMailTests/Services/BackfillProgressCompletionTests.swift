@@ -25,6 +25,7 @@ struct BackfillProgressCompletionTests {
         totalEmails: Int,
         ftsIndexed: Int,
         pendingBodyCount: Int,
+        unindexedBodyCount: Int = 0,
         uidTotal: Int = 0
     ) -> BackfillProgress {
         var p = BackfillProgress(
@@ -38,6 +39,7 @@ struct BackfillProgressCompletionTests {
         )
         p.uidTotal = uidTotal
         p.pendingBodyCount = pendingBodyCount
+        p.unindexedBodyCount = unindexedBodyCount
         return p
     }
 
@@ -78,6 +80,41 @@ struct BackfillProgressCompletionTests {
         // bodies pending → complete.
         let p = progress(headersDone: true, totalEmails: 800, ftsIndexed: 800, pendingBodyCount: 0, uidTotal: 12_000)
         #expect(p.isFullyComplete)
+    }
+
+    @Test("Terminal-unindexed bodies allow truthful completion and a full progress bar")
+    func terminalUnindexedCompletesTruthfully() {
+        let p = progress(
+            headersDone: true,
+            totalEmails: 100,
+            ftsIndexed: 98,
+            pendingBodyCount: 0,
+            unindexedBodyCount: 2
+        )
+        #expect(p.isFullyComplete)
+        #expect(p.unindexedBodyCount == 2)
+        #expect(p.fractionComplete == 1.0)
+        #expect(BodyIndexingProgressText.completion(unindexedCount: 2)
+                == "Sync complete with 2 messages not indexed")
+        #expect(BodyIndexingProgressText.terminalCompletion(
+            isComplete: p.isFullyComplete,
+            unindexedCount: p.unindexedBodyCount
+        ) == "Sync complete with 2 messages not indexed")
+    }
+
+    @Test("Terminal completion text handles singular and clean completion")
+    func terminalCompletionTextGrammar() {
+        #expect(BodyIndexingProgressText.completion(unindexedCount: 0) == "Sync complete")
+        #expect(BodyIndexingProgressText.completion(unindexedCount: 1)
+                == "Sync complete with 1 message not indexed")
+        #expect(BodyIndexingProgressText.terminalCompletion(
+            isComplete: false,
+            unindexedCount: 1
+        ) == nil)
+        #expect(BodyIndexingProgressText.terminalCompletion(
+            isComplete: true,
+            unindexedCount: 0
+        ) == nil)
     }
 
     @Test("Display fraction is unchanged (still ftsIndexed / totalEmails)")

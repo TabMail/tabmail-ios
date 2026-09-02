@@ -343,8 +343,20 @@ struct UserLabelIdentityMigrationTests {
             folderId: "\(accountId):INBOX", accountId: accountId,
             folderPath: "INBOX", isInInbox: true)
         header.headerComplete = true
-        let toInsert = header
-        try db.write { try toInsert.insert($0) }
+        // Raw SQL because this fixture deliberately stops at v81 while the
+        // current MessageHeader model includes columns introduced later.
+        try db.write { connection in
+            try connection.execute(sql: """
+                INSERT INTO messageHeader
+                    (id, folderId, accountId, folderPath, isInInbox, messageId,
+                     subject, `from`, fromAddress, `to`, date, snippet, headerComplete)
+                VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 1)
+                """, arguments: [
+                    header.id, header.folderId, header.accountId, header.folderPath,
+                    header.messageId, header.subject, header.from, header.fromAddress,
+                    header.to, header.date, header.snippet,
+                ])
+        }
         return header
     }
 

@@ -19,7 +19,125 @@ import Foundation
 @Suite("IMAPProvider — nested rfc822 end-to-end", .serialized)
 struct IMAPProviderMockNestedEmlTests {
 
+    private actor SuspendedEmlFetch {
+        private var continuation: CheckedContinuation<Data, Never>?
+
+        func fetch() async -> Data {
+            await withCheckedContinuation { continuation = $0 }
+        }
+
+        func waitUntilStarted() async {
+            while continuation == nil { await Task.yield() }
+        }
+
+        func finish(with data: Data) {
+            continuation?.resume(returning: data)
+            continuation = nil
+        }
+    }
+
+    private actor PresentationBarrier {
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        func wait() async {
+            await withCheckedContinuation { continuation = $0 }
+        }
+
+        func waitUntilBlocked() async {
+            while continuation == nil { await Task.yield() }
+        }
+
+        func release() {
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+
     // MARK: - File-uploaded .eml (filename-based, octet-stream, base64 transfer)
+
+    @Test("A cancelled .eml fetch cannot freeze previews after its view disappears")
+    @MainActor
+    func cancelledEmlFetchDoesNotAcquirePreviewFreeze() async {
+        PreviewFreezeGate.shared.end()
+        defer { PreviewFreezeGate.shared.end() }
+        let suspendedFetch = SuspendedEmlFetch()
+        let attachment = AttachmentInfo(
+            filename: "attached.eml",
+            contentType: "message/rfc822",
+            section: "2",
+            size: 128,
+            encoding: nil
+        )
+        let bytes = Data("""
+        From: Sender <sender@example.com>\r
+        To: Recipient <recipient@example.com>\r
+        Subject: Cancelled preview\r
+        \r
+        Body
+        """.utf8)
+
+        let coordinator = EmlAttachmentPreviewTaskCoordinator()
+        let presentationTask = coordinator.start {
+            do {
+                _ = try await EmlAttachmentPreviewLoader.load(attachment: attachment) {
+                    await suspendedFetch.fetch()
+                }
+                try EmlAttachmentPreviewLoader.beginPreviewFreeze()
+            } catch is CancellationError {
+                // The production task handles lifecycle cancellation silently.
+            } catch {
+                Issue.record("Unexpected load failure: \(error)")
+            }
+        }
+        await suspendedFetch.waitUntilStarted()
+        coordinator.cancel()
+        await suspendedFetch.finish(with: bytes)
+        await presentationTask.value
+        #expect(!PreviewFreezeGate.shared.isFrozen)
+    }
+
+    @Test("Cancellation after .eml parsing still prevents preview freeze acquisition")
+    @MainActor
+    func cancellationBetweenLoadAndPresentationDoesNotAcquirePreviewFreeze() async {
+        PreviewFreezeGate.shared.end()
+        defer { PreviewFreezeGate.shared.end() }
+        let barrier = PresentationBarrier()
+        let attachment = AttachmentInfo(
+            filename: "attached.eml",
+            contentType: "message/rfc822",
+            section: "2",
+            size: 128,
+            encoding: nil
+        )
+        let bytes = Data("""
+        From: Sender <sender@example.com>\r
+        To: Recipient <recipient@example.com>\r
+        Subject: Parsed before cancellation\r
+        \r
+        Body
+        """.utf8)
+
+        let presentationTask = Task { @MainActor in
+            let payload = try await EmlAttachmentPreviewLoader.load(attachment: attachment) {
+                bytes
+            }
+            await barrier.wait()
+            try EmlAttachmentPreviewLoader.beginPreviewFreeze()
+            return payload
+        }
+        await barrier.waitUntilBlocked()
+        presentationTask.cancel()
+        await barrier.release()
+
+        do {
+            _ = try await presentationTask.value
+            Issue.record("A cancelled presentation must not acquire the preview freeze")
+        } catch is CancellationError {
+            #expect(!PreviewFreezeGate.shared.isFrozen)
+        } catch {
+            Issue.record("Unexpected cancellation result: \(error)")
+        }
+    }
 
     /// Regression test for the "messageNotFound" bug where tapping a nested
     /// attachment inside a file-uploaded `.eml` would throw because the
@@ -31,7 +149,7 @@ struct IMAPProviderMockNestedEmlTests {
     /// `.eml` filename and `BASE64` transfer encoding. `BODY[<section>]`
     /// returns base64-encoded bytes that decode to a multipart RFC 822
     /// containing a nested PDF.
-    @Test("fetchMessage + fetchAttachment round-trip for file-uploaded .eml with base64 transfer")
+    @Test("Background skips an opaque .eml; on-demand fetch preserves nested attachment access")
     func fileUploadedEmlBase64EndToEnd() async throws {
         let topHtml = "<p>TOP BODY</p>"
         let topHtmlBytes = Data(topHtml.utf8)
@@ -147,38 +265,52 @@ struct IMAPProviderMockNestedEmlTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        // === Part 1: fetchMessage surfaces marker + nested PDF ===
+        // === Part 1: background body fetch leaves the opaque .eml metadata-only ===
 
         let info = try await provider.fetchMessage(id: "77", folder: "INBOX")
+        #expect(info.observedUidValidity == 1)
         let html = try #require(info.htmlBody)
-        #expect(html.contains("class=\"tm-eml-section\""))
-        #expect(html.contains("data-filename=\"carrier.eml\""))
-        #expect(html.contains("data-subject=\"IMAP NESTED SUBJECT\""))
-        #expect(html.contains("NESTED BODY"))
+        #expect(html.contains("TOP BODY"))
+        #expect(!html.contains("tm-eml-section"))
+        #expect(!html.contains("NESTED BODY"))
+        #expect(info.attachments.allSatisfy { $0.filename != "imap-nested.pdf" })
 
-        let nested = info.attachments.first { $0.filename == "imap-nested.pdf" }
-        let pdfAtt = try #require(nested)
-        #expect(pdfAtt.parentEmlSection == "2")
+        let carrier = try #require(info.attachments.first { $0.filename == "carrier.eml" })
+        #expect(carrier.section == "2")
+        #expect(carrier.encoding?.lowercased() == "base64")
+
+        // === Part 2: tapping the .eml fetches and decodes its parent bytes ===
+
+        let preview = try await EmlAttachmentPreviewLoader.load(attachment: carrier) {
+            try await provider.fetchAttachment(
+                messageId: "77", folder: "INBOX",
+                section: carrier.section, encoding: carrier.encoding,
+                expectedObservedUidValidity: nil,
+                expectedRfc822MessageId: "outer@example.com"
+            )
+        }
+        #expect(preview.html.contains("NESTED BODY"))
+        let nested = try #require(
+            preview.nestedAttachments.first { $0.filename == "imap-nested.pdf" }
+        )
+
+        // === Part 3: an attachment selected inside that preview resolves through
+        // === the compound section and the same bounded parent-fetch path.      ===
+
         let expectedCompound = EmlParsing.nestedSection(parent: "2", index: 0)
-        #expect(pdfAtt.section == expectedCompound)
-        // The critical invariant: encoding is the PARENT's transfer encoding,
-        // not the nested attachment's. Tap-time dispatch uses this to
-        // base64-decode the parent correctly before EMLParser sees the bytes.
-        #expect(pdfAtt.encoding?.lowercased() == "base64")
-
-        // === Part 2: fetchAttachment compound path — parent's base64 ===
-        // === encoding is carried through the recursive call            ===
-
         let fetchedBytes = try await provider.fetchAttachment(
             messageId: "77", folder: "INBOX",
-            section: pdfAtt.section, encoding: pdfAtt.encoding
+            section: expectedCompound, encoding: carrier.encoding,
+            expectedObservedUidValidity: nil,
+            expectedRfc822MessageId: "outer@example.com"
         )
         let fetchedString = String(data: fetchedBytes, encoding: .utf8) ?? ""
+        #expect(nested.filename == "imap-nested.pdf")
         #expect(fetchedString.contains("%%SYNTHETIC-IMAP-PDF%%"))
     }
 
-    @Test("fetchMessage emits marker for nested message/rfc822 part with BODYSTRUCTURE recursion")
-    func nestedRfc822EmitsMarker() async throws {
+    @Test("Background excludes attached message/rfc822 descendants but keeps parent metadata")
+    func nestedRfc822RemainsMetadataOnly() async throws {
         // Top-level body (section 1) — text/html.
         let topHtml = "<p>TOP BODY TEXT</p>"
         let topHtmlBytes = Data(topHtml.utf8)
@@ -292,11 +424,137 @@ struct IMAPProviderMockNestedEmlTests {
             return
         }
 
-        // The whole point — htmlBody contains the top body AND the marker for
-        // the nested rfc822 part.
+        // The top-level render body is present, while the attached message and
+        // its flattened descendants remain metadata-only until explicitly opened.
         let html = try #require(info.htmlBody)
         #expect(html.contains("TOP BODY TEXT"))
-        #expect(html.contains("class=\"tm-eml-section\""))
-        #expect(html.contains("INNER BODY TEXT"))
+        #expect(html.contains("tm-eml-section"))
+        #expect(!html.contains("INNER BODY TEXT"))
+        let attachedMessage = try #require(info.attachments.first { $0.filename == "inner.eml" })
+        #expect(attachedMessage.section == "2")
+
+        let preview = try await EmlAttachmentPreviewLoader.load(attachment: attachedMessage) {
+            try await provider.fetchAttachment(
+                messageId: "42", folder: "INBOX",
+                section: attachedMessage.section, encoding: attachedMessage.encoding,
+                expectedObservedUidValidity: 1,
+                expectedRfc822MessageId: "outer@example.com"
+            )
+        }
+        #expect(preview.html.contains("INNER BODY TEXT"))
+        #expect(server.recordedCommands().contains {
+            $0.contains("BODY.PEEK[2]<0.\(innerRfc822Bytes.count)>")
+        })
+        #expect(server.recordedCommands().contains {
+            $0.contains("BODY.PEEK[2]<\(innerRfc822Bytes.count).1>")
+        })
+    }
+
+    @Test("UIDVALIDITY turnover refuses normal and .eml attachment payloads")
+    func attachmentReadsRefuseUidTurnover() async throws {
+        let bodystructure = """
+        (("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 4 1)("APPLICATION" "PDF" ("NAME" "document.pdf") NIL NIL "7BIT" 3 NIL ("attachment" ("filename" "document.pdf")))("APPLICATION" "OCTET-STREAM" ("NAME" "attached.eml") NIL NIL "7BIT" 8 NIL ("attachment" ("filename" "attached.eml"))) "MIXED")
+        """
+        func message(id: String, normal: String, eml: String) -> FakeIMAPServer.Message {
+            FakeIMAPServer.makeMultipartMessage(
+                uid: 9,
+                subject: "Attachment identity",
+                from: "Sender <sender@example.com>",
+                to: "Recipient <recipient@example.com>",
+                date: "Thu, 02 Oct 2025 01:50:00 +0000",
+                internalDate: "02-Oct-2025 01:50:00 +0000",
+                messageID: "<\(id)>",
+                rawHeader: "Message-ID: <\(id)>\r\nDate: Thu, 02 Oct 2025 01:50:00 +0000\r\n\r\n",
+                fullMessage: Data(),
+                bodystructure: bodystructure,
+                partBodies: [
+                    "1": Data("body".utf8),
+                    "2": Data(normal.utf8),
+                    "3": Data(eml.utf8),
+                ]
+            )
+        }
+
+        let originalId = "original-attachment@example.com"
+        let server = FakeIMAPServer(messages: [
+            message(id: originalId, normal: "old", eml: "old-eml")
+        ])
+        server.setUidValidity(41, for: "INBOX")
+        try server.start()
+        defer { server.stop() }
+
+        let provider = IMAPProvider(
+            host: "127.0.0.1", port: server.port,
+            username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false
+        )
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        // The row still names epoch 41/UID 9, while UID 9 now belongs to a
+        // different message in epoch 42. Neither a normal file nor a metadata-
+        // only .eml tap may read the replacement payload.
+        server.setMessages([
+            message(id: "replacement@example.com", normal: "new", eml: "new-eml")
+        ], in: "INBOX")
+        server.setUidValidity(42, for: "INBOX")
+
+        for section in ["2", "3"] {
+            do {
+                _ = try await provider.fetchAttachment(
+                    messageId: "9",
+                    folder: "INBOX",
+                    section: section,
+                    encoding: nil,
+                    expectedObservedUidValidity: 41,
+                    expectedRfc822MessageId: originalId
+                )
+                Issue.record("Section \(section) was fetched across UIDVALIDITY turnover")
+            } catch ProviderError.uidValidityChanged(let folder, let stored, let live) {
+                #expect(folder == "INBOX")
+                #expect(stored == 41)
+                #expect(live == 42)
+            } catch {
+                Issue.record("Unexpected turnover refusal for section \(section): \(error)")
+            }
+        }
+
+        // Epoch agreement alone must not override contradictory RFC identity.
+        // Refuse before requesting any normal attachment payload.
+        server.setUidValidity(41, for: "INBOX")
+        do {
+            _ = try await provider.fetchAttachment(
+                messageId: "9",
+                folder: "INBOX",
+                section: "2",
+                encoding: nil,
+                expectedObservedUidValidity: 41,
+                expectedRfc822MessageId: originalId
+            )
+            Issue.record("Matching UIDVALIDITY accepted a contradictory Message-ID")
+        } catch ProviderError.actionIdentityResolutionFailed(let messageId) {
+            #expect(messageId == "9")
+        } catch {
+            Issue.record("Unexpected matching-epoch identity refusal: \(error)")
+        }
+
+        do {
+            _ = try await provider.fetchAttachment(
+                messageId: "9",
+                folder: "INBOX",
+                section: "2",
+                encoding: nil,
+                expectedObservedUidValidity: nil,
+                expectedRfc822MessageId: originalId
+            )
+            Issue.record("Message-ID fallback accepted a replacement message")
+        } catch ProviderError.actionIdentityResolutionFailed(let messageId) {
+            #expect(messageId == "9")
+        } catch {
+            Issue.record("Unexpected Message-ID fallback refusal: \(error)")
+        }
+        #expect(!server.recordedCommands().contains { command in
+            command.contains("BODY.PEEK[2]") || command.contains("BODY.PEEK[3]")
+        })
     }
 }

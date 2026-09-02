@@ -283,6 +283,12 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// messages, the FETCH over a range covering all N returns fewer than N.
         /// Empty for every pre-existing test.
         var fetchRecordSuppressedByMailbox: [String: Set<Int>] = [:]
+        /// Numeric MIME sections whose server response ignores a requested
+        /// `<offset.count>` range and returns the whole section without the
+        /// mandatory origin marker. This intentionally nonconforming shape
+        /// validates that SwiftMail rejects, rather than silently accepts, an
+        /// unbounded literal for a bounded request.
+        var partialRangeIgnoredSections: Set<String> = []
         /// Invariant test layer (2026-07-16) — wrong-message wire oracle,
         /// deliverable 1. The rfc822 Message-ID(s) the CURRENT test's user
         /// intention(s) target, registered via `expectMutation(rfc822MessageId:)`.
@@ -1001,6 +1007,10 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// failure it leaves the client with no id for the missing message at all.
     func suppressFetchRecord(in mailbox: String, uids: Set<Int>) {
         withState { $0.fetchRecordSuppressedByMailbox[mailbox] = uids }
+    }
+
+    func ignorePartialRange(forSection section: String) {
+        withState { _ = $0.partialRangeIgnoredSections.insert(section) }
     }
 
     /// Test seam (T1.2b): make this mailbox's SELECT/EXAMINE omit the
@@ -2395,7 +2405,8 @@ final class FakeIMAPServer: @unchecked Sendable {
                 flags: state.flagsByMailbox[mailbox] ?? [:],
                 uidSuppressed: state.fetchUidSuppressedByMailbox[mailbox] ?? [],
                 internalDateSuppressed: state.fetchInternalDateSuppressedByMailbox[mailbox] ?? [],
-                recordSuppressed: state.fetchRecordSuppressedByMailbox[mailbox] ?? []
+                recordSuppressed: state.fetchRecordSuppressedByMailbox[mailbox] ?? [],
+                partialRangeIgnoredSections: state.partialRangeIgnoredSections
             )
         }
         let matched = parseSequenceSet(seqStr, uidMode: uidMode, messages: snapshot.messages)
@@ -2460,7 +2471,22 @@ final class FakeIMAPServer: @unchecked Sendable {
                         "BODY[\(section)]",
                         "BODY.PEEK[\(section)]"
                     ]
-                    if patterns.contains(where: { itemsStr.contains($0) }) {
+                    if let partial = patterns.compactMap({
+                        partialRange(in: itemsStr, after: $0)
+                    }).first {
+                        if snapshot.partialRangeIgnoredSections.contains(section) {
+                            let str = String(data: bytes, encoding: .utf8) ?? ""
+                            fetchItems.append("BODY[\(section)] {\(bytes.count)}\r\n\(str)")
+                        } else {
+                            let start = min(partial.offset, bytes.count)
+                            let end = min(start + partial.count, bytes.count)
+                            let slice = bytes.subdata(in: start..<end)
+                            let str = String(data: slice, encoding: .utf8) ?? ""
+                            fetchItems.append(
+                                "BODY[\(section)]<\(partial.offset)> {\(slice.count)}\r\n\(str)"
+                            )
+                        }
+                    } else if patterns.contains(where: { itemsStr.contains($0) }) {
                         let str = String(data: bytes, encoding: .utf8) ?? ""
                         fetchItems.append("BODY[\(section)] {\(bytes.count)}\r\n\(str)")
                     }
@@ -2472,6 +2498,23 @@ final class FakeIMAPServer: @unchecked Sendable {
 
         response += "\(tag) OK \(uidMode ? "UID " : "")FETCH completed\r\n"
         return response
+    }
+
+    /// Parse the request suffix in `BODY.PEEK[section]<offset.count>`.
+    /// The response echoes only `<offset>` per RFC 3501 §7.4.2.
+    private func partialRange(
+        in fetchItems: String,
+        after token: String
+    ) -> (offset: Int, count: Int)? {
+        guard let tokenRange = fetchItems.range(of: token) else { return nil }
+        let suffix = fetchItems[tokenRange.upperBound...]
+        guard suffix.first == "<", let close = suffix.firstIndex(of: ">") else { return nil }
+        let valueStart = suffix.index(after: suffix.startIndex)
+        let fields = suffix[valueStart..<close].split(separator: ".", omittingEmptySubsequences: false)
+        guard fields.count == 2,
+              let offset = Int(fields[0]), offset >= 0,
+              let count = Int(fields[1]), count > 0 else { return nil }
+        return (offset, count)
     }
 
     private func parseSequenceSet(_ seqStr: String, uidMode: Bool, messages: [Message]) -> [Message] {

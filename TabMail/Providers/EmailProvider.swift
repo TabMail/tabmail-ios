@@ -192,6 +192,10 @@ struct InlineImage: Sendable {
 
 struct FullMessageInfo: Sendable {
     let header: MessageHeaderInfo
+    /// UIDVALIDITY from the exact IMAP SELECT that supplied this message's
+    /// BODYSTRUCTURE and render parts. Nil for providers without mailbox-local
+    /// UID epochs, or when the server omitted UIDVALIDITY.
+    let observedUidValidity: Int?
     let htmlBody: String?
     let textBody: String?
     let attachments: [AttachmentInfo]
@@ -199,14 +203,21 @@ struct FullMessageInfo: Sendable {
     /// Pre-fetched ICS calendar data (from pipelined batch fetch).
     /// When present, renderBody skips the separate fetchAttachment call.
     let icsData: Data?
+    /// IMAP MIME sections allowed to contribute render-time attachment data.
+    /// `nil` for providers whose attachment identifiers are not MIME sections.
+    /// The background renderer filters its calendar fallback through this set,
+    /// while `attachments` remains complete BODYSTRUCTURE metadata for taps.
+    let renderIngredientSections: Set<String>?
 
-    init(header: MessageHeaderInfo, htmlBody: String?, textBody: String?, attachments: [AttachmentInfo] = [], inlineImages: [InlineImage] = [], icsData: Data? = nil) {
+    init(header: MessageHeaderInfo, observedUidValidity: Int? = nil, htmlBody: String?, textBody: String?, attachments: [AttachmentInfo] = [], inlineImages: [InlineImage] = [], icsData: Data? = nil, renderIngredientSections: Set<String>? = nil) {
         self.header = header
+        self.observedUidValidity = observedUidValidity
         self.htmlBody = htmlBody
         self.textBody = textBody
         self.attachments = attachments
         self.inlineImages = inlineImages
         self.icsData = icsData
+        self.renderIngredientSections = renderIngredientSections
     }
 }
 
@@ -425,8 +436,9 @@ protocol EmailProvider: Sendable {
     /// Batch fetch full messages for body processing (MessageBody + FTS + rendering).
     /// IMAP: single connection, one SELECT, bulk BODYSTRUCTURE, per-message body parts.
     /// Gmail/Exchange: concurrent HTTP fetches (default sequential fallback).
-    /// Returns successfully fetched messages keyed by message ID.
-    /// Throws on connection-level errors. Individual message failures are omitted from result.
+    /// Returns successfully fetched messages keyed by message ID. Connection failures throw;
+    /// providers may also throw a typed terminal failure identifying the one message whose
+    /// bounded fetch contract failed. Other individual parse failures are omitted from the result.
     func fetchMessagesBatch(ids: [String], folder: String) async throws -> [String: FullMessageInfo]
 }
 
@@ -725,6 +737,15 @@ enum ProviderError: LocalizedError {
     /// the request boundary so the bug surfaces at its source, not as an opaque
     /// network error.
     case syntheticFolderPath(String)
+    /// A server did not honor the bounded IMAP partial-fetch contract required
+    /// to index this message without an unbounded response. Deterministic for
+    /// the current server/app combination: background queues terminalize this
+    /// message truthfully instead of retrying forever.
+    case bodyIndexingUnsupported(
+        messageId: String,
+        observedUidValidity: Int?,
+        fetchedRfc822MessageId: String?
+    )
     /// The row's provider address is not corroborated — a move is in flight, so
     /// `(folderPath, messageId)` may name a DIFFERENT message on the wire. Thrown by
     /// `AccountManager.fetchAttachment`; see `BodyAddressGate`. TRANSIENT in the DATABASE — it
@@ -748,6 +769,8 @@ enum ProviderError: LocalizedError {
             return "UIDVALIDITY changed for \(folderPath): stored=\(stored) live=\(live)"
         case .syntheticPlaceholderId(let ids): return "Synthetic placeholder id(s) leaked into provider fetch: \(ids.prefix(3))"
         case .syntheticFolderPath(let path): return "Synthetic folder path leaked into provider request: \(path)"
+        case .bodyIndexingUnsupported:
+            return "This server cannot fetch the message body in bounded pieces, so it was not indexed."
         // ⚠️ Deliberately names GOING BACK TO THE LIST, not "try again" and not "close it".
         // An already-open view holds the pre-move `MessageHeader` in memory and `publishMoveFinish`
         // does not push the re-keyed row into it, so repeated taps re-submit the same stale value

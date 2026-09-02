@@ -3517,7 +3517,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // this re-SELECT. It runs on the ACTION connection, which
         // `withActionConnection` has already SELECTed, so this is the second
         // SELECT of the pair and the one whose epoch is live at FETCH time.
-        _ = try await selectMailboxTracked(server, folder: folder)
+        let selection = try await selectMailboxTracked(server, folder: folder)
+        let selectedEpoch = selection.uidValidity.value
+        let observedUidValidity = selectedEpoch == 0 ? nil : Int(selectedEpoch)
 
         let results = try nativeUIDSet([id])
         guard !results.isEmpty else {
@@ -3527,14 +3529,59 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let uids = results.toArray()
         guard let uid = uids.first else { throw ProviderError.messageNotFound }
 
-        let info = try await server.fetchMessageInfo(for: uid)
+        let info: MessageInfo?
+        do {
+            info = try await server.fetchMessageInfo(
+                for: uid,
+                options: IMAPFetchMapping.bodyFetchMetadataOptions
+            )
+        } catch {
+            if IMAPFetchMapping.isResponseBufferOverflow(error) {
+                throw ProviderError.bodyIndexingUnsupported(
+                    messageId: id,
+                    observedUidValidity: observedUidValidity,
+                    fetchedRfc822MessageId: nil
+                )
+            }
+            throw error
+        }
         guard let info else { throw ProviderError.messageNotFound }
 
-        let message = try await server.fetchMessage(from: info)
+        var parts = info.parts
+        do {
+            for index in IMAPFetchMapping.requiredBodyPartIndices(in: parts) {
+                let section = parts[index].section
+                let expectedSize = parts[index].size
+                parts[index].data = try await IMAPFetchMapping.concatenateEncodedPart(
+                    expectedSize: expectedSize
+                ) { offset, count in
+                    try await server.fetchPart(
+                        section: section,
+                        of: uid,
+                        offset: offset,
+                        count: count
+                    )
+                }
+            }
+        } catch {
+            if IMAPFetchMapping.isDeterministicPartialFetchFailure(error) {
+                throw ProviderError.bodyIndexingUnsupported(
+                    messageId: id,
+                    observedUidValidity: observedUidValidity,
+                    fetchedRfc822MessageId: IMAPFetchMapping.rfc822MessageId(from: info)
+                )
+            }
+            throw error
+        }
+        let message = Message(header: info, parts: parts)
 
         // buildFullMessageInfo returns nil when mapMessageInfo can't parse the header
         // (e.g., date parse failure). Treat as a fetch failure so the caller retries.
-        guard let full = buildFullMessageInfo(info: info, message: message) else {
+        guard let full = buildFullMessageInfo(
+            info: info,
+            message: message,
+            observedUidValidity: observedUidValidity
+        ) else {
             throw ProviderError.messageNotFound
         }
         return full
@@ -3543,8 +3590,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// Build FullMessageInfo from BODYSTRUCTURE info + fetched message data.
     /// Extracted from fetchMessageOnConnection so batch fetch can reuse it.
     /// Returns nil if the header can't be parsed — caller should treat as fetch failure.
-    private func buildFullMessageInfo(info: MessageInfo, message: Message) -> FullMessageInfo? {
+    private func buildFullMessageInfo(
+        info: MessageInfo,
+        message: Message,
+        observedUidValidity: Int?
+    ) -> FullMessageInfo? {
         guard let header = mapMessageInfo(info) else { return nil }
+        let renderIngredientSections = Set(
+            IMAPFetchMapping.requiredBodyPartIndices(in: info.parts)
+                .map { info.parts[$0].section.description }
+        )
 
         // Classify each attachment as top-level vs nested-in-.eml by checking
         // whether its MIME section is a descendant of any message/rfc822 section.
@@ -3576,18 +3631,20 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 filename: filename,
                 contentType: part.contentType,
                 section: part.section.description,
-                size: part.data?.count ?? 0,
+                size: part.size ?? part.data?.count ?? 0,
                 encoding: part.encoding,
                 parentEmlSection: parentEml
             )
         }
 
-        // Surface attachments nested INSIDE file-uploaded `.eml` parts.
+        // Surface attachments nested INSIDE file-uploaded `.eml` parts when
+        // parent bytes happen to be present (for example, an on-demand path).
         // Server-parsed `message/rfc822` parts already have their children
         // visible at the top level (BODYSTRUCTURE exposes them at numeric
         // sub-sections like `2.1`, and the block above catches them).
-        // File-uploaded `.eml`s are opaque blobs server-side — the nested
-        // attachments only exist after we parse the bytes ourselves.
+        // File-uploaded `.eml`s are opaque blobs server-side — background body
+        // indexing deliberately does not download their attachment payloads, so
+        // BODYSTRUCTURE exposes only the parent until it is opened on demand.
         //
         // `encoding` on each nested AttachmentInfo is set to the PARENT's
         // transfer encoding (not the inner attachment's). Tap-time
@@ -3614,23 +3671,23 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             }
         }
 
-        // Extract CID inline images — data is already fetched by SwiftMail.
-        // Use decodedData() to handle content transfer encoding (base64, quoted-printable)
-        // before we re-encode as data: URI in AccountManagerFetch.
-        let inlineImages: [InlineImage] = message.cids.prefix(SyncConfig.maxInlineImages).compactMap { part in
-            guard let rawId = part.contentId, let data = part.decodedData() else { return nil }
-            // Strip angle brackets + whitespace: "< image001@host >" → "image001@host"
-            let contentId = rawId.trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !contentId.isEmpty else { return nil }
-            return InlineImage(contentId: contentId, contentType: part.contentType, data: data)
+        let inlineImages = IMAPFetchMapping.extractInlineImages(
+            message: message,
+            maxInlineImages: SyncConfig.maxInlineImages,
+            eligibleSections: renderIngredientSections
+        ).map { image in
+            InlineImage(
+                contentId: image.contentId,
+                contentType: image.contentType,
+                data: image.data
+            )
         }
 
         // Extract ICS calendar data from already-fetched parts (avoids re-fetch in renderBody)
-        let icsData: Data? = message.parts.first(where: {
-            $0.contentType.lowercased().contains("text/calendar")
-        })?.decodedData()
+        let icsData = IMAPFetchMapping.extractICSData(
+            message: message,
+            eligibleSections: renderIngredientSections
+        )
 
         // Log body part structure for debugging embedded .eml rendering.
         //
@@ -3675,31 +3732,24 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
         return FullMessageInfo(
             header: header,
+            observedUidValidity: observedUidValidity,
             htmlBody: htmlBody,
             textBody: textBody,
             attachments: attachments,
             inlineImages: inlineImages,
-            icsData: icsData
+            icsData: icsData,
+            renderIngredientSections: renderIngredientSections
         )
     }
 
     // MARK: - Batch Full Message Fetch
 
-    /// Batch fetch full messages on a single connection using pipelined part fetches.
-    /// Flow: one SELECT → one bulk BODYSTRUCTURE → pipelined FETCH for all parts across all messages.
-    /// Avoids redundant per-message BODYSTRUCTURE re-fetch that `fetchMessage(from:)` does internally.
-    /// ⚠️ CORRECTED 2026-08-05: this line previously read "PayloadTooLarge messages
-    /// are marked bodyEmptyConfirmed and omitted from result." That has not been
-    /// true on this path for some time and the identical stale line is present at
-    /// the release base `07a4bb703` too, so it is pre-existing rather than a
-    /// regression. **A `PayloadTooLargeError` is THROWN, not absorbed**: it
-    /// contaminates the NIO connection (unfulfilled promises crash on dealloc), so
-    /// the batch is failed and the connection released as unhealthy rather than
-    /// retried here. Deleting the `bodyEmptyConfirmed = 1` write was the CORRECT
-    /// change — an oversized body is the opposite of "content confirmed gone", and
-    /// marking it would violate the Data Integrity rule against marking unfetched
-    /// content as fetched. The message stays retryable.
-    /// Throws on connection-level errors (caller should retry the batch).
+    /// Batch fetch renderable message content on one folder connection.
+    /// Flow: one SELECT → one bulk BODYSTRUCTURE → bounded partial FETCH commands
+    /// for text/calendar/CID parts. Normal attachments remain metadata-only and
+    /// are fetched on demand. A server that ignores or malforms a partial range is
+    /// surfaced as a typed per-message terminal failure; connection/transient
+    /// errors still fail the batch for retry.
     func fetchMessagesBatch(ids: [String], folder: String) async throws -> [String: FullMessageInfo] {
         // Defensive guard — see `EmailProvider.fetchMessagesBatch` extension default
         // for the rationale. The implicit `UInt32(id)` filter below would already
@@ -3722,7 +3772,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
         if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch START: \(uidPairs.count) UIDs in \(folder)") }
 
-        return try await withFolderConnection(folder: folder) { server in
+        var partialFetchMessageId: String?
+        var metadataFetchMessageId: String?
+        var partialFetchObservedUidValidity: Int?
+        var partialFetchRfc822MessageId: String?
+        do {
+            return try await withFolderConnection(folder: folder) { server in
             // 1. SELECT (re-selects on pinned connection — fast, refreshes state)
             let tSelect = CFAbsoluteTimeGetCurrent()
             // T5.3 PORT — `v2final:…:IMAPProvider.fetchMessagesBatch` tracks this
@@ -3730,7 +3785,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // hot path and runs concurrently with the backfill walk on the SAME
             // folder path, so it is one of the SELECTs most likely to be the
             // first to see a turnover.
-            _ = try await selectMailboxTracked(server, folder: folder)
+            let selection = try await selectMailboxTracked(server, folder: folder)
+            let selectedEpoch = selection.uidValidity.value
+            partialFetchObservedUidValidity = selectedEpoch == 0 ? nil : Int(selectedEpoch)
             let selectMs = Int((CFAbsoluteTimeGetCurrent() - tSelect) * 1000)
             if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch SELECT: \(selectMs)ms") }
 
@@ -3738,7 +3795,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             let tStruct = CFAbsoluteTimeGetCurrent()
             var uidSet = UIDSet()
             for (_, uid) in uidPairs { uidSet.insert(UID(uid)) }
-            let infos = try await server.fetchMessageInfosBulk(using: uidSet)
+            metadataFetchMessageId = uidPairs.count == 1 ? uidPairs[0].id : nil
+            let infos = try await server.fetchMessageInfosBulk(
+                using: uidSet,
+                options: IMAPFetchMapping.bodyFetchMetadataOptions
+            )
+            metadataFetchMessageId = nil
             let structMs = Int((CFAbsoluteTimeGetCurrent() - tStruct) * 1000)
             if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch BODYSTRUCTURE: \(infos.count)/\(uidPairs.count) returned in \(structMs)ms") }
 
@@ -3752,72 +3814,72 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 }
             }
 
-            // 3. Collect ALL parts from ALL messages for pipelined fetch.
-            //    We already have BODYSTRUCTURE from step 2 — no need to re-fetch it
-            //    (fetchMessage(from:) internally calls fetchStructure again, which is wasteful
-            //    and causes NIO buffer accumulation with 200+ redundant IMAP commands).
-            var partRequests: [(uid: UID, section: Section)] = []
+            // 3. Fetch only render-required parts in bounded encoded-byte chunks.
+            // BODYSTRUCTURE already supplies attachment metadata, so normal file
+            // attachment payloads are intentionally absent from this background path.
+            // Each part is transfer-decoded only after all encoded chunks are joined.
+            let tParts = CFAbsoluteTimeGetCurrent()
             var partsByUID: [UInt32: [MessagePart]] = [:]
+            var fetchedSectionsByUID: [UInt32: Set<String>] = [:]
+            var totalParts = 0
 
             for (uidValue, entry) in infoByUID {
                 let uid = UID(uidValue)
-                partsByUID[uidValue] = entry.info.parts
-                for part in entry.info.parts {
-                    partRequests.append((uid: uid, section: part.section))
+                var parts = entry.info.parts
+                var fetchedSections: Set<String> = []
+                for index in IMAPFetchMapping.requiredBodyPartIndices(in: parts) {
+                    totalParts += 1
+                    partialFetchMessageId = entry.id
+                    partialFetchRfc822MessageId = IMAPFetchMapping.rfc822MessageId(
+                        from: entry.info
+                    )
+                    let section = parts[index].section
+                    let expectedSize = parts[index].size
+                    parts[index].data = try await IMAPFetchMapping.concatenateEncodedPart(
+                        expectedSize: expectedSize
+                    ) { offset, count in
+                        try await server.fetchPart(
+                            section: section,
+                            of: uid,
+                            offset: offset,
+                            count: count
+                        )
+                    }
+                    fetchedSections.insert(section.description)
                 }
-            }
-
-            let totalParts = partRequests.count
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch: \(totalParts) parts to fetch across \(infoByUID.count) messages") }
-
-            // 4. Pipelined fetch — all parts in one burst.
-            //    PayloadTooLarge contaminates the NIO connection (unfulfilled promises crash
-            //    on dealloc), so we do NOT retry here. Instead, throw to the queue which
-            //    handles halving with a fresh connection on each retry.
-            let tParts = CFAbsoluteTimeGetCurrent()
-            let pipelinedResults: [UID: [(section: Section, data: Data)]]
-            if !partRequests.isEmpty {
-                pipelinedResults = try await server.fetchPartsPipelined(parts: partRequests)
-            } else {
-                pipelinedResults = [:]
+                partialFetchMessageId = nil
+                partialFetchRfc822MessageId = nil
+                partsByUID[uidValue] = parts
+                fetchedSectionsByUID[uidValue] = fetchedSections
             }
 
             let partsMs = Int((CFAbsoluteTimeGetCurrent() - tParts) * 1000)
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch PARTS PIPELINED: \(pipelinedResults.count) UIDs returned in \(partsMs)ms") }
+            if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch PARTS CHUNKED: \(totalParts) render parts across \(infoByUID.count) messages in \(partsMs)ms") }
 
-            // 5. Assemble Message objects from BODYSTRUCTURE + fetched part data
+            // 4. Assemble Message objects from BODYSTRUCTURE + fetched part data.
             var results: [String: FullMessageInfo] = [:]
             var fetchedCount = 0
             var failedCount = 0
 
             for (uidValue, entry) in infoByUID {
-                let uid = UID(uidValue)
-                guard var parts = partsByUID[uidValue] else { continue }
-
-                // Populate part data from pipelined results
-                let fetchedParts = pipelinedResults[uid] ?? []
-                var fetchedBySection: [String: Data] = [:]
-                for (section, data) in fetchedParts {
-                    fetchedBySection[section.description] = data
-                }
-
-                for i in 0..<parts.count {
-                    if let data = fetchedBySection[parts[i].section.description] {
-                        parts[i].data = data
-                    }
-                }
+                guard let parts = partsByUID[uidValue] else { continue }
+                let fetchedSections = fetchedSectionsByUID[uidValue] ?? []
 
                 let message = Message(header: entry.info, parts: parts)
                 // Skip entries where the header can't be parsed (date parse failure).
                 // Caller sees the entry missing from results and treats as fetch failure.
-                guard let fullInfo = self.buildFullMessageInfo(info: entry.info, message: message) else {
+                guard let fullInfo = self.buildFullMessageInfo(
+                    info: entry.info,
+                    message: message,
+                    observedUidValidity: partialFetchObservedUidValidity
+                ) else {
                     failedCount += 1
                     continue
                 }
                 // Data-integrity guard (CLAUDE.md rule #1 — never cache unfetched content).
                 // A top-level text/html section listed in BODYSTRUCTURE was NOT returned
-                // by the pipelined fetch (its section is absent from `fetchedBySection`) —
-                // i.e. the HTML content was silently DROPPED under NIO buffer pressure.
+                // by the chunked fetch (its section is absent from `fetchedSections`) —
+                // i.e. the HTML content was silently DROPPED.
                 // Rendering would fall back to the text/plain part — an HTML email FALSELY
                 // shown as plaintext — frozen by MessageBody.create's onConflict:.ignore
                 // until a manual pull-to-refresh. THROW so the body queue retries the batch
@@ -3831,12 +3893,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // must render as plaintext and cache normally, else the batch would retry
                 // that message forever. Single-message fetch self-heals dropped parts.
                 if IMAPFetchMapping.hasDroppedTopLevelHTMLSection(
-                    info: entry.info, fetchedSections: Set(fetchedBySection.keys)
+                    info: entry.info, fetchedSections: fetchedSections
                 ) {
-                    if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch: UID \(uidValue) — top-level text/html section dropped by pipelined fetch; failing batch for retry (not caching HTML as plaintext)") }
+                    if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch: UID \(uidValue) — top-level text/html section dropped by chunked fetch; failing batch for retry (not caching HTML as plaintext)") }
                     throw NSError(
                         domain: "IMAPProvider.IncompleteBodyFetch", code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "top-level text/html section dropped after pipelined fetch for UID \(uidValue)"]
+                        userInfo: [NSLocalizedDescriptionKey: "top-level text/html section dropped after chunked fetch for UID \(uidValue)"]
                     )
                 }
                 results[entry.id] = fullInfo
@@ -3854,6 +3916,25 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             let totalMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch DONE: \(fetchedCount) fetched, \(failedCount) failed in \(totalMs)ms (select=\(selectMs)ms, struct=\(structMs)ms, parts=\(partsMs)ms)") }
             return results
+            }
+        } catch {
+            if let messageId = metadataFetchMessageId,
+               IMAPFetchMapping.isResponseBufferOverflow(error) {
+                throw ProviderError.bodyIndexingUnsupported(
+                    messageId: messageId,
+                    observedUidValidity: partialFetchObservedUidValidity,
+                    fetchedRfc822MessageId: nil
+                )
+            }
+            if let messageId = partialFetchMessageId,
+               IMAPFetchMapping.isDeterministicPartialFetchFailure(error) {
+                throw ProviderError.bodyIndexingUnsupported(
+                    messageId: messageId,
+                    observedUidValidity: partialFetchObservedUidValidity,
+                    fetchedRfc822MessageId: partialFetchRfc822MessageId
+                )
+            }
+            throw error
         }
     }
 
@@ -5221,13 +5302,25 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     /// Fetch a single attachment's data by MIME section.
-    func fetchAttachment(messageId: String, folder: String, section: String, encoding: String?) async throws -> Data {
+    func fetchAttachment(
+        messageId: String,
+        folder: String,
+        section: String,
+        encoding: String?,
+        expectedObservedUidValidity: Int?,
+        expectedRfc822MessageId: String?
+    ) async throws -> Data {
         // Compound path: attachment nested inside a file-uploaded `.eml`.
         // Re-fetch parent `.eml` bytes, parse, return the nth nested payload.
         // One extra IMAP fetch per tap — the parse happens in-process.
         if let nested = EmlParsing.parseNestedSection(section) {
             let parentBytes = try await fetchAttachment(
-                messageId: messageId, folder: folder, section: nested.parent, encoding: encoding
+                messageId: messageId,
+                folder: folder,
+                section: nested.parent,
+                encoding: encoding,
+                expectedObservedUidValidity: expectedObservedUidValidity,
+                expectedRfc822MessageId: expectedRfc822MessageId
             )
             guard let bytes = EmlParsing.nestedBytes(rawBytes: parentBytes, index: nested.index) else {
                 throw ProviderError.messageNotFound
@@ -5238,16 +5331,88 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         return try await withActionConnection(folder: folder) { server in
             // T5.3 PORT — `v2final:…:IMAPProvider.fetchAttachment` tracks this
             // re-SELECT on the action connection.
-            _ = try await self.selectMailboxTracked(server, folder: folder)
+            let selection = try await self.selectMailboxTracked(server, folder: folder)
 
             let results = try self.nativeUIDSet([messageId])
             guard let uid = results.toArray().first else { throw ProviderError.messageNotFound }
 
             let mimeSection = Section(section)
-            let rawData = try await server.fetchPart(section: mimeSection, of: uid)
+            guard let info = try await server.fetchMessageInfo(
+                for: uid,
+                options: IMAPFetchMapping.bodyFetchMetadataOptions
+            ) else {
+                throw ProviderError.messageNotFound
+            }
+            try Self.requireAttachmentFetchIdentity(
+                messageId: messageId,
+                folder: folder,
+                expectedObservedUidValidity: expectedObservedUidValidity,
+                liveUidValidity: selection.uidValidity.value,
+                expectedRfc822MessageId: expectedRfc822MessageId,
+                fetchedRfc822MessageId: IMAPFetchMapping.rfc822MessageId(from: info)
+            )
+            guard let metadata = info.parts.first(where: { $0.section == mimeSection }) else {
+                throw ProviderError.messageNotFound
+            }
+            let rawData = try await IMAPFetchMapping.concatenateEncodedPart(
+                expectedSize: metadata.size
+            ) { offset, count in
+                try await server.fetchPart(
+                    section: mimeSection,
+                    of: uid,
+                    offset: offset,
+                    count: count
+                )
+            }
 
-            let part = MessagePart(section: mimeSection, contentType: "", encoding: encoding)
+            let part = MessagePart(
+                section: mimeSection,
+                contentType: metadata.contentType,
+                encoding: encoding ?? metadata.encoding
+            )
             return rawData.decoded(for: part)
+        }
+    }
+
+    /// Bind an attachment read to the row that initiated it. A mailbox-local
+    /// UID is safe only while its UIDVALIDITY agrees; when either side lacks an
+    /// epoch, matching RFC Message-ID is the fallback positive identity proof.
+    private static func requireAttachmentFetchIdentity(
+        messageId: String,
+        folder: String,
+        expectedObservedUidValidity: Int?,
+        liveUidValidity: UInt32,
+        expectedRfc822MessageId: String?,
+        fetchedRfc822MessageId: String?
+    ) throws {
+        let expectedEpoch = expectedObservedUidValidity.flatMap(UInt32.init(exactly:))
+            .flatMap { $0 == 0 ? nil : $0 }
+        let liveEpoch = liveUidValidity == 0 ? nil : liveUidValidity
+
+        if let expectedEpoch, let liveEpoch {
+            guard expectedEpoch == liveEpoch else {
+                throw ProviderError.uidValidityChanged(
+                    folderPath: folder,
+                    stored: expectedEpoch,
+                    live: liveEpoch
+                )
+            }
+            guard !BodyAddressGate.identityContradicts(
+                stored: expectedRfc822MessageId,
+                fetched: fetchedRfc822MessageId
+            ) else {
+                throw ProviderError.actionIdentityResolutionFailed(messageId)
+            }
+            return
+        }
+
+        guard let expectedRfc822MessageId,
+              let fetchedRfc822MessageId,
+              !expectedRfc822MessageId.isEmpty,
+              !fetchedRfc822MessageId.isEmpty,
+              EmailFilter.normalizeMessageId(expectedRfc822MessageId)
+                == EmailFilter.normalizeMessageId(fetchedRfc822MessageId) else {
+            throw ProviderError.actionIdentityResolutionFailed(messageId)
         }
     }
 
@@ -5949,7 +6114,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
                     for part in textParts {
                         do {
-                            let data = try await server.fetchPart(section: part.section, of: uid)
+                            let data = try await IMAPFetchMapping.concatenateEncodedPart(
+                                expectedSize: part.size
+                            ) { offset, count in
+                                try await server.fetchPart(
+                                    section: part.section,
+                                    of: uid,
+                                    offset: offset,
+                                    count: count
+                                )
+                            }
                             var populated = part
                             populated.data = data
                             if part.contentType.lowercased().hasPrefix("text/plain"), textBody == nil {

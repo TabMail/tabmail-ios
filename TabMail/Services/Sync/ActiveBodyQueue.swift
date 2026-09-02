@@ -339,7 +339,8 @@ actor ActiveBodyQueue {
                 try Row.fetchAll(db, sql: """
                     SELECT id, accountId, folderPath, messageId, isInInbox
                     FROM messageHeader
-                    WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
+                    WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0
+                      AND bodyIndexingFailureReason IS NULL AND isInInbox = 1
                     ORDER BY date DESC
                     """)
                 .map { row in
@@ -615,7 +616,32 @@ actor ActiveBodyQueue {
 
                 } catch {
                     let desc = "\(error)"
-                    if desc.contains("PayloadTooLargeError") {
+                    if let providerError = error as? ProviderError,
+                       case .bodyIndexingUnsupported(
+                            let messageId,
+                            let observedUidValidity,
+                            let fetchedRfc822MessageId
+                       ) = providerError,
+                       let failedItem = items.first(where: { $0.messageId == messageId }) {
+                        let processorItem = BodyFetchProcessor.Item(
+                            headerId: failedItem.headerId,
+                            accountId: failedItem.accountId,
+                            folderPath: failedItem.folderPath,
+                            messageId: failedItem.messageId,
+                            isInInbox: failedItem.isInInbox
+                        )
+                        let terminalized = await BodyFetchProcessor.markBodyUnindexed(
+                            item: processorItem,
+                            reason: .partialFetchUnsupported,
+                            observedUidValidity: observedUidValidity,
+                            fetchedRfc822MessageId: fetchedRfc822MessageId
+                        )
+                        print("[ActiveBody] Partial fetch unsupported — \(terminalized ? "recorded terminal-unindexed state" : "row changed; retrying")")
+                        self.batchItemDone(item: failedItem, shouldRetry: !terminalized)
+                        for item in items where item.headerId != failedItem.headerId {
+                            self.batchItemDone(item: item, shouldRetry: true)
+                        }
+                    } else if desc.contains("PayloadTooLargeError") {
                         // Defer a genuinely single oversized item WITHOUT marking it
                         // empty; a multi-item batch isolates its members so a later
                         // dispatch slices each one singly. The decision keys on THIS
@@ -859,7 +885,8 @@ actor ActiveBodyQueue {
                 try Row.fetchAll(db, sql: """
                     SELECT id, accountId, folderPath, messageId, isInInbox
                     FROM messageHeader
-                    WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
+                    WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0
+                      AND bodyIndexingFailureReason IS NULL AND isInInbox = 1
                     ORDER BY date DESC
                     """)
                 .map { row in

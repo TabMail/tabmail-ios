@@ -1,3 +1,13 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current amendment (2026-08-31, ADR-IOS-080):** `pendingBodyCount` now selects
+> `headerComplete=1 AND bodyComplete=0 AND bodyEmptyConfirmed=0 AND
+> bodyIndexingFailureReason IS NULL`. A deterministic failure to honor validated partial IMAP
+> ranges is persisted as terminal-unindexed, counted separately by `unindexedBodyCount`, and shown
+> as `Sync complete with N messages not indexed` once runnable work drains. Such rows are never
+> confirmed empty and never marked indexed; Smart Reindex clears the reason for an explicit retry.
+> This supersedes the preserved body's claim that every eligible row is self-terminating through
+> success/empty and its reference to oversized bodies as confirmed-empty.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ### Backfill / Fast Sync Completion — gate on `pendingBodyCount`, NEVER a server total
 - **`BackfillProgress.isFullyComplete` gates on `headersDone && totalEmails > 0 && pendingBodyCount == 0`** (`AccountManager.swift`). `pendingBodyCount` = body-eligible headers still awaiting fetch (`headerComplete=1 AND bodyComplete=0 AND bodyEmptyConfirmed=0`), the same criteria `BackfillBodyQueue`/`ActiveBodyQueue` select on. It is local and self-terminating (empty/404/oversized bodies confirm-empty), so it reaches 0 once the body queues have nothing fetchable left.
