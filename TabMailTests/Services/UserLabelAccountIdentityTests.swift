@@ -335,6 +335,15 @@ struct UserLabelIdentityMigrationTests {
     }
 
     @discardableResult
+    /// ⚠️ Inserts with an EXPLICIT COLUMN LIST, not `MessageHeader.insert`. This
+    /// database is stopped at v81 on purpose, so writing the CURRENT model breaks the
+    /// moment any later migration adds a column — "table messageHeader has no column
+    /// named …", which reads as a migration bug rather than as a fixture that outgrew
+    /// its schema. Naming the v81-era columns pins the fixture to the version under
+    /// test. Same reasoning as `insertPreV77Header` in `DatabaseMigrationTests`.
+    ///
+    /// The returned value is a convenience for its `id` and is NOT read back from the
+    /// database.
     private static func insertHeader(_ db: DatabaseQueue, accountId: String, uid: String) throws -> MessageHeader {
         var header = MessageHeader(
             messageId: uid, subject: "v82 fixture", from: "Sender",
@@ -343,8 +352,20 @@ struct UserLabelIdentityMigrationTests {
             folderId: "\(accountId):INBOX", accountId: accountId,
             folderPath: "INBOX", isInInbox: true)
         header.headerComplete = true
-        let toInsert = header
-        try db.write { try toInsert.insert($0) }
+        let row = header
+        try db.write { conn in
+            try conn.execute(sql: """
+                INSERT INTO messageHeader
+                    (id, folderId, accountId, folderPath, isInInbox, messageId,
+                     subject, `from`, fromAddress, `to`, date, snippet,
+                     headerComplete, tagSortOrder)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 99)
+                """, arguments: [
+                    row.id, row.folderId, row.accountId, row.folderPath,
+                    row.isInInbox, row.messageId, row.subject, row.from,
+                    row.fromAddress, row.to, row.date, row.snippet,
+                ])
+        }
         return header
     }
 

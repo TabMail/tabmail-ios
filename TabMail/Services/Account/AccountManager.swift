@@ -19,7 +19,12 @@ struct BackfillProgress {
 
     /// Total emails in FTS for this account (denominator — grows while headers are crawled)
     var totalEmails: Int = 0
-    /// Emails with non-empty FTS body for this account (numerator)
+    /// Emails whose body question is SETTLED for this account (numerator).
+    ///
+    /// Historically "emails with a non-empty FTS body", which is no longer what it
+    /// counts: it is `MessageHeader.bodySettledRequest`, i.e. fetched OR confirmed-empty
+    /// OR quarantined by the oversized-metadata flag. The name is kept because it is the
+    /// published field; read the request for the definition.
     var ftsIndexed: Int = 0
 
     /// UID-based progress (IMAP): total UIDs across all folders (sum of UIDNEXT-1)
@@ -28,11 +33,15 @@ struct BackfillProgress {
     var uidWalked: Int = 0
 
     /// Count of body-eligible headers still awaiting fetch — `headerComplete=1`,
-    /// no body yet, not confirmed-empty. Matches the selection criteria the body
-    /// queues use (BackfillBodyQueue/ActiveBodyQueue). The backfill body phase is
-    /// done when this reaches 0. Used for completion INSTEAD of `ftsIndexed >=
-    /// totalEmails`, because `totalEmails` can be a server-reported count that
-    /// counts a different population than what we store (see `isFullyComplete`).
+    /// no body yet, not confirmed-empty, and not quarantined by the
+    /// oversized-metadata flag. The definition lives in
+    /// `MessageHeader.pendingBodyRequest`; it matches the selection criteria the body
+    /// queues use (`ActiveBodyQueue.admissionSQL` / `BackfillBodyQueue.admissionSQL`),
+    /// which is what makes "reaches 0" mean "the queues have nothing left to offer".
+    /// The backfill body phase is done when this reaches 0. Used for completion INSTEAD
+    /// of `ftsIndexed >= totalEmails`, because `totalEmails` can be a server-reported
+    /// count that counts a different population than what we store (see
+    /// `isFullyComplete`).
     var pendingBodyCount: Int = 0
 
     // EMA rate tracking — messages per second.
@@ -63,8 +72,17 @@ struct BackfillProgress {
     /// it's the dedup'd `messagesTotal` vs. our per-label rows. It can permanently
     /// exceed what we can ever store, so an `ftsIndexed >= totalEmails` gate would
     /// never be satisfiable and "Sync Complete" would never fire. `pendingBodyCount`
-    /// is local and self-terminating (empty/404/oversized bodies confirm-empty),
-    /// so it reaches 0 once the body queues have nothing fetchable left.
+    /// is local and self-terminating, so it reaches 0 once the body queues have nothing
+    /// fetchable left.
+    ///
+    /// ⚠️ "Self-terminating" is not one mechanism. Empty and 404 bodies terminate by
+    /// CONFIRMING EMPTY (`bodyEmptyConfirmed = 1`, after three attempts). An OVERSIZED
+    /// body does the opposite — the content demonstrably exists, so confirming it empty
+    /// would be a data-integrity-rule-1 violation, and it terminates by being
+    /// QUARANTINED (`bodyMetadataOversized = 1`) instead. This comment used to lump all
+    /// three together as "confirm-empty"; that conflation is exactly what the quarantine
+    /// exists to undo, and it is how a permanently searchable-but-unopenable message got
+    /// shipped once already.
     var isFullyComplete: Bool {
         headersDone && totalEmails > 0 && pendingBodyCount == 0
     }

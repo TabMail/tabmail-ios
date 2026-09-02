@@ -152,6 +152,17 @@ extension SyncEngine {
         }
     }
 
+    /// The candidate scope, hoisted so the divergence documented on
+    /// `selfHealBackfillFTSMembership` has a pin that can actually fail. A transcribed
+    /// copy in a test asserts nothing about production: it stays green while the two
+    /// drift, which is precisely the regression that note warns against. Same reasoning
+    /// as `ActiveBodyQueue.admissionSQL`.
+    nonisolated static let backfillFTSSelfHealCandidateSQL = """
+        SELECT id FROM messageHeader
+        WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0
+        LIMIT 5000
+        """
+
     /// Sister of `selfHealFTSBodyMembership` for the backfill queue's scope:
     /// headers where `headerComplete=1` (so backfill will pick them up) but
     /// the FTS index has no row. Without this, `updateBodies` silently defers,
@@ -162,6 +173,23 @@ extension SyncEngine {
     ///
     /// Fix: re-index the header. Body queue's next dispatch will succeed.
     /// No `bodyComplete` reset needed (already 0). Runs once per startup.
+    /// ⚠️ "next dispatch will succeed" is no longer true of the whole scope, and the
+    /// exception is the subset the paragraph below deliberately keeps in it: for a row
+    /// carrying `bodyMetadataOversized = 1` there is NO next dispatch, because
+    /// `admissionSQL` has stopped returning it. Re-indexing its header is still the right
+    /// thing — that is what keeps it searchable — but the body arrives only when a
+    /// release fires (pull-to-refresh, Smart Reindex, a UIDVALIDITY reset, a success
+    /// write, or the bound-raising migration), never from this function. Named because a
+    /// correction that does not sweep its own restatements leaves the false half in
+    /// place. (Found by audit.)
+    ///
+    /// ⚠️ This scope DELIBERATELY omits `bodyMetadataOversized`, unlike the four body
+    /// -queue admission queries. It re-indexes HEADERS, and an oversized row's header is
+    /// perfectly healthy — dropping it here would make a quarantined message
+    /// unsearchable by subject and sender, which is a strictly larger loss than the
+    /// missing body. The two predicates diverged when that flag shipped; do not
+    /// re-merge them. Pinned by `OversizedDurableFlagConfinementTests
+    /// .ftsSelfHealStillSeesFlaggedRows`.
     func selfHealBackfillFTSMembership() async {
         do {
             // Same pattern as `selfHealFTSBodyMembership`: fetch only IDs first,
@@ -169,11 +197,7 @@ extension SyncEngine {
             // missing so avoiding 5000-row full-model allocation on every launch
             // is the win here.
             let candidateIds: [String] = try await dbPool.read { db in
-                try String.fetchAll(db, sql: """
-                    SELECT id FROM messageHeader
-                    WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0
-                    LIMIT 5000
-                    """)
+                try String.fetchAll(db, sql: Self.backfillFTSSelfHealCandidateSQL)
             }
             guard !candidateIds.isEmpty else { return }
 
@@ -326,8 +350,16 @@ extension SyncEngine {
                 guard !toHeal.isEmpty else { continue }
                 try await AppDatabase.backgroundPool.write { db in
                     let placeholders = toHeal.map { _ in "?" }.joined(separator: ",")
+                    // `bodyMetadataOversized = 0` rides along, like every other success
+                    // write. These rows were selected BECAUSE their FTS body text exists,
+                    // which is the positive evidence that refutes a recorded parser-overflow
+                    // observation against them — and leaving the flag set on a row this
+                    // statement is about to mark `bodyComplete = 1` would strand it in the
+                    // one state no gate can see: `markBodyMetadataOversized`'s
+                    // `AND bodyComplete = 0` guard and `isBodyQuarantined`'s `&& !bodyComplete`
+                    // fail-safe are both keyed on the row being incomplete. (Found by audit.)
                     try db.execute(
-                        sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE id IN (\(placeholders))",
+                        sql: "UPDATE messageHeader SET bodyComplete = 1, bodyMetadataOversized = 0 WHERE id IN (\(placeholders))",
                         arguments: StatementArguments(toHeal)
                     )
                 }

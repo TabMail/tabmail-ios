@@ -2,7 +2,7 @@
 
 **Class:** documentation / verification
 **Severity:** high
-**First seen:** 2026-08-04 · **Recurrences:** 8 (**8: appended a two-line citation note as BARE MARKDOWN to the GENERATED, byte-frozen `Companion/Process/Current/KnownIssues/ios-billing-001.md` (`a6f395517`), breaking `compact_known_issues.rb verify` from 2026-08-18 until `fb5d498a2` this morning — and `Companion/Memory/Current/115-known-issues-register-is-byte-frozen-and-has-no-append-path.md` ALREADY DOCUMENTED THAT EXACT HAZARD. The knowledge existed and was not reachable at the moment it was needed; see "Instance 8" at the end.** **7: killed `verify` with a GLOB — `…/KnownIssues/ios-*.md` written into a Ruby comment, by the exact mechanism the note below this line already describes; see "Instance 7" at the end.** **6: broke again the DAY AFTER instance 5 was repaired — see "Instance 6" at the end.** 5: was fail-open for two days — `345c04a6f` edited a preserved body and `verify` aborted on its FIRST check from 2026-08-10 to 2026-08-12, silently disabling the ADR census, routing, link, pointer and budget checks. ✅ REPAIRED 2026-08-12 the prescribed way — body restored byte-for-byte from the pinned source, amendment moved into a `COMPANION-CURRENT-NOTE` wrapper, SHA **not** re-pinned. See "Instance 5 — resolution" at the end of this file**) · **Status:** Active
+**First seen:** 2026-08-04 · **Recurrences:** 9 (**9: edited the preserved body of `Companion/Memory/Current/030-backfill-fast-sync-completion-gate-on-pendingbodycount-never-a-server-to.md` to correct a `pendingBodyCount` predicate the oversized-quarantine stop-gap had changed — a FACTUALLY CORRECT amendment in the WRONG PLACE. `verify` aborted on its first gate (`hash mismatch:`), hiding nine downstream checks. Caught by a round-5 review specialist, not by me; see "Instance 9" at the end.** **8: appended a two-line citation note as BARE MARKDOWN to the GENERATED, byte-frozen `Companion/Process/Current/KnownIssues/ios-billing-001.md` (`a6f395517`), breaking `compact_known_issues.rb verify` from 2026-08-18 until `fb5d498a2` this morning — and `Companion/Memory/Current/115-known-issues-register-is-byte-frozen-and-has-no-append-path.md` ALREADY DOCUMENTED THAT EXACT HAZARD. The knowledge existed and was not reachable at the moment it was needed; see "Instance 8" at the end.** **7: killed `verify` with a GLOB — `…/KnownIssues/ios-*.md` written into a Ruby comment, by the exact mechanism the note below this line already describes; see "Instance 7" at the end.** **6: broke again the DAY AFTER instance 5 was repaired — see "Instance 6" at the end.** 5: was fail-open for two days — `345c04a6f` edited a preserved body and `verify` aborted on its FIRST check from 2026-08-10 to 2026-08-12, silently disabling the ADR census, routing, link, pointer and budget checks. ✅ REPAIRED 2026-08-12 the prescribed way — body restored byte-for-byte from the pinned source, amendment moved into a `COMPANION-CURRENT-NOTE` wrapper, SHA **not** re-pinned. See "Instance 5 — resolution" at the end of this file**) · **Status:** Active
 **Related:** [MIS-IOS-006](MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md); **MIS-023** and
 **MIS-027** in the monorepo-root tree (`rg -n 'MIS-023|MIS-027' ../MISTAKES.md`) — both are the same
 shape: reading a number instead of reading how far the run got.
@@ -549,3 +549,36 @@ rg -n --fixed-strings "$(basename "$REL_PATH")" Companion/Process/Current/KnownI
 #   <!-- KNOWN-ISSUES-AMENDMENT-END -->
 # Tail position needs a blank line INSIDE the block and none before BEGIN — see memory topic 115.
 ```
+
+
+---
+
+## Instance 9 — 2026-09-02, and the tell was *"this line is now wrong"*
+
+**What happened.** The oversized-metadata quarantine stop-gap added a fourth conjunct to
+`pendingBodyCount`'s predicate and changed how an oversized body terminates. Memory fragment
+`030-backfill-fast-sync-completion-gate-…md` stated the OLD predicate and said oversized bodies
+"confirm-empty" — a conflation that is now a data-integrity-rule-1 violation. So I edited the two
+lines in place. Both edits were correct; the location was not. The fragment is row `order 30` of
+`Companion/Memory/manifest.tsv` with `sha256 a4cd0ab1…`, and `exact_body` strips only a LEADING
+`COMPANION-CURRENT-NOTE` wrapper, so my bytes were hashed. `verify` `abort`ed at
+`verify_manifest("PROJECT_MEMORY.md", …)` — its FIRST gate — so the `DECISIONS.md` manifest, the ADR
+census, ported-decision and ported-memory checks, memory links, Markdown links, repository companion
+references and the index-budget report all silently stopped running.
+
+**The tell, and it is the same tell every time:** *"this documented line is now wrong, and I am the
+one who made it wrong."* That is exactly the moment the wrapper exists for, and exactly the moment
+the urge to just fix the sentence is strongest. Being RIGHT about the content is not evidence that
+the edit is legal — instances 5 and 8 were both correct content too.
+
+**Repair (the prescribed one, unchanged since instance 5).** Restore the preserved body byte-for-byte
+from the pinned source, move the amendment into a LEADING
+`<!-- COMPANION-CURRENT-NOTE-BEGIN --> … <!-- COMPANION-CURRENT-NOTE-END -->` block, do **not**
+re-pin `manifest.tsv`. Verified: the stripped body hashes back to `a4cd0ab1…`, and `verify` now
+reports both trees `byte-identical` with `grep -c "hash mismatch"` = 0.
+
+⚠️ **One trap while verifying this repair:** run the verifier from the PRIMARY checkout, or expect a
+false failure. `verify`'s Markdown-link check resolves `PROJECT_MEMORY.md`'s `../CLAUDE.md` against
+the monorepo root, which exists at `tabmail-ios/../CLAUDE.md` but NOT at
+`.worktrees/<name>/../CLAUDE.md`. In a worktree that link check fails and `rc=1` even when every hash
+is clean — so read the failure lines, never just the return code.

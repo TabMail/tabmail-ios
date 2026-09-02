@@ -6,6 +6,102 @@ import Foundation
 import GRDB
 import UIKit
 
+/// The refusal classes `AccountManagerFetch.fetchBody` can throw, and the two facts a
+/// caller needs about each: the user-facing sentence, and whether anything in the
+/// background could still produce this body.
+///
+/// This exists because `MessageDetailViewModel` has to make that second decision.
+/// `loadBody` ends with `if messageBody == nil { startBodyPoll() }`, a 2s cadence that
+/// calls `fetchBody` directly. For a refusal nothing will retract, that loop pays a full
+/// TCP + TLS + LOGIN + SELECT every two seconds for as long as the detail view lives
+/// (`bodyPollTask` is cancelled only in `deinit`) — with no bound, since `fetchAttempt`
+/// is logging only. Matching the refusal by its user-facing string would tie control flow
+/// to copy; matching it by a bare `-1` would be the hardcoded numeric value the repo bans.
+///
+/// ⚠️ `payloadTooLarge` is terminal for the POLL, never for the user. An overflow is an
+/// observation about one wire attempt — the parser's bound is on unread aggregate bytes
+/// measured after the decode loop stops, so it is fragmentation-dependent — and
+/// pull-to-refresh (`replaceExistingBody: true`) is exempt at the funnel and still reaches
+/// the wire. Ending the poll removes the doomed cadence, not the retry.
+enum BodyFetchRefusal {
+    static let domain = "TabMail"
+
+    /// The metadata FETCH overflowed the parser on this attempt.
+    static let payloadTooLarge = -1
+    /// A transient failure the caller may retry.
+    static let retryable = -2
+    /// A previously observed overflow is recorded durably against this row.
+    static let quarantined = -4
+    // -3 is deliberately vacant. It used to be `addressInFlight`, carrying a byte-identical
+    // copy of `ProviderError.addressPendingMove`'s user-facing sentence. The funnel now
+    // throws that typed case directly — the same one `fetchAttachment` throws roughly a
+    // hundred lines below, and the one `ComposeView` matches BY TYPE. Two independent
+    // copies of one recovery instruction is the `IOS-BODY-005` failure shape (its sentence
+    // took three attempts to get right, each wrong one caught by a separate audit round),
+    // and a caller copying `ComposeView`'s idiom around a body fetch would silently have
+    // failed to match an NSError encoding. The number is left unused rather than reassigned
+    // so a stale `-3` anywhere cannot quietly acquire a new meaning. (Found by audit.)
+
+    static let payloadTooLargeMessage = "This message is too large to display."
+    static let retryableMessage = "Failed to load message. Please try again."
+    /// Shared TEXT for the funnel's refusal, `loadBody`'s quarantine branch and the
+    /// poll's — not a shared rendered string, and on the detail surface not a shipped
+    /// one either. Two qualifications, both established by audit:
+    ///
+    /// 1. `error(_:_:)` wraps the message in `ProviderError.networkError`, whose
+    ///    `errorDescription` is `"Network error: \(underlying.localizedDescription)"`. So
+    ///    a refusal that reaches the user through a caller's `error.localizedDescription`
+    ///    carries that prefix, while the two branches that assign this constant directly
+    ///    do not. For −1 and −2 the prefix is INHERITED — they have always been wrapped
+    ///    this way — and is left alone rather than unwrapped at one call site, which
+    ///    would trade a visible inconsistency for an invisible one. ⚠️ −4 is NOT
+    ///    inherited: `BodyFetchRefusal.quarantined` is introduced by this change, so the
+    ///    prefix on it is a deliberate choice to MATCH −1/−2 rather than a legacy left
+    ///    undisturbed. An earlier version of this sentence said all three had "always"
+    ///    been wrapped, which would have licensed the new class on an argument that did
+    ///    not cover it. (Found by audit.)
+    /// 2. `MessageCardView` renders `viewModel.error` only under
+    ///    `DebugModeManager.isLoggingEnabled()`; a Release user sees its generic
+    ///    "Unable to load message. Pull to retry." instead — which names the one path
+    ///    that is exempt at the funnel. These constants are therefore the DEBUG-surface
+    ///    text on that screen. Do not reword them expecting a user-visible change.
+    static let quarantinedMessage = "Unable to load this message's content."
+
+    static func error(_ code: Int, _ message: String) -> ProviderError {
+        ProviderError.networkError(
+            underlying: NSError(domain: domain, code: code,
+                userInfo: [NSLocalizedDescriptionKey: message]))
+    }
+
+    /// True when no background path can produce this body, so a poll would only repeat a
+    /// refusal.
+    ///
+    /// `retryable` (−2) is deliberately NOT included, and the mid-move refusal is excluded
+    /// structurally rather than by omission: it is `ProviderError.addressPendingMove`, not
+    /// a `.networkError`, so it fails the first `guard`. Both exclusions say the same
+    /// thing — a transient failure clearing, or a move completing, IS the state change the
+    /// poll is waiting for, so ending the poll on either would delete the poll's entire
+    /// reason to exist. Pinned by `bodyFetchRefusalEndsPollingOnlyForTerminalClasses`,
+    /// which walks every class rather than relying on a control that exits at the first
+    /// guard. (Found by audit.)
+    ///
+    /// ⚠️ `payloadTooLarge` matters here for a state the durable flag cannot cover. Both
+    /// `BodyFetchProcessor.markBodyMetadataOversized`'s `AND bodyComplete = 0` guard and
+    /// `MessageHeader.isBodyQuarantined`'s `&& !bodyComplete` fail-safe are keyed on the
+    /// row being incomplete — deliberately, so an evicted-but-fetched row can still
+    /// recover. A row that WAS fetched, whose `messageBody` was then evicted by
+    /// `BodyAssetMaintenance` (which leaves `bodyComplete = 1` by design), and whose
+    /// re-fetch now overflows is therefore invisible to the flag at every site: nothing
+    /// records it and nothing gates on it. Without this check that row polls forever.
+    /// (Found by audit.)
+    static func endsPolling(_ error: Error) -> Bool {
+        guard case ProviderError.networkError(let underlying) = error else { return false }
+        let ns = underlying as NSError
+        guard ns.domain == domain else { return false }
+        return ns.code == payloadTooLarge || ns.code == quarantined
+    }
+}
+
 extension AccountManager {
 
     // MARK: - Stale Header Eviction
@@ -100,7 +196,11 @@ extension AccountManager {
         for message: MessageHeader,
         replaceExistingBody: Bool = false
     ) async throws {
-        print("[FetchBody] Opening: id=\(message.id.prefix(40)) msgId=\(message.messageId.prefix(30)) folder=\(message.folderPath)")
+        // Debug-gated (rule 12). Pre-existing and ungated until this change: it is a
+        // diagnostic, and `folderPath` is a user-authored custom folder name.
+        if DebugModeManager.isLoggingEnabled() {
+            print("[FetchBody] Opening: id=\(message.id.prefix(40)) msgId=\(message.messageId.prefix(30)) folder=\(message.folderPath)")
+        }
 
         // Body already loaded — nothing to do
         let hasBody = (try? await dbPool.read { db in try MessageBody.fetchOne(db, key: message.id) != nil }) ?? false
@@ -117,11 +217,55 @@ extension AccountManager {
         // converges here; the caller-side check now only decides which UI state to show.
         // (Found by audit.)
         if await bodyFetchIsBlockedByPendingAddress(for: message) {
-            print("[MoveTrace] fetchBody — address not corroborated (move in flight), skipping fetch for \(message.id.prefix(40))")
-            throw ProviderError.networkError(
-                underlying: NSError(domain: "TabMail", code: -3,
-                    userInfo: [NSLocalizedDescriptionKey: "This message is still being moved. Go back to the message list and open it again in a moment."])
-            )
+            // Debug-gated (rule 12), like its sibling at the top of this function.
+            // Pre-existing and ungated until this change: gating one and leaving the other
+            // makes the function read as compliant while it still logs in Release.
+            if DebugModeManager.isLoggingEnabled() {
+                print("[MoveTrace] fetchBody — address not corroborated (move in flight), skipping fetch for \(message.id.prefix(40))")
+            }
+            // The SAME typed case `fetchAttachment` throws for the same condition, so the
+            // two mid-move refusals cannot drift apart and a `case ProviderError
+            // .addressPendingMove` match works against either. Behaviour at both
+            // `fetchBody` call sites is unchanged: `fetchBodyWithRetry` retries only
+            // `messageNotFound` and `SyncEngine.isConnectionError`, and neither matches
+            // this case nor the `NSError(domain: "TabMail", code: -3)` it replaces.
+            throw ProviderError.addressPendingMove(message.id)
+        }
+
+        // Oversized-metadata quarantine: the last observed attempt at this message's
+        // metadata FETCH overflowed the parser. A retry costs a full TCP + TLS + LOGIN +
+        // SELECT, because `IMAPProvider.withFolderConnection` classifies
+        // `PayloadTooLargeError` as unhealthy and tears the folder connection down — a cost
+        // also paid by whatever else was using that connection. Refuse before the wire.
+        //
+        // ⚠️ **At the funnel, for the same reason the address gate above is.** Caller-side
+        // gates alone were not enough: `MessageDetailViewModel.loadBody` checks the flag,
+        // but `startBodyPoll` reaches this function directly on a 2s cadence, and
+        // `loadThreadMessageBody` — a collapsed thread bubble the user expands — had no
+        // check at all and paid the round trip on every tap, swallowing the failure into a
+        // debug print. The caller-side checks now only decide which UI state to show.
+        // (Found by audit.)
+        //
+        // Read FRESH rather than trusting the caller's `message`: a body queue can flag the
+        // row while a detail view is open, and callers hold headers of varying age.
+        //
+        // `replaceExistingBody` is the deliberate escape hatch, and it is load-bearing:
+        // pull-to-refresh is the ONE path that must still reach the wire. An overflow is an
+        // observation about a single wire attempt — the parser's bound is on unread
+        // aggregate bytes measured after the decode loop stops, so it is
+        // fragmentation-dependent, not size-deterministic — never a verdict that the body is
+        // unfetchable. Without this exemption the flag would be unfalsifiable by the user.
+        if !replaceExistingBody {
+            let quarantined: Bool = (try? await dbPool.read { db in
+                try MessageHeader.fetchOne(db, key: message.id)?.isBodyQuarantined ?? false
+            }) ?? false
+            if quarantined {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[FetchBody] Refused — body quarantined (oversized metadata FETCH) for \(message.id.prefix(40))")
+                }
+                throw BodyFetchRefusal.error(
+                    BodyFetchRefusal.quarantined, BodyFetchRefusal.quarantinedMessage)
+            }
         }
 
         // Ensure provider exists
@@ -159,15 +303,11 @@ extension AccountManager {
         case .success, .confirmedEmpty:
             break
         case .payloadTooLarge:
-            throw ProviderError.networkError(
-                underlying: NSError(domain: "TabMail", code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "This message is too large to display."])
-            )
+            throw BodyFetchRefusal.error(
+                BodyFetchRefusal.payloadTooLarge, BodyFetchRefusal.payloadTooLargeMessage)
         case .retry:
-            throw ProviderError.networkError(
-                underlying: NSError(domain: "TabMail", code: -2,
-                    userInfo: [NSLocalizedDescriptionKey: "Failed to load message. Please try again."])
-            )
+            throw BodyFetchRefusal.error(
+                BodyFetchRefusal.retryable, BodyFetchRefusal.retryableMessage)
         }
     }
 

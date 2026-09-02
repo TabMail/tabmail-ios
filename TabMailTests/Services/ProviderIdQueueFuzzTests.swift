@@ -1033,9 +1033,30 @@ struct ProviderIdQueueFuzzTests {
             await provider.createFolderConnectionCreationTestHook == nil,
             "folder-creation chaos hook survived teardown",
             sourceLocation: sourceLocation)
+        // `provider.disconnect()` returns once the CLIENT side has closed its
+        // socket. The fake server drops the fd from `loggedInFds` on its own
+        // `handleClient` thread, in `closeClientFd`, when it observes that close —
+        // nothing synchronises the two, so reading the count immediately is a race
+        // that a loaded machine loses. Measured on a full-suite run at load average
+        // ~140: `liveSessionCount()` read 1 immediately, healed to 0 after 50ms,
+        // with `abandonedSessionCount() == 0` — nothing had actually been
+        // abandoned, the oracle had simply looked too early.
+        //
+        // So wait for the transport to settle, bounded: a session that is genuinely
+        // left live never heals and still fails here. This does not weaken the
+        // abandoned-session invariant, which `abandonedSessionCount()` pins exactly
+        // and monotonically (it never heals, by construction) for the callers that
+        // assert it.
+        var live = server.liveSessionCount()
+        var settleWaitMs = 0
+        while live != 0 && settleWaitMs < 2000 {
+            try? await Task.sleep(for: .milliseconds(25))
+            settleWaitMs += 25
+            live = server.liveSessionCount()
+        }
         #expect(
-            server.liveSessionCount() == 0,
-            "provider disconnect returned with a live fake-server session",
+            live == 0,
+            "provider disconnect left a live fake-server session unclosed after \(settleWaitMs)ms",
             sourceLocation: sourceLocation)
     }
 

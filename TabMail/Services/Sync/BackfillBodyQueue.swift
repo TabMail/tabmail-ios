@@ -22,6 +22,40 @@ actor BackfillBodyQueue {
         let isInInbox: Bool
     }
 
+    /// The SOLE admission query for this queue: every row that still needs a body
+    /// fetch, in the order the queue wants them. Hoisted into ONE symbol because it
+    /// has three consumers that must never diverge — `repopulateFromDatabase`
+    /// (launch / foreground / sync recovery), `repopulateOnDrain` (the drain-time
+    /// safety net), and the tests that assert what the queue will and will not admit.
+    /// Two byte-identical copies plus a test replica meant the `bodyMetadataOversized`
+    /// quarantine had to be added in three places and could be silently dropped from
+    /// one of them; a test replica in particular can keep passing while production
+    /// admits a row it should refuse.
+    ///
+    /// `bodyMetadataOversized = 0` is the quarantine gate — see
+    /// `MessageHeader.bodyMetadataOversized` for the full CLEARED enumeration.
+    nonisolated static let admissionSQL = """
+        SELECT id, accountId, folderPath, messageId, isInInbox
+        FROM messageHeader
+        WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 0
+          AND bodyMetadataOversized = 0
+        ORDER BY date DESC
+        """
+
+    /// Runs `admissionSQL` and maps it to queue items. Synchronous — the caller owns
+    /// the `dbPool.read`, so this stays usable from any read the callers already have.
+    nonisolated static func admissionItems(_ db: Database) throws -> [Item] {
+        try Row.fetchAll(db, sql: admissionSQL).map { row in
+            Item(
+                headerId: row["id"],
+                accountId: row["accountId"],
+                folderPath: row["folderPath"],
+                messageId: row["messageId"],
+                isInInbox: row["isInInbox"]
+            )
+        }
+    }
+
     private var storage = QueueStorage<Item>()
 
     private var debounceTask: Task<Void, Never>?
@@ -74,23 +108,53 @@ actor BackfillBodyQueue {
     /// the clear and re-inserting the stale OLD-epoch headerId.
     private var resetGeneration = 0
 
-    /// Process-lifetime set of headerIds deferred because their body overflowed the
-    /// fixed NIO buffer (`PayloadTooLargeError` — size-deterministic per binary).
+    /// Process-lifetime set of headerIds deferred because their metadata FETCH
+    /// overflowed the IMAP response parser's buffer (`PayloadTooLargeError`).
+    ///
+    /// ⚠️ CORRECTION: this was documented as "size-deterministic per binary". It is
+    /// NOT. The bound is on unread AGGREGATE bytes measured after the decode loop
+    /// stops, so it depends on how the response happened to fragment on the wire —
+    /// the same message can overflow on a lossy link and parse fine on WiFi. Nothing
+    /// here may treat an overflow as a verdict that the body is unfetchable.
     ///
     /// ⚑ THIS IS A BOUNDED, VISIBLE, RETRYABLE QUARANTINE — NOT A DISCARD. The DB
     /// row is left honestly `bodyComplete = 0 / bodyEmptyConfirmed = 0`, so it stays
-    /// in every work-remaining query, stays visible to `StuckMessageDiagnostics`, and
-    /// stays fetchable by the on-demand user-open path (`BodyFetchProcessor
-    /// .fetchAndProcess`, which never consults this set). Only the BACKGROUND
-    /// pre-fetch is suppressed, and only until one of its three releases fires:
-    ///   1. process relaunch — the set starts empty, so a new binary (whose NIO
-    ///      buffer may be larger) gets one fresh attempt per item;
+    /// visible to `StuckMessageDiagnostics`, keeps its FTS-indexed header, and stays
+    /// fetchable by an explicit user retry (`MessageDetailViewModel.refetchBody` →
+    /// `BodyFetchProcessor.fetchAndProcess`, which never consults this set).
+    ///
+    /// ⚠️ What the durable flag DOES suppress, beyond the background pre-fetch, since
+    /// the owner decision of 2026-09-01: backfill progress counts a flagged row as
+    /// resolved (so "Sync Complete" can fire), and simply OPENING the message reports
+    /// "unable to load" without a wire attempt. Both are documented in full on
+    /// `MessageHeader.bodyMetadataOversized`. The in-memory set below is unchanged by
+    /// that decision — it still governs only the background pre-fetch, and only until
+    /// one of its three releases fires:
+    ///   1. ⛔ NO LONGER RELAUNCH. The set still starts empty, but the durable
+    ///      `messageHeader.bodyMetadataOversized` flag written beside every insert
+    ///      below now keeps the row out of the admission queries across launches.
+    ///      Relaunch-as-release was the re-fetch loop: every launch re-fetched every
+    ///      oversized message and failed again, and each failure tears the connection
+    ///      down (`withFolderConnection` treats `PayloadTooLargeError` as unhealthy),
+    ///      so the next attempt pays a full TCP + TLS + LOGIN + SELECT.
+    ///      Its PURPOSE — "a new binary whose parser buffer is larger deserves a
+    ///      fresh attempt" — is preserved and made exact: the migration that ships
+    ///      the raised bound clears the flag in ONE statement
+    ///      (`UPDATE messageHeader SET bodyMetadataOversized = 0
+    ///        WHERE bodyMetadataOversized = 1`), which is possible only because every
+    ///      row carrying the flag was written by this code. One targeted retry when
+    ///      the bound actually changes, instead of a retry every launch forever;
     ///   2. a UIDVALIDITY reset for the folder — `clearOversizedDeferred`;
     ///   3. a UID remap / cross-folder move — that mints a NEW headerId which is not
-    ///      in this set, so `admit` takes it.
-    /// NOT cleared per drain cycle: a size-deterministic oversize cannot become
-    /// fetchable mid-process, so re-attempting it every cycle is exactly the hot loop
-    /// this set exists to stop. `private(set)` so tests can assert membership.
+    ///      in this set, so `admit` takes it. ⚠️ IN-MEMORY HALF ONLY: the durable flag
+    ///      is copied onto the new row (`MessageHeaderRekey.apply` carries the whole
+    ///      row), so a re-key does NOT release the quarantine. `admit` never consults
+    ///      the durable flag, but `admissionSQL` does, so the row is still refused at
+    ///      admission. The write-side guard against a MISATTRIBUTED mark is in
+    ///      `BodyFetchProcessor.markBodyMetadataOversized`, not here.
+    /// NOT cleared per drain cycle: re-attempting every cycle is exactly the hot loop
+    /// this set exists to stop, and a fresh fragmentation roll is not worth a
+    /// connection teardown per attempt. `private(set)` so tests can assert membership.
     private(set) var oversizedDeferredThisSession: Set<String> = []
 
     // Background-tagged: deep-backfill body writes (partition/cleanup flag flips)
@@ -159,11 +223,17 @@ actor BackfillBodyQueue {
     /// deferred oversized item for the whole process lifetime.
     ///
     /// The gate itself: skip a headerId already deferred as oversized so a deferred item is
-    /// never re-admitted this process lifetime. The repopulate/drain SELECTs still
-    /// return the row (`bodyComplete = 0 / bodyEmptyConfirmed = 0` is truthfully
-    /// retryable — the row is NOT lied about), but this gate keeps it out of the
-    /// queue, which is what stops the repopulate → dispatch → overflow → repopulate
-    /// hot loop. Returns true iff the item was actually enqueued.
+    /// never re-admitted this process lifetime.
+    ///
+    /// ⚠️ This comment used to say the repopulate/drain SELECTs "still return the row"
+    /// and that this gate is what stops the repopulate → dispatch → overflow →
+    /// repopulate hot loop. That is no longer the whole truth: once the dispatched
+    /// durable write commits, `admissionSQL`'s `AND bodyMetadataOversized = 0` stops
+    /// returning an oversized row at all, and that SQL half is the only one that
+    /// survives a relaunch. This set covers the window BEFORE the write commits, and
+    /// the live enqueue producers the SELECTs never see. A row deferred for any OTHER
+    /// reason is still returned by the SELECTs and still held out only here.
+    /// Returns true iff the item was actually enqueued.
     @discardableResult
     func admit(_ item: Item) -> Bool {
         guard !oversizedDeferredThisSession.contains(item.headerId) else { return false }
@@ -193,10 +263,78 @@ actor BackfillBodyQueue {
         isolationPending = isolationPending.filter {
             !MessageIdentity.headerIdBelongsToFolder($0, accountId: accountId, folderPath: folderPath)
         }
+        // Durable half — dispatched, so the synchronous section above is unaffected.
+        clearOversizedDurably(accountId: accountId, folderPath: folderPath)
         let removed = before - (oversizedDeferredThisSession.count + isolationPending.count)
         if removed > 0, DebugModeManager.isLoggingEnabled() {
             print("[BackfillBody] Cleared \(removed) oversized-deferred/isolation key(s) for \(folderPath) after UIDVALIDITY reset")
         }
+    }
+
+    /// Durable half of the oversized quarantine — writes
+    /// `messageHeader.bodyMetadataOversized = 1` so the deferral survives a relaunch.
+    ///
+    /// ⚑ THE ACCEPTED LIMITATIONS OF THIS FLAG — registered as `IOS-BODY-006`, filed `open`
+    /// and NOT owner-blessed; do not "fix" them without asking — are enumerated ONCE, on the
+    /// single writer this calls:
+    /// `BodyFetchProcessor.markBodyMetadataOversized`. Registered as `IOS-BODY-006`.
+    /// They were duplicated verbatim here and on the sibling queue until 2026-09-02.
+    private func markOversizedDurably(_ headerId: String) {
+        if DebugModeManager.isLoggingEnabled() {
+            print("[BackfillBody] Durably flagging oversized \(headerId.prefix(30))")
+        }
+        enqueueDurableWrite(label: "flag \(headerId.prefix(30))") { db in
+            // Both guards — "a proven body always wins" and "the observation must be
+            // ABOUT this row" — live in the shared writer, so they cannot be added to
+            // one queue and forgotten in the other.
+            try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: headerId)
+        }
+    }
+
+    /// Durable half of `clearOversizedDeferred`, dispatched onto this queue's chain.
+    /// The statement itself, its `(accountId, folderPath)` COLUMN scoping, and why that
+    /// deliberately differs from the in-memory half's header-id STRING filter, all live on
+    /// `BodyFetchProcessor.clearBodyMetadataOversized` — one symbol, so the predicate
+    /// cannot be tightened on one queue and left alone on the other.
+    private func clearOversizedDurably(accountId: String, folderPath: String) {
+        enqueueDurableWrite(label: "clear \(folderPath)") { db in
+            try BodyFetchProcessor.clearBodyMetadataOversized(
+                db, accountId: accountId, folderPath: folderPath)
+        }
+    }
+
+    /// This queue's serialized tail of dispatched durable flag writes.
+    ///
+    /// ⛔ The serialization is a CORRECTNESS requirement, not a convenience — a mark and a
+    /// clear dispatched microseconds apart must commit in dispatch order or the clear can
+    /// execute first and the mark re-flag a row whose address no longer names the same
+    /// message. The full rationale, the reason the two queues share the TYPE but never the
+    /// INSTANCE, and why `pool` is passed per call rather than captured, all live on
+    /// `BodyFetchProcessor.DurableWriteChain`. One symbol, so a hardening cannot be applied
+    /// to one queue and forgotten on the other.
+    private var durableWrites = BodyFetchProcessor.DurableWriteChain(owner: "[BackfillBody]")
+
+    /// Dispatches one durable flag write on this queue's chain.
+    /// `dbPool` (`AppDatabase.backgroundPool`) is resolved HERE, synchronously, and passed by
+    /// value — see the parameter's note on `DurableWriteChain.enqueue`.
+    private func enqueueDurableWrite(
+        label: String,
+        _ op: @escaping @Sendable (Database) throws -> Void
+    ) {
+        durableWrites.enqueue(pool: dbPool, label: label, op)
+    }
+
+
+    /// Test seam: await every durable flag write dispatched so far.
+    /// The writes are deliberately fire-and-forget in production; a test that asserts
+    /// on the row must be able to wait for them without polling.
+    ///
+    /// ⚠️ Not `#if DEBUG`-gated on purpose: the gate follows the HAZARD, not the
+    /// `ForTesting` suffix. `StuckMessageDiagnostics.countForTesting` is gated because it
+    /// interpolates a caller string into SQL; this takes no input and has no production
+    /// caller.
+    func awaitDurableWritesForTesting() async {
+        await durableWrites.drain()
     }
 
     /// Dispatch grouping key. `isolationHeaderId` is non-nil only for a forced
@@ -265,21 +403,7 @@ actor BackfillBodyQueue {
             // Single query — no OFFSET pagination (OFFSET re-reads all preceding rows).
             // 5 columns * 200K rows ≈ 30MB, acceptable for one-time startup load.
             let items: [Item] = try await dbPool.read { db in
-                try Row.fetchAll(db, sql: """
-                    SELECT id, accountId, folderPath, messageId, isInInbox
-                    FROM messageHeader
-                    WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 0
-                    ORDER BY date DESC
-                    """)
-                .map { row in
-                    Item(
-                        headerId: row["id"],
-                        accountId: row["accountId"],
-                        folderPath: row["folderPath"],
-                        messageId: row["messageId"],
-                        isInInbox: row["isInInbox"]
-                    )
-                }
+                try Self.admissionItems(db)
             }
 
             var totalAdded = 0
@@ -643,10 +767,10 @@ actor BackfillBodyQueue {
     /// enqueue in between the set insert and the queue removal.
     ///
     ///  - `items.count == 1` (a genuinely isolated oversized message): DEFER without
-    ///    completion. `PayloadTooLargeError` is size-deterministic (the NIO buffer is
-    ///    fixed per binary), so it cannot become fetchable this process lifetime.
-    ///    Insert the headerId into the process-lifetime
-    ///    `oversizedDeferredThisSession` set, then `storage.removeFromQueue`
+    ///    completion. Insert the headerId into the process-lifetime
+    ///    `oversizedDeferredThisSession` set, durably flag the row via
+    ///    `markOversizedDurably` so the deferral survives a relaunch, then
+    ///    `storage.removeFromQueue`
     ///    DIRECTLY. We do NOT mark `bodyEmptyConfirmed` (Data Integrity rule 1: an
     ///    oversized body is the OPPOSITE of "content confirmed gone" — the body
     ///    demonstrably exists, it merely did not fit — so the row stays honestly
@@ -686,6 +810,10 @@ actor BackfillBodyQueue {
             oversizedDeferredThisSession.insert(item.headerId)
             isolationPending.remove(item.headerId)   // resolved as the oversized one
             storage.removeFromQueue(item)
+            // Durable half of the same disposition. Dispatched, never awaited — see
+            // `markOversizedDurably`; the critical section above must stay
+            // synchronous.
+            markOversizedDurably(item.headerId)
         } else {
             // One (or a few) of these is oversized, but the batch error doesn't say
             // which. Isolate each so a later dispatch tests it ALONE — reaching the
@@ -1034,21 +1162,7 @@ actor BackfillBodyQueue {
     private func repopulateOnDrain() async {
         do {
             let items: [Item] = try await dbPool.read { db in
-                try Row.fetchAll(db, sql: """
-                    SELECT id, accountId, folderPath, messageId, isInInbox
-                    FROM messageHeader
-                    WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 0
-                    ORDER BY date DESC
-                    """)
-                .map { row in
-                    Item(
-                        headerId: row["id"],
-                        accountId: row["accountId"],
-                        folderPath: row["folderPath"],
-                        messageId: row["messageId"],
-                        isInInbox: row["isInInbox"]
-                    )
-                }
+                try Self.admissionItems(db)
             }
             guard !items.isEmpty else { return }
             var added = 0

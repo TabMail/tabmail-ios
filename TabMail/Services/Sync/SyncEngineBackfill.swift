@@ -174,9 +174,22 @@ extension SyncEngine {
                     Column("backfillPageToken").set(to: nil as String?)
                 )
         }
-        // Reset bodyEmptyConfirmed — gives previously-empty messages a fresh chance
+        // Reset bodyEmptyConfirmed — gives previously-empty messages a fresh chance,
+        // and bodyMetadataOversized so a row whose metadata FETCH overflowed the
+        // parser buffer is re-attempted too (the overflow is fragmentation-dependent,
+        // so a fresh attempt can genuinely succeed).
+        //
+        // ⚠️ BOTH HALVES OR THIS IS INERT. `bodyMetadataOversized` must be in the
+        // WHERE as well as the SET: a flagged row has `bodyEmptyConfirmed = 0`, so
+        // the original predicate does not select it and adding it to the SET alone
+        // would silently skip exactly the rows Smart Reindex is invoked for.
         try? await AppDatabase.backgroundPool.write { db in
-            try db.execute(sql: "UPDATE messageHeader SET bodyEmptyConfirmed = 0, emptyFetchCount = 0, bodyComplete = 0 WHERE bodyEmptyConfirmed = 1")
+            try db.execute(sql: """
+                UPDATE messageHeader
+                SET bodyEmptyConfirmed = 0, emptyFetchCount = 0, bodyComplete = 0,
+                    bodyMetadataOversized = 0
+                WHERE bodyEmptyConfirmed = 1 OR bodyMetadataOversized = 1
+                """)
         }
         // Reset cc/bcc backfill flag so existing messages get cc/bcc populated
         UserDefaults.standard.set(false, forKey: "ccBccBackfillDone")
@@ -327,20 +340,22 @@ extension SyncEngine {
         // GRDB is sole authority for body status flags
         let (grdbTotal, grdbIndexed, pendingBody) = (try? await dbPool.read { db -> (Int, Int, Int) in
             let total = try MessageHeader.filter(Column("accountId") == accountId).fetchCount(db)
-            let indexed = try MessageHeader.filter(
-                Column("accountId") == accountId &&
-                (Column("bodyComplete") == true || Column("bodyEmptyConfirmed") == true)
-            ).fetchCount(db)
-            // Body-eligible headers still awaiting fetch — same criteria the body
-            // queues use (BackfillBodyQueue/ActiveBodyQueue: headerComplete=1,
-            // no body yet, not confirmed-empty). Completion gates on this reaching
-            // 0, not on an exact count match against a server-reported total.
-            let pending = try MessageHeader.filter(
-                Column("accountId") == accountId &&
-                Column("headerComplete") == true &&
-                Column("bodyComplete") == false &&
-                Column("bodyEmptyConfirmed") == false
-            ).fetchCount(db)
+            // Both predicates live on `MessageHeader` as named requests rather than
+            // inline `filter(…)` chains — see `bodySettledRequest` /
+            // `pendingBodyRequest` for what they contain and why they are named. A
+            // chain here is invisible to every SQL-text census and unreachable from
+            // the test tree, and both properties cost real defects before.
+            //
+            // `bodyMetadataOversized` counts as SETTLED, not pending: those bodies
+            // are unfetchable by this build, and leaving them in work-remaining
+            // means `pendingBodyCount` never reaches 0, `isFullyComplete` is false
+            // forever, and the sync banner never clears. Owner decision 2026-09-01.
+            // If a future fix makes these bodies fetchable again, the two requests
+            // and the body-queue admission queries drop the flag together.
+            let indexed = try MessageHeader.bodySettledRequest(accountId: accountId).fetchCount(db)
+            // Completion gates on this reaching 0, not on an exact count match
+            // against a server-reported total.
+            let pending = try MessageHeader.pendingBodyRequest(accountId: accountId).fetchCount(db)
             return (total, indexed, pending)
         }) ?? (0, 0, 1)   // pending=1 on read failure → never false-complete
 

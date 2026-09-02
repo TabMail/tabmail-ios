@@ -723,6 +723,21 @@ extension SyncEngine {
                 CREATE INDEX IF NOT EXISTS messageHeader_unreadSweep
                 ON messageHeader(folderId, id)
                 WHERE isRead = 0
+                """),
+        // Extends v40's `messageHeader_bodyRepopulate` by the one equality column the
+        // body-queue admission queries gained with `bodyMetadataOversized`, keeping
+        // `date` last so one index serves both the seek and the ORDER BY. Deferred
+        // rather than built in `v88_addBodyMetadataOversized` because its absence
+        // degrades performance and nothing else: without it those queries still seek on
+        // four of five equality columns, in date order, with no temp B-tree — the fifth
+        // conjunct is simply filtered per row. That is the transient window this
+        // mechanism exists to accept.
+        DeferredIndex(
+            name: "messageHeader_bodyRepopulateV2",
+            sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_bodyRepopulateV2
+                ON messageHeader(isInInbox, headerComplete, bodyComplete,
+                                 bodyEmptyConfirmed, bodyMetadataOversized, date)
                 """)
     ]
 

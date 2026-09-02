@@ -101,11 +101,16 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Update 2026-09-02:** `IOS-NSE-008` filed `open`, taking the live count to **5**. It is not
-> migrated to GitHub — it carries an owner decision (accept, or close the window), not a fix in
-> flight.
+> **Current tracker census (2026-09-02): 6 `open` records, all of them amendment rows —
+> `IOS-BODY-006`, `IOS-COMPOSE-002`, `IOS-IMAP-015`, `IOS-IMAP-016`, `IOS-NSE-008`,
+> `IOS-PERF-012`.**
+> `IOS-BODY-006` was filed on 2026-09-02 with the oversized-metadata body quarantine and is
+> `open` rather than `accepted` precisely because its two consequential properties still need
+> the owner's decision. `IOS-NSE-008` was filed the same day with the NSE identity-mirror refresh and is
+> `open` rather than `accepted` because it carries an owner decision (accept the residuals,
+> or close the window), not a fix in flight.
 >
-> **Current tracker census (2026-08-20): 4 `open` records, all of them amendment rows —
+> *Superseded, preserved:* **Current tracker census (2026-08-20): 4 `open` records, all of them amendment rows —
 > `IOS-COMPOSE-002`, `IOS-IMAP-015`, `IOS-IMAP-016`, `IOS-PERF-012`. No base-register row has an open
 > live disposition any more** — the frozen table above still shows `open` for `IOS-CLEANUP-001` and
 > `IOS-PUSH-001` because those bytes cannot change, and both are now superseded by the overrides
@@ -220,6 +225,12 @@ regenerated from it; their detail files live in
 |---|---|---|
 | [IOS-SEARCH-004](Companion/Process/Current/KnownIssues/Amendments/ios-search-004.md) | `not-defect` | ✅ NOT A DEFECT (2026-08-15) — the filed multi-folder date-range query is not production- or test-reachable: `EmailSearchTool`, the sole `SearchIndex.search` caller, never supplies `folderIds`, and `SearchView` never reaches `scanByDateRange`. The actually reachable unscoped `"*"` + date arm remains an off-main 22 ms residual; adding index/build/write cost for that different arm is not proportionate without user-visible evidence. Reopen if a production `folderIds` caller, interactive date-filter UI, or measured agent delay makes either query live |
 | [IOS-SEARCH-005](Companion/Process/Current/KnownIssues/Amendments/ios-search-005.md) | `resolved` | ✅ **RESOLVED (2026-08-13, `374a8b3c1`)** — `SearchIndex.searchFTSOnly` generated an FTS5 `snippet()` for **every row every arm matched**, then discarded all but the rows surviving the final `LIMIT`. The 6-arm `UNION ALL` carries **no per-arm `ORDER BY`/`LIMIT`** — ordering and limiting happen once over the union — so `snippet()`, which reassembles and tokenises the matched column, ran across the entire match set while only `SearchConfig.searchDefaultLimit` rows were displayed. Split into two phases (select `fts.rowid` + `bm25`, order and limit, then snippet only the survivors): **1,145 ms → ~597 ms per keystroke, −48%**. ⚠️ **NOT the index-defeating sorter class** despite the shared audit: that class's remedy is a per-partition rewrite, which works only where an ordering index exists, and **FTS5 `MATCH` output has no date order** — measured per-folder 187 ms vs IN-list 191 ms, so the rewrite buys nothing here. The cost was the **auxiliary function**, not the plan. 🚨 **A defect in the FIRST version was caught pre-commit and its lesson is the reusable part:** it threw `SearchIndexError.snippetMissing` for the "impossible" surviving-row-without-snippet case, but the only per-keystroke consumer is `SearchView`'s `(try? await …keywordSearch(…)) ?? []` — so the throw would have **silently discarded the entire ranked result set**, turning a cosmetic single-row defect into a whole-result-set one. Rule-4 pincer: the argument for the throw was that both phases share one `dbPool.read` snapshot, making the case impossible ⇒ the throw is either dead code or actively harmful, and **neither branch justifies it**. **Before adding a `throw` to a fail-closed guard, grep the call chain for `try?` and `?? []`** — fail-closed is only fail-*safe* if someone is listening. ⚠️ **Same shape survives in `SearchIndex.searchFTSCandidates`** (hybrid/agent-chat path via `EmailSearchTool`, not per-keystroke) — left untouched by scope; start there when sweeping |
+
+### BODY (1)
+
+| ID | Class | Executive statement |
+|---|---|---|
+| [IOS-BODY-006](Companion/Process/Current/KnownIssues/Amendments/ios-body-006.md) | `open` | 📋 **OPEN — AWAITING THE OWNER'S DECISION (2026-09-02).** The oversized-metadata body quarantine (`messageHeader.bodyMetadataOversized`) stops an unbounded re-fetch storm and makes "Sync Complete" reachable again, at two costs that are deliberate but **not yet blessed**. (A) It is a **ONE-STRIKE LATCH on a signal that is not deterministic** — the parser bound is on unread AGGREGATE bytes measured after the decode loop stops, so the trigger is fragmentation-dependent and an ordinary, fetchable message on a lossy link can roll into it. The codebase's prior art for the same shape is a counter (`emptyFetchCount >= 3` before `bodyEmptyConfirmed`); a counter was NOT built here because a new column is more mechanism than one gesture of recovery warrants. (B) The two **non-queue** writers routed through `BodyFetchProcessor.markOversizedDurably` capture no `resetGeneration`, so an overflow already on the wire when a same-folder UIDVALIDITY reset lands can quarantine a re-inserted row that reused the UID and never overflowed. Neither drops a user intention, mutates a wrong message, or deletes anything; the header stays FTS-indexed and searchable, and **pull-to-refresh is exempt at the funnel** and clears the flag on success. Six further accepted limitations are enumerated in the source on `BodyFetchProcessor.markBodyMetadataOversized`, the single writer both queues call. Retired entirely by raising `IMAPFetchMapping.responseBufferLimit` — a **first-party** constant — plus the one-statement clearing migration |
 
 ### NSE (1)
 

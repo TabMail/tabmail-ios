@@ -16,15 +16,13 @@ import GRDB
 @Suite("BackfillBodyQueue.repopulateOnDrain — query correctness")
 struct BackfillBodyRepopulateOnDrainTests {
 
-    /// Runs the exact SQL from `BackfillBodyQueue.repopulateOnDrain`.
+    /// Runs the PRODUCTION SQL that `BackfillBodyQueue.repopulateOnDrain` runs — the
+    /// symbol itself, not a copy of it. This was a verbatim transcription, which cannot
+    /// go red when production changes: it would keep asserting the old predicate against
+    /// a queue that had stopped using it (`feedback_tests_that_bless_the_bug`).
     private func queryRepopulateOnDrain(_ db: DatabaseQueue) throws -> [Row] {
         try db.read { dbConn in
-            try Row.fetchAll(dbConn, sql: """
-                SELECT id, accountId, folderPath, messageId, isInInbox
-                FROM messageHeader
-                WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 0
-                ORDER BY date DESC
-                """)
+            try Row.fetchAll(dbConn, sql: BackfillBodyQueue.admissionSQL)
         }
     }
 

@@ -876,6 +876,10 @@ struct UidValidityResetPurgeCompanionTests {
             await ActiveBodyQueue.shared.clearOversizedDeferred(accountId: accountId, folderPath: "INBOX")
             await ActiveBodyQueue.shared.clearOversizedDeferred(accountId: accountId, folderPath: "Archive")
             await BackfillBodyQueue.shared.clearOversizedDeferred(accountId: accountId, folderPath: "INBOX")
+            // Both calls above also dispatch a DURABLE write off the actor. Settle them
+            // here so nothing lands in a later suite's swapped `AppDatabase.shared`.
+            await ActiveBodyQueue.shared.awaitDurableWritesForTesting()
+            await BackfillBodyQueue.shared.awaitDurableWritesForTesting()
         }
         await clearBoth()
 
@@ -883,6 +887,8 @@ struct UidValidityResetPurgeCompanionTests {
         await ActiveBodyQueue.shared.handlePayloadTooLarge(items: [victim], folderPath: "INBOX")
         await ActiveBodyQueue.shared.handlePayloadTooLarge(items: [bystander], folderPath: "Archive")
         await BackfillBodyQueue.shared.handlePayloadTooLarge(items: [backfillVictim], folderPath: "INBOX")
+        await ActiveBodyQueue.shared.awaitDurableWritesForTesting()
+        await BackfillBodyQueue.shared.awaitDurableWritesForTesting()
 
         let activeSeeded = await ActiveBodyQueue.shared.oversizedDeferredThisSession
         let backfillSeeded = await BackfillBodyQueue.shared.oversizedDeferredThisSession

@@ -35,11 +35,18 @@ struct FastSyncView: View {
 
     /// True when all accounts have progress AND all are fully complete.
     ///
-    /// This is a TRUTH CLAIM about the mailbox and deliberately stays gated on
-    /// `BackfillProgress.isFullyComplete` (`pendingBodyCount == 0`): an account
-    /// holding a quarantined oversized body genuinely does not have every body
-    /// indexed, so the "Sync Complete" label stays withheld rather than lying.
-    /// Only the wake lock moved to the runnable-state predicate below.
+    /// Gated on `BackfillProgress.isFullyComplete` (`pendingBodyCount == 0`).
+    ///
+    /// ⚠️ AMENDED BY THE OWNER, 2026-09-01, AND THE OLD REASONING IS RECORDED RATHER
+    /// THAN ERASED. This comment used to say the label "stays withheld rather than
+    /// lying", because an account holding a quarantined oversized body genuinely does
+    /// not have every body indexed. That reasoning was sound and was overruled on
+    /// product grounds: while the parser bound is what it is, those bodies are simply
+    /// not fetchable, and nagging the user forever about work that cannot be done is
+    /// the worse outcome. `pendingBodyCount` now counts a `bodyMetadataOversized` row
+    /// as SETTLED, so this does reach true — and the "N / M indexed" numerator beside
+    /// it counts the same rows as resolved, so the two agree. The user still learns the
+    /// truth about the individual message: opening it reports "unable to load".
     private var isAllComplete: Bool {
         let values = Array(state.backfillProgressByAccount.values)
         return !values.isEmpty && values.allSatisfy(\.isFullyComplete)
@@ -51,12 +58,16 @@ struct FastSyncView: View {
     /// `ActiveBodyQueue.handlePayloadTooLarge` / `BackfillBodyQueue
     /// .handlePayloadTooLarge` leave an oversized (`PayloadTooLargeError`) row
     /// honestly `bodyComplete = 0 / bodyEmptyConfirmed = 0` — the body demonstrably
-    /// exists, it merely did not fit — so `BackfillProgress.pendingBodyCount` keeps
-    /// counting it and never reaches 0 for that account. The old
-    /// `keepScreenAwake(while: !isAllComplete)` gate therefore pinned the wake lock
-    /// indefinitely on any account holding a single oversized message. This
-    /// predicate instead follows the header walk plus the two body queues' idle
-    /// state, releasing once the walk is complete and the queues drain — the
+    /// exists, it merely did not fit. Before `bodyMetadataOversized` shipped,
+    /// `BackfillProgress.pendingBodyCount` kept counting such a row and never reached
+    /// 0 for that account, so the old `keepScreenAwake(while: !isAllComplete)` gate
+    /// pinned the wake lock indefinitely on any account holding a single oversized
+    /// message. The flag now also excludes it from that count, so `isAllComplete` is no
+    /// longer the failure mode it was — but this predicate stays, because it is the
+    /// correct one on its own terms: the wake lock belongs to RUNNABLE work, not to a
+    /// durable-completeness figure, and that remains true for every future reason a
+    /// body can be unfetchable. It follows the header walk plus the two body queues'
+    /// idle state, releasing once the walk is complete and the queues drain — the
     /// quarantined rows are `removeFromQueue`'d and never re-admitted, so an
     /// oversized-only remainder goes idle. Pure and `nonisolated` so it is
     /// assertable without driving SwiftUI. Holds awake when:

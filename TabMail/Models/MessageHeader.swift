@@ -175,6 +175,206 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     /// Reset by Smart Reindex to give previously-empty messages a fresh chance.
     var bodyEmptyConfirmed: Bool = false
 
+    /// The metadata FETCH for this message overflowed the IMAP response parser's
+    /// buffer (`PayloadTooLargeError`), so its body could not be retrieved.
+    ///
+    /// ⚠️ This records an OBSERVATION ABOUT ONE WIRE ATTEMPT, not a verdict about the
+    /// message. The parser's bound is on unread aggregate bytes measured after the
+    /// decode loop stops, so it is FRAGMENTATION-DEPENDENT: the same message can
+    /// overflow on a lossy link and parse fine on WiFi. It is therefore NOT a claim
+    /// that the body is unfetchable, and it must never be treated as one.
+    ///
+    /// SET by every path IN THE MAIN APP that observes the overflow, so the flagged
+    /// population is "every row that overflowed" rather than "the rows a background queue
+    /// happened to reach first". The writers are enumerated ONCE, under `WRITTEN by` at the
+    /// bottom of this comment — do not restate them here; two enumerations in one comment is
+    /// how the roster went stale the first time.
+    ///
+    /// ⚠️ The negative case, because "every path" is an absolute:
+    /// `NSEIMAPConnection.performFetch`, in the notification-service extension, observes a
+    /// `PayloadTooLargeError` and DISCARDS it — its catch logs through `NSELog.step` and
+    /// returns nil. Deliberate: the NSE is a separate process on a hard memory and
+    /// wall-clock budget, and a pushed message usually has no `messageHeader` row to flag
+    /// yet. The cost is one bounded extra NSE fetch if that message is pushed again; the
+    /// NSE does not retry in-process, so there is no loop.
+    ///
+    /// Read by the consumers below, which is a ROSTER, not a count — deliberately, because
+    /// this sentence carried two independent integers ("five kinds of consumer", "three of
+    /// them are code, the other two are SQL") and both were wrong: the code side omitted
+    /// `AccountManagerFetch.fetchBody`, the AUTHORITATIVE gate every future caller inherits
+    /// (see the ⚠️ below), and the SQL side omitted `StuckMessageDiagnostics`' `bodyless*`
+    /// predicates and `SyncEngineBackfill.resetCrawlState`'s selection. Two integers in one
+    /// sentence go stale independently, which is how both drifted unnoticed. Every code
+    /// reader asks the same question through `isBodyQuarantined` below; every SQL reader
+    /// spells the column out. (Found by audit.)
+    ///  1. The four body-fetch admission queries
+    ///     (`Active`/`BackfillBodyQueue.repopulateFromDatabase` and `.repopulateOnDrain`)
+    ///     — a flagged row is not offered to the background queues.
+    ///  2. Backfill progress (`SyncEngineBackfill.updateBackfillProgressForAccount`)
+    ///     — a flagged row is counted as RESOLVED, not as pending. This is what lets
+    ///     `BackfillProgress.isFullyComplete` become true, the sync banner clear, and
+    ///     Fast Sync stop keeping the device awake, on an account holding one of these
+    ///     messages. Owner decision 2026-09-01: while the parser bound is what it is,
+    ///     these bodies are simply not fetchable, and nagging the user forever about
+    ///     work that cannot be done is the worse product outcome. Note the scope of that
+    ///     premise: not fetchable BY THIS BUILD, on the parser bound this build ships.
+    ///     Nothing here claims the body is gone or that a later build cannot get it.
+    ///     The rule, stated as a property rather than a list, because a list of this
+    ///     shape is a cache that goes stale silently: EVERY consumer of
+    ///     `BackfillProgress.isFullyComplete` and EVERY consumer of
+    ///     `BackfillProgress.ftsIndexed` moves with this decision. Today that is at least
+    ///     the Fast Sync "Sync Complete" banner, the wake lock, the "N / M indexed"
+    ///     numerator, `DynamicIslandChatButton.isBackfillInProgress` — the chat pill's
+    ///     "agent search results may be incomplete" notice, which reads `!isFullyComplete`
+    ///     and therefore also clears — and, through `ftsIndexed`, `progressFraction`,
+    ///     `estimatedSecondsRemaining` (`remaining = totalEmails - ftsIndexed`) and
+    ///     `updateRate()`'s throughput EMA (`delta = ftsIndexed - lastIndexedCount`).
+    ///     For an account holding a quarantined body the chat-pill notice is literally
+    ///     still true, and it is inside the same decision: a notice that can never clear is
+    ///     exactly the permanent nag that was overruled. The ETA and rate consequence is
+    ///     accepted and small: a quarantine event counts as throughput it did not perform,
+    ///     so the displayed ETA shrinks slightly — the alternative is an ETA that never
+    ///     reaches zero, which is the same permanent nag one surface further out.
+    ///     ⚠️ This enumerated "four surfaces, not three" and named only the first four
+    ///     until 2026-09-02; the two `ftsIndexed` arithmetic consumers were never in it.
+    ///     (Found by audit.)
+    ///  3. The user-open path (`MessageDetailViewModel.loadBody`) — a flagged row
+    ///     reports "unable to load" immediately, in exactly the state a fetch that just
+    ///     failed would leave behind, instead of spending a full connection on an
+    ///     attempt this build cannot complete.
+    ///  4. That view model's BODY POLL — the 2s retry loop `loadBody` starts on each of
+    ///     its three cancelled-read exits, and that `refetchBody` restarts whenever a
+    ///     pull-to-refresh produced no body. Those exits return BEFORE consumer 3's
+    ///     branch, so without a gate of its own the poll retries a flagged row forever,
+    ///     each attempt paying a full TCP + TLS + LOGIN + SELECT (the overflow marks the
+    ///     folder connection unhealthy, so no attempt can reuse it). It reports the same
+    ///     load-failed state and ends.
+    ///  5. The inbox snippet loader's network tier (`InboxViewModel.loadSnippetBatch`) —
+    ///     tier 2 calls `provider.fetchMessage` DIRECTLY, bypassing the funnel below, so
+    ///     it needs its own gate. A flagged row is blacklisted for the session instead.
+    ///     It matters that this one is gated at all: `reloadMessages` clears that
+    ///     blacklist and re-queues the visible window, so an ungated row would be retried
+    ///     on every single reload. Tier 2 is also a WRITER — see below.
+    ///
+    /// ⚠️ Consumers 3–5 ask this question through `isBodyQuarantined`, never by reading
+    /// the column directly — the `&& !bodyComplete` fail-safe lives inside that property, so
+    /// grepping any of those call sites for `bodyComplete` finds nothing.
+    ///
+    /// ⚠️ Consumers 3–4 are UI-STATE checks, not the network guard. The authoritative
+    /// refusal lives at the funnel, `AccountManagerFetch.fetchBody`, beside the address
+    /// gate whose comment states the rule. Gating callers alone was not enough:
+    /// `MessageDetailViewModel.loadThreadMessageBody` — a collapsed thread bubble the user
+    /// expands — reaches the funnel directly and had no check at all. Any FUTURE caller of
+    /// `fetchBody` is covered for free; only a path that skips the funnel (consumer 5)
+    /// needs its own. Pull-to-refresh is exempt at the funnel via `replaceExistingBody`.
+    ///
+    /// The row is NOT retired: `bodyComplete` stays 0, the header stays FTS-indexed and
+    /// searchable by subject and sender, the FTS membership self-heal still sees it, and
+    /// pull-to-refresh (`MessageDetailViewModel.refetchBody`) still performs a genuine
+    /// retry. That retry is the user's escape hatch, and it is the reason the ⚠️ above
+    /// still holds: this is an observation, not a verdict.
+    ///
+    /// CLEARED — the full set, because a flag that outlives its truth is worse than no
+    /// flag at all:
+    ///  • by ANY successful body write, which is positive evidence refuting the
+    ///    observation. All five: `BodyFetchProcessor.flushBatch` (the body branch),
+    ///    `BodyFetchProcessor.process` (the confirmed-empty branch — a different
+    ///    function, not another branch of `flushBatch`), `NSEDataBridge
+    ///    .flushNSEBatchToFTS`, `SyncEngine.applySnippetUpdates`, and
+    ///    `SyncEngineFTS.oneTimeBodyCompleteRestore` (which heals rows selected BECAUSE
+    ///    their FTS body text exists — the same positive evidence).
+    ///    ⚠️ The set is defined by CONSEQUENCE, not by name: any statement that sets
+    ///    `bodyComplete = 1` must clear this flag in the SAME statement, or it strands the
+    ///    row in the one state no gate can see (both the writer's `AND bodyComplete = 0`
+    ///    guard and `isBodyQuarantined`'s `&& !bodyComplete` fail-safe are keyed on the row
+    ///    being incomplete). The one remaining `bodyComplete = 1` writer that does not
+    ///    clear it is `AccountManagerOutbox`'s optimistic-Sent insert, and it cannot strand
+    ///    anything: the row it writes is a brand-new `sent-<UUID>` that has never been
+    ///    fetched, so the flag is 0 there by construction.
+    ///    ⚠️ "The one remaining writer" counts RUNTIME writers. A full census also finds
+    ///    two MIGRATIONS that set `bodyComplete = 1` — `v31_addHasBodyInFTS` and
+    ///    `v57_repairOptimisticSentBodyComplete` — and neither is an exception: on a fresh
+    ///    database both run BEFORE `v88_addBodyMetadataOversized`, so the column does not
+    ///    yet exist, and on an existing database both have already run and a registered
+    ///    migration is frozen. Named because an absolute with no negative case is the
+    ///    shape that walks the next reader past a real one. (Found by audit.)
+    ///    ⚠️ A `rg 'bodyMetadataOversized = 0'` census does NOT find all five, and the
+    ///    invariant — not the integer — is: exactly ONE of the five is invisible to
+    ///    SQL-text search, `applySnippetUpdates`, which writes it as a GRDB `updateAll`
+    ///    chain (`Column("bodyMetadataOversized").set(to: false)`). Census this flag by
+    ///    SYMBOL, not by statement text.
+    ///    ⚠️ This said "finds only THREE" until 2026-09-02. It was correct when written
+    ///    and went stale the moment round 4 added `oneTimeBodyCompleteRestore`'s clear —
+    ///    the enumeration above was updated to five and the count below it was not. A
+    ///    reader running the grep, finding four, and reconciling against "three" would
+    ///    have concluded the roster was wrong in the other direction. State the
+    ///    property, not the instance count. (Found by audit.)
+    ///    This is load-bearing, not tidiness:
+    ///    `BodyAssetMaintenance` evicts the `messageBody` row while deliberately leaving
+    ///    `bodyComplete = 1`, and the detail view's cache-miss fetch is the only
+    ///    recovery — a stale flag would delete that recovery and brick a message this
+    ///    build has already fetched once.
+    ///  • on a UIDVALIDITY reset (the address changed, so the observation is void).
+    ///    ⚠️ Scope: this is the folder-wide UIDVALIDITY reset path
+    ///    (`clearOversizedDeferred` / `clearOversizedDurably`), which releases every
+    ///    flagged row in the folder. A single-message UID REMAP is a different event and
+    ///    does not run it — but it cannot strand a flag either, because the remap
+    ///    re-keys the header row and the flag travels with the row it describes.
+    ///  • by Smart Reindex (`SyncEngine.resetCrawlState`), the user's explicit
+    ///    try-everything-again gesture.
+    ///    ⚠️ DURABLE HALF ONLY. The process-lifetime sets `ActiveBodyQueue
+    ///    .oversizedDeferredThisSession` / `isolationPending` survive it, so `admit` still
+    ///    refuses the row for the rest of this launch: the count goes back above 0 and the
+    ///    sync banner comes back up until the next relaunch, which gives the row one
+    ///    genuine retry and then re-quarantines it. Self-healing and strictly better than
+    ///    the pre-flag behaviour (the banner never cleared at all), but it is not the
+    ///    immediate release the bullet above reads like on its own.
+    ///    ⚠️ AND IT IS OUTSIDE THE SERIALIZED WRITE CHAIN. `resetCrawlState` writes through
+    ///    `AppDatabase.backgroundPool` directly, so — unlike the UIDVALIDITY reset's clear,
+    ///    which shares `enqueueDurableWrite` with all four marks — a mark dispatched
+    ///    microseconds before the user taps Smart Reindex can commit AFTER this clear and
+    ///    re-quarantine the row. (The five success-write clears need no such ordering: the
+    ///    mark's own `AND bodyComplete = 0` makes a mark-after-success a no-op.) Left as a
+    ///    fail-closed edge per THE MANTRA — the recovery is one more ordinary gesture, and
+    ///    routing `resetCrawlState` through a queue actor's chain would be a larger change
+    ///    for a narrower window. (Found by audit.)
+    ///  • exactly, in one statement, by the migration that ships a raised parser bound —
+    ///    which is the whole re-fetch mechanism for this population. ⚠️ That bound is
+    ///    `IMAPFetchMapping.responseBufferLimit`, a FIRST-PARTY constant in this repo, not
+    ///    an upstream dependency (upstream PR #179 already made it a constructor
+    ///    parameter). Nothing external gates the release; it is a decision here about how
+    ///    many bytes a single IMAP response may buffer. (Found by audit.)
+    ///
+    /// WRITTEN by one symbol only — `BodyFetchProcessor.markBodyMetadataOversized` —
+    /// which carries BOTH guards (`AND bodyComplete = 0`, so a row that already has a body
+    /// can never acquire the flag; and the re-minted-key comparison, so an overflow
+    /// observed inside an `optimisticMoveToFolder` window is not recorded against the
+    /// message the row's key names). Four call sites reach it: both queues'
+    /// `markOversizedDurably` (through their serialized `enqueueDurableWrite`),
+    /// `BodyFetchProcessor.fetch`'s `PayloadTooLargeError` branch, and
+    /// `InboxViewModel.loadSnippetBatch`'s tier-2 catch. It is ONE symbol on purpose: the
+    /// guards were previously transcribed three times, which is how a guard gets added to
+    /// one copy and forgotten in another.
+    var bodyMetadataOversized: Bool = false
+
+    /// THE READ-SIDE INVARIANT, in one place: is this row's body quarantined right now?
+    ///
+    /// Every fetch initiator asks the same question, and they must never disagree — the
+    /// four background admission queries ask it in SQL (`bodyMetadataOversized = 0`), and
+    /// the three code paths that can start a fetch on their own ask it here:
+    /// `MessageDetailViewModel.loadBody` (user open), that view model's body poll (the
+    /// retry loop the three cancelled-read exits and `refetchBody` leave behind), and
+    /// `InboxViewModel.loadSnippetBatch`'s tier-2 network fetch. Written out three times
+    /// as `flag && !bodyComplete`, one of them would eventually be added, moved or
+    /// negated alone.
+    ///
+    /// `!bodyComplete` is a FAIL-SAFE, not the primary defence — see the flag's own
+    /// documentation above. The cache deleters remove a `messageBody` row while leaving
+    /// `bodyComplete = 1` and rely on the detail view's cache-miss fetch as their only
+    /// recovery, so a stale flag must cost a wasted round trip, never a permanently
+    /// unopenable message.
+    var isBodyQuarantined: Bool { bodyMetadataOversized && !bodyComplete }
+
     /// How many times a body fetch returned empty (no text, no attachments).
     /// Used to guard against false empties from partial IMAP responses.
     /// bodyEmptyConfirmed is only set when emptyFetchCount >= 3.
@@ -279,6 +479,66 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
         self.hasAttachments = false
         self.isReplied = false
         self.isForwarded = false
+    }
+}
+
+// MARK: - Backfill-progress predicates
+
+extension MessageHeader {
+
+    /// Rows that still owe a body fetch for `accountId` — the numerator of
+    /// "work remaining" that `BackfillProgress.pendingBodyCount` publishes and
+    /// `isFullyComplete` gates on.
+    ///
+    /// ⚠️ **This exists as a shared symbol so the test tree can assert the REAL
+    /// predicate.** It used to be an inline `filter(…)` chain inside
+    /// `SyncEngineBackfill.updateBackfillProgressForAccount`, and every test of it was
+    /// a hand-copied replica — which cannot go red when production changes, and would
+    /// have blessed a regression here (`feedback_tests_that_bless_the_bug`). Being a
+    /// query-interface chain it is also invisible to every SQL-text grep
+    /// (`feedback_census_inherits_its_search_shape`), so a name is the only way a
+    /// future census finds it.
+    ///
+    /// `bodyMetadataOversized = 0` is part of the predicate: a message whose metadata
+    /// FETCH overflows the IMAP response parser cannot be fetched by this build, and
+    /// counting it as outstanding leaves the sync banner up forever. See the flag's own
+    /// documentation for the owner decision behind that.
+    static func pendingBodyRequest(accountId: String) -> QueryInterfaceRequest<MessageHeader> {
+        MessageHeader.filter(
+            Column("accountId") == accountId &&
+            Column("headerComplete") == true &&
+            Column("bodyComplete") == false &&
+            Column("bodyEmptyConfirmed") == false &&
+            Column("bodyMetadataOversized") == false
+        )
+    }
+
+    /// Rows whose body question is SETTLED for `accountId` — fetched, confirmed empty,
+    /// or unfetchable by this build, and the numerator behind the "N / M indexed" readouts.
+    ///
+    /// ⚠️ This request is deliberately NOT scoped to `headerComplete`, while
+    /// `pendingBodyRequest` is. The complement relation between the two therefore holds
+    /// only when RESTRICTED to header-complete rows — a `headerComplete = 0` row with a
+    /// settled disposition is counted here and is outside `pendingBodyRequest`'s
+    /// population entirely. Such rows are reachable: `NSEDataBridge` stages headers with
+    /// `headerComplete = false` and flips the flag in a separate statement (ADR-IOS-047's
+    /// two-phase merge). The asymmetry is INHERITED, not introduced — the inline filter
+    /// this replaced omitted the conjunct too — so do not "restore" symmetry by adding
+    /// `headerComplete` here or removing it there. Either edit moves the published
+    /// `ftsIndexed` / `pendingBodyCount` numbers, and with them the "N / M indexed"
+    /// readout and `BackfillProgress.isFullyComplete`; that is a behaviour change and
+    /// needs its own justification. (Found by audit.)
+    ///
+    /// ⚠️ Keep the two in lockstep on DISPOSITIONS. If a disposition counts as settled
+    /// here but still counts as pending there, the progress bar parks below 100% beside a
+    /// green completion check — the same nag in a different widget.
+    static func bodySettledRequest(accountId: String) -> QueryInterfaceRequest<MessageHeader> {
+        MessageHeader.filter(
+            Column("accountId") == accountId &&
+            (Column("bodyComplete") == true
+                || Column("bodyEmptyConfirmed") == true
+                || Column("bodyMetadataOversized") == true)
+        )
     }
 }
 

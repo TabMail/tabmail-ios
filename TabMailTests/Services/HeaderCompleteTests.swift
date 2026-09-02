@@ -149,14 +149,12 @@ struct HeaderCompleteRepopulateTests {
             snippet: "test"
         )
 
-        // Run the same query as ActiveBodyQueue.repopulateFromDatabase
+        // The PRODUCTION query `ActiveBodyQueue.repopulateFromDatabase` runs, not a copy.
+        // The copy that used to be here had already drifted — it never gained the
+        // `bodyMetadataOversized` conjunct — so it was asserting a predicate production
+        // no longer used.
         let items: [Row] = try db.read { dbConn in
-            try Row.fetchAll(dbConn, sql: """
-                SELECT id, accountId, folderPath, messageId, isInInbox
-                FROM messageHeader
-                WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                ORDER BY date DESC
-                """)
+            try Row.fetchAll(dbConn, sql: ActiveBodyQueue.admissionSQL)
         }
         #expect(items.isEmpty, "headerComplete=0 row should be excluded from repopulate")
     }
@@ -182,12 +180,7 @@ struct HeaderCompleteRepopulateTests {
         }
 
         let items: [Row] = try db.read { dbConn in
-            try Row.fetchAll(dbConn, sql: """
-                SELECT id, accountId, folderPath, messageId, isInInbox
-                FROM messageHeader
-                WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                ORDER BY date DESC
-                """)
+            try Row.fetchAll(dbConn, sql: ActiveBodyQueue.admissionSQL)
         }
         #expect(items.count == 1)
         guard items.count == 1 else { return }
@@ -215,10 +208,11 @@ struct HeaderCompleteRepopulateTests {
         }
 
         let items: [Row] = try db.read { dbConn in
-            try Row.fetchAll(dbConn, sql: """
-                SELECT id FROM messageHeader
-                WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                """)
+            // The production query itself. A hand-copied replica stops BEING the
+            // admission predicate the moment production gains a clause — it just
+            // gained `AND bodyMetadataOversized = 0`, and this assertion would have
+            // gone on describing a queue that no longer asks this question.
+            try Row.fetchAll(dbConn, sql: ActiveBodyQueue.admissionSQL)
         }
         #expect(items.isEmpty, "bodyComplete=1 should be excluded")
     }
@@ -556,10 +550,11 @@ struct HeaderCompleteFullPipelineTests {
 
         // 8. Verify this header is now excluded from repopulate query
         let repopIds: [String] = try await db.read { dbConn in
-            try Row.fetchAll(dbConn, sql: """
-                SELECT id FROM messageHeader
-                WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                """).map { $0["id"] as String }
+            // The production query itself. A hand-copied replica stops BEING the
+            // admission predicate the moment production gains a clause — it just
+            // gained `AND bodyMetadataOversized = 0`, and this assertion would have
+            // gone on describing a queue that no longer asks this question.
+            try Row.fetchAll(dbConn, sql: ActiveBodyQueue.admissionSQL).map { $0["id"] as String }
         }
         let found = repopIds.contains(header.id)
         #expect(!found, "Completed header should be excluded from repopulate")
