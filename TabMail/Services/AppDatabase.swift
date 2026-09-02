@@ -3715,9 +3715,15 @@ final class AppDatabase: Sendable {
         //     CHOSEN; the planner keeps preferring `messageHeader_bodyRepopulate`, so
         //     it would be pure write amplification;
         //   - this extended index → SEARCH on all 5 equality columns, date ordered.
-        // Per ADR-IOS-029 the v40 index is NOT dropped (other queries use it); a new
-        // one is added alongside, which is the same thing v40 itself did to v22's
-        // `idx_messageHeader_bodyStatus`.
+        // Per ADR-IOS-029 the v40 index is NOT dropped; a new one is added alongside,
+        // which is the same thing v40 itself did to v22's `idx_messageHeader_bodyStatus`.
+        // (An earlier version of this comment justified keeping it with "other queries use
+        // it" — unverified, and not the reason. The measured reason is that v40 remains
+        // the FALLBACK plan for these same four queries: with the extended index dropped
+        // they still plan `SEARCH … USING INDEX messageHeader_bodyRepopulate` on four of
+        // the five equality columns, date-ordered, no temp B-tree. That is asserted by
+        // `OversizedDurableFlagIndexTests
+        // .withoutTheIndexTheFifthPredicateLeavesTheSeek`.)
         //
         // ⛔ THE INDEX IS NOT BUILT HERE. It lives in
         // `SyncEngine.deferredIndexes` as `messageHeader_bodyRepopulateV2`.

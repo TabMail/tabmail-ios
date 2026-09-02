@@ -1471,6 +1471,22 @@ final class InboxViewModel {
         return true
     }
 
+    #if DEBUG
+    /// Test seam: run ONE snippet batch over `ids` and report the loader's blacklist.
+    ///
+    /// `loadSnippetBatch` and `snippetFailed` are both private, so the tier-2 gate — a
+    /// quarantined row is never handed to `provider.fetchMessage` — is otherwise
+    /// observable only by letting the loader reach the network, which is the exact thing
+    /// the gate exists to prevent. Returning the blacklist makes the two cases separable
+    /// without a provider: a gated row is blacklisted here, while a row that merely has
+    /// no provider available is left retryable (tier 2 `continue`s without blacklisting).
+    func runSnippetBatchForTesting(_ ids: [String]) async -> Set<String> {
+        for id in ids { snippetQueue.insert(id) }
+        await loadSnippetBatch()
+        return snippetFailed
+    }
+    #endif
+
     private func scheduleSnippetLoad() {
         guard snippetTask == nil else { return }
         snippetTask = Task { @MainActor in
@@ -1562,6 +1578,23 @@ final class InboxViewModel {
             }
             // Need network fetch — reuse the tier-0 batched read (no sync re-read on main)
             if let header = headerFor(headerId) {
+                // Oversized-metadata quarantine (`bodyMetadataOversized`): tier 2 below
+                // calls `provider.fetchMessage` — the SAME fetch whose metadata response
+                // overflowed the IMAP parser and got this row flagged. It cannot succeed
+                // on this build, and the overflow marks the folder connection unhealthy,
+                // so every attempt pays a full TCP+TLS+LOGIN+SELECT teardown. The body
+                // queues already stopped offering this row; this is the third initiator
+                // and needs the same gate. Treat it as a permanent per-session failure
+                // (`snippetFailed`) rather than leaving it retryable: a transient-looking
+                // row would be re-queued by the next `requeueVisibleSnippets` pass.
+                // `&& !header.bodyComplete` mirrors the fail-safe in
+                // `MessageDetailViewModel.loadBody` — a row that demonstrably has a body
+                // must stay fetchable even if a stale flag survived on it.
+                if header.isBodyQuarantined {
+                    if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Skipping oversized-quarantined \(headerId)") }
+                    snippetFailed.insert(headerId)
+                    continue
+                }
                 networkNeeded.append((headerId: headerId, header: header))
             } else {
                 snippetFailed.insert(headerId)

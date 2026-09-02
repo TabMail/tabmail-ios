@@ -31,6 +31,38 @@ enum BodyFetchProcessor {
         case payloadTooLarge
     }
 
+    /// Records a parser-overflow observation on the user-open path, so the flag's
+    /// population is every row that overflowed and not merely the rows a background queue
+    /// happened to reach first. Same statement and same guard as the two queues'
+    /// `markOversizedDurably`; see `MessageHeader.bodyMetadataOversized` for the full
+    /// contract and the CLEARED enumeration.
+    ///
+    /// `AND bodyComplete = 0`: a row that already has a body must never acquire the flag.
+    /// A pull-to-refresh can land a body between this overflow and this write, and a
+    /// stale flag on a completed row is the shape the detail view's fail-safe has to
+    /// absorb — do not mint one deliberately.
+    ///
+    /// Failure is swallowed on purpose. This is an optimisation of a path that is already
+    /// failing: without the flag the caller still reports the error, and the poll behind
+    /// it still runs — just unbounded. Turning a missed write into a second user-visible
+    /// failure would trade a slow path for a broken one.
+    private static func markOversizedDurably(headerId: String) async {
+        do {
+            try await AppDatabase.dbPool.write { db in
+                try db.execute(
+                    sql: """
+                        UPDATE messageHeader SET bodyMetadataOversized = 1
+                        WHERE id = ? AND bodyComplete = 0
+                        """,
+                    arguments: [headerId])
+            }
+        } catch {
+            if !error.isDatabaseSuspensionAbort {
+                print("[BodyFetch] Oversized flag write failed for \(headerId.prefix(30)): \(error)")
+            }
+        }
+    }
+
     /// Fetch phase: provider.fetchMessage + render body. Provider-bound (network I/O).
     /// Returns the rendered MessageBody and extracted plain text, or an error result.
     struct FetchResult: Sendable {
@@ -151,19 +183,38 @@ enum BodyFetchProcessor {
                 // empty-confirmation budget that `process` spends on genuinely empty
                 // fetches.
                 //
-                // Termination: this branch is reachable only from the single-item
-                // user-open path (`fetchAndProcess` ← `AccountManagerFetch
-                // .fetchBodyIfNeeded`). That path performs no retry loop — it surfaces
-                // `.payloadTooLarge` to the user as a visible error and stops — so
-                // leaving the row retryable cannot spin. The batched queues never reach
-                // here (they use `fetchMessagesBatch` + `renderFetched` and own their
-                // separate oversize handling).
+                // Reachable only from the single-item user-open path (`fetchAndProcess`
+                // ← `AccountManagerFetch.fetchBodyIfNeeded`). The batched queues never
+                // reach here — they use `fetchMessagesBatch` + `renderFetched` and own
+                // their separate oversize handling.
+                //
+                // ⚠️ Termination is NOT free on this path, and a comment here used to
+                // claim it was ("that path performs no retry loop … so leaving the row
+                // retryable cannot spin"). It does loop: `loadBody` ends with
+                // `if messageBody == nil { startBodyPoll() }`, and that poll re-fetches
+                // every 2 seconds indefinitely — each attempt paying a full
+                // TCP + TLS + LOGIN + SELECT, because the overflow marks the folder
+                // connection unhealthy so no attempt can reuse it.
+                //
+                // So this observation is RECORDED, exactly as the body queues record
+                // theirs (`Active`/`BackfillBodyQueue.markOversizedDurably`). One
+                // statement, the same `AND bodyComplete = 0` guard, the same meaning —
+                // and it is what lets the poll's own quarantine gate stop the loop on its
+                // next tick. Without it the flag's population would be "whatever the
+                // background queues happened to reach first", and the one path that
+                // detects the overflow soonest would throw the information away.
+                //
+                // Still NOT `bodyEmptyConfirmed`, and still no `emptyFetchCount` strike:
+                // the row stays truthfully retryable, and pull-to-refresh remains a
+                // genuine wire attempt (`MessageDetailViewModel.refetchBody` does not
+                // consult the flag).
                 //
                 // PORT of `v2final`'s `BodyFetchProcessor.fetch` (commit `737aea64f`),
                 // which deleted this same write from this same branch.
                 if DebugModeManager.isLoggingEnabled() {
                     print("[BodyFetch] Body too large for \(item.messageId) — exceeds buffer (left honestly-incomplete, not marked empty)")
                 }
+                await markOversizedDurably(headerId: item.headerId)
                 return .failure(.payloadTooLarge)
             } else {
                 print("[BodyFetch] Fetch failed for \(item.messageId): \(error)")

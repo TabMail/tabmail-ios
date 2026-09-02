@@ -127,15 +127,29 @@ struct OversizedBodyQuarantineDatabaseTests {
     /// oversized conjunct because it re-indexes HEADERS, and an oversized row's header
     /// is healthy. The two predicates diverged when the durable flag shipped; do not
     /// re-merge them.
+    /// ⚠️ NOT a transcription of the admission predicate. A hand-copied `SELECT` here
+    /// could not go red when production's changed — it would keep asserting the old
+    /// predicate against a queue that had stopped using it, which is precisely how a test
+    /// blesses the regression it was written to catch. So this drives the REAL queue:
+    /// a fresh instance, its real `repopulateFromDatabase()`, and whether the row is in
+    /// the work it admitted. "Reachable by a later background body fetch" has no more
+    /// direct definition than that.
     private func isEligibleForLaterBodyFetch(headerId: String) async throws -> Bool {
-        let found: Int = try await AppDatabase.dbPool.read { db in
-            try Int.fetchOne(db, sql: """
-                SELECT COUNT(*) FROM messageHeader
-                WHERE id = ? AND headerComplete = 1 AND bodyComplete = 0
-                  AND bodyEmptyConfirmed = 0 AND bodyMetadataOversized = 0
-                """, arguments: [headerId]) ?? 0
+        let header = try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: headerId)
         }
-        return found == 1
+        guard let header else { return false }
+        // Inbox rows are the ACTIVE queue's; everything else the BACKFILL queue's. The
+        // split is the `isInInbox` conjunct in the two admission queries, so asking the
+        // wrong queue would report a false negative for every row.
+        if header.isInInbox {
+            let queue = ActiveBodyQueue()
+            await queue.repopulateFromDatabase()
+            return await queue.queuedItemsForTesting.contains { $0.headerId == headerId }
+        }
+        let queue = BackfillBodyQueue()
+        await queue.repopulateFromDatabase()
+        return await queue.queuedItemsForTesting.contains { $0.headerId == headerId }
     }
 
     /// The same predicate MINUS the oversized flag. Pairing the two is what makes the
@@ -150,15 +164,17 @@ struct OversizedBodyQuarantineDatabaseTests {
     /// decision of 2026-09-01 the user-open path (`MessageDetailViewModel.loadBody`)
     /// reads the flag too and reports "unable to load" without a wire attempt; the
     /// remaining live retry is pull-to-refresh (`refetchBody`).
+    /// Also a production symbol, not a replica: `SyncEngine.backfillFTSSelfHealCandidateSQL`
+    /// IS this predicate — `headerComplete = 1 AND bodyComplete = 0 AND
+    /// bodyEmptyConfirmed = 0`, with no oversized conjunct — because the FTS self-heal is
+    /// the one scope that deliberately keeps quarantined rows. Reusing it here makes the
+    /// control real and pins the divergence from both directions at once: if anyone ever
+    /// adds the flag to that scope, every two-sided assertion in this suite goes red.
     private func isPendingBodyIgnoringOversizedFlag(headerId: String) async throws -> Bool {
-        let found: Int = try await AppDatabase.dbPool.read { db in
-            try Int.fetchOne(db, sql: """
-                SELECT COUNT(*) FROM messageHeader
-                WHERE id = ? AND headerComplete = 1 AND bodyComplete = 0
-                  AND bodyEmptyConfirmed = 0
-                """, arguments: [headerId]) ?? 0
+        let ids: [String] = try await AppDatabase.dbPool.read { db in
+            try String.fetchAll(db, sql: SyncEngine.backfillFTSSelfHealCandidateSQL)
         }
-        return found == 1
+        return ids.contains(headerId)
     }
 
     // MARK: Side 1 — oversized must never be recorded as fetched
@@ -191,6 +207,7 @@ struct OversizedBodyQuarantineDatabaseTests {
         )
         #expect(stored.bodyComplete == false, "nothing was indexed, so the body is not complete")
         #expect(stored.emptyFetchCount == 0, "a too-large response is not an empty response — it must not spend a strike from the empty-confirmation budget")
+        #expect(stored.missFetchCount == 0, "nor a strike from the MISS budget — the server answered, and the answer was merely too big to parse; a miss is a message that was not there at all")
         #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false,
                 "the durable flag must take the row OUT of background admission — that is the fix; an in-memory-only quarantine re-fetched it every launch")
         #expect(try await isPendingBodyIgnoringOversizedFlag(headerId: header.id),
@@ -229,6 +246,7 @@ struct OversizedBodyQuarantineDatabaseTests {
         )
         #expect(stored.bodyComplete == false)
         #expect(stored.emptyFetchCount == 0)
+        #expect(stored.missFetchCount == 0, "nor a strike from the MISS budget — the server answered, and the answer was merely too big to parse; a miss is a message that was not there at all")
         #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false,
                 "the durable flag must take the row OUT of background admission")
         #expect(try await isPendingBodyIgnoringOversizedFlag(headerId: header.id),
@@ -686,6 +704,123 @@ struct OversizedBodyQuarantineDatabaseTests {
         #expect(row?.bodyComplete == true, "precondition — the success write landed")
         #expect(row?.bodyMetadataOversized == false,
                 "a written body refutes the overflow observation; leaving it set would brick this row on the next cache eviction")
+    }
+
+    // MARK: The mark's own `AND bodyComplete = 0` guard
+
+    /// The durable mark is dispatched, not awaited — so a body can land between the
+    /// overflow and the write. `markOversizedDurably` carries `AND bodyComplete = 0`
+    /// precisely for that window: quarantining a row that now HAS a body would create
+    /// the stale flag the eviction fail-safe exists to survive, at the one moment the
+    /// system knows better.
+    ///
+    /// The property is the end state, not the statement: after an overflow on a row that
+    /// has since completed, the row is not quarantined.
+    @Test("ActiveBodyQueue: an overflow cannot quarantine a row that acquired a body first")
+    func activeMarkSkipsARowThatAlreadyHasABody() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        // The body landed while the overflow was still in flight.
+        try await AppDatabase.dbPool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE id = ?",
+                           arguments: [header.id])
+        }
+
+        let queue = ActiveBodyQueue()
+        let item = activeItem(header.id, folderPath: header.folderPath)
+        await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+
+        let stored = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        })
+        #expect(stored.bodyMetadataOversized == false,
+                "a row that already has a body must never acquire the flag — that is a stale flag minted deliberately")
+        #expect(stored.bodyComplete, "and the body it acquired is untouched")
+    }
+
+    /// NON-VACUITY for the guard above, from the other side. Without it the assertion
+    /// could pass on a build whose mark had stopped writing at all.
+    @Test("CONTROL: the identical overflow DOES quarantine the same row when it has no body")
+    func activeMarkStillFlagsABodylessRow() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        let queue = ActiveBodyQueue()
+        let item = activeItem(header.id, folderPath: header.folderPath)
+        await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+
+        let stored = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        })
+        #expect(stored.bodyMetadataOversized,
+                "the ONLY difference from the case above is bodyComplete, so the mark must land here")
+    }
+
+    @Test("BackfillBodyQueue: an overflow cannot quarantine a row that acquired a body first")
+    func backfillMarkSkipsARowThatAlreadyHasABody() async throws {
+        let (header, restore) = try makeSwappedDB(folderPath: "Archive", isInInbox: false)
+        defer { restore() }
+
+        try await AppDatabase.dbPool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE id = ?",
+                           arguments: [header.id])
+        }
+
+        let queue = BackfillBodyQueue()
+        let item = backfillItem(header.id, folderPath: header.folderPath)
+        await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+
+        let stored = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        })
+        #expect(stored.bodyMetadataOversized == false,
+                "the backfill queue runs over whole mailboxes, so a mark that ignores the guard mints stale flags in bulk")
+    }
+
+    // MARK: The confirmed-empty success write
+
+    /// The FOURTH clear site, and the least obvious one: a body fetch that comes back
+    /// empty three times writes `bodyComplete = 1` for the UI. That write must clear the
+    /// flag too — it is a success write like any other, and leaving the flag standing
+    /// beside `bodyComplete = 1` is exactly the stale-flag shape the detail view's
+    /// fail-safe has to absorb. Driven through the REAL `BodyFetchProcessor.process`.
+    @Test("The confirmed-empty write clears the oversized flag, through the real processor")
+    func confirmedEmptyWriteClearsTheFlag() async throws {
+        // Two prior empties already recorded — this fetch is the third, which confirms.
+        let (header, restore) = try makeSwappedDB(emptyFetchCount: 2)
+        defer { restore() }
+
+        let queue = ActiveBodyQueue()
+        let item = activeItem(header.id, folderPath: header.folderPath)
+        await queue.handlePayloadTooLarge(items: [item], folderPath: header.folderPath)
+        await queue.awaitDurableWritesForTesting()
+        #expect(try await isEligibleForLaterBodyFetch(headerId: header.id) == false,
+                "precondition — the row is durably flagged")
+
+        let result = await BodyFetchProcessor.process(
+            fetchResult: BodyFetchProcessor.FetchResult(
+                item: BodyFetchProcessor.Item(
+                    headerId: header.id, accountId: header.accountId,
+                    folderPath: header.folderPath, messageId: header.messageId,
+                    isInInbox: header.isInInbox),
+                renderedBody: MessageBody(contentKey: ContentKey(rawValue: header.id), htmlContent: ""),
+                plainText: nil,
+                hasAttachments: false,
+                hasUnresolvedICS: false,
+                fetchedRfc822MessageId: nil),
+            enableAI: false)
+
+        #expect(result.0 == .confirmedEmpty, "precondition — the third empty fetch confirms")
+        let stored = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        })
+        #expect(stored.bodyComplete, "precondition — the confirmed-empty write landed")
+        #expect(stored.bodyMetadataOversized == false,
+                "every write that sets bodyComplete = 1 must retract the overflow observation, or the row carries a permanent lie")
     }
 
     // MARK: Smart Reindex, through the real method

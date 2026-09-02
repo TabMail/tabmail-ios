@@ -184,7 +184,15 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     /// overflow on a lossy link and parse fine on WiFi. It is therefore NOT a claim
     /// that the body is unfetchable, and it must never be treated as one.
     ///
-    /// Read by three kinds of consumer:
+    /// SET by every path that observes the overflow, so the flagged population is "every
+    /// row that overflowed" and not "the rows a background queue happened to reach
+    /// first": `ActiveBodyQueue.markOversizedDurably`,
+    /// `BackfillBodyQueue.markOversizedDurably`, and `BodyFetchProcessor.fetch`'s
+    /// `PayloadTooLargeError` branch (the single-item user-open path). All three write the
+    /// same statement under the same `AND bodyComplete = 0` guard.
+    ///
+    /// Read by five kinds of consumer. Three of them are code, and they all ask the same
+    /// question through `isBodyQuarantined` below; the other two are SQL.
     ///  1. The four body-fetch admission queries
     ///     (`Active`/`BackfillBodyQueue.repopulateFromDatabase` and `.repopulateOnDrain`)
     ///     — a flagged row is not offered to the background queues.
@@ -194,11 +202,25 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     ///     Fast Sync stop keeping the device awake, on an account holding one of these
     ///     messages. Owner decision 2026-09-01: while the parser bound is what it is,
     ///     these bodies are simply not fetchable, and nagging the user forever about
-    ///     work that cannot be done is the worse product outcome.
+    ///     work that cannot be done is the worse product outcome. Note the scope of that
+    ///     premise: not fetchable BY THIS BUILD, on the parser bound this build ships.
+    ///     Nothing here claims the body is gone or that a later build cannot get it.
     ///  3. The user-open path (`MessageDetailViewModel.loadBody`) — a flagged row
     ///     reports "unable to load" immediately, in exactly the state a fetch that just
     ///     failed would leave behind, instead of spending a full connection on an
     ///     attempt this build cannot complete.
+    ///  4. That view model's BODY POLL — the 2s retry loop `loadBody` starts on each of
+    ///     its three cancelled-read exits, and that `refetchBody` restarts whenever a
+    ///     pull-to-refresh produced no body. Those exits return BEFORE consumer 3's
+    ///     branch, so without a gate of its own the poll retries a flagged row forever,
+    ///     each attempt paying a full TCP + TLS + LOGIN + SELECT (the overflow marks the
+    ///     folder connection unhealthy, so no attempt can reuse it). It reports the same
+    ///     load-failed state and ends.
+    ///  5. The inbox snippet loader's network tier (`InboxViewModel.loadSnippetBatch`) —
+    ///     tier 2 calls the very `provider.fetchMessage` that overflowed. A flagged row
+    ///     is blacklisted for the session instead. It matters that this one is gated at
+    ///     all: `reloadMessages` clears that blacklist and re-queues the visible window,
+    ///     so an ungated row would be retried on every single reload.
     ///
     /// The row is NOT retired: `bodyComplete` stays 0, the header stays FTS-indexed and
     /// searchable by subject and sender, the FTS membership self-heal still sees it, and
@@ -209,14 +231,25 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     /// CLEARED — the full set, because a flag that outlives its truth is worse than no
     /// flag at all:
     ///  • by ANY successful body write, which is positive evidence refuting the
-    ///    observation. All four: `BodyFetchProcessor.flushBatch` (both the body branch
-    ///    and the confirmed-empty branch), `NSEDataBridge.flushNSEBatchToFTS`, and
-    ///    `SyncEngine.applySnippetUpdates`. This is load-bearing, not tidiness:
+    ///    observation. All four: `BodyFetchProcessor.flushBatch` (the body branch),
+    ///    `BodyFetchProcessor.process` (the confirmed-empty branch — a different
+    ///    function, not another branch of `flushBatch`), `NSEDataBridge
+    ///    .flushNSEBatchToFTS`, and `SyncEngine.applySnippetUpdates`.
+    ///    ⚠️ A `rg 'bodyMetadataOversized = 0'` census finds only THREE of them:
+    ///    `applySnippetUpdates` writes it as a GRDB `updateAll` chain
+    ///    (`Column("bodyMetadataOversized").set(to: false)`) and is invisible to every
+    ///    SQL-text search. Census this flag by SYMBOL, not by statement text.
+    ///    This is load-bearing, not tidiness:
     ///    `BodyAssetMaintenance` evicts the `messageBody` row while deliberately leaving
     ///    `bodyComplete = 1`, and the detail view's cache-miss fetch is the only
     ///    recovery — a stale flag would delete that recovery and brick a message this
     ///    build has already fetched once.
     ///  • on a UIDVALIDITY reset (the address changed, so the observation is void).
+    ///    ⚠️ Scope: this is the folder-wide UIDVALIDITY reset path
+    ///    (`clearOversizedDeferred` / `clearOversizedDurably`), which releases every
+    ///    flagged row in the folder. A single-message UID REMAP is a different event and
+    ///    does not run it — but it cannot strand a flag either, because the remap
+    ///    re-keys the header row and the flag travels with the row it describes.
     ///  • by Smart Reindex (`SyncEngine.resetCrawlState`), the user's explicit
     ///    try-everything-again gesture.
     ///  • exactly, in one statement, by the migration that ships a raised parser bound —
@@ -226,6 +259,24 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     /// The mark itself carries `AND bodyComplete = 0` for the same reason: a row that
     /// already has a body can never acquire this flag.
     var bodyMetadataOversized: Bool = false
+
+    /// THE READ-SIDE INVARIANT, in one place: is this row's body quarantined right now?
+    ///
+    /// Every fetch initiator asks the same question, and they must never disagree — the
+    /// four background admission queries ask it in SQL (`bodyMetadataOversized = 0`), and
+    /// the three code paths that can start a fetch on their own ask it here:
+    /// `MessageDetailViewModel.loadBody` (user open), that view model's body poll (the
+    /// retry loop the three cancelled-read exits and `refetchBody` leave behind), and
+    /// `InboxViewModel.loadSnippetBatch`'s tier-2 network fetch. Written out three times
+    /// as `flag && !bodyComplete`, one of them would eventually be added, moved or
+    /// negated alone.
+    ///
+    /// `!bodyComplete` is a FAIL-SAFE, not the primary defence — see the flag's own
+    /// documentation above. The cache deleters remove a `messageBody` row while leaving
+    /// `bodyComplete = 1` and rely on the detail view's cache-miss fetch as their only
+    /// recovery, so a stale flag must cost a wasted round trip, never a permanently
+    /// unopenable message.
+    var isBodyQuarantined: Bool { bodyMetadataOversized && !bodyComplete }
 
     /// How many times a body fetch returned empty (no text, no attachments).
     /// Used to guard against false empties from partial IMAP responses.

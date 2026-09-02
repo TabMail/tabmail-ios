@@ -23,7 +23,15 @@ import GRDB
 /// Two-sided by construction: the identical fixture with the flag cleared MUST fetch,
 /// so a short-circuit that fired unconditionally (or a fixture that never reached the
 /// fetch at all) cannot pass this suite.
-@Suite("Opening an oversized-quarantined message reports failure without a fetch")
+/// `.serialized, .processGlobalState` is REQUIRED, not decorative. The poll tests below
+/// run a REAL body poll, and a poll touches `AccountManager.shared` — `recoverHeaderIfMissing`,
+/// the address-corroboration check, and (absent an injected override) `fetchBody` itself,
+/// which will `connectAccount` a provider into the shared registry. Without the trait this
+/// suite runs in parallel with `ProviderIdQueueFuzzTests`, which swaps `AppDatabase.shared`
+/// and asserts on that same registry — and it did: three consecutive full-suite runs failed
+/// that suite's `liveSessionCount() == 0` teardown assertion while an isolated re-run of it
+/// passed. `.serialized` alone would not have helped; it orders tests only INSIDE one suite.
+@Suite("Opening an oversized-quarantined message reports failure without a fetch", .serialized, .processGlobalState)
 struct MessageDetailOversizedQuarantineTests {
 
     /// Counts real fetch attempts. `loadBody` routes through `fetchBodyOverride` when
@@ -162,12 +170,15 @@ struct MessageDetailOversizedQuarantineTests {
     /// Pull-to-refresh is the user's explicit "try again", and it is the escape hatch
     /// that keeps the quarantine an observation rather than a verdict. It must stay a
     /// GENUINE retry: the flag is deliberately not consulted here.
-    @Test("Pull-to-refresh still performs a real fetch on a flagged message")
+    @Test("Pull-to-refresh still performs a real fetch on a flagged message, and leaves a poll behind")
     @MainActor
     func pullToRefreshStillRetries() async throws {
         let probe = FetchProbe()
         let (vm, pool, dir) = try makeVM(oversized: true, probe: probe)
-        defer { cleanup(pool, dir) }
+        // The poll `refetchBody` starts is REAL: its 2s tick calls `manager.fetchBody`
+        // on the live AccountManager, not the injected override. Stop it before the
+        // fixture DB is retired, or it outlives this test.
+        defer { vm.cancelBodyPollForTesting(); cleanup(pool, dir) }
 
         await vm.loadBody()
         #expect(probe.attempts == 0)
@@ -176,6 +187,78 @@ struct MessageDetailOversizedQuarantineTests {
 
         #expect(probe.attempts == 1,
                 "an explicit user retry must reach the wire — the parser bound is fragmentation-dependent, so the same message can succeed on a different connection")
+        // Stated, not incidental: the retry produced no body (the override is a no-op),
+        // so `refetchBody`'s tail restarts the poll. That poll is what the next two
+        // tests are about — it is the ONE path by which a flagged row can still end up
+        // with a background retry loop behind it.
+        #expect(vm.hasStartedBodyPollForTesting,
+                "a refresh that produced no body restarts the poll — the quarantine's poll-side gate is what keeps that bounded")
+    }
+
+    // MARK: - The poll-side gate
+
+    /// 🚨 THE OTHER HALF OF THE QUARANTINE. `loadBody`'s branch is unreachable on three
+    /// paths — a cancelled header read, a cancelled resolve and a cancelled body
+    /// cache-check each `startBodyPoll(); return` BEFORE it — and `refetchBody` restarts
+    /// the poll unconditionally when no body arrived. On a flagged row that poll used to
+    /// retry every 2 seconds forever, each attempt paying a full TCP + TLS + LOGIN +
+    /// SELECT because the parser overflow marks the folder connection unhealthy. Gating
+    /// only the four background queries and the open path left this initiator live.
+    ///
+    /// The property asserted is the user-visible end state the poll must reach on its
+    /// own: the load-failed presentation, without the caller ever calling `loadBody`
+    /// again. Not "we added a guard at line N".
+    @Test("The poll stops itself on a flagged row and reports the load failure")
+    @MainActor
+    func bodyPollStopsItselfOnAFlaggedRow() async throws {
+        let probe = FetchProbe()
+        let (vm, pool, dir) = try makeVM(oversized: true, probe: probe)
+        defer { vm.cancelBodyPollForTesting(); cleanup(pool, dir) }
+
+        // Drive the poll DIRECTLY — that is the state the three cancelled-read exits in
+        // `loadBody` leave behind, and `loadBody`'s own branch is not involved.
+        // Hoisted: `messageId` is main-actor isolated and the read closure is Sendable.
+        let key = vm.messageId
+        vm._testSeedMessage(try #require(try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: key)
+        }))
+        vm.startBodyPoll()
+
+        // One tick is 2s; give it a second tick's worth of slack rather than racing it.
+        try await Task.sleep(for: .seconds(5))
+
+        #expect(vm.error != nil,
+                "the poll must reach the same load-failed state the open path reports, on its own")
+        #expect(vm.isLoading == false, "a spinner would promise progress that cannot come")
+        #expect(vm.messageBody == nil, "nothing was fetched, so nothing may be shown as content")
+        #expect(probe.attempts == 0,
+                "and it must reach that state WITHOUT a wire attempt — the point of the gate is the connection it does not spend")
+    }
+
+    /// CONTROL. Without it the assertion above passes on a build whose poll sets `error`
+    /// for any reason at all — including one that never reaches the quarantine check.
+    /// An unflagged row's poll takes the ordinary fetch path, whose failures are logged
+    /// and retried, never surfaced as `error`.
+    @Test("CONTROL: the identical unflagged row's poll does NOT report a load failure")
+    @MainActor
+    func unflaggedRowPollDoesNotReportFailure() async throws {
+        let probe = FetchProbe()
+        let (vm, pool, dir) = try makeVM(oversized: false, probe: probe)
+        defer { vm.cancelBodyPollForTesting(); cleanup(pool, dir) }
+
+        // Hoisted: `messageId` is main-actor isolated and the read closure is Sendable.
+        let key = vm.messageId
+        vm._testSeedMessage(try #require(try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: key)
+        }))
+        vm.startBodyPoll()
+
+        try await Task.sleep(for: .seconds(5))
+
+        #expect(probe.attempts >= 1,
+                "the ONLY difference from the case above is the flag, so this poll must reach the wire")
+        #expect(vm.error == nil,
+                "…and an ordinary poll failure is logged and retried, never surfaced as a load failure")
     }
 
     /// 🚨 THE EVICTION-RECOVERY INVARIANT — the regression the round-1 audit caught.

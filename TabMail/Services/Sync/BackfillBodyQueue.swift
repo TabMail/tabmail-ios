@@ -22,6 +22,40 @@ actor BackfillBodyQueue {
         let isInInbox: Bool
     }
 
+    /// The SOLE admission query for this queue: every row that still needs a body
+    /// fetch, in the order the queue wants them. Hoisted into ONE symbol because it
+    /// has three consumers that must never diverge — `repopulateFromDatabase`
+    /// (launch / foreground / sync recovery), `repopulateOnDrain` (the drain-time
+    /// safety net), and the tests that assert what the queue will and will not admit.
+    /// Two byte-identical copies plus a test replica meant the `bodyMetadataOversized`
+    /// quarantine had to be added in three places and could be silently dropped from
+    /// one of them; a test replica in particular can keep passing while production
+    /// admits a row it should refuse.
+    ///
+    /// `bodyMetadataOversized = 0` is the quarantine gate — see
+    /// `MessageHeader.bodyMetadataOversized` for the full CLEARED enumeration.
+    nonisolated static let admissionSQL = """
+        SELECT id, accountId, folderPath, messageId, isInInbox
+        FROM messageHeader
+        WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 0
+          AND bodyMetadataOversized = 0
+        ORDER BY date DESC
+        """
+
+    /// Runs `admissionSQL` and maps it to queue items. Synchronous — the caller owns
+    /// the `dbPool.read`, so this stays usable from any read the callers already have.
+    nonisolated static func admissionItems(_ db: Database) throws -> [Item] {
+        try Row.fetchAll(db, sql: admissionSQL).map { row in
+            Item(
+                headerId: row["id"],
+                accountId: row["accountId"],
+                folderPath: row["folderPath"],
+                messageId: row["messageId"],
+                isInInbox: row["isInInbox"]
+            )
+        }
+    }
+
     private var storage = QueueStorage<Item>()
 
     private var debounceTask: Task<Void, Never>?
@@ -246,8 +280,18 @@ actor BackfillBodyQueue {
     ///      carry this flag: it re-indexes HEADERS, and this row's header is healthy.
     ///      Excluding it would drop a good message out of subject/sender search.
     ///   4. Opening an affected message reports "unable to load" immediately without a
-    ///      wire attempt (`MessageDetailViewModel.loadBody`). The user's retry is
-    ///      pull-to-refresh, which still performs a genuine fetch.
+    ///      wire attempt (`MessageDetailViewModel.loadBody`), and the body poll that
+    ///      view model leaves behind stops itself the same way rather than retrying
+    ///      every 2s forever. The user's retry is pull-to-refresh, which still performs
+    ///      a genuine fetch — and whose own trailing poll then stops itself too.
+    ///   5. The inbox snippet loader refuses the row at its network tier and blacklists
+    ///      it for the session (`InboxViewModel.loadSnippetBatch`), so an affected row
+    ///      shows no snippet preview. The blacklist is cleared on every reload, which
+    ///      costs a repeated DB read and no wire traffic.
+    ///
+    /// The read-side predicate shared by items 4 and 5 is `MessageHeader
+    /// .isBodyQuarantined`; the four background queries are the SQL half of the same
+    /// question (`ActiveBodyQueue.admissionSQL` / `BackfillBodyQueue.admissionSQL`).
     ///
     /// Dispatch and ordering guarantees are documented on `enqueueDurableWrite`.
     private func markOversizedDurably(_ headerId: String) {
@@ -275,8 +319,21 @@ actor BackfillBodyQueue {
     /// folder's UIDs no longer address the same messages, so a per-row observation
     /// about "the message at this address" is void and must not outlive it.
     ///
-    /// Scoped by `(accountId, folderPath)` in SQL rather than by re-deriving the
-    /// header-id shape, so it cannot drift from `MessageIdentity`'s parsing.
+    /// Scoped by the `(accountId, folderPath)` COLUMNS in SQL, while the in-memory half
+    /// above filters header-id STRINGS through `MessageIdentity.headerIdBelongsToFolder`.
+    ///
+    /// ⚠️ Those two are not the same predicate, and an earlier version of this comment
+    /// claimed the SQL form "cannot drift from `MessageIdentity`'s parsing". It can:
+    /// `optimisticMoveToFolder` leaves a row whose id was minted under the SOURCE folder
+    /// while its columns already name the DESTINATION, so for that row the string filter
+    /// and the column filter disagree about which folder it belongs to.
+    ///
+    /// Kept as-is because the disagreement is benign in BOTH directions, and the columns
+    /// are the better half: a UIDVALIDITY reset is a statement about the folder the row is
+    /// IN. If the durable clear releases a mid-move row the in-memory half kept, the row
+    /// is merely re-offered to the queues — the worst case is one wasted fetch. If it
+    /// keeps one the in-memory half released, the row stays quarantined until the next
+    /// reset, a success write, or Smart Reindex, exactly as any other flagged row does.
     private func clearOversizedDurably(accountId: String, folderPath: String) {
         enqueueDurableWrite(label: "clear \(folderPath)") { db in
             try db.execute(
@@ -406,22 +463,7 @@ actor BackfillBodyQueue {
             // Single query — no OFFSET pagination (OFFSET re-reads all preceding rows).
             // 5 columns * 200K rows ≈ 30MB, acceptable for one-time startup load.
             let items: [Item] = try await dbPool.read { db in
-                try Row.fetchAll(db, sql: """
-                    SELECT id, accountId, folderPath, messageId, isInInbox
-                    FROM messageHeader
-                    WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 0
-                      AND bodyMetadataOversized = 0
-                    ORDER BY date DESC
-                    """)
-                .map { row in
-                    Item(
-                        headerId: row["id"],
-                        accountId: row["accountId"],
-                        folderPath: row["folderPath"],
-                        messageId: row["messageId"],
-                        isInInbox: row["isInInbox"]
-                    )
-                }
+                try Self.admissionItems(db)
             }
 
             var totalAdded = 0
@@ -1180,22 +1222,7 @@ actor BackfillBodyQueue {
     private func repopulateOnDrain() async {
         do {
             let items: [Item] = try await dbPool.read { db in
-                try Row.fetchAll(db, sql: """
-                    SELECT id, accountId, folderPath, messageId, isInInbox
-                    FROM messageHeader
-                    WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 0
-                      AND bodyMetadataOversized = 0
-                    ORDER BY date DESC
-                    """)
-                .map { row in
-                    Item(
-                        headerId: row["id"],
-                        accountId: row["accountId"],
-                        folderPath: row["folderPath"],
-                        messageId: row["messageId"],
-                        isInInbox: row["isInInbox"]
-                    )
-                }
+                try Self.admissionItems(db)
             }
             guard !items.isEmpty else { return }
             var added = 0

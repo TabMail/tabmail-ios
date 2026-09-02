@@ -179,6 +179,93 @@ struct PayloadTooLargeRetryabilityTests {
         #expect(eligible, "the message must stay in the body queues' candidate set so a later attempt can fetch it")
     }
 
+    /// 🚨 THE USER-OPEN PATH RECORDS ITS OBSERVATION TOO.
+    ///
+    /// This branch is the SOONEST the app can learn a message overflows the parser — it
+    /// runs on the very first open, before any background queue has reached the row. It
+    /// used to throw that knowledge away, and the comment here asserted the omission was
+    /// harmless because "that path performs no retry loop". It does loop: `loadBody` ends
+    /// with `if messageBody == nil { startBodyPoll() }`, and that poll re-fetches every
+    /// 2 seconds indefinitely, each attempt paying a full TCP + TLS + LOGIN + SELECT
+    /// because the overflow marks the folder connection unhealthy.
+    ///
+    /// The property: after a user-open overflow the row is quarantined, by the same
+    /// definition every other consumer uses (`MessageHeader.isBodyQuarantined`) — which
+    /// is what lets the poll's own gate stop the loop on its next tick.
+    @Test("A user-open payload-too-large records the observation, so the poll behind it can stop")
+    func payloadTooLargeOnTheOpenPathQuarantinesTheRow() async throws {
+        let (header, restore) = try makeTestDB()
+        defer { restore() }
+
+        let provider = MockEmailProvider()
+        await provider.setFetchMessageThrows(StubPayloadTooLargeError())
+
+        let result = await BodyFetchProcessor.fetchAndProcess(
+            item: makeItem(header), provider: provider, enableAI: false
+        )
+        #expect(result == .payloadTooLarge, "precondition — the overflow branch ran")
+
+        let stored = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        })
+        #expect(stored.isBodyQuarantined,
+                "the one path that detects the overflow first must not discard what it learned — otherwise the flag's population is whatever a background queue happened to reach, and the poll behind this failure spins forever")
+        // Recorded, NOT retired: every assertion in `payloadTooLargeLeavesMessageRetryable`
+        // still holds, and pull-to-refresh is still a genuine wire attempt.
+        #expect(stored.bodyEmptyConfirmed == false)
+        #expect(stored.bodyComplete == false)
+        #expect(stored.emptyFetchCount == 0)
+        #expect(stored.missFetchCount == 0)
+    }
+
+    /// NON-VACUITY for the mark above. A fetch that fails for any OTHER reason must not
+    /// quarantine anything — the flag names one specific, upstream-fixable failure mode,
+    /// and a mark that fired on every error would take ordinary transient failures out of
+    /// background admission permanently.
+    @Test("CONTROL: an ordinary fetch failure does NOT quarantine the row")
+    func ordinaryFetchFailureDoesNotQuarantine() async throws {
+        let (header, restore) = try makeTestDB()
+        defer { restore() }
+
+        let provider = MockEmailProvider()
+        await provider.setFetchMessageThrows(ProviderError.messageNotFound)
+
+        _ = await BodyFetchProcessor.fetchAndProcess(
+            item: makeItem(header), provider: provider, enableAI: false
+        )
+
+        let stored = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        })
+        #expect(stored.isBodyQuarantined == false,
+                "only a parser overflow may set this flag — a transient failure that got quarantined would never be retried by any background queue again")
+    }
+
+    /// The write-side guard, on this path too: a body that landed between the overflow
+    /// and the write means the row must not be quarantined at all.
+    @Test("A row that already has a body is not quarantined by a payload-too-large")
+    func payloadTooLargeSkipsARowThatAlreadyHasABody() async throws {
+        let (header, restore) = try makeTestDB()
+        defer { restore() }
+
+        try await AppDatabase.dbPool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE id = ?",
+                           arguments: [header.id])
+        }
+
+        let provider = MockEmailProvider()
+        await provider.setFetchMessageThrows(StubPayloadTooLargeError())
+        _ = await BodyFetchProcessor.fetchAndProcess(
+            item: makeItem(header), provider: provider, enableAI: false
+        )
+
+        let stored = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        })
+        #expect(stored.bodyMetadataOversized == false,
+                "the mark carries `AND bodyComplete = 0` — minting a stale flag on a completed row is exactly what the detail view's fail-safe exists to survive, and must not be done deliberately")
+    }
+
     // MARK: - Side 2 — a genuinely empty body must STILL confirm empty
 
     /// The non-vacuity half. Without this, side 1 would also pass against a build

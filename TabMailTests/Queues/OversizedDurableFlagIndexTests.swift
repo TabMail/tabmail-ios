@@ -9,39 +9,30 @@ import GRDB
 
 // MARK: - Shared SQL
 
-/// The four BODY-FETCH ADMISSION queries, verbatim from production. These are the only
-/// queries that carry `bodyMetadataOversized = 0`, and the only ones
-/// `messageHeader_bodyRepopulateV2` serves.
+/// The BODY-FETCH ADMISSION queries — taken from the PRODUCTION symbols, not transcribed.
+/// `ActiveBodyQueue.admissionSQL` and `BackfillBodyQueue.admissionSQL` are each the sole
+/// source used by that queue's `repopulateFromDatabase` and `repopulateOnDrain`, so the
+/// plan asserted below is the plan production runs. These used to be hand-copied string
+/// literals: a transcription cannot fail when production changes, so the gate silently
+/// stopped measuring anything the moment the two drifted.
 ///
-/// ⚠️ Transcribed SQL is a WEAK oracle — it cannot fail when production changes. These
-/// copies exist only to gate the PLAN SHAPE, which needs a literal statement to hand to
-/// `EXPLAIN QUERY PLAN`. The behavioural claim (a flagged row leaves background
-/// admission) is pinned against the REAL queues in
-/// `OversizedBodyQuarantineDatabaseTests`, which calls `repopulateFromDatabase()`.
+/// The behavioural claim (a flagged row leaves background admission) is pinned separately
+/// against the REAL queues in `OversizedBodyQuarantineDatabaseTests`, which drives
+/// `repopulateFromDatabase()` itself.
 private enum AdmissionSQL {
-    static let activeRepopulate = """
-        SELECT id, accountId, folderPath, messageId, isInInbox
-        FROM messageHeader
-        WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-          AND bodyMetadataOversized = 0
-        ORDER BY date DESC
-        """
-    static let backfillRepopulate = """
-        SELECT id, accountId, folderPath, messageId, isInInbox
-        FROM messageHeader
-        WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 0
-          AND bodyMetadataOversized = 0
-        ORDER BY date DESC
-        """
+    static let activeRepopulate = ActiveBodyQueue.admissionSQL
+    static let backfillRepopulate = BackfillBodyQueue.admissionSQL
+
     /// The same query WITHOUT the new conjunct — the negative control. Without it the
     /// gate cannot tell "the index is used because we added the clause" from "the index
-    /// would have been used anyway".
-    static let withoutConjunct = """
-        SELECT id, accountId, folderPath, messageId, isInInbox
-        FROM messageHeader
-        WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 0
-        ORDER BY date DESC
-        """
+    /// would have been used anyway". Derived from the production string by deleting the
+    /// conjunct, so it cannot drift away from the query it is a control for. Line-based
+    /// rather than a literal `replacingOccurrences` so it survives the indentation Swift
+    /// strips from a multi-line literal.
+    static let withoutConjunct = backfillRepopulate
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .filter { !$0.contains("bodyMetadataOversized") }
+        .joined(separator: "\n")
 
     static let all: [(name: String, sql: String)] = [
         ("ActiveBodyQueue.repopulateFromDatabase / .repopulateOnDrain", activeRepopulate),
@@ -171,6 +162,10 @@ struct OversizedDurableFlagIndexTests {
     /// future edit that drops it from one of the four queries is visible.
     @Test("A query without the conjunct returns the flagged row — the clause is load-bearing, not decorative")
     func withoutTheConjunctTheFlaggedRowComesBack() throws {
+        // The control is DERIVED from the production string — if the derivation ever
+        // no-ops, the two are identical and every assertion below becomes vacuous.
+        #expect(AdmissionSQL.withoutConjunct != AdmissionSQL.backfillRepopulate,
+                "the negative control must actually differ from the production query")
         let db = try TestDatabase.make()
         try seedFlaggedRow(db)
 
@@ -381,6 +376,60 @@ struct OversizedDurableFlagConfinementTests {
                 "indexed must reach total once the only outstanding row is unfetchable")
     }
 
+    /// 🚨 THE PARTITION PROPERTY, over the WHOLE truth table rather than the one row the
+    /// two tests above happen to seed.
+    ///
+    /// `pendingBodyCount` and the "N / M indexed" readout are the same question asked
+    /// from opposite sides, and the stop-gap added a THIRD settled disposition to a pair
+    /// that previously had two. If a disposition is settled on one side and still pending
+    /// on the other, the progress bar parks below 100% beside a green completion check;
+    /// if it lands on both, the numerator can exceed the denominator. Neither is visible
+    /// from a single-row fixture — only from every combination at once.
+    ///
+    /// Scoped to header-complete rows on purpose: a row whose HEADER has not landed is
+    /// outside the body question entirely, and `pendingBodyRequest` says so with its
+    /// `headerComplete` conjunct.
+    @Test("Pending and settled partition every header-complete row — disjoint and exhaustive across the whole disposition table")
+    func pendingAndSettledPartitionEveryHeaderCompleteRow() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+
+        // All 8 combinations of the three dispositions, each on its own row.
+        var ids: [String] = []
+        for (n, (complete, empty, oversized)) in [
+            (false, false, false), (true, false, false), (false, true, false), (false, false, true),
+            (true, true, false), (true, false, true), (false, true, true), (true, true, true),
+        ].enumerated() {
+            let h = try TestDatabase.insertMessageHeader(
+                db, messageId: "\(n)", folderId: "acc1:Archive", folderPath: "Archive", isInInbox: false)
+            try db.write { conn in
+                try conn.execute(sql: """
+                    UPDATE messageHeader
+                    SET headerComplete = 1, bodyComplete = ?, bodyEmptyConfirmed = ?, bodyMetadataOversized = ?
+                    WHERE id = ?
+                    """, arguments: [complete, empty, oversized, h.id])
+            }
+            ids.append(h.id)
+        }
+        #expect(ids.count == 8, "precondition — one row per disposition combination")
+
+        let pending = try db.read { conn in
+            try MessageHeader.pendingBodyRequest(accountId: "acc1").fetchAll(conn).map(\.id)
+        }
+        let settled = try db.read { conn in
+            try MessageHeader.bodySettledRequest(accountId: "acc1").fetchAll(conn).map(\.id)
+        }
+
+        #expect(Set(pending).isDisjoint(with: Set(settled)),
+                "no row may be both outstanding and resolved — that makes the indexed numerator exceed its denominator; overlap was \(Set(pending).intersection(Set(settled)))")
+        #expect(Set(pending).union(Set(settled)) == Set(ids),
+                "and none may be neither — an uncounted row parks the bar below 100% forever; missing was \(Set(ids).subtracting(Set(pending).union(Set(settled))))")
+        // Non-vacuity: the split is real, not "everything landed on one side".
+        #expect(pending.count == 1, "exactly one combination — all three dispositions false — is outstanding")
+        #expect(settled.count == 7, "and the other seven are settled")
+    }
+
     /// `selfHealBackfillFTSMembership` re-indexes HEADERS. The flagged row's header is
     /// perfectly healthy — only its body is missing — so excluding it would silently
     /// drop a good message out of subject and sender search.
@@ -389,30 +438,24 @@ struct OversizedDurableFlagConfinementTests {
         let db = try TestDatabase.make()
         _ = try seed(db)
 
+        // THE PRODUCTION SCOPE ITSELF. Transcribing it here would make this test
+        // permanently green: a copy cannot notice when production adds the conjunct,
+        // which is the single regression this test exists to catch.
         let candidates = try db.read { conn in
-            try String.fetchAll(conn, sql: """
-                SELECT id FROM messageHeader
-                WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0
-                LIMIT 5000
-                """)
+            try String.fetchAll(conn, sql: SyncEngine.backfillFTSSelfHealCandidateSQL)
         }
         #expect(candidates.count == 1,
                 "the self-heal scope must NOT carry the oversized conjunct — the header is healthy and must stay indexed")
+        #expect(!SyncEngine.backfillFTSSelfHealCandidateSQL.contains("bodyMetadataOversized"),
+                "and it must not mention the flag at all — a future re-merge of the two predicates is the failure this pins")
     }
 
-    /// Data Integrity Rule 1: an oversized body is the opposite of "content confirmed
-    /// gone" — the body demonstrably exists, it merely did not fit.
-    @Test("Flagging never marks the row complete, empty, or spends a strike from the empty budget")
-    func flaggingNeverRetiresTheRow() throws {
-        let db = try TestDatabase.make()
-        let id = try seed(db)
-        let row = try db.read { try MessageHeader.fetchOne($0, key: id) }
-        let stored = try #require(row)
-        #expect(stored.bodyComplete == false)
-        #expect(stored.bodyEmptyConfirmed == false)
-        #expect(stored.emptyFetchCount == 0)
-        #expect(stored.missFetchCount == 0)
-    }
+    // `flaggingNeverRetiresTheRow` lived here and was DELETED as vacuous: its fixture set
+    // the flag with a direct `UPDATE`, so it only ever asserted that a statement which
+    // touches one column leaves the others alone. The real claim — that the PRODUCTION
+    // mark (`markOversizedDurably`) retires nothing — is asserted against both queues in
+    // `OversizedBodyQuarantineDatabaseTests.markingNeverRetiresTheRow*`, where the flag
+    // is set by the code under test.
 
     /// NEGATIVE CONTROL for the half-port. Smart Reindex's statement needs the flag in
     /// BOTH halves: a flagged row has `bodyEmptyConfirmed = 0`, so the ORIGINAL `WHERE`

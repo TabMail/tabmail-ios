@@ -149,14 +149,12 @@ struct HeaderCompleteRepopulateTests {
             snippet: "test"
         )
 
-        // Run the same query as ActiveBodyQueue.repopulateFromDatabase
+        // The PRODUCTION query `ActiveBodyQueue.repopulateFromDatabase` runs, not a copy.
+        // The copy that used to be here had already drifted — it never gained the
+        // `bodyMetadataOversized` conjunct — so it was asserting a predicate production
+        // no longer used.
         let items: [Row] = try db.read { dbConn in
-            try Row.fetchAll(dbConn, sql: """
-                SELECT id, accountId, folderPath, messageId, isInInbox
-                FROM messageHeader
-                WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                ORDER BY date DESC
-                """)
+            try Row.fetchAll(dbConn, sql: ActiveBodyQueue.admissionSQL)
         }
         #expect(items.isEmpty, "headerComplete=0 row should be excluded from repopulate")
     }
@@ -182,12 +180,7 @@ struct HeaderCompleteRepopulateTests {
         }
 
         let items: [Row] = try db.read { dbConn in
-            try Row.fetchAll(dbConn, sql: """
-                SELECT id, accountId, folderPath, messageId, isInInbox
-                FROM messageHeader
-                WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                ORDER BY date DESC
-                """)
+            try Row.fetchAll(dbConn, sql: ActiveBodyQueue.admissionSQL)
         }
         #expect(items.count == 1)
         guard items.count == 1 else { return }

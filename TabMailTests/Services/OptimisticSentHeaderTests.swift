@@ -576,12 +576,11 @@ struct OptimisticSentHeaderInsertionTests {
             body: "Body that is already on disk locally"
         )
 
+        // The PRODUCTION query, not a copy — the copy here had drifted from it (no
+        // `bodyMetadataOversized` conjunct, no `ORDER BY`), so it no longer answered the
+        // question the assertion below asks.
         let candidates = try db.read { dbConn in
-            try Row.fetchAll(dbConn, sql: """
-                SELECT id, accountId, folderPath, messageId, isInInbox
-                FROM messageHeader
-                WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 0
-                """)
+            try Row.fetchAll(dbConn, sql: BackfillBodyQueue.admissionSQL)
         }
 
         // The optimistic Sent placeholder must NOT match BackfillBody's repopulate
