@@ -1,3 +1,18 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note (2026-09-01):** the two statements below are current authority; their
+> frozen predecessor wording remains in the preserved body underneath.
+
+- **`pendingBodyCount`'s predicate gained a fourth conjunct**: `headerComplete=1 AND bodyComplete=0
+  AND bodyEmptyConfirmed=0 AND bodyMetadataOversized=0`. It is no longer transcribed anywhere — the
+  definition is the named symbol `MessageHeader.pendingBodyRequest`, and the body queues' half is
+  `ActiveBodyQueue.admissionSQL` / `BackfillBodyQueue.admissionSQL`.
+- ⚠️ **"Self-terminating" is TWO mechanisms, not one.** Empty and 404 bodies terminate by CONFIRMING
+  EMPTY (`bodyEmptyConfirmed=1` after three attempts). An OVERSIZED body must not — the content
+  demonstrably exists, so confirming it empty is a data-integrity-rule-1 violation that leaves the
+  message searchable-but-unopenable (shipped once; that is the bug the quarantine fixed). It
+  terminates by being QUARANTINED (`bodyMetadataOversized=1`) instead. The preserved line below
+  reads "empty/404/oversized bodies confirm-empty"; do not restore that conflation.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ### Backfill / Fast Sync Completion — gate on `pendingBodyCount`, NEVER a server total
 - **`BackfillProgress.isFullyComplete` gates on `headersDone && totalEmails > 0 && pendingBodyCount == 0`** (`AccountManager.swift`). `pendingBodyCount` = body-eligible headers still awaiting fetch (`headerComplete=1 AND bodyComplete=0 AND bodyEmptyConfirmed=0`), the same criteria `BackfillBodyQueue`/`ActiveBodyQueue` select on. It is local and self-terminating (empty/404/oversized bodies confirm-empty), so it reaches 0 once the body queues have nothing fetchable left.

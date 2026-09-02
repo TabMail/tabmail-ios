@@ -29,14 +29,14 @@ import GRDB
 /// (`MIS-033`), rather than trusting any integer here:
 /// ```
 /// rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' \
-///    TabMail/Services/AppDatabase.swift                                    → 20
+///    TabMail/Services/AppDatabase.swift                                    → 21
 /// rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' \
-///    TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 20
+///    TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 21
 /// ```
 /// Equal counts are the invariant: every migration from `v68` up runs
 /// `.immediate`, none below `v68` does, and `everyLiveForeignKeyCascades` below
-/// checks the premise that licenses it. At the current top (`v87`) the two
-/// counts are 20; at 87 registered migrations that leaves 67 still
+/// checks the premise that licenses it. At the current top (`v88`) the two
+/// counts are 21; at 88 registered migrations that leaves 67 still
 /// running the whole-database check (66 on the GRDB default plus `v2`, the only
 /// explicit `.deferred` left).
 ///

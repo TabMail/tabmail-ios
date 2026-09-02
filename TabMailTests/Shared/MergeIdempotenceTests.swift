@@ -124,11 +124,11 @@ struct MergeIdempotenceTests {
 
         // Verify ActiveBodyQueue filter includes this message for re-fetch.
         let enqueued: Int = try db.read {
-            try Int.fetchOne($0, sql: """
-                SELECT COUNT(*) FROM messageHeader
-                WHERE id = ? AND headerComplete = 1 AND bodyComplete = 0
-                  AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                """, arguments: [headerId])!
+            // The production query itself, via `ActiveBodyQueue.admissionItems`. A hand-copied
+            // predicate stops BEING the admission predicate the moment production gains a
+            // clause — it just gained `AND bodyMetadataOversized = 0`, and a never-drop claim
+            // measured against a stale copy proves nothing about the queue that actually runs.
+            try ActiveBodyQueue.admissionItems($0).filter { $0.headerId == headerId }.count
         }
         #expect(enqueued == 1, "CID-unresolved message must remain in ActiveBodyQueue's filter")
     }
@@ -271,11 +271,11 @@ struct MergeIdempotenceTests {
         // Step 2: Sync runs, would enqueue for body fetch ONLY if bodyComplete=0.
         // Verify the header is filtered OUT by ActiveBodyQueue's SQL predicate.
         let shouldEnqueue: Int = try db.read {
-            try Int.fetchOne($0, sql: """
-                SELECT COUNT(*) FROM messageHeader
-                WHERE headerComplete = 1 AND bodyComplete = 0
-                  AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                """)!
+            // The production query itself, via `ActiveBodyQueue.admissionItems`. A hand-copied
+            // predicate stops BEING the admission predicate the moment production gains a
+            // clause — it just gained `AND bodyMetadataOversized = 0`, and a never-drop claim
+            // measured against a stale copy proves nothing about the queue that actually runs.
+            try ActiveBodyQueue.admissionItems($0).count
         }
         #expect(shouldEnqueue == 0, "NSE-complete body must be skipped by sync's body queue")
     }

@@ -108,6 +108,39 @@ final class MessageDetailViewModel {
     /// (e.g., lock contention caused a timeout, but a later retry wrote the body).
     	@ObservationIgnored nonisolated(unsafe) private var bodyPollTask: Task<Void, Never>?
 
+    /// Test seam: has a body poll been started on this view model?
+    ///
+    /// Internal (not `private`) because `@testable import` cannot reach `private`
+    /// members, and "no poll was started" is otherwise unobservable: a poll produces no
+    /// synchronous effect, so an unwanted one would simply run in the background instead
+    /// of failing a test. The oversized-metadata quarantine in `loadBody` depends on not
+    /// starting one.
+    ///
+    /// (Its retry now goes through `_fetchBodyOverride` like every other fetch site, so an
+    /// injected probe counts the poll's attempts too — but that is a wire oracle, not an
+    /// answer to "was one started at all".)
+    ///
+    /// ⚠️ NOT `#if DEBUG`-gated, and that is a decision rather than an oversight. The same
+    /// change gates `InboxViewModel.runSnippetBatchForTesting` (drives a network tier) and
+    /// `StuckMessageDiagnostics.countForTesting` (interpolates a caller string into SQL) —
+    /// the gate follows the HAZARD, not the `ForTesting` suffix. This seam and
+    /// `cancelBodyPollForTesting` take no input, reach no network, and have no production
+    /// caller, which puts them with the ~24 ungated seams already in the tree.
+    var hasStartedBodyPollForTesting: Bool { bodyPollTask != nil }
+
+    /// Test seam: stop a poll a test deliberately started.
+    ///
+    /// A poll that outlives its test is not inert — its 2s tick calls
+    /// `manager.fetchBody` on the REAL `AccountManager`, so a leaked one reaches for the
+    /// network from whatever test happens to be running next. `deinit` cancels it, but a
+    /// test cannot control when the view model is released. Tests that exercise a poll
+    /// on purpose (`refetchBody`'s trailing restart, the quarantine's poll-side gate)
+    /// call this in `defer`.
+    func cancelBodyPollForTesting() {
+        bodyPollTask?.cancel()
+        bodyPollTask = nil
+    }
+
     /// True while pull-to-refresh is fetching a replacement. The previous body
     /// remains readable; concurrent adoption waits so the refresh has one stable
     /// visible baseline.
@@ -1085,10 +1118,71 @@ final class MessageDetailViewModel {
                 guard !self.isRefetchingBody else { continue }
                 // 2. Re-attempt server fetch (connection may have recovered)
                 guard let msg = self.message else { continue }
+                // Oversized-metadata quarantine — a UI-STATE check, not the network
+                // guard. `AccountManagerFetch.fetchBody` refuses a quarantined row at the
+                // funnel, so nothing here can reach the wire. This mirrors the address
+                // gate's split, whose funnel comment states the rule — "the caller-side
+                // check now only decides which UI state to show".
+                //
+                // ⚠️ This comment used to justify the gate with "what the funnel cannot do
+                // is end this poll or say anything to the user, because the catch below
+                // only logs and continues". That stopped being true in the same branch: the
+                // catch's FIRST statement is now `if BodyFetchRefusal.endsPolling(error)`,
+                // which reaches the identical end state. Two things still make this gate
+                // worth its per-tick read, and they are the reasons to keep it:
+                //   - it ends the poll one tick EARLIER, without an attempt; and
+                //   - it pre-empts the funnel's ADDRESS gate, which is evaluated FIRST.
+                //     For a quarantined row whose move is in flight the funnel throws
+                //     `ProviderError.addressPendingMove`, which `endsPolling` excludes
+                //     structurally — it is not a `.networkError`, so it fails the first
+                //     guard, and that is correct because a move completing IS a real state
+                //     change worth waiting for. Without this gate such a row keeps polling
+                //     until the move settles, even though the quarantine already decided
+                //     the outcome.
+                //
+                // `loadBody`'s own branch cannot serve here: all three paths that start
+                // this poll (`startBodyPoll(); return` on a cancelled header read, a
+                // cancelled resolve, and a cancelled body cache-check) return BEFORE it.
+                //
+                // Read the flag FRESH rather than trusting `msg`: the body queues can mark
+                // this row WHILE the poll is running, and `self.message` is only re-read
+                // when it is nil. A nil read (row re-keyed out from under us) falls through
+                // exactly as before. `dbPool.pool` honors a `_dbPoolOverride` test pool.
+                //
+                // Ends the poll (`return`, not `continue`): nothing is fetching this body
+                // in the background — the flag is what removed it from both queues — so
+                // there is no state change to wait for. The header-recovery half of the
+                // poll's job is complete too, since we just read the row. Pull-to-refresh
+                // remains the user's genuine retry, and it is exempt at the funnel.
+                let latestForQuarantine = try? await self.dbPool.pool.read({ db in try MessageHeader.fetchOne(db, key: rid) })
+                if let latestForQuarantine, latestForQuarantine.isBodyQuarantined {
+                    guard !self.isRefetchingBody else { continue }
+                    if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] Poll stopping — body quarantined (oversized metadata FETCH) for \(rid.prefix(40))") }
+                    self.error = BodyFetchRefusal.quarantinedMessage
+                    self.isLoading = false
+                    self.loadThreadMessagesAsync()
+                    return
+                }
                 fetchAttempt += 1
                 if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] Poll fetch attempt \(fetchAttempt) for \(rid.prefix(40))") }
                 do {
-                    try await self.manager.fetchBody(for: msg)
+                    // Same injection point `loadBody` uses. Deliberately NOT
+                    // `fetchBodyWithRetry` — the poll IS the retry, and wrapping a retry in
+                    // a retry is what the 2s cadence replaces.
+                    //
+                    // The override matters beyond symmetry: without it this line reaches the
+                    // live `AccountManager` from any test that leaves a poll running, and
+                    // `AccountManagerFetch.fetchBody` will `connectAccount` a real provider
+                    // for any account id it finds in whatever database is installed as
+                    // `AppDatabase.shared` at that moment. A poll that outlives its test then
+                    // opens sessions inside an unrelated suite. `hasStartedBodyPollForTesting`
+                    // was added because this was unobservable; routing the fetch through the
+                    // override makes it harmless as well.
+                    if let override = self._fetchBodyOverride {
+                        try await override(msg)
+                    } else {
+                        try await self.manager.fetchBody(for: msg)
+                    }
                     // Read BOTH the fetched body AND the refreshed header, THEN gate
                     // on a single mutation-site `!isRefetchingBody` and write
                     // SYNCHRONOUSLY — there is no `await` between the guard and the
@@ -1120,6 +1214,21 @@ final class MessageDetailViewModel {
                     }
                 } catch {
                     if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] Poll fetch failed (attempt \(fetchAttempt)): \(error)") }
+                    // End the poll on a refusal nothing will retract, rather than repeating it
+                    // every 2s for the life of this view model. The fresh-read quarantine gate
+                    // above already covers the recorded-flag case; this covers the one it
+                    // structurally cannot see — a row with `bodyComplete = 1` whose `messageBody`
+                    // was evicted and whose re-fetch overflows, which no writer will flag
+                    // (`AND bodyComplete = 0`) and no reader will gate (`&& !bodyComplete`).
+                    // Show the failure, stop paying for it; pull-to-refresh is still the retry.
+                    // (Found by audit.)
+                    if BodyFetchRefusal.endsPolling(error) {
+                        guard !self.isRefetchingBody else { continue }
+                        self.error = error.localizedDescription
+                        self.isLoading = false
+                        self.loadThreadMessagesAsync()
+                        return
+                    }
                     // ⚠️ **NO REKEY RECOVERY HERE — REMOVED DELIBERATELY, DO NOT RE-ADD.**
                     //
                     // Rounds 3 and 4 of the audit each found a WRONG-MESSAGE (C3) hole in an
@@ -1384,6 +1493,51 @@ final class MessageDetailViewModel {
             loadThreadMessagesAsync()
             return
         }
+        // Oversized-metadata quarantine (`bodyMetadataOversized`, stop-gap for the
+        // IMAP response-parser overflow). The metadata FETCH for this message
+        // overflowed the parser's read buffer on a previous attempt, so the body
+        // could not be retrieved and the body queues have stopped offering it.
+        //
+        // Present the SAME state a fetch that just failed would leave behind —
+        // `error` set, not loading, no body — instead of attempting a fetch that
+        // this build cannot complete. Owner decision 2026-09-01: showing "unable to
+        // load" immediately is the honest, cheap answer; a real attempt here costs a
+        // full TCP+TLS+LOGIN+SELECT (the parser overflow marks the folder connection
+        // unhealthy, so the retry cannot reuse it) and ends in this same state.
+        //
+        // Deliberately NO `startBodyPoll()`: nothing is fetching this body in the
+        // background — the flag is precisely what removed it from both queues — so a
+        // 2s poll would spin forever against a row that cannot change.
+        //
+        // That is NOT the only way a poll can end up behind a flagged row, which is why
+        // the poll carries the same gate. This function starts one on each of its three
+        // cancelled-read exits (all of which return BEFORE this branch), and
+        // `refetchBody` restarts one whenever an explicit retry produced no body. The
+        // poll's own quarantine check ends those.
+        //
+        // Placed AFTER the durable-body and NSE-staged lookups above on purpose: if
+        // bytes exist by any route, show them. The flag records one failed wire
+        // attempt, not a verdict that content is unobtainable, so pull-to-refresh
+        // (`refetchBody`) still performs a genuine retry — that is the user's escape
+        // hatch, and it is why this returns rather than latching anything.
+        // `&& !msg.bodyComplete` is a FAIL-SAFE, not the primary defence. Every success
+        // write clears the flag, so a row with a body should never reach here carrying
+        // one — but `bodyComplete = 1` means a body demonstrably existed, and the cache
+        // deleters (`BodyAssetMaintenance.dropMessage`, `wipeAll(.inlineImage)`,
+        // `SyncEngine.runEvictStaleBodies` / `runPruneIfOverBudget`) delete
+        // the `messageBody` row while deliberately leaving `bodyComplete = 1`, relying
+        // on THIS function's cache-miss fetch as their only recovery. Refusing that
+        // fetch on a stale flag would make an already-fetched message permanently
+        // unopenable, so a future writer of `bodyComplete = 1` that forgets to clear the
+        // flag costs a wasted round trip here rather than a broken message.
+        if msg.isBodyQuarantined {
+            if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] Body quarantined (oversized metadata FETCH) — reporting load failure without a fetch for \(rid.prefix(40))") }
+            BootProfiler.mark("detail body OVERSIZED-QUARANTINED → report failure \(rid.prefix(24))")
+            error = BodyFetchRefusal.quarantinedMessage
+            isLoading = false
+            loadThreadMessagesAsync()
+            return
+        }
         // Address-corroboration pre-gate (`BodyAddressGate`). `optimisticMoveToFolder`
         // leaves the row at (destination folder, SOURCE UID) with a nil epoch until the
         // drain's `finishMove` re-keys it — and on IMAP that address names a DIFFERENT
@@ -1418,6 +1572,10 @@ final class MessageDetailViewModel {
 
         isLoading = true
         BootProfiler.mark("detail body MISS everywhere → SERVER fetch \(rid.prefix(24))")
+        // Kept so the poll decision below can inspect the refusal CLASS. `self.error` holds
+        // only `localizedDescription`, and it is deliberately not set for a connection
+        // error, so it cannot answer "will anything retract this?".
+        var lastFetchError: Error?
         do {
             if let override = _fetchBodyOverride {
                 try await override(msg)
@@ -1430,6 +1588,7 @@ final class MessageDetailViewModel {
             startBodyPoll()
             return
         } catch {
+            lastFetchError = error
             if !SyncEngine.isConnectionError(error) {
                 self.error = error.localizedDescription
             }
@@ -1455,7 +1614,16 @@ final class MessageDetailViewModel {
         // Covers: connection errors (where self.error stays nil), lock timeouts,
         // or any transient failure. A reconnect or background path may still
         // write the body to DB later.
-        if messageBody == nil {
+        //
+        // ⚠️ Except behind a refusal nothing will retract. The poll re-enters
+        // `AccountManagerFetch.fetchBody` every 2s and is bounded only by this view model's
+        // lifetime, so for an overflow or a recorded quarantine it repeats a full
+        // TCP + TLS + LOGIN + SELECT forever — the exact cost the quarantine exists to stop.
+        // The quarantine case is also caught by the poll's own fresh-read gate; the OVERFLOW
+        // case is not reachable there, because a row that already has `bodyComplete = 1`
+        // (fetched once, `messageBody` later evicted) is invisible to both the flag's writer
+        // and `isBodyQuarantined`. See `BodyFetchRefusal.endsPolling`. (Found by audit.)
+        if messageBody == nil, !(lastFetchError.map(BodyFetchRefusal.endsPolling) ?? false) {
             startBodyPoll()
         }
     }

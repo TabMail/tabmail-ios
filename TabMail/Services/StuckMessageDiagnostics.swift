@@ -45,6 +45,7 @@ enum StuckMessageDiagnostics {
         let folderExists: Bool
         let hasHealthySibling: Bool
         let emptyFetchCount: Int
+        let bodyMetadataOversized: Bool
     }
 
     static func run() async {
@@ -68,16 +69,22 @@ enum StuckMessageDiagnostics {
         let pkMismatchBodyless = await count(pool, "m.id <> m.accountId || ':' || m.folderPath || ':' || m.messageId AND m.bodyComplete = 0")
         // Bodyless breakdown.
         let bodyless = await count(pool, "m.bodyComplete = 0")
-        let bodylessLocked = await count(pool, "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 1")
-        let bodylessFailing = await count(pool, "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 0 AND m.emptyFetchCount > 0")
-        let bodylessPending = await count(pool, "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 0 AND m.emptyFetchCount = 0")
+        let bodylessLocked = await count(pool, bodylessLockedPredicate)
+        // Quarantined by the oversized-metadata stop-gap: NOT "pending" — no queue will
+        // ever offer these rows again on this build, so counting them with the rows that
+        // are merely waiting their turn is the exact misreading this scan exists to
+        // prevent. Split out BEFORE `failing`/`pending` so the four buckets stay an exact
+        // partition of `bodyless` (a quarantined row can also carry emptyFetchCount > 0).
+        let bodylessQuarantined = await count(pool, bodylessQuarantinedPredicate)
+        let bodylessFailing = await count(pool, bodylessFailingPredicate)
+        let bodylessPending = await count(pool, bodylessPendingPredicate)
         // Missing rfc822 among the not-browsable set → UID-remap can never recover.
         let notBrowsableNoRfc = await count(pool, "f.id IS NULL AND (m.rfc822MessageId IS NULL OR m.rfc822MessageId = '')")
 
         BackgroundSyncLogger.logStuckDiag("total messageHeader rows: \(total)")
         BackgroundSyncLogger.logStuckDiag("NOT-browsable (folderId matches no folder): \(notBrowsable)  [empty=\(notBrowsableEmpty), orphan=\(notBrowsableOrphan), bodyless=\(notBrowsableBodyless), missing-rfc822=\(notBrowsableNoRfc)]")
         BackgroundSyncLogger.logStuckDiag("PK/folder mismatch (optimistic-move remnant): \(pkMismatch)  [bodyless=\(pkMismatchBodyless)]")
-        BackgroundSyncLogger.logStuckDiag("bodyless (bodyComplete=0): \(bodyless)  [lockedEmpty=\(bodylessLocked), failing=\(bodylessFailing), pending=\(bodylessPending)]")
+        BackgroundSyncLogger.logStuckDiag("bodyless (bodyComplete=0): \(bodyless)  [lockedEmpty=\(bodylessLocked), quarantinedOversized=\(bodylessQuarantined), failing=\(bodylessFailing), pending=\(bodylessPending)]")
 
         // --- Per-provider breakdown of not-browsable -----------------------
         let byProvider = await group(pool,
@@ -119,6 +126,36 @@ enum StuckMessageDiagnostics {
     }
 
     // MARK: - Helpers (all read-only)
+
+    // The four bodyless buckets, hoisted so the "exact partition" claim above can be
+    // asserted against the PRODUCTION predicates. A transcribed copy in a test proves
+    // nothing about this scan: it stays green while the two drift, which is the same
+    // reasoning that made `ActiveBodyQueue.admissionSQL` a shared symbol. Ordering is
+    // load-bearing — a quarantined row can also carry `emptyFetchCount > 0`, so the
+    // oversized bucket must be subtracted from the other two, not layered beside them.
+    static let bodylessLockedPredicate =
+        "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 1"
+    static let bodylessQuarantinedPredicate =
+        "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 0 AND m.bodyMetadataOversized = 1"
+    static let bodylessFailingPredicate =
+        "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 0 AND m.bodyMetadataOversized = 0 AND m.emptyFetchCount > 0"
+    static let bodylessPendingPredicate =
+        "m.bodyComplete = 0 AND m.bodyEmptyConfirmed = 0 AND m.bodyMetadataOversized = 0 AND m.emptyFetchCount = 0"
+
+    /// Test seam: `count` is private and takes a pool, which is exactly what a partition
+    /// assertion needs. Exposed rather than duplicated so the test exercises the real
+    /// counting path (including its `m` alias) and not a re-implementation of it.
+    // `#if DEBUG`, unlike the ~24 other `…ForTesting` seams in this subsystem which all
+    // ship unconditioned: this one interpolates its argument into a SQL statement. Every
+    // call site passes one of the four `bodyless*Predicate` constants above and it is
+    // `internal` with no production caller, so it is not reachable by an attacker — but a
+    // string-into-SQL entry point has no business existing in a Release binary at all,
+    // and gating it costs nothing. (Found by audit.)
+    #if DEBUG
+    static func countForTesting(_ pool: DatabasePool, _ whereSQL: String) async -> Int {
+        await count(pool, whereSQL)
+    }
+    #endif
 
     private static func count(_ pool: DatabasePool, _ whereSQL: String) async -> Int {
         (try? await pool.read { db in
@@ -209,6 +246,7 @@ enum StuckMessageDiagnostics {
                    (m.rfc822MessageId IS NOT NULL AND m.rfc822MessageId <> '') AS hasRfc,
                    m.bodyComplete AS bodyComplete, m.bodyEmptyConfirmed AS bodyEmpty,
                    m.emptyFetchCount AS emptyCnt, m.isInInbox AS isInbox,
+                   m.bodyMetadataOversized AS oversized,
                    (f.id IS NOT NULL) AS folderExists, COALESCE(f.role, '-') AS folderRole,
                    COALESCE(a.provider, '?') AS provider,
                    EXISTS(SELECT 1 FROM messageHeader s JOIN folder sf ON s.folderId = sf.id
@@ -238,7 +276,8 @@ enum StuckMessageDiagnostics {
                     isInInbox: ((r["isInbox"] as Int?) ?? 0) != 0,
                     folderExists: ((r["folderExists"] as Int?) ?? 0) != 0,
                     hasHealthySibling: ((r["sibling"] as Int?) ?? 0) != 0,
-                    emptyFetchCount: (r["emptyCnt"] as Int?) ?? 0
+                    emptyFetchCount: (r["emptyCnt"] as Int?) ?? 0,
+                    bodyMetadataOversized: ((r["oversized"] as Int?) ?? 0) != 0
                 )
             }
         }) ?? []
@@ -263,7 +302,7 @@ enum StuckMessageDiagnostics {
             let inFTS = missingFromFTS.contains(ContentKey(rawValue: r.id)) ? "n" : "Y"
             // Display-only: id/messageId/subject are abbreviated, full data stays in DB.
             BackgroundSyncLogger.logStuckDiag(
-                "  id=\(r.id) prov=\(r.provider) folderId=\(r.folderId.isEmpty ? "''" : r.folderId) path=\(r.folderPath) msgId=\(r.messageId) rfc822=\(r.hasRfc822 ? "Y" : "n") body=\(r.bodyComplete ? "Y" : "n") emptyConf=\(r.bodyEmptyConfirmed ? "Y" : "n") emptyCnt=\(r.emptyFetchCount) inbox=\(r.isInInbox ? "Y" : "n") folderExists=\(r.folderExists ? "Y" : "n") role=\(r.folderRole) sibling=\(r.hasHealthySibling ? "Y" : "n") inFTS=\(inFTS) date=\(r.dateStr) subj=\"\(r.subject)\""
+                "  id=\(r.id) prov=\(r.provider) folderId=\(r.folderId.isEmpty ? "''" : r.folderId) path=\(r.folderPath) msgId=\(r.messageId) rfc822=\(r.hasRfc822 ? "Y" : "n") body=\(r.bodyComplete ? "Y" : "n") emptyConf=\(r.bodyEmptyConfirmed ? "Y" : "n") emptyCnt=\(r.emptyFetchCount) oversized=\(r.bodyMetadataOversized ? "Y" : "n") inbox=\(r.isInInbox ? "Y" : "n") folderExists=\(r.folderExists ? "Y" : "n") role=\(r.folderRole) sibling=\(r.hasHealthySibling ? "Y" : "n") inFTS=\(inFTS) date=\(r.dateStr) subj=\"\(r.subject)\""
             )
         }
     }

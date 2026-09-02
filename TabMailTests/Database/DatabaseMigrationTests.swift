@@ -351,9 +351,19 @@ struct DatabaseMigrationTests {
         #expect(try db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM pendingOperation") } == 1)
         // Flags survive verbatim, including the AI tag — a body-cache drop is not a
         // reason to lose a message's triage state.
-        let after = try db.read { try MessageHeader.fetchOne($0, key: readId) }
-        #expect(after?.isRead == true)
-        #expect(after?.actionTag == .reply)
+        // ⚠️ Read RAW COLUMNS, not a decoded `MessageHeader`. This database is
+        // deliberately stopped at a historical migration, so decoding the CURRENT model
+        // fails the moment any later migration adds a non-optional column — the failure
+        // is "column not found", which reads as a migration bug rather than as a test
+        // that outgrew its fixture. Selecting the columns under test keeps the
+        // assertion pinned to this migration.
+        let after = try #require(try db.read { conn in
+            try Row.fetchOne(
+                conn, sql: "SELECT isRead, actionTag FROM messageHeader WHERE id = ?",
+                arguments: [readId])
+        })
+        #expect((after["isRead"] as Bool) == true)
+        #expect((after["actionTag"] as String?) == ActionTag.reply.rawValue)
     }
 
     /// 🚨 THE INVARIANT `v70` IS BOUND BY, PINNED WHERE IT CAN REGRESS.
@@ -1041,18 +1051,40 @@ struct V70CrossStoreInvariantTests {
         let column = try #require(columns.first { ($0["name"] as String) == "actionTagSetAt" })
         #expect((column["notnull"] as Int) == 0)
 
-        let tagged = try db.read { try MessageHeader.fetchOne($0, key: taggedId) }
-        #expect(tagged?.actionTag == .reply, "the tag itself must survive the upgrade untouched")
+        // ⚠️ Read RAW COLUMNS, not a decoded `MessageHeader`. This database is
+        // deliberately stopped at a historical migration, so decoding the CURRENT model
+        // fails the moment any later migration adds a non-optional column — the failure
+        // is "column not found", which reads as a migration bug rather than as a test
+        // that outgrew its fixture. Selecting the columns under test keeps the
+        // assertion pinned to this migration.
+        let tagged = try #require(try db.read { conn in
+            try Row.fetchOne(
+                conn, sql: "SELECT actionTag, actionTagSetAt FROM messageHeader WHERE id = ?",
+                arguments: [taggedId])
+        })
+        #expect((tagged["actionTag"] as String?) == ActionTag.reply.rawValue,
+                "the tag itself must survive the upgrade untouched")
         #expect(
-            tagged?.actionTagSetAt == nil,
+            (tagged["actionTagSetAt"] as Date?) == nil,
             "a pre-v81 tagged row must emerge UNSTAMPED, so the sweep sees it as already expired"
         )
 
-        let untagged = try db.read { try MessageHeader.fetchOne($0, key: untaggedId) }
-        #expect(untagged?.actionTag == nil)
-        #expect(untagged?.actionTagSetAt == nil, "no tag means nothing to stamp")
+        let untagged = try #require(try db.read { conn in
+            try Row.fetchOne(
+                conn, sql: "SELECT actionTag, actionTagSetAt FROM messageHeader WHERE id = ?",
+                arguments: [untaggedId])
+        })
+        #expect((untagged["actionTag"] as String?) == nil)
+        #expect((untagged["actionTagSetAt"] as Date?) == nil, "no tag means nothing to stamp")
 
         // The going-forward side: v81 relaxes history, not the invariant.
+        //
+        // ⚠️ Bring the schema fully up to date first. A "going-forward" writer is by
+        // definition writing the CURRENT model, and that cannot be inserted into a
+        // database deliberately stopped at v81 — every later column-adding migration
+        // would make this line fail with "no column named …", which reads as a
+        // migration bug rather than as a fixture pinned to an older schema.
+        try AppDatabase.runMigrations(on: db)
         var fresh = MessageHeader(
             messageId: "81-post-upgrade", subject: "s", from: "Sender",
             fromAddress: "sender@example.com", to: "recipient@example.com",

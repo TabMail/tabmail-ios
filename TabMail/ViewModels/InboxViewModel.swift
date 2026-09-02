@@ -1471,6 +1471,22 @@ final class InboxViewModel {
         return true
     }
 
+    #if DEBUG
+    /// Test seam: run ONE snippet batch over `ids` and report the loader's blacklist.
+    ///
+    /// `loadSnippetBatch` and `snippetFailed` are both private, so the tier-2 gate — a
+    /// quarantined row is never handed to `provider.fetchMessage` — is otherwise
+    /// observable only by letting the loader reach the network, which is the exact thing
+    /// the gate exists to prevent. Returning the blacklist makes the two cases separable
+    /// without a provider: a gated row is blacklisted here, while a row that merely has
+    /// no provider available is left retryable (tier 2 `continue`s without blacklisting).
+    func runSnippetBatchForTesting(_ ids: [String]) async -> Set<String> {
+        for id in ids { snippetQueue.insert(id) }
+        await loadSnippetBatch()
+        return snippetFailed
+    }
+    #endif
+
     private func scheduleSnippetLoad() {
         guard snippetTask == nil else { return }
         snippetTask = Task { @MainActor in
@@ -1562,6 +1578,23 @@ final class InboxViewModel {
             }
             // Need network fetch — reuse the tier-0 batched read (no sync re-read on main)
             if let header = headerFor(headerId) {
+                // Oversized-metadata quarantine (`bodyMetadataOversized`): tier 2 below
+                // calls `provider.fetchMessage` — the SAME fetch whose metadata response
+                // overflowed the IMAP parser and got this row flagged. It cannot succeed
+                // on this build, and the overflow marks the folder connection unhealthy,
+                // so every attempt pays a full TCP+TLS+LOGIN+SELECT teardown. The body
+                // queues already stopped offering this row; this is the third initiator
+                // and needs the same gate. Treat it as a permanent per-session failure
+                // (`snippetFailed`) rather than leaving it retryable: a transient-looking
+                // row would be re-queued by the next `requeueVisibleSnippets` pass.
+                // `&& !header.bodyComplete` mirrors the fail-safe in
+                // `MessageDetailViewModel.loadBody` — a row that demonstrably has a body
+                // must stay fetchable even if a stale flag survived on it.
+                if header.isBodyQuarantined {
+                    if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Skipping oversized-quarantined \(headerId.prefix(40))") }
+                    snippetFailed.insert(headerId)
+                    continue
+                }
                 networkNeeded.append((headerId: headerId, header: header))
             } else {
                 snippetFailed.insert(headerId)
@@ -1615,6 +1648,40 @@ final class InboxViewModel {
                 }
             } catch {
                 if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Failed for \(item.headerId): \(error)") }
+                // RECORD the overflow durably — do not merely remember it in
+                // `snippetFailed`. Tier 2 calls the same `provider.fetchMessage` the body
+                // queues do, and on a scrolling user it is often the FIRST path to observe
+                // an oversized message: deep-history mail can sit far down
+                // `BackfillBodyQueue.admissionSQL`'s `date DESC` order for a long time.
+                // Without this the flagged population would be "the rows a background queue
+                // happened to reach first" — exactly the property
+                // `MessageHeader.bodyMetadataOversized` claims it is NOT.
+                //
+                // `snippetFailed` alone is not enough: `reloadMessages` calls
+                // `resetSnippetState()` on every `.inboxDataDidChange` (throttled ~500ms
+                // during sync) and then re-queues the visible window, so the same doomed
+                // fetch — a full TCP + TLS + LOGIN + SELECT plus a folder-connection
+                // teardown — repeats on every reload while the row is on screen.
+                //
+                // Description-substring test is this codebase's established predicate for
+                // this error (`IMAPProvider.withFolderConnection`, both queues,
+                // `BodyFetchProcessor.fetch`); `SyncEngine.isConnectionError` deliberately
+                // does not match it. The shared writer carries both guards. (Found by audit.)
+                //
+                // ⚠️ This is the 14th hand-copy of that substring test in the tree, and a
+                // 14th copy is a real cost — a maintainer replacing the stringly test (or
+                // SwiftMail renaming the error) must sweep all of them, and missing THIS one
+                // silently reverts the flagged population to "whatever a background queue
+                // reached first", the one property `MessageHeader.bodyMetadataOversized`
+                // claims it is not. A local helper is deliberately NOT minted here: the
+                // canonical symbol already exists on the branch for #103
+                // (`IMAPFetchMapping.isResponseBufferOverflow`), and adding a competing one
+                // would leave two predicates to reconcile at merge instead of one. Fold all
+                // 14 into that symbol when the branches meet; do not add a 15th copy in the
+                // meantime. (Found by audit.)
+                if "\(error)".contains("PayloadTooLargeError") {
+                    await BodyFetchProcessor.markOversizedDurably(headerId: item.headerId)
+                }
                 // Only blacklist on non-connection errors (e.g., messageNotFound).
                 // Connection errors are transient — leave retryable for next scroll/appearance.
                 if !SyncEngine.isConnectionError(error) {

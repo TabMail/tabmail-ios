@@ -339,6 +339,57 @@ struct NSEGradualMergeTests {
         #expect(afterBody?.bodyComplete == true)
     }
 
+    /// The quarantine's release valve at THIS writer. `bodyMetadataOversized` is a
+    /// recorded OBSERVATION ("the IMAP parser overflowed on this message's metadata"),
+    /// and a body arriving from the NSE refutes it — the notification extension parses
+    /// with a different code path and can succeed where the app's fetch did not.
+    ///
+    /// If this clear were ever dropped from the batch flip, the row would keep
+    /// `bodyComplete = 1` (so no queue would ever re-fetch it) AND
+    /// `bodyMetadataOversized = 1` (so `admissionSQL` would refuse it even if one
+    /// tried) — a message that is permanently unreadable despite its body sitting in
+    /// FTS. That is why this is pinned separately from the `bodyComplete` assertion
+    /// above: the two flags flip in one statement, and a test that watches only the
+    /// first one stays green while the second silently disappears.
+    @Test("An NSE-delivered body clears a recorded oversized-metadata observation")
+    @MainActor func nseBodyMergeClearsTheOversizedObservation() async throws {
+        let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
+        }
+        let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
+
+        try stageHeaderRow(q)
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+
+        // Record the observation the app's own fetch would have made.
+        try await pool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET bodyMetadataOversized = 1 WHERE id = ?",
+                arguments: [headerId()])
+        }
+        let quarantined = try await pool.read { try MessageHeader.fetchOne($0, key: headerId()) }
+        // Non-vacuity: the merge below must be observed clearing a flag that was
+        // genuinely set, not asserting a column that was 0 the whole time.
+        #expect(quarantined?.bodyMetadataOversized == true, "fixture failed to record the observation")
+
+        try stageBodyRow(q)
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+
+        let afterBody = try await pool.read { try MessageHeader.fetchOne($0, key: headerId()) }
+        #expect(afterBody?.bodyComplete == true)
+        #expect(
+            afterBody?.bodyMetadataOversized == false,
+            "a delivered body refutes the overflow observation — leaving the flag set strands the row behind both `bodyComplete = 1` and `admissionSQL`, permanently")
+    }
+
     @Test("Unresolved-CID body: header becomes visible; no MessageBody cached, bodyComplete stays 0")
     @MainActor func unresolvedCIDMergeStillVisible() async throws {
         let (dir, pool, previous) = try makeAppDatabase()
@@ -382,13 +433,11 @@ struct NSEGradualMergeTests {
         // itself isn't driven here — it starts a real IMAP body fetch the unit host
         // can't service.)
         let isBodyFetchCandidate = try await pool.read { db in
-            try Bool.fetchOne(db, sql: """
-                SELECT EXISTS(
-                    SELECT 1 FROM messageHeader
-                    WHERE id = ? AND headerComplete = 1 AND bodyComplete = 0
-                      AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                )
-                """, arguments: [headerId()]) ?? false
+            // The production query itself, via `ActiveBodyQueue.admissionItems`. A hand-copied
+            // predicate stops BEING the admission predicate the moment production gains a
+            // clause — it just gained `AND bodyMetadataOversized = 0`, and a never-drop claim
+            // measured against a stale copy proves nothing about the queue that actually runs.
+            try ActiveBodyQueue.admissionItems(db).contains { $0.headerId == headerId() }
         }
         #expect(isBodyFetchCandidate, "CID push must match ActiveBodyQueue's precache filter")
     }

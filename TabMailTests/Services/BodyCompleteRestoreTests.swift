@@ -33,7 +33,8 @@ struct BodyCompleteRestoreTests {
         accountId: String,
         messageId: String,
         bodyComplete: Bool,
-        bodyEmptyConfirmed: Bool = false
+        bodyEmptyConfirmed: Bool = false,
+        bodyMetadataOversized: Bool = false
     ) async throws -> String {
         let folderPath = "Archive"
         let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)
@@ -59,6 +60,7 @@ struct BodyCompleteRestoreTests {
             header.headerComplete = true
             header.bodyComplete = bodyComplete
             header.bodyEmptyConfirmed = bodyEmptyConfirmed
+            header.bodyMetadataOversized = bodyMetadataOversized
             try header.insert(db)
         }
         return headerId
@@ -78,6 +80,12 @@ struct BodyCompleteRestoreTests {
         if let body {
             let written = try await index.updateBodies([(headerId: headerId, body: body)].map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
             #expect(written.contains(ContentKey(rawValue: headerId)), "test setup: FTS body write must succeed")
+        }
+    }
+
+    private func oversizedFlag(_ headerId: String) async -> Bool? {
+        try? await AppDatabase.dbPool.read { db in
+            try Bool.fetchOne(db, sql: "SELECT bodyMetadataOversized FROM messageHeader WHERE id = ?", arguments: [headerId])
         }
     }
 
@@ -122,6 +130,54 @@ struct BodyCompleteRestoreTests {
         #expect(await bodyCompleteFlag(headerId) == true, "FTS-backed pending row must be healed without refetch")
         #expect(UserDefaults(suiteName: suite)!.bool(forKey: SyncEngine.bodyCompleteRestoreDoneKey), "gate must be set after a clean pass")
         await cleanup(headerId: headerId)
+    }
+
+    /// 🚨 THE FIFTH CLEAR SITE. `oneTimeBodyCompleteRestore` is the only one of the five
+    /// enumerated `bodyMetadataOversized` clearers that is not a body-fetch success write,
+    /// and until this test it had NO coverage: deleting `, bodyMetadataOversized = 0` from
+    /// its `UPDATE` left the whole suite green.
+    ///
+    /// Why it must clear: this row's body IS in FTS, so the restore is proving the message
+    /// was fetched successfully at some point. Leaving the quarantine flag on it would
+    /// contradict the row it just healed — `bodyComplete = 1` with the flag still set is
+    /// precisely the state `isBodyQuarantined`'s `&& !bodyComplete` fail-safe exists to
+    /// absorb, and relying on a fail-safe to cover a writer that could simply be correct is
+    /// how a fail-safe stops being a fail-safe.
+    ///
+    /// Two-sided by construction: the SECOND row is a cached-HTML row, which the restore
+    /// deliberately skips. It must KEEP its flag — a blanket clear would release every
+    /// quarantined row in the account on a pass that healed none of them.
+    @Test("The restore releases the oversized quarantine on the rows it heals — and only those")
+    func restoreClearsTheOversizedFlagOnHealedRowsOnly() async throws {
+        let acct = "bcr-oversized-\(UUID().uuidString.prefix(8))"
+        let healed = try await insertHeader(
+            accountId: acct, messageId: "m1", bodyComplete: false, bodyMetadataOversized: true)
+        try await indexInFTS(headerId: healed, messageId: "m1", body: "the full indexed body text of this message")
+
+        // Skipped by the restore: a cached `messageBody` row means this is a re-render
+        // state, not an eviction victim.
+        let skipped = try await insertHeader(
+            accountId: acct, messageId: "m2", bodyComplete: false, bodyMetadataOversized: true)
+        try await indexInFTS(headerId: skipped, messageId: "m2", body: "another indexed body")
+        try await AppDatabase.dbPool.write { db in
+            let body = MessageBody( contentKey: ContentKey(rawValue: skipped), htmlContent: "<p>cached</p>")
+            try body.insert(db)
+        }
+
+        let suite = makeDefaultsSuite()
+        defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        await engine().oneTimeBodyCompleteRestore(defaults: UserDefaults(suiteName: suite)!, scopePrefix: acct)
+
+        #expect(await bodyCompleteFlag(healed) == true, "fixture check: the eviction victim must be healed")
+        #expect(await oversizedFlag(healed) == false,
+                "a row the restore proves was fetched must lose the quarantine — otherwise the heal leaves a self-contradicting row that only the read-side fail-safe rescues")
+
+        #expect(await bodyCompleteFlag(skipped) == false, "fixture check: the cached-HTML row must be skipped")
+        #expect(await oversizedFlag(skipped) == true,
+                "…and the clear must be scoped to the healed set: a blanket clear would release rows this pass proved nothing about")
+
+        await cleanup(headerId: healed)
+        await cleanup(headerId: skipped)
     }
 
     @Test("Row with cached HTML (messageBody present) is NOT healed — re-render states stay refetchable")
