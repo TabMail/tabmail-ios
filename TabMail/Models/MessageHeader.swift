@@ -198,8 +198,15 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     /// yet. The cost is one bounded extra NSE fetch if that message is pushed again; the
     /// NSE does not retry in-process, so there is no loop.
     ///
-    /// Read by five kinds of consumer. Three of them are code, and they all ask the same
-    /// question through `isBodyQuarantined` below; the other two are SQL.
+    /// Read by the consumers below, which is a ROSTER, not a count — deliberately, because
+    /// this sentence carried two independent integers ("five kinds of consumer", "three of
+    /// them are code, the other two are SQL") and both were wrong: the code side omitted
+    /// `AccountManagerFetch.fetchBody`, the AUTHORITATIVE gate every future caller inherits
+    /// (see the ⚠️ below), and the SQL side omitted `StuckMessageDiagnostics`' `bodyless*`
+    /// predicates and `SyncEngineBackfill.resetCrawlState`'s selection. Two integers in one
+    /// sentence go stale independently, which is how both drifted unnoticed. Every code
+    /// reader asks the same question through `isBodyQuarantined` below; every SQL reader
+    /// spells the column out. (Found by audit.)
     ///  1. The four body-fetch admission queries
     ///     (`Active`/`BackfillBodyQueue.repopulateFromDatabase` and `.repopulateOnDrain`)
     ///     — a flagged row is not offered to the background queues.
@@ -212,13 +219,25 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     ///     work that cannot be done is the worse product outcome. Note the scope of that
     ///     premise: not fetchable BY THIS BUILD, on the parser bound this build ships.
     ///     Nothing here claims the body is gone or that a later build cannot get it.
-    ///     Four surfaces move with that decision, not three: the Fast Sync "Sync Complete"
-    ///     banner, the wake lock, the "N / M indexed" numerator, and
-    ///     `DynamicIslandChatButton.isBackfillInProgress` — the chat pill's "agent search
-    ///     results may be incomplete" notice, which reads `!isFullyComplete` and therefore
-    ///     also clears. For an account holding a quarantined body that notice is literally
+    ///     The rule, stated as a property rather than a list, because a list of this
+    ///     shape is a cache that goes stale silently: EVERY consumer of
+    ///     `BackfillProgress.isFullyComplete` and EVERY consumer of
+    ///     `BackfillProgress.ftsIndexed` moves with this decision. Today that is at least
+    ///     the Fast Sync "Sync Complete" banner, the wake lock, the "N / M indexed"
+    ///     numerator, `DynamicIslandChatButton.isBackfillInProgress` — the chat pill's
+    ///     "agent search results may be incomplete" notice, which reads `!isFullyComplete`
+    ///     and therefore also clears — and, through `ftsIndexed`, `progressFraction`,
+    ///     `estimatedSecondsRemaining` (`remaining = totalEmails - ftsIndexed`) and
+    ///     `updateRate()`'s throughput EMA (`delta = ftsIndexed - lastIndexedCount`).
+    ///     For an account holding a quarantined body the chat-pill notice is literally
     ///     still true, and it is inside the same decision: a notice that can never clear is
-    ///     exactly the permanent nag that was overruled.
+    ///     exactly the permanent nag that was overruled. The ETA and rate consequence is
+    ///     accepted and small: a quarantine event counts as throughput it did not perform,
+    ///     so the displayed ETA shrinks slightly — the alternative is an ETA that never
+    ///     reaches zero, which is the same permanent nag one surface further out.
+    ///     ⚠️ This enumerated "four surfaces, not three" and named only the first four
+    ///     until 2026-09-02; the two `ftsIndexed` arithmetic consumers were never in it.
+    ///     (Found by audit.)
     ///  3. The user-open path (`MessageDetailViewModel.loadBody`) — a flagged row
     ///     reports "unable to load" immediately, in exactly the state a fetch that just
     ///     failed would leave behind, instead of spending a full connection on an
@@ -279,10 +298,17 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     ///    yet exist, and on an existing database both have already run and a registered
     ///    migration is frozen. Named because an absolute with no negative case is the
     ///    shape that walks the next reader past a real one. (Found by audit.)
-    ///    ⚠️ A `rg 'bodyMetadataOversized = 0'` census finds only THREE of them:
-    ///    `applySnippetUpdates` writes it as a GRDB `updateAll` chain
-    ///    (`Column("bodyMetadataOversized").set(to: false)`) and is invisible to every
-    ///    SQL-text search. Census this flag by SYMBOL, not by statement text.
+    ///    ⚠️ A `rg 'bodyMetadataOversized = 0'` census does NOT find all five, and the
+    ///    invariant — not the integer — is: exactly ONE of the five is invisible to
+    ///    SQL-text search, `applySnippetUpdates`, which writes it as a GRDB `updateAll`
+    ///    chain (`Column("bodyMetadataOversized").set(to: false)`). Census this flag by
+    ///    SYMBOL, not by statement text.
+    ///    ⚠️ This said "finds only THREE" until 2026-09-02. It was correct when written
+    ///    and went stale the moment round 4 added `oneTimeBodyCompleteRestore`'s clear —
+    ///    the enumeration above was updated to five and the count below it was not. A
+    ///    reader running the grep, finding four, and reconciling against "three" would
+    ///    have concluded the roster was wrong in the other direction. State the
+    ///    property, not the instance count. (Found by audit.)
     ///    This is load-bearing, not tidiness:
     ///    `BodyAssetMaintenance` evicts the `messageBody` row while deliberately leaving
     ///    `bodyComplete = 1`, and the detail view's cache-miss fetch is the only

@@ -173,6 +173,15 @@ extension SyncEngine {
     ///
     /// Fix: re-index the header. Body queue's next dispatch will succeed.
     /// No `bodyComplete` reset needed (already 0). Runs once per startup.
+    /// ⚠️ "next dispatch will succeed" is no longer true of the whole scope, and the
+    /// exception is the subset the paragraph below deliberately keeps in it: for a row
+    /// carrying `bodyMetadataOversized = 1` there is NO next dispatch, because
+    /// `admissionSQL` has stopped returning it. Re-indexing its header is still the right
+    /// thing — that is what keeps it searchable — but the body arrives only when a
+    /// release fires (pull-to-refresh, Smart Reindex, a UIDVALIDITY reset, a success
+    /// write, or the bound-raising migration), never from this function. Named because a
+    /// correction that does not sweep its own restatements leaves the false half in
+    /// place. (Found by audit.)
     ///
     /// ⚠️ This scope DELIBERATELY omits `bodyMetadataOversized`, unlike the four body
     /// -queue admission queries. It re-indexes HEADERS, and an oversized row's header is

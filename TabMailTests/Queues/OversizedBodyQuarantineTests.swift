@@ -116,6 +116,63 @@ struct OversizedBodyQuarantineDatabaseTests {
         return (header, restore)
     }
 
+    /// Seeds an extra account + folder + FLAGGED header alongside whatever `makeSwappedDB`
+    /// already installed, so a scoping assertion has something to be scoped AGAINST.
+    ///
+    /// ⚠️ The row is flagged through the production writer, not by setting the column on
+    /// the struct: `BodyFetchProcessor.markBodyMetadataOversized` carries the re-minted-key
+    /// guard (`id = accountId || ':' || folderPath || ':' || messageId`), so a bystander
+    /// seeded any other way could be flagged in a way production never produces, and the
+    /// scoping assertion would be about a row that cannot exist.
+    @discardableResult
+    private func seedFlaggedBystander(
+        accountId: String, folderPath: String, messageId: String
+    ) async throws -> String {
+        let headerId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: folderPath, messageId: messageId)
+        try await AppDatabase.dbPool.write { db in
+            if try Account.fetchOne(db, key: accountId) == nil {
+                var account = Account(
+                    emailAddress: "bystander@example.com", displayName: "Bystander", provider: .imap)
+                account.id = accountId
+                try account.insert(db)
+            }
+            let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)
+            if try Folder.fetchOne(db, key: folderId) == nil {
+                var folder = Folder(
+                    name: folderPath, path: folderPath, role: .archive, accountId: accountId)
+                folder.lastKnownUidValidity = 1000
+                try folder.insert(db)
+            }
+            var header = MessageHeader(
+                messageId: messageId,
+                subject: "A bystander in another scope",
+                from: "sender@example.com",
+                fromAddress: "sender@example.com",
+                to: "recipient@example.com",
+                date: Date(),
+                snippet: "",
+                folderId: folderId,
+                accountId: accountId,
+                folderPath: folderPath,
+                isInInbox: false
+            )
+            header.headerComplete = true
+            try header.insert(db)
+            try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: headerId)
+        }
+        return headerId
+    }
+
+    /// Reads one row's durable flag. `#require`s the row so a fixture that silently failed
+    /// to insert cannot read as "not flagged".
+    private func durableFlag(_ headerId: String) async throws -> Bool {
+        let row = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: headerId)
+        }, "fixture row \(headerId) must exist")
+        return row.bodyMetadataOversized
+    }
+
     /// "Still reachable by a later BACKGROUND body fetch" IS membership in the body
     /// queues' candidate set — the predicate shared verbatim by
     /// `ActiveBodyQueue.repopulateFromDatabase`, `BackfillBodyQueue
@@ -1098,6 +1155,56 @@ struct OversizedBodyQuarantineDatabaseTests {
         #expect(pending == 1, "the unflagged row with no strikes is PENDING; the flagged one with no strikes must not join it")
     }
 
+    /// The durable clear's SCOPE, which nothing else pins.
+    ///
+    /// Every other clear test in this tree asserts the in-memory
+    /// `oversizedDeferredThisSession` / `isolationPendingForTesting` sets — a header-id
+    /// STRING filter that the production comment itself records as a DIFFERENT predicate
+    /// from the SQL column filter. And every DB fixture here seeds exactly one account,
+    /// one folder and one row, so `WHERE accountId = ? AND folderPath = ?` is satisfied
+    /// vacuously: drop either conjunct and the whole suite stays green.
+    ///
+    /// What that would cost in production: any folder's UIDVALIDITY reset (or Smart
+    /// Reindex, which shares this writer) would release the quarantine for every flagged
+    /// row in the account — or, without the accountId term, on the device. Those rows
+    /// re-enter admission, overflow the response buffer again, and re-trigger the
+    /// connection-teardown loop this change exists to stop, now fanned out across folders
+    /// no gesture named. That is issue #104's own regression, wider.
+    ///
+    /// TWO-SIDED BY CONSTRUCTION: one bystander defeats only the `folderPath` conjunct and
+    /// the other only the `accountId` conjunct, so each term is pinned separately rather
+    /// than both together. (Found by audit.)
+    @Test("The durable clear releases ONE account's ONE folder — a sibling folder and a second account keep theirs")
+    func durableClearIsScopedToItsAccountAndFolder() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        let sameAccountOtherFolder = try await seedFlaggedBystander(
+            accountId: "acc1", folderPath: "Archive", messageId: "7001")
+        let otherAccountSameFolder = try await seedFlaggedBystander(
+            accountId: "acc2", folderPath: "INBOX", messageId: "7002")
+        try await AppDatabase.dbPool.write { db in
+            try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: header.id)
+        }
+        // Fixture check: all three are flagged BEFORE the clear, or the assertions below
+        // are satisfied by rows that were never quarantined in the first place.
+        #expect(try await durableFlag(header.id))
+        #expect(try await durableFlag(sameAccountOtherFolder))
+        #expect(try await durableFlag(otherAccountSameFolder))
+
+        try await AppDatabase.dbPool.write { db in
+            try BodyFetchProcessor.clearBodyMetadataOversized(
+                db, accountId: "acc1", folderPath: "INBOX")
+        }
+
+        #expect(try await durableFlag(header.id) == false,
+                "the named folder is released — this is the clear doing its job")
+        #expect(try await durableFlag(sameAccountOtherFolder),
+                "a DIFFERENT folder of the SAME account keeps its quarantine: dropping `AND folderPath = ?` releases every folder the gesture never named")
+        #expect(try await durableFlag(otherAccountSameFolder),
+                "a folder with the SAME PATH under a DIFFERENT account keeps its quarantine: dropping `AND accountId = ?` releases it across every account on the device")
+    }
+
     @Test("The body-fetch funnel refuses a quarantined row, so every caller is covered without its own gate")
     func funnelRefusesQuarantinedRow() async throws {
         let (header, restore) = try makeSwappedDB()
@@ -1130,6 +1237,48 @@ struct OversizedBodyQuarantineDatabaseTests {
         let ns = try #require(refusal, "the funnel must refuse with its own error, not fall through")
         #expect(ns.domain == BodyFetchRefusal.domain, "the refusal must be the funnel's, not a provider failure")
         #expect(ns.code == BodyFetchRefusal.quarantined, "…and specifically the oversized-quarantine refusal")
+    }
+
+    /// The funnel re-reads the header from the database instead of trusting the one the
+    /// caller handed it, and THAT is what makes "any future caller is covered for free"
+    /// true rather than "covered as far as the caller's copy is fresh".
+    ///
+    /// Every other funnel test passes a header whose in-memory state already matches its
+    /// row, so replacing the fresh read with `message.isBodyQuarantined` survives them all.
+    /// The caller this protects is real: `MessageDetailViewModel.loadThreadMessageBody`
+    /// (expanding a collapsed thread bubble) holds headers captured when the thread was
+    /// loaded, which a background queue can flag at any time afterwards. Under the
+    /// mutation every tap on such a row spends a full TCP + TLS + LOGIN + SELECT on a
+    /// fetch that overflows, and tears the folder connection down for whatever else was
+    /// using it.
+    ///
+    /// The poll side already has this twin (`bodyPollHonoursAFlagSetWhileItIsRunning`);
+    /// the funnel did not. (Found by audit.)
+    @Test("The funnel gates on the FRESH row, not the caller's stale copy of it")
+    func funnelGatesOnTheFreshRowNotTheCallersStaleCopy() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        // `header` is the pre-flag struct and is never re-read — it is deliberately the
+        // stale copy a thread bubble would still be holding.
+        #expect(header.isBodyQuarantined == false, "fixture check: the caller's copy does NOT know about the flag")
+        try await AppDatabase.dbPool.write { db in
+            try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: header.id)
+        }
+
+        var refusal: NSError?
+        do {
+            try await AccountManager.shared.fetchBody(for: header)
+            Issue.record("the funnel must refuse on the row's CURRENT state, not the caller's snapshot of it")
+        } catch let ProviderError.networkError(underlying) {
+            refusal = underlying as NSError
+        } catch {
+            Issue.record("expected the funnel's typed refusal, got \(error)")
+        }
+        let ns = try #require(refusal, "the funnel must refuse with its own error, not fall through to provider work")
+        #expect(ns.domain == BodyFetchRefusal.domain)
+        #expect(ns.code == BodyFetchRefusal.quarantined,
+                "the refusal must be the oversized-quarantine one — reached only by re-reading the row")
     }
 
     /// THE ESCAPE HATCH, at the funnel. `replaceExistingBody: true` is pull-to-refresh, and

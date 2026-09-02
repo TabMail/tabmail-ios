@@ -501,4 +501,46 @@ struct MessageDetailOversizedQuarantineTests {
                 "the quarantine still applies to the population it was built for")
         #expect(vm.error != nil)
     }
+
+    /// `endsPolling`'s MEMBERSHIP, walked class by class — the thing no behavioural test
+    /// in this suite can reach.
+    ///
+    /// Both poll controls throw `ProviderError.messageNotFound`, which is not a
+    /// `.networkError` and therefore exits at the function's FIRST guard, never reaching
+    /// the code comparison. So widening the predicate — `|| ns.code == retryable`, or
+    /// `return true` for any TabMail-domain `.networkError` — leaves every poll test
+    /// green while deleting the poll's entire transient-recovery role: `retryable` is
+    /// exactly what the funnel throws on an ordinary blip on the poll's own call path,
+    /// and `loadBody`'s tail does not restart a poll that ended, so the user is parked on
+    /// a terminal error state until they pull to refresh.
+    ///
+    /// Six cases, chosen so each guard in the function is the sole reason for one
+    /// outcome: two terminal classes, one retryable class, one foreign domain carrying a
+    /// terminal code, one non-`networkError` `ProviderError`, and the mid-move refusal
+    /// whose exclusion became structural when it stopped being an NSError code.
+    /// (Found by audit.)
+    @Test("endsPolling ends the poll for the terminal refusal classes and for nothing else")
+    func bodyFetchRefusalEndsPollingOnlyForTerminalClasses() {
+        #expect(BodyFetchRefusal.endsPolling(
+            BodyFetchRefusal.error(BodyFetchRefusal.payloadTooLarge, BodyFetchRefusal.payloadTooLargeMessage)),
+            "an overflow observed on THIS attempt ends the poll — it is the state the durable flag cannot see")
+        #expect(BodyFetchRefusal.endsPolling(
+            BodyFetchRefusal.error(BodyFetchRefusal.quarantined, BodyFetchRefusal.quarantinedMessage)),
+            "a durably recorded overflow ends the poll — no background path can retract it")
+
+        #expect(BodyFetchRefusal.endsPolling(
+            BodyFetchRefusal.error(BodyFetchRefusal.retryable, BodyFetchRefusal.retryableMessage)) == false,
+            "a TRANSIENT refusal must NOT end the poll — waiting for it to clear is the poll's whole job")
+        #expect(BodyFetchRefusal.endsPolling(
+            ProviderError.addressPendingMove("acc1:INBOX:1")) == false,
+            "the mid-move refusal must NOT end the poll — a move completing is the state change it is waiting for")
+
+        // The two guards, each isolated. A foreign domain carrying a terminal CODE proves
+        // the domain check is load-bearing; a non-`networkError` proves the outer one is.
+        #expect(BodyFetchRefusal.endsPolling(ProviderError.networkError(
+            underlying: NSError(domain: "SomeOtherFramework", code: BodyFetchRefusal.payloadTooLarge))) == false,
+            "a foreign error that happens to carry code -1 is not our refusal")
+        #expect(BodyFetchRefusal.endsPolling(ProviderError.messageNotFound) == false,
+            "a non-networkError never reaches the code comparison")
+    }
 }

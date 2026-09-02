@@ -1132,10 +1132,13 @@ final class MessageDetailViewModel {
                 // worth its per-tick read, and they are the reasons to keep it:
                 //   - it ends the poll one tick EARLIER, without an attempt; and
                 //   - it pre-empts the funnel's ADDRESS gate, which is evaluated FIRST.
-                //     For a quarantined row whose move is in flight the funnel returns
-                //     `addressInFlight`, which `endsPolling` deliberately EXCLUDES (a move
-                //     completing is a real state change worth waiting for) — so without
-                //     this gate such a row keeps polling until the move settles.
+                //     For a quarantined row whose move is in flight the funnel throws
+                //     `ProviderError.addressPendingMove`, which `endsPolling` excludes
+                //     structurally — it is not a `.networkError`, so it fails the first
+                //     guard, and that is correct because a move completing IS a real state
+                //     change worth waiting for. Without this gate such a row keeps polling
+                //     until the move settles, even though the quarantine already decided
+                //     the outcome.
                 //
                 // `loadBody`'s own branch cannot serve here: all three paths that start
                 // this poll (`startBodyPoll(); return` on a cancelled header read, a

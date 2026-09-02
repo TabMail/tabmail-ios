@@ -1667,6 +1667,18 @@ final class InboxViewModel {
                 // this error (`IMAPProvider.withFolderConnection`, both queues,
                 // `BodyFetchProcessor.fetch`); `SyncEngine.isConnectionError` deliberately
                 // does not match it. The shared writer carries both guards. (Found by audit.)
+                //
+                // ⚠️ This is the 14th hand-copy of that substring test in the tree, and a
+                // 14th copy is a real cost — a maintainer replacing the stringly test (or
+                // SwiftMail renaming the error) must sweep all of them, and missing THIS one
+                // silently reverts the flagged population to "whatever a background queue
+                // reached first", the one property `MessageHeader.bodyMetadataOversized`
+                // claims it is not. A local helper is deliberately NOT minted here: the
+                // canonical symbol already exists on the branch for #103
+                // (`IMAPFetchMapping.isResponseBufferOverflow`), and adding a competing one
+                // would leave two predicates to reconcile at merge instead of one. Fold all
+                // 14 into that symbol when the branches meet; do not add a 15th copy in the
+                // meantime. (Found by audit.)
                 if "\(error)".contains("PayloadTooLargeError") {
                     await BodyFetchProcessor.markOversizedDurably(headerId: item.headerId)
                 }

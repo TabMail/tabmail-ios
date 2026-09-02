@@ -30,15 +30,20 @@ enum BodyFetchRefusal {
     static let payloadTooLarge = -1
     /// A transient failure the caller may retry.
     static let retryable = -2
-    /// An optimistic move is in flight, so the row's address is not corroborated.
-    static let addressInFlight = -3
     /// A previously observed overflow is recorded durably against this row.
     static let quarantined = -4
+    // -3 is deliberately vacant. It used to be `addressInFlight`, carrying a byte-identical
+    // copy of `ProviderError.addressPendingMove`'s user-facing sentence. The funnel now
+    // throws that typed case directly — the same one `fetchAttachment` throws roughly a
+    // hundred lines below, and the one `ComposeView` matches BY TYPE. Two independent
+    // copies of one recovery instruction is the `IOS-BODY-005` failure shape (its sentence
+    // took three attempts to get right, each wrong one caught by a separate audit round),
+    // and a caller copying `ComposeView`'s idiom around a body fetch would silently have
+    // failed to match an NSError encoding. The number is left unused rather than reassigned
+    // so a stale `-3` anywhere cannot quietly acquire a new meaning. (Found by audit.)
 
     static let payloadTooLargeMessage = "This message is too large to display."
     static let retryableMessage = "Failed to load message. Please try again."
-    static let addressInFlightMessage =
-        "This message is still being moved. Go back to the message list and open it again in a moment."
     /// Shared TEXT for the funnel's refusal, `loadBody`'s quarantine branch and the
     /// poll's — not a shared rendered string, and on the detail surface not a shipped
     /// one either. Two qualifications, both established by audit:
@@ -47,7 +52,7 @@ enum BodyFetchRefusal {
     ///    `errorDescription` is `"Network error: \(underlying.localizedDescription)"`. So
     ///    a refusal that reaches the user through a caller's `error.localizedDescription`
     ///    carries that prefix, while the two branches that assign this constant directly
-    ///    do not. The prefix is inherited — codes −1/−2/−3 have always been wrapped this
+    ///    do not. The prefix is inherited — codes −1/−2/−4 have always been wrapped this
     ///    way — and is left alone rather than unwrapped at one call site, which would
     ///    trade a visible inconsistency for an invisible one.
     /// 2. `MessageCardView` renders `viewModel.error` only under
@@ -64,8 +69,16 @@ enum BodyFetchRefusal {
     }
 
     /// True when no background path can produce this body, so a poll would only repeat a
-    /// refusal. `addressInFlight` is deliberately NOT included: a move completing IS the
-    /// state change the poll is waiting for.
+    /// refusal.
+    ///
+    /// `retryable` (−2) is deliberately NOT included, and the mid-move refusal is excluded
+    /// structurally rather than by omission: it is `ProviderError.addressPendingMove`, not
+    /// a `.networkError`, so it fails the first `guard`. Both exclusions say the same
+    /// thing — a transient failure clearing, or a move completing, IS the state change the
+    /// poll is waiting for, so ending the poll on either would delete the poll's entire
+    /// reason to exist. Pinned by `bodyFetchRefusalEndsPollingOnlyForTerminalClasses`,
+    /// which walks every class rather than relying on a control that exits at the first
+    /// guard. (Found by audit.)
     ///
     /// ⚠️ `payloadTooLarge` matters here for a state the durable flag cannot cover. Both
     /// `BodyFetchProcessor.markBodyMetadataOversized`'s `AND bodyComplete = 0` guard and
@@ -205,8 +218,13 @@ extension AccountManager {
             if DebugModeManager.isLoggingEnabled() {
                 print("[MoveTrace] fetchBody — address not corroborated (move in flight), skipping fetch for \(message.id.prefix(40))")
             }
-            throw BodyFetchRefusal.error(
-                BodyFetchRefusal.addressInFlight, BodyFetchRefusal.addressInFlightMessage)
+            // The SAME typed case `fetchAttachment` throws for the same condition, so the
+            // two mid-move refusals cannot drift apart and a `case ProviderError
+            // .addressPendingMove` match works against either. Behaviour at both
+            // `fetchBody` call sites is unchanged: `fetchBodyWithRetry` retries only
+            // `messageNotFound` and `SyncEngine.isConnectionError`, and neither matches
+            // this case nor the `NSError(domain: "TabMail", code: -3)` it replaces.
+            throw ProviderError.addressPendingMove(message.id)
         }
 
         // Oversized-metadata quarantine: the last observed attempt at this message's
