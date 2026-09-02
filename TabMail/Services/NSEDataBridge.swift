@@ -319,8 +319,7 @@ enum NSEDataBridge {
     /// Mirror all current state to shared UserDefaults.
     /// Call on app launch and whenever relevant state changes.
     static func mirrorAllState() {
-        mirrorAccountMap()
-        mirrorIMAPAccounts()
+        mirrorAccountIdentity()
         mirrorPrompts()
         mirrorUserName()
         mirrorBackendConfig()
@@ -329,24 +328,161 @@ enum NSEDataBridge {
         mirrorDebugLogging()
     }
 
+    /// Re-derive both NSE identity mirrors — `nse.accountMap` (address →
+    /// account id) and `nse.imapAccounts` (account id → host/port/username) —
+    /// from the current database state.
+    ///
+    /// These two are the ONLY way the extension can resolve a push to an
+    /// account: it cannot read the main database, so every push handler starts
+    /// by mapping the payload address to an account id, and the IMAP handlers
+    /// then read that account's connection info. An account whose mirrors were
+    /// never refreshed is invisible to the extension — the reconnect handler
+    /// returns before it can re-subscribe — so a mirrored column must never be
+    /// written durably without refreshing here.
+    ///
+    /// They are pure derived state, which is why the refresh is a full
+    /// re-derivation rather than an incremental edit: it is idempotent, it
+    /// costs two unfiltered scans of `account` (a handful of rows), and it
+    /// converges no matter which writer left the mirrors stale. Both reads are
+    /// synchronous, so call this off the main actor.
+    ///
+    /// LIMITATION, FILED AS `IOS-NSE-008` — ordering against account removal.
+    /// Removal edits the mirrors *before* its authoritative delete
+    /// (`removeAccountFromMirrors`), precisely so there is no commit-to-mirror
+    /// window. That ordering is safe only against a serial reader: a
+    /// re-derivation running concurrently, whose read happens before the delete
+    /// commits but whose write lands after the removal has already edited the
+    /// mirrors, can
+    /// briefly restore the removed account's entries. Not guarded, for the
+    /// reasons below. ⚠️ It is filed `open`, NOT `accepted` — the owner has not
+    /// taken a decision on it. See
+    /// `Companion/Process/Current/KnownIssues/Amendments/ios-nse-008.md`, which
+    /// also enumerates the three remedies.
+    ///
+    /// The restored entries are stale identity for an account being torn down.
+    /// `removeAccount` deletes its credentials in `disconnectAccount`, which it
+    /// enters two statements after the post-commit convergence, so for the
+    /// remainder of that hop
+    /// the credentials still exist and a push could still be serviced — with
+    /// the removed account's own mail, so no cross-account access. Note that
+    /// the re-subscribe hop is not read-only: it re-posts that account's stored
+    /// connection credentials, so the bound that matters is the credential
+    /// delete, not the mirror content. Once the teardown has run, the
+    /// extension's keychain lookup fails and it takes no action on the account:
+    /// `attemptSilentResubscribe` returns false and `fetchIMAPMessage` returns
+    /// nil. The one user-visible difference is that a new-mail push for the
+    /// removed address then delivers the payload's own alert instead of the
+    /// "connection lost" override an unresolvable address would have produced —
+    /// a stale notification, dismissable, and gone once the next re-derivation
+    /// drops the entries.
+    ///
+    /// ⚠️ "The next re-derivation" is usually the next foreground return, but
+    /// NOT when the account removed was the last mail account: `RootView` gates
+    /// `startForegroundPolling()` on `!navigationStore.accounts.isEmpty`, so
+    /// with zero accounts there is no next foreground pass and the entries
+    /// survive to the next cold launch — the same bound the code had before the
+    /// pass existed. `AppDataWiper.wipeAll` has the same shape with a wider
+    /// window — it clears the mirrors with a per-account
+    /// `removeAccountFromMirrors` LOOP and only then runs its multi-table
+    /// delete — but that file records that `wipeAll` has no callers, so the
+    /// widest window is not currently reachable. (Its rollback re-derivation is
+    /// not part of the window either — it runs when the delete threw, so the
+    /// rows are still there and re-deriving is exactly right.)
+    ///
+    /// ⚠️ The straddle is one instance of a more general property, stated here
+    /// so nobody reads the removal case as the whole of it: this pair is a
+    /// read-then-write with no lock, epoch or CAS, and it now has several
+    /// production launch points on different executors. Any two overlapping
+    /// re-derivations resolve last-writer-wins per key, so a pass holding the
+    /// OLDER snapshot can land last — briefly re-opening whichever window the
+    /// other pass had just closed, in either direction. Every outcome fails
+    /// closed and the next pass converges, so the sentence above about
+    /// converging "no matter which writer left the mirrors stale" holds for
+    /// SEQUENTIAL writers and is what the design leans on; a concurrent
+    /// re-derivation is itself a writer that can leave them stale for one
+    /// interval. Widened into `IOS-NSE-008` Residual A.
+    ///
+    /// Closing the window would need a compare-and-swap epoch over state that is
+    /// purely derived, which is more mechanism than the consequence is worth.
+    static func mirrorAccountIdentity(defaults override: UserDefaults? = nil) {
+        mirrorAccountMap(defaults: override)
+        mirrorIMAPAccounts(defaults: override)
+    }
+
     /// Mirror account email→accountId mapping.
-    /// Call on account add/remove.
+    /// Refreshed as one pair with the IMAP connection info — call
+    /// `mirrorAccountIdentity()` rather than this half on its own.
+    ///
+    /// A `calendarOnly` row may NEVER displace a mail account here. This map is
+    /// address-keyed and is the extension's only resolver, while
+    /// `mirrorIMAPAccounts` filters by provider — so a calendar row winning an
+    /// address gives the extension an account id it can resolve but has no
+    /// connection info for, and every push for that address dead-ends at
+    /// `deliverPassive` with no re-subscribe. That collision is reachable
+    /// without any concurrency: `addCalDAVAccount` stores the CalDAV *username*
+    /// as `emailAddress`, that username is conventionally the user's mail
+    /// address, and it does no cross-provider duplicate check. That one axis is
+    /// resolved explicitly below rather than by scan order, which is arbitrary.
+    ///
+    /// ⚠️ SCOPE: the rule below settles the CALENDAR-vs-MAIL axis and nothing
+    /// else. Two rows that are both mail rows still contend for the address by
+    /// scan order — `addIMAPAccount` runs no duplicate check at all, and
+    /// `Account.existing(forEmail:provider:in:)` is provider-scoped, so an OAuth
+    /// row and an IMAP row at one address coexist. That collision has NO
+    /// correct precedence to apply: an address→id map has one slot, and
+    /// whichever row wins it, pushes for the other provider dead-end. Filed as
+    /// Residual C of `IOS-NSE-008`; do not "fix" it here by picking a winner.
+    ///
+    /// The comparison is on the RAW stored address, deliberately, even though
+    /// the sibling `Account.existing(forEmail:provider:in:)` case-FOLDS for the
+    /// same mail-beats-calendar precedence. The consumer decides which is
+    /// right: `NSEState.findAccountId` is an exact `map[email]` lookup, so the
+    /// writer's keys must be the raw stored addresses. Folding here would
+    /// collapse a case-variant pair into one key and cost the extension the
+    /// ability to resolve whichever spelling it was actually sent. Precedence
+    /// only has to arbitrate rows that share a key the reader can hit.
     static func mirrorAccountMap(defaults override: UserDefaults? = nil) {
-        guard let target = override ?? suite else { return }
+        guard let target = override ?? suite else {
+            BackgroundSyncLogger.logError(
+                "mirrorAccountMap: no App Group suite — the notification extension "
+                    + "cannot resolve any account",
+                source: "NSEDataBridge"
+            )
+            return
+        }
         do {
             let accounts = try AppDatabase.dbPool.read { db in
-                try Row.fetchAll(db, sql: "SELECT id, emailAddress FROM account")
+                try Row.fetchAll(db, sql: "SELECT id, emailAddress, calendarOnly FROM account")
             }
             var map: [String: String] = [:]
+            var mailOwnedAddresses: Set<String> = []
             for row in accounts {
                 if let email: String = row["emailAddress"], let id: String = row["id"] {
+                    let calendarOnly: Bool? = row["calendarOnly"]
+                    if calendarOnly == true {
+                        // Keep it — a calendar-only address still belongs in the
+                        // extension's suppress set — but never over a mail row.
+                        if mailOwnedAddresses.contains(email) { continue }
+                    } else {
+                        mailOwnedAddresses.insert(email)
+                    }
                     map[email] = id
                 }
             }
             let data = try JSONEncoder().encode(map)
             target.set(String(data: data, encoding: .utf8), forKey: "nse.accountMap")
         } catch {
-            print("[NSEDataBridge] Failed to mirror account map: \(error)")
+            // `logError`, not a bare `print`: since this pair became the
+            // convergence mechanism that closes the mirrored-column staleness
+            // class, a read that fails EVERY pass leaves the extension unable
+            // to resolve any account, and the foreground pass would otherwise
+            // report success by silence. `logError` still prints and also
+            // reaches the retained error channel.
+            BackgroundSyncLogger.logError(
+                "mirrorAccountMap failed — the notification extension keeps the previous, "
+                    + "possibly stale address map: \(error)",
+                source: "NSEDataBridge"
+            )
         }
     }
 
@@ -360,7 +496,17 @@ enum NSEDataBridge {
         email: String,
         defaults override: UserDefaults? = nil
     ) {
-        guard let target = override ?? suite else { return }
+        guard let target = override ?? suite else {
+            // Louder than the two re-derivation halves for a reason: a silent
+            // no-op HERE leaves a removed account resolvable to the extension
+            // and no convergence pass can repair it, because that pass would
+            // no-op on the same nil suite.
+            BackgroundSyncLogger.logError(
+                "removeAccountFromMirrors: App Group defaults unavailable; mirrors not cleared",
+                source: "NSEDataBridge"
+            )
+            return
+        }
 
         if let json = target.string(forKey: "nse.accountMap"),
            let data = json.data(using: .utf8),
@@ -396,9 +542,17 @@ enum NSEDataBridge {
     /// The password is already in shared Keychain
     /// (`KeychainHelper.passwordKey(accountId:)` reads/writes via the
     /// app-group access group, so NSE reads it via `SharedKeychain`).
-    /// Call on account add / remove / IMAP-config edit.
+    /// Refreshed as one pair with the account map — call
+    /// `mirrorAccountIdentity()` rather than this half on its own.
     static func mirrorIMAPAccounts(defaults override: UserDefaults? = nil) {
-        guard let target = override ?? suite else { return }
+        guard let target = override ?? suite else {
+            BackgroundSyncLogger.logError(
+                "mirrorIMAPAccounts: no App Group suite — the notification extension "
+                    + "cannot open a connection for any account",
+                source: "NSEDataBridge"
+            )
+            return
+        }
         do {
             let rows = try AppDatabase.dbPool.read { db in
                 try Row.fetchAll(
@@ -435,7 +589,11 @@ enum NSEDataBridge {
             let data = try JSONSerialization.data(withJSONObject: map, options: [.sortedKeys])
             target.set(String(data: data, encoding: .utf8), forKey: "nse.imapAccounts")
         } catch {
-            print("[NSEDataBridge] Failed to mirror IMAP accounts: \(error)")
+            BackgroundSyncLogger.logError(
+                "mirrorIMAPAccounts failed — the notification extension keeps the previous, "
+                    + "possibly stale connection map: \(error)",
+                source: "NSEDataBridge"
+            )
         }
     }
 

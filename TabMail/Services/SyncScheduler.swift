@@ -526,6 +526,39 @@ final class SyncScheduler {
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
         }
 
+        // ── ALWAYS, UNGATED: converge the shared identity mirrors ──
+        // The extension cannot read this database; the shared mirrors are the
+        // only way it can resolve a push to an account. They are pure derived
+        // state, so re-deriving them on every foreground return heals any
+        // writer that changed a mirrored column without refreshing them —
+        // independently of, and in addition to, the refresh each account-add
+        // path already performs. Ungated for the same reason as the merge
+        // above: a foreground that arrives while the herd holds the gate must
+        // not leave the extension addressing a stale account set.
+        // Detached because both reads are synchronous and this type is
+        // main-actor isolated; a blocking read here would stall the foreground
+        // paint. `.medium` and never lower: the pass takes a reader on the main
+        // GRDB pool, and ADR-IOS-031 makes `.medium` the floor for anything that
+        // does, so it cannot open a QoS gap under a MainActor that wants the same
+        // reader mid-foreground-return. That floor governs THIS site and any
+        // new one; it is not a licence to retier the launch-time caller of the
+        // same helper. `TabMailApp` runs `mirrorAllState()` inside a
+        // `Task.detached(priority: .utility)`, and that site is one of
+        // `IOS-PERF-001`'s registered residuals — the one with runtime
+        // corroboration, where `mirrorAccountMap` appears by name as a Thread
+        // Performance Checker holder frame — governed by that row's standing
+        // "count and name, never churn production tiers" policy.
+        //
+        // Losing the pass to a process kill costs nothing durable: the two
+        // `UserDefaults` writes are separate, so a kill between them leaves a
+        // half-updated pair, but both half-states fail closed (the extension
+        // either cannot resolve the address or cannot open a connection, and in
+        // both cases takes no action on the account) and the next launch's
+        // `mirrorAllState()` re-derives the same values.
+        Task.detached(priority: .medium) {
+            NSEDataBridge.mirrorAccountIdentity()
+        }
+
         // ── GATED: the heavy herd (sync / push resub / poll) — one cycle at a time ──
         if !isStartupInFlight {
             isStartupInFlight = true
