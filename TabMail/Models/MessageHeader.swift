@@ -184,12 +184,19 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     /// overflow on a lossy link and parse fine on WiFi. It is therefore NOT a claim
     /// that the body is unfetchable, and it must never be treated as one.
     ///
-    /// SET by every path that observes the overflow, so the flagged population is "every
-    /// row that overflowed" and not "the rows a background queue happened to reach
-    /// first": `ActiveBodyQueue.markOversizedDurably`,
-    /// `BackfillBodyQueue.markOversizedDurably`, and `BodyFetchProcessor.fetch`'s
-    /// `PayloadTooLargeError` branch (the single-item user-open path). All three write the
-    /// same statement under the same `AND bodyComplete = 0` guard.
+    /// SET by every path IN THE MAIN APP that observes the overflow, so the flagged
+    /// population is "every row that overflowed" rather than "the rows a background queue
+    /// happened to reach first". The writers are enumerated ONCE, under `WRITTEN by` at the
+    /// bottom of this comment — do not restate them here; two enumerations in one comment is
+    /// how the roster went stale the first time.
+    ///
+    /// ⚠️ The negative case, because "every path" is an absolute:
+    /// `NSEIMAPConnection.performFetch`, in the notification-service extension, observes a
+    /// `PayloadTooLargeError` and DISCARDS it — its catch logs through `NSELog.step` and
+    /// returns nil. Deliberate: the NSE is a separate process on a hard memory and
+    /// wall-clock budget, and a pushed message usually has no `messageHeader` row to flag
+    /// yet. The cost is one bounded extra NSE fetch if that message is pushed again; the
+    /// NSE does not retry in-process, so there is no loop.
     ///
     /// Read by five kinds of consumer. Three of them are code, and they all ask the same
     /// question through `isBodyQuarantined` below; the other two are SQL.
@@ -205,6 +212,13 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     ///     work that cannot be done is the worse product outcome. Note the scope of that
     ///     premise: not fetchable BY THIS BUILD, on the parser bound this build ships.
     ///     Nothing here claims the body is gone or that a later build cannot get it.
+    ///     Four surfaces move with that decision, not three: the Fast Sync "Sync Complete"
+    ///     banner, the wake lock, the "N / M indexed" numerator, and
+    ///     `DynamicIslandChatButton.isBackfillInProgress` — the chat pill's "agent search
+    ///     results may be incomplete" notice, which reads `!isFullyComplete` and therefore
+    ///     also clears. For an account holding a quarantined body that notice is literally
+    ///     still true, and it is inside the same decision: a notice that can never clear is
+    ///     exactly the permanent nag that was overruled.
     ///  3. The user-open path (`MessageDetailViewModel.loadBody`) — a flagged row
     ///     reports "unable to load" immediately, in exactly the state a fetch that just
     ///     failed would leave behind, instead of spending a full connection on an
@@ -223,6 +237,10 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     ///     blacklist and re-queues the visible window, so an ungated row would be retried
     ///     on every single reload. Tier 2 is also a WRITER — see below.
     ///
+    /// ⚠️ Consumers 3–5 ask this question through `isBodyQuarantined`, never by reading
+    /// the column directly — the `&& !bodyComplete` fail-safe lives inside that property, so
+    /// grepping any of those call sites for `bodyComplete` finds nothing.
+    ///
     /// ⚠️ Consumers 3–4 are UI-STATE checks, not the network guard. The authoritative
     /// refusal lives at the funnel, `AccountManagerFetch.fetchBody`, beside the address
     /// gate whose comment states the rule. Gating callers alone was not enough:
@@ -240,10 +258,20 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     /// CLEARED — the full set, because a flag that outlives its truth is worse than no
     /// flag at all:
     ///  • by ANY successful body write, which is positive evidence refuting the
-    ///    observation. All four: `BodyFetchProcessor.flushBatch` (the body branch),
+    ///    observation. All five: `BodyFetchProcessor.flushBatch` (the body branch),
     ///    `BodyFetchProcessor.process` (the confirmed-empty branch — a different
     ///    function, not another branch of `flushBatch`), `NSEDataBridge
-    ///    .flushNSEBatchToFTS`, and `SyncEngine.applySnippetUpdates`.
+    ///    .flushNSEBatchToFTS`, `SyncEngine.applySnippetUpdates`, and
+    ///    `SyncEngineFTS.oneTimeBodyCompleteRestore` (which heals rows selected BECAUSE
+    ///    their FTS body text exists — the same positive evidence).
+    ///    ⚠️ The set is defined by CONSEQUENCE, not by name: any statement that sets
+    ///    `bodyComplete = 1` must clear this flag in the SAME statement, or it strands the
+    ///    row in the one state no gate can see (both the writer's `AND bodyComplete = 0`
+    ///    guard and `isBodyQuarantined`'s `&& !bodyComplete` fail-safe are keyed on the row
+    ///    being incomplete). The one remaining `bodyComplete = 1` writer that does not
+    ///    clear it is `AccountManagerOutbox`'s optimistic-Sent insert, and it cannot strand
+    ///    anything: the row it writes is a brand-new `sent-<UUID>` that has never been
+    ///    fetched, so the flag is 0 there by construction.
     ///    ⚠️ A `rg 'bodyMetadataOversized = 0'` census finds only THREE of them:
     ///    `applySnippetUpdates` writes it as a GRDB `updateAll` chain
     ///    (`Column("bodyMetadataOversized").set(to: false)`) and is invisible to every
@@ -261,6 +289,13 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     ///    re-keys the header row and the flag travels with the row it describes.
     ///  • by Smart Reindex (`SyncEngine.resetCrawlState`), the user's explicit
     ///    try-everything-again gesture.
+    ///    ⚠️ DURABLE HALF ONLY. The process-lifetime sets `ActiveBodyQueue
+    ///    .oversizedDeferredThisSession` / `isolationPending` survive it, so `admit` still
+    ///    refuses the row for the rest of this launch: the count goes back above 0 and the
+    ///    sync banner comes back up until the next relaunch, which gives the row one
+    ///    genuine retry and then re-quarantines it. Self-healing and strictly better than
+    ///    the pre-flag behaviour (the banner never cleared at all), but it is not the
+    ///    immediate release the bullet above reads like on its own.
     ///  • exactly, in one statement, by the migration that ships a raised parser bound —
     ///    which is the whole re-fetch mechanism for this population once upstream is
     ///    fixed.

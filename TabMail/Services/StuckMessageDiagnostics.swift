@@ -145,9 +145,17 @@ enum StuckMessageDiagnostics {
     /// Test seam: `count` is private and takes a pool, which is exactly what a partition
     /// assertion needs. Exposed rather than duplicated so the test exercises the real
     /// counting path (including its `m` alias) and not a re-implementation of it.
+    // `#if DEBUG`, unlike the ~24 other `…ForTesting` seams in this subsystem which all
+    // ship unconditioned: this one interpolates its argument into a SQL statement. Every
+    // call site passes one of the four `bodyless*Predicate` constants above and it is
+    // `internal` with no production caller, so it is not reachable by an attacker — but a
+    // string-into-SQL entry point has no business existing in a Release binary at all,
+    // and gating it costs nothing. (Found by audit.)
+    #if DEBUG
     static func countForTesting(_ pool: DatabasePool, _ whereSQL: String) async -> Int {
         await count(pool, whereSQL)
     }
+    #endif
 
     private static func count(_ pool: DatabasePool, _ whereSQL: String) async -> Int {
         (try? await pool.read { db in

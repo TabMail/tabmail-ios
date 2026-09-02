@@ -99,16 +99,30 @@ struct InboxSnippetOversizedQuarantineTests {
         let (flaggedId, cleanId, folder, restore) = try makeSwappedDB()
         defer { restore() }
 
-        let vm = InboxViewModel(folders: [folder])
-        let blacklisted = await vm.runSnippetBatchForTesting([flaggedId, cleanId])
+        // A REGISTERED provider, so the oracle can be the wire itself. Without one both
+        // rows fail identically at tier 2's provider lookup, and a gate that blacklisted
+        // the row while STILL appending it to `networkNeeded` would satisfy a
+        // blacklist-only assertion while spending exactly the connection the gate exists
+        // to save. `callLog` records every `fetchMessage`, so absence there is the
+        // property this suite's own header claims. (Found by audit.)
+        let provider = MockEmailProvider()
+        var blacklisted: Set<String> = []
+        await TestProviderRegistry.withRegisteredProvider(accountId: "acc1", provider: provider) {
+            let vm = InboxViewModel(folders: [folder])
+            blacklisted = await vm.runSnippetBatchForTesting([flaggedId, cleanId])
+        }
+        let calls = await provider.callLog.filter { $0.hasPrefix("fetchMessage(") }
 
+        #expect(!calls.contains { $0.contains("id:9001") },
+                "the flagged row must never reach the wire — that fetch is the one that overflowed the parser, and each attempt costs a full connection teardown")
+        // THE CONTROL, and it is what makes the assertion above mean something: the two
+        // rows are identical apart from the flag, so an unflagged row MUST reach the wire.
+        // A loader that skipped everything would satisfy the assertion above while proving
+        // nothing.
+        #expect(calls.contains { $0.contains("id:9002") },
+                "an identical row without the flag must still be fetched")
         #expect(blacklisted.contains(flaggedId),
-                "the flagged row must be refused before tier 2 — that tier calls the very fetch that overflowed the parser, and each attempt costs a full connection teardown")
-        // THE CONTROL, and it is what makes the assertion above mean something. Both rows
-        // reach tier 2's provider lookup; neither has a provider in a unit test. The
-        // difference in outcome can therefore come from nothing but the gate.
-        #expect(!blacklisted.contains(cleanId),
-                "an identical row without the flag must stay retryable — a loader that blacklisted everything would satisfy the assertion above while proving nothing")
+                "…and the flagged row is also blacklisted, so this reload does not re-queue it")
     }
 
     /// The eviction fail-safe, at this initiator too. `BodyAssetMaintenance` deletes the
@@ -154,6 +168,9 @@ struct InboxSnippetOversizedQuarantineTests {
             let vm = InboxViewModel(folders: [folder])
             _ = await vm.runSnippetBatchForTesting([cleanId])
         }
+        // Tier 2's mark goes onto `ActiveBodyQueue`'s serialized durable-write chain
+        // (shared with the UIDVALIDITY reset's clear), so drain it before reading.
+        await ActiveBodyQueue.shared.awaitDurableWritesForTesting()
 
         let stored = try #require(try await AppDatabase.dbPool.read { db in
             try MessageHeader.fetchOne(db, key: cleanId)
@@ -182,6 +199,9 @@ struct InboxSnippetOversizedQuarantineTests {
             let vm = InboxViewModel(folders: [folder])
             _ = await vm.runSnippetBatchForTesting([cleanId])
         }
+        // Tier 2's mark goes onto `ActiveBodyQueue`'s serialized durable-write chain
+        // (shared with the UIDVALIDITY reset's clear), so drain it before reading.
+        await ActiveBodyQueue.shared.awaitDurableWritesForTesting()
 
         let stored = try #require(try await AppDatabase.dbPool.read { db in
             try MessageHeader.fetchOne(db, key: cleanId)

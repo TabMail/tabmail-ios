@@ -276,6 +276,14 @@ actor BackfillBodyQueue {
     ///
     /// ⚑ ACCEPTED LIMITATIONS OF THIS FLAG (owner-blessed; do not "fix" them without
     /// asking):
+    ///
+    /// ⚠️ THIS BLOCK IS DUPLICATED VERBATIM ON `ActiveBodyQueue.markOversizedDurably`.
+    /// The two queue actors keep byte-identical copies of it and of
+    /// `clearOversizedDurably`/`enqueueDurableWrite` on purpose — a shared helper
+    /// would need an `await` inside `handlePayloadTooLarge`'s synchronous critical
+    /// section, or unchecked-`Sendable` state mutated under two isolations. Edit both
+    /// copies or neither; a guard added to one and forgotten in the other is exactly
+    /// the defect that made `BodyFetchProcessor.markBodyMetadataOversized` one symbol.
     ///   1. The body stays unindexed and unsearchable BY CONTENT until a raised
     ///      parser bound ships upstream. The header stays FTS-indexed, so the message
     ///      is still findable by subject and sender.
@@ -299,10 +307,21 @@ actor BackfillBodyQueue {
     ///      it for the session (`InboxViewModel.loadSnippetBatch`), so an affected row
     ///      shows no snippet preview. The blacklist is cleared on every reload, which
     ///      costs a repeated DB read and no wire traffic.
+    ///   6. Expanding a collapsed thread bubble whose message is flagged
+    ///      (`MessageDetailViewModel.loadThreadMessageBody`) now yields nothing at all —
+    ///      no body, no error, no wire attempt. That function has always swallowed EVERY
+    ///      failure into a debug print, so the user-visible outcome is unchanged from any
+    ///      other error it hits; what changed is that the tap no longer buys a lucky
+    ///      re-roll on a different fragmentation. The recovery is to open that message as
+    ///      the focused message, where pull-to-refresh is exempt at the funnel. Listed
+    ///      because it is a consequence of gating at the funnel rather than in the
+    ///      callers, and the enumeration must be exhaustive to be worth reading.
+    ///      (Found by audit.)
     ///
-    /// The read-side predicate shared by items 4 and 5 is `MessageHeader
+    /// The read-side predicate shared by items 4, 5 and 6 is `MessageHeader
     /// .isBodyQuarantined`; the four background queries are the SQL half of the same
     /// question (`ActiveBodyQueue.admissionSQL` / `BackfillBodyQueue.admissionSQL`).
+    /// Item 6 reaches it through the funnel, `AccountManagerFetch.fetchBody`, not directly.
     ///
     /// Dispatch and ordering guarantees are documented on `enqueueDurableWrite`.
     private func markOversizedDurably(_ headerId: String) {
@@ -379,11 +398,27 @@ actor BackfillBodyQueue {
         label: String,
         _ op: @escaping @Sendable (Database) throws -> Void
     ) {
+        // Resolve the pool NOW, before the task, and capture it. `dbPool` is a computed
+        // property over `AppDatabase.shared`; reading it *inside* the task would resolve it
+        // after `await previous?.value`, i.e. against whichever database is installed by
+        // the time this write finally runs — not the one whose UIDVALIDITY reset produced
+        // it. An identity resolved before an `await` is not a fact after it, and here the
+        // identity we need is the one from before.
+        //
+        // In production `AppDatabase.shared` is installed once at boot and this is a no-op.
+        // It is load-bearing for tests: suites swap `AppDatabase.shared` to a temp pool and
+        // restore it in `defer`, so a late-resolving write would land on an unrelated
+        // suite's database and clear `bodyMetadataOversized` out from under its fixture.
+        // With the pool captured, a write that outlives its suite targets the retired pool
+        // and fails harmlessly into the `catch` below instead of corrupting a sibling.
+        let pool = dbPool
         let previous = durableWriteChain
-        durableWriteChain = Task { [self] in
+        // No `[self]`: with the pool captured above, nothing in this task touches the actor,
+        // so the chain no longer keeps it alive.
+        durableWriteChain = Task {
             await previous?.value
             do {
-                try await dbPool.write { db in try op(db) }
+                try await pool.write { db in try op(db) }
             } catch {
                 if DebugModeManager.isLoggingEnabled() {
                     print("[BackfillBody] Durable oversized write failed (\(label)): \(error)")

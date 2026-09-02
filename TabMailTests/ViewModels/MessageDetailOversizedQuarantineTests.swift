@@ -261,6 +261,53 @@ struct MessageDetailOversizedQuarantineTests {
                 "…and an ordinary poll failure is logged and retried, never surfaced as a load failure")
     }
 
+    /// The poll reads the flag FRESH from the database each tick rather than trusting the
+    /// header it was started with — and this is the fixture that can tell the difference.
+    /// Both existing poll tests seed a header that is ALREADY in its final state, so a
+    /// build that read `msg.isBodyQuarantined` once at start-up would pass them both.
+    ///
+    /// The production scenario is the one the source comment names: a body queue can flag
+    /// this row WHILE the detail view is open and polling. `self.message` is only re-read
+    /// when it is nil, so a poll that trusted its seeded header would keep paying a full
+    /// TCP + TLS + LOGIN + SELECT every 2 seconds against a row the rest of the build has
+    /// already given up on. (Found by audit.)
+    @Test("A row flagged mid-poll stops the poll — the gate reads the database, not the seeded header")
+    @MainActor
+    func bodyPollHonoursAFlagSetWhileItIsRunning() async throws {
+        let probe = FetchProbe()
+        // Seeded UNFLAGGED. A build that trusts the seed can never stop this poll.
+        let (vm, pool, dir) = try makeVM(oversized: false, probe: probe)
+        defer { vm.cancelBodyPollForTesting(); cleanup(pool, dir) }
+
+        let key = vm.messageId
+        vm._testSeedMessage(try #require(try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: key)
+        }))
+        vm.startBodyPoll()
+
+        // Let at least one ordinary tick run, so the fixture provably reached the wire
+        // before the flag existed. Without this the test could pass on a poll that never
+        // started at all.
+        try await Task.sleep(for: .seconds(3))
+        #expect(probe.attempts >= 1, "fixture check: the unflagged poll must be running and fetching")
+
+        // Now flag it, exactly as a background queue would — through the production writer,
+        // so the fixture cannot drift from what that writer actually records.
+        try await pool.write { db in
+            try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: key)
+        }
+
+        try await Task.sleep(for: .seconds(5))
+
+        #expect(vm.error != nil,
+                "the poll must observe the NEW flag and reach the load-failed state — the seeded header says otherwise")
+        #expect(vm.isLoading == false, "a spinner would promise progress that cannot come")
+        let after = probe.attempts
+        try await Task.sleep(for: .seconds(5))
+        #expect(probe.attempts == after,
+                "…and it must actually STOP: a poll that reported the failure but kept fetching still pays the connection every 2s")
+    }
+
     /// 🚨 THE EVICTION-RECOVERY INVARIANT — the regression the round-1 audit caught.
     ///
     /// `BodyAssetMaintenance` (`dropMessage`, `wipeAll(.inlineImage)`, `runEvictStaleBodies`,

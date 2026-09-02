@@ -1081,21 +1081,21 @@ struct NSEStagedRowEpochGuardTests {
         #expect(fresh.actionTag == nil, "unprovable staged AI was applied")
 
         // 🚨 THE RETENTION HALF — this is what separates "refused a write" from
-        // "dropped an arrival", and it is asserted through the body queue's OWN
-        // selection predicate (`ActiveBodyQueue`: `headerComplete = 1 AND
-        // bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1`) rather
-        // than through any single column. A row that satisfies it is one the body
-        // fetch WILL pick up; any one of those four columns being wrong strands
-        // the message body-less indefinitely, with its staging row already
-        // consumed — and THAT would be a never-drop violation, not hardening.
+        // "dropped an arrival", and it is asserted by RUNNING the body queue's own
+        // selection query rather than by checking any single column. A row that
+        // query returns is one the body fetch WILL pick up; a row it omits is
+        // stranded body-less indefinitely with its staging row already consumed —
+        // and THAT would be a never-drop violation, not hardening.
+        //
+        // Deliberately NOT restating the predicate's columns here: it gained a fifth
+        // (`bodyMetadataOversized = 0`) and an enumerating sentence is a cache that
+        // goes stale silently. `ActiveBodyQueue.admissionSQL` is the only statement of it.
         let refetchable = try await world.pool.read { db in
-            try Bool.fetchOne(db, sql: """
-                SELECT EXISTS(
-                    SELECT 1 FROM messageHeader
-                     WHERE id = ? AND headerComplete = 1 AND bodyComplete = 0
-                       AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                )
-                """, arguments: ["acc1:INBOX:11"]) ?? false
+            // The production query itself, via `ActiveBodyQueue.admissionItems`. A hand-copied
+            // predicate stops BEING the admission predicate the moment production gains a
+            // clause — it just gained `AND bodyMetadataOversized = 0`, and a never-drop claim
+            // measured against a stale copy proves nothing about the queue that actually runs.
+            try ActiveBodyQueue.admissionItems(db).contains { $0.headerId == "acc1:INBOX:11" }
         }
         #expect(refetchable, """
                 the staged row was consumed while its message was left neither visible nor \

@@ -341,8 +341,16 @@ extension SyncEngine {
                 guard !toHeal.isEmpty else { continue }
                 try await AppDatabase.backgroundPool.write { db in
                     let placeholders = toHeal.map { _ in "?" }.joined(separator: ",")
+                    // `bodyMetadataOversized = 0` rides along, like every other success
+                    // write. These rows were selected BECAUSE their FTS body text exists,
+                    // which is the positive evidence that refutes a recorded parser-overflow
+                    // observation against them — and leaving the flag set on a row this
+                    // statement is about to mark `bodyComplete = 1` would strand it in the
+                    // one state no gate can see: `markBodyMetadataOversized`'s
+                    // `AND bodyComplete = 0` guard and `isBodyQuarantined`'s `&& !bodyComplete`
+                    // fail-safe are both keyed on the row being incomplete. (Found by audit.)
                     try db.execute(
-                        sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE id IN (\(placeholders))",
+                        sql: "UPDATE messageHeader SET bodyComplete = 1, bodyMetadataOversized = 0 WHERE id IN (\(placeholders))",
                         arguments: StatementArguments(toHeal)
                     )
                 }

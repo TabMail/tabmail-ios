@@ -887,6 +887,10 @@ struct OversizedBodyQuarantineDatabaseTests {
             "fixture check: the row must actually be mid-move, or this test proves nothing")
 
         await BodyFetchProcessor.markOversizedDurably(headerId: header.id)
+        // The mark is enqueued on `ActiveBodyQueue`'s serialized durable-write chain,
+        // shared with the UIDVALIDITY reset's clear so the two cannot commit out of
+        // order. Drain it before reading, or this asserts on a write that has not run.
+        await ActiveBodyQueue.shared.awaitDurableWritesForTesting()
 
         let moved = try #require(try await AppDatabase.dbPool.read { db in
             try MessageHeader.fetchOne(db, key: header.id)
@@ -909,6 +913,10 @@ struct OversizedBodyQuarantineDatabaseTests {
                             header.id])
         }
         await BodyFetchProcessor.markOversizedDurably(headerId: header.id)
+        // The mark is enqueued on `ActiveBodyQueue`'s serialized durable-write chain,
+        // shared with the UIDVALIDITY reset's clear so the two cannot commit out of
+        // order. Drain it before reading, or this asserts on a write that has not run.
+        await ActiveBodyQueue.shared.awaitDurableWritesForTesting()
         let settled = try #require(try await AppDatabase.dbPool.read { db in
             try MessageHeader.fetchOne(db, key: header.id)
         })
@@ -941,13 +949,45 @@ struct OversizedBodyQuarantineDatabaseTests {
             "a success write must retract the quarantine, or eviction later strands a body this build already fetched")
     }
 
-    @Test("The bodyless diagnostic buckets stay an exact partition when a quarantined row also carries empty strikes")
+    /// TWO quarantined rows, because the bucket predicates subtract the quarantine from
+    /// two different siblings and one fixture cannot exercise both. A quarantined row with
+    /// `emptyFetchCount > 0` is the overlap the FAILING bucket must subtract; a quarantined
+    /// row with `emptyFetchCount = 0` is the overlap the PENDING bucket must subtract.
+    ///
+    /// ⚠️ Measured: with only the `emptyFetchCount = 2` row, deleting
+    /// `AND m.bodyMetadataOversized = 0` from `bodylessPendingPredicate` left this test
+    /// GREEN — that row fails `emptyFetchCount = 0` either way, so the mutation was
+    /// invisible to it. The second row is what makes the pending half non-vacuous.
+    @Test("The bodyless diagnostic buckets stay an exact partition for a quarantined row with strikes and one without")
     func bodylessDiagnosticBucketsArePartition() async throws {
         let (header, restore) = try makeSwappedDB(emptyFetchCount: 2)
         defer { restore() }
-        // The overlap case the ordering exists for: quarantined AND previously empty.
+
+        // Second row: quarantined, never empty. Same folder and account, so it shares the
+        // `folder` join the production scan does.
+        let clean: MessageHeader = {
+            var h = MessageHeader(
+                messageId: "4243",
+                subject: "A second message whose body overflows the buffer",
+                from: "sender@example.com",
+                fromAddress: "sender@example.com",
+                to: "recipient@example.com",
+                date: Date(),
+                snippet: "",
+                folderId: MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX"),
+                accountId: "acc1",
+                folderPath: "INBOX",
+                isInInbox: true
+            )
+            h.headerComplete = true
+            return h
+        }()
+        // Both rows are flagged through the production writer, not by raw SQL, so the
+        // fixture cannot drift from what the writer would actually record.
         try await AppDatabase.dbPool.write { db in
+            try clean.insert(db)
             try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: header.id)
+            try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: clean.id)
         }
 
         // `rawPool`, not `dbPool`: `StuckMessageDiagnostics.count` takes the bare
@@ -963,16 +1003,18 @@ struct OversizedBodyQuarantineDatabaseTests {
         let pending = await StuckMessageDiagnostics.countForTesting(
             pool, StuckMessageDiagnostics.bodylessPendingPredicate)
 
-        #expect(bodyless == 1, "fixture check: exactly one bodyless row")
-        #expect(quarantined == 1, "fixture check: it is the quarantined one")
+        #expect(bodyless == 2, "fixture check: exactly two bodyless rows")
+        #expect(quarantined == 2, "fixture check: both are quarantined")
         // The INVARIANT: the buckets partition `bodyless`. Double-counting a quarantined
-        // row as "pending" reports work still queued that no queue will ever offer again,
-        // which is the exact misreading this scan exists to prevent.
+        // row reports work still queued that no queue will ever offer again, which is the
+        // exact misreading this scan exists to prevent. Stated as a sum, not as four
+        // separate equalities, so it holds however the buckets are later re-cut.
         #expect(
             locked + quarantined + failing + pending == bodyless,
             "the four buckets must partition bodyless — got \(locked)+\(quarantined)+\(failing)+\(pending) vs \(bodyless)")
-        #expect(failing == 0, "a quarantined row must not ALSO be counted as failing, despite emptyFetchCount > 0")
-        #expect(pending == 0, "nor as pending")
+        #expect(failing == 0, "the quarantined row with emptyFetchCount > 0 must not ALSO be counted as failing")
+        #expect(pending == 0, "nor may the quarantined row with emptyFetchCount == 0 be counted as pending")
+        #expect(locked == 0, "neither row is confirmed-empty")
     }
 
     @Test("The body-fetch funnel refuses a quarantined row, so every caller is covered without its own gate")
@@ -1005,8 +1047,93 @@ struct OversizedBodyQuarantineDatabaseTests {
             Issue.record("expected the funnel's typed refusal, got \(error)")
         }
         let ns = try #require(refusal, "the funnel must refuse with its own error, not fall through")
-        #expect(ns.domain == "TabMail", "the refusal must be the funnel's, not a provider failure")
-        #expect(ns.code == -4, "…and specifically the oversized-quarantine refusal")
+        #expect(ns.domain == BodyFetchRefusal.domain, "the refusal must be the funnel's, not a provider failure")
+        #expect(ns.code == BodyFetchRefusal.quarantined, "…and specifically the oversized-quarantine refusal")
+    }
+
+    /// THE ESCAPE HATCH, at the funnel. `replaceExistingBody: true` is pull-to-refresh, and
+    /// it is the whole reason the flag is an OBSERVATION rather than a verdict: the parser's
+    /// bound is on unread aggregate bytes measured after the decode loop stops, so it is
+    /// fragmentation-dependent and the same message can parse fine on a different
+    /// connection. Delete the `if !replaceExistingBody` condition — make the gate
+    /// unconditional — and the quarantine becomes unfalsifiable by the user, with nothing
+    /// else in the build able to retract it.
+    ///
+    /// Non-vacuity: `funnelRefusesQuarantinedRow` above passes `replaceExistingBody: false`
+    /// on the same fixture and demands the refusal, so the two together pin the CONDITION
+    /// rather than either outcome. A gate that always fires fails this test; a gate that
+    /// never fires fails that one.
+    @Test("Pull-to-refresh is exempt at the funnel — the quarantine stays falsifiable by the user")
+    func funnelExemptsPullToRefresh() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+        try await AppDatabase.dbPool.write { db in
+            try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: header.id)
+        }
+        let quarantined = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        })
+        #expect(quarantined.isBodyQuarantined, "fixture check: the row is quarantined")
+
+        // No provider is registered, so this call cannot reach the wire and must fail for
+        // SOME reason. The assertion is about WHICH reason: anything other than the
+        // quarantine refusal means the gate let it past, which is the property under test.
+        var refusalCode: Int?
+        do {
+            try await AccountManager.shared.fetchBody(for: quarantined, replaceExistingBody: true)
+        } catch let ProviderError.networkError(underlying) {
+            let ns = underlying as NSError
+            if ns.domain == BodyFetchRefusal.domain { refusalCode = ns.code }
+        } catch {
+            // Provider resolution failing is the expected outcome here — it means the
+            // quarantine gate was passed, which is exactly what this test wants.
+        }
+        #expect(
+            refusalCode != BodyFetchRefusal.quarantined,
+            "pull-to-refresh must reach past the quarantine gate — without this exemption the flag can never be disproved")
+    }
+
+    /// THE EVICTION FAIL-SAFE, at the funnel. `BodyAssetMaintenance` and
+    /// `SyncEngine.runEvictStaleBodies` delete a `messageBody` row while deliberately
+    /// leaving `bodyComplete = 1` (ADR-IOS-050), and the detail view's cache-miss fetch is
+    /// the ONLY recovery. So the funnel must gate on `isBodyQuarantined`
+    /// (`bodyMetadataOversized && !bodyComplete`), never on `bodyMetadataOversized` alone —
+    /// weaken it to the bare column and a message this build already fetched successfully
+    /// becomes permanently unopenable, which is strictly worse than the bug being fixed.
+    ///
+    /// This cannot be covered by the `MessageDetailViewModel` suites: every test there
+    /// injects `_fetchBodyOverride`, and all three of that view model's fetch sites
+    /// short-circuit to the override before reaching `AccountManagerFetch.fetchBody`.
+    @Test("A stale flag on a proven-fetchable row does not reach the funnel's refusal")
+    func funnelDoesNotRefuseAProvenFetchableRow() async throws {
+        let (header, restore) = try makeSwappedDB()
+        defer { restore() }
+        // Flag it, THEN complete it — the eviction shape: fetched once, flag left behind,
+        // `messageBody` since deleted. `markBodyMetadataOversized` refuses a completed row,
+        // so the flag has to be set first for this state to be reachable at all.
+        try await AppDatabase.dbPool.write { db in
+            try BodyFetchProcessor.markBodyMetadataOversized(db, headerId: header.id)
+            try db.execute(sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE id = ?",
+                           arguments: [header.id])
+        }
+        let evicted = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        })
+        #expect(evicted.bodyMetadataOversized, "fixture check: the stale flag is still set")
+        #expect(!evicted.isBodyQuarantined, "fixture check: but the row is not quarantined, because it is complete")
+
+        var refusalCode: Int?
+        do {
+            try await AccountManager.shared.fetchBody(for: evicted)
+        } catch let ProviderError.networkError(underlying) {
+            let ns = underlying as NSError
+            if ns.domain == BodyFetchRefusal.domain { refusalCode = ns.code }
+        } catch {
+            // Provider resolution failing means the gate was passed — the desired outcome.
+        }
+        #expect(
+            refusalCode != BodyFetchRefusal.quarantined,
+            "a stale flag may cost a wasted round trip, never a permanently unopenable message — eviction's only recovery runs through this funnel")
     }
 
 }

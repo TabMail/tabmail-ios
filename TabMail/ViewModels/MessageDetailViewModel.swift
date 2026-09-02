@@ -1138,7 +1138,7 @@ final class MessageDetailViewModel {
                 if let latestForQuarantine, latestForQuarantine.isBodyQuarantined {
                     guard !self.isRefetchingBody else { continue }
                     if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] Poll stopping — body quarantined (oversized metadata FETCH) for \(rid.prefix(40))") }
-                    self.error = "Unable to load this message's content."
+                    self.error = BodyFetchRefusal.quarantinedMessage
                     self.isLoading = false
                     self.loadThreadMessagesAsync()
                     return
@@ -1194,6 +1194,21 @@ final class MessageDetailViewModel {
                     }
                 } catch {
                     if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] Poll fetch failed (attempt \(fetchAttempt)): \(error)") }
+                    // End the poll on a refusal nothing will retract, rather than repeating it
+                    // every 2s for the life of this view model. The fresh-read quarantine gate
+                    // above already covers the recorded-flag case; this covers the one it
+                    // structurally cannot see — a row with `bodyComplete = 1` whose `messageBody`
+                    // was evicted and whose re-fetch overflows, which no writer will flag
+                    // (`AND bodyComplete = 0`) and no reader will gate (`&& !bodyComplete`).
+                    // Show the failure, stop paying for it; pull-to-refresh is still the retry.
+                    // (Found by audit.)
+                    if BodyFetchRefusal.endsPolling(error) {
+                        guard !self.isRefetchingBody else { continue }
+                        self.error = error.localizedDescription
+                        self.isLoading = false
+                        self.loadThreadMessagesAsync()
+                        return
+                    }
                     // ⚠️ **NO REKEY RECOVERY HERE — REMOVED DELIBERATELY, DO NOT RE-ADD.**
                     //
                     // Rounds 3 and 4 of the audit each found a WRONG-MESSAGE (C3) hole in an
@@ -1498,7 +1513,7 @@ final class MessageDetailViewModel {
         if msg.isBodyQuarantined {
             if DebugModeManager.isLoggingEnabled() { print("[MessageDetail] Body quarantined (oversized metadata FETCH) — reporting load failure without a fetch for \(rid.prefix(40))") }
             BootProfiler.mark("detail body OVERSIZED-QUARANTINED → report failure \(rid.prefix(24))")
-            error = "Unable to load this message's content."
+            error = BodyFetchRefusal.quarantinedMessage
             isLoading = false
             loadThreadMessagesAsync()
             return
@@ -1537,6 +1552,10 @@ final class MessageDetailViewModel {
 
         isLoading = true
         BootProfiler.mark("detail body MISS everywhere → SERVER fetch \(rid.prefix(24))")
+        // Kept so the poll decision below can inspect the refusal CLASS. `self.error` holds
+        // only `localizedDescription`, and it is deliberately not set for a connection
+        // error, so it cannot answer "will anything retract this?".
+        var lastFetchError: Error?
         do {
             if let override = _fetchBodyOverride {
                 try await override(msg)
@@ -1549,6 +1568,7 @@ final class MessageDetailViewModel {
             startBodyPoll()
             return
         } catch {
+            lastFetchError = error
             if !SyncEngine.isConnectionError(error) {
                 self.error = error.localizedDescription
             }
@@ -1574,7 +1594,16 @@ final class MessageDetailViewModel {
         // Covers: connection errors (where self.error stays nil), lock timeouts,
         // or any transient failure. A reconnect or background path may still
         // write the body to DB later.
-        if messageBody == nil {
+        //
+        // ⚠️ Except behind a refusal nothing will retract. The poll re-enters
+        // `AccountManagerFetch.fetchBody` every 2s and is bounded only by this view model's
+        // lifetime, so for an overflow or a recorded quarantine it repeats a full
+        // TCP + TLS + LOGIN + SELECT forever — the exact cost the quarantine exists to stop.
+        // The quarantine case is also caught by the poll's own fresh-read gate; the OVERFLOW
+        // case is not reachable there, because a row that already has `bodyComplete = 1`
+        // (fetched once, `messageBody` later evicted) is invisible to both the flag's writer
+        // and `isBodyQuarantined`. See `BodyFetchRefusal.endsPolling`. (Found by audit.)
+        if messageBody == nil, !(lastFetchError.map(BodyFetchRefusal.endsPolling) ?? false) {
             startBodyPoll()
         }
     }

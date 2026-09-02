@@ -6,6 +6,70 @@ import Foundation
 import GRDB
 import UIKit
 
+/// The refusal classes `AccountManagerFetch.fetchBody` can throw, and the two facts a
+/// caller needs about each: the user-facing sentence, and whether anything in the
+/// background could still produce this body.
+///
+/// This exists because `MessageDetailViewModel` has to make that second decision.
+/// `loadBody` ends with `if messageBody == nil { startBodyPoll() }`, a 2s cadence that
+/// calls `fetchBody` directly. For a refusal nothing will retract, that loop pays a full
+/// TCP + TLS + LOGIN + SELECT every two seconds for as long as the detail view lives
+/// (`bodyPollTask` is cancelled only in `deinit`) — with no bound, since `fetchAttempt`
+/// is logging only. Matching the refusal by its user-facing string would tie control flow
+/// to copy; matching it by a bare `-1` would be the hardcoded numeric value the repo bans.
+///
+/// ⚠️ `payloadTooLarge` is terminal for the POLL, never for the user. An overflow is an
+/// observation about one wire attempt — the parser's bound is on unread aggregate bytes
+/// measured after the decode loop stops, so it is fragmentation-dependent — and
+/// pull-to-refresh (`replaceExistingBody: true`) is exempt at the funnel and still reaches
+/// the wire. Ending the poll removes the doomed cadence, not the retry.
+enum BodyFetchRefusal {
+    static let domain = "TabMail"
+
+    /// The metadata FETCH overflowed the parser on this attempt.
+    static let payloadTooLarge = -1
+    /// A transient failure the caller may retry.
+    static let retryable = -2
+    /// An optimistic move is in flight, so the row's address is not corroborated.
+    static let addressInFlight = -3
+    /// A previously observed overflow is recorded durably against this row.
+    static let quarantined = -4
+
+    static let payloadTooLargeMessage = "This message is too large to display."
+    static let retryableMessage = "Failed to load message. Please try again."
+    static let addressInFlightMessage =
+        "This message is still being moved. Go back to the message list and open it again in a moment."
+    /// Shared by the funnel's refusal, `loadBody`'s quarantine branch and the poll's, so
+    /// the same condition cannot present three different sentences.
+    static let quarantinedMessage = "Unable to load this message's content."
+
+    static func error(_ code: Int, _ message: String) -> ProviderError {
+        ProviderError.networkError(
+            underlying: NSError(domain: domain, code: code,
+                userInfo: [NSLocalizedDescriptionKey: message]))
+    }
+
+    /// True when no background path can produce this body, so a poll would only repeat a
+    /// refusal. `addressInFlight` is deliberately NOT included: a move completing IS the
+    /// state change the poll is waiting for.
+    ///
+    /// ⚠️ `payloadTooLarge` matters here for a state the durable flag cannot cover. Both
+    /// `BodyFetchProcessor.markBodyMetadataOversized`'s `AND bodyComplete = 0` guard and
+    /// `MessageHeader.isBodyQuarantined`'s `&& !bodyComplete` fail-safe are keyed on the
+    /// row being incomplete — deliberately, so an evicted-but-fetched row can still
+    /// recover. A row that WAS fetched, whose `messageBody` was then evicted by
+    /// `BodyAssetMaintenance` (which leaves `bodyComplete = 1` by design), and whose
+    /// re-fetch now overflows is therefore invisible to the flag at every site: nothing
+    /// records it and nothing gates on it. Without this check that row polls forever.
+    /// (Found by audit.)
+    static func endsPolling(_ error: Error) -> Bool {
+        guard case ProviderError.networkError(let underlying) = error else { return false }
+        let ns = underlying as NSError
+        guard ns.domain == domain else { return false }
+        return ns.code == payloadTooLarge || ns.code == quarantined
+    }
+}
+
 extension AccountManager {
 
     // MARK: - Stale Header Eviction
@@ -100,7 +164,11 @@ extension AccountManager {
         for message: MessageHeader,
         replaceExistingBody: Bool = false
     ) async throws {
-        print("[FetchBody] Opening: id=\(message.id.prefix(40)) msgId=\(message.messageId.prefix(30)) folder=\(message.folderPath)")
+        // Debug-gated (rule 12). Pre-existing and ungated until this change: it is a
+        // diagnostic, and `folderPath` is a user-authored custom folder name.
+        if DebugModeManager.isLoggingEnabled() {
+            print("[FetchBody] Opening: id=\(message.id.prefix(40)) msgId=\(message.messageId.prefix(30)) folder=\(message.folderPath)")
+        }
 
         // Body already loaded — nothing to do
         let hasBody = (try? await dbPool.read { db in try MessageBody.fetchOne(db, key: message.id) != nil }) ?? false
@@ -118,10 +186,8 @@ extension AccountManager {
         // (Found by audit.)
         if await bodyFetchIsBlockedByPendingAddress(for: message) {
             print("[MoveTrace] fetchBody — address not corroborated (move in flight), skipping fetch for \(message.id.prefix(40))")
-            throw ProviderError.networkError(
-                underlying: NSError(domain: "TabMail", code: -3,
-                    userInfo: [NSLocalizedDescriptionKey: "This message is still being moved. Go back to the message list and open it again in a moment."])
-            )
+            throw BodyFetchRefusal.error(
+                BodyFetchRefusal.addressInFlight, BodyFetchRefusal.addressInFlightMessage)
         }
 
         // Oversized-metadata quarantine: the last observed attempt at this message's
@@ -155,10 +221,8 @@ extension AccountManager {
                 if DebugModeManager.isLoggingEnabled() {
                     print("[FetchBody] Refused — body quarantined (oversized metadata FETCH) for \(message.id.prefix(40))")
                 }
-                throw ProviderError.networkError(
-                    underlying: NSError(domain: "TabMail", code: -4,
-                        userInfo: [NSLocalizedDescriptionKey: "Unable to load this message's content."])
-                )
+                throw BodyFetchRefusal.error(
+                    BodyFetchRefusal.quarantined, BodyFetchRefusal.quarantinedMessage)
             }
         }
 
@@ -197,15 +261,11 @@ extension AccountManager {
         case .success, .confirmedEmpty:
             break
         case .payloadTooLarge:
-            throw ProviderError.networkError(
-                underlying: NSError(domain: "TabMail", code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "This message is too large to display."])
-            )
+            throw BodyFetchRefusal.error(
+                BodyFetchRefusal.payloadTooLarge, BodyFetchRefusal.payloadTooLargeMessage)
         case .retry:
-            throw ProviderError.networkError(
-                underlying: NSError(domain: "TabMail", code: -2,
-                    userInfo: [NSLocalizedDescriptionKey: "Failed to load message. Please try again."])
-            )
+            throw BodyFetchRefusal.error(
+                BodyFetchRefusal.retryable, BodyFetchRefusal.retryableMessage)
         }
     }
 

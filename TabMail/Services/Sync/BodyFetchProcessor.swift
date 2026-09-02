@@ -85,16 +85,26 @@ enum BodyFetchProcessor {
     /// have no serialized write chain of their own: `fetch`'s `PayloadTooLargeError`
     /// branch and `InboxViewModel.loadSnippetBatch`'s tier-2 catch. The two queues call
     /// `markBodyMetadataOversized` through their own `enqueueDurableWrite` instead.
+    /// Record an observed overflow durably, from a path that is NOT one of the body queues:
+    /// `BodyFetchProcessor.fetch` (the user-open funnel) and `InboxViewModel.loadSnippetBatch`
+    /// tier 2.
+    ///
+    /// 🚨 Routed through `ActiveBodyQueue`'s serialized durable-write chain rather than
+    /// writing directly, and that is a CORRECTNESS requirement, not tidiness. The chain is
+    /// also what `AccountManagerUidValidityReset` uses for the reset's CLEAR, so ordering
+    /// between a mark and a clear is only defined for writers that share it. A direct write
+    /// races: overflow on `acct:INBOX:900` enqueues a mark → INBOX turns over → the reset
+    /// purges and clears → the resync inserts a fresh-epoch row that reuses UID 900 → the
+    /// stale mark commits last and passes both of `markBodyMetadataOversized`'s guards
+    /// (`bodyComplete = 0`, key consistent) against a message that never overflowed. That
+    /// row is then excluded from both admission queries, counted settled, and refused at the
+    /// funnel — recoverable only by pull-to-refresh, the next reset, or Smart Reindex.
+    ///
+    /// `ActiveBodyQueue` specifically, not `BackfillBodyQueue`: the reset clears on both, so
+    /// either orders correctly, and both of this function's callers are foreground paths.
+    /// (Found by audit.)
     static func markOversizedDurably(headerId: String) async {
-        do {
-            try await AppDatabase.dbPool.write { db in
-                try markBodyMetadataOversized(db, headerId: headerId)
-            }
-        } catch {
-            if !error.isDatabaseSuspensionAbort, DebugModeManager.isLoggingEnabled() {
-                print("[BodyFetch] Oversized flag write failed for \(headerId.prefix(30)): \(error)")
-            }
-        }
+        await ActiveBodyQueue.shared.markOversizedDurably(headerId)
     }
 
     /// Fetch phase: provider.fetchMessage + render body. Provider-bound (network I/O).

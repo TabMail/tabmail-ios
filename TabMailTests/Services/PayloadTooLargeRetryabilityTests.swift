@@ -205,6 +205,11 @@ struct PayloadTooLargeRetryabilityTests {
         )
         #expect(result == .payloadTooLarge, "precondition — the overflow branch ran")
 
+        // The mark is enqueued on `ActiveBodyQueue`'s serialized durable-write chain — the
+        // same chain the UIDVALIDITY reset's clear uses, so the two cannot commit out of
+        // order. Drain it, or this reads before the write runs.
+        await ActiveBodyQueue.shared.awaitDurableWritesForTesting()
+
         let stored = try #require(try await AppDatabase.dbPool.read { db in
             try MessageHeader.fetchOne(db, key: header.id)
         })

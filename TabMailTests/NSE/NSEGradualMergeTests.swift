@@ -433,13 +433,11 @@ struct NSEGradualMergeTests {
         // itself isn't driven here — it starts a real IMAP body fetch the unit host
         // can't service.)
         let isBodyFetchCandidate = try await pool.read { db in
-            try Bool.fetchOne(db, sql: """
-                SELECT EXISTS(
-                    SELECT 1 FROM messageHeader
-                    WHERE id = ? AND headerComplete = 1 AND bodyComplete = 0
-                      AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                )
-                """, arguments: [headerId()]) ?? false
+            // The production query itself, via `ActiveBodyQueue.admissionItems`. A hand-copied
+            // predicate stops BEING the admission predicate the moment production gains a
+            // clause — it just gained `AND bodyMetadataOversized = 0`, and a never-drop claim
+            // measured against a stale copy proves nothing about the queue that actually runs.
+            try ActiveBodyQueue.admissionItems(db).contains { $0.headerId == headerId() }
         }
         #expect(isBodyFetchCandidate, "CID push must match ActiveBodyQueue's precache filter")
     }

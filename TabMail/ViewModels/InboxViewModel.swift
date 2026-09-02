@@ -1591,7 +1591,7 @@ final class InboxViewModel {
                 // `MessageDetailViewModel.loadBody` — a row that demonstrably has a body
                 // must stay fetchable even if a stale flag survived on it.
                 if header.isBodyQuarantined {
-                    if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Skipping oversized-quarantined \(headerId)") }
+                    if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Skipping oversized-quarantined \(headerId.prefix(40))") }
                     snippetFailed.insert(headerId)
                     continue
                 }
