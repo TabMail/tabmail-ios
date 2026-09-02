@@ -58,18 +58,28 @@ enum BodyFetchProcessor {
     /// re-attempted after `finishMove` re-keys it. (Found by audit.)
     ///
     ///
-    /// ⚑ ACCEPTED LIMITATIONS OF THIS FLAG (owner-blessed; do not "fix" them without
-    /// asking):
+    /// ⚑ ACCEPTED LIMITATIONS OF THIS FLAG — registered as `IOS-BODY-006`, filed `open` and
+    /// **NOT owner-blessed as a SET**. Each is a deliberate design choice with a stated
+    /// rationale, and exactly TWO carry an actual owner decision, both dated 2026-09-01 and
+    /// both reversals of an earlier stance recorded here: item 2 (let "Sync Complete" fire)
+    /// and item 4's fail-fast-on-open (report the failure immediately instead of attempting
+    /// a wire fetch). Items 1, 3, 5, 6 and 7 do NOT — and item 7, the one-strike latch on a
+    /// non-deterministic signal, is precisely the question `IOS-BODY-006` was filed to put
+    /// in front of the owner. Do not "fix" any of them without asking, and do not cite the
+    /// set as accepted — a source comment claiming a blessing the register withholds is how
+    /// a future reader stops asking. (Found by audit.)
     ///
     /// ⚠️ THIS ENUMERATION USED TO BE DUPLICATED VERBATIM on both queues'
     /// `markOversizedDurably`, under a "edit both copies or neither" instruction. It lives
     /// here now, on the single writer both of them call, because an instruction in a
     /// comment is not load-bearing — `MIS-IOS-009` is this repo's record of exactly that,
     /// and it is at nine recurrences. (Found by audit.)
-    /// Edit both copies or neither. The SQL is NOT duplicated: the mark and the
-    /// UIDVALIDITY clear are single symbols (`BodyFetchProcessor.markBodyMetadataOversized`
-    /// / `.clearBodyMetadataOversized`), so a guard cannot be added to one queue and
-    /// forgotten in the other.
+    /// The SQL is NOT duplicated either: the mark and the UIDVALIDITY clear are single
+    /// symbols (`BodyFetchProcessor.markBodyMetadataOversized` / `.clearBodyMetadataOversized`),
+    /// so a guard cannot be added to one queue and forgotten in the other. ⚠️ The line that
+    /// used to sit here said "Edit both copies or neither" — it survived the hoist that
+    /// deleted the second copy, instructing the reader to maintain a duplication that no
+    /// longer exists. Exactly the dead-instruction class the paragraph above cites.
     ///
     /// What legitimately stays per-queue is the write CHAIN — one INSTANCE of
     /// `BodyFetchProcessor.DurableWriteChain` per queue, never one shared instance.
@@ -106,7 +116,10 @@ enum BodyFetchProcessor {
     ///      carry this flag: it re-indexes HEADERS, and this row's header is healthy.
     ///      Excluding it would drop a good message out of subject/sender search.
     ///   4. Opening an affected message reports a load failure immediately without a
-    ///      wire attempt (`MessageDetailViewModel.loadBody`), and the body poll that
+    ///      wire attempt (`MessageDetailViewModel.loadBody`) — **owner decision 2026-09-01**,
+    ///      reversing an earlier stance that left the open path attempting the fetch; a
+    ///      doomed attempt that costs a connection teardown buys the user nothing. The
+    ///      body poll that
     ///      view model leaves behind stops itself the same way rather than retrying
     ///      every 2s forever. The user's retry is pull-to-refresh, which still performs
     ///      a genuine fetch — and whose own trailing poll then stops itself too.

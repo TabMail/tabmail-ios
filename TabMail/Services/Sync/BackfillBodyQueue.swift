@@ -274,8 +274,9 @@ actor BackfillBodyQueue {
     /// Durable half of the oversized quarantine — writes
     /// `messageHeader.bodyMetadataOversized = 1` so the deferral survives a relaunch.
     ///
-    /// ⚑ THE ACCEPTED LIMITATIONS OF THIS FLAG (owner-blessed; do not "fix" them without
-    /// asking) are enumerated ONCE, on the single writer this calls:
+    /// ⚑ THE ACCEPTED LIMITATIONS OF THIS FLAG — registered as `IOS-BODY-006`, filed `open`
+    /// and NOT owner-blessed; do not "fix" them without asking — are enumerated ONCE, on the
+    /// single writer this calls:
     /// `BodyFetchProcessor.markBodyMetadataOversized`. Registered as `IOS-BODY-006`.
     /// They were duplicated verbatim here and on the sibling queue until 2026-09-02.
     private func markOversizedDurably(_ headerId: String) {

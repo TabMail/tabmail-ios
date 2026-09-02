@@ -3708,7 +3708,18 @@ final class AppDatabase: Sendable {
         // `bodyMetadataOversized` before `date` extends that shape by one equality
         // column and preserves both properties.
         //
-        // ⚠️ MEASURED, not assumed. EXPLAIN QUERY PLAN over the four shapes:
+        // ⚠️ MEASURED, not assumed — and MEASURED UNDER A STATED STATISTICS REGIME, which
+        // `IOS-PERF-012` makes mandatory for any query-plan claim. Every figure below was
+        // taken under the regime `AppDatabase.runMigrations` leaves on a FRESH database:
+        // no `sqlite_stat1` row for any full `messageHeader` index. That is the shipped
+        // fresh-install regime and the operationally relevant one, but it is only one of
+        // the two — the post-maintenance-pass FRESH-statistics side is UNMEASURED here.
+        // `IOS-PERF-009` records that on a small analyzed fixture the plan can flip to
+        // `SCAN … USING INDEX messageHeader_date`, so treat the MAGNITUDE below as
+        // regime-scoped. The ELIGIBILITY argument does not depend on the regime: the
+        // index is named in no `INDEXED BY` clause, no write depends on it, and the
+        // queries return identical rows without it under any plan. (Found by audit.)
+        // EXPLAIN QUERY PLAN over the four shapes:
         //   - existing index alone → SEARCH on 4 of the 5 equality columns, the fifth
         //     filtered per row;
         //   - a PARTIAL `(isInInbox, date) WHERE <the four flags>` index → NEVER
@@ -3743,6 +3754,30 @@ final class AppDatabase: Sendable {
         // 1,589 pages against v83's 138 ms / 1,311 pages — and Mac timings understate
         // device by 2-4x. Building it here would re-add to the launch path exactly what
         // that amendment removed.
+        //
+        // ⚠️ AN EARLIER IN-BRANCH REVISION BUILT THIS INDEX INSIDE v88, and the statement
+        // was moved out to `deferredIndexes` later on the same branch. GRDB records
+        // applied state by migration NAME, so a dev database that launched the earlier
+        // revision already ran the old body and will never run the new one. The two
+        // states converge and neither is broken: `SyncEngine.createDeferredIndexes`
+        // issues the identical statement as `CREATE INDEX IF NOT EXISTS` and
+        // `missingDeferredIndexes` probes `sqlite_master` BY NAME, so the already-indexed
+        // database resolves to "already present" while a fresh install gets the column
+        // from v88 and the index from background maintenance. Recorded because data
+        // integrity rule 5 asks for the convergence to be STATED when a migration's
+        // coverage is split, and a diff cannot show it. (Found by audit.)
+        //
+        // ⚠️ THE NUMBER 88 COLLIDES with `agent/oversized-imap-metadata` (PR #103), which
+        // registers `v88_addBodyIndexingFailureReason`. There is NO correctness break —
+        // GRDB keys on the FULL identifier string, so after a merge both run exactly
+        // once, and nothing in this tree parses the integer out of an identifier. What
+        // breaks is the SELF-CHECKING ARITHMETIC this file publishes below: the FK-range
+        // census counts DISTINCT migration numbers, so two v88s collapse to one (21)
+        // while `foreignKeyChecks: .immediate` counts 22, and the next reader reads a
+        // satisfied invariant as violated and goes hunting for a migration that is not
+        // `.immediate`. Whichever branch lands SECOND must renumber — legal, since
+        // neither has shipped in a tagged release — and per data integrity rule 5 every
+        // dev database that ran the old name must then be wiped. (Found by audit.)
         //
         // The ADD COLUMN below stays blocking: a column is correctness, not performance,
         // and code compiled against it must never meet a database without it.

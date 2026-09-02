@@ -514,12 +514,24 @@ extension MessageHeader {
     }
 
     /// Rows whose body question is SETTLED for `accountId` — fetched, confirmed empty,
-    /// or unfetchable by this build. The complement of `pendingBodyRequest` among
-    /// header-complete rows, and the numerator behind the "N / M indexed" readouts.
+    /// or unfetchable by this build, and the numerator behind the "N / M indexed" readouts.
     ///
-    /// ⚠️ Keep the two in lockstep. If a disposition counts as settled here but still
-    /// counts as pending there, the progress bar parks below 100% beside a green
-    /// completion check — the same nag in a different widget.
+    /// ⚠️ This request is deliberately NOT scoped to `headerComplete`, while
+    /// `pendingBodyRequest` is. The complement relation between the two therefore holds
+    /// only when RESTRICTED to header-complete rows — a `headerComplete = 0` row with a
+    /// settled disposition is counted here and is outside `pendingBodyRequest`'s
+    /// population entirely. Such rows are reachable: `NSEDataBridge` stages headers with
+    /// `headerComplete = false` and flips the flag in a separate statement (ADR-IOS-047's
+    /// two-phase merge). The asymmetry is INHERITED, not introduced — the inline filter
+    /// this replaced omitted the conjunct too — so do not "restore" symmetry by adding
+    /// `headerComplete` here or removing it there. Either edit moves the published
+    /// `ftsIndexed` / `pendingBodyCount` numbers, and with them the "N / M indexed"
+    /// readout and `BackfillProgress.isFullyComplete`; that is a behaviour change and
+    /// needs its own justification. (Found by audit.)
+    ///
+    /// ⚠️ Keep the two in lockstep on DISPOSITIONS. If a disposition counts as settled
+    /// here but still counts as pending there, the progress bar parks below 100% beside a
+    /// green completion check — the same nag in a different widget.
     static func bodySettledRequest(accountId: String) -> QueryInterfaceRequest<MessageHeader> {
         MessageHeader.filter(
             Column("accountId") == accountId &&

@@ -3,8 +3,12 @@
 **Class:** `open` · **Opened:** 2026-09-02 · **Register classification:** post-freeze amendment
 (no row in the hash-pinned 2026-08-09 archive).
 **Disposition:** filed `open`, NOT `accepted` — every limitation below is a deliberate design
-choice with a stated rationale, but none has the owner's blessing yet. The accompanying pull
-request asks for that decision explicitly. Do not reclassify without it.
+choice with a stated rationale, and exactly TWO carry the owner's decision: item 2 (let "Sync
+Complete" fire) and the fail-fast-on-open half of item 4, both dated 2026-09-01 and both
+reversals of an earlier stance. The remainder — items 1, 3, 5, 6 and 7, and in particular item 7,
+the one-strike latch on a non-deterministic signal — have NO blessing yet, and item 7 is the
+question this record was filed to put in front of the owner. The accompanying pull request asks
+for that decision explicitly. Do not reclassify without it.
 
 ## What this record is
 
@@ -20,9 +24,12 @@ the row at the fetch funnel. This record collects what that costs.
 
 ## The accepted limitations of the flag
 
-These are enumerated in full, verbatim and in both copies, on
-`ActiveBodyQueue.markOversizedDurably` and `BackfillBodyQueue.markOversizedDurably` — the source is
-the authority, this row is the tracker entry. In summary:
+These are enumerated in full on `BodyFetchProcessor.markBodyMetadataOversized`, the single writer
+both queues call — the source is the authority, this row is the tracker entry. (They were
+duplicated verbatim on `ActiveBodyQueue.markOversizedDurably` and
+`BackfillBodyQueue.markOversizedDurably` under an "edit both copies or neither" instruction; the
+duplication was removed because an instruction in a comment is not load-bearing — `MIS-IOS-009`.
+Both queue methods now carry a pointer to the single site.) In summary:
 
 1. The body is unsearchable BY CONTENT until the parser bound is raised. The header stays
    FTS-indexed, so the message is still findable by subject and sender. The bound is **first-party**

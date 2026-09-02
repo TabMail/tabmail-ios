@@ -760,6 +760,87 @@ struct BodyAddressGateTests {
     ///
     /// The `notConnected` case is the two-sided control: it proves the predicate is live and that a
     /// `false` here means something, rather than the predicate simply never firing. (Found by audit.)
+    /// 🚨 **THE PRODUCER SIDE of the case the test above classifies.** Both halves were green
+    /// while the contract between them was untested: `addressPendingMoveIsNotAConnectionError`
+    /// CONSTRUCTS a `ProviderError.addressPendingMove` by hand and asserts how it is classified,
+    /// and `attachmentFetchIsBlockedForInFlightAddress` asserts the PREDICATE
+    /// `attachmentFetchIsBlockedByPendingAddress` returns `true` — but nothing ran the funnel and
+    /// checked WHICH error comes out of it.
+    ///
+    /// That gap is load-bearing here specifically. This refusal used to be
+    /// `NSError(domain: "TabMail", code: -3)` wrapped in `ProviderError.networkError`, and it was
+    /// changed to the typed case so the body and attachment refusals cannot drift apart and a
+    /// single `case ProviderError.addressPendingMove` match works against either. Restore the old
+    /// NSError at this throw site and every existing test in this suite stays green — while
+    /// `SyncEngine.isConnectionError` starts returning `true` for it, which sends
+    /// `fetchAttachment`'s `for attempt in 1...2` loop into a pointless second attempt and tells
+    /// the user to check their network for a refusal that has nothing to do with it.
+    /// (`feedback_validation_needs_a_producer_side_test`: both halves green, contract dead.)
+    ///
+    /// Non-vacuity is two-sided IN THE SAME RUN: no provider is registered for either call, so both
+    /// must fail. The assertion is about WHICH failure. A gate that refused everything would fail
+    /// the settled half; a gate that refused nothing would fail the mid-move half.
+    @Test("The body funnel throws the typed pending-move case in the mid-move window, and only there")
+    func funnelThrowsTypedPendingMoveInTheMidMoveWindow() async throws {
+        let accountId = "gate-funnel-typed"
+        let (pool, dir, previous) = try Self.fixture(accountId: accountId, provider: .imap)
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        // (1) MID-MOVE. The row's PK still encodes the SOURCE folder while its columns name the
+        //     destination — the window `optimisticMoveToFolder` opens and `finishMove` closes.
+        let movedId = try Self.insertOptimisticallyMovedHeader(
+            accountId: accountId, sourcePath: "INBOX", destinationPath: "Archive",
+            uid: "41", rfc822: "victim@example.com", pool: pool)
+        let moved = try #require(try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: movedId)
+        })
+        // Fixture self-check: assert the row really is in the window this test is about, so the
+        // test cannot quietly stop reproducing it if the helper changes.
+        #expect(
+            BodyAddressGate.addressIsInFlight(
+                id: moved.id, accountId: moved.accountId,
+                folderPath: moved.folderPath, messageId: moved.messageId),
+            "fixture check: the row must be inside the mid-move window")
+
+        var pendingMoveId: String?
+        var unexpected: Error?
+        do {
+            try await AccountManager.shared.fetchBody(for: moved)
+            Issue.record("the funnel must refuse a mid-move address before it reaches the wire")
+        } catch let ProviderError.addressPendingMove(id) {
+            pendingMoveId = id
+        } catch {
+            unexpected = error
+        }
+        #expect(
+            pendingMoveId == moved.id,
+            "the funnel must throw the TYPED pending-move case carrying this row's id, not a wrapped NSError; got \(unexpected.map { "\($0)" } ?? "no throw")")
+
+        // (2) SETTLED — the control, same fixture, same missing provider. This one must fail for
+        //     some OTHER reason: reaching provider resolution is proof the gate let it past.
+        let settled = try Self.makeHeader(
+            accountId: accountId, folderPath: "Archive", uid: "77",
+            rfc822: "settled@example.com", observedUidValidity: 202, pool: pool)
+        var settledThrewPendingMove = false
+        do {
+            try await AccountManager.shared.fetchBody(for: settled)
+        } catch is CancellationError {
+            // not the case under test
+        } catch let ProviderError.addressPendingMove(id) {
+            settledThrewPendingMove = true
+            Issue.record("a settled address must not be refused as mid-move (id: \(id))")
+        } catch {
+            // Expected: provider resolution or the fetch itself fails. Anything that is not
+            // `addressPendingMove` proves the gate did not fire.
+        }
+        #expect(
+            !settledThrewPendingMove,
+            "refusing a settled address as mid-move would make every body permanently unfetchable")
+    }
+
     @Test("A pending-move refusal is not a connection error")
     func addressPendingMoveIsNotAConnectionError() {
         #expect(!SyncEngine.isConnectionError(ProviderError.addressPendingMove("acct:INBOX:41")))

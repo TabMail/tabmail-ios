@@ -395,6 +395,34 @@ struct OversizedDurableFlagConfinementTests {
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
 
+        // A SECOND ACCOUNT, and it is what makes `Column("accountId") == accountId` mean
+        // anything here. Every fixture in this suite seeded one account, so that conjunct
+        // was satisfied vacuously and could be DELETED from either request with the whole
+        // suite green. On a multi-account device that deletion makes
+        // `updateBackfillProgressForAccount` compute `totalEmails` account-scoped while the
+        // numerator and pending count absorb every account's rows: `ftsIndexed` exceeds its
+        // denominator, and no account ever reaches `isFullyComplete` while any OTHER account
+        // has an outstanding body — the exact failure this change exists to remove, now
+        // global. Two rows, one shaped pending and one shaped settled, so dropping the
+        // conjunct from EITHER request pulls a foreign row into that request's result.
+        // (Found by audit — the same vacuity the durable clear's scoping test closes.)
+        try TestDatabase.insertAccount(db, id: "acc2", email: "second@example.com")
+        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive, accountId: "acc2")
+        var foreignIds: [String] = []
+        for (n, (complete, empty, oversized)) in [(false, false, false), (true, false, false)].enumerated() {
+            let h = try TestDatabase.insertMessageHeader(
+                db, messageId: "foreign-\(n)", folderId: "acc2:Archive",
+                accountId: "acc2", folderPath: "Archive", isInInbox: false)
+            try db.write { conn in
+                try conn.execute(sql: """
+                    UPDATE messageHeader
+                    SET headerComplete = 1, bodyComplete = ?, bodyEmptyConfirmed = ?, bodyMetadataOversized = ?
+                    WHERE id = ?
+                    """, arguments: [complete, empty, oversized, h.id])
+            }
+            foreignIds.append(h.id)
+        }
+
         // All 8 combinations of the three dispositions, each on its own row.
         var ids: [String] = []
         for (n, (complete, empty, oversized)) in [
@@ -428,6 +456,14 @@ struct OversizedDurableFlagConfinementTests {
         // Non-vacuity: the split is real, not "everything landed on one side".
         #expect(pending.count == 1, "exactly one combination — all three dispositions false — is outstanding")
         #expect(settled.count == 7, "and the other seven are settled")
+        // ACCOUNT SCOPE, stated as the property the arithmetic depends on rather than as a
+        // restatement of the request's text: neither request may see a row belonging to
+        // another account, in EITHER direction. Both foreign rows are header-complete, so
+        // nothing else in this fixture excludes them.
+        #expect(Set(pending).isDisjoint(with: Set(foreignIds)),
+                "a second account's outstanding row must not count as THIS account's pending work")
+        #expect(Set(settled).isDisjoint(with: Set(foreignIds)),
+                "…nor its settled row as this account's indexed numerator")
     }
 
     /// `selfHealBackfillFTSMembership` re-indexes HEADERS. The flagged row's header is

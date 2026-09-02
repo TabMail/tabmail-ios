@@ -52,9 +52,14 @@ enum BodyFetchRefusal {
     ///    `errorDescription` is `"Network error: \(underlying.localizedDescription)"`. So
     ///    a refusal that reaches the user through a caller's `error.localizedDescription`
     ///    carries that prefix, while the two branches that assign this constant directly
-    ///    do not. The prefix is inherited — codes −1/−2/−4 have always been wrapped this
-    ///    way — and is left alone rather than unwrapped at one call site, which would
-    ///    trade a visible inconsistency for an invisible one.
+    ///    do not. For −1 and −2 the prefix is INHERITED — they have always been wrapped
+    ///    this way — and is left alone rather than unwrapped at one call site, which
+    ///    would trade a visible inconsistency for an invisible one. ⚠️ −4 is NOT
+    ///    inherited: `BodyFetchRefusal.quarantined` is introduced by this change, so the
+    ///    prefix on it is a deliberate choice to MATCH −1/−2 rather than a legacy left
+    ///    undisturbed. An earlier version of this sentence said all three had "always"
+    ///    been wrapped, which would have licensed the new class on an argument that did
+    ///    not cover it. (Found by audit.)
     /// 2. `MessageCardView` renders `viewModel.error` only under
     ///    `DebugModeManager.isLoggingEnabled()`; a Release user sees its generic
     ///    "Unable to load message. Pull to retry." instead — which names the one path
