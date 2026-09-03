@@ -75,9 +75,15 @@ work.
 ⚠️ **One clause of the base record's own reasoning is also retired.** The 2026-09-03 candidate
 initially coupled the auth leg to the worker's status code ("logout only after a successful
 release"), on the theory that a registration the worker still holds needs its session kept alive.
-Round-1 review established that the push worker's own server-side staleness sweep already covers
-that case, so the coupling protected nothing while leaving this device with a live server-side
-session after every worker outage. **Both legs now run unconditionally, worker first.** Do not
+Round-1 review retired the coupling because it protected nothing while leaving this device with a
+live server-side session after every worker outage. ⚠️ **Round 1 also justified that in the present
+tense by naming a server-side staleness sweep that is NOT DEPLOYED yet — do not restate it as an
+existing backstop.** On the currently deployed worker the only server-side nets that retire a
+registration whose session ended before the release landed are the next-owner eviction (the next
+account to claim the same APNs token displaces the older registration) and APNs feedback once the app
+is uninstalled; the general staleness sweep lands with the push worker's half of issue #42 and, once
+deployed, becomes the standing backstop. The retirement stands either way — the coupling's cost is
+certain and its benefit was never established. **Both legs now run unconditionally, worker first.** Do not
 reinstate the coupling; the only thing that suppresses the logout is the bound itself
 (`guard !Task.isCancelled` between the legs).
 
@@ -87,8 +93,12 @@ Ordinary sign-out is a deliberate user gesture from the account dashboard, so th
 whenever a signed-in user signs out — it is the common path, not an edge. Every failure mode is
 recoverable by an ordinary user gesture or by server-side expiry:
 
-- A failed or timed-out release leaves the registration for the worker's own staleness sweep. No
-  local state claims it is still registered: the cache clears run in a `defer`, so a release whose
+- A failed or timed-out release leaves the registration in place on the worker. On the currently
+  deployed worker the only server-side nets that retire it are the next-owner eviction — the next
+  account to claim the same APNs token displaces the older registration — and APNs feedback once the
+  app is uninstalled; a general server-side staleness sweep lands with the push worker's half of
+  issue #42 and becomes the standing backstop only once deployed. No local state claims the install
+  is still registered: the cache clears run in a `defer`, so a release whose
   outcome is unknown never leaves a "registered" cache that would make the next sign-in skip
   registration.
 - A failed or timed-out logout leaves this device's auth session to its natural expiry, exactly as

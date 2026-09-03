@@ -159,10 +159,25 @@ final class TabMailAuthService: NSObject {
     ///    session.
     /// 2. **Both legs always run, worker first.** The release goes first because
     ///    the worker's own check needs a live session for the subject; the
-    ///    logout follows whether or not the release threw. The worker's
-    ///    server-side sweep catches a logout that outran a failed release, so
-    ///    coupling the auth leg to the worker's status code protected nothing
-    ///    while leaving this device's session alive after every worker outage.
+    ///    logout follows whether or not the release threw. Coupling the auth leg
+    ///    to the worker's status code protected nothing while leaving this
+    ///    device's session alive after every worker outage, so the legs are
+    ///    independent — and they stay independent regardless of how much the
+    ///    server can tidy up on its own. Today that server-side cleanup is
+    ///    narrow: a registration whose session ended before the release landed
+    ///    is retired only when the next account claims the same APNs token
+    ///    (which displaces the older registration), or by APNs feedback once the
+    ///    app is uninstalled. A general staleness sweep lands with the push
+    ///    worker's half of this work; once deployed it is the standing backstop,
+    ///    and this rule is the same either way.
+    ///
+    /// The handshake runs BEFORE `completeSession(mode: .deactivate)`, so a local
+    /// deactivate that FAILS leaves this install holding a local session whose
+    /// server-side auth session the logout leg has already ended and whose worker
+    /// registration has already been released — token validation therefore starts
+    /// failing once the access token expires. Recovery is one ordinary gesture:
+    /// the dashboard shows its retry message and a second tap re-runs
+    /// `completeSession`, with the handshake repeating idempotently.
     ///
     /// Scope: this is the ordinary user-initiated path only. The
     /// account-deletion flow and RootView's "account no longer available" path
@@ -210,11 +225,16 @@ final class TabMailAuthService: NSObject {
     /// then end the auth session server-side — in that order, and BOTH legs run.
     ///
     /// The worker's release check needs a live session, so the registration goes
-    /// first. The logout follows regardless of how the release went: the push
-    /// worker's own server-side staleness sweep catches a registration whose
-    /// session ended before the release landed, so making the auth leg depend on
-    /// the worker's status code protected nothing while leaving this device's
-    /// session alive after any worker outage.
+    /// first. The logout follows regardless of how the release went: making the
+    /// auth leg depend on the worker's status code protected nothing while
+    /// leaving this device's session alive after any worker outage.
+    ///
+    /// A registration the release failed to give up is, on the currently deployed
+    /// worker, retired only when the next account claims the same APNs token —
+    /// which displaces the older registration — or when APNs feedback reports the
+    /// app uninstalled. The server-side staleness sweep that would catch it
+    /// directly ships with the push worker's half of this work; once deployed it
+    /// widens that net without changing this ordering rule.
     ///
     /// - Parameter subject: the subject that was signed in when sign-out began.
     ///   The single comparison below is the handshake's chokepoint: identity
@@ -258,9 +278,13 @@ final class TabMailAuthService: NSObject {
         }
     }
 
-    /// GoTrue logout for THIS session only. `scope=local` is load-bearing: the
-    /// default scope is `global`, which would end the user's sessions on every
-    /// other device — and with them the push registrations those devices hold.
+    /// GoTrue logout for THIS session only. `scope=local` is load-bearing: only
+    /// this install's session should end here, and the default scope is `global`,
+    /// which would end the user's sessions on every other device too. Ending a
+    /// session deletes NO device registration on the worker, so what `global`
+    /// would actually cost those devices is an app-level sign-out there, plus
+    /// failures on their next register/unregister call until they
+    /// re-authenticate.
     private static func logoutRequest(accessToken: String) -> URLRequest {
         var request = URLRequest(url: URL(string: "\(supabaseURL)/auth/v1/logout?scope=local")!)
         request.httpMethod = "POST"

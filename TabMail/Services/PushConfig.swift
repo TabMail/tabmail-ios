@@ -131,12 +131,25 @@ enum PushConfig {
     /// this device's worker registration, then this session's server-side
     /// logout — before clearing the local session anyway.
     ///
-    /// The handshake runs on every ordinary sign-out and is best-effort: at most
-    /// two sequential round-trips (worker `DELETE /register-device`, then GoTrue
-    /// `POST /auth/v1/logout?scope=local`), so 5s covers the warm case with
-    /// headroom while keeping the worst-case Sign Out delay short. A release
-    /// that does not finish in time leaves the registration to the worker's own
-    /// staleness sweep, which is why nothing is retried or persisted here; the
-    /// reasoning against a longer bound is the same as for the flush above.
+    /// The handshake runs on every ordinary sign-out and is best-effort. THIS
+    /// CLIENT issues at most two sequential round-trips (worker
+    /// `DELETE /register-device`, then GoTrue `POST /auth/v1/logout?scope=local`),
+    /// but two client legs are not two units of work: the release does
+    /// non-trivial work on the server — removing this install's per-account
+    /// routes, and releasing the durable per-token state behind them — so 5s is
+    /// a best-effort budget that covers the warm case with headroom, not a
+    /// latency guarantee. That is acceptable because the bound fails CLOSED: it
+    /// ends the wait, never the sign-out, which is also why nothing is retried
+    /// or persisted here. The reasoning against a longer bound is the same as
+    /// for the flush above.
+    ///
+    /// A release that does not finish in time leaves the registration in place
+    /// on the worker. On the currently deployed worker the server-side nets that
+    /// eventually retire such a registration are narrow: the next account to
+    /// claim the same APNs token displaces the older registration, and APNs
+    /// feedback retires it once the app is uninstalled. A general server-side
+    /// staleness sweep is NOT deployed yet — it lands with the push worker's
+    /// half of this work, and once deployed it becomes the standing backstop
+    /// this bound leans on.
     static let signOutHandshakeTimeoutSeconds: TimeInterval = 5
 }
