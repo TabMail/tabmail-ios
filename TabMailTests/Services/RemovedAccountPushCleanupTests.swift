@@ -189,10 +189,19 @@ struct RemovedAccountPushCleanupTests {
             client: mock,
             defaults: SendableRemovedAccountCleanupDefaults(value: defaults)
         )
+        // Sign-out releases the device registration and then ends the session
+        // server-side; that logout leg must never reach the live auth host from
+        // a unit test, so it is answered locally with the 401 every sign-out
+        // path has to tolerate anyway.
+        await TabMailAuthService._setSignOutLogoutTransportForTesting { request in
+            let url = request.url ?? URL(string: "https://example.com")!
+            return (Data(), HTTPURLResponse(url: url, statusCode: 401, httpVersion: nil, headerFields: nil)!)
+        }
 
         do {
             try await body(defaults, mock)
         } catch {
+            await TabMailAuthService._setSignOutLogoutTransportForTesting(nil)
             await PushNotificationService.shared._setRemovedAccountCleanupDependenciesForTesting(
                 client: nil,
                 defaults: nil
@@ -204,6 +213,7 @@ struct RemovedAccountPushCleanupTests {
             throw error
         }
 
+        await TabMailAuthService._setSignOutLogoutTransportForTesting(nil)
         await PushNotificationService.shared._setRemovedAccountCleanupDependenciesForTesting(
             client: nil,
             defaults: nil
@@ -807,8 +817,12 @@ struct RemovedAccountPushCleanupTests {
 
             await TabMailAuthService.signOut()
 
-            #expect(await mock.recordedCalls().isEmpty,
-                    "the ordinary sign-out path must not gain a network round-trip")
+            // The sign-out release handshake (`unregister-device`) is the only
+            // network work an ordinary sign-out performs; no debt means no
+            // removed-account cleanup call may join it.
+            let cleanupCalls = await mock.recordedCalls().filter { $0 != "unregister-device" }
+            #expect(cleanupCalls.isEmpty,
+                    "sign-out without cleanup debt must perform no removed-account cleanup work")
             #expect(!TabMailAuthService.hasSession())
         }
     }
@@ -836,7 +850,8 @@ struct RemovedAccountPushCleanupTests {
             try await installTestSession(userId: "different-worker-user")
             await TabMailAuthService.signOut()
 
-            #expect(await mock.recordedCalls().isEmpty,
+            let cleanupCalls = await mock.recordedCalls().filter { $0 != "unregister-device" }
+            #expect(cleanupCalls.isEmpty,
                     "only the subject that owns the debt may advance it remotely")
             let retained = PendingRemovedAccountPushCleanup.load(from: defaults)
             #expect(retained.count == 1, "another subject's sign-out must not retire the debt")

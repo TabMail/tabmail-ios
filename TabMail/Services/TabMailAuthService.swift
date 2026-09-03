@@ -58,6 +58,23 @@ final class TabMailAuthService: NSObject {
     private static let billingURL = "https://billing.tabmail.ai"
     private var currentSession: ASWebAuthenticationSession?
 
+    #if DEBUG
+    /// Test-only override for the transport behind the sign-out logout request.
+    /// When nil, the shared ephemeral session is used. Lets tests observe the
+    /// request and fault or stall the response without touching the network.
+    private static var signOutLogoutTransportOverride: TabMailTokenCoordinator.DataForRequest?
+    static func _setSignOutLogoutTransportForTesting(_ transport: TabMailTokenCoordinator.DataForRequest?) {
+        signOutLogoutTransportOverride = transport
+    }
+    #endif
+
+    private static var signOutLogoutTransport: TabMailTokenCoordinator.DataForRequest {
+        #if DEBUG
+        if let signOutLogoutTransportOverride { return signOutLogoutTransportOverride }
+        #endif
+        return { request in try await sharedEphemeralSession.data(for: request) }
+    }
+
     nonisolated static func hasSession(sessionStore: TabMailSessionStore = .shared) -> Bool {
         getSession(sessionStore: sessionStore) != nil
     }
@@ -107,7 +124,8 @@ final class TabMailAuthService: NSObject {
     }
 
     /// Ordinary user-initiated sign-out: hand off any remote push-cleanup debt
-    /// this session still owns, then clear the session and tell the UI.
+    /// this session still owns, release this device's push registration and
+    /// end the session server-side, then clear the local session and tell the UI.
     ///
     /// IOS-PUSH-001. Worker cleanup authenticates with `tabmail_session`, and
     /// `drainPendingRemovedAccountCleanupsOnce` re-reads that subject on every
@@ -124,10 +142,13 @@ final class TabMailAuthService: NSObject {
     /// itself is UNCONDITIONAL: it never fails, never waits past the bound, and
     /// never depends on the flush's outcome.
     ///
-    /// Bounds the scope deliberately: `AppDataWiper.wipeAll` already flushes and
-    /// then blocks on undischarged debt, and both the account-deletion flow and
-    /// RootView's "account no longer available" path sign out against a subject
-    /// the server has already invalidated, where these calls would only 401.
+    /// The release handshake (`releasePushRegistrationAndEndAuthSession`) is
+    /// bounded and best-effort in the same way and runs after the flush, because
+    /// a flush may re-register the device for the surviving accounts. It also
+    /// runs for the account-deletion flow and RootView's "account no longer
+    /// available" path, which sign out against a subject the server has already
+    /// invalidated: there both legs answer 401, and that is tolerated silently.
+    /// `AppDataWiper.wipeAll` has its own reset variant and does not come here.
     @discardableResult
     static func signOut() async -> Bool {
         // The subject about to be destroyed is exactly the one allowed to
@@ -143,10 +164,69 @@ final class TabMailAuthService: NSObject {
             // which writes a refreshed session BACK to the Keychain and would
             // resurrect the session this method is about to clear. Cancelling
             // the flush task itself (not merely the `withTimeout` waiter) closes
-            // the window that a timed-out flush would otherwise leave open.
+            // the window that a timed-out flush would otherwise leave open. The
+            // release handshake below follows the same rule for the same reason.
             flush.cancel()
         }
+        if subject != nil {
+            let transport = signOutLogoutTransport
+            let handshake = Task { await releasePushRegistrationAndEndAuthSession(transport: transport) }
+            _ = try? await withTimeout(seconds: PushConfig.signOutHandshakeTimeoutSeconds) {
+                await handshake.value
+            }
+            // Cancel-first, as above: the handshake resolves its bearer through
+            // the coordinator, which can refresh and write to the Keychain, and
+            // its logout request must not still be in flight when the local
+            // session is destroyed.
+            handshake.cancel()
+        }
         return completeSession(mode: .deactivate)
+    }
+
+    /// The sign-out release handshake: release this device's worker registration,
+    /// then end the auth session server-side — in that order, and the second only
+    /// when the first succeeded. The worker's release check needs a live session,
+    /// so the registration goes first; and a registration the worker still holds
+    /// must keep its session alive so the worker's own staleness sweep can still
+    /// recognise it, which is why a failed release deliberately skips the logout.
+    /// Every outcome — including a 401 from a subject the server has already
+    /// invalidated — is tolerated silently: this never throws, and the caller
+    /// bounds its duration and cancels it.
+    private static func releasePushRegistrationAndEndAuthSession(
+        transport: TabMailTokenCoordinator.DataForRequest
+    ) async {
+        guard case .success(let accessToken) = await TabMailTokenCoordinator.shared.validToken() else {
+            AuthDiagnostics.log("Sign-out handshake skipped: no valid bearer")
+            return
+        }
+        do {
+            try await PushCleanupIdentity.$pinnedAuthToken.withValue(accessToken) {
+                try await PushNotificationService.shared.unregisterDeviceForSignOut()
+            }
+        } catch {
+            AuthDiagnostics.log("Sign-out handshake: device release failed, session left for the worker's staleness sweep (\(error.localizedDescription))")
+            return
+        }
+        guard !Task.isCancelled else { return }
+        do {
+            let (_, response) = try await transport(logoutRequest(accessToken: accessToken))
+            let status = (response as? HTTPURLResponse).map { String($0.statusCode) } ?? "non-HTTP"
+            AuthDiagnostics.log("Sign-out handshake: logout returned \(status)")
+        } catch {
+            AuthDiagnostics.log("Sign-out handshake: logout failed (\(error.localizedDescription))")
+        }
+    }
+
+    /// GoTrue logout for THIS session only. `scope=local` is load-bearing: the
+    /// default scope is `global`, which would end the user's sessions on every
+    /// other device — and with them the push registrations those devices hold.
+    private static func logoutRequest(accessToken: String) -> URLRequest {
+        var request = URLRequest(url: URL(string: "\(supabaseURL)/auth/v1/logout?scope=local")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(supabaseAnonKey, forHTTPHeaderField: "apikey")
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        return request
     }
 
     // MARK: - OAuth Providers

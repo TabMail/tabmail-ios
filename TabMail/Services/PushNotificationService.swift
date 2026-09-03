@@ -338,6 +338,24 @@ actor PushNotificationService {
         BackgroundSyncLogger.logPush("Device unregistered for factory reset")
     }
 
+    /// Ordinary sign-out releases this device's worker registration while the
+    /// session that owns it is still valid (`TabMailAuthService.signOut()`).
+    /// Unlike `unregisterDeviceForReset`, it keeps the cached APNs token: APNs
+    /// only re-delivers the token at launch, and the next sign-in in this same
+    /// process re-registers from that cache. The registration cache is reset so
+    /// that sign-in registers again instead of trusting a registration this call
+    /// released. Failure is thrown to the caller, which decides what may follow.
+    /// Goes through the removed-account cleanup seams so tests can observe and
+    /// fault the worker call.
+    func unregisterDeviceForSignOut() async throws {
+        let signOutDeviceId = removedAccountCleanupDefaults.string(forKey: PushConfig.deviceIdKey) ?? deviceId
+        try await removedAccountCleanupClient.unregisterDevice(deviceId: signOutDeviceId)
+        lastRegistrationTime = nil
+        lastRegisteredStateHash = nil
+        removedAccountCleanupDefaults.removeObject(forKey: PushConfig.registeredEmailsKey)
+        BackgroundSyncLogger.logPush("Device unregistered for sign-out")
+    }
+
     // MARK: - Removed-account cleanup debt
 
     /// Persist the worker-owned cleanup tuple before the authoritative account

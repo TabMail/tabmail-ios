@@ -126,4 +126,17 @@ enum PushConfig {
     /// network that is still failing at 5s will not recover by 8s, and the
     /// debt survives either way.
     static let signOutCleanupFlushTimeoutSeconds: TimeInterval = 5
+
+    /// Upper bound on how long sign-out waits for its own release handshake —
+    /// this device's worker registration, then this session's server-side
+    /// logout — before clearing the local session anyway.
+    ///
+    /// The handshake runs on every ordinary sign-out and is best-effort: at most
+    /// two sequential round-trips (worker `DELETE /register-device`, then GoTrue
+    /// `POST /auth/v1/logout?scope=local`), so 5s covers the warm case with
+    /// headroom while keeping the worst-case Sign Out delay short. A release
+    /// that does not finish in time leaves the registration to the worker's own
+    /// staleness sweep, which is why nothing is retried or persisted here; the
+    /// reasoning against a longer bound is the same as for the flush above.
+    static let signOutHandshakeTimeoutSeconds: TimeInterval = 5
 }
