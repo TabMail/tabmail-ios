@@ -139,6 +139,19 @@ actor PushNotificationService {
         self.hasSucceededConsentScanOnce = false
     }
 
+    /// Read/seed the IN-MEMORY device-registration cache
+    /// (`lastRegistrationTime` / `lastRegisteredStateHash`). Those two decide
+    /// whether `registerDeviceWithWorker` skips a registration inside its TTL,
+    /// so a path that releases the registration must provably clear them — and
+    /// UserDefaults assertions cannot see them.
+    func _deviceRegistrationCacheForTesting() -> (lastRegistrationTime: Date?, lastRegisteredStateHash: Int?) {
+        (lastRegistrationTime, lastRegisteredStateHash)
+    }
+    func _setDeviceRegistrationCacheForTesting(lastRegistrationTime: Date?, lastRegisteredStateHash: Int?) {
+        self.lastRegistrationTime = lastRegistrationTime
+        self.lastRegisteredStateHash = lastRegisteredStateHash
+    }
+
     /// Test-only override for the iOS notification-settings read backing
     /// `visualAlertsEnabled()`. When nil, the live `UNUserNotificationCenter`
     /// is used. Lets tests drive the visible-vs-silent decision without a real
@@ -340,19 +353,35 @@ actor PushNotificationService {
 
     /// Ordinary sign-out releases this device's worker registration while the
     /// session that owns it is still valid (`TabMailAuthService.signOut()`).
-    /// Unlike `unregisterDeviceForReset`, it keeps the cached APNs token: APNs
-    /// only re-delivers the token at launch, and the next sign-in in this same
-    /// process re-registers from that cache. The registration cache is reset so
-    /// that sign-in registers again instead of trusting a registration this call
-    /// released. Failure is thrown to the caller, which decides what may follow.
-    /// Goes through the removed-account cleanup seams so tests can observe and
-    /// fault the worker call.
+    ///
+    /// `PushConfig.lastDeviceTokenKey` MUST survive: APNs re-delivers the device
+    /// token only at launch, so dropping it here would leave a sign-out →
+    /// sign-in in the same process with no token to register with. That is the
+    /// whole reason this is a sibling of `unregisterDeviceForReset` rather than
+    /// a reuse of it.
+    ///
+    /// Everything else about the local registration record is cleared in a
+    /// `defer`, on EVERY exit including a thrown one. A release that timed out
+    /// on this side but completed on the worker would otherwise leave a 24 h
+    /// "already registered" cache behind, and the next sign-in would trust it
+    /// and skip registration — dead push until the TTL lapses. A redundant
+    /// re-registration is an idempotent upsert; a stale cache is not recoverable
+    /// by anything the user can do.
+    ///
+    /// Re-registration after the next sign-in is not implicit: it is driven by
+    /// `TabMailAuthService.restorePushRegistrationAfterSignIn()`, wired to
+    /// RootView's `.tabMailDidSignIn` receiver.
+    ///
+    /// Failure is thrown to the caller. Goes through the removed-account cleanup
+    /// seams so tests can observe and fault the worker call.
     func unregisterDeviceForSignOut() async throws {
         let signOutDeviceId = removedAccountCleanupDefaults.string(forKey: PushConfig.deviceIdKey) ?? deviceId
+        defer {
+            lastRegistrationTime = nil
+            lastRegisteredStateHash = nil
+            removedAccountCleanupDefaults.removeObject(forKey: PushConfig.registeredEmailsKey)
+        }
         try await removedAccountCleanupClient.unregisterDevice(deviceId: signOutDeviceId)
-        lastRegistrationTime = nil
-        lastRegisteredStateHash = nil
-        removedAccountCleanupDefaults.removeObject(forKey: PushConfig.registeredEmailsKey)
         BackgroundSyncLogger.logPush("Device unregistered for sign-out")
     }
 

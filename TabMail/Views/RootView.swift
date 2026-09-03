@@ -664,6 +664,10 @@ struct RootView: View {
             DeviceSyncService.shared.connect()
             // Reopen AI subscription gate — new login may have active subscription
             Task { await Self.revalidateAISubscriptionGate() }
+            // Re-establish this install's push registration. Sign-out releases
+            // it, so a sign-out → sign-in without leaving the app would
+            // otherwise have nothing registered until the next foreground pass.
+            Task { await TabMailAuthService.restorePushRegistrationAfterSignIn() }
         }
         .onChange(of: scenePhase) { _, phase in
             let phaseName = phase == .active ? "active" : (phase == .background ? "background" : "inactive")

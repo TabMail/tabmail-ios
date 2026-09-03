@@ -144,11 +144,32 @@ final class TabMailAuthService: NSObject {
     ///
     /// The release handshake (`releasePushRegistrationAndEndAuthSession`) is
     /// bounded and best-effort in the same way and runs after the flush, because
-    /// a flush may re-register the device for the surviving accounts. It also
-    /// runs for the account-deletion flow and RootView's "account no longer
-    /// available" path, which sign out against a subject the server has already
-    /// invalidated: there both legs answer 401, and that is tolerated silently.
-    /// `AppDataWiper.wipeAll` has its own reset variant and does not come here.
+    /// a flush may re-register the device for the surviving accounts.
+    ///
+    /// Two rules govern the handshake:
+    ///
+    /// 1. **Identity follows the work.** The subject read here — before any
+    ///    await — is passed to the handshake, which re-checks it once after it
+    ///    has a bearer. A sign-in that lands during the flush or inside the
+    ///    handshake window therefore makes the handshake REFUSE: no release, no
+    ///    logout. The local session is still cleared, exactly as on every other
+    ///    path. This mirrors the pinned-identity rule the removed-account drain
+    ///    already follows; acting for whoever happens to own the session slot at
+    ///    that instant would release the wrong device row and end the wrong
+    ///    session.
+    /// 2. **Both legs always run, worker first.** The release goes first because
+    ///    the worker's own check needs a live session for the subject; the
+    ///    logout follows whether or not the release threw. The worker's
+    ///    server-side sweep catches a logout that outran a failed release, so
+    ///    coupling the auth leg to the worker's status code protected nothing
+    ///    while leaving this device's session alive after every worker outage.
+    ///
+    /// Scope: this is the ordinary user-initiated path only. The
+    /// account-deletion flow and RootView's "account no longer available" path
+    /// do NOT reach `signOut()` — they call `completeSession(mode: .deactivate)`
+    /// directly and are deliberately outside this handshake, because they act on
+    /// a subject the server has already invalidated. `AppDataWiper.wipeAll` has
+    /// its own reset variant and does not come here either.
     @discardableResult
     static func signOut() async -> Bool {
         // The subject about to be destroyed is exactly the one allowed to
@@ -168,9 +189,11 @@ final class TabMailAuthService: NSObject {
             // release handshake below follows the same rule for the same reason.
             flush.cancel()
         }
-        if subject != nil {
+        if let subject {
             let transport = signOutLogoutTransport
-            let handshake = Task { await releasePushRegistrationAndEndAuthSession(transport: transport) }
+            let handshake = Task {
+                await releasePushRegistrationAndEndAuthSession(subject: subject, transport: transport)
+            }
             _ = try? await withTimeout(seconds: PushConfig.signOutHandshakeTimeoutSeconds) {
                 await handshake.value
             }
@@ -184,19 +207,35 @@ final class TabMailAuthService: NSObject {
     }
 
     /// The sign-out release handshake: release this device's worker registration,
-    /// then end the auth session server-side — in that order, and the second only
-    /// when the first succeeded. The worker's release check needs a live session,
-    /// so the registration goes first; and a registration the worker still holds
-    /// must keep its session alive so the worker's own staleness sweep can still
-    /// recognise it, which is why a failed release deliberately skips the logout.
+    /// then end the auth session server-side — in that order, and BOTH legs run.
+    ///
+    /// The worker's release check needs a live session, so the registration goes
+    /// first. The logout follows regardless of how the release went: the push
+    /// worker's own server-side staleness sweep catches a registration whose
+    /// session ended before the release landed, so making the auth leg depend on
+    /// the worker's status code protected nothing while leaving this device's
+    /// session alive after any worker outage.
+    ///
+    /// - Parameter subject: the subject that was signed in when sign-out began.
+    ///   The single comparison below is the handshake's chokepoint: identity
+    ///   follows the WORK, so if a sign-in switched the session slot while the
+    ///   cleanup flush ran or while the bearer was being resolved, this refuses
+    ///   outright rather than releasing the new user's device row and ending the
+    ///   new user's session. `signOut()` clears the local session either way.
+    ///
     /// Every outcome — including a 401 from a subject the server has already
     /// invalidated — is tolerated silently: this never throws, and the caller
     /// bounds its duration and cancels it.
     private static func releasePushRegistrationAndEndAuthSession(
+        subject: String,
         transport: TabMailTokenCoordinator.DataForRequest
     ) async {
         guard case .success(let accessToken) = await TabMailTokenCoordinator.shared.validToken() else {
             AuthDiagnostics.log("Sign-out handshake skipped: no valid bearer")
+            return
+        }
+        guard getSession()?.userId == subject else {
+            AuthDiagnostics.log("Sign-out handshake skipped: the session slot changed owner before the handshake could act")
             return
         }
         do {
@@ -204,8 +243,10 @@ final class TabMailAuthService: NSObject {
                 try await PushNotificationService.shared.unregisterDeviceForSignOut()
             }
         } catch {
-            AuthDiagnostics.log("Sign-out handshake: device release failed, session left for the worker's staleness sweep (\(error.localizedDescription))")
-            return
+            // `\(error)` and not `localizedDescription`: the worker's failures
+            // are `PushError.workerRequestFailed(statusCode:errorCode:)`, whose
+            // localized description drops both values.
+            AuthDiagnostics.log("Sign-out handshake: device release failed (\(error))")
         }
         guard !Task.isCancelled else { return }
         do {
@@ -227,6 +268,25 @@ final class TabMailAuthService: NSObject {
         request.setValue(supabaseAnonKey, forHTTPHeaderField: "apikey")
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         return request
+    }
+
+    /// The counterpart of `signOut()`'s release handshake: re-establish this
+    /// install's push registration once a new TabMail sign-in is live.
+    ///
+    /// Sign-out releases this device's worker registration, so without this a
+    /// sign-out followed by a sign-in IN THE SAME PROCESS would leave the
+    /// install with nothing registered until the next foreground pass reached
+    /// `SyncScheduler.startForegroundPolling` — which never happens if the user
+    /// simply stays in the app. This is the existing foreground primitive, not a
+    /// new one, and the worker upserts idempotently, so a redundant call costs a
+    /// round trip and nothing else.
+    ///
+    /// Called from RootView's `.tabMailDidSignIn` receiver, the single funnel
+    /// every sign-in completion posts through. Best-effort and unawaited by the
+    /// UI: `subscribeAllAccounts()` already swallows its own failures, and the
+    /// next foreground pass repeats it.
+    static func restorePushRegistrationAfterSignIn() async {
+        await PushNotificationService.shared.subscribeAllAccounts()
     }
 
     // MARK: - OAuth Providers

@@ -12,6 +12,12 @@ import Testing
 struct RemovedAccountPushCleanupTests {
     enum InjectedFailure: Error { case offline }
 
+    /// One sign-out logout request, as the harness transport saw it.
+    struct CapturedLogout: Sendable {
+        let url: URL?
+        let bearer: String?
+    }
+
     actor MockCleanupClient: RemovedAccountPushCleaning {
         private(set) var calls: [String] = []
         /// The identity pinned to the cleanup pass, as observed from INSIDE the
@@ -22,6 +28,10 @@ struct RemovedAccountPushCleanupTests {
         private(set) var observedBearers: [String?] = []
         /// The `userId` each `registerDevice` body carried.
         private(set) var registeredUserIds: [String] = []
+        /// Sign-out logout requests, recorded here rather than in a separate
+        /// journal so the twelve existing `withHarness` call sites keep their
+        /// two-parameter body.
+        private(set) var logouts: [CapturedLogout] = []
         private var shouldFail = true
         private var ownershipRefusal = false
         private var genericForbidden = false
@@ -38,6 +48,8 @@ struct RemovedAccountPushCleanupTests {
         func recordedCalls() -> [String] { calls }
         func recordedBearers() -> [String?] { observedBearers }
         func recordedRegisteredUserIds() -> [String] { registeredUserIds }
+        func recordedLogouts() -> [CapturedLogout] { logouts }
+        func noteLogout(_ logout: CapturedLogout) { logouts.append(logout) }
         private func noteBearer() { observedBearers.append(PushCleanupIdentity.pinnedAuthToken) }
         func blockDeviceAccount(email: String) { blockedDeviceAccountEmail = email }
         /// Whether the blocked call has been entered at least once. Lets a test
@@ -192,8 +204,16 @@ struct RemovedAccountPushCleanupTests {
         // Sign-out releases the device registration and then ends the session
         // server-side; that logout leg must never reach the live auth host from
         // a unit test, so it is answered locally with the 401 every sign-out
-        // path has to tolerate anyway.
-        await TabMailAuthService._setSignOutLogoutTransportForTesting { request in
+        // path has to tolerate anyway. It is also RECORDED, because "which
+        // subject's bearer did the logout carry" is an assertion this suite
+        // needs and the mock worker cannot see.
+        await TabMailAuthService._setSignOutLogoutTransportForTesting { [mock] request in
+            await mock.noteLogout(
+                CapturedLogout(
+                    url: request.url,
+                    bearer: request.value(forHTTPHeaderField: "Authorization")
+                )
+            )
             let url = request.url ?? URL(string: "https://example.com")!
             return (Data(), HTTPURLResponse(url: url, statusCode: 401, httpVersion: nil, headerFields: nil)!)
         }
@@ -1082,6 +1102,200 @@ struct RemovedAccountPushCleanupTests {
                     "the legacy device registration must run, or (iii) proves nothing")
             #expect(registeredIds.allSatisfy { $0 == testWorkerUserId },
                     "device re-registration must name the admitted subject, not the newly signed-in one")
+        }
+    }
+
+    // MARK: - The sign-out release handshake is pinned to the same subject
+    //
+    // The handshake sits AFTER the bounded flush, so it inherits the same
+    // hazard the flush already closed: a sign-in can land while sign-out is
+    // suspended in the flush, and the ambient session slot is then owned by
+    // somebody else. Releasing the device registration or ending the session
+    // under that identity would tear down the NEW user's push route and log the
+    // NEW user out of a session they just created.
+
+    @Test("a sign-in landing during the sign-out flush makes the release handshake refuse outright")
+    func midFlushSignInMakesTheReleaseHandshakeRefuse() async throws {
+        // A second, still-active account keeps the flush's legacy device
+        // registration on its `register-device` arm, so `unregister-device`
+        // below can only come from the release handshake.
+        var stillActive = Account(
+            emailAddress: "handshake-still-here@example.com",
+            displayName: "Active",
+            provider: .gmail
+        )
+        stillActive.id = "handshake-still-here-account"
+
+        try await withHarness(activeAccount: stillActive) { defaults, mock in
+            defaults.set("apns-device-token", forKey: PushConfig.lastDeviceTokenKey)
+
+            var removed = Account(
+                emailAddress: "handshake-identity@example.com",
+                displayName: "Removed",
+                provider: .gmail
+            )
+            removed.id = "handshake-identity-account"
+
+            await mock.setShouldFail(false)
+            await mock.blockDeviceAccount(email: removed.emailAddress)
+            let generation = await PushNotificationService.shared.prepareRemovedAccountCleanup(
+                removed,
+                caldavConfigIds: [],
+                outboxAttachmentDirNames: []
+            )
+            await PushNotificationService.shared.commitPreparedRemovedAccountCleanup(generation: generation)
+
+            let signOut = Task { await TabMailAuthService.signOut() }
+            await mock.waitUntilDeviceAccountBlocked()
+
+            // Account B signs in while A's sign-out is suspended inside its
+            // bounded flush — the ambient session slot now holds B's subject and
+            // B's bearer, which is everything the handshake would otherwise pick
+            // up when the flush releases.
+            try await installTestSession(userId: "other-user", accessToken: "test-access-B")
+            let liveSubject = await MainActor.run { TabMailAuthService.getSession()?.userId }
+            #expect(liveSubject == "other-user",
+                    "setup must genuinely switch the live session, or this test proves nothing")
+
+            await mock.releaseDeviceAccountBlock()
+            _ = await signOut.value
+
+            let calls = await mock.recordedCalls()
+            // Non-vacuity: the flush really did run to completion after the
+            // switch, so "no release" describes a refusal rather than a
+            // sign-out that never got that far.
+            #expect(calls.contains(where: { $0.hasPrefix("register-device:") }),
+                    "the flush must have completed, or the refusal below is vacuous")
+            #expect(!calls.contains("unregister-device"),
+                    "the handshake must not release a device registration for a subject it no longer owns")
+            #expect(await mock.recordedLogouts().isEmpty,
+                    "the handshake must not end the newly signed-in user's session")
+
+            let bearers = await mock.recordedBearers()
+            #expect(!bearers.contains("test-access-B"),
+                    "no handshake work may be sent under the newly signed-in user's bearer")
+            #expect(!TabMailAuthService.hasSession(),
+                    "the local session is cleared on every path, refusal included")
+        }
+    }
+
+    @Test("the sign-out release runs after the flush, so nothing re-registers the device behind it")
+    func signOutReleaseFollowsTheFlushDeviceRegistration() async throws {
+        // The flush's last worker action re-registers this device for the
+        // accounts that survive. If the release ran first, that re-registration
+        // would put the device back on the worker after sign-out had given it
+        // up — and nothing in this process would take it away again.
+        var stillActive = Account(
+            emailAddress: "order-still-here@example.com",
+            displayName: "Active",
+            provider: .gmail
+        )
+        stillActive.id = "order-still-here-account"
+
+        try await withHarness(activeAccount: stillActive) { defaults, mock in
+            defaults.set("apns-device-token", forKey: PushConfig.lastDeviceTokenKey)
+
+            var removed = Account(
+                emailAddress: "order-removed@example.com",
+                displayName: "Removed",
+                provider: .gmail
+            )
+            removed.id = "order-removed-account"
+
+            let generation = await PushNotificationService.shared.prepareRemovedAccountCleanup(
+                removed,
+                caldavConfigIds: [],
+                outboxAttachmentDirNames: []
+            )
+            await PushNotificationService.shared.commitPreparedRemovedAccountCleanup(generation: generation)
+            // Offline at removal time: the worker-owned actions stay durable.
+            await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
+            #expect(PendingRemovedAccountPushCleanup.load(from: defaults).count == 1,
+                    "the offline removal must leave debt for the sign-out flush to discharge")
+
+            await mock.setShouldFail(false)
+            await TabMailAuthService.signOut()
+
+            let calls = await mock.recordedCalls()
+            let releaseIndex = calls.firstIndex(of: "unregister-device")
+            #expect(releaseIndex != nil, "the sign-out release must have run")
+            guard let releaseIndex else { return }
+            #expect(calls[..<releaseIndex].contains(where: { $0.hasPrefix("register-device:") }),
+                    "the flush's device re-registration must have run, or the ordering claim is vacuous")
+            #expect(!calls[(releaseIndex + 1)...].contains(where: { $0.hasPrefix("register-device:") }),
+                    "no device registration may follow the release that gave this install's registration up")
+        }
+    }
+
+    @Test("completing a sign-in re-establishes the device registration the sign-out released")
+    func signInRestoresTheReleasedDeviceRegistration() async throws {
+        // CalDAV has no mailbox, so `subscribeAccount` returns before any live
+        // `PushClient` call; the only worker traffic this test can produce goes
+        // through the mocked cleanup seam.
+        var stillActive = Account(
+            emailAddress: "signin-restore@example.com",
+            displayName: "Active",
+            provider: .caldav
+        )
+        stillActive.id = "signin-restore-account"
+
+        try await withHarness(activeAccount: stillActive) { defaults, mock in
+            defaults.set("apns-device-token", forKey: PushConfig.lastDeviceTokenKey)
+
+            // `subscribeAllAccounts` ends in `registerDeviceWithWorker`, which
+            // reads the APNs token from STANDARD defaults and would use the real
+            // `PushClient`. Hold it on its documented no-token early return, and
+            // prove that precondition rather than assume it.
+            let standard = UserDefaults.standard
+            let savedStandardToken = standard.string(forKey: PushConfig.lastDeviceTokenKey)
+            standard.removeObject(forKey: PushConfig.lastDeviceTokenKey)
+            defer {
+                if let savedStandardToken {
+                    standard.set(savedStandardToken, forKey: PushConfig.lastDeviceTokenKey)
+                }
+            }
+            #expect(standard.string(forKey: PushConfig.lastDeviceTokenKey) == nil,
+                    "the live registration path must stay on its no-token early return")
+
+            var removed = Account(
+                emailAddress: "signin-restore-removed@example.com",
+                displayName: "Removed",
+                provider: .gmail
+            )
+            removed.id = "signin-restore-removed-account"
+            let generation = await PushNotificationService.shared.prepareRemovedAccountCleanup(
+                removed,
+                caldavConfigIds: [],
+                outboxAttachmentDirNames: []
+            )
+            await PushNotificationService.shared.commitPreparedRemovedAccountCleanup(generation: generation)
+
+            // The whole sign-out is offline, so the debt survives it and the
+            // registration this user still needs is provably given up.
+            await TabMailAuthService.signOut()
+            let afterSignOut = await mock.recordedCalls()
+            #expect(afterSignOut.contains("unregister-device"),
+                    "sign-out must have released this install's registration")
+            #expect(defaults.object(forKey: PushConfig.registeredEmailsKey) == nil,
+                    "sign-out must leave no local record claiming the device is registered")
+            #expect(!TabMailAuthService.hasSession())
+
+            // The same user signs back in without leaving the app. Nothing else
+            // in this process will re-register the device: the foreground
+            // re-subscribe only runs on a scene-phase transition.
+            try await installTestSession(userId: testWorkerUserId)
+            await mock.setShouldFail(false)
+            await TabMailAuthService.restorePushRegistrationAfterSignIn()
+
+            let calls = await mock.recordedCalls()
+            let signOutRelease = calls.lastIndex(of: "unregister-device")
+            #expect(signOutRelease != nil)
+            guard let signOutRelease else { return }
+            #expect(calls[(signOutRelease + 1)...].contains("register-device:signin-restore@example.com"),
+                    "the sign-in must put this device back on the worker for the accounts that are active")
+            #expect(defaults.object(forKey: PushConfig.registeredEmailsKey) as? [String]
+                        == ["signin-restore@example.com"],
+                    "the local registration record must be rebuilt for the live accounts")
         }
     }
 }

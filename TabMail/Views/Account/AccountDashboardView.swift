@@ -19,7 +19,11 @@ struct AccountDashboardView: View {
     /// Dedup guard for the unstructured initial load (see `.task` comment).
     @State private var loadInFlight = false
     /// Disables the Sign Out button while `TabMailAuthService.signOut()` is
-    /// awaiting its bounded push-cleanup flush (IOS-PUSH-001).
+    /// awaiting its two bounded push windows (IOS-PUSH-001): the removed-account
+    /// cleanup flush, and then the release handshake that gives up this device's
+    /// worker registration and ends the session server-side. The worst case is
+    /// therefore `signOutCleanupFlushTimeoutSeconds +
+    /// signOutHandshakeTimeoutSeconds`, not the flush bound alone.
     @State private var isSigningOut = false
     @Environment(StoreKitManager.self) private var storeKit
     @Environment(\.scenePhase) private var scenePhase
@@ -246,8 +250,11 @@ struct AccountDashboardView: View {
                     if !DemoModeStore.shared.isActive {
                         Button(role: .destructive) {
                             // `signOut()` can wait briefly for a removed-account
-                            // cleanup flush (IOS-PUSH-001), so it is async and
-                            // the button must not accept a second tap meanwhile.
+                            // cleanup flush and then for its device-release
+                            // handshake (IOS-PUSH-001), so it is async and the
+                            // button must not accept a second tap meanwhile —
+                            // a second sign-out would race the first one's
+                            // handshake for the same session.
                             isSigningOut = true
                             Task {
                                 if !(await TabMailAuthService.signOut()) {
