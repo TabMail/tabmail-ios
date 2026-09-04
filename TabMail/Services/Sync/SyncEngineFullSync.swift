@@ -2173,6 +2173,29 @@ extension SyncEngine {
             if upsUpdated + upsNoop + upsDraftSentSkip > 0 || !newHeaders.isEmpty {
                 let loopMs = Int((CFAbsoluteTimeGetCurrent() - upsLoopT0) * 1000)
                 BootProfiler.mark("fullSync upsert[\(folder.name)]: ins=\(newHeaders.count) upd=\(upsUpdated) noop=\(upsNoop) dsSkip=\(upsDraftSentSkip) stale=\(staleIds.count) loop=\(loopMs)ms recon=\(Int(upsReconSeconds * 1000))ms")
+                // WHICH rows, not just how many. The `ins=` count above is exactly
+                // what the reappearing-message investigation (`IOS-QUEUE-008`) had
+                // and could not use: it proves a full sync inserted N rows but not
+                // whether the message the user had just deleted was one of them.
+                // Debug-gated and file-backed on `.sync`, so it interleaves with the
+                // drain's `queueLog` lines in the one `tabmail.log` and is a no-op in
+                // a shipping build (global `CLAUDE.md` rule 12).
+                //
+                // The `prefix` is a DISPLAY cap on synthetic header IDS — no user
+                // content is involved, nothing stored is shortened, and the elided
+                // count is stated rather than dropped. Global rule 11 names exactly
+                // this as not being data truncation.
+                if DebugModeManager.isLoggingEnabled() {
+                    let insertedIds = newHeaders.map(\.id)
+                    let overflow = insertedIds.count > SyncConfig.upsertInsertedIdLogCap
+                        ? " (+\(insertedIds.count - SyncConfig.upsertInsertedIdLogCap) more)" : ""
+                    let line = "[MoveTrace] fullSync upsert[\(folder.name)] — inserted "
+                        + "\(insertedIds.count) header(s): "
+                        + insertedIds.prefix(SyncConfig.upsertInsertedIdLogCap).joined(separator: ",")
+                        + overflow
+                    print(line)
+                    AppLogStore.append(line, channel: .sync)
+                }
             }
             return (newHeaders, staleIds, replyDetectIds, uidMigratedOldMsgIds, ftsRekeys, headerRekeys)
         }

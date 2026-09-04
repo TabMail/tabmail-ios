@@ -5,6 +5,40 @@
 import Foundation
 import GRDB
 
+/// Debug-gated, file-backed writer for the `[MoveTrace] deltaSync` decision lines
+/// — the per-folder insert/remove/skip verdicts Gmail's delta arm reaches for each
+/// message.
+///
+/// These lines were bare, UNGATED `print`s. Both halves of that were wrong:
+///
+/// * **Ungated** violates global `CLAUDE.md` rule 12 — a diagnostic must be a
+///   no-op in a shipping build. The `guard` below is that gate, and it covers the
+///   console sink as well as the file one.
+/// * **`print`** meant they went NOWHERE on a device. There is no
+///   `freopen`/`dup2` in this tree, so `stdout` is unreadable outside an attached
+///   Xcode console — the exact situation of the Gmail delete → undo → delete whose
+///   message reappeared 31 minutes later (`IOS-QUEUE-008`). These seven lines name
+///   which sync arm re-inserted a row, which was one of the two facts the
+///   investigation needed and the exported log could not supply. Routing them to
+///   the single `tabmail.log` via `AppLogStore` on the `.sync` channel — the same
+///   channel `queueLog` uses, so the drain and the sync interleave in ONE file in
+///   append order — is what makes the next occurrence diagnosable.
+///
+/// `@autoclosure` so the interpolation is skipped entirely when the gate is off;
+/// these fire per message per folder. Same shape as `AccountManagerQueue`'s
+/// `queueLog`.
+///
+/// ⚠️ SCOPE: this helper is deliberately used ONLY by the seven
+/// `[MoveTrace] deltaSync` sites. The rest of this file's `print` corpus — and the
+/// sync engines' generally — is the whole-tree sweep tracked as issue #72 and is
+/// out of scope here.
+private func deltaMoveTraceLog(_ message: @autoclosure () -> String) {
+    guard DebugModeManager.isLoggingEnabled() else { return }
+    let line = message()
+    print(line)
+    AppLogStore.append(line, channel: .sync)
+}
+
 extension SyncEngine {
 
     // MARK: - Delta Sync
@@ -185,20 +219,20 @@ extension SyncEngine {
 
                         if existsLocally && !belongsInFolder && !isPendingAny {
                             // Message was removed from this folder (e.g., archived from inbox)
-                            print("[MoveTrace] deltaSync — removing \(info.messageId) from \(folder.name)(\(folder.id)) — not in labels \(labelIds)")
+                            deltaMoveTraceLog("[MoveTrace] deltaSync — removing \(info.messageId) from \(folder.name)(\(folder.id)) — not in labels \(labelIds)")
                             if let existing {
                                 removedIds.append(existing.id)
                                 try existing.delete(db)
                             }
                         } else if existsLocally && !belongsInFolder && isPendingAny {
-                            print("[MoveTrace] deltaSync — SKIPPING removal of \(info.messageId) from \(folder.name) — has pending op")
+                            deltaMoveTraceLog("[MoveTrace] deltaSync — SKIPPING removal of \(info.messageId) from \(folder.name) — has pending op")
                         } else if !existsLocally && belongsInFolder && isPendingDestructive {
-                            print("[MoveTrace] deltaSync — SKIPPING insert of \(info.messageId) into \(folder.name) — has pending destructive op")
+                            deltaMoveTraceLog("[MoveTrace] deltaSync — SKIPPING insert of \(info.messageId) into \(folder.name) — has pending destructive op")
                         } else if !existsLocally && belongsInFolder && recentlyCompletedSnapshot[info.messageId] != nil {
-                            print("[MoveTrace] deltaSync — SKIPPING insert of \(info.messageId) into \(folder.name) — recently completed op")
+                            deltaMoveTraceLog("[MoveTrace] deltaSync — SKIPPING insert of \(info.messageId) into \(folder.name) — recently completed op")
                         } else if !existsLocally && belongsInFolder && !isPendingDestructive {
                             // New message in this folder
-                            print("[MoveTrace] deltaSync — inserting \(info.messageId) into \(folder.name)(\(folder.id)) — labels=\(labelIds)")
+                            deltaMoveTraceLog("[MoveTrace] deltaSync — inserting \(info.messageId) into \(folder.name)(\(folder.id)) — labels=\(labelIds)")
                             // Other half of draft rekey visibility (see the matching
                             // delete-side log above): the NEW message.id Gmail minted
                             // for a re-pushed draft lands here as an ordinary insert.
@@ -270,7 +304,7 @@ extension SyncEngine {
                                     rfc822MessageId: orphaned.rfc822MessageId
                                 )
                                 if orphanIsPending {
-                                    print("[MoveTrace] deltaSync — SKIPPING orphan reclaim for \(orphaned.id) — pending destructive op (server folder=\(folder.name) but user moved locally)")
+                                    deltaMoveTraceLog("[MoveTrace] deltaSync — SKIPPING orphan reclaim for \(orphaned.id) — pending destructive op (server folder=\(folder.name) but user moved locally)")
                                     continue
                                 }
                                 print("[Sync] deltaSync reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folder.id)")
@@ -348,7 +382,7 @@ extension SyncEngine {
                                 // inside the same transaction. Skipping the insert is
                                 // always safer than throwing UNIQUE.
                                 guard try MessageHeader.fetchOne(db, key: header.id) == nil else {
-                                    print("[MoveTrace] deltaSync — SKIPPING insert for id=\(header.id) — already exists (post-snapshot)")
+                                    deltaMoveTraceLog("[MoveTrace] deltaSync — SKIPPING insert for id=\(header.id) — already exists (post-snapshot)")
                                     continue
                                 }
                                 try header.insert(db)

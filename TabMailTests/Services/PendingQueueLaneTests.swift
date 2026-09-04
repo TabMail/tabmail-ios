@@ -229,4 +229,79 @@ struct PendingQueueLaneTests {
                     "a lane mixed accounts: \(lane.map { "\($0.accountId)/\($0.folderPath)" })")
         }
     }
+
+    // MARK: - 9. The lane diagnostic renders every op, in lane order
+
+    /// `laneDiagnosticSummary` is the formatter `drainPendingQueue` logs right
+    /// after `buildLanes` returns, and it is the ONLY artifact that records which
+    /// ops shared a lane and in what order. The lane assignment IS the ordering
+    /// decision (`IOS-QUEUE-008`: same lane ⇒ serialized, separate lanes ⇒ raced),
+    /// so a summary that silently omitted an op, or reordered one, would misreport
+    /// the very fact a future investigation reads it for.
+    ///
+    /// It is deliberately pure — no dates, no clock, no I/O — so it can be pinned
+    /// here without a DB, a provider or an actor hop, exactly like `buildLanes`.
+    @Test("lane diagnostic names every op with its address, in lane order")
+    func laneDiagnosticSummaryNamesEveryOpInLaneOrder() {
+        let now = Date()
+        // Same two-lane shape the suite uses above: one merged stable-id lane
+        // (undo inverse + re-delete of ONE Gmail message) plus a disjoint lane.
+        let opInverse = makeOp(
+            type: .move, messageIds: ["m1"], accountId: "acc-gmail",
+            folderPath: "TRASH", destinationPath: "INBOX", createdAt: now)
+        let opRedelete = makeOp(
+            type: .move, messageIds: ["m1"], accountId: "acc-gmail",
+            folderPath: "INBOX", destinationPath: "TRASH",
+            createdAt: now.addingTimeInterval(1))
+        let opOther = makeOp(
+            type: .markRead, messageIds: ["m2"], accountId: "acc-gmail",
+            folderPath: "INBOX", createdAt: now.addingTimeInterval(2))
+
+        let lanes = AccountManager.buildLanes(
+            [opInverse, opRedelete, opOther], folderLocalAccountIds: [])
+        #expect(lanes.count == 2)
+        guard lanes.count == 2 else { return }
+
+        let summary = AccountManager.laneDiagnosticSummary(lanes)
+
+        // Every op is named by the short id the drain's own lines print.
+        for op in [opInverse, opRedelete, opOther] {
+            #expect(summary.contains(String(op.id.prefix(8))),
+                    "op \(op.id.prefix(8)) (\(op.type.rawValue)) missing from: \(summary)")
+        }
+        // …with its address, which is what makes a move readable at all.
+        #expect(summary.contains("TRASH→INBOX"), "missing inverse address in: \(summary)")
+        #expect(summary.contains("INBOX→TRASH"), "missing re-delete address in: \(summary)")
+        // A non-move has no destination and renders the placeholder, not a crash.
+        #expect(summary.contains("INBOX→-"), "missing destination-less address in: \(summary)")
+        // Member ids are carried through — the lane key is derived from them.
+        #expect(summary.contains("ids=[m1]"))
+        #expect(summary.contains("ids=[m2]"))
+
+        // ORDER IS THE POINT: within the merged lane the inverse precedes the
+        // re-delete, matching `createdAt` order and therefore wire order.
+        guard let inversePos = summary.range(of: String(opInverse.id.prefix(8))),
+              let redeletePos = summary.range(of: String(opRedelete.id.prefix(8))) else {
+            Issue.record("both merged-lane ops must appear in: \(summary)")
+            return
+        }
+        #expect(inversePos.lowerBound < redeletePos.lowerBound,
+                "the inverse must be rendered BEFORE the re-delete it serializes against: \(summary)")
+        // Both lanes are labelled and sized, so a reader can tell 2 lanes of (2, 1)
+        // from 1 lane of 3 — the difference between serialized and raced.
+        #expect(summary.contains("lane0(2)"), "expected a 2-op lane 0 in: \(summary)")
+        #expect(summary.contains("lane1(1)"), "expected a 1-op lane 1 in: \(summary)")
+    }
+
+    /// The empty case is not decoration: `drainPendingQueue` logs the summary
+    /// BEFORE its `guard !lanes.isEmpty else { break }`, so an empty result is a
+    /// reachable input on every drain that claimed nothing. It must render a
+    /// visible marker rather than an empty string, or the line reads as a missing
+    /// log instead of "nothing to drain".
+    @Test("lane diagnostic on empty input renders a visible marker, not an empty line")
+    func laneDiagnosticSummaryOnEmptyInputIsStable() {
+        let summary = AccountManager.laneDiagnosticSummary([])
+        #expect(!summary.isEmpty)
+        #expect(summary == "<no lanes>")
+    }
 }
