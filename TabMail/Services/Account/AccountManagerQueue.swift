@@ -47,14 +47,22 @@ struct ExecutedOperation: Sendable {
 }
 
 /// Debug-gated diagnostic log for this file (global `CLAUDE.md` development
-/// rule 12). `DebugModeManager.isLoggingEnabled()` is false for every ordinary
-/// user — it requires the ten-tap unlock AND an allowed account — so in a
-/// shipping build this is a no-op.
+/// rule 12) — a thin forwarder onto `BackgroundSyncLogger.logQueue`, the façade
+/// that owns the gate, the escaping, the console echo and the `AppLogStore`
+/// append for the `.queue` channel.
 ///
-/// `@autoclosure` so the interpolation itself is skipped when the gate is off.
-/// These fire per drain pass, per claimed op and per executed member, and the
-/// string was previously built on every one of them. Same shape as
-/// `NotificationActionRouter.log` and `MessageContentStore.log`.
+/// ⚠️ IT IS NOT "A NO-OP IN A SHIPPING BUILD", and an earlier wording of this
+/// paragraph said so. `DebugModeManager.isLoggingEnabled()` is a RUNTIME gate —
+/// the ten-tap unlock flag AND an allowed user — and it is deliberately live on
+/// TestFlight and App Store builds for such a user. That is the whole point:
+/// these lines have to be capturable on a real device, from a real occurrence.
+/// It is a no-op for everyone else.
+///
+/// `@autoclosure` twice over, and the laziness survives the hop: this wrapper's
+/// `message()` is evaluated INSIDE the façade's own autoclosure argument, so a
+/// closed gate still builds nothing. These fire per drain pass, per claimed op
+/// and per executed member. Same shape as `NotificationActionRouter.log` and
+/// `MessageContentStore.log`.
 ///
 /// 🚨 THREE lines in this file are DELIBERATELY LEFT AS UNGATED `print` and
 /// must stay that way; each is marked `UNGATED BY DECISION` at its site. Each
@@ -90,16 +98,20 @@ struct ExecutedOperation: Sendable {
 /// sites was INVISIBLE in a log exported from a device. That is not academic —
 /// a Gmail delete → undo → delete that reappeared 31 minutes later
 /// (`IOS-QUEUE-008`) could not be root-caused from the exported log, because
-/// nothing recorded which drain lane ran first. Writing the same line to the
-/// single `tabmail.log` via `AppLogStore` on the `.sync` channel makes the whole
-/// drain readable after the fact, and `DebugLogView`'s "App Logs" share exports
-/// it. The gate is unchanged and still covers BOTH sinks, so this stays a no-op
-/// in a shipping build (global `CLAUDE.md` rule 12).
+/// nothing recorded which drain lane ran first.
+///
+/// 🚨 IT GOES ON `.queue`, NOT ON THE ALWAYS-ON `.sync` CHANNEL. Every channel
+/// in this app is EITHER always-on or debug-gated, exactly once
+/// (`AppLogStoreTests.everyChannelIsClassifiedExactlyOnce`, memory topic 122),
+/// and `.sync` is the always-on one `BackgroundSyncLogger.log` owns. Writing a
+/// gated line onto it would give one channel two lifetime policies and hide this
+/// writer from the locked / unlocked / print-gate tests that pin the split. The
+/// `.queue` channel carries this file's drain lines AND the sync engine's
+/// `[MoveTrace]` verdicts, so `AppLogStore.read(channel: .queue)` reconstructs
+/// the whole interleaved decision sequence; `DebugLogView`'s "App Logs" share
+/// exports it.
 private func queueLog(_ message: @autoclosure () -> String) {
-    guard DebugModeManager.isLoggingEnabled() else { return }
-    let line = message()
-    print(line)
-    AppLogStore.append(line, channel: .sync)
+    BackgroundSyncLogger.logQueue(message())
 }
 
 extension AccountManager {
@@ -250,6 +262,46 @@ extension AccountManager {
         case haltLane
     }
 
+    /// The ids of the accounts whose message ids are IMMUTABLE ACROSS A MOVE, and
+    /// which may therefore share ONE drain lane for one message regardless of the
+    /// folder each op names. This is the ONLY place membership is decided; it is
+    /// extracted from `drainPendingQueue` so it can be unit-tested directly
+    /// against real `account` rows rather than only through a full drain.
+    ///
+    /// Membership is `AccountProvider.gmail`, plus the demo account
+    /// (`DemoSeed.demoAccountId`, stored as `.imap` but backed by `DemoProvider`,
+    /// whose local ids never change). ⚠️ **Outlook/Graph is deliberately NOT a
+    /// member even though its ids are folder-independent** — Graph reallocates a
+    /// message id on every move and this tree sends no
+    /// `Prefer: IdType="ImmutableId"` (`IOS-GRAPH-002`), so serializing its ops
+    /// would make an inherited race a deterministic intention loss. The full
+    /// argument is on `buildLanes`; do not add `.outlook` here without reading it.
+    ///
+    /// 🚨 ID-ONLY, MATCHED ON THE RAW PROVIDER COLUMN — deliberately NOT
+    /// `Account.fetchAll(db)`. `AccountProvider` is a closed `String, Codable`
+    /// enum while the `account.provider` column is unconstrained text, so decoding
+    /// whole rows lets ONE bystander row carrying an unrecognised provider string
+    /// (persistent corruption, or a row written by a newer build) throw
+    /// `DecodingError.dataCorrupted` before any op is claimed. In `drainPendingQueue`
+    /// that throw takes the `catch`'s `break`, every later drain reproduces it
+    /// identically, and valid ops for EVERY OTHER account stay queued forever
+    /// behind a debug-gated log nobody sees — the wedge corollary, app-wide.
+    /// Selecting only the ids of the rows that MATCH cannot be defeated by a row
+    /// that does not. Precedent:
+    /// `AccountManagerUidValidityReset.armImapUidValidityResetForEpochRebuildIfNeeded`.
+    ///
+    /// An unrecognised provider is therefore simply not a member, which is the
+    /// SAFE side: it gets the folder-qualified key the base always used. Its ops
+    /// cannot execute anyway (`providers[op.accountId]` is nil, so the claim loop
+    /// skips them), so no address-space decision is ever acted on for it. No
+    /// "unknown" classification, no quarantine state, no new column.
+    nonisolated static func immutableIdAccountIds(_ db: Database) throws -> Set<String> {
+        Set(try String.fetchAll(db, Account
+            .select(Column("id"))
+            .filter(Column("provider") == AccountProvider.gmail.rawValue
+                || Column("id") == DemoSeed.demoAccountId)))
+    }
+
     /// Groups claimed pending operations into serialized "lanes" via connected-
     /// component grouping over shared message ADDRESSES. Two ops that name ANY
     /// member at the same address land in the same lane — and transitively, any
@@ -265,19 +317,28 @@ extension AccountManager {
     /// between two gestures on one message and a wire race.
     ///
     /// 🚨 THE KEY IS THE OP'S ADDRESS SPACE, NOT A FIXED SHAPE, and which space
-    /// an op lives in is a property of its ACCOUNT — decided from
-    /// `Account.provider`, the same way `admittedOrdinaryActionTargets` and
-    /// checkpoint A already decide it. This function is pure, so it cannot read
-    /// the `Account` row itself; the caller passes `folderLocalAccountIds`, and
-    /// the parameter is deliberately REQUIRED rather than defaulted — a default
-    /// would silently classify an IMAP account as stable-id, which is the
-    /// direction that re-opens `IOS-QUEUE-001`.
+    /// an op lives in is a property of its ACCOUNT. This function is pure, so it
+    /// cannot read the `Account` row itself; the caller passes
+    /// `immutableIdAccountIds` (see `AccountManager.immutableIdAccountIds(_:)`,
+    /// which is the single place that decides membership).
     ///
-    /// - **Folder-local ids — IMAP/iCloud (`folderLocalAccountIds`)** — key
-    ///   `"accountId:folderPath:msgId"`. A UID is mailbox-local: UID 77 in
-    ///   `INBOX` and UID 77 in `Archive` are DIFFERENT PHYSICAL MESSAGES, and
-    ///   every id an ordinary IMAP gesture enqueues is a bare UID
-    ///   (`admittedOrdinaryActionTargets` requires `messageId == String(uid)`).
+    /// 🚨 THE DEFAULT IS THE FOLDER-QUALIFIED KEY, AND THAT IS DELIBERATE. An
+    /// account is account-qualified only by being NAMED in the set; an empty set
+    /// reproduces the pre-`IOS-QUEUE-008` behaviour exactly. So an account this
+    /// code has never heard of — an unknown `provider` string, a provider added
+    /// by a newer build — falls on the CONSERVATIVE side by construction, and no
+    /// "unknown" classification, quarantine state or extra column is needed to
+    /// make that true. ⚠️ The parameter is still REQUIRED rather than defaulted:
+    /// a defaulted-empty parameter would let a caller silently lose the Gmail
+    /// serialization that `IOS-QUEUE-008` exists for, which is a wrong end state
+    /// rather than merely a conservative one.
+    ///
+    /// - **Folder-qualified — EVERYTHING NOT IN THE SET (IMAP, iCloud, Outlook,
+    ///   and anything unknown)** — key `"accountId:folderPath:msgId"`. A UID is
+    ///   mailbox-local: UID 77 in `INBOX` and UID 77 in `Archive` are DIFFERENT
+    ///   PHYSICAL MESSAGES, and every id an ordinary IMAP gesture enqueues is a
+    ///   bare UID (`admittedOrdinaryActionTargets` requires
+    ///   `messageId == String(uid)`).
     ///   Merging them was a NEVER-DROP BUG (`IOS-QUEUE-001`): a lane halts on the
     ///   first evidence refusal, `executeSingleOp`'s `ProviderEvidenceUnavailable`
     ///   arm returns `.haltLane` and requeues, and a server that stops reporting
@@ -287,10 +348,31 @@ extension AccountManager {
     ///   BYSTANDER, and its owner could neither see nor clear it, because no UI
     ///   lists `PendingOperation` rows. An op that stays queued but prevents
     ///   other intentions executing has not been preserved.
-    /// - **Stable ids — Gmail/Graph, and the demo account** — key
-    ///   `"accountId:msgId"`, folder deliberately EXCLUDED. The provider's id is
-    ///   folder-independent, so the folder is not part of the address and
-    ///   including it splits one resource across two lanes.
+    /// - **Account-qualified — IMMUTABLE-ID accounts only: Gmail, plus the demo
+    ///   account** — key `"accountId:msgId"`, folder deliberately EXCLUDED. The
+    ///   provider's id is folder-independent AND SURVIVES A MOVE, so the folder is
+    ///   not part of the address and including it splits one resource across two
+    ///   lanes.
+    ///
+    /// 🚨 WHY OUTLOOK/GRAPH IS **NOT** HERE, EVEN THOUGH ITS IDS ARE
+    /// FOLDER-INDEPENDENT — DO NOT "FIX" THIS BY ADDING IT. Folder-independent is
+    /// not the same property as immutable. Microsoft Graph REALLOCATES a message's
+    /// default id on every move, and this tree never sends
+    /// `Prefer: IdType="ImmutableId"` (`IOS-GRAPH-002`). Account-qualifying Graph
+    /// would put a move `A: Inbox→Archive` and any op on `A` that was queued
+    /// BEFORE that move landed (offline, or simply in the same drain snapshot)
+    /// into ONE lane — which GUARANTEES the follower runs after the move, against
+    /// the id the move just invalidated. `MessageHeaderRekey.finishMove` re-keys
+    /// the `MessageHeader` and nothing rewrites a later `PendingOperation`'s
+    /// `messageIds`, so the follower goes to the wire with a dead id, Graph
+    /// answers 404, and `executeSingleOp`'s single-message conflict arm DELETES
+    /// it: the user's latest intention is gone. Folder-qualified, those two ops
+    /// sit in different lanes and merely RACE — sometimes wrong, sometimes right,
+    /// and recoverable. Serializing them would convert an inherited race into a
+    /// DETERMINISTIC loss, which is strictly worse. The real fix (carry a move's
+    /// A→B handoff into later same-lane members before their wire call) is a
+    /// queue-semantics change routed to the owner as its own follow-up issue; it
+    /// is NOT implemented here. Until it exists, Graph stays folder-qualified.
     ///
     /// 🚨 THE NEGATIVE CASE THAT MOTIVATED THE SPLIT (`IOS-QUEUE-008`): on
     /// Gmail, delete → undo → delete again. `undoMove` enqueues a real inverse
@@ -334,19 +416,20 @@ extension AccountManager {
     /// Ops with empty `messageIds` (no id to key on) fall back to a singleton lane,
     /// matching the pre-existing fallback (`messageIds.first ?? op.id`).
     ///
-    /// - Parameter folderLocalAccountIds: ids of the accounts whose message ids
-    ///   are FOLDER-LOCAL (IMAP/iCloud). Required, not defaulted; see above.
+    /// - Parameter immutableIdAccountIds: ids of the accounts whose message ids
+    ///   are IMMUTABLE ACROSS A MOVE (Gmail, plus the demo account). Everything
+    ///   absent from this set is folder-qualified. Required, not defaulted.
     nonisolated static func buildLanes(
         _ ops: [PendingOperation],
-        folderLocalAccountIds: Set<String>
+        immutableIdAccountIds: Set<String>
     ) -> [[PendingOperation]] {
         /// The op's ADDRESS, in whichever address space its account uses. Both
         /// key-building passes below go through this one function, so the union
         /// pass and the lane-assignment pass cannot drift apart.
         func laneKey(_ op: PendingOperation, _ id: String) -> String {
-            folderLocalAccountIds.contains(op.accountId)
-                ? "\(op.accountId):\(op.folderPath):\(id)"
-                : "\(op.accountId):\(id)"
+            immutableIdAccountIds.contains(op.accountId)
+                ? "\(op.accountId):\(id)"
+                : "\(op.accountId):\(op.folderPath):\(id)"
         }
         // Union-Find over lane keys, with path compression.
         var parent: [String: String] = [:]
@@ -465,21 +548,15 @@ extension AccountManager {
         // Max 3 passes to pick up ops inserted during drain.
         for pass in 0..<3 {
             let ops: [PendingOperation]
-            // Which accounts address their messages FOLDER-LOCALLY (an IMAP UID is
-            // mailbox-local) rather than by a folder-independent provider id. Read
-            // here, in the SAME read as the ops snapshot and BEFORE anything is
+            // Which accounts address their messages by an id that SURVIVES A MOVE.
+            // Read here, in the SAME read as the ops snapshot and BEFORE anything is
             // claimed, so a failure still takes the existing `break` and leaves no
-            // row stranded `inFlight`. Same predicate as the claim loop's `isIMAP`
-            // and `admittedOrdinaryActionTargets`.
-            let folderLocalAccountIds: Set<String>
+            // row stranded `inFlight`.
+            let immutableIds: Set<String>
             do {
-                (ops, folderLocalAccountIds) = try await dbPool.read({ db in
+                (ops, immutableIds) = try await dbPool.read({ db in
                     let fetchedOps = try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
-                    let accounts = try Account.fetchAll(db)
-                    let folderLocal = Set(accounts
-                        .filter { $0.id != DemoSeed.demoAccountId && ($0.provider == .imap || $0.provider == .icloud) }
-                        .map(\.id))
-                    return (fetchedOps, folderLocal)
+                    return (fetchedOps, try Self.immutableIdAccountIds(db))
                 })
             } catch {
                 queueLog("[Queue] ERROR: Failed to fetch pending ops: \(error)")
@@ -691,9 +768,11 @@ extension AccountManager {
 
             // Connected-component lane grouping (F1) — pure, see buildLanes doc comment.
             // The lane key is the op's ADDRESS SPACE, which is a property of its
-            // ACCOUNT, not of the op: folder-qualified for `folderLocalAccountIds`,
-            // account-qualified for the stable-id providers.
-            let lanes = Self.buildLanes(claimed, folderLocalAccountIds: folderLocalAccountIds)
+            // ACCOUNT, not of the op: account-qualified for the IMMUTABLE-ID
+            // accounts (Gmail, demo), folder-qualified for everything else —
+            // IMAP, iCloud, Outlook, and any provider string this build cannot
+            // decode. Folder-qualified is the base behaviour and the safe default.
+            let lanes = Self.buildLanes(claimed, immutableIdAccountIds: immutableIds)
             // The lane assignment IS the concurrency decision, so record it before
             // anything runs: same lane ⇒ serialized, different lanes ⇒ concurrent.
             queueLog("[Queue] Lanes: \(Self.laneDiagnosticSummary(lanes))")
@@ -2175,10 +2254,20 @@ extension AccountManager {
     func logStuckOpDiagnostic(_ op: PendingOperation, error: Error) async {
         // Log-only helper: gate the WHOLE body, not just the emission. Every
         // `queueLog` below is individually gated too, but this guard is what
-        // skips the scoped DB read the dump exists to render — a read that in a
-        // shipping build could only ever feed a log nobody can see. The caller's
-        // `context.diagnosedOpIds` bookkeeping happens before this call, so
-        // returning early changes no control flow there.
+        // skips the scoped DB read the dump exists to render — a read whose only
+        // consumer is a line that is never rendered while the gate is closed.
+        //
+        // ⚠️ "while the gate is CLOSED", not "in a shipping build" — an earlier
+        // wording of this comment said the latter and it is FALSE.
+        // `DebugModeManager.isLoggingEnabled()` is a RUNTIME unlock, not a build
+        // configuration, so on a device or TestFlight build belonging to an
+        // allowed user who has unlocked debug logging this guard passes, the DB
+        // read runs, and the dump IS visible. That is the intended behaviour —
+        // this diagnostic exists to be readable in the field. Do not "optimise"
+        // it away on the belief that release builds never reach it.
+        //
+        // The caller's `context.diagnosedOpIds` bookkeeping happens before this
+        // call, so returning early changes no control flow there.
         guard DebugModeManager.isLoggingEnabled() else { return }
         let ageHours = Date().timeIntervalSince(op.createdAt) / 3600
         queueLog("[QueueDiag] === op=\(op.id) type=\(op.type.rawValue) ===")

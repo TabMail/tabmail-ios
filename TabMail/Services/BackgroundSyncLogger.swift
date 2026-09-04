@@ -21,7 +21,12 @@ import Foundation
 /// caller's thread; `logBackfill` and `logBoot` deliberately do NOT, because
 /// their callers already echo to the console themselves. Every writer that DOES
 /// have a console sink and is debug-gated gates the `print` too — a debug-gated
-/// channel must be a no-op in production on BOTH channels, not just on disk.
+/// channel must be silent on BOTH sinks while the gate is CLOSED, not just on
+/// disk. (Read "while the gate is closed", never "in a release build": the gate
+/// is the RUNTIME unlock described above, so these writers are live on device and
+/// TestFlight for an allowed user who has unlocked debug logging. Pinned by
+/// `AppLogStoreTests.gatedWritersGateTheirPrintToo`, which parses each writer's
+/// body and requires every console sink to sit AFTER the guard.)
 enum BackgroundSyncLogger {
 
     // MARK: - Background sync (always-on)
@@ -230,6 +235,50 @@ enum BackgroundSyncLogger {
         guard DebugModeManager.isLoggingEnabled() else { return }
         print("[StuckDiag] \(message)")
         AppLogStore.append(message, channel: .stuckDiag)
+    }
+
+    // MARK: - Action-queue drain + sync move traces (debug-gated)
+
+    /// Append one action-queue drain or sync-side move-convergence trace line.
+    ///
+    /// ONE façade on ONE channel for both, because the two halves are only
+    /// useful READ TOGETHER: `IOS-QUEUE-008` was a Gmail delete → undo →
+    /// delete whose message reappeared 31 minutes later, and answering it needs
+    /// the drain's lane composition and per-op order INTERLEAVED with the sync
+    /// arm's insert/remove verdicts. `AppLogStore`'s single file preserves that
+    /// append ordering; `read(channel: .queue)` keeps the pair out of the
+    /// always-on `.sync` traffic that would otherwise bury them. Before this
+    /// existed all of these lines were bare `print`s, and there is no
+    /// `freopen`/`dup2` anywhere in this tree, so on a device they went nowhere
+    /// at all — the exported log could not answer the question.
+    ///
+    /// `@autoclosure` so a closed gate never even builds the string: these fire
+    /// per drain pass, per claimed op, per member, and per message per folder.
+    /// The caller's own message already carries its `[Queue]` / `[MoveTrace]`
+    /// prefix, so nothing is prepended here — the console text is what the call
+    /// site wrote.
+    ///
+    /// ⚠️ THE WHOLE RENDERED LINE IS ESCAPED HERE, IN THE FAÇADE, exactly as
+    /// `logChatError` escapes its two spans. `AppLogStore` is line-oriented and
+    /// `entryTag` accepts any physical line shaped `[..] [TAG] `, so a value
+    /// carrying `"\n[x] [AUTH] …"` forges an AUTH entry, truncates the real
+    /// entry on a channel-filtered read, and survives `clear(channel: .queue)`.
+    /// These lines interpolate `PendingOperation.folderPath` (an IMAP mailbox
+    /// name is server- and user-authored), folder names, header ids and provider
+    /// error descriptions — none of which this app authors. Whole-line escaping
+    /// costs nothing because no call site intends a newline, and doing it once
+    /// here is the only place it cannot be forgotten (`IOS-LOG-002`'s registered
+    /// negative bound is about not ADDING user-content interpolations to an
+    /// always-on channel; this channel is gated, and it escapes anyway).
+    ///
+    /// A no-op unless debug logging is unlocked by an allowed user — it IS
+    /// active on device / TestFlight for such a user, which is the point
+    /// (global `CLAUDE.md` rule 12). The guard covers the console sink too.
+    static func logQueue(_ message: @autoclosure () -> String) {
+        guard DebugModeManager.isLoggingEnabled() else { return }
+        let line = DebugModeManager.escapedForLogLine(message())
+        print(line)
+        AppLogStore.append(line, channel: .queue)
     }
 
     // MARK: - Body double-escape detector (pure / ungated — unit-testable)

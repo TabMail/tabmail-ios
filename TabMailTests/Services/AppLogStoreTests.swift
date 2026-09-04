@@ -95,8 +95,9 @@ struct AppLogStoreTests {
         },
     ]
 
-    /// The ten channels added for investigation, each a no-op unless debug mode
-    /// is unlocked (global `CLAUDE.md` rule 12).
+    /// The eleven channels added for investigation, each a no-op unless debug
+    /// mode is unlocked (global `CLAUDE.md` rule 12). Ten at consolidation;
+    /// `.queue` joined them for `IOS-QUEUE-008`.
     static let debugGatedWriters: [ChannelWriter] = [
         ChannelWriter(channel: .bgAppRefresh, backgroundSyncLoggerFunction: "logBGAppRefresh") {
             BackgroundSyncLogger.logBGAppRefresh($0)
@@ -127,6 +128,9 @@ struct AppLogStoreTests {
         },
         ChannelWriter(channel: .stuckDiag, backgroundSyncLoggerFunction: "logStuckDiag") {
             BackgroundSyncLogger.logStuckDiag($0)
+        },
+        ChannelWriter(channel: .queue, backgroundSyncLoggerFunction: "logQueue") {
+            BackgroundSyncLogger.logQueue($0)
         },
     ]
 
@@ -499,6 +503,71 @@ struct AppLogStoreTests {
         }
     }
 
+    @Test("A newline in a logQueue line cannot forge another channel's entry")
+    func queueLineCannotForgeAnotherChannel() {
+        // `logQueue`'s lines interpolate values this app does NOT author:
+        // `PendingOperation.folderPath` (an IMAP mailbox name is chosen by the
+        // server and by the user), folder names, header ids, and provider error
+        // descriptions. Before the `.queue` channel existed these were
+        // console-only `print`s, where a newline costs a confusing second line;
+        // persisted into the shared, line-oriented `tabmail.log` it becomes a
+        // FORGERY — `AppLogStore.entryTag` accepts any physical line shaped
+        // `[..] [TAG] `.
+        //
+        // The INVARIANT, not the mechanism (mirrors
+        // `chatErrorUserMessageCannotForgeAnotherChannel`): nothing an
+        // interpolated value carries produces an entry attributed to a channel it
+        // was never written on, the whole line stays inside the ONE `.queue`
+        // entry that carries it, and clearing `.queue` takes all of it. Escaping
+        // the fully rendered line in the façade is one way to get there; the
+        // properties are what is pinned.
+        withTempLog { _ in
+            withDebugLogging(true) {
+                let stamp = String(UUID().uuidString.prefix(8))
+                let queueMarker = Self.marker(for: .queue, stamp)
+                let forged = "forged-\(stamp)"
+                // Shaped like a real drain line, with the hostile value in the
+                // position `folderPath` actually occupies.
+                let hostileFolderPath = "INBOX\n[x] [AUTH] \(forged) someone@example.com"
+                BackgroundSyncLogger.logQueue(
+                    "[Queue] \(queueMarker) executing move \(hostileFolderPath)→TRASH")
+
+                // 1. No AUTH entry carries it. Scoped to this test's own stamp
+                //    rather than to the AUTH channel being empty: `AuthDiagnostics`
+                //    is always-on, so a task escaping an earlier test can land real
+                //    AUTH entries in this same redirected file.
+                #expect(!AppLogStore.read(channel: .auth).contains(forged),
+                        "an interpolated value forged an AUTH entry")
+
+                // 2. Exactly ONE physical QUEUE line, carrying the whole text. A
+                //    forged line that STARTS a new entry would end the QUEUE run,
+                //    so the tail would be cut out of the one channel it belongs to
+                //    and a filtered export would be silently truncated.
+                let queueLog = AppLogStore.read(channel: .queue)
+                #expect(queueLog.contains(queueMarker), "the QUEUE entry's own head is missing")
+                #expect(queueLog.contains(forged),
+                        "the interpolated text was truncated out of its own channel")
+                let mine = queueLog
+                    .split(separator: "\n", omittingEmptySubsequences: true)
+                    .filter { $0.contains(stamp) }
+                #expect(mine.count == 1,
+                        "one call produced \(mine.count) physical lines: \(queueLog)")
+                // Non-vacuity: the newline really was escaped, so this measures an
+                // escaper rather than an input that could never have forged
+                // anything. `escapedForLogLine` rewrites U+000A as the six
+                // characters backslash-u-0-0-0-a.
+                #expect(queueLog.contains("\\u000a"),
+                        "nothing was escaped — this input cannot discriminate")
+
+                // 3. Clearing QUEUE takes all of it. A forged tail that no channel
+                //    owns outlives every clear the UI offers short of "Clear All".
+                AppLogStore.clear(channel: .queue)
+                #expect(!AppLogStore.read().contains(forged),
+                        "a forged remainder survived clear(channel: .queue)")
+            }
+        }
+    }
+
     @Test("logChatError bounds how much of the user's text it persists")
     func chatErrorUserMessageIsCapped() {
         // Nothing in the tree writes a `userMessage` longer than a chat prompt,
@@ -727,7 +796,7 @@ struct AppLogStoreTests {
     @Test("Every AppLogChannel is classified always-on or debug-gated, exactly once")
     func everyChannelIsClassifiedExactlyOnce() {
         // The two sets above are hand-maintained; `AppLogChannel.allCases` is
-        // not. Deriving the oracle from `allCases` is what makes a SIXTEENTH
+        // not. Deriving the oracle from `allCases` is what makes a SEVENTEENTH
         // channel visible: added with an ungated writer and no entry here, it
         // used to slip past both gating tests (they only ever iterate their own
         // hand-written marker lists) and ship un-gated in production.
@@ -981,7 +1050,7 @@ struct AppLogStoreTests {
         // enough to catch one that special-cases any channel they happen to miss:
         // seeding `dropping = channel != .auth` left that pair green while a
         // fragment of user text survived `clear(channel: .auth)`. Deriving the
-        // oracle from `allCases` is also what makes a SIXTEENTH channel covered
+        // oracle from `allCases` is also what makes a SEVENTEENTH channel covered
         // the day it is added, with no edit here.
         for channel in AppLogChannel.allCases {
             // The surviving entry has to sit on a channel OTHER than the one being
@@ -1121,7 +1190,7 @@ struct AppLogStoreTests {
         // `DeviceSyncLogger` rewrote their whole file with
         // `write(to:atomically:true)` — an atomic replace cannot leave a partial
         // line — and every other channel appended to a file only IT wrote. All
-        // fifteen now append in place to ONE shared file.
+        // sixteen now append in place to ONE shared file.
         try withTempLog { url in
             try withDebugLogging(true) {
                 let stamp = UUID().uuidString.prefix(8)
@@ -1293,7 +1362,7 @@ struct AppLogStoreTests {
 
     @Test("The production byte caps are 32 MB, trimmed back to 16 MB")
     func productionByteCapsArePinned() {
-        // The cap has to hold FIFTEEN channels now, not the one
+        // The cap has to hold SIXTEEN channels now, not the one
         // `background_sync.log` held at 16 MB — and the trim is whole-file with
         // no per-channel reservation, so the ceiling is the only thing standing
         // between a chatty channel and a quiet channel's evicted history.
@@ -1395,7 +1464,7 @@ struct AppLogStoreTests {
     @Test("The store bounds an entry from a writer that bounds nothing itself")
     func appendBoundsAnUnboundedWriter() {
         // `logChatError` is the only façade that bounds its own spans. The other
-        // fourteen hand `AppLogStore.append` whatever they were given, so the
+        // fifteen hand `AppLogStore.append` whatever they were given, so the
         // SIZE bound belongs at the STORE boundary, where it covers every writer
         // rather than only the one that bounds itself. ⚠️ This is defence in
         // depth, not a live production path: with the bound in place no façade
@@ -1441,7 +1510,7 @@ struct AppLogStoreTests {
                 // and the other twelve went on persisting unbounded entries.
                 // Driving `AppLogStore.append` directly is what distinguishes a
                 // STORE-boundary bound from a façade-only one, and `appendRaw` is
-                // private, so this is the same door all fifteen writers use.
+                // private, so this is the same door all sixteen writers use.
                 let direct = "direct-\(stamp)"
                 let directTail = "directtail-\(stamp)"
                 AppLogStore.append(

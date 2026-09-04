@@ -1787,3 +1787,337 @@ struct RunSyncLargeFolderStaleSafetyTests {
         #expect(!result.staleIds.contains("racc:Archive:1"))
     }
 }
+
+// MARK: - A3.6: SyncEngine.upsertInsertedIdSummary (pure formatter)
+
+/// `SyncEngine.upsertInsertedIdSummary` is the PURE renderer behind the
+/// debug-gated `fullSync upsert[...]` `[MoveTrace]` diagnostic
+/// (`SyncEngineFullSync.swift`, inside `runSyncMessages`'s write closure —
+/// see `BackgroundSyncLogger.logQueue`'s call site). Extracted so both its
+/// branches are directly unit-testable without a debug gate, a DB, or a sync
+/// fixture that has to produce `SyncConfig.upsertInsertedIdLogCap` (20)
+/// inserted headers in one pass.
+///
+/// Global `CLAUDE.md` rule 11: the cap is a DISPLAY cap on synthetic header
+/// ids only — it bounds no fetch, no batch and nothing written to the
+/// database. This suite pins the FORMATTER's contract in isolation; the real
+/// full-sync path (proving the cap never truncates the DURABLE row) is
+/// pinned in `SyncEngineFullSyncUpsertDiagnosticTests` below.
+@Suite("SyncEngine.upsertInsertedIdSummary")
+struct SyncEngineUpsertInsertedIdSummaryTests {
+
+    @Test("Under the cap renders every id verbatim with no overflow suffix")
+    func underCapRendersEveryIdVerbatim() {
+        let ids = ["hdr-a", "hdr-b", "hdr-c"]
+        let summary = SyncEngine.upsertInsertedIdSummary(ids)
+        #expect(summary == "inserted 3 header(s): hdr-a,hdr-b,hdr-c")
+    }
+
+    @Test("Exactly at the cap renders every id with no overflow suffix — elided > 0, not >= 0")
+    func exactlyAtCapRendersNoOverflowSuffix() {
+        let cap = SyncConfig.upsertInsertedIdLogCap
+        let ids = (0..<cap).map { "hdr-\($0)" }
+        let summary = SyncEngine.upsertInsertedIdSummary(ids)
+        #expect(summary == "inserted \(cap) header(s): " + ids.joined(separator: ","))
+        #expect(!summary.contains("more)"),
+                "exactly-cap must not trigger the overflow suffix: \(summary)")
+    }
+
+    @Test("Over the cap renders exactly cap ids and states the elided remainder arithmetically")
+    func overCapElidesAndStatesRemainderArithmetically() {
+        let cap = SyncConfig.upsertInsertedIdLogCap
+        let extra = 7
+        let total = cap + extra
+        let ids = (0..<total).map { "hdr-\($0)" }
+        let summary = SyncEngine.upsertInsertedIdSummary(ids)
+
+        let prefixLabel = "inserted \(total) header(s): "
+        #expect(summary.hasPrefix(prefixLabel), "total must be stated exactly: \(summary)")
+        guard summary.hasPrefix(prefixLabel) else { return }
+        let remainder = summary.dropFirst(prefixLabel.count)
+
+        guard let overflowRange = remainder.range(of: " (+") else {
+            Issue.record("missing overflow suffix in: \(summary)")
+            return
+        }
+        let renderedIdsJoined = remainder[remainder.startIndex..<overflowRange.lowerBound]
+        let renderedIds = renderedIdsJoined.isEmpty
+            ? [] : renderedIdsJoined.split(separator: ",").map(String.init)
+        #expect(renderedIds.count == cap, "exactly cap ids must render: got \(renderedIds.count)")
+        #expect(renderedIds == Array(ids.prefix(cap)))
+
+        let suffix = remainder[overflowRange.lowerBound...]
+        guard suffix.hasSuffix(" more)") else {
+            Issue.record("overflow suffix malformed: \(suffix)")
+            return
+        }
+        let digits = suffix.dropFirst(" (+".count).dropLast(" more)".count)
+        guard let elidedFromString = Int(digits) else {
+            Issue.record("overflow count not parseable: \(suffix)")
+            return
+        }
+        // Arithmetic, not a hardcoded literal: whatever the elided count says,
+        // it must exactly account for what the cap left out — this must hold
+        // regardless of what `extra` above is set to.
+        #expect(elidedFromString + cap == total,
+                "elided(\(elidedFromString)) + cap(\(cap)) must equal total(\(total))")
+    }
+}
+
+// MARK: - A3.6: full-sync upsert diagnostic — real runSyncMessages, [MoveTrace] queue line
+
+/// Drives the REAL `SyncEngine.runSyncMessages` end to end (real DB, real
+/// `AppLogStore`/`DebugModeManager` gate) to pin the debug-gated
+/// `[MoveTrace] fullSync upsert[...]` diagnostic that `SyncEngineFullSync.swift`
+/// writes via `BackgroundSyncLogger.logQueue` — the `.queue` channel line this
+/// round added alongside `SyncEngine.upsertInsertedIdSummary`.
+///
+/// `.serialized, .processGlobalState`: every test here rebinds the same
+/// process globals `AppLogStoreTests` and `AccountManagerQueueDrainTests` do
+/// (`AppLogStore.fileURLOverride`, `DebugModeManager.loggingEnabledOverrideForTesting`).
+@Suite("SyncEngine full-sync upsert diagnostic — [MoveTrace] fullSync upsert", .serialized, .processGlobalState)
+struct SyncEngineFullSyncUpsertDiagnosticTests {
+
+    private func makePool() throws -> (DatabasePool, URL) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path)
+        try AppDatabase.runMigrations(on: pool)
+        return (pool, dir)
+    }
+
+    /// Redirect the single app log at a private temp file and force the
+    /// runtime debug gate for the duration of `body`, then restore both
+    /// unconditionally. Async-safe form of `AppLogStoreTests`' synchronous
+    /// `withTempLog`/`withDebugLogging` pair (that helper's `body` is
+    /// `() throws -> T`, not `async`, so it cannot wrap the `async throws`
+    /// bodies below) — mirrors the setup/`defer` shape in
+    /// `AccountManagerQueueDrainTests.drainLaneInstrumentationIsReadableFromTheExportedLog`.
+    private func withTempLogAndDebugGate<T>(
+        enabled: Bool, _ body: () async throws -> T
+    ) async throws -> T {
+        let logDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fullsync_upsert_log_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        AppLogStore.fileURLOverride.withLock { $0 = logDir.appendingPathComponent("tabmail.log") }
+        DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = enabled }
+        defer {
+            DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil }
+            AppLogStore._resetForTesting()
+            try? FileManager.default.removeItem(at: logDir)
+        }
+        return try await body()
+    }
+
+    /// Insert an account + one inbox folder named `folderName`, feed the mock
+    /// `count` distinct brand-new remote messages (empty local DB — every one
+    /// is an INSERT, so the diagnostic's `!newHeaders.isEmpty` gate always
+    /// opens), and drive the REAL `SyncEngine.runSyncMessages`.
+    private func runFullSyncUpsert(
+        pool: DatabasePool, accountId: String, folderName: String, count: Int
+    ) async throws -> (result: SyncEngine.SyncMessagesResult, expectedIds: [String]) {
+        let folderPath = "INBOX"
+        try await pool.write { db in
+            var acc = Account(emailAddress: "\(accountId)@example.com", displayName: "T", provider: .imap)
+            acc.id = accountId
+            try acc.insert(db)
+            try Folder(name: folderName, path: folderPath, role: .inbox, accountId: accountId).insert(db)
+        }
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "\(accountId):\(folderPath)")! }
+
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let expectedIds = (0..<count).map { "\(accountId):\(folderPath):hdr-\($0)" }
+        let remoteMessages = (0..<count).map { i in
+            makeHeaderInfo(
+                messageId: "hdr-\(i)", rfc822MessageId: "<hdr-\(i)@example.com>",
+                date: date.addingTimeInterval(Double(i)))
+        }
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult(remoteMessages)
+
+        let result = try await SyncEngine.runSyncMessages(
+            for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
+            dbPool: PrioritizedDatabase(pool: pool))
+        return (result, expectedIds)
+    }
+
+    /// Every `[MoveTrace] fullSync upsert[<folderName>] — …` entry on the
+    /// `.queue` channel, with `AppLogStore.append`'s `[<ts>] [QUEUE] ` prefix
+    /// stripped so assertions compare against exactly what the call site
+    /// built (the timestamp is non-deterministic and not part of the
+    /// contract under test).
+    private func moveTraceUpsertBodies(in queueLog: String, folderName: String) -> [String] {
+        let marker = "[MoveTrace] fullSync upsert[\(folderName)] — "
+        return queueLog
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .compactMap { line -> String? in
+                guard let range = line.range(of: marker) else { return nil }
+                return String(line[range.lowerBound...])
+            }
+    }
+
+    /// One `[MoveTrace] fullSync upsert[...]` body, decomposed. Independent of
+    /// `SyncEngine.upsertInsertedIdSummary`'s own implementation — it PARSES
+    /// the rendered text rather than recomputing the formula, so a fix that
+    /// changed the formula but kept the observable text would still be
+    /// caught by these structural assertions.
+    private struct ParsedUpsertLine {
+        let total: Int
+        let renderedIds: [String]
+        /// nil when the line carries no `(+N more)` suffix at all.
+        let elided: Int?
+    }
+
+    private func parseUpsertBody(_ body: String) -> ParsedUpsertLine? {
+        guard let insertedRange = body.range(of: "inserted ") else { return nil }
+        let afterInserted = body[insertedRange.upperBound...]
+        guard let headerRange = afterInserted.range(of: " header(s): ") else { return nil }
+        guard let total = Int(afterInserted[afterInserted.startIndex..<headerRange.lowerBound]) else { return nil }
+        var rest = afterInserted[headerRange.upperBound...]
+        var elided: Int?
+        if let overflowRange = rest.range(of: " (+") {
+            let suffix = rest[overflowRange.lowerBound...]
+            guard suffix.hasSuffix(" more)") else { return nil }
+            let digits = suffix.dropFirst(" (+".count).dropLast(" more)".count)
+            elided = Int(digits)
+            rest = rest[rest.startIndex..<overflowRange.lowerBound]
+        }
+        let renderedIds = rest.isEmpty ? [] : rest.split(separator: ",").map(String.init)
+        return ParsedUpsertLine(total: total, renderedIds: renderedIds, elided: elided)
+    }
+
+    // MARK: - Under / at the cap
+
+    @Test("Single inserted header — exact total, id and DB row; no overflow suffix")
+    func fullSyncUpsertLogsSingleInsertedHeader() async throws {
+        try await withTempLogAndDebugGate(enabled: true) {
+            let (pool, dir) = try makePool()
+            defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+            let accountId = "upsert-one"
+            let folderName = "OneHeaderFolder"
+            let (result, expectedIds) = try await runFullSyncUpsert(
+                pool: pool, accountId: accountId, folderName: folderName, count: 1)
+            #expect(result.newHeaders.count == 1)
+            guard result.newHeaders.count == 1 else { return }
+
+            let queueLog = AppLogStore.read(channel: .queue)
+            let bodies = moveTraceUpsertBodies(in: queueLog, folderName: folderName)
+            #expect(bodies.count == 1, "expected exactly one matching entry, got: \(bodies)")
+            guard bodies.count == 1, let parsed = parseUpsertBody(bodies[0]) else { return }
+
+            #expect(parsed.total == 1)
+            #expect(parsed.renderedIds == expectedIds)
+            #expect(parsed.elided == nil, "a single inserted header must render no overflow suffix")
+
+            let dbIds = try await pool.read {
+                try MessageHeader.filter(Column("folderId") == "\(accountId):INBOX").fetchAll($0).map(\.id)
+            }
+            #expect(Set(dbIds) == Set(expectedIds))
+        }
+    }
+
+    @Test("Exactly cap inserted headers — every id rendered, no overflow suffix (elided > 0, not >= 0)")
+    func fullSyncUpsertLogsExactlyCapInsertedHeadersNoOverflow() async throws {
+        try await withTempLogAndDebugGate(enabled: true) {
+            let (pool, dir) = try makePool()
+            defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+            let accountId = "upsert-atcap"
+            let folderName = "AtCapFolder"
+            let cap = SyncConfig.upsertInsertedIdLogCap
+            let (result, expectedIds) = try await runFullSyncUpsert(
+                pool: pool, accountId: accountId, folderName: folderName, count: cap)
+            #expect(result.newHeaders.count == cap)
+            guard result.newHeaders.count == cap else { return }
+
+            let queueLog = AppLogStore.read(channel: .queue)
+            let bodies = moveTraceUpsertBodies(in: queueLog, folderName: folderName)
+            #expect(bodies.count == 1, "expected exactly one matching entry, got: \(bodies)")
+            guard bodies.count == 1, let parsed = parseUpsertBody(bodies[0]) else { return }
+
+            #expect(parsed.total == cap)
+            #expect(parsed.renderedIds == expectedIds)
+            #expect(parsed.elided == nil, "exactly-cap must not trigger the overflow suffix")
+
+            let dbIds = try await pool.read {
+                try MessageHeader.filter(Column("folderId") == "\(accountId):INBOX").fetchAll($0).map(\.id)
+            }
+            #expect(Set(dbIds) == Set(expectedIds))
+        }
+    }
+
+    // MARK: - Over the cap — rule 11's DB half
+
+    @Test("Cap+1 inserted headers — the log line elides the last id; the DB still holds all cap+1 rows")
+    func fullSyncUpsertLogsCapPlusOneElidesLastIdButDBHoldsAll() async throws {
+        try await withTempLogAndDebugGate(enabled: true) {
+            let (pool, dir) = try makePool()
+            defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+            let accountId = "upsert-overcap"
+            let folderName = "OverCapFolder"
+            let cap = SyncConfig.upsertInsertedIdLogCap
+            let count = cap + 1
+            let (result, expectedIds) = try await runFullSyncUpsert(
+                pool: pool, accountId: accountId, folderName: folderName, count: count)
+            #expect(result.newHeaders.count == count)
+            guard result.newHeaders.count == count else { return }
+
+            let queueLog = AppLogStore.read(channel: .queue)
+            let bodies = moveTraceUpsertBodies(in: queueLog, folderName: folderName)
+            #expect(bodies.count == 1, "expected exactly one matching entry, got: \(bodies)")
+            guard bodies.count == 1, let parsed = parseUpsertBody(bodies[0]) else { return }
+
+            #expect(parsed.total == count)
+            #expect(parsed.renderedIds.count == cap)
+            #expect(parsed.renderedIds == Array(expectedIds.prefix(cap)))
+            guard let elided = parsed.elided else {
+                Issue.record("cap+1 inserted headers must render an overflow suffix — got: \(bodies[0])")
+                return
+            }
+            // Arithmetic, not a hardcoded literal — whatever the line says was
+            // elided must exactly account for what the cap left out.
+            #expect(elided + cap == count)
+
+            let elidedId = expectedIds[cap] // the one id past the cap, in insertion order
+            #expect(!bodies[0].contains(elidedId),
+                    "the DISPLAY cap must elide this id from the log line")
+
+            // Rule 11's DB half: the display cap never truncates the STORED
+            // copy — every one of the cap+1 rows, including the elided id, is
+            // a durable, independently-fetched DB row.
+            let dbIds = try await pool.read {
+                try MessageHeader.filter(Column("folderId") == "\(accountId):INBOX").fetchAll($0).map(\.id)
+            }
+            #expect(Set(dbIds) == Set(expectedIds))
+            #expect(dbIds.contains(elidedId),
+                    "the elided-from-the-log id must still be a durable DB row")
+        }
+    }
+
+    // MARK: - Two-sided non-vacuity: the gate, not an absent sync
+
+    @Test("Debug gate closed — no [MoveTrace] fullSync upsert line reaches the queue channel, though the sync itself still ran")
+    func fullSyncUpsertDiagnosticAbsentWhenGateClosed() async throws {
+        try await withTempLogAndDebugGate(enabled: false) {
+            let (pool, dir) = try makePool()
+            defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+            let accountId = "upsert-gated"
+            let folderName = "GatedUpsertFolder"
+            let (result, expectedIds) = try await runFullSyncUpsert(
+                pool: pool, accountId: accountId, folderName: folderName, count: 3)
+            #expect(result.newHeaders.count == 3)
+
+            let queueLog = AppLogStore.read(channel: .queue)
+            #expect(moveTraceUpsertBodies(in: queueLog, folderName: folderName).isEmpty,
+                    "a gate-closed sync must not write the diagnostic: \(queueLog)")
+            #expect(!queueLog.contains(folderName),
+                    "the folder's unique marker must not reach the queue channel while the gate is closed")
+
+            // Non-vacuity: the sync really ran and really inserted rows — the
+            // silence above is the closed gate, not an absent sync.
+            let dbIds = try await pool.read {
+                try MessageHeader.filter(Column("folderId") == "\(accountId):INBOX").fetchAll($0).map(\.id)
+            }
+            #expect(Set(dbIds) == Set(expectedIds))
+        }
+    }
+}

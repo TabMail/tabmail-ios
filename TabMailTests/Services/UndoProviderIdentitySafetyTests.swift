@@ -38,7 +38,12 @@ private actor UndoWriteGate {
     }
 }
 
-@Suite("Undo provider identity safety", .processGlobalState)
+// A3.4: `queuedInverseDiagnosticCorrelatesWithTheInsertedRow` below redirects
+// `AppLogStore.fileURLOverride` and forces
+// `DebugModeManager.loggingEnabledOverrideForTesting` — process-global seams
+// (mirrors `AccountManagerQueueDrainTests`/`AppLogStoreTests`) — so the suite
+// now also carries `.serialized` alongside the pre-existing `.processGlobalState`.
+@Suite("Undo provider identity safety", .serialized, .processGlobalState)
 struct UndoProviderIdentitySafetyTests {
     private struct Fixture {
         let pool: DatabasePool
@@ -884,5 +889,162 @@ struct UndoProviderIdentitySafetyTests {
         #expect(result.1?.actionTag == nil, "the unrelated destination row stays byte-for-byte locally moved")
         #expect(result.2.count == 1)
         #expect(result.2.first?.messageIds == ["graph-801"])
+    }
+
+    // MARK: - A3.4: the `phase=queuedInverse` diagnostic correlates with the durable row
+
+    /// The `.inbox`-channel entry MESSAGES — the `] [INBOX] ` head stripped —
+    /// the same shape `AccountManagerQueueDrainTests.queueEntryMessages` uses
+    /// for `.queue`. A physical line with no entry head is dropped: nothing
+    /// this scenario writes emits a continuation line, and treating one as an
+    /// entry would make a field-split depend on text that is not one.
+    private static func inboxEntryMessages(in log: String) -> [String] {
+        let head = "] [\(AppLogChannel.inbox.tag)] "
+        return log.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line in
+            guard line.hasPrefix("["), let range = line.range(of: head) else { return nil }
+            return String(line[range.upperBound...])
+        }
+    }
+
+    /// Every `phase=queuedInverse` line's fields, split on spaces and keyed by
+    /// the text before each token's `=` — never string-containment on the
+    /// whole rendered sentence, so a wrong `from`/`to`, a mismatched `opId`,
+    /// or a re-stamped `createdAt` cannot hide behind a `contains` that a
+    /// wrong render would still satisfy.
+    private static func queuedInverseFieldSets(in log: String) -> [[String: String]] {
+        inboxEntryMessages(in: log).compactMap { line -> [String: String]? in
+            let tokens = line.split(separator: " ")
+            guard tokens.count > 2,
+                  tokens[0] == "[RoleActionTrace]",
+                  tokens[1] == "manager.undoMove",
+                  tokens[2] == "phase=queuedInverse"
+            else { return nil }
+            var fields: [String: String] = [:]
+            for token in tokens[3...] {
+                guard let eq = token.firstIndex(of: "=") else { continue }
+                fields[String(token[token.startIndex..<eq])] = String(token[token.index(after: eq)...])
+            }
+            return fields
+        }
+    }
+
+    /// GRDB's `.datetime` column stores `Date` as TEXT
+    /// `"yyyy-MM-dd HH:mm:ss.SSS"` — millisecond precision
+    /// (`GRDB/Core/Support/Foundation/Date.swift`) — so a `PendingOperation`
+    /// row fetched AFTER its insert commits has necessarily dropped whatever
+    /// sub-millisecond digits `Date()` produced when `inverseOp` was
+    /// constructed. Comparing at millisecond granularity is EXACT at the
+    /// precision the row can actually persist; a bit-for-bit `Double`
+    /// comparison against the pre-round-trip value would fail on entirely
+    /// correct code every time "now" does not land on an exact millisecond
+    /// boundary — which is effectively always.
+    private static let createdAtMillisecondTolerance = 0.001
+
+    @Test("Undo of a completed stable-provider move logs phase=queuedInverse with opId/createdAt correlated to the inserted row, and stays silent when debug logging is locked")
+    @MainActor
+    func queuedInverseDiagnosticCorrelatesWithTheInsertedRow() async throws {
+        let fixture = try install(provider: .gmail)
+        defer { uninstall(fixture) }
+
+        // Redirect the shared app log to a private temp file for the duration
+        // of this test — a process-global seam (mirrors
+        // `AccountManagerQueueDrainTests.drainLaneInstrumentationIsReadableFromTheExportedLog`
+        // and `AppLogStoreTests.withTempLog`/`withDebugLogging`). Both
+        // overrides are restored unconditionally.
+        let logDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("undoqueuedinverselog_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        AppLogStore.fileURLOverride.withLock { $0 = logDir.appendingPathComponent("tabmail.log") }
+        defer {
+            DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil }
+            AppLogStore._resetForTesting()
+            try? FileManager.default.removeItem(at: logDir)
+        }
+
+        // ---- Gate OPEN ----------------------------------------------------
+        // Same shape as `completedStableProviderUndo`: a Gmail (stable-id,
+        // non-IMAP) account with no active queued/in-flight move for this
+        // message, so `undoMove` takes the "completed forward, ordinary
+        // inverse" branch and reaches `phase=queuedInverse` — never the
+        // `annihilate`/`deferBehindInFlight` branches, which log a different
+        // phase and insert no row.
+        DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
+        let unlockedProviderId = "gmail-queuedinverse-unlocked"
+        let unlockedOriginal = sourceHeader(
+            fixture, providerId: unlockedProviderId,
+            rfc: "queuedinverse-unlocked@example.com", sourceEpoch: nil)
+        try installOptimisticallyMoved(unlockedOriginal, pool: fixture.pool)
+
+        await AccountManager.shared.undoDestructiveAction(
+            [unlockedOriginal], accountId: fixture.accountId, originalOpType: .move,
+            fromFolderPath: "Archive", toFolderPath: "INBOX", toFolderId: "\(fixture.accountId):INBOX"
+        )
+
+        // Non-vacuity: the fixture really produced a durable inverse row and
+        // the optimistic local restoration, so the log assertions below
+        // describe a scenario that actually queued something rather than a
+        // silently-refused undo.
+        let unlockedState = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: unlockedOriginal.id), try PendingOperation.fetchAll(db))
+        }
+        #expect(unlockedState.0?.folderPath == "INBOX",
+                "the optimistic local restoration must be durable, or the log line describes nothing real")
+        let unlockedOps = unlockedState.1.filter { $0.messageIds == [unlockedProviderId] }
+        #expect(unlockedOps.count == 1,
+                "exactly one inverse PendingOperation must have been queued for this scenario")
+        guard unlockedOps.count == 1, let inverseRow = unlockedOps.first else { return }
+        #expect(inverseRow.folderPath == "Archive")
+        #expect(inverseRow.destinationPath == "INBOX")
+
+        let unlockedLog = AppLogStore.read(channel: .inbox)
+        let matches = Self.queuedInverseFieldSets(in: unlockedLog).filter {
+            $0["providerIds"] == "[\(unlockedProviderId)]"
+        }
+        #expect(matches.count == 1,
+                "exactly one phase=queuedInverse line for this scenario, got \(matches.count):\n\(unlockedLog)")
+        guard matches.count == 1, let fields = matches.first else { return }
+        #expect(fields["from"] == "Archive")
+        #expect(fields["to"] == "INBOX")
+        #expect(fields["opId"] == inverseRow.id,
+                "opId= must equal the inserted row's id exactly")
+        let loggedCreatedAt: Double? = fields["createdAt"].flatMap { Double($0) }
+        #expect(loggedCreatedAt != nil,
+                "createdAt= did not parse as a Double: \(fields["createdAt"] ?? "<missing>")")
+        if let loggedCreatedAt {
+            #expect(abs(loggedCreatedAt - inverseRow.createdAt.timeIntervalSince1970) < Self.createdAtMillisecondTolerance,
+                    "createdAt=\(loggedCreatedAt) does not correlate with the inserted row's createdAt=\(inverseRow.createdAt.timeIntervalSince1970)")
+        }
+
+        // ---- Gate CLOSED (two-sided non-vacuity) ---------------------------
+        AppLogStore.clear()
+        DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = false }
+        let lockedProviderId = "gmail-queuedinverse-locked"
+        let lockedOriginal = sourceHeader(
+            fixture, providerId: lockedProviderId,
+            rfc: "queuedinverse-locked@example.com", sourceEpoch: nil)
+        try installOptimisticallyMoved(lockedOriginal, pool: fixture.pool)
+
+        await AccountManager.shared.undoDestructiveAction(
+            [lockedOriginal], accountId: fixture.accountId, originalOpType: .move,
+            fromFolderPath: "Archive", toFolderPath: "INBOX", toFolderId: "\(fixture.accountId):INBOX"
+        )
+
+        // Non-vacuity for THIS half: the locked-gate scenario also really
+        // queued its own inverse row and restored the header, so the silence
+        // below is the gate rather than an undo that never ran.
+        let lockedState = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: lockedOriginal.id), try PendingOperation.fetchAll(db))
+        }
+        #expect(lockedState.0?.folderPath == "INBOX",
+                "the locked-gate undo never restored the row — its silence proves nothing")
+        let lockedOps = lockedState.1.filter { $0.messageIds == [lockedProviderId] }
+        #expect(lockedOps.count == 1,
+                "the locked-gate undo never queued its inverse — its silence proves nothing")
+
+        let lockedLog = AppLogStore.read(channel: .inbox)
+        #expect(!lockedLog.contains(lockedProviderId),
+                "the .inbox channel persisted content for the locked-gate undo: \(lockedLog)")
+        #expect(Self.queuedInverseFieldSets(in: lockedLog).isEmpty,
+                "a phase=queuedInverse line survived the closed debug gate: \(lockedLog)")
     }
 }

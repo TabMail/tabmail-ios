@@ -160,9 +160,21 @@ struct QueueCoreInvariantTests {
     // bystander's `markRead` never reaches the provider and its durable row is
     // still queued after the drain.
 
-    @Test("a permanently evidence-refused op on (INBOX, 77) does not starve an unrelated message at (Archive, 77)")
-    func laneHaltInOneFolderDoesNotStarveTheSameUidInAnother() async throws {
-        let fixture = try fixture(accountId: "acc-queue-001-bystander")
+    // A3.1: parameterized over BOTH mailbox-local providers. The lane key is
+    // folder-qualified for every account ABSENT from
+    // `AccountManager.immutableIdAccountIds` (which admits only `.gmail` and the
+    // demo account), so `.imap` and `.icloud` must classify identically here —
+    // an iCloud UID is just as mailbox-local as an IMAP one. A mutation that
+    // admitted `.icloud` into the account-qualified set would be invisible to an
+    // `.imap`-only fixture, because `.imap` alone still exercises the "folder is
+    // part of the address" branch of `buildLanes` and this test would stay green.
+    // The exact-set oracle for the classifier itself lives in
+    // `AccountManagerQueueDrainTests.immutableIdAccountIdsAdmitsOnlyGmailAndTheDemoAccount`.
+    @Test("a permanently evidence-refused op on (INBOX, 77) does not starve an unrelated message at (Archive, 77)",
+          arguments: [AccountProvider.imap, .icloud])
+    func laneHaltInOneFolderDoesNotStarveTheSameUidInAnother(accountProvider: AccountProvider) async throws {
+        let fixture = try fixture(
+            accountId: "acc-queue-001-bystander-\(accountProvider.rawValue)", provider: accountProvider)
         defer { finish(fixture) }
 
         let provider = MockEmailProvider()

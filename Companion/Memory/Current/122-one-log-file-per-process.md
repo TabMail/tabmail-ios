@@ -77,8 +77,16 @@ not by the author. The honest statement is two-sided:
   report actually needs. The thirteen formerly byte-capped channels (ten debug-gated plus the
   always-on `.sync`, `.error` and `.chatError`) therefore have a **narrower guarantee** than before,
   and the two ring-retained files have **no floor at all** rather than a larger one. ⚠️ "13 debug
-  channels" was wrong: the gating split is FIVE always-on to TEN debug-gated, which does not line up
-  with the thirteen-byte-capped grouping.
+  channels" was wrong: at consolidation the gating split was FIVE always-on to TEN debug-gated, which
+  does not line up with the thirteen-byte-capped grouping.
+  ⚠️ **The channel count is NOT frozen at fifteen — it is now SIXTEEN, split FIVE always-on to ELEVEN
+  debug-gated.** `.queue` (tag `QUEUE`, written only by `BackgroundSyncLogger.logQueue`) was added
+  2026-09-04 for `IOS-QUEUE-008`, so the action-queue drain lines and the sync-side `[MoveTrace]`
+  move-convergence lines — which must interleave in ONE ordered artifact to reconstruct a lane race —
+  stop riding the always-on `.sync` channel. **Do not read "fifteen" in this topic as a channel
+  count.** Every other "fifteen" here counts the fifteen replaced log FILES, a closed historical set
+  that does not grow when a channel is added; the two numbers were equal for exactly as long as no
+  channel had been added since consolidation, which is why they are easy to conflate.
 - **Gained: a much larger shared budget**, which for any single channel in ordinary use is more
   headroom than its old per-file cap gave it.
 

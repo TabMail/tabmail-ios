@@ -1556,3 +1556,380 @@ struct ProviderIdQueueFuzzTests {
         }
     }
 }
+
+// MARK: - A3.2 — stable-id (Gmail) lane fuzzer, Testing Rule 11
+//
+// Everything above this line exercises `.imap` fixtures only, and every
+// planned gesture in `providerIdQueueFuzz` targets a DIFFERENT uid — so that
+// fuzzer never creates an immutable-id account and never creates two
+// cross-folder ops naming ONE provider resource. Reverting only the
+// immutable-id arm of `AccountManagerQueue.buildLanes`'s `laneKey`
+// (folder-qualifying it unconditionally) therefore leaves the whole suite
+// above green. This extension closes that gap.
+//
+// ## The invariant under test
+//
+// `buildLanes(_:immutableIdAccountIds:)` keys an account whose provider id is
+// NEVER reallocated by `"accountId:msgId"` — folder deliberately EXCLUDED,
+// because such an id is folder-independent. Everything else — IMAP, iCloud,
+// AND Outlook — keys `"accountId:folderPath:msgId"`, the same folder-local
+// key IMAP always used; that is the SAFE DEFAULT. Outlook is deliberately on
+// the folder-qualified (safe-default) side despite being a "stable id"
+// provider: Microsoft Graph's default message ids are REALLOCATED on every
+// move (`IOS-GRAPH-002`; this tree sends no `Prefer: IdType="ImmutableId"`),
+// so account-qualifying Outlook would make an INHERITED race deterministic —
+// a follower op queued before an in-flight move would be guaranteed to run
+// AFTER it, against an id the move just invalidated, 404, and the conflict
+// arm would delete the follower (a dropped intention). Only Gmail (and the
+// demo account, `DemoSeed.demoAccountId`, stored as `.imap` but carved out
+// the same way admission already does) get genuinely immutable ids.
+//
+// `IOS-QUEUE-008`: on Gmail, delete → undo → re-delete produced
+// `TRASH→INBOX` and `INBOX→TRASH` on ONE message; under a uniformly
+// folder-qualified key they land in different connected components,
+// `drainPendingQueue` launches one Task per lane CONCURRENTLY, and the
+// inverse can finish last — the deleted message reappears. See
+// `AccountManagerQueueDrainTests
+// .drainPendingQueueRealStableIdSameMessageOpsNeverOverlapAndRunInIssueOrder`,
+// the deterministic pin this fuzzer generalizes with seeded adversarial
+// scheduling and a retryable fault.
+//
+// ## ACCEPTANCE BAR (Testing Rule 11)
+//
+// With the immutable-id arm of `buildLanes`'s local `laneKey` reverted —
+//     func laneKey(_ op: PendingOperation, _ id: String) -> String {
+//         immutableIdAccountIds.contains(op.accountId)
+//             ? "\(op.accountId):\(id)"
+//             : "\(op.accountId):\(op.folderPath):\(id)"
+//     }
+// → body replaced with the unconditional `"\(op.accountId):\(op.folderPath):\(id)"`
+// — `stableIdQueueLaneFuzz` must fail on its wire oracle (`overlapped` — two
+// `move()` calls for one `(account, id)` observed concurrently), independent
+// of scheduling luck: the two target ops land in different lanes, each lane
+// is its own concurrently-launched Task, and the hook's own bounded window
+// makes a genuine overlap provable rather than merely likely. The failure
+// message embeds the replay seed (`seedHex`, `0x…`) and round index, exactly
+// like every other assertion in this file — reproduce with
+// `QUEUE_FUZZ_REPLAY_SEED=0x… xcodebuild test …` (`TEST_RUNNER_` prefix on
+// the CLI; see `FuzzConfig`'s doc comment above).
+extension ProviderIdQueueFuzzTests {
+
+    // MARK: - Config
+
+    /// Tunables for the stable-id lane fuzzer, kept separate from the
+    /// IMAP-shaped `FuzzConfig` above (which this extension still reuses for
+    /// `seeds`/`rounds` — same knobs, same spelling, same env vars).
+    private enum StableFuzzConfig {
+        /// How long the move-hook's wire oracle holds its window open after
+        /// its own seeded chaos park. `ChaosScheduler.point()` is a NO-OP
+        /// ~20% of the time (its `roll(100) < 80` guard), so relying on it
+        /// alone would make overlap detection a matter of luck. This widens
+        /// the window deterministically, mirroring
+        /// `AccountManagerQueueDrainTests`'s fixed 250ms wire-oracle sleep —
+        /// shorter here because at most one pair of moves is ever in flight
+        /// per round (kept the default-runtime bound tight).
+        static let moveOverlapWindowMs = 80
+        /// How long a `.transientThenClears` fault stays armed before a
+        /// background task clears it. Deliberately LARGER than
+        /// `moveOverlapWindowMs` so the FIRST attempt's hook completes and
+        /// the throw-check still sees the fault armed — otherwise the fault
+        /// could clear mid-hook and the "retryable failure" would never
+        /// actually manifest as one.
+        static let transientFaultClearDelayMs = 150
+        /// Bystander count range (inclusive), seeded per round.
+        static let bystanderCountMin = 2
+        static let bystanderCountRange = 3 // picks 0..<3, so count is 2...4
+    }
+
+    /// A retryable fault injected on the target id's `move()` calls for some
+    /// rounds (Testing Rule 11(a) — seeded fault injection).
+    private enum StableFaultMode: Sendable {
+        /// No fault this round.
+        case none
+        /// Armed at round start, cleared by a background task after
+        /// `transientFaultClearDelayMs` — models a connectivity blip that
+        /// resolves before the user would notice, so the round must still
+        /// fully CONVERGE.
+        case transientThenClears
+        /// Armed and never cleared this round — the queue must NOT drop the
+        /// intention; it must retain EXACTLY the retry state the failure
+        /// justifies (one attempted-and-failed op, one halted-ahead-of-it
+        /// op, both still durably queued).
+        case permanentThisRound
+    }
+
+    private struct StableIdFixture {
+        let pool: DatabasePool
+        let directory: URL
+        let previous: AppDatabase?
+        let inbox: Folder
+        let trash: Folder
+    }
+
+    /// Mirrors `ProviderIdQueueFuzzTests.makeFixture`, parameterized by
+    /// `AccountProvider` (that one hardcodes `.imap`) and by folder shape
+    /// (INBOX + TRASH, the two folders a delete/undo/re-delete cycle
+    /// addresses, rather than INBOX + Archive).
+    private func makeStableIdFixture(accountId: String, provider: AccountProvider) throws -> StableIdFixture {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration
+        )
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prior = current
+            current = appDatabase
+            return prior
+        }
+        var account = Account(emailAddress: "\(accountId)@example.com", displayName: "Test", provider: provider)
+        account.id = accountId
+        let inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId)
+        let trash = Folder(name: "TRASH", path: "TRASH", role: .trash, accountId: accountId)
+        try pool.writeWithoutTransaction { db in
+            try account.insert(db)
+            try inbox.insert(db)
+            try trash.insert(db)
+        }
+        return StableIdFixture(pool: pool, directory: directory, previous: previous, inbox: inbox, trash: trash)
+    }
+
+    /// Mirrors `ProviderIdQueueFuzzTests.restore` exactly (same overlay/NSE
+    /// bridge reset, same `InstalledTestDatabaseLifetime.finish` retention
+    /// rationale — the drain fires unstructured background Tasks that can
+    /// outlive the round, so no earlier boundary can safely close the pool).
+    private func restoreStableIdFixture(_ fixture: StableIdFixture) {
+        let snapshot = AccountManager.shared.snapshotOverlay()
+        AccountManager.shared.removeOverlayEntries(ids: Array(snapshot.keys))
+        NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+        NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
+        InstalledTestDatabaseLifetime.finish(
+            previous: fixture.previous,
+            pool: fixture.pool,
+            directory: fixture.directory
+        )
+    }
+
+    // MARK: - The fuzz test
+
+    @Test(
+        "A3.2: on a Gmail (immutable-id) account, cross-folder gestures on ONE message never overlap on the wire, land in createdAt order, the latest destination wins, disjoint work still converges, and a retryable fault yields exactly the retry state it justifies (Testing Rule 11)",
+        arguments: FuzzConfig.seeds
+    )
+    @MainActor
+    func stableIdQueueLaneFuzz(seed: UInt64) async throws {
+        let seedHex = "0x" + String(seed, radix: 16)
+        var rng = SplitMix64(seed: seed ^ 0xB1AB_0000_0000_0001)
+        // Same class, same shape as `ProviderIdQueueFuzzTests.ChaosScheduler`
+        // usage above — a distinct seed derivation only so this round's
+        // parking sequence doesn't shadow the IMAP round's.
+        let chaos = ChaosScheduler(seed: seed ^ 0xB1AB_79B9_7F4A_7C15)
+
+        for round in 0..<FuzzConfig.rounds {
+            // GMAIL ONLY — deliberately not `.outlook`. Microsoft Graph's
+            // default message ids are REALLOCATED on every move
+            // (`IOS-GRAPH-002`), so Outlook stays on the folder-qualified
+            // (safe-default) side of `buildLanes`; a serialization round for
+            // it would bless an inherited race rather than prove this one.
+            let provider: AccountProvider = .gmail
+            let faultMode: StableFaultMode
+            switch rng.pick(3) {
+            case 0: faultMode = .none
+            case 1: faultMode = .transientThenClears
+            default: faultMode = .permanentThisRound
+            }
+            let bystanderCount = StableFuzzConfig.bystanderCountMin + rng.pick(StableFuzzConfig.bystanderCountRange)
+
+            let accountId = "stablefuzz-\(String(seed, radix: 16))-r\(round)-\(UUID().uuidString)"
+            let fixture = try makeStableIdFixture(accountId: accountId, provider: provider)
+            defer { restoreStableIdFixture(fixture) }
+
+            let mockProvider = MockEmailProvider()
+
+            // ---- The race: an undo inverse (TRASH→INBOX) and a re-delete
+            // (INBOX→TRASH) of the SAME stable id, exactly the IOS-QUEUE-008
+            // shape — "two or more cross-folder gestures on ONE stable id".
+            let targetId = "stablefuzz-target-\(UUID().uuidString)"
+            let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
+            // Bound with `let` (built inside an immediately-applied closure
+            // because `createdAt` is set after init): these are captured by the
+            // `@Sendable` drain closure below, and Swift 6 rejects capturing a
+            // `var` in concurrently-executing code.
+            let opInverse: PendingOperation = {
+                var op = PendingOperation(
+                    type: .move, messageIds: [targetId], accountId: accountId,
+                    folderPath: fixture.trash.path, destinationPath: fixture.inbox.path)
+                op.createdAt = t0
+                return op
+            }()
+            let opRedelete: PendingOperation = {
+                var op = PendingOperation(
+                    type: .move, messageIds: [targetId], accountId: accountId,
+                    folderPath: fixture.inbox.path, destinationPath: fixture.trash.path)
+                op.createdAt = t0.addingTimeInterval(1)
+                return op
+            }()
+
+            // ---- Disjoint bystander work — different ids, different lanes,
+            // no fault — proves the target lane's fencing/fault never
+            // strands unrelated intentions on the same account.
+            // Same reason as `opInverse`/`opRedelete` above — captured by the
+            // concurrent closure, so both must be `let` by the time they are.
+            // `bystanderIds` is DERIVED from the ops rather than accumulated in
+            // parallel, so the two can never disagree about membership.
+            let bystanderOps: [PendingOperation] = (0..<bystanderCount).map { index in
+                let bystanderId = "stablefuzz-bystander-\(index)-\(UUID().uuidString)"
+                let type: OperationType = index.isMultiple(of: 2) ? .markRead : .markFlagged
+                return PendingOperation(
+                    type: type, messageIds: [bystanderId], accountId: accountId,
+                    folderPath: fixture.inbox.path)
+            }
+            let bystanderIds: [String] = bystanderOps.compactMap(\.messageIds.first)
+
+            if faultMode != .none {
+                await mockProvider.setMoveThrowsOnId(targetId, error: ProviderError.notConnected)
+            }
+            if faultMode == .transientThenClears {
+                Task {
+                    try? await Task.sleep(for: .milliseconds(StableFuzzConfig.transientFaultClearDelayMs))
+                    await mockProvider.clearMoveThrowsOnId()
+                }
+            }
+
+            // Adversarial layer (a)+(b): the SAME seeded ChaosScheduler this
+            // file already uses, installed on every provider-call seam
+            // `MockEmailProvider` exposes for the calls this round makes
+            // (`move`, `markRead` — it has no `markFlagged`/`markUnread`
+            // hook, so those calls go unperturbed; documented limitation,
+            // not a gap in coverage of THIS invariant, which is about `move`).
+            let wireState = Mutex<(inFlight: Int, overlapped: Bool)>((inFlight: 0, overlapped: false))
+            await mockProvider.setMoveHook { [chaos] in
+                wireState.withLock { state in
+                    state.inFlight += 1
+                    if state.inFlight > 1 { state.overlapped = true }
+                }
+                await chaos.point()
+                try? await Task.sleep(for: .milliseconds(StableFuzzConfig.moveOverlapWindowMs))
+                wireState.withLock { $0.inFlight -= 1 }
+            }
+            await mockProvider.setMarkReadHook { [chaos] in await chaos.point() }
+
+            try await withProviderLifetime(
+                accountId: accountId, provider: mockProvider,
+                imapProvider: nil, pool: fixture.pool
+            ) {
+                try await fixture.pool.writeWithoutTransaction { db in
+                    try opInverse.insert(db)
+                    try opRedelete.insert(db)
+                    for op in bystanderOps { try op.insert(db) }
+                }
+
+                switch faultMode {
+                case .none, .transientThenClears:
+                    // Two bounded barrier passes, mirroring the IMAP round's
+                    // drain → backstop → drain ordering above.
+                    try await drainProviderQueue(pool: fixture.pool, recordedCommands: { () -> [String] in [] })
+                    try await drainProviderQueue(pool: fixture.pool, recordedCommands: { () -> [String] in [] })
+                case .permanentThisRound:
+                    // A permanent fault never converges — polling to
+                    // emptiness would burn the whole barrier bound and throw
+                    // a spurious timeout diagnostic. One direct drain call is
+                    // provably sufficient: lanes run to completion (all
+                    // Tasks awaited) before `drainPendingQueue()` returns,
+                    // and the outer pass loop breaks itself once the target
+                    // account's ops become unclaimable (`failedAccounts`).
+                    await AccountManager.shared.drainPendingQueue()
+                }
+
+                // ---- Invariant: max in-flight per (account, id) == 1 — the
+                // wire oracle. Timing-independent: a genuine concurrent pair
+                // is provably observed inside the hook's own window,
+                // regardless of which one happens to finish first.
+                let overlapped = wireState.withLock { $0.overlapped }
+                #expect(
+                    !overlapped,
+                    "\(seedHex) round \(round) [\(provider.rawValue), fault=\(faultMode)]: two cross-folder moves on ONE stable id executed concurrently on the wire"
+                )
+
+                let allMoves = await mockProvider.movedIds
+                let targetMoves = allMoves.filter { $0.ids.contains(targetId) }
+                let landed = targetMoves.map { "\($0.from)→\($0.to)" }
+
+                switch faultMode {
+                case .none, .transientThenClears:
+                    // ---- Invariant: successful calls on one id follow
+                    // createdAt order, and the LATEST destination wins.
+                    #expect(
+                        targetMoves.count == 2,
+                        "\(seedHex) round \(round): both cross-folder moves must reach the provider, got \(landed)"
+                    )
+                    if targetMoves.count == 2 {
+                        let expected = [
+                            "\(fixture.trash.path)→\(fixture.inbox.path)",
+                            "\(fixture.inbox.path)→\(fixture.trash.path)",
+                        ]
+                        #expect(
+                            landed == expected,
+                            "\(seedHex) round \(round): moves must land in createdAt (issue) order, got \(landed)"
+                        )
+                        #expect(
+                            targetMoves[1].to == fixture.trash.path,
+                            "\(seedHex) round \(round): the user's LATEST destination must win on the wire, got \(targetMoves[1].to)"
+                        )
+                    }
+                    // ---- Invariant: the durable queue converges.
+                    let remaining = try await fixture.pool.read { db in try PendingOperation.fetchCount(db) }
+                    #expect(
+                        remaining == 0,
+                        "\(seedHex) round \(round): queue did not converge — \(remaining) op(s) remain"
+                    )
+                case .permanentThisRound:
+                    // ---- Invariant: the queue retains EXACTLY the retry
+                    // state the injected failure justifies — never a drop,
+                    // never a duplicate wire attempt.
+                    #expect(
+                        targetMoves.isEmpty,
+                        "\(seedHex) round \(round): a permanently-failing move must never record a successful call, got \(landed)"
+                    )
+                    let remainingTargetOps = try await fixture.pool.read { db in
+                        try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
+                    }
+                    #expect(
+                        remainingTargetOps.count == 2,
+                        "\(seedHex) round \(round): both halves of the halted lane must stay durably queued, got \(remainingTargetOps.count)"
+                    )
+                    if remainingTargetOps.count == 2 {
+                        #expect(remainingTargetOps.allSatisfy { $0.messageIds == [targetId] })
+                        #expect(remainingTargetOps.allSatisfy { $0.status == PendingStatus.queued.rawValue })
+                        let attemptedCount = remainingTargetOps.filter { $0.retryCount > 0 }.count
+                        #expect(
+                            attemptedCount == 1,
+                            "\(seedHex) round \(round): exactly one op in the halted lane must show a real wire attempt, got \(attemptedCount)"
+                        )
+                    }
+                }
+
+                // ---- Invariant: disjoint work still progresses, regardless
+                // of the target lane's fault mode.
+                let readCalls = await mockProvider.markedReadIds
+                let flaggedCalls = await mockProvider.markedFlaggedIds
+                for (index, bystanderId) in bystanderIds.enumerated() {
+                    if index.isMultiple(of: 2) {
+                        #expect(
+                            readCalls.contains { $0.ids == [bystanderId] },
+                            "\(seedHex) round \(round): disjoint bystander \(bystanderId) never reached the provider"
+                        )
+                    } else {
+                        #expect(
+                            flaggedCalls.contains { $0.ids == [bystanderId] },
+                            "\(seedHex) round \(round): disjoint bystander \(bystanderId) never reached the provider"
+                        )
+                    }
+                }
+            }
+        }
+    }
+}

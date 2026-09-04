@@ -7,36 +7,42 @@ import GRDB
 
 /// Debug-gated, file-backed writer for the `[MoveTrace] deltaSync` decision lines
 /// — the per-folder insert/remove/skip verdicts Gmail's delta arm reaches for each
-/// message.
+/// message. A thin forwarder onto `BackgroundSyncLogger.logQueue`, which owns the
+/// gate, the escaping, the console echo and the `AppLogStore` append.
 ///
 /// These lines were bare, UNGATED `print`s. Both halves of that were wrong:
 ///
-/// * **Ungated** violates global `CLAUDE.md` rule 12 — a diagnostic must be a
-///   no-op in a shipping build. The `guard` below is that gate, and it covers the
-///   console sink as well as the file one.
+/// * **Ungated** violates global `CLAUDE.md` rule 12. The façade's `guard` is
+///   that gate, and it covers the console sink as well as the file one. ⚠️ That
+///   makes this a no-op unless debug logging is unlocked by an allowed user —
+///   NOT "a no-op in production builds", which an earlier wording claimed:
+///   `isLoggingEnabled()` is a RUNTIME gate that is deliberately active on device
+///   and on TestFlight for such a user, which is the point of writing to a file
+///   at all.
 /// * **`print`** meant they went NOWHERE on a device. There is no
 ///   `freopen`/`dup2` in this tree, so `stdout` is unreadable outside an attached
 ///   Xcode console — the exact situation of the Gmail delete → undo → delete whose
 ///   message reappeared 31 minutes later (`IOS-QUEUE-008`). These seven lines name
 ///   which sync arm re-inserted a row, which was one of the two facts the
-///   investigation needed and the exported log could not supply. Routing them to
-///   the single `tabmail.log` via `AppLogStore` on the `.sync` channel — the same
-///   channel `queueLog` uses, so the drain and the sync interleave in ONE file in
-///   append order — is what makes the next occurrence diagnosable.
+///   investigation needed and the exported log could not supply.
+///
+/// They land on the `.queue` channel — the SAME channel `AccountManagerQueue`'s
+/// `queueLog` uses, so the drain's lane decisions and these sync verdicts
+/// interleave in ONE file in append order and `AppLogStore.read(channel: .queue)`
+/// returns the whole sequence. ⚠️ Not on `.sync`: that channel is always-on, and
+/// a gated writer on it would give one channel two lifetime policies and hide
+/// itself from the tests that pin the split (memory topic 122, `IOS-LOG-002`).
 ///
 /// `@autoclosure` so the interpolation is skipped entirely when the gate is off;
-/// these fire per message per folder. Same shape as `AccountManagerQueue`'s
-/// `queueLog`.
+/// these fire per message per folder, and the laziness survives the forward
+/// because `message()` is evaluated inside the façade's own autoclosure argument.
 ///
 /// ⚠️ SCOPE: this helper is deliberately used ONLY by the seven
 /// `[MoveTrace] deltaSync` sites. The rest of this file's `print` corpus — and the
 /// sync engines' generally — is the whole-tree sweep tracked as issue #72 and is
 /// out of scope here.
 private func deltaMoveTraceLog(_ message: @autoclosure () -> String) {
-    guard DebugModeManager.isLoggingEnabled() else { return }
-    let line = message()
-    print(line)
-    AppLogStore.append(line, channel: .sync)
+    BackgroundSyncLogger.logQueue(message())
 }
 
 extension SyncEngine {

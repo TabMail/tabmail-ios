@@ -65,10 +65,18 @@ struct AccountManagerQueueDrainTests {
     /// The GAP3 cases exercise lane mechanics with opaque ids. Make their
     /// account explicitly stable-provider-backed so T2.6's IMAP UID/epoch
     /// checkpoint is correctly inapplicable.
-    private func insertStableProviderFixture(accountId: String, pool: DatabasePool) throws {
+    ///
+    /// `provider` defaults to `.gmail` — every pre-existing caller. A3.1 adds a
+    /// second immutable-id shape (the demo account, whose row is stored `.imap`
+    /// but admitted into `AccountManager.immutableIdAccountIds` BY ID), so a
+    /// caller that needs to pin that classification passes it explicitly instead
+    /// of this file growing a near-duplicate helper.
+    private func insertStableProviderFixture(
+        accountId: String, pool: DatabasePool, provider: AccountProvider = .gmail
+    ) throws {
         try pool.writeWithoutTransaction { db in
             var account = Account(
-                emailAddress: "\(accountId)@example.com", displayName: "GAP3", provider: .gmail)
+                emailAddress: "\(accountId)@example.com", displayName: "GAP3", provider: provider)
             account.id = accountId
             try account.insert(db)
             try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId).insert(db)
@@ -526,17 +534,146 @@ struct AccountManagerQueueDrainTests {
     /// concurrent entries into `move` and sleeps long enough that a genuinely
     /// parallel pair must be seen as parallel, so a regression cannot pass by
     /// timing luck, and a serialized pair cannot fail by it either.
-    @Test("drainPendingQueue() (real): on a stable-id account, an undo inverse and a re-delete of the same message never overlap on the wire and run in issue order")
-    func drainPendingQueueRealStableIdSameMessageOpsNeverOverlapAndRunInIssueOrder() async throws {
+    ///
+    /// A3.1: parameterized over EVERY way `AccountManager.immutableIdAccountIds`
+    /// admits an account into the account-qualified lane space. It admits an id
+    /// two ways — by PROVIDER (`provider == .gmail`) and by ID
+    /// (`DemoSeed.demoAccountId`, whose row is nonetheless stored `.imap`). A
+    /// term-by-term mutation of either — deleting the demo-id arm, or narrowing
+    /// the provider arm — must show up as a wire-order/overlap failure on the
+    /// affected case and nowhere else. The pure `buildLanes` unit tests in
+    /// `PendingQueueLaneTests` inject the set directly, so they cannot see a
+    /// defect in how the drain COMPUTES it; only a real-drain fixture per
+    /// classification can.
+    ///
+    /// 🚨 THERE IS DELIBERATELY NO OUTLOOK CASE HERE, and adding one would be a
+    /// test that BLESSES A BUG. Graph reallocates a message's id on every move
+    /// (`IOS-GRAPH-002` — this tree sends no `Prefer: IdType="ImmutableId"`), and
+    /// nothing rewrites a later `PendingOperation`'s `messageIds` after
+    /// `finishMove` re-keys the header. Serializing two Graph ops on one message
+    /// would therefore GUARANTEE the follower runs against the id the move just
+    /// invalidated → 404 → the conflict arm deletes it → the user's latest
+    /// intention is lost. Outlook is folder-qualified on purpose; the test that
+    /// pins that is `immutableIdAccountIdsAdmitsOnlyGmailAndTheDemoAccount`.
+    // Not `private`: it is the parameter type of a `@Test(arguments:)` function,
+    // and Swift requires a method to be at least as accessible as its parameter
+    // types. It stays scoped by being nested in this suite.
+    struct StableIdAccountCase: CustomStringConvertible, Sendable {
+        let label: String
+        let accountId: String
+        /// What is written to the `account.provider` column. For the demo case
+        /// this is deliberately `.imap` — the classifier admits it BY ID, not by
+        /// provider, so the fixture must prove the admission holds even though
+        /// the stored provider alone would say "folder-qualified".
+        let dbProvider: AccountProvider
+        var description: String { label }
+    }
+
+    private static let stableIdAccountCases: [StableIdAccountCase] = [
+        StableIdAccountCase(
+            label: "gmail", accountId: "acc-stable-id-same-message-gmail", dbProvider: .gmail),
+        StableIdAccountCase(
+            label: "demo (row stored .imap, admitted by DemoSeed.demoAccountId)",
+            accountId: DemoSeed.demoAccountId, dbProvider: .imap),
+    ]
+
+    /// The classifier, tested DIRECTLY against real `account` rows — every
+    /// provider at once, in one call, asserted as an EXACT set.
+    ///
+    /// Why this exists in addition to the real-drain parameterization: a drain
+    /// fixture can only show that the account it seeds is classified correctly.
+    /// It is structurally blind to an account it does not seed, so "`.outlook`
+    /// was quietly admitted" is invisible to every drain test — and admitting
+    /// Outlook is the one mutation here whose consequence is a DETERMINISTIC lost
+    /// intention rather than a race (Graph reallocates ids on move,
+    /// `IOS-GRAPH-002`; a serialized follower goes to the wire with a dead id,
+    /// 404s, and is deleted by the conflict arm). An exact-set oracle over rows
+    /// for every provider is the only shape that can fail on an account the test
+    /// author did not think to seed.
+    ///
+    /// The unknown-provider row is not decoration either: it pins that the
+    /// classifier reads the RAW `provider` column rather than decoding
+    /// `AccountProvider`, so one corrupt bystander row cannot throw the whole
+    /// snapshot (`DecodingError.dataCorrupted`) and wedge every account's drain.
+    @Test("AccountManager.immutableIdAccountIds admits Gmail and the demo account and NOTHING else — not Outlook, not IMAP, not iCloud, not an undecodable provider string")
+    func immutableIdAccountIdsAdmitsOnlyGmailAndTheDemoAccount() async throws {
         let (pool, dir, previous) = try makeTestDB()
-        let accountId = "acc-stable-id-same-message"
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let gmailId = "acc-classifier-gmail"
+        let outlookId = "acc-classifier-outlook"
+        let imapId = "acc-classifier-imap"
+        let icloudId = "acc-classifier-icloud"
+        let unknownId = "acc-classifier-unknown"
+
+        try await pool.writeWithoutTransaction { db in
+            for (id, provider) in [
+                (gmailId, AccountProvider.gmail),
+                (outlookId, .outlook),
+                (imapId, .imap),
+                (icloudId, .icloud),
+                // The demo account's row is stored `.imap` ON PURPOSE — it is
+                // admitted BY ID, and a fixture that stored it as `.gmail` would
+                // pass even if the demo-id arm were deleted.
+                (DemoSeed.demoAccountId, .imap),
+                // Inserted as a decodable provider, then corrupted by raw SQL —
+                // `Account` cannot ENCODE a string its enum does not have.
+                (unknownId, .gmail),
+            ] {
+                var account = Account(
+                    emailAddress: "\(id)@example.com", displayName: id, provider: provider)
+                account.id = id
+                try account.insert(db)
+            }
+            try db.execute(
+                sql: "UPDATE account SET provider = ? WHERE id = ?",
+                arguments: ["future-provider", unknownId])
+        }
+
+        // Non-vacuity for the corrupt row: decoding whole `Account` rows really
+        // does throw here, so the classifier's id-only query is doing work a
+        // naive `Account.fetchAll(db)` could not.
+        let wholeRowDecodeThrows = try await pool.read { db -> Bool in
+            do {
+                _ = try Account.fetchAll(db)
+                return false
+            } catch {
+                return true
+            }
+        }
+        #expect(wholeRowDecodeThrows,
+                "fixture is not exercising the corrupt-row path — Account.fetchAll decoded cleanly")
+
+        let classified = try await pool.read { db in
+            try AccountManager.immutableIdAccountIds(db)
+        }
+
+        #expect(classified == [gmailId, DemoSeed.demoAccountId], """
+            immutableIdAccountIds must be EXACTLY {gmail, demo}.
+            observed: \(classified.sorted())
+            outlook admitted: \(classified.contains(outlookId)) \
+            (this one is a deterministic intention loss, not a race — see IOS-GRAPH-002)
+            imap admitted: \(classified.contains(imapId))
+            icloud admitted: \(classified.contains(icloudId))
+            undecodable admitted: \(classified.contains(unknownId))
+            """)
+    }
+
+    @Test("drainPendingQueue() (real): on an immutable-id account, an undo inverse and a re-delete of the same message never overlap on the wire and run in issue order",
+          arguments: stableIdAccountCases)
+    func drainPendingQueueRealStableIdSameMessageOpsNeverOverlapAndRunInIssueOrder(
+        accountCase: StableIdAccountCase
+    ) async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        let accountId = accountCase.accountId
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let provider = MockEmailProvider()
         try await TestProviderRegistry.withRegisteredProvider(
             accountId: accountId, provider: provider
         ) {
-            try insertStableProviderFixture(accountId: accountId, pool: pool)
+            try insertStableProviderFixture(
+                accountId: accountId, pool: pool, provider: accountCase.dbProvider)
             // The inverse op's SOURCE folder — `optimisticMoveToFolder` restored
             // the row to the destination of the op it undid, so the inverse is
             // addressed from TRASH and needs that folder row to exist.
@@ -593,6 +730,264 @@ struct AccountManagerQueueDrainTests {
                 try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
             }
             #expect(remaining.isEmpty, "both ops executed (deleted)")
+        }
+    }
+
+    // MARK: - 10c. IOS-QUEUE-008: the exported log has to be able to answer it
+
+    /// The MESSAGE half of every entry in a `read(channel: .queue)` result —
+    /// `[<ISO8601>] [QUEUE] ` stripped — so an assertion can compare EXACT text
+    /// without depending on a timestamp. A physical line with no entry head is
+    /// dropped: no `.queue` writer emits a continuation line, and treating one as
+    /// an entry would make an exact-list assertion depend on text that is not one.
+    private static func queueEntryMessages(in log: String) -> [String] {
+        let head = "] [\(AppLogChannel.queue.tag)] "
+        return log.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line in
+            guard line.hasPrefix("["), let range = line.range(of: head) else { return nil }
+            return String(line[range.upperBound...])
+        }
+    }
+
+    /// The lane-composition line and the per-op drain lines, in append order.
+    ///
+    /// Deliberately narrower than "every `.queue` entry": other entries in the
+    /// same read legitimately name an op id too
+    /// (`[MoveTrace] executeOperation.move … opId=`, `[MoveTrace] entered inbox …
+    /// op <id>`), and this artifact is about the lane/order decision, not about
+    /// those. Prefix-anchored so `[Queue] Draining N ops:` — a different line
+    /// that also starts `[Queue] D` — cannot drift into the set.
+    private static func laneOrderEntries(in log: String) -> [String] {
+        queueEntryMessages(in: log).filter {
+            $0.hasPrefix("[Queue] Lanes: ") || $0.hasPrefix("[Queue] drain lane ")
+        }
+    }
+
+    /// THE INVARIANT: the wire order of the drain is RECONSTRUCTIBLE from the
+    /// exported log. Not "the formatter renders this string" — what
+    /// `IOS-QUEUE-008` actually needed, and could not get, was an artifact that
+    /// answers *which lane did each op land in, and in what order did they go
+    /// out*. `print` alone could never answer it (no `freopen`/`dup2` in this
+    /// tree, so `stdout` is unreachable on a device) and neither could an
+    /// instrumentation whose gate is never open.
+    ///
+    /// Measured at `4f9bd4bbc`, before this test existed: the `queueLog` body had
+    /// **0 hits across 1,310 calls** on the whole suite, and both per-op drain
+    /// lines had 0. No test flipped `DebugModeManager.loggingEnabledOverrideForTesting`,
+    /// and the real gate is always false in the test host (no unlock flag, no
+    /// session), so the instrumentation whose entire purpose is this artifact had
+    /// never once been executed.
+    ///
+    /// Two-sided on purpose: the same drain writes NOTHING to the channel while
+    /// the gate is closed. Without that half, a writer that had been accidentally
+    /// hard-enabled would satisfy the first half and look correct.
+    @Test("drainPendingQueue() (real): with debug logging unlocked, the exported QUEUE channel reconstructs the lane composition and the per-op wire order — and stays silent when it is locked")
+    func drainLaneInstrumentationIsReadableFromTheExportedLog() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        let accountId = "acc-queue-log-lane-order"
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        // Redirect the single app log at a temp file of its own, and force the
+        // runtime debug gate, for the duration of this test. Both are
+        // process-global seams — hence `.serialized, .processGlobalState` on this
+        // suite — and both are restored unconditionally.
+        let logDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("queuelog_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        AppLogStore.fileURLOverride.withLock { $0 = logDir.appendingPathComponent("tabmail.log") }
+        defer {
+            DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil }
+            AppLogStore._resetForTesting()
+            try? FileManager.default.removeItem(at: logDir)
+        }
+
+        let provider = MockEmailProvider()
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: provider
+        ) {
+            try insertStableProviderFixture(accountId: accountId, pool: pool)
+            try await pool.writeWithoutTransaction { db in
+                try Folder(name: "TRASH", path: "TRASH", role: .trash, accountId: accountId).insert(db)
+            }
+
+            /// Queue the `IOS-QUEUE-008` pair on one message: the undo's inverse
+            /// (TRASH→INBOX) and, one second later, the user's newest intention
+            /// (INBOX→TRASH). Same shape as
+            /// `drainPendingQueueRealStableIdSameMessageOpsNeverOverlapAndRunInIssueOrder`,
+            /// which pins the WIRE; this pins that the LOG says the same thing.
+            func queuePair(messageId: String) throws -> (inverse: String, redelete: String) {
+                // Dynamic (repo rule: no hardcoded dates); whole-second so the
+                // GRDB date round-trip compares exactly.
+                let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
+                var opInverse = PendingOperation(
+                    type: .move, messageIds: [messageId], accountId: accountId,
+                    folderPath: "TRASH", destinationPath: "INBOX")
+                opInverse.createdAt = t0
+                var opRedelete = PendingOperation(
+                    type: .move, messageIds: [messageId], accountId: accountId,
+                    folderPath: "INBOX", destinationPath: "TRASH")
+                opRedelete.createdAt = t0.addingTimeInterval(1)
+                try insertOp(opInverse, pool: pool)
+                try insertOp(opRedelete, pool: pool)
+                return (String(opInverse.id.prefix(8)), String(opRedelete.id.prefix(8)))
+            }
+
+            // ---- Gate OPEN ------------------------------------------------
+            DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
+            let unlockedPair = try queuePair(messageId: "m1")
+            await AccountManager.shared.drainPendingQueue()
+            let queueLog = AppLogStore.read(channel: .queue)
+
+            // The EXACT, count-guarded artifact. Equality, not containment: a
+            // containment oracle stays green when the op TYPE is dropped from the
+            // line, when source→destination is reversed, when an entry appears
+            // twice, when `executed` precedes `executing`, and when the two ops
+            // are reported in DIFFERENT lanes — which is precisely the state that
+            // brought the deleted message back (`IOS-QUEUE-008`).
+            //
+            // `lane0(2)` in the composition line and `pos 1/2` / `pos 2/2` in the
+            // per-op lines are the same fact stated twice, deliberately: the
+            // composition line is written BEFORE any Task starts and the per-op
+            // lines are written by the lane Task itself, so agreeing is evidence
+            // that the plan and the execution are the same plan.
+            let inverse = unlockedPair.inverse
+            let redelete = unlockedPair.redelete
+            let expected = [
+                "[Queue] Lanes: lane0(2): \(inverse) move TRASH→INBOX ids=[m1]"
+                    + " | \(redelete) move INBOX→TRASH ids=[m1]",
+                "[Queue] drain lane 0 pos 1/2 — executing \(inverse) move TRASH→INBOX ids=[m1]",
+                "[Queue] drain lane 0 pos 1/2 — executed \(inverse) move TRASH→INBOX ids=[m1] outcome=proceed",
+                "[Queue] drain lane 0 pos 2/2 — executing \(redelete) move INBOX→TRASH ids=[m1]",
+                "[Queue] drain lane 0 pos 2/2 — executed \(redelete) move INBOX→TRASH ids=[m1] outcome=proceed",
+            ]
+            let observed = Self.laneOrderEntries(in: queueLog)
+            #expect(observed == expected,
+                    "the exported log does not reconstruct the drain.\nexpected:\n\(expected.joined(separator: "\n"))\nobserved:\n\(observed.joined(separator: "\n"))")
+
+            // ---- Gate CLOSED (two-sided non-vacuity) ----------------------
+            AppLogStore.clear()
+            DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = false }
+            let lockedPair = try queuePair(messageId: "m2")
+            await AccountManager.shared.drainPendingQueue()
+
+            let lockedLog = AppLogStore.read(channel: .queue)
+            #expect(!lockedLog.contains(lockedPair.inverse) && !lockedLog.contains(lockedPair.redelete),
+                    "the drain persisted QUEUE lines while debug logging was locked: \(lockedLog)")
+            #expect(Self.laneOrderEntries(in: lockedLog).isEmpty,
+                    "a lane/order line survived the closed gate: \(lockedLog)")
+            // Non-vacuity for THIS half: the drain really ran, so the silence is
+            // the gate rather than an absent drain.
+            let moved = await provider.movedIds
+            #expect(moved.contains { $0.ids == ["m2"] },
+                    "the locked-gate half never drained — its silence proves nothing")
+        }
+    }
+
+    // MARK: - 10d. One undecodable account row must not stall every other account
+
+    /// THE INVARIANT: one bystander `account` row cannot stop OTHER accounts'
+    /// queued intentions from draining.
+    ///
+    /// `AccountProvider` is a closed `String, Codable` enum and the
+    /// `account.provider` column is unconstrained text, so a snapshot that
+    /// decodes whole `Account` rows throws `DecodingError.dataCorrupted` on one
+    /// unrecognised value — before ANY op is claimed. The drain's `catch`
+    /// `break`s, every later drain reproduces it identically, and valid ops for
+    /// every account stay queued forever behind a debug-gated log nobody sees.
+    /// That is the wedge corollary with a bystander, one level up from
+    /// `IOS-QUEUE-001`: an op that stays queued but prevents other intentions
+    /// executing has not been preserved.
+    ///
+    /// The fix is to read only the IDS of the rows that MATCH the immutable-id
+    /// predicate, which a row that does not match cannot defeat. An unknown
+    /// provider is then simply not admitted, which is the SAFE side — it gets the
+    /// folder-qualified key the base always used — and it costs nothing anyway:
+    /// nothing can construct a provider for it, so its ops are skipped at the
+    /// claim loop and no address-space decision is ever acted on for them.
+    @Test("drainPendingQueue() (real): an account row whose provider string does not decode cannot stall every other account's ops")
+    func drainPendingQueueRealUndecodableAccountRowDoesNotStallOtherAccounts() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        let goodAccountId = "acc-known-provider"
+        let unknownAccountId = "acc-unknown-provider"
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let provider = MockEmailProvider()
+        // Deliberately NOT registered. In production nothing can construct a
+        // provider for an account whose provider string does not decode, so
+        // `providers[op.accountId]` is nil and its ops are skipped at the claim
+        // loop; leaving this mock unregistered reproduces that state, and
+        // asserting its call log stays empty pins that the undecodable row never
+        // becomes an executing account by some other route.
+        let unknownProvider = MockEmailProvider()
+
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: goodAccountId, provider: provider
+        ) {
+            try insertStableProviderFixture(accountId: goodAccountId, pool: pool)
+            try await pool.writeWithoutTransaction { db in
+                try Folder(name: "TRASH", path: "TRASH", role: .trash, accountId: goodAccountId).insert(db)
+                // A NORMAL insert first — `Account` cannot ENCODE a provider
+                // string its enum does not have — then a raw UPDATE that puts the
+                // undecodable value in the column. That is exactly the durable
+                // state persistent corruption, or a row written by a newer
+                // provider-aware build, leaves behind.
+                var future = Account(
+                    emailAddress: "future@example.com", displayName: "Future", provider: .gmail)
+                future.id = unknownAccountId
+                try future.insert(db)
+                try db.execute(
+                    sql: "UPDATE account SET provider = ? WHERE id = ?",
+                    arguments: ["future-provider", unknownAccountId])
+            }
+
+            // Precondition, and the whole reason this fixture discriminates: the
+            // row really is undecodable. Without it the test would pass against a
+            // well-formed database and prove nothing.
+            let wholeRowDecodeThrows = try await pool.read { db -> Bool in
+                do {
+                    _ = try Account.fetchAll(db)
+                    return false
+                } catch {
+                    return true
+                }
+            }
+            #expect(wholeRowDecodeThrows,
+                    "the fixture's provider column still decodes — this test cannot discriminate")
+
+            let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
+            var goodOp = PendingOperation(
+                type: .move, messageIds: ["m-good"], accountId: goodAccountId,
+                folderPath: "INBOX", destinationPath: "TRASH")
+            goodOp.createdAt = t0
+            var unknownOp = PendingOperation(
+                type: .move, messageIds: ["m-unknown"], accountId: unknownAccountId,
+                folderPath: "INBOX", destinationPath: "TRASH")
+            unknownOp.createdAt = t0.addingTimeInterval(1)
+            try insertOp(goodOp, pool: pool)
+            try insertOp(unknownOp, pool: pool)
+
+            await AccountManager.shared.drainPendingQueue()
+
+            // 1. The valid account's intention executed and left the queue. THIS
+            //    is the assertion that goes red when the snapshot decodes whole
+            //    `Account` rows.
+            let moved = await provider.movedIds
+            #expect(moved.contains { $0.ids == ["m-good"] },
+                    "the valid account's op never reached its provider — one bystander row stalled the whole drain")
+            let goodSurvivor = try fetchOp(goodOp.id, pool: pool)
+            #expect(goodSurvivor == nil, "the valid account's op must have left the queue")
+
+            // 2. The undecodable account's op is PRESERVED — never dropped, never
+            //    stranded `inFlight`.
+            let unknownSurvivor = try fetchOp(unknownOp.id, pool: pool)
+            #expect(unknownSurvivor?.status == PendingStatus.queued.rawValue,
+                    "the undecodable account's op must stay queued, got \(unknownSurvivor?.status ?? "<deleted>")")
+
+            // 3. And nothing executed on its behalf, on any provider.
+            let unknownCalls = await unknownProvider.callLog
+            #expect(unknownCalls.isEmpty,
+                    "an account whose provider string does not decode must never execute: \(unknownCalls)")
+            #expect(!moved.contains { $0.ids.contains("m-unknown") },
+                    "the undecodable account's message id reached another account's provider")
         }
     }
 
