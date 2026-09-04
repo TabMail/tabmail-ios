@@ -909,3 +909,35 @@ SwiftMail PR #208 MOVE post-completion contract — typed partial completion is 
 <!-- BEGIN VERBATIM ROW 165 (pass 5b) -->
 🚨 **POST-LOGIN ROUTING WAITS FOR AN AUTHORITATIVE `/whoami`** (issue #56: active subscriber sent to paywall; configured Gmail re-offered) — `PendingPlanNavigationLatch` / `pending_plan_navigation`, `AISubscriptionGate.lastAuthoritativeApplyAt`, `Account.existing(forEmail:provider:in:)` CASE-FOLDED, `signInGeneration`/`applyIfCurrentEpoch`
 <!-- END VERBATIM ROW 165 (pass 5b) -->
+
+---
+
+## Source line 161 (post-pass-5 numbering; pass 7 at a3ac432e5) — Current → `118-trial-ended-is-derived-never-a-new-whoami-flag.md`
+
+<!-- BEGIN VERBATIM ROW 161 (pass 7) -->
+🚨 **"TRIAL ENDED" IS DERIVED, NEVER A NEW `/whoami` FLAG** — `has_subscription:false` + the `trial` KEY present; `.active` REQUIRES `plan_tier == "Trial"` (a legacy **CARD trial** stays a plain subscriber); `AccountInfo.trialState(now:)`, `AISubscriptionGate.trialHasEnded`; intro-offer DELETED (#55)
+<!-- END VERBATIM ROW 161 (pass 7) -->
+
+---
+
+## Source line 162 (post-pass-5 numbering; pass 7 at a3ac432e5) — Current → `119-post-login-routing-waits-for-an-authoritative-whoami.md`
+
+<!-- BEGIN VERBATIM ROW 162 (pass 7) -->
+🚨 **POST-LOGIN ROUTING WAITS FOR AN AUTHORITATIVE `/whoami`** (issue #56) — `PendingPlanNavigationLatch` / `pending_plan_navigation`, `AISubscriptionGate.lastAuthoritativeApplyAt`, `Account.existing(forEmail:provider:in:)` CASE-FOLDED, `signInGeneration`/`applyIfCurrentEpoch`
+<!-- END VERBATIM ROW 162 (pass 7) -->
+
+---
+
+## Source line 165 (post-pass-5 numbering; pass 7 at a3ac432e5) — Current → `123-a-durable-write-to-a-mirrored-identity-column-must-refresh-the-nse-mirrors.md`
+
+<!-- BEGIN VERBATIM ROW 165 (pass 7) -->
+🚨 **A DURABLE WRITE TO A MIRRORED IDENTITY COLUMN MUST REFRESH THE NSE MIRRORS** — `nse.accountMap`/`nse.imapAccounts` are the extension's ONLY resolver; `addIMAPAccount`/`addICloudAccount` refreshed neither, so `handleIMAPReconnect` early-returned till cold launch. `mirrorAccountIdentity()` never a half; `startForegroundPolling` re-derives ungated at `.medium`; removal clears pre-commit AND converges post-commit; `calendarOnly` never wins an address; straddle = `IOS-NSE-008`
+<!-- END VERBATIM ROW 165 (pass 7) -->
+
+---
+
+## Source line 166 (post-pass-5 numbering; pass 7 at a3ac432e5) — Current → `124-ordinary-sign-out-releases-the-device-push-registration-and-ends-the-auth-session.md`
+
+<!-- BEGIN VERBATIM ROW 166 (pass 7) -->
+🚨 **ORDINARY SIGN-OUT RELEASES THE DEVICE PUSH REGISTRATION AND ENDS THE AUTH SESSION** — `TabMailAuthService.signOut()` runs `unregisterDeviceForSignOut()` FIRST (the worker's check needs the live session), then GoTrue `logout?scope=local` — **BOTH legs always**, the old "only after a successful release" coupling is RETIRED; ONE identity chokepoint `guard getSession()?.userId == subject` after `validToken()` so a mid-flush sign-in makes the handshake REFUSE; one bound `PushConfig.signOutHandshakeTimeoutSeconds` with `guard !Task.isCancelled` between the legs; handshake Task cancelled BEFORE `completeSession`; 401 silent; release-failure log uses `\(error)` not `localizedDescription`; `unregisterDeviceForSignOut`'s cache clears sit in a `defer` and `lastDeviceTokenKey` SURVIVES; never reuse `unregisterDeviceForReset`; sign-in re-registers via `TabMailAuthService.restorePushRegistrationAfterSignIn()` from RootView's `.tabMailDidSignIn` receiver; account-deletion and "account no longer available" call `completeSession` directly and never reach `signOut()`; supersedes IOS-PUSH-001 §3; push#42; `SignOutHandshakeTests`
+<!-- END VERBATIM ROW 166 (pass 7) -->

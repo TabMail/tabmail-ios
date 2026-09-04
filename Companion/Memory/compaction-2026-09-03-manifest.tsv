@@ -1,0 +1,12 @@
+# companion-compact manifest — tabmail-ios / Memory tree (2026-09-03 pass 7)
+# Source: PROJECT_MEMORY.md BEFORE this pass (26890 B, sha256 37a72f135ce404ff9d51779184f578e1490588ce5c467ae2c09ef0a747a92bbb; git a3ac432e5:PROJECT_MEMORY.md)
+# CONTENT DELETED: none. Every row below is a byte-exact fragment MOVED out of the index
+# into 110-pre-compaction-index-row-abstracts.md; the index kept a shortened routing line.
+# row-N = the pre-pass *Topic / search terms* CELL of one row (Status and [read in full] cells untouched).
+# Stage 4a rebuild (run from tabmail-ios/): same script as compaction-2026-08-20-manifest.tsv with '(pass 5)' -> '(pass 7)'
+#   and only the VERBATIM ROW loop; result must equal the Source size and sha256 above.
+fragment_id	route_target	index_line	bytes	sha256
+row-161 (pass 7)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	161	305	c55025bf72b9eadf7d7e6e9e8155f7db9e2da3a3c13f12e9043c43ad0d93aa71
+row-162 (pass 7)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	162	281	4ccd663a834fcc408595db495f274a56a3ea9dd440582ddd285b6e3925c4985c
+row-165 (pass 7)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	165	485	eaee18d14e26188eb8ff7e7bd9d661d3945e24da1cbe7681457f44266bb5d7dd
+row-166 (pass 7)	Companion/Memory/History/110-pre-compaction-index-row-abstracts.md	166	1139	303d89e8283bd0d470dd34f5cef4135f0b4add743956eaa252d6753def84e7f1
