@@ -2,7 +2,7 @@
 
 **Class:** review-discipline / fail-closed design
 **Severity:** high (a false "recoverable" claim shipped in a commit body, and it was the load-bearing justification for the fix's accepted cost)
-**First seen:** 2026-08 · **Recurrences:** 4 · **Status:** Active
+**First seen:** 2026-08 · **Recurrences:** 5 · **Status:** Active
 **Related:** `MIS-IOS-007` (the same session, the same guard — a premise that felt checked because real code was read) · **Rule owner:** `tabmail-ios/CLAUDE.md` § *THE MANTRA*
 
 ## The tell
@@ -169,6 +169,39 @@ delivery as recovery.
 This recurrence adds an intention-identity question to the negative pass: **which user intention is
 the named mechanism completing?** A durable fallback for intention A cannot establish
 recoverability for refused intention B merely because both operate on the same row.
+
+---
+
+## Instance 5 — 2026-09-04, IOS-QUEUE-008: the "one ordinary gesture" recovery re-enters the failing state
+
+`IOS-QUEUE-008` (the drain-lane split for provider-stable ids — Gmail/Outlook) was closed as a
+decision on 2026-08-05 on the ground that the wrong end state is "fixed by one ordinary gesture".
+That is the same shape as this entry's whole register: a recovery mechanism was named — the user
+repeats the gesture, sees the correct state, done — and the claim stopped there.
+
+It was never checked **what the gesture does**. Here the corrective gesture IS the same delete that
+produced the race: undo an already-drained delete, then delete again quickly. Performing it queues a
+fresh undo-inverse operation and a fresh delete operation on the same message, which is exactly the
+two-queued-ops precondition `buildLanes`' folder-independent key split needs to route them into
+different lanes and run them concurrently — the same race, not a repair of it. On the owner's device
+this was performed three times on one message before the state stuck, and thirty-one minutes after
+the second race a full sync silently reinserted the message into the inbox as if it were new mail.
+
+This is a NEW quantifier failure in the same family, distinct from instances 1–4: those asked whether
+the recovery mechanism can *run* from the failing state (instance 1: code guards on the recovery
+path; instance 2: an affordance owned by a different subsystem; instance 3: a predicate the fallback
+does not have; instance 4: which intention the mechanism actually completes). This one asks whether
+*performing the recovery mechanism recreates the precondition of the failure it is meant to cure* —
+a question none of the first four instances needed, because in each of them the recovery path was
+causally separate from the failure. Here it is not: the recovery IS a re-invocation of the exact
+operation that built the race.
+
+**Countermeasure amendment — new step 2c, alongside instance 2's step 2b:**
+
+> 2c. If the recovery is **a user gesture that repeats (all or part of) the action that caused the
+>     failure**, ask whether performing it recreates the failure's precondition rather than curing
+>     it. Trace what the gesture enqueues or executes, not just what state it is meant to leave
+>     behind — a gesture that re-enters the race is not a recovery, however ordinary it looks.
 
 ## Pre-compaction index line (verbatim, 2026-08-15)
 
