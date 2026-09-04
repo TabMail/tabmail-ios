@@ -582,3 +582,13 @@ false failure. `verify`'s Markdown-link check resolves `PROJECT_MEMORY.md`'s `..
 the monorepo root, which exists at `tabmail-ios/../CLAUDE.md` but NOT at
 `.worktrees/<name>/../CLAUDE.md`. In a worktree that link check fails and `rc=1` even when every hash
 is clean — so read the failure lines, never just the return code.
+
+## Index-line tells routed out on 2026-09-03 (companion-compact; verbatim from `MISTAKES.md`, leading/trailing separators kept)
+
+Fragment 1 (from the MIS-IOS-009 index line):
+
+**×8: `a6f395517` appended a bare-Markdown citation note to the generated `KnownIssues/ios-billing-001.md`, breaking `compact_known_issues.rb verify` from 2026-08-18 until `fb5d498a2` — while memory topic `115` already documented that exact hazard.** 
+
+Fragment 2 (from the MIS-IOS-009 index line):
+
+⚠️ **×9 (2026-09-02): a FACTUALLY CORRECT amendment in the wrong place** — the tell is *"this documented line is now wrong, and I made it wrong"*; being right about the content is not a licence to edit the body. In a WORKTREE `verify` also fails `../CLAUDE.md` for free — read the lines, not `rc`. 
