@@ -102,6 +102,15 @@
 >
 > Architecture, the full channel table, and the rule that a new channel is an `AppLogChannel` case
 > rather than a sixteenth file: [`Companion/Memory/Current/122-one-log-file-per-process.md`](../../../Memory/Current/122-one-log-file-per-process.md).
+>
+> ⚠️ **2026-09-04 — the channel arithmetic in this block is now stale, and "all fifteen main-app
+> channels" above is FALSE: it is SIXTEEN.** `AppLogChannel.queue` (tag `QUEUE`, sole writer
+> `BackgroundSyncLogger.logQueue`) was added for `IOS-QUEUE-008`, taking the gating split from FIVE
+> always-on / TEN debug-gated to FIVE / ELEVEN. The disposition of this row is UNCHANGED — the new
+> channel is debug-gated at the write and whole-line escaped, so it is strictly narrower than the
+> corpus classes B and C defer. Note the sentence immediately above stays correct: "sixteenth FILE"
+> counts the fifteen replaced log files, a closed historical set, not channels — do not renumber it.
+> Full amendment: [`Amendments/ios-log-002.md`](Amendments/ios-log-002.md).
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-LOG-002
 

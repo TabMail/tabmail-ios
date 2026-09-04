@@ -8,6 +8,31 @@ import Synchronization
 
 extension SyncEngine {
 
+    /// Render the inserted-header id list for the debug-gated `fullSync upsert`
+    /// diagnostic: `"inserted N header(s): a,b,c (+K more)"`.
+    ///
+    /// Extracted as a PURE, `nonisolated static` function for the same reason
+    /// `AccountManager.laneDiagnosticSummary` is one — the diagnostic it renders
+    /// lives inside a `dbPool.write` closure behind a runtime debug gate, so
+    /// inline it can only be executed by a test that also unlocks that gate, and
+    /// its OVERFLOW branch needs more inserted headers than any sync fixture
+    /// produces. Split out, both branches are directly unit-testable and the call
+    /// site is one expression.
+    ///
+    /// ⚠️ The cap is a DISPLAY cap on synthetic header IDS and nothing else. It
+    /// bounds no fetch, no batch and nothing written to the database: every
+    /// inserted row is still inserted, and the elided count is STATED rather than
+    /// dropped, so the line never claims to be exhaustive when it is not. Global
+    /// `CLAUDE.md` rule 11 names exactly this shape as not being data truncation.
+    nonisolated static func upsertInsertedIdSummary(_ insertedIds: [String]) -> String {
+        let cap = SyncConfig.upsertInsertedIdLogCap
+        let elided = insertedIds.count - cap
+        let overflow = elided > 0 ? " (+\(elided) more)" : ""
+        return "inserted \(insertedIds.count) header(s): "
+            + insertedIds.prefix(cap).joined(separator: ",")
+            + overflow
+    }
+
     /// The one optimistic-placeholder dedup statement shared by full sync,
     /// Gmail delta sync, and Exchange delta sync. Named so plan and consumer
     /// coverage execute the same SQL as production.
@@ -2177,25 +2202,21 @@ extension SyncEngine {
                 // what the reappearing-message investigation (`IOS-QUEUE-008`) had
                 // and could not use: it proves a full sync inserted N rows but not
                 // whether the message the user had just deleted was one of them.
-                // Debug-gated and file-backed on `.sync`, so it interleaves with the
-                // drain's `queueLog` lines in the one `tabmail.log` and is a no-op in
-                // a shipping build (global `CLAUDE.md` rule 12).
+                // Debug-gated and file-backed on `.queue`, so it interleaves with
+                // the drain's `queueLog` lines in the one `tabmail.log` and
+                // `AppLogStore.read(channel: .queue)` returns both halves in append
+                // order. ⚠️ NOT on the always-on `.sync` channel: one channel may
+                // carry only one lifetime policy (memory topic 122, `IOS-LOG-002`).
+                // A no-op unless debug logging is unlocked by an allowed user — it
+                // IS active on device / TestFlight for such a user, which is the
+                // point (global `CLAUDE.md` rule 12).
                 //
-                // The `prefix` is a DISPLAY cap on synthetic header IDS — no user
-                // content is involved, nothing stored is shortened, and the elided
-                // count is stated rather than dropped. Global rule 11 names exactly
-                // this as not being data truncation.
-                if DebugModeManager.isLoggingEnabled() {
-                    let insertedIds = newHeaders.map(\.id)
-                    let overflow = insertedIds.count > SyncConfig.upsertInsertedIdLogCap
-                        ? " (+\(insertedIds.count - SyncConfig.upsertInsertedIdLogCap) more)" : ""
-                    let line = "[MoveTrace] fullSync upsert[\(folder.name)] — inserted "
-                        + "\(insertedIds.count) header(s): "
-                        + insertedIds.prefix(SyncConfig.upsertInsertedIdLogCap).joined(separator: ",")
-                        + overflow
-                    print(line)
-                    AppLogStore.append(line, channel: .sync)
-                }
+                // The rendering is a pure static function so BOTH its branches can
+                // be unit-tested; it is evaluated inside `logQueue`'s `@autoclosure`
+                // argument, so a closed gate still builds nothing.
+                BackgroundSyncLogger.logQueue(
+                    "[MoveTrace] fullSync upsert[\(folder.name)] — "
+                        + SyncEngine.upsertInsertedIdSummary(newHeaders.map(\.id)))
             }
             return (newHeaders, staleIds, replyDetectIds, uidMigratedOldMsgIds, ftsRekeys, headerRekeys)
         }
