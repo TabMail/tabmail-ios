@@ -2178,18 +2178,33 @@ extension AccountManager {
                         folderPath: forwardDestinationPath, db: db),
                         admission.messages.count == currentRows.count
                     else { return UndoMoveWriteResult() }
-                    try PendingOperation(
+                    // Bound to a local ONLY so the diagnostic below can name the row's
+                    // `id` and `createdAt`. `PendingOperation` is a `PersistableRecord`
+                    // (non-mutating `insert`), so this is the same value, inserted the
+                    // same way, in the same transaction.
+                    let inverseOp = PendingOperation(
                         type: .move,
                         messageIds: admission.providerIds,
                         accountId: accountId,
                         folderPath: forwardDestinationPath,
                         destinationPath: sourcePath,
                         observedUidValidity: admission.observedUidValidity
-                    ).insert(db)
+                    )
+                    try inverseOp.insert(db)
+                    // `opId` and `createdAt` are what CORRELATE this inverse with the
+                    // drain lines it later produces: `queueLog` prints `id.prefix(8)`
+                    // and `buildLanes` orders a lane by `createdAt`, so without both an
+                    // undo cannot be matched to the lane it landed in — the gap that
+                    // made `IOS-QUEUE-008` unreadable from an exported log.
+                    // `createdAt` is rendered as an epoch interval deliberately:
+                    // sub-second resolution is what distinguishes a delete from the
+                    // undo issued a moment later.
                     BackgroundSyncLogger.logInbox(
                         "[RoleActionTrace] manager.undoMove phase=queuedInverse "
                             + "from=\(forwardDestinationPath) to=\(sourcePath) "
-                            + "providerIds=[\(admission.providerIds.joined(separator: ","))]")
+                            + "providerIds=[\(admission.providerIds.joined(separator: ","))] "
+                            + "opId=\(inverseOp.id) "
+                            + "createdAt=\(inverseOp.createdAt.timeIntervalSince1970)")
                 }
 
                 // Undo remains instant, as it was in 1.6.38. For a queued IMAP

@@ -770,4 +770,14 @@ enum SyncConfig {
     /// the condition the anti-brick rule keys on.
     static let uidValidityVerifyFetchBatchSize =
         uidValidityVerifySampleHighCount + uidValidityVerifySampleLowCount
+    /// How many inserted header IDS the debug-gated `fullSync upsert` diagnostic
+    /// RENDERS before eliding the rest as `(+N more)`.
+    ///
+    /// ⚠️ This is a DISPLAY cap on a log line and nothing else. It bounds neither a
+    /// fetch, a batch, nor anything written to the database: every inserted row is
+    /// still inserted, and the elided count is stated rather than dropped. Global
+    /// `CLAUDE.md` rule 11 names a display-side prefix as explicitly not data
+    /// truncation — the rule it would violate is the one about hardcoding a bare
+    /// numeric literal at the site, which is why it lives here.
+    static let upsertInsertedIdLogCap = 20
 }

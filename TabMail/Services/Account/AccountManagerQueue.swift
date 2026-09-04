@@ -83,9 +83,23 @@ struct ExecutedOperation: Sendable {
 /// `PendingOperation` row is still there (its delete failed / it was requeued
 /// whole), so the row itself is durable evidence of the op; what no durable
 /// artifact recorded was the FAILURE. Each site states its own case.
+///
+/// 🚨 THE GATED PATH IS FILE-BACKED TOO, for the same reason the three ungated
+/// sites above are. `print` alone reaches only an attached Xcode console: with
+/// no `freopen`/`dup2` anywhere in this tree, every one of this helper's call
+/// sites was INVISIBLE in a log exported from a device. That is not academic —
+/// a Gmail delete → undo → delete that reappeared 31 minutes later
+/// (`IOS-QUEUE-008`) could not be root-caused from the exported log, because
+/// nothing recorded which drain lane ran first. Writing the same line to the
+/// single `tabmail.log` via `AppLogStore` on the `.sync` channel makes the whole
+/// drain readable after the fact, and `DebugLogView`'s "App Logs" share exports
+/// it. The gate is unchanged and still covers BOTH sinks, so this stays a no-op
+/// in a shipping build (global `CLAUDE.md` rule 12).
 private func queueLog(_ message: @autoclosure () -> String) {
     guard DebugModeManager.isLoggingEnabled() else { return }
-    print(message())
+    let line = message()
+    print(line)
+    AppLogStore.append(line, channel: .sync)
 }
 
 extension AccountManager {
@@ -388,6 +402,35 @@ extension AccountManager {
         return lanes
     }
 
+    /// Render the composition of a `buildLanes` result as ONE log line: per lane,
+    /// in lane order, every op's short id, type, `folderPath`→`destinationPath`
+    /// and member ids.
+    ///
+    /// WHY THIS IS A SEPARATE FUNCTION AND NOT A LOG INSIDE `buildLanes`:
+    /// `buildLanes` is `nonisolated static` and PURE, and its unit tests depend on
+    /// that purity. Giving it a side effect — even a gated one — would make the
+    /// grouping decision and its diagnostic inseparable. This formatter is
+    /// likewise pure and deterministic (no dates, no clock, no I/O), so it is
+    /// directly unit-testable; the drain calls it through `queueLog`, whose
+    /// `@autoclosure` means it is not even evaluated unless debug logging is on.
+    ///
+    /// WHAT IT BUYS: the lane assignment IS the ordering decision — two ops on one
+    /// message in ONE lane serialize, in two lanes they race (`IOS-QUEUE-008`).
+    /// When a message reappears after a delete → undo → delete, the first question
+    /// is "which lane did each op land in, and in what order" and until now no
+    /// artifact answered it.
+    nonisolated static func laneDiagnosticSummary(_ lanes: [[PendingOperation]]) -> String {
+        guard !lanes.isEmpty else { return "<no lanes>" }
+        return lanes.enumerated().map { laneIndex, lane in
+            let ops = lane.map { op in
+                "\(op.id.prefix(8)) \(op.type.rawValue) "
+                    + "\(op.folderPath)→\(op.destinationPath ?? "-") "
+                    + "ids=[\(op.messageIds.joined(separator: ","))]"
+            }.joined(separator: " | ")
+            return "lane\(laneIndex)(\(lane.count)): \(ops)"
+        }.joined(separator: "  ;  ")
+    }
+
     /// Drain all queued operations with per-message parallelism.
     ///
     /// Ops are grouped into lanes by `buildLanes`: an op joins the lane of ANY op
@@ -651,6 +694,9 @@ extension AccountManager {
             // ACCOUNT, not of the op: folder-qualified for `folderLocalAccountIds`,
             // account-qualified for the stable-id providers.
             let lanes = Self.buildLanes(claimed, folderLocalAccountIds: folderLocalAccountIds)
+            // The lane assignment IS the concurrency decision, so record it before
+            // anything runs: same lane ⇒ serialized, different lanes ⇒ concurrent.
+            queueLog("[Queue] Lanes: \(Self.laneDiagnosticSummary(lanes))")
             guard !lanes.isEmpty else { break }
 
             // Launch one Task per lane. Each task drains its lane sequentially,
@@ -658,7 +704,9 @@ extension AccountManager {
             // op never runs ahead of an unresolved predecessor sharing a message id.
             // Different lanes (disjoint connected components) run concurrently.
             var tasks: [Task<Void, Never>] = []
-            for lane in lanes {
+            // `enumerated()` only supplies the lane's index to the diagnostic lines
+            // below — the iteration, its order and its body are unchanged.
+            for (laneIndex, lane) in lanes.enumerated() {
                 let capturedLane = lane
                 let capturedCtx = ctx
                 let task = Task { [self] in
@@ -717,10 +765,27 @@ extension AccountManager {
                         // passed to queue.execute is @Sendable, so it cannot capture a
                         // mutable local var directly under Swift 6 strict concurrency.
                         let outcomeBox = Mutex<SingleOpOutcome>(.proceed)
+                        // WIRE ORDER, RECORDED. The pair of lines around this call is
+                        // what lets an exported log answer "which op went out first,
+                        // and in which lane" after the fact — the question
+                        // `IOS-QUEUE-008` could not answer. Position within the lane
+                        // proves FIFO; the lane index proves what serialized against
+                        // what; the outcome proves whether the lane kept draining.
+                        queueLog(
+                            "[Queue] drain lane \(laneIndex) pos \(index + 1)/\(capturedLane.count) — "
+                                + "executing \(op.id.prefix(8)) \(op.type.rawValue) "
+                                + "\(op.folderPath)→\(op.destinationPath ?? "-") "
+                                + "ids=[\(op.messageIds.joined(separator: ","))]")
                         await queue.execute(priority: .userAction) {
                             let result = await self.executeSingleOp(op, provider: provider, context: capturedCtx)
                             outcomeBox.withLock { $0 = result }
                         }
+                        queueLog(
+                            "[Queue] drain lane \(laneIndex) pos \(index + 1)/\(capturedLane.count) — "
+                                + "executed \(op.id.prefix(8)) \(op.type.rawValue) "
+                                + "\(op.folderPath)→\(op.destinationPath ?? "-") "
+                                + "ids=[\(op.messageIds.joined(separator: ","))] "
+                                + "outcome=\(outcomeBox.withLock({ $0 }))")
                         if outcomeBox.withLock({ $0 }) == .haltLane {
                             // Requeue the REMAINING claimed ops of this lane — exactly
                             // like the failedAccounts requeue path above — then stop.
