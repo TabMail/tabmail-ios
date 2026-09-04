@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 /// Real-`executeSingleOp` queue persistence and lane-halt tests.
@@ -501,6 +502,97 @@ struct AccountManagerQueueDrainTests {
             }
             let readCalls = await provider.markedReadIds
             #expect(readCalls.contains { $0.ids == ["msg-2"] }, "lane 2's op also executed")
+        }
+    }
+
+    // MARK: - 10b. IOS-QUEUE-008: same provider RESOURCE, two folder paths
+
+    /// THE SYSTEM PROPERTY: two queued operations that name the same provider
+    /// RESOURCE never execute concurrently and execute in `createdAt` (issue)
+    /// order. On Gmail/Graph a message id is folder-INDEPENDENT, so "same
+    /// resource" is `(account, id)` — the folder is not part of the address.
+    ///
+    /// The gesture that produced this (delete → undo ≈2s later → delete again
+    /// ≈1s later, one Gmail message): undo enqueues the INVERSE move, whose
+    /// source is by construction the forward op's DESTINATION, so the queue held
+    /// `TRASH→INBOX` at t0 and `INBOX→TRASH` at t0+1 while ONE drain pass fetched
+    /// both. A folder-qualified lane key put them in different connected
+    /// components, `drainPendingQueue` launches one Task per lane concurrently,
+    /// the inverse finished LAST, and Gmail kept the message in INBOX while the
+    /// local row said TRASH — both ops retiring as provider successes, so the
+    /// next full sync re-inserted the row the user had deleted.
+    ///
+    /// The oracle is the wire itself, in both directions: the move hook counts
+    /// concurrent entries into `move` and sleeps long enough that a genuinely
+    /// parallel pair must be seen as parallel, so a regression cannot pass by
+    /// timing luck, and a serialized pair cannot fail by it either.
+    @Test("drainPendingQueue() (real): on a stable-id account, an undo inverse and a re-delete of the same message never overlap on the wire and run in issue order")
+    func drainPendingQueueRealStableIdSameMessageOpsNeverOverlapAndRunInIssueOrder() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        let accountId = "acc-stable-id-same-message"
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let provider = MockEmailProvider()
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: provider
+        ) {
+            try insertStableProviderFixture(accountId: accountId, pool: pool)
+            // The inverse op's SOURCE folder — `optimisticMoveToFolder` restored
+            // the row to the destination of the op it undid, so the inverse is
+            // addressed from TRASH and needs that folder row to exist.
+            try await pool.writeWithoutTransaction { db in
+                try Folder(name: "TRASH", path: "TRASH", role: .trash, accountId: accountId).insert(db)
+            }
+
+            // Dynamic (repo rule: no hardcoded dates); whole-second so the GRDB
+            // date round-trip compares exactly.
+            let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
+            // The undo's inverse: restore the message the delete moved to TRASH.
+            var opInverse = PendingOperation(
+                type: .move, messageIds: ["m1"], accountId: accountId,
+                folderPath: "TRASH", destinationPath: "INBOX")
+            opInverse.createdAt = t0
+            // The user's NEWEST intention: delete it again.
+            var opRedelete = PendingOperation(
+                type: .move, messageIds: ["m1"], accountId: accountId,
+                folderPath: "INBOX", destinationPath: "TRASH")
+            opRedelete.createdAt = t0.addingTimeInterval(1)
+            try insertOp(opInverse, pool: pool)
+            try insertOp(opRedelete, pool: pool)
+
+            let wire = Mutex<(inFlight: Int, overlapped: Bool)>((inFlight: 0, overlapped: false))
+            await provider.setMoveHook {
+                wire.withLock { state in
+                    state.inFlight += 1
+                    if state.inFlight > 1 { state.overlapped = true }
+                }
+                // Long enough that a second, genuinely concurrent `move` is
+                // observed inside this window rather than after it.
+                try? await Task.sleep(for: .milliseconds(250))
+                wire.withLock { $0.inFlight -= 1 }
+            }
+
+            await AccountManager.shared.drainPendingQueue()
+
+            let overlapped = wire.withLock { $0.overlapped }
+            #expect(!overlapped,
+                    "two ops on the same Gmail message executed concurrently; the later one can land first and undo the user's newest intention")
+
+            let allMoves = await provider.movedIds
+            let m1Moves = allMoves.filter { $0.ids.contains("m1") }
+            let landed = m1Moves.map { "\($0.from)→\($0.to)" }
+            #expect(m1Moves.count == 2,
+                    "both moves must have reached the provider, got \(landed)")
+            guard m1Moves.count == 2 else { return }
+            #expect(landed == ["TRASH→INBOX", "INBOX→TRASH"],
+                    "the two moves must land on the wire in createdAt (issue) order, got \(landed)")
+            #expect(m1Moves[1].to == "TRASH",
+                    "the user's LATEST destination must be the one that wins on the wire, got \(m1Moves[1].to)")
+
+            let remaining = try await pool.read { db in
+                try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
+            }
+            #expect(remaining.isEmpty, "both ops executed (deleted)")
         }
     }
 

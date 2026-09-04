@@ -237,58 +237,104 @@ extension AccountManager {
     }
 
     /// Groups claimed pending operations into serialized "lanes" via connected-
-    /// component grouping over shared message ADDRESSES (scoped per account AND
-    /// per folder). Two ops that name ANY member at the same address land in the
-    /// same lane — and transitively, any op sharing an address with either of
-    /// those joins too (union-find).
+    /// component grouping over shared message ADDRESSES. Two ops that name ANY
+    /// member at the same address land in the same lane — and transitively, any
+    /// op sharing an address with either of those joins too (union-find).
     ///
-    /// 🚨 THE FOLDER IS PART OF THE ADDRESS, AND OMITTING IT WAS A NEVER-DROP
-    /// BUG (`IOS-QUEUE-001`). On IMAP a UID is mailbox-local: UID 77 in `INBOX`
-    /// and UID 77 in `Archive` are DIFFERENT PHYSICAL MESSAGES, and every id an
-    /// ordinary IMAP gesture enqueues is a bare UID
-    /// (`admittedOrdinaryActionTargets` requires `messageId == String(uid)`).
-    /// The lane key used to be `"accountId:msgId"`, so those two unrelated
-    /// messages shared a lane. Delay was the benign half. The harmful half is
-    /// the WEDGE COROLLARY WITH A BYSTANDER: `executeSingleOp`'s
-    /// `ProviderEvidenceUnavailable` arm returns `.haltLane` and requeues, and a
-    /// server that stops reporting `UIDVALIDITY` on SELECT reproduces that
-    /// refusal identically on every drain, forever. With the folder-less key
-    /// that permanent halt propagated to a message in a DIFFERENT FOLDER that
-    /// merely shared the UID number — and its owner could neither see nor clear
-    /// it, because no UI lists `PendingOperation` rows. An op that stays queued
-    /// but prevents other intentions executing has not been preserved.
+    /// 🚨 THE INVARIANT THIS EXISTS TO ENFORCE: two queued operations that name
+    /// the same provider RESOURCE do not execute concurrently, and execute in
+    /// `createdAt` (issue) order. `drainPendingQueue` launches one Task per lane
+    /// CONCURRENTLY, each drawing from a `ProviderWorkQueue` whose concurrency is
+    /// well above 1 (10 for Gmail and for Graph; up to
+    /// `SyncConfig.imapMaxConnectionCeiling` for IMAP, which is separate
+    /// connections), so "same resource ⇒ same lane" is the only thing standing
+    /// between two gestures on one message and a wire race.
+    ///
+    /// 🚨 THE KEY IS THE OP'S ADDRESS SPACE, NOT A FIXED SHAPE, and which space
+    /// an op lives in is a property of its ACCOUNT — decided from
+    /// `Account.provider`, the same way `admittedOrdinaryActionTargets` and
+    /// checkpoint A already decide it. This function is pure, so it cannot read
+    /// the `Account` row itself; the caller passes `folderLocalAccountIds`, and
+    /// the parameter is deliberately REQUIRED rather than defaulted — a default
+    /// would silently classify an IMAP account as stable-id, which is the
+    /// direction that re-opens `IOS-QUEUE-001`.
+    ///
+    /// - **Folder-local ids — IMAP/iCloud (`folderLocalAccountIds`)** — key
+    ///   `"accountId:folderPath:msgId"`. A UID is mailbox-local: UID 77 in
+    ///   `INBOX` and UID 77 in `Archive` are DIFFERENT PHYSICAL MESSAGES, and
+    ///   every id an ordinary IMAP gesture enqueues is a bare UID
+    ///   (`admittedOrdinaryActionTargets` requires `messageId == String(uid)`).
+    ///   Merging them was a NEVER-DROP BUG (`IOS-QUEUE-001`): a lane halts on the
+    ///   first evidence refusal, `executeSingleOp`'s `ProviderEvidenceUnavailable`
+    ///   arm returns `.haltLane` and requeues, and a server that stops reporting
+    ///   `UIDVALIDITY` on SELECT reproduces that refusal identically on every
+    ///   drain, forever — so a permanent halt on `(INBOX, 77)` starved the
+    ///   unrelated message at `(Archive, 77)`. That is the WEDGE COROLLARY WITH A
+    ///   BYSTANDER, and its owner could neither see nor clear it, because no UI
+    ///   lists `PendingOperation` rows. An op that stays queued but prevents
+    ///   other intentions executing has not been preserved.
+    /// - **Stable ids — Gmail/Graph, and the demo account** — key
+    ///   `"accountId:msgId"`, folder deliberately EXCLUDED. The provider's id is
+    ///   folder-independent, so the folder is not part of the address and
+    ///   including it splits one resource across two lanes.
+    ///
+    /// 🚨 THE NEGATIVE CASE THAT MOTIVATED THE SPLIT (`IOS-QUEUE-008`): on
+    /// Gmail, delete → undo → delete again. `undoMove` enqueues a real inverse
+    /// whose source is by construction the forward op's DESTINATION, so the queue
+    /// held `TRASH→INBOX` and, one second later, `INBOX→TRASH` on ONE message.
+    /// Under a uniformly folder-qualified key they landed in different connected
+    /// components, ran concurrently, and the INVERSE finished last: the server
+    /// kept the message in INBOX while the local row said TRASH, both ops retired
+    /// as provider successes, and the next full sync imported the wrong state as
+    /// if it were fresh — the deleted message reappeared. That also inverts
+    /// never-drop's ordering clause, since the user's NEWEST intention lost to an
+    /// older one.
     ///
     /// The op already CARRIES the folder (`PendingOperation.folderPath`, used by
-    /// checkpoint A, by `retirePartiallyCompletedOp` and by the executor), so
-    /// this reads information that was present and discarded rather than
-    /// reconstructing one. Every producer takes that path from the same source —
-    /// a `Folder.path` or a `MessageHeader.folderPath`, never a literal — and
-    /// the batch-split site in `executeSingleOp` copies `currentOp.folderPath`,
-    /// so two ops on the SAME message still key identically and still serialize.
+    /// checkpoint A, by `retirePartiallyCompletedOp` and by the executor), so the
+    /// folder-local key reads information that was present and discarded rather
+    /// than reconstructing one. Every producer takes that path from the same
+    /// source — a `Folder.path` or a `MessageHeader.folderPath`, never a literal
+    /// — and the batch-split site in `executeSingleOp` copies
+    /// `currentOp.folderPath`, so the children of a split key exactly as their
+    /// parent did.
     ///
     /// The key is a plain colon join, exactly like `MessageIdentity.folderId`.
     /// A folder path containing a colon can only make two distinct addresses
     /// collide, which OVER-merges — the conservative direction, and precisely
-    /// the behaviour that shipped before this change.
+    /// the behaviour that shipped before the folder was added to the key.
     ///
-    /// WHY this matters: `drainPendingQueue` runs one Task per lane CONCURRENTLY,
-    /// each drawing from `ProviderWorkQueue` (bounded concurrency > 1 — separate
-    /// IMAP connections). The OLD lane key was `"accountId:messageIds.first"`, so a
-    /// batch move `[A,B,C]` landed in a lane keyed by A while a LATER single-id op
-    /// on B (e.g. a flag change) landed in a SEPARATE lane keyed by B — even though
-    /// B is a member of both. The two lanes then ran concurrently, racing on the
-    /// wire: a flag STORE on B could race the batch MOVE of B, silently losing the
-    /// flag on the MOVE's source cleanup, or running against the old location
-    /// before the move finishes. Connected-component lanes guarantee
-    /// any op sharing a member id with an in-flight op serializes AFTER it.
+    /// WHY LANES EXIST AT ALL: the ORIGINAL key was `"accountId:messageIds.first"`,
+    /// so a batch move `[A,B,C]` landed in a lane keyed by A while a LATER
+    /// single-id op on B (e.g. a flag change) landed in a SEPARATE lane keyed by
+    /// B — even though B is a member of both. The two lanes then ran
+    /// concurrently, racing on the wire: a flag STORE on B could race the batch
+    /// MOVE of B, silently losing the flag on the MOVE's source cleanup, or
+    /// running against the old location before the move finishes.
+    /// Connected-component lanes make any op sharing a member id with an
+    /// in-flight op serialize AFTER it.
     ///
     /// Pure and side-effect free (no DB/IO) — `nonisolated static` so it's directly
     /// unit-testable without an actor hop. Callers pass ops in createdAt-asc order;
     /// each lane preserves that relative order (FIFO within its component).
     /// Ops with empty `messageIds` (no id to key on) fall back to a singleton lane,
     /// matching the pre-existing fallback (`messageIds.first ?? op.id`).
-    nonisolated static func buildLanes(_ ops: [PendingOperation]) -> [[PendingOperation]] {
-        // Union-Find over "accountId:folderPath:msgId" keys, with path compression.
+    ///
+    /// - Parameter folderLocalAccountIds: ids of the accounts whose message ids
+    ///   are FOLDER-LOCAL (IMAP/iCloud). Required, not defaulted; see above.
+    nonisolated static func buildLanes(
+        _ ops: [PendingOperation],
+        folderLocalAccountIds: Set<String>
+    ) -> [[PendingOperation]] {
+        /// The op's ADDRESS, in whichever address space its account uses. Both
+        /// key-building passes below go through this one function, so the union
+        /// pass and the lane-assignment pass cannot drift apart.
+        func laneKey(_ op: PendingOperation, _ id: String) -> String {
+            folderLocalAccountIds.contains(op.accountId)
+                ? "\(op.accountId):\(op.folderPath):\(id)"
+                : "\(op.accountId):\(id)"
+        }
+        // Union-Find over lane keys, with path compression.
         var parent: [String: String] = [:]
 
         func find(_ x: String) -> String {
@@ -313,7 +359,7 @@ extension AccountManager {
         for op in ops {
             let ids = op.messageIds
             guard !ids.isEmpty else { continue }
-            let keys = ids.map { "\(op.accountId):\(op.folderPath):\($0)" }
+            let keys = ids.map { laneKey(op, $0) }
             for key in keys where parent[key] == nil {
                 parent[key] = key
             }
@@ -331,7 +377,7 @@ extension AccountManager {
                 lanes.append([op])
                 continue
             }
-            let root = find("\(op.accountId):\(op.folderPath):\(firstId)")
+            let root = find(laneKey(op, firstId))
             if let idx = laneIndexForRoot[root] {
                 lanes[idx].append(op)
             } else {
@@ -376,9 +422,21 @@ extension AccountManager {
         // Max 3 passes to pick up ops inserted during drain.
         for pass in 0..<3 {
             let ops: [PendingOperation]
+            // Which accounts address their messages FOLDER-LOCALLY (an IMAP UID is
+            // mailbox-local) rather than by a folder-independent provider id. Read
+            // here, in the SAME read as the ops snapshot and BEFORE anything is
+            // claimed, so a failure still takes the existing `break` and leaves no
+            // row stranded `inFlight`. Same predicate as the claim loop's `isIMAP`
+            // and `admittedOrdinaryActionTargets`.
+            let folderLocalAccountIds: Set<String>
             do {
-                ops = try await dbPool.read({ db in
-                    try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
+                (ops, folderLocalAccountIds) = try await dbPool.read({ db in
+                    let fetchedOps = try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
+                    let accounts = try Account.fetchAll(db)
+                    let folderLocal = Set(accounts
+                        .filter { $0.id != DemoSeed.demoAccountId && ($0.provider == .imap || $0.provider == .icloud) }
+                        .map(\.id))
+                    return (fetchedOps, folderLocal)
                 })
             } catch {
                 queueLog("[Queue] ERROR: Failed to fetch pending ops: \(error)")
@@ -589,7 +647,10 @@ extension AccountManager {
             }
 
             // Connected-component lane grouping (F1) — pure, see buildLanes doc comment.
-            let lanes = Self.buildLanes(claimed)
+            // The lane key is the op's ADDRESS SPACE, which is a property of its
+            // ACCOUNT, not of the op: folder-qualified for `folderLocalAccountIds`,
+            // account-qualified for the stable-id providers.
+            let lanes = Self.buildLanes(claimed, folderLocalAccountIds: folderLocalAccountIds)
             guard !lanes.isEmpty else { break }
 
             // Launch one Task per lane. Each task drains its lane sequentially,
