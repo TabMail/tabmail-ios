@@ -195,3 +195,40 @@ same `DatabasePool.write` transaction, the key the orphan check had just read, a
 `messageHeader` write between the two reads is the Sent-dedup DELETE. The Exchange arm's `print`
 twin went with it. Six `[MoveTrace] deltaSync` sites remain on the `.queue` channel. Detail and the
 transaction-boundary facts: `Companion/Process/Current/KnownIssues/Amendments/ios-label-004.md`.
+
+## 2026-09-04 — round 5 (PR #113): the full-sync upsert line now tells the truth (R4-RS-1)
+
+Two lies in the `[MoveTrace] fullSync upsert[<folder>] — …` line the follow-up above added, both
+removed in `SyncEngine.runSyncMessages` (`SyncEngineFullSync.swift`):
+
+1. **Reclaimed rows were reported as inserted.** The orphan-reclaim arm UPDATES an existing row in
+   place — a local row an optimistic move re-homed, whose server folder disagreed; for this issue
+   the MORE interesting event — and appended it to `newHeaders`, which the line rendered under
+   `inserted N header(s):`. The line now carries TWO segments, always both, each capped by
+   `SyncConfig.upsertInsertedIdLogCap`: `inserted N header(s): … | reclaimed M header(s): …`.
+   `insertedIds` grows only next to a `header.insert(db)` (the plain insert, the DraftDedup
+   replacement and the pre-sync inbox reclaim — each a NEW row under the reported id);
+   `reclaimedIds` only at the orphan-reclaim arm's in-place update. `newHeaders` is unchanged for
+   its FTS / body-queue consumers and is no longer the source of the diagnostic. An update-only
+   pass renders `inserted 0 header(s):  | reclaimed 0 header(s): ` (both trailing spaces kept).
+   The renderer is the same pure `SyncEngine.upsertInsertedIdSummary`, now with a `verb:`
+   parameter defaulting to `"inserted"`.
+2. **The line was written before COMMIT.** It was emitted inside the `dbPool.write` closure, and
+   `AppLogStore.append` enqueues file I/O that no ROLLBACK can retract, so a commit failure (I/O
+   error, full disk) left a line naming rows that never became durable. The closure now RETURNS the
+   rendered line (`upsertLine: String?`, nil when the pass emits nothing — the emission condition
+   is unchanged) as one more field of its result tuple, and `BackgroundSyncLogger.logQueue` runs
+   only after the write has returned; a thrown write never reaches it. `BootProfiler.mark` stays
+   inside the closure as before.
+
+Pinned in `SyncEngineRunSyncTests` (`SyncEngineFullSyncUpsertDiagnosticTests`; real
+`runSyncMessages`, debug gate unlocked, oracle `AppLogStore.read(channel: .queue)`): an orphan
+reclaim under a `.date` stale window (the Gmail/Exchange arm — IMAP refuses the reclaim, see
+`RFC822IdentityMergeGuardTests`) is reported under `reclaimed` and not `inserted`, with the row back
+in the synced folder; a mixed pass (one insert + one reclaim) pins the exact two-segment line; and a
+GRDB `TransactionObserver` whose `databaseWillCommit()` throws once the sync's transaction has
+written `messageHeader` proves a rolled-back pass leaves NO line and NO row. All three were red on
+`2f0294c8c`, and each condition has a mutation proof (emit inside the transaction again → the
+rollback test goes red; append reclaimed ids to `insertedIds` → the reclaim tests go red). The pure
+suite `SyncEngineUpsertInsertedIdSummaryTests` gained the `verb: "reclaimed"` case; the only
+pre-existing oracle the new shape changed is the update-only line above.
