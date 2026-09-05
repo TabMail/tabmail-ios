@@ -162,7 +162,13 @@ move and BEFORE the retirement transaction commits, that move's queued followers
 On relaunch `reconcilePendingOperations` DROPS the interrupted `.move` — it cannot distinguish a
 completed move from an uncommitted one and prefers a dropped move to a duplicate — so the header
 converges by sync while the FOLLOWER's intention does not: its next attempt `404`s and the conflict
-arm deletes it.
+arm deletes it. **⚠️ SITE CORRECTED 2026-09-05 (#114 round 4): that relaunch drop now
+happens in `AppDatabase.recoverPreviousSessionResidue(on:)`, called from
+`AppDatabase.init(pool:runStartupResets:)` before `AppDatabase.shared` is published, not in
+`reconcilePendingOperations` — the disposition and this accepted limitation are unchanged, but the
+sweep had to leave that function, which `RootView` runs only after the LAST account connects and
+therefore long after earlier accounts have begun draining, where it deleted a retained retirement
+this live process still owned (`IOS-GRAPH-005`).**
 
 It is **not closable in this design.** Re-associating the follower needs the response that was lost,
 and RFC identity may NOT be used as a mutation authority to bridge the gap: that is exactly the

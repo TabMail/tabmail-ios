@@ -877,7 +877,10 @@ actor DraftStore {
 
     /// LAUNCH-ONLY crash recovery for the draft push's in-flight state. Returns the
     /// number of rows re-admitted. Runs inside the caller's transaction — see
-    /// `AccountManager.reconcilePendingOperations`, which is its only caller.
+    /// `AppDatabase.recoverPreviousSessionResidue(on:)`, which is its only caller.
+    /// (MOVED 2026-09-05: the caller used to be
+    /// `AccountManager.reconcilePendingOperations`. Same transaction, same
+    /// predicate, strictly earlier boundary — see that function's banner.)
     ///
     /// `performStageA` durably commits `"pushing"` BEFORE the provider call, and
     /// `pushDraftToServer`'s entry guard admits `nil`, `"dirty"`, and — only when
@@ -914,9 +917,15 @@ actor DraftStore {
     /// in-process claim `pushesInFlight`, so it can distinguish residue from a live
     /// attempt in a way a blind predicate sweep cannot.
     ///
-    /// ⚠ WHY THE LAUNCH ENTRY, STILL. At `reconcilePendingOperations` nothing has
-    /// drained yet IN THIS PROCESS, so no claim can be held and any `"pushing"` row
-    /// is orphaned — which is what lets this carry no drain latch. That remains the
+    /// ⚠ WHY THE LAUNCH ENTRY, STILL. At `AppDatabase.recoverPreviousSessionResidue`
+    /// nothing has drained yet IN THIS PROCESS, so no claim can be held and any
+    /// `"pushing"` row is orphaned — which is what lets this carry no drain latch.
+    /// CORRECTED 2026-09-05: that sentence used to name `reconcilePendingOperations`,
+    /// where it was an ARGUMENT that turned out to be false — `RootView` calls that
+    /// function only after every account has connected, by which time a connected
+    /// account's gestures have already been draining. At the new site the premise is
+    /// STRUCTURAL: the pool is not yet published as `AppDatabase.shared`, so nothing
+    /// in this process can have claimed anything. That remains the
     /// correct scope for a BLIND, predicate-only, whole-table reset: read the banner
     /// on `AccountManager.reconcileOutbox`, which records a real shipped bug
     /// where a reset landed on a row whose send was already on the wire. This

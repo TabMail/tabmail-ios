@@ -231,6 +231,68 @@ drain against the churning Graph server, three refused commits then recovery),
 from the old mechanism's whole-bundle-requeue expectation to the invariant) and its account-scoped
 sibling `.narrowedRetirementThatCannotCommitIsReplayedOnAnAccountScopedProvider`.
 
+### ⚠️ CORRECTED 2026-09-05 (round 4, A1) — the crash-residue sweep ran where a live drain could already own the rows
+
+The retention-and-replay design above is correct and unchanged. What was wrong is a site it depends
+on: the sweep that reconciles the PREVIOUS process's residue sat at the top of
+`AccountManager.reconcilePendingOperations`, and that function is **not** the launch-only entry
+point its own comment claimed.
+
+**Invariant.** Crash residue from a PREVIOUS process is reconciled at a point where nothing in this
+process can have claimed anything — the database-startup boundary — and nothing this process owns (a
+retained retirement, a claimed lane, a halted suffix) is ever swept.
+
+**Mechanism of the defect.** `RootView` calls `reconcilePendingOperations` only after EVERY account
+has finished connecting, while a connected account's gestures and the background entry points have
+already been draining. The sweep blindly resets every `inFlight` row and DELETES every
+`everAttempted` `.move`. So: account A's Outlook move succeeds on Graph, its retirement write is
+refused, the proof is retained and the row stays `inFlight` + `everAttempted`; account B's connect
+completes; the sweep DELETES A's row; the drain that follows hits `replayRetainedRetirements`'
+row-gone arm, drops the proof as if the user had wiped the row, and the follower is claimed alone at
+the id Graph already reallocated — `404`, single-message conflict arm, the user's newest gesture
+deleted. Live process, no crash: **outside the accepted process-death window.** On a retained
+PARTIAL retirement it costs strictly more — deleting the bundle discards the still-owed, never-executed
+members too. The correctness angle reproduced both shapes independently on GRDB 7.11.1 (COR-1).
+
+**The fix is a MOVE, not a new mechanism, and it adds no state.** The sweep body is unchanged and now
+lives in `AppDatabase.recoverPreviousSessionResidue(on:)`, called unconditionally from
+`AppDatabase.init(pool:runStartupResets:)` after `runMigrations` and before the inbox observer is
+wired. No latch, no flag, no `…ForTesting` reset seam: the premise becomes STRUCTURAL rather than
+conventional, because the only writer of `pendingOperation.status = inFlight` is the drain's claim,
+every drain reaches the database through `AppDatabase.dbPool` → `rawPool` → `shared`, and `shared` is
+not published until that initializer returns. It is deliberately NOT inside `StartupMigrations.run`
+and NOT gated by `runStartupResets` — those are one-time, flag-gated, production-only data resets,
+while this is per-launch recovery with no UserDefaults or FTS side effect, so test fixtures run it
+too. `reconcilePendingOperations` keeps its name and both callers and is now exactly
+`drainPendingQueue()` + `reconcileOutbox()` + `reconcileCalendarQueue()`.
+
+**Failure semantics at the boundary: fail closed.** A throw PROPAGATES out of `init`, exactly as a
+failed migration or the observer-seeding write does; `AppStartup` renders "TabMail couldn't open its
+local database" and **does not publish the pool**. A database that cannot take the recovery write
+must not go on to release new claims into unreconciled state, so there is no `try?`, no retry ladder
+and no swallow-and-log. The previous site swallowed the failure (`try? await retryWrite`) and drained
+anyway.
+
+**The NSE cannot reach it.** `TabMailNotificationService` compiles only `TabMailNotificationService/`
++ `Shared/` (`project.yml`) and never `TabMail/Services/AppDatabase.swift`; the whole-tree census of
+`AppDatabase(` in production is `TabMailApp.swift` (the real launch) and `PreviewMocks.swift`.
+
+**Fences.** Three new real-drain witnesses in `OutlookQueueHandoffTests`, all driven through the REAL
+`reconcilePendingOperations()` — the `RootView` entry — and all RED on the pre-fix code:
+`theLaunchReconcilerDoesNotEraseARetirementThisProcessStillOwns` (full retention: the follower
+PATCHed at the invalidated id and was deleted),
+`theLaunchReconcilerDoesNotEraseAHeldNarrowingsStillOwedMembers` (partial retention: the still-owed
+member never moved at all) and
+`theLaunchReconcilerArrivingDuringADrainLeavesTheClaimedLaneAlone` (the reconciler arriving while a
+move is parked in the wire route: the claimed move row was DELETED and its follower released back to
+`queued` under the lane task still holding it). The sweep itself is pinned at its new boundary by the
+two tests that used to pin it at the old one, rewritten to enter through `AppDatabase(dbPool:)` with
+every assertion kept verbatim:
+`AccountManagerQueueDrainTests.databaseStartupRecoveryResetsInFlightDeletesCancelledLeavesQueued`
+(renamed from `.reconcilePendingOperationsResetsInFlightDeletesCancelledLeavesQueued`) and
+`.launchReconciliationReAdmitsAnOrphanedDraftPush`. Their inverted proof is deleting the `init` call
+while keeping the static.
+
 ## Tests
 
 All named tests are RED against a named inversion of the fix and GREEN after; the mutation matrix

@@ -750,7 +750,9 @@ enum MessageHeaderRekey {
     /// ⚠️ ACCEPTED LIMITATION — THE CRASH WINDOW (owner-accepted 2026-09-04).
     /// If the process dies AFTER Graph returns 2xx for the move and BEFORE this
     /// transaction commits, that move's queued followers keep the dead id. On
-    /// relaunch `reconcilePendingOperations` drops the interrupted `.move` (it
+    /// relaunch `AppDatabase.recoverPreviousSessionResidue` drops the interrupted
+    /// `.move` (MOVED 2026-09-05 from `reconcilePendingOperations`; same disposition
+    /// — it
     /// cannot tell a completed move from an uncommitted one, and prefers a dropped
     /// move to a duplicate — tracked separately as `TabMail/tabmail-ios#116`), the
     /// header row converges by sync, but the FOLLOWER's intention does not: its
