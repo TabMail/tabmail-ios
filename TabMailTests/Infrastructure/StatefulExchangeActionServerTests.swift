@@ -624,4 +624,164 @@ struct StatefulExchangeActionServerTests {
             "unexpected served sequence: \(server.http.servedCallSequence())"
         )
     }
+
+    // MARK: - Seam self-checks (IOS-GRAPH-005)
+    //
+    // Four seams were added to the fixture for the Outlook queue-handoff tests.
+    // Each is proved HERE, at the fixture boundary, because a seam asserted only
+    // through a full drain is indistinguishable from a seam that never fires: a
+    // test whose oracle is "no PATCH happened while the move was held" passes
+    // trivially if the hold silently did nothing.
+
+    /// `holdNextMove()` really parks a move inside the route until released, and
+    /// releases exactly one.
+    @Test("holdNextMove parks the next move in the route until the test releases it")
+    func holdNextMoveParksTheMoveUntilReleased() async throws {
+        let rfc = "hold-next-move@example.com"
+        let server = StatefulExchangeActionServer(messages: [.init(
+            rfc822MessageId: rfc, providerMessageId: "graph-hold-1", folderId: "source")])
+        defer { server.close() }
+        let provider = server.provider()
+
+        let release = server.holdNextMove()
+        let move = Task {
+            try await provider.moveProvingDestinations(
+                ids: ["graph-hold-1"], from: "source", to: "archive")
+        }
+
+        // The move is inside the route and has NOT applied its effect yet.
+        var held = false
+        for _ in 0..<300 where !held {
+            held = server.heldMoveCount() == 1
+            if !held { try await Task.sleep(for: .milliseconds(10)) }
+        }
+        #expect(held, "the move was never held — every 'while held' oracle in the handoff suite would be vacuous")
+        #expect(server.snapshot(providerMessageId: "graph-hold-1")?.folderId == "source",
+                "the held move applied its effect anyway, so the hold is not a barrier")
+
+        release()
+        _ = try await move.value
+        #expect(server.snapshots(rfc822MessageId: rfc).map(\.folderId) == ["archive"],
+                "the released move never landed")
+        #expect(server.heldMoveCount() == 1, "the hold is one-shot; a second move must not be held")
+    }
+
+    /// The overlap counter can report `true`. This is the POSITIVE CONTROL for
+    /// every `moveOverlapObserved() == false` assertion elsewhere: without it a
+    /// zero could mean "serialized" or "this fixture can never see an overlap",
+    /// and those are not the same claim.
+    @Test("the /move overlap counter reports an overlap when two moves really are in the route at once")
+    func moveOverlapCounterCanReportAnOverlap() async throws {
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: "overlap-a@example.com",
+                  providerMessageId: "graph-overlap-a", folderId: "source"),
+            .init(rfc822MessageId: "overlap-b@example.com",
+                  providerMessageId: "graph-overlap-b", folderId: "source"),
+        ])
+        defer { server.close() }
+        let provider = server.provider()
+
+        #expect(!server.moveOverlapObserved(), "the counter must start clean")
+
+        let release = server.holdNextMove()
+        let first = Task {
+            try await provider.moveProvingDestinations(
+                ids: ["graph-overlap-a"], from: "source", to: "archive")
+        }
+        var held = false
+        for _ in 0..<300 where !held {
+            held = server.heldMoveCount() == 1
+            if !held { try await Task.sleep(for: .milliseconds(10)) }
+        }
+        #expect(held)
+
+        let second = Task {
+            try await provider.moveProvingDestinations(
+                ids: ["graph-overlap-b"], from: "source", to: "archive")
+        }
+        // The second move only has to REACH the route; it is not held.
+        var overlapped = false
+        for _ in 0..<300 where !overlapped {
+            overlapped = server.moveOverlapObserved()
+            if !overlapped { try await Task.sleep(for: .milliseconds(10)) }
+        }
+        release()
+        _ = try? await first.value
+        _ = try? await second.value
+
+        #expect(overlapped, """
+            two concurrent moves were never observed in the route together \
+            (peak = \(server.peakConcurrentMoves())). Either the transport \
+            serializes requests, in which case every moveOverlapObserved() == false \
+            elsewhere is structurally unfalsifiable and must not be read as \
+            evidence of serialization.
+            """)
+    }
+
+    /// `failNextPatch()` fails a PATCH and leaves a `/move` alone — which is the
+    /// whole reason it exists next to `failNextMutation()`, whose budget the
+    /// predecessor's move would consume first.
+    @Test("failNextPatch fails one PATCH and does not touch the move that precedes it")
+    func failNextPatchTargetsOnlyThePatch() async throws {
+        let rfc = "fail-next-patch@example.com"
+        let server = StatefulExchangeActionServer(messages: [.init(
+            rfc822MessageId: rfc, providerMessageId: "graph-patch-1", folderId: "source")])
+        defer { server.close() }
+        let provider = server.provider()
+
+        server.failNextPatch()
+
+        // The move is untouched by the PATCH-only budget.
+        let outcome = try await provider.moveProvingDestinations(
+            ids: ["graph-patch-1"], from: "source", to: "archive")
+        #expect(outcome.provenIds == ["graph-patch-1"],
+                "failNextPatch consumed the move — it is not PATCH-scoped")
+        guard let movedId = server.snapshots(rfc822MessageId: rfc).first?.providerMessageId
+        else {
+            Issue.record("the move did not land, so the PATCH leg cannot be exercised")
+            return
+        }
+
+        // The next PATCH fails …
+        await #expect(throws: (any Error).self) {
+            try await provider.markRead(ids: [movedId], folder: "archive")
+        }
+        #expect(server.snapshot(providerMessageId: movedId)?.isRead == false,
+                "the failed PATCH applied its effect anyway")
+
+        // … and only that one.
+        try await provider.markRead(ids: [movedId], folder: "archive")
+        #expect(server.snapshot(providerMessageId: movedId)?.isRead == true,
+                "the budget was not one-shot")
+    }
+
+    /// `failAllMutations(_:)` is a PERMANENT fault, not a budget: it keeps
+    /// failing until it is turned off, and it consumes no one-shot budget while
+    /// it is on.
+    @Test("failAllMutations keeps failing every mutating verb until it is turned off")
+    func failAllMutationsIsPermanentUntilCleared() async throws {
+        let rfc = "fail-all-mutations@example.com"
+        let server = StatefulExchangeActionServer(messages: [.init(
+            rfc822MessageId: rfc, providerMessageId: "graph-perm-1", folderId: "source")])
+        defer { server.close() }
+        let provider = server.provider()
+
+        server.failAllMutations(true)
+        for attempt in 1...3 {
+            await #expect(throws: (any Error).self, "attempt \(attempt) succeeded under a permanent fault") {
+                try await provider.markRead(ids: ["graph-perm-1"], folder: "source")
+            }
+        }
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.moveProvingDestinations(
+                ids: ["graph-perm-1"], from: "source", to: "archive")
+        }
+        #expect(server.snapshot(providerMessageId: "graph-perm-1")?.folderId == "source",
+                "a mutation landed while every mutation was supposed to fail")
+
+        server.failAllMutations(false)
+        try await provider.markRead(ids: ["graph-perm-1"], folder: "source")
+        #expect(server.snapshot(providerMessageId: "graph-perm-1")?.isRead == true,
+                "clearing the permanent fault did not restore ordinary service")
+    }
 }
