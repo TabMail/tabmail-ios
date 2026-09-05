@@ -888,18 +888,64 @@ extension AccountManager {
                         // sequential task, so there is no window to lose here and no
                         // CAS is required.
                         //
-                        // ⚠️ NO `?? op` FALLBACK. `nil` means the row is gone since
-                        // the claim, and the only writers that can delete a claimed
-                        // row are cancel and annihilation — both of which guard on
-                        // `!everAttempted` and `queued`, i.e. both are the user
-                        // deliberately withdrawing this intention. Falling back to the
-                        // captured struct would resurrect a withdrawn gesture from
-                        // memory and send it to the wire; a defaulted seam like that
-                        // is fail-DANGEROUS, not fail-safe.
-                        guard let liveOp = await liveOperation(op.id) else {
+                        // 🚨 A THROWN RE-READ IS NOT AN ABSENT ROW, and the two must
+                        // not share an arm. `try?` used to collapse them, so an
+                        // interrupted / busy / I-O read looked exactly like a deleted
+                        // row: the op stayed `inFlight` (the claim commits `inFlight`
+                        // AND `everAttempted` in one transaction), the lane kept
+                        // draining past it, no later drain could claim it because the
+                        // claim loop refuses `inFlight`, and at the next launch
+                        // `reconcilePendingOperations` DELETED an attempted `.move`
+                        // that had never reached the wire. "We could not determine the
+                        // answer" is retryable, never authoritative — clause 2 of
+                        // `Companion/Rules/Active/never-drop-user-intention.md`.
+                        //
+                        // So the catch requeues THIS op and every remaining claimed
+                        // member of the lane — the same shape as the `evidenceRefused`
+                        // branch above — and halts the lane so no later member
+                        // overtakes an unresolved predecessor. The retry count is NOT
+                        // incremented: a database read failure says nothing about the
+                        // provider. If the requeue write ITSELF fails the row stays
+                        // `inFlight` until the next launch, which is the same
+                        // pre-existing class as every other `try? await retryWrite`
+                        // requeue site in this loop — nothing new and nothing widened.
+                        //
+                        // ⚠️ NO `?? op` FALLBACK, and `nil` means exactly one thing:
+                        // the row no longer exists. It CANNOT mean cancel or
+                        // annihilation — both of those predicates require `queued` and
+                        // `!everAttempted` (`AccountManagerActions`' exact-opposite
+                        // fold and `undoMove`'s `annihilable` filter), which the claim
+                        // has already made false for this row. The writers that CAN
+                        // delete it are the ones that never join a running drain: the
+                        // local wipes and resets — `SettingsView.localIndexWipeTxn`
+                        // (`DELETE FROM pendingOperation WHERE type != 'saveDraft'`),
+                        // `AppDataWiper`, `AccountManagerSetup`'s per-account delete
+                        // and `DemoSeed`'s demo reset — plus the UIDVALIDITY-reset
+                        // sweep. Those are the user's NEWER gesture, and it wins over
+                        // the one this lane captured. Falling back to the captured
+                        // struct would resurrect a withdrawn gesture from memory and
+                        // send it to the wire; a defaulted seam like that is
+                        // fail-DANGEROUS, not fail-safe.
+                        let reReadOp: PendingOperation?
+                        do {
+                            reReadOp = try await liveOperation(op.id)
+                        } catch {
                             queueLog(
                                 "[Queue] drain lane \(laneIndex) pos \(index + 1)/\(capturedLane.count) — "
-                                    + "row \(op.id.prefix(8)) vanished since the claim (cancelled or annihilated); skipping")
+                                    + "re-read of row \(op.id.prefix(8)) failed: \(error); "
+                                    + "requeueing it and the rest of this lane, lane halted")
+                            for heldOp in capturedLane[index...] {
+                                try? await retryWrite(dbPool, label: "Queue") { db in
+                                    try PendingOperation.markQueued(db, id: heldOp.id)
+                                }
+                            }
+                            break
+                        }
+                        guard let liveOp = reReadOp else {
+                            queueLog(
+                                "[Queue] drain lane \(laneIndex) pos \(index + 1)/\(capturedLane.count) — "
+                                    + "row \(op.id.prefix(8)) no longer exists — a local wipe or reset "
+                                    + "removed it after the claim; skipping")
                             continue
                         }
                         if liveOp.messageIds != op.messageIds {
@@ -1009,13 +1055,49 @@ extension AccountManager {
                 + result.readdressedOperationIds.map { String($0.prefix(8)) }.joined(separator: ","))
     }
 
+    /// TEST-ONLY one-shot fault for the post-claim re-read below.
+    ///
+    /// Holds an operation id; the next `liveOperation` call for that id throws a
+    /// `DatabaseError` instead of reading, and clears the arming in the same
+    /// critical section so it fires EXACTLY ONCE. `nil` (the default) is no
+    /// fault, so production behaviour is the unarmed path.
+    ///
+    /// Modelled on `DebugModeManager.loggingEnabledOverrideForTesting`: `#if
+    /// DEBUG` only, `Mutex`-wrapped, and it may only ADD a throw — it can never
+    /// skip a guard, change a disposition, or make a read succeed that would
+    /// otherwise fail. It exists because the state this seam produces (a read
+    /// that throws AFTER the claim committed `inFlight` + `everAttempted`) is
+    /// reachable in production from an interrupted/busy/I-O SQLite read but is
+    /// not schedulable from a test against a healthy pool: every earlier read of
+    /// the same drain — the ops snapshot, the classifier, the claim — runs on
+    /// the same `PrioritizedDatabase`, so a connection-level fault would fail the
+    /// drain before anything is ever claimed, which is a different scenario.
+    #if DEBUG
+    nonisolated static let liveOperationReadFaultForTesting = Mutex<String?>(nil)
+    #endif
+
     /// The row as it is RIGHT NOW, by primary key — the address the drain is
     /// about to send, rather than the one it snapshotted.
     ///
-    /// `nil` means the row no longer exists. The caller must skip that op; see
-    /// the lane loop for why there is deliberately no `?? capturedOp` fallback.
-    private func liveOperation(_ id: String) async -> PendingOperation? {
-        try? await dbPool.read { db in try PendingOperation.fetchOne(db, key: id) }
+    /// `nil` means exactly one thing: the row no longer exists. A read that
+    /// FAILS throws instead, because "we could not determine the answer" is not
+    /// evidence about the row and must stay retryable — see the lane loop for
+    /// what the caller does with each of the two, and for why there is
+    /// deliberately no `?? capturedOp` fallback.
+    private func liveOperation(_ id: String) async throws -> PendingOperation? {
+        #if DEBUG
+        let faultArmed = Self.liveOperationReadFaultForTesting.withLock { armed -> Bool in
+            guard armed == id else { return false }
+            armed = nil
+            return true
+        }
+        if faultArmed {
+            throw DatabaseError(
+                resultCode: .SQLITE_INTERRUPT,
+                message: "injected post-claim re-read failure for \(id)")
+        }
+        #endif
+        return try await dbPool.read { db in try PendingOperation.fetchOne(db, key: id) }
     }
 
     /// Record which members of a just-completed `.move` are now sitting in an

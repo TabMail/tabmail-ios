@@ -1159,6 +1159,128 @@ struct AccountManagerQueueDrainTests {
         }
     }
 
+    // MARK: - COR-1 — a post-claim re-read that FAILS is not an absent row
+    //
+    // THE INVARIANT, pinned here rather than the mechanism that delivers it: a
+    // claimed operation whose post-claim row re-read FAILS is left RETRYABLE —
+    // durable status `queued`, `everAttempted` unchanged, `retryCount`
+    // unchanged — its lane HALTS so no later member overtakes it, and a healthy
+    // later drain executes it exactly once, in issue order. `nil` from the
+    // re-read means exactly one thing: the row no longer exists.
+    //
+    // WHY IT MATTERS. The claim commits `inFlight` + `everAttempted` in one
+    // transaction. Before the fix `liveOperation` was `try? await dbPool.read`,
+    // so an interrupted / busy / I-O read collapsed into the same `nil` an
+    // absent row produces and the lane took the skip arm: the op stayed
+    // `inFlight` forever (every later drain's claim loop refuses `inFlight`),
+    // its lane kept draining so a LATER member overtook it, and at the next
+    // launch `reconcilePendingOperations` DELETED it if it was a `.move` — a
+    // dropped intention that never reached the wire. "We could not determine
+    // the answer" is retryable, never authoritative (never-drop clause 2).
+    //
+    // THE FAULT is `AccountManager.liveOperationReadFaultForTesting`, a
+    // `#if DEBUG` one-shot keyed by op id that can only ADD a throw. The state
+    // it produces is reachable in production (the reviewer reproduced it with a
+    // real `sqlite3_progress_handler` interrupt on GRDB 7.11.1) but is not
+    // schedulable from a test against a healthy pool: the drain's ops snapshot,
+    // the account-scoped classifier and the claim all run on this same
+    // `PrioritizedDatabase` BEFORE the re-read, so a connection-level fault
+    // fails the drain before anything is claimed — a different scenario.
+    //
+    // RED-FIRST (recorded in `r114b-cor1-red.log`): with the call site restored
+    // to the pre-fix `guard let liveOp = try? await liveOperation(op.id) else {
+    // … continue }`, opA is left `inFlight` and DELETED from the durable
+    // expectations here, opB overtakes it and flags the message, and the
+    // healthy redrive can never claim opA again — so the phase-1 status/`isEmpty`
+    // expectations and every phase-2 expectation fail.
+    @Test("drainPendingQueue() (real): a post-claim re-read that THROWS requeues that op and the rest of its lane — nothing reaches the wire, nothing is stranded inFlight, no retry is charged, and a healthy redrive executes both exactly once in issue order")
+    func drainPendingQueueRealFailedPostClaimReReadKeepsTheLaneRetryable() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        let accountId = "acc-cor1-reread"
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        defer { AccountManager.liveOperationReadFaultForTesting.withLock { $0 = nil } }
+
+        let provider = MockEmailProvider()
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: provider
+        ) {
+            // `.gmail` ⇒ account-scoped ids ⇒ both ops on `msg-1` land in ONE
+            // lane (`buildLanes`), which is what makes "a later member overtakes
+            // an unresolved predecessor" observable at all.
+            try insertStableProviderFixture(accountId: accountId, pool: pool)
+
+            let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
+            var opA = PendingOperation(
+                type: .markRead, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
+            opA.createdAt = t0
+            var opB = PendingOperation(
+                type: .markFlagged, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
+            opB.createdAt = t0.addingTimeInterval(1)
+            try insertOp(opA, pool: pool)
+            try insertOp(opB, pool: pool)
+
+            AccountManager.liveOperationReadFaultForTesting.withLock { $0 = opA.id }
+
+            await AccountManager.shared.drainPendingQueue()
+
+            // Phase 1 — the failed re-read. Read each row on its own so a row
+            // that was wrongly executed or dropped cannot gate the other row's
+            // assertions (that is exactly the pre-fix outcome).
+            let heldA = try fetchOp(opA.id, pool: pool)
+            let heldB = try fetchOp(opB.id, pool: pool)
+            #expect(heldA != nil, "the op whose re-read failed was dropped — a read that could not determine the answer is never authoritative")
+            #expect(heldB != nil, "the later same-lane member was executed or dropped while its predecessor was unresolved")
+            #expect(heldA?.status == PendingStatus.queued.rawValue,
+                    "the op whose re-read failed must be left RETRYABLE, not stranded inFlight — got \(heldA?.status ?? "<deleted>")")
+            #expect(heldB?.status == PendingStatus.queued.rawValue,
+                    "the rest of the halted lane must be requeued — got \(heldB?.status ?? "<deleted>")")
+            #expect(heldA?.everAttempted == true,
+                    "the claim's durable proof stands; a requeue never erases it")
+            #expect(heldB?.everAttempted == true,
+                    "the claim's durable proof stands; a requeue never erases it")
+            #expect(heldA?.retryCount == 0,
+                    "a database read failure is not a provider failure — no retry may be charged; got \(heldA?.retryCount ?? -1)")
+            #expect(heldB?.retryCount == 0,
+                    "a database read failure is not a provider failure — no retry may be charged; got \(heldB?.retryCount ?? -1)")
+
+            let readsDuringFault = await provider.markedReadIds
+            let flagsDuringFault = await provider.markedFlaggedIds
+            #expect(readsDuringFault.isEmpty,
+                    "the op whose re-read failed must never reach the wire: \(readsDuringFault.map(\.ids))")
+            #expect(flagsDuringFault.isEmpty,
+                    "the LATER member of the same lane overtook an unresolved predecessor: \(flagsDuringFault.map(\.ids))")
+
+            // Phase 2 — a healthy redrive. The fault is one-shot; clearing it
+            // makes this phase's premise explicit rather than implied.
+            AccountManager.liveOperationReadFaultForTesting.withLock { $0 = nil }
+            await AccountManager.shared.drainPendingQueue()
+
+            let survivors = try await pool.read { db in
+                try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
+            }
+            #expect(survivors.isEmpty,
+                    "a healthy redrive must complete both ops — \(survivors.count) left, statuses \(survivors.map(\.status))")
+
+            let reads = await provider.markedReadIds
+            let flags = await provider.markedFlaggedIds
+            #expect(reads.count == 1, "the re-read-failed op must execute EXACTLY once on the redrive — got \(reads.count)")
+            #expect(flags.count == 1, "the held follower must execute EXACTLY once on the redrive — got \(flags.count)")
+            guard reads.count == 1, flags.count == 1 else { return }
+            #expect(reads[0].ids == ["msg-1"])
+            #expect(flags[0].ids == ["msg-1"])
+
+            let wire = await provider.callLog.filter {
+                $0.hasPrefix("markRead(") || $0.hasPrefix("markFlagged(")
+            }
+            #expect(wire.count == 2, "unexpected wire traffic: \(wire)")
+            guard wire.count == 2 else { return }
+            #expect(wire[0].hasPrefix("markRead("),
+                    "issue order was not preserved across the requeue: \(wire)")
+            #expect(wire[1].hasPrefix("markFlagged("),
+                    "issue order was not preserved across the requeue: \(wire)")
+        }
+    }
+
     @Test("drainPendingQueue() (real): two concurrent calls are safe — the isDraining/needsRedrain guard serializes them, the op executes exactly once (no duplication, no crash)")
     func drainPendingQueueRealConcurrentCallsExecuteOpsExactlyOnce() async throws {
         let (pool, dir, previous) = try makeTestDB()
