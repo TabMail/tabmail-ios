@@ -281,17 +281,38 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     /// is. Matching zero rows is the normal, correct outcome and is NOT an
     /// error — the caller does not need to know.
     ///
-    /// No retry increment, deliberately: a refused local transaction says
-    /// nothing about the provider, and the suffix was never attempted on the
-    /// wire at all. Status is the only thing this decision observed, so status
-    /// is the only thing it writes — the same reasoning as `markQueued`'s
-    /// banner, for the same reason (a struct-shaped `save` would write back
-    /// `messageIdsJSON` that the retirement in this very transaction has just
-    /// re-addressed).
-    static func requeueIfInFlight(_ db: Database, id: String) throws {
-        try db.execute(
-            sql: "UPDATE pendingOperation SET status = ? WHERE id = ? AND status = ?",
-            arguments: [PendingStatus.queued.rawValue, id, PendingStatus.inFlight.rawValue])
+    /// The retry charge is the CALLER's, and it defaults to none. The
+    /// retained-retirement suffix passes nothing, deliberately: a refused local
+    /// transaction says nothing about the provider, and the suffix was never
+    /// attempted on the wire at all. But this function is also the recovery
+    /// write for a requeue that was itself refused (`recoverPendingRequeues`),
+    /// and there the charge belongs to the ORIGINAL site — an evidence-refused
+    /// or transient-error requeue charges `retryCount + 1`, and a recovery that
+    /// silently dropped that charge would leave the runaway-retry case invisible
+    /// again. So the parameter mirrors `markQueued`'s exactly, the guarded
+    /// `WHERE status = 'inFlight'` predicate above is kept for both, and neither
+    /// contract is widened into the other.
+    ///
+    /// Status (and at most the counter) is all this writes — the same reasoning
+    /// as `markQueued`'s banner, for the same reason: a struct-shaped `save`
+    /// would write back `messageIdsJSON` that a retirement may have just
+    /// re-addressed.
+    static func requeueIfInFlight(
+        _ db: Database, id: String, incrementRetryCount: Bool = false
+    ) throws {
+        if incrementRetryCount {
+            try db.execute(
+                sql: """
+                    UPDATE pendingOperation
+                    SET status = ?, retryCount = retryCount + 1
+                    WHERE id = ? AND status = ?
+                    """,
+                arguments: [PendingStatus.queued.rawValue, id, PendingStatus.inFlight.rawValue])
+        } else {
+            try db.execute(
+                sql: "UPDATE pendingOperation SET status = ? WHERE id = ? AND status = ?",
+                arguments: [PendingStatus.queued.rawValue, id, PendingStatus.inFlight.rawValue])
+        }
     }
 }
 

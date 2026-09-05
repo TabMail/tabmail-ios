@@ -3227,4 +3227,311 @@ struct OutlookQueueHandoffTests {
         await AccountManager.shared.unregisterProviderForTesting(accountId: secondAccountId)
         await finish(f)
     }
+
+    // MARK: - R1 — a claimed row whose REQUEUE the same failure refused
+
+    /// A GRDB `TransactionObserver` that refuses the COMMIT of any transaction
+    /// which UPDATEd ONE named `pendingOperation` row, after letting the first
+    /// such transaction through.
+    ///
+    /// `databaseWillCommit()` throwing makes SQLite's commit hook abort the
+    /// COMMIT, so GRDB rolls back and rethrows to `pool.write`'s caller — the
+    /// shape GRDB's own suspension produces when the app is backgrounded
+    /// mid-drain while WAL reads keep working (`ADR-IOS-041`), and the shape a
+    /// full disk or an I/O error at COMMIT produces.
+    ///
+    /// 🚨 WHY IT IS SCOPED TO ONE ROW RATHER THAN ARMED BY A CLOCK. The scenario
+    /// needs THREE different transactions to land differently inside a single
+    /// drain — the claim commits, the predecessor's requeue is refused, the
+    /// FOLLOWER's requeue commits — and there is no point between them a test can
+    /// synchronise on: the predecessor never reaches the wire (its post-claim
+    /// re-read throws), so `holdNextMove` cannot park it. Keying on the row the
+    /// scenario is about answers all three deterministically and does not depend
+    /// on how many other transactions the drain happens to run. `allowingFirst: 1`
+    /// is the drain's own claim of that row, which must commit or nothing is
+    /// claimed at all.
+    ///
+    /// File-private, exactly like `HeaderCommitRefuser`, `AllWritesRefuser` and
+    /// `HeaderCommitOrdinalRefuser` above: there is no shared test utility for
+    /// this and this change does not invent one.
+    private final class OneRowUpdateRefuser: TransactionObserver, Sendable {
+        struct CommitRefused: Error {}
+        private let rowID: Int64
+        private let sawTargetUpdate = Mutex(false)
+        private let allowance: Mutex<Int>
+        private let armed = Mutex(true)
+        let allowed = Mutex(0)
+        let refusals = Mutex(0)
+
+        init(rowID: Int64, allowingFirst allowance: Int) {
+            self.rowID = rowID
+            self.allowance = Mutex(allowance)
+        }
+
+        func disarm() { armed.withLock { $0 = false } }
+
+        func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
+            guard eventKind.tableName == PendingOperation.databaseTableName else { return false }
+            if case .update = eventKind { return true }
+            return false
+        }
+        func databaseDidChange(with event: DatabaseEvent) {
+            guard event.rowID == rowID else { return }
+            sawTargetUpdate.withLock { $0 = true }
+        }
+        func databaseWillCommit() throws {
+            guard sawTargetUpdate.withLock({ $0 }) else { return }
+            guard armed.withLock({ $0 }) else { return }
+            let permitted = allowance.withLock { left -> Bool in
+                guard left > 0 else { return false }
+                left -= 1
+                return true
+            }
+            if permitted {
+                allowed.withLock { $0 += 1 }
+                return
+            }
+            refusals.withLock { $0 += 1 }
+            throw CommitRefused()
+        }
+        func databaseDidCommit(_ db: Database) {
+            sawTargetUpdate.withLock { $0 = false }
+        }
+        func databaseDidRollback(_ db: Database) {
+            sawTargetUpdate.withLock { $0 = false }
+        }
+    }
+
+    /// **THE PROPERTY: every operation this process CLAIMED and did not execute
+    /// becomes claimable again IN THIS SAME PROCESS — even when the failure that
+    /// forced the requeue also refused the requeue write itself.**
+    ///
+    /// THE DEFECT, in a live process with no crash in it. Eight sites in the
+    /// drain return a claimed-but-unexecuted operation to `queued` best-effort
+    /// (`try? await retryWrite { PendingOperation.markQueued }`) and DISCARD the
+    /// write's error. When that write fails the row stays `inFlight` — a state
+    /// only the claim transaction writes, and one the claim loop refuses — so no
+    /// later pass in this process can pick it up. At the next launch
+    /// `AppDatabase.recoverPreviousSessionResidue` deletes an `everAttempted`
+    /// `.move`: a user gesture that never reached the provider, lost with no
+    /// crash at all. This drives the site the round-3 post-claim re-read
+    /// introduced, whose producer is exactly the database-wide refusal that also
+    /// swallows the requeue (`ADR-IOS-041`).
+    ///
+    /// THE SCHEDULE, and why every element of it is load-bearing. A mark-flagged
+    /// BYSTANDER first: it succeeds on the wire and sets `executedAny`, which is
+    /// what keeps the pass loop running — without it the drain stops for a reason
+    /// unrelated to anything under test and every assertion below is vacuous.
+    /// Then the `.move` whose post-claim re-read is faulted. Then a mark-read
+    /// FOLLOWER on the same message, so all three are ONE account-scoped lane.
+    /// The refusal is scoped to the MOVE's row, so the predecessor's requeue
+    /// fails while the follower's succeeds — the split that leaves the follower
+    /// `queued` and claimable ALONE in the next pass, running ahead of a
+    /// predecessor this process has not resolved.
+    ///
+    /// THE ORACLES ARE THE WIRE AND THE DURABLE QUEUE, never membership of any
+    /// in-memory recovery structure, which is a mechanism and not the property
+    /// (`MIS-015`). Three, and they fail in different directions:
+    ///   (i)   while the refusal stands, the message's own work does not reach the
+    ///         wire and the follower is still owed rather than executed;
+    ///   (ii)  a further drain under the same refusal sends NO new provider work
+    ///         and charges no retry for what was a purely local write failure;
+    ///   (iii) once writes recover, the move and its follower each execute
+    ///         EXACTLY ONCE, in issue order, and the newest intended server state
+    ///         wins.
+    @Test("Outlook: a claimed operation whose requeue the same failure refused is still claimable in this process")
+    @MainActor
+    func aRefusedRequeueAfterAFailedReReadStaysClaimableInThisProcess() async throws {
+        let rfc = "graph-handoff-refused-requeue@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: rfc, providerMessageId: "graph-1", folderId: Self.source),
+        ])
+        defer { server.close() }
+
+        let f = try fixture(accountId: "graph-handoff-refused-requeue")
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-1", rfc: rfc, destination: Self.firstDestination,
+            isRead: true, isFlagged: true)
+
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a previous test left a retained retirement on the shared AccountManager")
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "a drain from an earlier test is still running, so this schedule is not this test's")
+
+        let ordered = try seedSchedule(f, [
+            PendingOperation(
+                type: .markFlagged, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.source),
+            PendingOperation(
+                type: .move, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.source,
+                destinationPath: Self.firstDestination),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.firstDestination),
+        ])
+        #expect(ordered.count == 3)
+        guard ordered.count == 3 else { return }
+        let moveOpId = ordered[1].id
+        let followerOpId = ordered[2].id
+
+        await register(server.provider(), f)
+
+        let moveRowID = try await f.pool.read { db in
+            try Int64.fetchOne(
+                db, sql: "SELECT rowid FROM pendingOperation WHERE id = ?", arguments: [moveOpId])
+        }
+        #expect(moveRowID != nil, "the move row was not seeded, so nothing can be scoped to it")
+        guard let moveRowID else { return }
+
+        let refuser = OneRowUpdateRefuser(rowID: moveRowID, allowingFirst: 1)
+        f.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+
+        defer { AccountManager.liveOperationReadFaultForTesting.withLock { $0 = nil } }
+        AccountManager.liveOperationReadFaultForTesting.withLock { $0 = moveOpId }
+        #expect(AccountManager.liveOperationReadFaultForTesting.withLock { $0 } == moveOpId,
+                "the post-claim re-read fault did not arm")
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // NON-VACUITY, three ways. The fault is a one-shot that clears itself, so
+        // an unarmed seam means the re-read never happened. The claim of the move
+        // must have committed (or nothing was claimed at all). And the three
+        // refusals are its `retryWrite` attempts — fewer means the requeue was
+        // never attempted under the refusal, more means some other transaction
+        // was caught in it (`MIS-027`).
+        #expect(AccountManager.liveOperationReadFaultForTesting.withLock { $0 } == nil, """
+            the post-claim re-read never consulted the fault, so this test is not \
+            exercising the failure it names
+            """)
+        #expect(refuser.allowed.withLock { $0 } == 1, """
+            the move's claim did not commit exactly once: \
+            \(refuser.allowed.withLock { $0 })
+            """)
+        #expect(refuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on the move's requeue for exactly its three \
+            attempts: \(refuser.refusals.withLock { $0 })
+            """)
+
+        let firstDrain = server.http.servedCallSequence()
+
+        // NON-VACUITY, the other side: the bystander really did make progress in
+        // this pass, so `executedAny` is set and the pass loop is live. Without it
+        // the drain stops for a reason that has nothing to do with the gate.
+        #expect(server.snapshot(providerMessageId: "graph-1")?.isFlagged == true, """
+            the bystander did not execute, so nothing set `executedAny` and this \
+            test is not exercising the pass boundary: \(firstDrain)
+            """)
+
+        // 🚨 ORACLE (i). The move never reached the wire — its re-read threw
+        // before it could — and NOTHING may go out behind it while it is
+        // unresolved. A second PATCH here is the follower claimed ALONE in a later
+        // pass, running ahead of a predecessor whose fate this process has not
+        // settled.
+        #expect(firstDrain.filter { $0.hasSuffix("/move") }.isEmpty, """
+            the move reached the wire though its post-claim re-read failed: \
+            \(firstDrain)
+            """)
+        #expect(firstDrain.filter { $0.hasPrefix("PATCH ") }.count == 1, """
+            a claim pass started while this process still owned a claimed row it \
+            could not return to `queued`, so the follower ran ahead of the \
+            unresolved move: \(firstDrain)
+            """)
+
+        // Durable state, read after the drain returned — never mid-drain.
+        let (heldMove, heldFollower) = try await f.pool.read { db in
+            (try PendingOperation.fetchOne(db, key: moveOpId),
+             try PendingOperation.fetchOne(db, key: followerOpId))
+        }
+        #expect(heldMove?.status == PendingStatus.inFlight.rawValue, """
+            the move's requeue survived a refusal aimed at exactly it, so this \
+            test cannot see the state the defect lives in: \
+            \(heldMove?.status ?? "<deleted>")
+            """)
+        #expect(heldFollower != nil, """
+            the follower was DESTROYED while its predecessor was still unresolved \
+            — the user's newest gesture is gone
+            """)
+        #expect(heldFollower?.status == PendingStatus.queued.rawValue, """
+            the follower is not retryable, so the split this test needs (the \
+            predecessor's requeue refused, the follower's committed) did not \
+            happen: \(heldFollower?.status ?? "<deleted>")
+            """)
+        #expect(heldMove?.retryCount == 0 && heldFollower?.retryCount == 0, """
+            a provider retry was charged for a LOCAL write failure: \
+            move=\(heldMove?.retryCount ?? -1) follower=\(heldFollower?.retryCount ?? -1)
+            """)
+
+        // 🚨 ORACLE (ii). A further drain while the refusal still stands must send
+        // no new provider work and charge nobody. Recovery is local, so it is
+        // attempted; it fails; nothing else may proceed on the strength of that.
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(server.http.servedCallSequence() == firstDrain, """
+            a drain taken while the requeue was still refused sent new provider \
+            work: \(server.http.servedCallSequence())
+            """)
+        let (retriedMove, retriedFollower) = try await f.pool.read { db in
+            (try PendingOperation.fetchOne(db, key: moveOpId),
+             try PendingOperation.fetchOne(db, key: followerOpId))
+        }
+        #expect(retriedMove?.retryCount == 0 && retriedFollower?.retryCount == 0, """
+            a retry was charged by a drain that made no provider attempt at all: \
+            move=\(retriedMove?.retryCount ?? -1) follower=\(retriedFollower?.retryCount ?? -1)
+            """)
+        #expect(retriedMove?.messageIds == ["graph-1"], """
+            the move row lost or changed members while nothing had executed: \
+            \(String(describing: retriedMove?.messageIds))
+            """)
+
+        // The database accepts writes again — the state every live process reaches
+        // when it returns to the foreground.
+        refuser.disarm()
+        try await drainToQuiescence(f)
+
+        // 🚨 ORACLE (iii). Both gestures execute exactly once, in issue order, and
+        // the newest intended state is what the server ends up holding.
+        let finalCalls = server.http.servedCallSequence()
+        #expect(finalCalls.filter { $0.hasSuffix("/move") }.count == 1, """
+            the move did not execute exactly once after the requeue recovered: \
+            \(finalCalls)
+            """)
+        let moveIndex = finalCalls.firstIndex { $0.hasSuffix("/move") }
+        #expect(moveIndex != nil, "the move never executed at all: \(finalCalls)")
+        guard let moveIndex else { return }
+        let current = liveId(server, rfc: rfc)
+        #expect(current != nil && current != "graph-1",
+                "Graph did not reallocate the id, so issue order cannot be read off the addresses")
+        guard let current else { return }
+        let followerPatches = finalCalls.dropFirst(moveIndex + 1).filter { $0.hasPrefix("PATCH ") }
+        #expect(followerPatches.count == 1, """
+            the follower did not execute exactly once after its predecessor: \
+            \(finalCalls)
+            """)
+        #expect(followerPatches.allSatisfy { $0.hasSuffix("/\(current)") }, """
+            a PATCH went out at an address the move had already invalidated \
+            (proven id \(current)): \(Array(followerPatches))
+            """)
+
+        let headers = try rows(f)
+        #expect(headers.count == 1)
+        guard headers.count == 1 else { return }
+        #expect(headers[0].messageId == current && headers[0].folderPath == Self.firstDestination, """
+            the header was left at the address Graph invalidated: \
+            messageId=\(headers[0].messageId) folder=\(headers[0].folderPath)
+            """)
+        #expect(serverFolders(server, rfc: rfc) == [Self.firstDestination], """
+            the move the user asked for is not reflected on the server: \
+            \(serverFolders(server, rfc: rfc))
+            """)
+        let landed = server.snapshot(providerMessageId: current)
+        #expect(landed?.isFlagged == true, "the bystander's flag was lost: \(String(describing: landed))")
+
+        try expectGesturePreservedAndExecuted(
+            f, effectVisibleOnServer: landed?.isRead == true,
+            gesture: "the mark-read stranded behind a requeue the same failure refused",
+            serverState: "id=\(current) folders=\(serverFolders(server, rfc: rfc))")
+
+        await finish(f)
+    }
 }

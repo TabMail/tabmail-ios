@@ -268,8 +268,15 @@ extension AccountManager {
         /// successfully, or it was CONFIRMED stale/invalid and dropped (deleted, or
         /// split into fresh individual ops). The lane may proceed to its next op.
         case proceed
-        /// The op was reset to `.queued` for retry (its staleness/success could NOT
-        /// be confirmed this pass). The REST of this lane must halt: a later op on
+        /// The op did not reach a terminal state this pass — its staleness or
+        /// success could NOT be confirmed. USUALLY it has been reset to `.queued`
+        /// for retry; since `ce4a0299d` there is one halt cause where it has
+        /// deliberately NOT been, because the provider PROVED the work and only
+        /// the local retirement failed: that row stays `inFlight` with all of its
+        /// members while this process holds the proof, so the claim loop refuses
+        /// it and the move is never sent to the wire twice
+        /// (`AccountManager.pendingRetirements`, `IOS-GRAPH-005`). Either way the
+        /// operation is unresolved. The REST of this lane must halt: a later op on
         /// the same connected component (e.g. a flag change queued after a move of
         /// the same message) must never run ahead of its unresolved predecessor —
         /// running it would race the predecessor's eventual retry on the wire. The
@@ -602,6 +609,13 @@ extension AccountManager {
         // concurrently with itself or with a pass.
         guard await replayRetainedRetirements(context: ctx) else { return }
 
+        // AND FINISH ANY REQUEUE THIS PROCESS COULD NOT COMMIT, for the same
+        // reason and in the same window: a row this process claimed and did not
+        // execute is invisible to the claim loop until it is `queued` again, so
+        // resolving that ownership must happen before anything is claimed, and it
+        // must not wait for connectivity it does not use.
+        guard await recoverPendingRequeues() else { return }
+
         guard NetworkMonitor.checkConnected() else { return }
 
         pruneRecentlyCompleted()
@@ -852,9 +866,7 @@ extension AccountManager {
                 let task = Task { [self] in
                     for (index, op) in capturedLane.enumerated() {
                         if capturedCtx.failedAccounts.contains(op.accountId) {
-                            try? await retryWrite(dbPool, label: "Queue") { db in
-                                try PendingOperation.markQueued(db, id: op.id)
-                            }
+                            await requeueOrRetain(op.id)
                             continue
                         }
                         // 🚨 ALREADY REFUSED THIS DRAIN for want of provider evidence.
@@ -882,16 +894,12 @@ extension AccountManager {
                             // `.haltLane` branch below, where the op has already been
                             // dispositioned by `executeSingleOp`.
                             for heldOp in capturedLane[index...] {
-                                try? await retryWrite(dbPool, label: "Queue") { db in
-                                    try PendingOperation.markQueued(db, id: heldOp.id)
-                                }
+                                await requeueOrRetain(heldOp.id)
                             }
                             break
                         }
                         guard let queue = self.workQueues[op.accountId] else {
-                            try? await retryWrite(dbPool, label: "Queue") { db in
-                                try PendingOperation.markQueued(db, id: op.id)
-                            }
+                            await requeueOrRetain(op.id)
                             continue
                         }
                         let provider = queue.provider
@@ -927,10 +935,22 @@ extension AccountManager {
                         // branch above — and halts the lane so no later member
                         // overtakes an unresolved predecessor. The retry count is NOT
                         // incremented: a database read failure says nothing about the
-                        // provider. If the requeue write ITSELF fails the row stays
-                        // `inFlight` until the next launch, which is the same
-                        // pre-existing class as every other `try? await retryWrite`
-                        // requeue site in this loop — nothing new and nothing widened.
+                        // provider.
+                        //
+                        // 🚨 AND THE REQUEUE ITSELF IS OWNED, not best-effort. THE
+                        // INVARIANT: every row this process claimed and did not
+                        // execute becomes claimable again IN THIS PROCESS, even when
+                        // the failure that forced the requeue also refuses the requeue
+                        // write. `requeueOrRetain` keeps the id when its write throws
+                        // and `recoverPendingRequeues` finishes it before the next
+                        // drain claims anything; until then the pass boundary below
+                        // refuses to start another claim pass. (This comment used to
+                        // dismiss a failed requeue here as "the same pre-existing class
+                        // as every other `try? await retryWrite` requeue site in this
+                        // loop — nothing new and nothing widened". That was wrong
+                        // twice: this read boundary is new to this change, so its
+                        // residue was not inherited, and the class it appealed to is
+                        // now closed at all eight of its sites.)
                         //
                         // ⚠️ NO `?? op` FALLBACK, and `nil` means exactly one thing:
                         // the row no longer exists. It CANNOT mean cancel or
@@ -957,9 +977,7 @@ extension AccountManager {
                                     + "re-read of row \(op.id.prefix(8)) failed: \(error); "
                                     + "requeueing it and the rest of this lane, lane halted")
                             for heldOp in capturedLane[index...] {
-                                try? await retryWrite(dbPool, label: "Queue") { db in
-                                    try PendingOperation.markQueued(db, id: heldOp.id)
-                                }
+                                await requeueOrRetain(heldOp.id)
                             }
                             break
                         }
@@ -1029,9 +1047,7 @@ extension AccountManager {
                                 pendingRetirementSuffixes[liveOp.id] = remaining.map(\.id)
                             }
                             for remainingOp in remaining {
-                                try? await retryWrite(dbPool, label: "Queue") { db in
-                                    try PendingOperation.markQueued(db, id: remainingOp.id)
-                                }
+                                await requeueOrRetain(remainingOp.id)
                             }
                             break
                         }
@@ -1042,8 +1058,9 @@ extension AccountManager {
             for task in tasks { await task.value }
 
             // 🚨 NO CLAIM PASS STARTS WHILE THIS PROCESS HOLDS AN UNRESOLVED
-            // PROVEN RETIREMENT — the same invariant the top-of-drain replay
-            // enforces, restated at the drain's OTHER entry into a claim pass.
+            // PROVEN RETIREMENT, OR A CLAIMED ROW IT COULD NOT RETURN TO
+            // `queued` — the same invariant the top-of-drain recoveries enforce,
+            // restated at the drain's OTHER entry into a claim pass.
             //
             // A retirement whose local write could not commit leaves its move
             // `inFlight` with every member, and halting its lane requeues the
@@ -1069,7 +1086,19 @@ extension AccountManager {
             // overwhelmingly still refusing it, and a second recovery point for
             // one fact is two places to keep in step (owner decision
             // 2026-09-05, `TabMail/tabmail-ios#120`, `IOS-GRAPH-005`).
-            if !pendingRetirements.isEmpty { break }
+            //
+            // 🚨 AND `pendingRequeues` IS LOAD-BEARING HERE, NOT SYMMETRY. Inside
+            // the failed-read catch and the lane-halt loop each row is requeued
+            // by its OWN `retryWrite`, so a predecessor's requeue can fail while
+            // its follower's succeeds. That leaves the follower `queued` and
+            // claimable ALONE in the next pass — the claim loop refuses the
+            // predecessor, which is still `inFlight` — running ahead of an
+            // unresolved predecessor in the same lane, which is exactly the
+            // ordering violation `.haltLane` exists to prevent. The next drain
+            // owns the recovery: `recoverPendingRequeues` runs before anything is
+            // claimed, so either the ownership resolves or the drain refuses to
+            // start.
+            if !pendingRetirements.isEmpty || !pendingRequeues.isEmpty { break }
 
             if !ctx.executedAny { break }
             ctx.executedAny = false
@@ -1350,6 +1379,90 @@ extension AccountManager {
                 queueLog(
                     "[Queue] retirement replay — \(opId.prefix(8)) still cannot commit: \(error); "
                         + "the provider's proven result is retained and this drain stops")
+                return false
+            }
+        }
+        return true
+    }
+
+    /// RETURN A CLAIMED-BUT-UNEXECUTED OPERATION TO `queued`, AND KEEP OWNING IT
+    /// IF THAT WRITE FAILS.
+    ///
+    /// The one implementation of a shape that used to be written out eight times
+    /// as `try? await retryWrite(dbPool, label: "Queue") { PendingOperation
+    /// .markQueued(...) }` — with the write's error discarded at every one of
+    /// them. Discarding it is the defect: the producers of that failure are
+    /// database-wide (GRDB suspension while backgrounded, ADR-IOS-041; a full
+    /// disk; an I/O error at COMMIT), the row stays `inFlight`, the claim loop
+    /// refuses `inFlight`, and no later pass in this process can ever pick it up.
+    /// At the next launch `AppDatabase.recoverPreviousSessionResidue` deletes it
+    /// if it is an `everAttempted` `.move` — a gesture that never reached the
+    /// provider, lost with no crash at all.
+    ///
+    /// On success the id is released; on a throw this process KEEPS it, with the
+    /// caller's own retry-count choice, and `recoverPendingRequeues` finishes the
+    /// job at the top of the next drain. The write itself is unchanged: same
+    /// `retryWrite`, same `markQueued`, same column semantics.
+    ///
+    /// `removeValue` on the success path matters as much as the insert: a site
+    /// that requeues an id this process was still holding has resolved that
+    /// ownership, and leaving a stale entry behind would stop later drains for a
+    /// row that is already `queued`.
+    private func requeueOrRetain(_ id: String, incrementRetryCount: Bool = false) async {
+        do {
+            try await retryWrite(dbPool, label: "Queue") { db in
+                try PendingOperation.markQueued(
+                    db, id: id, incrementRetryCount: incrementRetryCount)
+            }
+            pendingRequeues.removeValue(forKey: id)
+        } catch {
+            pendingRequeues[id] = incrementRetryCount
+            queueLog(
+                "[Queue] requeue of \(id.prefix(8)) failed: \(error); this process keeps the row "
+                    + "(retry charge: \(incrementRetryCount)) and recovers it at the next drain")
+        }
+    }
+
+    /// FINISH EVERY REQUEUE THIS PROCESS COULD NOT COMMIT, BEFORE THE DRAIN
+    /// CLAIMS ANYTHING.
+    ///
+    /// ⚠️ IT RUNS BEFORE THE `NetworkMonitor` CHECK, for the same reason
+    /// `replayRetainedRetirements` does: the work is entirely LOCAL, and making
+    /// it wait for connectivity would strand a claimed row behind an offline
+    /// window it has nothing to do with.
+    ///
+    /// The write is `requeueIfInFlight`, not `markQueued`, and the guard is the
+    /// point. This runs an unbounded time after the claim, so the row may since
+    /// have been cancelled by the user, deleted by a local wipe or reset, or
+    /// already requeued by the retained retirement that owns the same suffix.
+    /// Only `inFlight` means "still claimed by this process and never executed".
+    /// A ZERO-ROW UPDATE IS SUCCESS: whatever the row's state is now, this
+    /// process no longer owns it, so the entry is released.
+    ///
+    /// A failure STOPS THE DRAIN with ownership retained. A database that cannot
+    /// take this one-column write cannot claim, execute or retire anything else
+    /// safely either, and starting a claim pass while an unresolved claimed row
+    /// is invisible to the claim loop is exactly how a follower gets admitted
+    /// alone ahead of its predecessor. It schedules no redrain of its own: the
+    /// next drain from any ordinary entry point runs this again, first.
+    ///
+    /// - Returns: `false` when the drain must stop.
+    private func recoverPendingRequeues() async -> Bool {
+        guard !pendingRequeues.isEmpty else { return true }
+        for (opId, incrementRetryCount) in pendingRequeues {
+            do {
+                try await retryWrite(dbPool, label: "Queue") { db in
+                    try PendingOperation.requeueIfInFlight(
+                        db, id: opId, incrementRetryCount: incrementRetryCount)
+                }
+                pendingRequeues.removeValue(forKey: opId)
+                queueLog(
+                    "[Queue] requeue recovery — released \(opId.prefix(8)); it is claimable again "
+                        + "(or was already cancelled, wiped or requeued)")
+            } catch {
+                queueLog(
+                    "[Queue] requeue recovery — \(opId.prefix(8)) still cannot be returned to "
+                        + "`queued`: \(error); this process keeps the row and this drain stops")
                 return false
             }
         }
@@ -1997,9 +2110,7 @@ extension AccountManager {
                 } catch {
                     // The provider wrote nothing. If retiring the refused op
                     // fails, preserve the exact original bundle for retry.
-                    try? await retryWrite(dbPool, label: "Queue") { db in
-                        try PendingOperation.markQueued(db, id: currentOp.id)
-                    }
+                    await requeueOrRetain(currentOp.id)
                     return .haltLane
                 }
             }
@@ -2259,9 +2370,7 @@ extension AccountManager {
                     context.diagnosedOpIds.insert(currentOp.id)
                     await logStuckOpDiagnostic(currentOp, error: error)
                 }
-                try? await retryWrite(dbPool, label: "Queue") { db in
-                    try PendingOperation.markQueued(db, id: currentOp.id, incrementRetryCount: true)
-                }
+                await requeueOrRetain(currentOp.id, incrementRetryCount: true)
                 context.evidenceRefused.insert(currentOp.id)
                 return .haltLane
             }
@@ -2305,9 +2414,7 @@ extension AccountManager {
             // is visible in [QueueDiag] dumps). Previously this stayed at 0
             // forever, masking the runaway-retry case where we observed
             // `retryCount=0 ageHours=217` on the same op.
-            try? await retryWrite(dbPool, label: "Queue") { db in
-                try PendingOperation.markQueued(db, id: currentOp.id, incrementRetryCount: true)
-            }
+            await requeueOrRetain(currentOp.id, incrementRetryCount: true)
             context.failedAccounts.insert(currentOp.accountId)
             return .haltLane
         }

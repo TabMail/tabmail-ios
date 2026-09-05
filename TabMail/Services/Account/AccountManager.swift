@@ -531,6 +531,55 @@ actor AccountManager {
     /// the accepted crash window, unchanged.
     var pendingRetirementSuffixes: [String: [String]] = [:]
 
+    /// THIS PROCESS STILL OWNS EVERY ROW IT CLAIMED AND COULD NOT RETURN TO
+    /// `queued`.
+    ///
+    /// `PendingOperation.id` -> the `incrementRetryCount` choice the site that
+    /// tried to requeue it made. Written by `requeueOrRetain` when its
+    /// `retryWrite` throws, consumed by `recoverPendingRequeues` at the top of
+    /// the next drain.
+    ///
+    /// 🚨 WHY IT EXISTS. Eight drain sites return a claimed-but-unexecuted
+    /// operation to `queued`, and every one of them ran best-effort with the
+    /// write's error DISCARDED (`try? await retryWrite`). The producers of those
+    /// failures are database-wide — GRDB suspends writes when the app is
+    /// backgrounded mid-drain while WAL reads keep working (ADR-IOS-041); a full
+    /// disk or an I/O error at COMMIT does the same — so the requeue fails in the
+    /// same breath as whatever forced it. The row is then left `inFlight`, a
+    /// state only the claim transaction writes and one the claim loop refuses, so
+    /// NO later pass in this process can pick it up; at the next launch
+    /// `AppDatabase.recoverPreviousSessionResidue` DELETES it if it is an
+    /// `everAttempted` `.move`. A user gesture that never reached the provider,
+    /// lost in a live process with no crash in it.
+    ///
+    /// The value is the retry-count choice rather than `Void` so the recovery
+    /// charges exactly what the original site would have charged: the
+    /// evidence-unavailable and transient-error sites pass `true`, the other six
+    /// pass the default, and a recovery that flattened them would either hide the
+    /// runaway-retry case or invent a provider failure that never happened.
+    ///
+    /// 🚨 IT DOES NOT REPLACE `pendingRetirementSuffixes`, AND THE OVERLAP IS
+    /// DELIBERATE. That map's requeue runs INSIDE the retirement's own
+    /// transaction, so a follower is never made claimable while still naming the
+    /// address that same transaction is about to invalidate; moving it out here,
+    /// into a later and separate transaction, would open a NEW window in which a
+    /// correctly re-addressed follower sits `inFlight` across a process death and
+    /// is deleted at launch. An id held by both is harmless: the retirement
+    /// requeues it atomically, and this map's guarded update then matches zero
+    /// rows and clears its entry.
+    ///
+    /// BOUNDED and SHORT-LIVED exactly like the two maps above: an entry exists
+    /// only between a refused requeue and the next drain, and leaves on recovery
+    /// (including the zero-row case — the row was cancelled, wiped or already
+    /// requeued, so ownership is resolved either way) or with the process.
+    ///
+    /// THE RESIDUAL, stated where the next editor will read it: a PROCESS DEATH
+    /// while an id is owned only in memory leaves the row `inFlight`, and launch
+    /// applies its existing disposition to it — the behaviour registered as
+    /// [#116](https://github.com/TabMail/tabmail-ios/issues/116), inside the
+    /// process-death window this design already accepts. Nothing here widens it.
+    var pendingRequeues: [String: Bool] = [:]
+
     // MARK: - FIFO Local Write Queue
 
     /// Serial queue for ALL local DB writes from user actions.
