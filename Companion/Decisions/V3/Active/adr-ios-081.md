@@ -130,6 +130,20 @@ race that is sometimes wrong and recoverable would become a DETERMINISTIC droppe
    a fallback would resurrect a withdrawn gesture and send it to the wire. A nil-defaulted or
    silently-falling-back seam is fail-DANGEROUS here, not fail-safe.
 
+   > ⚠️ **CORRECTED 2026-09-05 (#114 round 5) — the CONCLUSION stands, the named writers do not.**
+   > The sentence above is preserved verbatim because the decision it records is unchanged: there is
+   > no `?? capturedOp` fallback, and `nil` still means "the row no longer exists". What is wrong is
+   > the premise a future reader would reason from. **Cancel and annihilation CANNOT delete a claimed
+   > row at all** — the cancel fold and `undoMove`'s `annihilable` filter both require `queued` and
+   > `!everAttempted`, and the claim transaction commits `inFlight` AND `everAttempted` together, so
+   > by the time the lane loop re-reads, both predicates are already false. The writers that CAN
+   > delete a claimed row are the local wipes and resets, none of which join a running drain:
+   > `SettingsView.localIndexWipeTxn` (`DELETE FROM pendingOperation WHERE type != 'saveDraft'`),
+   > `AppDataWiper`, `AccountManagerSetup`'s per-account delete, `DemoSeed`'s demo reset, and the
+   > UIDVALIDITY-reset sweep. They are still the user's NEWER gesture winning over the one the lane
+   > captured, which is why the conclusion survives its premise. Same correction as `IOS-GRAPH-005`
+   > COR-1, which named the writers correctly while this clause did not.
+
 7. **`finishMove` gains a NON-defaulted `accountScopedIds: Bool`.**
    Every call site — two production, eight test — passes it explicitly. A defaulted parameter would
    let a future provider acquire, or lose, the row-following re-key and the queue handoff BY

@@ -293,6 +293,17 @@ every assertion kept verbatim:
 `.launchReconciliationReAdmitsAnOrphanedDraftPush`. Their inverted proof is deleting the `init` call
 while keeping the static.
 
+⚠️ **The fail-closed half had no witness until round 5.** Both rewritten startup tests use writable
+pools and assert only the success path, so restoring the old swallowing `try?` on the recovery call
+left every expectation in the file green — a STRICTER contract with nothing pinning it.
+`AccountManagerQueueDrainTests.databaseStartupRecoveryThatCannotCommitRefusesToOpenTheDatabase`
+(round 5, TC-1) closes that: a file-private `TransactionObserver` refuses the COMMIT of any
+transaction writing `pendingOperation` (the `HeaderCommitRefuser`/`AllWritesRefuser` pattern already
+file-private in four test files), armed explicitly so migrations run first, and the oracle is that
+`AppDatabase(dbPool:)` THROWS, the refusal landed exactly once, and the seeded residue is still
+untouched — then disarming and constructing again applies the ordinary dispositions, so the throw was
+the recovery's and not the fixture's. RED with the `try?` restored.
+
 ### ⚠️ EXTENDED 2026-09-05 (round 4, R1) — a refused retirement now OWNS the suffix its lane halt left behind
 
 **Invariant.** Every row this process claimed and did not execute is returned to `queued` by the same
@@ -368,6 +379,91 @@ byte-identical to the first drain's, the proof is still held, and both durable r
 retry charged — then a healthy drain converges to one `/move`, one `PATCH` at the proven id and an
 empty queue. RED before the change because the bespoke read never consults the seam: the replay
 commits at once, the follower goes to the wire, and the seam is left armed.
+
+### ⚠️ EXTENDED 2026-09-05 (round 5, R1) — a requeue the same failure refused is OWNED, not best-effort
+
+**Invariant.** Every operation this process CLAIMED and did not execute becomes claimable again in
+this same process — **even when the failure that forced the requeue also refused the requeue write
+itself.** Nothing here may leave a claimed row unreachable for the life of the process.
+
+**Mechanism of the defect.** Eight sites in `AccountManagerQueue.swift` returned a
+claimed-but-unexecuted operation to `queued` best-effort — `try? await retryWrite(dbPool,
+label: "Queue") { try PendingOperation.markQueued(…) }` — and DISCARDED the write's error: the
+`failedAccounts` skip, the `evidenceRefused` held suffix, the missing-`workQueue` guard, the failed
+post-claim re-read, the `.haltLane` suffix loop, the refused-op requeue in the
+`ProviderError.uidValidityChanged` arm, the `ProviderEvidenceUnavailable` arm and the transient-error
+arm. The producers of that failure are DATABASE-WIDE — GRDB suspends writes when the app is
+backgrounded mid-drain while WAL reads keep working (ADR-IOS-041); a full disk or an I/O error at
+COMMIT does the same — so the requeue fails in the same breath as whatever forced it. The row is then
+left `inFlight`, a state only the claim transaction writes and one the claim loop refuses, so no later
+pass in this process can pick it up; at the next launch `AppDatabase.recoverPreviousSessionResidue`
+DELETES it if it is an `everAttempted` `.move`. A user gesture that never reached the provider, lost
+in a live process with no crash in it.
+
+The `.haltLane` suffix site was already covered for the ONE cause a retained retirement produces
+(`pendingRetirementSuffixes`, the round-4 R1 extension above). The other seven were not, and the
+failed post-claim re-read is **new to this change** — the base has no post-claim re-read at all — so
+its residue was introduced here rather than inherited. The comment at that site said the residue was
+"the same pre-existing class as every other `try? await retryWrite` requeue site in this loop —
+nothing new and nothing widened"; that reasoning was wrong on both counts and is corrected in place.
+
+**The fix, and the deletion that pays for it.** One helper on the actor,
+`AccountManager.requeueOrRetain(_:incrementRetryCount:)`, replaces all eight duplicated blocks: it
+runs the SAME `retryWrite` + `markQueued` those sites ran, releases the id on success, and on a
+thrown write RETAINS it in `AccountManager.pendingRequeues: [String: Bool]` with that caller's own
+retry-count choice, logging on the debug-gated queue channel. Eight copies of one shape collapse into
+one implementation. The value is the retry choice rather than `Void` so the recovery charges exactly
+what the original site would have charged — the `ProviderEvidenceUnavailable` and transient-error
+sites pass `true`, the other six pass the default — and
+`PendingOperation.requeueIfInFlight(_:id:incrementRetryCount:)` gains the same parameter
+`markQueued` already had, so the guarded `WHERE status = 'inFlight'` predicate is kept AND the charge
+is not silently dropped by the recovery path.
+
+`AccountManager.recoverPendingRequeues()` runs in `drainPendingQueue` between the retained-retirement
+replay and the `NetworkMonitor` check — under `isDraining`, after `replayRetainedRetirements`, before
+any claim pass — because the work is entirely LOCAL and must not wait for connectivity. Its write is
+the guarded `requeueIfInFlight`, and a ZERO-ROW UPDATE IS SUCCESS: the row was since cancelled,
+wiped, or already requeued, and ownership is resolved either way. A failure STOPS the drain with
+ownership retained, and schedules no redrain of its own — the next drain from any ordinary entry
+point runs it again, first.
+
+**The pass boundary stops on it too, and that is load-bearing rather than symmetry.** Inside the
+failed-read catch and the lane-halt loop each row is requeued by its OWN `retryWrite`, so a
+predecessor's requeue can fail while its follower's succeeds — leaving the follower `queued` and
+claimable ALONE in the next pass, running ahead of an unresolved predecessor in the same lane. That
+is exactly the ordering violation `.haltLane` exists to prevent, so the existing gate becomes
+`if !pendingRetirements.isEmpty || !pendingRequeues.isEmpty { break }`.
+
+**`pendingRetirementSuffixes` is NOT folded into the new map and nothing is deleted from it.** That
+requeue runs INSIDE the retirement's own transaction on purpose, so a follower is never made
+claimable while still naming the address that same transaction is about to invalidate. Moving it into
+the later, separate general recovery would open a NEW and WIDER window: after the retirement commits
+and before the general requeue commits, a process death leaves a correctly re-addressed follower
+`.move` still `inFlight`, which launch then deletes. Overlapping ownership of one id is harmless and
+expected — the retirement requeues the suffix atomically and the general recovery's guarded update
+then matches zero rows and clears its entry.
+
+**The residual, unchanged in kind and NOT widened.** What survives is PROCESS DEATH while an id is
+owned only in memory: the row stays `inFlight` and launch applies its existing disposition, which is
+the already registered [#116](https://github.com/TabMail/tabmail-ios/issues/116) behaviour inside the
+process-death window this record already accepts. No new accepted limitation is introduced. The
+statement is carried in the source beside `AccountManager.pendingRequeues`.
+
+**Fence.** `OutlookQueueHandoffTests.aRefusedRequeueAfterAFailedReReadStaysClaimableInThisProcess` —
+a real drain against the churning Graph server. A mark-flagged BYSTANDER (which succeeds and sets
+`executedAny`, without which the pass loop stops for an unrelated reason and every assertion is
+vacuous), then a `.move` whose post-claim re-read is faulted, then a mark-read FOLLOWER on the same
+message, all one account-scoped lane. The refusal is scoped to the MOVE's row by `rowid`
+(`OneRowUpdateRefuser`, file-private like its three siblings), so the predecessor's requeue fails
+while the follower's commits — the split that makes the follower claimable alone. Keying on the row
+rather than arming by a clock is what makes the schedule deterministic: the predecessor never reaches
+the wire, so `holdNextMove` cannot park it and there is no point to synchronise on. The oracles are
+the wire and the durable queue, never membership of `pendingRequeues`: (i) nothing goes out behind the
+unresolved move and the follower is still owed rather than executed; (ii) a further drain under the
+same refusal sends no new provider work and charges no retry; (iii) once writes recover the move and
+its follower each execute exactly once, in issue order, at the proven address. RED on the unmodified
+code (two PATCHes instead of one, the follower row destroyed, zero `/move` ever) and RED on a named
+inversion of the fix (`recoverPendingRequeues` made a no-op returning true).
 
 ## Tests
 
