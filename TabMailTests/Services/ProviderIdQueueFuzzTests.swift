@@ -1621,7 +1621,8 @@ extension ProviderIdQueueFuzzTests {
 
     /// Tunables for the stable-id lane fuzzer, kept separate from the
     /// IMAP-shaped `FuzzConfig` above (which this extension still reuses for
-    /// `seeds`/`rounds` — same knobs, same spelling, same env vars).
+    /// `seeds`/`rounds`/`drainPollAttempts`/`drainPollIntervalMs` — same
+    /// knobs, same spelling, same env vars).
     private enum StableFuzzConfig {
         /// How long the move-hook's wire oracle holds its window open after
         /// its own seeded chaos park. `ChaosScheduler.point()` is a NO-OP
@@ -1632,27 +1633,28 @@ extension ProviderIdQueueFuzzTests {
         /// shorter here because at most one pair of moves is ever in flight
         /// per round (kept the default-runtime bound tight).
         static let moveOverlapWindowMs = 80
-        /// How long a `.transientThenClears` fault stays armed before a
-        /// background task clears it. Deliberately LARGER than
-        /// `moveOverlapWindowMs` so the FIRST attempt's hook completes and
-        /// the throw-check still sees the fault armed — otherwise the fault
-        /// could clear mid-hook and the "retryable failure" would never
-        /// actually manifest as one.
-        static let transientFaultClearDelayMs = 150
         /// Bystander count range (inclusive), seeded per round.
         static let bystanderCountMin = 2
         static let bystanderCountRange = 3 // picks 0..<3, so count is 2...4
     }
 
-    /// A retryable fault injected on the target id's `move()` calls for some
-    /// rounds (Testing Rule 11(a) — seeded fault injection).
-    private enum StableFaultMode: Sendable {
+    /// A retryable fault injected on the target id's `move()` calls
+    /// (Testing Rule 11(a) — fault injection). An EXPLICIT `@Test(arguments:)`
+    /// dimension, not a seeded draw: the round-2 test-coverage review found
+    /// both checked-in seeds drew only `.none`/`.permanentThisRound`, so the
+    /// `.transientThenClears` arm never executed.
+    ///
+    /// Not `private`: it is a parameter type of a `@Test(arguments:)`
+    /// function, and Swift requires a method to be at least as accessible as
+    /// its parameter types (same as `AccountManagerQueueDrainTests.StableIdAccountCase`).
+    enum StableFaultMode: Sendable {
         /// No fault this round.
         case none
-        /// Armed at round start, cleared by a background task after
-        /// `transientFaultClearDelayMs` — models a connectivity blip that
-        /// resolves before the user would notice, so the round must still
-        /// fully CONVERGE.
+        /// Armed at round start and cleared by the TEST only after the first
+        /// failed attempt has been observed as DURABLE queue state
+        /// (predecessor requeued with `retryCount == 1`) — never by a timer,
+        /// so the failure provably manifests before the blip resolves. The
+        /// round must then fully CONVERGE on re-drive.
         case transientThenClears
         /// Armed and never cleared this round — the queue must NOT drop the
         /// intention; it must retain EXACTLY the retry state the failure
@@ -1720,10 +1722,10 @@ extension ProviderIdQueueFuzzTests {
 
     @Test(
         "A3.2: on a Gmail (immutable-id) account, cross-folder gestures on ONE message never overlap on the wire, land in createdAt order, the latest destination wins, disjoint work still converges, and a retryable fault yields exactly the retry state it justifies (Testing Rule 11)",
-        arguments: FuzzConfig.seeds
+        arguments: FuzzConfig.seeds, [StableFaultMode.none, .transientThenClears, .permanentThisRound]
     )
     @MainActor
-    func stableIdQueueLaneFuzz(seed: UInt64) async throws {
+    func stableIdQueueLaneFuzz(seed: UInt64, faultMode: StableFaultMode) async throws {
         let seedHex = "0x" + String(seed, radix: 16)
         var rng = SplitMix64(seed: seed ^ 0xB1AB_0000_0000_0001)
         // Same class, same shape as `ProviderIdQueueFuzzTests.ChaosScheduler`
@@ -1738,15 +1740,10 @@ extension ProviderIdQueueFuzzTests {
             // (safe-default) side of `buildLanes`; a serialization round for
             // it would bless an inherited race rather than prove this one.
             let provider: AccountProvider = .gmail
-            let faultMode: StableFaultMode
-            switch rng.pick(3) {
-            case 0: faultMode = .none
-            case 1: faultMode = .transientThenClears
-            default: faultMode = .permanentThisRound
-            }
+            let tag = "\(seedHex) round \(round) [\(provider.rawValue), fault=\(faultMode)]"
             let bystanderCount = StableFuzzConfig.bystanderCountMin + rng.pick(StableFuzzConfig.bystanderCountRange)
 
-            let accountId = "stablefuzz-\(String(seed, radix: 16))-r\(round)-\(UUID().uuidString)"
+            let accountId = "stablefuzz-\(String(seed, radix: 16))-\(faultMode)-r\(round)-\(UUID().uuidString)"
             let fixture = try makeStableIdFixture(accountId: accountId, provider: provider)
             defer { restoreStableIdFixture(fixture) }
 
@@ -1792,14 +1789,16 @@ extension ProviderIdQueueFuzzTests {
             }
             let bystanderIds: [String] = bystanderOps.compactMap(\.messageIds.first)
 
+            // ---- Exact wire shapes. `MockEmailProvider.move` appends
+            // `"move(ids:\(ids),from:\(from),to:\(to))"` to `callLog` BEFORE its
+            // hook and BEFORE its throw check, so a FAILED attempt is logged
+            // too — `callLog` is the attempt ledger, `movedIds` the success ledger.
+            let inverseCall = "move(ids:[\"\(targetId)\"],from:\(fixture.trash.path),to:\(fixture.inbox.path))"
+            let redeleteCall = "move(ids:[\"\(targetId)\"],from:\(fixture.inbox.path),to:\(fixture.trash.path))"
+            let isTargetMoveCall: @Sendable (String) -> Bool = { $0.hasPrefix("move(ids:") && $0.contains(targetId) }
+
             if faultMode != .none {
                 await mockProvider.setMoveThrowsOnId(targetId, error: ProviderError.notConnected)
-            }
-            if faultMode == .transientThenClears {
-                Task {
-                    try? await Task.sleep(for: .milliseconds(StableFuzzConfig.transientFaultClearDelayMs))
-                    await mockProvider.clearMoveThrowsOnId()
-                }
             }
 
             // Adversarial layer (a)+(b): the SAME seeded ChaosScheduler this
@@ -1809,10 +1808,27 @@ extension ProviderIdQueueFuzzTests {
             // hook, so those calls go unperturbed; documented limitation,
             // not a gap in coverage of THIS invariant, which is about `move`).
             let wireState = Mutex<(inFlight: Int, overlapped: Bool)>((inFlight: 0, overlapped: false))
-            await mockProvider.setMoveHook { [chaos] in
+            await mockProvider.setMoveHook { [chaos, mockProvider, bystanderIds] in
                 wireState.withLock { state in
                     state.inFlight += 1
                     if state.inFlight > 1 { state.overlapped = true }
+                }
+                // Bystander head start. `DrainContext.failedAccounts` is
+                // account-WIDE by design, so a same-account bystander lane
+                // that reaches its `failedAccounts` check only AFTER the
+                // target's failure is (correctly) parked for the rest of that
+                // drain. The exact-once bystander oracle below must measure
+                // the queue, not Task scheduling, so no target move — success
+                // or failure — may complete before every bystander has reached
+                // the provider. Bounded: on timeout the hook proceeds and the
+                // oracle reports the shortfall. The mock actor is reentrant at
+                // this suspension point, so the bystanders' calls proceed.
+                for _ in 0..<FuzzConfig.drainPollAttempts {
+                    let readIds = await mockProvider.markedReadIds.flatMap { $0.ids }
+                    let flaggedIds = await mockProvider.markedFlaggedIds.flatMap { $0.ids }
+                    let reached = Set(readIds + flaggedIds)
+                    if bystanderIds.allSatisfy({ reached.contains($0) }) { break }
+                    try? await Task.sleep(for: .milliseconds(FuzzConfig.drainPollIntervalMs))
                 }
                 await chaos.point()
                 try? await Task.sleep(for: .milliseconds(StableFuzzConfig.moveOverlapWindowMs))
@@ -1831,20 +1847,80 @@ extension ProviderIdQueueFuzzTests {
                 }
 
                 switch faultMode {
-                case .none, .transientThenClears:
+                case .none:
                     // Two bounded barrier passes, mirroring the IMAP round's
                     // drain → backstop → drain ordering above.
                     try await drainProviderQueue(pool: fixture.pool, recordedCommands: { () -> [String] in [] })
                     try await drainProviderQueue(pool: fixture.pool, recordedCommands: { () -> [String] in [] })
-                case .permanentThisRound:
-                    // A permanent fault never converges — polling to
+                case .transientThenClears, .permanentThisRound:
+                    // ONE direct drain while the fault is armed. Polling to
                     // emptiness would burn the whole barrier bound and throw
-                    // a spurious timeout diagnostic. One direct drain call is
+                    // a spurious timeout diagnostic. One direct call is
                     // provably sufficient: lanes run to completion (all
                     // Tasks awaited) before `drainPendingQueue()` returns,
                     // and the outer pass loop breaks itself once the target
                     // account's ops become unclaimable (`failedAccounts`).
                     await AccountManager.shared.drainPendingQueue()
+                    let settled = await AccountManager.shared.pendingQueueIsQuiescentForTesting()
+                    #expect(settled, "\(tag): the armed drain must be quiescent before its retry state is read")
+
+                    // ---- Invariant (armed fault, both modes): EXACTLY one wire
+                    // attempt, carried by the predecessor; the successor was
+                    // claimed and requeued UNTOUCHED (status back to queued,
+                    // retryCount still 0). `everAttempted` is set at CLAIM
+                    // time for every op of the lane (the claim loop in
+                    // `AccountManager.drainPendingQueue`), so it is true for
+                    // BOTH — the conservative evidence
+                    // `drainPendingQueueRealFirstOpFailureGatesRestOfLane` pins.
+                    let armedTargetCalls = (await mockProvider.callLog).filter(isTargetMoveCall)
+                    #expect(
+                        armedTargetCalls == [inverseCall],
+                        "\(tag): exactly ONE target move must have been attempted while the fault was armed, got \(armedTargetCalls)"
+                    )
+                    let armedTargetMoves = (await mockProvider.movedIds).filter { $0.ids.contains(targetId) }
+                    #expect(
+                        armedTargetMoves.isEmpty,
+                        "\(tag): a failing move must never record a successful call, got \(armedTargetMoves.map { "\($0.from)→\($0.to)" })"
+                    )
+
+                    let predecessor = try await fixture.pool.read { db in try PendingOperation.fetchOne(db, key: opInverse.id) }
+                    let successor = try await fixture.pool.read { db in try PendingOperation.fetchOne(db, key: opRedelete.id) }
+                    #expect(predecessor != nil, "\(tag): the failed predecessor must remain durably queued")
+                    #expect(successor != nil, "\(tag): the halted successor must remain durably queued")
+                    if let predecessor = predecessor, let successor = successor {
+                        #expect(predecessor.status == PendingStatus.queued.rawValue,
+                                "\(tag): predecessor status must be queued, got \(predecessor.status)")
+                        #expect(predecessor.retryCount == 1,
+                                "\(tag): predecessor must carry exactly ONE failed attempt, got retryCount=\(predecessor.retryCount)")
+                        #expect(predecessor.everAttempted,
+                                "\(tag): the predecessor was claimed, so everAttempted must be true")
+                        #expect(successor.status == PendingStatus.queued.rawValue,
+                                "\(tag): successor must be requeued to queued, got \(successor.status)")
+                        #expect(successor.retryCount == 0,
+                                "\(tag): the halted successor must never be attempted, got retryCount=\(successor.retryCount)")
+                        #expect(successor.everAttempted,
+                                "\(tag): the successor was claimed in the same pass, so everAttempted must be true (claim-time evidence, not a wire attempt)")
+                    }
+                    let accountOps = try await fixture.pool.read { db in
+                        try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
+                    }
+                    #expect(
+                        accountOps.count == 2,
+                        "\(tag): only the two halted target ops may remain on the account, got \(accountOps.map { "\($0.type.rawValue)\($0.messageIds)" })"
+                    )
+                    #expect(
+                        Set(accountOps.map(\.id)) == Set([opInverse.id, opRedelete.id]),
+                        "\(tag): the remaining ops must be exactly the two target ops"
+                    )
+
+                    if faultMode == .transientThenClears {
+                        // The blip resolves only AFTER its first failure was
+                        // observed above — deterministic, no timer. Then the
+                        // same two barrier passes as `.none`.
+                        await mockProvider.clearMoveThrowsOnId()
+                        try await drainProviderQueue(pool: fixture.pool, recordedCommands: { () -> [String] in [] })
+                        try await drainProviderQueue(pool: fixture.pool, recordedCommands: { () -> [String] in [] })
+                    }
                 }
 
                 // ---- Invariant: max in-flight per (account, id) == 1 — the
@@ -1852,85 +1928,50 @@ extension ProviderIdQueueFuzzTests {
                 // is provably observed inside the hook's own window,
                 // regardless of which one happens to finish first.
                 let overlapped = wireState.withLock { $0.overlapped }
-                #expect(
-                    !overlapped,
-                    "\(seedHex) round \(round) [\(provider.rawValue), fault=\(faultMode)]: two cross-folder moves on ONE stable id executed concurrently on the wire"
-                )
+                #expect(!overlapped, "\(tag): two cross-folder moves on ONE stable id executed concurrently on the wire")
 
                 let allMoves = await mockProvider.movedIds
                 let targetMoves = allMoves.filter { $0.ids.contains(targetId) }
                 let landed = targetMoves.map { "\($0.from)→\($0.to)" }
+                let targetCalls = (await mockProvider.callLog).filter(isTargetMoveCall)
 
                 switch faultMode {
                 case .none, .transientThenClears:
                     // ---- Invariant: successful calls on one id follow
                     // createdAt order, and the LATEST destination wins.
-                    #expect(
-                        targetMoves.count == 2,
-                        "\(seedHex) round \(round): both cross-folder moves must reach the provider, got \(landed)"
-                    )
+                    #expect(targetMoves.count == 2, "\(tag): both cross-folder moves must reach the provider, got \(landed)")
                     if targetMoves.count == 2 {
                         let expected = [
                             "\(fixture.trash.path)→\(fixture.inbox.path)",
                             "\(fixture.inbox.path)→\(fixture.trash.path)",
                         ]
-                        #expect(
-                            landed == expected,
-                            "\(seedHex) round \(round): moves must land in createdAt (issue) order, got \(landed)"
-                        )
-                        #expect(
-                            targetMoves[1].to == fixture.trash.path,
-                            "\(seedHex) round \(round): the user's LATEST destination must win on the wire, got \(targetMoves[1].to)"
-                        )
+                        #expect(landed == expected, "\(tag): moves must land in createdAt (issue) order, got \(landed)")
+                        #expect(targetMoves[1].to == fixture.trash.path,
+                                "\(tag): the user's LATEST destination must win on the wire, got \(targetMoves[1].to)")
                     }
+                    // ---- Invariant: the attempt ledger is exact. `.none` = the
+                    // two successes in issue order; transient = the ONE failed
+                    // attempt first, then the two successes.
+                    let expectedCalls = (faultMode == .transientThenClears ? [inverseCall] : []) + [inverseCall, redeleteCall]
+                    #expect(targetCalls == expectedCalls, "\(tag): target move calls must be exactly \(expectedCalls), got \(targetCalls)")
                     // ---- Invariant: the durable queue converges.
                     let remaining = try await fixture.pool.read { db in try PendingOperation.fetchCount(db) }
-                    #expect(
-                        remaining == 0,
-                        "\(seedHex) round \(round): queue did not converge — \(remaining) op(s) remain"
-                    )
+                    #expect(remaining == 0, "\(tag): queue did not converge — \(remaining) op(s) remain")
                 case .permanentThisRound:
-                    // ---- Invariant: the queue retains EXACTLY the retry
-                    // state the injected failure justifies — never a drop,
-                    // never a duplicate wire attempt.
-                    #expect(
-                        targetMoves.isEmpty,
-                        "\(seedHex) round \(round): a permanently-failing move must never record a successful call, got \(landed)"
-                    )
-                    let remainingTargetOps = try await fixture.pool.read { db in
-                        try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
-                    }
-                    #expect(
-                        remainingTargetOps.count == 2,
-                        "\(seedHex) round \(round): both halves of the halted lane must stay durably queued, got \(remainingTargetOps.count)"
-                    )
-                    if remainingTargetOps.count == 2 {
-                        #expect(remainingTargetOps.allSatisfy { $0.messageIds == [targetId] })
-                        #expect(remainingTargetOps.allSatisfy { $0.status == PendingStatus.queued.rawValue })
-                        let attemptedCount = remainingTargetOps.filter { $0.retryCount > 0 }.count
-                        #expect(
-                            attemptedCount == 1,
-                            "\(seedHex) round \(round): exactly one op in the halted lane must show a real wire attempt, got \(attemptedCount)"
-                        )
-                    }
+                    #expect(targetMoves.isEmpty, "\(tag): a permanently-failing move must never record a successful call, got \(landed)")
+                    #expect(targetCalls == [inverseCall], "\(tag): a permanent fault must leave exactly ONE (failed) target call, got \(targetCalls)")
                 }
 
-                // ---- Invariant: disjoint work still progresses, regardless
-                // of the target lane's fault mode.
+                // ---- Invariant: disjoint work progresses EXACTLY once per
+                // bystander, regardless of the target lane's fault mode
+                // (never dropped, never duplicated).
                 let readCalls = await mockProvider.markedReadIds
                 let flaggedCalls = await mockProvider.markedFlaggedIds
                 for (index, bystanderId) in bystanderIds.enumerated() {
-                    if index.isMultiple(of: 2) {
-                        #expect(
-                            readCalls.contains { $0.ids == [bystanderId] },
-                            "\(seedHex) round \(round): disjoint bystander \(bystanderId) never reached the provider"
-                        )
-                    } else {
-                        #expect(
-                            flaggedCalls.contains { $0.ids == [bystanderId] },
-                            "\(seedHex) round \(round): disjoint bystander \(bystanderId) never reached the provider"
-                        )
-                    }
+                    let hits = index.isMultiple(of: 2)
+                        ? readCalls.filter { $0.ids == [bystanderId] }.count
+                        : flaggedCalls.filter { $0.ids == [bystanderId] }.count
+                    #expect(hits == 1, "\(tag): disjoint bystander \(bystanderId) must reach the provider exactly once, got \(hits)")
                 }
             }
         }
