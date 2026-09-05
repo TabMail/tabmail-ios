@@ -436,53 +436,80 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         http.register(path: "/messages/", method: "POST") { [state, churnsIdOnMove] request in
             // One-shot hold, taken before any early return so a test that arms it
             // parks every move that reaches the route, not only the ones that
-            // would have succeeded.
+            // would have succeeded. Taking it is the SYNCHRONOUS part and stays
+            // on the loader thread, so `heldMoveCount` still rises the moment the
+            // move reaches the route and `awaitHeldMoves` keeps its meaning.
             if let gate = state.value.withLock({ model -> DispatchSemaphore? in
                 guard let gate = model.nextMoveHold else { return nil }
                 model.nextMoveHold = nil
                 model.heldMoveCount += 1
                 return gate
             }) {
+                // 🚨 THE WAIT HAPPENS OFF THE TRANSPORT. `FakeHTTP.CannedResponse.parked`
+                // evaluates this closure on a background queue, so the loader
+                // thread returns immediately and every OTHER route keeps being
+                // served while this move sits in the gate. Waiting here directly
+                // used to occupy the loader thread, which made "a second, different
+                // request is served while a move is parked" a scheduling race and
+                // flaked the failed-account requeue test (measured 3 red in 8
+                // standalone runs on unmodified production code).
+                //
+                // Nothing else about the hold changed: the model is still mutated
+                // only AFTER the release, because the whole rest of the handler is
+                // inside the parked closure.
+                //
                 // Bounded: 10 s is comfortably inside the queue's 15 s
                 // `pendingOperationTimeoutSeconds`, so a forgotten release fails an
                 // assertion instead of converting the test into a timeout test.
-                _ = gate.wait(timeout: .now() + 10)
-            }
-            guard !Self.consumeMutationFailure(state) else { return .status(503) }
-            guard let providerId = Self.messageId(from: request.url, move: true) else {
-                return .status(404)
-            }
-            let body = request.body.flatMap {
-                try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
-            } ?? [:]
-            guard let destination = body["destinationId"] as? String else {
-                return .status(400)
-            }
-
-            let moved = state.value.withLock { model -> Message? in
-                guard let prior = model.messagesByProviderId.removeValue(forKey: providerId) else {
-                    return nil
+                return .parked {
+                    _ = gate.wait(timeout: .now() + 10)
+                    return Self.serveMove(request, state: state, churnsIdOnMove: churnsIdOnMove)
                 }
-                let movedId = churnsIdOnMove
-                    ? "graph/moved+\(model.nextMoveGeneration)="
-                    : prior.providerMessageId
-                model.nextMoveGeneration += 1
-                let next = Message(
-                    rfc822MessageId: prior.rfc822MessageId,
-                    providerMessageId: movedId,
-                    folderId: destination,
-                    isRead: prior.isRead,
-                    isFlagged: prior.isFlagged,
-                    receivedAt: prior.receivedAt,
-                    categories: prior.categories
-                )
-                model.messagesByProviderId[movedId] = next
-                return next
             }
-            guard let moved else { return .status(404) }
-            let response = (try? JSONSerialization.data(withJSONObject: Self.graphRow(moved))) ?? Data()
-            return .bytes(response, contentType: "application/json")
+            return Self.serveMove(request, state: state, churnsIdOnMove: churnsIdOnMove)
         }
+    }
+
+    /// The `/move` route's whole body, verbatim, factored out so the held and
+    /// unheld paths run the SAME code — the held one just runs it after the gate
+    /// opens, on a background queue rather than the transport's loader thread.
+    private static func serveMove(
+        _ request: FakeHTTP.Request, state: StateBox, churnsIdOnMove: Bool
+    ) -> FakeHTTP.CannedResponse {
+        guard !Self.consumeMutationFailure(state) else { return .status(503) }
+        guard let providerId = Self.messageId(from: request.url, move: true) else {
+            return .status(404)
+        }
+        let body = request.body.flatMap {
+            try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+        } ?? [:]
+        guard let destination = body["destinationId"] as? String else {
+            return .status(400)
+        }
+
+        let moved = state.value.withLock { model -> Message? in
+            guard let prior = model.messagesByProviderId.removeValue(forKey: providerId) else {
+                return nil
+            }
+            let movedId = churnsIdOnMove
+                ? "graph/moved+\(model.nextMoveGeneration)="
+                : prior.providerMessageId
+            model.nextMoveGeneration += 1
+            let next = Message(
+                rfc822MessageId: prior.rfc822MessageId,
+                providerMessageId: movedId,
+                folderId: destination,
+                isRead: prior.isRead,
+                isFlagged: prior.isFlagged,
+                receivedAt: prior.receivedAt,
+                categories: prior.categories
+            )
+            model.messagesByProviderId[movedId] = next
+            return next
+        }
+        guard let moved else { return .status(404) }
+        let response = (try? JSONSerialization.data(withJSONObject: Self.graphRow(moved))) ?? Data()
+        return .bytes(response, contentType: "application/json")
     }
 
     /// Graph's structured `400` error body with a `code` that matches NO

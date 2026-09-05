@@ -42,17 +42,47 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
         let headers: [String: String]
         let body: Data
         let transportErrorCode: URLError.Code?
+        /// Non-nil when the real response is PRODUCED LATER, off the transport's
+        /// loader thread — see `parked(_:)`.
+        let parked: (@Sendable () -> CannedResponse)?
 
         private init(
             statusCode: Int,
             headers: [String: String],
             body: Data,
-            transportErrorCode: URLError.Code? = nil
+            transportErrorCode: URLError.Code? = nil,
+            parked: (@Sendable () -> CannedResponse)? = nil
         ) {
             self.statusCode = statusCode
             self.headers = headers
             self.body = body
             self.transportErrorCode = transportErrorCode
+            self.parked = parked
+        }
+
+        /// A response a handler wants to WITHHOLD until something else happens —
+        /// a test releasing a gate, typically — without holding the transport
+        /// while it waits.
+        ///
+        /// 🚨 THIS EXISTS BECAUSE BLOCKING INSIDE A HANDLER BLOCKS THE WHOLE
+        /// TRANSPORT, NOT JUST ITS OWN REQUEST. `URLProtocol.startLoading()` is
+        /// synchronous and runs on a loader thread the session owns; a handler
+        /// that sleeps or waits there occupies that thread. Whether a *different*
+        /// concurrent request then gets a loader thread of its own is a
+        /// scheduling race, so a test that parks one request and asserts on a
+        /// second one is order-dependent: it passes when the second request wins
+        /// the race to the transport and hangs until the release when it does
+        /// not. That is exactly how `OutlookQueueHandoffTests`' failed-account
+        /// requeue test flaked (measured 3 red in 8 standalone runs).
+        ///
+        /// `produce` is therefore evaluated on a background queue: it may block
+        /// for as long as it likes, the loader thread returns immediately, and
+        /// every other route keeps being served. The handler still runs its own
+        /// synchronous part — call counting, one-shot budgets — on the loader
+        /// thread before parking, so ordering of what was RECEIVED is unchanged;
+        /// only the production of this one response moves.
+        static func parked(_ produce: @escaping @Sendable () -> CannedResponse) -> CannedResponse {
+            CannedResponse(statusCode: 0, headers: [:], body: Data(), parked: produce)
         }
 
         /// Build a JSON response from a fixture file in `TabMailTests/Fixtures/`.
@@ -440,6 +470,22 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
             return fail(code: 599, body: "FakeHTTP: no matcher for \(method) \(url)")
         }
 
+        // PARKED: produce the response off the loader thread so this request
+        // cannot starve any other route while it waits. See `parked(_:)`.
+        if let produce = canned.parked {
+            DispatchQueue.global().async { [self] in
+                deliver(produce(), url: url)
+            }
+            return
+        }
+
+        deliver(canned, url: url)
+    }
+
+    /// Hand a finished response to the URL loading system. Split out of
+    /// `startLoading()` so the parked path completes through exactly the same
+    /// callbacks in exactly the same order.
+    private func deliver(_ canned: CannedResponse, url: URL) {
         if let transportErrorCode = canned.transportErrorCode {
             client?.urlProtocol(self, didFailWithError: URLError(transportErrorCode))
             return
