@@ -1729,7 +1729,7 @@ extension ProviderIdQueueFuzzTests {
     // MARK: - The fuzz test
 
     @Test(
-        "A3.2: on a Gmail (immutable-id) account, cross-folder gestures on ONE message never overlap on the wire, land in createdAt order, the latest destination wins, disjoint work still converges, and a retryable fault yields exactly the retry state it justifies (Testing Rule 11)",
+        "A3.2: on an account-scoped-id account (Gmail and Outlook, alternating per round), cross-folder gestures on ONE message never overlap on the wire, land in createdAt order, the latest destination wins, disjoint work still converges, and a retryable fault yields exactly the retry state it justifies (Testing Rule 11)",
         arguments: FuzzConfig.seeds, [StableFaultMode.none, .transientThenClears, .permanentThisRound]
     )
     @MainActor
@@ -1742,13 +1742,30 @@ extension ProviderIdQueueFuzzTests {
         let chaos = ChaosScheduler(seed: seed ^ 0xB1AB_79B9_7F4A_7C15)
 
         for round in 0..<FuzzConfig.rounds {
-            // GMAIL ONLY — deliberately not `.outlook`. Microsoft Graph's
-            // default message ids are REALLOCATED on every move
-            // (`IOS-GRAPH-002`), so Outlook stays on the folder-qualified
-            // (safe-default) side of `buildLanes`; a serialization round for
-            // it would bless an inherited race rather than prove this one.
-            let provider: AccountProvider = .gmail
+            // ALTERNATING, and the alternation is the point (`IOS-GRAPH-005`).
+            // Both providers are now on the account-qualified side of
+            // `buildLanes`, but for DIFFERENT reasons, and only one of them can
+            // catch a handoff regression:
+            //  * Gmail's ids are genuinely immutable across a move, so
+            //    `addressChangesOnMove` is false, `finishMove` returns `.empty`
+            //    and the handoff is a no-op there BY CONSTRUCTION. A Gmail-only
+            //    fuzzer therefore stays green with the handoff reverted — which
+            //    is exactly what makes these rounds the two-sided NON-VACUITY
+            //    leg rather than dead weight.
+            //  * Microsoft Graph REALLOCATES the id on every move
+            //    (`IOS-GRAPH-002`), so an Outlook round only converges if the
+            //    move's retirement re-addresses the follower still naming the
+            //    old id. Reverting the handoff must fail these rounds.
+            let provider: AccountProvider = round.isMultiple(of: 2) ? .gmail : .outlook
             let tag = "\(seedHex) round \(round) [\(provider.rawValue), fault=\(faultMode)]"
+            if provider == .outlook {
+                let outlookBystanders = StableFuzzConfig.bystanderCountMin
+                    + rng.pick(StableFuzzConfig.bystanderCountRange)
+                try await runOutlookStableIdRound(
+                    seed: seed, round: round, faultMode: faultMode, tag: tag,
+                    bystanderCount: outlookBystanders)
+                continue
+            }
             let bystanderCount = StableFuzzConfig.bystanderCountMin + rng.pick(StableFuzzConfig.bystanderCountRange)
 
             let accountId = "stablefuzz-\(String(seed, radix: 16))-\(faultMode)-r\(round)-\(UUID().uuidString)"
@@ -1982,6 +1999,199 @@ extension ProviderIdQueueFuzzTests {
                     #expect(hits == 1, "\(tag): disjoint bystander \(bystanderId) must reach the provider exactly once, got \(hits)")
                 }
             }
+        }
+    }
+
+    // MARK: - The Outlook round (IOS-GRAPH-005)
+
+    /// One round of the same invariant against a REAL `ExchangeProvider` and a
+    /// Graph server that reallocates the message id on every move.
+    ///
+    /// **Why this cannot reuse the Gmail round's body.** The Gmail round's
+    /// oracles are `MockEmailProvider`'s ledgers (`callLog`, `movedIds`), which
+    /// exist because the mock never changes an address. The question here is
+    /// precisely what happens to an address, so the oracle has to be the SERVER:
+    /// which folder the message is in, at which id, and how many copies exist.
+    ///
+    /// **Fault injection differs, deliberately.** The Gmail round scopes its
+    /// fault to the target id (`setMoveThrowsOnId`). The Graph fixture's
+    /// equivalent is `failAllMutations(_:)`, which is account-wide, so under a
+    /// fault the bystanders fail too. The bystander oracle is adapted to match
+    /// rather than weakened: with the fault cleared every bystander must land
+    /// EXACTLY once, and under a permanent fault every bystander operation must
+    /// still be DURABLY QUEUED — never dropped. Both are the never-drop
+    /// invariant; only the observable differs.
+    @MainActor
+    private func runOutlookStableIdRound(
+        seed: UInt64, round: Int, faultMode: StableFaultMode, tag: String, bystanderCount: Int
+    ) async throws {
+        let accountId = "stablefuzz-graph-\(String(seed, radix: 16))-\(faultMode)-r\(round)-\(UUID().uuidString)"
+        let fixture = try makeStableIdFixture(accountId: accountId, provider: .outlook)
+        defer { restoreStableIdFixture(fixture) }
+
+        let targetId = "graph/target+\(UUID().uuidString)="
+        let targetRfc = "stablefuzz-target-\(UUID().uuidString)@example.com"
+        let bystanderIds = (0..<bystanderCount).map { "graph/bystander+\($0)+\(UUID().uuidString)=" }
+        let bystanderRfcs = (0..<bystanderCount).map { "stablefuzz-bystander-\($0)-\(UUID().uuidString)@example.com" }
+
+        var seeds: [StatefulExchangeActionServer.Seed] = [
+            .init(rfc822MessageId: targetRfc, providerMessageId: targetId,
+                  folderId: fixture.trash.path),
+        ]
+        for (index, bystanderId) in bystanderIds.enumerated() {
+            seeds.append(.init(
+                rfc822MessageId: bystanderRfcs[index], providerMessageId: bystanderId,
+                folderId: fixture.inbox.path))
+        }
+        let server = StatefulExchangeActionServer(messages: seeds, churnsIdOnMove: true)
+        defer { server.close() }
+
+        // The local row the re-key follows. Seeded in TRASH, where the undo
+        // inverse starts, exactly as a sync would have left it.
+        var header = MessageHeader(
+            messageId: targetId,
+            subject: "stablefuzz graph target",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "\(accountId)@example.com",
+            date: Date(),
+            snippet: "stablefuzz graph body",
+            folderId: MessageIdentity.folderId(
+                accountId: accountId, folderPath: fixture.trash.path),
+            accountId: accountId,
+            folderPath: fixture.trash.path,
+            isInInbox: false)
+        header.rfc822MessageId = targetRfc
+        let seededHeader = header
+
+        // The IOS-QUEUE-008 shape: an undo inverse (TRASH→INBOX) and a
+        // re-delete (INBOX→TRASH) of ONE message, in issue order.
+        let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
+        let opInverse: PendingOperation = {
+            var op = PendingOperation(
+                type: .move, messageIds: [targetId], accountId: accountId,
+                folderPath: fixture.trash.path, destinationPath: fixture.inbox.path)
+            op.createdAt = t0
+            return op
+        }()
+        let opRedelete: PendingOperation = {
+            var op = PendingOperation(
+                type: .move, messageIds: [targetId], accountId: accountId,
+                folderPath: fixture.inbox.path, destinationPath: fixture.trash.path)
+            op.createdAt = t0.addingTimeInterval(1)
+            return op
+        }()
+        let bystanderOps: [PendingOperation] = bystanderIds.enumerated().map { index, bystanderId in
+            PendingOperation(
+                type: index.isMultiple(of: 2) ? .markRead : .markFlagged,
+                messageIds: [bystanderId], accountId: accountId,
+                folderPath: fixture.inbox.path)
+        }
+
+        try await withProviderLifetime(
+            accountId: accountId, provider: server.provider(),
+            imapProvider: nil, pool: fixture.pool
+        ) {
+            try await fixture.pool.writeWithoutTransaction { db in
+                try seededHeader.insert(db)
+                try opInverse.insert(db)
+                try opRedelete.insert(db)
+                for op in bystanderOps { try op.insert(db) }
+            }
+            let totalOps = 2 + bystanderOps.count
+
+            // ---- Phase A: the armed fault. Nothing may reach the server, and
+            // nothing may leave the queue.
+            if faultMode != .none {
+                server.failAllMutations(true)
+                await AccountManager.shared.drainPendingQueue()
+                let settled = await AccountManager.shared.pendingQueueIsQuiescentForTesting()
+                #expect(settled, "\(tag): the armed drain must be quiescent before its retry state is read")
+
+                #expect(server.snapshot(providerMessageId: targetId)?.folderId == fixture.trash.path,
+                        "\(tag): a move landed while every mutation was supposed to fail")
+                let armedOps = try await fixture.pool.read { db in
+                    try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
+                }
+                #expect(armedOps.count == totalOps, """
+                    \(tag): a failed attempt DROPPED an intention — \(armedOps.count) of \
+                    \(totalOps) operations survive. A transient refusal is never an exit.
+                    """)
+                #expect(armedOps.allSatisfy { $0.status == PendingStatus.queued.rawValue },
+                        "\(tag): an operation was left inFlight by the armed drain")
+
+                if faultMode == .permanentThisRound {
+                    // ---- Invariant: a permanent fault retains EXACTLY the
+                    // halted-lane state, and nothing on the wire moved.
+                    #expect(Set(armedOps.map(\.id))
+                        == Set([opInverse.id, opRedelete.id] + bystanderOps.map(\.id)),
+                            "\(tag): the retained operations are not the ones that were issued")
+                    #expect(server.snapshots(rfc822MessageId: targetRfc).map(\.folderId)
+                        == [fixture.trash.path],
+                            "\(tag): the target moved under a permanent fault")
+                    #expect(!server.moveOverlapObserved(), """
+                        \(tag): two cross-folder moves on ONE Graph id entered the wire \
+                        concurrently (peak \(server.peakConcurrentMoves()))
+                        """)
+                    return
+                }
+                server.failAllMutations(false)
+            }
+
+            // ---- Phase B: converge, with the first move parked so a genuinely
+            // concurrent pair is OBSERVED rather than inferred.
+            let release = server.holdNextMove()
+            let drain = Task { await AccountManager.shared.drainPendingQueue() }
+            var held = false
+            for _ in 0..<FuzzConfig.drainPollAttempts where !held {
+                held = server.heldMoveCount() >= 1
+                if !held { try await Task.sleep(for: .milliseconds(FuzzConfig.drainPollIntervalMs)) }
+            }
+            #expect(held, "\(tag): no move was parked, so the overlap oracle below is vacuous")
+            // The parked move holds the window open indefinitely, so this wait
+            // only has to be long enough for a SEPARATE lane's Task — launched
+            // in the same loop iteration — to reach the route. Four times the
+            // Gmail round's window, because here the cost of waiting is paid
+            // once per round rather than once per move.
+            try await Task.sleep(for: .milliseconds(4 * StableFuzzConfig.moveOverlapWindowMs))
+            #expect(!server.moveOverlapObserved(), """
+                \(tag): two cross-folder moves on ONE Graph id executed concurrently on \
+                the wire (peak \(server.peakConcurrentMoves())) — raced, the OLDER \
+                gesture can land last and the user's latest intention is reverted
+                """)
+            release()
+            _ = await drain.value
+            try await drainProviderQueue(pool: fixture.pool, recordedCommands: { () -> [String] in [] })
+
+            // ---- Invariant: the latest destination wins, at whatever id Graph
+            // reallocated along the way, with no duplicate left behind.
+            let copies = server.snapshots(rfc822MessageId: targetRfc)
+            #expect(copies.count == 1, "\(tag): the target was duplicated — \(copies.map(\.folderId))")
+            #expect(copies.map(\.folderId) == [fixture.trash.path], """
+                \(tag): the user's LATEST destination did not win — the message is at \
+                \(copies.map(\.folderId)). On Graph the re-delete names the id the \
+                inverse's move invalidated unless the retirement re-addressed it.
+                """)
+            #expect(copies.first?.providerMessageId != targetId,
+                    "\(tag): Graph did not reallocate the id, so this round is not exercising the churn")
+
+            // ---- Invariant: the durable queue converges.
+            let remaining = try await fixture.pool.read { db in try PendingOperation.fetchCount(db) }
+            #expect(remaining == 0, "\(tag): queue did not converge — \(remaining) op(s) remain")
+
+            // ---- Invariant: disjoint work progresses exactly once, never
+            // dropped and never duplicated, whatever the target lane did.
+            for (index, bystanderId) in bystanderIds.enumerated() {
+                let landed = server.snapshot(providerMessageId: bystanderId)
+                #expect(landed != nil, "\(tag): bystander \(bystanderId) vanished from the server")
+                let applied = index.isMultiple(of: 2) ? landed?.isRead : landed?.isFlagged
+                #expect(applied == true, """
+                    \(tag): disjoint bystander \(bystanderId) never reached the provider — \
+                    a halted target lane starved an unrelated intention (IOS-QUEUE-001)
+                    """)
+            }
+            #expect(Set(bystanderIds).count == bystanderIds.count,
+                    "\(tag): the round generated a duplicate bystander id, so the oracle above is ambiguous")
         }
     }
 }
