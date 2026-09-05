@@ -992,6 +992,23 @@ extension AccountManager {
         }
     }
 
+    /// Record which queued operations this retirement re-addressed.
+    ///
+    /// Debug-gated (`BackgroundSyncLogger.logQueue`, `AppLogChannel.queue`) and
+    /// present because `IOS-QUEUE-008` took a month to diagnose for exactly this
+    /// reason: the lane decision and the address handoff are both invisible after
+    /// the fact unless something writes them down. The line names the retiring op
+    /// and every follower whose members it rewrote.
+    private func logReaddressedFollowers(
+        _ result: MoveFinishResult, retiring op: PendingOperation
+    ) {
+        guard !result.readdressedOperationIds.isEmpty else { return }
+        BackgroundSyncLogger.logQueue(
+            "[Queue] handoff — move \(op.id.prefix(8)) retired and re-addressed "
+                + "\(result.readdressedOperationIds.count) queued op(s): "
+                + result.readdressedOperationIds.map { String($0.prefix(8)) }.joined(separator: ","))
+    }
+
     /// The row as it is RIGHT NOW, by primary key — the address the drain is
     /// about to send, rather than the one it snapshotted.
     ///
@@ -1508,16 +1525,25 @@ extension AccountManager {
             let finishResult: MoveFinishResult
             do {
                 finishResult = try await retryWrite(dbPool, label: "Queue") { db in
+                    // Read the classification INSIDE this write, from the same
+                    // `account` rows `drainPendingQueue` keyed the lanes from. The
+                    // two facts must not be allowed to drift: the lane key promises
+                    // that a follower runs after this move, and `accountScopedIds`
+                    // is what makes that promise safe by re-addressing it.
+                    let accountScopedIds = try AccountManager
+                        .accountScopedIdAccountIds(db).contains(currentOp.accountId)
                     let result = try MessageHeaderRekey.finishMove(
                         currentOp,
                         destinations: executed.provenDestinations,
                         addressChangesOnMove: executed.addressChangesOnMove,
+                        accountScopedIds: accountScopedIds,
                         db: db)
                     MessageHeaderRekey.publishAddressHandoffsAfterCommit(
                         result.applied, in: db)
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                     return result
                 }
+                logReaddressedFollowers(finishResult, retiring: currentOp)
             } catch {
                 // 🚨 UNGATED BY DECISION (rule 12's production-observability
                 // exception). A completed op that could not be deleted WILL run
@@ -2159,10 +2185,15 @@ extension AccountManager {
         }()
         do {
             let finishResult = try await retryWrite(dbPool, label: "Queue") { db in
+                // Same read as the full-retirement path — see there for why it is
+                // inside the write rather than captured from the drain snapshot.
+                let accountScopedIds = try AccountManager
+                    .accountScopedIdAccountIds(db).contains(currentOp.accountId)
                 let result = try MessageHeaderRekey.finishMove(
                     frozenRetiredOp,
                     destinations: provenDestinations,
                     addressChangesOnMove: addressChangesOnMove,
+                    accountScopedIds: accountScopedIds,
                     db: db)
                 MessageHeaderRekey.publishAddressHandoffsAfterCommit(
                     result.applied, in: db)
@@ -2174,6 +2205,7 @@ extension AccountManager {
                 try fresh.save(db)
                 return result
             }
+            logReaddressedFollowers(finishResult, retiring: frozenRetiredOp)
             await publishMoveFinish(finishResult)
             await materializeDeferredMoveSuccessors(after: frozenRetiredOp, result: finishResult)
         } catch {

@@ -142,6 +142,12 @@ struct MoveFinishResult: Sendable, Equatable {
     var applied: [HeaderRekeyRecord] = []
     var unsafeUndoOldHeaderIds: [String] = []
     var removedOldHeaderIds: [String] = []
+    /// Ids of the QUEUED/IN-FLIGHT `PendingOperation` rows whose members this
+    /// retirement re-addressed to the destination ids the wire just proved
+    /// (`IOS-GRAPH-005`). Reported so the caller can log the handoff — the
+    /// `IOS-QUEUE-008` lesson is that a serialization fact nobody can read back
+    /// out of an exported log gets misdiagnosed for a month.
+    var readdressedOperationIds: [String] = []
 
     static let empty = MoveFinishResult()
 }
@@ -505,13 +511,32 @@ enum MessageHeaderRekey {
     /// mutate a bystander. Gmail's label-based move keeps a stable provider id,
     /// so `addressChangesOnMove == false` bypasses address repair entirely.
     ///
+    /// **`accountScopedIds` SELECTS THE ADDRESS SPACE, and it is not cosmetic.**
+    /// It is the same fact the drain's lane key uses
+    /// (`AccountManager.accountScopedIdAccountIds`): one provider id names one
+    /// message per ACCOUNT, not one per FOLDER. It turns on two behaviours that
+    /// would be WRONG on IMAP:
+    ///  1. the member's row is located by `(accountId, messageId)` and re-keyed
+    ///     in whatever folder it currently occupies, instead of by primary key
+    ///     at `op.destinationPath` (§3.3 — the row-built gesture after an undo);
+    ///  2. every other non-cancelled operation of this account that still names
+    ///     a source id is re-addressed to the proven destination id in this same
+    ///     transaction (`readdressQueuedOperations`).
+    /// On IMAP a UID is mailbox-local, so both would be wrong-message mutations
+    /// (C3): a different message can legitimately carry the same numeric UID in
+    /// another folder. The flag is therefore NOT defaulted — every caller states
+    /// which address space its account is in, and a new call site cannot inherit
+    /// the wrong one by omission.
+    ///
     /// - Returns: applied re-keys, old ids whose completed source-address undo
-    ///   authority is unsafe, and removed old ids. Callers publish those
+    ///   authority is unsafe, removed old ids, and the ids of the queued
+    ///   operations re-addressed by this retirement. Callers publish those
     ///   dispositions to undo, FTS, and body assets.
     static func finishMove(
         _ op: PendingOperation,
         destinations: [ProvenDestinationAddress],
         addressChangesOnMove: Bool,
+        accountScopedIds: Bool,
         db: Database
     ) throws -> MoveFinishResult {
         guard op.type == .move, addressChangesOnMove,
@@ -542,27 +567,84 @@ enum MessageHeaderRekey {
         var result = MoveFinishResult.empty
         var visited: Set<String> = []
         for sourceProviderId in op.messageIds where visited.insert(sourceProviderId).inserted {
-            let oldId = MessageIdentity.headerId(
+            // The address this member had when the gesture was issued. On IMAP it
+            // IS the optimistic row's primary key. On an account-scoped provider
+            // it is only a REPORTING id for the "no row" and "ambiguous" arms,
+            // because the row is allowed to have moved on since (see below).
+            let sourceShapedOldId = MessageIdentity.headerId(
                 accountId: op.accountId, folderPath: op.folderPath,
                 messageId: sourceProviderId)
-            guard let row = try MessageHeader.fetchOne(db, key: oldId) else {
-                result.removedOldHeaderIds.append(oldId)
-                continue
-            }
-            // G3 — only the exact row this operation optimistically moved. A
-            // later gesture or a sync-owned replacement is outside this
-            // operation and must not be re-keyed or removed.
-            guard row.accountId == op.accountId,
-                  row.messageId == sourceProviderId,
-                  row.folderPath == destinationPath,
-                  row.folderId == destinationFolderId
-            else {
-                // The remote move succeeded, so the source-address undo member
-                // is invalid even though this local row is outside the op's
-                // authority. Retain the row and every external mirror, but
-                // explicitly revoke the stale undo target.
-                result.unsafeUndoOldHeaderIds.append(oldId)
-                continue
+            // The three facts the re-key needs: the row, its CURRENT primary key,
+            // and the folder it currently sits in.
+            let row: MessageHeader
+            let oldId: String
+            let landingFolderPath: String
+
+            if accountScopedIds {
+                // 🚨 FOLLOW THE ROW — DO NOT ASSUME IT IS STILL AT `destinationPath`.
+                // On an account-scoped provider the id names ONE message per
+                // account, so the row that carries it is the right row wherever it
+                // is. It legitimately is NOT at `destinationPath` in the sequence
+                // this branch exists for (`IOS-QUEUE-008`, `IOS-GRAPH-005`):
+                // delete → undo → re-delete. The undo is an ordinary reverse move,
+                // so when IT retires the row is back in INBOX while this op's
+                // `destinationPath` is INBOX too — but after a further move the row
+                // is somewhere else again. A primary-key lookup at
+                // `destinationPath` would miss it, G3 would decline, the row would
+                // keep the id the wire has just invalidated, and the NEXT gesture
+                // the user builds FROM THAT ROW would name a dead id, 404, and be
+                // deleted by the conflict arm. That is the user's LATEST intention
+                // lost, which is a red line — and no sync pass recovers it, because
+                // the intention was never on the server to re-derive.
+                //
+                // Exactly one row may match, and the requirement is fail-closed on
+                // both sides: zero matches is the ordinary "the row is already gone"
+                // case (unchanged semantics), and two or more means this build
+                // cannot tell which message the id names, so it re-keys nothing.
+                let candidates = try MessageHeader
+                    .filter(Column("accountId") == op.accountId
+                        && Column("messageId") == sourceProviderId)
+                    .fetchAll(db)
+                guard candidates.count == 1, let located = candidates.first else {
+                    if candidates.isEmpty {
+                        result.removedOldHeaderIds.append(sourceShapedOldId)
+                    } else {
+                        result.unsafeUndoOldHeaderIds.append(sourceShapedOldId)
+                    }
+                    continue
+                }
+                row = located
+                oldId = located.id
+                landingFolderPath = located.folderPath
+            } else {
+                guard let located = try MessageHeader.fetchOne(db, key: sourceShapedOldId) else {
+                    result.removedOldHeaderIds.append(sourceShapedOldId)
+                    continue
+                }
+                // G3 — only the exact row this operation optimistically moved. A
+                // later gesture or a sync-owned replacement is outside this
+                // operation and must not be re-keyed or removed.
+                //
+                // ⚠️ THE FOLDER CLAUSE IS IMAP-SPECIFIC, which is why it is inside
+                // this arm. A UID is mailbox-local, so "the row is not where this
+                // op put it" genuinely means "this is not the row this op moved".
+                // The same clause on an account-scoped provider would decline a row
+                // that is unambiguously the right one — see the arm above.
+                guard located.accountId == op.accountId,
+                      located.messageId == sourceProviderId,
+                      located.folderPath == destinationPath,
+                      located.folderId == destinationFolderId
+                else {
+                    // The remote move succeeded, so the source-address undo member
+                    // is invalid even though this local row is outside the op's
+                    // authority. Retain the row and every external mirror, but
+                    // explicitly revoke the stale undo target.
+                    result.unsafeUndoOldHeaderIds.append(sourceShapedOldId)
+                    continue
+                }
+                row = located
+                oldId = sourceShapedOldId
+                landingFolderPath = destinationPath
             }
 
             guard let destination = safeDestinations[sourceProviderId] else {
@@ -582,8 +664,11 @@ enum MessageHeaderRekey {
             }
 
             let newMessageId = destination.destinationProviderId
+            // The row keeps the folder it is in; only its ADDRESS changes. On IMAP
+            // `landingFolderPath` is `destinationPath` by G3's folder clause, so
+            // this is the same key it always built.
             let newId = MessageIdentity.headerId(
-                accountId: op.accountId, folderPath: destinationPath,
+                accountId: op.accountId, folderPath: landingFolderPath,
                 messageId: newMessageId)
             guard newId != oldId else {
                 result.unsafeUndoOldHeaderIds.append(oldId)
@@ -616,6 +701,107 @@ enum MessageHeaderRekey {
                 newProviderMessageId: newMessageId,
                 newObservedUidValidity: migrated.observedUidValidity))
         }
+        result.readdressedOperationIds = try readdressQueuedOperations(
+            op, accountScopedIds: accountScopedIds,
+            safeDestinations: safeDestinations, db: db)
         return result
+    }
+
+    /// CARRY THE HANDOFF INTO THE QUEUE: every other non-cancelled operation of
+    /// this account that still names one of the ids the wire just re-addressed is
+    /// rewritten to the destination id, in THIS transaction — the one that also
+    /// re-keys the header and retires the move.
+    ///
+    /// WHY IT EXISTS (`IOS-GRAPH-005`). Microsoft Graph REALLOCATES a message's
+    /// default id on every move and this tree sends no
+    /// `Prefer: IdType="ImmutableId"` (`IOS-GRAPH-002`). Outlook is on
+    /// account-qualified drain lanes (`IOS-QUEUE-008`'s amendment), which
+    /// GUARANTEES that an op sharing a message with an in-flight move runs AFTER
+    /// it. Without this rewrite that guarantee is the defect rather than the fix:
+    /// the follower would go to the wire naming the id the move had just
+    /// invalidated, Graph would answer 404, and `executeSingleOp`'s single-message
+    /// conflict arm would DELETE it — the user's latest intention lost
+    /// deterministically instead of merely raced. Serialization is only safe
+    /// because the address travels with it.
+    ///
+    /// WHY DURABLE, NOT A DRAIN-SCOPED MAP: the follower may be claimed in a LATER
+    /// drain entirely (an undo issues its inverse and requests a re-drain; an
+    /// offline follower is claimed in a pass that never saw the move's response),
+    /// and a process-local map cannot survive either. The table is the only truth;
+    /// the lane loop re-reads it before executing (`AccountManager.liveOperation`).
+    ///
+    /// WHY `status != cancelled` RATHER THAN `status == queued`: under
+    /// account-qualified lanes every op sharing an id with the retiring op was
+    /// claimed in the same pass — `buildLanes` is a connected-component grouping —
+    /// so it is `inFlight`, waiting behind this op in the SAME lane task. Those are
+    /// exactly the ops that must be re-addressed. An op inserted mid-pass is
+    /// `queued` and is covered too. Nothing else can hold the id: an op in another
+    /// lane cannot share a member, by construction.
+    ///
+    /// WHY THE `accountScopedIds` GATE IS LOAD-BEARING (C3): on IMAP a UID is
+    /// mailbox-local. `NSEDataBridge.queueSetTagPendingOp` inserts rows keyed by a
+    /// bare numeric id against a hard-coded `INBOX`, and any pre-move op can
+    /// legitimately name the same number for a DIFFERENT message in another
+    /// folder. Re-addressing those by `COPYUID` would mutate the wrong message.
+    /// IMAP has no legitimate follower to re-address anyway — the optimistic row
+    /// has a nil epoch and `admittedOrdinaryActionTargets` refuses it, which is the
+    /// reason `DeferredMoveSuccessor` exists.
+    ///
+    /// ⚠️ ACCEPTED LIMITATION — THE CRASH WINDOW (owner-accepted 2026-09-04).
+    /// If the process dies AFTER Graph returns 2xx for the move and BEFORE this
+    /// transaction commits, that move's queued followers keep the dead id. On
+    /// relaunch `reconcilePendingOperations` drops the interrupted `.move` (it
+    /// cannot tell a completed move from an uncommitted one, and prefers a dropped
+    /// move to a duplicate — tracked separately as `TabMail/tabmail-ios#116`), the
+    /// header row converges by sync, but the FOLLOWER's intention does not: its
+    /// next attempt 404s and the conflict arm deletes it. Nothing can re-associate
+    /// it without the response that was lost, and RFC identity may NOT be used as a
+    /// mutation authority to bridge the gap (banned, ADR-IOS-068 D4). The window is
+    /// bounded to ONE process death inside ONE write, and it is strictly NARROWER
+    /// than what it replaces: before this handoff existed, the same follower was
+    /// lost on every such move with no crash at all. It is not closable in this
+    /// design; the structural fix is to make Graph ids immutable
+    /// (`Prefer: IdType="ImmutableId"`), tracked in `TabMail/tabmail-ios#117`.
+    /// Do not "fix" it here with an in-memory map, a receipt table, or an identity
+    /// lookup.
+    ///
+    /// - Returns: the ids of the operations whose members were rewritten.
+    private static func readdressQueuedOperations(
+        _ op: PendingOperation,
+        accountScopedIds: Bool,
+        safeDestinations: [String: ProvenDestinationAddress],
+        db: Database
+    ) throws -> [String] {
+        guard accountScopedIds, !safeDestinations.isEmpty else { return [] }
+        let followers = try PendingOperation
+            .filter(Column("accountId") == op.accountId
+                && Column("id") != op.id
+                && Column("status") != PendingStatus.cancelled.rawValue)
+            .fetchAll(db)
+        var readdressed: [String] = []
+        for follower in followers {
+            // Per-id, so a follower `[X, Y]` whose predecessor moved only `X`
+            // becomes `[X', Y]`, and a chain converges because each retirement maps
+            // against the ids the row carries RIGHT NOW.
+            var members = follower.messageIds
+            var changed = false
+            for index in members.indices {
+                guard let destination = safeDestinations[members[index]] else { continue }
+                members[index] = destination.destinationProviderId
+                changed = true
+            }
+            guard changed else { continue }
+            var updated = follower
+            updated.messageIds = members
+            // Column-scoped: this transaction learned the ADDRESS and nothing else,
+            // so the address is the only thing it may write. A whole-row `save` of a
+            // struct fetched here would still be safe, but writing one column keeps
+            // the rule identical to `PendingOperation.markQueued`'s.
+            try db.execute(
+                sql: "UPDATE pendingOperation SET messageIdsJSON = ? WHERE id = ?",
+                arguments: [updated.messageIdsJSON, follower.id])
+            readdressed.append(follower.id)
+        }
+        return readdressed
     }
 }

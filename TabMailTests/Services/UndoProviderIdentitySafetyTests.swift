@@ -194,6 +194,9 @@ struct UndoProviderIdentitySafetyTests {
                     destinationProviderId: destinationId,
                     destinationUidValidity: destinationEpoch)],
                 addressChangesOnMove: true,
+                // Every fixture in this suite is IMAP (numeric UIDs, a positive
+                // `destinationEpoch`), which is the folder-qualified address space.
+                accountScopedIds: false,
                 db: db)
             _ = try PendingOperation.deleteOne(db, key: operation.id)
             MessageHeaderRekey.publishAddressHandoffsAfterCommit(
