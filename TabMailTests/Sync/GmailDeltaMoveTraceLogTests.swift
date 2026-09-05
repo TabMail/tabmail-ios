@@ -22,9 +22,7 @@ import GRDB
 /// line claiming it had inserted, removed or skipped a message. A debug
 /// instrument may miss a line, but it must not lie, and deletion was the
 /// smallest resolution the round-5 reviewers themselves named. The delta arm now
-/// writes no per-message line at all, which is also how the exported log
-/// attributes a reappearing message: no `fullSync upsert` line for it means the
-/// delta arm put it back.
+/// writes no per-message line at all.
 ///
 /// What survives here is exactly what the deletion did not touch — each site's
 /// DURABLE effect, which is the behaviour worth a test either way.
