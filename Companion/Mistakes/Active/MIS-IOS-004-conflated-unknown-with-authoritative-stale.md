@@ -2,7 +2,7 @@
 
 **Class:** data-integrity
 **Severity:** critical (dropped user intention)
-**First seen:** ongoing · **Recurrences:** many (+1, 2026-09-04, GitHub #115) · **Status:** Active
+**First seen:** ongoing · **Recurrences:** many (+1, 2026-09-04, GitHub #115; +1, 2026-09-05, GitHub #115 round 1's own fix) · **Status:** Active
 **Related:** [MIS-IOS-003](MIS-IOS-003-reconstructed-an-address-the-wire-already-gave-us.md) · **Rule owner:** `Companion/Rules/Active/never-drop-user-intention.md`
 
 > **`CLAUDE.md` calls this "the single most repeated defect in this codebase's history."** It has its
@@ -155,6 +155,47 @@ is already accepted (`IOS-IMAP-006`, `IOS-QUEUE-007`). Pinned by
 provider). Sibling of the same shape, NOT fixed here: `AccountManagerQueue.reconcilePendingOperations`
 deletes an attempted in-flight `.move` at launch "instead of risking a duplicate" — the arm cited it
 as precedent.
+
+## Instance (2026-09-05, GitHub #115 round 1's OWN FIX) — a LIST omission taken as authoritative absence
+
+**The fix for the instance above re-entered the same defect one line lower.** Round 1 deleted the
+`catch IMAPError.moveFailedAfterPossiblePartialCompletion` arm and let the error fall into the
+atomic route's PRE-EXISTING generic catch. That catch reads
+`guard await self.mailboxConfirmedAbsent(destination, server: server) else { throw error }; throw
+IMAPActionMailboxAbsent()`, and `IMAPActionMailboxAbsent` retires the WHOLE operation as a
+provider-authoritative no-op. Its evidence is an exact-name `LIST` that did not return the
+destination — and **that is an absence of evidence, not a positive fact.** RFC 4314 §4 defines `l`
+(visibility to LIST) and `i` (permission to COPY/MOVE into) as INDEPENDENT rights, so revoking `l`
+alone hides a mailbox that is still a perfectly legal MOVE target; RFC 9051 §6.3.9 separately lets a
+server silently ignore a syntactically valid pattern under a tagged OK. So a zero-mutation tagged NO
+could STILL empty the queue — the very drop #115 was opened to close, reached through a different
+door.
+
+**The tell, this time: the fix moved the decision into code the fix did not read.** Deleting an arm
+does not remove a decision; it hands the decision to whatever catches next. The generic catch was
+pre-existing, unchanged and therefore invisible in the diff — a reviewer checking "what did this
+commit change" sees a deletion and no new terminal path, while the terminal path arrived by
+inheritance. *When a fix deletes a handler, enumerate what now handles the case and re-run the
+exit-2 question on THAT.*
+
+**A second tell, in the fixture rather than the code.** Round 2 added
+`NeverDropExitClosureTests.aRefusedAtomicMoveIntoAListConfirmedAbsentDestinationRetiresAsANoOp`,
+which BLESSED the premise as correct. It could not have caught it: it drove
+`FakeIMAPServer.markMailboxDeleted`, in which "the mailbox is deleted" and "the mailbox is omitted
+from LIST" are the SAME state. *A fixture that cannot separate the two propositions cannot test
+which one the code is relying on* — the same shape as the 2026-08-13 tests that drove a fake which
+COMMITS the move and then answers NO, and so pinned the one world state in which the defect was
+harmless.
+
+**Fix (round 3): one typed arm, placed BEFORE the generic catch**, translating the refusal into a
+private `ProviderEvidenceUnavailable` (`IMAPAtomicMoveRefused`). It never reaches the LIST probe,
+and it lands in the drain's lane-local arm instead of the generic one, which also closed a second
+finding — the refusal had been inserting the whole ACCOUNT into `failedAccounts`, starving every
+disjoint lane on it. `mailboxConfirmedAbsent` and the generic catch are untouched. New seam
+`FakeIMAPServer.hideMailboxFromList` makes the distinguishing world state expressible; the blessing
+test is flipped to `aRefusedAtomicMoveIntoAListOmittedDestinationStaysQueuedAndLands`. Registered in
+`Amendments/ios-imap-013.md`; the sibling LIST probes elsewhere in `IMAPProvider` are recorded for
+the owner rather than changed here.
 
 ---
 

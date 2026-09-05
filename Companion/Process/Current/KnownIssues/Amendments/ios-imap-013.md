@@ -20,20 +20,31 @@
 
 ## Status
 
-✅ **CLOSED AS A DECISION — DISPOSITION RESTORED (2026-09-04, GitHub #115).** A tagged NO/BAD on
-`UID MOVE` that carries no `COPYUID` (`IMAPError.moveFailedAfterPossiblePartialCompletion`) is a
-retryable refusal again: it falls to the generic catch in `AccountManager.executeSingleOp`, the
-operation is requeued (`status = queued`, `retryCount += 1`) and the account lane halts for that
-drain. Only the `COPYUID`-bearing form, `moveFailedAfterPartialCompletion(copyUID:)`, retires the
-source members without retry, because it carries positive evidence that the destination copy exists.
+✅ **CLOSED AS A DECISION — DISPOSITION RESTORED (2026-09-04, GitHub #115), AND ROUTED LANE-LOCAL
+(2026-09-05, round 3).** A tagged NO/BAD on `UID MOVE` that carries no `COPYUID`
+(`IMAPError.moveFailedAfterPossiblePartialCompletion`) is a retryable refusal again. Only the
+`COPYUID`-bearing form, `moveFailedAfterPartialCompletion(copyUID:)`, retires the source members
+without retry, because it carries positive evidence that the destination copy exists.
+
 Round 2 (2026-09-04): because the typed error's payload is the server's raw tagged response text and
-`AccountManager.isMessageNotFoundError` runs BEFORE the generic catch with a substring fallback on
-the error's description, the classifier now structurally exempts
-`moveFailedAfterPossiblePartialCompletion` from that fallback, so the generic requeue arm is reached
-for every response text (pinned by
-`NeverDropExitClosureTests.aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt(refusal:)` over
-`No mailbox selected` / `[NONEXISTENT] No mailbox selected` / `UID not found`, and by
-`AccountManagerQueueIntegrationTests.typedNoCopyUIDMoveRefusalIsNeverMessageNotFound`).
+`AccountManager.isMessageNotFoundError` runs with a substring fallback on the error's description,
+the classifier structurally exempts the refusal from that fallback, so no response text can retire
+it (pinned by `NeverDropExitClosureTests.aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt(refusal:)`
+over `No mailbox selected` / `[NONEXISTENT] No mailbox selected` / `UID not found`).
+
+Round 3 (2026-09-05) — **THE ROUTING, which is the current disposition.**
+`IMAPProvider.move`'s atomic route catches the typed error in an arm of its own and rethrows it as a
+private `ProviderEvidenceUnavailable` conformer (`IMAPAtomicMoveRefused`, alongside
+`IMAPLivenessProbeInconclusive` / `IMAPDestinationEpochRefusal` / `IMAPEpochEvidenceMissing`; the
+server's reason text rides along as a diagnostic payload). It therefore reaches the drain's
+**lane-local evidence-unavailable arm** — requeue, `status = queued`, `retryCount += 1`,
+`evidenceRefused.insert`, `.haltLane` — and **not** the generic catch, which inserts the account into
+`DrainContext.failedAccounts` and suppresses every operation on the account for the rest of the
+drain. The refused MOVE and its same-lane successors are held; every disjoint lane on the same
+account keeps draining, on this drain and on every later one. The round-2 classifier exemption is
+restated on the PROTOCOL rather than on one transport library's enum
+(`if error is ProviderEvidenceUnavailable { return false }`), and `AccountManagerQueue.swift` no
+longer imports SwiftMail at all.
 
 ## Subsystem and search terms
 
@@ -49,7 +60,19 @@ absence of evidence; MIS-IOS-004; `providerIdQueueFuzz`; `killFragments`; seed `
 `NeverDropExitClosureTests.aVerifiedPartialAtomicMoveIsNeverReissued`;
 `IMAPMoveWireContractTests.atomicPossiblePartialCompletionIsRetriedToExactlyOneCopy`;
 `FakeIMAPServer.moveFailureAfterCommit`; `failNextCommand(containing: "UID MOVE")`; SwiftMail PR #208;
-`3f6a0a5a8`; GitHub #115; IOS-IMAP-012; IOS-IMAP-006; IOS-QUEUE-007
+`3f6a0a5a8`; GitHub #115; IOS-IMAP-012; IOS-IMAP-006; IOS-QUEUE-007;
+`ProviderEvidenceUnavailable`; `IMAPAtomicMoveRefused`; `IMAPLivenessProbeInconclusive`;
+`IMAPDestinationEpochRefusal`; `IMAPEpochEvidenceMissing`; `DrainContext.failedAccounts`;
+`evidenceRefused`; lane-local; account poisoning; wedge corollary; `mailboxConfirmedAbsent`;
+`IMAPActionMailboxAbsent`; LIST omission is not absence; RFC 4314 §4; RFC 9051 §6.3.9;
+RFC 3501 §6.4.7; `[TRYCREATE]`; `everAttempted`; `PendingStatus.cancelled`; no cancellation path;
+pending-actions surface; Retry/Cancel; owner decision pending; ADR-IOS-073;
+`FakeIMAPServer.hideMailboxFromList`;
+`NeverDropExitClosureTests.aRefusedAtomicMoveIntoAListOmittedDestinationStaysQueuedAndLands`;
+`NeverDropExitClosureTests.aPermanentlyRefusedAtomicMoveParksOnlyItsOwnLane`;
+`IMAPMoveWireContractTests.atomicRefusalWithoutCopyUIDIsEvidenceUnavailable`;
+`AccountManagerQueueIntegrationTests.evidenceUnavailableIsNeverMessageNotFound`;
+`FakeIMAPServerOracleTests.hiddenFromListMailboxStillExists`
 
 ## 2026-09-04 — the defect (GitHub #115): a refusal retired as a completion
 
@@ -82,6 +105,82 @@ mechanism, no classifier, no string-matching of the server's reason text. The
 carries the `COPYUID` the server returned, and legitimately retires the source members with the
 destination address admitted. `reconcilePendingOperations` is untouched. The invariant is stated in
 a comment on the generic catch in `IMAPProvider.move`.
+
+## 2026-09-05 (round 3) — two things that paragraph got wrong, and the routing that replaces it
+
+**(a) "Halts the lane" was not what the generic catch does.** It inserts the account into
+`DrainContext.failedAccounts`, which the drain consults before every operation on that account for
+the rest of the drain. `ctx` is per-drain, so a server that keeps refusing `UID MOVE` — which
+`ADR-IOS-073` expressly accepts as a thing servers do — reproduced that state on every drain and
+starved every disjoint-lane read, flag and move the user made on the account. Preserving one
+intention by denying every intention behind it is the never-drop WEDGE corollary, not a fix.
+
+**(b) A LIST omission was being read as authority.** With the arm deleted, the refusal reached the
+generic catch's `guard await self.mailboxConfirmedAbsent(destination, server: server) else { throw
+error }; throw IMAPActionMailboxAbsent()`, and `IMAPActionMailboxAbsent` retires the WHOLE operation
+as a provider-authoritative no-op. That guard's evidence is an exact-name `LIST` that did not return
+the destination, and **that is not evidence of absence**: RFC 4314 §4 defines `l` (visibility to
+LIST) and `i` (permission to COPY/MOVE into) as INDEPENDENT rights, so a mailbox may be hidden from
+LIST and still be a legal MOVE target, and RFC 9051 §6.3.9 lets a server silently ignore a
+syntactically valid pattern under a tagged OK. So a zero-mutation refusal could still empty the
+queue — the same drop, through a different door. The pinning test of that round,
+`NeverDropExitClosureTests.aRefusedAtomicMoveIntoAListConfirmedAbsentDestinationRetiresAsANoOp`,
+BLESSED the premise, because its fixture (`markMailboxDeleted`) made "gone" and "omitted from LIST"
+the same state and could not tell them apart.
+
+**The routing that replaces it.** One typed arm in `IMAPProvider.move`'s atomic route, placed BEFORE
+the generic catch, translates `IMAPError.moveFailedAfterPossiblePartialCompletion` into the private
+`IMAPAtomicMoveRefused` (a `ProviderEvidenceUnavailable`, carrying the server's reason text for
+diagnostics). Consequences, both of them intended:
+
+- the error never reaches the LIST probe, so no LIST result can retire an atomic-route MOVE;
+- it reaches the drain's lane-local evidence-unavailable arm, so the refusal parks its own lane and
+  leaves the account alone.
+
+The generic catch itself, `mailboxConfirmedAbsent`, `IMAPActionMailboxAbsent`, the action-SELECT
+LIST probe and the COPY-route destination-SELECT probe are pre-existing and are NOT changed by this
+round; the same LIST-omission argument applies to them and is recorded for the owner separately.
+`executeSingleOp`, `failedAccounts`, `.haltLane` and `reconcilePendingOperations` are untouched.
+
+## 2026-09-05 (round 3) — ⚠ THE RECOVERY CLAIM IN THE BASE RECORD IS FALSE, AND IS WITHDRAWN
+
+The base record's "WHY CLOSED AS A DECISION" reads: *"Capability/configuration correction makes the
+refusal recoverable, and existing operation cancellation remains the user-owned exit."* The second
+half describes a path that **does not exist**, and has not existed for as long as the row has:
+
+- Undo annihilation of a queued operation requires `!everAttempted`, and the claim transaction sets
+  `everAttempted = true` before any provider I/O — so from the FIRST attempt onward the operation
+  can no longer be annihilated by an inverse gesture.
+- `PendingStatus.cancelled` has **no production writer**. Nothing in the app ever sets it.
+- No view queries or lists `PendingOperation` rows, so there is no surface on which a user could see
+  a parked operation, let alone cancel or retry it.
+
+**What is therefore true.** A permanently refused `UID MOVE` **parks its lane**: the operation is
+never dropped and never applied, it retries on every drain, and its same-lane successors are held
+behind it. That is exactly the `ADR-IOS-073` disposition ("a server that advertises but permanently
+rejects MOVE can park the lane until its configuration is corrected"), and the only recovery that
+genuinely exists today is the server-side one: the configuration or ACL that causes the refusal is
+corrected, and the next drain lands the move.
+
+**This is PRE-EXISTING and is not widened by #115.** Every version of this code from `ADR-IOS-073`
+onward parks the lane on a permanent refusal; the 2026-08-13 arm (`3f6a0a5a8`) briefly replaced the
+park with a silent DROP, which is strictly worse, and #115 restores the park. Round 3 narrows the
+blast radius further, from the whole account to the one lane. Nothing in #115 makes a refused MOVE
+harder to recover than it was before that arm landed.
+
+**OWNER DECISIONS PENDING (no issue number yet — do not invent one).** Two, both deliberately not
+taken here because both are product-behaviour calls:
+
+1. **A user-visible pending-actions surface with Retry/Cancel.** It is the only thing that would make
+   a client-side recovery exist. It needs a durable terminal decision the user owns, and — because
+   the remote outcome of an attempted MOVE is unknown — a cancellation would have to force
+   source-and-destination reconciliation rather than simply deleting the row.
+2. **Retiring a MOVE into a genuinely deleted destination on the RFC 3501 §6.4.7 `[TRYCREATE]`
+   response code.** A conforming server answers `NO [TRYCREATE]` when the target mailbox does not
+   exist, which IS a positive statement about the destination — unlike a LIST omission. Adopting it
+   would convert this particular park back into a terminal no-op on evidence rather than on absence.
+   Not taken here: it is a new classification input on server-supplied text, and which behaviour the
+   product wants for "the user's archive target was deleted under them" is the owner's call.
 
 ## 2026-09-04 — why retrying a "possibly partial" MOVE is safe (the argument the 08-13 change lacked)
 
@@ -128,6 +227,56 @@ evidence classes; the 2026-08-13 change put both in the no-retry class on the st
   committing; a retry is served normally) so the flipped tests can converge.
 - `ProviderIdQueueFuzzTests.killFragments` gains `"UID MOVE"` so the fuzzer keeps reaching the
   mid-command kill on the atomic route; both recorded seeds are retained.
+
+## 2026-09-05 (round 3) — tests
+
+- NEW seam `FakeIMAPServer.hideMailboxFromList(_:)` — LIST omits the name while SELECT, `UID MOVE`
+  and STATUS behave normally. A second seam rather than a flag on `markMailboxDeleted`, which
+  conflates "deleted" with "omitted from LIST" and so cannot express this world state at all.
+  `markMailboxDeleted` is kept unchanged; other suites depend on it. Its own wire contract is pinned
+  by `FakeIMAPServerOracleTests.hiddenFromListMailboxStillExists` (LIST omits the name under a
+  tagged OK; SELECT and `UID MOVE` succeed; an unhidden mailbox is still listed by the same handler).
+- FLIPPED `NeverDropExitClosureTests.aRefusedAtomicMoveIntoAListConfirmedAbsentDestinationRetiresAsANoOp`
+  → `aRefusedAtomicMoveIntoAListOmittedDestinationStaysQueuedAndLands(refusal:)`. The old test
+  BLESSED the LIST-omission premise. The new one hides the destination from LIST while leaving it
+  fully functional, refuses the first `UID MOVE` once over the same three response texts as the
+  round-2 matrix (`[NONEXISTENT]` included), and asserts: after drain 1 the op is still queued with
+  `retryCount == 1`, the source untouched and no COPY/`\Deleted` STORE/EXPUNGE; after drain 2 the
+  message is in the destination exactly once, the source is empty, the queue is empty and the wire
+  oracle reports no wrong-message mutation. RED on `977958c37` — the first drain retires the op.
+- NEW `NeverDropExitClosureTests.aPermanentlyRefusedAtomicMoveParksOnlyItsOwnLane` — the
+  repeated-refusal bystander invariant, modelled on `unprovableOpDoesNotWedgeTheAccountsOtherGestures`.
+  Every `UID MOVE` is refused, on every drain, for four drains; one MOVE plus a same-lane successor
+  on message A, FIVE disjoint-lane gestures on message B. The bystander half is asserted after the
+  FIRST drain, and the lane is five gestures long, and both of those are load-bearing:
+  `DrainContext.failedAccounts` is per-drain and is re-evaluated before every op of a lane, so a
+  poisoned account lets whichever gestures are already past that check slip through, requeues the
+  rest, and then releases roughly one more per drain — measured only at the end of four drains, a
+  poisoned account and a healthy one reach the SAME state, and the test would have passed on the
+  parent. Asserts B's five gestures all retired within drain 1 with their effects on the SERVER,
+  then A's MOVE still queued with `retryCount >= 3`, its successor still held, and the queue holding
+  exactly the two A rows. RED on `977958c37`: `(unrelated → []).contains("\\Seen")` and the same for
+  `\Flagged` / `\Answered`, with five rows still queued where the property allows two.
+- NEW `IMAPMoveWireContractTests.atomicRefusalWithoutCopyUIDIsEvidenceUnavailable` — the provider
+  contract: a tagged NO with no `COPYUID` leaves `IMAPProvider.move` as an error that
+  `is ProviderEvidenceUnavailable` and is NOT an `IMAPError`, with zero wire mutation. RED on
+  `977958c37` — the raw `IMAPError` escapes.
+- REWRITTEN `AccountManagerQueueIntegrationTests.typedNoCopyUIDMoveRefusalIsNeverMessageNotFound` →
+  `evidenceUnavailableIsNeverMessageNotFound`, driving a locally declared
+  `ProviderEvidenceUnavailable` conformer whose description carries both `NONEXISTENT` and
+  `UID not found`. The guarantee under test is the PROTOCOL exemption, not one named error case, so
+  a future conformer is covered too. The positive legs (`ProviderError.messageNotFound`, the 404
+  shapes, the plain-text fallback) are unchanged, which is what keeps the exemption narrow.
+- RE-EXAMINED and LEFT UNCHANGED: `IMAPMoveWireContractTests.absentDestinationIsATerminalNoOp` pins
+  the OWNED COPY route (it builds its fake with `ownedCapabilities`, i.e. `MOVE` stripped), so it is
+  the pre-mutation destination-SELECT property and not the atomic route;
+  `UidValidityTurnoverDeletionGuardTests.deleteRecreateLifecycleStillLosesOrphanedMail`'s
+  `markMailboxDeleted("Archive", …)` pins the folder-row delete/re-create turnover through full
+  sync, not a MOVE disposition.
+- KEPT `NeverDropExitClosureTests.aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt(refusal:)`
+  (now the destination-PRESENT side of the pair) and
+  `aTransportLossMidAtomicMoveLeavesTheOpQueuedAndALaterDrainLandsIt` (the transport-kill witness,
+  which is a genuine connection fact and still uses the generic arm).
 
 ## 2026-09-04 — relationship to IOS-IMAP-012
 

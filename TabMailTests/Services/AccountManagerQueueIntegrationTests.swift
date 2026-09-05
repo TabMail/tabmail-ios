@@ -5,7 +5,6 @@
 import Testing
 import Foundation
 import GRDB
-import SwiftMail
 @testable import TabMail
 
 /// Integration tests for AccountManagerQueue drain flow patterns.
@@ -191,27 +190,51 @@ struct AccountManagerQueueIntegrationTests {
         #expect(result == true)
     }
 
-    /// GitHub #115 (round 2). SwiftMail raises
-    /// `IMAPError.moveFailedAfterPossiblePartialCompletion` for ANY tagged
-    /// NO/BAD on `UID MOVE` with no retained `COPYUID`, and its payload IS the
-    /// server's raw tagged response text. The queue must never read that error
-    /// as provider-authoritative "already gone", whatever the text says — a
-    /// refusal is an absence of evidence and stays queued. The payload here
-    /// deliberately carries BOTH an RFC 5530 `[NONEXISTENT]` code and the words
-    /// `UID not found`, i.e. two of the classifier's text-fallback fragments at
-    /// once. The `NSError` text cases above are unchanged: raw server text
-    /// reaching the queue on any OTHER error shape is still classified as before.
-    @Test("isMessageNotFoundError and isConfirmedGoneError are false for the typed no-COPYUID MOVE refusal, whatever its response text")
+    /// A `ProviderEvidenceUnavailable` whose rendered description carries the
+    /// classifier's text-fallback fragments — an `[NONEXISTENT]` response code
+    /// (RFC 5530 §3, which names a missing MAILBOX) and the words `UID not
+    /// found` — because several real conformers carry the server's raw tagged
+    /// response text as a diagnostic payload. Declared here rather than reusing
+    /// a production error type on purpose: the contract under test is the
+    /// PROTOCOL, so a future conformer nobody has written yet must be covered by
+    /// it too, and a test pinned to one concrete case would not say that.
+    private struct TextBearingEvidenceUnavailable: ProviderEvidenceUnavailable,
+        CustomStringConvertible
+    {
+        var description: String { "refused: no([NONEXISTENT] UID not found)" }
+    }
+
+    /// GitHub #115 (round 2, restated structurally in round 3). A provider that
+    /// could not obtain the evidence its safety gate needs has told the queue
+    /// NOTHING about whether the work is done — an absence of evidence, never
+    /// never-drop exit 2 — so the operation stays queued whatever the server's
+    /// response text happened to say. Because those errors may carry that text
+    /// as a payload, the classifier's substring fallback would otherwise read a
+    /// refusal quoting `[NONEXISTENT]` or `UID not found` as a
+    /// provider-authoritative "already gone" and delete the op.
+    ///
+    /// Round 3 moved the exemption from one transport library's enum case to the
+    /// `ProviderEvidenceUnavailable` protocol, which is why this test now drives
+    /// a conformer rather than an `IMAPError`: the guarantee is that NO
+    /// evidence-unavailable error can be text-classified, not that one named
+    /// case cannot. The `NSError` text cases above are unchanged — raw server
+    /// text reaching the queue on any OTHER error shape is still classified as
+    /// before, which is what keeps this exemption narrow.
+    @Test("isMessageNotFoundError and isConfirmedGoneError are false for an evidence-unavailable error, whatever its rendered text")
     @MainActor
-    func typedNoCopyUIDMoveRefusalIsNeverMessageNotFound() {
-        let error = IMAPError.moveFailedAfterPossiblePartialCompletion(
-            "no([NONEXISTENT] UID not found)")
+    func evidenceUnavailableIsNeverMessageNotFound() {
+        let error = TextBearingEvidenceUnavailable()
+        // NON-VACUITY: the description really does carry the fragments the
+        // fallback matches, so a passing result is the structural exemption and
+        // not a payload that never triggered the fallback.
+        #expect("\(error)".contains("NONEXISTENT"))
+        #expect("\(error)".contains("UID not found"))
         #expect(
             AccountManager.shared.isMessageNotFoundError(error) == false,
-            "a tagged NO with no COPYUID was classified as message-not-found on its response text: \(error)")
+            "an evidence-unavailable refusal was classified as message-not-found on its rendered text: \(error)")
         #expect(
             AccountManager.shared.isConfirmedGoneError(error) == false,
-            "a tagged NO with no COPYUID was classified as confirmed-gone: \(error)")
+            "an evidence-unavailable refusal was classified as confirmed-gone: \(error)")
     }
 
     @Test("isMessageNotFoundError returns false for connection error")

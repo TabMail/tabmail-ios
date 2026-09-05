@@ -1033,6 +1033,72 @@ struct FakeIMAPServerOracleTests {
 
         _ = try client.command(tag: "d8", "LOGOUT")
     }
+
+    // MARK: - GitHub #115 — LIST omission is not absence
+
+    /// The self-check for `hideMailboxFromList`, the seam #115 round 3 needs and
+    /// `markMailboxDeleted` structurally cannot provide: that one makes "deleted"
+    /// and "omitted from LIST" the SAME state, so a test driven by it can never
+    /// distinguish a mailbox that is gone from a mailbox the client merely cannot
+    /// see. RFC 4314 §4 (the `l` lookup right is independent of the `i` insert
+    /// right a MOVE target needs) and RFC 9051 §6.3.9 (a server may silently
+    /// ignore a valid pattern under a tagged OK) both make the second state
+    /// reachable on a conforming server.
+    ///
+    /// THE FAKE'S CONTRACT, at the wire: after `hideMailboxFromList("Archive")`
+    /// an exact-name LIST returns a tagged OK with NO row for it, while SELECT
+    /// and `UID MOVE` into it behave exactly as before. Driven raw rather than
+    /// through a provider so no production change can make it vacuous.
+    @Test("hideMailboxFromList omits the name from LIST while SELECT and UID MOVE still work")
+    func hiddenFromListMailboxStillExists() throws {
+        let target = "list-hidden-target@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 41, id: target)],
+            "Archive": [],
+        ])
+        server.hideMailboxFromList("Archive")
+        try server.start()
+        defer { server.stop() }
+
+        let client = try RawIMAPClient(port: server.port)
+        defer { client.close() }
+        try client.readGreeting()
+        _ = try client.command(tag: "h1", "LOGIN \(server.username) \(server.password)")
+
+        // 1 — the exact-name LIST omits it, under a tagged OK. This is the
+        // response `IMAPProvider.mailboxConfirmedAbsent` reads, and reading it as
+        // proof of absence is the defect #115 round 3 closes.
+        let exactList = try client.command(tag: "h2", "LIST \"\" \"Archive\"")
+        #expect(
+            exactList.contains("h2 OK"),
+            "the hidden-mailbox LIST must still succeed — the omission is the point, not a failure: \(exactList)")
+        #expect(
+            !exactList.contains("\"Archive\""),
+            "hideMailboxFromList did not omit the name from an exact-name LIST: \(exactList)")
+        // NON-VACUITY: a name that was NOT hidden is still listed by the same
+        // handler, so the omission above is the seam and not a broken LIST.
+        let inboxList = try client.command(tag: "h3", "LIST \"\" \"INBOX\"")
+        #expect(
+            inboxList.contains("\"INBOX\""),
+            "the LIST handler stopped reporting an unhidden mailbox: \(inboxList)")
+
+        // 2 — it EXISTS: SELECT succeeds where `markMailboxDeleted` would answer NO.
+        let select = try client.command(tag: "h4", "SELECT Archive")
+        #expect(
+            select.contains("h4 OK"),
+            "a mailbox hidden only from LIST must still SELECT: \(select)")
+
+        // 3 — and it is still a legal MOVE target.
+        _ = try client.command(tag: "h5", "SELECT INBOX")
+        let move = try client.command(tag: "h6", "UID MOVE 41 Archive")
+        #expect(
+            move.contains("h6 OK"),
+            "a mailbox hidden only from LIST must still accept UID MOVE: \(move)")
+        #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
+        #expect(server.messageIDs(in: "INBOX").isEmpty)
+
+        _ = try client.command(tag: "h7", "LOGOUT")
+    }
 }
 
 /// A minimal raw-socket IMAP client: enough to log in, select, and issue a
