@@ -325,3 +325,23 @@ pre-undo address, and that `AppLogStore.read(channel: .inbox)` carries NO `phase
 line. It is RED when that emission is moved back next to `try inverseOp.insert(db)` — the
 pre-`7b848ab5d` shape, same fields — which until 2026-09-05 nothing in the tree could tell apart
 from the committed one.
+
+## 2026-09-05 — round 8 (PR #113): the exported drain line now witnesses a HALTED lane
+
+- **`outcome=haltLane` has an oracle.** `AccountManagerQueueDrainTests.drainLaneInstrumentationIsReadableFromTheExportedLog()`
+  gained a third phase, between its gate-OPEN and gate-CLOSED halves, that arms the same retryable
+  provider fault the stable-id fuzzer's `.transientThenClears` mode uses
+  (`setMoveThrowsOnId(id, error: ProviderError.notConnected)`) on the predecessor of the
+  `IOS-QUEUE-008` pair, and asserts the exact three-entry lane/order artifact — the `lane0(2)`
+  composition line, `executing` and `executed … outcome=haltLane` for pos 1/2, and **nothing for
+  pos 2/2** — plus the durable state read independently of the log: both rows still `queued`,
+  `retryCount` 1 and 0, `everAttempted` true on both, exactly one `move` attempt in the mock's
+  attempt ledger and nothing in its success ledger; clearing the fault then drains the same lane to
+  completion with `outcome=proceed` twice and the inverse on the wire before the re-delete. Until
+  this phase existed the whole tree contained only two `outcome=proceed` expectations and no
+  `outcome=haltLane` expectation at all, so a **sink-only** mutation — replacing the interpolation
+  with the literal `outcome=proceed`, production behaviour untouched — left every test green while
+  the exported log would describe a halted lane as one that kept draining. The extended phase is RED
+  on exactly that mutation (one issue, on the `outcome=haltLane` equality) and green on the restored
+  tree. Keeping the field rather than deleting it is deliberate: it is the instrument's only positive
+  statement that a lane stopped, which is the question `IOS-QUEUE-008` could not answer.
