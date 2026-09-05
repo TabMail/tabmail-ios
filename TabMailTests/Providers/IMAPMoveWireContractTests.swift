@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import SwiftMail
 import Testing
 @testable import TabMail
 
@@ -316,6 +317,93 @@ struct IMAPMoveWireContractTests {
         #expect(Self.anyExpunges(server).isEmpty)
         #expect(server.messageIDs(in: "Work").isEmpty)
         #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
+        #expect(server.wrongMessageViolations().isEmpty)
+    }
+
+    /// GitHub #115 round 3 (architecture A-1 / robustness R1). The sibling above
+    /// pins WHAT HAPPENS TO THE MAIL after a no-`COPYUID` refusal; this pins
+    /// WHAT THE PROVIDER HANDS THE QUEUE, which is a separate contract and was
+    /// the defect. The refusal used to leave `IMAPProvider.move` as a raw
+    /// `IMAPError`, which matched no typed arm in `AccountManager.executeSingleOp`
+    /// and therefore reached the GENERIC catch — the arm that inserts the account
+    /// into `failedAccounts`, account-wide suppression the drain reserves for
+    /// facts about the CONNECTION. A tagged command refusal is a fact about ONE
+    /// command; `ADR-IOS-073` expressly accepts a server that advertises MOVE and
+    /// then permanently rejects it, and on such a server the generic arm starves
+    /// every disjoint lane on the account, every drain.
+    ///
+    /// THE PROPERTY: a tagged NO with no `COPYUID` leaves this provider as an
+    /// error that `is ProviderEvidenceUnavailable` — the drain's lane-local
+    /// disposition (requeue, bump `retryCount`, at most one attempt per drain,
+    /// halt only this lane, DO NOT touch `failedAccounts`) — and never as a bare
+    /// `IMAPError`, which has no arm of its own. The wire half is asserted
+    /// alongside it: the refusal costs zero mutation, so nothing was copied,
+    /// soft-deleted or expunged and the source is exactly as it was. Nothing here
+    /// asserts which catch arm ran or which error case was constructed.
+    ///
+    /// The queue-level consequence is pinned by
+    /// `NeverDropExitClosureTests.aPermanentlyRefusedAtomicMoveParksOnlyItsOwnLane`.
+    ///
+    /// RED PROOF (recorded, #115 round 3): on the parent `977958c37` the thrown
+    /// value is the raw `IMAPError`, failing both dispositions.
+    @Test("A tagged NO with no COPYUID leaves the provider as an evidence-unavailable refusal that mutated nothing")
+    func atomicRefusalWithoutCopyUIDIsEvidenceUnavailable() async throws {
+        let target = "atomic-refusal-disposition@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "Work": [Self.message(14, target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(Int(Self.epoch), for: "Work")
+        server.setUidValidity(Int(Self.epoch), for: "Archive")
+        // Answered BEFORE the fake's MOVE handler runs, so the refusal mutated
+        // nothing at all — the world state every transport-level refusal
+        // produces, and the one the deleted arm never exercised.
+        server.failNextCommand(
+            containing: "UID MOVE", message: "Move rejected by server policy")
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        var thrown: Error?
+        do {
+            _ = try await provider.move(
+                ids: ["14"], from: "Work", to: "Archive",
+                admittedUidValidity: Self.epoch)
+        } catch {
+            thrown = error
+        }
+
+        // NON-VACUITY: the atomic MOVE actually reached the wire, and the
+        // injected refusal is what answered it.
+        #expect(Self.commands(server, containing: "UID MOVE").count == 1)
+        #expect(server.consumedInjectedFailureCount() == 1)
+
+        let refusal = try #require(
+            thrown, "a refused UID MOVE must not return as if it had dispositioned its members")
+        #expect(
+            refusal is ProviderEvidenceUnavailable,
+            """
+            a refused UID MOVE must reach the drain's lane-local, account-preserving arm. As \
+            anything else it lands in the generic catch, which marks the whole ACCOUNT failed and \
+            starves every disjoint lane on it — thrown: \(refusal)
+            """)
+        #expect(
+            !(refusal is IMAPError),
+            """
+            the raw transport error escaped the provider. No arm in the drain matches it, so it \
+            falls through to the account-wide failure arm — thrown: \(refusal)
+            """)
+
+        // The wire half: a refusal answered before any mutation costs nothing.
+        #expect(Self.commands(server, containing: "UID COPY").isEmpty)
+        #expect(Self.deletedStores(server).isEmpty)
+        #expect(Self.anyExpunges(server).isEmpty)
+        #expect(server.messageIDs(in: "Work") == ["<\(target)>"])
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+        #expect(server.flags(in: "Work", uid: 14).isEmpty)
         #expect(server.wrongMessageViolations().isEmpty)
     }
 

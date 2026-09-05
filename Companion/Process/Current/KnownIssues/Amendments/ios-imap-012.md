@@ -27,12 +27,21 @@ source reconciliation; `NeverDropExitClosureTests.aVerifiedPartialAtomicMoveIsNe
 pins it. The possible-partial half is withdrawn: `moveFailedAfterPossiblePartialCompletion` is a
 tagged NO/BAD with NO retained `COPYUID` — the server refused the command and reported nothing about
 what it did — and is a retryable failure under `IOS-IMAP-013`'s disposition, not a no-retry outcome.
-`IMAPProvider.move` no longer catches it; the generic queue catch requeues the operation.
 Round 2 (2026-09-04): the queue classifier `AccountManager.isMessageNotFoundError` structurally
-exempts the typed no-`COPYUID` error from its message-not-found text fallback — its payload is the
-server's raw tagged response text, so a refusal carrying an RFC 5530 `[NONEXISTENT]` code or the
+exempts the refusal from its message-not-found text fallback — the refusal carries the server's raw
+tagged response text as a diagnostic payload, so one quoting an RFC 5530 `[NONEXISTENT]` code or the
 words `UID not found` would otherwise have been retired as provider-authoritative "already gone" —
-and the generic requeue arm is therefore reached for every response text.
+so no response text can retire it.
+Round 3 (2026-09-05): `IMAPProvider.move`'s atomic route catches the typed error in an arm of its
+own and rethrows it as a private `ProviderEvidenceUnavailable` conformer (`IMAPAtomicMoveRefused`),
+so it reaches the drain's LANE-LOCAL evidence-unavailable arm — requeue, `retryCount += 1`,
+`evidenceRefused`, `.haltLane`, account untouched — instead of the generic catch, which would insert
+the account into `failedAccounts` and suppress every disjoint lane on it. The round-2 classifier
+exemption is restated on the PROTOCOL rather than on one transport library's enum. The refusal
+consequently never reaches the generic catch's exact-name `LIST` probe either, which matters here:
+that probe cannot prove absence (RFC 4314 §4 separates the `l` and `i` rights; RFC 9051 §6.3.9
+permits silent pattern omission), so routing the refusal past it is what stops a LIST omission from
+retiring the operation. Full argument in `Amendments/ios-imap-013.md`.
 
 ## Subsystem and search terms
 
@@ -45,7 +54,13 @@ MIS-IOS-004; SwiftMail PR #208; `MoveHandler.handleTaggedErrorResponse`; `3f6a0a
 `NeverDropExitClosureTests.aPossiblyPartialAtomicMoveConvergesToExactlyOneDestinationCopy`;
 `IMAPMoveWireContractTests.atomicPossiblePartialCompletionIsRetriedToExactlyOneCopy`;
 `FakeIMAPServer.failUIDMoveAfterPossiblePartialCompletion`;
-`FakeIMAPServer.failUIDMoveAfterVerifiedPartialCompletion`; IOS-IMAP-013
+`FakeIMAPServer.failUIDMoveAfterVerifiedPartialCompletion`; IOS-IMAP-013;
+`ProviderEvidenceUnavailable`; `IMAPAtomicMoveRefused`; `failedAccounts`; `evidenceRefused`;
+`haltLane`; lane-local; account poisoning; `mailboxConfirmedAbsent`; LIST omission is not absence;
+RFC 4314 §4; RFC 9051 §6.3.9; `FakeIMAPServer.hideMailboxFromList`;
+`NeverDropExitClosureTests.aRefusedAtomicMoveIntoAListOmittedDestinationStaysQueuedAndLands`;
+`NeverDropExitClosureTests.aPermanentlyRefusedAtomicMoveParksOnlyItsOwnLane`;
+`IMAPMoveWireContractTests.atomicRefusalWithoutCopyUIDIsEvidenceUnavailable`
 
 ## 2026-09-04 — what stands from the 2026-08-13 amendment
 
@@ -72,6 +87,19 @@ the queue emptied and the user's archive was dropped while the message stayed in
 Retrying the refused command is safe (RFC 3501 §6.4.8 ignores an absent UID; §2.3.1.1 forbids UID
 reuse inside the epoch the drain checks; RFC 6851 §3.3's worst case is a duplicate, the residual
 already accepted under `IOS-IMAP-006` / `IOS-QUEUE-007`). The full argument is in
+`Amendments/ios-imap-013.md`; it is not repeated here.
+
+## 2026-09-05 (round 3) — the recovery claim both rows leaned on is false
+
+`IOS-IMAP-013`'s base record says a permanent refusal is recoverable by "capability/configuration
+correction" AND by "existing operation cancellation". The second half does not exist: Undo
+annihilation requires `!everAttempted` and the claim transaction sets `everAttempted = true` before
+any provider I/O, `PendingStatus.cancelled` has no production writer, and no view lists
+`PendingOperation` rows. What actually happens to a permanently refused MOVE is that it **parks its
+lane** — never dropped, never applied, retried every drain, same-lane successors held — which is the
+`ADR-IOS-073` disposition and is PRE-EXISTING, not widened by #115. A user-visible Retry/Cancel
+surface and the `[TRYCREATE]`-based retirement of a MOVE into a genuinely deleted destination are
+OWNER DECISIONS pending (no issue number yet); neither is built here. Stated once, in full, in
 `Amendments/ios-imap-013.md`; it is not repeated here.
 
 ## 2026-09-04 — the tests the 2026-08-13 amendment cited

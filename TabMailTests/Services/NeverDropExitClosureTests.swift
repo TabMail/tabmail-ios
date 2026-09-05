@@ -1335,15 +1335,23 @@ struct NeverDropExitClosureTests {
     /// observed (`providerIdQueueFuzz`, seed `0x70D8000000000002`).
     ///
     /// Parameterised over the server's refusal text because the property holds
-    /// REGARDLESS of it (#115 round 2). The typed no-`COPYUID` error carries the
-    /// raw tagged response text as its payload, and the queue's message-not-found
-    /// classifier ends in a substring match on the error's description — so a
-    /// refusal that happens to carry an RFC 5530 `[NONEXISTENT]` code (which
-    /// names a missing MAILBOX, not a missing message) or the words `UID not
-    /// found` used to be read as a provider-authoritative "already gone" and the
-    /// op was deleted: the same intention drop, on a different response text.
-    /// The original `No mailbox selected` argument contains none of the
-    /// classifier's fragments and never reached that path.
+    /// REGARDLESS of it (#115 round 2). The refusal carries the server's raw
+    /// tagged response text as a diagnostic payload, and the queue's
+    /// message-not-found classifier ends in a substring match on the error's
+    /// description — so a refusal that happens to carry an RFC 5530
+    /// `[NONEXISTENT]` code (which names a missing MAILBOX, not a missing
+    /// message) or the words `UID not found` used to be read as a
+    /// provider-authoritative "already gone" and the op was deleted: the same
+    /// intention drop, on a different response text. The original
+    /// `No mailbox selected` argument contains none of the classifier's
+    /// fragments and never reached that path. Round 3 made the exemption
+    /// structural on the `ProviderEvidenceUnavailable` protocol rather than on
+    /// one transport library's enum, and this matrix is what keeps it honest.
+    ///
+    /// This is the DESTINATION-PRESENT side of the round-3 pair; its sibling
+    /// `aRefusedAtomicMoveIntoAListOmittedDestinationStaysQueuedAndLands` runs
+    /// the same refusals against a destination the exact-name LIST omits. The
+    /// two together say the LIST result never decides this outcome.
     ///
     /// RED PROOF (recorded, #115): on the pre-fix provider the first drain
     /// retires the op with the message still in INBOX — `operations(f.pool)` is
@@ -1424,59 +1432,84 @@ struct NeverDropExitClosureTests {
         await finish(f)
     }
 
-    // MARK: - #115 round 2 — authoritative absence vs an ordinary refusal; the transport-loss witness
+    // MARK: - #115 round 3 — a LIST omission is not absence; the transport-loss witness
 
-    /// #115 round 2 (test-coverage finding T3). The deleted arm used to swallow
-    /// EVERY no-`COPYUID` tagged NO, so the true branch of the generic catch in
-    /// `IMAPProvider.move` — an exact LIST proving the destination ABSENT turns
-    /// the refusal into `IMAPActionMailboxAbsent`, the whole-op no-op — was
-    /// unreachable on the atomic (`MOVE`-capable) route. It is reachable now
-    /// and this is its pin at the queue level; the wire-level near-miss
-    /// `IMAPMoveWireContractTests.absentDestinationIsATerminalNoOp` strips
-    /// `MOVE` and therefore covers the owned route's pre-mutation SELECT only.
+    /// #115 round 3 (correctness finding P1). This test was
+    /// `aRefusedAtomicMoveIntoAListConfirmedAbsentDestinationRetiresAsANoOp`
+    /// and it BLESSED the defect. It pinned "an exact-name LIST that omits the
+    /// destination retires the whole operation as a provider-authoritative
+    /// no-op", driven by `markMailboxDeleted` — a fixture in which "the mailbox
+    /// is gone" and "the mailbox is omitted from LIST" are the SAME state, so
+    /// the test structurally could not tell the two apart.
     ///
-    /// THE PROPERTY: a destination the server has POSITIVELY reported absent
-    /// (an exact-name LIST omits it) is provider authority — never-drop exit 2
-    /// — so the durable op retires as a no-op with the source untouched, no
-    /// COPY/STORE/EXPUNGE fallback and no wrong-message mutation. Beside it,
-    /// `aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt` is the
-    /// present-destination false side: the same tagged NO with the destination
-    /// still LISTed stays queued. The two discriminate authoritative absence
-    /// from an absence of evidence, and neither pins a command count.
+    /// A LIST omission proves nothing about existence. RFC 4314 §4 defines `l`
+    /// (visibility to LIST) and `i` (permission to COPY/MOVE into) as
+    /// INDEPENDENT rights, so a mailbox may be invisible to LIST and still be a
+    /// legal MOVE target; RFC 9051 §6.3.9 separately lets a server silently
+    /// ignore a syntactically valid pattern under a tagged OK. Retiring a
+    /// zero-mutation refusal on that omission is a dropped intention — the very
+    /// defect #115 exists to close, re-entered through a different door.
     ///
-    /// Parameterised over `markMailboxDeleted`'s two SELECT-response shapes
-    /// (`[NONEXISTENT]` code vs a code-less NO) to show that neither matters
-    /// here: the atomic route never SELECTs the destination, the fake refuses
-    /// the `UID MOVE` identically in both, and the LIST probe alone decides.
+    /// THE PROPERTY, stated as the invariant rather than the routing: a tagged
+    /// NO/BAD on `UID MOVE` that carries no `COPYUID` is an ABSENCE OF
+    /// EVIDENCE, so the operation stays durably queued with its retry count
+    /// advancing and a later drain lands it — regardless of the server's
+    /// response text, and regardless of what an exact-name LIST says about the
+    /// destination. Nothing here asserts a command count, an error type, or
+    /// which branch of the provider ran.
     ///
-    /// MUTATION PROOF (recorded, #115 round 2): with the generic catch's guard
-    /// inverted so it always rethrows, the op stays queued and the empty-queue
-    /// assertion fails for both arguments.
+    /// `hideMailboxFromList` is what makes the LIST half non-vacuous, and it is
+    /// two-sided. Forward: the destination is omitted from LIST for the whole
+    /// test and the move still completes into it on the second drain, so the
+    /// mailbox provably exists while hidden (the seam's own wire contract is
+    /// pinned by `FakeIMAPServerOracleTests.hiddenFromListMailboxStillExists`:
+    /// LIST omits the name under a tagged OK while SELECT and `UID MOVE`
+    /// succeed). Backward: on the parent commit the LIST probe fires on exactly
+    /// this fixture and retires the op, which is the red proof below — a
+    /// fixture whose omission were inert could not produce it.
+    ///
+    /// Parameterised over the same refusal texts as
+    /// `aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt`, `[NONEXISTENT]`
+    /// included, so no response text can decide this either.
+    ///
+    /// RED PROOF (recorded, #115 round 3): on the parent `977958c37` the first
+    /// drain RETIRES the operation for all three arguments —
+    /// `Expectation failed: (afterRefusedDrain.map(\.id) → []) == ([move.id] → [...])`,
+    /// with `status` and `retryCount` both `nil` because the row is gone, and
+    /// `Archive` still empty after the second drain. The queue is empty where
+    /// this test requires the move to still be there.
     @Test(
-        "A UID MOVE refused into a destination an exact LIST proves absent retires as a no-op with the source untouched",
-        arguments: [true, false])
+        "A UID MOVE refused into a destination an exact LIST omits stays queued, and the next drain lands it",
+        arguments: [
+            "No mailbox selected",
+            "[NONEXISTENT] No mailbox selected",
+            "UID not found",
+        ])
     @MainActor
-    func aRefusedAtomicMoveIntoAListConfirmedAbsentDestinationRetiresAsANoOp(
-        includeNonexistentCode: Bool
+    func aRefusedAtomicMoveIntoAListOmittedDestinationStaysQueuedAndLands(
+        refusal: String
     ) async throws {
-        let target = "atomic-absent-destination@example.com"
+        let target = "atomic-list-omitted-destination@example.com"
         let server = FakeIMAPServer(mailboxes: [
             "INBOX": [Self.message(uid: 77, id: target)],
             "Archive": [],
         ])
         server.setUidValidity(10, for: "INBOX")
         server.setUidValidity(10, for: "Archive")
-        // Deleted remotely between enqueue and drain: the fake refuses
-        // `UID MOVE … Archive` with a tagged NO carrying no COPYUID, and its
-        // LIST omits the name. The LOCAL Folder row still exists — local
-        // presence is not provider authority in either direction.
-        server.markMailboxDeleted("Archive", includeNonexistentCode: includeNonexistentCode)
+        // The destination EXISTS and accepts MOVE; it is merely invisible to
+        // LIST (an ACL `l` revocation, or a pattern the server chose to ignore).
+        server.hideMailboxFromList("Archive")
+        // Exactly ONE refusal, answered before the handler runs: the first
+        // UID MOVE is refused with zero mutation, every later one is served.
+        server.failNextCommand(containing: "UID MOVE", message: refusal)
         server.expectMutation(rfc822MessageId: target)
         try server.start()
         defer { server.stop() }
 
+        // One account id per argument so no per-account state in the shared
+        // manager can leak between the serialized cases.
         let f = try fixture(
-            accountId: "closure-atomic-absent-destination-\(includeNonexistentCode)")
+            accountId: "closure-atomic-list-omitted-" + refusal.lowercased().filter(\.isLetter))
         let provider = try await registeredIMAPProvider(server: server, fixture: f)
         let move = PendingOperation(
             type: .move, messageIds: ["77"], accountId: f.accountId,
@@ -1485,30 +1518,259 @@ struct NeverDropExitClosureTests {
 
         await AccountManager.shared.drainPendingQueue()
 
-        let commands = server.recordedCommands().map { $0.uppercased() }
-        // NON-VACUITY, both sides: the atomic MOVE actually reached the wire and
-        // was refused there, and the exact-name LIST probe ran for the
-        // destination (the fake's LIST omits every `markMailboxDeleted` name).
+        // NON-VACUITY, wire side: the atomic MOVE really was issued and really
+        // was refused, so what follows is about the refusal and not about a
+        // fixture that never got that far.
+        let firstDrain = server.recordedCommands().map { $0.uppercased() }
         #expect(
-            commands.contains { $0.contains("UID MOVE") && $0.contains("ARCHIVE") },
-            "the atomic UID MOVE never reached the wire: \(commands)")
+            firstDrain.contains { $0.contains("UID MOVE") && $0.contains("ARCHIVE") },
+            "the atomic UID MOVE never reached the wire: \(firstDrain)")
+        #expect(server.consumedInjectedFailureCount() == 1)
+
+        // HALF 1 — the intention survived a refusal into a destination the
+        // exact-name LIST omits, and nothing moved.
+        let afterRefusedDrain = try operations(f.pool)
         #expect(
-            commands.contains { $0.hasPrefix("LIST") && $0.contains("ARCHIVE") },
-            "no exact-name LIST probed the destination: \(commands)")
-        // THE PROPERTY — retired as a provider-authoritative no-op …
-        let remaining = try operations(f.pool)
-        #expect(
-            remaining.isEmpty,
+            afterRefusedDrain.map(\.id) == [move.id],
             """
-            a destination the server LISTs as absent left the move queued — no later drain can make \
-            an absent mailbox present, so this is a permanent lane wedge: \(remaining.map(\.type))
+            a tagged NO that carried no COPYUID evidence retired the durable move because an \
+            exact-name LIST omitted the destination. A LIST omission is not proof of absence \
+            (RFC 4314 §4 separates the l and i rights; RFC 9051 §6.3.9 permits silent pattern \
+            omission), so this retired a user intention on an absence of evidence — remaining \
+            ops: \(afterRefusedDrain.map(\.type))
             """)
-        // … with the source untouched and no fallback mutation of any kind.
+        #expect(afterRefusedDrain.first?.status == PendingStatus.queued.rawValue)
+        #expect(
+            afterRefusedDrain.first?.retryCount == 1,
+            "the refused attempt was not recorded as a retry: \(String(describing: afterRefusedDrain.first?.retryCount))")
         #expect(server.messageIDs(in: "INBOX") == ["<\(target)>"])
         #expect(server.messageIDs(in: "Archive").isEmpty)
         #expect(server.flags(in: "INBOX", uid: 77).isEmpty)
+        #expect(firstDrain.filter { $0.contains("UID COPY") }.isEmpty)
+        #expect(firstDrain.filter { $0.contains("UID STORE") && $0.contains("\\DELETED") }.isEmpty)
+        #expect(firstDrain.filter { $0.contains("EXPUNGE") }.isEmpty)
+
+        // The second drain is the retry boundary (`failedAccounts` is per drain).
+        await AccountManager.shared.drainPendingQueue()
+
+        // HALF 2 — the destination was there all along: the move lands in it
+        // exactly once, the source empties, the queue empties.
+        let archiveAfterRetry = server.messageIDs(in: "Archive")
+        #expect(
+            archiveAfterRetry == ["<\(target)>"],
+            "the retry did not land exactly one copy in the LIST-omitted destination: \(archiveAfterRetry)")
+        let inboxAfterRetry = server.messageIDs(in: "INBOX")
+        #expect(
+            inboxAfterRetry.isEmpty,
+            "the message is still in the source after the retry: \(inboxAfterRetry)")
+        let afterRetryDrain = try operations(f.pool)
+        #expect(
+            afterRetryDrain.isEmpty,
+            "the op did not retire after the move actually landed: \(afterRetryDrain.map(\.type))")
+        #expect(server.wrongMessageViolations().isEmpty)
+
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// #115 round 3 (architecture finding A-1 / robustness finding R1). The
+    /// sibling of `unprovableOpDoesNotWedgeTheAccountsOtherGestures`, for the
+    /// refusal this issue is about, and for the case its one-shot fixtures
+    /// cannot reach: a server that refuses `UID MOVE` on EVERY attempt.
+    ///
+    /// Before this round the refusal reached the drain's GENERIC catch, which
+    /// does `context.failedAccounts.insert(...)` — account-wide suppression the
+    /// drain documents as reserved for facts about the CONNECTION. A tagged
+    /// command refusal says nothing about the connection, and `ADR-IOS-073`
+    /// expressly accepts that a server may advertise MOVE and then permanently
+    /// reject it ("can park the lane until its configuration is corrected").
+    /// Parking a LANE is the accepted cost; parking the ACCOUNT is not: every
+    /// disjoint gesture the user made would be denied on every drain, which is
+    /// preserving one intention by dropping all the others.
+    ///
+    /// TWO PROPERTIES, both asserted at the server across repeated drains:
+    ///  1. the refused MOVE is still queued with its retry count advancing, and
+    ///     its same-lane successor is still held — `buildLanes` unions on shared
+    ///     message ids, so running a lane-mate ahead of an unresolved
+    ///     predecessor is the race `.haltLane` exists to prevent;
+    ///  2. FIVE disjoint-lane gestures on a different message all reach the
+    ///     server and retire WITHIN THE FIRST DRAIN, leaving the queue holding
+    ///     exactly the two lane-A rows. Five rather than one, and asserted after
+    ///     one drain rather than four, because `failedAccounts` is per-drain and
+    ///     is re-evaluated before every op of a lane: a poisoned account lets
+    ///     the gesture already past that check slip through, requeues the rest,
+    ///     and then releases roughly one more per drain — so measured only at
+    ///     the end, a starved account and a healthy one look identical.
+    ///
+    /// It never inspects `failedAccounts`, `evidenceRefused` or any other drain
+    /// internal: those are mechanism, and a test written against them would stay
+    /// green if the poisoning simply moved somewhere else.
+    ///
+    /// RED PROOF (recorded, #115 round 3): on the parent `977958c37` NOT ONE
+    /// bystander gesture reaches the server in the poisoned drain —
+    /// `Expectation failed: (unrelated → []).contains("\\Seen")`, likewise
+    /// `\Flagged` and `\Answered`, and `Set(afterFirstDrain.map(\.id))` holds
+    /// FIVE rows where the property allows two. The two gestures that did
+    /// execute were the flag REMOVALS, which leave no trace on a message that
+    /// never had the flags — which is why the lane is five gestures long and
+    /// why the assertion is made after one drain.
+    @Test("A permanently refused UID MOVE parks its own lane and never the account")
+    @MainActor
+    func aPermanentlyRefusedAtomicMoveParksOnlyItsOwnLane() async throws {
+        let refused = "permanent-refusal-target@example.com"
+        let bystander = "permanent-refusal-bystander@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [
+                Self.message(uid: 77, id: refused),
+                Self.message(uid: 88, id: bystander),
+            ],
+            "Archive": [],
+        ])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Archive")
+        // A PERMANENT refusal: every `UID MOVE`, on every drain, is answered
+        // with a tagged NO carrying no COPYUID and mutating nothing. The fake's
+        // injected failures are a FIFO whose head must have `skip == 0` to fire,
+        // so "always refuse" is armed as one `onMatch: 1` entry per possible
+        // attempt rather than one entry per ordinal. The response text
+        // deliberately carries none of the queue classifier's substring
+        // fragments, so this case is decided structurally and not by wording.
+        let drains = 4
+        for _ in 0..<(drains * 3) {
+            server.failCommand(
+                containing: "UID MOVE", onMatch: 1,
+                message: "Move rejected by server policy")
+        }
+        server.expectMutation(rfc822MessageId: refused)
+        server.expectMutation(rfc822MessageId: bystander)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "closure-permanent-move-refusal")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+
+        // Lane A — the refused move, and a successor the user issued after it on
+        // the SAME message, which must stay held behind it.
+        var refusedMove = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        refusedMove.createdAt = Date().addingTimeInterval(-60)
+
+        func later(
+            _ type: OperationType, on uid: String, _ secondsAgo: TimeInterval
+        ) -> PendingOperation {
+            var op = PendingOperation(
+                type: type, messageIds: [uid], accountId: f.accountId,
+                folderPath: "INBOX", observedUidValidity: 10)
+            op.createdAt = Date().addingTimeInterval(-secondsAgo)
+            return op
+        }
+        let laneMate = later(.markFlagged, on: "77", 50)
+        try insert(
+            [
+                refusedMove,
+                laneMate,
+                // Lane B — a different message, therefore a different lane,
+                // therefore nothing to do with the refusal. FIVE gestures, and
+                // the number is load-bearing: the account-wide skip is
+                // re-evaluated before EVERY op of a lane, so a poisoned account
+                // lets the one already past that check slip through and requeues
+                // all the rest. A single bystander gesture would be
+                // indistinguishable from a healthy account.
+                later(.markUnread, on: "88", 34),
+                later(.markUnflagged, on: "88", 32),
+                later(.markRead, on: "88", 30),
+                later(.markFlagged, on: "88", 20),
+                later(.markReplied, on: "88", 10),
+            ],
+            into: f.pool)
+
+        // ONE drain first, because `failedAccounts` is per-drain: a starved lane
+        // trickles through at roughly a gesture per drain, so after four drains
+        // a poisoned account and a healthy one reach the SAME end state. The
+        // difference is only observable inside a single drain.
+        await AccountManager.shared.drainPendingQueue()
+
+        // PROPERTY 2 — every disjoint-lane gesture reached the server, in the
+        // very drain in which the MOVE was refused.
+        let unrelated = server.flags(in: "INBOX", uid: 88)
+        #expect(
+            unrelated.contains("\\Seen"),
+            "a disjoint-lane gesture never reached the server — flags: \(unrelated)")
+        #expect(
+            unrelated.contains("\\Flagged"),
+            """
+            a gesture on an UNRELATED message was denied because a MOVE on a different message was \
+            refused. A refused command is not a provider outage, and one intention may never be \
+            preserved by denying every intention behind it — flags: \(unrelated)
+            """)
+        #expect(
+            unrelated.contains("\\Answered"),
+            """
+            the account is still suppressed after the earlier gestures got through — the \
+            account-wide skip is re-evaluated before every op in a lane, so a later one is denied \
+            even once an earlier one slipped past — flags: \(unrelated)
+            """)
+        let afterFirstDrain = try operations(f.pool)
+        #expect(
+            Set(afterFirstDrain.map(\.id)) == Set([refusedMove.id, laneMate.id]),
+            """
+            one drain did not retire every disjoint-lane gesture: a MOVE refused on ONE message \
+            suppressed unrelated work elsewhere on the same account, so the user's other \
+            intentions were denied to preserve this one — still queued: \
+            \(afterFirstDrain.map { "\($0.type)" })
+            """)
+
+        // The remaining drains are for property 1: the refusal keeps being
+        // retried, drain after drain, and is neither dropped nor applied.
+        for _ in 1..<drains {
+            await AccountManager.shared.drainPendingQueue()
+        }
+
+        // NON-VACUITY: the MOVE really was attempted, repeatedly, and really was
+        // refused every time.
+        let commands = server.recordedCommands().map { $0.uppercased() }
+        #expect(
+            commands.filter { $0.contains("UID MOVE") }.count >= 3,
+            "the refused move stopped being attempted: \(commands.filter { $0.contains("UID MOVE") }.count) UID MOVE command(s)")
+        #expect(server.consumedInjectedFailureCount() >= 3)
+
+        // PROPERTY 1 — the refused move is still queued and still advancing, its
+        // lane-mate is still held, and nothing else is left in the queue.
+        let remaining = try operations(f.pool)
+        #expect(
+            Set(remaining.map(\.id)) == Set([refusedMove.id, laneMate.id]),
+            """
+            the queue does not hold exactly the refused move and its held lane-mate — either the \
+            refusal dropped an intention or a disjoint-lane gesture was starved: \
+            \(remaining.map { "\($0.type):\($0.id)" })
+            """)
+        guard remaining.count == 2 else {
+            try? await provider.disconnect()
+            await finish(f)
+            return
+        }
+        let refusedRow = try #require(remaining.first { $0.id == refusedMove.id })
+        #expect(refusedRow.status == PendingStatus.queued.rawValue)
+        #expect(
+            refusedRow.retryCount >= 3,
+            "the repeatedly refused move is not being retried — retryCount \(refusedRow.retryCount) after \(drains) drains")
+        // The lane-mate is HELD, not executed: it names the same message as an
+        // unresolved predecessor. NON-VACUOUS by construction — the identical
+        // `.markFlagged` gesture on uid 88 provably landed above.
+        let heldLane = server.flags(in: "INBOX", uid: 77)
+        #expect(
+            !heldLane.contains("\\Flagged"),
+            """
+            a lane-mate of the refused move executed while that move was still queued. They name \
+            the SAME message by construction, so this ran ahead of a predecessor the user issued \
+            FIRST and whose eventual retry will act against state it never observed — flags: \
+            \(heldLane)
+            """)
+        // Nothing was mutated at the source or the destination by the refusals.
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+        #expect(server.messageIDs(in: "INBOX").contains("<\(refused)>"))
         #expect(commands.filter { $0.contains("UID COPY") }.isEmpty)
-        #expect(commands.filter { $0.contains("UID STORE") && $0.contains("\\DELETED") }.isEmpty)
         #expect(commands.filter { $0.contains("EXPUNGE") }.isEmpty)
         #expect(server.wrongMessageViolations().isEmpty)
 

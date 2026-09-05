@@ -152,6 +152,16 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// shape some real servers send). LIST also excludes these names
         /// regardless of shape — the LIST probe is the authority either way.
         var deletedMailboxes: [String: Bool] = [:]
+        /// Mailboxes LIST omits while they still fully EXIST — SELECT works,
+        /// `UID MOVE` into them works, `STATUS` works. The standards-valid
+        /// shape `deletedMailboxes` cannot express (GitHub #115): RFC 4314 §4
+        /// makes the `l` lookup right that governs LIST visibility independent
+        /// of the `i` insert right a MOVE target needs, and RFC 9051 §6.3.9
+        /// lets a server silently ignore a LIST pattern under a tagged OK. So
+        /// "the exact-name LIST did not return it" and "it is gone" are
+        /// different states, and only this seam produces the first without the
+        /// second. Empty for every pre-existing test.
+        var listHiddenMailboxes: Set<String> = []
         /// Per-mailbox UIDVALIDITY reported by SELECT/EXAMINE (RFC 3501
         /// §2.3.1.1). Missing entry defaults to 1 — every pre-existing test
         /// relies on that fixed value, so this is purely additive. ADR-IOS-060
@@ -736,6 +746,24 @@ final class FakeIMAPServer: @unchecked Sendable {
     ///     probe is the sole authority in both cases.
     func markMailboxDeleted(_ name: String, includeNonexistentCode: Bool) {
         withState { $0.deletedMailboxes[name] = includeNonexistentCode }
+    }
+
+    /// GitHub #115 — the mailbox is HIDDEN FROM LIST but otherwise entirely
+    /// normal: SELECT succeeds, `UID MOVE` into it succeeds, STATUS succeeds.
+    ///
+    /// Deliberately a SECOND seam rather than a flag on `markMailboxDeleted`,
+    /// which conflates "deleted" with "omitted from LIST" and therefore cannot
+    /// produce this world state at all. Two RFCs make it reachable on a
+    /// conforming server: RFC 4314 §4 defines `l` (visibility to LIST) and `i`
+    /// (permission to COPY/MOVE into) as independent ACL rights, so revoking
+    /// `l` alone hides a mailbox that remains a legal MOVE target; and RFC 9051
+    /// §6.3.9 lets a server silently ignore a syntactically valid pattern with a
+    /// tagged OK. An exact-name LIST that omits a name is therefore not proof
+    /// the name is gone, and any code that treats it as proof drops the user's
+    /// intention. `markMailboxDeleted` is kept unchanged — other suites use it
+    /// for the genuine deletion it models.
+    func hideMailboxFromList(_ name: String) {
+        withState { _ = $0.listHiddenMailboxes.insert(name) }
     }
 
     /// Undo `markMailboxDeleted` — the name exists again. Models the second half
@@ -1708,11 +1736,14 @@ final class FakeIMAPServer: @unchecked Sendable {
             // INBOX" stub) so `mailboxConfirmedAbsent`'s LIST probe is
             // meaningfully exercised: a name is "present" only if it has a
             // `messagesByMailbox` entry and was never `markMailboxDeleted`.
+            // `hideMailboxFromList` omits it HERE ONLY — the mailbox still
+            // exists everywhere else, which is the whole point of that seam.
             let pattern = args.replacingOccurrences(of: "\"", with: "")
                 .split(separator: " ").map(String.init).last ?? "*"
             let matches: [String] = withState { state in
                 state.messagesByMailbox.keys
                     .filter { state.deletedMailboxes[$0] == nil }
+                    .filter { !state.listHiddenMailboxes.contains($0) }
                     .filter { Self.imapListPatternMatches(pattern: pattern, name: $0) }
                     .sorted()
             }

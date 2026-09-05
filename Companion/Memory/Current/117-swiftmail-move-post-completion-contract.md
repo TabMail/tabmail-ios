@@ -12,6 +12,33 @@
 > `UID MOVE` — safe because RFC 3501 §6.4.8 ignores absent UIDs and §2.3.1.1 forbids UID reuse within
 > an epoch; the residual duplicate on a server that violates RFC 6851 §3.3 is accepted under
 > `IOS-IMAP-006` / `IOS-QUEUE-007`.
+>
+> **2026-09-05 (#115 round 3) — where the refusal now goes, because "deletes that arm" was only half
+> the answer.** With the arm merely deleted, `moveFailedAfterPossiblePartialCompletion` fell into the
+> atomic route's PRE-EXISTING generic catch, and that catch does two things neither #115 nor this
+> note intended. (1) It runs `mailboxConfirmedAbsent` — an exact-name `LIST` — and retires the WHOLE
+> operation as `IMAPActionMailboxAbsent` when the name is not returned. A LIST omission is not
+> evidence of absence: RFC 4314 §4 makes `l` (LIST visibility) independent of `i` (insert/COPY, which
+> is what a MOVE target needs), and RFC 9051 §6.3.9 lets a server silently ignore a valid pattern
+> under a tagged OK — so the zero-mutation refusal could still empty the queue. (2) When LIST DOES
+> list the destination, the raw `IMAPError` escapes the provider, matches no typed arm in
+> `AccountManager.executeSingleOp`, and reaches the drain's generic catch, which inserts the account
+> into `DrainContext.failedAccounts` — account-wide suppression reserved for facts about the
+> CONNECTION. A server that keeps refusing MOVE (`ADR-IOS-073` accepts that one may) then starved
+> every disjoint lane on the account, every drain.
+>
+> **The routing, current:** one typed arm in `IMAPProvider.move`'s atomic route, BEFORE the generic
+> catch, rethrows the error as the private `IMAPAtomicMoveRefused` — a `ProviderEvidenceUnavailable`
+> alongside `IMAPLivenessProbeInconclusive` / `IMAPDestinationEpochRefusal` /
+> `IMAPEpochEvidenceMissing`, carrying the server's reason text as a diagnostic payload. It therefore
+> never reaches the LIST probe, and it lands in the drain's LANE-LOCAL arm (requeue,
+> `retryCount += 1`, `evidenceRefused`, `.haltLane`, account untouched). `AccountManager.isMessageNotFoundError`
+> exempts the whole PROTOCOL structurally (`if error is ProviderEvidenceUnavailable { return false }`)
+> rather than one SwiftMail case, and `AccountManagerQueue.swift` no longer imports SwiftMail.
+> `mailboxConfirmedAbsent`, the generic catch, `IMAPActionMailboxAbsent`, the action-SELECT LIST probe
+> and the COPY-route destination probe are pre-existing and unchanged; the same LIST-omission argument
+> applies to them and is recorded for the owner. Registered in
+> `Companion/Process/Current/KnownIssues/Amendments/ios-imap-013.md`.
 <!-- COMPANION-CURRENT-NOTE-END -->
 # SwiftMail MOVE post-completion contract — PR #208
 

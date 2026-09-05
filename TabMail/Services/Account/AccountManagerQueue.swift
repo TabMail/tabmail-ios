@@ -4,7 +4,6 @@
 
 import Foundation
 import GRDB
-import SwiftMail
 import Synchronization
 
 /// What one dispatched operation PROVED, as reported by `executeOperation` to
@@ -25,14 +24,14 @@ struct ExecutedOperation: Sendable {
     /// distinguish that state from Gmail's address-stable label mutation.
     let addressChangesOnMove: Bool
     /// True ONLY when an IMAP MOVE ended with a tagged NO/BAD after the server
-    /// had already reported a `COPYUID` for the members it moved
-    /// (`IMAPError.moveFailedAfterPartialCompletion(copyUID:)`, the
-    /// evidence-bearing form). The original identifiers must not be retried,
-    /// and both mailbox views must be refreshed before the user decides whether
-    /// any remainder needs a new gesture. A tagged NO/BAD with NO `COPYUID`
-    /// (`moveFailedAfterPossiblePartialCompletion`) never sets this: it is a
-    /// refusal with no evidence of mutation, so the op stays queued and is
-    /// retried (GitHub #115).
+    /// had already reported a `COPYUID` for the members it moved — the
+    /// evidence-bearing form of the failure. The original identifiers must not
+    /// be retried, and both mailbox views must be refreshed before the user
+    /// decides whether any remainder needs a new gesture. A tagged NO/BAD with
+    /// NO `COPYUID` never sets this: it is a refusal with no evidence of
+    /// mutation, so `IMAPProvider.move` raises it as a
+    /// `ProviderEvidenceUnavailable` and the op stays queued and is retried
+    /// (GitHub #115).
     let reconcileMoveSource: Bool
 
     init(
@@ -2021,16 +2020,20 @@ extension AccountManager {
             }
             if (underlying as NSError).code == 404 { return true }
         }
-        // GitHub #115: a `UID MOVE` answered with a tagged NO/BAD and no retained
-        // `COPYUID` stays durably queued and is landed by the next drain,
-        // REGARDLESS of the server's response text. SwiftMail raises this typed
-        // error for every such refusal and its payload IS that raw text, so the
-        // substring fallback below would otherwise read a refusal that happens
-        // to carry an RFC 5530 `[NONEXISTENT]` code (a missing MAILBOX) or the
-        // words `UID not found` as a provider-authoritative "already gone" and
-        // delete the op. The error is an absence of evidence, never exit 2; it
-        // must reach the generic requeue arm. Structural, so no text can undo it.
-        if case IMAPError.moveFailedAfterPossiblePartialCompletion = error { return false }
+        // 🚨 NO EVIDENCE-UNAVAILABLE ERROR MAY BE READ AS "ALREADY GONE" BY ITS
+        // TEXT (GitHub #115). `ProviderEvidenceUnavailable` is the provider
+        // contract for "we asked the server for a fact our safety gate needs and
+        // did not get a usable one" — an ABSENCE of evidence, which is never
+        // exit 2 and must reach the drain's own lane-local requeue arm. Several
+        // of these errors carry the server's raw tagged response text as a
+        // diagnostic payload, so the substring fallback below would otherwise
+        // read a refusal that happens to quote an RFC 5530 `[NONEXISTENT]` code
+        // (which names a missing MAILBOX, not a missing message) or the words
+        // `UID not found` as a provider-authoritative disposition and delete the
+        // op. Structural and keyed on the PROTOCOL, not on one transport
+        // library's enum, so no response text and no future conformer can undo
+        // it.
+        if error is ProviderEvidenceUnavailable { return false }
         let desc = "\(error)"
         if desc.contains("no such message") || desc.contains("UID not found") ||
            desc.contains("Message not found") || desc.contains("NONEXISTENT") { return true }

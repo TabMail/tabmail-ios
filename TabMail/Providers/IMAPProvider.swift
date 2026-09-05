@@ -4390,6 +4390,51 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         case unknownAdmittedEpoch(folder: String, live: UInt32)
     }
 
+    /// GitHub #115 — the ATOMIC `UID MOVE` refusal, and the fourth member of the
+    /// `ProviderEvidenceUnavailable` family above.
+    ///
+    /// SwiftMail raises `IMAPError.moveFailedAfterPossiblePartialCompletion` for
+    /// ANY tagged NO/BAD answer to `UID MOVE` when it retained no `COPYUID`. The
+    /// server refused the command and said nothing about what it did — the same
+    /// epistemic shape as the three siblings: the provider asked for a fact its
+    /// safety gate needs and did not get a usable one, so nothing is determined
+    /// about this op, and nothing about the ACCOUNT either.
+    ///
+    /// That second half is why the typed error is translated here rather than
+    /// left to propagate as an `IMAPError`. Untranslated it matched no typed arm
+    /// in `AccountManager.executeSingleOp` and reached the GENERIC catch, which
+    /// does `context.failedAccounts.insert(...)` — account-wide suppression the
+    /// drain reserves for facts about the CONNECTION. A server that keeps
+    /// refusing `UID MOVE` (`ADR-IOS-073` accepts that a server may) would then
+    /// starve every disjoint lane on the account on every drain: one intention
+    /// preserved by denying every intention behind it. As a
+    /// `ProviderEvidenceUnavailable` it lands in the lane-local arm instead —
+    /// requeue, `retryCount += 1`, `evidenceRefused`, `.haltLane`, and the rest
+    /// of the account keeps draining.
+    ///
+    /// It also NEVER reaches the generic catch's `mailboxConfirmedAbsent` LIST
+    /// probe, which is the second half of #115 round 3: an exact-name LIST that
+    /// omits a mailbox proves nothing about its existence (RFC 4314 §4 makes the
+    /// `l` lookup right independent of the `i` insert right MOVE needs, and RFC
+    /// 9051 §6.3.9 lets a server silently ignore a pattern under a tagged OK), so
+    /// deciding a refusal terminally on that omission would drop the intention on
+    /// an absence of evidence — the very drop #115 exists to close.
+    ///
+    /// Deliberately NOT `ProviderError.uidValidityChanged` (exit 4 retires the op
+    /// and no epoch was proven to have moved) and NOT
+    /// `ProviderError.actionIdentityResolutionFailed` (the drain DELETES on it,
+    /// and a refused command is not a verdict on an identity). `private`, so it
+    /// can never become a classification input anywhere else, and its case name
+    /// and labels carry none of the substrings
+    /// `AccountManager.isMessageNotFoundError` matches — the server's own reason
+    /// text rides in the payload for diagnostics only, and that classifier now
+    /// excludes this whole protocol structurally rather than by wording.
+    private enum IMAPAtomicMoveRefused: ProviderEvidenceUnavailable {
+        /// The server answered `UID MOVE` with a tagged NO/BAD and no retained
+        /// `COPYUID`. `reason` is the server's raw tagged response text.
+        case taggedFailureWithoutCopyUID(destination: String, reason: String)
+    }
+
     /// The epoch comparison for every ADMITTED MUTATION in this file. `live` is
     /// what the server just reported for `folder`; `expected` is the epoch the
     /// operation is authorized under.
@@ -4703,29 +4748,63 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                             provenDestinations: Self.copyProvenDestinations(
                                 copyUID, requested: sourceUIDs),
                             requiresSourceReconciliation: true)
-                    } catch {
-                        // A tagged failure is terminal only when an exact LIST
-                        // proves the destination disappeared. Transport loss,
-                        // permission failures and every other unknown remain
-                        // retryable; critically, none can enter COPY fallback.
+                    } catch IMAPError.moveFailedAfterPossiblePartialCompletion(
+                        let reason
+                    ) {
+                        // 🚨 GITHUB #115. SwiftMail raises this for ANY tagged
+                        // NO/BAD answer to `UID MOVE` when it retained no
+                        // `COPYUID` — including a refusal answered before either
+                        // mailbox was touched: a transport loss between the A3'
+                        // SELECT above and the MOVE makes
+                        // `IMAPConnection.executeCommandBody` re-open a raw
+                        // channel (no LOGIN, no SELECT) and send the command
+                        // anyway, and the server answers `NO No mailbox
+                        // selected` with zero mutation. An arm here used to
+                        // retire every member on it (`3f6a0a5a8`): the queue
+                        // emptied with the message still in the source and the
+                        // UI already showing success — a dropped intention by
+                        // none of the four exits. The invariant: a tagged NO
+                        // WITHOUT `COPYUID` evidence is an ABSENCE OF EVIDENCE,
+                        // so it is retryable, never authoritative; only the
+                        // `COPYUID`-bearing sibling arm above carries a fact the
+                        // server asserted.
                         //
-                        // 🚨 THAT INCLUDES `IMAPError.moveFailedAfterPossiblePartialCompletion`
-                        // (GitHub #115). SwiftMail raises it for ANY tagged NO/BAD
-                        // on `UID MOVE` with no retained `COPYUID` — including a
-                        // refusal answered before either mailbox was touched: a
-                        // transport loss between the A3' SELECT above and the
-                        // MOVE makes `IMAPConnection.executeCommandBody` re-open
-                        // a raw channel (no LOGIN, no SELECT) and send the
-                        // command anyway, and the server answers
-                        // `NO No mailbox selected` with zero mutation. An arm
-                        // here used to retire every member on that error
-                        // (`3f6a0a5a8`): the queue emptied with the message still
-                        // in the source and the UI already showing success — a
-                        // dropped intention by none of the four exits. The
-                        // invariant: a tagged NO WITHOUT `COPYUID` evidence is an
-                        // absence of evidence, so it is retryable, never
-                        // authoritative; only the `COPYUID`-bearing sibling arm
-                        // above carries a fact the server asserted.
+                        // ROUTING (round 3), and it is why this arm exists at all
+                        // rather than letting the error fall to the generic catch
+                        // below. Translating to `IMAPAtomicMoveRefused` — a
+                        // `ProviderEvidenceUnavailable` — does two things the
+                        // generic catch cannot:
+                        //  - it keeps the refusal LANE-LOCAL. The drain's
+                        //    evidence-unavailable arm requeues, bumps
+                        //    `retryCount`, records `evidenceRefused` and halts
+                        //    only this lane; the generic arm inserts the account
+                        //    into `failedAccounts`, so a server that keeps
+                        //    refusing MOVE would starve every disjoint lane on
+                        //    the account on every drain.
+                        //  - it keeps this error away from the generic catch's
+                        //    `mailboxConfirmedAbsent` LIST probe. An exact-name
+                        //    LIST that omits a mailbox does NOT prove the mailbox
+                        //    is gone: RFC 4314 §4 makes the `l` lookup right
+                        //    independent of the `i` insert right a MOVE target
+                        //    needs, and RFC 9051 §6.3.9 lets a server silently
+                        //    ignore a pattern under a tagged OK. Deciding this
+                        //    refusal terminally on that omission would retire the
+                        //    whole op on an absence of evidence.
+                        //
+                        // ⚠ FAIL-CLOSED PARK, STATED PLAINLY — this is the cost.
+                        // A `UID MOVE` refused because the destination genuinely
+                        // no longer exists on the server (a conforming server
+                        // answers `NO [TRYCREATE]`) now stays queued and retries
+                        // on every drain, PARKING ITS LANE, instead of being
+                        // retired by the LIST probe. That is the `ADR-IOS-073`
+                        // no-fallback disposition — "a server that advertises but
+                        // permanently rejects MOVE can park the lane until its
+                        // configuration is corrected" — and it is what the drain
+                        // did for every such NO before `3f6a0a5a8`. The
+                        // structural alternative, retiring on the RFC 3501 §6.4.7
+                        // `[TRYCREATE]` response code, is an OWNER DECISION
+                        // recorded in the register (`IOS-IMAP-013`) and is not
+                        // taken here.
                         //
                         // A retried `UID MOVE` is safe: RFC 3501 §6.4.8 ignores
                         // a UID that no longer exists (an already-moved member is
@@ -4736,6 +4815,25 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         // member in BOTH mailboxes, which RFC 6851 §3.3 says a
                         // server SHOULD NOT do — accepted under `IOS-IMAP-006` /
                         // `IOS-QUEUE-007`, one delete to recover.
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[IMAP] Atomic MOVE refused with no COPYUID — op stays queued, this lane parks, the rest of the account keeps draining: \(reason)")
+                        }
+                        throw IMAPAtomicMoveRefused.taggedFailureWithoutCopyUID(
+                            destination: destination, reason: reason)
+                    } catch {
+                        // A tagged failure is terminal only when an exact LIST
+                        // proves the destination disappeared. Transport loss,
+                        // permission failures and every other unknown remain
+                        // retryable; critically, none can enter COPY fallback.
+                        //
+                        // ⚠ THE NO-`COPYUID` REFUSAL NO LONGER REACHES THIS
+                        // PROBE — it is caught and translated by the arm
+                        // immediately above (GitHub #115 round 3), because a LIST
+                        // omission is not evidence of absence. What is left here
+                        // is every OTHER failure of the atomic command: transport
+                        // errors, cancellation, malformed responses. This branch,
+                        // `mailboxConfirmedAbsent` and `IMAPActionMailboxAbsent`
+                        // are pre-existing and unchanged.
                         guard await self.mailboxConfirmedAbsent(
                             destination, server: server) else { throw error }
                         throw IMAPActionMailboxAbsent()
