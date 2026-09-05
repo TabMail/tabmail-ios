@@ -22,7 +22,7 @@ import GRDB
 /// * **`print`** meant they went NOWHERE on a device. There is no
 ///   `freopen`/`dup2` in this tree, so `stdout` is unreadable outside an attached
 ///   Xcode console — the exact situation of the Gmail delete → undo → delete whose
-///   message reappeared 31 minutes later (`IOS-QUEUE-008`). These seven lines name
+///   message reappeared 31 minutes later (`IOS-QUEUE-008`). These six lines name
 ///   which sync arm re-inserted a row, which was one of the two facts the
 ///   investigation needed and the exported log could not supply.
 ///
@@ -37,10 +37,13 @@ import GRDB
 /// these fire per message per folder, and the laziness survives the forward
 /// because `message()` is evaluated inside the façade's own autoclosure argument.
 ///
-/// ⚠️ SCOPE: this helper is deliberately used ONLY by the seven
-/// `[MoveTrace] deltaSync` sites. The rest of this file's `print` corpus — and the
-/// sync engines' generally — is the whole-tree sweep tracked as issue #72 and is
-/// out of scope here.
+/// ⚠️ SCOPE: this helper is deliberately used ONLY by the six
+/// `[MoveTrace] deltaSync` sites (seven until 2026-09-04, when the unreachable
+/// post-snapshot insert guard and its "SKIPPING insert for id=… — already exists
+/// (post-snapshot)" line were removed — see the comment above `header.insert` in
+/// `gmailDeltaSync`, and `IOS-LABEL-004`). The rest of this file's `print` corpus
+/// — and the sync engines' generally — is the whole-tree sweep tracked as issue
+/// #72 and is out of scope here.
 private func deltaMoveTraceLog(_ message: @autoclosure () -> String) {
     BackgroundSyncLogger.logQueue(message())
 }
@@ -383,14 +386,23 @@ extension SyncEngine {
                                     try optimistic.delete(db)
                                     print("[Sync] Gmail delta dedup: replaced optimistic sent header \(oldId) with \(header.id)")
                                 }
-                                // Defensive — an unrelated path (optimistic sent insert,
-                                // NSE, sibling folder iteration) may have written this id
-                                // inside the same transaction. Skipping the insert is
-                                // always safer than throwing UNIQUE.
-                                guard try MessageHeader.fetchOne(db, key: header.id) == nil else {
-                                    deltaMoveTraceLog("[MoveTrace] deltaSync — SKIPPING insert for id=\(header.id) — already exists (post-snapshot)")
-                                    continue
-                                }
+                                // The orphan check above (`fetchOne(db, key: header.id)`)
+                                // established inside THIS write transaction that no row
+                                // occupies `header.id`, and nothing can change that before the
+                                // insert: SQLite snapshot isolation plus `DatabasePool` writer
+                                // serialisation exclude every other writer (a concurrent delta
+                                // pass, the NSE process, a sibling folder iteration), the only
+                                // `messageHeader` write in between is the Sent-dedup DELETE, and
+                                // the table has no triggers (v87 dropped them) and no GRDB
+                                // persistence callbacks. A guard that re-read the key here was
+                                // unreachable and was removed 2026-09-04 (`IOS-LABEL-004`).
+                                // Should a colliding insert ever happen, it throws UNIQUE and
+                                // rolls back this whole batch — the messages-deleted write above
+                                // is a separate, already-committed transaction whose deletes are
+                                // idempotent on the re-run — while the `lastHistoryId` advance is
+                                // a SEPARATE `dbPool.write` at the end of this method, so the
+                                // cursor stays put and the next delta pass re-fetches the same
+                                // history and reclaims the row via the orphan check. No retry.
                                 try header.insert(db)
                                 if let sentBody = deferredSentBody { try sentBody.insert(db) }
                                 try ThreadUtils.insertMessageReferences(for: header, db: db)
@@ -769,10 +781,16 @@ extension SyncEngine {
                                 try optimistic.delete(db)
                                 print("[Sync] Exchange delta dedup: replaced optimistic sent header \(oldId) with \(header.id)")
                             }
-                            guard try MessageHeader.fetchOne(db, key: header.id) == nil else {
-                                print("[MoveTrace] exchangeDelta — SKIPPING insert for id=\(header.id) — already exists (post-snapshot)")
-                                continue
-                            }
+                            // Same invariant as the Gmail arm's insert above: the orphan check
+                            // established `header.id`'s absence inside THIS transaction, the
+                            // only `messageHeader` write since is the Sent-dedup DELETE, and no
+                            // other writer can interleave. The post-snapshot re-read guard that
+                            // sat here was unreachable and was removed 2026-09-04
+                            // (`IOS-LABEL-004`). A colliding insert throws UNIQUE and rolls the
+                            // batch back; the deltaToken (`lastHistoryId`) advance is a SEPARATE
+                            // `dbPool.write` at the end of this method, so the cursor stays put
+                            // and the next pass re-fetches the same delta and reclaims the row
+                            // via the orphan check. No retry.
                             try header.insert(db)
                             if let sentBody = deferredSentBody { try sentBody.insert(db) }
                             try ThreadUtils.insertMessageReferences(for: header, db: db)

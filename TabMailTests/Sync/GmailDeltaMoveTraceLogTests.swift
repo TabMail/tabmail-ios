@@ -7,13 +7,14 @@ import Foundation
 import GRDB
 @testable import TabMail
 
-/// A3.5 (`IOS-QUEUE-008` follow-up) — the seven `[MoveTrace] deltaSync` decision
-/// lines in Gmail's label-based delta arm (`SyncEngineDeltaSync.gmailDeltaSync`)
-/// now go through the file-private `deltaMoveTraceLog(_:)` façade, which forwards
+/// A3.5 (`IOS-QUEUE-008` follow-up) — the `[MoveTrace] deltaSync` decision lines
+/// in Gmail's label-based delta arm (`SyncEngineDeltaSync.gmailDeltaSync`) — seven
+/// when this suite was written, six since 2026-09-04 (see "Site 7" below) — go
+/// through the file-private `deltaMoveTraceLog(_:)` façade, which forwards
 /// to `BackgroundSyncLogger.logQueue`: debug-gated
 /// (`DebugModeManager.isLoggingEnabled()`), escaped, and appended to the `.queue`
 /// channel of the single consolidated `tabmail.log`. Before this item only one of
-/// the seven sites was ever reached by any test, and even that one ran with the
+/// the sites was ever reached by any test, and even that one ran with the
 /// gate closed so its interior never executed — the exact gap this suite closes.
 ///
 /// 🚨 These tests drive PRODUCTION `SyncEngine.performDeltaSync` end to end
@@ -22,7 +23,7 @@ import GRDB
 /// same reason (`IOS-OUTBOX-002`): a re-implementation of the branch logic would
 /// stay green no matter how the real branch broke.
 ///
-/// For each of the six constructible sites, one `@Test` drives TWO phases against
+/// For each of the six sites, one `@Test` drives TWO phases against
 /// two independently-seeded message ids in the SAME fixture:
 ///   1. Gate OPEN — assert the durable DB effect, THEN assert the channel holds
 ///      EXACTLY that site's marker line (array equality, not containment — a
@@ -42,31 +43,29 @@ import GRDB
 /// check. Sites 1–4 remain strictly mutually exclusive with everything else.
 ///
 /// **Site 7 — `[MoveTrace] deltaSync — SKIPPING insert for id=… — already exists
-/// (post-snapshot)` (`SyncEngineDeltaSync.swift`, the `guard try MessageHeader
-/// .fetchOne(db, key: header.id) == nil` guard right before `header.insert`) is
-/// NOT constructible with existing test infrastructure, and is deliberately
-/// absent from this file.** Its own doc comment names the guard as defensive
-/// against "an unrelated path... writing this id inside the SAME transaction".
-/// Reaching it requires the ONE READ AT THAT GUARD to disagree with the READ
-/// moments earlier at the orphan check (`MessageHeader.fetchOne(db, key:
-/// header.id)`, line ~302) for the exact same key, inside the exact same
-/// `dbPool.write` closure. Three independent facts close every path a fixture
-/// could use to force that disagreement:
-///   * `DatabasePool.write` serializes real writers, so no concurrently
-///     dispatched `dbPool.write` can interleave a write between those two reads.
-///   * The only writer to `header.id`'s row inside this SAME transaction before
-///     the guard is the Sent-dedup block a few lines above it, and its own SQL
-///     predicate (`messageId != header.messageId`) proves algebraically that the
-///     row it deletes can never BE `header.id` (same accountId/folderPath, but a
-///     provably different `messageId` component of the id formula).
+/// (post-snapshot)` — REMOVED 2026-09-04 together with its guard, and so
+/// deliberately absent from this file.** The `guard try MessageHeader.fetchOne(db,
+/// key: header.id) == nil` that sat right before `header.insert` re-read, inside
+/// the SAME `dbPool.write` closure, the exact key the orphan check
+/// (`MessageHeader.fetchOne(db, key: header.id)`) had read moments earlier, and
+/// three facts made those two reads unable to disagree — which is why no fixture
+/// could ever construct the site, and why it was deleted rather than pinned:
+///   * `DatabasePool.write` serializes real writers (and SQLite's write lock
+///     excludes the NSE process), so no concurrent writer can interleave a write
+///     between those two reads.
+///   * The only `messageHeader` writer inside this SAME transaction between them
+///     is the Sent-dedup block's DELETE, and its own SQL predicate
+///     (`messageId <> header.messageId`) proves algebraically that the row it
+///     deletes can never BE `header.id`. `messageHeader` has no triggers (v87
+///     dropped them) and `MessageHeader` has no persistence callbacks.
 ///   * The outer loops (`for detail in details { for folder in folders {...} }`)
 ///     can never visit the same `(folder, messageId)` pair twice: `details` is
 ///     built from `Array(toFetch)`, and `toFetch` is a `Set<String>`, so no Gmail
 ///     message id repeats within one call.
-/// Forcing the guard to fire would require either a genuine second concurrent
-/// writer (out of scope — "no new sync/production infrastructure") or editing
-/// `gmailDeltaSync` itself to introduce a manufactured race, which is also out of
-/// scope. Reported to the coordinator rather than hand-waved per the task brief.
+/// The invariant now lives in the comment above `header.insert` in
+/// `gmailDeltaSync` (and its Exchange twin); a colliding insert would surface as a
+/// thrown `UNIQUE` that rolls the batch back with the cursor untouched, not as a
+/// silent skip. Register: `IOS-LABEL-004` and its 2026-09-04 amendment.
 ///
 /// `.serialized, .processGlobalState` — these tests replace `AppDatabase.shared`,
 /// read/write the process-global `AppLogStore` file backing and
@@ -75,7 +74,7 @@ import GRDB
 /// that map at the start of every scoped test (`ProcessGlobalTestState.withLock`
 /// → `AccountManager.shared.clearRecentlyCompletedForTesting()`), so Site 4's
 /// entries can never leak into a sibling test.
-@Suite("Gmail delta sync's seven [MoveTrace] decision sites — six constructible, gated and queue-channel-routed", .serialized, .processGlobalState)
+@Suite("Gmail delta sync's six [MoveTrace] decision sites — all constructible, gated and queue-channel-routed", .serialized, .processGlobalState)
 struct GmailDeltaMoveTraceLogTests {
 
     // MARK: - Shared fixture helpers
