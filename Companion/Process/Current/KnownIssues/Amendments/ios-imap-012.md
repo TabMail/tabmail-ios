@@ -43,6 +43,20 @@ that probe cannot prove absence (RFC 4314 §4 separates the `l` and `i` rights; 
 permits silent pattern omission), so routing the refusal past it is what stops a LIST omission from
 retiring the operation. Full argument in `Amendments/ios-imap-013.md`.
 
+Round 3b (2026-09-05) — **OWNER DECISION**: a refusal whose resp-text BEGINS with a response code
+from the permanent set — `TRYCREATE` (RFC 3501 §6.4.7, carried to MOVE by RFC 6851 §3.3), `NOPERM`,
+`CANNOT`, `NONEXISTENT` (RFC 5530 §3) — **retires the operation**. That is provider AUTHORITY that
+the command can never succeed as issued, so it is never-drop exit 2, not the absence of evidence a
+LIST omission is: nothing was copied, the message is untouched in the SOURCE mailbox on the server,
+and the next sync of the source folder reclaims the local row. `IMAPProvider.move` throws the
+private `IMAPActionPermanentlyRefused` and its own outer `catch` returns
+`MoveOutcome(provenIds: ids, provenDestinations: [])`, the same terminal shape the pre-existing
+`IMAPActionMailboxAbsent` arm returns — that type is NOT widened, because "the mailbox is confirmed
+gone" has two other catch sites in the file. Every OTHER refusal keeps the round-3 disposition
+(evidence-unavailable, lane-local requeue, retried on the next drain): no code at all, or a code
+outside the permanent set (`OVERQUOTA`, `UNAVAILABLE`, `EXPUNGEISSUED`, `SERVERBUG`, `INUSE`,
+`LIMIT`, …), all of which describe conditions that can clear.
+
 ## Subsystem and search terms
 
 IMAP; atomic `UID MOVE`; `COPYUID`; tagged NO; tagged BAD; `No mailbox selected`;
@@ -61,6 +75,17 @@ RFC 4314 §4; RFC 9051 §6.3.9; `FakeIMAPServer.hideMailboxFromList`;
 `NeverDropExitClosureTests.aRefusedAtomicMoveIntoAListOmittedDestinationStaysQueuedAndLands`;
 `NeverDropExitClosureTests.aPermanentlyRefusedAtomicMoveParksOnlyItsOwnLane`;
 `IMAPMoveWireContractTests.atomicRefusalWithoutCopyUIDIsEvidenceUnavailable`
+permanent response code; RFC 3501 §7.1 `resp-text`; leading `resp-text-code`; structural not
+substring; `TRYCREATE`; `NOPERM`; `CANNOT`; `NONEXISTENT`; RFC 5530 §3; RFC 6851 §3.3;
+`OVERQUOTA`; `UNAVAILABLE`; `EXPUNGEISSUED`; `SERVERBUG`; `INUSE`; `LIMIT`;
+`IMAPActionPermanentlyRefused`; `IMAPProvider.leadingResponseCode(inRenderedReason:)`;
+`permanentMoveRefusalCodes`; `String(describing: TaggedResponse.State)`;
+`ResponseText.debugDescription`; `no([CODE] text)`; OWNER DECISION 2026-09-05; retire on a response
+code; queue-wide retry limit (pending, separate change); GitHub #118;
+`NeverDropExitClosureTests.aMoveRefusedIntoADeletedDestinationRetiresWithoutMutation`;
+`NeverDropExitClosureTests.aMoveRefusedWithAPermanentResponseCodeRetiresWithoutMutation`;
+`NeverDropExitClosureTests.aRefusalWhoseHumanTextMentionsACodeLaterStaysQueued`;
+`IMAPMoveWireContractTests.leadingResponseCodeIsReadStructurally`
 
 ## 2026-09-04 — what stands from the 2026-08-13 amendment
 
@@ -101,6 +126,28 @@ lane** — never dropped, never applied, retried every drain, same-lane successo
 surface and the `[TRYCREATE]`-based retirement of a MOVE into a genuinely deleted destination are
 OWNER DECISIONS pending (no issue number yet); neither is built here. Stated once, in full, in
 `Amendments/ios-imap-013.md`; it is not repeated here.
+
+## 2026-09-05 (round 3b) — the `[TRYCREATE]` owner decision is TAKEN, and what still parks
+
+The sentence in the round-3 section above — *"the `[TRYCREATE]`-based retirement of a MOVE into a
+genuinely deleted destination [is an] OWNER DECISION[] pending"* — is **resolved**. The owner decided
+it on 2026-09-05: *"if server has deleted folder, we should retire that op"*, *"if server says op is
+broken, we should retire it. and then later on full sync would catch that back"*. The code reads the
+response code STRUCTURALLY — RFC 3501 §7.1 gives `resp-text = ["[" resp-text-code "]" SP] text`, so
+only the bracketed atom at the very START of the resp-text is a protocol statement and the same word
+later in the server's prose is not — which is what keeps a server's human sentence from retiring a
+user's intention.
+
+**Nothing else is withdrawn.** The recovery-claim withdrawal above stands in full: there is still no
+client-side cancellation path, and `PendingStatus.cancelled` still has no production writer. The
+other pending owner decision — a user-visible pending-actions surface with Retry/Cancel — is
+untaken.
+
+**What still parks its lane, and the one follow-up that is pending rather than silent.** A refusal
+with NO response code (a non-conforming server — GitHub #118, wontfix) or with a code outside the
+permanent set stays queued and retries on every drain, exactly as round 3 left it. The owner has
+directed a **queue-wide retry limit** for that residual; it is a SEPARATE change and is deliberately
+not taken here, so the park is bounded by that future change and not by this row.
 
 ## 2026-09-04 — the tests the 2026-08-13 amendment cited
 

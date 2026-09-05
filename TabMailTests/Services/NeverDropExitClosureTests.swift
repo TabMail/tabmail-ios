@@ -1363,7 +1363,17 @@ struct NeverDropExitClosureTests {
         "A UID MOVE refused before any mutation stays queued, and the next drain lands it",
         arguments: [
             "No mailbox selected",
-            "[NONEXISTENT] No mailbox selected",
+            // ROUND 3B — this row used to read `[NONEXISTENT] No mailbox
+            // selected`. A LEADING `[NONEXISTENT]` is now a permanent response
+            // code and RETIRES the operation by owner decision, so that world
+            // state moved to
+            // `aMoveRefusedWithAPermanentResponseCodeRetiresWithoutMutation`
+            // and is replaced here by a TRANSIENT code. `UNAVAILABLE` (RFC 5530
+            // §3) describes a condition that clears, so it keeps the round-3
+            // property this test exists for, and it keeps the matrix
+            // non-vacuous about codes: a coded refusal that is NOT in the
+            // permanent set must still stay queued.
+            "[UNAVAILABLE] Backend temporarily unavailable",
             "UID not found",
         ])
     @MainActor
@@ -1482,7 +1492,17 @@ struct NeverDropExitClosureTests {
         "A UID MOVE refused into a destination an exact LIST omits stays queued, and the next drain lands it",
         arguments: [
             "No mailbox selected",
-            "[NONEXISTENT] No mailbox selected",
+            // ROUND 3B — this row used to read `[NONEXISTENT] No mailbox
+            // selected`. A LEADING `[NONEXISTENT]` is now a permanent response
+            // code and RETIRES the operation by owner decision, so that world
+            // state moved to
+            // `aMoveRefusedWithAPermanentResponseCodeRetiresWithoutMutation`
+            // and is replaced here by a TRANSIENT code. `UNAVAILABLE` (RFC 5530
+            // §3) describes a condition that clears, so it keeps the round-3
+            // property this test exists for, and it keeps the matrix
+            // non-vacuous about codes: a coded refusal that is NOT in the
+            // permanent set must still stay queued.
+            "[UNAVAILABLE] Backend temporarily unavailable",
             "UID not found",
         ])
     @MainActor
@@ -1567,6 +1587,257 @@ struct NeverDropExitClosureTests {
         #expect(
             afterRetryDrain.isEmpty,
             "the op did not retire after the move actually landed: \(afterRetryDrain.map(\.type))")
+        #expect(server.wrongMessageViolations().isEmpty)
+
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    // MARK: - #115 round 3b — a response code that says "never" retires the op
+
+    /// GitHub #115 round 3b, and the case the OWNER decided on 2026-09-05: *"if
+    /// server has deleted folder, we should retire that op"*, *"if server says op
+    /// is broken, we should retire it. and then later on full sync would catch
+    /// that back"*.
+    ///
+    /// A conforming server whose MOVE destination has genuinely been deleted
+    /// answers `NO [TRYCREATE] …` (RFC 3501 §6.4.7, carried onto MOVE by RFC 6851
+    /// §3.3). Unlike the LIST omission its sibling above is about, that is a
+    /// POSITIVE statement the server chose to make about the command it just
+    /// refused, so it is provider authority and never-drop exit 2.
+    ///
+    /// THE PROPERTY, and it is an end state, not a mechanism: after ONE drain the
+    /// queue is EMPTY, the message is still in the SOURCE mailbox on the server,
+    /// and the refusal cost zero wire mutation — no `UID COPY`, no `\Deleted`
+    /// STORE, no EXPUNGE, no wrong-message mutation. Nothing here asserts which
+    /// error type was thrown, which catch arm ran, or how many commands it took.
+    /// The message surviving in the source is the half that makes retiring
+    /// SAFE: the local optimistic row is reclaimed by the next sync of that
+    /// folder, so the cost is a stale row and never a lost message.
+    ///
+    /// `markMailboxDeleted` is the fixture rather than `failNextCommand` because
+    /// this is the WORLD STATE the owner decided about — a destination that is
+    /// really gone — and the fake answers `UID MOVE` into a deleted mailbox with
+    /// the `[TRYCREATE]` shape a conforming server sends. `includeNonexistentCode`
+    /// governs only the SELECT/LIST responses, which the atomic route never
+    /// issues for a destination, so the MOVE refusal is identical either way.
+    ///
+    /// RED PROOF (recorded, #115 round 3b): on the parent `f9dcd71ec` the op is
+    /// still queued after the drain —
+    /// `Expectation failed: (afterDrain.map(\.id) → [move.id]).isEmpty`, i.e.
+    /// `a UID MOVE the server refused with a permanent response code …` — because
+    /// round 3 routed every refusal, coded or not, to the lane-local park.
+    @Test("A UID MOVE refused with [TRYCREATE] because the destination was deleted retires with zero mutation")
+    @MainActor
+    func aMoveRefusedIntoADeletedDestinationRetiresWithoutMutation() async throws {
+        let target = "atomic-deleted-destination@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 77, id: target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Archive")
+        // The destination is genuinely gone: `UID MOVE` into it is answered
+        // `NO [TRYCREATE] UID MOVE destination does not exist`, every time.
+        server.markMailboxDeleted("Archive", includeNonexistentCode: false)
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "closure-atomic-deleted-destination")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let move = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        try insert([move], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // NON-VACUITY: the atomic MOVE really was issued and really was refused
+        // by the destination-deleted branch, so what follows is about the
+        // refusal and not about a fixture that never got that far.
+        let commands = server.recordedCommands().map { $0.uppercased() }
+        #expect(
+            commands.contains { $0.contains("UID MOVE") && $0.contains("ARCHIVE") },
+            "the atomic UID MOVE never reached the wire: \(commands)")
+
+        // THE PROPERTY — the operation retired.
+        let afterDrain = try operations(f.pool)
+        #expect(
+            afterDrain.isEmpty,
+            """
+            a UID MOVE the server refused with a permanent response code is still queued. The \
+            server said the command can never succeed as issued, so retrying it forever parks the \
+            lane and holds every same-lane successor behind it — still queued: \
+            \(afterDrain.map { "\($0.type):retry \($0.retryCount)" })
+            """)
+
+        // …and it retired on evidence, having mutated NOTHING: the message is
+        // still in the source, so the next sync of that folder reclaims the
+        // local row and the user's mail is where it always was.
+        let inbox = server.messageIDs(in: "INBOX")
+        #expect(
+            inbox == ["<\(target)>"],
+            "the refused move must leave the message in the source mailbox: \(inbox)")
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+        #expect(server.flags(in: "INBOX", uid: 77).isEmpty)
+        #expect(commands.filter { $0.contains("UID COPY") }.isEmpty)
+        #expect(commands.filter { $0.contains("UID STORE") && $0.contains("\\DELETED") }.isEmpty)
+        #expect(commands.filter { $0.contains("EXPUNGE") }.isEmpty)
+        #expect(server.wrongMessageViolations().isEmpty)
+
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// GitHub #115 round 3b — the same property as the test above, for the codes
+    /// a server sends WITHOUT having deleted anything. `NOPERM`, `CANNOT` and
+    /// `NONEXISTENT` are RFC 5530 §3 response codes, and each of them says the
+    /// command cannot succeed as issued: no permission for this operation, the
+    /// operation is not allowed, the named mailbox does not exist. By the same
+    /// owner decision they retire the operation.
+    ///
+    /// Parameterised because the property is about the CLASS of code, not about
+    /// any one of them, and because a set that quietly lost a member would
+    /// otherwise pass. Its complement is pinned by the two round-3 matrices,
+    /// which now carry the transient `[UNAVAILABLE]` and stay queued.
+    ///
+    /// The refusal is injected with `failNextCommand`, which answers BEFORE the
+    /// fake's MOVE handler runs, so every one of these mutates nothing at all —
+    /// the world state that makes retiring safe rather than a guess.
+    ///
+    /// RED PROOF (recorded, #115 round 3b): on the parent `f9dcd71ec` all three
+    /// arguments fail the same way — the op is still queued after the drain,
+    /// `Expectation failed: (afterDrain.map(\.id) → [move.id]).isEmpty`.
+    @Test(
+        "A UID MOVE refused with a permanent RFC 5530 response code retires with zero mutation",
+        arguments: [
+            "[NOPERM] Permission denied",
+            "[CANNOT] Policy forbids this move",
+            "[NONEXISTENT] No such mailbox",
+        ])
+    @MainActor
+    func aMoveRefusedWithAPermanentResponseCodeRetiresWithoutMutation(
+        refusal: String
+    ) async throws {
+        let target = "atomic-permanent-code@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 77, id: target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Archive")
+        server.failNextCommand(containing: "UID MOVE", message: refusal)
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        // One account id per argument so no per-account state in the shared
+        // manager can leak between the serialized cases.
+        let f = try fixture(
+            accountId: "closure-atomic-permanent-" + refusal.lowercased().filter(\.isLetter))
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let move = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        try insert([move], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // NON-VACUITY: the MOVE reached the wire and the injected refusal is
+        // what answered it.
+        let commands = server.recordedCommands().map { $0.uppercased() }
+        #expect(
+            commands.contains { $0.contains("UID MOVE") && $0.contains("ARCHIVE") },
+            "the atomic UID MOVE never reached the wire: \(commands)")
+        #expect(server.consumedInjectedFailureCount() == 1)
+
+        // THE PROPERTY — retired, with the message untouched in the source.
+        let afterDrain = try operations(f.pool)
+        #expect(
+            afterDrain.isEmpty,
+            """
+            a UID MOVE the server refused with a permanent response code is still queued. The \
+            server said the command can never succeed as issued, so retrying it forever parks the \
+            lane and holds every same-lane successor behind it — still queued: \
+            \(afterDrain.map { "\($0.type):retry \($0.retryCount)" })
+            """)
+        let inbox = server.messageIDs(in: "INBOX")
+        #expect(
+            inbox == ["<\(target)>"],
+            "the refused move must leave the message in the source mailbox: \(inbox)")
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+        #expect(server.flags(in: "INBOX", uid: 77).isEmpty)
+        #expect(commands.filter { $0.contains("UID COPY") }.isEmpty)
+        #expect(commands.filter { $0.contains("UID STORE") && $0.contains("\\DELETED") }.isEmpty)
+        #expect(commands.filter { $0.contains("EXPUNGE") }.isEmpty)
+        #expect(server.wrongMessageViolations().isEmpty)
+
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// GitHub #115 round 3b — the STRUCTURE half, and the reason the extractor is
+    /// not a substring search.
+    ///
+    /// RFC 3501 §7.1 defines `resp-text = ["[" resp-text-code "]" SP] text`: a
+    /// response code is a protocol statement ONLY in the leading position. The
+    /// same word inside the server's human sentence is prose. A server that
+    /// answers `NO Move refused, see [TRYCREATE] semantics` is explaining itself,
+    /// not invoking §6.4.7, and reading that as authority would let a server's
+    /// wording retire a user's intention — the #115 defect class exactly, entered
+    /// through the newest door.
+    ///
+    /// THE PROPERTY: such a refusal keeps the round-3 disposition — still queued
+    /// after the refused drain, nothing mutated — and the next drain lands it.
+    /// Its unit-level counterpart, over the exact rendered shapes SwiftMail
+    /// produces, is `IMAPMoveWireContractTests.leadingResponseCodeIsReadStructurally`;
+    /// these two are the fragile-contract pins for that rendering.
+    @Test("A refusal that mentions a response code later in its human text is not a response code")
+    @MainActor
+    func aRefusalWhoseHumanTextMentionsACodeLaterStaysQueued() async throws {
+        let target = "atomic-code-in-prose@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 77, id: target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Archive")
+        // The word appears, but NOT as a leading `resp-text-code`.
+        server.failNextCommand(
+            containing: "UID MOVE", message: "Move refused, see [TRYCREATE] semantics")
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "closure-atomic-code-in-prose")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let move = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        try insert([move], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(server.consumedInjectedFailureCount() == 1)
+        let afterRefusedDrain = try operations(f.pool)
+        #expect(
+            afterRefusedDrain.map(\.id) == [move.id],
+            """
+            a response code named in the middle of the server's human text retired the durable \
+            move. RFC 3501 §7.1 puts a resp-text-code only at the START of the response text, so \
+            this is the server's prose and not an assertion it can never perform the command — \
+            remaining ops: \(afterRefusedDrain.map(\.type))
+            """)
+        #expect(server.messageIDs(in: "INBOX") == ["<\(target)>"])
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+
+        // And it is genuinely re-attemptable, not merely undropped.
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
+        #expect(server.messageIDs(in: "INBOX").isEmpty)
+        #expect(try operations(f.pool).isEmpty)
         #expect(server.wrongMessageViolations().isEmpty)
 
         try? await provider.disconnect()
