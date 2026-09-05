@@ -213,25 +213,38 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
     /// Block the NEXT `/move` inside the route until the returned closure is
     /// called. One-shot: a later move is not held.
     ///
-    /// The wait happens on whatever thread `URLProtocol.startLoading()` runs on,
-    /// which is NOT the thread the test runs on, so the release closure can be
-    /// called from the test body. It is deliberately BOUNDED: a test that forgets
-    /// to release must fail on its own assertion, not hang the suite forever, and
+    /// The wait happens inside the parked closure the `/move` route hands to
+    /// `FakeHTTP.CannedResponse.parked`, which the transport evaluates on a
+    /// BACKGROUND QUEUE — not on the loader thread `URLProtocol.startLoading()`
+    /// runs on, and not on the test's thread, so the release closure can be
+    /// called from the test body and every other route keeps being served while
+    /// this move waits. It is deliberately BOUNDED: a test that forgets to
+    /// release must fail on its own assertion, not hang the suite forever, and
     /// the bound is comfortably inside `SyncConfig.pendingOperationTimeoutSeconds`
     /// (15 s) so a held move never becomes a queue TIMEOUT — which would change
     /// what the test is measuring from "ordering" to "timeout handling".
     ///
     /// ⚠️ THIS IS A HOLD, NOT AN OVERLAP DETECTOR, AND THIS FIXTURE HAS NO
-    /// OVERLAP DETECTOR — deliberately, because it cannot have a truthful one.
-    /// An earlier revision added a `movesInFlight`/`maxMovesInFlight` counter
-    /// sampled inside the `/move` route, plus a positive control that parked one
-    /// move and drove a second concurrently. The control FAILED: peak stayed at
-    /// `1` across a 3 s window (`i114-iso1.log`, 2026-09-05). `URLProtocol`-backed
-    /// transports do not admit a second request into the route while an earlier
-    /// one blocks inside `startLoading()`, so a route-level `overlapObserved ==
-    /// false` here says nothing about whether the QUEUE serialized — it is the
-    /// transport's own behaviour, and asserting on it would have been vacuous in
-    /// exactly the direction the assertion was supposed to exclude.
+    /// OVERLAP DETECTOR — deliberately. An earlier revision added a
+    /// `movesInFlight`/`maxMovesInFlight` counter sampled inside the `/move`
+    /// route, plus a positive control that parked one move and drove a second
+    /// concurrently. The control FAILED: peak stayed at `1` across a 3 s window
+    /// (`i114-iso1.log`, 2026-09-05).
+    ///
+    /// ⚠️ THAT MEASUREMENT WAS OF THE OLD, BLOCKING HOLD, AND ITS STATED REASON IS
+    /// NOW STALE. It concluded that `URLProtocol`-backed transports do not admit a
+    /// second request while an earlier one blocks inside `startLoading()`. What
+    /// was actually true is that the hold ITSELF occupied the loader thread, and
+    /// whether a concurrent request got a loader thread of its own was a
+    /// scheduling race — measured 3 red in 8 runs of the failed-account requeue
+    /// test, which needs a DIFFERENT route served while a move is parked. Parking
+    /// the response off the loader thread removed that race, so a second request
+    /// IS now served while a move is held. The conclusion nevertheless stands for
+    /// the reason the counter was removed: a route-level `overlapObserved` still
+    /// measures the transport's scheduling, not whether the QUEUE serialized, so
+    /// asserting on it would be vacuous in exactly the direction the assertion was
+    /// supposed to exclude — and a counter that now reports overlap would be worse
+    /// than one that never did, because it would look like evidence.
     ///
     /// The overlap oracle for the drain therefore lives one layer up, where
     /// concurrency is real: `AccountManagerQueueDrainTests`'

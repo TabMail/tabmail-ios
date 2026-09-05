@@ -255,10 +255,15 @@ struct OutlookQueueHandoffTests {
         let f = try fixture(accountId: "graph-handoff-follower")
         let seeded = try seedHeader(f, graphId: "graph-1", rfc: rfc)
 
-        // OFFLINE: no provider is registered yet, so both gestures queue without
+        // NO PROVIDER IS REGISTERED YET, so both gestures queue without
         // executing — the shape a user produces on a plane, and the only shape in
         // which a follower is guaranteed to be in the same drain pass as its
-        // predecessor.
+        // predecessor. ("OFFLINE" here means exactly that and nothing about
+        // connectivity: `NetworkMonitor.checkConnected()` is `true` throughout the
+        // test process, because nothing calls `NetworkMonitor.shared.start()` and
+        // its backing mutex keeps its `true` default. The drain's connectivity
+        // guard always passes; the claim loop's `providers[op.accountId] != nil`
+        // is what holds these gestures.)
         await AccountManager.shared.move([seeded], to: Self.firstDestination)
         let optimistic = try rows(f)
         #expect(optimistic.count == 1)
@@ -550,8 +555,9 @@ struct OutlookQueueHandoffTests {
         let f = try fixture(accountId: "graph-handoff-halt")
         let seeded = try seedHeader(f, graphId: "graph-1", rfc: rfc)
 
-        // OFFLINE: move, then two flag gestures, so the lane has something BEHIND
-        // the operation that fails.
+        // NO PROVIDER REGISTERED YET (see T1 for why that, not connectivity, is
+        // what "offline" means here): move, then two flag gestures, so the lane
+        // has something BEHIND the operation that fails.
         await AccountManager.shared.move([seeded], to: Self.firstDestination)
         let optimistic = try rows(f)
         #expect(optimistic.count == 1)
@@ -639,19 +645,42 @@ struct OutlookQueueHandoffTests {
     /// That arm is reached only when a SECOND lane is still mid-flight when the
     /// first one fails, and on Graph a second lane exists only because the lane
     /// key is `(account, message id)` — two different messages, two lanes, run
-    /// concurrently. The schedule is produced with the fixture's existing seams
-    /// and is deterministic in both directions:
+    /// concurrently. The schedule is produced with the fixture's existing seams:
     ///  - the handoff lane cannot advance past its move, because `holdNextMove`
-    ///    parks it inside the route;
-    ///  - the failure lane's `failNextPatch` is therefore consumed by the only
-    ///    PATCH that can reach the wire while the move is parked;
+    ///    parks it in the route (off the transport's loader thread, so lane B's
+    ///    PATCH is still served while it waits);
+    ///  - the failure lane's `failNextPatch` is therefore consumed by that PATCH;
     ///  - and the release waits on a strict HAPPENS-AFTER of the account being
     ///    marked failed: `failedAccounts.insert` precedes the `.haltLane`
     ///    requeue of the rest of that lane, so observing the second failure-lane
     ///    operation back at `queued` proves the flag is already set.
     ///
-    /// The oracle is the ADDRESS the follower carries and where it lands, never
-    /// "the arm was taken" (`MIS-015`).
+    /// 🚨 THE MID-DRAIN STATE IS NOT OBSERVABLE, AND THIS TEST NO LONGER READS
+    /// IT. It used to assert, after `release()`, that the held-back follower was
+    /// sitting `queued` at the proven address with no retry charged. There is no
+    /// barrier that can pin that state, for two independent reasons.
+    /// *First*, `await drain.value` is not one: every gesture above spawns its
+    /// own `Task { await drainPendingQueue() }`, so when one of those is still in
+    /// flight the explicit call finds `isDraining` set, records `needsRedrain`
+    /// and returns immediately — the task this test awaits can complete while the
+    /// real drain is still parking the move.
+    /// *Second*, even when the explicit drain IS the real one, any gesture drain
+    /// that arrived during it set `needsRedrain`, and the redrain that follows
+    /// EXECUTES the requeued follower — so "requeued but not yet executed" is
+    /// transient BY DESIGN and a test that waits for it longer only makes the
+    /// window more likely to have passed.
+    ///
+    /// What remains is monotonic, and it is the same property: the wire record is
+    /// append-only, so "no PATCH ever named `graph-1`" cannot be un-observed once
+    /// true, and it is exactly what a requeue that wrote the pre-handoff snapshot
+    /// back would violate — the follower would go out at the invalidated id,
+    /// Graph would answer 404, and the single-message conflict arm would delete
+    /// the user's gesture. The non-vacuity that the arm actually ran stays: the
+    /// move really was parked, and lane B's trailer really did come back to
+    /// `queued`, which is downstream of `failedAccounts.insert`.
+    ///
+    /// The oracle is the ADDRESS the follower reaches the wire at and where it
+    /// lands, never "the arm was taken" (`MIS-015`).
     @Test("Outlook: an operation requeued because another lane failed the account keeps the address the wire proved")
     @MainActor
     func aFailedAccountRequeueDoesNotRevertTheHandoff() async throws {
@@ -667,7 +696,12 @@ struct OutlookQueueHandoffTests {
         let handoffSeed = try seedHeader(f, graphId: "graph-1", rfc: handoffRfc)
         let unrelatedSeed = try seedHeader(f, graphId: "graph-2", rfc: unrelatedRfc)
 
-        // OFFLINE, so every gesture is durably queued before any of them runs.
+        // NO PROVIDER IS REGISTERED YET, so every gesture is durably queued
+        // before any of them runs. (`NetworkMonitor.checkConnected()` is `true`
+        // in the test process — nothing calls `NetworkMonitor.shared.start()`, so
+        // its mutex keeps its `true` default — and the drain's connectivity guard
+        // therefore always passes. What holds these gestures back is the claim
+        // loop's `providers[op.accountId] != nil`, not connectivity.)
         // LANE A (graph-1): a move, then a follower that must inherit its address.
         await AccountManager.shared.move([handoffSeed], to: Self.firstDestination)
         let optimistic = try rows(f).filter { $0.rfc822MessageId == handoffRfc }
@@ -679,7 +713,7 @@ struct OutlookQueueHandoffTests {
         await AccountManager.shared.markFlagged([unrelatedSeed], flagged: true)
         await AccountManager.shared.markRead([unrelatedSeed])
         #expect(try queuedOperationCount(f) == 4,
-                "all four gestures must be queued offline, or the two lanes do not overlap")
+                "all four gestures must be queued before the provider exists, or the two lanes do not overlap")
 
         let laneBTrailerId = try await f.pool.read { db -> String? in
             try PendingOperation.fetchAll(db).first {
@@ -713,12 +747,20 @@ struct OutlookQueueHandoffTests {
             follower does not take the requeue arm this test exists for
             """)
 
+        // NON-VACUITY, the second half: the move really was PARKED, so lane A
+        // really was held across lane B's failure. `heldMoveCount` is monotonic
+        // and one-shot, so this cannot be satisfied by a later move.
+        #expect(server.heldMoveCount() == 1, """
+            the move was not parked exactly once (\(server.heldMoveCount())), so \
+            lane A was not held across lane B's failure
+            """)
+
         release()
         _ = await drain.value
+        try await drainToQuiescence(f)
 
-        // PHASE 1 — inside the drain that marked the account failed. The follower
-        // was requeued rather than executed, and the requeue must have preserved
-        // the address the move's retirement had just committed.
+        // NON-VACUITY, wire side: the move landed and Graph reallocated the id,
+        // so a requeue that reverted the address had a dead id to fail on.
         #expect(serverFolders(server, rfc: handoffRfc) == [Self.firstDestination],
                 "the move did not land, so there is no handoff for the requeue to revert")
         #expect(server.snapshot(providerMessageId: "graph-1") == nil,
@@ -727,28 +769,26 @@ struct OutlookQueueHandoffTests {
         #expect(proven != nil && proven != "graph-1")
         guard let proven else { return }
 
-        let surviving = try await f.pool.read { db in try PendingOperation.fetchAll(db) }
-        let addresses = surviving.map { "\($0.type.rawValue)=\($0.messageIdsJSON)" }
-        let held = surviving.filter { $0.messageIds == [proven] }
-        #expect(held.count == 1, """
-            the follower is not addressed by the id the wire proved (\(proven)): \
-            \(addresses). A requeue that wrote the lane's pre-handoff snapshot back \
-            would leave it at graph-1, where the next drain 404s and the \
-            single-message conflict arm deletes the user's gesture.
+        // THE ORACLE — the wire record, which is append-only and therefore the
+        // only thing about this drain that can be read after the fact. A requeue
+        // that wrote the lane's pre-handoff snapshot back would leave the follower
+        // at `graph-1`; the next pass would PATCH that id, Graph would answer 404,
+        // and the single-message conflict arm would delete the user's gesture. So
+        // the misaddressed PATCH is the observable, not the row state that
+        // preceded it.
+        let patches = server.http.servedCallSequence().filter { $0.hasPrefix("PATCH ") }
+        let misaddressed = patches.filter { $0.hasSuffix("/graph-1") }
+        #expect(misaddressed.isEmpty, """
+            the follower requeued by the failed-account arm went out at the address \
+            the move invalidated: \(misaddressed). The requeue wrote the lane's \
+            pre-handoff snapshot back over the committed address.
             """)
-        guard held.count == 1 else { return }
-        #expect(held[0].status == PendingStatus.queued.rawValue,
-                "an operation held back by another lane's failure must be left retryable, not inFlight")
-        #expect(held[0].everAttempted == true, "the claim's durable proof stands across a requeue")
-        #expect(held[0].retryCount == 0, """
-            a retry was charged for a failure on a DIFFERENT operation — got \
-            \(held[0].retryCount)
+        let handoffPatches = patches.filter { $0.hasSuffix("/\(proven)") }
+        #expect(handoffPatches.count == 1, """
+            the follower did not reach the wire exactly once at the proven id \
+            (\(proven)): \(patches)
             """)
-        #expect(server.snapshot(providerMessageId: proven)?.isRead == false,
-                "the follower executed anyway while the account was marked failed")
 
-        // PHASE 2 — a healthy drain. Every gesture lands, at the proven address.
-        try await drainToQuiescence(f)
         let final = liveId(server, rfc: handoffRfc)
         #expect(final == proven, "the message moved again after the handoff, so the oracle below is not the one under test")
         try expectGesturePreservedAndExecuted(
@@ -842,7 +882,7 @@ struct OutlookQueueHandoffTests {
         let f = try fixture(accountId: "graph-handoff-retained")
         let seeded = try seedHeader(f, graphId: "graph-1", rfc: rfc)
 
-        // OFFLINE, so the follower is guaranteed to be claimed in the SAME pass
+        // NO PROVIDER REGISTERED YET (see T1), so the follower is guaranteed to be claimed in the SAME pass
         // as the move it is queued behind — the shape in which the lane's
         // serialization promise is what makes the handoff load-bearing.
         await AccountManager.shared.move([seeded], to: Self.firstDestination)
@@ -1012,7 +1052,7 @@ struct OutlookQueueHandoffTests {
         let f = try fixture(accountId: "graph-handoff-read-fault")
         let seeded = try seedHeader(f, graphId: "graph-1", rfc: rfc)
 
-        // OFFLINE, so the move and BOTH followers are in the same drain pass and
+        // NO PROVIDER REGISTERED YET (see T1), so the move and BOTH followers are in the same drain pass and
         // therefore in the same account-qualified lane.
         await AccountManager.shared.move([seeded], to: Self.firstDestination)
         let optimistic = try rows(f)
