@@ -742,4 +742,49 @@ struct StatefulExchangeActionServerTests {
         #expect(server.snapshot(providerMessageId: "graph-perm-1")?.isRead == true,
                 "clearing the permanent fault did not restore ordinary service")
     }
+
+    /// `failMoveOnce(providerMessageId:)` fails ONE named member of a batch move
+    /// and lets the members around it through, which is the only way this
+    /// fixture can produce a PARTIAL `MoveOutcome`.
+    ///
+    /// Both sides are asserted because they fail in opposite directions: a seam
+    /// that failed the whole batch would leave `provenIds` empty and the caller
+    /// would rethrow (no partial retirement at all), and a seam that fired for
+    /// the wrong member would prove the LATER one instead. Its one-shot-ness is
+    /// asserted too — a budget that outlived the batch would make the retry that
+    /// every calling test depends on fail as well.
+    @Test("failMoveOnce fails exactly the named member of a batch move, once")
+    func failMoveOnceTargetsOneMemberOfABatch() async throws {
+        let firstRfc = "fail-move-once-a@example.com"
+        let secondRfc = "fail-move-once-b@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: firstRfc, providerMessageId: "graph-batch-a", folderId: "source"),
+            .init(rfc822MessageId: secondRfc, providerMessageId: "graph-batch-b", folderId: "source"),
+        ])
+        defer { server.close() }
+        let provider = server.provider()
+
+        server.failMoveOnce(providerMessageId: "graph-batch-b")
+        let partial = try await provider.moveProvingDestinations(
+            ids: ["graph-batch-a", "graph-batch-b"], from: "source", to: "archive")
+
+        #expect(partial.provenIds == ["graph-batch-a"], """
+            the seam did not fail exactly the named member: proven=\(partial.provenIds)
+            """)
+        #expect(partial.provenDestinations.count == 1)
+        guard partial.provenDestinations.count == 1 else { return }
+        #expect(partial.provenDestinations[0].sourceProviderId == "graph-batch-a")
+        #expect(server.snapshots(rfc822MessageId: firstRfc).map(\.folderId) == ["archive"],
+                "the member that was NOT failed did not move")
+        #expect(server.snapshots(rfc822MessageId: secondRfc).map(\.folderId) == ["source"],
+                "the failed member moved anyway, so the fault applied an effect")
+        #expect(server.snapshot(providerMessageId: "graph-batch-b") != nil,
+                "the failed member's id was reallocated even though its move failed")
+
+        // One-shot: the retry lands.
+        let retry = try await provider.moveProvingDestinations(
+            ids: ["graph-batch-b"], from: "source", to: "archive")
+        #expect(retry.provenIds == ["graph-batch-b"], "the fault was not one-shot")
+        #expect(server.snapshots(rfc822MessageId: secondRfc).map(\.folderId) == ["archive"])
+    }
 }
