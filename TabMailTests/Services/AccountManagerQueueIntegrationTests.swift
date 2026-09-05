@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import SwiftMail
 @testable import TabMail
 
 /// Integration tests for AccountManagerQueue drain flow patterns.
@@ -188,6 +189,29 @@ struct AccountManagerQueueIntegrationTests {
         let error = NSError(domain: "IMAP", code: 0, userInfo: [NSLocalizedDescriptionKey: "NONEXISTENT mailbox"])
         let result = AccountManager.shared.isMessageNotFoundError(error)
         #expect(result == true)
+    }
+
+    /// GitHub #115 (round 2). SwiftMail raises
+    /// `IMAPError.moveFailedAfterPossiblePartialCompletion` for ANY tagged
+    /// NO/BAD on `UID MOVE` with no retained `COPYUID`, and its payload IS the
+    /// server's raw tagged response text. The queue must never read that error
+    /// as provider-authoritative "already gone", whatever the text says — a
+    /// refusal is an absence of evidence and stays queued. The payload here
+    /// deliberately carries BOTH an RFC 5530 `[NONEXISTENT]` code and the words
+    /// `UID not found`, i.e. two of the classifier's text-fallback fragments at
+    /// once. The `NSError` text cases above are unchanged: raw server text
+    /// reaching the queue on any OTHER error shape is still classified as before.
+    @Test("isMessageNotFoundError and isConfirmedGoneError are false for the typed no-COPYUID MOVE refusal, whatever its response text")
+    @MainActor
+    func typedNoCopyUIDMoveRefusalIsNeverMessageNotFound() {
+        let error = IMAPError.moveFailedAfterPossiblePartialCompletion(
+            "no([NONEXISTENT] UID not found)")
+        #expect(
+            AccountManager.shared.isMessageNotFoundError(error) == false,
+            "a tagged NO with no COPYUID was classified as message-not-found on its response text: \(error)")
+        #expect(
+            AccountManager.shared.isConfirmedGoneError(error) == false,
+            "a tagged NO with no COPYUID was classified as confirmed-gone: \(error)")
     }
 
     @Test("isMessageNotFoundError returns false for connection error")

@@ -26,6 +26,14 @@ retryable refusal again: it falls to the generic catch in `AccountManager.execut
 operation is requeued (`status = queued`, `retryCount += 1`) and the account lane halts for that
 drain. Only the `COPYUID`-bearing form, `moveFailedAfterPartialCompletion(copyUID:)`, retires the
 source members without retry, because it carries positive evidence that the destination copy exists.
+Round 2 (2026-09-04): because the typed error's payload is the server's raw tagged response text and
+`AccountManager.isMessageNotFoundError` runs BEFORE the generic catch with a substring fallback on
+the error's description, the classifier now structurally exempts
+`moveFailedAfterPossiblePartialCompletion` from that fallback, so the generic requeue arm is reached
+for every response text (pinned by
+`NeverDropExitClosureTests.aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt(refusal:)` over
+`No mailbox selected` / `[NONEXISTENT] No mailbox selected` / `UID not found`, and by
+`AccountManagerQueueIntegrationTests.typedNoCopyUIDMoveRefusalIsNeverMessageNotFound`).
 
 ## Subsystem and search terms
 
