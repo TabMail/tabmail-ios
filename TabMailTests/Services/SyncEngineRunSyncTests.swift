@@ -1862,6 +1862,16 @@ struct SyncEngineUpsertInsertedIdSummaryTests {
         #expect(elidedFromString + cap == total,
                 "elided(\(elidedFromString)) + cap(\(cap)) must equal total(\(total))")
     }
+
+    @Test("Empty input renders the zero-insert line verbatim — total 0, no ids, no overflow suffix, trailing separator retained")
+    func emptyInputRendersZeroInsertLineVerbatim() {
+        let summary = SyncEngine.upsertInsertedIdSummary([])
+        // Exact string, trailing space included: `"inserted \(0) header(s): "`
+        // + `""` (no ids) + `""` (no overflow). A phantom id, a clamped
+        // count, or a dropped separator each changes this text.
+        #expect(summary == "inserted 0 header(s): ")
+        #expect(!summary.contains("more)"), "an empty input must not render an overflow suffix: \(summary)")
+    }
 }
 
 // MARK: - A3.6: full-sync upsert diagnostic — real runSyncMessages, [MoveTrace] queue line
@@ -1939,6 +1949,52 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
             for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
             dbPool: PrioritizedDatabase(pool: pool))
         return (result, expectedIds)
+    }
+
+    /// Bound fetch epoch for the update-only fixture. `MockEmailProvider(staleWindowMode: .uid)`
+    /// reports NO epoch unless told to, and `SyncEngine.providerAddressOwnershipProven`
+    /// (`.uid` arm) refuses any existing-row merge without an epoch > 0 — the row would
+    /// take the "merge REFUSED" no-op branch and its read flag would never change. With
+    /// the epoch bound, the canonical PK carries the proof and the row is UPDATED,
+    /// exactly as `MessageHeaderObservationEpochTests.canonicalUpdateReplacesEpoch`.
+    private static let updateOnlyFetchEpoch: UInt32 = 101
+
+    /// Update/no-op-only pass: account + one inbox folder + ONE pre-existing
+    /// header (unread), then the mock serves the SAME message with `isRead: true`.
+    /// `newHeaders` is therefore EMPTY while `upsUpdated > 0` — the branch of the
+    /// diagnostic's condition that emits `inserted 0 header(s): `.
+    private func runFullSyncUpdateOnly(
+        pool: DatabasePool, accountId: String, folderName: String
+    ) async throws -> (result: SyncEngine.SyncMessagesResult, existingId: String) {
+        let folderPath = "INBOX"
+        let existingId = "\(accountId):\(folderPath):hdr-0"
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        try await pool.write { db in
+            var acc = Account(emailAddress: "\(accountId)@example.com", displayName: "T", provider: .imap)
+            acc.id = accountId
+            try acc.insert(db)
+            try Folder(name: folderName, path: folderPath, role: .inbox, accountId: accountId).insert(db)
+            var existing = MessageHeader(
+                messageId: "hdr-0", subject: "Test Subject", from: "Alice Smith",
+                fromAddress: "alice@example.com", to: "bob@example.com", date: date,
+                snippet: "Test snippet", folderId: "\(accountId):\(folderPath)",
+                accountId: accountId, folderPath: folderPath, isInInbox: true)
+            existing.rfc822MessageId = "<hdr-0@example.com>"
+            existing.isRead = false
+            try existing.insert(db)
+        }
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "\(accountId):\(folderPath)")! }
+
+        let remote = makeHeaderInfo(
+            messageId: "hdr-0", rfc822MessageId: "<hdr-0@example.com>", date: date, isRead: true)
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setMockedBoundFetchEpoch(Self.updateOnlyFetchEpoch, folderPath: folderPath)
+        await mock.setFetchMessagesResult([remote])
+
+        let result = try await SyncEngine.runSyncMessages(
+            for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
+            dbPool: PrioritizedDatabase(pool: pool))
+        return (result, existingId)
     }
 
     /// Every `[MoveTrace] fullSync upsert[<folderName>] — …` entry on the
@@ -2118,6 +2174,78 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
                 try MessageHeader.filter(Column("folderId") == "\(accountId):INBOX").fetchAll($0).map(\.id)
             }
             #expect(Set(dbIds) == Set(expectedIds))
+        }
+    }
+
+    // MARK: - Update/no-op-only pass — the zero-insert line is still emitted
+
+    @Test("Update-only pass (no inserts) — exactly one line, total 0, no ids, no overflow suffix; the pre-existing row is updated in place")
+    func fullSyncUpsertLogsZeroInsertedHeadersOnUpdateOnlyPass() async throws {
+        try await withTempLogAndDebugGate(enabled: true) {
+            let (pool, dir) = try makePool()
+            defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+            let accountId = "upsert-updateonly"
+            let folderName = "UpdateOnlyFolder"
+            let (result, existingId) = try await runFullSyncUpdateOnly(
+                pool: pool, accountId: accountId, folderName: folderName)
+            #expect(result.newHeaders.isEmpty,
+                    "an update-only pass must insert nothing, got \(result.newHeaders.map(\.id))")
+            guard result.newHeaders.isEmpty else { return }
+
+            let queueLog = AppLogStore.read(channel: .queue)
+            let bodies = moveTraceUpsertBodies(in: queueLog, folderName: folderName)
+            #expect(bodies.count == 1, "expected exactly one matching entry, got: \(bodies)")
+            guard bodies.count == 1 else { return }
+            let marker = "[MoveTrace] fullSync upsert[\(folderName)] — "
+            #expect(bodies[0] == marker + "inserted 0 header(s): ",
+                    "the zero-insert line must be rendered verbatim (trailing space included), got: \(bodies[0])")
+            guard let parsed = parseUpsertBody(bodies[0]) else {
+                Issue.record("zero-insert line did not parse: \(bodies[0])")
+                return
+            }
+            #expect(parsed.total == 0)
+            #expect(parsed.renderedIds.isEmpty, "no id may be rendered for an update-only pass, got \(parsed.renderedIds)")
+            #expect(parsed.elided == nil, "an update-only pass must render no overflow suffix")
+
+            // The pre-existing row is still the ONLY row, and it was UPDATED in
+            // place (unread → read, epoch stamped) — the sync really merged.
+            let rows = try await pool.read {
+                try MessageHeader.filter(Column("folderId") == "\(accountId):INBOX").fetchAll($0)
+            }
+            #expect(rows.count == 1, "the pre-existing row must be the only row, got \(rows.map(\.id))")
+            guard rows.count == 1 else { return }
+            #expect(rows[0].id == existingId)
+            #expect(rows[0].isRead == true, "the remote read flag must have been merged into the pre-existing row")
+            #expect(rows[0].observedUidValidity == Int(Self.updateOnlyFetchEpoch))
+        }
+    }
+
+    @Test("Debug gate closed — an update-only pass writes no [MoveTrace] fullSync upsert line, though the row was still updated")
+    func fullSyncUpsertZeroInsertDiagnosticAbsentWhenGateClosed() async throws {
+        try await withTempLogAndDebugGate(enabled: false) {
+            let (pool, dir) = try makePool()
+            defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+            let accountId = "upsert-updateonly-gated"
+            let folderName = "GatedUpdateOnlyFolder"
+            let (result, existingId) = try await runFullSyncUpdateOnly(
+                pool: pool, accountId: accountId, folderName: folderName)
+            #expect(result.newHeaders.isEmpty)
+
+            let queueLog = AppLogStore.read(channel: .queue)
+            #expect(moveTraceUpsertBodies(in: queueLog, folderName: folderName).isEmpty,
+                    "a gate-closed sync must not write the diagnostic: \(queueLog)")
+            #expect(!queueLog.contains(folderName),
+                    "the folder's unique marker must not reach the queue channel while the gate is closed")
+
+            // Non-vacuity: the sync really ran and really merged — the silence
+            // above is the closed gate, not an absent sync.
+            let rows = try await pool.read {
+                try MessageHeader.filter(Column("folderId") == "\(accountId):INBOX").fetchAll($0)
+            }
+            #expect(rows.count == 1)
+            guard rows.count == 1 else { return }
+            #expect(rows[0].id == existingId)
+            #expect(rows[0].isRead == true)
         }
     }
 }
