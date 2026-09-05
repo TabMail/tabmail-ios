@@ -276,9 +276,11 @@ What was done, exactly:
   (`SyncEngineFullSync.swift`) is the reference for how a diagnostic that must survive is written —
   render inside the write, RETURN it, emit after the write returns.
 - **Attribution after the deletion:** the delta arm now writes NO per-message line. A message that
-  reappears is attributed to the delta arm **by elimination** — the full-sync arm always renders its
-  `fullSync upsert[<folder>] — inserted … | reclaimed …` line when it writes, so a reappearance with
-  no such line naming that id did not come from full sync.
+  reappears is attributed to the delta arm **by elimination** — the full-sync arm renders its
+  `fullSync upsert[<folder>] — inserted … | reclaimed …` line when it writes — a heuristic bounded by
+  the 20-id display cap (`SyncEngine.upsertInsertedIdSummary` renders at most 20 ids and elides the
+  rest as `(+N more)`, pinned by `fullSyncUpsertLogsCapPlusOneElidesLastIdButDBHoldsAll`) and by log
+  availability.
 - **Tests:** `GmailDeltaMoveTraceLogTests` keeps all six of its tests and every durable-DB and
   history-cursor assertion; only the expectations that required a `[MoveTrace] deltaSync` line, and
   the now-unused `moveTraceLines` extractor, were removed. No test was added: red-first does not
