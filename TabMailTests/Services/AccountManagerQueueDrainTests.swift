@@ -62,6 +62,18 @@ struct AccountManagerQueueDrainTests {
         try pool.read { db in try PendingOperation.fetchOne(db, key: id) }
     }
 
+    /// Has every registered migration already run on this pool?
+    ///
+    /// Non-`async` on purpose, so `pool.read` resolves to the synchronous
+    /// overload and the `DatabaseMigrator` never has to cross a `@Sendable`
+    /// boundary. Same construction as `AppDatabase.hasPendingMigrationWork`,
+    /// minus the startup-reset half, which is irrelevant to a test pool.
+    private func schemaIsFullyMigrated(_ pool: DatabasePool) throws -> Bool {
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        return try pool.read { db in try migrator.hasCompletedMigrations(db) }
+    }
+
     /// The GAP3 cases exercise lane mechanics with opaque ids. Make their
     /// account explicitly stable-provider-backed so T2.6's IMAP UID/epoch
     /// checkpoint is correctly inapplicable.
@@ -414,6 +426,175 @@ struct AccountManagerQueueDrainTests {
         // THE INVARIANT: the intention survives the crash — the next drain can push.
         #expect(try await admitsAFreshPushAttempt("draft-retry-b@example.com") == true,
                 "a push interrupted by a crash must be retryable after launch recovery")
+    }
+
+    // MARK: - 8c. The startup recovery boundary FAILS CLOSED
+
+    /// A GRDB `TransactionObserver` that REFUSES the commit of any transaction
+    /// which wrote `pendingOperation`, and counts its refusals.
+    ///
+    /// `databaseWillCommit()` throwing makes SQLite's commit hook abort the
+    /// COMMIT, so GRDB rolls back and rethrows to `pool.write`'s caller — the
+    /// same shape a full disk or an I/O error at COMMIT produces, and the same
+    /// shape GRDB's own suspension produces when the app is backgrounded while
+    /// reads keep working (`ADR-IOS-041`). It is a real production possibility,
+    /// not a manufactured writer.
+    ///
+    /// Modelled on the file-private `HeaderCommitRefuser` /`AllWritesRefuser`
+    /// pattern this repo already uses in four test files (`FinishTheMoveLocallyTests`,
+    /// `QueueCoreInvariantTests`, `SyncEngineRunSyncTests`,
+    /// `OutlookQueueHandoffTests`); file-private here exactly as those are,
+    /// because there is no shared test utility for it and this change does not
+    /// invent one.
+    ///
+    /// ARMED EXPLICITLY rather than at registration, and scoped to
+    /// `pendingOperation`, so it cannot refuse anything but the transaction under
+    /// test: the fixture's own seeding writes commit normally, and the migrator's
+    /// bookkeeping is not `pendingOperation` at all. The premise that no
+    /// migration write happens here is nevertheless ASSERTED below rather than
+    /// assumed.
+    private final class QueueRecoveryCommitRefuser: TransactionObserver, Sendable {
+        struct CommitRefused: Error {}
+        private let sawQueueWrite = Mutex(false)
+        private let armed = Mutex(false)
+        let refusals = Mutex(0)
+
+        func arm() { armed.withLock { $0 = true } }
+        func disarm() { armed.withLock { $0 = false } }
+
+        func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
+            eventKind.tableName == PendingOperation.databaseTableName
+        }
+        func databaseDidChange(with event: DatabaseEvent) {
+            sawQueueWrite.withLock { $0 = true }
+        }
+        func databaseWillCommit() throws {
+            guard armed.withLock({ $0 }), sawQueueWrite.withLock({ $0 }) else { return }
+            refusals.withLock { $0 += 1 }
+            throw CommitRefused()
+        }
+        func databaseDidCommit(_ db: Database) {
+            sawQueueWrite.withLock { $0 = false }
+        }
+        func databaseDidRollback(_ db: Database) {
+            sawQueueWrite.withLock { $0 = false }
+        }
+    }
+
+    /// **THE INVARIANT: a database that cannot take the previous-session
+    /// recovery write does not produce a usable `AppDatabase`. The error
+    /// propagates out of the initializer and NO pool is published, so no drain
+    /// can ever release claims into unreconciled state.**
+    ///
+    /// This is a failure semantic the `IOS-GRAPH-005` round-4 move introduced and
+    /// nothing pinned. The old site ran the sweep under `try? await retryWrite`
+    /// and DRAINED ANYWAY when the write failed; the new site calls
+    /// `try Self.recoverPreviousSessionResidue(on: pool)` from
+    /// `AppDatabase.init(pool:runStartupResets:)` and lets the throw out, exactly
+    /// as a failed migration or the observer-seeding write already does. Both
+    /// rewritten startup tests use writable pools and assert only the success
+    /// path, so replacing that `try` with `try?` leaves every other expectation
+    /// in this file green — a stricter contract with no witness.
+    ///
+    /// THE ORACLE IS THE CONSTRUCTION AND THE DURABLE ROWS, never a column the
+    /// recovery would have written (`MIS-015`): the initializer must throw, the
+    /// refusal must actually have fired, and the seeded residue must be
+    /// BYTE-FOR-BYTE where it started, because the recovery is ONE transaction
+    /// and a refused one may leave nothing behind.
+    ///
+    /// TWO-SIDED ON ONE FIXTURE, which is what stops it passing against an
+    /// initializer that always throws: with the refusal lifted, the very same
+    /// pool must construct and the ordinary dispositions must then apply — the
+    /// `inFlight` row back to `queued`, the `cancelled` row gone.
+    @Test("AppDatabase startup recovery fails CLOSED: a refused recovery write throws out of init and publishes no pool")
+    func databaseStartupRecoveryThatCannotCommitRefusesToOpenTheDatabase() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        // Residue seeded AFTER `makeTestDB`, whose own `AppDatabase(dbPool:)` has
+        // already migrated the pool and swept it. The `inFlight` non-move row is
+        // the one whose loss matters: a successful recovery resets it to `queued`
+        // and it retries, so a recovery that silently did not happen strands the
+        // user's gesture in a state no claim loop will ever pick up.
+        let accountId = "acc-startup-failclosed"
+        try await pool.writeWithoutTransaction { db in
+            var account = Account(
+                emailAddress: "\(accountId)@example.com", displayName: "Fail closed",
+                provider: .gmail)
+            account.id = accountId
+            try account.insert(db)
+        }
+        var inFlightOp = PendingOperation(
+            type: .markRead, messageIds: ["msg-failclosed"], accountId: accountId,
+            folderPath: "INBOX")
+        inFlightOp.status = PendingStatus.inFlight.rawValue
+        var cancelledOp = PendingOperation(
+            type: .markUnread, messageIds: ["msg-failclosed-cancelled"], accountId: accountId,
+            folderPath: "INBOX")
+        cancelledOp.status = PendingStatus.cancelled.rawValue
+        try insertOp(inFlightOp, pool: pool)
+        try insertOp(cancelledOp, pool: pool)
+
+        #expect(try fetchOp(inFlightOp.id, pool: pool)?.status == PendingStatus.inFlight.rawValue,
+                "the fixture did not start with the residue this test is about")
+        #expect(try fetchOp(cancelledOp.id, pool: pool)?.status == PendingStatus.cancelled.rawValue,
+                "the fixture did not start with the residue this test is about")
+
+        // THE PREMISE THE REFUSER DEPENDS ON, asserted rather than assumed: the
+        // pool is already fully migrated, so the second `AppDatabase(dbPool:)`
+        // below performs no migration write for the refuser to catch instead of
+        // the recovery transaction.
+        #expect(try schemaIsFullyMigrated(pool), """
+            the pool is NOT fully migrated, so the construction below would run \
+            migrations and this test would be measuring the migrator rather than \
+            the recovery transaction
+            """)
+
+        let refuser = QueueRecoveryCommitRefuser()
+        pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+        refuser.arm()
+
+        // 🚨 THE PROPERTY. `AppDatabase.init` must not hand back a usable
+        // database when the recovery write did not commit.
+        #expect(throws: (any Error).self, """
+            the initializer returned an `AppDatabase` whose previous-session \
+            recovery never committed — `AppStartup` would publish that pool and \
+            the very next drain would release claims into unreconciled state
+            """) {
+            _ = try AppDatabase(dbPool: pool)
+        }
+
+        // NON-VACUITY: it threw because the recovery transaction was REFUSED, not
+        // for some unrelated reason. Exactly one refusal — the recovery is a
+        // single `pool.write` with no retry ladder, deliberately.
+        #expect(refuser.refusals.withLock { $0 } == 1, """
+            the refusal did not land on the recovery transaction exactly once, so \
+            the throw above is not the one this test names: \
+            \(refuser.refusals.withLock { $0 })
+            """)
+
+        // A REFUSED TRANSACTION LEAVES NOTHING BEHIND. The recovery is one
+        // transaction, so a partially-applied sweep would be a worse state than
+        // no sweep at all.
+        let inFlightAfterRefusal = try fetchOp(inFlightOp.id, pool: pool)
+        let cancelledAfterRefusal = try fetchOp(cancelledOp.id, pool: pool)
+        #expect(inFlightAfterRefusal?.status == PendingStatus.inFlight.rawValue, """
+            the refused recovery transaction changed durable state: the inFlight \
+            row is \(inFlightAfterRefusal?.status ?? "<deleted>")
+            """)
+        #expect(cancelledAfterRefusal != nil,
+                "the refused recovery transaction deleted the cancelled row")
+
+        // THE OTHER SIDE, on the same fixture: with writes working the ordinary
+        // dispositions apply. Without this half the test would pass against an
+        // initializer that throws unconditionally.
+        refuser.disarm()
+        _ = try AppDatabase(dbPool: pool)
+
+        #expect(try fetchOp(inFlightOp.id, pool: pool)?.status == PendingStatus.queued.rawValue,
+                "the ordinary recovery disposition did not apply once writes worked again")
+        #expect(try fetchOp(cancelledOp.id, pool: pool) == nil,
+                "the cancelled row survived a recovery that was allowed to commit")
     }
 
     // MARK: - 9. GAP2: MockEmailProvider.setMoveThrowsOnId — partial-batch progress + requeue-then-retry
