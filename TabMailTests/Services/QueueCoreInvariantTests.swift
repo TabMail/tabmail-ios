@@ -548,6 +548,115 @@ struct QueueCoreInvariantTests {
         #expect(after?.status == PendingStatus.queued.rawValue)
     }
 
+    /// **THE PROPERTY: a re-addressed follower keeps EVERY member it named, in
+    /// order, with only the members the wire actually re-addressed rewritten.**
+    ///
+    /// The sibling above proves the handoff reaches the queue with a
+    /// single-member follower, which cannot tell three different rewrites apart:
+    /// "replace the whole array with the mapped ids", "rewrite the first member"
+    /// and "map each member through the proof, pass the rest through" all agree
+    /// on a one-element array whose one element is mapped. They disagree the
+    /// moment a follower names a member the move never touched — the ordinary
+    /// case, because a user selects a set and then acts on part of it.
+    ///
+    /// So this follower names `[untouched, moved-1, moved-2]`: the UNMAPPED
+    /// member comes FIRST, and TWO members are proven. A rewrite that keeps only
+    /// the mapped members silently drops `graph-untouched` — a dropped
+    /// intention. A rewrite that only touches the first member leaves both moved
+    /// ids at addresses Graph has already invalidated, where the follower 404s
+    /// and the single-message conflict arm deletes it.
+    ///
+    /// The follower's own identity is asserted unchanged as well: a re-address
+    /// rewrites an ADDRESS, never the gesture, its folder, or the durable proof
+    /// that it was already claimed once.
+    @Test("Outlook: a re-addressed follower keeps its untouched members, in order, and its claim state")
+    func narrowedRetirementReaddressesOnlyTheMembersTheWireProved() async throws {
+        let fixture = try fixture(
+            accountId: "acc-queue-005-graph-mixed", provider: .outlook,
+            folders: [("INBOX", .inbox, nil), ("Archive", .archive, nil)])
+        defer { finish(fixture) }
+
+        try seedHeader(fixture, messageId: "graph-moved-1", folderPath: "INBOX", epoch: nil)
+        try seedHeader(fixture, messageId: "graph-moved-2", folderPath: "INBOX", epoch: nil)
+        try seedHeader(fixture, messageId: "graph-untouched", folderPath: "INBOX", epoch: nil)
+
+        // The follower the user queued behind the move. It names a member the
+        // move never touched FIRST, then both members the move is about to
+        // reallocate.
+        var follower = PendingOperation(
+            type: .markRead,
+            messageIds: ["graph-untouched", "graph-moved-1", "graph-moved-2"],
+            accountId: fixture.accountId, folderPath: "INBOX", observedUidValidity: nil)
+        follower.everAttempted = true
+        let frozenFollower = follower
+        try insertOp(frozenFollower, fixture)
+
+        var op = PendingOperation(
+            type: .move,
+            messageIds: ["graph-moved-1", "graph-moved-2", "graph-unproven"],
+            accountId: fixture.accountId, folderPath: "INBOX",
+            destinationPath: "Archive", observedUidValidity: nil)
+        op.status = PendingStatus.inFlight.rawValue
+        op.everAttempted = true
+        try insertOp(op, fixture)
+        let frozenOp = op
+
+        await AccountManager.shared.retirePartiallyCompletedOp(
+            frozenOp,
+            provenMembers: ["graph-moved-1", "graph-moved-2"],
+            remaining: ["graph-unproven"],
+            provenDestinations: [
+                ProvenDestinationAddress(
+                    sourceProviderId: "graph-moved-1",
+                    destinationProviderId: "graph-new-1",
+                    destinationUidValidity: nil),
+                ProvenDestinationAddress(
+                    sourceProviderId: "graph-moved-2",
+                    destinationProviderId: "graph-new-2",
+                    destinationUidValidity: nil),
+            ],
+            addressChangesOnMove: true,
+            context: AccountManager.DrainContext())
+
+        let readdressed = try fetchOp(frozenFollower.id, fixture)
+        #expect(readdressed?.messageIds == ["graph-untouched", "graph-new-1", "graph-new-2"], """
+            the re-address did not map member-for-member: observed \
+            \(String(describing: readdressed?.messageIds)). Keeping only the mapped \
+            members drops the user's gesture on graph-untouched; rewriting only the \
+            first member leaves graph-moved-1 and graph-moved-2 at ids Graph has \
+            already invalidated, where the follower 404s and is deleted.
+            """)
+
+        // THE ADDRESS CHANGED — NOTHING ELSE DID. `everAttempted` in particular
+        // is the durable proof that this row was already claimed once; a
+        // re-address that reset it would make the row annihilable again.
+        #expect(readdressed?.type == .markRead, "the re-address rewrote the gesture itself")
+        #expect(readdressed?.folderPath == "INBOX", "the re-address moved the follower's folder")
+        #expect(readdressed?.everAttempted == frozenFollower.everAttempted,
+                "the re-address discarded the durable claim proof")
+        #expect(readdressed?.retryCount == frozenFollower.retryCount,
+                "a retry was charged for a re-address, which is not a failure")
+
+        // The parent keeps EXACTLY its unproven remainder — the two proven
+        // members retired, the third never touched the wire.
+        let after = try fetchOp(frozenOp.id, fixture)
+        #expect(after?.messageIds == ["graph-unproven"])
+        #expect(after?.status == PendingStatus.queued.rawValue)
+
+        // POSITIVE CONTROL for the rows themselves: both proven members answer
+        // to the ids the wire named, and the untouched one does not move.
+        let messageIds = try await fixture.pool.read { db in
+            try MessageHeader
+                .filter(Column("accountId") == fixture.accountId)
+                .fetchAll(db)
+                .map(\.messageId)
+                .sorted()
+        }
+        #expect(messageIds == ["graph-new-1", "graph-new-2", "graph-untouched"], """
+            the re-key did not follow both proven members: \(messageIds)
+            """)
+    }
+
     /// A GRDB `TransactionObserver` that REFUSES the commit of any transaction
     /// which wrote `messageHeader` — the standard GRDB way to force a commit
     /// failure (`databaseWillCommit()` throws → SQLite's commit hook aborts the
