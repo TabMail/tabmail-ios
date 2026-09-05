@@ -110,9 +110,33 @@ because of the lane change. The two are one fix and must not be split.
 4. **The drain stops executing stale values.**
    The lane loop re-reads each operation by primary key immediately before executing it
    (`AccountManager.liveOperation`) and skips it if the row is gone. There is deliberately NO
-   `?? capturedOp` fallback: the only writers that delete a claimed row are cancel and annihilation,
-   both of which are the user withdrawing the intention, so a fallback would resurrect a withdrawn
-   gesture from memory and send it to the wire — a fail-DANGEROUS default.
+   `?? capturedOp` fallback: a fallback would resurrect a withdrawn gesture from memory and send it
+   to the wire — a fail-DANGEROUS default.
+
+   ⚠️ **CORRECTED 2026-09-05 (COR-1), in two places at once.** This item used to say the re-read
+   "skips it if the row is gone", full stop, and justified the missing fallback with "the only
+   writers that delete a claimed row are cancel and annihilation, both of which are the user
+   withdrawing the intention". Both halves were wrong.
+   - **The reason was wrong.** The claim commits `status = inFlight` AND `everAttempted = true` in
+     one transaction, and both the cancel fold and `undoMove`'s annihilation filter require `queued`
+     and `!everAttempted` — so neither can delete a row that has been claimed. The writers that CAN
+     are the local wipes and resets, which never join a running drain:
+     `SettingsView.localIndexWipeTxn` (`DELETE FROM pendingOperation WHERE type != 'saveDraft'`),
+     `AppDataWiper`, `AccountManagerSetup`'s per-account delete, `DemoSeed`'s demo reset, and the
+     UIDVALIDITY-reset sweep. The conclusion survives — those are still the user's NEWER gesture
+     winning over the one the lane captured — but the premise a future reader would reason from did
+     not.
+   - **The behaviour was wrong.** `liveOperation` was `try? await dbPool.read`, so a FAILED read
+     collapsed into the same `nil` an absent row produces and took the skip arm: the operation
+     stayed `inFlight` forever (every later claim loop refuses `inFlight`), its lane kept draining so
+     a later member overtook it, and `reconcilePendingOperations` deleted it at the next launch if it
+     was a `.move`. It is now `async throws`; `nil` means exactly one thing — the row no longer
+     exists — and a read that fails requeues that operation and the rest of its lane with
+     `markQueued`, halts the lane, and charges no retry. "We could not determine the answer" is
+     retryable, never authoritative. Witness:
+     `AccountManagerQueueDrainTests.drainPendingQueueRealFailedPostClaimReReadKeepsTheLaneRetryable`
+     (red-first) and `.drainPendingQueueRealRowDeletedByALocalWipeMidDrainIsSkipped`, which drives
+     the surviving `nil` arm through the real `SettingsView.localIndexWipeTxn`.
 
 5. **Requeues write columns, not structs.**
    The eight drain sites that returned an operation to `queued` by saving a captured struct now call
@@ -166,7 +190,16 @@ and its per-mutation red evidence are in the pull request.
   - **T4** `reDeleteAfterAnUndoIsTheGestureThatWins` — shape 2 end to end; the re-delete built from
     the row after an undo lands, because the row carries the proven address.
   - **T5** `aLaneHaltDoesNotRevertTheHandoff` — a lane that halts mid-drain resumes at the proven
-    addresses, not at its snapshot's.
+    addresses, not at its snapshot's. Its three-PATCH count proves the halt happened; the ADDRESS
+    each of those three named, and the refused mark-read's own `isRead` outcome, are asserted
+    separately, because a snapshot-restoring requeue produces the same count while sending the
+    retry to the dead id.
+  - **T6** `aFailedAccountRequeueDoesNotRevertTheHandoff` — the THIRD requeue site, the only one
+    driven from another lane: a connectivity failure on a second Graph message marks the account
+    failed, and the follower behind a retired move is requeued at the proven address, uncharged for
+    a failure that was not its own. The two-lane schedule uses only `holdNextMove` and
+    `failNextPatch`, and its barrier is a real happens-after — `failedAccounts.insert` precedes the
+    `.haltLane` requeue whose durable write the test waits on.
 - `AccountManagerQueueDrainTests.accountScopedIdAccountIdsAdmitsExactlyGmailOutlookAndTheDemoAccount`
   — exact-set oracle over `account` rows for every provider plus one row whose `provider` column is
   set by raw SQL to an undecodable string. Replaces the negative-sign version this record supersedes.
@@ -175,7 +208,17 @@ and its per-mutation red evidence are in the pull request.
   `.imapRekeyStillDeclinesWhenTheRowLeftTheDestination`,
   `.queuedFollowerIsReaddressedAndBystandersAreNot` — the `finishMove` unit trio, including the
   bystander half (re-addressing an operation naming a different message would be a wrong-message
-  mutation).
+  mutation). Its two boundaries are pinned separately, because the sweep's `WHERE` has two clauses
+  and each is a different C3: `.readdressingIsBoundedByAccountNotOnlyByMessageId` (another
+  MAILBOX's operation carrying the same opaque id string) and
+  `.imapReaddressingNeverCrossesAFolderBoundary` (a queued operation on `(Trash, UID 77)` while a
+  `COPYUID` proves `(INBOX, 77) → 5`). `.narrowedRetirementOnAnAccountScopedProviderCarriesTheAddressIntoTheQueue`
+  covers `retirePartiallyCompletedOp` on the arm Graph actually takes,
+  `.narrowedRetirementThatCannotCommitKeepsTheWholeBundleQueued` proves that write is all-or-nothing
+  under a `TransactionObserver` that refuses the COMMIT, and
+  `.accountScopedZeroMatchAfterAMessageDataResetIsClassifiedForMirrorRemoval` separates the
+  account-scoped "already gone" arm from the adjacent "ambiguous" arm using the real
+  `AccountDetailView.resetMessageDataTxn` as the producer.
 - `ProviderIdQueueFuzzTests.stableIdQueueLaneFuzz` — now alternates `.gmail` and `.outlook` per
   round (Testing Rule 11). The Outlook rounds run a real `ExchangeProvider` against a churning
   server with seeded fault modes and assert: the latest destination wins, exactly one copy per RFC
@@ -200,16 +243,39 @@ A `URLProtocol`-backed transport does not admit a second request into the route 
 is blocked inside `startLoading()`. So the counter could only ever answer "no overlap", that answer
 is the TRANSPORT's and not the QUEUE's, and it would have held identically with the lane key
 reverted. The tell was already visible in the mutation matrix before the control was written:
-inverting the lane classifier left T2 GREEN. With the counter removed T2 keeps only its outcome
-oracle — and that oracle DOES go red under the same inversion, because two racing lanes let the
-older gesture land last.
+inverting the lane classifier left T2 GREEN.
+
+⚠️ **NARROWED 2026-09-05 — what that mutation run actually says about T2's remaining oracle.** This
+paragraph used to end "With the counter removed T2 keeps only its outcome oracle — and that oracle
+DOES go red under the same inversion, because two racing lanes let the older gesture land last."
+That is **not** what was measured, and the very run cited above contradicts it: T2 was GREEN under
+the classifier inversion **while the outcome oracle was already present**, so every assertion T2
+still has passed under the inversion. No re-measurement was taken after the counter was removed.
+What is established is only the negative half — the deleted counter could not distinguish the two
+regimes. Whether the OUTCOME oracle can is UNKNOWN, and the mechanism above gives a concrete reason
+to expect it cannot: the same `URLProtocol` transport that refused to admit two `/move`s into the
+route concurrently also serializes the two racing lanes' moves, so the older gesture has no window
+in which to land last. Treat T2 as an outcome/no-duplicate test, not as a serialization oracle;
+the falsifiable serialization oracles are the two named below.
 
 The seam, its control, and all four assertions that consumed it (T2, and two in the fuzzer's Outlook
 round) were deleted rather than weakened. The falsifiable Outlook serialization oracles are
 `OutlookQueueHandoffTests` T1 — a follower's PATCH, a DIFFERENT request the transport does let
 through, must not reach the wire at all while its predecessor's move is unresolved — and
 `PendingQueueLaneTests.outlookSameIdInTwoFoldersSharesOneLane`, which asserts on `buildLanes`
-directly. Both go red when `.outlook` leaves the account-scoped set. The Gmail side keeps its
+directly.
+
+⚠️ **NARROWED 2026-09-05 — those two do not fail for the same reason, and only one of them sees the
+classifier at all.** This sentence used to read "Both go red when `.outlook` leaves the
+account-scoped set." The `buildLanes` test **cannot**: `buildLanes(_:accountScopedIdAccountIds:)`
+takes the set as a PARAMETER and the test INJECTS it (`accountScopedIdAccountIds: ["acc-outlook"]`),
+so it never reads `AccountManager.accountScopedIdAccountIds` and stays green with `.outlook` removed
+from it. What it pins is the LANE KEY given the classification — it goes red only if the key itself
+stops being account-qualified for a set member. The test that sees the classifier is
+`AccountManagerQueueDrainTests.accountScopedIdAccountIdsAdmitsExactlyGmailOutlookAndTheDemoAccount`
+(its exact-set oracle over real `account` rows), and end to end so does T1, which drives a real
+drain. Read the trio as three DIFFERENT mutations — membership, lane key, and end-to-end behaviour —
+not as one assertion made three times. The Gmail side keeps its
 `setMoveHook` in-flight counter, which works because it samples inside the fake PROVIDER rather than
 inside a URL-loading route.
 

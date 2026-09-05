@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -453,6 +454,214 @@ struct QueueCoreInvariantTests {
         #expect(after?.messageIds == ["88"], "the unproven member stays queued")
     }
 
+    /// **THE PROPERTY, on an ACCOUNT-SCOPED provider: a member retired in a
+    /// narrowing pass ends the drain addressed by the id the wire proved, in the
+    /// folder its row currently occupies, and every queued operation still
+    /// naming the old id is carried with it — all in the retiring transaction.**
+    ///
+    /// The two tests above only ever exercise the IMAP arm, and the two things
+    /// that make the Outlook handoff work are exactly the two the IMAP arm does
+    /// NOT do: follow the row out of `destinationPath`, and re-address the queue
+    /// (`readdressQueuedOperations` returns immediately when `accountScopedIds`
+    /// is false). So `retirePartiallyCompletedOp` — the drain's standing
+    /// contract for any provider that dispositions a strict subset — had no
+    /// coverage at all on the arm that Graph actually takes, even though it
+    /// reads its own `accountScopedIdAccountIds` classification inside the
+    /// narrowing write.
+    ///
+    /// The row is seeded back in `INBOX` while the move to `Archive` retires —
+    /// the archive/undo/re-delete sequence — so a primary-key lookup at
+    /// `destinationPath` would miss it, the row would keep the id Graph just
+    /// invalidated, and the user's next gesture built FROM THAT ROW would name a
+    /// dead id.
+    @Test("Outlook: a member retired in a narrowing pass carries the proven address into its row AND into the queue")
+    func narrowedRetirementOnAnAccountScopedProviderCarriesTheAddressIntoTheQueue() async throws {
+        let fixture = try fixture(
+            accountId: "acc-queue-005-graph", provider: .outlook,
+            folders: [("INBOX", .inbox, nil), ("Archive", .archive, nil)])
+        defer { finish(fixture) }
+
+        try seedHeader(
+            fixture, messageId: "graph-old", folderPath: "INBOX", epoch: nil)
+
+        // A follower the user queued behind the move, naming the id Graph is
+        // about to reallocate, and a bystander naming a different message.
+        let follower = PendingOperation(
+            type: .markRead, messageIds: ["graph-old"], accountId: fixture.accountId,
+            folderPath: "INBOX", observedUidValidity: nil)
+        let bystander = PendingOperation(
+            type: .markFlagged, messageIds: ["graph-other"], accountId: fixture.accountId,
+            folderPath: "INBOX", observedUidValidity: nil)
+        try insertOp(follower, fixture)
+        try insertOp(bystander, fixture)
+
+        var op = PendingOperation(
+            type: .move, messageIds: ["graph-old", "graph-unproven"],
+            accountId: fixture.accountId, folderPath: "INBOX",
+            destinationPath: "Archive", observedUidValidity: nil)
+        op.status = PendingStatus.inFlight.rawValue
+        op.everAttempted = true
+        try insertOp(op, fixture)
+        let frozenOp = op
+
+        await AccountManager.shared.retirePartiallyCompletedOp(
+            frozenOp, provenMembers: ["graph-old"], remaining: ["graph-unproven"],
+            provenDestinations: [ProvenDestinationAddress(
+                sourceProviderId: "graph-old", destinationProviderId: "graph-new",
+                destinationUidValidity: nil)],
+            addressChangesOnMove: true,
+            context: AccountManager.DrainContext())
+
+        // The row answers to the proven address, IN THE FOLDER IT OCCUPIES.
+        let landedId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "INBOX", messageId: "graph-new")
+        let rows = try await fixture.pool.read { db in
+            try MessageHeader.filter(Column("accountId") == fixture.accountId).fetchAll(db)
+        }
+        #expect(rows.count == 1)
+        guard rows.count == 1 else { return }
+        #expect(rows[0].id == landedId && rows[0].messageId == "graph-new"
+                    && rows[0].folderPath == "INBOX", """
+            the narrowing pass left the retired member at an address Graph had \
+            already invalidated: id=\(rows[0].id) messageId=\(rows[0].messageId) \
+            folder=\(rows[0].folderPath). The next gesture built from this row \
+            names a dead id, 404s, and is deleted by the conflict arm.
+            """)
+
+        // The handoff reached the QUEUE in the same transaction — and only the
+        // operation that actually named the moved id.
+        let (followerIds, bystanderIds) = try await fixture.pool.read { db in
+            (try PendingOperation.fetchOne(db, key: follower.id)?.messageIds,
+             try PendingOperation.fetchOne(db, key: bystander.id)?.messageIds)
+        }
+        #expect(followerIds == ["graph-new"], """
+            a follower queued behind a PARTIALLY retired move still names the \
+            dead id: observed \(String(describing: followerIds))
+            """)
+        #expect(bystanderIds == ["graph-other"],
+                "an operation naming a different message was re-addressed — that is a wrong-message mutation")
+
+        // The unproven member is preserved, narrowed, and retryable — never
+        // dropped and never left `inFlight`.
+        let after = try fetchOp(frozenOp.id, fixture)
+        #expect(after?.messageIds == ["graph-unproven"])
+        #expect(after?.status == PendingStatus.queued.rawValue)
+    }
+
+    /// A GRDB `TransactionObserver` that REFUSES the commit of any transaction
+    /// which wrote `messageHeader` — the standard GRDB way to force a commit
+    /// failure (`databaseWillCommit()` throws → SQLite's commit hook aborts the
+    /// COMMIT → GRDB rolls back and rethrows to `pool.write`'s caller). A real
+    /// production possibility (an I/O error or a full disk at COMMIT), not a
+    /// manufactured writer. Lifted from
+    /// `SyncEngineRunSyncTests.HeaderCommitRefuser`, refusal counter included so
+    /// a test can prove the refusal landed on the transaction it names.
+    private final class HeaderCommitRefuser: TransactionObserver, Sendable {
+        struct CommitRefused: Error {}
+        private let sawHeaderWrite = Mutex(false)
+        let refusals = Mutex(0)
+
+        func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
+            eventKind.tableName == MessageHeader.databaseTableName
+        }
+        func databaseDidChange(with event: DatabaseEvent) {
+            sawHeaderWrite.withLock { $0 = true }
+        }
+        func databaseWillCommit() throws {
+            guard sawHeaderWrite.withLock({ $0 }) else { return }
+            refusals.withLock { $0 += 1 }
+            throw CommitRefused()
+        }
+        func databaseDidCommit(_ db: Database) {
+            sawHeaderWrite.withLock { $0 = false }
+        }
+        func databaseDidRollback(_ db: Database) {
+            sawHeaderWrite.withLock { $0 = false }
+        }
+    }
+
+    /// **THE PROPERTY: the narrowing pass is ALL OR NOTHING. If its write does
+    /// not commit, the operation keeps every member it was issued with, stays
+    /// retryable, and no address anywhere has moved.**
+    ///
+    /// The two tests above assert what a SUCCESSFUL narrowing leaves behind.
+    /// Neither can see the state that matters more: the re-key and the narrowing
+    /// are one transaction, so a partial outcome — members removed from the row
+    /// while the header keeps its source address, or the reverse — would be a
+    /// silently dropped intention or a row nothing can address. `retryWrite`
+    /// exhausts its three attempts and the catch arm requeues the ORIGINAL
+    /// bundle, deliberately preferring a duplicate at the destination over a
+    /// lost member.
+    ///
+    /// The refusal is raised at COMMIT rather than by a poisoned statement, so
+    /// the transaction is one a real disk failure could produce, and the
+    /// refusal counter proves it landed on the narrowing write itself
+    /// (`MIS-027`: red for the right reason).
+    @Test("a narrowing pass whose write never commits keeps the WHOLE bundle queued and moves no address")
+    func narrowedRetirementThatCannotCommitKeepsTheWholeBundleQueued() async throws {
+        let fixture = try fixture(accountId: "acc-queue-005-rollback")
+        defer { finish(fixture) }
+
+        let seeded = try seedHeader(
+            fixture, messageId: "77", folderPath: "Archive",
+            keyedFromFolderPath: "INBOX", epoch: nil)
+
+        var op = PendingOperation(
+            type: .move, messageIds: ["77", "88"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
+        op.status = PendingStatus.inFlight.rawValue
+        op.everAttempted = true
+        try insertOp(op, fixture)
+        let frozenOp = op
+
+        // Installed AFTER the fixture seeding, so the only header-writing
+        // transaction it can refuse is the narrowing write itself.
+        let refuser = HeaderCommitRefuser()
+        fixture.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+        defer { fixture.pool.remove(transactionObserver: refuser) }
+
+        await AccountManager.shared.retirePartiallyCompletedOp(
+            frozenOp, provenMembers: ["77"], remaining: ["88"],
+            provenDestinations: [ProvenDestinationAddress(
+                sourceProviderId: "77", destinationProviderId: "5",
+                destinationUidValidity: 42)],
+            addressChangesOnMove: true,
+            context: AccountManager.DrainContext())
+
+        // NON-VACUITY: the narrowing write really was attempted and really was
+        // refused — once per `retryWrite` attempt, and never more.
+        #expect(refuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on the narrowing write for all three \
+            attempts, so this test is not measuring a rollback: \
+            \(refuser.refusals.withLock { $0 })
+            """)
+
+        // NOTHING was narrowed: the proven member is still owed, so a retry
+        // re-copies it. A duplicate at the destination is the accepted cost;
+        // a member removed from the row by a write that never committed would
+        // be a dropped intention.
+        let after = try fetchOp(frozenOp.id, fixture)
+        #expect(after?.messageIds == ["77", "88"], """
+            the operation was narrowed by a transaction that never committed — \
+            observed \(String(describing: after?.messageIds))
+            """)
+        #expect(after?.status == PendingStatus.queued.rawValue,
+                "a failed narrowing must never leave the row inFlight — nothing would unstick it before the next launch")
+        #expect(after?.retryCount == 0,
+                "the requeue after a failed local write charges no provider retry")
+
+        // And NO address moved: the header is exactly where the seeding left it.
+        let rows = try await fixture.pool.read { db in
+            try MessageHeader.filter(Column("accountId") == fixture.accountId).fetchAll(db)
+        }
+        #expect(rows.count == 1)
+        guard rows.count == 1 else { return }
+        #expect(rows[0].id == seeded.id && rows[0].messageId == "77", """
+            the re-key survived a transaction that was rolled back: \
+            id=\(rows[0].id) messageId=\(rows[0].messageId)
+            """)
+    }
+
     // MARK: - IOS-UNDO-002 / IOS-SEARCH-002 — publishing a committed re-key
     //
     // Both rows are about the window AFTER the GRDB write commits, when stores
@@ -851,6 +1060,146 @@ struct QueueCoreInvariantTests {
         #expect(result.readdressedOperationIds == [follower.id])
     }
 
+    /// **THE FIRST BOUNDARY: "one id names one message" holds PER ACCOUNT, so a
+    /// second account's operation carrying the SAME id string is a different
+    /// message and must not be touched.**
+    ///
+    /// The test above bounds the sweep by MESSAGE (a different id in the same
+    /// account is left alone). Nothing bounded it by ACCOUNT, and that is the
+    /// direction where the id strings actually collide: Graph ids are opaque
+    /// base64-ish blobs, two mailboxes of the same organisation are ordinary,
+    /// and a restored-from-backup or re-added account can legitimately carry the
+    /// same string. The account clause is the ONLY thing separating them —
+    /// `readdressQueuedOperations` selects on `accountId`, and if that clause
+    /// were dropped the sweep would rewrite another mailbox's queued gesture to
+    /// an address the wire proved for a completely different message. That is a
+    /// C3 wrong-message mutation, and nothing recovers it.
+    @Test("a second account's operation naming the SAME provider id string is not re-addressed")
+    func readdressingIsBoundedByAccountNotOnlyByMessageId() async throws {
+        let fixture = try fixture(
+            accountId: "acc-graph-readdress-a", provider: .outlook,
+            folders: [("INBOX", .inbox, nil), ("Archive", .archive, nil)])
+        defer { finish(fixture) }
+
+        // A SECOND Outlook account in the same database, whose queued gesture
+        // names the identical id string.
+        let otherAccountId = "acc-graph-readdress-b"
+        try await fixture.pool.write { db in
+            var other = Account(
+                emailAddress: "queue-core-other@example.com", displayName: "Queue core B",
+                provider: .outlook)
+            other.id = otherAccountId
+            try other.insert(db)
+            for (path, role) in [("INBOX", FolderRole.inbox), ("Archive", FolderRole.archive)] {
+                try Folder(name: path, path: path, role: role, accountId: otherAccountId)
+                    .insert(db)
+            }
+        }
+
+        _ = try seedHeader(
+            fixture, messageId: "graph-old", folderPath: "Archive",
+            keyedFromFolderPath: "INBOX", epoch: nil)
+        let retiring = PendingOperation(
+            type: .move, messageIds: ["graph-old"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: nil)
+        let sameAccountFollower = PendingOperation(
+            type: .markRead, messageIds: ["graph-old"], accountId: fixture.accountId,
+            folderPath: "Archive", observedUidValidity: nil)
+        let otherAccountNamesake = PendingOperation(
+            type: .markFlagged, messageIds: ["graph-old"], accountId: otherAccountId,
+            folderPath: "INBOX", observedUidValidity: nil)
+        try insertOp(sameAccountFollower, fixture)
+        try insertOp(otherAccountNamesake, fixture)
+
+        let result = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                retiring,
+                destinations: [ProvenDestinationAddress(
+                    sourceProviderId: "graph-old",
+                    destinationProviderId: "graph-new",
+                    destinationUidValidity: nil)],
+                addressChangesOnMove: true,
+                accountScopedIds: true,
+                db: db)
+        }
+
+        let (mine, theirs) = try await fixture.pool.read { db in
+            (try PendingOperation.fetchOne(db, key: sameAccountFollower.id)?.messageIds,
+             try PendingOperation.fetchOne(db, key: otherAccountNamesake.id)?.messageIds)
+        }
+        // NON-VACUITY: the sweep really did run and really did rewrite something,
+        // so "the other account was untouched" is not the trivially true answer
+        // a no-op pass would also give.
+        #expect(mine == ["graph-new"],
+                "the sweep did not run at all, so the bystander half below proves nothing")
+        #expect(theirs == ["graph-old"], """
+            another ACCOUNT's queued gesture was re-addressed to an id proved for \
+            a different mailbox's message — a wrong-message mutation (C3). \
+            observed: \(String(describing: theirs))
+            """)
+        #expect(result.readdressedOperationIds == [sameAccountFollower.id])
+    }
+
+    /// **THE SECOND BOUNDARY, and the reason the whole sweep is gated: on IMAP a
+    /// UID is MAILBOX-LOCAL, so an operation naming UID 77 in another folder is
+    /// a different physical message and no `COPYUID` may re-address it.**
+    ///
+    /// `imapRekeyStillDeclinesWhenTheRowLeftTheDestination` covers the HEADER
+    /// side of this; the QUEUE side was uncovered. The producer is real and
+    /// routine: `NSEDataBridge.queueSetTagPendingOp` inserts rows keyed by a
+    /// bare numeric id against a hard-coded `INBOX`, and any pre-move operation
+    /// can legitimately name the same number for a different message elsewhere.
+    /// A sweep that keyed on the id alone would rewrite `77` to `5` in an
+    /// operation that never named this message, and the next drain would flag,
+    /// read or move whatever now sits at UID 5 in that other folder.
+    @Test("IMAP: a queued operation naming the same UID in ANOTHER folder is never re-addressed by a COPYUID")
+    func imapReaddressingNeverCrossesAFolderBoundary() async throws {
+        let fixture = try fixture(accountId: "acc-imap-readdress")
+        defer { finish(fixture) }
+
+        // The optimistic shape: shown in Archive, still keyed by its INBOX
+        // address, so the IMAP arm's G3 folder clause admits the re-key.
+        _ = try seedHeader(
+            fixture, messageId: "77", folderPath: "Archive",
+            keyedFromFolderPath: "INBOX")
+        let retiring = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
+        // A DIFFERENT physical message that happens to carry UID 77 in Trash.
+        let elsewhere = PendingOperation(
+            type: .markFlagged, messageIds: ["77"], accountId: fixture.accountId,
+            folderPath: "Trash", observedUidValidity: 42)
+        try insertOp(elsewhere, fixture)
+
+        let result = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                retiring,
+                destinations: [ProvenDestinationAddress(
+                    sourceProviderId: "77", destinationProviderId: "5",
+                    destinationUidValidity: 42)],
+                addressChangesOnMove: true,
+                accountScopedIds: false,
+                db: db)
+        }
+
+        // NON-VACUITY: the move DID prove a destination and the header DID move
+        // to it, so a sweep keyed on the id alone had everything it needed.
+        let movedId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "Archive", messageId: "5")
+        #expect(result.applied.map(\.newHeaderId) == [movedId],
+                "the re-key did not happen, so there was no proven mapping for a sweep to misapply")
+
+        let elsewhereIds = try fetchOp(elsewhere.id, fixture)?.messageIds
+        #expect(elsewhereIds == ["77"], """
+            a queued operation on (Trash, UID 77) was re-addressed by a COPYUID \
+            proved for (INBOX, UID 77) — a UID is mailbox-local, so that is a \
+            different physical message and this is a C3 wrong-message mutation. \
+            observed: \(String(describing: elsewhereIds))
+            """)
+        #expect(result.readdressedOperationIds.isEmpty,
+                "IMAP has no legitimate follower to re-address; the sweep must not run at all")
+    }
+
     @Test("an address-stable Gmail move does not require destination-address evidence")
     func addressStableGmailMoveDoesNotEnterAddressRepair() async throws {
         let fixture = try fixture(accountId: "acc-gmail-stable", provider: .gmail)
@@ -897,6 +1246,83 @@ struct QueueCoreInvariantTests {
         #expect(result.applied.isEmpty)
         #expect(result.unsafeUndoOldHeaderIds.isEmpty)
         #expect(result.removedOldHeaderIds == [oldId])
+    }
+
+    /// **THE ACCOUNT-SCOPED HALF OF THE SAME PROPERTY, with a REAL producer: a
+    /// move that retires against zero matching rows classifies the member for
+    /// mirror removal — it never declines, and it never re-keys a bystander.**
+    ///
+    /// The test above only reaches the IMAP arm's `fetchOne(key:) == nil` path.
+    /// The account-scoped arm answers "already gone" from a DIFFERENT test —
+    /// `candidates.isEmpty` on an `(accountId, messageId)` query — and it sits
+    /// beside the `candidates.count > 1` arm, which does the OPPOSITE (declines
+    /// and revokes undo authority). Nothing distinguished the two, so an
+    /// inversion that folded zero into the ambiguous arm would have gone
+    /// unnoticed, leaving external mirrors (FTS entries, body assets, undo
+    /// commands) pointing at a header id nothing will ever produce again.
+    ///
+    /// The rows are removed by the REAL producer rather than by a hand-written
+    /// `DELETE`: `AccountDetailView.resetMessageDataTxn`, the account-scoped
+    /// "reset message data" gesture, which deletes every `messageHeader` of the
+    /// account while deliberately leaving `pendingOperation` alone — so a move
+    /// can genuinely be in flight across it and retire into an empty header
+    /// table.
+    @Test("account-scoped: a move retiring after the account's message data was reset releases its old mirrors")
+    func accountScopedZeroMatchAfterAMessageDataResetIsClassifiedForMirrorRemoval() async throws {
+        let fixture = try fixture(
+            accountId: "acc-graph-missing-old-row", provider: .outlook,
+            folders: [("INBOX", .inbox, nil), ("Archive", .archive, nil)])
+        defer { finish(fixture) }
+
+        let seeded = try seedHeader(
+            fixture, messageId: "graph-old", folderPath: "INBOX", epoch: nil)
+
+        // THE REAL PRODUCER. Its own contract is asserted here too, because the
+        // arm under test depends on both halves of it: headers gone, operations
+        // untouched.
+        let survivingOp = PendingOperation(
+            type: .markRead, messageIds: ["graph-old"], accountId: fixture.accountId,
+            folderPath: "INBOX", observedUidValidity: nil)
+        try insertOp(survivingOp, fixture)
+        try await fixture.pool.write { db in
+            try AccountDetailView.resetMessageDataTxn(db, accountId: fixture.accountId)
+        }
+        let (headerCount, opSurvived) = try await fixture.pool.read { db in
+            (try MessageHeader.filter(Column("accountId") == fixture.accountId).fetchCount(db),
+             try PendingOperation.fetchOne(db, key: survivingOp.id) != nil)
+        }
+        #expect(headerCount == 0, "the reset did not remove the header, so the zero-match arm is not reached")
+        #expect(opSurvived, "the reset removed the queued operation, so nothing is left in flight across it")
+
+        let op = PendingOperation(
+            type: .move, messageIds: ["graph-old"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: nil)
+        let result = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                op,
+                destinations: [ProvenDestinationAddress(
+                    sourceProviderId: "graph-old",
+                    destinationProviderId: "graph-new",
+                    destinationUidValidity: nil)],
+                addressChangesOnMove: true,
+                accountScopedIds: true,
+                db: db)
+        }
+
+        #expect(result.applied.isEmpty, "there was no row to re-key")
+        #expect(result.unsafeUndoOldHeaderIds.isEmpty, """
+            zero matches was treated as the AMBIGUOUS case: the member's external \
+            mirrors are then retained against a header id that no longer exists \
+            and will never be produced again
+            """)
+        #expect(result.removedOldHeaderIds == [seeded.id], """
+            the vanished member was not classified for mirror removal — observed \
+            \(result.removedOldHeaderIds)
+            """)
+        // The queue handoff still runs: the wire proved an address, so a
+        // follower must carry it even though no local row survives to re-key.
+        #expect(try fetchOp(survivingOp.id, fixture)?.messageIds == ["graph-new"],
+                "the follower kept the id the move invalidated even though the wire proved its replacement")
     }
 
     /// A successful address-changing move invalidates the source-address undo

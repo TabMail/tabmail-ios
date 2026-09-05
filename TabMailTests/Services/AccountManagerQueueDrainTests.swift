@@ -1281,6 +1281,98 @@ struct AccountManagerQueueDrainTests {
         }
     }
 
+    /// **THE OTHER ARM OF THE SAME RE-READ, and the reason it must stay
+    /// separate: when the row really is GONE the drain skips it and does NOT
+    /// resurrect it from the snapshot it captured before the lane ran.**
+    ///
+    /// `nil` from the post-claim re-read means exactly one thing — the row no
+    /// longer exists — and the writers that can delete a CLAIMED row are not
+    /// cancel or annihilation (both require `queued` and `!everAttempted`, which
+    /// the claim has already made false). They are the local wipes and resets,
+    /// which never join a running drain. So `nil` is the user's NEWER gesture
+    /// beating the one this lane captured, and a `?? capturedOp` fallback would
+    /// send a withdrawn intention to the wire.
+    ///
+    /// The deletion here is performed by the REAL producer —
+    /// `SettingsView.localIndexWipeTxn`, the "delete all local email data"
+    /// gesture, whose statement list contains
+    /// `DELETE FROM pendingOperation WHERE type != 'saveDraft'` — driven INSIDE
+    /// the claimed window, while the lane's first operation is parked on the
+    /// wire. A hand-written `DELETE` in the test body would prove the arm runs;
+    /// only the real transaction proves the arm is REACHABLE.
+    @Test("drainPendingQueue() (real): an op the user's own local wipe deleted mid-drain is skipped, never resurrected from the drain's snapshot")
+    func drainPendingQueueRealRowDeletedByALocalWipeMidDrainIsSkipped() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        let accountId = "acc-cor1-wipe"
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let provider = MockEmailProvider()
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: provider
+        ) {
+            // `.gmail` ⇒ account-scoped ids ⇒ both ops on `msg-1` share ONE lane,
+            // so the second is re-read only after the first has returned.
+            try insertStableProviderFixture(accountId: accountId, pool: pool)
+
+            let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
+            var opMove = PendingOperation(
+                type: .move, messageIds: ["msg-1"], accountId: accountId,
+                folderPath: "INBOX", destinationPath: "Archive")
+            opMove.createdAt = t0
+            var opRead = PendingOperation(
+                type: .markRead, messageIds: ["msg-1"], accountId: accountId,
+                folderPath: "INBOX")
+            opRead.createdAt = t0.addingTimeInterval(1)
+            try insertOp(opMove, pool: pool)
+            try insertOp(opRead, pool: pool)
+
+            // Park the lane's FIRST op on the wire. Bounded, so a test that
+            // never releases fails on its own assertion instead of hanging.
+            let gate = Mutex<(entered: Bool, released: Bool)>((entered: false, released: false))
+            await provider.setMoveHook {
+                gate.withLock { $0.entered = true }
+                for _ in 0..<600 {
+                    if gate.withLock({ $0.released }) { return }
+                    try? await Task.sleep(for: .milliseconds(10))
+                }
+            }
+
+            let drain = Task { await AccountManager.shared.drainPendingQueue() }
+            var parked = false
+            for _ in 0..<600 {
+                if gate.withLock({ $0.entered }) { parked = true; break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(parked, "the move never parked, so the wipe below does not land inside the claimed window")
+
+            // THE USER'S NEWER GESTURE, committed while the lane holds its
+            // snapshot of both ops.
+            try await pool.write { db in try SettingsView.localIndexWipeTxn(db) }
+            let leftBehind = try await pool.read { db in try PendingOperation.fetchCount(db) }
+            #expect(leftBehind == 0,
+                    "the wipe left \(leftBehind) operation(s) behind, so the skip arm is not reached")
+
+            gate.withLock { $0.released = true }
+            _ = await drain.value
+
+            // NON-VACUITY: the parked op really did execute, so the lane really
+            // did reach its second member and re-read it.
+            let moves = await provider.movedIds
+            #expect(moves.count == 1, "the parked move never reached the wire: \(moves)")
+
+            let reads = await provider.markedReadIds
+            #expect(reads.isEmpty, """
+                the withdrawn operation was executed from the drain's captured \
+                snapshot — the user deleted it and the app sent it anyway: \(reads.map(\.ids))
+                """)
+            let survivors = try await pool.read { db in try PendingOperation.fetchAll(db) }
+            #expect(survivors.isEmpty, """
+                a skipped row was re-created after the wipe: \
+                \(survivors.map { "\($0.type.rawValue)/\($0.status)" })
+                """)
+        }
+    }
+
     @Test("drainPendingQueue() (real): two concurrent calls are safe — the isDraining/needsRedrain guard serializes them, the op executes exactly once (no duplication, no crash)")
     func drainPendingQueueRealConcurrentCallsExecuteOpsExactlyOnce() async throws {
         let (pool, dir, previous) = try makeTestDB()

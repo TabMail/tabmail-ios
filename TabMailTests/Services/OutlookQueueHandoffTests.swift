@@ -576,10 +576,178 @@ struct OutlookQueueHandoffTests {
             """)
 
         let current = liveId(server, rfc: rfc)
-        let flagged = current.flatMap { server.snapshot(providerMessageId: $0)?.isFlagged } == true
+
+        // WHICH ADDRESS THOSE THREE PATCHES NAMED, which is the actual subject of
+        // this test. Counting them proves the lane halted and re-drove; it does
+        // not distinguish a retry at the PROVEN id from a retry at the id the
+        // move destroyed. A snapshot-restoring requeue produces exactly the same
+        // count and sends the retry to `graph-1`, where Graph answers 404 and the
+        // single-message conflict arm deletes the user's gesture.
+        #expect(current != nil && current != "graph-1",
+                "Graph did not reallocate the id, so no PATCH could name a dead address and the correlation below is vacuous")
+        guard let current else { return }
+        let misaddressed = patches.filter { !$0.hasSuffix("/\(current)") }
+        #expect(misaddressed.isEmpty, """
+            a PATCH went out at an address the move had already invalidated — the \
+            requeue wrote the lane's pre-handoff snapshot back over the id the wire \
+            proved (\(current)): \(misaddressed)
+            """)
+
+        // BOTH gestures behind the halt, asserted separately: the refused one and
+        // the one requeued behind it fail in different ways, and an assertion on
+        // only the flag is satisfied by a run in which the mark-read was retried
+        // at the dead id, 404'd, and was deleted as "already done".
+        let snapshot = server.snapshot(providerMessageId: current)
         try expectGesturePreservedAndExecuted(
-            f, effectVisibleOnServer: flagged, gesture: "the mark-flagged behind the halt",
-            serverState: "id=\(String(describing: current)) folders=\(serverFolders(server, rfc: rfc))")
+            f, effectVisibleOnServer: snapshot?.isRead == true,
+            gesture: "the mark-read that was refused and requeued",
+            serverState: "id=\(current) folders=\(serverFolders(server, rfc: rfc))")
+        try expectGesturePreservedAndExecuted(
+            f, effectVisibleOnServer: snapshot?.isFlagged == true,
+            gesture: "the mark-flagged behind the halt",
+            serverState: "id=\(current) folders=\(serverFolders(server, rfc: rfc))")
+
+        await finish(f)
+    }
+
+    // MARK: - T6 — a whole-account halt must not revert the handoff either
+
+    /// **THE PROPERTY: an operation requeued because ANOTHER lane's failure took
+    /// the whole account down resumes at the address the wire proved, and is
+    /// never charged a retry for a failure that was not its own.**
+    ///
+    /// T5 covers the two requeues that happen INSIDE a lane (the refused op's own
+    /// halt, and the members behind it). This is the third requeue site and the
+    /// only one driven from a DIFFERENT lane: when any operation fails for a
+    /// connectivity reason, `executeSingleOp` puts the account into
+    /// `DrainContext.failedAccounts`, and every other lane of that account then
+    /// requeues its remaining members before executing them — deliberately, so
+    /// one drain does not hammer a server that is down.
+    ///
+    /// That arm is reached only when a SECOND lane is still mid-flight when the
+    /// first one fails, and on Graph a second lane exists only because the lane
+    /// key is `(account, message id)` — two different messages, two lanes, run
+    /// concurrently. The schedule is produced with the fixture's existing seams
+    /// and is deterministic in both directions:
+    ///  - the handoff lane cannot advance past its move, because `holdNextMove`
+    ///    parks it inside the route;
+    ///  - the failure lane's `failNextPatch` is therefore consumed by the only
+    ///    PATCH that can reach the wire while the move is parked;
+    ///  - and the release waits on a strict HAPPENS-AFTER of the account being
+    ///    marked failed: `failedAccounts.insert` precedes the `.haltLane`
+    ///    requeue of the rest of that lane, so observing the second failure-lane
+    ///    operation back at `queued` proves the flag is already set.
+    ///
+    /// The oracle is the ADDRESS the follower carries and where it lands, never
+    /// "the arm was taken" (`MIS-015`).
+    @Test("Outlook: an operation requeued because another lane failed the account keeps the address the wire proved")
+    @MainActor
+    func aFailedAccountRequeueDoesNotRevertTheHandoff() async throws {
+        let handoffRfc = "graph-handoff-failed-account@example.com"
+        let unrelatedRfc = "graph-handoff-bystander@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: handoffRfc, providerMessageId: "graph-1", folderId: Self.source),
+            .init(rfc822MessageId: unrelatedRfc, providerMessageId: "graph-2", folderId: Self.source),
+        ])
+        defer { server.close() }
+
+        let f = try fixture(accountId: "graph-handoff-failed-account")
+        let handoffSeed = try seedHeader(f, graphId: "graph-1", rfc: handoffRfc)
+        let unrelatedSeed = try seedHeader(f, graphId: "graph-2", rfc: unrelatedRfc)
+
+        // OFFLINE, so every gesture is durably queued before any of them runs.
+        // LANE A (graph-1): a move, then a follower that must inherit its address.
+        await AccountManager.shared.move([handoffSeed], to: Self.firstDestination)
+        let optimistic = try rows(f).filter { $0.rfc822MessageId == handoffRfc }
+        #expect(optimistic.count == 1)
+        guard optimistic.count == 1 else { return }
+        await AccountManager.shared.markRead([optimistic[0]])
+        // LANE B (graph-2): the operation that will fail, and one behind it whose
+        // requeue is this test's happens-after signal.
+        await AccountManager.shared.markFlagged([unrelatedSeed], flagged: true)
+        await AccountManager.shared.markRead([unrelatedSeed])
+        #expect(try queuedOperationCount(f) == 4,
+                "all four gestures must be queued offline, or the two lanes do not overlap")
+
+        let laneBTrailerId = try await f.pool.read { db -> String? in
+            try PendingOperation.fetchAll(db).first {
+                $0.messageIds == ["graph-2"] && $0.type == .markRead
+            }?.id
+        }
+        #expect(laneBTrailerId != nil, "lane B's trailing operation was not queued")
+        guard let laneBTrailerId else { return }
+
+        await register(server.provider(), f)
+        let release = server.holdNextMove()
+        server.failNextPatch()
+        let drain = Task { await AccountManager.shared.drainPendingQueue() }
+
+        #expect(try await awaitHeldMoves(server, count: 1),
+                "the move was never parked, so lane A can advance before lane B fails")
+
+        // Wait for lane B's trailing operation to be back at `queued`. That write
+        // happens strictly AFTER `failedAccounts.insert`, so it is a real barrier
+        // rather than a sleep.
+        var accountMarkedFailed = false
+        for _ in 0..<600 {
+            let status = try await f.pool.read { db in
+                try PendingOperation.fetchOne(db, key: laneBTrailerId)?.status
+            }
+            if status == PendingStatus.queued.rawValue { accountMarkedFailed = true; break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(accountMarkedFailed, """
+            lane B never halted, so the account was never marked failed and lane A's \
+            follower does not take the requeue arm this test exists for
+            """)
+
+        release()
+        _ = await drain.value
+
+        // PHASE 1 — inside the drain that marked the account failed. The follower
+        // was requeued rather than executed, and the requeue must have preserved
+        // the address the move's retirement had just committed.
+        #expect(serverFolders(server, rfc: handoffRfc) == [Self.firstDestination],
+                "the move did not land, so there is no handoff for the requeue to revert")
+        #expect(server.snapshot(providerMessageId: "graph-1") == nil,
+                "Graph did not reallocate the id, so this test is not exercising the churn")
+        let proven = liveId(server, rfc: handoffRfc)
+        #expect(proven != nil && proven != "graph-1")
+        guard let proven else { return }
+
+        let surviving = try await f.pool.read { db in try PendingOperation.fetchAll(db) }
+        let addresses = surviving.map { "\($0.type.rawValue)=\($0.messageIdsJSON)" }
+        let held = surviving.filter { $0.messageIds == [proven] }
+        #expect(held.count == 1, """
+            the follower is not addressed by the id the wire proved (\(proven)): \
+            \(addresses). A requeue that wrote the lane's pre-handoff snapshot back \
+            would leave it at graph-1, where the next drain 404s and the \
+            single-message conflict arm deletes the user's gesture.
+            """)
+        guard held.count == 1 else { return }
+        #expect(held[0].status == PendingStatus.queued.rawValue,
+                "an operation held back by another lane's failure must be left retryable, not inFlight")
+        #expect(held[0].everAttempted == true, "the claim's durable proof stands across a requeue")
+        #expect(held[0].retryCount == 0, """
+            a retry was charged for a failure on a DIFFERENT operation — got \
+            \(held[0].retryCount)
+            """)
+        #expect(server.snapshot(providerMessageId: proven)?.isRead == false,
+                "the follower executed anyway while the account was marked failed")
+
+        // PHASE 2 — a healthy drain. Every gesture lands, at the proven address.
+        try await drainToQuiescence(f)
+        let final = liveId(server, rfc: handoffRfc)
+        #expect(final == proven, "the message moved again after the handoff, so the oracle below is not the one under test")
+        try expectGesturePreservedAndExecuted(
+            f, effectVisibleOnServer: server.snapshot(providerMessageId: proven)?.isRead == true,
+            gesture: "the follower requeued by the failed-account arm",
+            serverState: "id=\(proven) folders=\(serverFolders(server, rfc: handoffRfc))")
+        let bystander = server.snapshot(providerMessageId: "graph-2")
+        #expect(bystander?.isFlagged == true && bystander?.isRead == true, """
+            the lane whose PATCH was refused did not converge: \
+            \(String(describing: bystander))
+            """)
 
         await finish(f)
     }
