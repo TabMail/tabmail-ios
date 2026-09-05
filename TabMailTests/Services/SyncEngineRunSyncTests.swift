@@ -1790,13 +1790,14 @@ struct RunSyncLargeFolderStaleSafetyTests {
 
 // MARK: - A3.6: SyncEngine.upsertInsertedIdSummary (pure formatter)
 
-/// `SyncEngine.upsertInsertedIdSummary` is the PURE renderer behind the
-/// debug-gated `fullSync upsert[...]` `[MoveTrace]` diagnostic
-/// (`SyncEngineFullSync.swift`, inside `runSyncMessages`'s write closure —
-/// see `BackgroundSyncLogger.logQueue`'s call site). Extracted so both its
-/// branches are directly unit-testable without a debug gate, a DB, or a sync
-/// fixture that has to produce `SyncConfig.upsertInsertedIdLogCap` (20)
-/// inserted headers in one pass.
+/// `SyncEngine.upsertInsertedIdSummary` is the PURE renderer behind each
+/// segment of the debug-gated `fullSync upsert[...]` `[MoveTrace]` diagnostic
+/// (`SyncEngineFullSync.swift`: rendered inside `runSyncMessages`'s write
+/// closure, emitted by `BackgroundSyncLogger.logQueue` only after that write
+/// has COMMITTED — see the call site). Extracted so both its branches are
+/// directly unit-testable without a debug gate, a DB, or a sync fixture that
+/// has to produce `SyncConfig.upsertInsertedIdLogCap` (20) inserted headers in
+/// one pass.
 ///
 /// Global `CLAUDE.md` rule 11: the cap is a DISPLAY cap on synthetic header
 /// ids only — it bounds no fetch, no batch and nothing written to the
@@ -1871,6 +1872,24 @@ struct SyncEngineUpsertInsertedIdSummaryTests {
         // count, or a dropped separator each changes this text.
         #expect(summary == "inserted 0 header(s): ")
         #expect(!summary.contains("more)"), "an empty input must not render an overflow suffix: \(summary)")
+    }
+
+    @Test("The verb is a parameter — a `reclaimed` segment renders with the same shape, cap and overflow arithmetic as `inserted`")
+    func reclaimedVerbRendersWithTheSameShapeCapAndOverflow() {
+        #expect(SyncEngine.upsertInsertedIdSummary([], verb: "reclaimed") == "reclaimed 0 header(s): ")
+        #expect(SyncEngine.upsertInsertedIdSummary(["hdr-a", "hdr-b"], verb: "reclaimed")
+                == "reclaimed 2 header(s): hdr-a,hdr-b")
+
+        // Same cap, same elision arithmetic — only the verb differs.
+        let cap = SyncConfig.upsertInsertedIdLogCap
+        let total = cap + 3
+        let ids = (0..<total).map { "hdr-\($0)" }
+        let reclaimed = SyncEngine.upsertInsertedIdSummary(ids, verb: "reclaimed")
+        let inserted = SyncEngine.upsertInsertedIdSummary(ids)
+        #expect(reclaimed.hasPrefix("reclaimed \(total) header(s): "), "total must be stated exactly: \(reclaimed)")
+        #expect(reclaimed.dropFirst("reclaimed".count) == inserted.dropFirst("inserted".count),
+                "the two verbs must render byte-identical bodies: \(reclaimed) vs \(inserted)")
+        #expect(reclaimed.hasSuffix(" (+\(total - cap) more)"), "the elided remainder must be stated: \(reclaimed)")
     }
 }
 
@@ -1997,6 +2016,93 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
         return (result, existingId)
     }
 
+    /// Orphan-reclaim fixture — the `IOS-QUEUE-008` event itself. Seeds an
+    /// account, the inbox folder `folderName` (path `INBOX`) plus an `Archive`
+    /// folder, and ONE committed row whose PRIMARY KEY names the inbox
+    /// (`<acc>:INBOX:m1`) while its membership columns say `Archive` — the
+    /// durable shape an optimistic move leaves behind on a stable-id provider
+    /// (the same fixture shape as `RFC822IdentityMergeGuardTests.insertHeader`).
+    /// The mock then serves `m1` in the inbox again (plus a brand-new `m2` when
+    /// `withGenuineInsert`) under a `.date` stale window — the Gmail/Exchange
+    /// arm, where `SyncEngine.providerAddressOwnershipProven` holds on the
+    /// account + messageId match alone — so the REAL `runSyncMessages` takes
+    /// its orphan-reclaim arm: the existing row is UPDATED in place back into
+    /// this folder (no insert), while `m2`, if served, is an ordinary insert.
+    private func runFullSyncOrphanReclaim(
+        pool: DatabasePool, accountId: String, folderName: String, withGenuineInsert: Bool
+    ) async throws -> (result: SyncEngine.SyncMessagesResult, reclaimedId: String, insertedId: String?) {
+        let folderPath = "INBOX"
+        let reclaimedId = "\(accountId):\(folderPath):m1"
+        let insertedId = withGenuineInsert ? "\(accountId):\(folderPath):m2" : nil
+        let date = Date().addingTimeInterval(-60)
+        try await pool.write { db in
+            var acc = Account(emailAddress: "\(accountId)@example.com", displayName: "T", provider: .gmail)
+            acc.id = accountId
+            try acc.insert(db)
+            try Folder(name: folderName, path: folderPath, role: .inbox, accountId: accountId).insert(db)
+            try Folder(name: "Archive", path: "Archive", role: .archive, accountId: accountId).insert(db)
+            var orphan = MessageHeader(
+                messageId: "m1", subject: "Test Subject", from: "Alice Smith",
+                fromAddress: "alice@example.com", to: "bob@example.com", date: date,
+                snippet: "Test snippet", folderId: "\(accountId):\(folderPath)",
+                accountId: accountId, folderPath: folderPath, isInInbox: true)
+            orphan.rfc822MessageId = "<m1@example.com>"
+            try orphan.insert(db)
+            // The optimistic move: the membership columns move, the PK does not.
+            try MessageHeader.filter(Column("id") == orphan.id).updateAll(
+                db,
+                Column("folderId").set(to: "\(accountId):Archive"),
+                Column("folderPath").set(to: "Archive"),
+                Column("isInInbox").set(to: false))
+        }
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "\(accountId):\(folderPath)")! }
+
+        var remote = [makeHeaderInfo(messageId: "m1", rfc822MessageId: "<m1@example.com>", date: date)]
+        if withGenuineInsert {
+            remote.append(makeHeaderInfo(
+                messageId: "m2", rfc822MessageId: "<m2@example.com>", date: date.addingTimeInterval(1)))
+        }
+        let mock = MockEmailProvider(staleWindowMode: .date)
+        await mock.setFetchMessagesResult(remote)
+
+        let result = try await SyncEngine.runSyncMessages(
+            for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
+            dbPool: PrioritizedDatabase(pool: pool))
+        return (result, reclaimedId, insertedId)
+    }
+
+    /// A GRDB `TransactionObserver` that REFUSES the commit of any transaction
+    /// which wrote `messageHeader` — the standard GRDB way to force a commit
+    /// failure: `databaseWillCommit()` throws → SQLite's commit hook aborts the
+    /// COMMIT → GRDB rolls the transaction back and rethrows this very error to
+    /// `pool.write`'s caller. A real production possibility (an I/O error or a
+    /// full disk at COMMIT), not a manufactured writer. Keyed on the header
+    /// write and counting its refusals, so a test can prove the refusal landed
+    /// on the sync's own upsert transaction (`MIS-027`: red for the right reason).
+    private final class HeaderCommitRefuser: TransactionObserver, Sendable {
+        struct CommitRefused: Error {}
+        private let sawHeaderWrite = Mutex(false)
+        let refusals = Mutex(0)
+
+        func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
+            eventKind.tableName == MessageHeader.databaseTableName
+        }
+        func databaseDidChange(with event: DatabaseEvent) {
+            sawHeaderWrite.withLock { $0 = true }
+        }
+        func databaseWillCommit() throws {
+            guard sawHeaderWrite.withLock({ $0 }) else { return }
+            refusals.withLock { $0 += 1 }
+            throw CommitRefused()
+        }
+        func databaseDidCommit(_ db: Database) {
+            sawHeaderWrite.withLock { $0 = false }
+        }
+        func databaseDidRollback(_ db: Database) {
+            sawHeaderWrite.withLock { $0 = false }
+        }
+    }
+
     /// Every `[MoveTrace] fullSync upsert[<folderName>] — …` entry on the
     /// `.queue` channel, with `AppLogStore.append`'s `[<ts>] [QUEUE] ` prefix
     /// stripped so assertions compare against exactly what the call site
@@ -2012,24 +2118,39 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
             }
     }
 
-    /// One `[MoveTrace] fullSync upsert[...]` body, decomposed. Independent of
+    /// One segment of a `[MoveTrace] fullSync upsert[...]` body —
+    /// `<verb> N header(s): a,b (+K more)` — decomposed.
+    private struct ParsedSegment {
+        let total: Int
+        let renderedIds: [String]
+        /// nil when the segment carries no `(+N more)` suffix at all.
+        let elided: Int?
+    }
+
+    /// One `[MoveTrace] fullSync upsert[...]` body, decomposed into its
+    /// `inserted` segment and its `reclaimed` segment. Independent of
     /// `SyncEngine.upsertInsertedIdSummary`'s own implementation — it PARSES
     /// the rendered text rather than recomputing the formula, so a fix that
     /// changed the formula but kept the observable text would still be
     /// caught by these structural assertions.
+    ///
+    /// `reclaimed` is optional in the PARSER only, so that a line which omits
+    /// the segment still parses and the assertion that needs it fails on the
+    /// segment — not on a parse failure that a `guard … else { return }` would
+    /// silently swallow (`MIS-027`: red for the right reason). The pinned
+    /// shape itself always carries both segments.
     private struct ParsedUpsertLine {
-        let total: Int
-        let renderedIds: [String]
-        /// nil when the line carries no `(+N more)` suffix at all.
-        let elided: Int?
+        let inserted: ParsedSegment
+        let reclaimed: ParsedSegment?
     }
 
-    private func parseUpsertBody(_ body: String) -> ParsedUpsertLine? {
-        guard let insertedRange = body.range(of: "inserted ") else { return nil }
-        let afterInserted = body[insertedRange.upperBound...]
-        guard let headerRange = afterInserted.range(of: " header(s): ") else { return nil }
-        guard let total = Int(afterInserted[afterInserted.startIndex..<headerRange.lowerBound]) else { return nil }
-        var rest = afterInserted[headerRange.upperBound...]
+    private func parseSegment(_ segment: String, verb: String) -> ParsedSegment? {
+        let verbPrefix = "\(verb) "
+        guard segment.hasPrefix(verbPrefix) else { return nil }
+        let afterVerb = segment.dropFirst(verbPrefix.count)
+        guard let headerRange = afterVerb.range(of: " header(s): ") else { return nil }
+        guard let total = Int(afterVerb[afterVerb.startIndex..<headerRange.lowerBound]) else { return nil }
+        var rest = afterVerb[headerRange.upperBound...]
         var elided: Int?
         if let overflowRange = rest.range(of: " (+") {
             let suffix = rest[overflowRange.lowerBound...]
@@ -2039,7 +2160,29 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
             rest = rest[rest.startIndex..<overflowRange.lowerBound]
         }
         let renderedIds = rest.isEmpty ? [] : rest.split(separator: ",").map(String.init)
-        return ParsedUpsertLine(total: total, renderedIds: renderedIds, elided: elided)
+        return ParsedSegment(total: total, renderedIds: renderedIds, elided: elided)
+    }
+
+    private func parseUpsertBody(_ body: String) -> ParsedUpsertLine? {
+        guard let insertedRange = body.range(of: "inserted ") else { return nil }
+        let segments = String(body[insertedRange.lowerBound...]).components(separatedBy: " | ")
+        guard let first = segments.first, let inserted = parseSegment(first, verb: "inserted") else { return nil }
+        guard segments.count <= 2 else { return nil }
+        var reclaimed: ParsedSegment?
+        if segments.count == 2 {
+            guard let parsed = parseSegment(segments[1], verb: "reclaimed") else { return nil }
+            reclaimed = parsed
+        }
+        return ParsedUpsertLine(inserted: inserted, reclaimed: reclaimed)
+    }
+
+    /// The shape every SUCCESSFUL pass renders: both segments present, and the
+    /// reclaimed one empty unless the test says otherwise. Used by the
+    /// insert-only and update-only cases so a dropped segment fails loudly.
+    private func expectEmptyReclaimedSegment(_ parsed: ParsedUpsertLine, in body: String) {
+        #expect(parsed.reclaimed?.total == 0, "every pass renders a reclaimed segment; expected `reclaimed 0`: \(body)")
+        #expect(parsed.reclaimed?.renderedIds.isEmpty == true, "no id may be reported as reclaimed here: \(body)")
+        #expect(parsed.reclaimed?.elided == nil, "an empty reclaimed segment must render no overflow suffix: \(body)")
     }
 
     // MARK: - Under / at the cap
@@ -2059,11 +2202,16 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
             let queueLog = AppLogStore.read(channel: .queue)
             let bodies = moveTraceUpsertBodies(in: queueLog, folderName: folderName)
             #expect(bodies.count == 1, "expected exactly one matching entry, got: \(bodies)")
-            guard bodies.count == 1, let parsed = parseUpsertBody(bodies[0]) else { return }
+            guard bodies.count == 1 else { return }
+            guard let parsed = parseUpsertBody(bodies[0]) else {
+                Issue.record("upsert line did not parse: \(bodies[0])")
+                return
+            }
 
-            #expect(parsed.total == 1)
-            #expect(parsed.renderedIds == expectedIds)
-            #expect(parsed.elided == nil, "a single inserted header must render no overflow suffix")
+            #expect(parsed.inserted.total == 1)
+            #expect(parsed.inserted.renderedIds == expectedIds)
+            #expect(parsed.inserted.elided == nil, "a single inserted header must render no overflow suffix")
+            expectEmptyReclaimedSegment(parsed, in: bodies[0])
 
             let dbIds = try await pool.read {
                 try MessageHeader.filter(Column("folderId") == "\(accountId):INBOX").fetchAll($0).map(\.id)
@@ -2088,11 +2236,16 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
             let queueLog = AppLogStore.read(channel: .queue)
             let bodies = moveTraceUpsertBodies(in: queueLog, folderName: folderName)
             #expect(bodies.count == 1, "expected exactly one matching entry, got: \(bodies)")
-            guard bodies.count == 1, let parsed = parseUpsertBody(bodies[0]) else { return }
+            guard bodies.count == 1 else { return }
+            guard let parsed = parseUpsertBody(bodies[0]) else {
+                Issue.record("upsert line did not parse: \(bodies[0])")
+                return
+            }
 
-            #expect(parsed.total == cap)
-            #expect(parsed.renderedIds == expectedIds)
-            #expect(parsed.elided == nil, "exactly-cap must not trigger the overflow suffix")
+            #expect(parsed.inserted.total == cap)
+            #expect(parsed.inserted.renderedIds == expectedIds)
+            #expect(parsed.inserted.elided == nil, "exactly-cap must not trigger the overflow suffix")
+            expectEmptyReclaimedSegment(parsed, in: bodies[0])
 
             let dbIds = try await pool.read {
                 try MessageHeader.filter(Column("folderId") == "\(accountId):INBOX").fetchAll($0).map(\.id)
@@ -2120,12 +2273,17 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
             let queueLog = AppLogStore.read(channel: .queue)
             let bodies = moveTraceUpsertBodies(in: queueLog, folderName: folderName)
             #expect(bodies.count == 1, "expected exactly one matching entry, got: \(bodies)")
-            guard bodies.count == 1, let parsed = parseUpsertBody(bodies[0]) else { return }
+            guard bodies.count == 1 else { return }
+            guard let parsed = parseUpsertBody(bodies[0]) else {
+                Issue.record("upsert line did not parse: \(bodies[0])")
+                return
+            }
 
-            #expect(parsed.total == count)
-            #expect(parsed.renderedIds.count == cap)
-            #expect(parsed.renderedIds == Array(expectedIds.prefix(cap)))
-            guard let elided = parsed.elided else {
+            #expect(parsed.inserted.total == count)
+            #expect(parsed.inserted.renderedIds.count == cap)
+            #expect(parsed.inserted.renderedIds == Array(expectedIds.prefix(cap)))
+            expectEmptyReclaimedSegment(parsed, in: bodies[0])
+            guard let elided = parsed.inserted.elided else {
                 Issue.record("cap+1 inserted headers must render an overflow suffix — got: \(bodies[0])")
                 return
             }
@@ -2197,15 +2355,19 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
             #expect(bodies.count == 1, "expected exactly one matching entry, got: \(bodies)")
             guard bodies.count == 1 else { return }
             let marker = "[MoveTrace] fullSync upsert[\(folderName)] — "
-            #expect(bodies[0] == marker + "inserted 0 header(s): ",
-                    "the zero-insert line must be rendered verbatim (trailing space included), got: \(bodies[0])")
+            // ONE fixed shape, both segments always rendered — the empty inserted
+            // segment keeps its trailing space before the ` | ` separator, and the
+            // empty reclaimed segment keeps its own trailing space.
+            #expect(bodies[0] == marker + "inserted 0 header(s):  | reclaimed 0 header(s): ",
+                    "the zero-insert line must be rendered verbatim (both segments, trailing spaces included), got: \(bodies[0])")
             guard let parsed = parseUpsertBody(bodies[0]) else {
                 Issue.record("zero-insert line did not parse: \(bodies[0])")
                 return
             }
-            #expect(parsed.total == 0)
-            #expect(parsed.renderedIds.isEmpty, "no id may be rendered for an update-only pass, got \(parsed.renderedIds)")
-            #expect(parsed.elided == nil, "an update-only pass must render no overflow suffix")
+            #expect(parsed.inserted.total == 0)
+            #expect(parsed.inserted.renderedIds.isEmpty, "no id may be rendered for an update-only pass, got \(parsed.inserted.renderedIds)")
+            #expect(parsed.inserted.elided == nil, "an update-only pass must render no overflow suffix")
+            expectEmptyReclaimedSegment(parsed, in: bodies[0])
 
             // The pre-existing row is still the ONLY row, and it was UPDATED in
             // place (unread → read, epoch stamped) — the sync really merged.
@@ -2246,6 +2408,140 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
             guard rows.count == 1 else { return }
             #expect(rows[0].id == existingId)
             #expect(rows[0].isRead == true)
+        }
+    }
+
+    // MARK: - Orphan reclaim — the IOS-QUEUE-008 event is reported as what it is
+
+    @Test("Orphan reclaim — the re-homed row is reported under `reclaimed`, never under `inserted`, and is back in the synced folder")
+    func fullSyncUpsertReportsOrphanReclaimAsReclaimedNotInserted() async throws {
+        try await withTempLogAndDebugGate(enabled: true) {
+            let (pool, dir) = try makePool()
+            defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+            let accountId = "upsert-reclaim"
+            let folderName = "ReclaimFolder"
+            let (result, reclaimedId, _) = try await runFullSyncOrphanReclaim(
+                pool: pool, accountId: accountId, folderName: folderName, withGenuineInsert: false)
+            // `newHeaders` is untouched in kind: the reclaimed row still rides it
+            // for the FTS / body-queue consumers downstream.
+            #expect(result.newHeaders.map(\.id) == [reclaimedId])
+
+            // The row was RE-HOMED — same PK, membership rewritten back to this
+            // folder — and it is the ONLY row for the message: nothing was inserted.
+            let rows = try await pool.read {
+                try MessageHeader
+                    .filter(Column("accountId") == accountId && Column("messageId") == "m1")
+                    .fetchAll($0)
+            }
+            #expect(rows.count == 1, "the orphan must be reclaimed in place, not duplicated: \(rows.map(\.id))")
+            guard rows.count == 1 else { return }
+            #expect(rows[0].id == reclaimedId)
+            #expect(rows[0].folderId == "\(accountId):INBOX")
+            #expect(rows[0].folderPath == "INBOX")
+            #expect(rows[0].isInInbox == true)
+
+            let queueLog = AppLogStore.read(channel: .queue)
+            let bodies = moveTraceUpsertBodies(in: queueLog, folderName: folderName)
+            #expect(bodies.count == 1, "expected exactly one matching entry, got: \(bodies)")
+            guard bodies.count == 1 else { return }
+            guard let parsed = parseUpsertBody(bodies[0]) else {
+                Issue.record("upsert line did not parse: \(bodies[0])")
+                return
+            }
+            #expect(parsed.reclaimed?.renderedIds == [reclaimedId],
+                    "a row re-homed in place must be reported as reclaimed: \(bodies[0])")
+            #expect(parsed.reclaimed?.total == 1, "exactly one row was reclaimed: \(bodies[0])")
+            #expect(!parsed.inserted.renderedIds.contains(reclaimedId),
+                    "an in-place update must NOT be reported as an insert: \(bodies[0])")
+            #expect(parsed.inserted.total == 0, "nothing was inserted in this pass: \(bodies[0])")
+            #expect(parsed.inserted.renderedIds.isEmpty, "no id may be reported as inserted: \(bodies[0])")
+        }
+    }
+
+    @Test("Mixed pass — one genuine insert plus one orphan reclaim renders both segments, in exactly this shape")
+    func fullSyncUpsertMixedPassRendersBothSegmentsVerbatim() async throws {
+        try await withTempLogAndDebugGate(enabled: true) {
+            let (pool, dir) = try makePool()
+            defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+            let accountId = "upsert-mixed"
+            let folderName = "MixedPassFolder"
+            let (result, reclaimedId, insertedId) = try await runFullSyncOrphanReclaim(
+                pool: pool, accountId: accountId, folderName: folderName, withGenuineInsert: true)
+            guard let insertedId else {
+                Issue.record("the mixed fixture must name the genuinely inserted id")
+                return
+            }
+            #expect(Set(result.newHeaders.map(\.id)) == [reclaimedId, insertedId])
+
+            let queueLog = AppLogStore.read(channel: .queue)
+            let bodies = moveTraceUpsertBodies(in: queueLog, folderName: folderName)
+            #expect(bodies.count == 1, "expected exactly one matching entry, got: \(bodies)")
+            guard bodies.count == 1 else { return }
+            let marker = "[MoveTrace] fullSync upsert[\(folderName)] — "
+            #expect(bodies[0] == marker + "inserted 1 header(s): \(insertedId) | reclaimed 1 header(s): \(reclaimedId)",
+                    "the mixed line must render both segments verbatim, got: \(bodies[0])")
+
+            // Both rows are committed in the synced folder — the reclaimed PK
+            // re-homed, the new PK inserted — and the Archive membership is gone.
+            let dbIds = try await pool.read {
+                try MessageHeader.filter(Column("folderId") == "\(accountId):INBOX").fetchAll($0).map(\.id)
+            }
+            #expect(Set(dbIds) == [reclaimedId, insertedId])
+            let archiveCount = try await pool.read {
+                try MessageHeader.filter(Column("folderId") == "\(accountId):Archive").fetchCount($0)
+            }
+            #expect(archiveCount == 0, "the reclaimed row must have left its Archive membership")
+        }
+    }
+
+    // MARK: - Rolled-back pass — the line is emitted only after COMMIT
+
+    @Test("Rolled-back pass — a commit refused after the header insert leaves NO [MoveTrace] fullSync upsert line and NO header row")
+    func fullSyncUpsertEmitsNothingWhenTheWriteRollsBack() async throws {
+        try await withTempLogAndDebugGate(enabled: true) {
+            let (pool, dir) = try makePool()
+            defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+            let accountId = "upsert-rollback"
+            let folderName = "RollbackFolder"
+            let folderPath = "INBOX"
+            try await pool.write { db in
+                var acc = Account(emailAddress: "\(accountId)@example.com", displayName: "T", provider: .imap)
+                acc.id = accountId
+                try acc.insert(db)
+                try Folder(name: folderName, path: folderPath, role: .inbox, accountId: accountId).insert(db)
+            }
+            let folder = try await pool.read { try Folder.fetchOne($0, key: "\(accountId):\(folderPath)")! }
+            let remote = makeHeaderInfo(
+                messageId: "hdr-0", rfc822MessageId: "<hdr-0@example.com>",
+                date: Date().addingTimeInterval(-60))
+            let mock = MockEmailProvider(staleWindowMode: .uid)
+            await mock.setFetchMessagesResult([remote])
+
+            // Installed AFTER the fixture seeding, so the only header-writing
+            // transaction it can refuse is the sync's own upsert.
+            let refuser = HeaderCommitRefuser()
+            pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+
+            await #expect(throws: HeaderCommitRefuser.CommitRefused.self) {
+                _ = try await SyncEngine.runSyncMessages(
+                    for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
+                    dbPool: PrioritizedDatabase(pool: pool))
+            }
+            // Non-vacuity: the sync reached its header insert and the COMMIT of
+            // that very transaction was refused, exactly once.
+            #expect(refuser.refusals.withLock { $0 } == 1,
+                    "the refusal must land on the sync's own upsert transaction, exactly once")
+
+            // The property: a rolled-back pass reports nothing — no line for
+            // rows that never became durable …
+            let queueLog = AppLogStore.read(channel: .queue)
+            #expect(moveTraceUpsertBodies(in: queueLog, folderName: folderName).isEmpty,
+                    "a rolled-back pass must emit no upsert line: \(queueLog)")
+            // … and no row.
+            let rowCount = try await pool.read {
+                try MessageHeader.filter(Column("folderId") == "\(accountId):\(folderPath)").fetchCount($0)
+            }
+            #expect(rowCount == 0, "a refused commit must leave no header row")
         }
     }
 }

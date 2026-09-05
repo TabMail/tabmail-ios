@@ -8,28 +8,32 @@ import Synchronization
 
 extension SyncEngine {
 
-    /// Render the inserted-header id list for the debug-gated `fullSync upsert`
-    /// diagnostic: `"inserted N header(s): a,b,c (+K more)"`.
+    /// Render one segment of the debug-gated `fullSync upsert` diagnostic:
+    /// `"<verb> N header(s): a,b,c (+K more)"`. `verb` is `"inserted"` for the
+    /// rows a pass INSERTED and `"reclaimed"` for the existing rows it re-homed
+    /// into the folder in place (the orphan-reclaim arm); both segments use the
+    /// same cap and overflow arithmetic, so a reader compares like with like.
     ///
     /// Extracted as a PURE, `nonisolated static` function for the same reason
     /// `AccountManager.laneDiagnosticSummary` is one — the diagnostic it renders
-    /// lives inside a `dbPool.write` closure behind a runtime debug gate, so
-    /// inline it can only be executed by a test that also unlocks that gate, and
-    /// its OVERFLOW branch needs more inserted headers than any sync fixture
-    /// produces. Split out, both branches are directly unit-testable and the call
-    /// site is one expression.
+    /// is built inside a `dbPool.write` closure (and emitted only after that
+    /// write commits) behind a runtime debug gate, so inline it can only be
+    /// executed by a test that also unlocks that gate, and its OVERFLOW branch
+    /// needs more inserted headers than any sync fixture produces. Split out,
+    /// both branches are directly unit-testable and the call site is one
+    /// expression per segment.
     ///
     /// ⚠️ The cap is a DISPLAY cap on synthetic header IDS and nothing else. It
     /// bounds no fetch, no batch and nothing written to the database: every
     /// inserted row is still inserted, and the elided count is STATED rather than
     /// dropped, so the line never claims to be exhaustive when it is not. Global
     /// `CLAUDE.md` rule 11 names exactly this shape as not being data truncation.
-    nonisolated static func upsertInsertedIdSummary(_ insertedIds: [String]) -> String {
+    nonisolated static func upsertInsertedIdSummary(_ ids: [String], verb: String = "inserted") -> String {
         let cap = SyncConfig.upsertInsertedIdLogCap
-        let elided = insertedIds.count - cap
+        let elided = ids.count - cap
         let overflow = elided > 0 ? " (+\(elided) more)" : ""
-        return "inserted \(insertedIds.count) header(s): "
-            + insertedIds.prefix(cap).joined(separator: ",")
+        return "\(verb) \(ids.count) header(s): "
+            + ids.prefix(cap).joined(separator: ",")
             + overflow
     }
 
@@ -1194,7 +1198,7 @@ extension SyncEngine {
         // in-flight write (DatabaseWriteQueue can't preempt SQLite), so a single long
         // folder write here is the residual cap to chunk. Remove once confirmed bounded.
         let writeStart = CFAbsoluteTimeGetCurrent()
-        let syncResult: (newHeaders: [MessageHeader], staleIds: [String], replyDetectIds: [String], uidMigratedOldIds: [String], ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)], headerRekeys: [HeaderRekeyRecord]) = try await dbPool.write { db in
+        let syncResult: (newHeaders: [MessageHeader], staleIds: [String], replyDetectIds: [String], uidMigratedOldIds: [String], ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)], headerRekeys: [HeaderRekeyRecord], upsertLine: String?) = try await dbPool.write { db in
             // ⚠ PRE-EXISTING HAZARD, deliberately NOT closed by T1.2 and tracked
             // separately: this merge pass has NO UIDVALIDITY guard. `selectStaleHeaders`
             // below classifies "the server did not return UID n" as stale, which on a
@@ -1272,7 +1276,7 @@ extension SyncEngine {
             // full sync re-drives an interrupted reaction on every cycle.
             if folderInTxn?.uidValidityResetPendingAt != nil {
                 BackgroundSyncLogger.log("[Sync] merge pass SKIPPED for \(folderId) — folder is in UIDVALIDITY quarantine; the reaction owns it")
-                return (newHeaders: [], staleIds: [], replyDetectIds: [], uidMigratedOldIds: [], ftsRekeys: [], headerRekeys: [])
+                return (newHeaders: [], staleIds: [], replyDetectIds: [], uidMigratedOldIds: [], ftsRekeys: [], headerRekeys: [], upsertLine: nil)
             }
             // (b) EPOCH DISAGREEMENT.
             let storedEpochInTxn = Self.knownUidValidity(
@@ -1286,7 +1290,7 @@ extension SyncEngine {
                     accountId: accountId, folderPath: folderPath,
                     storedValue: stored, observedValue: observed
                 )
-                return (newHeaders: [], staleIds: [], replyDetectIds: [], uidMigratedOldIds: [], ftsRekeys: [], headerRekeys: [])
+                return (newHeaders: [], staleIds: [], replyDetectIds: [], uidMigratedOldIds: [], ftsRekeys: [], headerRekeys: [], upsertLine: nil)
             }
             try Self.bootstrapFolderUidValidity(
                 db, folderId: folderId, observed: observedEpochAtFetch.map { Int($0) })
@@ -1325,6 +1329,15 @@ extension SyncEngine {
                 print("[MoveTrace] fullSync \(folder.name) — pendingDestructiveIds=\(pendingDestructiveIds) pendingAllIds=\(pendingAllIds)")
             }
             var newHeaders: [MessageHeader] = []
+            // Diagnostic-only id lists for the `[MoveTrace] fullSync upsert` line
+            // rendered at the end of this closure: `insertedIds` grows ONLY next
+            // to a `header.insert(db)`, `reclaimedIds` ONLY at the orphan-reclaim
+            // arm's in-place update. `newHeaders` carries BOTH kinds for the FTS /
+            // body-queue consumers and is deliberately not the source of either
+            // list — an in-place update reported as an insert is the lie R4-RS-1
+            // removed.
+            var insertedIds: [String] = []
+            var reclaimedIds: [String] = []
             var staleIds: [String] = []
             var ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)] = []
             var headerRekeys: [HeaderRekeyRecord] = []
@@ -1891,6 +1904,7 @@ extension SyncEngine {
                             .insert(db, onConflict: .ignore)
                     }
                     newHeaders.append(header)
+                    insertedIds.append(header.id)
                     if folder.role == .drafts || folder.role == .sent {
                         print("[Sync] DraftDedup: replaced optimistic \(folder.role.rawValue) header \(oldId) → \(header.id) | oldSnippet=\(String(optimistic.snippet.prefix(60))) | newSnippet=\(String(header.snippet.prefix(60)))")
                     } else {
@@ -2036,6 +2050,10 @@ extension SyncEngine {
                             .insert(db, onConflict: .ignore)
                     }
                     newHeaders.append(header)
+                    // A NEW row under `header.id` (the pre-sync row was deleted
+                    // above and re-inserted here), so it is an insert for the
+                    // diagnostic even though the log line below says "reclaimed".
+                    insertedIds.append(header.id)
                     print("[Sync] Reclaimed pre-sync inbox row \(oldId) → \(header.id) (folderPath drift, preserved AI)")
                     // Clean up any additional duplicates — their AI fields
                     // already merged via the fetchAll scan isn't worth doing
@@ -2143,6 +2161,8 @@ extension SyncEngine {
                             .insert(db, onConflict: .ignore)
                     }
                     newHeaders.append(orphaned)
+                    // In-place UPDATE of an existing row, never an insert.
+                    reclaimedIds.append(orphaned.id)
                 } else {
                     // Defensive — the pending-op filter above should have already
                     // skipped optimistic-move rows whose id PK collides with this
@@ -2172,6 +2192,7 @@ extension SyncEngine {
                             .insert(db, onConflict: .ignore)
                     }
                     newHeaders.append(header)
+                    insertedIds.append(header.id)
                 }
             }
 
@@ -2195,6 +2216,7 @@ extension SyncEngine {
             // steady-state re-syncs (Archive/etc.) — it counts the redundant writes the
             // change-detection above eliminated. A stuck-high `upd` with unchanged mail
             // fingerprints an always-dirty column to normalize.
+            var upsertLine: String?
             if upsUpdated + upsNoop + upsDraftSentSkip > 0 || !newHeaders.isEmpty {
                 let loopMs = Int((CFAbsoluteTimeGetCurrent() - upsLoopT0) * 1000)
                 BootProfiler.mark("fullSync upsert[\(folder.name)]: ins=\(newHeaders.count) upd=\(upsUpdated) noop=\(upsNoop) dsSkip=\(upsDraftSentSkip) stale=\(staleIds.count) loop=\(loopMs)ms recon=\(Int(upsReconSeconds * 1000))ms")
@@ -2202,6 +2224,13 @@ extension SyncEngine {
                 // what the reappearing-message investigation (`IOS-QUEUE-008`) had
                 // and could not use: it proves a full sync inserted N rows but not
                 // whether the message the user had just deleted was one of them.
+                // Two segments, ALWAYS both, so a reader never wonders whether one
+                // was omitted: `inserted` lists the rows this pass INSERTED
+                // (`insertedIds`) and `reclaimed` lists the existing rows it
+                // re-homed into this folder in place (`reclaimedIds`, the
+                // orphan-reclaim arm) — for `IOS-QUEUE-008` the MORE interesting
+                // event, a locally moved row the server disagreed with, reported
+                // as what it is rather than as an insert (R4-RS-1).
                 // Debug-gated and file-backed on `.queue`, so it interleaves with
                 // the drain's `queueLog` lines in the one `tabmail.log` and
                 // `AppLogStore.read(channel: .queue)` returns both halves in append
@@ -2211,18 +2240,32 @@ extension SyncEngine {
                 // IS active on device / TestFlight for such a user, which is the
                 // point (global `CLAUDE.md` rule 12).
                 //
-                // The rendering is a pure static function so BOTH its branches can
-                // be unit-tested; it is evaluated inside `logQueue`'s `@autoclosure`
-                // argument, so a closed gate still builds nothing.
-                BackgroundSyncLogger.logQueue(
-                    "[MoveTrace] fullSync upsert[\(folder.name)] — "
-                        + SyncEngine.upsertInsertedIdSummary(newHeaders.map(\.id)))
+                // RENDERED here, EMITTED only after `dbPool.write` has returned —
+                // see the `logQueue` call below the closure. `AppLogStore.append`
+                // enqueues file I/O that no SQLite ROLLBACK can retract, so a line
+                // written from inside the transaction would survive a COMMIT
+                // failure (I/O error, full disk) and name ids for rows that never
+                // became durable. The line therefore rides the closure's return
+                // tuple, nil when the pass emits nothing, and a thrown write never
+                // reaches the emission at all. The rendering is a pure static
+                // function so BOTH its branches can be unit-tested; it is cheap
+                // (two capped joins), and `logQueue` still checks the gate, so a
+                // closed gate still writes nothing.
+                upsertLine = "[MoveTrace] fullSync upsert[\(folder.name)] — "
+                    + SyncEngine.upsertInsertedIdSummary(insertedIds)
+                    + " | "
+                    + SyncEngine.upsertInsertedIdSummary(reclaimedIds, verb: "reclaimed")
             }
-            return (newHeaders, staleIds, replyDetectIds, uidMigratedOldMsgIds, ftsRekeys, headerRekeys)
+            return (newHeaders, staleIds, replyDetectIds, uidMigratedOldMsgIds, ftsRekeys, headerRekeys, upsertLine)
         }
         let writeMs = Int((CFAbsoluteTimeGetCurrent() - writeStart) * 1000)
         if writeMs > 30 {
             BootProfiler.mark("fullSync write[\(folder.name)]: \(messages.count) msg in \(writeMs)ms")
+        }
+        // Reached only when the write above COMMITTED: a rolled-back pass throws
+        // past this point and reports nothing (R4-RS-1).
+        if let upsertLine = syncResult.upsertLine {
+            BackgroundSyncLogger.logQueue(upsertLine)
         }
 
         return SyncMessagesResult(
