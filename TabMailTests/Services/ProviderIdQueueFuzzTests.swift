@@ -1560,32 +1560,40 @@ struct ProviderIdQueueFuzzTests {
     }
 }
 
-// MARK: - A3.2 — stable-id (Gmail) lane fuzzer, Testing Rule 11
+// MARK: - A3.2 — account-scoped-id lane fuzzer, Testing Rule 11
 //
 // Everything above this line exercises `.imap` fixtures only, and every
 // planned gesture in `providerIdQueueFuzz` targets a DIFFERENT uid — so that
-// fuzzer never creates an immutable-id account and never creates two
+// fuzzer never creates an account-scoped-id account and never creates two
 // cross-folder ops naming ONE provider resource. Reverting only the
-// immutable-id arm of `AccountManagerQueue.buildLanes`'s `laneKey`
+// account-scoped arm of `AccountManagerQueue.buildLanes`'s `laneKey`
 // (folder-qualifying it unconditionally) therefore leaves the whole suite
 // above green. This extension closes that gap.
 //
 // ## The invariant under test
 //
-// `buildLanes(_:immutableIdAccountIds:)` keys an account whose provider id is
-// NEVER reallocated by `"accountId:msgId"` — folder deliberately EXCLUDED,
-// because such an id is folder-independent. Everything else — IMAP, iCloud,
-// AND Outlook — keys `"accountId:folderPath:msgId"`, the same folder-local
-// key IMAP always used; that is the SAFE DEFAULT. Outlook is deliberately on
-// the folder-qualified (safe-default) side despite being a "stable id"
-// provider: Microsoft Graph's default message ids are REALLOCATED on every
-// move (`IOS-GRAPH-002`; this tree sends no `Prefer: IdType="ImmutableId"`),
-// so account-qualifying Outlook would make an INHERITED race deterministic —
-// a follower op queued before an in-flight move would be guaranteed to run
-// AFTER it, against an id the move just invalidated, 404, and the conflict
-// arm would delete the follower (a dropped intention). Only Gmail (and the
-// demo account, `DemoSeed.demoAccountId`, stored as `.imap` but carved out
-// the same way admission already does) get genuinely immutable ids.
+// `buildLanes(_:accountScopedIdAccountIds:)` keys an account whose provider id
+// names ONE MESSAGE PER ACCOUNT by `"accountId:msgId"` — folder deliberately
+// EXCLUDED, because such an id is folder-independent. Everything else — IMAP
+// and iCloud — keys `"accountId:folderPath:msgId"`, the same folder-local key
+// IMAP always used; that is the SAFE DEFAULT for a mailbox-local UID.
+//
+// The account-qualified side is Gmail, Outlook, and the demo account
+// (`DemoSeed.demoAccountId`, stored as `.imap` but carved out the same way
+// admission already does). Gmail and the demo account get ids that are also
+// IMMUTABLE. Outlook does not: Microsoft Graph REALLOCATES a message's default
+// id on every move (`IOS-GRAPH-002`; this tree sends no
+// `Prefer: IdType="ImmutableId"`), which is why Outlook was excluded from this
+// set until 2026-09-04 — account-qualifying it made an INHERITED race
+// DETERMINISTIC, because a follower queued before an in-flight move was
+// guaranteed to run AFTER it against the id the move had just invalidated,
+// 404, and the conflict arm deleted the follower. Outlook is admitted now
+// because `MessageHeaderRekey.finishMove` readdresses every queued follower
+// inside the transaction that retires the move (`IOS-GRAPH-005`), so
+// "runs after the move" now means "runs at the address the move PROVED".
+// That is why this fuzzer alternates the provider per round: the Gmail rounds
+// exercise the immutable-id shape, the Outlook rounds exercise the
+// churn-plus-handoff shape, and only the second can catch a handoff regression.
 //
 // `IOS-QUEUE-008`: on Gmail, delete → undo → re-delete produced
 // `TRASH→INBOX` and `INBOX→TRASH` on ONE message; under a uniformly
@@ -1599,9 +1607,9 @@ struct ProviderIdQueueFuzzTests {
 //
 // ## ACCEPTANCE BAR (Testing Rule 11)
 //
-// With the immutable-id arm of `buildLanes`'s local `laneKey` reverted —
+// With the account-scoped arm of `buildLanes`'s local `laneKey` reverted —
 //     func laneKey(_ op: PendingOperation, _ id: String) -> String {
-//         immutableIdAccountIds.contains(op.accountId)
+//         accountScopedIdAccountIds.contains(op.accountId)
 //             ? "\(op.accountId):\(id)"
 //             : "\(op.accountId):\(op.folderPath):\(id)"
 //     }

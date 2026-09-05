@@ -220,6 +220,49 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     ) -> String {
         "\(accountId):\(draftsFolderPath):\(draftPlaceholderMessageId(draftId: draftId, instanceEpoch: instanceEpoch))"
     }
+
+    /// Return a claimed row to `queued` by writing ONLY the two columns the
+    /// requeue actually decides, addressed by primary key.
+    ///
+    /// 🚨 WHY THIS IS NOT `var updated = op; updated.status = …; try updated.save(db)`.
+    /// A `save` is an UPDATE of EVERY column from the in-memory struct, and in the
+    /// drain that struct is a SNAPSHOT taken at the start of the pass, before any
+    /// lane ran. Since `MessageHeaderRekey.readdressQueuedOperations` rewrites a
+    /// queued follower's `messageIdsJSON` inside the transaction that retires its
+    /// predecessor's move (`IOS-GRAPH-005`), a struct-shaped requeue of the
+    /// REMAINING lane members — the `.haltLane` and evidence-refused paths — would
+    /// write the pre-handoff ids back over the addresses the wire had just proved,
+    /// and the follower would go out at a dead id on the next drain. That is the
+    /// "identity resolved before an `await` is not a fact after it" trap: the
+    /// requeue's DECISION (status, and whether this attempt counts as a retry) is
+    /// the only thing it observed, so it is the only thing it may write.
+    ///
+    /// `incrementRetryCount` is computed by SQL rather than from the snapshot for
+    /// the same reason — `retryCount + 1` cannot regress a count another writer
+    /// advanced. A row deleted since the claim (cancel/annihilation) simply
+    /// matches nothing; that is not an error, and the caller does not need to know.
+    ///
+    /// Callers that fetch and save inside ONE transaction (`reconcilePendingOperations`,
+    /// the claim loop, `retirePartiallyCompletedOp`'s narrowing) are NOT this case
+    /// and are deliberately left alone: their struct is read in the same
+    /// transaction that writes it, so it cannot be stale.
+    static func markQueued(
+        _ db: Database, id: String, incrementRetryCount: Bool = false
+    ) throws {
+        if incrementRetryCount {
+            try db.execute(
+                sql: """
+                    UPDATE pendingOperation
+                    SET status = ?, retryCount = retryCount + 1
+                    WHERE id = ?
+                    """,
+                arguments: [PendingStatus.queued.rawValue, id])
+        } else {
+            try db.execute(
+                sql: "UPDATE pendingOperation SET status = ? WHERE id = ?",
+                arguments: [PendingStatus.queued.rawValue, id])
+        }
+    }
 }
 
 // MARK: - Sync Filter Snapshot
