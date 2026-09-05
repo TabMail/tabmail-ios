@@ -92,15 +92,28 @@ struct PendingQueueLaneTests {
         #expect(laneIds.contains([opEmpty.id]))
     }
 
-    // MARK: - 4. Same message id across DIFFERENT accounts stays separate
+    // MARK: - 4. Two accounts never share a lane, in EITHER address space
 
-    @Test("same message id on different accounts lands in separate lanes (no cross-account merge)")
-    func sameMessageIdDifferentAccountsSeparateLanes() {
+    /// THE INVARIANT: the lane key is account-qualified in BOTH address spaces,
+    /// so two accounts that happen to name the same message-id string never
+    /// merge into one lane — whichever arm of `laneKey` their ops take.
+    ///
+    /// `buildLanes` builds the folder-qualified key `accountId:folderPath:id`
+    /// for accounts ABSENT from `immutableIdAccountIds` and the immutable-id key
+    /// `accountId:id` for accounts NAMED in it. Passing only the empty set would
+    /// exercise the folder-qualified arm twice and leave the immutable arm's
+    /// account qualifier unwitnessed — dropping `op.accountId` from that arm
+    /// alone (key = `id`) would merge two admitted accounts' ops into one lane,
+    /// and a retryable failure in one account would then halt the other's work.
+    /// Both arms are therefore driven from the same oracle, on the same fixture.
+    @Test("two accounts never share a lane in EITHER address space (folder-qualified and immutable-id)",
+          arguments: [Set<String>(), Set(["acc1", "acc2"])])
+    func sameMessageIdDifferentAccountsSeparateLanes(admitted: Set<String>) {
         let now = Date()
         let opAcc1 = makeOp(messageIds: ["shared-id"], accountId: "acc1", createdAt: now)
         let opAcc2 = makeOp(messageIds: ["shared-id"], accountId: "acc2", createdAt: now.addingTimeInterval(1))
 
-        let lanes = AccountManager.buildLanes([opAcc1, opAcc2], immutableIdAccountIds: [])
+        let lanes = AccountManager.buildLanes([opAcc1, opAcc2], immutableIdAccountIds: admitted)
 
         #expect(lanes.count == 2)
         let laneIds = lanes.map { $0.map(\.id) }
