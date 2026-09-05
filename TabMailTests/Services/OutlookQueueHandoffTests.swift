@@ -1039,10 +1039,41 @@ struct OutlookQueueHandoffTests {
         await AccountManager.shared.drainPendingQueue()
 
         // NON-VACUITY. The fault is one-shot and clears itself when it fires, so
-        // an empty seam here proves the re-read really threw; and the move
-        // really did land and really did churn the id, so a reverted address
-        // would have a dead id to fail on.
-        #expect(AccountManager.liveOperationReadFaultForTesting.withLock { $0 } == nil, """
+        // an empty seam PROVES the re-read really threw.
+        //
+        // ⚠️ IT IS WAITED FOR, NOT READ ONCE. Each gesture above triggers its own
+        // drain, so the call just above may find `isDraining` already set, record
+        // the redrain and return without having run a pass — the pass then
+        // happens in the deferred task. The seam clearing is a strict
+        // HAPPENS-AFTER of `liveOperation` being called for this row, so polling
+        // it is a real barrier rather than a sleep, and it does not care which
+        // drain consumed the fault.
+        var faultFired = false
+        var foreignArming: String?
+        for _ in 0..<600 {
+            let armed = AccountManager.liveOperationReadFaultForTesting.withLock { $0 }
+            if armed == nil {
+                faultFired = true
+                break
+            }
+            // TWO-SIDED: `nil` only means "MY fault fired" while the seam still
+            // belongs to this test. `.processGlobalState` serializes every suite
+            // that touches this seam, so a foreign id here would mean that
+            // guarantee has broken and the wait below would be satisfied by
+            // somebody else's fault — a silently vacuous test rather than a
+            // failing one.
+            if armed != firstFollowerId {
+                foreignArming = armed
+                break
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(foreignArming == nil, """
+            the one-shot re-read seam was re-armed by another test while this one \
+            was waiting on it (\(String(describing: foreignArming))); this test's \
+            barrier is no longer its own
+            """)
+        #expect(faultFired, """
             the injected re-read fault never fired, so this test did not exercise \
             the arm it exists for
             """)
