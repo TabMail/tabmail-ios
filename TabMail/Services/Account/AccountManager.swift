@@ -460,6 +460,49 @@ actor AccountManager {
     /// Old source-address header id -> latest successor.
     var deferredMoveSuccessors: [String: DeferredMoveSuccessor] = [:]
 
+    /// A retirement whose LOCAL write could not commit, kept exactly as the
+    /// provider handed it to us so the next drain can replay it.
+    ///
+    /// The wire has already PROVEN the move — Graph answered `2xx` and named
+    /// the destination id, or IMAP returned `COPYUID` — and the only thing that
+    /// failed is a transaction. GRDB suspends writes when the app is
+    /// backgrounded mid-drain while reads keep working (ADR-IOS-041), and a full
+    /// disk or an I/O error at COMMIT does the same. Discarding the provider's
+    /// own returned result there loses the address for every holder of the old
+    /// one: the follower serialized behind the move in the same account-scoped
+    /// lane runs next naming the id Graph has just invalidated, Graph answers
+    /// `404`, and `executeSingleOp`'s single-message conflict arm reads that as
+    /// provider-authoritative "already done" and DELETES the user's newer
+    /// intention (`IOS-GRAPH-005`, owner decision 2026-09-05,
+    /// `TabMail/tabmail-ios#120`).
+    ///
+    /// Each case captures EXACTLY the inputs its caller's retirement transaction
+    /// needs and nothing else, so the replay runs the SAME helper the original
+    /// site ran rather than a second copy of it that can drift.
+    ///
+    /// BOUNDED by the number of claimed moves whose retirement failed: an entry
+    /// exists only between that failure and the next drain, and leaves on replay
+    /// success, when the row is gone (a local wipe or reset removed it), or with
+    /// the process. A process death before the replay is the accepted crash
+    /// window, unchanged — see the acceptance beside
+    /// `MessageHeaderRekey.readdressQueuedOperations`.
+    enum PendingRetirement: Sendable {
+        /// `executeSingleOp`'s whole-op success path.
+        case full(op: PendingOperation, executed: ExecutedOperation)
+        /// `retirePartiallyCompletedOp`'s narrowing path.
+        case partial(
+            op: PendingOperation,
+            provenMembers: [String],
+            remaining: [String],
+            provenDestinations: [ProvenDestinationAddress],
+            addressChangesOnMove: Bool)
+    }
+
+    /// `PendingOperation.id` -> the retirement whose local write has not
+    /// committed yet. Read and written only inside `drainPendingQueue` and the
+    /// two retirement callers it drives, all on this actor.
+    var pendingRetirements: [String: PendingRetirement] = [:]
+
     // MARK: - FIFO Local Write Queue
 
     /// Serial queue for ALL local DB writes from user actions.

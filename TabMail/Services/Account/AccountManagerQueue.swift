@@ -573,7 +573,6 @@ extension AccountManager {
             needsRedrain = true
             return
         }
-        guard NetworkMonitor.checkConnected() else { return }
         isDraining = true
         defer {
             isDraining = false
@@ -583,8 +582,21 @@ extension AccountManager {
             }
         }
 
-        pruneRecentlyCompleted()
         let ctx = DrainContext()
+
+        // 🚨 FINISH ANY RETIREMENT THIS PROCESS ALREADY HAS THE PROOF FOR, FIRST
+        // AND WHILE STILL OFFLINE. An operation whose provider result committed
+        // nowhere is holding an address every later gesture on that message
+        // needs, and its lane is halted until it commits — so it must be retired
+        // before anything is claimed, and it must not be made to wait for
+        // connectivity it does not use. `isDraining` is therefore set ABOVE the
+        // `NetworkMonitor` check now: the replay is real work that must not run
+        // concurrently with itself or with a pass.
+        guard await replayRetainedRetirements(context: ctx) else { return }
+
+        guard NetworkMonitor.checkConnected() else { return }
+
+        pruneRecentlyCompleted()
 
         // Max 3 passes to pick up ops inserted during drain.
         for pass in 0..<3 {
@@ -1053,6 +1065,179 @@ extension AccountManager {
             "[Queue] handoff — move \(op.id.prefix(8)) retired and re-addressed "
                 + "\(result.readdressedOperationIds.count) queued op(s): "
                 + result.readdressedOperationIds.map { String($0.prefix(8)) }.joined(separator: ","))
+    }
+
+    /// THE WHOLE-OP RETIREMENT TRANSACTION, as one value.
+    ///
+    /// Extracted from `executeSingleOp` verbatim so the REPLAY in
+    /// `replayRetainedRetirements` runs the SAME write rather than a second copy
+    /// that can drift away from it. Nothing about the transaction's content
+    /// changed in the extraction: the classification is still read INSIDE the
+    /// write, from the same `account` rows `drainPendingQueue` keyed the lanes
+    /// from, because the two facts must not be allowed to drift — the lane key
+    /// promises that a follower runs after this move, and `accountScopedIds` is
+    /// what makes that promise safe by re-addressing it.
+    ///
+    /// 🚨 THE MOVE IS FINISHED LOCALLY HERE, IN THE SAME WRITE THAT DELETES THE
+    /// OP. `optimisticMoveToFolder` left the row's primary key and `messageId`
+    /// at their SOURCE values with a NIL epoch, so until it is re-keyed the row
+    /// is refused by `admittedOrdinaryActionTargets` and the user's NEXT gesture
+    /// on a just-moved message is a silent dead no-op. Re-keying it to the
+    /// address the server itself named in `COPYUID` (already in hand — see
+    /// `MessageHeaderRekey.finishMove` for the four guards) closes that, and
+    /// makes undo-after-drain an ordinary reverse move.
+    nonisolated static func commitFullRetirement(
+        _ op: PendingOperation, executed: ExecutedOperation, db: Database
+    ) throws -> MoveFinishResult {
+        let accountScopedIds = try AccountManager
+            .accountScopedIdAccountIds(db).contains(op.accountId)
+        let result = try MessageHeaderRekey.finishMove(
+            op,
+            destinations: executed.provenDestinations,
+            addressChangesOnMove: executed.addressChangesOnMove,
+            accountScopedIds: accountScopedIds,
+            db: db)
+        MessageHeaderRekey.publishAddressHandoffsAfterCommit(result.applied, in: db)
+        _ = try PendingOperation.deleteOne(db, key: op.id)
+        return result
+    }
+
+    /// THE NARROWING TRANSACTION, as one value — the partial sibling of
+    /// `commitFullRetirement`, extracted from `retirePartiallyCompletedOp` for
+    /// the same reason and with the same content.
+    ///
+    /// `frozenRetiredOp` carries the PROVEN members only, so the re-key is
+    /// scoped to them and an unproven member is never re-keyed. The durable row
+    /// is then narrowed to `remaining` and made retryable, in this same write:
+    /// a partial outcome — members removed while the header keeps its source
+    /// address, or the reverse — would be a dropped intention or a row nothing
+    /// can address (`IOS-QUEUE-005`).
+    nonisolated static func commitPartialRetirement(
+        _ frozenRetiredOp: PendingOperation,
+        remaining: [String],
+        provenDestinations: [ProvenDestinationAddress],
+        addressChangesOnMove: Bool,
+        db: Database
+    ) throws -> MoveFinishResult {
+        let accountScopedIds = try AccountManager
+            .accountScopedIdAccountIds(db).contains(frozenRetiredOp.accountId)
+        let result = try MessageHeaderRekey.finishMove(
+            frozenRetiredOp,
+            destinations: provenDestinations,
+            addressChangesOnMove: addressChangesOnMove,
+            accountScopedIds: accountScopedIds,
+            db: db)
+        MessageHeaderRekey.publishAddressHandoffsAfterCommit(result.applied, in: db)
+        guard var fresh = try PendingOperation.fetchOne(db, key: frozenRetiredOp.id) else {
+            return result
+        }
+        fresh.messageIds = remaining
+        fresh.status = PendingStatus.queued.rawValue
+        try fresh.save(db)
+        return result
+    }
+
+    /// REPLAY every retirement whose local write could not commit earlier in
+    /// this process, before the drain claims anything.
+    ///
+    /// The provider proved these operations on the wire; only a transaction
+    /// failed. Each entry is re-run through the SAME helper its original site
+    /// ran, and the post-commit steps that site would have run happen here
+    /// instead, because they are what a committed retirement publishes.
+    ///
+    /// ⚠️ THIS RUNS BEFORE THE `NetworkMonitor` CHECK, deliberately: the work
+    /// left to do is entirely LOCAL, and making a local recovery wait for
+    /// connectivity would strand a proven move behind an offline window it has
+    /// nothing to do with.
+    ///
+    /// - Returns: `false` when the drain must stop. A replay that still cannot
+    ///   commit says the database is still refusing writes, and nothing else in
+    ///   this drain could retire safely either — so there is no per-account skip
+    ///   machinery, just a stop. The entry is kept and the next drain tries
+    ///   again.
+    private func replayRetainedRetirements(context: DrainContext) async -> Bool {
+        guard !pendingRetirements.isEmpty else { return true }
+        for (opId, retirement) in pendingRetirements {
+            do {
+                // ⚠️ THE ROW CAN BE GONE, and that is not a failure. The writers
+                // that delete a claimed row are the local wipes and resets —
+                // `SettingsView.localIndexWipeTxn`, `AppDataWiper`,
+                // `AccountManagerSetup`'s per-account delete, `DemoSeed`'s demo
+                // reset and the UIDVALIDITY-reset sweep — which never join a
+                // running drain. Same reasoning as `liveOperation`'s nil arm:
+                // that is the user's NEWER gesture winning, so the retained proof
+                // is dropped rather than replayed against a row nobody wants.
+                guard try await dbPool.read({ db in
+                    try PendingOperation.fetchOne(db, key: opId) != nil
+                }) else {
+                    pendingRetirements.removeValue(forKey: opId)
+                    queueLog(
+                        "[Queue] retirement replay — row \(opId.prefix(8)) no longer exists; "
+                            + "a local wipe or reset removed it, so the retained proof is dropped")
+                    continue
+                }
+                switch retirement {
+                case .full(let op, let executed):
+                    let result = try await retryWrite(dbPool, label: "Queue") { db in
+                        try Self.commitFullRetirement(op, executed: executed, db: db)
+                    }
+                    pendingRetirements.removeValue(forKey: opId)
+                    queueLog(
+                        "[Queue] retirement replay — committed the retained retirement of "
+                            + "\(opId.prefix(8)) \(op.type.rawValue)")
+                    logReaddressedFollowers(result, retiring: op)
+                    await publishMoveFinish(result)
+                    await materializeDeferredMoveSuccessors(after: op, result: result)
+                    if [.archive, .delete, .move].contains(op.type), let dest = op.destinationPath {
+                        context.foldersToSync.insert("\(op.accountId)|\(dest)")
+                        if executed.reconcileMoveSource {
+                            context.foldersToSync.insert("\(op.accountId)|\(op.folderPath)")
+                        }
+                        if op.type == .move, dest != op.folderPath {
+                            await recordMembersThatEnteredInbox(
+                                op, destinationPath: dest, context: context)
+                        }
+                    }
+                    if [.saveDraft, .deleteDraft].contains(op.type) {
+                        context.foldersToSync.insert("\(op.accountId)|\(op.folderPath)")
+                    }
+                    context.executedAny = true
+                case .partial(let op, let provenMembers, let remaining,
+                              let provenDestinations, let addressChangesOnMove):
+                    let frozenRetiredOp: PendingOperation = {
+                        var frozen = op
+                        frozen.messageIds = provenMembers
+                        return frozen
+                    }()
+                    let result = try await retryWrite(dbPool, label: "Queue") { db in
+                        try Self.commitPartialRetirement(
+                            frozenRetiredOp, remaining: remaining,
+                            provenDestinations: provenDestinations,
+                            addressChangesOnMove: addressChangesOnMove, db: db)
+                    }
+                    pendingRetirements.removeValue(forKey: opId)
+                    queueLog(
+                        "[Queue] retirement replay — committed the retained narrowing of "
+                            + "\(opId.prefix(8)) \(op.type.rawValue): "
+                            + "\(provenMembers.count) proven member(s) retired, "
+                            + "\(remaining.count) still owed")
+                    logReaddressedFollowers(result, retiring: frozenRetiredOp)
+                    await publishMoveFinish(result)
+                    await materializeDeferredMoveSuccessors(
+                        after: frozenRetiredOp, result: result)
+                    if [.archive, .delete, .move].contains(op.type), let dest = op.destinationPath {
+                        context.foldersToSync.insert("\(op.accountId)|\(dest)")
+                    }
+                    context.executedAny = true
+                }
+            } catch {
+                queueLog(
+                    "[Queue] retirement replay — \(opId.prefix(8)) still cannot commit: \(error); "
+                        + "the provider's proven result is retained and this drain stops")
+                return false
+            }
+        }
+        return true
     }
 
     /// TEST-ONLY one-shot fault for the post-claim re-read below.
@@ -1607,44 +1792,53 @@ extension AccountManager {
             let finishResult: MoveFinishResult
             do {
                 finishResult = try await retryWrite(dbPool, label: "Queue") { db in
-                    // Read the classification INSIDE this write, from the same
-                    // `account` rows `drainPendingQueue` keyed the lanes from. The
-                    // two facts must not be allowed to drift: the lane key promises
-                    // that a follower runs after this move, and `accountScopedIds`
-                    // is what makes that promise safe by re-addressing it.
-                    let accountScopedIds = try AccountManager
-                        .accountScopedIdAccountIds(db).contains(currentOp.accountId)
-                    let result = try MessageHeaderRekey.finishMove(
-                        currentOp,
-                        destinations: executed.provenDestinations,
-                        addressChangesOnMove: executed.addressChangesOnMove,
-                        accountScopedIds: accountScopedIds,
-                        db: db)
-                    MessageHeaderRekey.publishAddressHandoffsAfterCommit(
-                        result.applied, in: db)
-                    _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                    return result
+                    try Self.commitFullRetirement(currentOp, executed: executed, db: db)
                 }
                 logReaddressedFollowers(finishResult, retiring: currentOp)
             } catch {
+                // 🚨 THE PROOF IS RETAINED, NOT DISCARDED. The provider already
+                // completed this op and — for an address-changing move — already
+                // told us where each member landed. The only thing that failed is
+                // a local transaction, which GRDB's suspension (the app was
+                // backgrounded mid-drain, ADR-IOS-041), a full disk, or an I/O
+                // error at COMMIT all produce while the process keeps running and
+                // reads keep working. Dropping `executed` here would leave every
+                // holder of the old address behind: the follower serialized after
+                // this move in the same account-scoped lane would name the id the
+                // move just invalidated, the provider would answer 404, and the
+                // single-message conflict arm below would delete the user's NEWER
+                // intention. So the returned result is kept in memory and replayed
+                // through the SAME transaction at the next drain
+                // (`replayRetainedRetirements`), and the lane halts so nothing
+                // behind this op runs against an address that has not been
+                // committed yet (owner decision 2026-09-05,
+                // `TabMail/tabmail-ios#120`, `IOS-GRAPH-005`).
+                //
+                // The row stays `inFlight`: the claim loop refuses `inFlight`, so
+                // it cannot be handed to the provider a second time, and that is
+                // what makes "exactly one wire operation per proven operation"
+                // hold without any new guard. A process death before the replay is
+                // the accepted crash window, unchanged.
+                //
                 // 🚨 UNGATED BY DECISION (rule 12's production-observability
-                // exception). A completed op that could not be deleted WILL run
-                // again on the next drain, so the wire effect it already applied
-                // can be applied twice. No sync pass or retry recovers a
-                // duplicate that has already been made, and gating this would hide
-                // it behind a debug unlock the affected user does not have.
+                // exception). The user's queue is now holding a completed
+                // operation that only this process can retire, and the two states
+                // it can reach — replayed, or lost with the process — are not
+                // distinguishable from anything durable. Gating this would hide it
+                // behind a debug unlock the affected user does not have.
                 //
                 // ⚠️ CORRECTED — this line is NOT "its only witness". The DELETE is
                 // what failed, so the `PendingOperation` row SURVIVES and is itself
-                // durable evidence of the op that will re-run. What nothing durable
-                // records is the FAILURE, which is what the `logError` below writes.
-                // A bare `print` could not have been the witness in any case: with
-                // no `freopen`/`dup2` in this tree, `stdout` is discarded on device.
-                print("[Queue] CRITICAL: Failed to delete completed PendingOperation \(currentOp.id) after retries — will re-execute on next drain")
+                // durable evidence of the op. What nothing durable records is the
+                // FAILURE, which is what the `logError` below writes. A bare
+                // `print` could not have been the witness in any case: with no
+                // `freopen`/`dup2` in this tree, `stdout` is discarded on device.
+                pendingRetirements[currentOp.id] = .full(op: currentOp, executed: executed)
+                print("[Queue] CRITICAL: Failed to retire completed PendingOperation \(currentOp.id) after retries — the row stays inFlight and the provider's proven result is retained for replay at the next drain")
                 BackgroundSyncLogger.logError(
-                    "CRITICAL: failed to delete completed PendingOperation \(currentOp.id) (type \(opType)) after retries — it stays queued and WILL re-execute, so a wire effect already applied may be applied twice: \(error)",
+                    "CRITICAL: failed to retire completed PendingOperation \(currentOp.id) (type \(opType)) after retries — the row stays inFlight, so it will NOT re-execute, and the provider's proven result is retained in memory and replayed at the next drain; a process death before that replay is the accepted crash window (TabMail/tabmail-ios#120): \(error)",
                     source: "actionQueue")
-                finishResult = .empty
+                return .haltLane
             }
             await publishMoveFinish(finishResult)
             await materializeDeferredMoveSuccessors(after: currentOp, result: finishResult)
@@ -2267,56 +2461,51 @@ extension AccountManager {
         }()
         do {
             let finishResult = try await retryWrite(dbPool, label: "Queue") { db in
-                // Same read as the full-retirement path — see there for why it is
-                // inside the write rather than captured from the drain snapshot.
-                let accountScopedIds = try AccountManager
-                    .accountScopedIdAccountIds(db).contains(currentOp.accountId)
-                let result = try MessageHeaderRekey.finishMove(
-                    frozenRetiredOp,
-                    destinations: provenDestinations,
-                    addressChangesOnMove: addressChangesOnMove,
-                    accountScopedIds: accountScopedIds,
-                    db: db)
-                MessageHeaderRekey.publishAddressHandoffsAfterCommit(
-                    result.applied, in: db)
-                guard var fresh = try PendingOperation.fetchOne(db, key: currentOp.id) else {
-                    return result
-                }
-                fresh.messageIds = remaining
-                fresh.status = PendingStatus.queued.rawValue
-                try fresh.save(db)
-                return result
+                try Self.commitPartialRetirement(
+                    frozenRetiredOp, remaining: remaining,
+                    provenDestinations: provenDestinations,
+                    addressChangesOnMove: addressChangesOnMove, db: db)
             }
             logReaddressedFollowers(finishResult, retiring: frozenRetiredOp)
             await publishMoveFinish(finishResult)
             await materializeDeferredMoveSuccessors(after: frozenRetiredOp, result: finishResult)
         } catch {
-            // The narrowing write failed. NEVER leave the row `inFlight` (it
-            // would only unstick at the next launch's crash recovery) and never
-            // delete it: requeue the ORIGINAL bundle. A retry re-copies the
-            // proven members — a duplicate at the destination, which this
-            // codebase prefers over a dropped intention.
+            // 🚨 THE PROVEN PREFIX IS RETAINED, NOT HANDED BACK TO THE WIRE. This
+            // used to requeue the ORIGINAL bundle, accepting a duplicate at the
+            // destination in exchange for never losing a member. That trade also
+            // discarded the destination addresses the provider had ALREADY named
+            // for the proven prefix — and on an account-scoped provider those are
+            // the queued followers' addresses too, so the next pass sent the
+            // follower to an id Graph had reallocated, where the single-message
+            // conflict arm deletes it.
+            //
+            // The row is left exactly as the provider left it — `inFlight`, with
+            // ALL of its members, no retry charged — so nothing can claim it and
+            // re-copy the proven prefix, and the narrowing is replayed from the
+            // retained result at the next drain (`replayRetainedRetirements`,
+            // owner decision 2026-09-05, `TabMail/tabmail-ios#120`). A process
+            // death before that replay is the accepted crash window, unchanged.
+            //
             // 🚨 UNGATED BY DECISION (rule 12's production-observability
-            // exception). The requeued bundle re-copies members the provider
-            // already proved, so this names a duplicate that WILL be created at
-            // the destination, and a duplicate already made is not recovered by a
-            // later sync.
+            // exception). A partially-completed bundle that only this process can
+            // narrow is a state nothing durable distinguishes from an ordinary
+            // in-flight one.
             //
             // ⚠️ CORRECTED — the sibling CRITICAL above used to call itself "its
             // only witness" and this site inherited the claim. It is false in both
-            // places: the requeue below leaves the `PendingOperation` row in place,
-            // so the row is durable evidence of the bundle that will re-run. What
-            // nothing durable records is the NARROWING FAILURE and the duplication
-            // it implies — that is what the `logError` below writes, ungated and
-            // file-backed, because on a device `stdout` is discarded (no
-            // `freopen`/`dup2` exists in this tree).
-            print("[Queue] CRITICAL: could not narrow partially-completed \(currentOp.id) after retries — requeuing the whole bundle (may duplicate already-moved members)")
+            // places: the `PendingOperation` row stays in place, so the row is
+            // durable evidence of the bundle. What nothing durable records is the
+            // NARROWING FAILURE — that is what the `logError` below writes,
+            // ungated and file-backed, because on a device `stdout` is discarded
+            // (no `freopen`/`dup2` exists in this tree).
+            pendingRetirements[currentOp.id] = .partial(
+                op: currentOp, provenMembers: provenMembers, remaining: remaining,
+                provenDestinations: provenDestinations,
+                addressChangesOnMove: addressChangesOnMove)
+            print("[Queue] CRITICAL: could not narrow partially-completed \(currentOp.id) after retries — the row stays inFlight with all members and the proven prefix is retained for replay at the next drain")
             BackgroundSyncLogger.logError(
-                "CRITICAL: could not narrow partially-completed \(currentOp.id) (type \(currentOp.type.rawValue)) after retries — requeuing the WHOLE bundle, so the \(provenMembers.count) member(s) the provider already proved will be re-applied and may duplicate at the destination: \(error)",
+                "CRITICAL: could not narrow partially-completed \(currentOp.id) (type \(currentOp.type.rawValue)) after retries — the row stays inFlight with all \(currentOp.messageIds.count) member(s), so nothing re-applies the \(provenMembers.count) member(s) the provider already proved, and the narrowing is retained in memory and replayed at the next drain; a process death before that replay is the accepted crash window (TabMail/tabmail-ios#120): \(error)",
                 source: "actionQueue")
-            try? await retryWrite(dbPool, label: "Queue") { db in
-                try PendingOperation.markQueued(db, id: currentOp.id)
-            }
         }
         if [.archive, .delete, .move].contains(currentOp.type), let dest = currentOp.destinationPath {
             context.foldersToSync.insert("\(currentOp.accountId)|\(dest)")

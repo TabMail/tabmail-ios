@@ -171,6 +171,49 @@ The same statement is carried IN THE SOURCE, beside `readdressQueuedOperations` 
 `TabMail/Services/MessageHeaderRekey.swift` — a limitation recorded only in a document is not
 recorded where the next person to edit the mechanism will read it.
 
+### ⚠️ NARROWED 2026-09-05 to PROCESS DEATH ONLY (owner decision B, `TabMail/tabmail-ios#120`)
+
+The acceptance above was written as though a failed retirement transaction implied a dead process.
+It does not. The round-2 reviewers reproduced, independently and on GRDB 7.11.1, a LIVE process in
+which all three `retryWrite` attempts fail: GRDB suspends writes when the app is backgrounded
+mid-drain while reads keep working (ADR-IOS-041), and a full disk or an I/O error at COMMIT does the
+same. On that path the provider's returned `ExecutedOperation` — carrying `provenDestinations` —
+was discarded and the operation fell through to `.proceed`, so the follower serialized behind it in
+the same account-scoped lane ran next naming the id Graph had just invalidated, got a structural
+`404`, and was DELETED by the single-message conflict arm. `retirePartiallyCompletedOp`'s catch was
+the twin: it requeued the ORIGINAL bundle including the already-moved source id, so later passes
+re-ran the move on the wire, split and dropped the dead member, and deleted its stale-address
+follower. In both shapes the user's NEWER intention was lost with no crash at all.
+
+The owner's decision (option B, 2026-09-05) keeps the process-death window ACCEPTED exactly as
+stated above, and closes the live-process half by RETENTION AND REPLAY:
+
+- `AccountManager.pendingRetirements` holds the provider's own returned result, keyed by operation
+  id, for exactly the operations whose retirement write failed. Both retirement callers store into
+  it instead of discarding (full path) or requeueing the whole bundle (partial path), and both
+  leave the row `inFlight` with ALL of its members and no retry charged, so the claim loop refuses
+  it and the move is never sent to the wire twice.
+- Both callers' transaction bodies are factored into `AccountManager.commitFullRetirement` and
+  `AccountManager.commitPartialRetirement`, so the replay runs the SAME write rather than a second
+  copy that can drift. The transaction content is unchanged.
+- `AccountManager.replayRetainedRetirements` runs at the top of `drainPendingQueue`, after the
+  `isDraining` guard and BEFORE the `NetworkMonitor` check — the recovery is entirely local and must
+  not wait for connectivity. On success it runs the post-commit steps the original site would have
+  run; on a row the local wipes/resets removed it drops the entry, for the same reason
+  `liveOperation`'s nil arm skips; on a still-failing commit it keeps the entry and stops the drain,
+  because a database that cannot commit cannot retire anything else safely either.
+
+No identity lookup, no receipt table, no schema change, and no wire replay of the move: RFC identity
+remains banned as a mutation authority (ADR-IOS-068 D4, `IOS-IMAP-002`). The map is bounded by the
+number of claimed moves whose retirement failed, and entries leave on replay success, when the row
+is gone, or with the process — which is the accepted window above, now stated at its true width.
+
+Fences: `OutlookQueueHandoffTests.aRetirementThatCannotCommitRetainsTheProofAndReplaysIt` (real
+drain against the churning Graph server, three refused commits then recovery),
+`QueueCoreInvariantTests.narrowedRetirementThatCannotCommitKeepsTheWholeBundleQueued` (rewritten
+from the old mechanism's whole-bundle-requeue expectation to the invariant) and its account-scoped
+sibling `.narrowedRetirementThatCannotCommitIsReplayedOnAnAccountScopedProvider`.
+
 ## Tests
 
 All named tests are RED against a named inversion of the fix and GREEN after; the mutation matrix
