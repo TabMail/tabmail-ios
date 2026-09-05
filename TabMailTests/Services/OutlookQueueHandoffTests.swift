@@ -2055,4 +2055,394 @@ struct OutlookQueueHandoffTests {
 
         await finish(f)
     }
+
+    // MARK: - A1 — the launch reconciler must never sweep what THIS process owns
+
+    /// **THE PROPERTY: a proven retirement this LIVE process is still holding is
+    /// not erased by `reconcilePendingOperations`.**
+    ///
+    /// The premise that made a blind whole-table sweep safe inside that function
+    /// was *"nothing has drained yet in this process"*. It is FALSE at its call
+    /// site: `RootView` calls it only after EVERY account has finished
+    /// connecting, and a connected account's gestures (and the background entry
+    /// points) already drain before that. So the sweep runs in the middle of a
+    /// live queue, and its `.move` + `everAttempted` arm deletes a row whose
+    /// provider result this process is still holding.
+    ///
+    /// End to end, on the unmodified code: the move is proven on the wire, its
+    /// retirement write is refused, the proof is retained and the row stays
+    /// `inFlight` + `everAttempted`. The sweep DELETES that row.
+    /// `replayRetainedRetirements` then finds no row, takes the arm that exists
+    /// for *"the user wiped this"*, and drops the proof — after which the
+    /// follower is claimed ALONE at the id Graph already reallocated, `404`s, and
+    /// is deleted by the single-message conflict arm as provider-authoritative
+    /// "already done". No crash, live process: outside the accepted window.
+    ///
+    /// The fix moves that sweep to the database-startup boundary
+    /// (`AppDatabase.recoverPreviousSessionResidue`, run inside `init` before the
+    /// pool is ever published, where nothing in this process can have claimed
+    /// anything) and DELETES it from here. The oracle is therefore what this
+    /// entry point no longer does, measured on the wire and the durable queue.
+    @Test("Outlook: the launch reconciler does not erase a proven retirement this process still holds")
+    @MainActor
+    func theLaunchReconcilerDoesNotEraseARetirementThisProcessStillOwns() async throws {
+        let rfc = "graph-handoff-reconcile-full@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: rfc, providerMessageId: "graph-1", folderId: Self.source),
+        ])
+        defer { server.close() }
+
+        let f = try fixture(accountId: "graph-handoff-reconcile-full")
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-1", rfc: rfc, destination: Self.firstDestination)
+
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a previous test left a retained retirement on the shared AccountManager")
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "a drain from an earlier test is still running, so this schedule is not this test's")
+
+        let ordered = try seedSchedule(f, [
+            PendingOperation(
+                type: .move, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.source,
+                destinationPath: Self.firstDestination),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.firstDestination),
+        ])
+        #expect(ordered.count == 2)
+        guard ordered.count == 2 else { return }
+        let moveOpId = ordered[0].id
+        let followerOpId = ordered[1].id
+
+        await register(server.provider(), f)
+
+        let refuser = HeaderCommitRefuser()
+        f.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+        await AccountManager.shared.drainPendingQueue()
+        // Writes work again BEFORE the reconciler runs: the defect under test is
+        // the SWEEP, not a second refusal, and a refuser still installed would
+        // stop the replay for the wrong reason (`MIS-027`).
+        f.pool.remove(transactionObserver: refuser)
+
+        #expect(refuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on the retirement write for exactly its \
+            three attempts: \(refuser.refusals.withLock { $0 })
+            """)
+        #expect(await AccountManager.shared.pendingRetirements.count == 1, """
+            the provider's proven result was not retained, so there is nothing \
+            for the sweep to erase and this test proves nothing
+            """)
+        let afterFirstDrain = server.http.servedCallSequence()
+        #expect(afterFirstDrain.filter { $0.hasSuffix("/move") }.count == 1,
+                "the move was not sent exactly once: \(afterFirstDrain)")
+        #expect(afterFirstDrain.filter { $0.hasPrefix("PATCH ") }.isEmpty, """
+            the follower executed while its predecessor's proof was still \
+            uncommitted: \(afterFirstDrain.filter { $0.hasPrefix("PATCH ") })
+            """)
+        #expect(server.snapshot(providerMessageId: "graph-1") == nil,
+                "Graph did not reallocate the id, so there is no dead address to fail on")
+
+        // NON-VACUITY for the sweep itself: the retained row is in EXACTLY the
+        // state the sweep's `.move` + `everAttempted` arm selects on. If it were
+        // not, the reconciler below would leave it alone for a reason unrelated
+        // to the fix.
+        let (heldMove, heldFollower) = try await f.pool.read { db in
+            (try PendingOperation.fetchOne(db, key: moveOpId),
+             try PendingOperation.fetchOne(db, key: followerOpId))
+        }
+        #expect(heldMove?.status == PendingStatus.inFlight.rawValue
+                    && heldMove?.everAttempted == true, """
+            the retained move is not in the state the sweep selects on: \
+            status=\(heldMove?.status ?? "<deleted>") \
+            everAttempted=\(heldMove?.everAttempted ?? false)
+            """)
+        #expect(heldMove?.retryCount == 0 && heldFollower?.retryCount == 0, """
+            a provider retry was charged for a LOCAL write failure: \
+            move=\(heldMove?.retryCount ?? -1) follower=\(heldFollower?.retryCount ?? -1)
+            """)
+
+        // 🚨 THE ENTRY POINT UNDER TEST — the real `RootView` one, arriving after
+        // this account already drained. Never `drainPendingQueue`, and never the
+        // startup static: the defect is what THIS function does on its way to the
+        // drain.
+        await AccountManager.shared.reconcilePendingOperations()
+        try await drainToQuiescence(f)
+
+        let finalCalls = server.http.servedCallSequence()
+        #expect(finalCalls.filter { $0.hasSuffix("/move") }.count == 1, """
+            the move was replayed on the wire — a proven move must be applied \
+            exactly once: \(finalCalls)
+            """)
+        let current = liveId(server, rfc: rfc)
+        #expect(current != nil && current != "graph-1")
+        guard let current else { return }
+        let patches = finalCalls.filter { $0.hasPrefix("PATCH ") }
+        #expect(patches.count == 1, """
+            the follower did not execute exactly once — the reconciler's sweep \
+            deleted the row holding its address, so the proof was dropped and \
+            the follower went out at the id Graph had already invalidated: \(patches)
+            """)
+        #expect(patches.allSatisfy { $0.hasSuffix("/\(current)") }, """
+            a PATCH went out at an address the move had already invalidated \
+            (proven id \(current)): \(patches)
+            """)
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "the retained proof never resolved")
+
+        try expectGesturePreservedAndExecuted(
+            f, effectVisibleOnServer: server.snapshot(providerMessageId: current)?.isRead == true,
+            gesture: "the mark-read behind a retirement the launch reconciler swept",
+            serverState: "id=\(current) folders=\(serverFolders(server, rfc: rfc))")
+
+        await finish(f)
+    }
+
+    /// **THE PROPERTY: the launch reconciler does not erase a retained NARROWING
+    /// either — and the members that narrowing still OWES survive it.**
+    ///
+    /// The partial arm loses strictly more than the full one, which is why it is
+    /// a separate witness rather than a variant of the previous test. The bundle
+    /// row is `inFlight` with BOTH members: the one the wire proved and the one
+    /// it refused. The sweep's `.move` + `everAttempted` arm deletes the whole
+    /// row, so the still-owed, never-executed member is discarded along with the
+    /// proof — a user gesture that never reached the wire at all, dropped by
+    /// none of the four exits.
+    ///
+    /// The schedule is `aHeldNarrowingStopsTheDrainWithoutABystander`'s: a
+    /// two-member move whose first member Graph proves (and reallocates) while
+    /// the second is refused with a transient `503`, which is the only shape that
+    /// reaches the partial arm at all.
+    @Test("Outlook: the launch reconciler does not erase a held narrowing or the members it still owes")
+    @MainActor
+    func theLaunchReconcilerDoesNotEraseAHeldNarrowingsStillOwedMembers() async throws {
+        let firstRfc = "graph-handoff-reconcile-narrow-a@example.com"
+        let secondRfc = "graph-handoff-reconcile-narrow-b@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: firstRfc, providerMessageId: "graph-a", folderId: Self.source),
+            .init(rfc822MessageId: secondRfc, providerMessageId: "graph-b", folderId: Self.source),
+        ])
+        defer { server.close() }
+
+        let f = try fixture(accountId: "graph-handoff-reconcile-narrow")
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-a", rfc: firstRfc, destination: Self.firstDestination, isRead: true)
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-b", rfc: secondRfc, destination: Self.firstDestination)
+
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a previous test left a retained retirement on the shared AccountManager")
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "a drain from an earlier test is still running, so this schedule is not this test's")
+
+        let ordered = try seedSchedule(f, [
+            PendingOperation(
+                type: .move, messageIds: ["graph-a", "graph-b"],
+                accountId: f.accountId, folderPath: Self.source,
+                destinationPath: Self.firstDestination),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-a"],
+                accountId: f.accountId, folderPath: Self.firstDestination),
+        ])
+        #expect(ordered.count == 2)
+        guard ordered.count == 2 else { return }
+        let moveOpId = ordered[0].id
+
+        await register(server.provider(), f)
+        server.failMoveOnce(providerMessageId: "graph-b")
+
+        let refuser = HeaderCommitRefuser()
+        f.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+        await AccountManager.shared.drainPendingQueue()
+        f.pool.remove(transactionObserver: refuser)
+
+        #expect(refuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on the narrowing write for exactly its \
+            three attempts: \(refuser.refusals.withLock { $0 })
+            """)
+        #expect(await AccountManager.shared.pendingRetirements.count == 1, """
+            the provider's proven partial result was not retained, so there is \
+            nothing for the sweep to erase
+            """)
+        #expect(server.snapshot(providerMessageId: "graph-a") == nil,
+                "Graph did not reallocate A's id, so there is no dead address to fail on")
+        #expect(server.snapshots(rfc822MessageId: secondRfc).map(\.folderId) == [Self.source],
+                "B moved even though its move was refused, so this is not a partial batch")
+
+        // NON-VACUITY: the row the sweep selects on still carries BOTH members —
+        // the proven one and the one that is still owed.
+        let heldMove = try await f.pool.read { db in
+            try PendingOperation.fetchOne(db, key: moveOpId)
+        }
+        #expect(heldMove?.messageIds == ["graph-a", "graph-b"], """
+            the bundle was narrowed even though the narrowing write never \
+            committed: \(String(describing: heldMove?.messageIds))
+            """)
+        #expect(heldMove?.status == PendingStatus.inFlight.rawValue
+                    && heldMove?.everAttempted == true, """
+            the retained bundle is not in the state the sweep selects on: \
+            status=\(heldMove?.status ?? "<deleted>") \
+            everAttempted=\(heldMove?.everAttempted ?? false)
+            """)
+
+        await AccountManager.shared.reconcilePendingOperations()
+        try await drainToQuiescence(f)
+
+        let finalCalls = server.http.servedCallSequence()
+        let provenA = liveId(server, rfc: firstRfc)
+        #expect(provenA != nil && provenA != "graph-a")
+        guard let provenA else { return }
+
+        #expect(finalCalls.filter { $0.hasSuffix("/messages/graph-a/move") }.count == 1, """
+            the proven member's move was re-sent, which would seat a second copy \
+            at the destination: \(finalCalls)
+            """)
+        // 🚨 THE MEMBER THE SWEEP DISCARDS. B never reached the wire successfully
+        // before the reconciler ran; if its row is gone, the user's move of B is
+        // a dropped intention by none of the four exits.
+        #expect(serverFolders(server, rfc: secondRfc) == [Self.firstDestination], """
+            the still-owed member never moved — the launch reconciler deleted \
+            the bundle that owed it: \(serverFolders(server, rfc: secondRfc))
+            """)
+        #expect(finalCalls.filter { $0.hasSuffix("/messages/graph-b/move") }.count == 2, """
+            the refused member was not retried exactly once after its transient \
+            failure: \(finalCalls)
+            """)
+
+        let patches = finalCalls.filter { $0.hasPrefix("PATCH ") }
+        #expect(patches.count == 1, "the follower did not execute exactly once: \(patches)")
+        #expect(patches.allSatisfy { $0.hasSuffix("/\(provenA)") }, """
+            a PATCH went out at an address the move had already invalidated \
+            (proven id \(provenA)): \(patches)
+            """)
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "the retained proof never resolved")
+
+        try expectGesturePreservedAndExecuted(
+            f, effectVisibleOnServer: server.snapshot(providerMessageId: provenA)?.isRead == true,
+            gesture: "the mark-read behind a narrowing the launch reconciler swept",
+            serverState: "id=\(provenA) folders=\(serverFolders(server, rfc: firstRfc))")
+
+        await finish(f)
+    }
+
+    /// **THE PROPERTY: the launch reconciler arriving WHILE A DRAIN IS ACTIVE
+    /// touches neither the move that drain has claimed nor the follower behind
+    /// it.**
+    ///
+    /// This is the defect at its root, with no retirement failure involved at
+    /// all: `reconcilePendingOperations` is reentrant with a running drain,
+    /// because `RootView` calls it after the LAST account connects while the
+    /// FIRST account's gestures have been draining for some time. A blind sweep
+    /// there deletes a `.move` row whose provider call is on the wire right now,
+    /// and returns its claimed follower to `queued` while the lane task that owns
+    /// it is still holding it.
+    ///
+    /// ⚠️ WHY THESE TWO ROW READS ARE DETERMINISTIC even though a drain is in
+    /// flight. The only other writer of either row while the move is parked is
+    /// the lane task, and it is blocked inside the fixture's `/move` route until
+    /// `release()` is called; the reconciler call above it has been AWAITED to
+    /// completion. So the reads observe exactly one candidate writer — the sweep
+    /// — which is what they are here to see. Every other oracle in this test is
+    /// the terminal wire record and the terminal queue, per the standing rule
+    /// that mid-drain row state is not an oracle.
+    @Test("Outlook: the launch reconciler arriving during a live drain leaves the claimed move and its follower alone")
+    @MainActor
+    func theLaunchReconcilerArrivingDuringADrainLeavesTheClaimedLaneAlone() async throws {
+        let rfc = "graph-handoff-reconcile-live@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: rfc, providerMessageId: "graph-1", folderId: Self.source),
+        ])
+        defer { server.close() }
+
+        let f = try fixture(accountId: "graph-handoff-reconcile-live")
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-1", rfc: rfc, destination: Self.firstDestination)
+
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a previous test left a retained retirement on the shared AccountManager")
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "a drain from an earlier test is still running, so this schedule is not this test's")
+
+        let ordered = try seedSchedule(f, [
+            PendingOperation(
+                type: .move, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.source,
+                destinationPath: Self.firstDestination),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.firstDestination),
+        ])
+        #expect(ordered.count == 2)
+        guard ordered.count == 2 else { return }
+        let moveOpId = ordered[0].id
+        let followerOpId = ordered[1].id
+
+        await register(server.provider(), f)
+        let release = server.holdNextMove()
+        let drain = Task { await AccountManager.shared.drainPendingQueue() }
+
+        let held = try await awaitHeldMoves(server, count: 1)
+        #expect(held, "the move was never parked, so the reconciler never arrives mid-drain")
+        guard held else {
+            release()
+            _ = await drain.value
+            await finish(f)
+            return
+        }
+
+        // 🚨 THE RECONCILER ARRIVES MID-DRAIN. Its own `drainPendingQueue()` sees
+        // `isDraining` and records a redrain, so this call returns without
+        // waiting — which is exactly why the sweep that used to run first was
+        // able to hit a live queue.
+        await AccountManager.shared.reconcilePendingOperations()
+
+        let (midMove, midFollower) = try await f.pool.read { db in
+            (try PendingOperation.fetchOne(db, key: moveOpId),
+             try PendingOperation.fetchOne(db, key: followerOpId))
+        }
+        #expect(midMove != nil, """
+            the launch reconciler DELETED a move whose provider call is on the \
+            wire right now. Nothing in the queue records that the user ever \
+            asked, and the result the wire is about to return has no row to retire.
+            """)
+        #expect(midMove?.status == PendingStatus.inFlight.rawValue, """
+            the launch reconciler returned a CLAIMED, in-flight move to the \
+            queue, where the next claim pass can hand it to the provider a \
+            second time: \(midMove?.status ?? "<deleted>")
+            """)
+        #expect(midFollower?.status == PendingStatus.inFlight.rawValue, """
+            the launch reconciler released a follower its own lane task is still \
+            holding, so a concurrent pass can claim and execute it against the \
+            address the unresolved move is about to invalidate: \
+            \(midFollower?.status ?? "<deleted>")
+            """)
+
+        release()
+        _ = await drain.value
+        try await drainToQuiescence(f)
+
+        let finalCalls = server.http.servedCallSequence()
+        #expect(finalCalls.filter { $0.hasSuffix("/move") }.count == 1, """
+            the move did not run exactly once: \(finalCalls)
+            """)
+        let current = liveId(server, rfc: rfc)
+        #expect(current != nil && current != "graph-1")
+        guard let current else { return }
+        let patches = finalCalls.filter { $0.hasPrefix("PATCH ") }
+        #expect(patches.count == 1, "the follower did not execute exactly once: \(patches)")
+        #expect(patches.allSatisfy { $0.hasSuffix("/\(current)") }, """
+            a PATCH went out at an address the move had already invalidated \
+            (proven id \(current)): \(patches)
+            """)
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a retirement was retained by a drain that had no write failure in it")
+
+        try expectGesturePreservedAndExecuted(
+            f, effectVisibleOnServer: server.snapshot(providerMessageId: current)?.isRead == true,
+            gesture: "the mark-read behind a move the launch reconciler arrived on top of",
+            serverState: "id=\(current) folders=\(serverFolders(server, rfc: rfc))")
+
+        await finish(f)
+    }
 }

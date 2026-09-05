@@ -221,22 +221,36 @@ struct AccountManagerQueueDrainTests {
         }
     }
 
-    // MARK: - 8. GAP1: reconcilePendingOperations (real function) — launch-time crash recovery
+    // MARK: - 8. GAP1: AppDatabase startup recovery (real initializer) — previous-session residue
 
-    @Test("reconcilePendingOperations: ordinary inFlight retries, attempted MOVE is dropped, cancelled deletes")
-    func reconcilePendingOperationsResetsInFlightDeletesCancelledLeavesQueued() async throws {
+    /// THE INVARIANT IS UNCHANGED — ordinary `inFlight` operations return to
+    /// `queued`, an attempted MOVE is dropped, cancelled rows are deleted — and
+    /// every assertion below is the one this test has always made. What changed
+    /// is the ENTRY POINT.
+    ///
+    /// 🚨 WHY IT MOVED (`IOS-GRAPH-005`, #114). This sweep used to run at the top
+    /// of `AccountManager.reconcilePendingOperations`, and this test drove it
+    /// from there. That placement was wrong: `RootView` calls that function only
+    /// after EVERY account has finished connecting, while a connected account has
+    /// already been draining, so the blind whole-table sweep reached rows the
+    /// LIVE process owned — deleting a `.move` whose proven provider result was
+    /// being held for replay. The sweep now runs in
+    /// `AppDatabase.recoverPreviousSessionResidue`, called from `AppDatabase.init`
+    /// before the pool is ever published, which is the only boundary at which
+    /// "residue" is provable rather than assumed. Pinning it here at that
+    /// boundary is what stops it drifting back to a site where a drain can
+    /// already be in flight.
+    @Test("AppDatabase startup recovery: ordinary inFlight retries, attempted MOVE is dropped, cancelled deletes")
+    func databaseStartupRecoveryResetsInFlightDeletesCancelledLeavesQueued() async throws {
         let (pool, dir, previous) = try makeTestDB()
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
-        // No provider registered for "acc-gap1" — drainPendingQueue's claim
-        // loop (`guard providers[op.accountId] != nil else { ...skip... }`,
-        // AccountManagerQueue.swift) no-ops on both surviving ops without
-        // ever calling executeSingleOp, so this test observes ONLY
-        // reconcilePendingOperations' own crash-recovery SQL (reset
-        // inFlight→queued, delete cancelled), not drain behavior. The
-        // subsequent reconcileOutbox()/reconcileCalendarQueue() calls inside
-        // reconcilePendingOperations no-op safely too — their tables are
-        // empty in this test DB.
+        // The startup boundary DRAINS NOTHING — `AppDatabase.init` runs
+        // migrations, the gated startup resets and this recovery write, and
+        // returns. So what follows observes ONLY the recovery SQL (reset
+        // inFlight→queued, delete the attempted move, delete cancelled), with no
+        // drain behaviour mixed in at all. The account row is still seeded
+        // because the fixture's foreign keys require it.
         var inFlightOp = PendingOperation(type: .markRead, messageIds: ["msg-inflight"], accountId: "acc-gap1", folderPath: "INBOX")
         inFlightOp.status = PendingStatus.inFlight.rawValue
         var cancelledOp = PendingOperation(type: .markUnread, messageIds: ["msg-cancelled"], accountId: "acc-gap1", folderPath: "INBOX")
@@ -264,7 +278,12 @@ struct AccountManagerQueueDrainTests {
         try insertOp(preEmissionMove, pool: pool)
         try insertOp(queuedOp, pool: pool)
 
-        await AccountManager.shared.reconcilePendingOperations()
+        // 🚨 THE REAL LAUNCH BOUNDARY, over the seeded pool. A second
+        // `AppDatabase` instance is the production initializer verbatim; it is a
+        // local that dies at the end of this test, and GRDB holds its inbox
+        // observer weakly, so it goes with it. The fixture's own instance stays
+        // installed as `AppDatabase.shared`.
+        _ = try AppDatabase(dbPool: pool)
 
         let remaining = try await pool.read { db in
             try PendingOperation.filter(Column("accountId") == "acc-gap1").fetchAll(db)
@@ -383,7 +402,14 @@ struct AccountManagerQueueDrainTests {
         #expect(try await admitsAFreshPushAttempt("draft-retry-a@example.com") == false,
                 "fixture must start wedged, or the post-sweep half proves nothing")
 
-        await AccountManager.shared.reconcilePendingOperations()
+        // 🚨 ENTRY POINT CORRECTED 2026-09-05 (`IOS-GRAPH-005`, #114). This sweep
+        // is unchanged, but it no longer lives in
+        // `AccountManager.reconcilePendingOperations` — it runs in
+        // `AppDatabase.recoverPreviousSessionResidue`, called from
+        // `AppDatabase.init` before the pool is published, because that function
+        // was NOT the launch-only entry point its comment claimed. The
+        // disposition this test asserts is untouched; only where it happens is.
+        _ = try AppDatabase(dbPool: pool)
 
         // THE INVARIANT: the intention survives the crash — the next drain can push.
         #expect(try await admitsAFreshPushAttempt("draft-retry-b@example.com") == true,
@@ -1174,8 +1200,11 @@ struct AccountManagerQueueDrainTests {
     // absent row produces and the lane took the skip arm: the op stayed
     // `inFlight` forever (every later drain's claim loop refuses `inFlight`),
     // its lane kept draining so a LATER member overtook it, and at the next
-    // launch `reconcilePendingOperations` DELETED it if it was a `.move` — a
-    // dropped intention that never reached the wire. "We could not determine
+    // launch the previous-session sweep DELETED it if it was a `.move` — a
+    // dropped intention that never reached the wire. (That sweep lived in
+    // `reconcilePendingOperations` when this was written and now lives in
+    // `AppDatabase.recoverPreviousSessionResidue`; the disposition is the same.)
+    // "We could not determine
     // the answer" is retryable, never authoritative (never-drop clause 2).
     //
     // THE FAULT is `AccountManager.liveOperationReadFaultForTesting`, a

@@ -1,3 +1,43 @@
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **⚠️ SITE CORRECTED (2026-09-05, #114 round 4) — the disposition below is UNCHANGED; only where
+> `resetOrphanedPushingDrafts` runs has moved.** The body is preserved unedited (it is regenerated
+> from the hash-pinned archive and byte-compared); this block records the correction instead.
+>
+> The cell below repeatedly states that `DraftStore.resetOrphanedPushingDrafts` runs inside "the
+> existing launch crash-recovery transaction in `AccountManager.reconcilePendingOperations`", and
+> that "`reconcilePendingOperations` is launch-only (`RootView`)". **The second statement is false,
+> and it was false when it was written.** `RootView` calls that function only after EVERY account
+> has finished connecting, while a connected account's gestures and the background entry points have
+> already been draining — so the function is reentrant with a live queue, not launch-only. The
+> discovery came from the QUEUE half of the same transaction, where the blind sweep deleted a `.move`
+> row the live process still owned (`IOS-GRAPH-005`, #114).
+>
+> **Where it runs now.** The whole transaction — the `inFlight` reset, the attempted-move delete, the
+> cancelled cleanup and `DraftStore.resetOrphanedPushingDrafts` — is in
+> `AppDatabase.recoverPreviousSessionResidue(on:)`, called unconditionally from
+> `AppDatabase.init(pool:runStartupResets:)` before `AppDatabase.shared` is published. That is a
+> genuine launch-only boundary rather than an assumed one: every drain reaches the database through
+> `AppDatabase.dbPool` → `rawPool` → `shared`, so no drain can have run.
+>
+> **What this row keeps, and what it gains.** The fix this row records
+> (`DraftStore.reAdmitOrphanedPushingDraft` + the `DraftStore.pushesInFlight` claim), the accepted
+> residual, the re-push duplicate accounting, the refused mirror image and every named
+> non-recovering case are unchanged — the per-draft in-process claim is what handles LIVE residue,
+> and it always was. What the move fixes is the SWEEP's own premise: the row's paragraph beginning
+> *"Why launch-only, and why that is not a shortcut"* argued the sweep needs no drain latch because
+> nothing has drained yet in this process. That argument is now sound, because the site finally
+> matches it. The paragraph's own warning — *"If a future change gates the sweep on anything, that
+> gate becomes the non-recovering case"* — still applies and is still satisfied: the new call is
+> UNCONDITIONAL, not gated by `runStartupResets`, and runs on every launch including in tests.
+>
+> **One failure semantic is stricter.** The old site swallowed a failed sweep (`try? await
+> retryWrite`) and drained anyway; a throw now propagates out of `init` and `AppStartup` refuses to
+> publish the pool.
+>
+> **Test entry point.** `AccountManagerQueueDrainTests.launchReconciliationReAdmitsAnOrphanedDraftPush`
+> keeps its name and every assertion, and now drives `AppDatabase(dbPool:)` instead of
+> `AccountManager.shared.reconcilePendingOperations()`.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-DRAFT-016
 
 > Routed from `KNOWN_ISSUES.md` line 1059 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).

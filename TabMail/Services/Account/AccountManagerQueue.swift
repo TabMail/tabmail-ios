@@ -915,7 +915,9 @@ extension AccountManager {
                         // AND `everAttempted` in one transaction), the lane kept
                         // draining past it, no later drain could claim it because the
                         // claim loop refuses `inFlight`, and at the next launch
-                        // `reconcilePendingOperations` DELETED an attempted `.move`
+                        // `AppDatabase.recoverPreviousSessionResidue` (named
+                        // `reconcilePendingOperations` until 2026-09-05) DELETED an
+                        // attempted `.move`
                         // that had never reached the wire. "We could not determine the
                         // answer" is retryable, never authoritative — clause 2 of
                         // `Companion/Rules/Active/never-drop-user-intention.md`.
@@ -3076,57 +3078,26 @@ extension AccountManager {
         return .allMembers
     }
 
-    /// On app launch, recover from any crash during the previous session.
-    /// Ordinary operations return to queued. An attempted MOVE is deliberately
-    /// dropped instead: after a process death we cannot know whether the server
-    /// committed it, and resending can duplicate the move. The normal foreground
-    /// sync that follows launch restores whichever state the server actually has.
+    /// The post-connect queue kick: drain whatever the durable action queue
+    /// still owes, then run the outbox and calendar-queue reconcilers.
+    ///
+    /// 🚨 THIS IS NOT CRASH RECOVERY ANY MORE, and it must never become it
+    /// again. The blind whole-table sweep of previous-session residue that used
+    /// to open this function now lives in
+    /// `AppDatabase.recoverPreviousSessionResidue`, called from
+    /// `AppDatabase.init` before the pool is ever published — the only boundary
+    /// at which "residue" is provable. It could not stay here: `RootView` calls
+    /// this function only AFTER every account has finished connecting, while a
+    /// connected account's gestures and the background entry points have already
+    /// been draining, so a whole-table sweep here reaches rows this LIVE process
+    /// owns. It deleted a `.move` whose proven provider result this process was
+    /// still holding for replay, after which the replay dropped that proof as if
+    /// the user had wiped the row and the follower went to the wire at an
+    /// address Graph had already reallocated (`IOS-GRAPH-005`, #114).
+    ///
+    /// The name and both callers are unchanged; what changed is that this
+    /// function no longer writes anything before it drains.
     func reconcilePendingOperations() async {
-        // Crash recovery MUST succeed — inFlight ops from the previous session are stuck
-        // and will never drain unless reset to queued.
-        try? await retryWrite(dbPool, label: "Queue") { db in
-            let staleOps = try PendingOperation
-                .filter(Column("status") == PendingStatus.inFlight.rawValue)
-                .fetchAll(db)
-            if !staleOps.isEmpty {
-                for op in staleOps {
-                    if op.type == .move, op.everAttempted {
-                        _ = try PendingOperation.deleteOne(db, key: op.id)
-                        continue
-                    }
-                    var updated = op
-                    updated.status = PendingStatus.queued.rawValue
-                    try updated.save(db)
-                }
-            }
-            // Clean up cancelled ops from previous session
-            _ = try PendingOperation
-                .filter(Column("status") == PendingStatus.cancelled.rawValue)
-                .deleteAll(db)
-            // Same crash-recovery class as the inFlight reset above, for the OTHER
-            // in-flight state a previous session can leave behind: a draft push whose
-            // Stage A durably committed `"pushing"` and then died before the provider
-            // call returned. Left alone, `pushDraftToServer`'s `.notApplied` is a
-            // NORMAL return, so the next drain retires the durable `.saveDraft`
-            // producer through the generic success arm — a dropped intention by none
-            // of the four exits.
-            //
-            // 🚨 CORRECTED 2026-08-06. This comment used to end: *"Launch-only is
-            // what makes this safe without a drain latch: nothing has drained yet in
-            // this process, so a `"pushing"` row is orphaned by definition."* The
-            // first half is still exactly why THIS blind whole-table reset is safe
-            // HERE. The second half was being read as a claim that `"pushing"` residue
-            // can ONLY arise across a process boundary, and that is FALSE: an
-            // in-process `restorePushableAfterProviderThrow` (or
-            // `applyPushCompletion`) write that itself throws leaves the row
-            // `"pushing"` while the process runs on, and the very next drain then
-            // deleted the producer — before this launch entry ever ran again. That
-            // hole is closed inside `pushDraftToServer` by a per-draft in-process
-            // claim, not here. Full rationale, the mirror-image trap, and the residue
-            // census are on `DraftStore.resetOrphanedPushingDrafts` and
-            // `DraftStore.reAdmitOrphanedPushingDraft`.
-            _ = try DraftStore.resetOrphanedPushingDrafts(db: db)
-        }
         await drainPendingQueue()
         await reconcileOutbox()
         await reconcileCalendarQueue()

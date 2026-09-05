@@ -242,8 +242,11 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     /// advanced. A row deleted since the claim (cancel/annihilation) simply
     /// matches nothing; that is not an error, and the caller does not need to know.
     ///
-    /// Callers that fetch and save inside ONE transaction (`reconcilePendingOperations`,
-    /// the claim loop, `retirePartiallyCompletedOp`'s narrowing) are NOT this case
+    /// Callers that fetch and save inside ONE transaction
+    /// (`AppDatabase.recoverPreviousSessionResidue` — named
+    /// `reconcilePendingOperations` until 2026-09-05, when the sweep moved to the
+    /// launch boundary — the claim loop, `retirePartiallyCompletedOp`'s narrowing)
+    /// are NOT this case
     /// and are deliberately left alone: their struct is read in the same
     /// transaction that writes it, so it cannot be stale.
     static func markQueued(

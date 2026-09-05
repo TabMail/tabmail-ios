@@ -109,12 +109,21 @@ final class AppDatabase: Sendable {
     }
 
     /// Designated initializer. Wraps an already-open `pool`, runs schema
-    /// migrations, and — production only — the one-time destructive cached-mail
-    /// resets. Migrations run BEFORE the pool is exposed (`AppDatabase.shared`)
-    /// or the inbox observer is wired: DB opens → schema migrates → data resets
-    /// → only THEN can sync / NSE merge / demo+screenshot seed touch it.
+    /// migrations, then — production only — the one-time destructive cached-mail
+    /// resets, and finally reconciles whatever queue and draft residue the
+    /// PREVIOUS process left behind. All of it runs BEFORE the pool is exposed
+    /// (`AppDatabase.shared`) or the inbox observer is wired: DB opens → schema
+    /// migrates → data resets → previous-session queue/draft residue recovered →
+    /// only THEN can sync / NSE merge / demo+screenshot seed touch it.
     /// `runStartupResets` is false for tests so they never mutate global
     /// UserDefaults flags or the FTS directory.
+    ///
+    /// 🚨 THE ORDER IS THE SAFETY ARGUMENT for the recovery step, not a
+    /// convenience: `recoverPreviousSessionResidue` is a BLIND whole-table sweep,
+    /// and it is safe HERE and nowhere later precisely because nothing in this
+    /// process can have claimed anything yet — every drain reaches the database
+    /// through `AppDatabase.shared`, which this initializer has not returned to
+    /// publish.
     init(pool: DatabasePool, runStartupResets: Bool) throws {
         self.dbPool = pool
         // Migration timing breadcrumb (RC2 / PLAN_HANG_FIX): the O(mailbox-size)
@@ -129,6 +138,13 @@ final class AppDatabase: Sendable {
         if runStartupResets {
             StartupMigrations.run(pool)
         }
+        // Unconditional — production AND tests. This is per-launch recovery of
+        // another process's residue, not a one-time flag-gated data reset, so it
+        // is deliberately NOT inside `StartupMigrations.run` and NOT gated by
+        // `runStartupResets`: it touches no UserDefaults flag and no FTS
+        // directory, and a test fixture that skipped it would be running a queue
+        // whose launch boundary never ran.
+        try Self.recoverPreviousSessionResidue(on: pool)
         self.inboxNotificationObserver = try Self.makeInboxNotificationObserver(on: pool)
     }
 
@@ -153,6 +169,99 @@ final class AppDatabase: Sendable {
             db.add(transactionObserver: observer)
         }
         return observer
+    }
+
+    /// PREVIOUS-SESSION QUEUE AND DRAFT RESIDUE, reconciled at the one boundary
+    /// where "residue" is provable.
+    ///
+    /// Ordinary in-flight operations return to `queued`. An attempted MOVE is
+    /// deliberately DELETED instead: after a process death we cannot know whether
+    /// the server committed it, and resending can duplicate the move — the normal
+    /// foreground sync that follows launch restores whichever state the server
+    /// actually has (`IOS-MOVE-003`). Cancelled rows are cleaned up.
+    ///
+    /// 🚨 WHY IT RUNS HERE, AND WHY IT MAY NEVER RUN LATER. This is a BLIND
+    /// whole-table sweep: it resets, deletes and normalises rows without asking
+    /// who owns them. That is only sound where nothing in this process can own
+    /// anything. The sole writer of `pendingOperation.status = inFlight` is the
+    /// drain's claim in `AccountManagerQueue.drainPendingQueue`; every drain
+    /// reaches the database through `AppDatabase.dbPool` → `rawPool` → `shared`;
+    /// and `shared` is not published until this initializer has returned. So
+    /// every row this sweep can see was left by a PREVIOUS process, by
+    /// construction rather than by convention.
+    ///
+    /// It used to sit at the top of `AccountManager.reconcilePendingOperations`,
+    /// whose comment stated the premise *"nothing has drained yet in this
+    /// process"*. That premise was FALSE at that call site: `RootView` invokes
+    /// that function only after EVERY account has finished connecting, while a
+    /// connected account's gestures — and the background entry points — have been
+    /// draining for some time. It therefore deleted a `.move` row whose proven
+    /// provider result the live process was still holding for replay; the replay
+    /// then found no row, took the arm meant for "the user wiped this", and
+    /// dropped the proof, after which the follower went to the wire at an id
+    /// Graph had already reallocated, `404`d, and was deleted as
+    /// provider-authoritative "already done" (`IOS-GRAPH-005`, #114).
+    ///
+    /// A THROW PROPAGATES OUT OF `init`, deliberately. `init` already throws on a
+    /// failed migration and on the observer-seeding write that follows, and
+    /// `AppStartup` turns that into the "couldn't open its local database"
+    /// failure WITHOUT publishing the pool. A database that cannot take this
+    /// write must not go on to release new claims into unreconciled state, so
+    /// there is no `try?`, no retry ladder (migrations have none) and no
+    /// swallow-and-log.
+    private static func recoverPreviousSessionResidue(on pool: DatabasePool) throws {
+        try pool.write { db in
+            let staleOps = try PendingOperation
+                .filter(Column("status") == PendingStatus.inFlight.rawValue)
+                .fetchAll(db)
+            if !staleOps.isEmpty {
+                for op in staleOps {
+                    if op.type == .move, op.everAttempted {
+                        _ = try PendingOperation.deleteOne(db, key: op.id)
+                        continue
+                    }
+                    var updated = op
+                    updated.status = PendingStatus.queued.rawValue
+                    try updated.save(db)
+                }
+            }
+            // Clean up cancelled ops from previous session
+            _ = try PendingOperation
+                .filter(Column("status") == PendingStatus.cancelled.rawValue)
+                .deleteAll(db)
+            // Same crash-recovery class as the inFlight reset above, for the OTHER
+            // in-flight state a previous session can leave behind: a draft push whose
+            // Stage A durably committed `"pushing"` and then died before the provider
+            // call returned. Left alone, `pushDraftToServer`'s `.notApplied` is a
+            // NORMAL return, so the next drain retires the durable `.saveDraft`
+            // producer through the generic success arm — a dropped intention by none
+            // of the four exits.
+            //
+            // 🚨 CORRECTED 2026-08-06. This comment used to end: *"Launch-only is
+            // what makes this safe without a drain latch: nothing has drained yet in
+            // this process, so a `"pushing"` row is orphaned by definition."* The
+            // first half is still exactly why THIS blind whole-table reset is safe
+            // HERE. The second half was being read as a claim that `"pushing"` residue
+            // can ONLY arise across a process boundary, and that is FALSE: an
+            // in-process `restorePushableAfterProviderThrow` (or
+            // `applyPushCompletion`) write that itself throws leaves the row
+            // `"pushing"` while the process runs on, and the very next drain then
+            // deleted the producer — before this launch entry ever ran again. That
+            // hole is closed inside `pushDraftToServer` by a per-draft in-process
+            // claim, not here. Full rationale, the mirror-image trap, and the residue
+            // census are on `DraftStore.resetOrphanedPushingDrafts` and
+            // `DraftStore.reAdmitOrphanedPushingDraft`.
+            //
+            // 🚨 MOVED 2026-09-05, and the first half of that correction is why.
+            // "Launch-only is what makes this safe" was true of the SWEEP and false
+            // of the SITE: `AccountManager.reconcilePendingOperations` is not a
+            // launch-only entry point, because `RootView` runs it after the last
+            // account connects while earlier accounts have already drained. The
+            // sweep now runs at the database-startup boundary above, where the
+            // premise it always depended on is structural — see this function's own
+            // comment and `IOS-GRAPH-005`.
+            _ = try DraftStore.resetOrphanedPushingDrafts(db: db)
+        }
     }
 
     /// Read-only access (concurrent readers, no blocking).
