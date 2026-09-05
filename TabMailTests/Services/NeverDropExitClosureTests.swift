@@ -1334,12 +1334,32 @@ struct NeverDropExitClosureTests {
     /// so the first attempt mutates nothing — the exact world state the fuzzer
     /// observed (`providerIdQueueFuzz`, seed `0x70D8000000000002`).
     ///
+    /// Parameterised over the server's refusal text because the property holds
+    /// REGARDLESS of it (#115 round 2). The typed no-`COPYUID` error carries the
+    /// raw tagged response text as its payload, and the queue's message-not-found
+    /// classifier ends in a substring match on the error's description — so a
+    /// refusal that happens to carry an RFC 5530 `[NONEXISTENT]` code (which
+    /// names a missing MAILBOX, not a missing message) or the words `UID not
+    /// found` used to be read as a provider-authoritative "already gone" and the
+    /// op was deleted: the same intention drop, on a different response text.
+    /// The original `No mailbox selected` argument contains none of the
+    /// classifier's fragments and never reached that path.
+    ///
     /// RED PROOF (recorded, #115): on the pre-fix provider the first drain
     /// retires the op with the message still in INBOX — `operations(f.pool)` is
     /// empty after the refused drain and Archive is still empty after both.
-    @Test("A UID MOVE refused before any mutation stays queued, and the next drain lands it")
+    /// RED PROOF (recorded, #115 round 2): on `2bbeba9e5` the two added
+    /// arguments fail the same way — the op is deleted after the refused drain —
+    /// while the original argument stays green.
+    @Test(
+        "A UID MOVE refused before any mutation stays queued, and the next drain lands it",
+        arguments: [
+            "No mailbox selected",
+            "[NONEXISTENT] No mailbox selected",
+            "UID not found",
+        ])
     @MainActor
-    func aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt() async throws {
+    func aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt(refusal: String) async throws {
         let target = "atomic-refused-before-mutation@example.com"
         let server = FakeIMAPServer(mailboxes: [
             "INBOX": [Self.message(uid: 77, id: target)],
@@ -1349,12 +1369,15 @@ struct NeverDropExitClosureTests {
         server.setUidValidity(10, for: "Archive")
         // Exactly ONE refusal, answered before the handler runs: the first
         // UID MOVE is refused with zero mutation, every later one is served.
-        server.failNextCommand(containing: "UID MOVE", message: "No mailbox selected")
+        server.failNextCommand(containing: "UID MOVE", message: refusal)
         server.expectMutation(rfc822MessageId: target)
         try server.start()
         defer { server.stop() }
 
-        let f = try fixture(accountId: "closure-atomic-refused")
+        // One account id per argument so no per-account state in the shared
+        // manager can leak between the serialized cases.
+        let f = try fixture(
+            accountId: "closure-atomic-refused-" + refusal.lowercased().filter(\.isLetter))
         let provider = try await registeredIMAPProvider(server: server, fixture: f)
         let move = PendingOperation(
             type: .move, messageIds: ["77"], accountId: f.accountId,

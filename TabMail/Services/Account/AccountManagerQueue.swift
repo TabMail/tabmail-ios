@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import SwiftMail
 import Synchronization
 
 /// What one dispatched operation PROVED, as reported by `executeOperation` to
@@ -23,10 +24,15 @@ struct ExecutedOperation: Sendable {
     /// address (IMAP and Microsoft Graph). Empty destination evidence cannot
     /// distinguish that state from Gmail's address-stable label mutation.
     let addressChangesOnMove: Bool
-    /// True when an IMAP MOVE ended after possible partial completion. The
-    /// original identifiers must not be retried, and both mailbox views must be
-    /// refreshed before the user decides whether any remainder needs a new
-    /// gesture.
+    /// True ONLY when an IMAP MOVE ended with a tagged NO/BAD after the server
+    /// had already reported a `COPYUID` for the members it moved
+    /// (`IMAPError.moveFailedAfterPartialCompletion(copyUID:)`, the
+    /// evidence-bearing form). The original identifiers must not be retried,
+    /// and both mailbox views must be refreshed before the user decides whether
+    /// any remainder needs a new gesture. A tagged NO/BAD with NO `COPYUID`
+    /// (`moveFailedAfterPossiblePartialCompletion`) never sets this: it is a
+    /// refusal with no evidence of mutation, so the op stays queued and is
+    /// retried (GitHub #115).
     let reconcileMoveSource: Bool
 
     init(
@@ -2015,6 +2021,16 @@ extension AccountManager {
             }
             if (underlying as NSError).code == 404 { return true }
         }
+        // GitHub #115: a `UID MOVE` answered with a tagged NO/BAD and no retained
+        // `COPYUID` stays durably queued and is landed by the next drain,
+        // REGARDLESS of the server's response text. SwiftMail raises this typed
+        // error for every such refusal and its payload IS that raw text, so the
+        // substring fallback below would otherwise read a refusal that happens
+        // to carry an RFC 5530 `[NONEXISTENT]` code (a missing MAILBOX) or the
+        // words `UID not found` as a provider-authoritative "already gone" and
+        // delete the op. The error is an absence of evidence, never exit 2; it
+        // must reach the generic requeue arm. Structural, so no text can undo it.
+        if case IMAPError.moveFailedAfterPossiblePartialCompletion = error { return false }
         let desc = "\(error)"
         if desc.contains("no such message") || desc.contains("UID not found") ||
            desc.contains("Message not found") || desc.contains("NONEXISTENT") { return true }

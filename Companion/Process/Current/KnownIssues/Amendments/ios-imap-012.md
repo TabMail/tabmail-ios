@@ -28,6 +28,11 @@ pins it. The possible-partial half is withdrawn: `moveFailedAfterPossiblePartial
 tagged NO/BAD with NO retained `COPYUID` — the server refused the command and reported nothing about
 what it did — and is a retryable failure under `IOS-IMAP-013`'s disposition, not a no-retry outcome.
 `IMAPProvider.move` no longer catches it; the generic queue catch requeues the operation.
+Round 2 (2026-09-04): the queue classifier `AccountManager.isMessageNotFoundError` structurally
+exempts the typed no-`COPYUID` error from its message-not-found text fallback — its payload is the
+server's raw tagged response text, so a refusal carrying an RFC 5530 `[NONEXISTENT]` code or the
+words `UID not found` would otherwise have been retired as provider-authoritative "already gone" —
+and the generic requeue arm is therefore reached for every response text.
 
 ## Subsystem and search terms
 
