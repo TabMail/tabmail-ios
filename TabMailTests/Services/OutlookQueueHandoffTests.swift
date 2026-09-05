@@ -265,6 +265,7 @@ struct OutlookQueueHandoffTests {
         // guard always passes; the claim loop's `providers[op.accountId] != nil`
         // is what holds these gestures.)
         await AccountManager.shared.move([seeded], to: Self.firstDestination)
+
         let optimistic = try rows(f)
         #expect(optimistic.count == 1)
         guard optimistic.count == 1 else { return }
@@ -886,6 +887,26 @@ struct OutlookQueueHandoffTests {
         // as the move it is queued behind — the shape in which the lane's
         // serialization promise is what makes the handoff load-bearing.
         await AccountManager.shared.move([seeded], to: Self.firstDestination)
+
+        // THE UNDO STACK, pushed exactly as the swipe pushes it: from the
+        // PRE-move snapshot, naming the source address. A committed retirement
+        // re-points it at the address the wire proved (`publishMoveFinish`), and
+        // the recovery below asserts the REPLAY publishes that too — an undo
+        // entry left naming the destroyed id authenticates against
+        // `MessageHeader.fetchOne(db, key: originalHeaderId)`, now nil, and is
+        // refused WHOLE with no way to repair an entry already offered to the
+        // user (`IOS-UNDO-002`).
+        UndoService.shared.dismissAll()
+        let undoAction = UndoableAction(
+            type: .move(fromPath: Self.source, toPath: Self.firstDestination),
+            messages: [seeded],
+            originalFolderId: seeded.folderId,
+            originalFolderPath: Self.source,
+            accountId: f.accountId,
+            timestamp: Date())
+        let undoActionId = undoAction.id
+        UndoService.shared.push(undoAction)
+        defer { UndoService.shared.dismissAll() }
         let optimistic = try rows(f)
         #expect(optimistic.count == 1)
         guard optimistic.count == 1 else { return }
@@ -972,6 +993,17 @@ struct OutlookQueueHandoffTests {
             move=\(heldMove?.retryCount ?? -1) follower=\(heldFollower?.retryCount ?? -1)
             """)
 
+        // NON-VACUITY for the publication oracle below: nothing has been
+        // published yet, because nothing has committed. The stack still names
+        // the address the gesture captured.
+        let heldMember = UndoService.shared.undoStack.last?.commands.first?.members.first
+        #expect(UndoService.shared.undoStack.last?.id == undoActionId,
+                "the undo entry under test is not the one on top of the stack")
+        #expect(heldMember?.providerMessageId == "graph-1", """
+            the undo stack was re-pointed by a retirement that never committed: \
+            \(String(describing: heldMember?.providerMessageId))
+            """)
+
         // The database accepts writes again — the recovery every live process
         // eventually reaches when the app returns to the foreground.
         f.pool.remove(transactionObserver: refuser)
@@ -1006,6 +1038,28 @@ struct OutlookQueueHandoffTests {
             id=\(headers[0].id) messageId=\(headers[0].messageId) \
             folder=\(headers[0].folderPath)
             """)
+
+        // 🚨 THE REPLAY MUST PUBLISH WHAT THE DIRECT PATH PUBLISHES. A committed
+        // retirement is not just a durable write: `publishMoveFinish` re-points
+        // the undo stack at the address the wire proved. Recovering through the
+        // REPLAY arm and skipping that leaves the user an Undo button that is
+        // refused whole the moment it is pressed.
+        let republished = UndoService.shared.undoStack.last?.commands.first?.members.first
+        #expect(UndoService.shared.undoStack.last?.id == undoActionId,
+                "the undo entry was dropped by the recovery")
+        #expect(republished?.providerMessageId == current, """
+            the undo stack still names the address the move destroyed after \
+            recovery through the retirement REPLAY (proven id \(current)): \
+            \(String(describing: republished?.providerMessageId))
+            """)
+        #expect(republished?.originalHeaderId == headers[0].id, """
+            the undo entry does not authenticate against the re-keyed row, so \
+            pressing Undo refuses the whole command: \
+            \(String(describing: republished?.originalHeaderId)) vs \(headers[0].id)
+            """)
+        // The fields that describe where the message came FROM must NOT move.
+        #expect(republished?.sourceFolderPath == Self.source,
+                "the re-key rewrote the restore target: \(String(describing: republished?.sourceFolderPath))")
 
         try expectGesturePreservedAndExecuted(
             f, effectVisibleOnServer: server.snapshot(providerMessageId: current)?.isRead == true,
@@ -1166,12 +1220,19 @@ struct OutlookQueueHandoffTests {
     /// `messageId` both stay at their SOURCE values while the row already shows
     /// at the destination. Reproducing that shape is what makes the two tests
     /// below exercise the same rows a real gesture would produce.
+    ///
+    /// Both shapes are returned. `moved` is what the database now holds;
+    /// `source` is the PRE-gesture snapshot, which is what a real swipe captures
+    /// into the undo stack (`UndoMember.init(header:)` reads the folder, epoch,
+    /// inbox flag and tag to RESTORE, so it must be built from the row as it was
+    /// before the optimistic move, exactly as `UndoService` builds it).
     @discardableResult
     private func seedOptimisticallyMovedHeader(
         _ fixture: Fixture, graphId: String, rfc: String, destination: String,
         isRead: Bool = false, isFlagged: Bool = false
-    ) throws -> MessageHeader {
+    ) throws -> (source: MessageHeader, moved: MessageHeader) {
         var header = try seedHeader(fixture, graphId: graphId, rfc: rfc)
+        let source = header
         header.folderPath = destination
         header.folderId = MessageIdentity.folderId(
             accountId: fixture.accountId, folderPath: destination)
@@ -1181,7 +1242,7 @@ struct OutlookQueueHandoffTests {
         header.observedUidValidity = nil
         let moved = header
         try fixture.pool.writeWithoutTransaction { db in try moved.update(db) }
-        return moved
+        return (source: source, moved: moved)
     }
 
     /// Insert a whole schedule of durable operations in a fixed `createdAt`
@@ -1423,10 +1484,26 @@ struct OutlookQueueHandoffTests {
         defer { server.close() }
 
         let f = try fixture(accountId: "graph-handoff-narrowing")
-        try seedOptimisticallyMovedHeader(
+        let a = try seedOptimisticallyMovedHeader(
             f, graphId: "graph-a", rfc: firstRfc, destination: Self.firstDestination, isRead: true)
         try seedOptimisticallyMovedHeader(
             f, graphId: "graph-b", rfc: secondRfc, destination: Self.firstDestination)
+
+        // The undo entry the batch gesture would have pushed, built from the
+        // PRE-move snapshot of the member the provider proves. The narrowing
+        // replay must re-point it at the proven address for the same reason the
+        // whole-op replay must (`IOS-UNDO-002`).
+        UndoService.shared.dismissAll()
+        let undoAction = UndoableAction(
+            type: .move(fromPath: Self.source, toPath: Self.firstDestination),
+            messages: [a.source],
+            originalFolderId: a.source.folderId,
+            originalFolderPath: Self.source,
+            accountId: f.accountId,
+            timestamp: Date())
+        let undoActionId = undoAction.id
+        UndoService.shared.push(undoAction)
+        defer { UndoService.shared.dismissAll() }
 
         #expect(await AccountManager.shared.pendingRetirements.isEmpty,
                 "a previous test left a retained retirement on the shared AccountManager")
@@ -1508,6 +1585,15 @@ struct OutlookQueueHandoffTests {
             already moved: \(heldMove?.status ?? "<deleted>")
             """)
 
+        // NON-VACUITY for the publication oracle below: an uncommitted narrowing
+        // publishes nothing, so the stack still names the captured address.
+        #expect(UndoService.shared.undoStack.last?.id == undoActionId,
+                "the undo entry under test is not the one on top of the stack")
+        #expect(
+            UndoService.shared.undoStack.last?.commands.first?.members.first?
+                .providerMessageId == "graph-a",
+            "the undo stack was re-pointed by a narrowing that never committed")
+
         f.pool.remove(transactionObserver: refuser)
         try await drainToQuiescence(f)
 
@@ -1540,10 +1626,432 @@ struct OutlookQueueHandoffTests {
             (proven id \(provenA)): \(patches)
             """)
 
+        // 🚨 THE NARROWING REPLAY MUST PUBLISH TOO. `commitPartialRetirement`
+        // re-keys only the PROVEN members, and the replay arm is responsible for
+        // publishing that re-key to the undo stack exactly as the direct path is.
+        let republished = UndoService.shared.undoStack.last?.commands.first?.members.first
+        #expect(UndoService.shared.undoStack.last?.id == undoActionId,
+                "the undo entry was dropped by the recovery")
+        #expect(republished?.providerMessageId == provenA, """
+            the undo stack still names the address the move destroyed after \
+            recovery through the narrowing REPLAY (proven id \(provenA)): \
+            \(String(describing: republished?.providerMessageId))
+            """)
+        #expect(
+            republished?.originalHeaderId == MessageIdentity.headerId(
+                accountId: f.accountId, folderPath: Self.firstDestination,
+                messageId: provenA),
+            """
+            the undo entry does not authenticate against the re-keyed row, so \
+            pressing Undo refuses the whole command: \
+            \(String(describing: republished?.originalHeaderId))
+            """)
+        #expect(republished?.sourceFolderPath == Self.source,
+                "the re-key rewrote the restore target: \(String(describing: republished?.sourceFolderPath))")
+
         try expectGesturePreservedAndExecuted(
             f, effectVisibleOnServer: server.snapshot(providerMessageId: provenA)?.isRead == true,
             gesture: "the mark-read behind a narrowing that could not commit",
             serverState: "id=\(provenA) folders=\(serverFolders(server, rfc: firstRfc))")
+
+        await finish(f)
+    }
+
+    // MARK: - T-H / T-I — the replay that FAILS AGAIN, and charges nobody
+
+    /// **THE PROPERTY: a retained retirement whose replay fails AGAIN stops the
+    /// drain with the proof still held, and charges the failure to nobody.**
+    ///
+    /// This is `replayRetainedRetirements`' catch arm, reached through the real
+    /// caller: `drainPendingQueue` calls it at the top, it re-runs
+    /// `commitFullRetirement`, the database refuses that write for a second time,
+    /// and it returns `false`. The drain must then stop BEFORE the
+    /// `NetworkMonitor` check and before any claim pass — because the alternative
+    /// is the exact drop `IOS-GRAPH-005` is about: the follower is `queued`, its
+    /// `inFlight` predecessor is refused by the claim loop, so the follower is
+    /// claimed ALONE naming the id Graph reallocated, `404`s, and is deleted by
+    /// the single-message conflict arm as provider-authoritative "already done".
+    ///
+    /// "Charges nobody" is the second half and it is not cosmetic: a LOCAL write
+    /// that will not commit is not the provider failing, so neither the held move
+    /// nor the follower may accumulate `retryCount`. A replay that charged a
+    /// retry per drain would walk an operation to its retry ceiling during an
+    /// ordinary backgrounded-writes window.
+    @Test("Outlook: a retirement replay that fails again stops the drain, keeps the proof, and charges no retry")
+    @MainActor
+    func aRetirementReplayThatFailsAgainStopsTheDrainAndChargesNobody() async throws {
+        let rfc = "graph-handoff-replay-refused@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: rfc, providerMessageId: "graph-1", folderId: Self.source),
+        ])
+        defer { server.close() }
+
+        let f = try fixture(accountId: "graph-handoff-replay-refused")
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-1", rfc: rfc, destination: Self.firstDestination)
+
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a previous test left a retained retirement on the shared AccountManager")
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "a drain from an earlier test is still running, so this schedule is not this test's")
+
+        let ordered = try seedSchedule(f, [
+            PendingOperation(
+                type: .move, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.source,
+                destinationPath: Self.firstDestination),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.firstDestination),
+        ])
+        #expect(ordered.count == 2)
+        guard ordered.count == 2 else { return }
+        let moveOpId = ordered[0].id
+        let followerOpId = ordered[1].id
+
+        await register(server.provider(), f)
+
+        let refuser = HeaderCommitRefuser()
+        f.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(refuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on the retirement write for exactly its \
+            three attempts: \(refuser.refusals.withLock { $0 })
+            """)
+        #expect(await AccountManager.shared.pendingRetirements.count == 1, """
+            the provider's proven result was not retained, so the second drain \
+            below has no replay to attempt
+            """)
+
+        let afterFirstDrain = server.http.servedCallSequence()
+        #expect(afterFirstDrain.filter { $0.hasSuffix("/move") }.count == 1,
+                "the move was not sent exactly once: \(afterFirstDrain)")
+
+        // 🚨 EXACTLY ONE MORE DRAIN, not a quiescence loop. The refusal COUNT is
+        // this test's oracle, and a helper that keeps calling the drain until
+        // the queue empties would call it an unbounded number of times and turn
+        // that oracle into noise. Quiescence is asserted first so this call is
+        // provably the only drain running: `drainPendingQueue` returns
+        // immediately and records a redrain when one is already in flight.
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "the first drain has not settled, so the second is not this test's")
+        await AccountManager.shared.drainPendingQueue()
+
+        // The replay ran, and ran the SAME write — three more `retryWrite`
+        // attempts and no more.
+        #expect(refuser.refusals.withLock { $0 } == 6, """
+            the retained retirement was not replayed for exactly its three \
+            attempts on the second drain: \(refuser.refusals.withLock { $0 })
+            """)
+
+        // 🚨 THE ORACLE. The second drain reached the wire NOT AT ALL — it did
+        // not claim, so it did not execute, so the wire record is byte-identical
+        // to the one the first drain left.
+        #expect(server.http.servedCallSequence() == afterFirstDrain, """
+            a claim pass ran after a retirement replay that could not commit: \
+            \(server.http.servedCallSequence()). The only address the follower \
+            can name is the one the still-uncommitted proof is holding.
+            """)
+        #expect(await AccountManager.shared.pendingRetirements.count == 1, """
+            the provider's proven result was DISCARDED by a replay that failed — \
+            the wire effect it applied is now recorded nowhere
+            """)
+
+        let (heldMove, heldFollower) = try await f.pool.read { db in
+            (try PendingOperation.fetchOne(db, key: moveOpId),
+             try PendingOperation.fetchOne(db, key: followerOpId))
+        }
+        #expect(heldFollower != nil, """
+            the follower was DESTROYED across a second failed replay while this \
+            process still held the proof that would have re-addressed it
+            """)
+        #expect(heldMove?.status == PendingStatus.inFlight.rawValue,
+                "the held move left `inFlight`: \(heldMove?.status ?? "<deleted>")")
+        #expect(heldMove?.messageIds == ["graph-1"],
+                "the move row lost members: \(String(describing: heldMove?.messageIds))")
+        #expect(heldFollower?.status == PendingStatus.queued.rawValue,
+                "the follower is not retryable: \(heldFollower?.status ?? "<deleted>")")
+        #expect(heldFollower?.messageIds == ["graph-1"],
+                "the follower's address moved with nothing committed to prove it")
+        // A LOCAL write that will not commit is not the provider failing. A
+        // replay that charged a retry per drain would exhaust an operation
+        // during an ordinary backgrounded-writes window.
+        #expect(heldMove?.retryCount == 0 && heldFollower?.retryCount == 0, """
+            a failed replay charged a provider retry: \
+            move=\(heldMove?.retryCount ?? -1) follower=\(heldFollower?.retryCount ?? -1)
+            """)
+
+        // Recovery, unchanged by the extra failed attempt.
+        f.pool.remove(transactionObserver: refuser)
+        try await drainToQuiescence(f)
+
+        let finalCalls = server.http.servedCallSequence()
+        #expect(finalCalls.filter { $0.hasSuffix("/move") }.count == 1, """
+            the move was replayed on the wire — a proven move must be applied \
+            exactly once: \(finalCalls)
+            """)
+        let current = liveId(server, rfc: rfc)
+        #expect(current != nil && current != "graph-1")
+        guard let current else { return }
+        let patches = finalCalls.filter { $0.hasPrefix("PATCH ") }
+        #expect(patches.count == 1, "the follower did not execute exactly once: \(patches)")
+        #expect(patches.allSatisfy { $0.hasSuffix("/\(current)") }, """
+            a PATCH went out at an address the move had already invalidated \
+            (proven id \(current)): \(patches)
+            """)
+
+        try expectGesturePreservedAndExecuted(
+            f, effectVisibleOnServer: server.snapshot(providerMessageId: current)?.isRead == true,
+            gesture: "the mark-read behind a retirement whose replay failed a second time",
+            serverState: "id=\(current) folders=\(serverFolders(server, rfc: rfc))")
+
+        await finish(f)
+    }
+
+    /// **THE SAME PROPERTY ON THE PARTIAL ARM: a retained NARROWING whose replay
+    /// fails again stops the drain, keeps the proof, and charges nobody.**
+    ///
+    /// Kept separate from the whole-op sibling because the two run different
+    /// transactions through the same catch — `commitPartialRetirement` re-keys
+    /// only the PROVEN members and narrows the durable row to the ones still
+    /// owed, so a replay that failed halfway would leave a row nothing can
+    /// address (`IOS-QUEUE-005`). The bundle must therefore still hold BOTH
+    /// members after the second refusal, not just the unproven one.
+    @Test("Outlook: a narrowing replay that fails again stops the drain, keeps the proof, and charges no retry")
+    @MainActor
+    func aNarrowingReplayThatFailsAgainStopsTheDrainAndChargesNobody() async throws {
+        let firstRfc = "graph-handoff-narrowing-replay-a@example.com"
+        let secondRfc = "graph-handoff-narrowing-replay-b@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: firstRfc, providerMessageId: "graph-a", folderId: Self.source),
+            .init(rfc822MessageId: secondRfc, providerMessageId: "graph-b", folderId: Self.source),
+        ])
+        defer { server.close() }
+
+        let f = try fixture(accountId: "graph-handoff-narrowing-replay")
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-a", rfc: firstRfc, destination: Self.firstDestination)
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-b", rfc: secondRfc, destination: Self.firstDestination)
+
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a previous test left a retained retirement on the shared AccountManager")
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "a drain from an earlier test is still running, so this schedule is not this test's")
+
+        let ordered = try seedSchedule(f, [
+            PendingOperation(
+                type: .move, messageIds: ["graph-a", "graph-b"],
+                accountId: f.accountId, folderPath: Self.source,
+                destinationPath: Self.firstDestination),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-a"],
+                accountId: f.accountId, folderPath: Self.firstDestination),
+        ])
+        #expect(ordered.count == 2)
+        guard ordered.count == 2 else { return }
+        let moveOpId = ordered[0].id
+        let followerOpId = ordered[1].id
+
+        await register(server.provider(), f)
+        server.failMoveOnce(providerMessageId: "graph-b")
+
+        let refuser = HeaderCommitRefuser()
+        f.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(refuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on the narrowing write for exactly its \
+            three attempts: \(refuser.refusals.withLock { $0 })
+            """)
+        #expect(await AccountManager.shared.pendingRetirements.count == 1,
+                "the partial result was not retained, so there is no replay to attempt")
+
+        let afterFirstDrain = server.http.servedCallSequence()
+        #expect(afterFirstDrain.filter { $0.hasSuffix("/move") }.count == 2,
+                "both members were not attempted, so the partial arm was not reached: \(afterFirstDrain)")
+
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "the first drain has not settled, so the second is not this test's")
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(refuser.refusals.withLock { $0 } == 6, """
+            the retained narrowing was not replayed for exactly its three \
+            attempts on the second drain: \(refuser.refusals.withLock { $0 })
+            """)
+        #expect(server.http.servedCallSequence() == afterFirstDrain, """
+            a claim pass ran after a narrowing replay that could not commit: \
+            \(server.http.servedCallSequence())
+            """)
+        #expect(await AccountManager.shared.pendingRetirements.count == 1,
+                "the proven half of the batch was DISCARDED by a replay that failed")
+
+        let (heldMove, heldFollower) = try await f.pool.read { db in
+            (try PendingOperation.fetchOne(db, key: moveOpId),
+             try PendingOperation.fetchOne(db, key: followerOpId))
+        }
+        #expect(heldFollower != nil,
+                "the follower was DESTROYED across a second failed narrowing replay")
+        #expect(heldMove?.messageIds == ["graph-a", "graph-b"], """
+            the bundle was narrowed by a replay whose write never committed, so \
+            the unproven member is owed by nobody: \
+            \(String(describing: heldMove?.messageIds))
+            """)
+        #expect(heldMove?.status == PendingStatus.inFlight.rawValue,
+                "the bundle left `inFlight`: \(heldMove?.status ?? "<deleted>")")
+        #expect(heldFollower?.messageIds == ["graph-a"],
+                "the follower's address moved with nothing committed to prove it")
+        #expect(heldMove?.retryCount == 0 && heldFollower?.retryCount == 0, """
+            a failed replay charged a provider retry: \
+            move=\(heldMove?.retryCount ?? -1) follower=\(heldFollower?.retryCount ?? -1)
+            """)
+
+        f.pool.remove(transactionObserver: refuser)
+        try await drainToQuiescence(f)
+
+        let finalCalls = server.http.servedCallSequence()
+        let provenA = liveId(server, rfc: firstRfc)
+        #expect(provenA != nil && provenA != "graph-a")
+        guard let provenA else { return }
+        #expect(finalCalls.filter { $0.hasSuffix("/messages/graph-a/move") }.count == 1,
+                "the proven member's move was re-sent: \(finalCalls)")
+        #expect(serverFolders(server, rfc: secondRfc) == [Self.firstDestination],
+                "the refused member did not converge: \(serverFolders(server, rfc: secondRfc))")
+        let patches = finalCalls.filter { $0.hasPrefix("PATCH ") }
+        #expect(patches.count == 1, "the follower did not execute exactly once: \(patches)")
+        #expect(patches.allSatisfy { $0.hasSuffix("/\(provenA)") }, """
+            a PATCH went out at an address the move had already invalidated \
+            (proven id \(provenA)): \(patches)
+            """)
+
+        try expectGesturePreservedAndExecuted(
+            f, effectVisibleOnServer: server.snapshot(providerMessageId: provenA)?.isRead == true,
+            gesture: "the mark-read behind a narrowing whose replay failed a second time",
+            serverState: "id=\(provenA) folders=\(serverFolders(server, rfc: firstRfc))")
+
+        await finish(f)
+    }
+
+    // MARK: - T-J — the retained proof whose ROW the user deleted
+
+    /// **THE PROPERTY: a retained proof whose durable operation the user has
+    /// since deleted is DROPPED, and the drain carries on with everything else.**
+    ///
+    /// This is `replayRetainedRetirements`' row-gone arm, and it is the mirror of
+    /// the catch arm above: absence of the row is NOT a failure to commit. The
+    /// writers that can delete a claimed row are the local wipes and resets —
+    /// here the real one, `SettingsView.localIndexWipeTxn`, the user's own
+    /// "delete all local email data" gesture — which never join a running drain.
+    /// So the row being gone is the user's NEWER decision winning, and replaying
+    /// a retirement against a row nobody wants would re-key a header the wipe
+    /// deleted.
+    ///
+    /// Treating it as a failure instead is the shape that must never ship: the
+    /// entry can never be resolved, so the top-of-drain gate refuses EVERY
+    /// subsequent drain for the life of the process and the queue wedges whole —
+    /// every later gesture, on every account, starves behind one dead entry.
+    ///
+    /// The deletion is performed by the REAL producer, not a hand-written
+    /// `DELETE`, for the reason
+    /// `drainPendingQueueRealRowDeletedByALocalWipeMidDrainIsSkipped` states: a
+    /// hand-written delete proves the arm runs, only the real transaction proves
+    /// it is REACHABLE.
+    @Test("Outlook: a retained proof whose row the user's local wipe deleted is dropped, and the drain proceeds")
+    @MainActor
+    func aRetainedProofWhoseRowWasWipedIsDroppedAndTheDrainProceeds() async throws {
+        let movedRfc = "graph-handoff-wiped-move@example.com"
+        let bystanderRfc = "graph-handoff-wiped-bystander@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: movedRfc, providerMessageId: "graph-1", folderId: Self.source),
+            .init(rfc822MessageId: bystanderRfc, providerMessageId: "graph-2", folderId: Self.source),
+        ])
+        defer { server.close() }
+
+        let f = try fixture(accountId: "graph-handoff-wiped")
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-1", rfc: movedRfc, destination: Self.firstDestination)
+
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a previous test left a retained retirement on the shared AccountManager")
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "a drain from an earlier test is still running, so this schedule is not this test's")
+
+        let ordered = try seedSchedule(f, [
+            PendingOperation(
+                type: .move, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.source,
+                destinationPath: Self.firstDestination),
+        ])
+        #expect(ordered.count == 1)
+        guard ordered.count == 1 else { return }
+
+        await register(server.provider(), f)
+
+        let refuser = HeaderCommitRefuser()
+        f.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(refuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on the retirement write for exactly its \
+            three attempts: \(refuser.refusals.withLock { $0 })
+            """)
+        #expect(await AccountManager.shared.pendingRetirements.count == 1,
+                "the provider's proven result was not retained, so there is nothing to drop")
+        let afterMove = server.http.servedCallSequence()
+        #expect(afterMove.filter { $0.hasSuffix("/move") }.count == 1,
+                "the move was not sent exactly once: \(afterMove)")
+
+        // Writes work again BEFORE the wipe: `localIndexWipeStatements` begins
+        // with `DELETE FROM messageHeader`, so a refuser still installed would
+        // refuse the user's gesture instead of the retirement.
+        f.pool.remove(transactionObserver: refuser)
+
+        // THE USER'S NEWER DECISION, through its real transaction.
+        try await f.pool.write { db in try SettingsView.localIndexWipeTxn(db) }
+        #expect(try queuedOperationCount(f) == 0,
+                "the wipe left the operation behind, so the row-gone arm is not reached")
+        #expect(try rows(f).isEmpty, "the wipe left headers behind")
+
+        // An ORDINARY, independent operation on a different message, seeded
+        // after the wipe. It is what proves the drain PROCEEDED rather than
+        // merely not crashing.
+        try seedHeader(f, graphId: "graph-2", rfc: bystanderRfc)
+        let independent = try seedSchedule(f, [
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-2"],
+                accountId: f.accountId, folderPath: Self.source),
+        ])
+        #expect(independent.count == 1)
+
+        try await drainToQuiescence(f)
+
+        // 🚨 THE ORACLE, both halves. The dead entry is gone, and the drain that
+        // dropped it went on to do the work in front of it.
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty, """
+            a retained proof whose durable row no longer exists was kept, so the \
+            top-of-drain gate refuses every later drain for the life of the \
+            process and the whole queue wedges
+            """)
+        let finalCalls = server.http.servedCallSequence()
+        #expect(finalCalls.filter { $0.hasPrefix("PATCH ") } == ["PATCH /v1.0/me/messages/graph-2"], """
+            the independent operation did not execute, so the drain did not \
+            proceed past the dropped entry: \(finalCalls)
+            """)
+        #expect(finalCalls.filter { $0.hasSuffix("/move") }.count == 1, """
+            the wiped operation's move was replayed on the wire against a row \
+            the user deleted: \(finalCalls)
+            """)
+        #expect(server.snapshot(providerMessageId: "graph-2")?.isRead == true,
+                "the independent operation's effect is not visible on the server")
+
+        let survivors = try await f.pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(survivors.isEmpty, """
+            the queue did not converge: \
+            \(survivors.map { "\($0.type.rawValue)/\($0.status)" })
+            """)
 
         await finish(f)
     }
