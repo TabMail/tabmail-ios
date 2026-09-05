@@ -604,7 +604,6 @@ extension AccountManager {
                         }
                         if fetched.status == PendingStatus.cancelled.rawValue {
                             _ = try PendingOperation.deleteOne(db, key: fetched.id)
-                            queueLog("[Queue] Op \(op.id.prefix(8)) cancelled by undo, deleted")
                             return nil
                         }
                         if fetched.status == PendingStatus.inFlight.rawValue {
@@ -2693,13 +2692,9 @@ extension AccountManager {
                 .filter(Column("status") == PendingStatus.inFlight.rawValue)
                 .fetchAll(db)
             if !staleOps.isEmpty {
-                queueLog("[Queue] Crash recovery: reconciling \(staleOps.count) inFlight ops")
                 for op in staleOps {
                     if op.type == .move, op.everAttempted {
                         _ = try PendingOperation.deleteOne(db, key: op.id)
-                        queueLog(
-                            "[Queue] Dropped interrupted MOVE \(op.id.prefix(8)) " +
-                            "instead of risking a duplicate; foreground sync will reconcile")
                         continue
                     }
                     var updated = op
@@ -2708,12 +2703,9 @@ extension AccountManager {
                 }
             }
             // Clean up cancelled ops from previous session
-            let cancelledCount = try PendingOperation
+            _ = try PendingOperation
                 .filter(Column("status") == PendingStatus.cancelled.rawValue)
                 .deleteAll(db)
-            if cancelledCount > 0 {
-                queueLog("[Queue] Crash recovery: cleaned up \(cancelledCount) cancelled ops")
-            }
             // Same crash-recovery class as the inFlight reset above, for the OTHER
             // in-flight state a previous session can leave behind: a draft push whose
             // Stage A durably committed `"pushing"` and then died before the provider
@@ -2736,10 +2728,7 @@ extension AccountManager {
             // claim, not here. Full rationale, the mirror-image trap, and the residue
             // census are on `DraftStore.resetOrphanedPushingDrafts` and
             // `DraftStore.reAdmitOrphanedPushingDraft`.
-            let reAdmittedPushes = try DraftStore.resetOrphanedPushingDrafts(db: db)
-            if reAdmittedPushes > 0 {
-                queueLog("[Queue] Crash recovery: re-admitted \(reAdmittedPushes) orphaned draft pushes")
-            }
+            _ = try DraftStore.resetOrphanedPushingDrafts(db: db)
         }
         await drainPendingQueue()
         await reconcileOutbox()

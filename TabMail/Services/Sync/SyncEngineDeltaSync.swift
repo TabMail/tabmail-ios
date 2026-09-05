@@ -5,49 +5,6 @@
 import Foundation
 import GRDB
 
-/// Debug-gated, file-backed writer for the `[MoveTrace] deltaSync` decision lines
-/// — the per-folder insert/remove/skip verdicts Gmail's delta arm reaches for each
-/// message. A thin forwarder onto `BackgroundSyncLogger.logQueue`, which owns the
-/// gate, the escaping, the console echo and the `AppLogStore` append.
-///
-/// These lines were bare, UNGATED `print`s. Both halves of that were wrong:
-///
-/// * **Ungated** violates global `CLAUDE.md` rule 12. The façade's `guard` is
-///   that gate, and it covers the console sink as well as the file one. ⚠️ That
-///   makes this a no-op unless debug logging is unlocked by an allowed user —
-///   NOT "a no-op in production builds", which an earlier wording claimed:
-///   `isLoggingEnabled()` is a RUNTIME gate that is deliberately active on device
-///   and on TestFlight for such a user, which is the point of writing to a file
-///   at all.
-/// * **`print`** meant they went NOWHERE on a device. There is no
-///   `freopen`/`dup2` in this tree, so `stdout` is unreadable outside an attached
-///   Xcode console — the exact situation of the Gmail delete → undo → delete whose
-///   message reappeared 31 minutes later (`IOS-QUEUE-008`). These six lines name
-///   which sync arm re-inserted a row, which was one of the two facts the
-///   investigation needed and the exported log could not supply.
-///
-/// They land on the `.queue` channel — the SAME channel `AccountManagerQueue`'s
-/// `queueLog` uses, so the drain's lane decisions and these sync verdicts
-/// interleave in ONE file in append order and `AppLogStore.read(channel: .queue)`
-/// returns the whole sequence. ⚠️ Not on `.sync`: that channel is always-on, and
-/// a gated writer on it would give one channel two lifetime policies and hide
-/// itself from the tests that pin the split (memory topic 122, `IOS-LOG-002`).
-///
-/// `@autoclosure` so the interpolation is skipped entirely when the gate is off;
-/// these fire per message per folder, and the laziness survives the forward
-/// because `message()` is evaluated inside the façade's own autoclosure argument.
-///
-/// ⚠️ SCOPE: this helper is deliberately used ONLY by the six
-/// `[MoveTrace] deltaSync` sites (seven until 2026-09-04, when the unreachable
-/// post-snapshot insert guard and its "SKIPPING insert for id=… — already exists
-/// (post-snapshot)" line were removed — see the comment above `header.insert` in
-/// `gmailDeltaSync`, and `IOS-LABEL-004`). The rest of this file's `print` corpus
-/// — and the sync engines' generally — is the whole-tree sweep tracked as issue
-/// #72 and is out of scope here.
-private func deltaMoveTraceLog(_ message: @autoclosure () -> String) {
-    BackgroundSyncLogger.logQueue(message())
-}
-
 extension SyncEngine {
 
     // MARK: - Delta Sync
@@ -228,20 +185,23 @@ extension SyncEngine {
 
                         if existsLocally && !belongsInFolder && !isPendingAny {
                             // Message was removed from this folder (e.g., archived from inbox)
-                            deltaMoveTraceLog("[MoveTrace] deltaSync — removing \(info.messageId) from \(folder.name)(\(folder.id)) — not in labels \(labelIds)")
                             if let existing {
                                 removedIds.append(existing.id)
                                 try existing.delete(db)
                             }
                         } else if existsLocally && !belongsInFolder && isPendingAny {
-                            deltaMoveTraceLog("[MoveTrace] deltaSync — SKIPPING removal of \(info.messageId) from \(folder.name) — has pending op")
+                            // Removal SKIPPED — a pending op on this identity makes the
+                            // user's optimistic folder authoritative until it drains.
                         } else if !existsLocally && belongsInFolder && isPendingDestructive {
-                            deltaMoveTraceLog("[MoveTrace] deltaSync — SKIPPING insert of \(info.messageId) into \(folder.name) — has pending destructive op")
+                            // Insert SKIPPED — a pending destructive op owns this identity.
                         } else if !existsLocally && belongsInFolder && recentlyCompletedSnapshot[info.messageId] != nil {
-                            deltaMoveTraceLog("[MoveTrace] deltaSync — SKIPPING insert of \(info.messageId) into \(folder.name) — recently completed op")
+                            // Insert SKIPPED — the queue completed an op on this message
+                            // within the TTL, so the server state just read is stale.
+                            // 🚨 This arm carries no statement but is NOT removable: it is
+                            // what stops a just-completed message from falling through to
+                            // the insert arm below and reappearing.
                         } else if !existsLocally && belongsInFolder && !isPendingDestructive {
                             // New message in this folder
-                            deltaMoveTraceLog("[MoveTrace] deltaSync — inserting \(info.messageId) into \(folder.name)(\(folder.id)) — labels=\(labelIds)")
                             // Other half of draft rekey visibility (see the matching
                             // delete-side log above): the NEW message.id Gmail minted
                             // for a re-pushed draft lands here as an ordinary insert.
@@ -313,7 +273,6 @@ extension SyncEngine {
                                     rfc822MessageId: orphaned.rfc822MessageId
                                 )
                                 if orphanIsPending {
-                                    deltaMoveTraceLog("[MoveTrace] deltaSync — SKIPPING orphan reclaim for \(orphaned.id) — pending destructive op (server folder=\(folder.name) but user moved locally)")
                                     continue
                                 }
                                 print("[Sync] deltaSync reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folder.id)")

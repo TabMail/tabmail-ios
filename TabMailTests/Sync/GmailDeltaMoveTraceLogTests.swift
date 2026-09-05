@@ -7,15 +7,27 @@ import Foundation
 import GRDB
 @testable import TabMail
 
-/// A3.5 (`IOS-QUEUE-008` follow-up) — the `[MoveTrace] deltaSync` decision lines
-/// in Gmail's label-based delta arm (`SyncEngineDeltaSync.gmailDeltaSync`) — seven
-/// when this suite was written, six since 2026-09-04 (see "Site 7" below) — go
-/// through the file-private `deltaMoveTraceLog(_:)` façade, which forwards
-/// to `BackgroundSyncLogger.logQueue`: debug-gated
-/// (`DebugModeManager.isLoggingEnabled()`), escaped, and appended to the `.queue`
-/// channel of the single consolidated `tabmail.log`. Before this item only one of
-/// the sites was ever reached by any test, and even that one ran with the
-/// gate closed so its interior never executed — the exact gap this suite closes.
+/// A3.5 (`IOS-QUEUE-008` follow-up) — the six decision sites Gmail's label-based
+/// delta arm (`SyncEngineDeltaSync.gmailDeltaSync`) reaches for each changed
+/// message: remove, skip removal, skip insert (pending destructive op), skip
+/// insert (recently completed op), insert, and skip orphan reclaim.
+///
+/// ⚠️ **This suite was written to pin the `[MoveTrace] deltaSync` line each site
+/// emitted. All six lines — and the file-private façade onto
+/// `BackgroundSyncLogger.logQueue` that carried them — were DELETED on
+/// 2026-09-05 by owner decision, so every expectation about them is gone from
+/// this file.** They were emitted from INSIDE the changed-message
+/// `dbPool.write` closure, and `AppLogStore.append` enqueues file I/O that no
+/// SQLite `ROLLBACK` can retract: a batch that rolled back still left a durable
+/// line claiming it had inserted, removed or skipped a message. A debug
+/// instrument may miss a line, but it must not lie, and deletion was the
+/// smallest resolution the round-5 reviewers themselves named. The delta arm now
+/// writes no per-message line at all, which is also how the exported log
+/// attributes a reappearing message: no `fullSync upsert` line for it means the
+/// delta arm put it back.
+///
+/// What survives here is exactly what the deletion did not touch — each site's
+/// DURABLE effect, which is the behaviour worth a test either way.
 ///
 /// 🚨 These tests drive PRODUCTION `SyncEngine.performDeltaSync` end to end
 /// (`FakeHTTP` + a real `GmailProvider` + a real `DatabasePool`-backed
@@ -23,28 +35,17 @@ import GRDB
 /// same reason (`IOS-OUTBOX-002`): a re-implementation of the branch logic would
 /// stay green no matter how the real branch broke.
 ///
-/// For each of the six sites, one `@Test` drives TWO phases against
-/// two independently-seeded message ids in the SAME fixture:
-///   1. Gate OPEN — assert the durable DB effect, THEN assert the channel holds
-///      EXACTLY that site's marker line (array equality, not containment — a
-///      containment check cannot prove a NEIGHBOURING site's marker is absent).
-///   2. Gate CLOSED — a fresh id, same shape. Assert the SAME durable DB effect
-///      still happened (non-vacuity: silence must not be mistaken for "the branch
-///      didn't run"; the account's `lastHistoryId` advancing to this phase's
-///      value on top of the DB effect proves the delta pass ran to completion),
-///      then assert the `.queue` channel carries NO `[MoveTrace]` line at all.
+/// For each of the six sites, one `@Test` drives TWO phases against two
+/// independently-seeded message ids in the SAME fixture: once with the debug
+/// gate UNLOCKED and once with it LOCKED. BOTH phases assert the same durable
+/// DB effect, and each asserts the account's `lastHistoryId` advancing to that
+/// phase's value — which proves the delta pass ran to completion rather than
+/// bailing early, and that the debug gate changes nothing the branch does.
 ///
-/// ⚠️ **Sites 5 and 6 are not mutually exclusive with each other** — site 5's
-/// line fires UNCONDITIONALLY on entering the "new message in this folder" arm,
-/// before the code even checks for an orphaned row. `gmailDeltaSyncSkipsOrphan
-/// ReclaimWhenOrphanHasPendingDestructiveOp` below asserts site 5's line and site
-/// 6's line as an ORDERED PAIR for this reason — that co-occurrence is a fact
-/// about the branch structure, not a gap in the "neighbouring markers absent"
-/// check. Sites 1–4 remain strictly mutually exclusive with everything else.
-///
-/// **Site 7 — `[MoveTrace] deltaSync — SKIPPING insert for id=… — already exists
-/// (post-snapshot)` — REMOVED 2026-09-04 together with its guard, and so
-/// deliberately absent from this file.** The `guard try MessageHeader.fetchOne(db,
+/// **A seventh site — the post-snapshot re-read guard, whose skip line read
+/// `SKIPPING insert for id=… — already exists (post-snapshot)` — was REMOVED
+/// 2026-09-04 together with that guard, and so is deliberately absent from this
+/// file.** The `guard try MessageHeader.fetchOne(db,
 /// key: header.id) == nil` that sat right before `header.insert` re-read, inside
 /// the SAME `dbPool.write` closure, the exact key the orphan check
 /// (`MessageHeader.fetchOne(db, key: header.id)`) had read moments earlier, and
@@ -74,7 +75,7 @@ import GRDB
 /// that map at the start of every scoped test (`ProcessGlobalTestState.withLock`
 /// → `AccountManager.shared.clearRecentlyCompletedForTesting()`), so Site 4's
 /// entries can never leak into a sibling test.
-@Suite("Gmail delta sync's six [MoveTrace] decision sites — all constructible, gated and queue-channel-routed", .serialized, .processGlobalState)
+@Suite("Gmail delta sync's six decision sites — all constructible, with the same durable effect whether or not debug logging is unlocked", .serialized, .processGlobalState)
 struct GmailDeltaMoveTraceLogTests {
 
     // MARK: - Shared fixture helpers
@@ -160,21 +161,6 @@ struct GmailDeltaMoveTraceLogTests {
         """
     }
 
-    /// Only the `[MoveTrace] deltaSync` message bodies from `.queue` channel text,
-    /// in append order — the `[<ts>] [QUEUE] ` entry prefix stripped off, so an
-    /// expected-array comparison is exact-content equality rather than a
-    /// containment check that could stay green while a neighbouring marker also
-    /// snuck in.
-    private static func moveTraceLines(in channelText: String) -> [String] {
-        channelText
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .compactMap { line -> String? in
-                guard let range = line.range(of: "] [QUEUE] ") else { return nil }
-                let message = String(line[range.upperBound...])
-                return message.hasPrefix("[MoveTrace] deltaSync") ? message : nil
-            }
-    }
-
     private static func headerExists(_ headerId: String, pool: DatabasePool) throws -> Bool {
         try pool.read { db in try MessageHeader.fetchOne(db, key: headerId) != nil }
     }
@@ -185,7 +171,7 @@ struct GmailDeltaMoveTraceLogTests {
 
     // MARK: - Site 1: existsLocally && !belongsInFolder && !isPendingAny → removes
 
-    @Test("Gmail delta sync removes a header that fell out of its folder's labels — silently when debug logging is locked")
+    @Test("Gmail delta sync removes a header that fell out of its folder's labels — identically whether or not debug logging is unlocked")
     func gmailDeltaSyncRemovesHeaderNoLongerInFolderLabels() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer {
@@ -232,11 +218,6 @@ struct GmailDeltaMoveTraceLogTests {
         #expect(try Self.headerExists(openHeaderId, pool: pool) == false,
                 "Site 1: the header must be REMOVED once it fell out of the folder's labels")
 
-        let openLines = Self.moveTraceLines(in: AppLogStore.read(channel: .queue))
-        let expectedOpenLine = "[MoveTrace] deltaSync — removing \(msgOpen) from \(folder.name)(\(folder.id)) — not in labels []"
-        #expect(openLines == [expectedOpenLine],
-                "Site 1's marker must be the ONLY MoveTrace line, with every neighbouring site's marker absent")
-
         AppLogStore.clear()
 
         // Phase CLOSED
@@ -251,17 +232,14 @@ struct GmailDeltaMoveTraceLogTests {
 
         let closedHeaderId = MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: msgClosed)
         #expect(try Self.headerExists(closedHeaderId, pool: pool) == false,
-                "non-vacuity: the locked-gate pass must still have removed the header — silence alone proves nothing")
+                "non-vacuity: the locked-gate pass must still have removed the header")
         #expect(try Self.currentLastHistoryId(accountId: accountId, pool: pool) == "1002",
                 "non-vacuity: the whole delta pass, including its final historyId write, must have completed")
-
-        #expect(Self.moveTraceLines(in: AppLogStore.read(channel: .queue)).isEmpty,
-                "Site 1's marker must be ABSENT while the gate is locked")
     }
 
     // MARK: - Site 2: existsLocally && !belongsInFolder && isPendingAny → skips removal
 
-    @Test("Gmail delta sync SKIPS removing a header out of its folder's labels when a pending op protects it — silently when debug logging is locked")
+    @Test("Gmail delta sync SKIPS removing a header out of its folder's labels when a pending op protects it — identically whether or not debug logging is unlocked")
     func gmailDeltaSyncSkipsRemovalWhenPendingOpProtectsHeader() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer {
@@ -309,11 +287,6 @@ struct GmailDeltaMoveTraceLogTests {
         #expect(try Self.headerExists(openHeaderId, pool: pool),
                 "Site 2: the header must SURVIVE — the pending op must block the removal")
 
-        let openLines = Self.moveTraceLines(in: AppLogStore.read(channel: .queue))
-        let expectedOpenLine = "[MoveTrace] deltaSync — SKIPPING removal of \(msgOpen) from \(folder.name) — has pending op"
-        #expect(openLines == [expectedOpenLine],
-                "Site 2's marker must be the ONLY MoveTrace line, with every neighbouring site's marker absent")
-
         AppLogStore.clear()
 
         // Phase CLOSED
@@ -328,17 +301,14 @@ struct GmailDeltaMoveTraceLogTests {
 
         let closedHeaderId = MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: msgClosed)
         #expect(try Self.headerExists(closedHeaderId, pool: pool),
-                "non-vacuity: the locked-gate pass must still have preserved the header — silence alone proves nothing")
+                "non-vacuity: the locked-gate pass must still have preserved the header")
         #expect(try Self.currentLastHistoryId(accountId: accountId, pool: pool) == "1002",
                 "non-vacuity: the whole delta pass, including its final historyId write, must have completed")
-
-        #expect(Self.moveTraceLines(in: AppLogStore.read(channel: .queue)).isEmpty,
-                "Site 2's marker must be ABSENT while the gate is locked")
     }
 
     // MARK: - Site 3: !existsLocally && belongsInFolder && isPendingDestructive → skips insert
 
-    @Test("Gmail delta sync SKIPS inserting a header with a pending destructive op on its own identity — silently when debug logging is locked")
+    @Test("Gmail delta sync SKIPS inserting a header with a pending destructive op on its own identity — identically whether or not debug logging is unlocked")
     func gmailDeltaSyncSkipsInsertWhenPendingDestructiveOpBlocksIt() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer {
@@ -351,7 +321,7 @@ struct GmailDeltaMoveTraceLogTests {
         let msgOpen = "s3-open-msg"
         let msgClosed = "s3-closed-msg"
 
-        let (account, folder) = try Self.makeAccountAndFolder(
+        let (account, _) = try Self.makeAccountAndFolder(
             accountId: accountId, folderPath: folderPath, historyCursor: "1000", pool: pool)
 
         try await pool.write { db in
@@ -384,11 +354,6 @@ struct GmailDeltaMoveTraceLogTests {
         #expect(try Self.headerExists(openHeaderId, pool: pool) == false,
                 "Site 3: the header must NOT be inserted — the pending destructive op must block it")
 
-        let openLines = Self.moveTraceLines(in: AppLogStore.read(channel: .queue))
-        let expectedOpenLine = "[MoveTrace] deltaSync — SKIPPING insert of \(msgOpen) into \(folder.name) — has pending destructive op"
-        #expect(openLines == [expectedOpenLine],
-                "Site 3's marker must be the ONLY MoveTrace line, with every neighbouring site's marker absent")
-
         AppLogStore.clear()
 
         // Phase CLOSED
@@ -403,17 +368,14 @@ struct GmailDeltaMoveTraceLogTests {
 
         let closedHeaderId = MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: msgClosed)
         #expect(try Self.headerExists(closedHeaderId, pool: pool) == false,
-                "non-vacuity: the locked-gate pass must still have blocked the insert — silence alone proves nothing")
+                "non-vacuity: the locked-gate pass must still have blocked the insert")
         #expect(try Self.currentLastHistoryId(accountId: accountId, pool: pool) == "1002",
                 "non-vacuity: the whole delta pass, including its final historyId write, must have completed")
-
-        #expect(Self.moveTraceLines(in: AppLogStore.read(channel: .queue)).isEmpty,
-                "Site 3's marker must be ABSENT while the gate is locked")
     }
 
     // MARK: - Site 4: !existsLocally && belongsInFolder && recentlyCompleted → skips insert
 
-    @Test("Gmail delta sync SKIPS inserting a header the queue just completed — silently when debug logging is locked")
+    @Test("Gmail delta sync SKIPS inserting a header the queue just completed — identically whether or not debug logging is unlocked")
     func gmailDeltaSyncSkipsInsertWhenRecentlyCompletedProtectsIt() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer {
@@ -426,7 +388,7 @@ struct GmailDeltaMoveTraceLogTests {
         let msgOpen = "s4-open-msg"
         let msgClosed = "s4-closed-msg"
 
-        let (account, folder) = try Self.makeAccountAndFolder(
+        let (account, _) = try Self.makeAccountAndFolder(
             accountId: accountId, folderPath: folderPath, historyCursor: "1000", pool: pool)
 
         // No PendingOperation at all — `recentlyCompleted` is the only protection,
@@ -456,11 +418,6 @@ struct GmailDeltaMoveTraceLogTests {
         #expect(try Self.headerExists(openHeaderId, pool: pool) == false,
                 "Site 4: the header must NOT be inserted — the recently-completed protection must block it")
 
-        let openLines = Self.moveTraceLines(in: AppLogStore.read(channel: .queue))
-        let expectedOpenLine = "[MoveTrace] deltaSync — SKIPPING insert of \(msgOpen) into \(folder.name) — recently completed op"
-        #expect(openLines == [expectedOpenLine],
-                "Site 4's marker must be the ONLY MoveTrace line, with every neighbouring site's marker absent")
-
         AppLogStore.clear()
 
         // Phase CLOSED
@@ -475,17 +432,14 @@ struct GmailDeltaMoveTraceLogTests {
 
         let closedHeaderId = MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: msgClosed)
         #expect(try Self.headerExists(closedHeaderId, pool: pool) == false,
-                "non-vacuity: the locked-gate pass must still have blocked the insert — silence alone proves nothing")
+                "non-vacuity: the locked-gate pass must still have blocked the insert")
         #expect(try Self.currentLastHistoryId(accountId: accountId, pool: pool) == "1002",
                 "non-vacuity: the whole delta pass, including its final historyId write, must have completed")
-
-        #expect(Self.moveTraceLines(in: AppLogStore.read(channel: .queue)).isEmpty,
-                "Site 4's marker must be ABSENT while the gate is locked")
     }
 
     // MARK: - Site 5: !existsLocally && belongsInFolder && !isPendingDestructive, no orphan → inserts
 
-    @Test("Gmail delta sync inserts a genuinely new header when nothing local, pending or orphaned blocks it — silently when debug logging is locked")
+    @Test("Gmail delta sync inserts a genuinely new header when nothing local, pending or orphaned blocks it — identically whether or not debug logging is unlocked")
     func gmailDeltaSyncInsertsNewHeaderWithNoOrphanOrPending() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer {
@@ -498,7 +452,7 @@ struct GmailDeltaMoveTraceLogTests {
         let msgOpen = "s5-open-msg"
         let msgClosed = "s5-closed-msg"
 
-        let (account, folder) = try Self.makeAccountAndFolder(
+        let (account, _) = try Self.makeAccountAndFolder(
             accountId: accountId, folderPath: folderPath, historyCursor: "1000", pool: pool)
         // No header, no PendingOperation, no recentlyCompleted entry for either id.
 
@@ -525,11 +479,6 @@ struct GmailDeltaMoveTraceLogTests {
         #expect(try Self.headerExists(openHeaderId, pool: pool),
                 "Site 5: the header must be INSERTED — nothing blocks it")
 
-        let openLines = Self.moveTraceLines(in: AppLogStore.read(channel: .queue))
-        let expectedOpenLine = "[MoveTrace] deltaSync — inserting \(msgOpen) into \(folder.name)(\(folder.id)) — labels=[\"INBOX\"]"
-        #expect(openLines == [expectedOpenLine],
-                "Site 5's marker must be the ONLY MoveTrace line (no orphan row means Site 6/7 never fire), with every neighbouring site's marker absent")
-
         AppLogStore.clear()
 
         // Phase CLOSED
@@ -544,17 +493,14 @@ struct GmailDeltaMoveTraceLogTests {
 
         let closedHeaderId = MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: msgClosed)
         #expect(try Self.headerExists(closedHeaderId, pool: pool),
-                "non-vacuity: the locked-gate pass must still have inserted the header — silence alone proves nothing")
+                "non-vacuity: the locked-gate pass must still have inserted the header")
         #expect(try Self.currentLastHistoryId(accountId: accountId, pool: pool) == "1002",
                 "non-vacuity: the whole delta pass, including its final historyId write, must have completed")
-
-        #expect(Self.moveTraceLines(in: AppLogStore.read(channel: .queue)).isEmpty,
-                "Site 5's marker must be ABSENT while the gate is locked")
     }
 
     // MARK: - Site 6: orphan row found, orphan's OWN identity has a pending destructive op → skips reclaim
 
-    @Test("Gmail delta sync SKIPS reclaiming an orphaned row whose OWN identity has a pending destructive op — silently when debug logging is locked")
+    @Test("Gmail delta sync SKIPS reclaiming an orphaned row whose OWN identity has a pending destructive op — identically whether or not debug logging is unlocked")
     func gmailDeltaSyncSkipsOrphanReclaimWhenOrphanHasPendingDestructiveOp() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer {
@@ -634,14 +580,6 @@ struct GmailDeltaMoveTraceLogTests {
         #expect(openOrphanRow?.messageId == orphanTagOpen,
                 "Site 6: the orphan reclaim must be SKIPPED — messageId must stay the orphan's own, not overwritten to \(msgOpen)")
 
-        let openLines = Self.moveTraceLines(in: AppLogStore.read(channel: .queue))
-        let expectedOpenLines = [
-            "[MoveTrace] deltaSync — inserting \(msgOpen) into \(folder.name)(\(folder.id)) — labels=[\"INBOX\"]",
-            "[MoveTrace] deltaSync — SKIPPING orphan reclaim for \(forcedOpenId) — pending destructive op (server folder=\(folder.name) but user moved locally)"
-        ]
-        #expect(openLines == expectedOpenLines,
-                "Site 6's marker must follow Site 5's marker as an ORDERED PAIR (Site 5 fires unconditionally on entering this arm), with every OTHER neighbouring site's marker absent")
-
         AppLogStore.clear()
 
         // Phase CLOSED
@@ -656,13 +594,10 @@ struct GmailDeltaMoveTraceLogTests {
 
         let closedOrphanRow = try await pool.read { db in try MessageHeader.fetchOne(db, key: forcedClosedId) }
         #expect(closedOrphanRow?.folderId == staleFolderId,
-                "non-vacuity: the locked-gate pass must still have skipped the reclaim — silence alone proves nothing")
+                "non-vacuity: the locked-gate pass must still have skipped the reclaim")
         #expect(closedOrphanRow?.messageId == orphanTagClosed,
-                "non-vacuity: the locked-gate pass must still have skipped the reclaim — silence alone proves nothing")
+                "non-vacuity: the locked-gate pass must still have skipped the reclaim")
         #expect(try Self.currentLastHistoryId(accountId: accountId, pool: pool) == "1002",
                 "non-vacuity: the whole delta pass, including its final historyId write, must have completed")
-
-        #expect(Self.moveTraceLines(in: AppLogStore.read(channel: .queue)).isEmpty,
-                "Site 6's marker (and Site 5's) must be ABSENT while the gate is locked")
     }
 }

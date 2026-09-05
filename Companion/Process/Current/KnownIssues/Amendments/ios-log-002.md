@@ -91,3 +91,28 @@ seventeenth.
 channels; five always-on eleven debug-gated; `debugGatedWriters`; `escapedForLogLine`; whole-line
 escaping; channel forgery; `IOS-QUEUE-008`; `[MoveTrace]`; `queueLog`; `deltaMoveTraceLog`;
 `upsertInsertedIdSummary`; runtime unlock not build configuration; `DebugModeManager.isLoggingEnabled`
+
+## 2026-09-05 — one of `.queue`'s three writers is gone; the channel is not
+
+`SyncEngineDeltaSync.deltaMoveTraceLog` — named above under "What changed" as one of the `.queue`
+channel's three call sites — was **removed 2026-09-05** together with all six
+`[MoveTrace] deltaSync` lines it carried (PR #113, round 6b; owner decision, deletion-first). The
+row above is superseded on that point only and is kept as history: `.queue`'s writers are now
+**two**, `AccountManagerQueue.queueLog` and the full-sync upsert line, both still routed through
+`BackgroundSyncLogger.logQueue`.
+
+Nothing else in this record changes. `AppLogChannel` still has **sixteen** cases and the gating
+split is still **5 always-on / 11 debug-gated** — a channel is not deleted when a writer is; `.queue`
+still carries the drain's lane composition and the full-sync move-convergence line in ONE ordered
+artifact, which is the property the record exists to defend. The exposure restatement (class C:
+`folderPath`, folder display names, header/provider ids), the runtime-unlock warning, the whole-line
+escaping note, and the `debugGatedWriters` registry obligation all stand unchanged.
+
+Why the writer went: `logQueue` → `AppLogStore.append` enqueues file I/O on an independent serial
+queue that no SQLite `ROLLBACK` retracts, and all six of those lines were emitted from INSIDE the
+delta arm's `dbPool.write` closure — so a rolled-back batch still left a durable line claiming it had
+inserted, removed or skipped a message. A debug instrument may miss a line; it must not lie. Detail:
+`ios-queue-008.md`'s 2026-09-05 section, which also carries the standing in-write-emission census.
+
+Search terms for this amendment: `deltaMoveTraceLog` removed 2026-09-05; two `.queue` writers not
+three; in-write emission survives rollback; deletion-first; PR #113 round 6b.
