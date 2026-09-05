@@ -314,10 +314,20 @@ struct OutlookQueueHandoffTests {
     /// This is `IOS-QUEUE-008` in the Graph id space. Folder-qualified, the two
     /// ops key on `source` and `firstDestination` and land in different connected
     /// components, so `drainPendingQueue` launches them as concurrent tasks and
-    /// whichever finishes last wins — including the OLDER gesture. The overlap is
-    /// observed positively inside the fixture's `/move` route rather than inferred
-    /// from the outcome, so a regression cannot pass on timing luck.
-    @Test("Outlook: two queued moves of one message never overlap on the wire and the latest destination wins")
+    /// whichever finishes last wins — including the OLDER gesture.
+    ///
+    /// ⚠️ THE ORACLE HERE IS THE OUTCOME, NOT A WIRE-LEVEL OVERLAP COUNT, and that
+    /// is a measured constraint rather than a preference. A `URLProtocol`
+    /// transport does not admit a second request into a route while an earlier one
+    /// is blocked inside `startLoading()`, so "no two `/move`s were in the route at
+    /// once" is something the TRANSPORT guarantees regardless of the lane key — it
+    /// cannot distinguish a serialized queue from a raced one. The falsifiable
+    /// Outlook serialization oracles are `T1` (a follower's PATCH must not reach
+    /// the wire at all while its predecessor's move is unresolved — a DIFFERENT
+    /// request, which the transport does let through) and
+    /// `PendingQueueLaneTests.outlookSameIdInTwoFoldersSharesOneLane` (the lane
+    /// key itself). Both go red when `.outlook` leaves the account-scoped set.
+    @Test("Outlook: two queued moves of one message run in issue order and the latest destination wins")
     @MainActor
     func twoQueuedMovesOfOneMessageSerializeAndTheLatestWins() async throws {
         let rfc = "graph-handoff-two-moves@example.com"
@@ -342,15 +352,7 @@ struct OutlookQueueHandoffTests {
         let drain = Task { await AccountManager.shared.drainPendingQueue() }
 
         let held = try await awaitHeldMoves(server, count: 1)
-        #expect(held, "the first move was never parked, so the overlap oracle below is vacuous")
-        try await Task.sleep(for: .milliseconds(Self.concurrencySettleMilliseconds))
-
-        #expect(!server.moveOverlapObserved(), """
-            the second move entered the wire while the first was still unresolved \
-            (peak concurrent moves = \(server.peakConcurrentMoves())). Two moves of \
-            ONE Graph message must serialize; raced, the OLDER gesture can land \
-            last and the user's latest intention is silently reverted.
-            """)
+        #expect(held, "the first move was never parked, so this is not the in-flight window")
 
         release()
         _ = await drain.value
@@ -400,8 +402,20 @@ struct OutlookQueueHandoffTests {
         guard optimistic.count == 1 else { return }
         #expect(optimistic[0].folderPath == Self.firstDestination,
                 "the optimistic move has not been applied, so the undo is not the in-flight case")
+        // 🚨 THE UNDO IS COMMANDED FROM THE PRE-MOVE HEADER, not from the row the
+        // optimistic move left behind — `UndoMember.init(header:)` reads
+        // `sourceFolderPath`/`sourceFolderId`/`sourceObservedUidValidity` off the
+        // header it is handed, and those describe where the message came FROM.
+        // The real UI captures its members at gesture time, before the optimistic
+        // update (`UndoService`), which is why every other undo suite passes the
+        // source-folder header while the DB row already sits at the destination
+        // (`UndoProviderIdentitySafetyTests.installOptimisticallyMoved`). Handing
+        // in the post-move row instead makes `sourcePath` the DESTINATION, the
+        // forward operation stops matching `exactPayload`, and `undoMove` refuses
+        // the whole command silently — the test would then be measuring a
+        // mis-built command rather than the handoff.
         await AccountManager.shared.undoDestructiveAction(
-            [optimistic[0]], accountId: f.accountId, originalOpType: .move,
+            [seeded], accountId: f.accountId, originalOpType: .move,
             fromFolderPath: Self.firstDestination, toFolderPath: Self.source,
             toFolderId: MessageIdentity.folderId(
                 accountId: f.accountId, folderPath: Self.source))
@@ -459,8 +473,11 @@ struct OutlookQueueHandoffTests {
         let afterOptimisticMove = try rows(f)
         #expect(afterOptimisticMove.count == 1)
         guard afterOptimisticMove.count == 1 else { return }
+        #expect(afterOptimisticMove[0].folderPath == Self.firstDestination,
+                "the optimistic move has not been applied, so gesture 2 is not the in-flight case")
+        // Commanded from the PRE-move header — see the note in T3.
         await AccountManager.shared.undoDestructiveAction(
-            [afterOptimisticMove[0]], accountId: f.accountId, originalOpType: .move,
+            [seeded], accountId: f.accountId, originalOpType: .move,
             fromFolderPath: Self.firstDestination, toFolderPath: Self.source,
             toFolderId: MessageIdentity.folderId(
                 accountId: f.accountId, folderPath: Self.source))
@@ -537,16 +554,26 @@ struct OutlookQueueHandoffTests {
         // the lane and requeues the mark-flagged behind it.
         server.failNextPatch()
         await AccountManager.shared.drainPendingQueue()
+        try await drainToQuiescence(f)
 
-        // NON-VACUITY: the lane really did halt with work still owed.
-        #expect(try queuedOperationCount(f) > 0, """
-            nothing was left queued after the first drain, so the requeue path \
-            this test exists for never ran
-            """)
+        // NON-VACUITY, read from the WIRE once everything has settled rather than
+        // from the queue mid-pass. `drainPendingQueue()` re-drives itself from its
+        // own `defer` when a lane halted, and a caller that arrives while a pass is
+        // running returns immediately instead of joining it — so there is no
+        // instant at which "the queue still has work" can be sampled reliably, and
+        // an earlier revision of this test sampled it before the halt had even
+        // happened. The refusal leaves a permanent mark on the wire instead: THREE
+        // PATCHes must have been served for two flag gestures — the mark-read that
+        // was refused, its retry after the requeue, and the mark-flagged that was
+        // requeued behind it. Two would mean the lane never halted and the requeue
+        // path this test exists for never ran.
         #expect(serverFolders(server, rfc: rfc) == [Self.firstDestination],
                 "the move did not land, so there is no handoff for the requeue to revert")
-
-        try await drainToQuiescence(f)
+        let patches = server.http.servedCallSequence().filter { $0.hasPrefix("PATCH ") }
+        #expect(patches.count == 3, """
+            the mark-read's PATCH was not refused and retried, so the lane never \
+            halted and nothing was requeued behind it: \(patches)
+            """)
 
         let current = liveId(server, rfc: rfc)
         let flagged = current.flatMap { server.snapshot(providerMessageId: $0)?.isFlagged } == true

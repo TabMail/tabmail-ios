@@ -80,12 +80,6 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         /// as its own flag rather than a huge budget so a test asserts "the lane
         /// is halted", not "the budget outlived the drain".
         var allMutationsFail = false
-        /// The `/move` route's own concurrency, sampled inside the route.
-        /// `maxMovesInFlight > 1` is a positive observation that two moves for
-        /// this server overlapped — the failure mode account-qualified lanes
-        /// exist to prevent (`IOS-QUEUE-008`).
-        var movesInFlight = 0
-        var maxMovesInFlight = 0
         /// Handed to the NEXT `/move` to arrive, which blocks on it until the
         /// TEST signals it. One-shot; a second move is not held.
         var nextMoveHold: DispatchSemaphore?
@@ -227,9 +221,23 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
     /// (15 s) so a held move never becomes a queue TIMEOUT — which would change
     /// what the test is measuring from "ordering" to "timeout handling".
     ///
-    /// ⚠️ This is a HOLD, not an overlap detector. It proves a second request can
-    /// be observed while a move is parked; `moveOverlapObserved()` is the oracle
-    /// for whether two MOVES were ever in the route at once.
+    /// ⚠️ THIS IS A HOLD, NOT AN OVERLAP DETECTOR, AND THIS FIXTURE HAS NO
+    /// OVERLAP DETECTOR — deliberately, because it cannot have a truthful one.
+    /// An earlier revision added a `movesInFlight`/`maxMovesInFlight` counter
+    /// sampled inside the `/move` route, plus a positive control that parked one
+    /// move and drove a second concurrently. The control FAILED: peak stayed at
+    /// `1` across a 3 s window (`i114-iso1.log`, 2026-09-05). `URLProtocol`-backed
+    /// transports do not admit a second request into the route while an earlier
+    /// one blocks inside `startLoading()`, so a route-level `overlapObserved ==
+    /// false` here says nothing about whether the QUEUE serialized — it is the
+    /// transport's own behaviour, and asserting on it would have been vacuous in
+    /// exactly the direction the assertion was supposed to exclude.
+    ///
+    /// The overlap oracle for the drain therefore lives one layer up, where
+    /// concurrency is real: `AccountManagerQueueDrainTests`'
+    /// `setMoveHook` in-flight counter, and — for Graph — the ORDER a follower's
+    /// verb reaches the wire in (`OutlookQueueHandoffTests` T1) plus
+    /// `PendingQueueLaneTests`' direct assertion on `buildLanes`.
     func holdNextMove() -> @Sendable () -> Void {
         let gate = DispatchSemaphore(value: 0)
         state.value.withLock { $0.nextMoveHold = gate }
@@ -241,25 +249,6 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
     /// all, and its conclusion would be structurally vacuous.
     func heldMoveCount() -> Int {
         state.value.withLock { $0.heldMoveCount }
-    }
-
-    /// Did two `/move` requests for this server ever sit in the route at the same
-    /// time? Sampled INSIDE the route, so it is a positive observation of overlap
-    /// rather than an inference from timing.
-    ///
-    /// ⚠️ READ THE NEGATIVE CAREFULLY. `false` means no overlap was OBSERVED. It
-    /// is only evidence of serialization if the fixture can also produce a `true`
-    /// — which is why `StatefulExchangeActionServerTests` contains a positive
-    /// control that drives two concurrent moves and asserts `true`. Without that
-    /// control every `moveOverlapObserved() == false` in the suite would be
-    /// unfalsifiable.
-    func moveOverlapObserved() -> Bool {
-        state.value.withLock { $0.maxMovesInFlight > 1 }
-    }
-
-    /// The peak number of `/move` requests observed in the route at once.
-    func peakConcurrentMoves() -> Int {
-        state.value.withLock { $0.maxMovesInFlight }
     }
 
     /// Inject an UNCLASSIFIED structural 400 for the source-folder `$filter`
@@ -445,15 +434,9 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             return removed ? .status(204) : .status(404)
         }
         http.register(path: "/messages/", method: "POST") { [state, churnsIdOnMove] request in
-            // Enter the route BEFORE any early return, so the peak is sampled for
-            // every request that reaches it, and leave it on every path.
-            state.value.withLock { model in
-                model.movesInFlight += 1
-                model.maxMovesInFlight = max(model.maxMovesInFlight, model.movesInFlight)
-            }
-            defer { state.value.withLock { $0.movesInFlight -= 1 } }
-            // One-shot hold, taken while the in-flight count is already raised so a
-            // second concurrent move is visible as an overlap.
+            // One-shot hold, taken before any early return so a test that arms it
+            // parks every move that reaches the route, not only the ones that
+            // would have succeeded.
             if let gate = state.value.withLock({ model -> DispatchSemaphore? in
                 guard let gate = model.nextMoveHold else { return nil }
                 model.nextMoveHold = nil

@@ -2129,17 +2129,22 @@ extension ProviderIdQueueFuzzTests {
                     #expect(server.snapshots(rfc822MessageId: targetRfc).map(\.folderId)
                         == [fixture.trash.path],
                             "\(tag): the target moved under a permanent fault")
-                    #expect(!server.moveOverlapObserved(), """
-                        \(tag): two cross-folder moves on ONE Graph id entered the wire \
-                        concurrently (peak \(server.peakConcurrentMoves()))
-                        """)
                     return
                 }
                 server.failAllMutations(false)
             }
 
-            // ---- Phase B: converge, with the first move parked so a genuinely
-            // concurrent pair is OBSERVED rather than inferred.
+            // ---- Phase B: converge, with the first move parked so the round
+            // really passes through the in-flight window rather than draining in
+            // one uncontended sweep.
+            //
+            // ⚠️ NO WIRE-LEVEL OVERLAP ASSERTION. A `URLProtocol` transport does
+            // not admit a second request into a route while an earlier one blocks
+            // inside `startLoading()`, so a route-sampled "no two moves at once"
+            // is the transport's answer, not the queue's, and holds whatever the
+            // lane key is. The convergence assertions below — latest destination
+            // wins, no duplicate, queue empties — are the ones a lane-key
+            // regression actually breaks.
             let release = server.holdNextMove()
             let drain = Task { await AccountManager.shared.drainPendingQueue() }
             var held = false
@@ -2147,18 +2152,7 @@ extension ProviderIdQueueFuzzTests {
                 held = server.heldMoveCount() >= 1
                 if !held { try await Task.sleep(for: .milliseconds(FuzzConfig.drainPollIntervalMs)) }
             }
-            #expect(held, "\(tag): no move was parked, so the overlap oracle below is vacuous")
-            // The parked move holds the window open indefinitely, so this wait
-            // only has to be long enough for a SEPARATE lane's Task — launched
-            // in the same loop iteration — to reach the route. Four times the
-            // Gmail round's window, because here the cost of waiting is paid
-            // once per round rather than once per move.
-            try await Task.sleep(for: .milliseconds(4 * StableFuzzConfig.moveOverlapWindowMs))
-            #expect(!server.moveOverlapObserved(), """
-                \(tag): two cross-folder moves on ONE Graph id executed concurrently on \
-                the wire (peak \(server.peakConcurrentMoves())) — raced, the OLDER \
-                gesture can land last and the user's latest intention is reverted
-                """)
+            #expect(held, "\(tag): no move was parked, so this round never entered the in-flight window")
             release()
             _ = await drain.value
             try await drainProviderQueue(pool: fixture.pool, recordedCommands: { () -> [String] in [] })

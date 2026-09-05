@@ -432,9 +432,9 @@ provider string still lands on the safe side by construction.
 prohibition existed is gone. It runs the real `AccountManager` drain and a real `ExchangeProvider`
 against `StatefulExchangeActionServer` with `churnsIdOnMove: true`, seeding the SOURCE folder only —
 no destination `Folder` row, so the post-drain sync (a repair strictly downstream of the defect)
-cannot mask a failure. Its five cases cover a follower queued behind a move, two moves of one message
-(asserted non-overlapping from the SERVER's in-flight counter, not inferred from a final state a
-lucky race would share), an undo inside the in-flight window, the delete → undo → re-delete shape
+cannot mask a failure. Its five cases cover a follower queued behind a move — pinned by the ORDER its
+PATCH reaches the wire in, which is the one concurrency oracle a `URLProtocol` transport can
+actually falsify — two moves of one message, an undo inside the in-flight window, the delete → undo → re-delete shape
 this record was filed for — now in the Graph id space — and a lane halt that must resume at the proven
 addresses rather than at its snapshot's. `ProviderIdQueueFuzzTests.stableIdQueueLaneFuzz` now
 alternates `.gmail` and `.outlook` per round with no case-count change.
