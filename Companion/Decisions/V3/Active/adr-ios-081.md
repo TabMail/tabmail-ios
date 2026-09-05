@@ -220,6 +220,9 @@ churning Graph server, source folder only so the post-drain sync cannot mask a f
 `.imapSameUidInTwoFoldersStaysInSeparateLanes`;
 `AccountManagerQueueDrainTests.accountScopedIdAccountIdsAdmitsExactlyGmailOutlookAndTheDemoAccount`;
 `ProviderIdQueueFuzzTests.stableIdQueueLaneFuzz`, now alternating `.gmail` and `.outlook` per round;
-and `StatefulExchangeActionServerTests`' self-checks for the fixture seams, including a positive
-control for the `/move` overlap counter without which every serialization assertion here would be
-vacuous.
+and `StatefulExchangeActionServerTests`' self-checks for the three fixture seams. A fourth seam — a
+`/move` overlap counter — was built and REMOVED when its positive control failed: a `URLProtocol`
+transport does not admit a second request into a route while an earlier one is blocked, so the
+counter reported the transport's serialization rather than the queue's and its negative was
+unfalsifiable. Outlook serialization is instead pinned by the ORDER a follower's differently-shaped
+verb reaches the wire in, and by `buildLanes` directly.

@@ -627,11 +627,21 @@ struct StatefulExchangeActionServerTests {
 
     // MARK: - Seam self-checks (IOS-GRAPH-005)
     //
-    // Four seams were added to the fixture for the Outlook queue-handoff tests.
+    // Three seams were added to the fixture for the Outlook queue-handoff tests.
     // Each is proved HERE, at the fixture boundary, because a seam asserted only
     // through a full drain is indistinguishable from a seam that never fires: a
     // test whose oracle is "no PATCH happened while the move was held" passes
     // trivially if the hold silently did nothing.
+    //
+    // ⚠️ A FOURTH SEAM WAS PROPOSED AND IS DELIBERATELY ABSENT: a `/move` overlap
+    // counter sampled inside the route. Its positive control — park one move,
+    // drive a second concurrently, expect a peak of 2 — FAILED, with the peak
+    // stuck at 1 across a 3 s window. A `URLProtocol` transport does not admit a
+    // second request into the route while an earlier one blocks inside
+    // `startLoading()`, so the counter could only ever report "no overlap", which
+    // is the transport's answer and not the queue's. Rather than keep a seam
+    // whose negative is unfalsifiable, it was removed; see `holdNextMove()`'s
+    // doc for where the drain's real overlap oracles live.
 
     /// `holdNextMove()` really parks a move inside the route until released, and
     /// releases exactly one.
@@ -664,58 +674,6 @@ struct StatefulExchangeActionServerTests {
         #expect(server.snapshots(rfc822MessageId: rfc).map(\.folderId) == ["archive"],
                 "the released move never landed")
         #expect(server.heldMoveCount() == 1, "the hold is one-shot; a second move must not be held")
-    }
-
-    /// The overlap counter can report `true`. This is the POSITIVE CONTROL for
-    /// every `moveOverlapObserved() == false` assertion elsewhere: without it a
-    /// zero could mean "serialized" or "this fixture can never see an overlap",
-    /// and those are not the same claim.
-    @Test("the /move overlap counter reports an overlap when two moves really are in the route at once")
-    func moveOverlapCounterCanReportAnOverlap() async throws {
-        let server = StatefulExchangeActionServer(messages: [
-            .init(rfc822MessageId: "overlap-a@example.com",
-                  providerMessageId: "graph-overlap-a", folderId: "source"),
-            .init(rfc822MessageId: "overlap-b@example.com",
-                  providerMessageId: "graph-overlap-b", folderId: "source"),
-        ])
-        defer { server.close() }
-        let provider = server.provider()
-
-        #expect(!server.moveOverlapObserved(), "the counter must start clean")
-
-        let release = server.holdNextMove()
-        let first = Task {
-            try await provider.moveProvingDestinations(
-                ids: ["graph-overlap-a"], from: "source", to: "archive")
-        }
-        var held = false
-        for _ in 0..<300 where !held {
-            held = server.heldMoveCount() == 1
-            if !held { try await Task.sleep(for: .milliseconds(10)) }
-        }
-        #expect(held)
-
-        let second = Task {
-            try await provider.moveProvingDestinations(
-                ids: ["graph-overlap-b"], from: "source", to: "archive")
-        }
-        // The second move only has to REACH the route; it is not held.
-        var overlapped = false
-        for _ in 0..<300 where !overlapped {
-            overlapped = server.moveOverlapObserved()
-            if !overlapped { try await Task.sleep(for: .milliseconds(10)) }
-        }
-        release()
-        _ = try? await first.value
-        _ = try? await second.value
-
-        #expect(overlapped, """
-            two concurrent moves were never observed in the route together \
-            (peak = \(server.peakConcurrentMoves())). Either the transport \
-            serializes requests, in which case every moveOverlapObserved() == false \
-            elsewhere is structurally unfalsifiable and must not be read as \
-            evidence of serialization.
-            """)
     }
 
     /// `failNextPatch()` fails a PATCH and leaves a `/move` alone — which is the

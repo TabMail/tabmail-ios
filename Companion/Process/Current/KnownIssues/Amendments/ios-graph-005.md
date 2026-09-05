@@ -34,7 +34,8 @@ Action queue; Microsoft Graph; Outlook; drain lanes; address handoff; retirement
 `AccountManager.liveOperation`; account-scoped id; folder-independent vs immutable; row-following
 re-key; `IOS-QUEUE-008`; `IOS-GRAPH-002`; `IOS-GRAPH-003`; `IOS-QUEUE-001`; `MIS-IOS-003`;
 `OutlookQueueHandoffTests`; `inheritedRowid` (NOT introduced — see "what this record does not
-contain").
+contain"); `moveOverlapObserved` / `peakConcurrentMoves` (built, then REMOVED — see "the overlap
+oracle this fixture cannot have"); `URLProtocol` `startLoading` serialization.
 
 ## The two shapes this record is about
 
@@ -157,8 +158,9 @@ and its per-mutation red evidence are in the pull request.
   cannot mask anything:
   - **T1** `markReadQueuedBehindAMoveLandsAtTheProvenId` — a follower does not reach the wire while
     its predecessor's move is unresolved, and then lands at the id the move proved.
-  - **T2** `twoQueuedMovesOfOneMessageSerializeAndTheLatestWins` — two moves of one message never
-    overlap in the server's `/move` route, and the latest destination wins with no duplicate.
+  - **T2** `twoQueuedMovesOfOneMessageSerializeAndTheLatestWins` — two moves of one message run in
+    issue order and the latest destination wins, with no duplicate. Its oracle is the OUTCOME; see
+    "the overlap oracle this fixture cannot have" below for why there is no wire-level one.
   - **T3** `undoDuringTheInFlightWindowRestoresTheMessage` — an undo issued inside the in-flight
     window restores the message on the server.
   - **T4** `reDeleteAfterAnUndoIsTheGestureThatWins` — shape 2 end to end; the re-delete built from
@@ -176,13 +178,40 @@ and its per-mutation red evidence are in the pull request.
   mutation).
 - `ProviderIdQueueFuzzTests.stableIdQueueLaneFuzz` — now alternates `.gmail` and `.outlook` per
   round (Testing Rule 11). The Outlook rounds run a real `ExchangeProvider` against a churning
-  server with seeded fault modes and assert: no `/move` overlap, latest destination wins, exactly
-  one copy per RFC identity, durable convergence, disjoint bystanders progress exactly once, and a
-  permanent fault retains exactly the halted-lane state.
-- `StatefulExchangeActionServerTests` — self-checks for the four fixture seams this work added
-  (`holdNextMove`, the `/move` overlap counter *and its positive control*, `failNextPatch`,
-  `failAllMutations`). A seam proved only through a full drain is indistinguishable from a seam that
-  never fires.
+  server with seeded fault modes and assert: the latest destination wins, exactly one copy per RFC
+  identity, durable convergence, disjoint bystanders progress exactly once, and a permanent fault
+  retains exactly the halted-lane state.
+- `StatefulExchangeActionServerTests` — self-checks for the three fixture seams this work added
+  (`holdNextMove`, `failNextPatch`, `failAllMutations`). A seam proved only through a full drain is
+  indistinguishable from a seam that never fires.
+
+### The overlap oracle this fixture cannot have
+
+A fourth seam was built and then REMOVED, and the removal is the finding worth recording. The
+Graph fixture gained a `movesInFlight`/`maxMovesInFlight` counter sampled inside its `/move` route,
+so that "two moves of one message never overlapped" could be a positive observation rather than an
+inference from a final state a lucky race would share. Testing rule "non-vacuity must be two-sided"
+required a positive control: park one move inside the route, drive a second concurrently, and assert
+the peak reaches 2.
+
+**The control FAILED.** The peak stayed at `1` across a 3 s window, and the fixture's own record of
+what it served while the first move was parked contained exactly one entry — the parked move itself.
+A `URLProtocol`-backed transport does not admit a second request into the route while an earlier one
+is blocked inside `startLoading()`. So the counter could only ever answer "no overlap", that answer
+is the TRANSPORT's and not the QUEUE's, and it would have held identically with the lane key
+reverted. The tell was already visible in the mutation matrix before the control was written:
+inverting the lane classifier left T2 GREEN. With the counter removed T2 keeps only its outcome
+oracle — and that oracle DOES go red under the same inversion, because two racing lanes let the
+older gesture land last.
+
+The seam, its control, and all four assertions that consumed it (T2, and two in the fuzzer's Outlook
+round) were deleted rather than weakened. The falsifiable Outlook serialization oracles are
+`OutlookQueueHandoffTests` T1 — a follower's PATCH, a DIFFERENT request the transport does let
+through, must not reach the wire at all while its predecessor's move is unresolved — and
+`PendingQueueLaneTests.outlookSameIdInTwoFoldersSharesOneLane`, which asserts on `buildLanes`
+directly. Both go red when `.outlook` leaves the account-scoped set. The Gmail side keeps its
+`setMoveHook` in-flight counter, which works because it samples inside the fake PROVIDER rather than
+inside a URL-loading route.
 
 Unchanged and still green, as the two-sided non-vacuity legs:
 `FinishTheMoveLocallyGraphTests.twoGesturesWorkWhenGraphIdsDoNotChurn`,
