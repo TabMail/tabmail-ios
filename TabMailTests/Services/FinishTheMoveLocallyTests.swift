@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -750,6 +751,175 @@ struct FinishTheMoveLocallyTests {
 
         // C3: nothing was mutated that the gesture did not select.
         #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    // MARK: - The retirement REPLAY publishes what the direct path publishes
+
+    /// A GRDB `TransactionObserver` that REFUSES the commit of any transaction
+    /// which wrote `messageHeader`, and counts the refusals.
+    ///
+    /// The same shape a full disk, an I/O error at COMMIT, or GRDB's own
+    /// suspension when the app is backgrounded mid-drain produces. Copied
+    /// file-private from `OutlookQueueHandoffTests` exactly as that one was
+    /// copied from `QueueCoreInvariantTests` and `SyncEngineRunSyncTests`: there
+    /// is no shared test utility for it and this change does not invent one.
+    private final class HeaderCommitRefuser: TransactionObserver, Sendable {
+        struct CommitRefused: Error {}
+        private let sawHeaderWrite = Mutex(false)
+        let refusals = Mutex(0)
+
+        func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
+            eventKind.tableName == MessageHeader.databaseTableName
+        }
+        func databaseDidChange(with event: DatabaseEvent) {
+            sawHeaderWrite.withLock { $0 = true }
+        }
+        func databaseWillCommit() throws {
+            guard sawHeaderWrite.withLock({ $0 }) else { return }
+            refusals.withLock { $0 += 1 }
+            throw CommitRefused()
+        }
+        func databaseDidCommit(_ db: Database) {
+            sawHeaderWrite.withLock { $0 = false }
+        }
+        func databaseDidRollback(_ db: Database) {
+            sawHeaderWrite.withLock { $0 = false }
+        }
+    }
+
+    /// **THE PROPERTY: an Undo recorded while a proven move's retirement could
+    /// not commit is still carried out, at the address the server proved, when
+    /// that retirement is recovered by the REPLAY.**
+    ///
+    /// A committed retirement is not only a durable write. It also
+    /// MATERIALIZES the deferred inverse an Undo left waiting behind the
+    /// in-flight forward move: `undoMove` cannot queue that inverse itself,
+    /// because while the forward `COPY` is on the wire the only address it could
+    /// name is the SOURCE UID the move is about to invalidate — naming it would
+    /// move whatever now occupies that UID (C3). So the inverse is recorded as a
+    /// `DeferredMoveSuccessor` and `materializeDeferredMoveSuccessors` turns it
+    /// into an ordinary reverse move once `COPYUID` has named the destination.
+    ///
+    /// The direct retirement path calls that. The REPLAY path is a second
+    /// caller of the same transaction, and if it commits the retirement without
+    /// publishing what the retirement publishes, the user's Undo is silently
+    /// dropped — the button was pressed, the message stays in `Archive`, and the
+    /// waiting successor is stranded in memory for the life of the process with
+    /// nothing left to materialize it.
+    ///
+    /// Driven end to end through the real callers: a real drain against
+    /// `FakeIMAPServer`, a real retention (`HeaderCommitRefuser` refusing the
+    /// retirement's write), the real `undoMove`, and recovery by a real drain.
+    /// Asserted as END STATE ON THE SERVER, plus the fake's wrong-message wire
+    /// oracle.
+    ///
+    /// 🚨 WHY THIS WITNESS LIVES IN THE IMAP SUITE and not beside the other
+    /// retention tests in `OutlookQueueHandoffTests`. `undoMove` registers a
+    /// `DeferredMoveSuccessor` only on its `isIMAP` branch — `account.provider`
+    /// must be `.imap` or `.icloud` — because deferral exists for the address
+    /// space where the forward move renumbers the message's UID and the inverse
+    /// therefore cannot be named until `COPYUID` answers. On a Graph account the
+    /// same gesture is admitted as an ordinary reverse move immediately, so
+    /// `deferredMoveSuccessors` can never be populated there and the replay's
+    /// `materializeDeferredMoveSuccessors` call is unreachable from an Outlook
+    /// fixture. The retention machinery itself (`pendingRetirements`, the
+    /// replay) is provider-agnostic, which is what lets the two halves of this
+    /// property be witnessed in the two suites that can each reach one.
+    @Test("A deferred Undo behind a retirement that could not commit is materialized by the replay")
+    @MainActor
+    func aDeferredUndoIsMaterializedByTheRetirementReplay() async throws {
+        let target = "replay-deferred-undo@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 88, id: target)],
+            "Archive": [],
+            "Trash": [],
+        ])
+        for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "address-replay-defer")
+        let seeded = try seedHeader(f, uid: 88, rfc: target)
+
+        await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a previous test left a retained retirement on the shared AccountManager")
+
+        // The gesture is issued with NO provider registered, so its own drain
+        // does nothing and the refuser below can be installed before the
+        // retirement — the optimistic header write has already committed.
+        await AccountManager.shared.move([seeded], to: "Archive")
+
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let refuser = HeaderCommitRefuser()
+        f.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // NON-VACUITY: the forward move really did land on the server, and its
+        // LOCAL retirement really was refused — this is a proven move whose
+        // address the app has not recorded yet.
+        #expect(server.messageIDs(in: "Archive") == ["<\(target)>"], """
+            the forward move did not reach the server, so there is no proven \
+            destination address for the replay to publish: \
+            Archive=\(server.messageIDs(in: "Archive")) INBOX=\(server.messageIDs(in: "INBOX"))
+            """)
+        #expect(refuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on the retirement write for exactly its \
+            three attempts: \(refuser.refusals.withLock { $0 })
+            """)
+        #expect(await AccountManager.shared.pendingRetirements.count == 1,
+                "the provider's proven result was not retained, so no replay happens")
+
+        // THE UNDO, pressed inside the held window. It cannot be queued yet, so
+        // it is recorded as a successor waiting on the forward operation.
+        let restored = await AccountManager.shared.undoMove(
+            accountId: f.accountId,
+            forwardDestinationPath: "Archive",
+            members: [UndoMember(header: seeded)])
+        #expect(restored == [seeded.id], """
+            undo was refused inside the held window, so nothing is waiting on \
+            the replay and this test proves nothing: \(restored)
+            """)
+        #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 1, """
+            the inverse was not deferred behind the in-flight forward move, so \
+            the replay has no successor to materialize
+            """)
+
+        // The database accepts writes again; recovery runs through the replay.
+        f.pool.remove(transactionObserver: refuser)
+        await AccountManager.shared.drainPendingQueue()
+        try await settleUndo(f)
+
+        // 🚨 THE ORACLE: where the mail actually is. The user pressed Undo and
+        // the message is back, at the address `COPYUID` proved rather than the
+        // one the forward move invalidated.
+        #expect(server.messageIDs(in: "INBOX") == ["<\(target)>"], """
+            the Undo deferred behind a retirement that could not commit was \
+            silently dropped by the recovery — the message is still wherever \
+            the forward move left it. INBOX: \(server.messageIDs(in: "INBOX")), \
+            Archive: \(server.messageIDs(in: "Archive"))
+            """)
+        #expect(server.messageIDs(in: "Archive").isEmpty,
+                "a copy was left behind in the destination: \(server.messageIDs(in: "Archive"))")
+        #expect(server.wrongMessageViolations().isEmpty, """
+            the materialized inverse named a message the gesture never selected: \
+            \(server.wrongMessageViolations())
+            """)
+        #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 0, """
+            the successor is still waiting after its predecessor was retired, so \
+            nothing will ever materialize it
+            """)
+        let survivors = try await f.pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(survivors.isEmpty, """
+            the queue did not converge: \
+            \(survivors.map { "\($0.type.rawValue)/\($0.status)" })
+            """)
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "the retained proof was not cleared by the replay that committed it")
+
         try? await provider.disconnect()
         await finish(f)
     }
