@@ -15,6 +15,7 @@ MIS-IOS-013. · **make a guard read a transient in-memory global, or quote a log
 · **gate a view on async state, hang `.task`/`.onAppear` on a `Group` or on a conditional the task
 flips, or give a test seam a default that differs from production's initial value → MIS-IOS-017.**
 · **make a processing/queue policy visible by hiding or replacing UI in the same change → MIS-IOS-018.**
+· **write `AppLogStore.append(` anywhere but `BackgroundSyncLogger`/`DeviceSyncLogger`/`AuthDiagnostics`, or reuse an existing channel's tag "so the lines interleave" → MIS-IOS-019.**
 
 ## Data integrity — the irreversible ones
 
@@ -35,6 +36,7 @@ flips, or give a test seam a default that differs from production's initial valu
 
 - **[MIS-IOS-017](Companion/Mistakes/Active/MIS-IOS-017-gated-a-view-on-state-that-only-that-view-could-resolve.md)** — gated a view on async state whose **only resolver was that view's own lifecycle**: `recentInboxEligible: Bool?` started `nil` → `.hidden` → `EmptyView`, and the resolving `.task` hung on the **transparent `Group`** — the AI summary bubble was invisible for every message in LIVE `v1.7.11` (`7a31f1d22`). 🚨 15 tests on that function passed: 1 BLESSED `nil → .hidden`, 12 omitted the arg whose seam default `= true` **production never starts in**. **Unresolved must render the pre-gate outcome; a seam default must equal the production initial value.** (×1)
 - **[MIS-IOS-018](Companion/Mistakes/Active/MIS-IOS-018-extended-a-processing-bound-into-display-semantics.md)** — a PROCESSING bound (newest-100 AI window, `recentInboxWindowContains`) leaked into DISPLAY: a suppression notice replaced summary bubbles whose content already EXISTED (`7a31f1d22`/`v1.7.11`; reversed by ADR-IOS-078). **Existence beats eligibility.** ***Tell: making a queue policy "legible" by hiding UI.*** (×1)
+- **[MIS-IOS-019](Companion/Mistakes/Active/MIS-IOS-019-added-persistent-log-writers-outside-the-facade-its-registry-test-was-built-to-see.md)** — added three debug-gated `AppLogStore.append(…, channel: .sync)` writers OUTSIDE `BackgroundSyncLogger` because I wanted their lines to INTERLEAVE with sync's (`4f9bd4bbc`, PR #113): the store already interleaves every tag; the always-on `.sync` tag now carried debug-gated writers; `AppLogStoreTests.everyChannelIsClassifiedExactlyOnce` could not see them; every new gated body had **0 hits** in 9,437 tests; unescaped `folderPath`/error text could forge another channel's entry. **A new persistent diagnostic stream = new `AppLogChannel` case + tag + ONE facade + a `debugGatedWriters` row; `rg "AppLogStore.append\("` outside the three facades must be empty.** (×1)
 
 ## Build & test ops
 
