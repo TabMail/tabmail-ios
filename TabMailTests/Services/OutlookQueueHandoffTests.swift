@@ -3534,4 +3534,233 @@ struct OutlookQueueHandoffTests {
 
         await finish(f)
     }
+
+    /// **THE PROPERTY: a requeue the operation had EARNED a retry charge for
+    /// still charges exactly that one retry when this process recovers the
+    /// ownership on a later drain — exactly one, not two, not zero.**
+    ///
+    /// Equivalently, and this is the thing under test: the ownership
+    /// `pendingRequeues` retains carries the retry DISPOSITION of the requeue it
+    /// stands in for, not a default.
+    ///
+    /// WHY THIS IS A SEPARATE CASE FROM ITS SIBLING ABOVE. That test drives the
+    /// same recovery for a requeue whose site charges NOTHING — a failed
+    /// post-claim re-read is a purely LOCAL write failure — and asserts the false
+    /// side as an oracle (*"a provider retry was charged for a LOCAL write
+    /// failure"*). Two of the eight requeue sites are the other kind: the
+    /// evidence-unavailable arm and the transient provider-error arm both requeue
+    /// with `incrementRetryCount: true`, because the PROVIDER was attempted and
+    /// refused, and that charge is what keeps the runaway-retry case visible at
+    /// all — the arm's own comment records `retryCount` having "stayed at 0
+    /// forever" on an op that was hours old. With only the false side pinned, the
+    /// retained disposition is entirely unwitnessed: a recovery that ignored the
+    /// stored value and always passed `false`, or one that dropped the value and
+    /// made the map a set of ids, forgives every provider retry a refused requeue
+    /// had earned — and stays green.
+    ///
+    /// THE SCHEDULE. One `.markRead`, and a `503` on its PATCH: the provider is
+    /// attempted and refuses, which is the transient-error arm and one of the two
+    /// sites that charge. The requeue that arm then makes is refused by a commit
+    /// observer scoped to exactly that row — the database-wide refusal shape
+    /// `ADR-IOS-041` produces — so the charge rolls back WITH the requeue that
+    /// carried it and this process is left owning an `inFlight` row.
+    ///
+    /// THE SECOND PROVIDER ATTEMPT HAS TO BE NEUTRALISED, or "exactly one" cannot
+    /// be read off the row at all: the moment the recovery returns the row to
+    /// `queued` the same drain claims it again, and a second `503` would charge a
+    /// second, entirely legitimate retry. So the recovery drain arms the one-shot
+    /// post-claim re-read fault, whose own requeue charges nothing
+    /// (`requeueOrRetain`'s default). What the row carries when that drain returns
+    /// is therefore exactly what the recovery charged and nothing else, and the
+    /// fault having cleared itself is the proof the row was claimed again.
+    ///
+    /// THE ORACLES ARE THE DURABLE ROW, READ AFTER EACH DRAIN RETURNED, AND THE
+    /// APPEND-ONLY WIRE RECORD — never membership of `pendingRequeues`, which is
+    /// the mechanism and not the property (`MIS-015`). Four, and they fail in
+    /// different directions:
+    ///   (i)   the provider really was attempted and really did refuse, so the
+    ///         charge was EARNED — and it is NOT on the row while the requeue
+    ///         stands refused, because the increment rolled back with it;
+    ///   (ii)  a drain taken while the refusal still stands charges nothing and
+    ///         sends no new provider work — a recovery may not charge what it
+    ///         cannot commit;
+    ///   (iii) the drain in which the recovery COMMITS leaves `retryCount == 1`;
+    ///   (iv)  the intention was never in danger: it still executes exactly once
+    ///         and the server converges.
+    @Test("Outlook: a requeue the same failure refused still charges exactly the one retry the provider refusal earned")
+    @MainActor
+    func aRecoveredRequeueChargesTheOneRetryTheProviderRefusalEarned() async throws {
+        let rfc = "graph-handoff-recovered-charge@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: rfc, providerMessageId: "graph-1", folderId: Self.source),
+        ])
+        defer { server.close() }
+
+        let f = try fixture(accountId: "graph-handoff-recovered-charge")
+        try seedHeader(f, graphId: "graph-1", rfc: rfc)
+
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a previous test left a retained retirement on the shared AccountManager")
+        #expect(await AccountManager.shared.pendingRequeues.isEmpty,
+                "a previous test left a retained requeue on the shared AccountManager")
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "a drain from an earlier test is still running, so this schedule is not this test's")
+
+        let ordered = try seedSchedule(f, [
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.source),
+        ])
+        #expect(ordered.count == 1)
+        guard ordered.count == 1 else { return }
+        let opId = ordered[0].id
+
+        await register(server.provider(), f)
+
+        let opRowID = try await f.pool.read { db in
+            try Int64.fetchOne(
+                db, sql: "SELECT rowid FROM pendingOperation WHERE id = ?", arguments: [opId])
+        }
+        #expect(opRowID != nil, "the operation row was not seeded, so nothing can be scoped to it")
+        guard let opRowID else { return }
+
+        let refuser = OneRowUpdateRefuser(rowID: opRowID, allowingFirst: 1)
+        f.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+
+        // THE PROVIDER IS ATTEMPTED AND REFUSES. A 503 on the PATCH is a
+        // connection/transient error, which is the arm that requeues with
+        // `incrementRetryCount: true` — the charge this test follows.
+        server.failNextPatch()
+
+        await AccountManager.shared.drainPendingQueue()
+
+        let firstDrain = server.http.servedCallSequence()
+
+        // 🚨 ORACLE (i), and the non-vacuity that makes the charge EARNED rather
+        // than assumed: the operation reached the provider, exactly once and at
+        // its own address, and the provider refused it. A test that never got a
+        // provider attempt has nothing to be charged for and cannot fail here.
+        let firstPatches = firstDrain.filter { $0.hasPrefix("PATCH ") }
+        #expect(firstPatches.count == 1 && firstPatches.allSatisfy { $0.hasSuffix("/graph-1") }, """
+            the operation did not reach the provider exactly once at its own \
+            address, so no retry charge was ever EARNED: \(firstDrain)
+            """)
+        #expect(server.snapshot(providerMessageId: "graph-1")?.isRead == false, """
+            the PATCH was applied rather than refused, so this drain did not take \
+            the transient-error arm and nothing charged a retry: \
+            \(String(describing: server.snapshot(providerMessageId: "graph-1")))
+            """)
+
+        // NON-VACUITY, the other side: the refusal landed on the REQUEUE and on
+        // nothing else — one permitted commit, the drain's own claim, without
+        // which nothing was claimed at all, then exactly the three `retryWrite`
+        // attempts of the requeue that followed it (`MIS-027`).
+        #expect(refuser.allowed.withLock { $0 } == 1, """
+            the operation's claim did not commit exactly once: \
+            \(refuser.allowed.withLock { $0 })
+            """)
+        #expect(refuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on the requeue for exactly its three \
+            attempts: \(refuser.refusals.withLock { $0 })
+            """)
+
+        // Durable state, read after the drain RETURNED. This process owns the row,
+        // and the charge the transient arm asked for is not on it — the increment
+        // rolled back with the requeue that carried it.
+        let held = try await f.pool.read { db in try PendingOperation.fetchOne(db, key: opId) }
+        #expect(held?.status == PendingStatus.inFlight.rawValue, """
+            the requeue survived a refusal aimed at exactly it, so this test \
+            cannot reach the recovery whose charge it measures: \
+            \(held?.status ?? "<deleted>")
+            """)
+        #expect(held?.retryCount == 0, """
+            a retry was charged by a write that never committed: \
+            \(held?.retryCount ?? -1)
+            """)
+
+        // 🚨 ORACLE (ii). A drain taken while the refusal still stands recovers
+        // nothing, so it may charge nothing and send no new provider work.
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(server.http.servedCallSequence() == firstDrain, """
+            a drain taken while the requeue was still refused sent new provider \
+            work: \(server.http.servedCallSequence())
+            """)
+        #expect(refuser.refusals.withLock { $0 } == 6, """
+            the recovery did not attempt the guarded requeue for exactly its \
+            three attempts: \(refuser.refusals.withLock { $0 })
+            """)
+        let stillHeld = try await f.pool.read { db in
+            try PendingOperation.fetchOne(db, key: opId)
+        }
+        #expect(stillHeld?.status == PendingStatus.inFlight.rawValue, """
+            the row left this process's ownership without a write that committed: \
+            \(stillHeld?.status ?? "<deleted>")
+            """)
+        #expect(stillHeld?.retryCount == 0, """
+            a recovery that could not commit charged a retry anyway: \
+            \(stillHeld?.retryCount ?? -1)
+            """)
+
+        // The database accepts writes again — the state every live process reaches
+        // when it returns to the foreground. The one-shot post-claim re-read fault
+        // neutralises the SECOND provider attempt this recovery would otherwise
+        // release; its own requeue charges nothing, so what the row carries when
+        // this drain returns is exactly what the recovery charged.
+        refuser.disarm()
+        defer { AccountManager.liveOperationReadFaultForTesting.withLock { $0 = nil } }
+        AccountManager.liveOperationReadFaultForTesting.withLock { $0 = opId }
+        #expect(AccountManager.liveOperationReadFaultForTesting.withLock { $0 } == opId,
+                "the post-claim re-read fault did not arm")
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // NON-VACUITY for the drain the charge is read off. The fault is a
+        // one-shot that clears itself, so an unarmed seam proves the row really
+        // was claimed again — i.e. the recovery's write COMMITTED — and the
+        // unchanged wire record proves nothing went out behind it that could have
+        // charged a retry of its own.
+        #expect(AccountManager.liveOperationReadFaultForTesting.withLock { $0 } == nil, """
+            the recovered operation was never re-claimed, so the recovery's write \
+            did not commit and the count below is read off the wrong drain
+            """)
+        #expect(server.http.servedCallSequence() == firstDrain, """
+            the neutralised second attempt reached the provider, so a further \
+            provider refusal could have charged the retry this test attributes to \
+            the recovery: \(server.http.servedCallSequence())
+            """)
+
+        // 🚨 ORACLE (iii) — THE ONE THIS TEST EXISTS FOR.
+        let recovered = try await f.pool.read { db in
+            try PendingOperation.fetchOne(db, key: opId)
+        }
+        #expect(recovered?.status == PendingStatus.queued.rawValue, """
+            the operation is not claimable again after the recovery committed: \
+            \(recovered?.status ?? "<deleted>")
+            """)
+        #expect(recovered?.retryCount == 1, """
+            the recovery charged \(recovered?.retryCount ?? -1) retries, not the \
+            ONE the provider's refusal had already earned. A recovery that passes \
+            a default instead of the disposition the requeue retained silently \
+            forgives every charge a refused requeue earned, which is exactly the \
+            masking the charge was added to end.
+            """)
+
+        // 🚨 ORACLE (iv). The intention was never in danger: it still executes,
+        // exactly once, and the server converges.
+        try await drainToQuiescence(f)
+
+        let finalCalls = server.http.servedCallSequence()
+        #expect(finalCalls.filter { $0.hasPrefix("PATCH ") }.count == 2, """
+            the mark-read did not execute exactly once after its refused requeue \
+            recovered — the first PATCH is the 503 this schedule began with: \
+            \(finalCalls)
+            """)
+        try expectGesturePreservedAndExecuted(
+            f, effectVisibleOnServer: server.snapshot(providerMessageId: "graph-1")?.isRead == true,
+            gesture: "the mark-read whose earned retry charge the same failure refused",
+            serverState: "id=graph-1 folders=\(serverFolders(server, rfc: rfc))")
+
+        await finish(f)
+    }
 }

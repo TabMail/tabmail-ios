@@ -465,6 +465,24 @@ its follower each execute exactly once, in issue order, at the proven address. R
 code (two PATCHes instead of one, the follower row destroyed, zero `/move` ever) and RED on a named
 inversion of the fix (`recoverPendingRequeues` made a no-op returning true).
 
+**Fence — the retry CHARGE the recovery carries.**
+`OutlookQueueHandoffTests.aRecoveredRequeueChargesTheOneRetryTheProviderRefusalEarned`. The fence
+above pins the FALSE side of the map's value — a failed post-claim re-read is a purely LOCAL write
+failure and charges nothing — and coverage measured on the candidate showed the TRUE side entirely
+unwitnessed: `PendingOperation.requeueIfInFlight` was entered 27 times across the whole suite and its
+`incrementRetryCount` branch ZERO times, so a `recoverPendingRequeues` that ignored the stored value
+and always passed `false`, or that dropped the value and made the map a set of ids, passed every
+test. The schedule is one `.markRead` and a `503` on its PATCH — the transient-provider-error arm,
+one of the two sites that charge — with the same row-scoped `OneRowUpdateRefuser` refusing the
+requeue, so the charge rolls back WITH the requeue that carried it. The recovery drain then arms the
+one-shot post-claim re-read fault, whose own requeue charges nothing: without that, the re-claim the
+recovery releases takes a second and entirely legitimate charge and "exactly one" cannot be read off
+the row at all. Oracles are the durable row read after each drain RETURNED and the append-only wire
+record — the provider really was attempted and really did refuse (so the charge was EARNED), a drain
+taken while the refusal stands charges nothing and sends nothing, the drain in which the recovery
+COMMITS leaves `retryCount == 1`, and the intention still executes exactly once. RED on a named
+inversion (`recoverPendingRequeues` passing a literal `false`), on that one oracle and no other.
+
 ## Tests
 
 All named tests are RED against a named inversion of the fix and GREEN after; the mutation matrix
