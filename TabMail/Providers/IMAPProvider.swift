@@ -4524,6 +4524,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// pinned SwiftMail fork is the better home and is recorded as a follow-up
     /// in `Companion/Memory/Current/117-swiftmail-move-post-completion-contract.md`.
     ///
+    /// ⚠ THE CLOSING BRACKET IS PART OF THE GRAMMAR, and requiring it is what
+    /// closes the round-4 defect. §7.1's `resp-text` writes the code as
+    /// `"[" resp-text-code "]"`, so an atom that is NOT closed by `]`
+    /// immediately — an unclosed bracket, or a code carrying arguments — is not
+    /// a response code and returns `nil`. Found by review on 2026-09-05 against
+    /// the real NIOIMAP parser, which accepts exactly those inputs as UNCODED
+    /// text (`ResponseText.code == nil`): the server stated no code at all, so
+    /// reading the leading word as one would retire a user's move on a
+    /// non-code, in the retryable direction this whole path exists to protect.
+    ///
     /// Deliberately INTERNAL rather than `private`, for the same reason as
     /// `mapTransportSecurityFailure` and `mapRole`: it is a pure function whose
     /// structural contract is pinned directly by a unit test
@@ -4541,8 +4551,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             }
         }
         guard body.hasPrefix("[") else { return nil }
-        let atom = body.dropFirst().prefix { $0 != "]" && $0 != " " }
+        let afterBracket = body.dropFirst()
+        let atom = afterBracket.prefix { $0 != "]" && $0 != " " }
         guard !atom.isEmpty else { return nil }
+        guard afterBracket[atom.endIndex...].first == "]" else { return nil }
         return atom.uppercased()
     }
 

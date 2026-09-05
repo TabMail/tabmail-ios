@@ -2,7 +2,7 @@
 
 **Class:** data-integrity
 **Severity:** critical (dropped user intention)
-**First seen:** ongoing · **Recurrences:** many (+1, 2026-09-04, GitHub #115; +1, 2026-09-05, GitHub #115 round 1's own fix) · **Status:** Active
+**First seen:** ongoing · **Recurrences:** many (+1, 2026-09-04, GitHub #115; +1, 2026-09-05, GitHub #115 round 1's own fix; +1, 2026-09-05, GitHub #115 round 3b's own fix) · **Status:** Active
 **Related:** [MIS-IOS-003](MIS-IOS-003-reconstructed-an-address-the-wire-already-gave-us.md) · **Rule owner:** `Companion/Rules/Active/never-drop-user-intention.md`
 
 > **`CLAUDE.md` calls this "the single most repeated defect in this codebase's history."** It has its
@@ -196,6 +196,33 @@ disjoint lane on it. `mailboxConfirmedAbsent` and the generic catch are untouche
 test is flipped to `aRefusedAtomicMoveIntoAListOmittedDestinationStaysQueuedAndLands`. Registered in
 `Amendments/ios-imap-013.md`; the sibling LIST probes elsewhere in `IMAPProvider` are recorded for
 the owner rather than changed here.
+
+## Instance (2026-09-05, GitHub #115 round 3b's OWN FIX) — a RECOGNIZER stopped at the delimiter without requiring the CLOSING one
+
+**The tell, and it is new: I wrote a scanner that stops AT a delimiter and never checked the
+delimiter was there.** Round 3b added `IMAPProvider.leadingResponseCode(inRenderedReason:)`, which
+took the atom after `[` with `prefix { $0 != "]" && $0 != " " }` and returned it — no check that a
+`]` closed it. RFC 3501 §7.1 writes the code as `"[" resp-text-code "]"`: the closing bracket IS the
+grammar. Against the real NIOIMAP parser, `[TRYCREATE temporary diagnostic`, `[CANNOT temporary
+failure`, `[NOPERM extra] Temporary failure`, `[NONEXISTENT UID not found` and `[TRYCREATE` are all
+accepted as plain text with `ResponseText.code == nil` — **the server stated no code at all** — yet
+the extractor manufactured one, so a refusal that is retryable by the owner's own D9 decision
+retired the user's move with the message still at its source.
+
+**Why it is the same class, entering through the newest door.** The three earlier #115 instances read
+an ABSENCE (a "may have", a LIST omission) as provider authority. This one *fabricates* the positive
+fact instead: a permissive lexer turns "no response code" into "TRYCREATE". The epistemics are
+identical — nothing the server asserted authorised the retirement.
+
+**The rule this instance adds:** a recognizer for a bracketed/quoted/delimited token must consume the
+CLOSING delimiter, and a scan that stops at a terminator has not proved the terminator is present. A
+prefix is not a token.
+
+**Fix (round 4): DELETE the acceptance of incomplete tokens** — one guard requiring the character
+immediately after the atom to be `]`; nothing else changed. Pinned by five new `nil` rows in
+`IMAPMoveWireContractTests.leadingResponseCodeIsReadStructurally` and one new unclosed-bracket
+argument in `NeverDropExitClosureTests.aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt`, all six
+red on the pre-fix extractor. Registered in `Amendments/ios-imap-013.md`.
 
 ---
 

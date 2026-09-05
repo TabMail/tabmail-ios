@@ -1676,6 +1676,14 @@ struct IMAPMoveWireContractTests {
     /// authority would let the server's wording retire a user's intention. The
     /// end-to-end counterpart is
     /// `NeverDropExitClosureTests.aRefusalWhoseHumanTextMentionsACodeLaterStaysQueued`.
+    ///
+    /// ROUND 4 — the UNCLOSED-BRACKET rows are load-bearing for the same reason,
+    /// and they were reproduced against the real NIOIMAP parser: for every one
+    /// of them `parseResponseText` accepts the input as plain text with
+    /// `ResponseText.code == nil`, so the server stated NO response code at all,
+    /// and a reader that took the atom after `[` without requiring the closing
+    /// bracket the §7.1 grammar mandates would retire a user's move on a
+    /// non-code.
     @Test(
         "The leading response code is read as RFC 3501 §7.1 structure, never as a substring",
         arguments: [
@@ -1685,6 +1693,11 @@ struct IMAPMoveWireContractTests {
             ("no([UNAVAILABLE] Backend temporarily unavailable)", "UNAVAILABLE"),
             ("no(Move refused, see [TRYCREATE] semantics)", nil),
             ("no(No mailbox selected)", nil),
+            ("no([TRYCREATE temporary diagnostic)", nil),
+            ("no([CANNOT temporary failure)", nil),
+            ("no([NOPERM extra] Temporary failure)", nil),
+            ("no([NONEXISTENT UID not found)", nil),
+            ("no([TRYCREATE)", nil),
         ] as [(String, String?)])
     func leadingResponseCodeIsReadStructurally(
         rendered: String, expected: String?

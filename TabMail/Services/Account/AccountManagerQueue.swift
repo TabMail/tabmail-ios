@@ -32,6 +32,15 @@ struct ExecutedOperation: Sendable {
     /// mutation, so `IMAPProvider.move` raises it as a
     /// `ProviderEvidenceUnavailable` and the op stays queued and is retried
     /// (GitHub #115).
+    ///
+    /// ⚠ QUALIFIED (round 3b, owner decision D9 2026-09-05): "stays queued and
+    /// is retried" is true only of refusals WITHOUT a permanent code. A refusal
+    /// whose resp-text BEGINS with a complete code in
+    /// `IMAPProvider.permanentMoveRefusalCodes` — `TRYCREATE`, `NOPERM`,
+    /// `CANNOT`, `NONEXISTENT` — is instead RETIRED by `move` with zero
+    /// mutation: `provenIds` = the input ids, `provenDestinations` empty, and
+    /// `reconcileMoveSource` false, because nothing was copied and the message
+    /// is untouched in the source mailbox on the server.
     let reconcileMoveSource: Bool
 
     init(
@@ -174,10 +183,12 @@ extension AccountManager {
         /// about round trips rather than duplicates". BOTH halves were false at
         /// the tip, and the correction is recorded rather than silently applied
         /// because this comment is precisely a case of documentation outliving
-        /// the code it describes. `ProviderEvidenceUnavailable` has THREE
+        /// the code it describes. `ProviderEvidenceUnavailable` has FOUR
         /// conformers, all private enums in `IMAPProvider`:
-        /// `IMAPDestinationEpochRefusal`, `IMAPEpochEvidenceMissing` and
-        /// `IMAPLivenessProbeInconclusive` — the third was never enumerated.
+        /// `IMAPDestinationEpochRefusal`, `IMAPEpochEvidenceMissing`,
+        /// `IMAPLivenessProbeInconclusive` — the third was never enumerated —
+        /// and `IMAPAtomicMoveRefused`, added by GitHub #115 round 3 for a
+        /// tagged NO/BAD without `COPYUID` on the atomic route.
         /// Some refusal sites in `IMAPProvider.move` ARE pre-mutation
         /// (assertions A1 and A2, and `IMAPDestinationEpochRefusal
         /// .unknownAtProbe` at the destination probe), which is what made the
