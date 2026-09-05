@@ -370,3 +370,39 @@ are all untouched. The refusal still never reaches the LIST probe.
 The 2026-08-13 head amendment on `ios-imap-012.md` described the same arm as "the same no-retry
 safety class as an atomic success with missing evidence". That claim is half-withdrawn by
 `Amendments/ios-imap-012.md`: the `COPYUID`-bearing half stands, the possible-partial half does not.
+
+## 2026-09-05 (round 4) — the recognizer required the CLOSING bracket only after review
+
+Round 3b's `IMAPProvider.leadingResponseCode(inRenderedReason:)` read the atom after `[` with
+`prefix { $0 != "]" && $0 != " " }` and returned it **without checking that a `]` closed it**. RFC
+3501 §7.1 writes the code as `"[" resp-text-code "]"`, so the closing bracket is part of the
+grammar. The round-3 robustness reviewer reproduced five false terminal classifications against the
+real NIOIMAP parser — `[TRYCREATE temporary diagnostic`, `[CANNOT temporary failure`, `[NOPERM
+extra] Temporary failure`, `[NONEXISTENT UID not found`, `[TRYCREATE` — for every one of which
+`parseResponseText` accepts the input as plain text with `ResponseText.code == nil`, i.e. the server
+stated NO response code at all. The extractor nevertheless yielded the leading word, the refusal was
+classified `IMAPActionPermanentlyRefused`, and a refusal that is retryable by the owner's own D9
+decision RETIRED the user's move with the message still at its source — the `MIS-IOS-004` shape one
+more time, through the newest door. The controls behaved correctly throughout (`[TRYCREATE]` →
+retire, `[UNAVAILABLE]` → stays queued, a code later in prose → ignored).
+
+**The fix DELETES the extractor's acceptance of incomplete tokens** — one guard requiring the
+character immediately after the atom to be `]`, nothing else changed: not
+`permanentMoveRefusalCodes`, not `IMAPActionPermanentlyRefused`, not `IMAPAtomicMoveRefused`, not
+`executeSingleOp`, not `isMessageNotFoundError`, not `FakeIMAPServer`, not SwiftMail. The invariant
+it pins: a tagged MOVE refusal retires ONLY when its resp-text begins with a COMPLETE `[ATOM]` whose
+atom is in the permanent set; anything else keeps the round-3 lane-local park.
+
+**Tests.** `IMAPMoveWireContractTests.leadingResponseCodeIsReadStructurally` gains the five rows
+above, all expecting `nil`; `NeverDropExitClosureTests.aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt`
+gains `[TRYCREATE temporary diagnostic` — an unclosed bracket whose atom IS in the permanent set —
+and asserts the round-3 property end to end (still queued after the refused drain, landed by the
+next). All six were RED on the pre-fix extractor (it returned `TRYCREATE` / `CANNOT` / `NOPERM` /
+`NONEXISTENT` / `TRYCREATE` where `nil` was required, and the queue row's op was retired on the
+refused drain) and every pre-existing row stayed green.
+
+**Two comment-only accuracy amendments** landed in the same commit, with no runtime change:
+`ExecutedOperation.reconcileMoveSource`'s "the op stays queued and is retried" is now qualified to
+refusals WITHOUT a permanent code, and `DrainContext.evidenceRefused`'s conformer census reads FOUR
+rather than THREE (`IMAPAtomicMoveRefused` added by round 3; re-derived at the tip —
+`rg -n ': ProviderEvidenceUnavailable' TabMail/` returns exactly four).

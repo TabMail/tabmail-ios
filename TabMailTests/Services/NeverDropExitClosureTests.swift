@@ -1375,6 +1375,11 @@ struct NeverDropExitClosureTests {
             // permanent set must still stay queued.
             "[UNAVAILABLE] Backend temporarily unavailable",
             "UID not found",
+            // ROUND 4 — an UNCLOSED bracket whose atom IS in the permanent set.
+            // NIOIMAP parses this as plain text with no response code, so the
+            // server stated nothing: it must stay queued and land on the next
+            // drain, exactly like the uncoded rows above.
+            "[TRYCREATE temporary diagnostic",
         ])
     @MainActor
     func aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt(refusal: String) async throws {
