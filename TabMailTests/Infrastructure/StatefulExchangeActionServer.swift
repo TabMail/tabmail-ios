@@ -71,6 +71,25 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         var lookupFailuresRemaining = 0
         var lookupFailuresConsumed = 0
         var mutationFailuresRemaining = 0
+        /// PATCH-only failure budget. Separate from `mutationFailuresRemaining`
+        /// (which any mutating verb consumes) so a test can fail the FOLLOWER's
+        /// verb without touching the `/move` that precedes it in the same lane.
+        var patchFailuresRemaining = 0
+        /// When true EVERY mutating verb answers 503, for as long as it is set —
+        /// a permanent fault, as opposed to the one-shot budgets above. Modeled
+        /// as its own flag rather than a huge budget so a test asserts "the lane
+        /// is halted", not "the budget outlived the drain".
+        var allMutationsFail = false
+        /// The `/move` route's own concurrency, sampled inside the route.
+        /// `maxMovesInFlight > 1` is a positive observation that two moves for
+        /// this server overlapped — the failure mode account-qualified lanes
+        /// exist to prevent (`IOS-QUEUE-008`).
+        var movesInFlight = 0
+        var maxMovesInFlight = 0
+        /// Handed to the NEXT `/move` to arrive, which blocks on it until the
+        /// TEST signals it. One-shot; a second move is not held.
+        var nextMoveHold: DispatchSemaphore?
+        var heldMoveCount = 0
         /// RFC Message-IDs whose source-folder `$filter` search
         /// (`resolveActionMessageId`'s first-page fetch) returns a
         /// structural `400` whose body matches NO known terminal shape (not
@@ -172,6 +191,75 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
 
     func failNextMutation() {
         state.value.withLock { $0.mutationFailuresRemaining += 1 }
+    }
+
+    /// Fail the next PATCH (and only a PATCH) with 503.
+    ///
+    /// `failNextMutation()` is consumed by whichever mutating verb happens to
+    /// arrive first, which in a move-then-flag lane is the MOVE. This seam exists
+    /// so a test can fail the FOLLOWER while letting its predecessor's move
+    /// succeed — the shape that proves a re-addressed follower stays queued at its
+    /// NEW id rather than being retried at the dead one.
+    func failNextPatch() {
+        state.value.withLock { $0.patchFailuresRemaining += 1 }
+    }
+
+    /// Turn a PERMANENT mutation fault on or off: while on, every mutating verb
+    /// answers 503 and no wire effect lands.
+    ///
+    /// Distinct from the one-shot budgets on purpose. A fuzz round that wants
+    /// "this lane halts and stays halted for the whole round" cannot express that
+    /// with a budget — a budget that runs out mid-round silently turns the round
+    /// into a transient-fault round, and the round's oracle ("exactly the halted
+    /// state is retained") would then be asserted against the wrong scenario.
+    func failAllMutations(_ failing: Bool) {
+        state.value.withLock { $0.allMutationsFail = failing }
+    }
+
+    /// Block the NEXT `/move` inside the route until the returned closure is
+    /// called. One-shot: a later move is not held.
+    ///
+    /// The wait happens on whatever thread `URLProtocol.startLoading()` runs on,
+    /// which is NOT the thread the test runs on, so the release closure can be
+    /// called from the test body. It is deliberately BOUNDED: a test that forgets
+    /// to release must fail on its own assertion, not hang the suite forever, and
+    /// the bound is comfortably inside `SyncConfig.pendingOperationTimeoutSeconds`
+    /// (15 s) so a held move never becomes a queue TIMEOUT — which would change
+    /// what the test is measuring from "ordering" to "timeout handling".
+    ///
+    /// ⚠️ This is a HOLD, not an overlap detector. It proves a second request can
+    /// be observed while a move is parked; `moveOverlapObserved()` is the oracle
+    /// for whether two MOVES were ever in the route at once.
+    func holdNextMove() -> @Sendable () -> Void {
+        let gate = DispatchSemaphore(value: 0)
+        state.value.withLock { $0.nextMoveHold = gate }
+        return { gate.signal() }
+    }
+
+    /// How many `/move` requests were actually held by `holdNextMove()`. A test
+    /// that arms the hold and then reads `0` here is not exercising the hold at
+    /// all, and its conclusion would be structurally vacuous.
+    func heldMoveCount() -> Int {
+        state.value.withLock { $0.heldMoveCount }
+    }
+
+    /// Did two `/move` requests for this server ever sit in the route at the same
+    /// time? Sampled INSIDE the route, so it is a positive observation of overlap
+    /// rather than an inference from timing.
+    ///
+    /// ⚠️ READ THE NEGATIVE CAREFULLY. `false` means no overlap was OBSERVED. It
+    /// is only evidence of serialization if the fixture can also produce a `true`
+    /// — which is why `StatefulExchangeActionServerTests` contains a positive
+    /// control that drives two concurrent moves and asserts `true`. Without that
+    /// control every `moveOverlapObserved() == false` in the suite would be
+    /// unfalsifiable.
+    func moveOverlapObserved() -> Bool {
+        state.value.withLock { $0.maxMovesInFlight > 1 }
+    }
+
+    /// The peak number of `/move` requests observed in the route at once.
+    func peakConcurrentMoves() -> Int {
+        state.value.withLock { $0.maxMovesInFlight }
     }
 
     /// Inject an UNCLASSIFIED structural 400 for the source-folder `$filter`
@@ -310,6 +398,12 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             return .bytes(body, contentType: "application/json")
         }
         http.register(path: "/messages/", method: "PATCH") { [state] request in
+            let patchFailed = state.value.withLock { model -> Bool in
+                guard model.patchFailuresRemaining > 0 else { return false }
+                model.patchFailuresRemaining -= 1
+                return true
+            }
+            guard !patchFailed else { return .status(503) }
             guard !Self.consumeMutationFailure(state) else { return .status(503) }
             guard let providerId = Self.messageId(from: request.url, move: false) else {
                 return .status(404)
@@ -351,6 +445,26 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             return removed ? .status(204) : .status(404)
         }
         http.register(path: "/messages/", method: "POST") { [state, churnsIdOnMove] request in
+            // Enter the route BEFORE any early return, so the peak is sampled for
+            // every request that reaches it, and leave it on every path.
+            state.value.withLock { model in
+                model.movesInFlight += 1
+                model.maxMovesInFlight = max(model.maxMovesInFlight, model.movesInFlight)
+            }
+            defer { state.value.withLock { $0.movesInFlight -= 1 } }
+            // One-shot hold, taken while the in-flight count is already raised so a
+            // second concurrent move is visible as an overlap.
+            if let gate = state.value.withLock({ model -> DispatchSemaphore? in
+                guard let gate = model.nextMoveHold else { return nil }
+                model.nextMoveHold = nil
+                model.heldMoveCount += 1
+                return gate
+            }) {
+                // Bounded: 10 s is comfortably inside the queue's 15 s
+                // `pendingOperationTimeoutSeconds`, so a forgotten release fails an
+                // assertion instead of converting the test into a timeout test.
+                _ = gate.wait(timeout: .now() + 10)
+            }
             guard !Self.consumeMutationFailure(state) else { return .status(503) }
             guard let providerId = Self.messageId(from: request.url, move: true) else {
                 return .status(404)
@@ -404,6 +518,10 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
 
     private static func consumeMutationFailure(_ state: StateBox) -> Bool {
         state.value.withLock { model in
+            // The permanent fault is checked FIRST and consumes nothing — a
+            // one-shot budget must not be silently eaten by a round that is
+            // failing everything anyway.
+            if model.allMutationsFail { return true }
             guard model.mutationFailuresRemaining > 0 else { return false }
             model.mutationFailuresRemaining -= 1
             return true
