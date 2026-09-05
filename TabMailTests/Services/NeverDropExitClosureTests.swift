@@ -1424,6 +1424,192 @@ struct NeverDropExitClosureTests {
         await finish(f)
     }
 
+    // MARK: - #115 round 2 — authoritative absence vs an ordinary refusal; the transport-loss witness
+
+    /// #115 round 2 (test-coverage finding T3). The deleted arm used to swallow
+    /// EVERY no-`COPYUID` tagged NO, so the true branch of the generic catch in
+    /// `IMAPProvider.move` — an exact LIST proving the destination ABSENT turns
+    /// the refusal into `IMAPActionMailboxAbsent`, the whole-op no-op — was
+    /// unreachable on the atomic (`MOVE`-capable) route. It is reachable now
+    /// and this is its pin at the queue level; the wire-level near-miss
+    /// `IMAPMoveWireContractTests.absentDestinationIsATerminalNoOp` strips
+    /// `MOVE` and therefore covers the owned route's pre-mutation SELECT only.
+    ///
+    /// THE PROPERTY: a destination the server has POSITIVELY reported absent
+    /// (an exact-name LIST omits it) is provider authority — never-drop exit 2
+    /// — so the durable op retires as a no-op with the source untouched, no
+    /// COPY/STORE/EXPUNGE fallback and no wrong-message mutation. Beside it,
+    /// `aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt` is the
+    /// present-destination false side: the same tagged NO with the destination
+    /// still LISTed stays queued. The two discriminate authoritative absence
+    /// from an absence of evidence, and neither pins a command count.
+    ///
+    /// Parameterised over `markMailboxDeleted`'s two SELECT-response shapes
+    /// (`[NONEXISTENT]` code vs a code-less NO) to show that neither matters
+    /// here: the atomic route never SELECTs the destination, the fake refuses
+    /// the `UID MOVE` identically in both, and the LIST probe alone decides.
+    ///
+    /// MUTATION PROOF (recorded, #115 round 2): with the generic catch's guard
+    /// inverted so it always rethrows, the op stays queued and the empty-queue
+    /// assertion fails for both arguments.
+    @Test(
+        "A UID MOVE refused into a destination an exact LIST proves absent retires as a no-op with the source untouched",
+        arguments: [true, false])
+    @MainActor
+    func aRefusedAtomicMoveIntoAListConfirmedAbsentDestinationRetiresAsANoOp(
+        includeNonexistentCode: Bool
+    ) async throws {
+        let target = "atomic-absent-destination@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 77, id: target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Archive")
+        // Deleted remotely between enqueue and drain: the fake refuses
+        // `UID MOVE … Archive` with a tagged NO carrying no COPYUID, and its
+        // LIST omits the name. The LOCAL Folder row still exists — local
+        // presence is not provider authority in either direction.
+        server.markMailboxDeleted("Archive", includeNonexistentCode: includeNonexistentCode)
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(
+            accountId: "closure-atomic-absent-destination-\(includeNonexistentCode)")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let move = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        try insert([move], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        let commands = server.recordedCommands().map { $0.uppercased() }
+        // NON-VACUITY, both sides: the atomic MOVE actually reached the wire and
+        // was refused there, and the exact-name LIST probe ran for the
+        // destination (the fake's LIST omits every `markMailboxDeleted` name).
+        #expect(
+            commands.contains { $0.contains("UID MOVE") && $0.contains("ARCHIVE") },
+            "the atomic UID MOVE never reached the wire: \(commands)")
+        #expect(
+            commands.contains { $0.hasPrefix("LIST") && $0.contains("ARCHIVE") },
+            "no exact-name LIST probed the destination: \(commands)")
+        // THE PROPERTY — retired as a provider-authoritative no-op …
+        let remaining = try operations(f.pool)
+        #expect(
+            remaining.isEmpty,
+            """
+            a destination the server LISTs as absent left the move queued — no later drain can make \
+            an absent mailbox present, so this is a permanent lane wedge: \(remaining.map(\.type))
+            """)
+        // … with the source untouched and no fallback mutation of any kind.
+        #expect(server.messageIDs(in: "INBOX") == ["<\(target)>"])
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+        #expect(server.flags(in: "INBOX", uid: 77).isEmpty)
+        #expect(commands.filter { $0.contains("UID COPY") }.isEmpty)
+        #expect(commands.filter { $0.contains("UID STORE") && $0.contains("\\DELETED") }.isEmpty)
+        #expect(commands.filter { $0.contains("EXPUNGE") }.isEmpty)
+        #expect(server.wrongMessageViolations().isEmpty)
+
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// #115 round 2 (test-coverage finding T4). The ORIGINAL #115 world state,
+    /// pinned deterministically: the transport dies mid-`UID MOVE`. The fake
+    /// closes the socket with NO response — the same seam the fuzzer's
+    /// transient-kill step arms (`killConnectionOnNextCommand`, see
+    /// `ProviderIdQueueFuzzTests.performStep`). `killFragments` gained
+    /// `"UID MOVE"` for this, but neither checked-in seed ever draws that
+    /// member, so this test is its deterministic witness:
+    /// `consumedInjectedFailureCount() == 1` proves the kill landed on a
+    /// `UID MOVE` and on nothing else.
+    ///
+    /// THE PROPERTY, in two halves: the first attempt left the intention
+    /// durable and re-attemptable — row still queued, `retryCount` bumped,
+    /// INBOX still holding the message, Archive empty, no COPY/STORE/EXPUNGE
+    /// fallback — and a later drain converges: Archive holds exactly the
+    /// message, INBOX is empty, the queue is empty, no wrong-message mutation.
+    /// How many wire attempts or drains convergence takes is the mechanism and
+    /// is bounded, not pinned.
+    @Test("A transport loss mid-UID MOVE leaves the op queued and retryable, and a later drain lands it")
+    @MainActor
+    func aTransportLossMidAtomicMoveLeavesTheOpQueuedAndALaterDrainLandsIt() async throws {
+        let target = "atomic-transport-loss@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 77, id: target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Archive")
+        // A real dead TCP connection on the next UID MOVE — no response at all.
+        server.killConnectionOnNextCommand(containing: "UID MOVE")
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "closure-atomic-transport-loss")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let move = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        try insert([move], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // NON-VACUITY: the kill was consumed, and by a UID MOVE — the only
+        // command it was armed for.
+        #expect(server.consumedInjectedFailureCount() == 1)
+        let firstAttempt = server.recordedCommands().map { $0.uppercased() }
+        #expect(
+            firstAttempt.contains { $0.contains("UID MOVE") && $0.contains("ARCHIVE") },
+            "the atomic UID MOVE never reached the wire: \(firstAttempt)")
+
+        // HALF 1 — durable and re-attemptable, nothing mutated.
+        let afterKilledDrain = try operations(f.pool)
+        #expect(
+            afterKilledDrain.map(\.id) == [move.id],
+            """
+            a transport loss mid-MOVE retired the durable move — an absence of evidence was read as \
+            a provider disposition, which is none of the four exits — remaining ops: \
+            \(afterKilledDrain.map(\.type))
+            """)
+        #expect(afterKilledDrain.first?.status == PendingStatus.queued.rawValue)
+        #expect(
+            afterKilledDrain.first?.retryCount == 1,
+            "the failed attempt was not recorded as a retry: \(String(describing: afterKilledDrain.first?.retryCount))")
+        #expect(server.messageIDs(in: "INBOX") == ["<\(target)>"])
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+        #expect(firstAttempt.filter { $0.contains("UID COPY") }.isEmpty)
+        #expect(firstAttempt.filter { $0.contains("UID STORE") && $0.contains("\\DELETED") }.isEmpty)
+        #expect(firstAttempt.filter { $0.contains("EXPUNGE") }.isEmpty)
+
+        // HALF 2 — a later drain converges. Bounded, not pinned: convergence
+        // within a few drains IS the property; the exact count is the mechanism.
+        var retryDrains = 0
+        while retryDrains < 3, try !operations(f.pool).isEmpty {
+            await AccountManager.shared.drainPendingQueue()
+            retryDrains += 1
+        }
+        let archiveAfterRetry = server.messageIDs(in: "Archive")
+        #expect(
+            archiveAfterRetry == ["<\(target)>"],
+            "the retry did not land exactly one copy in Archive after \(retryDrains) drain(s): \(archiveAfterRetry)")
+        let inboxAfterRetry = server.messageIDs(in: "INBOX")
+        #expect(
+            inboxAfterRetry.isEmpty,
+            "the message is still in the source after the retry: \(inboxAfterRetry)")
+        let afterRetryDrain = try operations(f.pool)
+        #expect(
+            afterRetryDrain.isEmpty,
+            "the op did not retire after the move actually landed: \(afterRetryDrain.map(\.type))")
+        #expect(server.wrongMessageViolations().isEmpty)
+
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
     // MARK: - A-6 — the completed-send flag producer, at the wire
 
     /// A-6, the OUTBOX half. `imapUserLabelGestureReachesTheWire` above pins the
