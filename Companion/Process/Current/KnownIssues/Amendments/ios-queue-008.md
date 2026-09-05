@@ -187,3 +187,11 @@ escapes its fully rendered line, and appends to the **new `AppLogChannel.queue`*
 so the next occurrence of this race is readable from the exported app log on a device or TestFlight
 build, for a user with debug logging unlocked. Note the gate is a RUNTIME unlock, not a build
 configuration: these lines are live on shipping builds for an allowed user, which is the point.
+
+**Later the same day (2026-09-04): six, not seven.** One of the seven `[MoveTrace] deltaSync`
+lines — `SKIPPING insert for id=… — already exists (post-snapshot)` — was removed together with the
+post-snapshot re-read guard it witnessed, because the guard was unreachable: it re-read, inside the
+same `DatabasePool.write` transaction, the key the orphan check had just read, and the only
+`messageHeader` write between the two reads is the Sent-dedup DELETE. The Exchange arm's `print`
+twin went with it. Six `[MoveTrace] deltaSync` sites remain on the `.queue` channel. Detail and the
+transaction-boundary facts: `Companion/Process/Current/KnownIssues/Amendments/ios-label-004.md`.
