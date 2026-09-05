@@ -780,6 +780,13 @@ struct AccountManagerQueueDrainTests {
     /// Two-sided on purpose: the same drain writes NOTHING to the channel while
     /// the gate is closed. Without that half, a writer that had been accidentally
     /// hard-enabled would satisfy the first half and look correct.
+    ///
+    /// A third phase, between the two, arms a RETRYABLE provider fault so the lane
+    /// HALTS: `outcome=haltLane` is the instrument's only positive statement that a
+    /// lane stopped, and an all-succeed phase can never observe it — replacing that
+    /// interpolation with the literal `outcome=proceed` left every test in the tree
+    /// green while the exported log would describe a halted lane as one that kept
+    /// draining. A debug instrument may miss a line, but it must not lie.
     @Test("drainPendingQueue() (real): with debug logging unlocked, the exported QUEUE channel reconstructs the lane composition and the per-op wire order — and stays silent when it is locked")
     func drainLaneInstrumentationIsReadableFromTheExportedLog() async throws {
         let (pool, dir, previous) = try makeTestDB()
@@ -862,6 +869,115 @@ struct AccountManagerQueueDrainTests {
             let observed = Self.laneOrderEntries(in: queueLog)
             #expect(observed == expected,
                     "the exported log does not reconstruct the drain.\nexpected:\n\(expected.joined(separator: "\n"))\nobserved:\n\(observed.joined(separator: "\n"))")
+
+            // ---- Gate OPEN, ARMED FAULT: a lane that HALTS ----------------
+            // The m1 phase above can only ever observe `outcome=proceed`, so it
+            // does not constrain the field at all: replacing the interpolation
+            // with the literal `outcome=proceed` keeps every test in this tree
+            // green while the exported log reports a HALTED lane as one that kept
+            // draining. `outcome=` is the instrument's only positive statement
+            // that a lane stopped — the thing `IOS-QUEUE-008` needed the log to
+            // say — so it is witnessed here rather than deleted.
+            //
+            // The fault is the same retryable one the stable-id fuzzer's
+            // `.transientThenClears` mode arms (`ProviderIdQueueFuzzTests`:
+            // `setMoveThrowsOnId(targetId, error: ProviderError.notConnected)`).
+            // It reaches `executeSingleOp`'s generic transient arm — "Connection/
+            // transient error — reset op to queued and mark account failed" — so
+            // the predecessor is requeued with `retryCount += 1`, the account
+            // enters `failedAccounts`, and `.haltLane` is returned, which makes
+            // the drain loop requeue the successor and break the lane. That arm
+            // deliberately does NOT set `executedAny`, so the outer pass loop
+            // terminates and the drain writes exactly one lane-composition line.
+            AppLogStore.clear()
+            let armedPair = try queuePair(messageId: "m3")
+            await provider.setMoveThrowsOnId("m3", error: ProviderError.notConnected)
+            await AccountManager.shared.drainPendingQueue()
+
+            let armedInverse = armedPair.inverse
+            let armedRedelete = armedPair.redelete
+            // Equality, not containment, for the same reason as the m1 phase —
+            // and here it carries a second fact: NOTHING is reported for pos 2/2.
+            // The successor never went out, and a log that named it would be
+            // describing a wire event that did not happen.
+            let armedExpected = [
+                "[Queue] Lanes: lane0(2): \(armedInverse) move TRASH→INBOX ids=[m3]"
+                    + " | \(armedRedelete) move INBOX→TRASH ids=[m3]",
+                "[Queue] drain lane 0 pos 1/2 — executing \(armedInverse) move TRASH→INBOX ids=[m3]",
+                "[Queue] drain lane 0 pos 1/2 — executed \(armedInverse) move TRASH→INBOX ids=[m3] outcome=haltLane",
+            ]
+            let armedObserved = Self.laneOrderEntries(in: AppLogStore.read(channel: .queue))
+            #expect(armedObserved == armedExpected,
+                    "the exported log does not report the halted lane.\nexpected:\n\(armedExpected.joined(separator: "\n"))\nobserved:\n\(armedObserved.joined(separator: "\n"))")
+
+            // The durable state, read independently of the log: the log is the
+            // artifact under test, so it cannot also be the evidence that the
+            // scenario it describes actually arose.
+            let armedAllRows = try await pool.read { db in
+                try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
+            }
+            let armedRows = armedAllRows.filter { $0.messageIds == ["m3"] }
+            #expect(armedRows.count == 2,
+                    "both m3 ops must survive the halt: \(armedRows.map { "\($0.id.prefix(8)) \($0.folderPath)→\($0.destinationPath ?? "-") \($0.status)" })")
+            guard armedRows.count == 2 else { return }
+            let haltedOp = armedRows[0]
+            let heldOp = armedRows[1]
+            #expect(haltedOp.id.hasPrefix(armedInverse) && heldOp.id.hasPrefix(armedRedelete),
+                    "createdAt order must still put the inverse first")
+            #expect(haltedOp.status == PendingStatus.queued.rawValue)
+            #expect(heldOp.status == PendingStatus.queued.rawValue)
+            #expect(haltedOp.retryCount == 1, "the halted op was attempted once and requeued")
+            #expect(heldOp.retryCount == 0, "the successor was requeued WITHOUT being attempted")
+            #expect(haltedOp.everAttempted && heldOp.everAttempted,
+                    "both rows were claimed this pass, so both carry the attempted-row proof")
+
+            // `callLog` is the ATTEMPT ledger (appended before the throw hook),
+            // `movedIds` the SUCCESS ledger — so together they say the predecessor
+            // went out exactly once and landed nothing, and the successor never
+            // reached the wire.
+            let armedCallLog = await provider.callLog
+            let armedMoveCalls = armedCallLog.filter { $0.hasPrefix("move(ids:") && $0.contains("m3") }
+            #expect(armedMoveCalls == ["move(ids:[\"m3\"],from:TRASH,to:INBOX)"],
+                    "exactly one m3 move attempt, and it is the inverse: \(armedMoveCalls)")
+            let armedMoved = await provider.movedIds
+            #expect(!armedMoved.contains { $0.ids == ["m3"] },
+                    "the armed move must have landed nothing: \(armedMoved.map { "\($0.ids) \($0.from)→\($0.to)" })")
+
+            // The blip clears: the SAME lane now drains to completion, in order,
+            // and the log says `proceed` twice — which is what makes the
+            // `haltLane` above a discriminating observation rather than a
+            // constant.
+            await provider.clearMoveThrowsOnId()
+            AppLogStore.clear()
+            await AccountManager.shared.drainPendingQueue()
+
+            let clearedExpected = [
+                "[Queue] Lanes: lane0(2): \(armedInverse) move TRASH→INBOX ids=[m3]"
+                    + " | \(armedRedelete) move INBOX→TRASH ids=[m3]",
+                "[Queue] drain lane 0 pos 1/2 — executing \(armedInverse) move TRASH→INBOX ids=[m3]",
+                "[Queue] drain lane 0 pos 1/2 — executed \(armedInverse) move TRASH→INBOX ids=[m3] outcome=proceed",
+                "[Queue] drain lane 0 pos 2/2 — executing \(armedRedelete) move INBOX→TRASH ids=[m3]",
+                "[Queue] drain lane 0 pos 2/2 — executed \(armedRedelete) move INBOX→TRASH ids=[m3] outcome=proceed",
+            ]
+            let clearedObserved = Self.laneOrderEntries(in: AppLogStore.read(channel: .queue))
+            #expect(clearedObserved == clearedExpected,
+                    "the exported log does not reconstruct the completing retry.\nexpected:\n\(clearedExpected.joined(separator: "\n"))\nobserved:\n\(clearedObserved.joined(separator: "\n"))")
+
+            let clearedMoved = await provider.movedIds
+            let m3Moves = clearedMoved.filter { $0.ids == ["m3"] }
+            #expect(m3Moves.count == 2,
+                    "the retry lands both m3 moves: \(m3Moves.map { "\($0.from)→\($0.to)" })")
+            guard m3Moves.count == 2 else { return }
+            #expect(m3Moves[0].from == "TRASH" && m3Moves[0].to == "INBOX",
+                    "the undo's inverse goes out first")
+            #expect(m3Moves[1].from == "INBOX" && m3Moves[1].to == "TRASH",
+                    "the user's newest intention goes out second")
+            let remainingAllRows = try await pool.read { db in
+                try PendingOperation.fetchAll(db)
+            }
+            let remainingM3 = remainingAllRows.filter { $0.messageIds == ["m3"] }
+            #expect(remainingM3.isEmpty,
+                    "both m3 ops completed, so neither row remains: \(remainingM3.map { $0.id })")
 
             // ---- Gate CLOSED (two-sided non-vacuity) ----------------------
             AppLogStore.clear()
