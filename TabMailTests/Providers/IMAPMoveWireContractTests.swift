@@ -1652,4 +1652,51 @@ struct IMAPMoveWireContractTests {
         #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
         #expect(server.wrongMessageViolations().isEmpty)
     }
+
+    // MARK: - #115 round 3b — the response code is read STRUCTURALLY
+
+    /// GitHub #115 round 3b. The fragile-contract pin for
+    /// `IMAPProvider.leadingResponseCode(inRenderedReason:)`, over the EXACT
+    /// strings SwiftMail produces rather than invented ones.
+    ///
+    /// SwiftMail's `MoveHandler.handleTaggedErrorResponse` builds the payload of
+    /// both move-failure cases as `String(describing: response.state)`, and
+    /// `TaggedResponse.State` wraps a `ResponseText` whose `debugDescription`
+    /// re-encodes the WIRE form `[CODE] text`. The refusal therefore arrives as
+    /// `no([TRYCREATE] …)` / `bad([CANNOT] …)`. That rendering is NOT an API
+    /// contract, so this test exists to make an upstream change to it fail a
+    /// test instead of silently changing behaviour — the observed strings were
+    /// captured from `FakeIMAPServer` before the extractor was written.
+    ///
+    /// THE PROPERTY IS STRUCTURAL: RFC 3501 §7.1 gives
+    /// `resp-text = ["[" resp-text-code "]" SP] text`, so a bracketed atom is a
+    /// response code only at the very START of the resp-text. The two `nil`
+    /// cases are the load-bearing ones — a code named in the middle of the
+    /// server's prose, and a plain uncoded refusal — because reading either as
+    /// authority would let the server's wording retire a user's intention. The
+    /// end-to-end counterpart is
+    /// `NeverDropExitClosureTests.aRefusalWhoseHumanTextMentionsACodeLaterStaysQueued`.
+    @Test(
+        "The leading response code is read as RFC 3501 §7.1 structure, never as a substring",
+        arguments: [
+            ("no([TRYCREATE] UID MOVE destination does not exist)", "TRYCREATE"),
+            ("bad([CANNOT] Policy forbids this move)", "CANNOT"),
+            ("no([NOPERM] Permission denied)", "NOPERM"),
+            ("no([UNAVAILABLE] Backend temporarily unavailable)", "UNAVAILABLE"),
+            ("no(Move refused, see [TRYCREATE] semantics)", nil),
+            ("no(No mailbox selected)", nil),
+        ] as [(String, String?)])
+    func leadingResponseCodeIsReadStructurally(
+        rendered: String, expected: String?
+    ) {
+        #expect(
+            IMAPProvider.leadingResponseCode(inRenderedReason: rendered) == expected,
+            """
+            \(rendered) parsed as \
+            \(String(describing: IMAPProvider.leadingResponseCode(inRenderedReason: rendered))) \
+            rather than \(String(describing: expected)). A response code is a protocol statement \
+            only in RFC 3501 §7.1's leading position; anywhere else it is the server's prose, and \
+            reading it as authority retires a user intention on a sentence.
+            """)
+    }
 }

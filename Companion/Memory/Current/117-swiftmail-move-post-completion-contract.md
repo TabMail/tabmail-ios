@@ -39,6 +39,36 @@
 > and the COPY-route destination probe are pre-existing and unchanged; the same LIST-omission argument
 > applies to them and is recorded for the owner. Registered in
 > `Companion/Process/Current/KnownIssues/Amendments/ios-imap-013.md`.
+>
+> **2026-09-05 (#115 round 3b) — THE RENDERED-REASON CONTRACT, because the provider now PARSES that
+> payload.** `MoveHandler.handleTaggedErrorResponse` builds the payload of BOTH move failure cases as
+> `let reason = String(describing: response.state)`. `response.state` is
+> `NIOIMAPCore.TaggedResponse.State`, an enum whose `ok` / `no` / `bad` cases each carry a
+> `ResponseText`; `ResponseText` conforms to `CustomDebugStringConvertible` and its
+> `debugDescription` re-encodes the WIRE form, writing `"[" <code> "] "` before the human text
+> whenever `code != nil`. So the reason string TabMail receives is
+> `no([TRYCREATE] UID MOVE destination does not exist)` — enum-case wrapper, then the RFC 3501 §7.1
+> `resp-text` verbatim. VERIFIED EMPIRICALLY against `FakeIMAPServer` before the parser was written,
+> not inferred from the types.
+>
+> `IMAPProvider.leadingResponseCode(inRenderedReason:)` is anchored on exactly that shape: it strips
+> one optional `no(` / `bad(` / `ok(` wrapper with its matching trailing `)`, and reads the
+> bracketed atom ONLY when it is the first thing in the remainder. Everything else returns nil. That
+> is deliberate — a response code is a protocol statement only in the LEADING position, so
+> `no(Move refused, see [TRYCREATE] semantics)` must not, and does not, parse.
+>
+> ⚠ **THIS DEPENDS ON A `String(describing:)` RENDERING, WHICH IS NOT AN API CONTRACT.** An upstream
+> change to `TaggedResponse.State`'s case names, or a `CustomStringConvertible` conformance added to
+> `ResponseText` that differs from its `debugDescription`, would silently change the payload and the
+> extractor would return nil — failing CLOSED (every refusal parks its lane again, the round-3
+> disposition) rather than open, which is why this is acceptable rather than a defect waiting to
+> happen. The better home is a STRUCTURAL carrier in the pinned SwiftMail fork — the `ResponseText`'s
+> `code` surfaced on the `IMAPError` case itself instead of flattened into a string — and that is a
+> FOLLOW-UP, not done here. It is pinned meanwhile by
+> `IMAPMoveWireContractTests.leadingResponseCodeIsReadStructurally` and by the end-to-end
+> `NeverDropExitClosureTests` cases, so an upstream rendering change fails a test rather than
+> changing behaviour silently. Registered in
+> `Companion/Process/Current/KnownIssues/Amendments/ios-imap-013.md`.
 <!-- COMPANION-CURRENT-NOTE-END -->
 # SwiftMail MOVE post-completion contract — PR #208
 

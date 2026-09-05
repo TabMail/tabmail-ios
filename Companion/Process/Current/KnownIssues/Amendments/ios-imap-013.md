@@ -46,6 +46,32 @@ restated on the PROTOCOL rather than on one transport library's enum
 (`if error is ProviderEvidenceUnavailable { return false }`), and `AccountManagerQueue.swift` no
 longer imports SwiftMail at all.
 
+Round 3b (2026-09-05) — **OWNER DECISION: a refusal whose RESPONSE CODE says the command can never
+succeed RETIRES the operation.** The owner decided the `[TRYCREATE]` question the round-3 section
+below records as pending: *"if server has deleted folder, we should retire that op"*, *"if server
+says op is broken, we should retire it. and then later on full sync would catch that back"*. A
+tagged NO/BAD on `UID MOVE` with no retained `COPYUID` whose resp-text BEGINS with `TRYCREATE`
+(RFC 3501 §6.4.7, RFC 6851 §3.3), `NOPERM`, `CANNOT` or `NONEXISTENT` (RFC 5530 §3) is provider
+AUTHORITY — a positive statement about the command the server just refused, unlike the LIST omission
+round 3 routed around — so `IMAPProvider.move` throws the private `IMAPActionPermanentlyRefused` and
+its own outer `catch` returns `MoveOutcome(provenIds: ids, provenDestinations: [])`. Zero wire
+mutation, the message untouched in the SOURCE mailbox on the server, the queue empty, and the next
+sync of the source folder reclaims the local row. `IMAPActionMailboxAbsent` is NOT widened to carry
+this (it means "an exact LIST proved the mailbox gone" and has two other catch sites), and its
+LIST-probe producers are untouched.
+
+The code is read STRUCTURALLY: RFC 3501 §7.1 defines `resp-text = ["[" resp-text-code "]" SP] text`,
+so only the bracketed atom at the very START of the resp-text counts. `NO Move refused, see
+[TRYCREATE] semantics` is a server explaining itself in prose and does NOT retire anything — a
+substring search there would let a server's human sentence drop a user's intention.
+
+Every other refusal keeps the round-3 disposition unchanged — evidence-unavailable, lane-local
+requeue, `retryCount += 1`, `.haltLane`, account untouched, retried on the next drain: no code at
+all (a non-conforming server; GitHub #118, wontfix) and every code outside the permanent set
+(`OVERQUOTA`, `UNAVAILABLE`, `EXPUNGEISSUED`, `SERVERBUG`, `INUSE`, `LIMIT`, …), all of which
+describe conditions that can clear. **The owner has directed a queue-wide RETRY LIMIT for that
+residual as a SEPARATE change; it is pending, not silent, and is not taken here.**
+
 ## Subsystem and search terms
 
 IMAP; RFC 6851; RFC 3501 §6.4.8; RFC 3501 §2.3.1.1; RFC 6851 §3.3; `UID MOVE`; tagged NO; tagged BAD;
@@ -73,6 +99,17 @@ pending-actions surface; Retry/Cancel; owner decision pending; ADR-IOS-073;
 `IMAPMoveWireContractTests.atomicRefusalWithoutCopyUIDIsEvidenceUnavailable`;
 `AccountManagerQueueIntegrationTests.evidenceUnavailableIsNeverMessageNotFound`;
 `FakeIMAPServerOracleTests.hiddenFromListMailboxStillExists`
+permanent response code; leading `resp-text-code`; RFC 3501 §7.1; structural not substring;
+`TRYCREATE`; `NOPERM`; `CANNOT`; `NONEXISTENT`; RFC 5530 §3; `OVERQUOTA`; `UNAVAILABLE`;
+`EXPUNGEISSUED`; `SERVERBUG`; `INUSE`; `LIMIT`; `IMAPActionPermanentlyRefused`;
+`IMAPProvider.leadingResponseCode(inRenderedReason:)`; `permanentMoveRefusalCodes`;
+`String(describing: TaggedResponse.State)`; `ResponseText.debugDescription`; `no([CODE] text)`;
+OWNER DECISION 2026-09-05; retire on a response code; queue-wide retry limit (pending, separate
+change); GitHub #118; `markMailboxDeleted`;
+`NeverDropExitClosureTests.aMoveRefusedIntoADeletedDestinationRetiresWithoutMutation`;
+`NeverDropExitClosureTests.aMoveRefusedWithAPermanentResponseCodeRetiresWithoutMutation`;
+`NeverDropExitClosureTests.aRefusalWhoseHumanTextMentionsACodeLaterStaysQueued`;
+`IMAPMoveWireContractTests.leadingResponseCodeIsReadStructurally`
 
 ## 2026-09-04 — the defect (GitHub #115): a refusal retired as a completion
 
@@ -277,6 +314,56 @@ evidence classes; the 2026-08-13 change put both in the no-retry class on the st
   (now the destination-PRESENT side of the pair) and
   `aTransportLossMidAtomicMoveLeavesTheOpQueuedAndALaterDrainLandsIt` (the transport-kill witness,
   which is a genuine connection fact and still uses the generic arm).
+
+## 2026-09-05 (round 3b) — the decision taken, the shape of the parser, and the tests
+
+**What changed in the code.** One `private static func
+IMAPProvider.leadingResponseCode(inRenderedReason:)` plus a four-member
+`permanentMoveRefusalCodes` set, and one `if` inside the round-3 typed arm. The extractor is
+anchored on the ONE rendering contract this path depends on and nothing else: SwiftMail's
+`MoveHandler.handleTaggedErrorResponse` builds its payload as
+`String(describing: response.state)`, and `TaggedResponse.State`'s associated value is a
+`ResponseText` whose `debugDescription` writes the WIRE form `[CODE] text` — so the reason arrives as
+`no([TRYCREATE] UID MOVE destination does not exist)` / `bad([CANNOT] …)`. The extractor strips that
+single enum wrapper and reads the bracketed atom only when it is the FIRST thing in the remainder.
+It does no substring search over the human text, which is the whole safety argument: a response code
+is a protocol statement only in the leading position (RFC 3501 §7.1).
+
+**What is deliberately NOT changed.** `executeSingleOp`, `isMessageNotFoundError`, `failedAccounts`,
+`mailboxConfirmedAbsent`, `IMAPActionMailboxAbsent` and its LIST-probe producers, the action-SELECT
+LIST probe, the COPY-route destination probe, `FakeIMAPServer`'s production behaviour and SwiftMail
+are all untouched. The refusal still never reaches the LIST probe.
+
+**Tests.**
+
+- NEW `NeverDropExitClosureTests.aMoveRefusedIntoADeletedDestinationRetiresWithoutMutation` — the
+  conforming-server case the owner decided: `markMailboxDeleted("Archive", …)` makes the fake answer
+  `NO [TRYCREATE] UID MOVE destination does not exist`, and after ONE drain the queue is EMPTY, the
+  message is still in the source mailbox on the server, and no `UID COPY`, `\Deleted` STORE or
+  EXPUNGE was issued. RED on `f9dcd71ec`, where the op stays queued.
+- NEW `NeverDropExitClosureTests.aMoveRefusedWithAPermanentResponseCodeRetiresWithoutMutation`,
+  parameterised over `[NOPERM] Permission denied`, `[CANNOT] Policy forbids this move` and
+  `[NONEXISTENT] No such mailbox` — the same end state for the codes a server sends without deleting
+  anything. RED on `f9dcd71ec`.
+- NEW `NeverDropExitClosureTests.aRefusalWhoseHumanTextMentionsACodeLaterStaysQueued` — `NO Move
+  refused, see [TRYCREATE] semantics` carries NO leading code, so it keeps the round-3 park: still
+  queued after the refused drain, and the next drain lands it.
+- NEW `IMAPMoveWireContractTests.leadingResponseCodeIsReadStructurally` — the extractor over the
+  exact rendered shapes (`no([TRYCREATE] x)` → `TRYCREATE`, `bad([CANNOT] x)` → `CANNOT`,
+  `no(x [TRYCREATE])` → nil, `no(No mailbox selected)` → nil). This and the test above are the
+  fragile-contract pins for the `String(describing:)` rendering.
+- CHANGED the round-3 refusal matrices: `[NONEXISTENT] No mailbox selected` moves out of
+  `aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt` and
+  `aRefusedAtomicMoveIntoAListOmittedDestinationStaysQueuedAndLands` — a structured `[NONEXISTENT]`
+  now RETIRES by owner decision, so that row belongs to the new permanent-code test — and is
+  replaced by the transient `[UNAVAILABLE] Backend temporarily unavailable`. The no-code rows are
+  kept, and the round-3 property (stays queued, next drain lands it) is unchanged and still red on
+  `977958c37` in spirit; that is not re-proved here.
+- UNCHANGED: the round-3 classifier test
+  (`AccountManagerQueueIntegrationTests.evidenceUnavailableIsNeverMessageNotFound`) — a permanent
+  refusal is retired inside the provider and never reaches the classifier at all — and
+  `aPermanentlyRefusedAtomicMoveParksOnlyItsOwnLane`, whose refusal text
+  (`Move rejected by server policy`) carries no response code and therefore still parks.
 
 ## 2026-09-04 — relationship to IOS-IMAP-012
 

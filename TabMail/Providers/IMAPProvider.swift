@@ -1566,6 +1566,43 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// retry classification, only a different error value.
     private struct IMAPActionMailboxAbsent: Error {}
 
+    /// GitHub #115 round 3b — marker for "the server's own RESPONSE CODE says
+    /// this command can never succeed as issued".
+    ///
+    /// The sibling of `IMAPActionMailboxAbsent` and deliberately a DISTINCT
+    /// type. That one means one specific thing — an exact-name `LIST` did not
+    /// return the mailbox — and it has two other catch sites in this file
+    /// (`mutateAdmittedUIDs`, `deleteDraft`) plus three LIST-probe producers, so
+    /// widening it to also mean "refused permanently" would change all of them
+    /// on the strength of a decision made about one. This type means only what
+    /// its payload says: a tagged NO/BAD on `UID MOVE`, carrying no `COPYUID`,
+    /// whose resp-text BEGAN with a response code in `permanentMoveRefusalCodes`.
+    ///
+    /// ⚠ THE EVIDENCE CLASS IS THE OPPOSITE OF THE LIST PROBE'S, which is the
+    /// whole reason this may retire an operation while a LIST omission may not.
+    /// A LIST that omits a name is an ABSENCE — RFC 4314 §4 makes the `l` right
+    /// independent of the `i` right a MOVE target needs, and RFC 9051 §6.3.9
+    /// lets a server silently ignore a valid pattern under a tagged OK. A
+    /// leading `resp-text-code` is a POSITIVE statement the server chose to make
+    /// about the command it just refused (RFC 3501 §7.1), so it is
+    /// provider-authoritative and lands on never-drop exit 2.
+    ///
+    /// OWNER DECISION 2026-09-05 — *"if server has deleted folder, we should
+    /// retire that op"*, *"if server says op is broken, we should retire it. and
+    /// then later on full sync would catch that back"*. `move`'s outer catch
+    /// returns every member proven with no destination address: nothing was
+    /// copied, the message is untouched in the SOURCE mailbox on the server, and
+    /// the next sync of the source folder reclaims the local row.
+    ///
+    /// `private`, like its sibling, so it can never become a classification
+    /// input outside this file.
+    private struct IMAPActionPermanentlyRefused: Error {
+        /// The bracketed `resp-text-code` atom, upper-cased, that decided this.
+        let code: String
+        /// The server's raw rendered tagged response, for diagnostics only.
+        let reason: String
+    }
+
     /// T3.3 — authoritative existence probe, used ONLY after a SELECT has
     /// already failed on an ACTION path.
     ///
@@ -4435,6 +4472,80 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         case taggedFailureWithoutCopyUID(destination: String, reason: String)
     }
 
+    /// GitHub #115 round 3b — the response codes that make a `UID MOVE` refusal
+    /// PERMANENT: the server has stated that the command, AS ISSUED, can never
+    /// succeed, so the operation retires instead of parking its lane forever.
+    ///
+    ///  - `TRYCREATE` — RFC 3501 §6.4.7, carried onto MOVE by RFC 6851 §3.3: the
+    ///    destination mailbox does not exist.
+    ///  - `NOPERM` — RFC 5530 §3: the user has no permission for this operation.
+    ///  - `CANNOT` — RFC 5530 §3: the operation is not allowed and cannot be
+    ///    made to work by repeating it.
+    ///  - `NONEXISTENT` — RFC 5530 §3: the named mailbox does not exist.
+    ///
+    /// ⚠ THE EXCLUSIONS ARE THE POINT, and this set must not grow without the
+    /// same test. `OVERQUOTA`, `UNAVAILABLE`, `EXPUNGEISSUED`, `SERVERBUG`,
+    /// `INUSE` and `LIMIT` each describe a condition that CAN CLEAR, so they
+    /// stay in the round-3 evidence-unavailable disposition — lane-local
+    /// requeue, retried on the next drain — and so does a refusal with no code
+    /// at all. Adding a clearable code here would convert a transient failure
+    /// into a dropped intention, which is exactly the defect #115 exists to
+    /// close.
+    private static let permanentMoveRefusalCodes: Set<String> = [
+        "TRYCREATE", "NOPERM", "CANNOT", "NONEXISTENT",
+    ]
+
+    /// The LEADING response code of a tagged failure as SwiftMail renders it, or
+    /// `nil` when the resp-text carries none.
+    ///
+    /// ⚠ STRUCTURAL, NOT A SUBSTRING SEARCH, and that is the entire safety
+    /// argument. RFC 3501 §7.1 gives `resp-text = ["[" resp-text-code "]" SP]
+    /// text`: a response code is a machine-readable atom that may appear ONLY at
+    /// the very start of the response text. The same word later is part of the
+    /// server's human sentence and carries no protocol meaning — `NO Move
+    /// refused, see [TRYCREATE] semantics` is a server explaining itself, not a
+    /// server invoking §6.4.7 — so a substring match would let a server's prose
+    /// retire a user's intention.
+    ///
+    /// THE INPUT SHAPE, verified empirically against `FakeIMAPServer` before
+    /// this was written rather than inferred from the types: SwiftMail's
+    /// `MoveHandler.handleTaggedErrorResponse` builds the payload as
+    /// `String(describing: response.state)`; `TaggedResponse.State` wraps a
+    /// `ResponseText` whose `debugDescription` re-encodes the WIRE form
+    /// `[CODE] text`. So the reason arrives as
+    /// `no([TRYCREATE] UID MOVE destination does not exist)` or
+    /// `bad([CANNOT] …)`. This strips that one enum wrapper and reads the
+    /// bracketed atom only if it is the first thing in the remainder.
+    ///
+    /// It FAILS CLOSED by construction: any shape it does not recognise returns
+    /// `nil`, which keeps the round-3 park (retryable, lane-local) rather than
+    /// retiring anything. That is what makes the dependency on a
+    /// `String(describing:)` rendering acceptable; a structural carrier in the
+    /// pinned SwiftMail fork is the better home and is recorded as a follow-up
+    /// in `Companion/Memory/Current/117-swiftmail-move-post-completion-contract.md`.
+    ///
+    /// Deliberately INTERNAL rather than `private`, for the same reason as
+    /// `mapTransportSecurityFailure` and `mapRole`: it is a pure function whose
+    /// structural contract is pinned directly by a unit test
+    /// (`IMAPMoveWireContractTests.leadingResponseCodeIsReadStructurally`), and
+    /// a fragile-contract pin that cannot be called is not a pin. It has one
+    /// production caller, in `move`'s atomic route.
+    static func leadingResponseCode(inRenderedReason reason: String) -> String? {
+        var body = Substring(reason)
+        if body.hasSuffix(")") {
+            let lowered = reason.lowercased()
+            if let wrapper = ["no(", "bad(", "ok("].first(
+                where: { lowered.hasPrefix($0) }
+            ) {
+                body = body.dropFirst(wrapper.count).dropLast()
+            }
+        }
+        guard body.hasPrefix("[") else { return nil }
+        let atom = body.dropFirst().prefix { $0 != "]" && $0 != " " }
+        guard !atom.isEmpty else { return nil }
+        return atom.uppercased()
+    }
+
     /// The epoch comparison for every ADMITTED MUTATION in this file. `live` is
     /// what the server just reported for `folder`; `expected` is the epoch the
     /// operation is authorized under.
@@ -4791,20 +4902,39 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         //    refusal terminally on that omission would retire the
                         //    whole op on an absence of evidence.
                         //
-                        // ⚠ FAIL-CLOSED PARK, STATED PLAINLY — this is the cost.
-                        // A `UID MOVE` refused because the destination genuinely
-                        // no longer exists on the server (a conforming server
-                        // answers `NO [TRYCREATE]`) now stays queued and retries
-                        // on every drain, PARKING ITS LANE, instead of being
-                        // retired by the LIST probe. That is the `ADR-IOS-073`
-                        // no-fallback disposition — "a server that advertises but
-                        // permanently rejects MOVE can park the lane until its
-                        // configuration is corrected" — and it is what the drain
-                        // did for every such NO before `3f6a0a5a8`. The
-                        // structural alternative, retiring on the RFC 3501 §6.4.7
-                        // `[TRYCREATE]` response code, is an OWNER DECISION
-                        // recorded in the register (`IOS-IMAP-013`) and is not
-                        // taken here.
+                        // ⚠ THE PARK IS NOW SCOPED, AND THIS IS WHAT IS LEFT
+                        // OF IT (round 3b, OWNER DECISION 2026-09-05 — "if
+                        // server has deleted folder, we should retire that op",
+                        // "if server says op is broken, we should retire it. and
+                        // then later on full sync would catch that back").
+                        //
+                        // A refusal whose resp-text BEGINS with a code in
+                        // `permanentMoveRefusalCodes` — `TRYCREATE` (RFC 3501
+                        // §6.4.7 / RFC 6851 §3.3), `NOPERM`, `CANNOT`,
+                        // `NONEXISTENT` (RFC 5530 §3) — is the server stating
+                        // that this command can never succeed AS ISSUED. That is
+                        // a POSITIVE statement about the command it just refused,
+                        // the opposite evidence class from the LIST omission this
+                        // arm exists to route around, so it is never-drop exit 2:
+                        // the op RETIRES via `IMAPActionPermanentlyRefused`,
+                        // caught at the bottom of `move`. Nothing was copied, the
+                        // message is untouched in the SOURCE mailbox on the
+                        // server, and the next sync of the source folder reclaims
+                        // the local row.
+                        //
+                        // WHAT STILL PARKS is every OTHER refusal: no code at all
+                        // (a non-conforming server — GitHub #118, wontfix) or a
+                        // code outside that set (`OVERQUOTA`, `UNAVAILABLE`,
+                        // `EXPUNGEISSUED`, `SERVERBUG`, `INUSE`, `LIMIT`, …),
+                        // every one of which describes a condition that CAN
+                        // CLEAR. Those stay queued and retry on every drain,
+                        // parking their lane — the `ADR-IOS-073` no-fallback
+                        // disposition, "a server that advertises but permanently
+                        // rejects MOVE can park the lane until its configuration
+                        // is corrected", and what the drain did for every such NO
+                        // before `3f6a0a5a8`. A queue-wide RETRY LIMIT for that
+                        // residual is an owner-directed change of its own; it is
+                        // pending (`IOS-IMAP-013`) and is NOT taken here.
                         //
                         // A retried `UID MOVE` is safe: RFC 3501 §6.4.8 ignores
                         // a UID that no longer exists (an already-moved member is
@@ -4815,8 +4945,18 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         // member in BOTH mailboxes, which RFC 6851 §3.3 says a
                         // server SHOULD NOT do — accepted under `IOS-IMAP-006` /
                         // `IOS-QUEUE-007`, one delete to recover.
+                        let responseCode = Self.leadingResponseCode(
+                            inRenderedReason: reason)
+                        if let responseCode,
+                           Self.permanentMoveRefusalCodes.contains(responseCode) {
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[IMAP] Atomic MOVE refused with permanent response code [\(responseCode)] — the server says this command can never succeed as issued, so the op RETIRES with zero wire mutation; the message is untouched in '\(source)' and the next source sync reclaims the row: \(reason)")
+                            }
+                            throw IMAPActionPermanentlyRefused(
+                                code: responseCode, reason: reason)
+                        }
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] Atomic MOVE refused with no COPYUID — op stays queued, this lane parks, the rest of the account keeps draining: \(reason)")
+                            print("[IMAP] Atomic MOVE refused with no COPYUID (leading response code: \(responseCode ?? "none")) — op stays queued, this lane parks, the rest of the account keeps draining: \(reason)")
                         }
                         throw IMAPAtomicMoveRefused.taggedFailureWithoutCopyUID(
                             destination: destination, reason: reason)
@@ -5308,6 +5448,28 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             //
             // No destination address: nothing was copied anywhere, so there is
             // nothing to re-key.
+            return MoveOutcome(provenIds: ids, provenDestinations: [])
+        } catch is IMAPActionPermanentlyRefused {
+            // GitHub #115 round 3b — OWNER DECISION 2026-09-05. The atomic
+            // `UID MOVE` was refused with a response code from the permanent set
+            // (`TRYCREATE` / `NOPERM` / `CANNOT` / `NONEXISTENT`), read
+            // STRUCTURALLY as RFC 3501 §7.1's leading `resp-text-code` rather
+            // than found anywhere in the server's prose. That is provider
+            // AUTHORITY that the command can never succeed as issued — a
+            // positive statement about the refused command, not the absence a
+            // LIST omission is — so it is never-drop exit 2 and the whole
+            // operation retires.
+            //
+            // Nothing was copied: the server answered the refusal INSTEAD OF
+            // performing the move, so the message is untouched in the source
+            // mailbox and no destination address exists to re-key. The next sync
+            // of the source folder reclaims the local optimistic row, which is
+            // why retiring here costs a stale row and never a lost message.
+            //
+            // Deliberately NOT folded into the `IMAPActionMailboxAbsent` arm
+            // above: that type means "an exact LIST proved the mailbox gone" and
+            // is thrown from two other call sites in this file, so widening it
+            // would change their dispositions too.
             return MoveOutcome(provenIds: ids, provenDestinations: [])
         }
     }
