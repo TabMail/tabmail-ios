@@ -80,6 +80,11 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         /// as its own flag rather than a huge budget so a test asserts "the lane
         /// is halted", not "the budget outlived the drain".
         var allMutationsFail = false
+        /// Provider ids whose NEXT `/move` answers 503 and applies nothing.
+        /// One-shot per id — the id is removed when it fires. Scoped to an id
+        /// rather than to a count because the shape it exists for is a BATCH
+        /// whose earlier member must succeed.
+        var oneShotMoveFailureIds: Set<String> = []
         /// Handed to the NEXT `/move` to arrive, which blocks on it until the
         /// TEST signals it. One-shot; a second move is not held.
         var nextMoveHold: DispatchSemaphore?
@@ -208,6 +213,28 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
     /// state is retained") would then be asserted against the wrong scenario.
     func failAllMutations(_ failing: Bool) {
         state.value.withLock { $0.allMutationsFail = failing }
+    }
+
+    /// Fail the NEXT `/move` of exactly ONE provider id with 503, applying
+    /// nothing, and let every other member of the same batch through.
+    ///
+    /// Neither existing mutation seam can express this. `failNextMutation()` is
+    /// a COUNT, consumed by whichever mutating verb arrives first — in a
+    /// two-member move that is the FIRST member — and `failAllMutations(_:)`
+    /// fails every member. The shape this exists for is the opposite one: a
+    /// batch whose EARLIER member the provider proved (so Graph has already
+    /// reallocated that member's id) while a LATER member failed, which is what
+    /// routes an operation through `AccountManager.retirePartiallyCompletedOp`
+    /// rather than the whole-op retirement. Nothing else in the fixture can
+    /// produce a partial `MoveOutcome`.
+    ///
+    /// One-shot per id, in the style of `holdNextMove()`: the id is removed the
+    /// moment it fires, so the retry after the fault lands normally. 503 rather
+    /// than 404 deliberately — a transient refusal leaves the unproven member
+    /// durably queued, where a 404 would make it an authoritative-stale drop and
+    /// change what the calling test measures.
+    func failMoveOnce(providerMessageId: String) {
+        _ = state.value.withLock { $0.oneShotMoveFailureIds.insert(providerMessageId) }
     }
 
     /// Block the NEXT `/move` inside the route until the returned closure is
@@ -492,6 +519,13 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         guard !Self.consumeMutationFailure(state) else { return .status(503) }
         guard let providerId = Self.messageId(from: request.url, move: true) else {
             return .status(404)
+        }
+        // The id-scoped one-shot fault (`failMoveOnce(providerMessageId:)`).
+        // Checked HERE, after the id is parsed, because it keys on that id, and
+        // it consumes only when it actually fires — so an armed id that a test
+        // never moves stays armed rather than being eaten by a sibling member.
+        guard !state.value.withLock({ $0.oneShotMoveFailureIds.remove(providerId) != nil }) else {
+            return .status(503)
         }
         let body = request.body.flatMap {
             try? JSONSerialization.jsonObject(with: $0) as? [String: Any]

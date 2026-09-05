@@ -1155,4 +1155,396 @@ struct OutlookQueueHandoffTests {
 
         await finish(f)
     }
+
+    // MARK: - T9/T10 — a PASS BOUNDARY is a CLAIM BOUNDARY
+
+    /// A header exactly as `optimisticMoveToFolder` leaves one after a move
+    /// gesture, seeded directly.
+    ///
+    /// That function updates `folderId`, `folderPath`, `isInInbox` and
+    /// `observedUidValidity` and NOTHING ELSE, so the row's PRIMARY KEY and its
+    /// `messageId` both stay at their SOURCE values while the row already shows
+    /// at the destination. Reproducing that shape is what makes the two tests
+    /// below exercise the same rows a real gesture would produce.
+    @discardableResult
+    private func seedOptimisticallyMovedHeader(
+        _ fixture: Fixture, graphId: String, rfc: String, destination: String,
+        isRead: Bool = false, isFlagged: Bool = false
+    ) throws -> MessageHeader {
+        var header = try seedHeader(fixture, graphId: graphId, rfc: rfc)
+        header.folderPath = destination
+        header.folderId = MessageIdentity.folderId(
+            accountId: fixture.accountId, folderPath: destination)
+        header.isInInbox = false
+        header.isRead = isRead
+        header.isFlagged = isFlagged
+        header.observedUidValidity = nil
+        let moved = header
+        try fixture.pool.writeWithoutTransaction { db in try moved.update(db) }
+        return moved
+    }
+
+    /// Insert a whole schedule of durable operations in a fixed `createdAt`
+    /// order, so ONE explicit `drainPendingQueue()` owns it end to end.
+    ///
+    /// 🚨 WHY THE ROWS ARE SEEDED AND NOT GESTURED. Every `AccountManager`
+    /// gesture spawns its OWN drain task, so a later explicit
+    /// `drainPendingQueue()` may find `isDraining` already true, record a
+    /// redrain and return immediately — it is NOT a barrier, and an assertion
+    /// written as though it were is reading a partially-drained queue. With the
+    /// rows seeded there is no drain at all until the test starts exactly one,
+    /// and every oracle below is either the append-only wire record or a durable
+    /// row read after that one call has returned.
+    ///
+    /// The dates are absolute and tiny rather than `Date()`-relative offsets
+    /// because only their ORDER is load-bearing here (the drain sorts by
+    /// `createdAt` ascending) and nothing in the queue compares them to now.
+    private func seedSchedule(
+        _ fixture: Fixture, _ ops: [PendingOperation]
+    ) throws -> [PendingOperation] {
+        var ordered: [PendingOperation] = []
+        for (index, op) in ops.enumerated() {
+            var stamped = op
+            stamped.createdAt = Date(timeIntervalSince1970: Double(index + 1))
+            ordered.append(stamped)
+        }
+        let toInsert = ordered
+        try fixture.pool.writeWithoutTransaction { db in
+            for op in toInsert { try op.insert(db) }
+        }
+        return ordered
+    }
+
+    /// **THE PROPERTY: while this process holds a proven retirement it could not
+    /// commit, NO claim pass starts — so the follower behind that retirement is
+    /// never claimed alone against the address the retirement is still holding.**
+    ///
+    /// This is the FULL-retirement arm, with a bystander. `executeSingleOp`'s
+    /// retention catch returns `.haltLane` without setting `executedAny`, so on
+    /// its own it does stop the drain. But `executedAny` is a DRAIN-WIDE flag and
+    /// any other operation that made progress in the same pass sets it — here an
+    /// ordinary earlier gesture on the same message, a mark-flagged issued before
+    /// the move, which succeeds on the wire and retires cleanly. The pass loop
+    /// then iterates; the claim loop refuses the retained predecessor because it
+    /// is `inFlight`; and the follower the lane halt requeued is claimed ALONE,
+    /// still naming the id Graph reallocated, because nothing has committed the
+    /// re-address. Its PATCH `404`s and the single-message conflict arm reads
+    /// that as provider-authoritative "already done" and DELETES the user's
+    /// NEWEST gesture — no crash, inside a live process that still holds the
+    /// proof. That is outside the accepted process-death window.
+    ///
+    /// The recovery is the next drain, not a retry here:
+    /// `replayRetainedRetirements` runs at the top of `drainPendingQueue` BEFORE
+    /// anything is claimed, so the proof commits — re-addressing the follower in
+    /// the same transaction — or the drain refuses to start.
+    @Test("Outlook: a bystander's success does not start a claim pass while a proven retirement is still held")
+    @MainActor
+    func aBystandersProgressDoesNotReleaseAHeldRetirementsFollower() async throws {
+        let rfc = "graph-handoff-pass-boundary@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: rfc, providerMessageId: "graph-1", folderId: Self.source),
+        ])
+        defer { server.close() }
+
+        let f = try fixture(accountId: "graph-handoff-pass-boundary")
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-1", rfc: rfc, destination: Self.firstDestination,
+            isRead: true, isFlagged: true)
+
+        // PRECONDITION — no earlier test leaked a retained retirement into the
+        // shared `AccountManager`. One would stop this drain for a reason that
+        // has nothing to do with what is being measured.
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a previous test left a retained retirement on the shared AccountManager")
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "a drain from an earlier test is still running, so this schedule is not this test's")
+
+        // mark-flagged (the BYSTANDER, earliest) → move → mark-read (the
+        // FOLLOWER). All three name one Graph id, so on an account-scoped
+        // provider they are ONE lane and run in `createdAt` order.
+        let ordered = try seedSchedule(f, [
+            PendingOperation(
+                type: .markFlagged, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.source),
+            PendingOperation(
+                type: .move, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.source,
+                destinationPath: Self.firstDestination),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.firstDestination),
+        ])
+        #expect(ordered.count == 3)
+        guard ordered.count == 3 else { return }
+        let moveOpId = ordered[1].id
+        let followerOpId = ordered[2].id
+
+        await register(server.provider(), f)
+
+        // Installed AFTER every fixture write, so the only header-writing
+        // transaction it can refuse is the move's retirement. The bystander and
+        // the follower are PATCH-shaped operations whose retirement writes
+        // `pendingOperation` only (`finishMove` returns `.empty` for anything
+        // that is not an address-changing move), which is why the exact refusal
+        // count below is a meaningful oracle.
+        let refuser = HeaderCommitRefuser()
+        f.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // NON-VACUITY: exactly the retirement's three `retryWrite` attempts were
+        // refused. More would mean some OTHER header write was refused too and
+        // this is not the scenario under test (`MIS-027`).
+        #expect(refuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on the retirement write for exactly its \
+            three attempts: \(refuser.refusals.withLock { $0 })
+            """)
+
+        let firstDrain = server.http.servedCallSequence()
+        #expect(firstDrain.filter { $0.hasSuffix("/move") }.count == 1,
+                "the move was not sent exactly once: \(firstDrain)")
+        let moveIndex = firstDrain.firstIndex { $0.hasSuffix("/move") }
+        #expect(moveIndex != nil)
+        guard let moveIndex else { return }
+
+        // NON-VACUITY, the other side: the bystander really did make progress in
+        // this pass. Without it `executedAny` is false and the pass loop stops
+        // for a reason unrelated to the gate under test, which would make every
+        // assertion below vacuous.
+        let bystanderPatches = firstDrain[..<moveIndex].filter { $0.hasPrefix("PATCH ") }
+        #expect(bystanderPatches.count == 1, """
+            the bystander did not execute before the move, so nothing set \
+            `executedAny` and this test is not exercising the pass boundary: \
+            \(Array(firstDrain))
+            """)
+        #expect(server.snapshot(providerMessageId: "graph-1") == nil,
+                "Graph did not reallocate the id, so the follower has no dead address to fail on")
+
+        // 🚨 THE ORACLE. Nothing may reach the wire after the move while its
+        // proof is uncommitted — a PATCH here can only name the id the move
+        // destroyed.
+        let afterTheMove = firstDrain.dropFirst(moveIndex + 1).filter { $0.hasPrefix("PATCH ") }
+        #expect(afterTheMove.isEmpty, """
+            a claim pass started while this process still held an unresolved \
+            proven retirement: \(Array(afterTheMove)). The follower named the \
+            address the move invalidated, Graph answered 404, and the \
+            single-message conflict arm read that as "already done".
+            """)
+
+        // Durable state, read after the drain returned — never mid-drain.
+        let (heldMove, heldFollower) = try await f.pool.read { db in
+            (try PendingOperation.fetchOne(db, key: moveOpId),
+             try PendingOperation.fetchOne(db, key: followerOpId))
+        }
+        #expect(heldFollower != nil, """
+            the follower was DESTROYED while this process still held the proof \
+            that would have re-addressed it — the user's newest gesture is gone
+            """)
+        #expect(heldFollower?.status == PendingStatus.queued.rawValue,
+                "the follower is not retryable: \(heldFollower?.status ?? "<deleted>")")
+        #expect(heldFollower?.messageIds == ["graph-1"], """
+            the follower's address moved even though the transaction that proves \
+            it never committed: \(String(describing: heldFollower?.messageIds))
+            """)
+        #expect(heldFollower?.retryCount == 0,
+                "a provider retry was charged for a LOCAL write failure")
+        #expect(heldMove?.status == PendingStatus.inFlight.rawValue, """
+            the move was returned to `queued` after the wire had already moved \
+            it: \(heldMove?.status ?? "<deleted>")
+            """)
+        #expect(heldMove?.messageIds == ["graph-1"],
+                "the move row lost members: \(String(describing: heldMove?.messageIds))")
+
+        // The database accepts writes again — the state every live process
+        // reaches when it returns to the foreground.
+        f.pool.remove(transactionObserver: refuser)
+        try await drainToQuiescence(f)
+
+        let finalCalls = server.http.servedCallSequence()
+        #expect(finalCalls.filter { $0.hasSuffix("/move") }.count == 1, """
+            the move was replayed on the wire — a proven move must be applied \
+            exactly once: \(finalCalls)
+            """)
+        let current = liveId(server, rfc: rfc)
+        #expect(current != nil && current != "graph-1")
+        guard let current else { return }
+        let misaddressed = finalCalls
+            .dropFirst(moveIndex + 1)
+            .filter { $0.hasPrefix("PATCH ") && !$0.hasSuffix("/\(current)") }
+        #expect(misaddressed.isEmpty, """
+            a PATCH went out at an address the move had already invalidated \
+            (proven id \(current)): \(Array(misaddressed))
+            """)
+        #expect(finalCalls.filter { $0.hasPrefix("PATCH ") && $0.hasSuffix("/\(current)") }.count == 1,
+                "the follower did not execute exactly once at the proven id: \(finalCalls)")
+
+        let headers = try rows(f)
+        #expect(headers.count == 1)
+        guard headers.count == 1 else { return }
+        #expect(headers[0].messageId == current && headers[0].folderPath == Self.firstDestination, """
+            the header was left at the address Graph invalidated: \
+            messageId=\(headers[0].messageId) folder=\(headers[0].folderPath)
+            """)
+        let landed = server.snapshot(providerMessageId: current)
+        #expect(landed?.isFlagged == true, "the bystander's flag was lost: \(String(describing: landed))")
+
+        try expectGesturePreservedAndExecuted(
+            f, effectVisibleOnServer: landed?.isRead == true,
+            gesture: "the mark-read behind a retirement held across a bystander's success",
+            serverState: "id=\(current) folders=\(serverFolders(server, rfc: rfc))")
+
+        await finish(f)
+    }
+
+    /// **THE PROPERTY, on the PARTIAL arm and with no bystander at all: a
+    /// narrowing that could not commit stops the drain by itself.**
+    ///
+    /// `retirePartiallyCompletedOp` sets `context.executedAny = true`
+    /// UNCONDITIONALLY, after its retention catch as well as after a successful
+    /// narrowing. So this arm needs nothing else in the pass to have made
+    /// progress: it keeps the pass loop running on its own, the claim loop
+    /// refuses the `inFlight` bundle, and the follower requeued by the lane halt
+    /// is claimed alone at the id Graph reallocated for the member the provider
+    /// DID prove.
+    ///
+    /// The schedule is a two-member move `[A, B]` whose first member the wire
+    /// proves — Graph reallocates A's id — while the second is refused, which is
+    /// the only shape that reaches the partial arm at all. A is also the message
+    /// the follower names.
+    @Test("Outlook: a narrowing that cannot commit stops the drain with no bystander at all")
+    @MainActor
+    func aHeldNarrowingStopsTheDrainWithoutABystander() async throws {
+        let firstRfc = "graph-handoff-narrowing-a@example.com"
+        let secondRfc = "graph-handoff-narrowing-b@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: firstRfc, providerMessageId: "graph-a", folderId: Self.source),
+            .init(rfc822MessageId: secondRfc, providerMessageId: "graph-b", folderId: Self.source),
+        ])
+        defer { server.close() }
+
+        let f = try fixture(accountId: "graph-handoff-narrowing")
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-a", rfc: firstRfc, destination: Self.firstDestination, isRead: true)
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-b", rfc: secondRfc, destination: Self.firstDestination)
+
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a previous test left a retained retirement on the shared AccountManager")
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "a drain from an earlier test is still running, so this schedule is not this test's")
+
+        let ordered = try seedSchedule(f, [
+            PendingOperation(
+                type: .move, messageIds: ["graph-a", "graph-b"],
+                accountId: f.accountId, folderPath: Self.source,
+                destinationPath: Self.firstDestination),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-a"],
+                accountId: f.accountId, folderPath: Self.firstDestination),
+        ])
+        #expect(ordered.count == 2)
+        guard ordered.count == 2 else { return }
+        let moveOpId = ordered[0].id
+        let followerOpId = ordered[1].id
+
+        await register(server.provider(), f)
+        // A moves and has its id reallocated; B is refused with a TRANSIENT 503,
+        // so it stays owed rather than becoming an authoritative-stale drop.
+        server.failMoveOnce(providerMessageId: "graph-b")
+
+        let refuser = HeaderCommitRefuser()
+        f.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(refuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on the narrowing write for exactly its \
+            three attempts: \(refuser.refusals.withLock { $0 })
+            """)
+
+        // NON-VACUITY: the provider really did return a PARTIAL result — A moved
+        // and its id churned, B did not move at all.
+        let firstDrain = server.http.servedCallSequence()
+        #expect(firstDrain.filter { $0.hasSuffix("/move") }.count == 2, """
+            both members were not attempted, so the partial arm was not reached: \
+            \(firstDrain)
+            """)
+        #expect(server.snapshot(providerMessageId: "graph-a") == nil,
+                "Graph did not reallocate A's id, so there is no dead address to fail on")
+        #expect(server.snapshots(rfc822MessageId: secondRfc).map(\.folderId) == [Self.source],
+                "B moved even though its move was refused, so this is not a partial batch")
+
+        // 🚨 THE ORACLE. No PATCH may reach the wire at all: the only address
+        // the follower can name is the one the uncommitted narrowing holds.
+        #expect(firstDrain.filter { $0.hasPrefix("PATCH ") }.isEmpty, """
+            a claim pass started while this process still held an unresolved \
+            proven narrowing: \(firstDrain.filter { $0.hasPrefix("PATCH ") }). \
+            `retirePartiallyCompletedOp` sets `executedAny` even when its write \
+            failed, so nothing else in the pass had to succeed for this to happen.
+            """)
+
+        let (heldMove, heldFollower) = try await f.pool.read { db in
+            (try PendingOperation.fetchOne(db, key: moveOpId),
+             try PendingOperation.fetchOne(db, key: followerOpId))
+        }
+        #expect(heldFollower != nil, """
+            the follower was DESTROYED while this process still held the proof \
+            that would have re-addressed it — the user's newest gesture is gone
+            """)
+        #expect(heldFollower?.status == PendingStatus.queued.rawValue,
+                "the follower is not retryable: \(heldFollower?.status ?? "<deleted>")")
+        #expect(heldFollower?.messageIds == ["graph-a"], """
+            the follower's address moved even though the narrowing never \
+            committed: \(String(describing: heldFollower?.messageIds))
+            """)
+        #expect(heldFollower?.retryCount == 0,
+                "a provider retry was charged for a LOCAL write failure")
+        #expect(heldMove?.messageIds == ["graph-a", "graph-b"], """
+            the bundle was narrowed even though the narrowing write never \
+            committed: \(String(describing: heldMove?.messageIds))
+            """)
+        #expect(heldMove?.status == PendingStatus.inFlight.rawValue, """
+            the bundle was returned to `queued` with a member the wire had \
+            already moved: \(heldMove?.status ?? "<deleted>")
+            """)
+
+        f.pool.remove(transactionObserver: refuser)
+        try await drainToQuiescence(f)
+
+        let finalCalls = server.http.servedCallSequence()
+        let provenA = liveId(server, rfc: firstRfc)
+        #expect(provenA != nil && provenA != "graph-a")
+        guard let provenA else { return }
+
+        // A's move is never re-sent — exactly the one request that proved it.
+        #expect(finalCalls.filter { $0.hasSuffix("/messages/graph-a/move") }.count == 1, """
+            the proven member's move was re-sent, which would seat a second copy \
+            at the destination: \(finalCalls)
+            """)
+        // B moved EXACTLY ONCE. It was ATTEMPTED twice — the first attempt
+        // answered 503 and applied nothing — and the server holds exactly one
+        // copy of it, in the destination.
+        #expect(finalCalls.filter { $0.hasSuffix("/messages/graph-b/move") }.count == 2, """
+            the refused member was not retried exactly once after its transient \
+            failure: \(finalCalls)
+            """)
+        #expect(serverFolders(server, rfc: secondRfc) == [Self.firstDestination], """
+            the refused member did not converge: \
+            \(serverFolders(server, rfc: secondRfc))
+            """)
+
+        let patches = finalCalls.filter { $0.hasPrefix("PATCH ") }
+        #expect(patches.count == 1, "the follower did not execute exactly once: \(patches)")
+        #expect(patches.allSatisfy { $0.hasSuffix("/\(provenA)") }, """
+            a PATCH went out at an address the move had already invalidated \
+            (proven id \(provenA)): \(patches)
+            """)
+
+        try expectGesturePreservedAndExecuted(
+            f, effectVisibleOnServer: server.snapshot(providerMessageId: provenA)?.isRead == true,
+            gesture: "the mark-read behind a narrowing that could not commit",
+            serverState: "id=\(provenA) folders=\(serverFolders(server, rfc: firstRfc))")
+
+        await finish(f)
+    }
 }

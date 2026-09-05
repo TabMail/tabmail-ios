@@ -202,6 +202,23 @@ stated above, and closes the live-process half by RETENTION AND REPLAY:
   run; on a row the local wipes/resets removed it drops the entry, for the same reason
   `liveOperation`'s nil arm skips; on a still-failing commit it keeps the entry and stops the drain,
   because a database that cannot commit cannot retire anything else safely either.
+- **The invariant is `no claim pass starts while this process holds an unresolved proven
+  retirement`, and `drainPendingQueue` therefore also STOPS AT THE PASS BOUNDARY on
+  `if !pendingRetirements.isEmpty { break }`** — placed immediately after the lane tasks are joined
+  and before `if !ctx.executedAny { break }` — because the top-of-drain replay runs only ONCE, while
+  the pass loop can start a second claim pass on any other progress in the same pass (a successful
+  bystander on the full arm; `retirePartiallyCompletedOp`, which sets `executedAny` unconditionally
+  even after its retention catch, on the partial one), and that pass claims the halted lane's
+  follower ALONE — the claim loop refuses the retained predecessor because it is `inFlight` — at the
+  id the uncommitted result has already invalidated, where the `404` and the single-message conflict
+  arm delete the user's newest gesture with no crash at all. The next drain owns the recovery: its
+  replay runs before anything is claimed, so the proof commits (re-addressing the follower in the
+  same transaction) or the drain refuses to start. Fences:
+  `OutlookQueueHandoffTests.aBystandersProgressDoesNotReleaseAHeldRetirementsFollower` (the full arm,
+  with a bystander) and `.aHeldNarrowingStopsTheDrainWithoutABystander` (the partial arm, which needs
+  none), both RED on the pre-gate code and on a named inversion of the gate; the second uses
+  `StatefulExchangeActionServer.failMoveOnce(providerMessageId:)`, the one-shot id-scoped `/move`
+  fault added so a batch's LATER member can fail while its earlier member is proved.
 
 No identity lookup, no receipt table, no schema change, and no wire replay of the move: RFC identity
 remains banned as a mutation authority (ADR-IOS-068 D4, `IOS-IMAP-002`). The map is bounded by the

@@ -584,7 +584,15 @@ extension AccountManager {
 
         let ctx = DrainContext()
 
-        // 🚨 FINISH ANY RETIREMENT THIS PROCESS ALREADY HAS THE PROOF FOR, FIRST
+        // 🚨 NO CLAIM PASS STARTS WHILE THIS PROCESS HOLDS AN UNRESOLVED PROVEN
+        // RETIREMENT. That is the invariant, and it is enforced at BOTH of the
+        // places a claim pass can begin: here, at the top of the drain, and
+        // again at every pass boundary — see the `pendingRetirements` check
+        // beside `if !ctx.executedAny` below. Stating it in one place only was
+        // the defect: the top-of-drain replay runs ONCE, so a retirement
+        // retained by pass N left pass N+1 free to claim its follower.
+        //
+        // FINISH ANY RETIREMENT THIS PROCESS ALREADY HAS THE PROOF FOR, FIRST
         // AND WHILE STILL OFFLINE. An operation whose provider result committed
         // nowhere is holding an address every later gesture on that message
         // needs, and its lane is halted until it commits — so it must be retired
@@ -1013,6 +1021,36 @@ extension AccountManager {
                 tasks.append(task)
             }
             for task in tasks { await task.value }
+
+            // 🚨 NO CLAIM PASS STARTS WHILE THIS PROCESS HOLDS AN UNRESOLVED
+            // PROVEN RETIREMENT — the same invariant the top-of-drain replay
+            // enforces, restated at the drain's OTHER entry into a claim pass.
+            //
+            // A retirement whose local write could not commit leaves its move
+            // `inFlight` with every member, and halting its lane requeues the
+            // rest of that lane to `queued`. The claim loop refuses `inFlight`,
+            // so the predecessor is NOT re-claimed next pass — but the follower
+            // IS, alone, still naming the id the provider's uncommitted result
+            // has already invalidated. Its wire call 404s and the single-message
+            // conflict arm reads that as provider-authoritative "already done"
+            // and DELETES the user's NEWEST gesture, in a live process that is
+            // still holding the proof that would have re-addressed it.
+            //
+            // Progress by ANYTHING ELSE in the pass is enough to reach here with
+            // `executedAny` set: a successful bystander on the full arm, and
+            // `retirePartiallyCompletedOp` — which sets it unconditionally,
+            // after its retention catch as well — on the partial one.
+            //
+            // STOPPING IS THE WHOLE FIX, and the NEXT DRAIN owns the recovery:
+            // `replayRetainedRetirements` runs at the top of `drainPendingQueue`
+            // BEFORE anything is claimed, so either the retained proof commits —
+            // re-addressing every holder of the old address in that same
+            // transaction — or the drain refuses to start at all. Nothing is
+            // replayed here: whatever refused the write milliseconds ago is
+            // overwhelmingly still refusing it, and a second recovery point for
+            // one fact is two places to keep in step (owner decision
+            // 2026-09-05, `TabMail/tabmail-ios#120`, `IOS-GRAPH-005`).
+            if !pendingRetirements.isEmpty { break }
 
             if !ctx.executedAny { break }
             ctx.executedAny = false
