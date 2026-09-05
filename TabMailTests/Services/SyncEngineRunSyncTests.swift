@@ -2071,6 +2071,134 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
         return (result, reclaimedId, insertedId)
     }
 
+    /// DraftDedup replacement fixture — the `insertedIds` contribution at the
+    /// DraftDedup arm. Seeds an account plus a Drafts folder named `folderName`
+    /// (path `Drafts`) holding ONE optimistic placeholder header with an
+    /// authored body, then serves that same message under its server-assigned
+    /// address. The block DELETES the placeholder, carries the body, and
+    /// INSERTS a brand-new row under the canonical id — a row this pass
+    /// created, so it belongs under `inserted`.
+    ///
+    /// Seeded exactly like
+    /// `RunSyncDedupReclaimFtsRoutingTests.draftDedupSuccessRoutesTheOldIdToFtsRekeys`,
+    /// duplicated rather than shared so that suite's tests are not touched —
+    /// including its `limit: 1`, where limit == message count makes the mock
+    /// report a PARTIAL fetch, so complete-knowledge stale detection is off and
+    /// the non-numeric placeholder id is not a UID-stale candidate. Without
+    /// that the placeholder would be deleted by the stale channel and this arm
+    /// would never run.
+    private func runFullSyncDraftDedupReplacement(
+        pool: DatabasePool, accountId: String, folderName: String
+    ) async throws -> (result: SyncEngine.SyncMessagesResult, placeholderId: String, canonicalId: String) {
+        let folderPath = "Drafts"
+        let rfc = "draft-upsert-diagnostic@example.com"
+        let placeholderId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: folderPath, messageId: "draft-local-1")
+        let canonicalId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: folderPath, messageId: "42")
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        try await pool.write { db in
+            var acc = Account(emailAddress: "\(accountId)@example.com", displayName: "T", provider: .imap)
+            acc.id = accountId
+            try acc.insert(db)
+            try Folder(name: folderName, path: folderPath, role: .drafts, accountId: accountId).insert(db)
+            var placeholder = MessageHeader(
+                messageId: "draft-local-1", subject: "fixture", from: "a@x",
+                fromAddress: "a@x", to: "b@x", date: date, snippet: "s",
+                folderId: "\(accountId):\(folderPath)", accountId: accountId,
+                folderPath: folderPath, isInInbox: false)
+            placeholder.rfc822MessageId = rfc
+            placeholder.headerComplete = true
+            placeholder.bodyComplete = true
+            try placeholder.insert(db)
+            try MessageBody(
+                contentKey: ContentKey(rawValue: placeholderId),
+                htmlContent: "<p>authored</p>").insert(db)
+        }
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "\(accountId):\(folderPath)")! }
+
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult([
+            makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: date)
+        ])
+
+        let result = try await SyncEngine.runSyncMessages(
+            for: folder, provider: mock, limit: 1, dbPool: PrioritizedDatabase(pool: pool))
+        return (result, placeholderId, canonicalId)
+    }
+
+    /// One inbox-flagged row for message `42`, inserted verbatim under a folder
+    /// path that disagrees with the folder full sync is about to run — the
+    /// folderPath drift the pre-sync reclaim exists to converge (the same
+    /// fixture shape as `RunSyncDedupReclaimFtsRoutingTests.insertHeader`).
+    private static func insertDriftedInboxRow(
+        _ db: Database, accountId: String, driftedPath: String, rfc822: String, date: Date
+    ) throws {
+        var header = MessageHeader(
+            messageId: "42", subject: "fixture", from: "a@x", fromAddress: "a@x",
+            to: "b@x", date: date, snippet: "s",
+            folderId: "\(accountId):\(driftedPath)", accountId: accountId,
+            folderPath: driftedPath, isInInbox: true)
+        header.rfc822MessageId = rfc822
+        header.headerComplete = true
+        header.bodyComplete = true
+        try header.insert(db)
+    }
+
+    /// Pre-sync inbox reclaim fixture — the `insertedIds` contribution at the
+    /// pre-sync replacement arm. Seeds an account, the inbox folder
+    /// `folderName` (path `INBOX`), two custom folders, and TWO drifted inbox
+    /// rows for the same message (the first carrying a body), then serves that
+    /// message in the inbox. The arm DELETES the first drifted row and INSERTS
+    /// a brand-new row under the canonical inbox id (carrying the body and the
+    /// AI fields), and deletes the tail duplicate outright — so the canonical
+    /// row is a row this pass created and neither drifted id survives.
+    ///
+    /// Seeded exactly like
+    /// `RunSyncDedupReclaimFtsRoutingTests.preSyncReclaimRoutesBothLegs`,
+    /// duplicated rather than shared so that suite's tests are not touched.
+    /// Which of the two drifted rows is reclaimed and which is dropped is not
+    /// pinned here — every assertion below holds either way.
+    private func runFullSyncPreSyncInboxReclaim(
+        pool: DatabasePool, accountId: String, folderName: String
+    ) async throws -> (result: SyncEngine.SyncMessagesResult, driftedIds: [String], canonicalId: String) {
+        let folderPath = "INBOX"
+        let rfc = "presync-upsert-diagnostic@example.com"
+        let firstDriftedId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: "NSE-A", messageId: "42")
+        let secondDriftedId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: "NSE-B", messageId: "42")
+        let canonicalId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: folderPath, messageId: "42")
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+
+        try await pool.write { db in
+            var acc = Account(emailAddress: "\(accountId)@example.com", displayName: "T", provider: .imap)
+            acc.id = accountId
+            try acc.insert(db)
+            try Folder(name: folderName, path: folderPath, role: .inbox, accountId: accountId).insert(db)
+            try Folder(name: "NSE-A", path: "NSE-A", role: .custom, accountId: accountId).insert(db)
+            try Folder(name: "NSE-B", path: "NSE-B", role: .custom, accountId: accountId).insert(db)
+            try Self.insertDriftedInboxRow(
+                db, accountId: accountId, driftedPath: "NSE-A", rfc822: rfc, date: date)
+            try MessageBody(
+                contentKey: ContentKey(rawValue: firstDriftedId),
+                htmlContent: "<p>reclaimed</p>").insert(db)
+            try Self.insertDriftedInboxRow(
+                db, accountId: accountId, driftedPath: "NSE-B", rfc822: rfc, date: date)
+        }
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "\(accountId):\(folderPath)")! }
+
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult([
+            makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: date)
+        ])
+
+        let result = try await SyncEngine.runSyncMessages(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
+        return (result, [firstDriftedId, secondDriftedId], canonicalId)
+    }
+
     /// A GRDB `TransactionObserver` that REFUSES the commit of any transaction
     /// which wrote `messageHeader` — the standard GRDB way to force a commit
     /// failure: `databaseWillCommit()` throws → SQLite's commit hook aborts the
@@ -2491,6 +2619,100 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
                 try MessageHeader.filter(Column("folderId") == "\(accountId):Archive").fetchCount($0)
             }
             #expect(archiveCount == 0, "the reclaimed row must have left its Archive membership")
+        }
+    }
+
+    // MARK: - The two replaced-row `inserted` contributions
+
+    @Test("DraftDedup replacement — the canonical row that replaced the placeholder is named under `inserted`, never `reclaimed`, and the deleted placeholder id appears nowhere in the line")
+    func fullSyncUpsertNamesTheDraftDedupReplacementUnderInserted() async throws {
+        try await withTempLogAndDebugGate(enabled: true) {
+            let (pool, dir) = try makePool()
+            defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+            let accountId = "upsert-draftdedup"
+            let folderName = "DraftDedupUpsertFolder"
+            let (result, placeholderId, canonicalId) = try await runFullSyncDraftDedupReplacement(
+                pool: pool, accountId: accountId, folderName: folderName)
+            // Non-vacuity: the dedup arm really ran and really produced the
+            // canonical row, so the line assertions below describe a pass that
+            // actually created something.
+            #expect(result.newHeaders.map(\.id) == [canonicalId],
+                    "the DraftDedup arm must have replaced the placeholder with the canonical row, got \(result.newHeaders.map(\.id))")
+
+            let queueLog = AppLogStore.read(channel: .queue)
+            let bodies = moveTraceUpsertBodies(in: queueLog, folderName: folderName)
+            #expect(bodies.count == 1, "expected exactly one matching entry, got: \(bodies)")
+            guard bodies.count == 1 else { return }
+            guard let parsed = parseUpsertBody(bodies[0]) else {
+                Issue.record("upsert line did not parse: \(bodies[0])")
+                return
+            }
+
+            // THE INVARIANT: the line names, under `inserted`, every row this
+            // pass CREATED — the canonical row that replaced the placeholder is
+            // one of them, and it is not a reclaim.
+            #expect(parsed.inserted.total == 1,
+                    "the replacement is a row full sync created and must be counted as inserted: \(bodies[0])")
+            #expect(parsed.inserted.renderedIds == [canonicalId],
+                    "the NEW canonical id must be named under inserted: \(bodies[0])")
+            expectEmptyReclaimedSegment(parsed, in: bodies[0])
+            #expect(!bodies[0].contains(placeholderId),
+                    "the DELETED placeholder id must appear nowhere in the line: \(bodies[0])")
+
+            // The durable facts the routing test establishes still hold.
+            #expect(try await pool.read { try MessageHeader.fetchOne($0, key: canonicalId) } != nil,
+                    "the canonical row must be durable")
+            #expect(try await pool.read { try MessageHeader.fetchOne($0, key: placeholderId) } == nil,
+                    "the placeholder row must be gone")
+        }
+    }
+
+    @Test("Pre-sync inbox reclaim — the canonical row that replaced the drifted row is named under `inserted`, never `reclaimed`, and neither deleted drifted id appears in the line")
+    func fullSyncUpsertNamesThePreSyncReplacementUnderInserted() async throws {
+        try await withTempLogAndDebugGate(enabled: true) {
+            let (pool, dir) = try makePool()
+            defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+            let accountId = "upsert-presync"
+            let folderName = "PreSyncReclaimUpsertFolder"
+            let (result, driftedIds, canonicalId) = try await runFullSyncPreSyncInboxReclaim(
+                pool: pool, accountId: accountId, folderName: folderName)
+            // Non-vacuity: the pre-sync arm really ran and really produced the
+            // canonical inbox row.
+            #expect(result.newHeaders.map(\.id) == [canonicalId],
+                    "the pre-sync arm must have replaced the drifted row with the canonical one, got \(result.newHeaders.map(\.id))")
+
+            let queueLog = AppLogStore.read(channel: .queue)
+            let bodies = moveTraceUpsertBodies(in: queueLog, folderName: folderName)
+            #expect(bodies.count == 1, "expected exactly one matching entry, got: \(bodies)")
+            guard bodies.count == 1 else { return }
+            guard let parsed = parseUpsertBody(bodies[0]) else {
+                Issue.record("upsert line did not parse: \(bodies[0])")
+                return
+            }
+
+            // THE INVARIANT, same one: this arm DELETES the drifted row and
+            // INSERTS a new row under the canonical id, so the canonical id is
+            // an insert — despite the `[Sync] Reclaimed pre-sync inbox row`
+            // wording at the site, which names the AI-preservation, not an
+            // in-place update.
+            #expect(parsed.inserted.total == 1,
+                    "the replacement is a row full sync created and must be counted as inserted: \(bodies[0])")
+            #expect(parsed.inserted.renderedIds == [canonicalId],
+                    "the NEW canonical id must be named under inserted: \(bodies[0])")
+            expectEmptyReclaimedSegment(parsed, in: bodies[0])
+            for driftedId in driftedIds {
+                #expect(!bodies[0].contains(driftedId),
+                        "the DELETED drifted id \(driftedId) must appear nowhere in the line: \(bodies[0])")
+            }
+
+            // The durable facts the routing test establishes still hold.
+            #expect(try await pool.read { try MessageHeader.fetchOne($0, key: canonicalId) } != nil,
+                    "the canonical inbox row must be durable")
+            let survivingDrifted = try await pool.read { db in
+                try driftedIds.filter { try MessageHeader.fetchOne(db, key: $0) != nil }
+            }
+            #expect(survivingDrifted.isEmpty,
+                    "both drifted rows are consumed by the reclaim — got \(survivingDrifted)")
         }
     }
 

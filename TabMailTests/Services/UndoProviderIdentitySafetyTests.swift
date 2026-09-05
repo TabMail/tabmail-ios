@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -1046,5 +1047,114 @@ struct UndoProviderIdentitySafetyTests {
                 "the .inbox channel persisted content for the locked-gate undo: \(lockedLog)")
         #expect(Self.queuedInverseFieldSets(in: lockedLog).isEmpty,
                 "a phase=queuedInverse line survived the closed debug gate: \(lockedLog)")
+    }
+
+    /// A GRDB `TransactionObserver` that REFUSES the commit of any transaction
+    /// which INSERTED a `pendingOperation` row — the standard GRDB way to force
+    /// a commit failure: `databaseWillCommit()` throws → SQLite's commit hook
+    /// aborts the COMMIT → GRDB rolls the transaction back and rethrows this
+    /// very error to `dbPool.write`'s caller. A real production possibility (an
+    /// I/O error or a full disk at COMMIT), not a manufactured writer. Keyed on
+    /// the inverse's own insert and counting its refusals, so a test can prove
+    /// the refusal landed on the undo's write rather than somewhere else
+    /// (`MIS-027`: red for the right reason). Modelled on
+    /// `SyncEngineFullSyncUpsertDiagnosticTests.HeaderCommitRefuser`.
+    private final class InverseCommitRefuser: TransactionObserver, Sendable {
+        struct CommitRefused: Error {}
+        private let sawInverseInsert = Mutex(false)
+        let refusals = Mutex(0)
+
+        func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
+            guard case .insert(let tableName) = eventKind else { return false }
+            return tableName == PendingOperation.databaseTableName
+        }
+        func databaseDidChange(with event: DatabaseEvent) {
+            sawInverseInsert.withLock { $0 = true }
+        }
+        func databaseWillCommit() throws {
+            guard sawInverseInsert.withLock({ $0 }) else { return }
+            refusals.withLock { $0 += 1 }
+            throw CommitRefused()
+        }
+        func databaseDidCommit(_ db: Database) {
+            sawInverseInsert.withLock { $0 = false }
+        }
+        func databaseDidRollback(_ db: Database) {
+            sawInverseInsert.withLock { $0 = false }
+        }
+    }
+
+    @Test("Undo whose write is refused at COMMIT queues no inverse, restores nothing, and persists NO phase=queuedInverse line")
+    @MainActor
+    func queuedInverseDiagnosticIsAbsentWhenTheUndoWriteRollsBack() async throws {
+        let fixture = try install(provider: .gmail)
+        defer { uninstall(fixture) }
+
+        // Same isolated-log seam as the sibling above: the shared app log is
+        // redirected at a private temp file and both process-global overrides
+        // are restored unconditionally.
+        let logDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("undoqueuedinverserollbacklog_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        AppLogStore.fileURLOverride.withLock { $0 = logDir.appendingPathComponent("tabmail.log") }
+        defer {
+            DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil }
+            AppLogStore._resetForTesting()
+            try? FileManager.default.removeItem(at: logDir)
+        }
+
+        // Gate UNLOCKED — the same fixture the sibling uses for its positive
+        // case, so the ONLY difference between the two is whether the write
+        // committed. With the gate closed this test could not tell a rolled-back
+        // emission from a gated one.
+        DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
+        let providerId = "gmail-queuedinverse-rollback"
+        let original = sourceHeader(
+            fixture, providerId: providerId,
+            rfc: "queuedinverse-rollback@example.com", sourceEpoch: nil)
+        try installOptimisticallyMoved(original, pool: fixture.pool)
+
+        // Installed AFTER the fixture seeding, so the only
+        // `pendingOperation`-inserting transaction it can refuse is the undo's
+        // own write, and removed immediately after so the assertions below read
+        // an unobstructed database.
+        let refuser = InverseCommitRefuser()
+        fixture.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+        let restored = await AccountManager.shared.undoDestructiveAction(
+            [original], accountId: fixture.accountId, originalOpType: .move,
+            fromFolderPath: "Archive", toFolderPath: "INBOX", toFolderId: "\(fixture.accountId):INBOX"
+        )
+        fixture.pool.remove(transactionObserver: refuser)
+
+        // Non-vacuity: the undo really reached its inverse insert and the COMMIT
+        // of that very transaction was refused, exactly once. Without this the
+        // silence below could be an undo that was refused before it ever wrote.
+        #expect(refuser.refusals.withLock { $0 } == 1,
+                "the refusal must land on the undo's own write, exactly once")
+
+        // THE PROPERTY, on the results the API actually exposes. `undoMove` does
+        // not throw: it catches the write failure and reports it by restoring
+        // nothing, so an empty return IS the surfaced failure.
+        #expect(restored.isEmpty,
+                "a refused undo write must restore nothing, got \(restored)")
+
+        let state = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: original.id), try PendingOperation.fetchAll(db))
+        }
+        #expect(state.1.isEmpty,
+                "a refused commit must leave no durable inverse operation, got \(state.1.map(\.id))")
+        // The header still sits at its pre-undo address — the rollback took the
+        // optimistic restoration with it.
+        #expect(state.0?.folderPath == "Archive")
+        #expect(state.0?.folderId == "\(fixture.accountId):Archive")
+        #expect(state.0?.isInInbox == false)
+
+        // … and the diagnostic named none of it. `AppLogStore.append` enqueues
+        // file I/O on an independent queue that no SQLite ROLLBACK retracts, so
+        // a line emitted from inside the write would still be here — naming an
+        // operation that never became durable.
+        let log = AppLogStore.read(channel: .inbox)
+        #expect(Self.queuedInverseFieldSets(in: log).isEmpty,
+                "a phase=queuedInverse line survived a rolled-back undo write: \(log)")
     }
 }
