@@ -93,3 +93,33 @@ post-snapshot guard removed; unreachable guard; `SKIPPING insert for id`; `alrea
 serialisation; `optimistic.delete(db)`; v87 triggers dropped; `lastHistoryId` separate transaction;
 UNIQUE rolls back batch; orphan reclaim; `deltaMoveTraceLog`; six `[MoveTrace] deltaSync` sites;
 `IOS-QUEUE-008`; deletion-first
+
+## 2026-09-05 — the `[MoveTrace] deltaSync` census is now ZERO, not six
+
+The paragraph above records that the census went from seven sites to **six** when the unreachable
+post-snapshot guard and its line were removed on 2026-09-04. That row is superseded — and kept as
+history — by this one: on **2026-09-05** the remaining **six** `[MoveTrace] deltaSync` lines were
+removed too, along with the file-private `deltaMoveTraceLog(_:)` façade and its doc comment (PR #113,
+round 6b). The census is **zero**; the Gmail delta arm writes no per-message diagnostic line at all.
+Every `[MoveTrace] deltaSync` line format quoted above is therefore **removed 2026-09-05** — the
+wordings are kept here as history, not as a description of the current tree.
+
+This deletion has a DIFFERENT premise from 2026-09-04's, and the two must not be conflated:
+
+- **2026-09-04** deleted a GUARD because the guard was unreachable; its line went with it.
+- **2026-09-05** deleted six LINES because they were emitted from inside the changed-message
+  `dbPool.write` closure while `AppLogStore.append` enqueues file I/O on an independent queue that no
+  `ROLLBACK` retracts — so a rolled-back batch left a durable line asserting an outcome that never
+  committed. Every branch they annotated is untouched and still reached; only the emission is gone.
+  Owner decision, deletion-first: a debug instrument may miss a line, but it must not lie.
+
+Consequences for this row: the "In its place is a comment at each `header.insert`" statement stands —
+those invariant comments are exactly what was NOT deleted. The three skip arms whose only statement
+was a trace line keep their `else if` and now carry a comment; in particular the
+`recentlyCompleted` arm is load-bearing, because removing it would let a just-completed message fall
+through to the insert arm and reappear. The Exchange twins are still bare `print`s and are still
+untouched. `GmailDeltaMoveTraceLogTests` survives with all six tests, minus the expectations that
+required a line.
+
+Search terms: zero `[MoveTrace] deltaSync` sites; `deltaMoveTraceLog` deleted; emission inside a
+write survives rollback; deletion-first; PR #113 round 6b; `ios-queue-008.md` 2026-09-05.

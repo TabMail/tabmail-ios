@@ -1924,6 +1924,17 @@ extension AccountManager {
         var affectedFolderIds: Set<String> = []
         var queuedInverse = false
         var deferredSuccessors: [DeferredMoveSuccessor] = []
+        /// The inverse `PendingOperation`'s identity, carried OUT of the write so
+        /// the `phase=queuedInverse` diagnostic can be emitted after the
+        /// transaction has committed. Both are set together, immediately after
+        /// `inverseOp.insert(db)`, and are nil on every path that queues no
+        /// inverse — so "both non-nil" is the same condition as "the row is
+        /// durable". A file-backed line emitted INSIDE the closure would survive
+        /// a rollback (`AppLogStore.append` enqueues its file I/O on an
+        /// independent queue that no `ROLLBACK` can retract) and would then name
+        /// an operation that never existed.
+        var inverseOpId: String?
+        var inverseCreatedAt: Date?
     }
 
     /// Compatibility entry point for the existing UI/test call shape. Execution
@@ -2112,6 +2123,9 @@ extension AccountManager {
                         && exactPayload($0)
                 }
                 let annihilate = related.count == 1 && annihilable.count == 1
+                // Carried out of the write; see `UndoMoveWriteResult`.
+                var inverseOpId: String?
+                var inverseCreatedAt: Date?
 
                 // The optimistic row still names the SOURCE UID while the
                 // exact IMAP forward is on the wire. Record the opposite now,
@@ -2178,10 +2192,11 @@ extension AccountManager {
                         folderPath: forwardDestinationPath, db: db),
                         admission.messages.count == currentRows.count
                     else { return UndoMoveWriteResult() }
-                    // Bound to a local ONLY so the diagnostic below can name the row's
-                    // `id` and `createdAt`. `PendingOperation` is a `PersistableRecord`
-                    // (non-mutating `insert`), so this is the same value, inserted the
-                    // same way, in the same transaction.
+                    // Bound to a local ONLY so the diagnostic emitted after this
+                    // write returns can name the row's `id` and `createdAt`.
+                    // `PendingOperation` is a `PersistableRecord` (non-mutating
+                    // `insert`), so this is the same value, inserted the same way, in
+                    // the same transaction.
                     let inverseOp = PendingOperation(
                         type: .move,
                         messageIds: admission.providerIds,
@@ -2191,20 +2206,8 @@ extension AccountManager {
                         observedUidValidity: admission.observedUidValidity
                     )
                     try inverseOp.insert(db)
-                    // `opId` and `createdAt` are what CORRELATE this inverse with the
-                    // drain lines it later produces: `queueLog` prints `id.prefix(8)`
-                    // and `buildLanes` orders a lane by `createdAt`, so without both an
-                    // undo cannot be matched to the lane it landed in — the gap that
-                    // made `IOS-QUEUE-008` unreadable from an exported log.
-                    // `createdAt` is rendered as an epoch interval deliberately:
-                    // sub-second resolution is what distinguishes a delete from the
-                    // undo issued a moment later.
-                    BackgroundSyncLogger.logInbox(
-                        "[RoleActionTrace] manager.undoMove phase=queuedInverse "
-                            + "from=\(forwardDestinationPath) to=\(sourcePath) "
-                            + "providerIds=[\(admission.providerIds.joined(separator: ","))] "
-                            + "opId=\(inverseOp.id) "
-                            + "createdAt=\(inverseOp.createdAt.timeIntervalSince1970)")
+                    inverseOpId = inverseOp.id
+                    inverseCreatedAt = inverseOp.createdAt
                 }
 
                 // Undo remains instant, as it was in 1.6.38. For a queued IMAP
@@ -2244,7 +2247,9 @@ extension AccountManager {
                 return UndoMoveWriteResult(
                     restoredOriginalHeaderIds: restoredIds,
                     affectedFolderIds: [sourceFolderId, destinationFolderId],
-                    queuedInverse: !annihilate
+                    queuedInverse: !annihilate,
+                    inverseOpId: inverseOpId,
+                    inverseCreatedAt: inverseCreatedAt
                 )
             }
         } catch {
@@ -2252,6 +2257,30 @@ extension AccountManager {
             return []
         }
         registerDeferredMoveSuccessors(result.deferredSuccessors)
+        // `opId` and `createdAt` are what CORRELATE this inverse with the drain
+        // lines it later produces: `queueLog` prints `id.prefix(8)` and
+        // `buildLanes` orders a lane by `createdAt`, so without both an undo
+        // cannot be matched to the lane it landed in — the gap that made
+        // `IOS-QUEUE-008` unreadable from an exported log. `createdAt` is
+        // rendered as an epoch interval deliberately: sub-second resolution is
+        // what distinguishes a delete from the undo issued a moment later.
+        //
+        // Emitted HERE rather than next to the insert because the write above
+        // can still roll back after the row is inserted, and this sink is
+        // file-backed: `AppLogStore.append` enqueues I/O that no `ROLLBACK`
+        // retracts, so a pre-commit line can name an operation that never
+        // became durable. `providerIds` is the list the write admitted — every
+        // member was authenticated against its `providerMessageId` and the
+        // inverse is queued only when admission returned one target per member,
+        // so it equals `providerIds` here.
+        if let inverseOpId = result.inverseOpId, let inverseCreatedAt = result.inverseCreatedAt {
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] manager.undoMove phase=queuedInverse "
+                    + "from=\(forwardDestinationPath) to=\(sourcePath) "
+                    + "providerIds=[\(providerIds.joined(separator: ","))] "
+                    + "opId=\(inverseOpId) "
+                    + "createdAt=\(inverseCreatedAt.timeIntervalSince1970)")
+        }
         BackgroundSyncLogger.logInbox(
             "[RoleActionTrace] manager.undoMove phase=result "
                 + "restored=[\(result.restoredOriginalHeaderIds.joined(separator: ","))] "

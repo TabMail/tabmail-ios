@@ -232,3 +232,85 @@ written `messageHeader` proves a rolled-back pass leaves NO line and NO row. All
 rollback test goes red; append reclaimed ids to `insertedIds` → the reclaim tests go red). The pure
 suite `SyncEngineUpsertInsertedIdSummaryTests` gained the `verb: "reclaimed"` case; the only
 pre-existing oracle the new shape changed is the update-only line above.
+
+## 2026-09-05 — round 6b (PR #113): every remaining in-write diagnostic line is DELETED
+
+⚠️ Line-format rows recorded in the 2026-09-04 sections above — the six `[MoveTrace] deltaSync`
+branch lines and the five in-write `[Queue]` lines — are **removed 2026-09-05**. Their wordings are
+kept above as history; they no longer describe the tree.
+
+Round 5 fixed the full-sync upsert line's transaction boundary at ONE site. The round-5 correctness
+and robustness angles both then named the SIBLINGS — the Gmail delta arm's six
+`[MoveTrace] deltaSync` lines, the drain's `[Queue] Op … cancelled by undo, deleted`, the four
+`[Queue] Crash recovery: …` lines inside `reconcilePendingOperations`' `retryWrite`, and
+`undoMove`'s `phase=queuedInverse` — and both offered the same two resolutions: delete the
+pre-commit emissions, or carry them out of the write and emit after commit. **The owner chose
+DELETION (2026-09-05 00:30): "this is a debug instrument; on rare occasions it's okay to miss that
+line."**
+
+The mechanism, stated once: `BackgroundSyncLogger.logQueue`/`.logInbox` → `AppLogStore.append`
+enqueues its file write on an independent serial `ioQueue`. No SQLite `ROLLBACK` retracts it. A line
+emitted from inside a `dbPool.write` closure therefore SURVIVES a transaction that later fails (a
+commit-time I/O error, a full disk, a `databaseWillCommit()` refusal), and the exported log then
+asserts an insert, a removal, a skip, a deletion, a crash-recovery cleanup or a queued inverse that
+never became durable. **A debug instrument may miss a line; it must not lie.** Deletion crosses none
+of the three red lines — no unbounded loop or retry, no secret retained or exposed, no older
+intention beating a newer one — because nothing here mutates state.
+
+What was done, exactly:
+
+- **Deleted:** the six `[MoveTrace] deltaSync` calls in `SyncEngine.gmailDeltaSync`'s changed-message
+  write, together with the file-private `deltaMoveTraceLog(_:)` façade and its doc comment; and the
+  five in-write `queueLog` calls (the drain's cancelled-by-undo line and the four crash-recovery
+  lines). The branch structure is unchanged — the three skip arms that held nothing but a log line
+  keep their `else if` and carry a comment instead, because the `recentlyCompleted` arm in
+  particular is what stops a just-completed message from falling through to the insert arm. Two
+  counters that became write-only (`cancelledCount`, `reAdmittedPushes`) are now `_ =`.
+- **Moved, not deleted:** `undoMove`'s `phase=queuedInverse` line pre-dates this branch. It is now
+  emitted AFTER the write returns, from two new optional fields on the existing `UndoMoveWriteResult`
+  (`inverseOpId`, `inverseCreatedAt`) set immediately after `try inverseOp.insert(db)`, guarded on
+  both being non-nil — which is the same condition as "the inverse row committed". The rendered text,
+  its fields and their order are byte-identical, so `UndoProviderIdentitySafetyTests` A3.4 and its
+  locked-gate twin pass unchanged.
+- **Retained shape:** the round-5 `[MoveTrace] fullSync upsert[<folder>] — …` line
+  (`SyncEngineFullSync.swift`) is the reference for how a diagnostic that must survive is written —
+  render inside the write, RETURN it, emit after the write returns.
+- **Attribution after the deletion:** the delta arm now writes NO per-message line. A message that
+  reappears is attributed to the delta arm **by elimination** — the full-sync arm always renders its
+  `fullSync upsert[<folder>] — inserted … | reclaimed …` line when it writes, so a reappearance with
+  no such line naming that id did not come from full sync.
+- **Tests:** `GmailDeltaMoveTraceLogTests` keeps all six of its tests and every durable-DB and
+  history-cursor assertion; only the expectations that required a `[MoveTrace] deltaSync` line, and
+  the now-unused `moveTraceLines` extractor, were removed. No test was added: red-first does not
+  apply to a deletion, and the owner's standing rule is no tests for tests' sake.
+
+### The standing fence
+
+Run from the iOS checkout root. It reports every `queueLog` / `deltaMoveTraceLog` /
+`BackgroundSyncLogger.logQueue|logInbox` call that is lexically inside an open database write, and
+must print exactly **TOTAL 3** — `undoMove`'s `phase=relatedOps`, `phase=deferBehindInFlight` and
+`phase=annihilateQueued`, all of which pre-date this branch and are untouched by it. It printed 15
+on `ef81ee3e5`.
+
+```
+python3 - <<'PY'
+import re,glob
+emit=re.compile(r'BackgroundSyncLogger\.log(Queue|Inbox)\(|queueLog\(|deltaMoveTraceLog\(')
+opener=re.compile(r'(\.write\s*\{|retryWrite\(|\.write\s*\(|\.inTransaction\s*\{|\.inSavepoint\s*\{|\.barrierWriteWithoutTransaction\s*\{)')
+hits=[]
+for f in sorted(glob.glob('TabMail/**/*.swift',recursive=True)):
+    depth=0; stack=[]
+    for i,line in enumerate(open(f).read().split('\n'),1):
+        code=re.sub(r'//.*','',line); code=re.sub(r'"(\\.|[^"\\])*"','""',code)
+        if opener.search(code): stack.append((i,depth))
+        if emit.search(line) and stack: hits.append((f,i,stack[-1][0],line.strip()[:100]))
+        depth+=code.count('{')-code.count('}')
+        while stack and depth<=stack[-1][1]: stack.pop()
+for h in hits: print(f"{h[0]}:{h[1]} (write opened at {h[2]}): {h[3]}")
+print("TOTAL",len(hits))
+PY
+```
+
+⚠️ Those three remaining lines are NOT blessed by this row — they are simply out of this change's
+scope. Whoever next touches `undoMove`'s write should carry them out on the same
+`UndoMoveWriteResult` seam or delete them, not add a fourth.
