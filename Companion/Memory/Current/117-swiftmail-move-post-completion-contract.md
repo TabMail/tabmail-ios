@@ -1,3 +1,18 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note (2026-09-04, GitHub #115): the first and third bullets below are HALF
+> wrong and are corrected here; the body is preserved unedited.** Only
+> `.moveFailedAfterPartialCompletion(copyUID:reason:)` is non-retryable — it carries positive
+> `COPYUID` evidence, and TabMail still retires on it and reconciles both folders.
+> `.moveFailedAfterPossiblePartialCompletion` is raised for ANY tagged NO/BAD with no retained
+> `COPYUID`, including a refusal answered before any mutation (a transport loss between the pre-move
+> `SELECT` and the `UID MOVE` makes `IMAPConnection.executeCommandBody` re-open a raw channel with no
+> LOGIN/SELECT, and the server answers `NO No mailbox selected`). Treating it as non-retryable dropped
+> the user's move (`3f6a0a5a8`; `MIS-IOS-004` recurrence). #115 deletes that arm: the error is a
+> typed, retryable failure (`IOS-IMAP-013`), the op stays queued, and the next drain reissues
+> `UID MOVE` — safe because RFC 3501 §6.4.8 ignores absent UIDs and §2.3.1.1 forbids UID reuse within
+> an epoch; the residual duplicate on a server that violates RFC 6851 §3.3 is accepted under
+> `IOS-IMAP-006` / `IOS-QUEUE-007`.
+<!-- COMPANION-CURRENT-NOTE-END -->
 # SwiftMail MOVE post-completion contract — PR #208
 
 - `IMAPError.moveFailedAfterPossiblePartialCompletion` and

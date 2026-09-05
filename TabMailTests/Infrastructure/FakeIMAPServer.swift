@@ -221,6 +221,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         var disconnectAfterUIDMoveCommitCount = 0
         /// SwiftMail PR #208's post-completion failure contract. The mutation
         /// lands first; only the evidence accompanying tagged NO differs.
+        /// Fires on the NEXT UID MOVE only, then clears (#115): a retry is
+        /// served normally, which is what lets a test assert that the queue
+        /// CONVERGES after the failure rather than counting commands.
         var moveFailureAfterCommit: MoveFailureAfterCommit = .none
         /// Whether UID SEARCH honours the RFC 3501 §6.4.4 `SINCE` / `BEFORE` date
         /// keys. `false` for every pre-existing test: this fake has always answered
@@ -894,14 +897,19 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.disconnectAfterUIDMoveCommitCount += 1 }
     }
 
-    /// Commit UID MOVE, then answer tagged NO without trustworthy COPYUID
-    /// evidence. A caller must reconcile both mailboxes and must not resend.
+    /// Commit the next UID MOVE, then answer tagged NO without any COPYUID
+    /// evidence. One-shot. SwiftMail raises the identical error for a NO that
+    /// mutated NOTHING (a refusal on a raw re-established channel), so a caller
+    /// cannot read it as a disposition — it must stay retryable (#115). The
+    /// retry then finds the source empty and lands nothing new (RFC 3501
+    /// §6.4.8), which is the convergence a test asserts.
     func failUIDMoveAfterPossiblePartialCompletion() {
         withState { $0.moveFailureAfterCommit = .possiblePartialCompletion }
     }
 
-    /// Commit UID MOVE, publish its COPYUID in an untagged OK, then answer
-    /// tagged NO. A caller may retain that mapping but must not resend.
+    /// Commit the next UID MOVE, publish its COPYUID in an untagged OK, then
+    /// answer tagged NO. One-shot. A caller may retain that mapping — it is the
+    /// server's own statement of which members moved.
     func failUIDMoveAfterVerifiedPartialCompletion() {
         withState { $0.moveFailureAfterCommit = .verifiedPartialCompletion }
     }
@@ -1996,12 +2004,16 @@ final class FakeIMAPServer: @unchecked Sendable {
                 state.messagesByMailbox[destination] = destinationMessages
                 state.flagsByMailbox[mailbox] = sourceFlags
                 state.flagsByMailbox[destination] = destinationFlags
+                // One-shot: the NEXT UID MOVE is the one that fails after
+                // committing; a retry is served normally (#115).
+                let failureAfterCommit = state.moveFailureAfterCommit
+                state.moveFailureAfterCommit = .none
                 return (
                     pairs,
                     state.uidValidityByMailbox[destination] ?? 1,
                     state.moveUidWithheldSourceUIDs,
                     state.moveUidCardinalityMismatch,
-                    state.moveFailureAfterCommit)
+                    failureAfterCommit)
             }
             let reported = moved.filter { !withheld.contains($0.source) }
             if case .possiblePartialCompletion = failureAfterCommit {

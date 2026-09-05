@@ -2,7 +2,7 @@ id	state	class	severity	recurrences	path	title
 MIS-IOS-001	Active	data-integrity	critical (brick)	2	Active/MIS-IOS-001-appended-to-an-already-applied-migration.md	I edited a migration that had already run, and bricked launch
 MIS-IOS-002	Active	data-integrity	critical (data loss)	1	Active/MIS-IOS-002-date-window-for-imap-sync.md	I windowed an IMAP sync query by date and deleted months of Archive
 MIS-IOS-003	Active	design-process	high	4	Active/MIS-IOS-003-reconstructed-an-address-the-wire-already-gave-us.md	I designed machinery to reconstruct an address the server already told us
-MIS-IOS-004	Active	data-integrity	critical (dropped user intention)	many	Active/MIS-IOS-004-conflated-unknown-with-authoritative-stale.md	I treated "I could not determine the answer" as "the provider said it's done"
+MIS-IOS-004	Active	data-integrity	critical (dropped user intention)	many (+1, 2026-09-04, #115)	Active/MIS-IOS-004-conflated-unknown-with-authoritative-stale.md	I treated "I could not determine the answer" as "the provider said it's done"
 MIS-IOS-005	Active	build-ops	high	2	Active/MIS-IOS-005-bare-xcodegen-broke-nse-signing.md	I ran `xcodegen generate` and silently killed smart push
 MIS-IOS-006	Active	testing	high	4	Active/MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md	I reported a test count from a bundle that never rebuilt
 MIS-IOS-007	Active	review-discipline	high	1	Active/MIS-IOS-007-read-the-first-create-table-as-the-effective-schema.md	I read the first `create(table:)` as the effective schema, after a later migration had replaced it

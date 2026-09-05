@@ -277,8 +277,17 @@ struct IMAPMoveWireContractTests {
         #expect(server.wrongMessageViolations().isEmpty)
     }
 
-    @Test("A tagged failure after possible partial UID MOVE completes without evidence and requires source reconciliation")
-    func atomicPossiblePartialCompletionIsNotRetryable() async throws {
+    /// GitHub #115. A tagged NO with no `COPYUID` is an absence of evidence:
+    /// SwiftMail raises the same `moveFailedAfterPossiblePartialCompletion` for
+    /// a refusal that mutated nothing, so the provider must not claim the
+    /// members are dispositioned. It throws and the queue requeues. Here the
+    /// server DID commit before its NO — the world state in which a retry
+    /// could, on a non-conforming server, duplicate — and the property is that
+    /// it does not: RFC 3501 §6.4.8 ignores the retry's now-absent UID, so the
+    /// destination ends with exactly one copy and the source empty. The number
+    /// of `UID MOVE` commands it took is the mechanism and is not asserted.
+    @Test("A tagged NO after a committed UID MOVE with no COPYUID is retryable, and the retry lands exactly one destination copy")
+    func atomicPossiblePartialCompletionIsRetriedToExactlyOneCopy() async throws {
         let target = "atomic-possible-partial@example.com"
         let server = FakeIMAPServer(mailboxes: [
             "Work": [Self.message(11, target)],
@@ -293,13 +302,18 @@ struct IMAPMoveWireContractTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        let outcome = try await provider.move(
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.move(
+                ids: ["11"], from: "Work", to: "Archive",
+                admittedUidValidity: Self.epoch)
+        }
+        let retry = try await provider.move(
             ids: ["11"], from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
 
-        #expect(outcome.provenIds == ["11"])
-        #expect(outcome.provenDestinations.isEmpty)
-        #expect(outcome.requiresSourceReconciliation)
-        #expect(Self.commands(server, containing: "UID MOVE").count == 1)
+        #expect(retry.provenIds == ["11"])
+        #expect(Self.commands(server, containing: "UID COPY").isEmpty)
+        #expect(Self.deletedStores(server).isEmpty)
+        #expect(Self.anyExpunges(server).isEmpty)
         #expect(server.messageIDs(in: "Work").isEmpty)
         #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
         #expect(server.wrongMessageViolations().isEmpty)

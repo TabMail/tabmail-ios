@@ -1194,19 +1194,57 @@ struct NeverDropExitClosureTests {
 
     // MARK: - SwiftMail PR #208 — tagged failure after MOVE changed state
 
-    /// PR #208 distinguishes a normal tagged failure from a MOVE whose server
-    /// state may already have changed. Neither form below may re-enter the
-    /// durable queue: reissuing the original source UIDs can duplicate a moved
-    /// message or address a later occupant. The only safe disposition is to
-    /// retire the attempt and reconcile both affected mailboxes, retaining the
-    /// server's COPYUID mapping when one survived.
-    @Test("A possibly-partial UID MOVE is reconciled and never re-issued")
+    /// PR #208 distinguishes two tagged failures after a MOVE that may already
+    /// have changed server state, and they are NOT one class (GitHub #115):
+    ///  - `moveFailedAfterPartialCompletion(copyUID:)` carries the server's own
+    ///    `COPYUID` for the members it moved. That IS a fact the provider
+    ///    asserted, so the attempt retires with its verified mapping and both
+    ///    mailboxes are reconciled — `aVerifiedPartialAtomicMoveIsNeverReissued`.
+    ///  - `moveFailedAfterPossiblePartialCompletion` is raised for ANY tagged
+    ///    NO/BAD with no retained `COPYUID`, including a refusal that mutated
+    ///    nothing. It is an absence of evidence, so the op stays queued and is
+    ///    retried; the property is that the retry CONVERGES — exactly one
+    ///    destination copy, source empty, queue empty — never how many wire
+    ///    attempts that took. The zero-mutation form is pinned by
+    ///    `aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt` below; this
+    ///    one is the committed-then-NO world state, where a retry could
+    ///    duplicate on a server that violates RFC 6851 §3.3 and must not on a
+    ///    conforming one (RFC 3501 §6.4.8 ignores the now-absent UID).
+    @Test("A possibly-partial UID MOVE converges to exactly one destination copy with the queue empty")
     @MainActor
-    func aPossiblyPartialAtomicMoveIsNeverReissued() async throws {
-        try await assertPostCommitAtomicMoveFailureIsNeverReissued(
-            accountId: "closure-atomic-possible-partial",
-            target: "atomic-possible-partial@example.com",
-            configure: { $0.failUIDMoveAfterPossiblePartialCompletion() })
+    func aPossiblyPartialAtomicMoveConvergesToExactlyOneDestinationCopy() async throws {
+        let target = "atomic-possible-partial@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 77, id: target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Archive")
+        // The fake COMMITS the move, then answers tagged NO with no COPYUID.
+        server.failUIDMoveAfterPossiblePartialCompletion()
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "closure-atomic-possible-partial")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let move = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        try insert([move], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+        await AccountManager.shared.drainPendingQueue()
+
+        let archive = server.messageIDs(in: "Archive")
+        #expect(archive == ["<\(target)>"], "expected exactly one destination copy: \(archive)")
+        #expect(server.messageIDs(in: "INBOX").isEmpty)
+        let remaining = try operations(f.pool)
+        #expect(remaining.isEmpty, "the move did not retire after converging: \(remaining.map(\.type))")
+        #expect(server.wrongMessageViolations().isEmpty)
+
+        try? await provider.disconnect()
+        await finish(f)
     }
 
     @Test("A COPYUID-proven partial UID MOVE is reconciled and never re-issued")
@@ -1265,6 +1303,98 @@ struct NeverDropExitClosureTests {
         #expect(try operations(f.pool).isEmpty)
         #expect(server.messageIDs(in: "INBOX").isEmpty)
         #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
+        #expect(server.wrongMessageViolations().isEmpty)
+
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    // MARK: - #115 — a tagged NO with no COPYUID evidence is a refusal, not a disposition
+
+    /// GitHub #115. SwiftMail raises `moveFailedAfterPossiblePartialCompletion`
+    /// for ANY tagged NO/BAD on `UID MOVE` that carried no `COPYUID` — including
+    /// a refusal the server answered before touching either mailbox. The
+    /// production shape: a transport loss in the one-RTT window between the
+    /// pre-move `SELECT` and the `UID MOVE` makes SwiftMail re-open a raw
+    /// channel (no LOGIN, no SELECT) and send the MOVE anyway, and the server
+    /// answers `NO No mailbox selected` with zero mutation. The provider used to
+    /// catch that case and retire every member as dispositioned: the queue
+    /// emptied, the message stayed in the source folder on the server, and the
+    /// UI had already shown the move as done — a dropped intention by none of
+    /// the four exits (`MIS-IOS-004`; `IOS-IMAP-013`'s recorded disposition is
+    /// that a tagged NO/BAD stays a typed, retryable failure).
+    ///
+    /// THE PROPERTY, in two halves: the intention survives the refusal (still
+    /// queued, nothing moved), and it is actually re-attemptable — the next
+    /// drain lands the message in the destination exactly once, with the
+    /// source empty and the queue empty. The `UID MOVE` count is deliberately
+    /// NOT asserted: how many wire attempts convergence takes is the mechanism.
+    ///
+    /// `failNextCommand` answers the injected NO BEFORE the fake's handler runs,
+    /// so the first attempt mutates nothing — the exact world state the fuzzer
+    /// observed (`providerIdQueueFuzz`, seed `0x70D8000000000002`).
+    ///
+    /// RED PROOF (recorded, #115): on the pre-fix provider the first drain
+    /// retires the op with the message still in INBOX — `operations(f.pool)` is
+    /// empty after the refused drain and Archive is still empty after both.
+    @Test("A UID MOVE refused before any mutation stays queued, and the next drain lands it")
+    @MainActor
+    func aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt() async throws {
+        let target = "atomic-refused-before-mutation@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 77, id: target)],
+            "Archive": [],
+        ])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Archive")
+        // Exactly ONE refusal, answered before the handler runs: the first
+        // UID MOVE is refused with zero mutation, every later one is served.
+        server.failNextCommand(containing: "UID MOVE", message: "No mailbox selected")
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "closure-atomic-refused")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let move = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        try insert([move], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // HALF 1 — the intention survived the refusal, and nothing moved.
+        let afterRefusedDrain = try operations(f.pool)
+        #expect(
+            afterRefusedDrain.map(\.id) == [move.id],
+            """
+            a tagged NO that carried no COPYUID evidence retired the durable move — an absence of \
+            evidence was read as a provider disposition, which is none of the four exits — \
+            remaining ops: \(afterRefusedDrain.map(\.type))
+            """)
+        let inboxAfterRefusal = server.messageIDs(in: "INBOX")
+        #expect(
+            inboxAfterRefusal == ["<\(target)>"],
+            "the refused UID MOVE must have mutated nothing: INBOX=\(inboxAfterRefusal)")
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+
+        // The second drain is the retry boundary (`failedAccounts` is per drain).
+        await AccountManager.shared.drainPendingQueue()
+
+        // HALF 2 — and it was actually re-attemptable: the message is in the
+        // destination exactly once, the source is empty, the queue is empty.
+        let archiveAfterRetry = server.messageIDs(in: "Archive")
+        #expect(
+            archiveAfterRetry == ["<\(target)>"],
+            "the retry did not land exactly one copy in Archive: \(archiveAfterRetry)")
+        let inboxAfterRetry = server.messageIDs(in: "INBOX")
+        #expect(
+            inboxAfterRetry.isEmpty,
+            "the message is still in the source after the retry: \(inboxAfterRetry)")
+        let afterRetryDrain = try operations(f.pool)
+        #expect(
+            afterRetryDrain.isEmpty,
+            "the op did not retire after the move actually landed: \(afterRetryDrain.map(\.type))")
         #expect(server.wrongMessageViolations().isEmpty)
 
         try? await provider.disconnect()
