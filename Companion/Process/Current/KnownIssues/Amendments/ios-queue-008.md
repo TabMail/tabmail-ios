@@ -314,3 +314,14 @@ PY
 ⚠️ Those three remaining lines are NOT blessed by this row — they are simply out of this change's
 scope. Whoever next touches `undoMove`'s write should carry them out on the same
 `UndoMoveWriteResult` seam or delete them, not add a fourth.
+
+## 2026-09-05 — the undo rollback boundary now has a witness
+
+`UndoProviderIdentitySafetyTests.queuedInverseDiagnosticIsAbsentWhenTheUndoWriteRollsBack` pins the
+boundary the "Moved, not deleted" bullet above created: a GRDB `TransactionObserver` refuses the
+COMMIT of the transaction that inserted the inverse `PendingOperation`, and the test asserts that
+`undoMove` restores nothing, that no inverse row is durable, that the header still sits at its
+pre-undo address, and that `AppLogStore.read(channel: .inbox)` carries NO `phase=queuedInverse`
+line. It is RED when that emission is moved back next to `try inverseOp.insert(db)` — the
+pre-`7b848ab5d` shape, same fields — which until 2026-09-05 nothing in the tree could tell apart
+from the committed one.

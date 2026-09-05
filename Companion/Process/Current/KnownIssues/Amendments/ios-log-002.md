@@ -116,3 +116,14 @@ inserted, removed or skipped a message. A debug instrument may miss a line; it m
 
 Search terms for this amendment: `deltaMoveTraceLog` removed 2026-09-05; two `.queue` writers not
 three; in-write emission survives rollback; deletion-first; PR #113 round 6b.
+
+## 2026-09-05 — the upsert line's two replaced-row `inserted` contributions now have witnesses
+
+`SyncEngineFullSyncUpsertDiagnosticTests.fullSyncUpsertNamesTheDraftDedupReplacementUnderInserted`
+and `SyncEngineFullSyncUpsertDiagnosticTests.fullSyncUpsertNamesThePreSyncReplacementUnderInserted`
+pin the invariant that the `[MoveTrace] fullSync upsert[<folder>]` line names, under `inserted`,
+every row full sync CREATED — including the canonical row that replaced a DraftDedup placeholder and
+the canonical row that replaced a drifted pre-sync inbox row — never reports either under
+`reclaimed`, and names the deleted old ids nowhere. Each case is RED when its own
+`insertedIds.append(header.id)` is deleted, and the DraftDedup case is RED again when that append is
+rerouted to `reclaimedIds`; until 2026-09-05 either edit passed every test in the tree.
