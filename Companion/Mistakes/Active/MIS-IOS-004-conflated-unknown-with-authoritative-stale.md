@@ -2,7 +2,7 @@
 
 **Class:** data-integrity
 **Severity:** critical (dropped user intention)
-**First seen:** ongoing · **Recurrences:** many · **Status:** Active
+**First seen:** ongoing · **Recurrences:** many (+1, 2026-09-04, GitHub #115) · **Status:** Active
 **Related:** [MIS-IOS-003](MIS-IOS-003-reconstructed-an-address-the-wire-already-gave-us.md) · **Rule owner:** `Companion/Rules/Active/never-drop-user-intention.md`
 
 > **`CLAUDE.md` calls this "the single most repeated defect in this codebase's history."** It has its
@@ -115,6 +115,46 @@ repeat of the gesture enqueues the same dead id and is dropped identically. Regi
 **Mirror-image trap, named because it is the obvious fix:** merely reclassifying the 404 as *retryable*
 converts a silent drop into a **lane wedge** (`buildLanes` keys on `accountId:folderPath:messageId`),
 and a starved op is also a dropped intention. It is the **re-key** that makes retry terminate.
+
+## Instance (2026-09-04, GitHub #115) — a tagged NO on a raw re-established channel read as "possibly partially completed", and retired
+
+`IMAPProvider.move`'s atomic route caught `IMAPError.moveFailedAfterPossiblePartialCompletion` and
+returned `MoveOutcome(provenIds: ids, provenDestinations: [], requiresSourceReconciliation: true)` —
+every member retired as dispositioned (`3f6a0a5a8`, 2026-08-13). SwiftMail raises that error for
+**any** tagged NO/BAD on `UID MOVE` with no retained `COPYUID`. The fuzzer (`providerIdQueueFuzz`,
+seed `0x70D8000000000002`, under full-suite load) produced the case where nothing happened at all: a
+`disconnect()` landed in the one-RTT window between the pre-move `SELECT` and the `UID MOVE`,
+SwiftMail's `executeCommandBody` re-opened a raw channel (no LOGIN, no SELECT) and sent the MOVE, and
+the fake answered `NO No mailbox selected` before its handler ran — zero mutation. The arm took the
+success path; the queue emptied with the message still in INBOX on the server and the UI already
+showing success. The `IntentionLedger` settled `UNACCOUNTED (stillQueued=false endStateAchieved=false)`.
+
+**The tell, this time:** the arm's own comment said *"the server MAY already have changed either
+mailbox but supplied no trustworthy mapping"*. A retirement justified by what the server *may* have
+done is a retirement on an absence of evidence. The sibling arm one line above,
+`moveFailedAfterPartialCompletion(copyUID:)`, is the shape that IS exit 2: it names the members the
+server *did* move. Two adjacent catch arms, one carrying evidence and one carrying a possibility,
+handled identically — the same one-site asymmetry the 2026-08-04 UIDNEXT instance describes.
+
+**What the countermeasure missed:** the arm landed WITH tests
+(`IMAPMoveWireContractTests.atomicPossiblePartialCompletionIsNotRetryable`,
+`NeverDropExitClosureTests.aPossiblyPartialAtomicMoveIsNeverReissued`), but both drove a fake that
+COMMITS the move and then answers NO, so both pinned the one world state in which retiring is
+harmless and asserted the mechanism (`moves.count == 1`, `provenIds == ids`). Neither exercised a NO
+with zero mutation — the world state every transport-level refusal produces. A test that blesses the
+mechanism inherits the spec's error. The arm also silently reversed the recorded `IOS-IMAP-013`
+disposition ("a tagged NO/BAD remains a typed failure; the durable operation stays queued") without
+amending the register.
+
+**Fix (#115): delete the arm.** The error falls into the generic `catch` and is rethrown;
+`executeSingleOp` requeues and halts the lane; the next drain retries with a fresh LOGIN/SELECT.
+Retrying `UID MOVE` is safe (RFC 3501 §6.4.8 ignores absent UIDs, §2.3.1.1 forbids UID reuse within
+an epoch, an epoch change is exit 4); the residual duplicate on a server that violates RFC 6851 §3.3
+is already accepted (`IOS-IMAP-006`, `IOS-QUEUE-007`). Pinned by
+`NeverDropExitClosureTests.aRefusedAtomicMoveStaysQueuedAndTheNextDrainLandsIt` (red on the pre-fix
+provider). Sibling of the same shape, NOT fixed here: `AccountManagerQueue.reconcilePendingOperations`
+deletes an attempted in-flight `.move` at launch "instead of risking a duplicate" — the arm cited it
+as precedent.
 
 ---
 

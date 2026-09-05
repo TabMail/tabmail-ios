@@ -4703,26 +4703,39 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                             provenDestinations: Self.copyProvenDestinations(
                                 copyUID, requested: sourceUIDs),
                             requiresSourceReconciliation: true)
-                    } catch IMAPError.moveFailedAfterPossiblePartialCompletion {
-                        // The server may already have changed either mailbox but
-                        // supplied no trustworthy mapping. The only safe bound is
-                        // the same one used for an interrupted in-flight MOVE at
-                        // launch: never resend these source UIDs; retire the
-                        // attempt and converge from fresh source + destination
-                        // state. The user's visible remainder can then be issued
-                        // as a new, freshly-addressed gesture.
-                        if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] Atomic MOVE may have partially completed; reconciling both mailboxes without retry")
-                        }
-                        return MoveOutcome(
-                            provenIds: ids,
-                            provenDestinations: [],
-                            requiresSourceReconciliation: true)
                     } catch {
                         // A tagged failure is terminal only when an exact LIST
                         // proves the destination disappeared. Transport loss,
                         // permission failures and every other unknown remain
                         // retryable; critically, none can enter COPY fallback.
+                        //
+                        // 🚨 THAT INCLUDES `IMAPError.moveFailedAfterPossiblePartialCompletion`
+                        // (GitHub #115). SwiftMail raises it for ANY tagged NO/BAD
+                        // on `UID MOVE` with no retained `COPYUID` — including a
+                        // refusal answered before either mailbox was touched: a
+                        // transport loss between the A3' SELECT above and the
+                        // MOVE makes `IMAPConnection.executeCommandBody` re-open
+                        // a raw channel (no LOGIN, no SELECT) and send the
+                        // command anyway, and the server answers
+                        // `NO No mailbox selected` with zero mutation. An arm
+                        // here used to retire every member on that error
+                        // (`3f6a0a5a8`): the queue emptied with the message still
+                        // in the source and the UI already showing success — a
+                        // dropped intention by none of the four exits. The
+                        // invariant: a tagged NO WITHOUT `COPYUID` evidence is an
+                        // absence of evidence, so it is retryable, never
+                        // authoritative; only the `COPYUID`-bearing sibling arm
+                        // above carries a fact the server asserted.
+                        //
+                        // A retried `UID MOVE` is safe: RFC 3501 §6.4.8 ignores
+                        // a UID that no longer exists (an already-moved member is
+                        // skipped, not duplicated), §2.3.1.1 forbids UID reuse
+                        // within an epoch, and an epoch change is refused by the
+                        // retry's own A1/A3' `requireUidValidity` (exit 4). The
+                        // only residual is a duplicate on a server that left a
+                        // member in BOTH mailboxes, which RFC 6851 §3.3 says a
+                        // server SHOULD NOT do — accepted under `IOS-IMAP-006` /
+                        // `IOS-QUEUE-007`, one delete to recover.
                         guard await self.mailboxConfirmedAbsent(
                             destination, server: server) else { throw error }
                         throw IMAPActionMailboxAbsent()
