@@ -1,3 +1,38 @@
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **AMENDMENT (2026-09-05) — the closed decision STANDS, and its stated precondition is now met.**
+> The body below is preserved unedited (it is regenerated from the hash-pinned archive and
+> byte-compared); this block only adds what changed. Record:
+> [`Amendments/ios-graph-005.md`](Amendments/ios-graph-005.md) (`IOS-GRAPH-005`, GitHub `#114`).
+>
+> **Nothing in the decision is reopened.** `deleteConfirmedGoneHeader` is UNCHANGED, `isConfirmedGoneError`
+> is UNCHANGED and was not widened to its string-matching branch, and the header delete was not made
+> more eager — the three things this row explicitly forbids. The closure reasoning (everything deleted
+> is re-derivable server state; no user-authored content; C3 not reached; the four-exit lattice does
+> not govern this limb) is untouched.
+>
+> **The precondition is met.** This row says: *"If this is fixed later, fix `IOS-GRAPH-002` first — a
+> re-key removes the precondition for path (1) entirely."* `IOS-GRAPH-002` is fixed (`cfe6720be`) and
+> as of 2026-09-05 its re-key also follows the row out of the destination folder and re-addresses the
+> queued operations that named the moved message. **The reachable paths narrow accordingly:**
+>
+> - **Path (1) — a retry of the move op after its wire call already landed** — now requires the
+>   process to die between Graph's `2xx` and the retirement commit. That window is owner-accepted
+>   (2026-09-04) and stated in the source beside `MessageHeaderRekey.readdressQueuedOperations`; note
+>   that on relaunch `reconcilePendingOperations` DROPS the interrupted `.move` rather than retrying
+>   it, which is itself tracked as [#116](https://github.com/TabMail/tabmail-ios/issues/116). So the
+>   path survives only as the crash window, not as an ordinary drain outcome.
+> - **Path (2) — a message whose Graph id churned because something ELSE moved it** (Outlook desktop,
+>   OWA, a server-side rule) — is UNCHANGED and unreachable by any local fix, because no local wire
+>   response ever carried that address. It remains the honest residual, with this row's own narrowing
+>   still the right one: a `404` proves "no message at this address", which on a folder-scoped-id
+>   provider is weaker than "this message is gone".
+> - **The third path** — move S→D then D→S with both dropped, then a gesture from S — depended on
+>   both moves being dropped, which the re-key and the queue handoff prevent for the ordinary case.
+>
+> **The post-move second-gesture path no longer produces a 404 for a follower queued before
+> retirement**, which was the largest producer of this arm's input. The date-windowed recovery gap
+> this row shares with `IOS-GRAPH-002` is unchanged in mechanism; it is simply reached far less often.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-GRAPH-003
 
 > Routed from `KNOWN_ISSUES.md` line 648 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).

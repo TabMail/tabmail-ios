@@ -120,3 +120,40 @@ Recorded because a later reader will otherwise re-propose the banned mechanism:
 So A1 step 3 applies as **INAPPLICABLE** (the release *had* an answer and v3 outlawed it), not
 **nonexistent**. Authoring was correct here, and saying *which* is what stops the next reader from
 "restoring" a banned search.
+
+## 2026-09-05 — the handoff now reaches the QUEUE and the row wherever it sits
+
+Re-learning the address was only half of it. `cfe6720be` stopped discarding Graph's new `id` and
+re-keyed the header with it; two holders of the OLD address were still left behind, and both are now
+served from the same chokepoint. **ADR-IOS-081**
+([`adr-ios-081.md`](../../Decisions/V3/Active/adr-ios-081.md)) and `IOS-GRAPH-005`
+([`Amendments/ios-graph-005.md`](../../Process/Current/KnownIssues/Amendments/ios-graph-005.md),
+GitHub `#114`):
+
+1. **The queued operations that named the old id.** `MessageHeaderRekey.finishMove` now also runs
+   `readdressQueuedOperations`: in the SAME transaction that re-keys the header and retires the move,
+   every non-cancelled same-account `PendingOperation` naming a proven source id has each such member
+   replaced by its mapped destination id. This page's own sentence *"nothing re-learns the new
+   id"* had a sibling — *nothing re-addresses the operations that already named the old one* — and
+   that one outlived the fix.
+2. **The header row, when it is no longer where the operation put it.** On an account-scoped provider
+   the member is located by `(accountId, messageId)` and re-keyed in the folder it CURRENTLY
+   occupies, not by primary key at the operation's destination path. The case that needed it is an
+   undo landing while the forward move is still in flight. ⚠️ The IMAP arm keeps the destination
+   clause byte-for-byte: a UID is mailbox-local, so a row that moved is a DIFFERENT message and
+   re-keying it would be a C3 wrong-message mutation. Same clause, opposite meaning, two address
+   spaces — which is this page's thesis, applied one level deeper.
+
+**The classifier's name was carrying the confusion.** `AccountManager.immutableIdAccountIds` is now
+`accountScopedIdAccountIds`. Graph ids are **folder-independent but not immutable**; the drain lane
+needs the first property and the address needs the second, and naming the set after the property it
+does not have is why Outlook sat outside the lane fix for a day. With the handoff in place `.outlook`
+is admitted — the two changes are ONE fix and must never be split, because the lane change alone
+converts an inherited race into a deterministic dropped intention.
+
+**Still true, still the fail direction:** the Graph epoch stays NIL, the 404 classification is
+untouched, and `Prefer: IdType="ImmutableId"` was NOT adopted
+([#117](https://github.com/TabMail/tabmail-ios/issues/117)). One window is owner-accepted: process
+death between Graph's `2xx` and the retirement commit leaves that move's followers on a dead id
+(stated in the source beside `readdressQueuedOperations`; the launch-time drop it relies on is
+[#116](https://github.com/TabMail/tabmail-ios/issues/116)).

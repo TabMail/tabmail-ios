@@ -1,3 +1,55 @@
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **AMENDMENT (2026-09-05) — the re-key this row prescribed now also FOLLOWS THE ROW, and the
+> queue is re-addressed with it.** The body below is preserved unedited (it is regenerated from the
+> hash-pinned archive and byte-compared); this block only adds what changed. Record:
+> [`Amendments/ios-graph-005.md`](Amendments/ios-graph-005.md) (`IOS-GRAPH-005`, GitHub `#114`).
+>
+> **What this row's fix left standing.** `cfe6720be` stopped discarding the address Graph's `/move`
+> response supplies, and `MessageHeaderRekey.finishMove` re-keys the header with it. Two gaps
+> survived, and both are now closed:
+>
+> 1. **The re-key was keyed to the operation's DESTINATION folder.** `finishMove`'s G3 clause fetches
+>    the member by primary key at `op.destinationPath`, so a row that had already left that folder —
+>    most commonly because an UNDO put it back in the source folder while the forward move was still
+>    in flight — was declined, and it kept the dead id. On an account-scoped provider the member is
+>    now located by `(accountId, messageId)` and re-keyed in the folder it CURRENTLY occupies,
+>    requiring exactly one match (zero is the ordinary "already gone" case; two or more declines).
+>    ⚠️ **The IMAP arm is byte-for-byte unchanged** and G3's folder clause is correct there for the
+>    opposite reason: a UID is mailbox-local, so a row that is not where the operation put it is a
+>    DIFFERENT physical message and re-keying it would be a C3 wrong-message mutation.
+> 2. **Nothing rewrote a later `PendingOperation.messageIds`** — this row's own words, and the exact
+>    sentence the `IOS-QUEUE-008` amendment cited when it excluded Outlook from account-qualified
+>    lanes. It is now false by construction: in the SAME transaction that re-keys the header and
+>    retires the move, every non-cancelled same-account queued operation naming a proven source id
+>    has each such member replaced by its mapped destination id
+>    (`MessageHeaderRekey.readdressQueuedOperations`, reported in
+>    `MoveFinishResult.readdressedOperationIds`).
+>
+> **The residual this row named is therefore closed for the ordinary path.** The row's reachability
+> paragraph lists "any two gestures on one message before the destination folder syncs — offline
+> triage drained together on reconnect; a swipe in Inbox followed by a swipe in Archive; an undo of a
+> drained move". None of those now produces a dead id on the wire: the follower is re-addressed
+> before it is executed, and the drain re-reads each operation by primary key immediately before
+> executing it so it cannot run a stale captured struct. The row's closing note that "the date-windowed
+> reachability is unchanged by this commit — the re-key is what makes that repair unnecessary" is now
+> true of the QUEUE as well as the header.
+>
+> **What is NOT closed.** Mirror-image trap 2 stands: `Prefer: IdType="ImmutableId"` was still NOT
+> adopted, for the account-wide migration reasons this row enumerates, and it remains the structural
+> fix — tracked as [#117](https://github.com/TabMail/tabmail-ios/issues/117). The 404 classification
+> is still untouched (trap 1), so no lane wedge was introduced. One window survives and is
+> owner-accepted (2026-09-04), stated in the source beside `readdressQueuedOperations`: process death
+> between Graph's `2xx` and the retirement commit leaves that move's queued followers on a dead id.
+> It is bounded to one process death inside one write and is strictly narrower than the pre-handoff
+> loss; the launch-time drop of the interrupted move it relies on is
+> [#116](https://github.com/TabMail/tabmail-ios/issues/116).
+>
+> **Renamed symbol, so a future `rg` finds the right thing:** `AccountManager.immutableIdAccountIds`
+> is now `AccountManager.accountScopedIdAccountIds`, and it admits `.outlook`. The property the lane
+> key needs is "one provider id names one message per ACCOUNT", not "the id survives a move" — Graph
+> satisfies the first and violates the second, which is the conflation this row's subsystem line
+> already warned about.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-GRAPH-002
 
 > Routed from `KNOWN_ISSUES.md` line 647 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).

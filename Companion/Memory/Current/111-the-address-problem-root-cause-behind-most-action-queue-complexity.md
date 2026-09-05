@@ -72,3 +72,4 @@ that was available on the wire all along.
 
 ---
 
+> **2026-09-05 pointer.** The same question — *did the wire already hand you the answer?* — had one more unanswered holder: the OPERATIONS queued behind the move, and the header row once an undo had moved it out of the destination folder. Both are now served from the retirement transaction, and Outlook is on account-qualified drain lanes as a result. **ADR-IOS-081** / `IOS-GRAPH-005` ([`Amendments/ios-graph-005.md`](../../Process/Current/KnownIssues/Amendments/ios-graph-005.md), GitHub `#114`); topic 108 carries the Graph-side detail.
