@@ -160,3 +160,18 @@ exactly one destination copy, an empty source, an empty queue, no `UID COPY`, no
 no expunge, no wrong-message mutation — and never a MOVE count. `FakeIMAPServer.moveFailureAfterCommit`
 is one-shot so the retry is served normally. The verified-form test named in the 2026-08-13 block is
 unchanged.
+
+## 2026-09-05 (round 4b) — two witnesses the round-3 test-coverage review found missing
+
+`NeverDropExitClosureTests.aPermanentlyRefusedAtomicMoveParksOnlyItsOwnLane` now asserts the
+per-drain attempt bound EXACTLY rather than as a lower bound — one `UID MOVE` on the wire, one
+consumed refusal and `retryCount == 1` after the first drain, and one consumed refusal and one
+retry per drain across the four — because the productive bystander lane keeps the outer drain loop
+looping, so only `DrainContext.evidenceRefused` stops a second attempt in the same pass and a `>=`
+form could not reject one. The new
+`NeverDropExitClosureTests.aPartiallyCompletedAtomicMoveKeepsEveryMemberAndConvergesOnRetry`
+is the suite's first genuinely PARTIAL batch (RFC 6851 §3.3): the one-shot
+`FakeIMAPServer.failUIDMoveAfterPossiblePartialCompletion(committingOnlyFirst:)` seam commits only
+the first requested member before the uncoded `NO`, and the test pins that the requeued operation
+keeps BOTH members, its source, destination and epoch, and that the next drain converges each member
+to exactly one destination copy with no `UID COPY`, no `\Deleted` store and no expunge.

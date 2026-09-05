@@ -1247,6 +1247,145 @@ struct NeverDropExitClosureTests {
         await finish(f)
     }
 
+    /// #115 round 4b (round-3 test-coverage finding). Every other
+    /// possible-partial witness in this suite moves a SINGLE message, so the
+    /// server either mutated nothing or mutated everything: the "partial" the
+    /// error is named for was never actually reproduced. RFC 6851 §3.3 permits
+    /// the real shape — a `UID MOVE` may move SOME of the requested members and
+    /// then end with a tagged NO — and with no `COPYUID` the client cannot tell
+    /// WHICH ones moved.
+    ///
+    /// THE INVARIANT, which is the never-drop invariant restricted to that wire
+    /// shape: an evidence-unavailable refusal preserves the WHOLE durable
+    /// operation — every member id, its source, its destination, its observed
+    /// epoch, queued, retry advanced — and the next drain converges every
+    /// member to EXACTLY ONE destination copy, with no destructive fallback
+    /// (`UID COPY`, `+FLAGS (\Deleted)` on the source, `EXPUNGE`) and no
+    /// collateral mutation of a bystander.
+    ///
+    /// Dropping the already-moved member from the requeued row would look
+    /// harmless — the server really did move it — but it is exactly exit 2
+    /// taken on an ABSENCE of evidence (`MIS-IOS-004`): this server publishes
+    /// no `COPYUID`, so "the first member landed" is the TEST's knowledge and
+    /// never the client's. The convergence half is the other side of the same
+    /// coin: re-issuing the whole set must not seat a second copy of the member
+    /// that already moved (RFC 3501 §6.4.8 — a UID command silently ignores a
+    /// UID that is no longer present).
+    @Test("A partially completed UID MOVE keeps every member queued and converges on the retry")
+    @MainActor
+    func aPartiallyCompletedAtomicMoveKeepsEveryMemberAndConvergesOnRetry() async throws {
+        let first = "atomic-partial-first@example.com"
+        let second = "atomic-partial-second@example.com"
+        let bystander = "atomic-partial-bystander@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [
+                Self.message(uid: 77, id: first),
+                Self.message(uid: 78, id: second),
+                Self.message(uid: 88, id: bystander),
+            ],
+            "Archive": [],
+        ])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Archive")
+        server.setFlags(["\\Seen"], in: "INBOX", uid: 88)
+        // The genuinely PARTIAL shape: commit the FIRST requested member only,
+        // leave the second where it was, then answer tagged NO with no COPYUID.
+        server.failUIDMoveAfterPossiblePartialCompletion(committingOnlyFirst: 1)
+        server.expectMutation(rfc822MessageId: first)
+        server.expectMutation(rfc822MessageId: second)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "closure-atomic-partial-batch")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let move = PendingOperation(
+            type: .move, messageIds: ["77", "78"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        try insert([move], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // NON-VACUITY: the server really did complete only half of the batch.
+        #expect(
+            server.messageIDs(in: "Archive") == ["<\(first)>"],
+            """
+            the fake did not commit exactly the first member, so this run is not the partial \
+            shape the test is named for — Archive: \(server.messageIDs(in: "Archive"))
+            """)
+        #expect(
+            Set(server.messageIDs(in: "INBOX")) == Set(["<\(second)>", "<\(bystander)>"]),
+            """
+            the source does not hold exactly the uncommitted member and the bystander — INBOX: \
+            \(server.messageIDs(in: "INBOX"))
+            """)
+        let firstDrainMoves = server.recordedCommands().filter {
+            $0.uppercased().contains("UID MOVE")
+        }
+        #expect(
+            firstDrainMoves.count == 1,
+            "the refused batch was attempted \(firstDrainMoves.count) time(s) in one drain: \(firstDrainMoves)")
+
+        // THE DURABLE ROW IS WHOLE. Losing the already-moved member here is the
+        // drop: nothing on the wire said it moved.
+        let afterFirstDrain = try operations(f.pool)
+        let parked = try #require(
+            afterFirstDrain.first { $0.id == move.id },
+            "the partially completed move left the queue on an absence of evidence")
+        #expect(
+            Set(parked.messageIds) == Set(["77", "78"]),
+            """
+            the requeued operation no longer names every member the user acted on — the server \
+            published no COPYUID, so no member may be retired — members: \(parked.messageIds)
+            """)
+        #expect(parked.folderPath == "INBOX")
+        #expect(parked.destinationPath == "Archive")
+        #expect(parked.observedUidValidity == 10)
+        #expect(parked.status == PendingStatus.queued.rawValue)
+        #expect(
+            parked.retryCount == 1,
+            "the retry count is \(parked.retryCount) after one drain, so the op was claimed more than once")
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // CONVERGENCE: each member exactly once at the destination, gone from
+        // the source, and the bystander untouched.
+        let archive = server.messageIDs(in: "Archive")
+        #expect(
+            archive.filter { $0 == "<\(first)>" }.count == 1,
+            "the already-moved member was duplicated or lost by the retry — Archive: \(archive)")
+        #expect(
+            archive.filter { $0 == "<\(second)>" }.count == 1,
+            "the member the server never moved did not land on the retry — Archive: \(archive)")
+        #expect(archive.count == 2, "the destination holds unexpected extra mail: \(archive)")
+        let inbox = server.messageIDs(in: "INBOX")
+        #expect(
+            inbox == ["<\(bystander)>"],
+            "the source is not left holding exactly the bystander — INBOX: \(inbox)")
+        #expect(
+            server.flags(in: "INBOX", uid: 88) == ["\\Seen"],
+            "the bystander's flags changed — flags: \(server.flags(in: "INBOX", uid: 88))")
+        let remaining = try operations(f.pool)
+        #expect(
+            remaining.isEmpty,
+            "the move did not retire after converging: \(remaining.map { "\($0.type):\($0.id)" })")
+
+        // No destructive fallback at any point in the run.
+        let commands = server.recordedCommands().map { $0.uppercased() }
+        #expect(
+            commands.filter { $0.contains("UID COPY") }.isEmpty,
+            "a partial atomic move fell back to COPY: \(commands.filter { $0.contains("UID COPY") })")
+        #expect(
+            commands.filter { $0.contains("+FLAGS") && $0.contains("\\DELETED") }.isEmpty,
+            "the source was soft-deleted on a route that never proved a destination copy")
+        #expect(
+            commands.filter { $0.contains("EXPUNGE") }.isEmpty,
+            "an expunge was issued without any per-member COPYUID proof")
+        #expect(server.wrongMessageViolations().isEmpty)
+
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
     @Test("A COPYUID-proven partial UID MOVE is reconciled and never re-issued")
     @MainActor
     func aVerifiedPartialAtomicMoveIsNeverReissued() async throws {
@@ -1864,7 +2003,7 @@ struct NeverDropExitClosureTests {
     /// disjoint gesture the user made would be denied on every drain, which is
     /// preserving one intention by dropping all the others.
     ///
-    /// TWO PROPERTIES, both asserted at the server across repeated drains:
+    /// THREE PROPERTIES, all asserted at the server across repeated drains:
     ///  1. the refused MOVE is still queued with its retry count advancing, and
     ///     its same-lane successor is still held — `buildLanes` unions on shared
     ///     message ids, so running a lane-mate ahead of an unresolved
@@ -1877,6 +2016,14 @@ struct NeverDropExitClosureTests {
     ///     the gesture already past that check slip through, requeues the rest,
     ///     and then releases roughly one more per drain — so measured only at
     ///     the end, a starved account and a healthy one look identical.
+    ///  3. (round 4b) the refused op is attempted AT MOST ONCE per
+    ///     `drainPendingQueue()` call, asserted EXACTLY — one `UID MOVE` on the
+    ///     wire, one consumed refusal and `retryCount == 1` after the first
+    ///     drain, four consumed refusals and `retryCount == 4` after four. The
+    ///     bystander lane succeeds, which sets `executedAny` and makes the outer
+    ///     loop take another pass, so the op WOULD be re-claimed; a lower bound
+    ///     cannot reject that, and it is the property `evidenceRefused` exists
+    ///     for.
     ///
     /// It never inspects `failedAccounts`, `evidenceRefused` or any other drain
     /// internal: those are mechanism, and a test written against them would stay
@@ -1997,6 +2144,36 @@ struct NeverDropExitClosureTests {
             \(afterFirstDrain.map { "\($0.type)" })
             """)
 
+        // PROPERTY 3 (round 4b) — THE PER-DRAIN BOUND, and it is EXACT: an
+        // evidence-refused operation is attempted AT MOST ONCE per
+        // `drainPendingQueue()` call. A lower bound cannot express this. The
+        // bystander lane above SUCCEEDS, which sets `executedAny`, so the outer
+        // drain loop takes another pass and would re-claim this op; only
+        // `DrainContext.evidenceRefused` stops the second attempt. Without it
+        // the wire sees two `UID MOVE`s and the durable `retryCount` advances
+        // twice in one drain, and every `>=` form here stays green.
+        let firstDrainMoves = server.recordedCommands()
+            .map { $0.uppercased() }
+            .filter { $0.contains("UID MOVE") && $0.contains("77") }
+        #expect(
+            firstDrainMoves.count == 1,
+            """
+            the refused move was attempted \(firstDrainMoves.count) time(s) in ONE drain. A \
+            refusal that re-attempts within a drain hammers the server for as long as any other \
+            lane keeps making progress — commands: \(firstDrainMoves)
+            """)
+        #expect(
+            server.consumedInjectedFailureCount() == 1,
+            "the injected refusal fired \(server.consumedInjectedFailureCount()) times in one drain")
+        let refusedRowAfterFirstDrain = try #require(
+            afterFirstDrain.first { $0.id == refusedMove.id })
+        #expect(
+            refusedRowAfterFirstDrain.retryCount == 1,
+            """
+            the durable retry count advanced to \(refusedRowAfterFirstDrain.retryCount) in a \
+            single drain, so the op was claimed and refused more than once in that pass
+            """)
+
         // The remaining drains are for property 1: the refusal keeps being
         // retried, drain after drain, and is neither dropped nor applied.
         for _ in 1..<drains {
@@ -2009,7 +2186,14 @@ struct NeverDropExitClosureTests {
         #expect(
             commands.filter { $0.contains("UID MOVE") }.count >= 3,
             "the refused move stopped being attempted: \(commands.filter { $0.contains("UID MOVE") }.count) UID MOVE command(s)")
-        #expect(server.consumedInjectedFailureCount() >= 3)
+        // EXACT across the whole run, by the same per-drain bound: four drains,
+        // one attempt each, four consumed refusals.
+        #expect(
+            server.consumedInjectedFailureCount() == drains,
+            """
+            \(drains) drains consumed \(server.consumedInjectedFailureCount()) refusals rather \
+            than one per drain
+            """)
 
         // PROPERTY 1 — the refused move is still queued and still advancing, its
         // lane-mate is still held, and nothing else is left in the queue.
@@ -2029,8 +2213,8 @@ struct NeverDropExitClosureTests {
         let refusedRow = try #require(remaining.first { $0.id == refusedMove.id })
         #expect(refusedRow.status == PendingStatus.queued.rawValue)
         #expect(
-            refusedRow.retryCount >= 3,
-            "the repeatedly refused move is not being retried — retryCount \(refusedRow.retryCount) after \(drains) drains")
+            refusedRow.retryCount == drains,
+            "the repeatedly refused move advanced its retry count \(refusedRow.retryCount) times over \(drains) drains — the bound is exactly one per drain")
         // The lane-mate is HELD, not executed: it names the same message as an
         // unresolved predecessor. NON-VACUOUS by construction — the identical
         // `.markFlagged` gesture on uid 88 provably landed above.

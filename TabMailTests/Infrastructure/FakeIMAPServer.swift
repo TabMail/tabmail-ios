@@ -132,8 +132,12 @@ final class FakeIMAPServer: @unchecked Sendable {
     private enum MoveFailureAfterCommit {
         case none
         /// The server changed mailbox state, supplied no trustworthy mapping,
-        /// then ended UID MOVE with tagged NO.
-        case possiblePartialCompletion
+        /// then ended UID MOVE with tagged NO. `committedMemberLimit` caps how
+        /// many of the requested members were actually committed — `nil` means
+        /// all of them, which is the shape every caller before #115 round 4b
+        /// used; a value of N models RFC 6851 §3.3's genuinely PARTIAL move,
+        /// where some members changed mailbox and the rest did not.
+        case possiblePartialCompletion(committedMemberLimit: Int?)
         /// The server supplied an untagged COPYUID for the changed state, then
         /// ended UID MOVE with tagged NO.
         case verifiedPartialCompletion
@@ -931,8 +935,17 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// cannot read it as a disposition — it must stay retryable (#115). The
     /// retry then finds the source empty and lands nothing new (RFC 3501
     /// §6.4.8), which is the convergence a test asserts.
-    func failUIDMoveAfterPossiblePartialCompletion() {
-        withState { $0.moveFailureAfterCommit = .possiblePartialCompletion }
+    ///
+    /// - Parameter committingOnlyFirst: commit only the first N requested
+    ///   members before answering NO, leaving the rest in the source mailbox.
+    ///   `nil` (the default) commits every requested member, so every caller
+    ///   that omits the argument is unaffected. A value models RFC 6851 §3.3's
+    ///   genuinely partial move: the client cannot tell WHICH members landed,
+    ///   because the server published no COPYUID.
+    func failUIDMoveAfterPossiblePartialCompletion(committingOnlyFirst limit: Int? = nil) {
+        withState {
+            $0.moveFailureAfterCommit = .possiblePartialCompletion(committedMemberLimit: limit)
+        }
     }
 
     /// Commit the next UID MOVE, publish its COPYUID in an untagged OK, then
@@ -2017,9 +2030,19 @@ final class FakeIMAPServer: @unchecked Sendable {
             let (moved, destinationUidValidity, withheld, mismatched, failureAfterCommit) = withState {
                 state -> ([(source: Int, destination: Int)], Int, Set<Int>, Bool, MoveFailureAfterCommit) in
                 recordOracleCheck(command: "UID MOVE", mailbox: mailbox, uids: uids, state: &state)
+                // One-shot: the NEXT UID MOVE is the one that fails after
+                // committing; a retry is served normally (#115). Read BEFORE the
+                // commit, because `.possiblePartialCompletion` may cap how many
+                // members are committed.
+                let failureAfterCommit = state.moveFailureAfterCommit
+                state.moveFailureAfterCommit = .none
                 let sourceMessages = state.messagesByMailbox[mailbox] ?? []
-                let moving = sourceMessages.filter { uids.contains($0.uid) }
-                state.messagesByMailbox[mailbox] = sourceMessages.filter { !uids.contains($0.uid) }
+                var moving = sourceMessages.filter { uids.contains($0.uid) }
+                if case .possiblePartialCompletion(let limit) = failureAfterCommit, let limit {
+                    moving = Array(moving.prefix(limit))
+                }
+                let committed = Set(moving.map(\.uid))
+                state.messagesByMailbox[mailbox] = sourceMessages.filter { !committed.contains($0.uid) }
 
                 var destinationMessages = state.messagesByMailbox[destination] ?? []
                 var nextUID = (destinationMessages.map(\.uid).max() ?? 0) + 1
@@ -2035,10 +2058,6 @@ final class FakeIMAPServer: @unchecked Sendable {
                 state.messagesByMailbox[destination] = destinationMessages
                 state.flagsByMailbox[mailbox] = sourceFlags
                 state.flagsByMailbox[destination] = destinationFlags
-                // One-shot: the NEXT UID MOVE is the one that fails after
-                // committing; a retry is served normally (#115).
-                let failureAfterCommit = state.moveFailureAfterCommit
-                state.moveFailureAfterCommit = .none
                 return (
                     pairs,
                     state.uidValidityByMailbox[destination] ?? 1,
