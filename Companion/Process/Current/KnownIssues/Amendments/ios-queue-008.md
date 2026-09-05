@@ -44,13 +44,13 @@ Action queue; undo inverse; re-delete; deleted email reappears; Gmail; `AccountM
 
 ## 2026-09-04 — observed defect, from the owner's device log
 
-Delete (tap) at 16:21:19 → undo at 16:21:21 → delete again at 16:21:22, on a Gmail account.
-Thirty-one minutes later a full sync inserted the message back into the inbox
-(`fullSync upsert[Inbox]: ins=1`), re-enqueuing the same message id for AI processing a second time
-and moving the inbox count from 39 to 40; the owner deleted it a third time. Gmail `history.list` for
-BOTH Gmail accounts on the device reported zero label adds/removes across the whole 16:22→16:53 gap,
-so no other client (Thunderbird was open at the time) touched the message: the INBOX label was
-re-added during the 16:21–16:22 churn, by TabMail's own undo inverse racing its own re-delete.
+Delete (tap) at t+0 s → undo at t+2 s → delete again at t+3 s, on a Gmail account. About half an
+hour later a full sync inserted the message back into the inbox (`fullSync upsert[Inbox]: ins=1`),
+re-enqueuing the same message id for AI processing a second time; the owner deleted it a third
+time. Gmail `history.list` for every Gmail account on the device reported zero label adds/removes
+across the whole gap, so no other client touched the message (another client was signed in at the
+time): the INBOX label was re-added during the churn around those three gestures, by TabMail's own
+undo inverse racing its own re-delete.
 
 ## 2026-09-04 — mechanism: `IOS-QUEUE-008`'s lane split, in a shape the base record never named
 
