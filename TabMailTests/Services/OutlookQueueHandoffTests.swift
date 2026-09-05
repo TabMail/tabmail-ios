@@ -327,7 +327,18 @@ struct OutlookQueueHandoffTests {
     /// the wire at all while its predecessor's move is unresolved — a DIFFERENT
     /// request, which the transport does let through) and
     /// `PendingQueueLaneTests.outlookSameIdInTwoFoldersSharesOneLane` (the lane
-    /// key itself). Both go red when `.outlook` leaves the account-scoped set.
+    /// key itself).
+    ///
+    /// ⚠️ CORRECTED — those two are NOT both red witnesses for the CLASSIFIER.
+    /// `outlookSameIdInTwoFoldersSharesOneLane` INJECTS the set it is testing
+    /// against (`accountScopedIdAccountIds: ["acc-outlook"]`) and never calls
+    /// `AccountManager.accountScopedIdAccountIds`, so it pins `buildLanes`' pure
+    /// grouping and stays green no matter which providers the classifier admits.
+    /// Removing `.outlook` from the set is caught by `T1`, which drives a real
+    /// drain through the classifier, and by
+    /// `AccountManagerQueueDrainTests.accountScopedIdAccountIdsAdmitsExactlyGmailOutlookAndTheDemoAccount`,
+    /// which asserts the membership directly. The three cover different things
+    /// and only the latter two bound the classifier.
     @Test("Outlook: two queued moves of one message run in issue order and the latest destination wins")
     @MainActor
     func twoQueuedMovesOfOneMessageSerializeAndTheLatestWins() async throws {
@@ -960,6 +971,116 @@ struct OutlookQueueHandoffTests {
             f, effectVisibleOnServer: server.snapshot(providerMessageId: current)?.isRead == true,
             gesture: "the mark-read behind a retirement that could not commit",
             serverState: "id=\(current) folders=\(serverFolders(server, rfc: rfc))")
+
+        await finish(f)
+    }
+
+    // MARK: - T8 — a post-claim re-read that FAILS after the handoff committed
+
+    /// **THE PROPERTY: a database read that fails after the move's handoff has
+    /// COMMITTED does not undo the handoff — the held-back followers keep the
+    /// address the wire proved and execute there.**
+    ///
+    /// The lane loop re-reads each row immediately before executing it, and a
+    /// thrown read is not an absent row: it requeues that op and every remaining
+    /// claimed member of the lane, then halts. What makes that arm delicate on
+    /// Graph is WHEN it runs — the predecessor's retirement has already rewritten
+    /// these very rows to the reallocated id, in a committed transaction. The
+    /// requeue therefore has to touch STATUS ONLY. Writing the captured struct
+    /// back — the obvious way to "restore" a claimed row — would silently revert
+    /// `messageIds` to the id Graph invalidated a moment earlier, and the redrive
+    /// would 404 and let the single-message conflict arm delete both gestures.
+    ///
+    /// Two followers, not one, because the arm requeues the rest of the lane as
+    /// well as the faulting op, and those are separate writes: a revert that hit
+    /// only one of them would still destroy a gesture.
+    ///
+    /// `AccountManagerQueueDrainTests.drainPendingQueueRealFailedPostClaimReReadKeepsTheLaneRetryable`
+    /// covers the same seam on a MOVE-STABLE provider, where no address can be
+    /// reverted because none changed; it stays as the retryability oracle. This
+    /// one is the address oracle, and only Graph's churn can state it.
+    @Test("Outlook: a failed post-claim re-read after a committed handoff does not revert the proven address")
+    @MainActor
+    func aFailedPostClaimReReadDoesNotRevertACommittedHandoff() async throws {
+        let rfc = "graph-handoff-read-fault@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: rfc, providerMessageId: "graph-1", folderId: Self.source),
+        ])
+        defer { server.close() }
+        defer { AccountManager.liveOperationReadFaultForTesting.withLock { $0 = nil } }
+
+        let f = try fixture(accountId: "graph-handoff-read-fault")
+        let seeded = try seedHeader(f, graphId: "graph-1", rfc: rfc)
+
+        // OFFLINE, so the move and BOTH followers are in the same drain pass and
+        // therefore in the same account-qualified lane.
+        await AccountManager.shared.move([seeded], to: Self.firstDestination)
+        let optimistic = try rows(f)
+        #expect(optimistic.count == 1)
+        guard optimistic.count == 1 else { return }
+        await AccountManager.shared.markRead([optimistic[0]])
+        await AccountManager.shared.markFlagged([optimistic[0]], flagged: true)
+        #expect(try queuedOperationCount(f) == 3,
+                "the move and both followers must be queued offline, or they do not share one lane")
+
+        let firstFollowerId = try await f.pool.read { db -> String? in
+            try PendingOperation.fetchAll(db).first { $0.type == .markRead }?.id
+        }
+        #expect(firstFollowerId != nil, "the first follower was not queued")
+        guard let firstFollowerId else { return }
+
+        // Arm the one-shot fault for the FIRST follower. It fires on the re-read
+        // the lane loop performs AFTER the predecessor's retirement committed.
+        AccountManager.liveOperationReadFaultForTesting.withLock { $0 = firstFollowerId }
+        #expect(AccountManager.liveOperationReadFaultForTesting.withLock { $0 } == firstFollowerId,
+                "the fault was not armed, so everything below is vacuous")
+
+        await register(server.provider(), f)
+        await AccountManager.shared.drainPendingQueue()
+
+        // NON-VACUITY. The fault is one-shot and clears itself when it fires, so
+        // an empty seam here proves the re-read really threw; and the move
+        // really did land and really did churn the id, so a reverted address
+        // would have a dead id to fail on.
+        #expect(AccountManager.liveOperationReadFaultForTesting.withLock { $0 } == nil, """
+            the injected re-read fault never fired, so this test did not exercise \
+            the arm it exists for
+            """)
+        #expect(server.snapshot(providerMessageId: "graph-1") == nil,
+                "Graph did not reallocate the id, so a reverted address would still work")
+        #expect(serverFolders(server, rfc: rfc) == [Self.firstDestination],
+                "the move never landed, so there is no committed handoff to revert")
+        let proven = liveId(server, rfc: rfc)
+        #expect(proven != nil && proven != "graph-1")
+        guard let proven else { return }
+
+        // The drain's own pass loop may already have redriven the held-back
+        // followers; quiescence is the only state this test depends on.
+        try await drainToQuiescence(f)
+
+        // THE ORACLE — the wire. Not one PATCH may have gone to the id the move
+        // invalidated, and both gestures must be visible at the proven one.
+        let patches = server.http.servedCallSequence().filter { $0.hasPrefix("PATCH ") }
+        let misaddressed = patches.filter { $0.hasSuffix("/graph-1") }
+        #expect(misaddressed.isEmpty, """
+            a follower went out at the address the move invalidated: \
+            \(misaddressed). The requeue after the failed re-read wrote the \
+            pre-handoff snapshot back over the committed address.
+            """)
+        #expect(!patches.isEmpty, "no follower ever reached the wire: \(patches)")
+        #expect(patches.allSatisfy { $0.hasSuffix("/\(proven)") },
+                "a follower was addressed by neither the proven id nor graph-1: \(patches)")
+
+        let landed = server.snapshot(providerMessageId: proven)
+        #expect(landed?.isRead == true && landed?.isFlagged == true, """
+            a gesture held back by the failed re-read never executed: \
+            \(String(describing: landed))
+            """)
+
+        try expectGesturePreservedAndExecuted(
+            f, effectVisibleOnServer: landed?.isRead == true && landed?.isFlagged == true,
+            gesture: "the two followers held back by a failed post-claim re-read",
+            serverState: "id=\(proven) folders=\(serverFolders(server, rfc: rfc))")
 
         await finish(f)
     }
