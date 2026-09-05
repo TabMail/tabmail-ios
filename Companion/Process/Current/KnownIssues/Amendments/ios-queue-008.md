@@ -11,10 +11,14 @@
   key `accountId:folderPath:messageId` from the `IOS-QUEUE-001` fix is **UNCHANGED for every other
   account and must NOT be reverted** — see `ios-queue-001.md`; reverting it re-opens a never-drop
   violation with a bystander.
-- ⚠️ **Outlook/Graph is deliberately NOT serialized, and this row does NOT cover it.** An earlier
+- ⚠️ ~~**Outlook/Graph is deliberately NOT serialized, and this row does NOT cover it.** An earlier
   wording of this amendment said "stable-id providers (Gmail/Outlook)"; that was narrowed
   2026-09-04 before any of it shipped. Rationale below under "why Outlook is excluded". Tracking:
-  follow-up issue (number pending).
+  follow-up issue (number pending).~~
+  **SUPERSEDED 2026-09-05 — Outlook IS serialized now**, once the missing precondition existed. The
+  follow-up whose number was pending is `TabMail/tabmail-ios#114`, recorded as `IOS-GRAPH-005`
+  (`Amendments/ios-graph-005.md`). See the dated section at the end of this file. The prohibition was
+  MET, not waived.
 - Amends: `Companion/Process/Current/KnownIssues/ios-queue-008.md`, the whole "Status" and "Full
   detail" sections — specifically the 2026-08-05 closed-decision disposition and its "the wrong end
   state is visible and fixed by one ordinary gesture" reasoning, which this amendment shows is false
@@ -121,6 +125,13 @@ Two properties of that shape are load-bearing and were both chosen deliberately:
 
 ## 2026-09-04 — why Outlook is excluded, even though Graph ids are folder-independent
 
+> ⚠️ **THIS WHOLE SECTION IS SUPERSEDED (2026-09-05) by `IOS-GRAPH-005`
+> ([`Amendments/ios-graph-005.md`](ios-graph-005.md), GitHub `#114`).** Its reasoning was correct and
+> is still the reason the two changes may not be split; what changed is that the handoff it calls
+> "deliberately NOT attempted here" now exists. The bytes below are preserved unedited as the
+> audit record — read them as history, not as current guidance, and read the final section of this
+> file before acting on anything in them.
+
 ⚠️ **Folder-independent is NOT the same property as immutable, and conflating them is what the
 first cut of this fix did.** Microsoft Graph REALLOCATES a message's default id on every move, and
 this tree sends no `Prefer: IdType="ImmutableId"` (`IOS-GRAPH-002`).
@@ -139,7 +150,8 @@ proper fix — carry a move's A→B handoff into later same-lane members before 
 queue-semantics change deliberately NOT attempted here; it is routed to the owner as its own
 follow-up issue (number pending). Until that exists, Graph stays folder-qualified.
 
-🚨 **Do not "complete" this fix by adding `.outlook` to `immutableIdAccountIds`.** The negative case
+🚨 *(SUPERSEDED 2026-09-05 — the precondition below is now met; see the final section.)*
+**Do not "complete" this fix by adding `.outlook` to `immutableIdAccountIds`.** The negative case
 is pinned by `AccountManagerQueueDrainTests.immutableIdAccountIdsAdmitsOnlyGmailAndTheDemoAccount()`,
 an exact-set oracle over rows for every provider — the only test shape that can fail on an account a
 drain fixture never seeds.
@@ -168,7 +180,9 @@ and a per-round wire oracle for max-in-flight-per-`(account, id)` == 1, `created
 latest-destination-wins, disjoint progress and durable convergence. Its acceptance bar is that
 reverting the account-qualified arm makes the fuzzer rediscover the race with no bespoke hook.
 
-⚠️ **There is deliberately NO Outlook real-drain test asserting serialization.** Writing one would
+⚠️ *(SUPERSEDED 2026-09-05 — `OutlookQueueHandoffTests` is now exactly that test, and it no longer
+blesses anything, because the bug it would have blessed is fixed.)*
+**There is deliberately NO Outlook real-drain test asserting serialization.** Writing one would
 be a test that BLESSES the bug described in the previous section.
 
 ## 2026-09-04 — instrumentation gap, follow-up not done here
@@ -347,3 +361,102 @@ from the committed one.
   on exactly that mutation (one issue, on the `outcome=haltLane` equality) and green on the restored
   tree. Keeping the field rather than deleting it is deliberate: it is the instrument's only positive
   statement that a lane stopped, which is the question `IOS-QUEUE-008` could not answer.
+
+## 2026-09-05 — Outlook now serialized: the handoff exists
+
+The follow-up this record routed to the owner with "number pending" is `TabMail/tabmail-ios#114`,
+recorded as **`IOS-GRAPH-005`** ([`Amendments/ios-graph-005.md`](ios-graph-005.md)). It is done, and
+`.outlook` is now admitted to account-qualified drain lanes. **This section supersedes three pieces
+of the text above; all three are preserved verbatim, here and in place.**
+
+### What changed, and why it is not the thing the exclusion forbade
+
+The exclusion's argument is unchanged and still correct as written:
+
+> Account-qualifying Graph would put a move `A: Inbox→Archive` and any op on `A` that was queued
+> BEFORE that move landed — offline, or simply in the same drain snapshot — into ONE lane. That
+> GUARANTEES the follower runs after the move, against the id the move just invalidated:
+> `MessageHeaderRekey.finishMove` re-keys the `MessageHeader` and nothing rewrites a later
+> `PendingOperation.messageIds`, so the follower reaches the wire with a dead id, Graph answers 404,
+> and `executeSingleOp`'s single-message conflict arm DELETES it. The user's latest intention is gone.
+>
+> Folder-qualified, those two ops sit in different lanes and merely RACE — sometimes wrong, sometimes
+> right, and recoverable. So serializing Outlook would convert an inherited race into a
+> **deterministic intention loss**, which is strictly worse than the defect this row is about. The
+> proper fix — carry a move's A→B handoff into later same-lane members before their wire call — is a
+> queue-semantics change deliberately NOT attempted here; it is routed to the owner as its own
+> follow-up issue (number pending). Until that exists, Graph stays folder-qualified.
+
+The clause that expired is the last one. **"Until that exists" — it exists.** The single sentence
+"nothing rewrites a later `PendingOperation.messageIds`" is now false: `finishMove` re-addresses
+every non-cancelled same-account queued operation naming a proven source id, per id, inside the same
+transaction that re-keys the header and retires the move. Everything else the paragraph says still
+holds, which is precisely why the lane change and the handoff are ONE fix and must never be split —
+landing the lane change alone reproduces, deterministically, exactly the loss described above.
+
+### The prohibition, met rather than waived
+
+> 🚨 **Do not "complete" this fix by adding `.outlook` to `immutableIdAccountIds`.** The negative case
+> is pinned by `AccountManagerQueueDrainTests.immutableIdAccountIdsAdmitsOnlyGmailAndTheDemoAccount()`,
+> an exact-set oracle over rows for every provider — the only test shape that can fail on an account a
+> drain fixture never seeds.
+
+Read as "do not add `.outlook` while the follower still names a dead id", it was obeyed: the handoff
+landed first, in the same change. The exact-set oracle it names was NOT weakened or deleted — it was
+re-pointed at the new expected set and is now
+`AccountManagerQueueDrainTests.accountScopedIdAccountIdsAdmitsExactlyGmailOutlookAndTheDemoAccount()`,
+still an exact set, still over rows for every provider, still including the row whose `provider`
+column is set by raw SQL to an undecodable string. A future `.icloud` or unknown provider slipping in
+fails it just as before.
+
+### The rename, and why it is the substance rather than cosmetics
+
+`AccountManager.immutableIdAccountIds` → **`AccountManager.accountScopedIdAccountIds`**, and
+`buildLanes(_:immutableIdAccountIds:)` → **`buildLanes(_:accountScopedIdAccountIds:)`**. The old name
+asserted a property the lane key never needed and that Graph does not have. What the key needs is
+**one provider id names one message per ACCOUNT** — folder-independence. Graph has that. What the old
+name claimed is **the id survives a move** — immutability. Graph does not have that, and this record's
+own exclusion section exists because the first cut of the fix conflated the two. The renamed symbol
+states the property that is actually load-bearing, so the next reader cannot repeat the conflation by
+reading the identifier. Both load-bearing shape properties recorded under "the fix and its tests" are
+unchanged: the query is still id-only over the raw `provider` column (a corrupt bystander row still
+cannot wedge every account's drain), and folder-qualified is still the DEFAULT, so an unrecognised
+provider string still lands on the safe side by construction.
+
+### The test that was forbidden is now the fence
+
+> ⚠️ **There is deliberately NO Outlook real-drain test asserting serialization.** Writing one would
+> be a test that BLESSES the bug described in the previous section.
+
+`TabMailTests/Services/OutlookQueueHandoffTests.swift` is now exactly that test, and the reason the
+prohibition existed is gone. It runs the real `AccountManager` drain and a real `ExchangeProvider`
+against `StatefulExchangeActionServer` with `churnsIdOnMove: true`, seeding the SOURCE folder only —
+no destination `Folder` row, so the post-drain sync (a repair strictly downstream of the defect)
+cannot mask a failure. Its five cases cover a follower queued behind a move, two moves of one message
+(asserted non-overlapping from the SERVER's in-flight counter, not inferred from a final state a
+lucky race would share), an undo inside the in-flight window, the delete → undo → re-delete shape
+this record was filed for — now in the Graph id space — and a lane halt that must resume at the proven
+addresses rather than at its snapshot's. `ProviderIdQueueFuzzTests.stableIdQueueLaneFuzz` now
+alternates `.gmail` and `.outlook` per round with no case-count change.
+
+### What did NOT change
+
+`PendingQueueLaneTests.imapSameUidInTwoFoldersStaysInSeparateLanes` and
+`QueueCoreInvariantTests.laneHaltInOneFolderDoesNotStarveTheSameUidInAnother` are untouched, and the
+folder-qualified key for IMAP and iCloud is untouched: `ios-queue-001.md`'s invariant still governs
+them and reverting it still re-opens a never-drop violation with a bystander. `finishMove`'s G3
+folder clause is byte-for-byte unchanged on the IMAP arm — a UID is mailbox-local, so a row that is
+not where the operation put it is a DIFFERENT physical message and re-keying it would be a C3
+wrong-message mutation. The account-scoped row-following arm is additive and gated on a
+non-defaulted flag, so no provider can acquire it by silence. Nothing in the
+`DeferredMoveSuccessor` family was deleted. No schema, migration or drain-ordering change was made.
+
+### The residual this leaves
+
+Process death between Graph's `2xx` for a move and the retirement commit leaves that move's queued
+followers on a dead id. Owner-accepted 2026-09-04, stated in the source beside
+`readdressQueuedOperations`, bounded to one process death inside one write, and strictly narrower
+than the loss this section's exclusion was protecting against — which needed no crash at all. The
+structural fix (Graph immutable ids, `Prefer: IdType="ImmutableId"`) is
+[#117](https://github.com/TabMail/tabmail-ios/issues/117); the launch-time drop of an interrupted
+move that the window relies on is [#116](https://github.com/TabMail/tabmail-ios/issues/116).

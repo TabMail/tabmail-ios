@@ -2,7 +2,7 @@
 
 **Class:** design-process
 **Severity:** high
-**First seen:** 2026-07 · **Recurrences:** 5 · **Status:** Active
+**First seen:** 2026-07 · **Recurrences:** 6 · **Status:** Active
 **Related:** [MIS-IOS-004](MIS-IOS-004-conflated-unknown-with-authoritative-stale.md), root `MIS-003` (see `../MISTAKES.md`) · **Rule owner:** `tabmail-ios/CLAUDE.md` § THE ADDRESS PROBLEM
 
 ## The tell
@@ -15,6 +15,43 @@ moved message can be named in its new folder. The design is growing and every br
 response is bound to `_`. Nothing is growing, nothing looks like identity machinery, and that is
 exactly why nobody looks: **the mistake at its origin is a single discarded return value.** The
 elaborate reconstruction machinery of instances 1–4 is what this grows into three subsystems later.
+
+## Instance 6 (2026-09-05) — the id was applied to the header and NOT to the queue
+
+The fix for instance 5 landed, and it was correct as far as it went: `ExchangeProvider` decodes the
+new `id` and `MessageHeaderRekey.finishMove` re-keys the `MessageHeader` with it. **Two other holders
+of the old address were never asked about.**
+
+1. **Every `PendingOperation` already queued that named the moved message.** `PendingOperation.messageIds`
+   is a second table storing the same address, and nothing rewrote it. So the header knew where the
+   message went and the user's next queued gesture did not — it reached the wire naming the id the
+   move had just destroyed, Graph answered `404`, and the single-message conflict arm deleted the
+   operation. The `IOS-QUEUE-008` amendment states this outright — *"nothing rewrites a later
+   `PendingOperation.messageIds`"* — and used it as the reason Outlook could not be put on
+   account-qualified drain lanes, i.e. the gap was WRITTEN DOWN as a constraint and read for a day as
+   a property of the world rather than as this mistake, one table over.
+2. **The header row itself, once it was no longer where the operation put it.** The re-key fetched by
+   primary key at `op.destinationPath`, so an undo that had already moved the row back declined the
+   re-key and the row kept a dead id. The wire's answer was in hand and was discarded because the
+   LOOKUP, not the address, was wrong.
+
+**The quiet form again, and the axis is the same failure as last time.** Instance 5 outlived the IMAP
+fix because the enumeration axis was the mechanism (`COPYUID`) rather than the property. Instance 6
+outlived the Graph fix because the axis was the **table** (`messageHeader`) rather than the property:
+*who is holding the address the wire just invalidated?* The answer was never one row. A grep for
+`finishMove` finds the header; nothing about the shape of that name suggests asking the queue.
+
+**The generalisation worth keeping.** When a wire response invalidates an address, enumerate the
+HOLDERS of that address before declaring the fix complete — every table, every in-flight capture,
+every snapshot a later write will save back. Two of the changes in `IOS-GRAPH-005` are only about
+holders: the requeue sites that wrote a whole captured struct back (`PendingOperation.markQueued`
+now writes columns), and the lane loop that executed a captured struct (it now re-reads by primary
+key). Neither is a new mechanism; both are the same question asked of a value that was already stale
+in memory.
+
+Fixed in `IOS-GRAPH-005` / ADR-IOS-081 (GitHub `#114`): the re-addressing happens inside the same
+transaction that retires the move, so the header and the queue can never disagree about where the
+message went.
 
 ## Instance 5 (2026-08-04) — the same discard, in the Graph id space, failing OPEN
 
