@@ -503,6 +503,34 @@ actor AccountManager {
     /// two retirement callers it drives, all on this actor.
     var pendingRetirements: [String: PendingRetirement] = [:]
 
+    /// THE RETAINED RETIREMENT OWNS THE SUFFIX ITS LANE HALT LEFT BEHIND.
+    ///
+    /// `PendingOperation.id` of a retained retirement -> the ids of the ops this
+    /// process CLAIMED in the same lane, behind that retirement, and never
+    /// executed. Set at the halt site, consumed by `replayRetainedRetirements`.
+    ///
+    /// 🚨 WHY THIS EXISTS AT ALL. The halt site already requeues the suffix
+    /// best-effort (`try? await retryWrite`), and that is enough for every halt
+    /// cause EXCEPT the one that produced this entry: a retirement write refused
+    /// by a DATABASE-WIDE refusal. GRDB suspends writes when the app is
+    /// backgrounded mid-drain while reads keep working (ADR-IOS-041); a full
+    /// disk or an I/O error at COMMIT does the same. The same refusal that lost
+    /// the retirement loses the requeue milliseconds later, the error is
+    /// discarded, and the suffix is left `inFlight` forever: the claim loop
+    /// refuses `inFlight`, so no later pass in this process can ever pick it up,
+    /// and the next launch's `AppDatabase.recoverPreviousSessionResidue` DELETES
+    /// an `everAttempted` `.move` — the user's newer, never-executed gesture,
+    /// discarded in a live process that still holds the proof which would have
+    /// re-addressed it. The replay's transaction is the FIRST write after the
+    /// refusal lifts, so putting the requeue in it is the smallest place the
+    /// two facts can be resolved together.
+    ///
+    /// BOUNDED and SHORT-LIVED exactly like `pendingRetirements`: an entry is
+    /// created only beside one, leaves with it (replay committed, or the row is
+    /// gone), and dies with the process. A process death before the replay is
+    /// the accepted crash window, unchanged.
+    var pendingRetirementSuffixes: [String: [String]] = [:]
+
     // MARK: - FIFO Local Write Queue
 
     /// Serial queue for ALL local DB writes from user actions.

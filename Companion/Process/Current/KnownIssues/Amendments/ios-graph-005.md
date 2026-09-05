@@ -293,6 +293,82 @@ every assertion kept verbatim:
 `.launchReconciliationReAdmitsAnOrphanedDraftPush`. Their inverted proof is deleting the `init` call
 while keeping the static.
 
+### ⚠️ EXTENDED 2026-09-05 (round 4, R1) — a refused retirement now OWNS the suffix its lane halt left behind
+
+**Invariant.** Every row this process claimed and did not execute is returned to `queued` by the same
+transaction that resolves the retirement its lane halted for. A row this process never claimed, or
+that has since been cancelled or deleted, is untouched. The proven predecessor is never re-sent.
+
+**Mechanism of the defect.** The lane halt requeues its unexecuted suffix best-effort
+(`try? await retryWrite { PendingOperation.markQueued }`), which is right for every halt cause but
+one. The producer of a refused retirement is a DATABASE-WIDE refusal — GRDB suspends the writer
+connection when the app is backgrounded mid-drain while WAL reads keep working (ADR-IOS-041); a full
+disk or an I/O error at COMMIT is equally indiscriminate — so the requeue fails in the same breath as
+the retirement and its error is discarded. The follower is left `inFlight`, a state only the claim
+transaction writes and one the claim loop refuses, so no later pass in this process can pick it up.
+The retained proof later replays, commits the predecessor and **re-addresses the follower's members**,
+and the follower still never runs: stranded at the right address with the wrong status. At the next
+launch `AppDatabase.recoverPreviousSessionResidue` sees an `everAttempted` `.move` and DELETES it.
+Live process, no crash: outside the accepted process-death window.
+
+**The fix, and why it is where it is.** One dictionary on the actor,
+`AccountManager.pendingRetirementSuffixes: [String: [String]]` (op id → the ids of the claimed,
+unexecuted followers), written at the halt site only when `pendingRetirements[liveOp.id] != nil` and
+consumed by `replayRetainedRetirements`. A separate map rather than a case payload on
+`PendingRetirement`: the enum value is constructed in `executeSingleOp`, before the halt site knows
+the suffix, so folding the ids in would mean rebuilding both cases with all their associated values
+at the halt — strictly more code for the same state. The requeue runs INSIDE the retirement's own
+`retryWrite`, after `commitFullRetirement` / `commitPartialRetirement` returns, so "the move is
+retired and its followers re-addressed" and "the followers this process claimed are claimable again"
+land together or not at all; a follower is never made claimable while still naming the address that
+same transaction is about to invalidate. There is deliberately **no second recovery point at the pass
+boundary** (one fact, one place) and the halt-site requeue is unchanged and still runs.
+
+**The write is guarded, and the guard is the point.** `PendingOperation.requeueIfInFlight(_:id:)` is
+a new static beside `markQueued`: `UPDATE pendingOperation SET status = 'queued' WHERE id = ? AND
+status = 'inFlight'`. `markQueued`'s contract is NOT widened. The replay runs an unbounded time after
+the claim, so the row may since have been cancelled by the user, deleted by a local wipe, or already
+requeued by the best-effort loop; only `inFlight` means "still claimed by this process and never
+executed", and every other state is somebody else's newer decision. Zero rows affected is the normal
+outcome, not an error. No retry increment — a refused local transaction says nothing about the
+provider, and the suffix never reached the wire. The row-gone arm applies the same guarded requeue
+inside its own `retryWrite`, so a wiped predecessor does not strand followers the wipe did not remove;
+a failure there lands in the existing catch and the entry is retained for the next drain.
+
+**Fences.** `aRefusedRetirementReturnsItsHaltedSuffixWhenItReplays` and
+`aRefusedNarrowingReturnsItsHaltedSuffixWhenItReplays` in `OutlookQueueHandoffTests`, one per
+retirement transaction because a fix to one leaves the other exactly as broken. Both drive the real
+drain against a new file-private `AllWritesRefuser` — `HeaderCommitRefuser` cannot witness this
+defect at all, because a status-only requeue of `pendingOperation` sails through a header-scoped
+refuser and the follower requeues on its own. The refuser is armed only after `holdNextMove()` has
+parked the move and `heldMoveCount() == 1`, so the claim is behind us and the first transaction it
+can refuse is the retirement; the refusal count is asserted to be exactly **6** (three retirement
+attempts + three suffix-requeue attempts), which is the whole scenario in one number. Inverted proof:
+skip the suffix requeue in the replay.
+
+### ⚠️ EXTENDED 2026-09-05 (round 4, TC-2) — the replay's existence read now distinguishes "row gone" from "read failed"
+
+**Invariant.** `nil` from the replay's existence read means exactly one thing — a local wipe or reset
+deleted the row, the user's newer decision winning, so the retained proof is dropped. A THROW is "we
+could not determine the answer" and stays retryable forever (clause 2 of
+`never-drop-user-intention.md`). The two must not share an arm.
+
+**The fix is a DELETION.** The replay's bespoke `dbPool.read { PendingOperation.fetchOne(…) != nil }`
+is replaced by the existing `liveOperation(opId)`, which the lane loop's post-claim re-read already
+uses and which already carries the `#if DEBUG` one-shot `liveOperationReadFaultForTesting` seam keyed
+by op id. Behaviour is unchanged (nil → row-gone arm, throw → catch → `return false`); what changes is
+that there is now ONE copy of the contract instead of two, and the thrown case is reachable from a
+test without inventing a seam. No new production surface was added.
+
+**Fence.** `aReplayWhoseExistenceReadFailsKeepsTheProof`: a proof is retained through the real drain,
+the header refuser is removed so writes work and the fault is the only thing that can stop the replay,
+the seam is armed with the retained op's id, and exactly ONE further drain is driven. The oracle is
+four-sided — the seam cleared itself (so the replay really consulted it), the wire record is
+byte-identical to the first drain's, the proof is still held, and both durable rows are intact with no
+retry charged — then a healthy drain converges to one `/move`, one `PATCH` at the proven id and an
+empty queue. RED before the change because the bespoke read never consults the seam: the replay
+commits at once, the follower goes to the wire, and the seam is left armed.
+
 ## Tests
 
 All named tests are RED against a named inversion of the fix and GREEN after; the mutation matrix

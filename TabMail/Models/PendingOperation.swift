@@ -266,6 +266,33 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
                 arguments: [PendingStatus.queued.rawValue, id])
         }
     }
+
+    /// Requeue a row ONLY IF THIS PROCESS STILL HOLDS IT — the guarded sibling
+    /// of `markQueued`, for the retained-retirement replay.
+    ///
+    /// 🚨 THE `status = 'inFlight'` PREDICATE IS THE WHOLE POINT, and it is why
+    /// this is a separate function rather than a parameter on `markQueued`. The
+    /// replay runs an unbounded time after the claim that recorded the suffix —
+    /// the database was refusing writes in between — so by the time it commits,
+    /// the row may have been cancelled by the user, deleted by a local wipe or
+    /// already requeued by the halt site's best-effort loop. Only `inFlight`
+    /// means "still claimed by this process and never executed"; every other
+    /// state is somebody else's newer decision and must be left exactly as it
+    /// is. Matching zero rows is the normal, correct outcome and is NOT an
+    /// error — the caller does not need to know.
+    ///
+    /// No retry increment, deliberately: a refused local transaction says
+    /// nothing about the provider, and the suffix was never attempted on the
+    /// wire at all. Status is the only thing this decision observed, so status
+    /// is the only thing it writes — the same reasoning as `markQueued`'s
+    /// banner, for the same reason (a struct-shaped `save` would write back
+    /// `messageIdsJSON` that the retirement in this very transaction has just
+    /// re-addressed).
+    static func requeueIfInFlight(_ db: Database, id: String) throws {
+        try db.execute(
+            sql: "UPDATE pendingOperation SET status = ? WHERE id = ? AND status = ?",
+            arguments: [PendingStatus.queued.rawValue, id, PendingStatus.inFlight.rawValue])
+    }
 }
 
 // MARK: - Sync Filter Snapshot

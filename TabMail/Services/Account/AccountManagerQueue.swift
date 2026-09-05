@@ -1011,6 +1011,23 @@ extension AccountManager {
                             // Requeue the REMAINING claimed ops of this lane — exactly
                             // like the failedAccounts requeue path above — then stop.
                             let remaining = capturedLane[(index + 1)...]
+                            // 🚨 HAND THE SUFFIX TO THE RETAINED RETIREMENT FIRST.
+                            // The best-effort loop below is unchanged and still runs;
+                            // this only covers the ONE halt cause it cannot cover.
+                            // When this halt is a retirement whose write was refused,
+                            // whatever refused it is a DATABASE-WIDE refusal (GRDB
+                            // suspension while backgrounded, a full disk, an I/O error
+                            // at COMMIT — ADR-IOS-041), so the `try?` requeue below
+                            // fails in the SAME refusal and its error is discarded.
+                            // The suffix would then stay `inFlight` for the life of
+                            // the process — unclaimable, and deleted at the next
+                            // launch if it is an `everAttempted` `.move`. Recording it
+                            // here lets `replayRetainedRetirements` requeue it inside
+                            // the very transaction that finally commits the
+                            // retirement, which is the first write known to succeed.
+                            if pendingRetirements[liveOp.id] != nil {
+                                pendingRetirementSuffixes[liveOp.id] = remaining.map(\.id)
+                            }
                             for remainingOp in remaining {
                                 try? await retryWrite(dbPool, label: "Queue") { db in
                                     try PendingOperation.markQueued(db, id: remainingOp.id)
@@ -1190,6 +1207,19 @@ extension AccountManager {
     /// connectivity would strand a proven move behind an offline window it has
     /// nothing to do with.
     ///
+    /// 🚨 IT ALSO RETURNS THE HALTED LANE'S UNEXECUTED SUFFIX, in the SAME
+    /// transaction. The refusal that lost the retirement is database-wide, so it
+    /// also lost the halt site's best-effort requeue of the ops claimed behind
+    /// it; those rows would otherwise stay `inFlight` — unclaimable for the life
+    /// of the process, then deleted at the next launch if they are attempted
+    /// `.move`s. Requeuing them here and not at the pass boundary keeps ONE
+    /// recovery point for one fact, and putting them in the retirement's own
+    /// transaction means a follower is never made claimable while still naming
+    /// the address that transaction is about to invalidate. The requeue is
+    /// guarded on `status = 'inFlight'` (`PendingOperation.requeueIfInFlight`),
+    /// so a row the user has since cancelled, a row a local wipe deleted, and a
+    /// row the best-effort loop already requeued are all left alone.
+    ///
     /// - Returns: `false` when the drain must stop. A replay that still cannot
     ///   commit says the database is still refusing writes, and nothing else in
     ///   this drain could retire safely either — so there is no per-account skip
@@ -1207,21 +1237,62 @@ extension AccountManager {
                 // running drain. Same reasoning as `liveOperation`'s nil arm:
                 // that is the user's NEWER gesture winning, so the retained proof
                 // is dropped rather than replayed against a row nobody wants.
-                guard try await dbPool.read({ db in
-                    try PendingOperation.fetchOne(db, key: opId) != nil
-                }) else {
+                //
+                // 🚨 THIS IS `liveOperation`, NOT A SECOND COPY OF IT. The
+                // existence check used to be a bespoke `dbPool.read` here, which
+                // asked the same question with the same two-outcome contract —
+                // `nil` is a deleted row, a THROW is "we could not determine the
+                // answer" and stays retryable (clause 2 of
+                // `never-drop-user-intention.md`). Two copies of that contract
+                // are two places for it to drift, and the copy carried no
+                // coverage for its thrown case at all. Reusing the function the
+                // lane loop already uses also inherits its `#if DEBUG` one-shot
+                // read fault, so the throw arm is now witnessable without a new
+                // seam. A throw lands in the catch below and stops the drain
+                // with the proof still held, which is exactly what the bespoke
+                // read did.
+                guard try await liveOperation(opId) != nil else {
+                    let orphanedSuffix = pendingRetirementSuffixes[opId] ?? []
+                    if !orphanedSuffix.isEmpty {
+                        // The predecessor's row is gone, but the suffix rows this
+                        // process claimed behind it are NOT the same gesture and
+                        // were not necessarily removed with it. Return them so a
+                        // later pass can claim them; a failure here throws into
+                        // the catch and the entry is retained for the next drain.
+                        try await retryWrite(dbPool, label: "Queue") { db in
+                            for suffixId in orphanedSuffix {
+                                try PendingOperation.requeueIfInFlight(db, id: suffixId)
+                            }
+                        }
+                    }
                     pendingRetirements.removeValue(forKey: opId)
+                    pendingRetirementSuffixes.removeValue(forKey: opId)
                     queueLog(
                         "[Queue] retirement replay — row \(opId.prefix(8)) no longer exists; "
-                            + "a local wipe or reset removed it, so the retained proof is dropped")
+                            + "a local wipe or reset removed it, so the retained proof is dropped"
+                            + (orphanedSuffix.isEmpty
+                                ? ""
+                                : "; requeued \(orphanedSuffix.count) claimed follower(s)"))
                     continue
                 }
+                // The suffix this retirement owns, resolved once for both arms.
+                // Requeued INSIDE the retirement's own transaction below: the two
+                // facts — "the move is retired and its followers re-addressed"
+                // and "the followers this process claimed are claimable again" —
+                // must land together or not at all.
+                let ownedSuffix = pendingRetirementSuffixes[opId] ?? []
                 switch retirement {
                 case .full(let op, let executed):
                     let result = try await retryWrite(dbPool, label: "Queue") { db in
-                        try Self.commitFullRetirement(op, executed: executed, db: db)
+                        let committed = try Self.commitFullRetirement(
+                            op, executed: executed, db: db)
+                        for suffixId in ownedSuffix {
+                            try PendingOperation.requeueIfInFlight(db, id: suffixId)
+                        }
+                        return committed
                     }
                     pendingRetirements.removeValue(forKey: opId)
+                    pendingRetirementSuffixes.removeValue(forKey: opId)
                     queueLog(
                         "[Queue] retirement replay — committed the retained retirement of "
                             + "\(opId.prefix(8)) \(op.type.rawValue)")
@@ -1250,12 +1321,17 @@ extension AccountManager {
                         return frozen
                     }()
                     let result = try await retryWrite(dbPool, label: "Queue") { db in
-                        try Self.commitPartialRetirement(
+                        let committed = try Self.commitPartialRetirement(
                             frozenRetiredOp, remaining: remaining,
                             provenDestinations: provenDestinations,
                             addressChangesOnMove: addressChangesOnMove, db: db)
+                        for suffixId in ownedSuffix {
+                            try PendingOperation.requeueIfInFlight(db, id: suffixId)
+                        }
+                        return committed
                     }
                     pendingRetirements.removeValue(forKey: opId)
+                    pendingRetirementSuffixes.removeValue(forKey: opId)
                     queueLog(
                         "[Queue] retirement replay — committed the retained narrowing of "
                             + "\(opId.prefix(8)) \(op.type.rawValue): "
