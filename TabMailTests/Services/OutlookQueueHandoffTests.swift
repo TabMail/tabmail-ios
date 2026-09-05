@@ -115,10 +115,15 @@ struct OutlookQueueHandoffTests {
 
     /// A local header seeded as an Exchange sync leaves it: addressed by its Graph
     /// resource id, with NO epoch (Exchange has no UIDVALIDITY space).
+    ///
+    /// `accountId` defaults to the fixture's own account and is only ever passed
+    /// by the multi-account test, which seeds a SECOND Outlook account into the
+    /// same pool so the drain has two disjoint lanes to retain proofs for.
     @discardableResult
     private func seedHeader(
-        _ fixture: Fixture, graphId: String, rfc: String
+        _ fixture: Fixture, graphId: String, rfc: String, accountId: String? = nil
     ) throws -> MessageHeader {
+        let owner = accountId ?? fixture.accountId
         var header = MessageHeader(
             messageId: graphId,
             subject: "graph handoff \(graphId)",
@@ -128,8 +133,8 @@ struct OutlookQueueHandoffTests {
             date: Date(),
             snippet: "graph handoff body",
             folderId: MessageIdentity.folderId(
-                accountId: fixture.accountId, folderPath: Self.source),
-            accountId: fixture.accountId,
+                accountId: owner, folderPath: Self.source),
+            accountId: owner,
             folderPath: Self.source,
             isInInbox: true)
         header.rfc822MessageId = rfc
@@ -1229,13 +1234,14 @@ struct OutlookQueueHandoffTests {
     @discardableResult
     private func seedOptimisticallyMovedHeader(
         _ fixture: Fixture, graphId: String, rfc: String, destination: String,
-        isRead: Bool = false, isFlagged: Bool = false
+        isRead: Bool = false, isFlagged: Bool = false, accountId: String? = nil
     ) throws -> (source: MessageHeader, moved: MessageHeader) {
-        var header = try seedHeader(fixture, graphId: graphId, rfc: rfc)
+        let owner = accountId ?? fixture.accountId
+        var header = try seedHeader(fixture, graphId: graphId, rfc: rfc, accountId: owner)
         let source = header
         header.folderPath = destination
         header.folderId = MessageIdentity.folderId(
-            accountId: fixture.accountId, folderPath: destination)
+            accountId: owner, folderPath: destination)
         header.isInInbox = false
         header.isRead = isRead
         header.isFlagged = isFlagged
@@ -2937,6 +2943,288 @@ struct OutlookQueueHandoffTests {
             gesture: "the mark-read behind a replay whose existence read failed",
             serverState: "id=\(current) folders=\(serverFolders(server, rfc: rfc))")
 
+        await finish(f)
+    }
+
+    // MARK: - TC-1 — MORE THAN ONE retained result in the same replay
+
+    /// A `HeaderCommitRefuser` that ALLOWS the first `allowance` header-writing
+    /// commits and refuses every one after that.
+    ///
+    /// 🚨 THE SELECTOR IS THE TRANSACTION ORDINAL, NEVER THE OP ID.
+    /// `replayRetainedRetirements` iterates a Swift `Dictionary`, whose order is
+    /// unspecified and seed-dependent, so a refuser keyed on "the second
+    /// account's op" would refuse the FIRST replayed entry on some runs and the
+    /// second on others — the test would be measuring the hash seed. Counting
+    /// commits instead names exactly what the scenario needs ("one replay lands,
+    /// the next does not") without depending on which entry that turns out to be,
+    /// and every assertion below is written so either assignment satisfies it.
+    private final class HeaderCommitOrdinalRefuser: TransactionObserver, Sendable {
+        struct CommitRefused: Error {}
+        private let sawHeaderWrite = Mutex(false)
+        private let remaining: Mutex<Int>
+        let allowed = Mutex(0)
+        let refusals = Mutex(0)
+
+        init(allowing allowance: Int) { self.remaining = Mutex(allowance) }
+
+        func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
+            eventKind.tableName == MessageHeader.databaseTableName
+        }
+        func databaseDidChange(with event: DatabaseEvent) {
+            sawHeaderWrite.withLock { $0 = true }
+        }
+        func databaseWillCommit() throws {
+            guard sawHeaderWrite.withLock({ $0 }) else { return }
+            let permitted = remaining.withLock { left -> Bool in
+                guard left > 0 else { return false }
+                left -= 1
+                return true
+            }
+            if permitted {
+                allowed.withLock { $0 += 1 }
+                return
+            }
+            refusals.withLock { $0 += 1 }
+            throw CommitRefused()
+        }
+        func databaseDidCommit(_ db: Database) {
+            sawHeaderWrite.withLock { $0 = false }
+        }
+        func databaseDidRollback(_ db: Database) {
+            sawHeaderWrite.withLock { $0 = false }
+        }
+    }
+
+    /// **THE PROPERTY: when this process holds MORE THAN ONE proven retirement,
+    /// a replay that resolves some of them and fails on the rest still starts no
+    /// claim pass — the unresolved proof is kept whole, nothing behind it reaches
+    /// the wire, and a later healthy drain converges every account.**
+    ///
+    /// Every earlier retention test holds exactly ONE proof, so all of them pass
+    /// against a replay that stops at the first entry, and all of them pass
+    /// against one that treats "some entries committed" as success. Two accounts
+    /// separate those: the drain-wide gate is `false` if ANY entry is still
+    /// unresolved, not "the last one I looked at". Getting that wrong claims the
+    /// unresolved account's follower ALONE — it is `queued`, because the lane
+    /// halt requeued it — against the id Graph has already reallocated. Its
+    /// `PATCH` `404`s, the single-message conflict arm reads that as
+    /// provider-authoritative "already done", and the user's newest gesture on
+    /// that account is deleted while this very process holds the proof that
+    /// would have re-addressed it.
+    ///
+    /// Two accounts is also the only shape in which the OTHER direction is
+    /// visible: a resolved retirement must not be re-sent to the wire because a
+    /// SIBLING entry failed. The recovery half asserts exactly one `/move` per
+    /// message across the whole test, per server.
+    ///
+    /// The two accounts are independent Outlook accounts with their own servers
+    /// and their own wire records, so "no follower reached the wire" is asserted
+    /// per account rather than as an aggregate that one account's silence could
+    /// satisfy.
+    @Test("Outlook: a replay holding TWO proven retirements that resolves only one starts no claim pass, and both accounts converge later")
+    @MainActor
+    func aReplayHoldingTwoProofsThatResolvesOnlyOneStartsNoClaimPass() async throws {
+        let firstRfc = "graph-handoff-multi-a@example.com"
+        let secondRfc = "graph-handoff-multi-b@example.com"
+        let firstServer = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: firstRfc, providerMessageId: "graph-a", folderId: Self.source),
+        ])
+        defer { firstServer.close() }
+        let secondServer = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: secondRfc, providerMessageId: "graph-b", folderId: Self.source),
+        ])
+        defer { secondServer.close() }
+
+        let f = try fixture(accountId: "graph-handoff-multi-a")
+        let secondAccountId = "graph-handoff-multi-b"
+        try await f.pool.write { db in
+            var account = Account(
+                emailAddress: "graph-handoff-second@example.com",
+                displayName: "Graph handoff second", provider: .outlook)
+            account.id = secondAccountId
+            try account.insert(db)
+            try Folder(
+                name: Self.source, path: Self.source, role: .inbox, accountId: secondAccountId
+            ).insert(db)
+        }
+        defer {
+            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: secondAccountId) }
+        }
+
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-a", rfc: firstRfc, destination: Self.firstDestination)
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-b", rfc: secondRfc, destination: Self.firstDestination,
+            accountId: secondAccountId)
+
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a previous test left a retained retirement on the shared AccountManager")
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "a drain from an earlier test is still running, so this schedule is not this test's")
+
+        let ordered = try seedSchedule(f, [
+            PendingOperation(
+                type: .move, messageIds: ["graph-a"],
+                accountId: f.accountId, folderPath: Self.source,
+                destinationPath: Self.firstDestination),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-a"],
+                accountId: f.accountId, folderPath: Self.firstDestination),
+            PendingOperation(
+                type: .move, messageIds: ["graph-b"],
+                accountId: secondAccountId, folderPath: Self.source,
+                destinationPath: Self.firstDestination),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-b"],
+                accountId: secondAccountId, folderPath: Self.firstDestination),
+        ])
+        #expect(ordered.count == 4)
+        guard ordered.count == 4 else { return }
+        let firstMoveOpId = ordered[0].id
+        let firstFollowerOpId = ordered[1].id
+        let secondMoveOpId = ordered[2].id
+        let secondFollowerOpId = ordered[3].id
+
+        await register(firstServer.provider(), f)
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: secondAccountId, provider: secondServer.provider())
+
+        // DRAIN 1 — both moves land on their servers, BOTH retirements are
+        // refused, so this process ends the drain holding two proofs.
+        let bothRefused = HeaderCommitOrdinalRefuser(allowing: 0)
+        f.pool.add(transactionObserver: bothRefused, extent: .databaseLifetime)
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(bothRefused.refusals.withLock { $0 } == 6, """
+            the refusal did not land on both retirement writes for exactly their \
+            three attempts each: \(bothRefused.refusals.withLock { $0 })
+            """)
+        let retainedAfterDrainOne = await AccountManager.shared.pendingRetirements.count
+        #expect(retainedAfterDrainOne == 2, """
+            this process is not holding two proofs, so the multi-entry replay \
+            under test never happens: \(retainedAfterDrainOne)
+            """)
+
+        let firstAfterDrainOne = firstServer.http.servedCallSequence()
+        let secondAfterDrainOne = secondServer.http.servedCallSequence()
+        #expect(firstAfterDrainOne.filter { $0.hasSuffix("/move") }.count == 1,
+                "account A's move was not sent exactly once: \(firstAfterDrainOne)")
+        #expect(secondAfterDrainOne.filter { $0.hasSuffix("/move") }.count == 1,
+                "account B's move was not sent exactly once: \(secondAfterDrainOne)")
+        #expect(firstAfterDrainOne.filter { $0.hasPrefix("PATCH ") }.isEmpty
+                    && secondAfterDrainOne.filter { $0.hasPrefix("PATCH ") }.isEmpty,
+                "a follower executed while its predecessor's proof was uncommitted")
+
+        // DRAIN 2 — exactly ONE of the two replays is allowed to commit. Which
+        // one is whichever the dictionary yields first; every assertion below is
+        // symmetric in the two accounts for exactly that reason.
+        f.pool.remove(transactionObserver: bothRefused)
+        let oneAllowed = HeaderCommitOrdinalRefuser(allowing: 1)
+        f.pool.add(transactionObserver: oneAllowed, extent: .databaseLifetime)
+
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "the first drain has not settled, so the second is not this test's")
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(oneAllowed.allowed.withLock { $0 } == 1, """
+            the second drain did not commit exactly one retirement, so it is not \
+            the partial-resolution scenario: \(oneAllowed.allowed.withLock { $0 }) \
+            committed, \(oneAllowed.refusals.withLock { $0 }) refused
+            """)
+
+        // 🚨 THE ORACLE. One proof resolved, one did not — and because one did
+        // not, NO claim pass ran on EITHER account.
+        let retainedAfterDrainTwo = await AccountManager.shared.pendingRetirements.count
+        #expect(retainedAfterDrainTwo == 1, """
+            a replay that could not commit every proof was treated as success, \
+            so the unresolved account's follower is now claimable against an \
+            address Graph has already reallocated: \(retainedAfterDrainTwo) proof(s) held
+            """)
+        #expect(firstServer.http.servedCallSequence() == firstAfterDrainOne, """
+            account A reached the wire after a replay that left a proof \
+            unresolved: \(firstServer.http.servedCallSequence())
+            """)
+        #expect(secondServer.http.servedCallSequence() == secondAfterDrainOne, """
+            account B reached the wire after a replay that left a proof \
+            unresolved: \(secondServer.http.servedCallSequence())
+            """)
+
+        // The unresolved side keeps its whole durable row; the resolved side's
+        // row is retired. Asserted as a COUNT so it holds whichever way the
+        // dictionary ordered them.
+        let (moves, followers) = try await f.pool.read { db in
+            (try PendingOperation.filter(
+                [firstMoveOpId, secondMoveOpId].contains(Column("id"))).fetchAll(db),
+             try PendingOperation.filter(
+                [firstFollowerOpId, secondFollowerOpId].contains(Column("id"))).fetchAll(db))
+        }
+        #expect(moves.count == 1, """
+            exactly one move row should survive a drain that resolved exactly one \
+            proof: \(moves.map { "\($0.id.prefix(8))/\($0.status)" })
+            """)
+        guard moves.count == 1 else { return }
+        #expect(moves[0].status == PendingStatus.inFlight.rawValue, """
+            the unresolved move left `inFlight`, where a claim pass can hand it \
+            to the provider a second time: \(moves[0].status)
+            """)
+        #expect(moves[0].messageIds.count == 1, """
+            the unresolved move lost members: \(moves[0].messageIds)
+            """)
+        #expect(followers.count == 2, """
+            a follower was DESTROYED by a partially-resolved replay: \
+            \(followers.map { $0.id.prefix(8) })
+            """)
+        #expect(followers.allSatisfy { $0.retryCount == 0 } && moves[0].retryCount == 0, """
+            a provider retry was charged for a LOCAL write failure: \
+            \(followers.map(\.retryCount)) move=\(moves[0].retryCount)
+            """)
+
+        // RECOVERY — writes work again, and both accounts converge.
+        f.pool.remove(transactionObserver: oneAllowed)
+        try await drainToQuiescence(f)
+
+        let firstFinal = firstServer.http.servedCallSequence()
+        let secondFinal = secondServer.http.servedCallSequence()
+        #expect(firstFinal.filter { $0.hasSuffix("/move") }.count == 1, """
+            account A's proven move was re-sent — a retirement resolved in an \
+            earlier drain must never go back to the wire because a SIBLING \
+            entry failed: \(firstFinal)
+            """)
+        #expect(secondFinal.filter { $0.hasSuffix("/move") }.count == 1,
+                "account B's proven move was re-sent: \(secondFinal)")
+
+        let firstCurrent = liveId(firstServer, rfc: firstRfc)
+        let secondCurrent = liveId(secondServer, rfc: secondRfc)
+        #expect(firstCurrent != nil && firstCurrent != "graph-a")
+        #expect(secondCurrent != nil && secondCurrent != "graph-b")
+        guard let firstCurrent, let secondCurrent else { return }
+
+        let firstPatches = firstFinal.filter { $0.hasPrefix("PATCH ") }
+        let secondPatches = secondFinal.filter { $0.hasPrefix("PATCH ") }
+        #expect(firstPatches.count == 1, "account A's follower did not execute exactly once: \(firstPatches)")
+        #expect(secondPatches.count == 1, "account B's follower did not execute exactly once: \(secondPatches)")
+        #expect(firstPatches.allSatisfy { $0.hasSuffix("/\(firstCurrent)") }, """
+            account A's PATCH went out at an address the move had already \
+            invalidated (proven id \(firstCurrent)): \(firstPatches)
+            """)
+        #expect(secondPatches.allSatisfy { $0.hasSuffix("/\(secondCurrent)") }, """
+            account B's PATCH went out at an address the move had already \
+            invalidated (proven id \(secondCurrent)): \(secondPatches)
+            """)
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a retained proof was never resolved")
+
+        try expectGesturePreservedAndExecuted(
+            f,
+            effectVisibleOnServer:
+                firstServer.snapshot(providerMessageId: firstCurrent)?.isRead == true
+                && secondServer.snapshot(providerMessageId: secondCurrent)?.isRead == true,
+            gesture: "both accounts' mark-reads behind a partially-resolved multi-entry replay",
+            serverState: "A: id=\(firstCurrent) folders=\(serverFolders(firstServer, rfc: firstRfc)); "
+                + "B: id=\(secondCurrent) folders=\(serverFolders(secondServer, rfc: secondRfc))")
+
+        await AccountManager.shared.unregisterProviderForTesting(accountId: secondAccountId)
         await finish(f)
     }
 }
