@@ -630,7 +630,7 @@ struct QueueCoreInvariantTests {
             try MessageHeaderRekey.finishMove(
                 op, destinations: [ProvenDestinationAddress(
                     sourceProviderId: "77", destinationProviderId: "5", destinationUidValidity: 42)],
-                addressChangesOnMove: true, db: db)
+                addressChangesOnMove: true, accountScopedIds: false, db: db)
         }
         await AccountManager.shared.publishMoveFinish(outcome)
 
@@ -672,6 +672,8 @@ struct QueueCoreInvariantTests {
                     destinationProviderId: "graph-new",
                     destinationUidValidity: nil)],
                 addressChangesOnMove: true,
+                // Outlook fixture — Graph ids are account-scoped.
+                accountScopedIds: true,
                 db: db)
         }
 
@@ -683,6 +685,170 @@ struct QueueCoreInvariantTests {
         #expect(result.applied == [HeaderRekeyRecord(
             oldHeaderId: old.id, newHeaderId: newId, newProviderMessageId: "graph-new")])
         #expect(moved?.messageId == "graph-new" && moved?.observedUidValidity == nil)
+    }
+
+    // MARK: - T11 — the address space decides where the row is, and who follows it
+
+    /// **THE PROPERTY: on an account-scoped provider the re-key follows the
+    /// MESSAGE, not the operation's destination folder.**
+    ///
+    /// One Graph id names one message per account, so the row that carries the
+    /// id IS the row this move re-addresses — wherever it currently sits. It
+    /// legitimately sits somewhere other than `destinationPath` in the sequence
+    /// this arm exists for (`IOS-QUEUE-008`): archive, undo, then re-delete. The
+    /// undo restores the row to the source folder while the forward move is still
+    /// on the wire, so when the forward retires the row is NOT at the
+    /// destination. A primary-key lookup there would miss it, the row would keep
+    /// the id Graph had just invalidated, and the NEXT gesture the user builds
+    /// FROM THAT ROW would name a dead id — 404, conflict arm, intention gone.
+    ///
+    /// Asserted as "the row now answers to the address the wire proved, in the
+    /// folder it occupies", not as "the arm was taken" (`MIS-015`).
+    @Test("account-scoped re-key: the row is re-addressed in the folder it currently occupies, not in the operation's destination")
+    func accountScopedRekeyFollowsTheRowOutOfTheDestinationFolder() async throws {
+        let fixture = try fixture(
+            accountId: "acc-graph-follows-row", provider: .outlook,
+            folders: [("INBOX", .inbox, nil), ("Archive", .archive, nil)])
+        defer { finish(fixture) }
+
+        // The row is back in INBOX (an undo landed) while the forward move to
+        // Archive is retiring. Its primary key is still the INBOX-shaped one the
+        // gesture created.
+        let row = try seedHeader(
+            fixture, messageId: "graph-old", folderPath: "INBOX", epoch: nil)
+        let op = PendingOperation(
+            type: .move, messageIds: ["graph-old"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: nil)
+
+        let result = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                op,
+                destinations: [ProvenDestinationAddress(
+                    sourceProviderId: "graph-old",
+                    destinationProviderId: "graph-new",
+                    destinationUidValidity: nil)],
+                addressChangesOnMove: true,
+                accountScopedIds: true,
+                db: db)
+        }
+
+        // NON-VACUITY: the row really is NOT in the operation's destination, so
+        // a destination-keyed lookup could not have found it.
+        #expect(row.folderPath == "INBOX" && op.destinationPath == "Archive",
+                "the fixture no longer poses the question this test exists for")
+
+        let landedId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "INBOX", messageId: "graph-new")
+        let moved = try await fixture.pool.read { db in
+            try MessageHeader.fetchOne(db, key: landedId)
+        }
+        #expect(moved?.messageId == "graph-new" && moved?.folderPath == "INBOX", """
+            the row kept an address the wire had already invalidated: the next \
+            gesture built from it would name a dead Graph id, 404, and be deleted \
+            by the conflict arm. applied=\(result.applied)
+            """)
+        #expect(result.applied.map(\.newHeaderId) == [landedId])
+        #expect(result.unsafeUndoOldHeaderIds.isEmpty)
+    }
+
+    /// **THE NEGATIVE CASE THAT BOUNDS IT: on IMAP the folder is part of the
+    /// address, so a row that has left the destination is NOT this move's row.**
+    ///
+    /// The same fixture shape, one flag apart. A UID is mailbox-local — UID 77 in
+    /// `INBOX` and UID 77 in `Archive` are different physical messages — so
+    /// "follow the id wherever it went" would re-key a bystander (C3). G3's
+    /// folder clause must still decline here, and it must decline by RETAINING
+    /// the row and revoking only the stale undo authority.
+    @Test("IMAP re-key still declines when the row has left the operation's destination folder")
+    func imapRekeyStillDeclinesWhenTheRowLeftTheDestination() async throws {
+        let fixture = try fixture(accountId: "acc-imap-declines-row")
+        defer { finish(fixture) }
+
+        let row = try seedHeader(fixture, messageId: "77", folderPath: "INBOX")
+        let op = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
+
+        let result = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                op,
+                destinations: [ProvenDestinationAddress(
+                    sourceProviderId: "77", destinationProviderId: "5",
+                    destinationUidValidity: 42)],
+                addressChangesOnMove: true,
+                accountScopedIds: false,
+                db: db)
+        }
+
+        #expect(result.applied.isEmpty, """
+            an IMAP row that is not in this operation's destination folder was \
+            re-keyed anyway — on IMAP that is a different physical message (C3)
+            """)
+        #expect(result.unsafeUndoOldHeaderIds == [row.id])
+        let survivor = try await fixture.pool.read { db in
+            try MessageHeader.fetchOne(db, key: row.id)
+        }
+        #expect(survivor?.messageId == "77", "the declined row must be retained, not removed")
+    }
+
+    /// **THE PROPERTY: the address the wire just proved is carried into every
+    /// queued operation of the account that still names the old one — and into
+    /// nothing else.**
+    ///
+    /// This is what makes account-qualified lanes SAFE for Graph
+    /// (`IOS-GRAPH-005`). Serializing a follower behind a move guarantees it runs
+    /// after the id was reallocated; without this rewrite that guarantee is the
+    /// defect, because the follower would go to the wire naming the dead id.
+    ///
+    /// The "and nothing else" half is not decoration: a re-address that swept in
+    /// an operation naming a DIFFERENT message would be a wrong-message mutation,
+    /// which nothing recovers.
+    @Test("a queued follower naming the moved id is re-addressed in the retiring transaction, and an unrelated operation is not")
+    func queuedFollowerIsReaddressedAndBystandersAreNot() async throws {
+        let fixture = try fixture(
+            accountId: "acc-graph-readdress", provider: .outlook,
+            folders: [("INBOX", .inbox, nil), ("Archive", .archive, nil)])
+        defer { finish(fixture) }
+
+        _ = try seedHeader(
+            fixture, messageId: "graph-old", folderPath: "Archive",
+            keyedFromFolderPath: "INBOX", epoch: nil)
+        let retiring = PendingOperation(
+            type: .move, messageIds: ["graph-old"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: nil)
+        let follower = PendingOperation(
+            type: .markRead, messageIds: ["graph-old"], accountId: fixture.accountId,
+            folderPath: "Archive", observedUidValidity: nil)
+        let bystander = PendingOperation(
+            type: .markFlagged, messageIds: ["graph-other"], accountId: fixture.accountId,
+            folderPath: "INBOX", observedUidValidity: nil)
+        try insertOp(follower, fixture)
+        try insertOp(bystander, fixture)
+
+        let result = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                retiring,
+                destinations: [ProvenDestinationAddress(
+                    sourceProviderId: "graph-old",
+                    destinationProviderId: "graph-new",
+                    destinationUidValidity: nil)],
+                addressChangesOnMove: true,
+                accountScopedIds: true,
+                db: db)
+        }
+
+        let (followerIds, bystanderIds) = try await fixture.pool.read { db in
+            (try PendingOperation.fetchOne(db, key: follower.id)?.messageIds,
+             try PendingOperation.fetchOne(db, key: bystander.id)?.messageIds)
+        }
+        #expect(followerIds == ["graph-new"], """
+            the follower still names the id the move invalidated: it will 404 and \
+            the single-message conflict arm will delete it — the user's latest \
+            intention, lost deterministically. observed: \(String(describing: followerIds))
+            """)
+        #expect(bystanderIds == ["graph-other"],
+                "an operation naming a different message was re-addressed — that is a wrong-message mutation")
+        #expect(result.readdressedOperationIds == [follower.id])
     }
 
     @Test("an address-stable Gmail move does not require destination-address evidence")
@@ -699,7 +865,10 @@ struct QueueCoreInvariantTests {
 
         let result = try await fixture.pool.write { db in
             try MessageHeaderRekey.finishMove(
-                op, destinations: [], addressChangesOnMove: false, db: db)
+                // Gmail ids are account-scoped, but `addressChangesOnMove: false`
+                // short-circuits before either arm — that is what this test pins.
+                op, destinations: [], addressChangesOnMove: false,
+                accountScopedIds: true, db: db)
         }
 
         #expect(result == .empty)
@@ -719,7 +888,8 @@ struct QueueCoreInvariantTests {
             folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
         let result = try await fixture.pool.write { db in
             try MessageHeaderRekey.finishMove(
-                op, destinations: [], addressChangesOnMove: true, db: db)
+                op, destinations: [], addressChangesOnMove: true,
+                accountScopedIds: false, db: db)
         }
         let oldId = MessageIdentity.headerId(
             accountId: fixture.accountId, folderPath: "INBOX", messageId: "77")
@@ -787,7 +957,7 @@ struct QueueCoreInvariantTests {
                 op, destinations: [ProvenDestinationAddress(
                     sourceProviderId: "77", destinationProviderId: "5",
                     destinationUidValidity: 42)],
-                addressChangesOnMove: true, db: db)
+                addressChangesOnMove: true, accountScopedIds: false, db: db)
         }
         await AccountManager.shared.publishMoveFinish(result)
 
@@ -987,6 +1157,7 @@ struct QueueCoreInvariantTests {
                     destinationProviderId: "5",
                     destinationUidValidity: 42)],
                 addressChangesOnMove: true,
+                accountScopedIds: false,
                 db: db)
         }
         #expect(finishResult.applied.count == 1)

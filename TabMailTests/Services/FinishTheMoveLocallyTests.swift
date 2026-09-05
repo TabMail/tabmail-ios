@@ -371,6 +371,9 @@ struct FinishTheMoveLocallyTests {
                     sourceProviderId: "77", destinationProviderId: "1",
                     destinationUidValidity: 20_260_803)],
                 addressChangesOnMove: true,
+                // IMAP: a UID is mailbox-local, so the row is located by primary
+                // key at `destinationPath` and no queued follower is re-addressed.
+                accountScopedIds: false,
                 db: db)
             _ = try PendingOperation.deleteOne(db, key: op.id)
             return result
