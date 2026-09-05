@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -748,6 +749,217 @@ struct OutlookQueueHandoffTests {
             the lane whose PATCH was refused did not converge: \
             \(String(describing: bystander))
             """)
+
+        await finish(f)
+    }
+
+    // MARK: - T7 — a proven move whose LOCAL retirement cannot commit
+
+    /// A GRDB `TransactionObserver` that REFUSES the commit of any transaction
+    /// which wrote `messageHeader`, and counts the refusals.
+    ///
+    /// `databaseWillCommit()` throwing makes SQLite's commit hook abort the
+    /// COMMIT, so GRDB rolls back and rethrows to `pool.write`'s caller — the
+    /// same shape a full disk or an I/O error at COMMIT produces, and the same
+    /// shape GRDB's own suspension produces when the app is backgrounded mid
+    /// drain while reads keep working. It is a real production possibility, not
+    /// a manufactured writer.
+    ///
+    /// Lifted from `QueueCoreInvariantTests.HeaderCommitRefuser` (itself lifted
+    /// from `SyncEngineRunSyncTests`), file-private per file exactly as those
+    /// two are: there is no shared test utility for it and this change does not
+    /// invent one.
+    private final class HeaderCommitRefuser: TransactionObserver, Sendable {
+        struct CommitRefused: Error {}
+        private let sawHeaderWrite = Mutex(false)
+        let refusals = Mutex(0)
+
+        func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
+            eventKind.tableName == MessageHeader.databaseTableName
+        }
+        func databaseDidChange(with event: DatabaseEvent) {
+            sawHeaderWrite.withLock { $0 = true }
+        }
+        func databaseWillCommit() throws {
+            guard sawHeaderWrite.withLock({ $0 }) else { return }
+            refusals.withLock { $0 += 1 }
+            throw CommitRefused()
+        }
+        func databaseDidCommit(_ db: Database) {
+            sawHeaderWrite.withLock { $0 = false }
+        }
+        func databaseDidRollback(_ db: Database) {
+            sawHeaderWrite.withLock { $0 = false }
+        }
+    }
+
+    /// **THE PROPERTY: a move Graph has already PROVEN is not un-proven by a
+    /// local write that will not commit. While the process lives the proof is
+    /// retained, nothing behind the move executes, the move is never sent to the
+    /// wire twice, and once the database accepts writes again the follower lands
+    /// at the id the move proved.**
+    ///
+    /// The failure this pins is NOT the process-death crash window, which stays
+    /// accepted: it is the LIVE process. GRDB suspends writes when the app is
+    /// backgrounded mid-drain while reads keep working
+    /// (`ADR-IOS-041`), and a full disk or an I/O error at COMMIT does the same
+    /// — the wire has answered `2xx` and named the destination id, and the only
+    /// thing that failed is a local transaction. Discarding the provider's own
+    /// returned result there costs the user their NEWEST gesture: the follower
+    /// serialized behind the move in the same account-scoped lane runs next
+    /// naming the id Graph has just invalidated, Graph answers `404`, and the
+    /// single-message conflict arm reads that as provider-authoritative
+    /// "already done" and DELETES it.
+    ///
+    /// Both halves are asserted, because they fail in opposite directions. The
+    /// first drain must leave the wire and the durable rows exactly as the
+    /// provider left them — one `/move`, no `PATCH` at any id, the move row
+    /// intact with every member, the follower still naming the old id, and no
+    /// retry charged to either. The second must converge: still exactly one
+    /// `/move` (the move is never replayed on the wire), the follower's only
+    /// `PATCH` at the NEW id, the server's own read flag set there, the header
+    /// re-keyed, and the queue empty.
+    @Test("Outlook: a proven move whose local retirement cannot commit keeps the proof, and the follower lands at the proven id once writes work again")
+    @MainActor
+    func aRetirementThatCannotCommitRetainsTheProofAndReplaysIt() async throws {
+        let rfc = "graph-handoff-retained@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: rfc, providerMessageId: "graph-1", folderId: Self.source),
+        ])
+        defer { server.close() }
+
+        let f = try fixture(accountId: "graph-handoff-retained")
+        let seeded = try seedHeader(f, graphId: "graph-1", rfc: rfc)
+
+        // OFFLINE, so the follower is guaranteed to be claimed in the SAME pass
+        // as the move it is queued behind — the shape in which the lane's
+        // serialization promise is what makes the handoff load-bearing.
+        await AccountManager.shared.move([seeded], to: Self.firstDestination)
+        let optimistic = try rows(f)
+        #expect(optimistic.count == 1)
+        guard optimistic.count == 1 else { return }
+        await AccountManager.shared.markRead([optimistic[0]])
+
+        let queued = try await f.pool.read { db in
+            try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
+        }
+        #expect(queued.count == 2,
+                "both gestures must be durably queued before the provider exists, or this test proves nothing")
+        guard queued.count == 2 else { return }
+        let moveOpId = queued.first(where: { $0.type == .move })?.id
+        let followerOpId = queued.first(where: { $0.type == .markRead })?.id
+        #expect(moveOpId != nil && followerOpId != nil,
+                "the fixture did not queue one move and one mark-read: \(queued.map(\.type.rawValue))")
+        guard let moveOpId, let followerOpId else { return }
+
+        await register(server.provider(), f)
+
+        // Installed AFTER every fixture write, so the only header-writing
+        // transaction it can refuse is the retirement itself.
+        let refuser = HeaderCommitRefuser()
+        f.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // NON-VACUITY: the retirement really was attempted, and really was
+        // refused — once per `retryWrite` attempt, and never more. More than
+        // three means some OTHER header write was refused too and this test is
+        // not measuring what it names (`MIS-027`).
+        #expect(refuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on the retirement write for exactly its \
+            three attempts, so this is not the scenario under test: \
+            \(refuser.refusals.withLock { $0 })
+            """)
+
+        // I1 + I3, on the wire: the provider proved the move exactly once, and
+        // the follower did not reach the wire at all while that proof was
+        // uncommitted. A follower that PATCHes here names an id Graph has
+        // already invalidated.
+        let firstDrainCalls = server.http.servedCallSequence()
+        #expect(firstDrainCalls.filter { $0.hasSuffix("/move") }.count == 1, """
+            the move was not sent exactly once: \(firstDrainCalls)
+            """)
+        #expect(firstDrainCalls.filter { $0.hasPrefix("PATCH ") }.isEmpty, """
+            the follower executed while its predecessor's proof was still \
+            uncommitted — it can only have named the id the move destroyed: \
+            \(firstDrainCalls.filter { $0.hasPrefix("PATCH ") })
+            """)
+        #expect(server.snapshot(providerMessageId: "graph-1") == nil,
+                "Graph did not reallocate the id, so this test is not exercising the churn")
+
+        // I5, durably: nothing was lost and nothing was invented. The move row
+        // keeps all of its members, the follower keeps its old address, and a
+        // failed LOCAL write charges no provider retry to either.
+        let (heldMove, heldFollower) = try await f.pool.read { db in
+            (try PendingOperation.fetchOne(db, key: moveOpId),
+             try PendingOperation.fetchOne(db, key: followerOpId))
+        }
+        #expect(heldMove != nil, """
+            the move whose retirement could not commit was deleted — the wire \
+            effect it applied is now unrecorded anywhere
+            """)
+        #expect(heldFollower != nil, """
+            the follower was DESTROYED: it went to the wire at an address this \
+            app had invalidated, 404'd, and the conflict arm read that as \
+            "already done". That is the user's newest gesture.
+            """)
+        #expect(heldMove?.messageIds == ["graph-1"],
+                "the move row lost members it was issued with: \(String(describing: heldMove?.messageIds))")
+        #expect(heldMove?.status == PendingStatus.inFlight.rawValue, """
+            the move was returned to `queued` after the wire had already moved \
+            it — the claim loop would hand it to the provider a second time: \
+            \(heldMove?.status ?? "<deleted>")
+            """)
+        #expect(heldFollower?.messageIds == ["graph-1"], """
+            the follower's address moved even though the transaction that \
+            proves it never committed: \(String(describing: heldFollower?.messageIds))
+            """)
+        #expect(heldMove?.everAttempted == true && heldFollower?.everAttempted == true,
+                "the claim's durable proof stands across a failed local write")
+        #expect(heldMove?.retryCount == 0 && heldFollower?.retryCount == 0, """
+            a provider retry was charged for a LOCAL write failure: \
+            move=\(heldMove?.retryCount ?? -1) follower=\(heldFollower?.retryCount ?? -1)
+            """)
+
+        // The database accepts writes again — the recovery every live process
+        // eventually reaches when the app returns to the foreground.
+        f.pool.remove(transactionObserver: refuser)
+        try await drainToQuiescence(f)
+
+        // I3: still exactly one move on the wire, ever.
+        let finalCalls = server.http.servedCallSequence()
+        #expect(finalCalls.filter { $0.hasSuffix("/move") }.count == 1, """
+            the move was replayed on the wire — a proven move must be applied \
+            exactly once: \(finalCalls)
+            """)
+
+        // I4: the follower landed, at the proven address and at no other.
+        let current = liveId(server, rfc: rfc)
+        #expect(current != nil && current != "graph-1")
+        guard let current else { return }
+        let patches = finalCalls.filter { $0.hasPrefix("PATCH ") }
+        #expect(patches.count == 1, "the follower did not execute exactly once: \(patches)")
+        let misaddressed = patches.filter { !$0.hasSuffix("/\(current)") }
+        #expect(misaddressed.isEmpty, """
+            a PATCH went out at an address the move had already invalidated \
+            (proven id \(current)): \(misaddressed)
+            """)
+
+        // The header answers to the proven address too, in the folder the move
+        // put it in.
+        let headers = try rows(f)
+        #expect(headers.count == 1)
+        guard headers.count == 1 else { return }
+        #expect(headers[0].messageId == current && headers[0].folderPath == Self.firstDestination, """
+            the header was left at the address Graph invalidated: \
+            id=\(headers[0].id) messageId=\(headers[0].messageId) \
+            folder=\(headers[0].folderPath)
+            """)
+
+        try expectGesturePreservedAndExecuted(
+            f, effectVisibleOnServer: server.snapshot(providerMessageId: current)?.isRead == true,
+            gesture: "the mark-read behind a retirement that could not commit",
+            serverState: "id=\(current) folders=\(serverFolders(server, rfc: rfc))")
 
         await finish(f)
     }

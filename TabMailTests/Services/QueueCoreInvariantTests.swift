@@ -580,24 +580,37 @@ struct QueueCoreInvariantTests {
         }
     }
 
-    /// **THE PROPERTY: the narrowing pass is ALL OR NOTHING. If its write does
-    /// not commit, the operation keeps every member it was issued with, stays
-    /// retryable, and no address anywhere has moved.**
+    /// **THE PROPERTY: the narrowing pass is ALL OR NOTHING, and a proof the
+    /// provider has already given us is not thrown away because the local write
+    /// would not commit. If the write does not commit the operation keeps every
+    /// member it was issued with, no address anywhere has moved, and nothing can
+    /// claim the row again — the proof is retained in this process and replayed
+    /// by the next drain, which then narrows the row to exactly its unproven
+    /// remainder.**
     ///
     /// The two tests above assert what a SUCCESSFUL narrowing leaves behind.
     /// Neither can see the state that matters more: the re-key and the narrowing
     /// are one transaction, so a partial outcome — members removed from the row
     /// while the header keeps its source address, or the reverse — would be a
-    /// silently dropped intention or a row nothing can address. `retryWrite`
-    /// exhausts its three attempts and the catch arm requeues the ORIGINAL
-    /// bundle, deliberately preferring a duplicate at the destination over a
-    /// lost member.
+    /// silently dropped intention or a row nothing can address.
+    ///
+    /// ⚠️ THIS TEST USED TO PIN THE OLD MECHANISM: it asserted the whole bundle
+    /// was returned to `queued`, so a retry would re-copy the members the
+    /// provider had already proved. That accepted a duplicate at the destination
+    /// to avoid losing a member — but it also DISCARDED the destination
+    /// addresses the wire had named for the proven prefix, which on an
+    /// account-scoped provider is the follower's address too. The invariant, not
+    /// the mechanism, is what is asserted now (`MIS-015`): what the operation
+    /// still owes, whether anything can execute it meanwhile, and where the row
+    /// ends up once the database accepts writes again
+    /// (`TabMail/tabmail-ios#120`).
     ///
     /// The refusal is raised at COMMIT rather than by a poisoned statement, so
-    /// the transaction is one a real disk failure could produce, and the
-    /// refusal counter proves it landed on the narrowing write itself
-    /// (`MIS-027`: red for the right reason).
-    @Test("a narrowing pass whose write never commits keeps the WHOLE bundle queued and moves no address")
+    /// the transaction is one a real disk failure — or GRDB's own suspension
+    /// when the app is backgrounded mid-drain — could produce, and the refusal
+    /// counter proves it landed on the narrowing write itself (`MIS-027`: red
+    /// for the right reason).
+    @Test("a narrowing pass whose write never commits keeps the WHOLE bundle unclaimable, moves no address, and is replayed by the next drain")
     func narrowedRetirementThatCannotCommitKeepsTheWholeBundleQueued() async throws {
         let fixture = try fixture(accountId: "acc-queue-005-rollback")
         defer { finish(fixture) }
@@ -618,7 +631,6 @@ struct QueueCoreInvariantTests {
         // transaction it can refuse is the narrowing write itself.
         let refuser = HeaderCommitRefuser()
         fixture.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
-        defer { fixture.pool.remove(transactionObserver: refuser) }
 
         await AccountManager.shared.retirePartiallyCompletedOp(
             frozenOp, provenMembers: ["77"], remaining: ["88"],
@@ -636,19 +648,25 @@ struct QueueCoreInvariantTests {
             \(refuser.refusals.withLock { $0 })
             """)
 
-        // NOTHING was narrowed: the proven member is still owed, so a retry
-        // re-copies it. A duplicate at the destination is the accepted cost;
-        // a member removed from the row by a write that never committed would
-        // be a dropped intention.
+        // NOTHING was narrowed: the proven member is still owed by the row, so
+        // no member has been dropped by a write that never committed.
         let after = try fetchOp(frozenOp.id, fixture)
         #expect(after?.messageIds == ["77", "88"], """
             the operation was narrowed by a transaction that never committed — \
             observed \(String(describing: after?.messageIds))
             """)
-        #expect(after?.status == PendingStatus.queued.rawValue,
-                "a failed narrowing must never leave the row inFlight — nothing would unstick it before the next launch")
+        // AND NOTHING CAN CLAIM IT MEANWHILE. The provider already moved the
+        // proven member; returning the bundle to `queued` here would hand that
+        // same member back to the wire on the next pass. `inFlight` is what the
+        // claim loop refuses, and it is what makes "exactly one wire move per
+        // proven move" hold without any new guard.
+        #expect(after?.status == PendingStatus.inFlight.rawValue, """
+            the bundle was made claimable again after the provider had already \
+            proved part of it, so the proven member will be re-sent: \
+            \(after?.status ?? "<deleted>")
+            """)
         #expect(after?.retryCount == 0,
-                "the requeue after a failed local write charges no provider retry")
+                "a failed LOCAL write charges no provider retry")
 
         // And NO address moved: the header is exactly where the seeding left it.
         let rows = try await fixture.pool.read { db in
@@ -660,6 +678,172 @@ struct QueueCoreInvariantTests {
             the re-key survived a transaction that was rolled back: \
             id=\(rows[0].id) messageId=\(rows[0].messageId)
             """)
+
+        // THE RECOVERY. The database accepts writes again — the state a live
+        // process reaches when the app returns to the foreground and GRDB's
+        // suspension lifts. The retained proof is replayed by the ordinary
+        // drain, through the SAME transaction the original site ran.
+        fixture.pool.remove(transactionObserver: refuser)
+        await AccountManager.shared.drainPendingQueue()
+
+        let replayed = try fetchOp(frozenOp.id, fixture)
+        #expect(replayed?.messageIds == ["88"], """
+            the retained proof was not replayed: the row still owes members the \
+            provider already moved — \(String(describing: replayed?.messageIds))
+            """)
+        #expect(replayed?.status == PendingStatus.queued.rawValue,
+                "the narrowed remainder must be retryable — \(replayed?.status ?? "<deleted>")")
+
+        let destinationId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "Archive", messageId: "5")
+        let replayedRows = try await fixture.pool.read { db in
+            try MessageHeader.filter(Column("accountId") == fixture.accountId).fetchAll(db)
+        }
+        #expect(replayedRows.count == 1)
+        guard replayedRows.count == 1 else { return }
+        #expect(replayedRows[0].id == destinationId && replayedRows[0].messageId == "5", """
+            the retired member is still at its SOURCE address after the replay, \
+            so the next gesture on it is a silent dead no-op: \
+            id=\(replayedRows[0].id) messageId=\(replayedRows[0].messageId)
+            """)
+    }
+
+    /// **THE SAME PROPERTY ON THE ARM GRAPH ACTUALLY TAKES: the retained proof
+    /// carries the address into the QUEUE when it is replayed, and the move is
+    /// never sent to the wire a second time.**
+    ///
+    /// The IMAP sibling above cannot see either half. `readdressQueuedOperations`
+    /// returns immediately when `accountScopedIds` is false, so on IMAP a
+    /// discarded proof costs only the header's address; on Outlook it costs the
+    /// FOLLOWER's, and a follower that goes out at the id Graph reallocated is
+    /// 404'd and deleted by the single-message conflict arm — the user's newest
+    /// gesture, destroyed.
+    ///
+    /// The provider ledger is the wire oracle and it is two-sided: after the
+    /// replay it must contain the move of the UNPROVEN member (proving the
+    /// registered provider is live and reachable from the drain, so a `0` below
+    /// is not structural) and must NOT contain any move naming the member the
+    /// provider already proved.
+    @Test("Outlook: a narrowing pass that cannot commit is replayed to the proven address, and the proven member is never moved twice")
+    func narrowedRetirementThatCannotCommitIsReplayedOnAnAccountScopedProvider() async throws {
+        // No `Archive` folder row: the post-drain sync is a repair strictly
+        // downstream of the defect, and against a mock provider it would rewrite
+        // the very rows this test reads. Omitting the destination `Folder` makes
+        // the post-drain lookup miss and skips it — the same reason
+        // `OutlookQueueHandoffTests` omits it.
+        let fixture = try fixture(
+            accountId: "acc-queue-005-graph-replay", provider: .outlook,
+            folders: [("INBOX", .inbox, nil)])
+        defer { finish(fixture) }
+
+        let seeded = try seedHeader(
+            fixture, messageId: "graph-old", folderPath: "INBOX", epoch: nil)
+
+        // The follower the user queued behind the move, naming the id Graph is
+        // about to reallocate.
+        let follower = PendingOperation(
+            type: .markRead, messageIds: ["graph-old"], accountId: fixture.accountId,
+            folderPath: "INBOX", observedUidValidity: nil)
+        try insertOp(follower, fixture)
+
+        var op = PendingOperation(
+            type: .move, messageIds: ["graph-old", "graph-unproven"],
+            accountId: fixture.accountId, folderPath: "INBOX",
+            destinationPath: "Archive", observedUidValidity: nil)
+        op.status = PendingStatus.inFlight.rawValue
+        op.everAttempted = true
+        try insertOp(op, fixture)
+        let frozenOp = op
+
+        let refuser = HeaderCommitRefuser()
+        fixture.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+
+        let provider = MockEmailProvider()
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: fixture.accountId, provider: provider
+        ) {
+            await AccountManager.shared.retirePartiallyCompletedOp(
+                frozenOp, provenMembers: ["graph-old"], remaining: ["graph-unproven"],
+                provenDestinations: [ProvenDestinationAddress(
+                    sourceProviderId: "graph-old", destinationProviderId: "graph-new",
+                    destinationUidValidity: nil)],
+                addressChangesOnMove: true,
+                context: AccountManager.DrainContext())
+
+            #expect(refuser.refusals.withLock { $0 } == 3, """
+                the refusal did not land on the narrowing write for all three \
+                attempts, so this test is not measuring a rollback: \
+                \(refuser.refusals.withLock { $0 })
+                """)
+
+            // PHASE 1 — nothing durable moved, and nothing can claim the row.
+            let held = try fetchOp(frozenOp.id, fixture)
+            #expect(held?.messageIds == ["graph-old", "graph-unproven"],
+                    "a member was removed by a write that never committed: \(String(describing: held?.messageIds))")
+            #expect(held?.status == PendingStatus.inFlight.rawValue, """
+                the bundle was made claimable again after Graph had already moved \
+                one of its members: \(held?.status ?? "<deleted>")
+                """)
+            #expect(held?.retryCount == 0, "a failed LOCAL write charges no provider retry")
+            let heldFollower = try fetchOp(follower.id, fixture)
+            #expect(heldFollower?.messageIds == ["graph-old"], """
+                the follower's address moved even though the transaction that \
+                proves it never committed: \(String(describing: heldFollower?.messageIds))
+                """)
+            let beforeRows = try await fixture.pool.read { db in
+                try MessageHeader.filter(Column("accountId") == fixture.accountId).fetchAll(db)
+            }
+            #expect(beforeRows.count == 1)
+            guard beforeRows.count == 1 else { return }
+            #expect(beforeRows[0].id == seeded.id && beforeRows[0].messageId == "graph-old",
+                    "the re-key survived a transaction that was rolled back: id=\(beforeRows[0].id)")
+
+            // PHASE 2 — writes work again, and an ordinary drain replays.
+            fixture.pool.remove(transactionObserver: refuser)
+            await AccountManager.shared.drainPendingQueue()
+
+            let replayedRows = try await fixture.pool.read { db in
+                try MessageHeader.filter(Column("accountId") == fixture.accountId).fetchAll(db)
+            }
+            #expect(replayedRows.count == 1)
+            guard replayedRows.count == 1 else { return }
+            #expect(replayedRows[0].messageId == "graph-new" && replayedRows[0].folderPath == "INBOX", """
+                the retired member is still at the address Graph invalidated: \
+                messageId=\(replayedRows[0].messageId) folder=\(replayedRows[0].folderPath)
+                """)
+
+            // THE WIRE LEDGER, both sides. The unproven member's move proves the
+            // provider is live and reachable from this drain; the absence of any
+            // move naming the proven member is the invariant.
+            let log = await provider.callLog
+            let moves = log.filter { $0.hasPrefix("move(") }
+            #expect(moves.count == 1, "unexpected move traffic: \(moves)")
+            guard moves.count == 1 else { return }
+            #expect(moves[0].contains("graph-unproven"), """
+                the narrowed remainder never reached the provider, so the \
+                "no second move" assertion below is structurally vacuous: \(moves)
+                """)
+            #expect(!moves[0].contains("graph-old"), """
+                the member the provider had already proved was moved a SECOND \
+                time on the wire: \(moves)
+                """)
+
+            // And the follower executed at the address the retirement proved.
+            let reads = log.filter { $0.hasPrefix("markRead(") }
+            #expect(reads.count == 1, "the follower did not execute exactly once: \(reads)")
+            guard reads.count == 1 else { return }
+            #expect(reads[0].contains("graph-new") && !reads[0].contains("graph-old"), """
+                the follower went to the wire at an address the move had already \
+                invalidated, where Graph answers 404 and the conflict arm deletes \
+                the user's newest gesture: \(reads)
+                """)
+
+            let survivors = try await fixture.pool.read { db in
+                try PendingOperation.filter(Column("accountId") == fixture.accountId).fetchAll(db)
+            }
+            #expect(survivors.isEmpty,
+                    "the queue did not drain after the replay: \(survivors.map(\.messageIdsJSON))")
+        }
     }
 
     // MARK: - IOS-UNDO-002 / IOS-SEARCH-002 — publishing a committed re-key

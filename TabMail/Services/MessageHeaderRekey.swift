@@ -762,8 +762,23 @@ enum MessageHeaderRekey {
     /// lost on every such move with no crash at all. It is not closable in this
     /// design; the structural fix is to make Graph ids immutable
     /// (`Prefer: IdType="ImmutableId"`), tracked in `TabMail/tabmail-ios#117`.
-    /// Do not "fix" it here with an in-memory map, a receipt table, or an identity
-    /// lookup.
+    ///
+    /// ⚠️ NARROWED 2026-09-05 TO PROCESS DEATH ONLY, and the narrowing is the
+    /// whole point of the distinction. An in-memory map cannot bridge a process
+    /// DEATH — the provider's response is gone with the process, so that half
+    /// stays the accepted window exactly as written above. But the same
+    /// transaction also fails while the process is very much ALIVE: GRDB
+    /// suspends writes when the app is backgrounded mid-drain while reads keep
+    /// working (ADR-IOS-041), and a full disk or an I/O error at COMMIT does the
+    /// same. There the response is still in hand, and discarding it was a
+    /// deterministic loss of the user's newest gesture rather than a crash
+    /// window. So for the LIVE-process case the provider's own returned result
+    /// is retained in `AccountManager.pendingRetirements` and replayed through
+    /// THIS SAME transaction at the next drain (owner decision 2026-09-05,
+    /// `TabMail/tabmail-ios#120`). RFC identity remains banned as a mutation
+    /// authority (ADR-IOS-068 D4), and there is still no receipt table: nothing
+    /// durable was added, and the replay carries the provider's own answer
+    /// rather than re-deriving one.
     ///
     /// - Returns: the ids of the operations whose members were rewritten.
     private static func readdressQueuedOperations(
