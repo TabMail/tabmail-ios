@@ -278,20 +278,41 @@ extension AccountManager {
         case haltLane
     }
 
-    /// The ids of the accounts whose message ids are IMMUTABLE ACROSS A MOVE, and
-    /// which may therefore share ONE drain lane for one message regardless of the
-    /// folder each op names. This is the ONLY place membership is decided; it is
+    /// The ids of the accounts whose message ids are ACCOUNT-SCOPED — one id names
+    /// exactly ONE message per ACCOUNT, never one per FOLDER — and which may
+    /// therefore share ONE drain lane for one message regardless of the folder each
+    /// op names. This is the ONLY place membership is decided; it is
     /// extracted from `drainPendingQueue` so it can be unit-tested directly
     /// against real `account` rows rather than only through a full drain.
     ///
-    /// Membership is `AccountProvider.gmail`, plus the demo account
-    /// (`DemoSeed.demoAccountId`, stored as `.imap` but backed by `DemoProvider`,
-    /// whose local ids never change). ⚠️ **Outlook/Graph is deliberately NOT a
-    /// member even though its ids are folder-independent** — Graph reallocates a
-    /// message id on every move and this tree sends no
-    /// `Prefer: IdType="ImmutableId"` (`IOS-GRAPH-002`), so serializing its ops
-    /// would make an inherited race a deterministic intention loss. The full
-    /// argument is on `buildLanes`; do not add `.outlook` here without reading it.
+    /// Membership is `AccountProvider.gmail` and `AccountProvider.outlook`, plus
+    /// the demo account (`DemoSeed.demoAccountId`, stored as `.imap` but backed by
+    /// `DemoProvider`, whose local ids never change).
+    ///
+    /// 🚨 THE PROPERTY IS "ONE ID, ONE MESSAGE PER ACCOUNT" — NOT "the id survives
+    /// a move", which is what this function's OLD name asserted (it was named for
+    /// id IMMUTABILITY) and which is FALSE of Graph: Microsoft reallocates a message's
+    /// default id on every folder move and this tree sends no
+    /// `Prefer: IdType="ImmutableId"` (`IOS-GRAPH-002`). Immutability is not what
+    /// the lane key needs. What it needs is that the id is not FOLDER-LOCAL, so
+    /// that two ops naming one id name one message and therefore must serialize.
+    ///
+    /// ⚠️ OUTLOOK WAS EXCLUDED UNTIL THE RETIREMENT HANDOFF EXISTED, and the
+    /// exclusion is now superseded rather than merely relaxed (`IOS-QUEUE-008`'s
+    /// amendment, `IOS-GRAPH-005`). Serializing a follower behind a move that
+    /// reallocates its id used to GUARANTEE the follower reached the wire with a
+    /// dead id — an inherited race turned into a deterministic 404 and a dropped
+    /// intention. `MessageHeaderRekey.finishMove` now rewrites every queued
+    /// follower's `messageIds` inside the SAME retirement transaction that learns
+    /// the new address (`readdressQueuedOperations`), so a follower reads its live
+    /// address before its own wire call and serializing is exactly what makes it
+    /// CORRECT. The two facts are one: this set is both the lane key's address
+    /// space AND the `accountScopedIds` argument the retirement passes to
+    /// `finishMove`.
+    ///
+    /// `.imap`/`.icloud` UIDs are mailbox-local and stay folder-qualified, as does
+    /// any provider string this build cannot decode; `.caldav` never carries mail
+    /// operations.
     ///
     /// 🚨 ID-ONLY, MATCHED ON THE RAW PROVIDER COLUMN — deliberately NOT
     /// `Account.fetchAll(db)`. `AccountProvider` is a closed `String, Codable`
@@ -311,10 +332,11 @@ extension AccountManager {
     /// cannot execute anyway (`providers[op.accountId]` is nil, so the claim loop
     /// skips them), so no address-space decision is ever acted on for it. No
     /// "unknown" classification, no quarantine state, no new column.
-    nonisolated static func immutableIdAccountIds(_ db: Database) throws -> Set<String> {
+    nonisolated static func accountScopedIdAccountIds(_ db: Database) throws -> Set<String> {
         Set(try String.fetchAll(db, Account
             .select(Column("id"))
             .filter(Column("provider") == AccountProvider.gmail.rawValue
+                || Column("provider") == AccountProvider.outlook.rawValue
                 || Column("id") == DemoSeed.demoAccountId)))
     }
 
@@ -335,7 +357,7 @@ extension AccountManager {
     /// 🚨 THE KEY IS THE OP'S ADDRESS SPACE, NOT A FIXED SHAPE, and which space
     /// an op lives in is a property of its ACCOUNT. This function is pure, so it
     /// cannot read the `Account` row itself; the caller passes
-    /// `immutableIdAccountIds` (see `AccountManager.immutableIdAccountIds(_:)`,
+    /// `accountScopedIdAccountIds` (see `AccountManager.accountScopedIdAccountIds(_:)`,
     /// which is the single place that decides membership).
     ///
     /// 🚨 THE DEFAULT IS THE FOLDER-QUALIFIED KEY, AND THAT IS DELIBERATE. An
@@ -349,8 +371,8 @@ extension AccountManager {
     /// serialization that `IOS-QUEUE-008` exists for, which is a wrong end state
     /// rather than merely a conservative one.
     ///
-    /// - **Folder-qualified — EVERYTHING NOT IN THE SET (IMAP, iCloud, Outlook,
-    ///   and anything unknown)** — key `"accountId:folderPath:msgId"`. A UID is
+    /// - **Folder-qualified — EVERYTHING NOT IN THE SET (IMAP, iCloud, and
+    ///   anything unknown)** — key `"accountId:folderPath:msgId"`. A UID is
     ///   mailbox-local: UID 77 in `INBOX` and UID 77 in `Archive` are DIFFERENT
     ///   PHYSICAL MESSAGES, and every id an ordinary IMAP gesture enqueues is a
     ///   bare UID (`admittedOrdinaryActionTargets` requires
@@ -364,31 +386,33 @@ extension AccountManager {
     ///   BYSTANDER, and its owner could neither see nor clear it, because no UI
     ///   lists `PendingOperation` rows. An op that stays queued but prevents
     ///   other intentions executing has not been preserved.
-    /// - **Account-qualified — IMMUTABLE-ID accounts only: Gmail, plus the demo
-    ///   account** — key `"accountId:msgId"`, folder deliberately EXCLUDED. The
-    ///   provider's id is folder-independent AND SURVIVES A MOVE, so the folder is
-    ///   not part of the address and including it splits one resource across two
+    /// - **Account-qualified — ACCOUNT-SCOPED-ID accounts: Gmail, Outlook, plus
+    ///   the demo account** — key `"accountId:msgId"`, folder deliberately
+    ///   EXCLUDED. The provider's id is folder-INDEPENDENT, so the folder is not
+    ///   part of the address and including it splits one resource across two
     ///   lanes.
     ///
-    /// 🚨 WHY OUTLOOK/GRAPH IS **NOT** HERE, EVEN THOUGH ITS IDS ARE
-    /// FOLDER-INDEPENDENT — DO NOT "FIX" THIS BY ADDING IT. Folder-independent is
-    /// not the same property as immutable. Microsoft Graph REALLOCATES a message's
-    /// default id on every move, and this tree never sends
-    /// `Prefer: IdType="ImmutableId"` (`IOS-GRAPH-002`). Account-qualifying Graph
-    /// would put a move `A: Inbox→Archive` and any op on `A` that was queued
-    /// BEFORE that move landed (offline, or simply in the same drain snapshot)
-    /// into ONE lane — which GUARANTEES the follower runs after the move, against
-    /// the id the move just invalidated. `MessageHeaderRekey.finishMove` re-keys
-    /// the `MessageHeader` and nothing rewrites a later `PendingOperation`'s
-    /// `messageIds`, so the follower goes to the wire with a dead id, Graph
-    /// answers 404, and `executeSingleOp`'s single-message conflict arm DELETES
-    /// it: the user's latest intention is gone. Folder-qualified, those two ops
-    /// sit in different lanes and merely RACE — sometimes wrong, sometimes right,
-    /// and recoverable. Serializing them would convert an inherited race into a
-    /// DETERMINISTIC loss, which is strictly worse. The real fix (carry a move's
-    /// A→B handoff into later same-lane members before their wire call) is a
-    /// queue-semantics change routed to the owner as its own follow-up issue; it
-    /// is NOT implemented here. Until it exists, Graph stays folder-qualified.
+    /// 🚨 OUTLOOK/GRAPH IS HERE BECAUSE THE RETIREMENT HANDOFF EXISTS, AND ONLY
+    /// BECAUSE OF IT (`IOS-GRAPH-005`). Folder-independent is not the same
+    /// property as immutable: Microsoft Graph REALLOCATES a message's default id
+    /// on every move, and this tree never sends `Prefer: IdType="ImmutableId"`
+    /// (`IOS-GRAPH-002`). Account-qualifying Graph puts a move `A: Inbox→Archive`
+    /// and any op on `A` queued BEFORE that move landed (offline, or simply in the
+    /// same drain snapshot) into ONE lane, which GUARANTEES the follower runs
+    /// AFTER the move. Until 2026-09-04 that guarantee was the defect: the
+    /// follower still named the id the move had just invalidated, Graph answered
+    /// 404, and `executeSingleOp`'s single-message conflict arm deleted it — the
+    /// user's latest intention, gone deterministically rather than merely raced.
+    /// `MessageHeaderRekey.finishMove` now REWRITES every non-cancelled
+    /// same-account operation whose members include an id the wire just
+    /// re-addressed, inside the same transaction that retires the move
+    /// (`readdressQueuedOperations`), and the lane loop re-reads each op from the
+    /// table immediately before executing it. So "the follower runs after the
+    /// move" now means "the follower runs against the address the move PROVED",
+    /// and serialization is what makes the newest gesture win instead of racing.
+    /// ⚠️ The two halves are not independent: reverting either the handoff or the
+    /// per-op re-read while leaving Outlook in this set restores the deterministic
+    /// loss. `IOS-QUEUE-008`'s amendment records the supersession.
     ///
     /// 🚨 THE NEGATIVE CASE THAT MOTIVATED THE SPLIT (`IOS-QUEUE-008`): on
     /// Gmail, delete → undo → delete again. `undoMove` enqueues a real inverse
@@ -432,18 +456,19 @@ extension AccountManager {
     /// Ops with empty `messageIds` (no id to key on) fall back to a singleton lane,
     /// matching the pre-existing fallback (`messageIds.first ?? op.id`).
     ///
-    /// - Parameter immutableIdAccountIds: ids of the accounts whose message ids
-    ///   are IMMUTABLE ACROSS A MOVE (Gmail, plus the demo account). Everything
-    ///   absent from this set is folder-qualified. Required, not defaulted.
+    /// - Parameter accountScopedIdAccountIds: ids of the accounts whose message
+    ///   ids name ONE MESSAGE PER ACCOUNT rather than one per folder (Gmail,
+    ///   Outlook, plus the demo account). Everything absent from this set is
+    ///   folder-qualified. Required, not defaulted.
     nonisolated static func buildLanes(
         _ ops: [PendingOperation],
-        immutableIdAccountIds: Set<String>
+        accountScopedIdAccountIds: Set<String>
     ) -> [[PendingOperation]] {
         /// The op's ADDRESS, in whichever address space its account uses. Both
         /// key-building passes below go through this one function, so the union
         /// pass and the lane-assignment pass cannot drift apart.
         func laneKey(_ op: PendingOperation, _ id: String) -> String {
-            immutableIdAccountIds.contains(op.accountId)
+            accountScopedIdAccountIds.contains(op.accountId)
                 ? "\(op.accountId):\(id)"
                 : "\(op.accountId):\(op.folderPath):\(id)"
         }
@@ -564,15 +589,16 @@ extension AccountManager {
         // Max 3 passes to pick up ops inserted during drain.
         for pass in 0..<3 {
             let ops: [PendingOperation]
-            // Which accounts address their messages by an id that SURVIVES A MOVE.
+            // Which accounts address their messages by an id that names ONE
+            // MESSAGE PER ACCOUNT rather than one per folder.
             // Read here, in the SAME read as the ops snapshot and BEFORE anything is
             // claimed, so a failure still takes the existing `break` and leaves no
             // row stranded `inFlight`.
-            let immutableIds: Set<String>
+            let accountScopedIds: Set<String>
             do {
-                (ops, immutableIds) = try await dbPool.read({ db in
+                (ops, accountScopedIds) = try await dbPool.read({ db in
                     let fetchedOps = try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
-                    return (fetchedOps, try Self.immutableIdAccountIds(db))
+                    return (fetchedOps, try Self.accountScopedIdAccountIds(db))
                 })
             } catch {
                 queueLog("[Queue] ERROR: Failed to fetch pending ops: \(error)")
@@ -783,11 +809,11 @@ extension AccountManager {
 
             // Connected-component lane grouping (F1) — pure, see buildLanes doc comment.
             // The lane key is the op's ADDRESS SPACE, which is a property of its
-            // ACCOUNT, not of the op: account-qualified for the IMMUTABLE-ID
-            // accounts (Gmail, demo), folder-qualified for everything else —
-            // IMAP, iCloud, Outlook, and any provider string this build cannot
+            // ACCOUNT, not of the op: account-qualified for the ACCOUNT-SCOPED-ID
+            // accounts (Gmail, Outlook, demo), folder-qualified for everything
+            // else — IMAP, iCloud, and any provider string this build cannot
             // decode. Folder-qualified is the base behaviour and the safe default.
-            let lanes = Self.buildLanes(claimed, immutableIdAccountIds: immutableIds)
+            let lanes = Self.buildLanes(claimed, accountScopedIdAccountIds: accountScopedIds)
             // The lane assignment IS the concurrency decision, so record it before
             // anything runs: same lane ⇒ serialized, different lanes ⇒ concurrent.
             queueLog("[Queue] Lanes: \(Self.laneDiagnosticSummary(lanes))")
@@ -807,9 +833,7 @@ extension AccountManager {
                     for (index, op) in capturedLane.enumerated() {
                         if capturedCtx.failedAccounts.contains(op.accountId) {
                             try? await retryWrite(dbPool, label: "Queue") { db in
-                                var updated = op
-                                updated.status = PendingStatus.queued.rawValue
-                                try updated.save(db)
+                                try PendingOperation.markQueued(db, id: op.id)
                             }
                             continue
                         }
@@ -839,22 +863,55 @@ extension AccountManager {
                             // dispositioned by `executeSingleOp`.
                             for heldOp in capturedLane[index...] {
                                 try? await retryWrite(dbPool, label: "Queue") { db in
-                                    var updated = heldOp
-                                    updated.status = PendingStatus.queued.rawValue
-                                    try updated.save(db)
+                                    try PendingOperation.markQueued(db, id: heldOp.id)
                                 }
                             }
                             break
                         }
                         guard let queue = self.workQueues[op.accountId] else {
                             try? await retryWrite(dbPool, label: "Queue") { db in
-                                var updated = op
-                                updated.status = PendingStatus.queued.rawValue
-                                try updated.save(db)
+                                try PendingOperation.markQueued(db, id: op.id)
                             }
                             continue
                         }
                         let provider = queue.provider
+                        // 🚨 RE-READ THE ROW. `op` is a value from the snapshot this
+                        // pass took BEFORE any lane ran, and under account-qualified
+                        // lanes a predecessor in THIS lane may have rewritten this
+                        // op's `messageIds` while retiring its own move
+                        // (`MessageHeaderRekey.readdressQueuedOperations`,
+                        // `IOS-GRAPH-005`). Executing the captured value would send
+                        // the address the move just invalidated — the deterministic
+                        // dropped intention that account-qualifying Graph used to
+                        // cause. This is a happens-before, not a hopeful re-read: the
+                        // predecessor's retirement COMMITTED earlier in this same
+                        // sequential task, so there is no window to lose here and no
+                        // CAS is required.
+                        //
+                        // ⚠️ NO `?? op` FALLBACK. `nil` means the row is gone since
+                        // the claim, and the only writers that can delete a claimed
+                        // row are cancel and annihilation — both of which guard on
+                        // `!everAttempted` and `queued`, i.e. both are the user
+                        // deliberately withdrawing this intention. Falling back to the
+                        // captured struct would resurrect a withdrawn gesture from
+                        // memory and send it to the wire; a defaulted seam like that
+                        // is fail-DANGEROUS, not fail-safe.
+                        guard let liveOp = await liveOperation(op.id) else {
+                            queueLog(
+                                "[Queue] drain lane \(laneIndex) pos \(index + 1)/\(capturedLane.count) — "
+                                    + "row \(op.id.prefix(8)) vanished since the claim (cancelled or annihilated); skipping")
+                            continue
+                        }
+                        if liveOp.messageIds != op.messageIds {
+                            // The handoff is only observable here and in the DB. The
+                            // `IOS-QUEUE-008` lesson is that a race nobody can read
+                            // from the exported log gets misdiagnosed for a month.
+                            BackgroundSyncLogger.logQueue(
+                                "readdressed follower \(liveOp.id.prefix(8)) \(liveOp.type.rawValue): "
+                                    + "claimed ids=[\(op.messageIds.joined(separator: ","))] "
+                                    + "→ live ids=[\(liveOp.messageIds.joined(separator: ","))] "
+                                    + "(predecessor move retired in this lane)")
+                        }
                         // Outcome captured via Mutex (not a plain var) — the closure
                         // passed to queue.execute is @Sendable, so it cannot capture a
                         // mutable local var directly under Swift 6 strict concurrency.
@@ -865,20 +922,22 @@ extension AccountManager {
                         // `IOS-QUEUE-008` could not answer. Position within the lane
                         // proves FIFO; the lane index proves what serialized against
                         // what; the outcome proves whether the lane kept draining.
+                        // The ids logged are the LIVE ones, because those are the ones
+                        // that go to the wire.
                         queueLog(
                             "[Queue] drain lane \(laneIndex) pos \(index + 1)/\(capturedLane.count) — "
-                                + "executing \(op.id.prefix(8)) \(op.type.rawValue) "
-                                + "\(op.folderPath)→\(op.destinationPath ?? "-") "
-                                + "ids=[\(op.messageIds.joined(separator: ","))]")
+                                + "executing \(liveOp.id.prefix(8)) \(liveOp.type.rawValue) "
+                                + "\(liveOp.folderPath)→\(liveOp.destinationPath ?? "-") "
+                                + "ids=[\(liveOp.messageIds.joined(separator: ","))]")
                         await queue.execute(priority: .userAction) {
-                            let result = await self.executeSingleOp(op, provider: provider, context: capturedCtx)
+                            let result = await self.executeSingleOp(liveOp, provider: provider, context: capturedCtx)
                             outcomeBox.withLock { $0 = result }
                         }
                         queueLog(
                             "[Queue] drain lane \(laneIndex) pos \(index + 1)/\(capturedLane.count) — "
-                                + "executed \(op.id.prefix(8)) \(op.type.rawValue) "
-                                + "\(op.folderPath)→\(op.destinationPath ?? "-") "
-                                + "ids=[\(op.messageIds.joined(separator: ","))] "
+                                + "executed \(liveOp.id.prefix(8)) \(liveOp.type.rawValue) "
+                                + "\(liveOp.folderPath)→\(liveOp.destinationPath ?? "-") "
+                                + "ids=[\(liveOp.messageIds.joined(separator: ","))] "
                                 + "outcome=\(outcomeBox.withLock({ $0 }))")
                         if outcomeBox.withLock({ $0 }) == .haltLane {
                             // Requeue the REMAINING claimed ops of this lane — exactly
@@ -886,9 +945,7 @@ extension AccountManager {
                             let remaining = capturedLane[(index + 1)...]
                             for remainingOp in remaining {
                                 try? await retryWrite(dbPool, label: "Queue") { db in
-                                    var updated = remainingOp
-                                    updated.status = PendingStatus.queued.rawValue
-                                    try updated.save(db)
+                                    try PendingOperation.markQueued(db, id: remainingOp.id)
                                 }
                             }
                             break
@@ -933,6 +990,15 @@ extension AccountManager {
                 await enqueueAIForMembersThatEnteredInbox(key: key, folderPath: folderPath, context: ctx)
             }
         }
+    }
+
+    /// The row as it is RIGHT NOW, by primary key — the address the drain is
+    /// about to send, rather than the one it snapshotted.
+    ///
+    /// `nil` means the row no longer exists. The caller must skip that op; see
+    /// the lane loop for why there is deliberately no `?? capturedOp` fallback.
+    private func liveOperation(_ id: String) async -> PendingOperation? {
+        try? await dbPool.read { db in try PendingOperation.fetchOne(db, key: id) }
     }
 
     /// Record which members of a just-completed `.move` are now sitting in an
@@ -1514,9 +1580,7 @@ extension AccountManager {
                     // The provider wrote nothing. If retiring the refused op
                     // fails, preserve the exact original bundle for retry.
                     try? await retryWrite(dbPool, label: "Queue") { db in
-                        var queued = currentOp
-                        queued.status = PendingStatus.queued.rawValue
-                        try queued.save(db)
+                        try PendingOperation.markQueued(db, id: currentOp.id)
                     }
                     return .haltLane
                 }
@@ -1778,10 +1842,7 @@ extension AccountManager {
                     await logStuckOpDiagnostic(currentOp, error: error)
                 }
                 try? await retryWrite(dbPool, label: "Queue") { db in
-                    var updated = currentOp
-                    updated.status = PendingStatus.queued.rawValue
-                    updated.retryCount += 1
-                    try updated.save(db)
+                    try PendingOperation.markQueued(db, id: currentOp.id, incrementRetryCount: true)
                 }
                 context.evidenceRefused.insert(currentOp.id)
                 return .haltLane
@@ -1822,15 +1883,12 @@ extension AccountManager {
                     print("[Queue] \(opType) destination Folder missing locally: \(currentOp.accountId):\(destPath) — op stays queued (local absence is not provider authority)")
                 }
             }
+            // Bump retryCount on each failure so the value matches reality (and
+            // is visible in [QueueDiag] dumps). Previously this stayed at 0
+            // forever, masking the runaway-retry case where we observed
+            // `retryCount=0 ageHours=217` on the same op.
             try? await retryWrite(dbPool, label: "Queue") { db in
-                var updated = currentOp
-                updated.status = PendingStatus.queued.rawValue
-                // Bump retryCount on each failure so the value matches reality (and
-                // is visible in [QueueDiag] dumps). Previously this stayed at 0
-                // forever, masking the runaway-retry case where we observed
-                // `retryCount=0 ageHours=217` on the same op.
-                updated.retryCount += 1
-                try updated.save(db)
+                try PendingOperation.markQueued(db, id: currentOp.id, incrementRetryCount: true)
             }
             context.failedAccounts.insert(currentOp.accountId)
             return .haltLane
@@ -2143,9 +2201,7 @@ extension AccountManager {
                 "CRITICAL: could not narrow partially-completed \(currentOp.id) (type \(currentOp.type.rawValue)) after retries — requeuing the WHOLE bundle, so the \(provenMembers.count) member(s) the provider already proved will be re-applied and may duplicate at the destination: \(error)",
                 source: "actionQueue")
             try? await retryWrite(dbPool, label: "Queue") { db in
-                var queued = currentOp
-                queued.status = PendingStatus.queued.rawValue
-                try queued.save(db)
+                try PendingOperation.markQueued(db, id: currentOp.id)
             }
         }
         if [.archive, .delete, .move].contains(currentOp.type), let dest = currentOp.destinationPath {

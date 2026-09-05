@@ -67,8 +67,8 @@ struct AccountManagerQueueDrainTests {
     /// checkpoint is correctly inapplicable.
     ///
     /// `provider` defaults to `.gmail` — every pre-existing caller. A3.1 adds a
-    /// second immutable-id shape (the demo account, whose row is stored `.imap`
-    /// but admitted into `AccountManager.immutableIdAccountIds` BY ID), so a
+    /// second account-scoped-id shape (the demo account, whose row is stored
+    /// `.imap` but admitted into `AccountManager.accountScopedIdAccountIds` BY ID), so a
     /// caller that needs to pin that classification passes it explicitly instead
     /// of this file growing a near-duplicate helper.
     private func insertStableProviderFixture(
@@ -535,7 +535,7 @@ struct AccountManagerQueueDrainTests {
     /// parallel pair must be seen as parallel, so a regression cannot pass by
     /// timing luck, and a serialized pair cannot fail by it either.
     ///
-    /// A3.1: parameterized over EVERY way `AccountManager.immutableIdAccountIds`
+    /// A3.1: parameterized over EVERY way `AccountManager.accountScopedIdAccountIds`
     /// admits an account into the account-qualified lane space. It admits an id
     /// two ways — by PROVIDER (`provider == .gmail`) and by ID
     /// (`DemoSeed.demoAccountId`, whose row is nonetheless stored `.imap`). A
@@ -546,15 +546,18 @@ struct AccountManagerQueueDrainTests {
     /// defect in how the drain COMPUTES it; only a real-drain fixture per
     /// classification can.
     ///
-    /// 🚨 THERE IS DELIBERATELY NO OUTLOOK CASE HERE, and adding one would be a
-    /// test that BLESSES A BUG. Graph reallocates a message's id on every move
-    /// (`IOS-GRAPH-002` — this tree sends no `Prefer: IdType="ImmutableId"`), and
-    /// nothing rewrites a later `PendingOperation`'s `messageIds` after
-    /// `finishMove` re-keys the header. Serializing two Graph ops on one message
-    /// would therefore GUARANTEE the follower runs against the id the move just
-    /// invalidated → 404 → the conflict arm deletes it → the user's latest
-    /// intention is lost. Outlook is folder-qualified on purpose; the test that
-    /// pins that is `immutableIdAccountIdsAdmitsOnlyGmailAndTheDemoAccount`.
+    /// 🚨 THE OUTLOOK CASE IS NOT HERE, AND ITS ABSENCE IS NOT AN OPINION ABOUT
+    /// GRAPH. Graph reallocates a message's id on every move (`IOS-GRAPH-002` —
+    /// this tree sends no `Prefer: IdType="ImmutableId"`), so a serialized Graph
+    /// follower is only safe because `finishMove` readdresses it in the same
+    /// transaction that retires the move (`IOS-GRAPH-005`). That property needs a
+    /// churning Graph server to be worth asserting, and this fixture's mock
+    /// provider does not churn — so Outlook's real-drain coverage lives in
+    /// `OutlookQueueHandoffTests` (T1/T2) against `StatefulExchangeActionServer`
+    /// with `churnsIdOnMove: true`, not here. What this suite still owns is the
+    /// two ADMISSION SHAPES, by provider and by id. Membership itself is pinned
+    /// as an exact set by
+    /// `accountScopedIdAccountIdsAdmitsExactlyGmailOutlookAndTheDemoAccount`.
     // Not `private`: it is the parameter type of a `@Test(arguments:)` function,
     // and Swift requires a method to be at least as accessible as its parameter
     // types. It stays scoped by being nested in this suite.
@@ -582,21 +585,29 @@ struct AccountManagerQueueDrainTests {
     ///
     /// Why this exists in addition to the real-drain parameterization: a drain
     /// fixture can only show that the account it seeds is classified correctly.
-    /// It is structurally blind to an account it does not seed, so "`.outlook`
-    /// was quietly admitted" is invisible to every drain test — and admitting
-    /// Outlook is the one mutation here whose consequence is a DETERMINISTIC lost
-    /// intention rather than a race (Graph reallocates ids on move,
-    /// `IOS-GRAPH-002`; a serialized follower goes to the wire with a dead id,
-    /// 404s, and is deleted by the conflict arm). An exact-set oracle over rows
-    /// for every provider is the only shape that can fail on an account the test
-    /// author did not think to seed.
+    /// It is structurally blind to an account it does not seed, so "`.icloud` was
+    /// quietly admitted" is invisible to every drain test — and admitting an
+    /// account whose ids are FOLDER-LOCAL is the mutation whose consequence is a
+    /// wrong-message mutation or a starved bystander (`IOS-QUEUE-001`): UID 77 in
+    /// `INBOX` and UID 77 in `Archive` would share one lane despite being
+    /// different physical messages. An exact-set oracle over rows for every
+    /// provider is the only shape that can fail on an account the test author did
+    /// not think to seed.
+    ///
+    /// ⚠️ Outlook's membership is load-bearing in the OTHER direction and is
+    /// asserted here positively: Graph ids are account-scoped, and since the
+    /// retirement handoff exists (`IOS-GRAPH-005`) the account-qualified lane is
+    /// what makes an undo inverse and a re-delete of one message serialize
+    /// instead of race. Dropping Outlook back out of the set is the mutation this
+    /// leg catches; before 2026-09-04 the same assertion ran with the opposite
+    /// sign (`IOS-QUEUE-008`'s amendment records the supersession).
     ///
     /// The unknown-provider row is not decoration either: it pins that the
     /// classifier reads the RAW `provider` column rather than decoding
     /// `AccountProvider`, so one corrupt bystander row cannot throw the whole
     /// snapshot (`DecodingError.dataCorrupted`) and wedge every account's drain.
-    @Test("AccountManager.immutableIdAccountIds admits Gmail and the demo account and NOTHING else — not Outlook, not IMAP, not iCloud, not an undecodable provider string")
-    func immutableIdAccountIdsAdmitsOnlyGmailAndTheDemoAccount() async throws {
+    @Test("AccountManager.accountScopedIdAccountIds admits Gmail, Outlook and the demo account and NOTHING else — not IMAP, not iCloud, not an undecodable provider string")
+    func accountScopedIdAccountIdsAdmitsExactlyGmailOutlookAndTheDemoAccount() async throws {
         let (pool, dir, previous) = try makeTestDB()
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
@@ -645,21 +656,23 @@ struct AccountManagerQueueDrainTests {
                 "fixture is not exercising the corrupt-row path — Account.fetchAll decoded cleanly")
 
         let classified = try await pool.read { db in
-            try AccountManager.immutableIdAccountIds(db)
+            try AccountManager.accountScopedIdAccountIds(db)
         }
 
-        #expect(classified == [gmailId, DemoSeed.demoAccountId], """
-            immutableIdAccountIds must be EXACTLY {gmail, demo}.
+        #expect(classified == [gmailId, outlookId, DemoSeed.demoAccountId], """
+            accountScopedIdAccountIds must be EXACTLY {gmail, outlook, demo}.
             observed: \(classified.sorted())
             outlook admitted: \(classified.contains(outlookId)) \
-            (this one is a deterministic intention loss, not a race — see IOS-GRAPH-002)
-            imap admitted: \(classified.contains(imapId))
+            (must be true — the retirement handoff is what makes the \
+            account-qualified lane correct for Graph; see IOS-GRAPH-005)
+            imap admitted: \(classified.contains(imapId)) \
+            (must be false — an IMAP UID is mailbox-local; see IOS-QUEUE-001)
             icloud admitted: \(classified.contains(icloudId))
             undecodable admitted: \(classified.contains(unknownId))
             """)
     }
 
-    @Test("drainPendingQueue() (real): on an immutable-id account, an undo inverse and a re-delete of the same message never overlap on the wire and run in issue order",
+    @Test("drainPendingQueue() (real): on an account-scoped-id account, an undo inverse and a re-delete of the same message never overlap on the wire and run in issue order",
           arguments: stableIdAccountCases)
     func drainPendingQueueRealStableIdSameMessageOpsNeverOverlapAndRunInIssueOrder(
         accountCase: StableIdAccountCase
@@ -1013,7 +1026,8 @@ struct AccountManagerQueueDrainTests {
     /// `IOS-QUEUE-001`: an op that stays queued but prevents other intentions
     /// executing has not been preserved.
     ///
-    /// The fix is to read only the IDS of the rows that MATCH the immutable-id
+    /// The fix is to read only the IDS of the rows that MATCH the
+    /// account-scoped-id
     /// predicate, which a row that does not match cannot defeat. An unknown
     /// provider is then simply not admitted, which is the SAFE side — it gets the
     /// folder-qualified key the base always used — and it costs nothing anyway:
