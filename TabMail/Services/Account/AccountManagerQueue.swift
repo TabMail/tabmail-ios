@@ -3820,7 +3820,7 @@ extension AccountManager {
     }
 
     /// The post-connect queue kick: drain whatever the durable action queue
-    /// still owes, then run the outbox and calendar-queue reconcilers.
+    /// still owes, then reconcile the outbox and drain the calendar queue.
     ///
     /// 🚨 THIS IS NOT CRASH RECOVERY ANY MORE, and it must never become it
     /// again. The blind whole-table sweep of previous-session residue that used
@@ -3841,6 +3841,6 @@ extension AccountManager {
     func reconcilePendingOperations() async {
         await drainPendingQueue()
         await reconcileOutbox()
-        await reconcileCalendarQueue()
+        await drainCalendarQueue()
     }
 }

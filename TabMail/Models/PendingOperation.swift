@@ -33,7 +33,7 @@ enum PendingStatus: String, Codable, Sendable {
     /// being deleted, so the failure survives the disappearance of the in-memory
     /// awaiter that used to be its only report channel. It is not a queue state:
     /// `drainCalendarQueue` fetches `status == queued` only, and
-    /// `reconcileCalendarQueue` resets `inFlight` only, so a `failed` row is never
+    /// `AppDatabase.init` resets `inFlight` only, so a `failed` row is never
     /// re-executed and can never head-of-line-block an account's lane — which is
     /// the mirror-image defect (`MIS-005`) that keeping terminal failures QUEUED
     /// would have created.

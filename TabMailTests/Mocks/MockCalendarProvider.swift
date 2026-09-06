@@ -27,6 +27,11 @@ actor MockCalendarProvider: CalendarProvider {
     var updateEventResult: GCalEvent?
     var updateEventThrows: Error?
     var deleteEventThrows: Error?
+    private var deleteEventHook: (@Sendable () async -> Void)?
+
+    func setDeleteEventHook(_ hook: @escaping @Sendable () async -> Void) {
+        deleteEventHook = hook
+    }
 
     // MARK: - Parameter Tracking
 
@@ -92,6 +97,7 @@ actor MockCalendarProvider: CalendarProvider {
     func deleteEvent(calendarId: String, eventId: String, sendUpdates: String) async throws {
         callLog.append("deleteEvent(calendarId:\(calendarId),eventId:\(eventId),sendUpdates:\(sendUpdates))")
         deletedEvents.append((calendarId: calendarId, eventId: eventId, sendUpdates: sendUpdates))
+        if let deleteEventHook { await deleteEventHook() }
         if let error = deleteEventThrows { throw error }
     }
 
