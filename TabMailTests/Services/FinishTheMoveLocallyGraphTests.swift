@@ -386,8 +386,8 @@ struct FinishTheMoveLocallyGraphTests {
     // MARK: - The batch with a member the server says is gone
 
     /// **THE PROPERTY: a member Graph answers `404` for is dispositioned in
-    /// place, its siblings still move, and the operation has nothing left to
-    /// narrow to.**
+    /// place rather than ending the operation, so its siblings still move and
+    /// nothing is left owed that can never resolve.**
     ///
     /// This is the provider half of deleting the drain's batch split. The split
     /// existed because a batch failure names no member; a per-member `/move`
@@ -401,9 +401,21 @@ struct FinishTheMoveLocallyGraphTests {
     /// the pre-change path had nothing at all to report — the shape that made the
     /// old code rethrow.
     ///
+    /// 🚨 ONE MEMBER PER ATTEMPT, SO THE PROPERTY IS READ ACROSS ATTEMPTS. An
+    /// attempt settles exactly one member and reports it, because a loop that
+    /// commits to a second request cannot protect what it has already settled
+    /// from `withTimeout`'s cancellation by any elapsed-time margin
+    /// (`MIS-IOS-022`). The narrowing this test performs by hand is the same one
+    /// `AccountManager.retirePartiallyCompletedOp` performs on the durable row —
+    /// which is asserted through the real drain in `OutlookQueueHandoffTests` and
+    /// `QueueMemberAbsenceTests`. What is asserted HERE is the provider contract
+    /// those depend on: every attempt settles at least one member, an absent
+    /// member is one of them, and the sibling behind it is untouched until an
+    /// attempt addresses it.
+    ///
     /// RED PROOF (recorded): against the pre-fix tree `moveProvingDestinations`
-    /// throws instead of returning, so this test fails at the `try await` with
-    /// the 404's `ProviderError`; the surviving member is never moved.
+    /// throws instead of returning, so the first attempt fails with the 404's
+    /// `ProviderError`; the surviving member is never moved.
     @Test("A gone member is dispositioned in place and its siblings still move")
     @MainActor
     func aGoneMemberIsDispositionedAndTheSiblingsStillMove() async throws {
@@ -416,27 +428,49 @@ struct FinishTheMoveLocallyGraphTests {
 
         // `graph-gone` has no resource on the server at all: a deterministic 404,
         // Graph's authoritative "this message no longer exists".
-        let outcome = try await provider.moveProvingDestinations(
-            ids: ["graph-gone", "graph-live"],
-            from: Self.source, to: Self.firstDestination)
+        var owed = ["graph-gone", "graph-live"]
+        var proven: [String] = []
+        var confirmedGone: [String] = []
+        var destinations: [ProvenDestinationAddress] = []
+        // Bounded so a provider that settles nothing fails an assertion instead
+        // of hanging the suite.
+        for _ in 0..<(owed.count + 1) where !owed.isEmpty {
+            let outcome = try await provider.moveProvingDestinations(
+                ids: owed, from: Self.source, to: Self.firstDestination)
+            #expect(!outcome.provenIds.isEmpty, """
+                an attempt settled NOTHING. An attempt that can settle nothing \
+                can never converge, and an operation that can never complete is a \
+                dropped intention by the wedge corollary. Still owed: \(owed)
+                """)
+            guard !outcome.provenIds.isEmpty else { break }
+            #expect(outcome.provenIds == Array(owed.prefix(outcome.provenIds.count)), """
+                the settled members are not a prefix of the request, in request \
+                order: \(outcome.provenIds) out of \(owed)
+                """)
+            proven += outcome.provenIds
+            confirmedGone += outcome.confirmedGoneIds
+            destinations += outcome.provenDestinations
+            owed.removeFirst(min(outcome.provenIds.count, owed.count))
+        }
+        #expect(owed.isEmpty, "the batch never converged: \(owed) is still owed")
 
         #expect(
             serverFolders(server, rfc: movedRfc) == [Self.firstDestination],
             "the surviving member was stranded by its absent sibling")
         #expect(
-            outcome.confirmedGoneIds == ["graph-gone"],
+            confirmedGone == ["graph-gone"],
             "the member the server reported gone must be named, or the drain cannot retire its ghost header")
         #expect(
-            outcome.provenIds.contains("graph-gone"),
+            proven.contains("graph-gone"),
             """
             a confirmed-gone member must count as dispositioned. Leaving it \
             unproven narrows the operation onto an address that can never \
             resolve, and an operation that can never complete is a dropped \
             intention by the wedge corollary.
             """)
-        #expect(outcome.provenIds.contains("graph-live"))
-        // It carries no destination address, because it never moved — only the
-        // member that actually landed has one to re-key onto.
-        #expect(outcome.provenDestinations.map(\.sourceProviderId) == ["graph-live"])
+        #expect(proven.contains("graph-live"))
+        // The gone member carries no destination address, because it never moved
+        // — only the member that actually landed has one to re-key onto.
+        #expect(destinations.map(\.sourceProviderId) == ["graph-live"])
     }
 }

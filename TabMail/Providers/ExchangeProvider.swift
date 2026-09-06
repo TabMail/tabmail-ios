@@ -587,40 +587,30 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Actions
 
-    /// THE PER-MEMBER BOUNDARY for every Graph setter. Graph's `PATCH /messages/{id}`
-    /// addresses ONE message per request, so this loop is where a not-found answer
-    /// can be attributed to a member; see the identical reasoning on
-    /// `GmailProvider.modifyEachMessage`, including why only a structural,
-    /// member-addressed not-found is absorbed and why re-running the surviving
-    /// members on a retry is accepted.
+    /// THE PER-MEMBER BOUNDARY for every Graph setter, and it settles EXACTLY ONE
+    /// MEMBER PER ATTEMPT.
+    ///
+    /// Graph's `PATCH /messages/{id}` addresses ONE message per request, so this
+    /// is where a not-found answer can be attributed to a member; see the
+    /// identical reasoning on `GmailProvider.modifyEachMessage`, including why
+    /// only a structural, member-addressed not-found is absorbed, why a time
+    /// budget cannot bound the request it is about to start (`MIS-IOS-022`), and
+    /// why an N-member operation converging in N attempts is the accepted cost.
     private func patchEachMessage(ids: [String], body: [String: Any]) async throws {
+        guard let id = ids.first else { return }
         var absent: [String] = []
-        var dispositioned: [String] = []
-        let deadline = ProviderMemberLoopBudget.deadlineFromNow()
-        for id in ids {
-            // See `GmailProvider.modifyEachMessage` for why this is checked
-            // BETWEEN members and never before the first one.
-            if !dispositioned.isEmpty, ContinuousClock.now >= deadline {
-                if DebugModeManager.isLoggingEnabled() {
-                    print("[Exchange] patchEachMessage: budget spent after \(dispositioned.count)/\(ids.count) member(s) — reporting the finished prefix so the operation narrows instead of repeating it")
-                }
-                break
-            }
-            do {
-                try await patchMessage(id: id, body: body)
-                dispositioned.append(id)
-            } catch {
-                guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
-                absent.append(id)
-                dispositioned.append(id)
-                if DebugModeManager.isLoggingEnabled() {
-                    print("[Exchange] patchMessage \(id): the server reports THIS message gone — the member is dispositioned and the remaining members are still processed")
-                }
+        do {
+            try await patchMessage(id: id, body: body)
+        } catch {
+            guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
+            absent.append(id)
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Exchange] patchMessage \(id): the server reports THIS message gone — the member is dispositioned and the operation narrows to the members still owed")
             }
         }
-        if !absent.isEmpty || dispositioned.count != ids.count {
+        if !absent.isEmpty || ids.count != 1 {
             throw ProviderMembersDispositioned(
-                dispositionedMemberIds: dispositioned, absentMemberIds: absent)
+                dispositionedMemberIds: [id], absentMemberIds: absent)
         }
     }
 
@@ -682,142 +672,113 @@ actor ExchangeProvider: EmailProvider {
     /// `roleMoveRejectDispositions` treats as `.terminalStale`: the mirror
     /// image of the bug this closes.
     ///
-    /// **PARTIAL BATCHES RETURN WHAT THEY PROVED.** A member that moved before
-    /// a later member failed has ALREADY had its id churned; throwing the whole
-    /// attempt away would discard that address and leave exactly the state this
-    /// method exists to prevent, one mid-batch failure later. Returning the
-    /// proven prefix routes it through
-    /// `AccountManager.retirePartiallyCompletedOp`, which retires and
-    /// re-keys those members and leaves the remainder durably queued — the
-    /// drain's standing contract for a provider that returns a strict subset,
-    /// which this arm is now the producer for. The error is re-thrown whenever
-    /// NOTHING was proven, so a whole-batch failure keeps its exact previous
-    /// classification (404 split, permanent-invalid, account-wide failure).
+    /// **ONE MEMBER PER ATTEMPT, AND THE PROVEN MEMBER IS RETURNED.** A member
+    /// that moved has ALREADY had its id churned, so an attempt that went on to a
+    /// second member and was then cancelled by
+    /// `withTimeout(SyncConfig.pendingOperationTimeoutSeconds)` would discard the
+    /// address the wire had just handed back — `withTimeout` resumes the drain
+    /// with `TimeoutError` FIRST and cancels the operation task second — and
+    /// leave exactly the state this method exists to prevent, on every retry,
+    /// forever. Returning after ONE member routes the outcome through
+    /// `AccountManager.retirePartiallyCompletedOp`, which retires and re-keys that
+    /// member and leaves the remainder durably queued under the SAME row.
+    ///
+    /// A margin measured in ELAPSED TIME cannot substitute for this: a
+    /// between-member check bounds what has already been spent and says nothing
+    /// about the duration of the request it is about to start, so members that
+    /// each fit the operation deadline can still straddle it two at a time
+    /// (`MIS-IOS-022`). An N-member move therefore converges in N attempts; that
+    /// cost is accepted, and batching must not be reintroduced to recover it.
     func moveProvingDestinations(
         ids: [String], from source: String, to destination: String
     ) async throws -> MoveOutcome {
         if DebugModeManager.isLoggingEnabled() {
             print("[MoveTrace] ExchangeProvider.move — ids=\(ids) to=\(destination)")
         }
-        var provenIds: [String] = []
-        var provenDestinations: [ProvenDestinationAddress] = []
-        var confirmedGone: [String] = []
-        // 🚨 THE SAME STOPPING RULE THE SETTER LOOPS USE, for the same reason: a
-        // batch whose members cost more wall time than the operation deadline is
-        // cancelled mid-loop with `withTimeout` already resumed, so every proven
-        // destination this loop learned is discarded and the next attempt repeats
-        // the same prefix forever. Stopping early returns the prefix through the
-        // narrowing path that this method is already the producer for.
-        let deadline = ProviderMemberLoopBudget.deadlineFromNow()
-        var stoppedOnBudget = false
-        do {
-            for id in ids {
-                if !provenIds.isEmpty, ContinuousClock.now >= deadline {
-                    stoppedOnBudget = true
-                    if DebugModeManager.isLoggingEnabled() {
-                        print("[MoveTrace] ExchangeProvider.move — budget spent after \(provenIds.count)/\(ids.count) member(s); returning the proven prefix so the operation narrows instead of repeating it")
-                    }
-                    break
-                }
-                // Legacy-label decay (ADR-IOS-036): on inbox-exit, strip residual
-                // tm_* Graph categories so pre-ADR pollution fades naturally as
-                // the user triages. Best-effort — a strip failure must NOT
-                // block the move.
-                if source == inboxFolderId {
-                    do {
-                        try await stripLegacyCategories(id: id)
-                    } catch {
-                        if DebugModeManager.isLoggingEnabled() { print("[Exchange] Legacy tm_* strip failed for \(id) (continuing): \(error)") }
-                    }
-                }
-                // 🚨 THE PER-MEMBER BOUNDARY, and it is what lets a batch whose
-                // FIRST member is gone still move the rest. Before it, an absent
-                // member threw with `provenIds` empty, the whole attempt was
-                // rethrown, and the drain split the row into one operation per
-                // member purely to find out which one it was. Graph addressed
-                // THIS id and answered that it is gone, so the member is
-                // dispositioned — nothing left to move — and it is recorded
-                // separately so its local header can be retired too.
-                //
-                // ⚠ NO WIDER THAN THE CLASSIFICATION THIS TREE ALREADY RETIRED
-                // ON: `ProviderMemberAbsence` matches a structural 404 or
-                // `ProviderError.messageNotFound` on this exact addressed request
-                // and nothing else — the same set `isMessageNotFoundError` has
-                // always required before the drain could retire an op. A bare 410
-                // is NOT in it (see that enum's doc comment), so no status becomes
-                // retirable that was not already.
-                // `IOS-GRAPH-002` records that a Graph 404 can also mean "the id
-                // churned on a move we performed" — that world state is closed by
-                // ADR-IOS-081's retirement-time re-addressing, and this arm does
-                // not reopen it.
-                let movedId: String?
-                do {
-                    movedId = try await moveMessage(id: id, destinationId: destination)
-                } catch {
-                    guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
-                    provenIds.append(id)
-                    confirmedGone.append(id)
-                    if DebugModeManager.isLoggingEnabled() {
-                        print("[MoveTrace] ExchangeProvider.move — \(id) is gone on the server; the member is dispositioned and the remaining members are still moved")
-                    }
-                    continue
-                }
-                // ⚑ THE ASYMMETRY IS DELIBERATE, AND IT ANSWERS TWO DIFFERENT
-                // QUESTIONS. `provenIds` answers *"did the work happen?"*;
-                // `provenDestinations` answers *"where did it land?"*. A 2xx
-                // settles the first on its own — `moveMessage` throws on any
-                // non-2xx, so reaching this line means Graph performed the move
-                // — while only a decodable `id` settles the second.
-                //
-                // So `provenIds.append` is UNCONDITIONAL by decision, not by
-                // oversight: the op retires on exit 1 (provider success), which
-                // is the truth. WITHHOLDING it would be the mirror image of the
-                // bug this method exists to close — the member would stay
-                // queued, its retry would re-address the OLD id that Graph has
-                // just invalidated, and that retry 404s into the
-                // `isMessageNotFoundError` arm which DELETES the
-                // `PendingOperation`. Fail-closed here does not preserve the
-                // intention; it launders a completed operation into a silent
-                // drop (or, if the classification were also changed, into the
-                // lane wedge `IOS-GRAPH-002`'s brief names as MIRROR-IMAGE TRAP
-                // 1 — the re-key is what makes a retry TERMINATE).
-                //
-                // The unnamed destination is WITHHELD EVIDENCE, not a fallback
-                // (repo rule 4): nothing is substituted or guessed, the row
-                // keeps its old address, and sync repairs it — byte-for-byte
-                // the shape the IMAP arm takes when a server furnishes no
-                // `COPYUID`. Graph's documented contract for `/move` returns the
-                // moved resource, so this arm is not reachable through it at
-                // all; it exists because a decode is not a promise.
-                provenIds.append(id)
-                if let movedId {
-                    provenDestinations.append(ProvenDestinationAddress(
-                        sourceProviderId: id,
-                        destinationProviderId: movedId,
-                        destinationUidValidity: nil))
-                }
-                if DebugModeManager.isLoggingEnabled() {
-                    print("[MoveTrace] ExchangeProvider.move — completed for \(id)")
-                }
+        guard let id = ids.first else {
+            return MoveOutcome(provenIds: [], provenDestinations: [], confirmedGoneIds: [])
+        }
+        // Legacy-label decay (ADR-IOS-036): on inbox-exit, strip residual
+        // tm_* Graph categories so pre-ADR pollution fades naturally as
+        // the user triages. Best-effort — a strip failure must NOT
+        // block the move.
+        if source == inboxFolderId {
+            do {
+                try await stripLegacyCategories(id: id)
+            } catch {
+                if DebugModeManager.isLoggingEnabled() { print("[Exchange] Legacy tm_* strip failed for \(id) (continuing): \(error)") }
             }
+        }
+        // 🚨 THE PER-MEMBER BOUNDARY, and it is what lets a batch whose
+        // FIRST member is gone still move the rest. Before it, an absent
+        // member threw with nothing proven, the whole attempt was
+        // rethrown, and the drain split the row into one operation per
+        // member purely to find out which one it was. Graph addressed
+        // THIS id and answered that it is gone, so the member is
+        // dispositioned — nothing left to move — and it is recorded
+        // separately so its local header can be retired too.
+        //
+        // ⚠ NO WIDER THAN THE CLASSIFICATION THIS TREE ALREADY RETIRED
+        // ON: `ProviderMemberAbsence` matches a structural 404 or
+        // `ProviderError.messageNotFound` on this exact addressed request
+        // and nothing else — the same set `isMessageNotFoundError` has
+        // always required before the drain could retire an op. A bare 410
+        // is NOT in it (see that enum's doc comment), so no status becomes
+        // retirable that was not already.
+        // `IOS-GRAPH-002` records that a Graph 404 can also mean "the id
+        // churned on a move we performed" — that world state is closed by
+        // ADR-IOS-081's retirement-time re-addressing, and this arm does
+        // not reopen it.
+        let movedId: String?
+        do {
+            movedId = try await moveMessage(id: id, destinationId: destination)
         } catch {
-            // A cancelled Task has NOT proved anything about the members it
-            // never reached, and `withTimeout` discards an abandoned Task's
-            // return value anyway — so cancellation is re-thrown whole rather
-            // than dressed up as a partial success.
-            if error is CancellationError { throw error }
-            guard !provenIds.isEmpty else { throw error }
+            guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
             if DebugModeManager.isLoggingEnabled() {
-                print("[MoveTrace] ExchangeProvider.move — \(provenIds.count)/\(ids.count) member(s) moved before \(error); returning the proven prefix so their re-learned addresses are not discarded")
+                print("[MoveTrace] ExchangeProvider.move — \(id) is gone on the server; the member is dispositioned and the members behind it stay owed")
             }
             return MoveOutcome(
-                provenIds: provenIds, provenDestinations: provenDestinations,
-                confirmedGoneIds: confirmedGone)
+                provenIds: [id], provenDestinations: [], confirmedGoneIds: [id])
+        }
+        // ⚑ THE ASYMMETRY IS DELIBERATE, AND IT ANSWERS TWO DIFFERENT
+        // QUESTIONS. `provenIds` answers *"did the work happen?"*;
+        // `provenDestinations` answers *"where did it land?"*. A 2xx
+        // settles the first on its own — `moveMessage` throws on any
+        // non-2xx, so reaching this line means Graph performed the move
+        // — while only a decodable `id` settles the second.
+        //
+        // So the member is proven UNCONDITIONALLY by decision, not by
+        // oversight: the op retires on exit 1 (provider success), which
+        // is the truth. WITHHOLDING it would be the mirror image of the
+        // bug this method exists to close — the member would stay
+        // queued, its retry would re-address the OLD id that Graph has
+        // just invalidated, and that retry 404s into the
+        // `isMessageNotFoundError` arm which DELETES the
+        // `PendingOperation`. Fail-closed here does not preserve the
+        // intention; it launders a completed operation into a silent
+        // drop (or, if the classification were also changed, into the
+        // lane wedge `IOS-GRAPH-002`'s brief names as MIRROR-IMAGE TRAP
+        // 1 — the re-key is what makes a retry TERMINATE).
+        //
+        // The unnamed destination is WITHHELD EVIDENCE, not a fallback
+        // (repo rule 4): nothing is substituted or guessed, the row
+        // keeps its old address, and sync repairs it — byte-for-byte
+        // the shape the IMAP arm takes when a server furnishes no
+        // `COPYUID`. Graph's documented contract for `/move` returns the
+        // moved resource, so this arm is not reachable through it at
+        // all; it exists because a decode is not a promise.
+        var provenDestinations: [ProvenDestinationAddress] = []
+        if let movedId {
+            provenDestinations.append(ProvenDestinationAddress(
+                sourceProviderId: id,
+                destinationProviderId: movedId,
+                destinationUidValidity: nil))
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            print("[MoveTrace] ExchangeProvider.move — completed for \(id)")
         }
         return MoveOutcome(
-            provenIds: stoppedOnBudget ? provenIds : ids,
-            provenDestinations: provenDestinations,
-            confirmedGoneIds: confirmedGone)
+            provenIds: [id], provenDestinations: provenDestinations, confirmedGoneIds: [])
     }
 
     /// Remove any residual `tm_*` categories from a message. PATCH replaces

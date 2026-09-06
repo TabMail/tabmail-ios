@@ -109,11 +109,15 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         var gone410OnModifyProviderIds: Set<String> = []
         var gone410OnModifyServed = 0
         var modifyLog: [ModifyCall] = []
-        /// Seconds every `/messages/{id}/modify` response is withheld for.
-        /// `0` (the default) keeps the fixture instantaneous — only the tests
-        /// that need a loop to outrun a deadline pay for it. See
-        /// `holdEachModify(forSeconds:)`.
-        var modifyLatencySeconds: TimeInterval = 0
+        /// Seconds the `/messages/{id}/modify` response for a given provider
+        /// message id is withheld for. Absent (the default) keeps the fixture
+        /// instantaneous — only the tests that need a request to cost real
+        /// wall-clock time against a deadline pay for it. PER ID rather than
+        /// uniform because the shape those tests need is a batch whose members
+        /// each fit the deadline while their SUM does not, which a single
+        /// latency cannot express without putting every margin in the fixture on
+        /// a knife edge. See `holdModify(providerMessageId:forSeconds:)`.
+        var modifyLatencyByProviderId: [String: TimeInterval] = [:]
         /// Provider message ids whose exact-ID metadata `GET /messages/{id}`
         /// (token-member resolution, `resolveTokenMember`) returns a
         /// structural `400` whose body matches NO known terminal shape — the
@@ -283,7 +287,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         state.value.withLock { $0.gone410OnModifyServed }
     }
 
-    /// Make every `/messages/{id}/modify` take `seconds` to answer.
+    /// Make `/messages/{providerMessageId}/modify` take `seconds` to answer.
     ///
     /// The per-member provider loops are SEQUENTIAL, so this is the only way a
     /// test can make one of them cost real wall-clock time and collide with the
@@ -299,8 +303,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// `modifyLog` append, the injection budgets, the state mutation) still runs
     /// in request order before the wait, so ordering of what was RECEIVED is
     /// unchanged.
-    func holdEachModify(forSeconds seconds: TimeInterval) {
-        state.value.withLock { $0.modifyLatencySeconds = seconds }
+    func holdModify(providerMessageId: String, forSeconds seconds: TimeInterval) {
+        state.value.withLock { $0.modifyLatencyByProviderId[providerMessageId] = seconds }
     }
 
     /// Inject an UNCLASSIFIED structural 400 for the exact-ID metadata `GET
@@ -610,7 +614,9 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         }
         http.register(path: "/messages/", method: "POST") { [state] request in
             let response = serveModify(request)
-            let latency = state.value.withLock { $0.modifyLatencySeconds }
+            let components = request.url.pathComponents
+            let providerId = components.count >= 2 ? components[components.count - 2] : ""
+            let latency = state.value.withLock { $0.modifyLatencyByProviderId[providerId] ?? 0 }
             guard latency > 0 else { return response }
             return .parked { Thread.sleep(forTimeInterval: latency); return response }
         }
