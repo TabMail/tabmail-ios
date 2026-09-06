@@ -3763,4 +3763,445 @@ struct OutlookQueueHandoffTests {
 
         await finish(f)
     }
+
+    // MARK: - TC-1 (round 8) — MORE THAN ONE retained REQUEUE in the same recovery
+
+    /// A `PendingOperation` commit refuser that ALLOWS the first `allowance`
+    /// commits which UPDATEd any of the WATCHED rows, and refuses every one after
+    /// that.
+    ///
+    /// 🚨 THE SELECTOR IS THE TRANSACTION ORDINAL, NEVER THE OP ID OR THE
+    /// ACCOUNT. `recoverPendingRequeues` iterates `AccountManager.pendingRequeues`,
+    /// a `[String: Bool]`, and Swift dictionary order is seed-dependent and varies
+    /// run to run — so a refuser keyed on "the second account's operation" would
+    /// refuse the FIRST recovered entry on some runs and the second on others, and
+    /// the mutation this test exists to catch would survive on half the seeds.
+    /// Counting commits instead names exactly what the scenario needs ("one
+    /// recovery lands, the next does not") without depending on which entry that
+    /// turns out to be, and every assertion below is written so either assignment
+    /// satisfies it.
+    ///
+    /// The same shape as `HeaderCommitOrdinalRefuser` above, scoped to
+    /// `PendingOperation` UPDATEs on named rowids rather than to header writes,
+    /// because the write this scenario must split is `requeueIfInFlight`. It is
+    /// deliberately NOT a generalisation of that type: file-private and
+    /// single-purpose, exactly like `HeaderCommitRefuser`, `AllWritesRefuser`,
+    /// `HeaderCommitOrdinalRefuser` and `OneRowUpdateRefuser`.
+    ///
+    /// 🚨 WHAT IT MUST NOT WATCH IS AS LOAD-BEARING AS WHAT IT WATCHES. Only the
+    /// two PREDECESSOR rows are named. A refused claim is merely logged and
+    /// skipped (`AccountManagerQueue`'s claim loop: `catch { queueLog(…);
+    /// continue }`), so if the followers were watched too, a drain that wrongly
+    /// started a claim pass would produce no wire traffic at all and the wire
+    /// oracle below would pass on broken code — the refusal, not the invariant,
+    /// would be what silenced the wire.
+    private final class PendingOperationCommitOrdinalRefuser: TransactionObserver, Sendable {
+        struct CommitRefused: Error {}
+        private let rowIDs: Set<Int64>
+        private let sawWatchedUpdate = Mutex(false)
+        private let remaining: Mutex<Int>
+        let allowed = Mutex(0)
+        let refusals = Mutex(0)
+
+        init(rowIDs: Set<Int64>, allowing allowance: Int) {
+            self.rowIDs = rowIDs
+            self.remaining = Mutex(allowance)
+        }
+
+        func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
+            guard eventKind.tableName == PendingOperation.databaseTableName else { return false }
+            if case .update = eventKind { return true }
+            return false
+        }
+        func databaseDidChange(with event: DatabaseEvent) {
+            guard rowIDs.contains(event.rowID) else { return }
+            sawWatchedUpdate.withLock { $0 = true }
+        }
+        func databaseWillCommit() throws {
+            guard sawWatchedUpdate.withLock({ $0 }) else { return }
+            let permitted = remaining.withLock { left -> Bool in
+                guard left > 0 else { return false }
+                left -= 1
+                return true
+            }
+            if permitted {
+                allowed.withLock { $0 += 1 }
+                return
+            }
+            refusals.withLock { $0 += 1 }
+            throw CommitRefused()
+        }
+        func databaseDidCommit(_ db: Database) {
+            sawWatchedUpdate.withLock { $0 = false }
+        }
+        func databaseDidRollback(_ db: Database) {
+            sawWatchedUpdate.withLock { $0 = false }
+        }
+    }
+
+    /// **THE PROPERTY: when this process is holding MORE THAN ONE unresolved
+    /// requeue, a drain that resolves only some of them starts no claim pass —
+    /// neither account reaches the wire, the unresolved row keeps its whole
+    /// durable state, and a later healthy drain executes every account's
+    /// operations exactly once, in issue order, so the user's LATEST intention is
+    /// the one left on the server.**
+    ///
+    /// Every other requeue-recovery witness on this branch retains exactly ONE
+    /// id, so all of them pass against a `recoverPendingRequeues` that reports
+    /// success the moment its first entry commits. Two accounts separate those:
+    /// the drain-wide gate is `false` if ANY retained ownership is still
+    /// unresolved, not "the last one I looked at".
+    ///
+    /// THE HARM THE MISSING WITNESS LETS THROUGH, with no process death in it.
+    /// Each account has an earlier claimed-but-unexecuted operation whose requeue
+    /// COMMIT was refused, and a later operation on the same message that the lane
+    /// halt returned to `queued`. Both predecessors sit `inFlight` — a state only
+    /// the claim transaction writes and one the claim loop refuses — so they are
+    /// INVISIBLE to the claim loop. If the recovery reports success after
+    /// resolving only one of them, the claim pass runs while the other predecessor
+    /// is still unresolved and that account's NEWER follower executes ALONE. A
+    /// later drain then recovers the predecessor and executes the OLDER intention
+    /// LAST, overwriting the user's latest one. The pass-boundary gate runs AFTER
+    /// those wire effects and cannot prevent them.
+    ///
+    /// THE SCHEDULE, and why every element of it is load-bearing.
+    ///   - **Two independent Outlook accounts in one pool, one lane each**, with
+    ///     their own servers and their own append-only wire records, so "nothing
+    ///     reached the wire" is asserted PER ACCOUNT rather than as an aggregate
+    ///     one account's silence could satisfy.
+    ///   - **No `.move` anywhere.** This scenario is about the requeue map alone;
+    ///     the retirement machinery must not be involved, and
+    ///     `pendingRetirements` is asserted empty at every boundary.
+    ///   - **Both retained entries are produced by REAL requeue failures.** A
+    ///     `503` on the predecessor's PATCH takes the transient-provider-error
+    ///     arm, which requeues with `incrementRetryCount: true`; a row-scoped
+    ///     `OneRowUpdateRefuser` per predecessor (the one permitted commit is that
+    ///     row's own claim, without which nothing was claimed at all) refuses that
+    ///     requeue, so the process retains the ownership. Nothing writes `status`
+    ///     by hand and no recovery entry point is called directly.
+    ///   - **`.markUnread` then `.markRead` on a message seeded UNREAD.** Both
+    ///     write the SAME observable field with DIFFERENT values, and the correct
+    ///     final value differs from the seeded one: correct order ends READ, an
+    ///     inversion ends unread, and nothing-ran also ends unread — which is why
+    ///     the per-account wire counts are asserted alongside it.
+    ///
+    /// THE ORACLES ARE THE APPEND-ONLY WIRE RECORD (per account) AND THE DURABLE
+    /// ROWS READ AFTER A DRAIN RETURNED — never mid-drain row state, and never
+    /// membership of `pendingRequeues` as the property under test, which is the
+    /// mechanism and not the invariant (`MIS-015`). Reading its count as a SETUP
+    /// anchor is a different thing and is done below, because a fixture that does
+    /// not actually retain TWO entries makes every later assertion vacuous
+    /// (`MIS-030`).
+    @Test("Outlook: a recovery holding TWO retained requeues that resolves only one starts no claim pass, and both accounts converge later")
+    @MainActor
+    func aRecoveryHoldingTwoRetainedRequeuesThatResolvesOnlyOneStartsNoClaimPass() async throws {
+        let firstRfc = "graph-handoff-multi-requeue-a@example.com"
+        let secondRfc = "graph-handoff-multi-requeue-b@example.com"
+        let firstServer = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: firstRfc, providerMessageId: "graph-a", folderId: Self.source),
+        ])
+        defer { firstServer.close() }
+        let secondServer = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: secondRfc, providerMessageId: "graph-b", folderId: Self.source),
+        ])
+        defer { secondServer.close() }
+
+        let f = try fixture(accountId: "graph-handoff-multi-requeue-a")
+        let secondAccountId = "graph-handoff-multi-requeue-b"
+        try await f.pool.write { db in
+            var account = Account(
+                emailAddress: "graph-handoff-second@example.com",
+                displayName: "Graph handoff second", provider: .outlook)
+            account.id = secondAccountId
+            try account.insert(db)
+            try Folder(
+                name: Self.source, path: Self.source, role: .inbox, accountId: secondAccountId
+            ).insert(db)
+        }
+        defer {
+            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: secondAccountId) }
+        }
+
+        try seedHeader(f, graphId: "graph-a", rfc: firstRfc)
+        try seedHeader(f, graphId: "graph-b", rfc: secondRfc, accountId: secondAccountId)
+
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a previous test left a retained retirement on the shared AccountManager")
+        #expect(await AccountManager.shared.pendingRequeues.isEmpty,
+                "a previous test left a retained requeue on the shared AccountManager")
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "a drain from an earlier test is still running, so this schedule is not this test's")
+
+        let ordered = try seedSchedule(f, [
+            PendingOperation(
+                type: .markUnread, messageIds: ["graph-a"],
+                accountId: f.accountId, folderPath: Self.source),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-a"],
+                accountId: f.accountId, folderPath: Self.source),
+            PendingOperation(
+                type: .markUnread, messageIds: ["graph-b"],
+                accountId: secondAccountId, folderPath: Self.source),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-b"],
+                accountId: secondAccountId, folderPath: Self.source),
+        ])
+        #expect(ordered.count == 4)
+        guard ordered.count == 4 else { return }
+        let firstPredecessorOpId = ordered[0].id
+        let firstFollowerOpId = ordered[1].id
+        let secondPredecessorOpId = ordered[2].id
+        let secondFollowerOpId = ordered[3].id
+        let predecessorOpIds = [firstPredecessorOpId, secondPredecessorOpId]
+        let followerOpIds = [firstFollowerOpId, secondFollowerOpId]
+
+        await register(firstServer.provider(), f)
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: secondAccountId, provider: secondServer.provider())
+
+        let predecessorRowIDs = try await f.pool.read { db in
+            try predecessorOpIds.compactMap { opId in
+                try Int64.fetchOne(
+                    db, sql: "SELECT rowid FROM pendingOperation WHERE id = ?", arguments: [opId])
+            }
+        }
+        #expect(predecessorRowIDs.count == 2,
+                "a predecessor row was not seeded, so nothing can be scoped to it")
+        guard predecessorRowIDs.count == 2 else { return }
+
+        // DRAIN 1 — each account's predecessor is claimed, reaches its provider,
+        // is refused with a 503, and the requeue that refusal asks for is itself
+        // refused. This process ends the drain owning TWO unresolved requeues.
+        let firstRefuser = OneRowUpdateRefuser(rowID: predecessorRowIDs[0], allowingFirst: 1)
+        let secondRefuser = OneRowUpdateRefuser(rowID: predecessorRowIDs[1], allowingFirst: 1)
+        f.pool.add(transactionObserver: firstRefuser, extent: .databaseLifetime)
+        f.pool.add(transactionObserver: secondRefuser, extent: .databaseLifetime)
+
+        firstServer.failNextPatch()
+        secondServer.failNextPatch()
+
+        await AccountManager.shared.drainPendingQueue()
+
+        let firstAfterDrainOne = firstServer.http.servedCallSequence()
+        let secondAfterDrainOne = secondServer.http.servedCallSequence()
+
+        // NON-VACUITY, the provider side: each predecessor really was attempted,
+        // exactly once and at its own address, and nothing followed it — so each
+        // account really did take the arm that requeues with a retry charge.
+        #expect(firstAfterDrainOne.filter { $0.hasPrefix("PATCH ") }.count == 1, """
+            account A's predecessor did not reach the provider exactly once, so \
+            no requeue was ever asked for: \(firstAfterDrainOne)
+            """)
+        #expect(secondAfterDrainOne.filter { $0.hasPrefix("PATCH ") }.count == 1, """
+            account B's predecessor did not reach the provider exactly once, so \
+            no requeue was ever asked for: \(secondAfterDrainOne)
+            """)
+        #expect(firstServer.snapshot(providerMessageId: "graph-a")?.isRead == false, """
+            account A's follower executed while its predecessor was unresolved: \
+            \(firstAfterDrainOne)
+            """)
+        #expect(secondServer.snapshot(providerMessageId: "graph-b")?.isRead == false, """
+            account B's follower executed while its predecessor was unresolved: \
+            \(secondAfterDrainOne)
+            """)
+
+        // NON-VACUITY, the write side: one permitted commit per predecessor — the
+        // drain's own claim, without which nothing was claimed at all — then
+        // exactly the three `retryWrite` attempts of the requeue that followed it.
+        // Fewer means the requeue was never attempted under the refusal; more
+        // means some other transaction was caught in it (`MIS-027`).
+        #expect(firstRefuser.allowed.withLock { $0 } == 1, """
+            account A's predecessor was not claimed exactly once: \
+            \(firstRefuser.allowed.withLock { $0 })
+            """)
+        #expect(secondRefuser.allowed.withLock { $0 } == 1, """
+            account B's predecessor was not claimed exactly once: \
+            \(secondRefuser.allowed.withLock { $0 })
+            """)
+        #expect(firstRefuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on account A's requeue for exactly its three \
+            attempts: \(firstRefuser.refusals.withLock { $0 })
+            """)
+        #expect(secondRefuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on account B's requeue for exactly its three \
+            attempts: \(secondRefuser.refusals.withLock { $0 })
+            """)
+
+        // THE PRECONDITION, ANCHORED (`MIS-030`). Without TWO retained entries
+        // there is no multi-entry recovery and every assertion below is vacuous.
+        let retainedAfterDrainOne = await AccountManager.shared.pendingRequeues.count
+        #expect(retainedAfterDrainOne == 2, """
+            this process is not holding two unresolved requeues, so the \
+            multi-entry recovery under test never happens: \(retainedAfterDrainOne)
+            """)
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty, """
+            a retirement was retained, so this scenario is not the requeue-only \
+            one it claims to be
+            """)
+
+        // The durable shape the recovery will act on, read after the drain
+        // RETURNED: both predecessors claimed-and-unexecuted, both followers
+        // returned to `queued` by the lane halt.
+        let (predecessorsAfterOne, followersAfterOne) = try await f.pool.read { db in
+            (try PendingOperation.filter(predecessorOpIds.contains(Column("id"))).fetchAll(db),
+             try PendingOperation.filter(followerOpIds.contains(Column("id"))).fetchAll(db))
+        }
+        #expect(predecessorsAfterOne.count == 2
+                    && predecessorsAfterOne.allSatisfy {
+                        $0.status == PendingStatus.inFlight.rawValue && $0.everAttempted
+                    }, """
+            both predecessors must be claimed-and-unexecuted for the recovery to \
+            have anything to resolve: \
+            \(predecessorsAfterOne.map { "\($0.status)/everAttempted=\($0.everAttempted)" })
+            """)
+        #expect(followersAfterOne.count == 2
+                    && followersAfterOne.allSatisfy { $0.status == PendingStatus.queued.rawValue }, """
+            the followers are not claimable, so the split this test needs (the \
+            predecessor's requeue refused, the follower's committed) did not \
+            happen: \(followersAfterOne.map(\.status))
+            """)
+
+        // DRAIN 2 — the partial recovery. Exactly ONE of the two retained
+        // requeues is allowed to commit; which one is whichever the dictionary
+        // yields first, and every assertion below is symmetric in the two
+        // accounts for exactly that reason.
+        f.pool.remove(transactionObserver: firstRefuser)
+        f.pool.remove(transactionObserver: secondRefuser)
+        let oneAllowed = PendingOperationCommitOrdinalRefuser(
+            rowIDs: Set(predecessorRowIDs), allowing: 1)
+        f.pool.add(transactionObserver: oneAllowed, extent: .databaseLifetime)
+
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                "the first drain has not settled, so the second is not this test's")
+        await AccountManager.shared.drainPendingQueue()
+
+        // NON-VACUITY, two-sided: exactly one recovery transaction committed, and
+        // at least one later write on a watched row was refused. The refusal
+        // count is asserted as `>= 1` rather than exactly — a recovery that
+        // stopped after its first success attempts a DIFFERENT number of writes,
+        // and the wire oracle below, not an incidental counter, must be what
+        // fails.
+        #expect(oneAllowed.allowed.withLock { $0 } == 1, """
+            the second drain did not commit exactly one retained requeue, so it \
+            is not the partial-resolution scenario: \
+            \(oneAllowed.allowed.withLock { $0 }) committed, \
+            \(oneAllowed.refusals.withLock { $0 }) refused
+            """)
+        #expect(oneAllowed.refusals.withLock { $0 } >= 1, """
+            nothing was refused in the second drain, so no ownership was left \
+            unresolved and this is not the partial-resolution scenario
+            """)
+
+        // 🚨 THE ORACLE. One ownership resolved, one did not — and because one
+        // did not, NO claim pass ran on EITHER account. A new call here is a
+        // follower admitted ALONE, ahead of a predecessor this process has not
+        // resolved, against the intention the user issued LAST.
+        #expect(firstServer.http.servedCallSequence() == firstAfterDrainOne, """
+            account A reached the wire after a recovery that left a retained \
+            requeue unresolved: \(firstServer.http.servedCallSequence())
+            """)
+        #expect(secondServer.http.servedCallSequence() == secondAfterDrainOne, """
+            account B reached the wire after a recovery that left a retained \
+            requeue unresolved: \(secondServer.http.servedCallSequence())
+            """)
+
+        // The intermediate durable state, read after the drain RETURNED. Asserted
+        // as COUNTS so either dictionary order satisfies it.
+        let (predecessorsAfterTwo, followersAfterTwo) = try await f.pool.read { db in
+            (try PendingOperation.filter(predecessorOpIds.contains(Column("id"))).fetchAll(db),
+             try PendingOperation.filter(followerOpIds.contains(Column("id"))).fetchAll(db))
+        }
+        #expect(predecessorsAfterTwo.count == 2, """
+            a predecessor row was DESTROYED by a partially-resolved recovery: \
+            \(predecessorsAfterTwo.map { $0.id.prefix(8) })
+            """)
+        let recoveredPredecessors = predecessorsAfterTwo.filter {
+            $0.status == PendingStatus.queued.rawValue
+        }
+        let heldPredecessors = predecessorsAfterTwo.filter {
+            $0.status == PendingStatus.inFlight.rawValue
+        }
+        #expect(recoveredPredecessors.count == 1 && heldPredecessors.count == 1, """
+            exactly one predecessor should have been returned to `queued` and \
+            exactly one kept by this process: \
+            \(predecessorsAfterTwo.map { "\($0.id.prefix(8))/\($0.status)" })
+            """)
+        guard recoveredPredecessors.count == 1, heldPredecessors.count == 1 else { return }
+        #expect(heldPredecessors[0].messageIds.count == 1, """
+            the unresolved predecessor lost members: \(heldPredecessors[0].messageIds)
+            """)
+        #expect(followersAfterTwo.count == 2, """
+            a follower was DESTROYED by a partially-resolved recovery: \
+            \(followersAfterTwo.map { $0.id.prefix(8) })
+            """)
+        #expect(followersAfterTwo.allSatisfy { $0.status == PendingStatus.queued.rawValue }, """
+            a follower left `queued` though nothing behind an unresolved \
+            predecessor may run: \(followersAfterTwo.map(\.status))
+            """)
+
+        // Retry accounting. The recovered ownership carries exactly the one retry
+        // the provider's refusal earned; the unrecovered one carries none,
+        // because its charge rolled back with the requeue that carried it; and
+        // neither follower is charged for a failure that was not its own.
+        #expect(recoveredPredecessors[0].retryCount == 1, """
+            the recovered predecessor carries \(recoveredPredecessors[0].retryCount) \
+            retries, not the ONE the provider's refusal had already earned
+            """)
+        #expect(heldPredecessors[0].retryCount == 0, """
+            a retry was charged by a write that never committed: \
+            \(heldPredecessors[0].retryCount)
+            """)
+        #expect(followersAfterTwo.allSatisfy { $0.retryCount == 0 }, """
+            a follower was charged for a failure that was not its own: \
+            \(followersAfterTwo.map(\.retryCount))
+            """)
+
+        // RECOVERY — writes work again, and both accounts converge.
+        f.pool.remove(transactionObserver: oneAllowed)
+        try await drainToQuiescence(f)
+
+        let firstFinal = firstServer.http.servedCallSequence()
+        let secondFinal = secondServer.http.servedCallSequence()
+        #expect(firstFinal.filter { $0.hasPrefix("PATCH ") }.count == 3, """
+            account A's two gestures did not each execute exactly once — the \
+            first PATCH is the 503 this schedule began with: \(firstFinal)
+            """)
+        #expect(secondFinal.filter { $0.hasPrefix("PATCH ") }.count == 3, """
+            account B's two gestures did not each execute exactly once — the \
+            first PATCH is the 503 this schedule began with: \(secondFinal)
+            """)
+
+        // 🚨 THE ORDERING ORACLE. Both operations write `isRead`; the message was
+        // seeded UNREAD. Read is the only state that means "both ran, in issue
+        // order". Unread means the mark-unread ran LAST — the follower was
+        // admitted ahead of its predecessor and the OLDER intention overwrote the
+        // newer one — or that nothing ran at all, which the wire counts above
+        // separate.
+        #expect(firstServer.snapshot(providerMessageId: "graph-a")?.isRead == true, """
+            account A's LATEST intention is not what the server holds: \(firstFinal)
+            """)
+        #expect(secondServer.snapshot(providerMessageId: "graph-b")?.isRead == true, """
+            account B's LATEST intention is not what the server holds: \(secondFinal)
+            """)
+
+        #expect(await AccountManager.shared.pendingRequeues.isEmpty,
+                "a retained requeue was never resolved")
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a retirement was retained by a scenario that has no move in it")
+        let finalHeaders = try rows(f)
+        #expect(finalHeaders.count == 2,
+                "a header was destroyed: \(finalHeaders.map(\.messageId))")
+
+        try expectGesturePreservedAndExecuted(
+            f,
+            effectVisibleOnServer:
+                firstServer.snapshot(providerMessageId: "graph-a")?.isRead == true
+                && secondServer.snapshot(providerMessageId: "graph-b")?.isRead == true,
+            gesture: "both accounts' mark-reads behind a partially-resolved multi-entry requeue recovery",
+            serverState: "A: folders=\(serverFolders(firstServer, rfc: firstRfc)); "
+                + "B: folders=\(serverFolders(secondServer, rfc: secondRfc))")
+
+        await AccountManager.shared.unregisterProviderForTesting(accountId: secondAccountId)
+        await finish(f)
+    }
 }
