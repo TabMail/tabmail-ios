@@ -2698,9 +2698,40 @@ extension AccountManager {
     /// the transaction shape the whole-op success path already uses, and it is
     /// scoped to `provenMembers` so an unproven member is never re-keyed.
     ///
+    /// 🚨 THIS IS NOW THE PRIMARY PRODUCTION PATH FOR EVERY MULTI-MEMBER
+    /// GMAIL AND GRAPH OPERATION — it is no longer test-only, and the sentence
+    /// that used to stand here ("no production provider returns a strict subset,
+    /// so a test IS this path's only reachability") is FALSE as of the change
+    /// that moved per-member absence to the provider boundary. `modifyEachMessage`
+    /// (Gmail) and `patchEachMessage` (Exchange) address exactly ONE id per
+    /// attempt and then throw `ProviderMembersDispositioned(dispositionedMemberIds:
+    /// [id], …)` whenever `ids.count != 1`; `executeOperation` converts that
+    /// report into `provenMembers == [id]`, so `executeSingleOp`'s
+    /// `Set(provenMembers) != Set(currentOp.messageIds)` test is TRUE on the very
+    /// first attempt of every `.markRead` / `.markUnread` / `.markFlagged` /
+    /// `.markUnflagged` / `.move` naming two or more members on those providers.
+    /// `ExchangeProvider.moveProvingDestinations` is the third producer, and
+    /// `IMAPProvider.move` is still not one (it dispositions every member at all
+    /// of its return sites). Anything reasoned about downstream of this function
+    /// — the re-key, the confirmed-gone header cleanup, the deferred-successor
+    /// materialization — must therefore be scoped as ORDINARY multi-member
+    /// traffic, not as a contingency.
+    ///
+    /// THE BOUND ON THAT TRAFFIC is the one stated above and it is worth reading
+    /// twice now that it is the common case: this arm sets `executedAny = true`
+    /// unconditionally (including in its retention `catch`) and returns
+    /// `.haltLane`, so the outer drain loop takes another pass and RE-CLAIMS the
+    /// narrowed row IN THE SAME DRAIN — up to `drainPendingQueue`'s 3-pass cap,
+    /// i.e. at most three members of one operation settle per drain, with the
+    /// remainder carried on the same row to the next drain (launch, foreground,
+    /// network restore, or a sync poll). Each pass narrows `messageIds` durably
+    /// and charges no retry, so progress is strict and monotonic; this is slow
+    /// convergence, never starvation (`MIS-IOS-022`, `IOS-ACTION-003`).
+    ///
     /// `internal` (not `private`) so tests can drive it directly, the same
-    /// reason `executeSingleOp` and `DrainContext` are: no production provider
-    /// returns a strict subset, so a test IS this path's only reachability.
+    /// reason `executeSingleOp` and `DrainContext` are — but that is now a
+    /// convenience for pinning shapes the wire reaches only rarely (an IMAP
+    /// narrowing), not this path's only reachability.
     func retirePartiallyCompletedOp(
         _ currentOp: PendingOperation,
         provenMembers: [String],
@@ -2759,6 +2790,28 @@ extension AccountManager {
             // left the row here may lose its header.
             await retireConfirmedGoneMemberHeaders(
                 currentOp, memberIds: confirmedGoneMembers.filter(provenMembers.contains))
+            // 🚨 DO NOT DELETE THIS BECAUSE NO PROVIDER REACHES IT TODAY.
+            // It was deleted once, silently, by the edit that inserted the call
+            // above it, and nothing caught it: a `DeferredMoveSuccessor` is only
+            // registered against an IMAP predecessor, and `IMAPProvider.move`
+            // returns `provenIds == ids` at every return site, so IMAP cannot
+            // enter this narrowing path and the successor map is empty here for
+            // every provider that can. That is a property of TODAY's providers,
+            // not of this contract: the moment any move returns a strict subset
+            // — which is exactly the shape the rest of this function exists to
+            // handle — the omission becomes a DROPPED USER INTENTION. The
+            // opposite move the user already gestured stays in
+            // `deferredMoveSuccessors` forever, its overlay entry is never
+            // released, and `coalesceDeferredMoves` folds every later gesture on
+            // that message into a successor that will never materialise
+            // (`MIS-IOS-008` / `IOS-QUEUE-008`). The other three retirement sites
+            // — whole-op success and both retained replays — all call this
+            // immediately after `retireConfirmedGoneMemberHeaders`, and the
+            // narrowing path's own replay in `replayRetainedRetirements` still
+            // does; a live path that disagrees with its own replay is the defect,
+            // not the dead code. Reachability is covered by
+            // `narrowedRetirementMaterializesTheDeferredInverseItsPredecessorOwes`.
+            await materializeDeferredMoveSuccessors(after: frozenRetiredOp, result: finishResult)
         } catch {
             // 🚨 THE PROVEN PREFIX IS RETAINED, NOT HANDED BACK TO THE WIRE. This
             // used to requeue the ORIGINAL bundle, accepting a duplicate at the

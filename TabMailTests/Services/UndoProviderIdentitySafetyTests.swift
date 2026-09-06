@@ -287,6 +287,120 @@ struct UndoProviderIdentitySafetyTests {
         #expect(AccountManager.shared.overlayOpRefCountForTesting()[original.id] == nil)
     }
 
+    /// **THE INVARIANT: a deferred move successor registered against a
+    /// predecessor that is retired by a NARROWING pass is materialized, so the
+    /// user's follow-up gesture is not stranded.**
+    ///
+    /// Undo behind an in-flight IMAP move is recorded as a process-local
+    /// `DeferredMoveSuccessor` instead of a queued operation, because the
+    /// inverse's source address does not exist until the forward's `COPYUID`
+    /// names it. The only thing that ever turns that record back into a durable
+    /// user intention is `materializeDeferredMoveSuccessors`, and the drain has
+    /// FOUR sites that retire an operation: whole-op success, the narrowing
+    /// pass, and the retained replay of each. A site that commits its retirement
+    /// without materializing leaves the successor in `deferredMoveSuccessors`
+    /// forever with its overlay entry still retained, and `coalesceDeferredMoves`
+    /// then folds every LATER gesture on that message into a successor that will
+    /// never run — the user's move silently never happens, which is the
+    /// `MIS-IOS-008` / `IOS-QUEUE-008` shape and is not recoverable by a sync.
+    ///
+    /// This pins the NARROWING site specifically, which is the one that lost the
+    /// call in `a270c312a` when the confirmed-gone header cleanup was written
+    /// over it. The assertion is on the OUTCOME the user can observe — a durable
+    /// inverse operation addressed by the id the wire proved — never on the call
+    /// itself, so any future shape that keeps the intention alive still passes.
+    ///
+    /// RED PROOF (recorded 2026-09-06): with the
+    /// `materializeDeferredMoveSuccessors` call removed from
+    /// `retirePartiallyCompletedOp`'s success arm, this test fails — the
+    /// deferred count is still 1 and the operation table holds only the narrowed
+    /// forward move, so no inverse is ever queued.
+    ///
+    /// REACHABILITY, stated rather than implied: no production provider makes an
+    /// IMAP move return a strict subset today (`IMAPProvider.move` dispositions
+    /// every member at all of its return sites), and a `DeferredMoveSuccessor`
+    /// is only ever registered against an IMAP predecessor — so the narrowing
+    /// pass is driven directly here, the same way `QueueCoreInvariantTests`
+    /// drives it and the reason `retirePartiallyCompletedOp` is `internal`.
+    /// Nothing else in the scenario is a seam: two archives, one whole-command
+    /// Undo, and one change of mind are all ordinary production API.
+    @Test("A narrowing retirement materializes the deferred inverse its predecessor owes")
+    @MainActor
+    func narrowedRetirementMaterializesTheDeferredInverseItsPredecessorOwes() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
+
+        let proven = sourceHeader(fixture, providerId: "101", rfc: "proven@example.com")
+        let owed = sourceHeader(fixture, providerId: "202", rfc: "owed@example.com")
+        try installOptimisticallyMoved(proven, pool: fixture.pool)
+        try installOptimisticallyMoved(owed, pool: fixture.pool)
+        let forward = try await insertInFlightMove(
+            fixture, messageIds: ["101", "202"], from: "INBOX", to: "Archive", epoch: 41)
+
+        // The user undoes the whole two-message archive while it is still on the
+        // wire. Undo is whole-command, so both members become deferred
+        // successors behind the same predecessor.
+        let restored = await AccountManager.shared.undoMove(
+            accountId: fixture.accountId,
+            forwardDestinationPath: "Archive",
+            members: [UndoMember(header: proven), UndoMember(header: owed)])
+        #expect(Set(restored) == Set([proven.id, owed.id]))
+        #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 2)
+
+        // ...then changes their mind about the second message and archives it
+        // again. Moving back to the predecessor's own destination cancels that
+        // successor outright, which leaves exactly ONE inverse still owed — and
+        // it belongs to the member the narrowing pass is about to prove, while
+        // the member left queued owes nothing.
+        _ = await AccountManager.shared.move([owed], to: "Archive")
+        #expect(
+            await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 1,
+            "precondition: one deferred inverse is owed, for the member the pass proves")
+
+        // The provider proved ONE of the two members and said nothing about the
+        // other, so the drain narrows the row instead of retiring it whole.
+        await AccountManager.shared.retirePartiallyCompletedOp(
+            forward,
+            provenMembers: ["101"],
+            remaining: ["202"],
+            provenDestinations: [ProvenDestinationAddress(
+                sourceProviderId: "101",
+                destinationProviderId: "901",
+                destinationUidValidity: 52)],
+            addressChangesOnMove: true,
+            context: AccountManager.DrainContext())
+        await AccountManager.shared.awaitWriteQueueDrain()
+
+        let ops = try await fixture.pool.read { db in
+            try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
+        }
+
+        // The unproven member is never dropped — same row, narrowed.
+        let narrowed = ops.first { $0.id == forward.id }
+        #expect(narrowed?.messageIds == ["202"])
+        #expect(narrowed?.status == PendingStatus.queued.rawValue)
+
+        // 🚨 THE PROPERTY. The user's Undo is a durable operation again,
+        // addressed by the destination UID the forward's COPYUID proved —
+        // not a process-local record waiting on a predecessor that is gone.
+        let deferredAfter = await AccountManager.shared.deferredMoveSuccessorCountForTesting()
+        let inverse = ops.filter { $0.id != forward.id }
+        let opSummary = ops.map { "\($0.type.rawValue)\($0.messageIds)" }.joined(separator: ",")
+        #expect(inverse.count == 1, """
+            the deferred inverse was stranded by the narrowing retirement: \
+            deferredStillWaiting=\(deferredAfter) ops=[\(opSummary)]
+            """)
+        guard inverse.count == 1 else { return }
+        #expect(inverse[0].type == .move)
+        #expect(inverse[0].messageIds == ["901"])
+        #expect(inverse[0].folderPath == "Archive")
+        #expect(inverse[0].destinationPath == "INBOX")
+        #expect(inverse[0].observedUidValidity == 52)
+        #expect(deferredAfter == 0, "the successor must be settled, not left waiting forever")
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[proven.id] == nil)
+    }
+
     @Test("Delete after an in-flight Delete Undo cancels the deferred move back")
     @MainActor
     func deleteUndoDeleteCancelsDeferredMoveBack() async throws {
