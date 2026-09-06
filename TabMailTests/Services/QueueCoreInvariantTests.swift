@@ -170,7 +170,7 @@ struct QueueCoreInvariantTests {
     // A mutation that
     // admitted `.icloud` into the account-qualified set would be invisible to an
     // `.imap`-only fixture, because `.imap` alone still exercises the "folder is
-    // part of the address" branch of `buildLanes` and this test would stay green.
+    // part of the address" branch of `buildRelatedChains` and this test would stay green.
     // The exact-set oracle for the classifier itself lives in
     // `AccountManagerQueueDrainTests.accountScopedIdAccountIdsAdmitsExactlyGmailOutlookAndTheDemoAccount`.
     @Test("a permanently evidence-refused op on (INBOX, 77) does not starve an unrelated message at (Archive, 77)",
@@ -222,7 +222,7 @@ struct QueueCoreInvariantTests {
     }
 
     @Test("two ops on the SAME (account, folder, UID) still serialize — the lane split is per address, not per op")
-    func sameFolderAndUidStillShareOneLane() async throws {
+    func sameFolderAndUidStillShareOneChain() async throws {
         let fixture = try fixture(accountId: "acc-queue-001-control")
         defer { finish(fixture) }
 

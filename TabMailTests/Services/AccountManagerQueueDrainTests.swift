@@ -831,8 +831,8 @@ struct AccountManagerQueueDrainTests {
     /// (`DemoSeed.demoAccountId`, whose row is nonetheless stored `.imap`). A
     /// term-by-term mutation of either — deleting the demo-id arm, or narrowing
     /// the provider arm — must show up as a wire-order/overlap failure on the
-    /// affected case and nowhere else. The pure `buildLanes` unit tests in
-    /// `PendingQueueLaneTests` inject the set directly, so they cannot see a
+    /// affected case and nowhere else. The pure `buildRelatedChains` unit tests in
+    /// `PendingQueueChainTests` inject the set directly, so they cannot see a
     /// defect in how the drain COMPUTES it; only a real-drain fixture per
     /// classification can.
     ///

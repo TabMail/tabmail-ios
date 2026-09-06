@@ -531,7 +531,7 @@ struct NeverDropExitClosureTests {
     ///     re-evaluated before EVERY op in a lane, so the second and third were
     ///     refused even once the first had slipped through.
     ///  2. **A LANE-MATE of the unprovable op does NOT reach the wire while that op
-    ///     is still queued.** `buildLanes` unions on shared message ids, so a
+    ///     is still queued.** `buildRelatedChains` unions on shared message ids, so a
     ///     lane-mate names the same message; running it ahead of an unresolved
     ///     predecessor is the race chain deferral exists to prevent, and the fix
     ///     must not buy property 1 by giving that up. This is a REGRESSION GUARD: it is
@@ -607,7 +607,7 @@ struct NeverDropExitClosureTests {
             [
                 unprovableMove,
                 // Property 2's subject: names the SAME message as the unprovable
-                // move, so `buildLanes` puts it in that op's lane, behind it.
+                // move, so `buildRelatedChains` puts it in that op's lane, behind it.
                 later(.markFlagged, on: "77", 40),
                 // Property 1's subjects: a different message, therefore a different
                 // lane, therefore nothing to do with the refusal.
@@ -666,7 +666,7 @@ struct NeverDropExitClosureTests {
     /// standards-valid non-UIDPLUS server the move threw before any wire
     /// mutation — on EVERY attempt, forever, because the missing capability is
     /// not evidence that can arrive later. The refusal's drain arm holds the op
-    /// back, and `buildLanes` unions ops that share a message id, so the user's
+    /// back, and `buildRelatedChains` unions ops that share a message id, so the user's
     /// every LATER gesture on that same message was held behind an op that could
     /// never resolve. Neither row had any user-visible resolution
     /// path: nothing lists or clears `PendingOperation`.
@@ -722,7 +722,7 @@ struct NeverDropExitClosureTests {
             type: .move, messageIds: ["77"], accountId: f.accountId,
             folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
         move.createdAt = Date().addingTimeInterval(-60)
-        // Issued AFTER the move and naming the SAME message, so `buildLanes` puts
+        // Issued AFTER the move and naming the SAME message, so `buildRelatedChains` puts
         // it in the move's lane, behind it. This is the gesture the wedge starved.
         var laneMate = PendingOperation(
             type: .markFlagged, messageIds: ["77"], accountId: f.accountId,
@@ -1020,7 +1020,7 @@ struct NeverDropExitClosureTests {
             type: .move, messageIds: ["77"], accountId: f.accountId,
             folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
         move.createdAt = Date().addingTimeInterval(-60)
-        // Issued AFTER the move and naming the SAME message, so `buildLanes`
+        // Issued AFTER the move and naming the SAME message, so `buildRelatedChains`
         // puts it in the move's lane, behind it.
         var laneMate = PendingOperation(
             type: .markFlagged, messageIds: ["77"], accountId: f.accountId,
@@ -1160,7 +1160,7 @@ struct NeverDropExitClosureTests {
             type: .move, messageIds: ["77"], accountId: f.accountId,
             folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
         move.createdAt = Date().addingTimeInterval(-60)
-        // Issued after the move on the SAME message, so `buildLanes` seats it in
+        // Issued after the move on the SAME message, so `buildRelatedChains` seats it in
         // the move's lane behind it: if the move wedges, this starves.
         var laneMate = PendingOperation(
             type: .markFlagged, messageIds: ["77"], accountId: f.accountId,
@@ -2030,7 +2030,7 @@ struct NeverDropExitClosureTests {
     ///
     /// THREE PROPERTIES, all asserted at the server across repeated drains:
     ///  1. the refused MOVE is still queued with its retry count advancing, and
-    ///     its same-lane successor is still held — `buildLanes` unions on shared
+    ///     its same-lane successor is still held — `buildRelatedChains` unions on shared
     ///     message ids, so running a lane-mate ahead of an unresolved
     ///     predecessor is the race chain deferral exists to prevent;
     ///  2. FIVE disjoint-lane gestures on a different message all reach the
@@ -2736,7 +2736,7 @@ struct NeverDropExitClosureTests {
     /// costs.
     ///
     /// A lane is a connected component over `"accountId:folderPath:messageId"`
-    /// (`buildLanes`), so a `.deleteDraft` op's lane is `<account>:<Drafts>:<uid>`.
+    /// (`buildRelatedChains`), so a `.deleteDraft` op's lane is `<account>:<Drafts>:<uid>`.
     /// Three ops here, drained TWICE against a Drafts mailbox that never reports an
     /// epoch:
     ///  - the draft delete — must still be durably queued after both passes;

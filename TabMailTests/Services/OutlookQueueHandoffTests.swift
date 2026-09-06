@@ -341,13 +341,13 @@ struct OutlookQueueHandoffTests {
     /// Outlook serialization oracles are `T1` (a follower's PATCH must not reach
     /// the wire at all while its predecessor's move is unresolved — a DIFFERENT
     /// request, which the transport does let through) and
-    /// `PendingQueueLaneTests.outlookSameIdInTwoFoldersSharesOneLane` (the lane
+    /// `PendingQueueChainTests.outlookSameIdInTwoFoldersSharesOneChain` (the lane
     /// key itself).
     ///
     /// ⚠️ CORRECTED — those two are NOT both red witnesses for the CLASSIFIER.
-    /// `outlookSameIdInTwoFoldersSharesOneLane` INJECTS the set it is testing
+    /// `outlookSameIdInTwoFoldersSharesOneChain` INJECTS the set it is testing
     /// against (`accountScopedIdAccountIds: ["acc-outlook"]`) and never calls
-    /// `AccountManager.accountScopedIdAccountIds`, so it pins `buildLanes`' pure
+    /// `AccountManager.accountScopedIdAccountIds`, so it pins `buildRelatedChains`' pure
     /// grouping and stays green no matter which providers the classifier admits.
     /// Removing `.outlook` from the set is caught by `T1`, which drives a real
     /// drain through the classifier, and by
