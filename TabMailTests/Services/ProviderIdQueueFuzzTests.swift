@@ -1098,7 +1098,7 @@ struct ProviderIdQueueFuzzTests {
             observedUidValidity: fixture.inbox.lastKnownUidValidity)
         operation.retryCount = 2
         let insertedOperation = operation
-        try await fixture.pool.writeWithoutTransaction { db in try insertedOperation.insert(db) }
+        try await fixture.pool.writeWithoutTransaction { db in _ = try insertedOperation.inserted(db) }
         server.killConnectionOnNextCommand(containing: "UID STORE")
 
         let transcriptAtDiagnostic = Mutex<[String]?>(nil)
@@ -1321,7 +1321,7 @@ struct ProviderIdQueueFuzzTests {
                             destinationPath: fixture.archive.path,
                             observedUidValidity: fixture.inbox.lastKnownUidValidity)
                         try await fixture.pool.writeWithoutTransaction { db in
-                            try operation.insert(db)
+                            _ = try operation.inserted(db)
                         }
                     }
                     try await drainProviderQueue(
@@ -1597,13 +1597,24 @@ struct ProviderIdQueueFuzzTests {
 //
 // `IOS-QUEUE-008`: on Gmail, delete → undo → re-delete produced
 // `TRASH→INBOX` and `INBOX→TRASH` on ONE message; under a uniformly
-// folder-qualified key they land in different connected components,
-// `drainPendingQueue` launches one Task per lane CONCURRENTLY, and the
-// inverse can finish last — the deleted message reappears. See
+// folder-qualified key they land in different connected components, the drain
+// of the day launched one Task per component CONCURRENTLY, and the inverse
+// could finish last — the deleted message reappears. See
 // `AccountManagerQueueDrainTests
 // .drainPendingQueueRealStableIdSameMessageOpsNeverOverlapAndRunInIssueOrder`,
 // the deterministic pin this fuzzer generalizes with seeded adversarial
 // scheduling and a retryable fault.
+//
+// ⚠️ THE CONSEQUENCE OF A WRONG KEY CHANGED WITH THE EXECUTOR, AND SO DID THE
+// ORACLE THAT CATCHES IT. The global single-operation executor runs ONE
+// operation at a time in `queuePosition` order, so a wrong key can no longer
+// produce concurrency at all — `wireState.overlapped` is now structurally
+// unreachable and is retained as an ANCHOR (if it ever fires, concurrent
+// dispatch came back), not as this file's non-vacuity argument. What a wrong
+// key costs today is the DEFERRAL's reach: relatedness is what decides which
+// rows move to the tail together, so splitting the pair leaves the re-delete
+// claimable the moment its unresolved predecessor is deferred, and it goes to
+// the wire ahead of it.
 //
 // ## ACCEPTANCE BAR (Testing Rule 11)
 //
@@ -1614,13 +1625,17 @@ struct ProviderIdQueueFuzzTests {
 //             : "\(op.accountId):\(op.folderPath):\(id)"
 //     }
 // → body replaced with the unconditional `"\(op.accountId):\(op.folderPath):\(id)"`
-// — `stableIdQueueLaneFuzz` must fail on its wire oracle (`overlapped` — two
-// `move()` calls for one `(account, id)` observed concurrently), independent
-// of scheduling luck: the two target ops land in different lanes, each lane
-// is its own concurrently-launched Task, and the hook's own bounded window
-// makes a genuine overlap provable rather than merely likely. The failure
-// message embeds the replay seed (`seedHex`, `0x…`) and round index, exactly
-// like every other assertion in this file — reproduce with
+// — `stableIdQueueLaneFuzz` must fail, DETERMINISTICALLY and independent of
+// scheduling luck, on the armed-fault round's ORDER oracles rather than on the
+// overlap counter: the two target ops fall into different components, so when
+// the inverse fails only IT moves to the tail, the re-delete becomes the live
+// front row while its predecessor is unresolved, and it goes to the wire. That
+// shows up twice over — `targetCalls` gains a `redeleteCall` (the
+// "exactly ONE failed target call PER DRAIN, all carried by the predecessor"
+// assertion) and the tail assertion no longer finds `[inverse, redelete]` in
+// order at the end of the queue. The failure message embeds the replay seed
+// (`seedHex`, `0x…`) and round index, exactly like every other assertion in
+// this file — reproduce with
 // `QUEUE_FUZZ_REPLAY_SEED=0x… xcodebuild test …` (`TEST_RUNNER_` prefix on
 // the CLI; see `FuzzConfig`'s doc comment above).
 extension ProviderIdQueueFuzzTests {
@@ -1729,7 +1744,7 @@ extension ProviderIdQueueFuzzTests {
     // MARK: - The fuzz test
 
     @Test(
-        "A3.2: on an account-scoped-id account (Gmail and Outlook, alternating per round), cross-folder gestures on ONE message never overlap on the wire, land in createdAt order, the latest destination wins, disjoint work still converges, and a retryable fault yields exactly the retry state it justifies (Testing Rule 11)",
+        "A3.2: on an account-scoped-id account (Gmail and Outlook, alternating per round), cross-folder gestures on ONE message never overlap on the wire, land in ADMISSION order, the latest destination wins, disjoint work still converges, and a retryable fault yields exactly the retry state it justifies (Testing Rule 11)",
         arguments: FuzzConfig.seeds, [StableFaultMode.none, .transientThenClears, .permanentThisRound]
     )
     @MainActor
@@ -1833,28 +1848,24 @@ extension ProviderIdQueueFuzzTests {
             // hook, so those calls go unperturbed; documented limitation,
             // not a gap in coverage of THIS invariant, which is about `move`).
             let wireState = Mutex<(inFlight: Int, overlapped: Bool)>((inFlight: 0, overlapped: false))
-            await mockProvider.setMoveHook { [chaos, mockProvider, bystanderIds] in
+            await mockProvider.setMoveHook { [chaos] in
                 wireState.withLock { state in
                     state.inFlight += 1
                     if state.inFlight > 1 { state.overlapped = true }
                 }
-                // Bystander head start. `DrainContext.failedAccounts` is
-                // account-WIDE by design, so a same-account bystander lane
-                // that reaches its `failedAccounts` check only AFTER the
-                // target's failure is (correctly) parked for the rest of that
-                // drain. The exact-once bystander oracle below must measure
-                // the queue, not Task scheduling, so no target move — success
-                // or failure — may complete before every bystander has reached
-                // the provider. Bounded: on timeout the hook proceeds and the
-                // oracle reports the shortfall. The mock actor is reentrant at
-                // this suspension point, so the bystanders' calls proceed.
-                for _ in 0..<FuzzConfig.drainPollAttempts {
-                    let readIds = await mockProvider.markedReadIds.flatMap { $0.ids }
-                    let flaggedIds = await mockProvider.markedFlaggedIds.flatMap { $0.ids }
-                    let reached = Set(readIds + flaggedIds)
-                    if bystanderIds.allSatisfy({ reached.contains($0) }) { break }
-                    try? await Task.sleep(for: .milliseconds(FuzzConfig.drainPollIntervalMs))
-                }
+                // ⚠️ A BYSTANDER HEAD START USED TO BE WAITED FOR HERE, AND
+                // UNDER THE GLOBAL SINGLE-OPERATION EXECUTOR IT DEADLOCKS THE
+                // ROUND. The predecessor dispatched lanes CONCURRENTLY, so the
+                // bystanders could reach the provider while the target move was
+                // parked in this hook, and the hook polled for exactly that so
+                // the account-wide `failedAccounts` skip could not park them
+                // before they ran. The executor now runs ONE operation at a
+                // time: nothing else can reach the provider while this hook is
+                // suspended, so the poll could only burn its whole bound. The
+                // bystanders' progress is now proved where it belongs — by a
+                // SECOND drain after the target's failure has moved its chain to
+                // the tail, which is the property that actually matters
+                // (unrelated mail is not held hostage by a failing gesture).
                 await chaos.point()
                 try? await Task.sleep(for: .milliseconds(StableFuzzConfig.moveOverlapWindowMs))
                 wireState.withLock { $0.inFlight -= 1 }
@@ -1866,9 +1877,9 @@ extension ProviderIdQueueFuzzTests {
                 imapProvider: nil, pool: fixture.pool
             ) {
                 try await fixture.pool.writeWithoutTransaction { db in
-                    try opInverse.insert(db)
-                    try opRedelete.insert(db)
-                    for op in bystanderOps { try op.insert(db) }
+                    try opInverse.inserted(db)
+                    try opRedelete.inserted(db)
+                    for var op in bystanderOps { try op.insert(db) }
                 }
 
                 switch faultMode {
@@ -1891,12 +1902,14 @@ extension ProviderIdQueueFuzzTests {
 
                     // ---- Invariant (armed fault, both modes): EXACTLY one wire
                     // attempt, carried by the predecessor; the successor was
-                    // claimed and requeued UNTOUCHED (status back to queued,
-                    // retryCount still 0). `everAttempted` is set at CLAIM
-                    // time for every op of the lane (the claim loop in
-                    // `AccountManager.drainPendingQueue`), so it is true for
-                    // BOTH — the conservative evidence
-                    // `drainPendingQueueRealFirstOpFailureGatesRestOfLane` pins.
+                    // never CLAIMED at all, so it carries neither a retry nor
+                    // the claim's durable attempt proof. `everAttempted` is
+                    // written in the claim transaction, and the global
+                    // single-operation executor stops at the predecessor's
+                    // failure — so `!successor.everAttempted` is the durable
+                    // evidence that no speculative claim ran ahead of it, the
+                    // same property `drainPendingQueueRealFirstOpFailureGatesRestOfLane`
+                    // pins directly.
                     let armedTargetCalls = (await mockProvider.callLog).filter(isTargetMoveCall)
                     #expect(
                         armedTargetCalls == [inverseCall],
@@ -1923,19 +1936,36 @@ extension ProviderIdQueueFuzzTests {
                                 "\(tag): successor must be requeued to queued, got \(successor.status)")
                         #expect(successor.retryCount == 0,
                                 "\(tag): the halted successor must never be attempted, got retryCount=\(successor.retryCount)")
-                        #expect(successor.everAttempted,
-                                "\(tag): the successor was claimed in the same pass, so everAttempted must be true (claim-time evidence, not a wire attempt)")
+                        #expect(!successor.everAttempted,
+                                "\(tag): the successor carries the claim's durable attempt proof though the drain stopped at its predecessor — a speculative claim ran ahead of a failure")
+                        // ---- Invariant: the failed chain moved to the TAIL,
+                        // relative order intact, BEHIND every unrelated
+                        // bystander. This is what lets the next drain run the
+                        // disjoint work first instead of reopening with the
+                        // gesture that just failed.
+                        #expect(predecessor.queuePosition < successor.queuePosition,
+                                "\(tag): the deferred chain lost its issue order — \(predecessor.queuePosition) vs \(successor.queuePosition)")
                     }
                     let accountOps = try await fixture.pool.read { db in
-                        try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
+                        try PendingOperation
+                            .filter(Column("accountId") == accountId)
+                            .order(Column("queuePosition").asc)
+                            .fetchAll(db)
                     }
                     #expect(
-                        accountOps.count == 2,
-                        "\(tag): only the two halted target ops may remain on the account, got \(accountOps.map { "\($0.type.rawValue)\($0.messageIds)" })"
+                        accountOps.count == 2 + bystanderCount,
+                        "\(tag): the two target ops and every untouched bystander must remain, got \(accountOps.map { "\($0.type.rawValue)\($0.messageIds)" })"
                     )
                     #expect(
-                        Set(accountOps.map(\.id)) == Set([opInverse.id, opRedelete.id]),
-                        "\(tag): the remaining ops must be exactly the two target ops"
+                        accountOps.suffix(2).map(\.id) == [opInverse.id, opRedelete.id],
+                        "\(tag): the failed chain must sit at the TAIL, behind every unrelated bystander, got \(accountOps.map { "\($0.type.rawValue)@\($0.queuePosition)" })"
+                    )
+                    #expect(
+                        accountOps.prefix(bystanderCount).allSatisfy {
+                            !$0.everAttempted && $0.retryCount == 0
+                                && $0.status == PendingStatus.queued.rawValue
+                        },
+                        "\(tag): an unrelated bystander was claimed or charged by a drain that stopped at the target's failure, got \(accountOps.prefix(bystanderCount).map { "\($0.type.rawValue)/\($0.status)/attempted=\($0.everAttempted)/retries=\($0.retryCount)" })"
                     )
 
                     if faultMode == .transientThenClears {
@@ -1945,6 +1975,17 @@ extension ProviderIdQueueFuzzTests {
                         await mockProvider.clearMoveThrowsOnId()
                         try await drainProviderQueue(pool: fixture.pool, recordedCommands: { () -> [String] in [] })
                         try await drainProviderQueue(pool: fixture.pool, recordedCommands: { () -> [String] in [] })
+                    } else {
+                        // ---- The fault stays armed. A SECOND drain opens on a
+                        // queue whose head is now the unrelated bystanders (the
+                        // failed chain went to the tail), so they all converge
+                        // while the target keeps failing. This is the property
+                        // the deleted head-start poll used to approximate, and
+                        // it is a durable ordering fact rather than a Task
+                        // scheduling accident.
+                        await AccountManager.shared.drainPendingQueue()
+                        let resettled = await AccountManager.shared.pendingQueueIsQuiescentForTesting()
+                        #expect(resettled, "\(tag): the second armed drain must be quiescent before its state is read")
                     }
                 }
 
@@ -1963,7 +2004,9 @@ extension ProviderIdQueueFuzzTests {
                 switch faultMode {
                 case .none, .transientThenClears:
                     // ---- Invariant: successful calls on one id follow
-                    // createdAt order, and the LATEST destination wins.
+                    // ADMISSION order — the `queuePosition` allocated when each
+                    // was inserted, not either row's `createdAt` — and the
+                    // LATEST destination wins.
                     #expect(targetMoves.count == 2, "\(tag): both cross-folder moves must reach the provider, got \(landed)")
                     if targetMoves.count == 2 {
                         let expected = [
@@ -1984,7 +2027,25 @@ extension ProviderIdQueueFuzzTests {
                     #expect(remaining == 0, "\(tag): queue did not converge — \(remaining) op(s) remain")
                 case .permanentThisRound:
                     #expect(targetMoves.isEmpty, "\(tag): a permanently-failing move must never record a successful call, got \(landed)")
-                    #expect(targetCalls == [inverseCall], "\(tag): a permanent fault must leave exactly ONE (failed) target call, got \(targetCalls)")
+                    // ---- Invariant: AT MOST ONE attempt per drain, and the
+                    // successor never gets one. Two drains ran while the fault
+                    // was armed, so exactly two failed attempts are on the
+                    // ledger — both the PREDECESSOR's. More would mean the
+                    // executor re-claimed a row it had already deferred and
+                    // retried it at wire speed within a single drain; a
+                    // `redeleteCall` would mean the successor overtook an
+                    // unresolved predecessor.
+                    #expect(targetCalls == [inverseCall, inverseCall],
+                            "\(tag): a permanent fault must leave exactly ONE failed target call PER DRAIN, all carried by the predecessor, got \(targetCalls)")
+                    // ---- Invariant: the two target ops are all that is left —
+                    // the unrelated bystanders converged around the failure.
+                    let stranded = try await fixture.pool.read { db in
+                        try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
+                    }
+                    #expect(
+                        Set(stranded.map(\.id)) == Set([opInverse.id, opRedelete.id]),
+                        "\(tag): only the two permanently-failing target ops may remain, got \(stranded.map { "\($0.type.rawValue)\($0.messageIds)" })"
+                    )
                 }
 
                 // ---- Invariant: disjoint work progresses EXACTLY once per
@@ -2094,9 +2155,9 @@ extension ProviderIdQueueFuzzTests {
         ) {
             try await fixture.pool.writeWithoutTransaction { db in
                 try seededHeader.insert(db)
-                try opInverse.insert(db)
-                try opRedelete.insert(db)
-                for op in bystanderOps { try op.insert(db) }
+                try opInverse.inserted(db)
+                try opRedelete.inserted(db)
+                for var op in bystanderOps { try op.insert(db) }
             }
             let totalOps = 2 + bystanderOps.count
 

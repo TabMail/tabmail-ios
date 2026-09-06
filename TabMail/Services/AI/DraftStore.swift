@@ -40,8 +40,9 @@ actor DraftStore {
     /// already live in this process — see `pushesInFlight`.
     ///
     /// Deliberately a plain `Error`: it must land in `executeSingleOp`'s GENERIC
-    /// transient arm (requeue + `retryCount += 1` + `.haltLane`), which is the arm
-    /// that preserves the durable producer. It must NOT be
+    /// transient arm (tail movement for the op and its related chain +
+    /// `retryCount += 1` + the account marked failed for this drain), which is
+    /// the arm that preserves the durable producer. It must NOT be
     /// `ProviderError.actionIdentityResolutionFailed` (the drain's terminal-drop
     /// signal) and must NOT conform to `ProviderEvidenceUnavailable` (whose skip
     /// contract is about a provider that could not obtain a proof). Its
@@ -642,12 +643,12 @@ actor DraftStore {
         // `KNOWN_ISSUES.md` `IOS-QUEUE-003` item 4 adjudicates and accepts.
         //
         // ⚠️ AND DO NOT "FIX" IT BY SWAPPING THE THROW TYPE. The obvious
-        // alternative, `ProviderEvidenceUnavailable`, lands in the requeue +
-        // `retryCount += 1` + `.haltLane` arm — and because
+        // alternative, `ProviderEvidenceUnavailable`, lands in the tail-movement
+        // + `retryCount += 1` + deferred-chain arm — and because
         // `draftRuntimeIdentityKind(for:)` is DETERMINISTIC PER PROVIDER CLASS,
         // every retry reproduces `.unknown` identically and forever. That is a
-        // permanent lane wedge, which the wedge corollary puts in the same
-        // non-recoverable set as a dropped intention. Swapping the type trades a
+        // permanent wedge for this draft's chain, which the wedge corollary puts
+        // in the same non-recoverable set as a dropped intention. Swapping the type trades a
         // drop for a wedge: the mirror image of this bug, which is exactly how
         // this comment came to be wrong in the first place.
         //

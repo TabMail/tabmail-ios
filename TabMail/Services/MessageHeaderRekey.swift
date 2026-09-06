@@ -739,14 +739,16 @@ enum MessageHeaderRekey {
     /// WHY DURABLE, NOT A DRAIN-SCOPED MAP: the follower may be claimed in a LATER
     /// drain entirely (an undo issues its inverse and requests a re-drain; an
     /// offline follower is claimed in a pass that never saw the move's response),
-    /// and a process-local map cannot survive either. The table is the only truth;
-    /// the lane loop re-reads it before executing (`AccountManager.liveOperation`).
+    /// and a process-local map cannot survive either. The table is the only
+    /// truth; `AccountManager.claimFrontierOperation` reads each row from it at
+    /// the moment it claims that row, so a follower re-addressed here goes out at
+    /// the address the wire proved and never at the one a snapshot remembers.
     ///
-    /// WHY `status != cancelled` RATHER THAN `status == queued`: under
-    /// account-qualified lanes every op sharing an id with the retiring op was
-    /// claimed in the same pass — `buildLanes` is a connected-component grouping —
-    /// so it is `inFlight`, waiting behind this op in the SAME lane task. Those are
-    /// exactly the ops that must be re-addressed. An op inserted mid-pass is
+    /// WHY `status != cancelled` RATHER THAN `status == queued`: a follower is
+    /// normally still `queued` when the move ahead of it retires — the global
+    /// single-operation executor claims ONE row at a time — but an `inFlight` row
+    /// this process still owns (a retained retirement or requeue) also holds the
+    /// id and must be re-addressed the same way. An op inserted mid-drain is
     /// `queued` and is covered too. Nothing else can hold the id: an op in another
     /// lane cannot share a member, by construction.
     ///

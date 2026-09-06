@@ -8,7 +8,7 @@ import GRDB
 import Synchronization
 @testable import TabMail
 
-/// Real-`executeSingleOp` queue persistence and lane-halt tests.
+/// Real-`executeSingleOp` queue persistence and chain-deferral tests.
 ///
 /// Unlike `AccountManagerQueueIntegrationTests.swift` (which only exercises
 /// `executeOperation`, a pure provider-dispatch function with no DB access),
@@ -21,7 +21,7 @@ import Synchronization
 ///
 /// `.serialized`: swaps the process-wide `AppDatabase.shared` singleton —
 /// mirrors `InboxGestureActionTests` / `MessageDetailStagedFallbackTests`.
-@Suite("AccountManagerQueue drain — executeSingleOp + lane halt (F2)", .serialized, .processGlobalState)
+@Suite("AccountManagerQueue drain — executeSingleOp + chain deferral (F2)", .serialized, .processGlobalState)
 struct AccountManagerQueueDrainTests {
 
     // MARK: - Harness (mirrors InboxGestureActionTests.makeTestDB/restoreTestDB)
@@ -55,7 +55,7 @@ struct AccountManagerQueueDrainTests {
     }
 
     private func insertOp(_ op: PendingOperation, pool: DatabasePool) throws {
-        try pool.writeWithoutTransaction { db in try op.insert(db) }
+        try pool.writeWithoutTransaction { db in _ = try op.inserted(db) }
     }
 
     private func fetchOp(_ id: String, pool: DatabasePool) throws -> PendingOperation? {
@@ -233,28 +233,33 @@ struct AccountManagerQueueDrainTests {
         let context = AccountManager.DrainContext()
         let outcome = await AccountManager.shared.executeSingleOp(op, provider: provider, context: context)
 
-        // .haltLane: the operation is still owed, so a later same-lane op must
-        // not run ahead of it.
-        #expect(outcome == .haltLane)
+        // `.deferred`: the operation is still owed, so it and its whole related
+        // chain move to the tail and are held for the rest of this drain. Every
+        // later op that names one of its messages moves WITH it, so none of them
+        // can run ahead of it; unrelated mail proceeds.
+        #expect(outcome == .deferred)
 
         // 🚨 A NOT-FOUND SAYS NOTHING ABOUT THE CONNECTION, and this is the only
         // place that fact is decidable. `failedAccounts` stops every OTHER lane on
         // the account for the rest of the drain, so routing this refusal through
         // the generic transient arm would isolate an account because one batch
-        // could not be attributed. A real-drain fixture cannot see it: the claim
-        // loop claims every lane up front, so independent work is already running
-        // when the flag would be set, and an op behind this one in the same lane
-        // is held by `.haltLane` regardless. Asserting it on the context this call
-        // owns is what makes it unmaskable.
+        // could not be attributed. A real-drain fixture cannot see it: unrelated
+        // work on the same account is claimed either before this op (already
+        // executed) or after it (executed BECAUSE the account was not marked
+        // failed), and an op behind this one in the same chain is held by the
+        // deferral regardless — so the flag's absence never changes an observable
+        // outcome from outside. Asserting it on the context this call owns is
+        // what makes it unmaskable.
         #expect(context.failedAccounts.isEmpty, """
             an unattributable batch not-found marked the whole account failed: \
             \(context.failedAccounts). Every other lane on it then stops for the \
             rest of the drain, on evidence that named no message and no connection.
             """)
-        #expect(context.executedAny == false, """
-            nothing advanced, so nothing may claim it did — `executedAny` is what \
-            buys the drain another claim pass, and an unresolved refusal that \
-            granted one would let this same op be re-sent inside one drain.
+        #expect(context.deferredOperationIds.contains(op.id), """
+            nothing advanced, so the op must be held for the rest of this drain — \
+            the deferred set is what stops the executor re-claiming it after it \
+            reaches the tail, and an unresolved refusal that skipped it would let \
+            this same op be re-sent inside one drain.
             """)
 
         let survivors = try await pool.read { db in
@@ -681,8 +686,9 @@ struct AccountManagerQueueDrainTests {
         let context = AccountManager.DrainContext()
         let outcome = await AccountManager.shared.executeSingleOp(op, provider: provider, context: context)
 
-        #expect(outcome == .haltLane)
+        #expect(outcome == .deferred)
         #expect(context.failedAccounts.contains("acc-gap2"))
+        #expect(context.deferredOperationIds.contains(op.id))
 
         let after = try fetchOp(op.id, pool: pool)
         #expect(after != nil, "the whole op must be reset to queued — a generic transient error is not confirmed staleness, so it must NOT split")
@@ -706,7 +712,7 @@ struct AccountManagerQueueDrainTests {
         var mutableReclaimed = after
         mutableReclaimed.status = PendingStatus.inFlight.rawValue
         let reclaimed = mutableReclaimed
-        try await pool.writeWithoutTransaction { db in try reclaimed.save(db) }
+        try await pool.writeWithoutTransaction { db in try reclaimed.update(db) }
 
         let secondOutcome = await AccountManager.shared.executeSingleOp(reclaimed, provider: provider, context: AccountManager.DrainContext())
         #expect(secondOutcome == .proceed)
@@ -721,8 +727,18 @@ struct AccountManagerQueueDrainTests {
 
     // MARK: - 10. GAP3: drainPendingQueue() end-to-end via registerProviderForTesting
 
-    @Test("drainPendingQueue() (real, end-to-end): 3 queued ops across two lanes all execute exactly once, and same-lane ops run in createdAt order")
-    func drainPendingQueueRealEndToEndExecutesLanesInCreatedAtOrder() async throws {
+    /// ⚠️ RETIRED DISPLAY NAME, recorded verbatim: this test was **"3 queued ops
+    /// across two lanes all execute exactly once, and same-lane ops run in
+    /// createdAt order"** until the global single-operation FIFO executor landed.
+    /// It named the wrong ordering key, and it was VACUOUS about the one it
+    /// named: the two related ops were admitted in the same order as their
+    /// timestamps, so `createdAt` and admission order agreed and neither could
+    /// be falsified. `createdAt` is AGE ONLY now, so the fixture below sets it
+    /// BACKWARDS — the op admitted FIRST carries the LATER timestamp — and the
+    /// order assertion therefore fails on any build that reintroduces a
+    /// timestamp sort.
+    @Test("drainPendingQueue() (real, end-to-end): 3 queued ops all execute exactly once, and two ops naming one message run in ADMISSION order even when their timestamps disagree")
+    func drainPendingQueueRealEndToEndExecutesInAdmissionOrder() async throws {
         let (pool, dir, previous) = try makeTestDB()
         let accountId = "acc-gap3-lanes"
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
@@ -736,12 +752,16 @@ struct AccountManagerQueueDrainTests {
             // Dynamic (repo rule: no hardcoded dates); whole-second so the GRDB
             // date round-trip compares exactly.
             let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
-            // Lane 1: two ops sharing "msg-1" (buildLanes connected-component) — must run in createdAt order.
+            // Two ops naming "msg-1" — one connected component, so a deferral
+            // would move them together. They must reach the provider in the
+            // order they were ADMITTED, and the timestamps are set BACKWARDS so
+            // that is the only reading which survives: `opA` is admitted first
+            // and stamped one second LATER than `opB`.
             var opA = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
-            opA.createdAt = t0
+            opA.createdAt = t0.addingTimeInterval(1)
             var opB = PendingOperation(type: .markFlagged, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
-            opB.createdAt = t0.addingTimeInterval(1)
-            // Lane 2: a different message id — a separate connected component, runs concurrently.
+            opB.createdAt = t0
+            // A different message id — unrelated work, admitted last, executed last.
             var opC = PendingOperation(type: .markRead, messageIds: ["msg-2"], accountId: accountId, folderPath: "INBOX")
             opC.createdAt = t0
             try insertOp(opA, pool: pool)
@@ -758,31 +778,47 @@ struct AccountManagerQueueDrainTests {
             let callLog = await provider.callLog
             let readIdx = callLog.firstIndex { $0.contains("markRead") && $0.contains("msg-1") }
             let flagIdx = callLog.firstIndex { $0.contains("markFlagged") && $0.contains("msg-1") }
-            #expect(readIdx != nil && flagIdx != nil, "both lane-1 ops must have reached the provider")
+            #expect(readIdx != nil && flagIdx != nil, "both msg-1 ops must have reached the provider")
             if let readIdx, let flagIdx {
-                #expect(readIdx < flagIdx, "same-lane ops (sharing msg-1) execute in createdAt order")
+                #expect(readIdx < flagIdx, """
+                    the two ops naming msg-1 went out in the wrong order. \
+                    markRead was ADMITTED first and must go out first; it carries \
+                    the LATER `createdAt`, so a build that ordered the queue by \
+                    timestamp would produce exactly this failure.
+                    """)
             }
             let readCalls = await provider.markedReadIds
-            #expect(readCalls.contains { $0.ids == ["msg-2"] }, "lane 2's op also executed")
+            #expect(readCalls.contains { $0.ids == ["msg-2"] }, "the unrelated msg-2 op also executed")
         }
     }
 
     // MARK: - 10b. IOS-QUEUE-008: same provider RESOURCE, two folder paths
 
     /// THE SYSTEM PROPERTY: two queued operations that name the same provider
-    /// RESOURCE never execute concurrently and execute in `createdAt` (issue)
-    /// order. On Gmail/Graph a message id is folder-INDEPENDENT, so "same
-    /// resource" is `(account, id)` — the folder is not part of the address.
+    /// RESOURCE never execute concurrently and execute in ISSUE order. On
+    /// Gmail/Graph a message id is folder-INDEPENDENT, so "same resource" is
+    /// `(account, id)` — the folder is not part of the address.
+    ///
+    /// ⚠️ "ISSUE ORDER" IS `queuePosition`, NOT `createdAt`, AND THE SENTENCE
+    /// ABOVE SAID `createdAt` UNTIL THE GLOBAL FIFO EXECUTOR LANDED. Nothing
+    /// about this fixture changes — the inverse is still admitted before the
+    /// re-delete — but the key that decides is the durable position allocated at
+    /// admission, and the timestamps are now age only.
     ///
     /// The gesture that produced this (delete → undo ≈2s later → delete again
     /// ≈1s later, one Gmail message): undo enqueues the INVERSE move, whose
     /// source is by construction the forward op's DESTINATION, so the queue held
     /// `TRASH→INBOX` at t0 and `INBOX→TRASH` at t0+1 while ONE drain pass fetched
     /// both. A folder-qualified lane key put them in different connected
-    /// components, `drainPendingQueue` launches one Task per lane concurrently,
-    /// the inverse finished LAST, and Gmail kept the message in INBOX while the
-    /// local row said TRASH — both ops retiring as provider successes, so the
-    /// next full sync re-inserted the row the user had deleted.
+    /// components and the drain of the day launched one Task per lane
+    /// CONCURRENTLY, so the inverse finished LAST, Gmail kept the message in
+    /// INBOX while the local row said TRASH — both ops retiring as provider
+    /// successes, so the next full sync re-inserted the row the user had
+    /// deleted. (Concurrent lane dispatch is gone; the executor runs one
+    /// operation at a time in queue order, which makes the overlap this test
+    /// watches for structurally impossible rather than merely keyed correctly.
+    /// The fixture is retained because "structurally impossible" is a claim
+    /// about code that can be edited, and this is what falsifies it.)
     ///
     /// The oracle is the wire itself, in both directions: the move hook counts
     /// concurrent entries into `move` and sleeps long enough that a genuinely
@@ -1015,18 +1051,17 @@ struct AccountManagerQueueDrainTests {
         }
     }
 
-    /// The lane-composition line and the per-op drain lines, in append order.
+    /// The per-operation drain lines, in append order.
     ///
     /// Deliberately narrower than "every `.queue` entry": other entries in the
     /// same read legitimately name an op id too
     /// (`[MoveTrace] executeOperation.move … opId=`, `[MoveTrace] entered inbox …
-    /// op <id>`), and this artifact is about the lane/order decision, not about
-    /// those. Prefix-anchored so `[Queue] Draining N ops:` — a different line
-    /// that also starts `[Queue] D` — cannot drift into the set.
+    /// op <id>`), and this artifact is about the ORDER decision, not about
+    /// those. Prefix-anchored on `[Queue] drain pos ` so `[Queue] drain complete
+    /// — N operation(s) claimed this drain` — a different line that also starts
+    /// `[Queue] drain ` — cannot drift into the set.
     private static func laneOrderEntries(in log: String) -> [String] {
-        queueEntryMessages(in: log).filter {
-            $0.hasPrefix("[Queue] Lanes: ") || $0.hasPrefix("[Queue] drain lane ")
-        }
+        queueEntryMessages(in: log).filter { $0.hasPrefix("[Queue] drain pos ") }
     }
 
     /// THE INVARIANT: the wire order of the drain is RECONSTRUCTIBLE from the
@@ -1048,12 +1083,18 @@ struct AccountManagerQueueDrainTests {
     /// the gate is closed. Without that half, a writer that had been accidentally
     /// hard-enabled would satisfy the first half and look correct.
     ///
-    /// A third phase, between the two, arms a RETRYABLE provider fault so the lane
-    /// HALTS: `outcome=haltLane` is the instrument's only positive statement that a
-    /// lane stopped, and an all-succeed phase can never observe it — replacing that
-    /// interpolation with the literal `outcome=proceed` left every test in the tree
-    /// green while the exported log would describe a halted lane as one that kept
-    /// draining. A debug instrument may miss a line, but it must not lie.
+    /// A third phase, between the two, arms a RETRYABLE provider fault so the
+    /// operation is DEFERRED: `outcome=deferred` is the instrument's only positive
+    /// statement that an operation yielded, and an all-succeed phase can never
+    /// observe it — replacing that interpolation with the literal
+    /// `outcome=proceed` left every test in the tree green while the exported log
+    /// would describe a deferred operation as one that kept draining. A debug
+    /// instrument may miss a line, but it must not lie.
+    ///
+    /// ⚠️ THE `Lanes:` COMPOSITION LINE IS GONE WITH THE LANES. There is no plan
+    /// to state ahead of execution any more — the executor claims the live front
+    /// row one at a time — so the queue POSITION carries the fact the composition
+    /// line used to carry, and the per-operation pair is the whole artifact.
     @Test("drainPendingQueue() (real): with debug logging unlocked, the exported QUEUE channel reconstructs the lane composition and the per-op wire order — and stays silent when it is locked")
     func drainLaneInstrumentationIsReadableFromTheExportedLog() async throws {
         let (pool, dir, previous) = try makeTestDB()
@@ -1115,47 +1156,44 @@ struct AccountManagerQueueDrainTests {
             // containment oracle stays green when the op TYPE is dropped from the
             // line, when source→destination is reversed, when an entry appears
             // twice, when `executed` precedes `executing`, and when the two ops
-            // are reported in DIFFERENT lanes — which is precisely the state that
+            // are reported OUT OF ORDER — which is precisely the state that
             // brought the deleted message back (`IOS-QUEUE-008`).
             //
-            // `lane0(2)` in the composition line and `pos 1/2` / `pos 2/2` in the
-            // per-op lines are the same fact stated twice, deliberately: the
-            // composition line is written BEFORE any Task starts and the per-op
-            // lines are written by the lane Task itself, so agreeing is evidence
-            // that the plan and the execution are the same plan.
+            // `pos 1` then `pos 2` is the durable `queuePosition`, read back from
+            // the row the executor actually claimed. So the line says which
+            // operation the FIFO owner picked and in which order, which is the
+            // question the composition line used to answer before lanes existed.
             let inverse = unlockedPair.inverse
             let redelete = unlockedPair.redelete
             let expected = [
-                "[Queue] Lanes: lane0(2): \(inverse) move TRASH→INBOX ids=[m1]"
-                    + " | \(redelete) move INBOX→TRASH ids=[m1]",
-                "[Queue] drain lane 0 pos 1/2 — executing \(inverse) move TRASH→INBOX ids=[m1]",
-                "[Queue] drain lane 0 pos 1/2 — executed \(inverse) move TRASH→INBOX ids=[m1] outcome=proceed",
-                "[Queue] drain lane 0 pos 2/2 — executing \(redelete) move INBOX→TRASH ids=[m1]",
-                "[Queue] drain lane 0 pos 2/2 — executed \(redelete) move INBOX→TRASH ids=[m1] outcome=proceed",
+                "[Queue] drain pos 1 — executing \(inverse) move TRASH→INBOX ids=[m1]",
+                "[Queue] drain pos 1 — executed \(inverse) move TRASH→INBOX ids=[m1] outcome=proceed",
+                "[Queue] drain pos 2 — executing \(redelete) move INBOX→TRASH ids=[m1]",
+                "[Queue] drain pos 2 — executed \(redelete) move INBOX→TRASH ids=[m1] outcome=proceed",
             ]
             let observed = Self.laneOrderEntries(in: queueLog)
             #expect(observed == expected,
                     "the exported log does not reconstruct the drain.\nexpected:\n\(expected.joined(separator: "\n"))\nobserved:\n\(observed.joined(separator: "\n"))")
 
-            // ---- Gate OPEN, ARMED FAULT: a lane that HALTS ----------------
+            // ---- Gate OPEN, ARMED FAULT: an operation that DEFERS ---------
             // The m1 phase above can only ever observe `outcome=proceed`, so it
             // does not constrain the field at all: replacing the interpolation
             // with the literal `outcome=proceed` keeps every test in this tree
-            // green while the exported log reports a HALTED lane as one that kept
-            // draining. `outcome=` is the instrument's only positive statement
-            // that a lane stopped — the thing `IOS-QUEUE-008` needed the log to
-            // say — so it is witnessed here rather than deleted.
+            // green while the exported log reports a DEFERRED operation as one
+            // that kept draining. `outcome=` is the instrument's only positive
+            // statement that an operation yielded — the thing `IOS-QUEUE-008`
+            // needed the log to say — so it is witnessed here rather than deleted.
             //
             // The fault is the same retryable one the stable-id fuzzer's
             // `.transientThenClears` mode arms (`ProviderIdQueueFuzzTests`:
             // `setMoveThrowsOnId(targetId, error: ProviderError.notConnected)`).
             // It reaches `executeSingleOp`'s generic transient arm — "Connection/
-            // transient error — reset op to queued and mark account failed" — so
-            // the predecessor is requeued with `retryCount += 1`, the account
-            // enters `failedAccounts`, and `.haltLane` is returned, which makes
-            // the drain loop requeue the successor and break the lane. That arm
-            // deliberately does NOT set `executedAny`, so the outer pass loop
-            // terminates and the drain writes exactly one lane-composition line.
+            // transient error" — so the predecessor is moved to the tail with
+            // `retryCount += 1`, the account enters `failedAccounts`, and the
+            // whole chain (both m3 rows: they name the same message, so they are
+            // ONE connected component) is marked deferred for this drain. The
+            // executor then finds no claimable front row and the drain ends after
+            // exactly ONE `executing`/`executed` pair.
             AppLogStore.clear()
             let armedPair = try queuePair(messageId: "m3")
             await provider.setMoveThrowsOnId("m3", error: ProviderError.notConnected)
@@ -1164,18 +1202,17 @@ struct AccountManagerQueueDrainTests {
             let armedInverse = armedPair.inverse
             let armedRedelete = armedPair.redelete
             // Equality, not containment, for the same reason as the m1 phase —
-            // and here it carries a second fact: NOTHING is reported for pos 2/2.
-            // The successor never went out, and a log that named it would be
+            // and here it carries a second fact: NOTHING is reported for the
+            // successor. It moved to the tail WITH its predecessor and is
+            // deferred, so it never went out, and a log that named it would be
             // describing a wire event that did not happen.
             let armedExpected = [
-                "[Queue] Lanes: lane0(2): \(armedInverse) move TRASH→INBOX ids=[m3]"
-                    + " | \(armedRedelete) move INBOX→TRASH ids=[m3]",
-                "[Queue] drain lane 0 pos 1/2 — executing \(armedInverse) move TRASH→INBOX ids=[m3]",
-                "[Queue] drain lane 0 pos 1/2 — executed \(armedInverse) move TRASH→INBOX ids=[m3] outcome=haltLane",
+                "[Queue] drain pos 1 — executing \(armedInverse) move TRASH→INBOX ids=[m3]",
+                "[Queue] drain pos 1 — executed \(armedInverse) move TRASH→INBOX ids=[m3] outcome=deferred",
             ]
             let armedObserved = Self.laneOrderEntries(in: AppLogStore.read(channel: .queue))
             #expect(armedObserved == armedExpected,
-                    "the exported log does not report the halted lane.\nexpected:\n\(armedExpected.joined(separator: "\n"))\nobserved:\n\(armedObserved.joined(separator: "\n"))")
+                    "the exported log does not report the deferred operation.\nexpected:\n\(armedExpected.joined(separator: "\n"))\nobserved:\n\(armedObserved.joined(separator: "\n"))")
 
             // The durable state, read independently of the log: the log is the
             // artifact under test, so it cannot also be the evidence that the
@@ -1185,18 +1222,23 @@ struct AccountManagerQueueDrainTests {
             }
             let armedRows = armedAllRows.filter { $0.messageIds == ["m3"] }
             #expect(armedRows.count == 2,
-                    "both m3 ops must survive the halt: \(armedRows.map { "\($0.id.prefix(8)) \($0.folderPath)→\($0.destinationPath ?? "-") \($0.status)" })")
+                    "both m3 ops must survive the deferral: \(armedRows.map { "\($0.id.prefix(8)) \($0.folderPath)→\($0.destinationPath ?? "-") \($0.status)" })")
             guard armedRows.count == 2 else { return }
             let haltedOp = armedRows[0]
             let heldOp = armedRows[1]
             #expect(haltedOp.id.hasPrefix(armedInverse) && heldOp.id.hasPrefix(armedRedelete),
-                    "createdAt order must still put the inverse first")
+                    "the chain kept its relative order through the tail movement")
+            #expect(haltedOp.queuePosition < heldOp.queuePosition,
+                    "the tail movement preserves the pair's relative order: \(haltedOp.queuePosition) vs \(heldOp.queuePosition)")
             #expect(haltedOp.status == PendingStatus.queued.rawValue)
             #expect(heldOp.status == PendingStatus.queued.rawValue)
-            #expect(haltedOp.retryCount == 1, "the halted op was attempted once and requeued")
-            #expect(heldOp.retryCount == 0, "the successor was requeued WITHOUT being attempted")
-            #expect(haltedOp.everAttempted && heldOp.everAttempted,
-                    "both rows were claimed this pass, so both carry the attempted-row proof")
+            #expect(haltedOp.retryCount == 1, "the deferred op was attempted once")
+            #expect(heldOp.retryCount == 0,
+                    "a follower deferred WITHOUT a provider attempt consumes no retry")
+            #expect(haltedOp.everAttempted,
+                    "the claimed row carries the attempted-row proof")
+            #expect(!heldOp.everAttempted,
+                    "the follower was never claimed under the single-operation executor, so it must NOT carry the attempted-row proof")
 
             // `callLog` is the ATTEMPT ledger (appended before the throw hook),
             // `movedIds` the SUCCESS ledger — so together they say the predecessor
@@ -1210,21 +1252,22 @@ struct AccountManagerQueueDrainTests {
             #expect(!armedMoved.contains { $0.ids == ["m3"] },
                     "the armed move must have landed nothing: \(armedMoved.map { "\($0.ids) \($0.from)→\($0.to)" })")
 
-            // The blip clears: the SAME lane now drains to completion, in order,
-            // and the log says `proceed` twice — which is what makes the
-            // `haltLane` above a discriminating observation rather than a
-            // constant.
+            // The blip clears: the SAME chain now drains to completion, in
+            // order, and the log says `proceed` twice — which is what makes the
+            // `deferred` above a discriminating observation rather than a
+            // constant. The positions are the ones the tail movement assigned,
+            // read from the rows rather than assumed, so the assertion also says
+            // the executor claimed at the CURRENT positions and not at the
+            // original ones.
             await provider.clearMoveThrowsOnId()
             AppLogStore.clear()
             await AccountManager.shared.drainPendingQueue()
 
             let clearedExpected = [
-                "[Queue] Lanes: lane0(2): \(armedInverse) move TRASH→INBOX ids=[m3]"
-                    + " | \(armedRedelete) move INBOX→TRASH ids=[m3]",
-                "[Queue] drain lane 0 pos 1/2 — executing \(armedInverse) move TRASH→INBOX ids=[m3]",
-                "[Queue] drain lane 0 pos 1/2 — executed \(armedInverse) move TRASH→INBOX ids=[m3] outcome=proceed",
-                "[Queue] drain lane 0 pos 2/2 — executing \(armedRedelete) move INBOX→TRASH ids=[m3]",
-                "[Queue] drain lane 0 pos 2/2 — executed \(armedRedelete) move INBOX→TRASH ids=[m3] outcome=proceed",
+                "[Queue] drain pos \(haltedOp.queuePosition) — executing \(armedInverse) move TRASH→INBOX ids=[m3]",
+                "[Queue] drain pos \(haltedOp.queuePosition) — executed \(armedInverse) move TRASH→INBOX ids=[m3] outcome=proceed",
+                "[Queue] drain pos \(heldOp.queuePosition) — executing \(armedRedelete) move INBOX→TRASH ids=[m3]",
+                "[Queue] drain pos \(heldOp.queuePosition) — executed \(armedRedelete) move INBOX→TRASH ids=[m3] outcome=proceed",
             ]
             let clearedObserved = Self.laneOrderEntries(in: AppLogStore.read(channel: .queue))
             #expect(clearedObserved == clearedExpected,
@@ -1375,7 +1418,20 @@ struct AccountManagerQueueDrainTests {
         }
     }
 
-    @Test("drainPendingQueue() (real): a generic connection error on the first same-lane op gates the rest of the lane — all remaining ops in that lane are requeued, none execute")
+    /// **THE PROPERTY: a generic connection error on the front-of-queue
+    /// operation stops the drain before its related follower is ever CLAIMED —
+    /// the follower does not execute, is not charged a retry, and does not
+    /// acquire the claim's durable `everAttempted` proof.**
+    ///
+    /// Under the global single-operation executor there is no "rest of the
+    /// lane" to requeue, because nothing behind the failure was ever claimed in
+    /// the first place. That is the stronger property, and the one asserted
+    /// here: the follower's UNTOUCHED-ness is itself the evidence that no
+    /// speculative claim ran ahead of a failure. A drain that claimed the whole
+    /// lane up front and then unwound it would leave `everAttempted == true` on
+    /// the follower — durable evidence of an attempt that never happened, which
+    /// the launch reconciler and the previous-session sweep both read.
+    @Test("drainPendingQueue() (real): a generic connection error on the front operation stops the drain — its related follower is never claimed, never charged, and never reaches the wire")
     func drainPendingQueueRealFirstOpFailureGatesRestOfLane() async throws {
         let (pool, dir, previous) = try makeTestDB()
         let accountId = "acc-gap3-failure"
@@ -1399,156 +1455,74 @@ struct AccountManagerQueueDrainTests {
             await AccountManager.shared.drainPendingQueue()
 
             let remaining = try await pool.read { db in
-                try PendingOperation.filter(Column("accountId") == accountId).order(Column("createdAt").asc).fetchAll(db)
+                try PendingOperation
+                    .filter(Column("accountId") == accountId)
+                    .order(Column("queuePosition").asc)
+                    .fetchAll(db)
             }
             #expect(remaining.count == 2, "both ops must still exist — requeued, not executed or dropped")
             guard remaining.count == 2 else { return }
             #expect(remaining.allSatisfy { $0.status == PendingStatus.queued.rawValue })
-            let everyClaimIsConservative = remaining.allSatisfy(\.everAttempted)
-            #expect(everyClaimIsConservative,
-                    "every row claimed in the drain snapshot must be durably conservative before any scheduled provider I/O; a later lane halt does not erase that evidence")
+
+            // The failed operation was CLAIMED: `everAttempted` is written in the
+            // same transaction as the claim, before any provider I/O, and no
+            // requeue erases it. Without this the assertion below is vacuous —
+            // "the follower was not claimed" would also hold of a drain that
+            // claimed nothing at all.
+            let failedOp = remaining.first { $0.id == opA.id }
+            #expect(failedOp?.everAttempted == true, """
+                the front operation was never claimed, so nothing in this test \
+                distinguishes a stopped drain from a drain that did not run
+                """)
+            #expect(failedOp?.retryCount == 1, """
+                the front operation's provider failure did not charge exactly the \
+                one retry it earned: \(failedOp?.retryCount ?? -1)
+                """)
+
+            // 🚨 THE ORACLE. Nothing behind the failure was CLAIMED — so no
+            // durable evidence of an attempt exists for an operation that never
+            // had one.
+            let follower = remaining.first { $0.id == opB.id }
+            #expect(follower?.everAttempted == false, """
+                the related follower carries the claim's durable attempt proof \
+                though it never reached a provider — a speculative claim ran \
+                ahead of a failure
+                """)
+            #expect(follower?.retryCount == 0, """
+                the related follower was charged for a failure that was not its \
+                own: \(follower?.retryCount ?? -1)
+                """)
+
+            // Both moved to the tail together, preserving their relative order:
+            // the failure defers its whole related chain, never just itself.
+            #expect(remaining.map(\.id) == [opA.id, opB.id], """
+                the failed operation and its related follower did not keep their \
+                issue order across the deferral: \(remaining.map(\.queuePosition))
+                """)
 
             let flagged = await provider.markedFlaggedIds
-            #expect(flagged.isEmpty, "the later same-lane op must never have reached the provider — failedAccounts gates the rest of the lane")
+            #expect(flagged.isEmpty, "the later related op must never have reached the provider — the drain stops at the failure")
         }
     }
 
-    // MARK: - COR-1 — a post-claim re-read that FAILS is not an absent row
-    //
-    // THE INVARIANT, pinned here rather than the mechanism that delivers it: a
-    // claimed operation whose post-claim row re-read FAILS is left RETRYABLE —
-    // durable status `queued`, `everAttempted` unchanged, `retryCount`
-    // unchanged — its lane HALTS so no later member overtakes it, and a healthy
-    // later drain executes it exactly once, in issue order. `nil` from the
-    // re-read means exactly one thing: the row no longer exists.
-    //
-    // WHY IT MATTERS. The claim commits `inFlight` + `everAttempted` in one
-    // transaction. Before the fix `liveOperation` was `try? await dbPool.read`,
-    // so an interrupted / busy / I-O read collapsed into the same `nil` an
-    // absent row produces and the lane took the skip arm: the op stayed
-    // `inFlight` forever (every later drain's claim loop refuses `inFlight`),
-    // its lane kept draining so a LATER member overtook it, and at the next
-    // launch the previous-session sweep DELETED it if it was a `.move` — a
-    // dropped intention that never reached the wire. (That sweep lived in
-    // `reconcilePendingOperations` when this was written and now lives in
-    // `AppDatabase.recoverPreviousSessionResidue`; the disposition is the same.)
-    // "We could not determine
-    // the answer" is retryable, never authoritative (never-drop clause 2).
-    //
-    // THE FAULT is `AccountManager.liveOperationReadFaultForTesting`, a
-    // `#if DEBUG` one-shot keyed by op id that can only ADD a throw. The state
-    // it produces is reachable in production (the reviewer reproduced it with a
-    // real `sqlite3_progress_handler` interrupt on GRDB 7.11.1) but is not
-    // schedulable from a test against a healthy pool: the drain's ops snapshot,
-    // the account-scoped classifier and the claim all run on this same
-    // `PrioritizedDatabase` BEFORE the re-read, so a connection-level fault
-    // fails the drain before anything is claimed — a different scenario.
-    //
-    // RED-FIRST (recorded in `r114b-cor1-red.log`): with the call site restored
-    // to the pre-fix `guard let liveOp = try? await liveOperation(op.id) else {
-    // … continue }`, opA is left `inFlight` and DELETED from the durable
-    // expectations here, opB overtakes it and flags the message, and the
-    // healthy redrive can never claim opA again — so the phase-1 status/`isEmpty`
-    // expectations and every phase-2 expectation fail.
-    @Test("drainPendingQueue() (real): a post-claim re-read that THROWS requeues that op and the rest of its lane — nothing reaches the wire, nothing is stranded inFlight, no retry is charged, and a healthy redrive executes both exactly once in issue order")
-    func drainPendingQueueRealFailedPostClaimReReadKeepsTheLaneRetryable() async throws {
-        let (pool, dir, previous) = try makeTestDB()
-        let accountId = "acc-cor1-reread"
-        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
-        defer { AccountManager.liveOperationReadFaultForTesting.withLock { $0 = nil } }
-
-        let provider = MockEmailProvider()
-        try await TestProviderRegistry.withRegisteredProvider(
-            accountId: accountId, provider: provider
-        ) {
-            // `.gmail` ⇒ account-scoped ids ⇒ both ops on `msg-1` land in ONE
-            // lane (`buildLanes`), which is what makes "a later member overtakes
-            // an unresolved predecessor" observable at all.
-            try insertStableProviderFixture(accountId: accountId, pool: pool)
-
-            let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
-            var opA = PendingOperation(
-                type: .markRead, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
-            opA.createdAt = t0
-            var opB = PendingOperation(
-                type: .markFlagged, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
-            opB.createdAt = t0.addingTimeInterval(1)
-            try insertOp(opA, pool: pool)
-            try insertOp(opB, pool: pool)
-
-            AccountManager.liveOperationReadFaultForTesting.withLock { $0 = opA.id }
-
-            await AccountManager.shared.drainPendingQueue()
-
-            // Phase 1 — the failed re-read. Read each row on its own so a row
-            // that was wrongly executed or dropped cannot gate the other row's
-            // assertions (that is exactly the pre-fix outcome).
-            let heldA = try fetchOp(opA.id, pool: pool)
-            let heldB = try fetchOp(opB.id, pool: pool)
-            #expect(heldA != nil, "the op whose re-read failed was dropped — a read that could not determine the answer is never authoritative")
-            #expect(heldB != nil, "the later same-lane member was executed or dropped while its predecessor was unresolved")
-            #expect(heldA?.status == PendingStatus.queued.rawValue,
-                    "the op whose re-read failed must be left RETRYABLE, not stranded inFlight — got \(heldA?.status ?? "<deleted>")")
-            #expect(heldB?.status == PendingStatus.queued.rawValue,
-                    "the rest of the halted lane must be requeued — got \(heldB?.status ?? "<deleted>")")
-            #expect(heldA?.everAttempted == true,
-                    "the claim's durable proof stands; a requeue never erases it")
-            #expect(heldB?.everAttempted == true,
-                    "the claim's durable proof stands; a requeue never erases it")
-            #expect(heldA?.retryCount == 0,
-                    "a database read failure is not a provider failure — no retry may be charged; got \(heldA?.retryCount ?? -1)")
-            #expect(heldB?.retryCount == 0,
-                    "a database read failure is not a provider failure — no retry may be charged; got \(heldB?.retryCount ?? -1)")
-
-            let readsDuringFault = await provider.markedReadIds
-            let flagsDuringFault = await provider.markedFlaggedIds
-            #expect(readsDuringFault.isEmpty,
-                    "the op whose re-read failed must never reach the wire: \(readsDuringFault.map(\.ids))")
-            #expect(flagsDuringFault.isEmpty,
-                    "the LATER member of the same lane overtook an unresolved predecessor: \(flagsDuringFault.map(\.ids))")
-
-            // Phase 2 — a healthy redrive. The fault is one-shot; clearing it
-            // makes this phase's premise explicit rather than implied.
-            AccountManager.liveOperationReadFaultForTesting.withLock { $0 = nil }
-            await AccountManager.shared.drainPendingQueue()
-
-            let survivors = try await pool.read { db in
-                try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
-            }
-            #expect(survivors.isEmpty,
-                    "a healthy redrive must complete both ops — \(survivors.count) left, statuses \(survivors.map(\.status))")
-
-            let reads = await provider.markedReadIds
-            let flags = await provider.markedFlaggedIds
-            #expect(reads.count == 1, "the re-read-failed op must execute EXACTLY once on the redrive — got \(reads.count)")
-            #expect(flags.count == 1, "the held follower must execute EXACTLY once on the redrive — got \(flags.count)")
-            guard reads.count == 1, flags.count == 1 else { return }
-            #expect(reads[0].ids == ["msg-1"])
-            #expect(flags[0].ids == ["msg-1"])
-
-            let wire = await provider.callLog.filter {
-                $0.hasPrefix("markRead(") || $0.hasPrefix("markFlagged(")
-            }
-            #expect(wire.count == 2, "unexpected wire traffic: \(wire)")
-            guard wire.count == 2 else { return }
-            #expect(wire[0].hasPrefix("markRead("),
-                    "issue order was not preserved across the requeue: \(wire)")
-            #expect(wire[1].hasPrefix("markFlagged("),
-                    "issue order was not preserved across the requeue: \(wire)")
-        }
-    }
-
-    /// **THE OTHER ARM OF THE SAME RE-READ, and the reason it must stay
-    /// separate: when the row really is GONE the drain skips it and does NOT
-    /// resurrect it from the snapshot it captured before the lane ran.**
+    /// **THE PROPERTY: an operation the user's own local wipe deleted while an
+    /// earlier one was on the wire is never resurrected — the executor claims
+    /// the LIVE front row, not a row from a snapshot taken before the drain
+    /// began.**
     ///
-    /// `nil` from the post-claim re-read means exactly one thing — the row no
-    /// longer exists — and the writers that can delete a CLAIMED row are not
-    /// cancel or annihilation (both require `queued` and `!everAttempted`, which
-    /// the claim has already made false). They are the local wipes and resets,
-    /// which never join a running drain. So `nil` is the user's NEWER gesture
-    /// beating the one this lane captured, and a `?? capturedOp` fallback would
-    /// send a withdrawn intention to the wire.
+    /// The global single-operation executor re-reads the frontier from the
+    /// database at the start of every iteration, so this is structural rather
+    /// than a guard: a row that is gone is simply not among the live rows the
+    /// claim orders by `queuePosition`. The test exists because the property is
+    /// only structural as long as no one reintroduces a captured snapshot —
+    /// the predecessor drain captured its operations ONCE, up front, and a
+    /// `?? capturedOp` fallback on the post-claim re-read sent a withdrawn
+    /// intention to the wire.
+    ///
+    /// The writers that can delete a row mid-drain are not cancel or
+    /// annihilation (both require `queued` and `!everAttempted`). They are the
+    /// local wipes and resets, which is what makes the deletion here reachable
+    /// at all.
     ///
     /// The deletion here is performed by the REAL producer —
     /// `SettingsView.localIndexWipeTxn`, the "delete all local email data"
@@ -1692,7 +1666,7 @@ struct AccountManagerQueueDrainTests {
     // (`case .networkError(400), .networkErrorWithBody(400, _): return true`),
     // `unclassifiedGmailActionBadRequestKeepsTheDurableOpQueued` fails at
     // `after != nil` — the row is nil, the intention destroyed — and its
-    // `outcome == .haltLane` expectation fails with `.proceed`.
+    // `outcome == .deferred` expectation fails with `.proceed`.
     //
     // NON-VACUITY is two-sided and DURABLE + WIRE on every one of the three:
     // each asserts both the row's end state and that its injected response was
@@ -1725,7 +1699,7 @@ struct AccountManagerQueueDrainTests {
             op, provider: server.provider(), context: AccountManager.DrainContext()
         )
 
-        #expect(outcome == .haltLane)
+        #expect(outcome == .deferred)
         let after = try fetchOp(op.id, pool: pool)
         #expect(
             after != nil,
@@ -1813,7 +1787,7 @@ struct AccountManagerQueueDrainTests {
         // The CONTROL: if the terminal classification were over-broad — or if
         // "the row is gone" in the sibling test came from something other than
         // the 400 — this row would be gone too.
-        #expect(outcome == .haltLane)
+        #expect(outcome == .deferred)
         let after = try fetchOp(op.id, pool: pool)
         #expect(after != nil, "a transient failure must never retire the user's intention")
         guard let after else { return }

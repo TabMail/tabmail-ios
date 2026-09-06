@@ -152,17 +152,25 @@ struct AppReleaseBoundaryAdmissionTests {
     /// can decode — the "legacy split child" stand-in that makes "retired
     /// without being decoded" a measured claim rather than a described one.
     private func seedPreviousReleaseWork(_ fixture: Fixture) throws {
-        let ordinary = PendingOperation(
+        var ordinary = PendingOperation(
             type: .move, messageIds: ["old-1", "old-2"], accountId: fixture.accountId,
             folderPath: Self.inboxPath, destinationPath: Self.archivePath)
         try fixture.pool.writeWithoutTransaction { db in
             try ordinary.insert(db)
+            // Raw SQL on purpose: this row's `type` is a string the CURRENT
+            // `OperationType` cannot represent, so it can only be written the way
+            // the older binary wrote it. `queuePosition` is named explicitly
+            // because the column is `NOT NULL` with no default — the record type
+            // allocates it in `willInsert`, and a raw writer must supply it.
             try db.execute(sql: """
                 INSERT INTO pendingOperation
-                    (id, type, messageIdsJSON, accountId, folderPath, createdAt, status, retryCount)
+                    (id, type, messageIdsJSON, accountId, folderPath, createdAt, status,
+                     retryCount, queuePosition)
                 VALUES ('legacy-split-child', 'splitChildFromAnOlderRelease', '<not json>', ?,
-                        ?, ?, 'queued', 0)
-                """, arguments: [fixture.accountId, Self.inboxPath, Date()])
+                        ?, ?, 'queued', 0, ?)
+                """, arguments: [
+                    fixture.accountId, Self.inboxPath, Date(),
+                    try PendingOperation.nextQueuePosition(db)])
         }
     }
 
@@ -174,7 +182,7 @@ struct AppReleaseBoundaryAdmissionTests {
 
     private func operations(_ fixture: Fixture) throws -> [PendingOperation] {
         try fixture.pool.read { db in
-            try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
+            try PendingOperation.order(Column("queuePosition").asc).fetchAll(db)
         }
     }
 

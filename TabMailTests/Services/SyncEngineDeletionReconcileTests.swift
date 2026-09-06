@@ -613,12 +613,13 @@ struct DeletionReconcileDeletePathTests {
             folderPath: folder.path, rfc822MessageId: EmailFilter.normalizeMessageId(rfc822)
         )
         try db.write { conn in
-            try PendingOperation(
+            var markReadOp = PendingOperation(
                 type: .markRead,
                 messageIds: [EmailFilter.normalizeMessageId(rfc822)],
                 accountId: "acc1",
                 folderPath: folder.path
-            ).insert(conn)
+            )
+            try markReadOp.insert(conn)
         }
         let deletedIds = try db.write { conn in
             try SyncEngine.deleteConfirmedGhostHeaders(
@@ -640,13 +641,14 @@ struct DeletionReconcileDeletePathTests {
             db, messageId: "300", folderId: folder.id, accountId: "acc1", folderPath: folder.path
         )
         try db.write { conn in
-            try PendingOperation(
+            var moveOp = PendingOperation(
                 type: .move,
                 messageIds: ["300"],
                 accountId: "acc1",
                 folderPath: "Archive",
                 destinationPath: folder.path
-            ).insert(conn)
+            )
+            try moveOp.insert(conn)
         }
         let deletedIds = try db.write { conn in
             try SyncEngine.deleteConfirmedGhostHeaders(
@@ -714,12 +716,13 @@ struct DeletionReconcileDeletePathTests {
             db, messageId: "600", folderId: folder.id, accountId: "acc1", folderPath: folder.path
         )
         try db.write { conn in
-            try PendingOperation(
+            var markReadOp2 = PendingOperation(
                 type: .markRead,
                 messageIds: ["600"],
                 accountId: "acc1",
                 folderPath: "Archive" // different folder, not targeting INBOX
-            ).insert(conn)
+            )
+            try markReadOp2.insert(conn)
         }
         let deletedIds = try db.write { conn in
             try SyncEngine.deleteConfirmedGhostHeaders(

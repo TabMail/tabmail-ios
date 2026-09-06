@@ -14,8 +14,8 @@ extension SyncEngine {
     /// into the folder in place (the orphan-reclaim arm); both segments use the
     /// same cap and overflow arithmetic, so a reader compares like with like.
     ///
-    /// Extracted as a PURE, `nonisolated static` function for the same reason
-    /// `AccountManager.laneDiagnosticSummary` is one — the diagnostic it renders
+    /// Extracted as a PURE, `nonisolated static` function because the diagnostic
+    /// it renders
     /// is built inside a `dbPool.write` closure (and emitted only after that
     /// write commits) behind a runtime debug gate, so inline it can only be
     /// executed by a test that also unlocks that gate, and its OVERFLOW branch
@@ -1749,7 +1749,7 @@ extension SyncEngine {
                     if existing.isReplied && existing.actionTag == .reply {
                         existing.actionTag = ActionTag.none
                         existing.tagSortOrder = ActionTag.none.sortOrder
-                        let tagOp = PendingOperation(
+                        var tagOp = PendingOperation(
                             type: .setTag,
                             messageIds: [existing.stableId],
                             accountId: accountId,
@@ -1817,7 +1817,7 @@ extension SyncEngine {
                 if header.isReplied && header.actionTag == .reply {
                     header.actionTag = ActionTag.none
                     header.tagSortOrder = ActionTag.none.sortOrder
-                    let tagOp = PendingOperation(
+                    var tagOp = PendingOperation(
                         type: .setTag,
                         messageIds: [header.stableId],
                         accountId: accountId,

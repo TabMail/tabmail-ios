@@ -2242,7 +2242,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v89 RANGE ─────────────────────
+        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v90 RANGE ─────────────────────
         //
         // `registerTimedMigration`'s DEFAULT stays `.deferred` and is NOT
         // changed. v1…v67 have never been adjudicated for `.immediate` safety,
@@ -2323,6 +2323,13 @@ final class AppDatabase: Sendable {
         //   • v89 — one `CREATE TABLE appReleaseStamp`. A brand-new table with no
         //     FK of its own and nothing referencing it, so it writes no key of
         //     either kind and nothing can cascade to or from it.
+        //   • v90 — `DROP TABLE pendingOperation` + recreate + one index. Same
+        //     argument as `v74`: that table declares no FK and NOTHING references
+        //     it, so neither the implicit delete `DROP TABLE` performs under
+        //     enforced FKs nor the recreate fires an FK action, and there is no
+        //     reference to repair. The rows are discarded without being decoded
+        //     (see that migration's own comment), so no key of either kind is
+        //     rewritten either.
         //
         //   • v82 — `DROP`/`CREATE` of `userLabel` + `messageUserLabel`. FK-clean
         //     per statement, verified statement by statement in that migration's own
@@ -2332,17 +2339,18 @@ final class AppDatabase: Sendable {
         //     house pattern, and the snapshots taken before either drop are what make
         //     the body safe.
         //
-        // ⚑ AMENDED 2026-08-06, RANGE RE-DERIVED AT R17-6 — **EVERY MIGRATION IN
-        // v68…v89 NOW RUNS `.immediate`, so this range runs ZERO whole-database
+        // ⚑ AMENDED 2026-08-06, RANGE RE-DERIVED AT R17-6 AND AGAIN WHEN `v90`
+        // LANDED — **EVERY MIGRATION IN v68…v90 NOW RUNS `.immediate`, so this
+        // range runs ZERO whole-database
         // foreign-key checks.** The range is an OPEN interval that moves with the
         // top of the chain, so it is re-derived rather than restated (`MIS-031` — a
         // sentence that enumerates is a cache, and this one had gone stale at `v84`
         // in five places at once). Comments excluded so this paragraph cannot
         // satisfy its own predicate (`MIS-033`, `IOS-DOC-002`):
         //   rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' \
-        //      TabMail/Services/AppDatabase.swift                            → 22
+        //      TabMail/Services/AppDatabase.swift                            → 23
         //   rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' \
-        //      TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 22
+        //      TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 23
         // Equal counts are the invariant: every migration from v68 to the top runs
         // `.immediate`, and none below v68 does. The sentence
         // that stood here said *"`v71` and `v82` stay `.deferred`, each for a
@@ -4061,6 +4069,87 @@ final class AppDatabase: Sendable {
                 t.primaryKey("id", .integer).check { $0 == 1 }
                 t.column("release", .text).notNull()
             }
+        }
+
+        // ⚑ NO REFERENCE — INVENTED. `v2final` ordered the global FIFO by the
+        // hidden `rowid` and re-positioned a demoted chain by physical
+        // delete-and-reinsert; this build carries the position as an EXPLICIT
+        // column so a deferral can move a row without deleting a durable
+        // operation, and so nothing depends on rowid maintenance.
+        //
+        // 🚨 THE TABLE IS RECREATED, NOT ALTERED, AND THAT IS THE POINT.
+        // SQLite cannot add a NOT NULL column without a DEFAULT, and a DEFAULT
+        // is exactly what must not exist here: a writer that omits the position
+        // has to FAIL its INSERT, not silently admit a row at position zero —
+        // which, under `ORDER BY queuePosition ASC`, is the HEAD of the queue.
+        // Recreating is what buys `NOT NULL` with no default plus
+        // `CHECK (queuePosition > 0)`, and the check is what makes the
+        // never-yet-allocated in-memory sentinel unrepresentable in the
+        // database. `NSEDataBridge`'s raw-SQL admission is the writer this
+        // guards; it is converted to the typed route in the same change, and the
+        // constraint is what will catch the NEXT one.
+        //
+        // 🚨 THE OLD ROWS ARE DISCARDED WITHOUT BEING DECODED, which is the
+        // owner-approved upgrade-boundary principle already shipped as
+        // `v74_purgeLegacyPendingOperations` and now as
+        // `retirePreviousReleaseActionQueue`. There is no seeding, no ranking
+        // and no order preservation: a previous release's queued actions do not
+        // survive an upgrade at all, so there is nothing to order. Authored
+        // `Draft`/`outboxMessage` content, mail, bodies and attachments are
+        // untouched — this migration names one table.
+        //
+        // COORDINATION WITH THE RELEASE BOUNDARY: migrations run FIRST in
+        // `AppDatabase.init`, before `retirePreviousReleaseActionQueue` and
+        // before anything can admit current-release work. So the table is empty
+        // when the boundary runs, the boundary's own `DELETE` is a no-op, and
+        // every admission that follows allocates a position against an empty or
+        // current-release table. Neither step depends on the other having found
+        // rows.
+        //
+        // ADDITIVE COMPATIBILITY: a development database that ran the SUPERSEDED
+        // `agent/ios-queue-inherited-rowid` branch — whose own, unrelated `v89`
+        // was `v89_addPendingOperationInheritedRowid`, not this tree's
+        // `v89_createAppReleaseStamp` — carries an extra `inheritedRowid` column. Recreating the table drops it, which is
+        // correct — nothing reads it, that design is superseded, and its queued
+        // CONTENT does not need preserving. The column list below is the
+        // EFFECTIVE schema (the fold of v1 + `userLabelId` + v67 + v69 + v72 +
+        // v76 + v78), verified against a real applied database rather than read
+        // off the first `create(table:)` — see `MIS-IOS-007`.
+        //
+        // The table declares no foreign key and nothing references it, so the
+        // recreate needs no reference repair.
+        migrator.registerTimedMigration(
+            "v90_addPendingOperationQueuePosition", foreignKeyChecks: .immediate
+        ) { db in
+            try db.execute(sql: "DROP TABLE IF EXISTS pendingOperation")
+            try db.create(table: "pendingOperation") { t in
+                t.primaryKey("id", .text)
+                t.column("type", .text).notNull()
+                t.column("messageIdsJSON", .text).notNull()
+                t.column("accountId", .text).notNull()
+                t.column("folderPath", .text).notNull()
+                t.column("destinationPath", .text)
+                t.column("tagValue", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.column("retryCount", .integer).notNull().defaults(to: 0)
+                t.column("status", .text).notNull().defaults(to: "queued")
+                t.column("userLabelId", .text)
+                t.column("uidResolutionRetryCount", .integer).notNull().defaults(to: 0)
+                t.column("observedUidValidity", .integer)
+                t.column("draftServerUidValidity", .integer)
+                t.column("instanceEpoch", .text)
+                t.column("draftId", .text)
+                t.column("draftDeleteAddressKind", .text)
+                t.column("everAttempted", .boolean).notNull().defaults(to: false)
+                // No default, and a check that refuses the unallocated sentinel.
+                t.column("queuePosition", .integer).notNull().check { $0 > 0 }
+            }
+            // The executor reads the front row on every iteration and the
+            // allocator reads MAX() on every admission; both are index lookups
+            // with this in place instead of a scan-and-sort of the whole queue.
+            try db.create(
+                index: "pendingOperation_queuePosition",
+                on: "pendingOperation", columns: ["queuePosition"])
         }
     }
 

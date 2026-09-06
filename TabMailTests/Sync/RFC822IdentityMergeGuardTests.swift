@@ -205,10 +205,11 @@ struct RFC822IdentityMergeGuardTests {
         _ pool: DatabasePool, stableId: String, from source: String, to destination: String
     ) throws {
         try pool.writeWithoutTransaction { db in
-            try PendingOperation(
+            var archiveOp = PendingOperation(
                 type: .archive, messageIds: [stableId],
                 accountId: "acc1", folderPath: source, destinationPath: destination
-            ).insert(db)
+            )
+            try archiveOp.insert(db)
         }
     }
 

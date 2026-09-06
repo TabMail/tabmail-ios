@@ -40,8 +40,26 @@ enum PendingStatus: String, Codable, Sendable {
     case failed
 }
 
-struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiable, Sendable {
+struct PendingOperation: Codable, FetchableRecord, MutablePersistableRecord, Identifiable, Sendable {
     static let databaseTableName = "pendingOperation"
+
+    // 🚨 THIS RECORD IS `MutablePersistableRecord`, NOT `PersistableRecord`, AND
+    // THE DIFFERENCE IS THE WHOLE QUEUE-POSITION CONTRACT. (Deliberately `//`
+    // and not `///`: it documents the CONFORMANCE on the line above, not the
+    // property below, and a doc comment here would be read as `id`'s.)
+    //
+    // `PersistableRecord` re-declares `willInsert(_:)` as NON-mutating, so a
+    // record that conforms to it cannot assign one of its own columns from
+    // inside the insert. `queuePosition` has to be allocated from the CURRENT
+    // MAXIMUM, inside the very transaction that admits the row, so the only
+    // callback that can do it is `MutablePersistableRecord`'s mutating
+    // `willInsert(_:)` below. Conforming to the mutable protocol makes `insert`
+    // and `save` mutating, which is why every admission site holds its record in
+    // a `var`; that is the cost of having ONE chokepoint instead of an
+    // enumerated list of writers that a future writer can be added outside of.
+    //
+    // Do not "simplify" this back to `PersistableRecord`: it compiles, and it
+    // silently stops allocating positions.
 
     var id: String
     var type: OperationType
@@ -56,6 +74,28 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     var userLabelId: String?
     var createdAt: Date
     var retryCount: Int
+    /// THIS ROW'S CURRENT PLACE IN THE ONE GLOBAL FIFO — durable, explicit, and
+    /// the ONLY ordering key the executor reads.
+    ///
+    /// Allocated after the current maximum inside the SAME write transaction as
+    /// admission (`willInsert(_:)`), and rewritten only by a deliberate tail
+    /// movement (`appendToTail`). It is not a clock and not a history: it orders
+    /// LIVE pending rows and nothing else, so a counter that restarts once the
+    /// table empties is harmless.
+    ///
+    /// 🚨 `createdAt` IS NO LONGER AN ORDERING KEY. It is age only — the stuck-op
+    /// diagnostics and the log lines still read it, and nothing else may. Two
+    /// rows admitted inside one millisecond, or admitted across a backward clock
+    /// step, get strictly increasing positions because the allocation reads the
+    /// table rather than the clock.
+    ///
+    /// 🚨 THERE IS NO ZERO DEFAULT AND NO NULLABLE STATE. The column is
+    /// `INTEGER NOT NULL CHECK (queuePosition > 0)`, so a writer that omits it —
+    /// including one that bypasses this record with raw SQL — fails its INSERT
+    /// loudly instead of silently admitting a row at the head of the queue.
+    /// `unallocated` below is the in-memory value a freshly constructed record
+    /// carries BEFORE `willInsert(_:)` runs; it can never reach the database.
+    var queuePosition: Int
     /// PORT — v2final's explicit persisted proof that provider I/O may have
     /// started. Existing rows are conservatively backfilled true by v78;
     /// newly admitted rows start false and the queue claim flips this true
@@ -190,6 +230,12 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
         self.userLabelId = userLabelId
         self.createdAt = Date()
         self.retryCount = 0
+        // Replaced by `willInsert(_:)` with a real position, from the table's
+        // current maximum, inside the admitting transaction. It is deliberately
+        // a value the schema REFUSES, so a row that somehow reached the database
+        // without that callback running would fail its INSERT rather than land
+        // at the head of the queue.
+        self.queuePosition = Self.unallocatedQueuePosition
         self.everAttempted = false
         self.uidResolutionRetryCount = 0
         self.observedUidValidity = observedUidValidity
@@ -198,6 +244,117 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
         self.draftId = draftId
         self.draftDeleteAddressKind = draftDeleteAddressKind?.rawValue
         self.status = PendingStatus.queued.rawValue
+    }
+
+    // MARK: - Queue position
+
+    /// The in-memory value a constructed-but-not-yet-inserted record carries.
+    /// The schema's `CHECK (queuePosition > 0)` refuses it, deliberately.
+    static let unallocatedQueuePosition = 0
+
+    /// THE ONE CHOKEPOINT for typed admissions. Every route that constructs a
+    /// `PendingOperation` and inserts it — gestures, sync-engine tag producers,
+    /// the outbox, the cold-notification path, the undo inverse — passes through
+    /// here without knowing it exists, so a writer added later cannot forget to
+    /// allocate.
+    ///
+    /// It reads the table's current maximum and adds one, INSIDE the caller's
+    /// write transaction. GRDB serializes writers, so within that transaction
+    /// the maximum cannot move under us: appending a chain of N records in one
+    /// transaction therefore yields a contiguous increasing range in the order
+    /// they were inserted, which is the order the gesture issued them in.
+    ///
+    /// It ALWAYS overwrites, and never honours a value the caller pre-set. A
+    /// preset position would be a second way to decide queue order, and the
+    /// whole point of this callback is that there is exactly one.
+    mutating func willInsert(_ db: Database) throws {
+        queuePosition = try Self.nextQueuePosition(db)
+    }
+
+    /// NON-MUTATING INSERT, for call sites that cannot hold a `var`.
+    ///
+    /// `insert` is `mutating` because `willInsert` writes the allocated
+    /// position back into the record, and that is exactly what makes the
+    /// allocation a chokepoint. It also makes `insert` unusable on a `let`, on a
+    /// function parameter, and on a value captured by a `@Sendable` write
+    /// closure — the last of which is the ordinary shape here, because a GRDB
+    /// write closure is `@Sendable` and mutating a captured `var` inside one is
+    /// a concurrency error rather than a style choice.
+    ///
+    /// It inserts a COPY and hands the copy back, so a caller that needs the
+    /// allocated position reads it from the return value. It is not a second
+    /// admission path: the copy goes through the same `insert`, so the same
+    /// `willInsert` allocates, and a writer cannot use this to skip allocation.
+    @discardableResult
+    func inserted(_ db: Database) throws -> PendingOperation {
+        var copy = self
+        try copy.insert(db)
+        return copy
+    }
+
+    /// `MAX(queuePosition) + 1`, or 1 for an empty table.
+    ///
+    /// Resetting to 1 once the table empties is harmless and deliberate: the
+    /// column orders LIVE pending rows only, and there are none to be ordered
+    /// against. It is not a clock, so nothing compares a position across that
+    /// boundary. Backed by the `pendingOperation_queuePosition` index, so this
+    /// is an index lookup rather than a table scan.
+    static func nextQueuePosition(_ db: Database) throws -> Int {
+        let maximum = try Int.fetchOne(
+            db, sql: "SELECT MAX(queuePosition) FROM pendingOperation") ?? 0
+        return max(maximum, 0) + 1
+    }
+
+    /// MOVE `ids` TO THE TAIL, IN THEIR GIVEN ORDER, IN ONE WRITE.
+    ///
+    /// This is the durable half of related-chain deferral: the failed row and
+    /// every pending row transitively related to it are appended together, so
+    /// unrelated mail moves ahead of them while their own relative order is
+    /// preserved exactly. `ids` MUST already be in the order the caller wants
+    /// them to keep — the caller reads them under the current ordering inside
+    /// this same transaction.
+    ///
+    /// 🚨 IT WRITES POSITION, STATUS AND (FOR ONE ROW) THE RETRY COUNTER, AND
+    /// NOTHING ELSE. Ids, payloads, `messageIdsJSON`, epochs, `createdAt` and
+    /// `everAttempted` are untouched, for `markQueued`'s reason and one more of
+    /// its own: a struct-shaped `save` would write back a snapshot taken before
+    /// the retirement that may have just re-addressed a follower
+    /// (`MessageHeaderRekey.readdressQueuedOperations`), and a deferral must
+    /// never undo an address the wire proved.
+    ///
+    /// 🚨 IT CANNOT RESURRECT A ROW. Every statement is an `UPDATE … WHERE id`,
+    /// so an id that undo, a cancel or an account deletion removed while the
+    /// provider call was outstanding simply matches nothing. That is the normal,
+    /// correct outcome and is not an error.
+    ///
+    /// `chargeRetryTo` is the ONE row that actually made a provider attempt.
+    /// Followers deferred behind it were never attempted and must not age toward
+    /// anything, so they are moved without a retry charge.
+    static func appendToTail(
+        _ db: Database, ids: [String], chargeRetryTo: String? = nil
+    ) throws {
+        guard !ids.isEmpty else { return }
+        var next = try nextQueuePosition(db)
+        for id in ids {
+            if id == chargeRetryTo {
+                try db.execute(
+                    sql: """
+                        UPDATE pendingOperation
+                        SET queuePosition = ?, status = ?, retryCount = retryCount + 1
+                        WHERE id = ?
+                        """,
+                    arguments: [next, PendingStatus.queued.rawValue, id])
+            } else {
+                try db.execute(
+                    sql: """
+                        UPDATE pendingOperation
+                        SET queuePosition = ?, status = ?
+                        WHERE id = ?
+                        """,
+                    arguments: [next, PendingStatus.queued.rawValue, id])
+            }
+            next += 1
+        }
     }
 
     enum SaveDraftSlots {
@@ -225,17 +382,18 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     /// requeue actually decides, addressed by primary key.
     ///
     /// 🚨 WHY THIS IS NOT `var updated = op; updated.status = …; try updated.save(db)`.
-    /// A `save` is an UPDATE of EVERY column from the in-memory struct, and in the
-    /// drain that struct is a SNAPSHOT taken at the start of the pass, before any
-    /// lane ran. Since `MessageHeaderRekey.readdressQueuedOperations` rewrites a
-    /// queued follower's `messageIdsJSON` inside the transaction that retires its
-    /// predecessor's move (`IOS-GRAPH-005`), a struct-shaped requeue of the
-    /// REMAINING lane members — the `.haltLane` and evidence-refused paths — would
-    /// write the pre-handoff ids back over the addresses the wire had just proved,
-    /// and the follower would go out at a dead id on the next drain. That is the
+    /// A `save` is an UPDATE of EVERY column from the in-memory struct, and the
+    /// struct the requeue holds was read BEFORE the provider call that failed.
+    /// Since `MessageHeaderRekey.readdressQueuedOperations` rewrites a queued
+    /// operation's `messageIdsJSON` inside the transaction that retires an
+    /// earlier move (`IOS-GRAPH-005`), a struct-shaped requeue would write the
+    /// pre-handoff ids back over the addresses the wire had just proved, and the
+    /// operation would go out at a dead id on the next drain. That is the
     /// "identity resolved before an `await` is not a fact after it" trap: the
     /// requeue's DECISION (status, and whether this attempt counts as a retry) is
-    /// the only thing it observed, so it is the only thing it may write.
+    /// the only thing it observed, so it is the only thing it may write. The same
+    /// reasoning is why `appendToTail` writes `queuePosition`/`status`/`retryCount`
+    /// and never `messageIds`.
     ///
     /// `incrementRetryCount` is computed by SQL rather than from the snapshot for
     /// the same reason — `retryCount + 1` cannot regress a count another writer
@@ -245,8 +403,8 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     /// Callers that fetch and save inside ONE transaction
     /// (`AppDatabase.recoverPreviousSessionResidue` — named
     /// `reconcilePendingOperations` until 2026-09-05, when the sweep moved to the
-    /// launch boundary — the claim loop, `retirePartiallyCompletedOp`'s narrowing)
-    /// are NOT this case
+    /// launch boundary — `claimFrontierOperation`, `retirePartiallyCompletedOp`'s
+    /// narrowing) are NOT this case
     /// and are deliberately left alone: their struct is read in the same
     /// transaction that writes it, so it cannot be stale.
     static func markQueued(

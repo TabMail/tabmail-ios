@@ -241,7 +241,7 @@ struct FolderSyncDeletionEdgeCaseTests {
         )
 
         // Create a pending operation referencing the folder path
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .move,
             messageIds: ["msg1"],
             accountId: "acc1",

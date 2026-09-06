@@ -77,7 +77,7 @@ struct NeverDropExitClosureTests {
 
     private func insert(_ operations: [PendingOperation], into pool: DatabasePool) throws {
         try pool.writeWithoutTransaction { db in
-            for operation in operations { try operation.insert(db) }
+            for var operation in operations { try operation.insert(db) }
         }
     }
 
@@ -421,7 +421,7 @@ struct NeverDropExitClosureTests {
     ///  1. Rounds 1–2: a NON-UIDPLUS server. That pinned "a move on a
     ///     non-UIDPLUS server leaves the source untouched and the op queued" as
     ///     correct, when the capability can never appear, so the op could never
-    ///     complete on any future drain and its `.haltLane` disposition starved
+    ///     complete on any future drain and its deferral disposition starved
     ///     every later gesture on that message forever. Round 3 deleted the
     ///     capability refusal; the two-sided partner is now
     ///     `aNonUidPlusNonMoveServerCompletesAndReleasesItsLane`.
@@ -533,17 +533,17 @@ struct NeverDropExitClosureTests {
     ///  2. **A LANE-MATE of the unprovable op does NOT reach the wire while that op
     ///     is still queued.** `buildLanes` unions on shared message ids, so a
     ///     lane-mate names the same message; running it ahead of an unresolved
-    ///     predecessor is the race `.haltLane` exists to prevent, and the fix must
-    ///     not buy property 1 by giving that up. This is a REGRESSION GUARD: it is
+    ///     predecessor is the race chain deferral exists to prevent, and the fix
+    ///     must not buy property 1 by giving that up. This is a REGRESSION GUARD: it is
     ///     green pre-fix (the poison stopped everything, including this) and green
     ///     post-fix, and it goes red on the natural-looking repair that skips the
     ///     refused op at CLAIM time — which lets its lane form without it.
     ///
     /// It deliberately does NOT assert that the unprovable op is still queued (that
     /// is `unprovableMoveKeepsTheOpQueued`'s job) and never inspects
-    /// `failedAccounts`, `evidenceRefused` or any other drain internal — all
-    /// mechanism, and a test written against them would keep passing if the poison
-    /// simply moved somewhere else.
+    /// `failedAccounts`, `DrainContext.deferredOperationIds` or any other drain
+    /// internal — all mechanism, and a test written against them would keep
+    /// passing if the poison simply moved somewhere else.
     ///
     /// ⚠ **RE-SCOPED TWICE, each time for the same reason and in lockstep with
     /// `unprovableMoveKeepsTheOpQueued` above — read that test's fixture history
@@ -665,10 +665,10 @@ struct NeverDropExitClosureTests {
     /// `guard await server.supportsUIDPlus else { throw … }`, so on a
     /// standards-valid non-UIDPLUS server the move threw before any wire
     /// mutation — on EVERY attempt, forever, because the missing capability is
-    /// not evidence that can arrive later. The refusal's drain arm returns
-    /// `.haltLane`, and `buildLanes` unions ops that share a message id, so the
-    /// user's every LATER gesture on that same message was held behind an op
-    /// that could never resolve. Neither row had any user-visible resolution
+    /// not evidence that can arrive later. The refusal's drain arm holds the op
+    /// back, and `buildLanes` unions ops that share a message id, so the user's
+    /// every LATER gesture on that same message was held behind an op that could
+    /// never resolve. Neither row had any user-visible resolution
     /// path: nothing lists or clears `PendingOperation`.
     ///
     /// **That is the never-drop WEDGE corollary — an op that stays queued but
@@ -943,8 +943,8 @@ struct NeverDropExitClosureTests {
         )
 
         // PROPERTY 3 — the lane-mate the user issued afterwards was attempted.
-        // NON-VACUOUS the other way round: pre-fix the lane halts and this
-        // command never appears on the wire at all.
+        // NON-VACUOUS the other way round: pre-fix the whole chain is held and
+        // this command never appears on the wire at all.
         let flagStores = server.recordedCommands().filter {
             let upper = $0.uppercased()
             return upper.contains("UID STORE") && upper.contains("\\FLAGGED")
@@ -1085,8 +1085,8 @@ struct NeverDropExitClosureTests {
     /// Before the fix, `let copyEvidence = try await server.copy(...)` had no
     /// `catch`, so the error raised on a cardinality mismatch propagated out of
     /// `IMAPProvider.move` to the generic arm in `AccountManager.executeSingleOp`,
-    /// which requeues the op
-    /// and halts the lane. The throw happens BEFORE the `STORE \Deleted`, so the
+    /// which moves the op and its related chain to the queue's tail with a retry
+    /// charge. The throw happens BEFORE the `STORE \Deleted`, so the
     /// source is untouched and the next drain re-runs the whole sequence and
     /// issues ANOTHER `UID COPY`. One more duplicate at the destination per drain,
     /// forever, on an op that can never retire — durable actions retry without a
@@ -2032,7 +2032,7 @@ struct NeverDropExitClosureTests {
     ///  1. the refused MOVE is still queued with its retry count advancing, and
     ///     its same-lane successor is still held — `buildLanes` unions on shared
     ///     message ids, so running a lane-mate ahead of an unresolved
-    ///     predecessor is the race `.haltLane` exists to prevent;
+    ///     predecessor is the race chain deferral exists to prevent;
     ///  2. FIVE disjoint-lane gestures on a different message all reach the
     ///     server and retire WITHIN THE FIRST DRAIN, leaving the queue holding
     ///     exactly the two lane-A rows. Five rather than one, and asserted after
@@ -2045,14 +2045,15 @@ struct NeverDropExitClosureTests {
     ///     `drainPendingQueue()` call, asserted EXACTLY — one `UID MOVE` on the
     ///     wire, one consumed refusal and `retryCount == 1` after the first
     ///     drain, four consumed refusals and `retryCount == 4` after four. The
-    ///     bystander lane succeeds, which sets `executedAny` and makes the outer
-    ///     loop take another pass, so the op WOULD be re-claimed; a lower bound
-    ///     cannot reject that, and it is the property `evidenceRefused` exists
+    ///     bystander work succeeds, so the executor keeps claiming while a live
+    ///     front row exists and the refused op WOULD be re-claimed when the tail
+    ///     movement brought it back round; a lower bound cannot reject that, and
+    ///     it is exactly the property `DrainContext.deferredOperationIds` exists
     ///     for.
     ///
-    /// It never inspects `failedAccounts`, `evidenceRefused` or any other drain
-    /// internal: those are mechanism, and a test written against them would stay
-    /// green if the poisoning simply moved somewhere else.
+    /// It never inspects `failedAccounts`, `DrainContext.deferredOperationIds` or
+    /// any other drain internal: those are mechanism, and a test written against
+    /// them would stay green if the poisoning simply moved somewhere else.
     ///
     /// RED PROOF (recorded, #115 round 3): on the parent `977958c37` NOT ONE
     /// bystander gesture reaches the server in the poisoned drain —
@@ -2172,9 +2173,10 @@ struct NeverDropExitClosureTests {
         // PROPERTY 3 (round 4b) — THE PER-DRAIN BOUND, and it is EXACT: an
         // evidence-refused operation is attempted AT MOST ONCE per
         // `drainPendingQueue()` call. A lower bound cannot express this. The
-        // bystander lane above SUCCEEDS, which sets `executedAny`, so the outer
-        // drain loop takes another pass and would re-claim this op; only
-        // `DrainContext.evidenceRefused` stops the second attempt. Without it
+        // bystander work above SUCCEEDS, so the executor keeps claiming while a
+        // live front row exists and would re-claim this op once its tail movement
+        // brought it back round; only `DrainContext.deferredOperationIds` stops
+        // the second attempt. Without it
         // the wire sees two `UID MOVE`s and the durable `retryCount` advances
         // twice in one drain, and every `>=` form here stays green.
         let firstDrainMoves = server.recordedCommands()
@@ -2726,11 +2728,12 @@ struct NeverDropExitClosureTests {
     /// zero: "an op that stays queued forever while starving other intentions has
     /// not been preserved."
     ///
-    /// The drain has NO retry budget for `ProviderEvidenceUnavailable` — it
-    /// requeues, bumps `retryCount` (diagnostics only for `PendingOperation`),
-    /// records the op in `evidenceRefused` and returns `.haltLane`. So a refusal
-    /// that can never clear halts ITS OWN lane indefinitely, and this test bounds
-    /// exactly what that costs.
+    /// The drain has NO retry budget for `ProviderEvidenceUnavailable` — it moves
+    /// the op and its related chain to the queue's tail, bumps `retryCount`
+    /// (diagnostics only for `PendingOperation`), and records the whole chain in
+    /// `DrainContext.deferredOperationIds`. So a refusal that can never clear
+    /// parks ITS OWN chain indefinitely, and this test bounds exactly what that
+    /// costs.
     ///
     /// A lane is a connected component over `"accountId:folderPath:messageId"`
     /// (`buildLanes`), so a `.deleteDraft` op's lane is `<account>:<Drafts>:<uid>`.
@@ -2983,11 +2986,12 @@ struct NeverDropExitClosureTests {
     ///
     /// ⚠️ **THIS IS AN ANCHOR, NOT A BLESSING** (`MIS-026` — the two are the same
     /// artifact seen from opposite sides, told apart by asking what breaks if it goes
-    /// the other way). The other way is `ProviderEvidenceUnavailable`, which requeues
-    /// with `retryCount += 1` and `.haltLane`. `draftRuntimeIdentityKind(for:)` is
-    /// DETERMINISTIC PER PROVIDER CLASS, so an `.unknown` kind is `.unknown` on every
-    /// retry: the op would starve forever and halt its lane behind it — the wedge
-    /// corollary, which is in the non-recoverable set. The held direction loses strictly
+    /// the other way). The other way is `ProviderEvidenceUnavailable`, which moves
+    /// the op and its chain to the tail with `retryCount += 1` and defers them.
+    /// `draftRuntimeIdentityKind(for:)` is DETERMINISTIC PER PROVIDER CLASS, so an
+    /// `.unknown` kind is `.unknown` on every retry: the op would starve forever
+    /// and hold its chain behind it — the wedge corollary, which is in the
+    /// non-recoverable set. The held direction loses strictly
     /// less, and the loss is bounded to the queue producer. Adjudicated at
     /// `KNOWN_ISSUES.md` `IOS-QUEUE-003` item 4 and `IOS-DRAFT-018`.
     ///

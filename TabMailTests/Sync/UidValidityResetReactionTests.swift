@@ -95,7 +95,7 @@ struct UidValidityResetReactionTests {
             observedUidValidity: observedUidValidity)
         op.id = id
         let toInsert = op
-        try pool.write { db in try toInsert.insert(db) }
+        try pool.write { db in _ = try toInsert.inserted(db) }
     }
 
     private static func opIds(_ pool: DatabasePool) throws -> Set<String> {

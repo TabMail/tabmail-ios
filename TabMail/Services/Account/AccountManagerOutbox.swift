@@ -1154,22 +1154,24 @@ extension AccountManager {
             if outbox.isForward {
                 if let flagAdmission {
                     original.isForwarded = true
-                    try PendingOperation(
+                    var markForwardedOp = PendingOperation(
                         type: .markForwarded,
                         messageIds: flagAdmission.providerIds,
                         accountId: original.accountId,
                         folderPath: original.folderPath,
-                        observedUidValidity: flagAdmission.observedUidValidity).insert(db)
+                        observedUidValidity: flagAdmission.observedUidValidity)
+                    try markForwardedOp.insert(db)
                 }
             } else {
                 if let flagAdmission {
                     original.isReplied = true
-                    try PendingOperation(
+                    var markRepliedOp = PendingOperation(
                         type: .markReplied,
                         messageIds: flagAdmission.providerIds,
                         accountId: original.accountId,
                         folderPath: original.folderPath,
-                        observedUidValidity: flagAdmission.observedUidValidity).insert(db)
+                        observedUidValidity: flagAdmission.observedUidValidity)
+                    try markRepliedOp.insert(db)
                 }
                 // ⚑ DELIBERATELY OUTSIDE the admission guard. An action tag is
                 // LOCAL-ONLY (ADR-IOS-036) — clearing `reply` claims nothing about
@@ -1182,12 +1184,13 @@ extension AccountManager {
                     // Optional.none — so this STAMPS `actionTagSetAt`, it does
                     // not clear it.
                     original.setActionTag(ActionTag.none)
-                    try PendingOperation(
+                    var setTagOp = PendingOperation(
                         type: .setTag,
                         messageIds: [original.stableId],
                         accountId: original.accountId,
                         folderPath: original.folderPath,
-                        tagValue: ActionTag.none.rawValue).insert(db)
+                        tagValue: ActionTag.none.rawValue)
+                    try setTagOp.insert(db)
                     replyDetectHeaderId = originalId
                 }
             }

@@ -229,12 +229,13 @@ struct DraftOptimisticSaveTests {
         // Simulate PendingOperation creation (from queueDraftSave)
         try db.write { db in
             let opMsgIds = [draftId, placeholderMsgId, rfc822]
-            try PendingOperation(
+            var saveDraftOp = PendingOperation(
                 type: .saveDraft,
                 messageIds: opMsgIds,
                 accountId: "acc1",
                 folderPath: "DRAFT"
-            ).insert(db)
+            )
+            try saveDraftOp.insert(db)
         }
 
         let ops = try db.read { db in
@@ -270,12 +271,13 @@ struct DraftOptimisticSaveTests {
                 return // Early return — no header or op created
             }
             // This code should NOT execute
-            try PendingOperation(
+            var saveDraftOp2 = PendingOperation(
                 type: .saveDraft,
                 messageIds: [nonExistentDraftId],
                 accountId: "acc1",
                 folderPath: "DRAFT"
-            ).insert(db)
+            )
+            try saveDraftOp2.insert(db)
         }
 
         // Verify nothing was created

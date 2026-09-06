@@ -247,7 +247,7 @@ extension SyncEngine {
                             if header.isReplied && header.actionTag == .reply {
                                 header.actionTag = ActionTag.none
                                 header.tagSortOrder = ActionTag.none.sortOrder
-                                let tagOp = PendingOperation(
+                                var tagOp = PendingOperation(
                                     type: .setTag,
                                     messageIds: [header.stableId],
                                     accountId: account.id,
@@ -662,7 +662,7 @@ extension SyncEngine {
                         if header.isReplied && header.actionTag == .reply {
                             header.actionTag = ActionTag.none
                             header.tagSortOrder = ActionTag.none.sortOrder
-                            let tagOp = PendingOperation(
+                            var tagOp = PendingOperation(
                                 type: .setTag,
                                 messageIds: [header.stableId],
                                 accountId: account.id,

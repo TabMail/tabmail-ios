@@ -15,7 +15,7 @@ struct DatabasePendingOpTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
 
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .archive,
             messageIds: ["msg1", "msg2"],
             accountId: "acc1",
@@ -34,7 +34,7 @@ struct DatabasePendingOpTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
 
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .delete,
             messageIds: ["msg1"],
             accountId: "acc1",
@@ -56,7 +56,7 @@ struct DatabasePendingOpTests {
 
         let types: [OperationType] = [.archive, .delete, .move, .markRead]
         for opType in types {
-            let op = PendingOperation(
+            var op = PendingOperation(
                 type: opType,
                 messageIds: ["msg1"],
                 accountId: "acc1",
@@ -94,7 +94,7 @@ struct DatabasePendingOpTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
 
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .move,
             messageIds: ["msg1"],
             accountId: "acc1",

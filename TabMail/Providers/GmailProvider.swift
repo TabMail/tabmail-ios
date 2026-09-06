@@ -1488,14 +1488,16 @@ actor GmailProvider: EmailProvider {
     /// arm, which rewraps an unclassified `400` as
     /// `ProviderError.persistentActionFailure` so the generic queue DEMOTES
     /// the failing chain to the queue tail rather than blocking the FIFO.
-    /// v3 has no `persistentActionFailure` case and no demote lane
-    /// (`AccountManagerQueue` says so at the `.actionIdentityResolutionFailed`
-    /// arm: "machinery this tree does not have (F2b L4)"). Adding the wrapper
-    /// without the lane would be strictly WORSE than not porting it: an
-    /// unrecognized case falls through to the queue's generic transient branch
-    /// and retries forever — the exact wedge the reference's arm exists to
-    /// prevent. Rethrowing unchanged sends the unclassified `400` to the queue's
-    /// generic transient branch.
+    /// v3 has no `persistentActionFailure` case, and the wrapper is still not
+    /// ported — but the DEMOTION it existed to trigger is now unconditional, so
+    /// there is nothing left for the wrapper to buy. Every retryable failure in
+    /// `AccountManager.executeSingleOp` — including the unclassified `400`'s
+    /// generic transient arm — runs `deferRelatedChainToTail`, which moves the
+    /// failing op AND its transitively related chain to the tail of the durable
+    /// `queuePosition` order and records the chain in
+    /// `DrainContext.deferredOperationIds` for the rest of the drain.
+    /// Rethrowing unchanged therefore reaches exactly the disposition the
+    /// reference's wrapper was reaching for.
     ///
     /// ⚠ CORRECTED (audit round 1, finding B-3). This paragraph used to end
     /// "Rethrowing unchanged keeps v3's shipped terminal disposition for a Gmail
@@ -1506,13 +1508,19 @@ actor GmailProvider: EmailProvider {
     /// `isPermanentlyInvalidError` now delegates to
     /// `isAuthoritativeActionRejection`, and an unclassified `400` retries.
     ///
-    /// **The wedge the reference's demote lane prevents is therefore REAL on v3
-    /// and remains unaddressed**: a chain whose head takes an unrecognised
-    /// permanent-shaped `400` blocks its lane on every drain. That is a bounded,
-    /// visible, retryable park rather than a silent discard, which is the trade
-    /// the never-drop rule explicitly prefers — but it is a known gap, not a
-    /// solved problem, and closing it needs the demote lane (F2b L4), not a
-    /// widened terminal matcher.
+    /// ⚠️ CORRECTED AGAIN when the global single-operation FIFO executor landed.
+    /// This paragraph used to read "**The wedge the reference's demote lane
+    /// prevents is therefore REAL on v3 and remains unaddressed**: a chain whose
+    /// head takes an unrecognised permanent-shaped `400` blocks its lane on
+    /// every drain." **That is no longer true, and the gap is closed.** A chain
+    /// whose head takes an unrecognised `400` is moved to the TAIL of the
+    /// `queuePosition` order and deferred for the remainder of the drain, so the
+    /// executor keeps claiming the live front row and every unrelated intention
+    /// on the same account — and every later intention on any account — executes
+    /// in that same drain, ahead of the retrying chain. The disposition is still
+    /// a bounded, visible, retrying park rather than a silent discard, which is
+    /// the trade the never-drop rule explicitly prefers; what changed is that
+    /// the park no longer costs anything behind it.
     ///
     /// SUBTRACT — the reference also handles `isGmailInvalidLabelError` here
     /// (invalid/gone label → stale no-op). Not ported as a local `return`,

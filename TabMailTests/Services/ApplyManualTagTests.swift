@@ -139,13 +139,14 @@ struct ApplyManualTagQueueTests {
         // Simulate queueTagWrite
         let tag: ActionTag = .archive
         try db.write { db in
-            try PendingOperation(
+            var setTagOp = PendingOperation(
                 type: .setTag,
                 messageIds: [msg.stableId],
                 accountId: "acc1",
                 folderPath: "INBOX",
                 tagValue: tag.rawValue
-            ).insert(db)
+            )
+            try setTagOp.insert(db)
         }
 
         let ops = try db.read { try PendingOperation.fetchAll($0) }
@@ -166,13 +167,14 @@ struct ApplyManualTagQueueTests {
 
         // Remove tag = nil → use removeTag type
         try db.write { db in
-            try PendingOperation(
+            var removeTagOp = PendingOperation(
                 type: .removeTag,
                 messageIds: [msg.stableId],
                 accountId: "acc1",
                 folderPath: "INBOX",
                 tagValue: "reply"  // previous tag value for IMAP keyword removal
-            ).insert(db)
+            )
+            try removeTagOp.insert(db)
         }
 
         let ops = try db.read { try PendingOperation.fetchAll($0) }

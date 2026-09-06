@@ -41,7 +41,7 @@ struct ReconcileCrashRecoveryTests {
         try TestDatabase.insertAccount(db)
 
         let op = makeOp(status: .inFlight)
-        try db.write { try op.insert($0) }
+        try db.write { _ = try op.inserted($0) }
 
         // Simulate reconcile: reset inFlight → queued
         try db.write { dbConn in
@@ -65,7 +65,7 @@ struct ReconcileCrashRecoveryTests {
         try TestDatabase.insertAccount(db)
 
         let op = makeOp(status: .cancelled)
-        try db.write { try op.insert($0) }
+        try db.write { _ = try op.inserted($0) }
 
         try db.write { dbConn in
             let deletedCount = try PendingOperation
@@ -84,7 +84,7 @@ struct ReconcileCrashRecoveryTests {
         try TestDatabase.insertAccount(db)
 
         let op = makeOp(status: .queued)
-        try db.write { try op.insert($0) }
+        try db.write { _ = try op.inserted($0) }
 
         // Reconcile only touches inFlight and cancelled
         try db.write { dbConn in
@@ -118,8 +118,8 @@ struct ReconcileCrashRecoveryTests {
         opQueued.destinationPath = "Archive"
 
         try db.write { dbConn in
-            try opInFlight.insert(dbConn)
-            try opCancelled.insert(dbConn)
+            try opInFlight.inserted(dbConn)
+            try opCancelled.inserted(dbConn)
             try opQueued.insert(dbConn)
         }
 
@@ -287,7 +287,7 @@ struct DrainAlgorithmTests {
         try TestDatabase.insertAccount(db)
 
         let op = makeOp(status: .cancelled)
-        try db.write { try op.insert($0) }
+        try db.write { _ = try op.inserted($0) }
 
         // Simulate claim phase
         let claimed = try db.write { dbConn -> PendingOperation? in
@@ -312,7 +312,7 @@ struct DrainAlgorithmTests {
         try TestDatabase.insertAccount(db)
 
         let op = makeOp(status: .inFlight)
-        try db.write { try op.insert($0) }
+        try db.write { _ = try op.inserted($0) }
 
         let claimed = try db.write { dbConn -> PendingOperation? in
             guard var fetched = try PendingOperation.fetchOne(dbConn, key: op.id) else { return nil }
@@ -351,7 +351,7 @@ struct DrainAlgorithmTests {
         try TestDatabase.insertAccount(db)
 
         let op = makeOp(type: .move, messageIds: ["msg1"], destinationPath: "Archive")
-        try db.write { try op.insert($0) }
+        try db.write { _ = try op.inserted($0) }
 
         // Single-message conflict — drop
         try db.write { dbConn in

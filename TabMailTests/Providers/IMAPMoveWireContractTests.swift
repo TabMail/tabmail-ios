@@ -555,8 +555,8 @@ struct IMAPMoveWireContractTests {
     /// reads as maximal safety and was in fact a permanent, unresolvable wedge:
     /// the missing capability can never appear, so the refusal fired on every
     /// attempt forever, the user's archive could never happen by any route, and
-    /// the refusal's `.haltLane` drain arm starved every later gesture on the
-    /// same message. `v1.6.38` moved mail on these servers perfectly well. The
+    /// the refusal's drain arm (`.haltLane` at the time, chain deferral today)
+    /// starved every later gesture on the same message. `v1.6.38` moved mail on these servers perfectly well. The
     /// gate is deleted; what authorizes the source cleanup on this class of
     /// server is the COPY's own tagged OK, which RFC 3501 §6.4.7 makes a
     /// positive statement that the whole named set copied (an unsuccessful COPY
@@ -652,7 +652,7 @@ struct IMAPMoveWireContractTests {
     /// "MAY omit" it "as it is not meaningful". Both are properties of the
     /// MAILBOX rather than of the attempt. For such a server the evidence never
     /// arrives, so the "bounded wait" is unbounded:
-    /// the op reaches none of the four never-drop exits, its `.haltLane`
+    /// the op reaches none of the four never-drop exits, its deferral
     /// disposition starves every later gesture on the same message, and — worse
     /// than the capability wedge round 3 deleted — the refusal is raised AFTER
     /// the `UID COPY`, so every drain seats another duplicate at the destination.
@@ -981,7 +981,8 @@ struct IMAPMoveWireContractTests {
     /// operation at 15s. A large archive against a server that withholds
     /// `COPYUID` therefore completed its `UID COPY` and then blew that deadline
     /// inside the probe, throwing out of `move` AFTER the copy. The drain's
-    /// generic arm requeues the op, poisons the account and halts the lane, so
+    /// generic arm moves the op and its related chain to the queue's tail and
+    /// poisons the account for the rest of that drain, so
     /// no source `\Deleted` is ever reached and the next drain REPEATS the
     /// `UID COPY` — a destination duplicate per drain, forever, with every
     /// later intention on that account starved behind it. That is the

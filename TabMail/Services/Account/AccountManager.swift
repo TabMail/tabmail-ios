@@ -510,34 +510,6 @@ actor AccountManager {
     /// two retirement callers it drives, all on this actor.
     var pendingRetirements: [String: PendingRetirement] = [:]
 
-    /// THE RETAINED RETIREMENT OWNS THE SUFFIX ITS LANE HALT LEFT BEHIND.
-    ///
-    /// `PendingOperation.id` of a retained retirement -> the ids of the ops this
-    /// process CLAIMED in the same lane, behind that retirement, and never
-    /// executed. Set at the halt site, consumed by `replayRetainedRetirements`.
-    ///
-    /// 🚨 WHY THIS EXISTS AT ALL. The halt site already requeues the suffix
-    /// best-effort (`try? await retryWrite`), and that is enough for every halt
-    /// cause EXCEPT the one that produced this entry: a retirement write refused
-    /// by a DATABASE-WIDE refusal. GRDB suspends writes when the app is
-    /// backgrounded mid-drain while reads keep working (ADR-IOS-041); a full
-    /// disk or an I/O error at COMMIT does the same. The same refusal that lost
-    /// the retirement loses the requeue milliseconds later, the error is
-    /// discarded, and the suffix is left `inFlight` forever: the claim loop
-    /// refuses `inFlight`, so no later pass in this process can ever pick it up,
-    /// and the next launch's `AppDatabase.recoverPreviousSessionResidue` DELETES
-    /// an `everAttempted` `.move` — the user's newer, never-executed gesture,
-    /// discarded in a live process that still holds the proof which would have
-    /// re-addressed it. The replay's transaction is the FIRST write after the
-    /// refusal lifts, so putting the requeue in it is the smallest place the
-    /// two facts can be resolved together.
-    ///
-    /// BOUNDED and SHORT-LIVED exactly like `pendingRetirements`: an entry is
-    /// created only beside one, leaves with it (replay committed, or the row is
-    /// gone), and dies with the process. A process death before the replay is
-    /// the accepted crash window, unchanged.
-    var pendingRetirementSuffixes: [String: [String]] = [:]
-
     /// THIS PROCESS STILL OWNS EVERY ROW IT CLAIMED AND COULD NOT RETURN TO
     /// `queued`.
     ///
@@ -553,7 +525,8 @@ actor AccountManager {
     /// backgrounded mid-drain while WAL reads keep working (ADR-IOS-041); a full
     /// disk or an I/O error at COMMIT does the same — so the requeue fails in the
     /// same breath as whatever forced it. The row is then left `inFlight`, a
-    /// state only the claim transaction writes and one the claim loop refuses, so
+    /// state only the claim transaction writes and one `claimFrontierOperation`
+    /// refuses, so
     /// NO later pass in this process can pick it up; at the next launch
     /// `AppDatabase.recoverPreviousSessionResidue` DELETES it if it is an
     /// `everAttempted` `.move`. A user gesture that never reached the provider,
@@ -565,17 +538,20 @@ actor AccountManager {
     /// pass the default, and a recovery that flattened them would either hide the
     /// runaway-retry case or invent a provider failure that never happened.
     ///
-    /// 🚨 IT DOES NOT REPLACE `pendingRetirementSuffixes`, AND THE OVERLAP IS
-    /// DELIBERATE. That map's requeue runs INSIDE the retirement's own
-    /// transaction, so a follower is never made claimable while still naming the
-    /// address that same transaction is about to invalidate; moving it out here,
-    /// into a later and separate transaction, would open a NEW window in which a
-    /// correctly re-addressed follower sits `inFlight` across a process death and
-    /// is deleted at launch. An id held by both is harmless: the retirement
-    /// requeues it atomically, and this map's guarded update then matches zero
-    /// rows and clears its entry.
+    /// 🚨 IT IS NOW THE ONLY IN-MEMORY OWNERSHIP MAP OF ITS KIND, because the
+    /// GLOBAL SINGLE-OPERATION EXECUTOR removed the thing the retired sibling
+    /// map (`pendingRetirementSuffixes`) existed for. That map returned the ops
+    /// this process had CLAIMED behind a halted lane's retirement, and a claimed
+    /// suffix is only possible when several rows are `inFlight` at once. The
+    /// executor claims exactly ONE row, executes it, and commits its result
+    /// before claiming again, so behind a retained retirement there is nothing
+    /// claimed — the followers are still `queued` and the next iteration reaches
+    /// them normally. Do not reintroduce a suffix map without first
+    /// reintroducing concurrent claims, which is the divergence this whole
+    /// change removes.
     ///
-    /// BOUNDED and SHORT-LIVED exactly like the two maps above: an entry exists
+    /// BOUNDED and SHORT-LIVED exactly like `pendingRetirements` above — the one
+    /// map left beside it: an entry exists
     /// only between a refused requeue and the next drain, and leaves on recovery
     /// (including the zero-row case — the row was cancelled, wiped or already
     /// requeued, so ownership is resolved either way) or with the process.

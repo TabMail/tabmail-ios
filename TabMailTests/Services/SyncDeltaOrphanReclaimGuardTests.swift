@@ -41,12 +41,13 @@ struct SyncDeltaOrphanReclaimGuardTests {
                 Column("isInInbox").set(to: false)
             )
             // PendingOp uses stableId == rfc822 for IMAP.
-            try PendingOperation(
+            var archiveOp = PendingOperation(
                 type: .archive,
                 messageIds: [rfc822],
                 accountId: "acc1",
                 folderPath: "INBOX"
-            ).insert(dbConn)
+            )
+            try archiveOp.insert(dbConn)
         }
 
         // Drive the guard directly: when iterating the source folder, the

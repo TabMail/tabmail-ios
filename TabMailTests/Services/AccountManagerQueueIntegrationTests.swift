@@ -266,7 +266,7 @@ struct AccountManagerQueueIntegrationTests {
     func drainPatternInsertAndDelete() throws {
         let db = try TestDatabase.make()
 
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .markRead,
             messageIds: ["msg-1"],
             accountId: "acc1",
@@ -351,7 +351,7 @@ struct AccountManagerQueueIntegrationTests {
     func drainPatternAtomicClaim() throws {
         let db = try TestDatabase.make()
 
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .markRead,
             messageIds: ["msg-1"],
             accountId: "acc1",
@@ -385,9 +385,9 @@ struct AccountManagerQueueIntegrationTests {
     func drainPatternFailedAccountsSkip() throws {
         let db = try TestDatabase.make()
 
-        let op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
-        let op2 = PendingOperation(type: .markRead, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX")
-        let op3 = PendingOperation(type: .markRead, messageIds: ["msg-3"], accountId: "acc2", folderPath: "INBOX")
+        var op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
+        var op2 = PendingOperation(type: .markRead, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX")
+        var op3 = PendingOperation(type: .markRead, messageIds: ["msg-3"], accountId: "acc2", folderPath: "INBOX")
         try db.write { dbConn in
             try op1.insert(dbConn)
             try op2.insert(dbConn)
@@ -444,7 +444,7 @@ struct AccountManagerQueueIntegrationTests {
         op1.status = PendingStatus.inFlight.rawValue
         var op2 = PendingOperation(type: .move, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX", destinationPath: "Trash")
         op2.status = PendingStatus.inFlight.rawValue
-        let op3 = PendingOperation(type: .markRead, messageIds: ["msg-3"], accountId: "acc1", folderPath: "INBOX")
+        var op3 = PendingOperation(type: .markRead, messageIds: ["msg-3"], accountId: "acc1", folderPath: "INBOX")
         // op3 stays queued
 
         try db.write { dbConn in
@@ -478,7 +478,7 @@ struct AccountManagerQueueIntegrationTests {
 
         var op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
         op1.status = PendingStatus.cancelled.rawValue
-        let op2 = PendingOperation(type: .move, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX", destinationPath: "Trash")
+        var op2 = PendingOperation(type: .move, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX", destinationPath: "Trash")
         // op2 stays queued
 
         try db.write { dbConn in

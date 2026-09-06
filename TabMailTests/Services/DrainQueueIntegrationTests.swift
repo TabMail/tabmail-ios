@@ -47,13 +47,25 @@ struct DrainQueueIntegrationTests {
     private func insertOp(
         _ op: PendingOperation
     ) throws {
-        try db.write { db in try op.insert(db) }
+        try db.write { db in _ = try op.inserted(db) }
     }
 
-    /// Fetch all pending operations ordered by createdAt.
+    /// Every queued operation in the order the PRODUCTION executor would claim
+    /// them: `queuePosition` ascending.
+    ///
+    /// ⚠️ IT ORDERED BY `createdAt` UNTIL THE GLOBAL SINGLE-OPERATION FIFO
+    /// EXECUTOR LANDED, AND THAT MADE THE ONE ORDERING TEST BELOW A TAUTOLOGY
+    /// ABOUT ITS OWN HELPER. `claimFrontierOperation` reads
+    /// `ORDER BY queuePosition ASC` and `createdAt` is age only, so a simulation
+    /// that sorted by the timestamp was asserting an order production does not
+    /// use — and would have stayed green through a build that ordered the real
+    /// queue any way at all. This helper is still a SIMULATION and still gives
+    /// zero signal on the real drain (see the file header); ordering it by the
+    /// production key is the difference between a simulation of the queue and a
+    /// simulation of something else.
     private func fetchAllOps() throws -> [PendingOperation] {
         try db.read { db in
-            try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
+            try PendingOperation.order(Column("queuePosition").asc).fetchAll(db)
         }
     }
 
@@ -503,7 +515,19 @@ struct DrainQueueIntegrationTests {
 
     // MARK: - 12. FIFO ordering
 
-    @Test("Operations execute in createdAt order (FIFO)")
+    /// ⚠️ RETIRED DISPLAY NAME, recorded verbatim: **"Operations execute in
+    /// createdAt order (FIFO)"**. `createdAt` is AGE ONLY — `queuePosition`,
+    /// allocated at admission, is the queue's order — so the old name asserted a
+    /// key production does not read, on a simulation that sorted by that same
+    /// key. The stamps below are now set BACKWARDS relative to admission, so
+    /// this fixture fails on any build (or helper) that reintroduces a timestamp
+    /// sort rather than agreeing with one.
+    ///
+    /// This is still a SIMULATION and is not evidence about the production
+    /// drain; `GlobalFifoExecutorTests` is. What it pins is that the simulated
+    /// dispatch this file's other twelve tests ride on walks the queue in the
+    /// same order the real executor does.
+    @Test("Operations execute in ADMISSION order (queuePosition), not by timestamp")
     func fifoOrdering() async throws {
         var op1 = PendingOperation(
             type: .markRead,
@@ -511,7 +535,7 @@ struct DrainQueueIntegrationTests {
             accountId: "acc1",
             folderPath: "INBOX"
         )
-        op1.createdAt = Date(timeIntervalSince1970: 1000)
+        op1.createdAt = Date(timeIntervalSince1970: 3000)
         try insertOp(op1)
 
         var op2 = PendingOperation(
@@ -529,7 +553,7 @@ struct DrainQueueIntegrationTests {
             accountId: "acc1",
             folderPath: "INBOX"
         )
-        op3.createdAt = Date(timeIntervalSince1970: 3000)
+        op3.createdAt = Date(timeIntervalSince1970: 1000)
         try insertOp(op3)
 
         var failedAccounts = Set<String>()
@@ -551,9 +575,11 @@ struct DrainQueueIntegrationTests {
         let unreads = await provider.markedUnreadIds
         #expect(reads.count == 2)
         #expect(unreads.count == 1)
-        #expect(reads[0].ids == ["msg-1"]) // First markRead (oldest)
-        #expect(unreads[0].ids == ["msg-2"]) // markUnread (middle)
-        #expect(reads[1].ids == ["msg-3"]) // Second markRead (newest)
+        // Admitted first, stamped LAST — a timestamp sort would put it third.
+        #expect(reads[0].ids == ["msg-1"])
+        #expect(unreads[0].ids == ["msg-2"])
+        // Admitted last, stamped FIRST — a timestamp sort would put it first.
+        #expect(reads[1].ids == ["msg-3"])
     }
 
     // MARK: - 13. Reconcile crash recovery

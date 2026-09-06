@@ -138,7 +138,7 @@ struct QueueMemberAbsenceTests {
     }
 
     private func insert(_ op: PendingOperation, into fixture: Fixture) throws {
-        try fixture.pool.writeWithoutTransaction { db in try op.insert(db) }
+        try fixture.pool.writeWithoutTransaction { db in _ = try op.inserted(db) }
     }
 
     private func operations(_ fixture: Fixture) throws -> [PendingOperation] {
@@ -773,11 +773,13 @@ struct QueueMemberAbsenceTests {
 
         // PHASE 2 — the durable half, through the real drain.
         //
-        // FIVE members against `drainPendingQueue`'s three-pass cap, so ONE drain
-        // cannot finish the batch and the narrowed row is observable between
-        // drains rather than only inside one. No latency here: the property is
-        // what the DURABLE row looks like while converging, and wall-clock time
-        // would only make it flaky.
+        // FIVE members, one per Gmail request. The executor has no pass cap and
+        // re-claims the narrowed remainder inside the SAME run, so there is no
+        // "between drains" instant to read any more — `observeNarrowingWhile
+        // OneDrainConverges` manufactures the instant by holding the middle
+        // member's request open, and then requires that same drain to converge
+        // all five. The property is what the DURABLE row looks like while
+        // converging.
         let members = (1...5).map { "bank-g-\($0)" }
         let server = StatefulGmailActionServer(messages: members.map {
             .init(rfc822MessageId: "\($0)@example.com", providerMessageId: $0,
@@ -801,15 +803,17 @@ struct QueueMemberAbsenceTests {
             return
         }
 
+        // The MIDDLE member's request is held open, so the durable row can be read
+        // at an instant when two members are settled and three are still owed.
+        server.holdModify(
+            providerMessageId: members[2], forSeconds: Self.midConvergenceHoldSeconds)
         await AccountManager.shared.registerProviderForTesting(
             accountId: f.accountId, provider: server.provider())
 
-        await drainPasses(1)
-        try assertNarrowedUnderTheOriginalRow(f, op: seeded)
+        try await observeNarrowingWhileOneDrainConverges(f, op: seeded) {
+            server.modifyLog().contains { $0.providerMessageId == members[2] }
+        }
 
-        try await drainToQuiescence(f)
-        #expect(try operations(f).isEmpty,
-                "the batch never converged — a member that is never requested has been dropped")
         let addressed = server.modifyLog().map(\.providerMessageId)
         #expect(addressed == members, """
             every member must be addressed exactly once, in request order. A member \
@@ -848,8 +852,13 @@ struct QueueMemberAbsenceTests {
         guard rows.count == 1 else { return }
         let row = rows[0]
         #expect(row.id == op.id, "the surviving row must be the user's ORIGINAL operation")
+        // `createdAt` is AGE, not order — `queuePosition` decides order and the
+        // narrowing deliberately moves it to the tail. What this pins is that the
+        // surviving row is the SAME DURABLE ROW the user created rather than a
+        // freshly constructed replacement wearing the same id: a rebuilt row
+        // would carry a new timestamp, and its age would restart.
         #expect(row.createdAt == op.createdAt,
-                "the narrowed row must keep its position — a new `createdAt` re-orders it against every other queued gesture")
+                "the narrowed row is not the original — its `createdAt` changed, so a replacement row was constructed instead of the user's own being narrowed")
         #expect(row.everAttempted, "the row was narrowed without ever being attempted")
         #expect(!row.messageIds.isEmpty,
                 "the row narrowed to nothing while still existing, so members left it without being settled")
@@ -861,6 +870,62 @@ struct QueueMemberAbsenceTests {
         #expect(row.messageIds == Array(op.messageIds.suffix(row.messageIds.count)), """
             the members still owed are not the tail of the original request, in \
             order: \(row.messageIds) out of \(op.messageIds)
+            """)
+    }
+
+    /// How long the mid-convergence member's request is held open. Wide enough
+    /// that the observation below is not a race, and far inside
+    /// `SyncConfig.pendingOperationTimeoutSeconds` (15 s) so the park can never
+    /// turn into an operation timeout — which would silently change what is
+    /// being measured into the deadline case phase 1 already covers.
+    private static let midConvergenceHoldSeconds: TimeInterval = 3.0
+
+    /// ONE drain, with the request for a MIDDLE member held open, observing the
+    /// durable row at the instant that request is in flight — and then requiring
+    /// that same drain to converge the WHOLE batch.
+    ///
+    /// 🚨 WHY THE OBSERVATION MOVED INSIDE THE DRAIN, AND WHY THAT IS THE POINT.
+    /// It used to be taken BETWEEN drains: the drain capped itself at three
+    /// passes and answered a narrowing by halting that lane, so a five-member
+    /// batch could not finish in one drain and the narrowed row was trivially
+    /// observable afterwards. Reading it that way also meant the user waited for
+    /// a fresh drain trigger — another gesture, a reconnect, or the poll — for
+    /// every three members of a gesture they had already made.
+    ///
+    /// The global single-operation executor has no pass cap and re-claims the
+    /// narrowed remainder as the live front row, so the whole batch settles in
+    /// ONE continuous run and there is no "between drains" left to look at. The
+    /// held member manufactures the instant instead, and the convergence
+    /// assertion at the end is the other half: both halves of the original
+    /// property — narrowed under the ORIGINAL row, and every member reached — are
+    /// still asserted, and the run count went from ⌈N/3⌉ to one.
+    @MainActor
+    private func observeNarrowingWhileOneDrainConverges(
+        _ fixture: Fixture,
+        op seeded: PendingOperation,
+        parkedMemberHasArrived: @escaping @Sendable () -> Bool
+    ) async throws {
+        let drain = Task { @MainActor in await AccountManager.shared.drainPendingQueue() }
+        var arrived = false
+        for _ in 0..<1200 {
+            if parkedMemberHasArrived() { arrived = true; break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(arrived, """
+            the held member's request never reached the server, so the durable \
+            observation below would be taken at an arbitrary instant rather than \
+            mid-convergence
+            """)
+        if arrived { try assertNarrowedUnderTheOriginalRow(fixture, op: seeded) }
+        await drain.value
+
+        let owed = try operations(fixture)
+        #expect(owed.isEmpty, """
+            ONE drain did not settle every member — \(owed.map(\.messageIds)) is \
+            still owed. An N-member operation must converge in a single continuous \
+            run: the executor keeps claiming while a live front row exists, and a \
+            narrowed remainder keeps its identity and its place in the queue \
+            instead of waiting for the next drain trigger.
             """)
     }
 
@@ -938,15 +1003,18 @@ struct QueueMemberAbsenceTests {
             return
         }
 
+        // See the Gmail sibling: the middle member is held so the narrowed row is
+        // observable at an instant, this executor having removed the between-drain
+        // window the observation used to be taken in.
+        server.holdPatch(
+            providerMessageId: members[2], forSeconds: Self.midConvergenceHoldSeconds)
         await AccountManager.shared.registerProviderForTesting(
             accountId: f.accountId, provider: server.provider())
 
-        await drainPasses(1)
-        try assertNarrowedUnderTheOriginalRow(f, op: seeded)
+        try await observeNarrowingWhileOneDrainConverges(f, op: seeded) {
+            Self.patchedIds(server).contains(members[2])
+        }
 
-        try await drainToQuiescence(f)
-        #expect(try operations(f).isEmpty,
-                "the batch never converged — a member that is never requested has been dropped")
         let patched = Self.patchedIds(server)
         #expect(patched == members, """
             every member must be PATCHed exactly once, in request order. A member \
@@ -1045,15 +1113,18 @@ struct QueueMemberAbsenceTests {
             return
         }
 
+        // See the Gmail sibling. The held id is the one the move is ADDRESSED to,
+        // which is still the source-side id at the moment the request is served —
+        // Graph reallocates it in the response, not before it.
+        server.holdMove(
+            providerMessageId: members[2], forSeconds: Self.midConvergenceHoldSeconds)
         await AccountManager.shared.registerProviderForTesting(
             accountId: f.accountId, provider: server.provider())
 
-        await drainPasses(1)
-        try assertNarrowedUnderTheOriginalRow(f, op: seeded)
+        try await observeNarrowingWhileOneDrainConverges(f, op: seeded) {
+            Self.movedIds(server).contains(members[2])
+        }
 
-        try await drainToQuiescence(f)
-        #expect(try operations(f).isEmpty,
-                "the batch never converged — a member that is never requested has been dropped")
         let moved = Self.movedIds(server)
         #expect(moved == members, """
             every member must be moved exactly once, in request order. A second \
@@ -1363,12 +1434,13 @@ struct QueueMemberAbsenceTests {
 
         case .absentFirstThenLiveSuffix, .twoAbsentSeparatedByALiveOne, .everyMemberAbsent:
             // DRAIN UNTIL IT STOPS. A settled member leaves the row one at a
-            // time, so an N-member batch costs N attempts and a 4- or 5-member
-            // layout cannot finish inside `drainPendingQueue`'s three-pass cap.
+            // time, so an N-member batch costs N attempts; the global executor
+            // now takes them all inside one run, and an absent member that
+            // routes through the retryable disposition still costs a fresh one.
             // A FIXED DRAIN COUNT WOULD PIN THE CONVERGENCE RATE, WHICH IS A
             // MECHANISM, NOT THE PROPERTY (`MIS-015`) — and it is the mechanism
-            // most likely to change again, since the whole round-2 correction was
-            // a change to exactly that number.
+            // most likely to change again: it has already changed twice, once by
+            // the round-2 correction to the pass cap and once by deleting the cap.
             try await drainToQuiescence(f)
 
             // 🚨 THE WIRE COUNT IS WHAT THE OLD DRAIN-COUNT ASSERTION WAS
@@ -1437,14 +1509,14 @@ struct QueueMemberAbsenceTests {
     /// further passes other work forces — and it neither mutates the follower
     /// waiting on one of its members nor stops the rest of its account.**
     ///
-    /// 🚨 THE FIXTURE HAS TO FORCE A SECOND PASS OR IT PROVES NOTHING.
-    /// `drainPendingQueue` only takes another claim pass when something in the
-    /// previous one EXECUTED (`DrainContext.executedAny`), so a fixture in which
-    /// the only op fails never reaches pass two — and every assertion about
-    /// "attempted once" is then satisfied by a drain that had one pass to begin
-    /// with. The independent `markRead` below is queued FIRST for exactly that
-    /// reason: it succeeds, the drain takes its remaining passes, and the bundle
-    /// is re-claimed on each of them.
+    /// 🚨 THE FIXTURE HAS TO GIVE THE EXECUTOR SOMEWHERE ELSE TO GO OR IT PROVES
+    /// NOTHING. The executor keeps claiming while a live front row exists, so a
+    /// fixture whose ONLY operation fails runs out of candidates immediately and
+    /// every assertion about "attempted once" is satisfied by a drain that had
+    /// one candidate to begin with. The independent `markRead` below is queued
+    /// FIRST for exactly that reason: it succeeds, the executor keeps walking, and
+    /// the refused bundle — now moved to the tail — is back in front of the walk,
+    /// where only `DrainContext.deferredOperationIds` stops it being re-claimed.
     ///
     /// The three failure directions, all asserted:
     ///
@@ -1469,11 +1541,12 @@ struct QueueMemberAbsenceTests {
     /// a wedge: once the provider stops refusing, the bundle and then the follower
     /// both execute, in that order.
     ///
-    /// RED PROOF (recorded): with `context.evidenceRefused.insert(currentOp.id)`
-    /// removed from the unresolved arm, the bundle is re-sent on every remaining
-    /// pass of the same drain — `movedIds.count` is 3 instead of 1 after the first
-    /// drain and 6 instead of 2 after the second, and `retryCount` is 3 instead of
-    /// 1.
+    /// RED PROOF (recorded): with the unresolved arm's tail movement no longer
+    /// recording the chain in `DrainContext.deferredOperationIds`, the bundle is
+    /// re-claimed and re-sent every time the walk comes back round to it inside
+    /// the same drain — `movedIds.count` climbs without bound instead of settling
+    /// at 1 after the first drain and 2 after the second, and `retryCount` climbs
+    /// with it.
     @Test("An unresolved multi-member failure is attempted once per drain, isolates nobody, and converges")
     @MainActor
     func anUnresolvedBatchIsAttemptedOncePerDrainAndConverges() async throws {

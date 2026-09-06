@@ -39,7 +39,7 @@ struct PendingOperationExtendedTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
 
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .archive,
             messageIds: ["msg1", "msg2", "msg3"],
             accountId: "acc1",

@@ -19,7 +19,7 @@ struct PendingOperationPersistenceTests {
     @Test("Insert and fetch round-trip preserves all fields")
     func insertFetchRoundTrip() throws {
         let db = try TestDatabase.make()
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .move,
             messageIds: ["msg-1", "msg-2"],
             accountId: "acc1",
@@ -46,7 +46,7 @@ struct PendingOperationPersistenceTests {
     @Test("Delete removes op from DB")
     func deleteRemovesOp() throws {
         let db = try TestDatabase.make()
-        let op = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
+        var op = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
         try db.write { try op.insert($0) }
 
         try db.write { _ = try PendingOperation.deleteOne($0, key: op.id) }
@@ -58,9 +58,9 @@ struct PendingOperationPersistenceTests {
     @Test("fetchAll returns all inserted ops")
     func fetchAllReturnsAll() throws {
         let db = try TestDatabase.make()
-        let op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
-        let op2 = PendingOperation(type: .markUnread, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX")
-        let op3 = PendingOperation(type: .move, messageIds: ["msg-3"], accountId: "acc2", folderPath: "INBOX", destinationPath: "Trash")
+        var op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
+        var op2 = PendingOperation(type: .markUnread, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX")
+        var op3 = PendingOperation(type: .move, messageIds: ["msg-3"], accountId: "acc2", folderPath: "INBOX", destinationPath: "Trash")
         try db.write { dbConn in
             try op1.insert(dbConn)
             try op2.insert(dbConn)
@@ -122,9 +122,9 @@ struct PendingOperationPersistenceTests {
     func filterByAccountId() throws {
         let db = try TestDatabase.make()
 
-        let op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
-        let op2 = PendingOperation(type: .markRead, messageIds: ["msg-2"], accountId: "acc2", folderPath: "INBOX")
-        let op3 = PendingOperation(type: .move, messageIds: ["msg-3"], accountId: "acc1", folderPath: "INBOX", destinationPath: "Trash")
+        var op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
+        var op2 = PendingOperation(type: .markRead, messageIds: ["msg-2"], accountId: "acc2", folderPath: "INBOX")
+        var op3 = PendingOperation(type: .move, messageIds: ["msg-3"], accountId: "acc1", folderPath: "INBOX", destinationPath: "Trash")
 
         try db.write { dbConn in
             try op1.insert(dbConn)
@@ -149,7 +149,7 @@ struct PendingOperationPersistenceTests {
     func filterByNonexistentAccountId() throws {
         let db = try TestDatabase.make()
 
-        let op = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
+        var op = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
         try db.write { try op.insert($0) }
 
         let result = try db.read {
@@ -206,7 +206,7 @@ struct PendingOperationPersistenceTests {
     func filterByStatus() throws {
         let db = try TestDatabase.make()
 
-        let op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
+        var op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
         var op2 = PendingOperation(type: .markUnread, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX")
         op2.status = PendingStatus.inFlight.rawValue
         var op3 = PendingOperation(type: .markFlagged, messageIds: ["msg-3"], accountId: "acc1", folderPath: "INBOX")
@@ -240,8 +240,8 @@ struct PendingOperationPersistenceTests {
     func uniqueUUIDs() throws {
         let db = try TestDatabase.make()
 
-        let op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
-        let op2 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
+        var op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
+        var op2 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
 
         try db.write { dbConn in
             try op1.insert(dbConn)
@@ -256,7 +256,7 @@ struct PendingOperationPersistenceTests {
     @Test("Duplicate insert with same id throws")
     func duplicateInsertThrows() throws {
         let db = try TestDatabase.make()
-        let op = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
+        var op = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
         try db.write { try op.insert($0) }
 
         #expect(throws: (any Error).self) {
@@ -269,7 +269,7 @@ struct PendingOperationPersistenceTests {
     @Test("setTag op persists tagValue")
     func setTagPersistsTagValue() throws {
         let db = try TestDatabase.make()
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .setTag,
             messageIds: ["msg-1"],
             accountId: "acc1",
@@ -286,7 +286,7 @@ struct PendingOperationPersistenceTests {
     @Test("removeTag op has nil tagValue")
     func removeTagNilTagValue() throws {
         let db = try TestDatabase.make()
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .removeTag,
             messageIds: ["msg-1"],
             accountId: "acc1",
@@ -304,7 +304,7 @@ struct PendingOperationPersistenceTests {
     @Test("messageIds with special characters round-trip correctly")
     func messageIdsSpecialChars() throws {
         let db = try TestDatabase.make()
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .markRead,
             messageIds: ["<msg@example.com>", "uid:123", "foo/bar"],
             accountId: "acc1",
@@ -319,7 +319,7 @@ struct PendingOperationPersistenceTests {
     @Test("Empty messageIds array persists correctly")
     func emptyMessageIds() throws {
         let db = try TestDatabase.make()
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .markRead,
             messageIds: [],
             accountId: "acc1",
@@ -395,7 +395,7 @@ struct PendingOperationPersistenceTests {
     func deleteAllByStatus() throws {
         let db = try TestDatabase.make()
 
-        let op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
+        var op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
         var op2 = PendingOperation(type: .markUnread, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX")
         op2.status = PendingStatus.cancelled.rawValue
         var op3 = PendingOperation(type: .markFlagged, messageIds: ["msg-3"], accountId: "acc1", folderPath: "INBOX")
@@ -431,7 +431,7 @@ struct PendingOperationPersistenceTests {
         ]
 
         for opType in types {
-            let op = PendingOperation(type: opType, messageIds: ["msg"], accountId: "acc1", folderPath: "INBOX")
+            var op = PendingOperation(type: opType, messageIds: ["msg"], accountId: "acc1", folderPath: "INBOX")
             try db.write { try op.insert($0) }
             let fetched = try db.read { try PendingOperation.fetchOne($0, key: op.id) }
             #expect(fetched?.type == opType, "OperationType \(opType.rawValue) should round-trip")

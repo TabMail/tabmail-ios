@@ -438,11 +438,12 @@ enum NotificationActionRouter {
                     // bare-UID op without it, which the drain's checkpoint A deleted
                     // — so an ARCHIVE/DELETE/MARK_READ tapped on a push banner for a
                     // not-yet-synced IMAP/iCloud message did nothing, silently.
-                    try PendingOperation(
+                    var markReadOp = try PendingOperation(
                         type: .markRead, messageIds: [messageId], accountId: accountId,
                         folderPath: inboxPath,
                         observedUidValidity: AccountManager.admissionEpochForNewGesture(
-                            accountId: accountId, folderPath: inboxPath, db: db)).insert(db)
+                            accountId: accountId, folderPath: inboxPath, db: db))
+                    try markReadOp.insert(db)
                     return true
                 }
                 log("[NotificationActionRouter] header not local — \(admitted ? "queued" : "REFUSED (unknown folder epoch)") markRead PendingOperation for \(messageId)")
@@ -457,11 +458,12 @@ enum NotificationActionRouter {
                     guard try !AccountManager.newGestureRefusedForUnknownEpoch(
                         accountId: accountId, folderPath: inboxPath, db: db) else { return false }
                     // Record the proven epoch — see the MARK_READ arm (audit A-1).
-                    try PendingOperation(
+                    var moveOp = try PendingOperation(
                         type: .move, messageIds: [messageId], accountId: accountId,
                         folderPath: inboxPath, destinationPath: destinationPath,
                         observedUidValidity: AccountManager.admissionEpochForNewGesture(
-                            accountId: accountId, folderPath: inboxPath, db: db)).insert(db)
+                            accountId: accountId, folderPath: inboxPath, db: db))
+                    try moveOp.insert(db)
                     return true
                 }
                 log("[NotificationActionRouter] header not local — \(admitted ? "queued" : "REFUSED (unknown folder epoch)") \(actionId) (.move) PendingOperation for \(messageId)")

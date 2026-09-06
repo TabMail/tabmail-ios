@@ -97,6 +97,16 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         /// chain-demotion path for RFC members.
         var unclassified400RFCs: Set<String> = []
         var unclassified400Served = 0
+        /// EVERY MUTATING REQUEST THIS SERVER SERVED, IN ARRIVAL ORDER.
+        ///
+        /// `"PATCH <providerId>"` / `"MOVE <providerId>"`. The wire-order oracle
+        /// for the global FIFO executor: a durable-state-only assertion cannot
+        /// tell "all eight members were settled" from "they were settled in the
+        /// order the queue holds them", and it cannot see an unrelated operation
+        /// yielded to in the middle of a narrowing chain at all. Appended inside
+        /// the route, before any parking, so it records ARRIVAL rather than
+        /// completion.
+        var mutationLog: [String] = []
         /// Seconds a `PATCH /messages/{id}` response is withheld for, per
         /// provider message id. Absent (the default) keeps the fixture
         /// instantaneous. PER ID rather than uniform because the shape the
@@ -218,10 +228,11 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
     /// answers 503 and no wire effect lands.
     ///
     /// Distinct from the one-shot budgets on purpose. A fuzz round that wants
-    /// "this lane halts and stays halted for the whole round" cannot express that
-    /// with a budget — a budget that runs out mid-round silently turns the round
-    /// into a transient-fault round, and the round's oracle ("exactly the halted
-    /// state is retained") would then be asserted against the wrong scenario.
+    /// "this chain defers and stays deferred for the whole round" cannot express
+    /// that with a budget — a budget that runs out mid-round silently turns the
+    /// round into a transient-fault round, and the round's oracle ("exactly the
+    /// deferred state is retained") would then be asserted against the wrong
+    /// scenario.
     func failAllMutations(_ failing: Bool) {
         state.value.withLock { $0.allMutationsFail = failing }
     }
@@ -334,6 +345,17 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
     /// unclassified 400 — one per provider attempt on the failing op.
     func unclassified400ServedCount() -> Int {
         state.value.withLock { $0.unclassified400Served }
+    }
+
+    /// Every mutating request served, in arrival order. See `State.mutationLog`.
+    func mutationLog() -> [String] {
+        state.value.withLock { $0.mutationLog }
+    }
+
+    /// Forget the recorded wire order, so a phase can assert about its own
+    /// requests without the previous phase's.
+    func clearMutationLog() {
+        state.value.withLock { $0.mutationLog.removeAll() }
     }
 
     /// v3 adaptation (D4): the durable action op records Graph's native
@@ -493,6 +515,9 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                 : .status(404)
         }
         http.register(path: "/messages/", method: "PATCH") { [state] request in
+            if let providerId = Self.messageId(from: request.url, move: false) {
+                state.value.withLock { $0.mutationLog.append("PATCH \(providerId)") }
+            }
             let response = servePatch(request)
             let providerId = Self.messageId(from: request.url, move: false) ?? ""
             let latency = state.value.withLock { $0.patchLatencyByProviderId[providerId] ?? 0 }
@@ -510,6 +535,9 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             return removed ? .status(204) : .status(404)
         }
         http.register(path: "/messages/", method: "POST") { [state, churnsIdOnMove] request in
+            if let providerId = Self.messageId(from: request.url, move: true) {
+                state.value.withLock { $0.mutationLog.append("MOVE \(providerId)") }
+            }
             // One-shot hold, taken before any early return so a test that arms it
             // parks every move that reaches the route, not only the ones that
             // would have succeeded. Taking it is the SYNCHRONOUS part and stays

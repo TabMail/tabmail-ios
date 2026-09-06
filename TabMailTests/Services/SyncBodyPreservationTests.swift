@@ -433,12 +433,13 @@ struct DraftStaleProtectionTests {
         // Insert PendingOperation with placeholder messageId (as queueDraftSave does)
         let opPlaceholder = "draft-\(draftId)"
         try db.write { dbConn in
-            try PendingOperation(
+            var saveDraftOp = PendingOperation(
                 type: .saveDraft,
                 messageIds: [draftId, opPlaceholder, rfc822],
                 accountId: "acc1",
                 folderPath: "Drafts"
-            ).insert(dbConn)
+            )
+            try saveDraftOp.insert(dbConn)
         }
 
         // Sync with empty server — placeholder should NOT be deleted
@@ -463,12 +464,13 @@ struct DraftStaleProtectionTests {
 
         // PendingOperation includes rfc822MessageId (third element, as queueDraftSave does)
         try db.write { dbConn in
-            try PendingOperation(
+            var saveDraftOp2 = PendingOperation(
                 type: .saveDraft,
                 messageIds: ["rfc-test", "draft-rfc-test", rfc822],
                 accountId: "acc1",
                 folderPath: "Drafts"
-            ).insert(dbConn)
+            )
+            try saveDraftOp2.insert(dbConn)
         }
 
         // Sync with empty server — protected by rfc822
@@ -514,13 +516,14 @@ struct DraftStaleProtectionTests {
 
         // PendingOperation targets Drafts via destinationPath
         try db.write { dbConn in
-            try PendingOperation(
+            var moveOp = PendingOperation(
                 type: .move,
                 messageIds: ["dest-protected"],
                 accountId: "acc1",
                 folderPath: "INBOX",
                 destinationPath: "Drafts"
-            ).insert(dbConn)
+            )
+            try moveOp.insert(dbConn)
         }
 
         let result = try simulateFullSync(db: db, folder: draftsFolder, messages: [])
@@ -599,13 +602,14 @@ struct MoveUIDRemapBodyTests {
             try body.insert(dbConn)
 
             // PendingOperation from INBOX → Archive, messageIds contain stableId
-            try PendingOperation(
+            var archiveOp = PendingOperation(
                 type: .archive,
                 messageIds: [rfc822], // stableId = rfc822MessageId for IMAP
                 accountId: "acc1",
                 folderPath: "INBOX",
                 destinationPath: "Archive"
-            ).insert(dbConn)
+            )
+            try archiveOp.insert(dbConn)
         }
 
         // Sync Archive with empty server (server hasn't processed the MOVE yet)
