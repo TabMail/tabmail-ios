@@ -218,7 +218,7 @@ private func simulateRunSyncMessages(
                 if existing.isReplied && existing.actionTag == .reply {
                     existing.actionTag = ActionTag.none
                     existing.tagSortOrder = ActionTag.none.sortOrder
-                    let tagOp = PendingOperation(
+                    var tagOp = PendingOperation(
                         type: .setTag,
                         messageIds: [existing.stableId],
                         accountId: accountId,
@@ -264,7 +264,7 @@ private func simulateRunSyncMessages(
             if header.isReplied && header.actionTag == .reply {
                 header.actionTag = ActionTag.none
                 header.tagSortOrder = ActionTag.none.sortOrder
-                let tagOp = PendingOperation(
+                var tagOp = PendingOperation(
                     type: .setTag,
                     messageIds: [header.stableId],
                     accountId: accountId,
@@ -503,7 +503,7 @@ struct RunSyncStaleDetectionTests {
         try TestDatabase.insertMessageHeader(db, messageId: "2", subject: "Has pending op")
 
         // Create a pending archive operation for message "2"
-        let pendingOp = PendingOperation(
+        var pendingOp = PendingOperation(
             type: .archive,
             messageIds: ["2"],
             accountId: "acc1",
@@ -866,7 +866,7 @@ struct RunSyncPendingOpProtectionTests {
         let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
 
         // Create pending archive operation for messageId "42" (user archived it)
-        let pendingOp = PendingOperation(
+        var pendingOp = PendingOperation(
             type: .archive,
             messageIds: ["42"],
             accountId: "acc1",
@@ -913,7 +913,7 @@ struct RunSyncPendingOpProtectionTests {
         }
 
         // Create pending markRead operation (user has in-flight read change)
-        let pendingOp = PendingOperation(
+        var pendingOp = PendingOperation(
             type: .markRead,
             messageIds: ["55"],
             accountId: "acc1",
@@ -951,7 +951,7 @@ struct RunSyncPendingOpProtectionTests {
         let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
 
         // Create pending delete operation
-        let pendingOp = PendingOperation(
+        var pendingOp = PendingOperation(
             type: .delete,
             messageIds: ["99"],
             accountId: "acc1",
@@ -982,7 +982,7 @@ struct RunSyncPendingOpProtectionTests {
         try TestDatabase.insertMessageHeader(db, messageId: "77", subject: "Moving msg")
 
         // Create pending move operation
-        let pendingOp = PendingOperation(
+        var pendingOp = PendingOperation(
             type: .move,
             messageIds: ["77"],
             accountId: "acc1",

@@ -303,7 +303,7 @@ struct DrainQueueResilienceTests {
             accountId: "acc1",
             folderPath: "INBOX"
         )
-        try await db.write { db in try op.insert(db) }
+        try await db.write { db in _ = try op.inserted(db) }
 
         await provider.setMarkReadThrows(ProviderError.notConnected)
 
@@ -324,8 +324,8 @@ struct DrainQueueResilienceTests {
         let op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
         let op2 = PendingOperation(type: .markRead, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX")
         try await db.write { db in
-            try op1.insert(db)
-            try op2.insert(db)
+            try op1.inserted(db)
+            try op2.inserted(db)
         }
 
         await provider.setMarkReadThrows(ProviderError.notConnected)
@@ -350,8 +350,8 @@ struct DrainQueueResilienceTests {
         let op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
         let op2 = PendingOperation(type: .move, messageIds: ["msg-2"], accountId: "acc2", folderPath: "INBOX", destinationPath: "Archive")
         try await db.write { db in
-            try op1.insert(db)
-            try op2.insert(db)
+            try op1.inserted(db)
+            try op2.inserted(db)
         }
 
         // Only markRead fails (acc1), move succeeds (acc2)
@@ -373,7 +373,7 @@ struct DrainQueueResilienceTests {
     @Test("Op survives multiple drain passes until connection restored")
     func opSurvivesMultipleDrainPasses() async throws {
         let op = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
-        try await db.write { db in try op.insert(db) }
+        try await db.write { db in _ = try op.inserted(db) }
 
         await provider.setMarkReadThrows(ProviderError.notConnected)
 

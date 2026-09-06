@@ -221,26 +221,34 @@ struct MergeIdempotenceTests {
         try TestDatabase.insertAccount(db, id: "acc1", email: "u@ex.com")
         try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
 
-        // Simulate merge inserting setTag pendingOp twice (e.g. crash between
-        // merge-write and staging-row-delete → merge re-runs).
+        // THE REAL PRODUCER, RUN TWICE — a crash between the merge write and the
+        // staging-row delete makes the merge re-run, and this is the function
+        // that admission goes through. It used to be simulated here by a raw
+        // `INSERT OR IGNORE` copied out of the implementation; that copy silently
+        // stopped describing production when the admission became a typed insert
+        // (the record type allocates `queuePosition` in `willInsert`, which no
+        // hand-written INSERT does), so the simulation is gone.
         let detId = "setTag:acc1:msg100:reply"
-        let messageIdsJSON = (try? JSONSerialization.data(withJSONObject: ["msg100"]))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
         for _ in 0..<2 {
             try db.write { db in
-                // try? because second insert is expected to violate PK UNIQUE.
-                try? db.execute(sql: """
-                    INSERT INTO pendingOperation (id, type, messageIdsJSON, accountId, folderPath, tagValue, createdAt, status, retryCount)
-                    VALUES (?, 'setTag', ?, ?, 'INBOX', ?, ?, 'queued', 0)
-                    """, arguments: [detId, messageIdsJSON, "acc1", "reply", Date()])
+                try NSEDataBridge.queueSetTagPendingOp(
+                    db: db, accountId: "acc1", messageId: "msg100", tag: "reply")
             }
         }
 
-        let count: Int = try db.read {
-            try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM pendingOperation WHERE id = ?",
-                             arguments: [detId])!
+        let rows = try db.read {
+            try PendingOperation.filter(Column("id") == detId).fetchAll($0)
         }
-        #expect(count == 1, "Deterministic id must dedup — one op, not two")
+        #expect(rows.count == 1, "Deterministic id must dedup — one op, not two")
+        guard let admitted = rows.first else { return }
+        #expect(admitted.type == .setTag)
+        #expect(admitted.messageIds == ["msg100"])
+        #expect(admitted.tagValue == "reply")
+        // The second call must not have re-admitted it at a NEW position either:
+        // a dedup that deleted and reinserted would move the user's intention to
+        // the back of the queue every time the merge re-ran.
+        #expect(admitted.queuePosition == 1,
+                "a deduped re-merge must leave the admitted position alone, got \(admitted.queuePosition)")
     }
 
     @Test("Sync-arrives-after-NSE: header already exists, body not re-fetched")

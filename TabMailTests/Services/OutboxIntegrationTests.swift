@@ -532,26 +532,28 @@ struct FinalizeOutboxReplyDetectTests {
                         arguments: [originalId]
                     )
                     if let original = try MessageHeader.fetchOne(dbConn, key: originalId) {
-                        try PendingOperation(
+                        var markForwardedOp = PendingOperation(
                             type: .markForwarded,
                             messageIds: [original.stableId],
                             accountId: original.accountId,
                             folderPath: original.folderPath
-                        ).insert(dbConn)
+                        )
+                        try markForwardedOp.insert(dbConn)
                     }
                 } else {
                     if var original = try MessageHeader.fetchOne(dbConn, key: originalId) {
                         original.isReplied = true
-                        try PendingOperation(
+                        var markRepliedOp = PendingOperation(
                             type: .markReplied,
                             messageIds: [original.stableId],
                             accountId: original.accountId,
                             folderPath: original.folderPath
-                        ).insert(dbConn)
+                        )
+                        try markRepliedOp.insert(dbConn)
                         if original.actionTag == .reply {
                             original.actionTag = ActionTag.none
                             original.tagSortOrder = ActionTag.none.sortOrder
-                            let tagOp = PendingOperation(
+                            var tagOp = PendingOperation(
                                 type: .setTag,
                                 messageIds: [original.stableId],
                                 accountId: original.accountId,
@@ -1113,12 +1115,13 @@ struct OutboxOptimisticReplyFlagTests {
             try OutboxMessage.deleteOne(dbConn, key: outboxId)
             // finalizeOutboxMessage sets flag again (idempotent) + queues PendingOp
             try dbConn.execute(sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?", arguments: [header.id])
-            try PendingOperation(
+            var markRepliedOp2 = PendingOperation(
                 type: .markReplied,
                 messageIds: [header.stableId],
                 accountId: header.accountId,
                 folderPath: header.folderPath
-            ).insert(dbConn)
+            )
+            try markRepliedOp2.insert(dbConn)
         }
 
         // PendingOperation now exists for server-side \Answered flag

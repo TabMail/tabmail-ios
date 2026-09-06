@@ -173,9 +173,10 @@ struct UndoProviderIdentitySafetyTests {
             observedUidValidity: epoch)
         operation.status = PendingStatus.inFlight.rawValue
         operation.everAttempted = true
-        let insertedOperation = operation
-        try await fixture.pool.write { db in try insertedOperation.insert(db) }
-        return insertedOperation
+        let toInsert = operation
+        // `inserted` returns the copy the write allocated a `queuePosition` for,
+        // so the value handed back matches the durable row.
+        return try await fixture.pool.write { db in try toInsert.inserted(db) }
     }
 
     @MainActor
@@ -584,13 +585,14 @@ struct UndoProviderIdentitySafetyTests {
         let insertedRow = row
         try await fixture.pool.write { db in
             try insertedRow.insert(db)
-            try PendingOperation(
+            var moveOp = PendingOperation(
                 type: .move,
                 messageIds: ["901"],
                 accountId: fixture.accountId,
                 folderPath: "Trash",
                 destinationPath: "INBOX",
-                observedUidValidity: 74).insert(db)
+                observedUidValidity: 74)
+            try moveOp.insert(db)
         }
 
         let outcome = await AccountManager.shared.move([insertedRow], to: "Trash")
@@ -849,14 +851,15 @@ struct UndoProviderIdentitySafetyTests {
         let original = sourceHeader(fixture, providerId: "101", rfc: "same@example.com")
         try installOptimisticallyMoved(original, pool: fixture.pool)
         try await fixture.pool.write { db in
-            try PendingOperation(
+            var moveOp2 = PendingOperation(
                 type: .move,
                 messageIds: ["101"],
                 accountId: fixture.accountId,
                 folderPath: "INBOX",
                 destinationPath: "Archive",
                 observedUidValidity: 41
-            ).insert(db)
+            )
+            try moveOp2.insert(db)
         }
 
         await AccountManager.shared.undoDestructiveAction(
@@ -911,12 +914,15 @@ struct UndoProviderIdentitySafetyTests {
         try installOptimisticallyMoved(mailbox, pool: fixture.pool)
         try installOptimisticallyMoved(epoch, pool: fixture.pool)
         try await fixture.pool.write { db in
-            try PendingOperation(type: .move, messageIds: ["301", "302"], accountId: fixture.accountId,
-                                 folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 41).insert(db)
-            try PendingOperation(type: .move, messageIds: ["401"], accountId: fixture.accountId,
-                                 folderPath: "Other", destinationPath: "Archive", observedUidValidity: 63).insert(db)
-            try PendingOperation(type: .move, messageIds: ["501"], accountId: fixture.accountId,
-                                 folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 40).insert(db)
+            var moveOp3 = PendingOperation(type: .move, messageIds: ["301", "302"], accountId: fixture.accountId,
+                                 folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 41)
+            try moveOp3.insert(db)
+            var moveOp4 = PendingOperation(type: .move, messageIds: ["401"], accountId: fixture.accountId,
+                                 folderPath: "Other", destinationPath: "Archive", observedUidValidity: 63)
+            try moveOp4.insert(db)
+            var moveOp5 = PendingOperation(type: .move, messageIds: ["501"], accountId: fixture.accountId,
+                                 folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 40)
+            try moveOp5.insert(db)
         }
 
         for original in [partial, mailbox, epoch] {

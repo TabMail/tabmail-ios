@@ -24,7 +24,7 @@ struct E2EEmailLifecycleTests {
         try db.write { try header.update($0) }
 
         // Queue PendingOp
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .archive,
             messageIds: ["1"],
             accountId: "acc1",
@@ -49,7 +49,7 @@ struct E2EEmailLifecycleTests {
         try TestDatabase.insertMessageHeader(db, messageId: "1")
 
         // Queue PendingOp for delete
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .delete,
             messageIds: ["1"],
             accountId: "acc1",
@@ -72,7 +72,7 @@ struct E2EEmailLifecycleTests {
         try db.write { try header.update($0) }
 
         // Queue PendingOp
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .markRead,
             messageIds: ["1"],
             accountId: "acc1",
@@ -95,7 +95,7 @@ struct E2EEmailLifecycleTests {
         header.isFlagged = true
         try db.write { try header.update($0) }
 
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .markFlagged,
             messageIds: ["1"],
             accountId: "acc1",
@@ -170,7 +170,7 @@ struct E2EEmailLifecycleTests {
         try db.write { try header.update($0) }
 
         // Queue setTag PendingOp
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .setTag,
             messageIds: ["1"],
             accountId: "acc1",

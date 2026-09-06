@@ -82,7 +82,7 @@ struct DeltaSyncDBPatternTests {
         try TestDatabase.insertMessageHeader(db, messageId: "msg-with-pending", accountId: "acc1")
 
         // Insert a pending operation for this message
-        let pendingOp = PendingOperation(
+        var pendingOp = PendingOperation(
             type: .move,
             messageIds: ["msg-with-pending"],
             accountId: "acc1",
@@ -203,7 +203,7 @@ struct TagOperationTests {
         try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
         try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
 
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .setTag,
             messageIds: ["msg-1"],
             accountId: "acc1",
@@ -227,7 +227,7 @@ struct TagOperationTests {
         try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
         try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
 
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .removeTag,
             messageIds: ["msg-1"],
             accountId: "acc1",
@@ -327,7 +327,7 @@ struct TagOperationTests {
         // Also queue pending ops for each
         try db.write { dbConn in
             for msgId in ["batch-1", "batch-2", "batch-3"] {
-                let op = PendingOperation(
+                var op = PendingOperation(
                     type: .setTag,
                     messageIds: [msgId],
                     accountId: "acc1",

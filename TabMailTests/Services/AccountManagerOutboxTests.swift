@@ -372,7 +372,7 @@ struct LocalIndexWipeOutboxTests {
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
 
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .move,
             messageIds: ["msg-1"],
             accountId: "acc1",
@@ -415,7 +415,7 @@ struct LocalIndexWipeOutboxTests {
             createdAt: now,
             updatedAt: now
         )
-        let save = PendingOperation(
+        var save = PendingOperation(
             type: .saveDraft,
             messageIds: [draftId, "placeholder-message-id"],
             accountId: "acc1",
@@ -452,7 +452,7 @@ struct LocalIndexWipeOutboxTests {
         // NON-VACUITY, two-sided: the wipe really ran (a header would be gone),
         // and the narrowing is a NARROWING — an ordinary action in the same table
         // is still purged, so this is not "the statement stopped deleting".
-        let move = PendingOperation(
+        var move = PendingOperation(
             type: .move, messageIds: ["msg-1"], accountId: "acc1",
             folderPath: "INBOX", destinationPath: "Archive")
         try db.write { try move.insert($0) }
@@ -568,7 +568,7 @@ struct LocalIndexWipeCalendarTests {
             calendarId: "primary",
             arguments: ["title": .string("Moved to Thursday")]
         )
-        let messageOp = PendingOperation(
+        var messageOp = PendingOperation(
             type: .archive,
             messageIds: ["msg-1"],
             accountId: "acc1",

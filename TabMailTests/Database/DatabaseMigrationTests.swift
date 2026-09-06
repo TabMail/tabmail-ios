@@ -144,18 +144,42 @@ struct DatabaseMigrationTests {
         }
     }
 
+    /// A pre-existing queue row, written the way a SHIPPED BINARY wrote it —
+    /// raw SQL naming only the columns that existed then.
+    ///
+    /// 🚨 `queuePosition` IS SUPPLIED ONLY WHEN THE SCHEMA UNDER TEST HAS IT.
+    /// This helper is called at two different schema versions: before `v90`,
+    /// where naming the column is a hard `no such column` error, and at the
+    /// current version, where OMITTING it is a hard `NOT NULL constraint
+    /// failed` — the column is deliberately `NOT NULL` with no default, so a
+    /// writer that forgets it fails loudly instead of admitting an operation
+    /// at the unallocated sentinel. Branching on the live schema is what lets
+    /// one helper serve both, and the branch is a fixture detail: production
+    /// never writes this table in raw SQL.
     private static func insertRawPendingOperation(
         _ db: DatabaseQueue,
         id: String,
         accountId: String,
-        type: String = OperationType.deleteDraft.rawValue
+        type: String = OperationType.deleteDraft.rawValue,
+        queuePosition: Int = 1
     ) throws {
         try db.write { connection in
-            try connection.execute(sql: """
-                INSERT INTO pendingOperation
-                    (id, type, messageIdsJSON, accountId, folderPath, createdAt)
-                VALUES (?, ?, '[\"42\"]', ?, 'DRAFT', datetime('now'))
-                """, arguments: [id, type, accountId])
+            let hasQueuePosition = try Row
+                .fetchAll(connection, sql: "PRAGMA table_info(pendingOperation)")
+                .contains { ($0["name"] as String) == "queuePosition" }
+            if hasQueuePosition {
+                try connection.execute(sql: """
+                    INSERT INTO pendingOperation
+                        (id, type, messageIdsJSON, accountId, folderPath, createdAt, queuePosition)
+                    VALUES (?, ?, '[\"42\"]', ?, 'DRAFT', datetime('now'), ?)
+                    """, arguments: [id, type, accountId, queuePosition])
+            } else {
+                try connection.execute(sql: """
+                    INSERT INTO pendingOperation
+                        (id, type, messageIdsJSON, accountId, folderPath, createdAt)
+                    VALUES (?, ?, '[\"42\"]', ?, 'DRAFT', datetime('now'))
+                    """, arguments: [id, type, accountId])
+            }
         }
     }
 
@@ -530,13 +554,17 @@ struct DatabaseMigrationTests {
             let names = columns.map { $0["name"] as String }
             #expect(names.contains("uidResolutionRetryCount"))
         }
-        // A row inserted via raw SQL that omits the column (mirrors the explicit-
-        // column INSERTs in AppDelegate.swift/NSEDataBridge.swift) must default to 0.
+        // A row inserted via raw SQL that omits the column must default to 0.
+        // `queuePosition` IS named: it is `NOT NULL` with no default precisely
+        // so that a writer which forgets it cannot admit an operation at the
+        // unallocated sentinel, which makes it the one column a raw INSERT can
+        // no longer leave out. That is the opposite of the property under test
+        // here and is asserted directly in `GlobalFifoExecutorTests`.
         try TestDatabase.insertAccount(db)
         try db.write { db in
             try db.execute(sql: """
-                INSERT INTO pendingOperation (id, type, messageIdsJSON, accountId, folderPath, createdAt, status, retryCount)
-                VALUES ('op1', 'markRead', '["msg-1"]', 'acc1', 'INBOX', datetime('now'), 'queued', 0)
+                INSERT INTO pendingOperation (id, type, messageIdsJSON, accountId, folderPath, createdAt, status, retryCount, queuePosition)
+                VALUES ('op1', 'markRead', '["msg-1"]', 'acc1', 'INBOX', datetime('now'), 'queued', 0, 1)
                 """)
         }
         let fetched = try db.read { db in try PendingOperation.fetchOne(db, key: "op1") }
@@ -664,17 +692,30 @@ struct DatabaseMigrationTests {
         #expect((column["notnull"] as Int) == 1)
         #expect((column["dflt_value"] as String?) == "0")
 
+        // RAW read, not a typed `PendingOperation.fetchOne`: this database is
+        // pinned at `v78`, and the record type describes the CURRENT schema
+        // (which has `queuePosition` from `v90`). Decoding it here would fail
+        // on a column this migration's database legitimately does not have, and
+        // that failure says nothing about the backfill under test.
         let existing = try db.read {
-            try PendingOperation.fetchOne($0, key: "op-existing")
+            try Bool.fetchOne(
+                $0, sql: "SELECT everAttempted FROM pendingOperation WHERE id = 'op-existing'")
         }
-        #expect(existing?.everAttempted == true)
+        #expect(existing == true)
 
-        let fresh = PendingOperation(
-            type: .markRead, messageIds: ["msg-new"],
-            accountId: "acc1", folderPath: "INBOX")
-        try db.write { try fresh.insert($0) }
-        let inserted = try db.read { try PendingOperation.fetchOne($0, key: fresh.id) }
-        #expect(inserted?.everAttempted == false)
+        // RAW insert for the same reason as the raw read above. A typed
+        // `PendingOperation.insert` runs `willInsert`, which allocates
+        // `queuePosition` from `SELECT MAX(queuePosition)` — a column `v90`
+        // adds and this `v78`-pinned database does not have. The subject here
+        // is `everAttempted`'s DEFAULT, which only a row the migration did not
+        // touch can show, so the insert must speak this database's schema.
+        try Self.insertRawPendingOperation(db, id: "op-new", accountId: "acc1")
+        let inserted = try db.read {
+            try Bool.fetchOne(
+                $0, sql: "SELECT everAttempted FROM pendingOperation WHERE id = 'op-new'")
+        }
+        #expect(inserted == false,
+                "a row inserted AFTER the migration must take the column's `0` default")
     }
 
     // MARK: - The migration chain's arrival invariants

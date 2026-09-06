@@ -86,9 +86,46 @@ enum EscapedDrainTransport {
         static let settleIntervalMs = 10
     }
 
-    /// Blocks until every durable pending operation has been ATTEMPTED and no
-    /// drain is in flight — i.e. until nothing the caller started is still
-    /// using the transport it is about to tear down.
+    /// The three facts the settle predicate is built from, read in one
+    /// transaction so they cannot disagree about the same queue.
+    private struct QueueSettleReading: Sendable {
+        var total: Int
+        var unattempted: Int
+        var claimed: Int
+
+        /// A drain really ran against this queue: it either emptied it or left
+        /// at least one row carrying the claim's durable attempt proof.
+        ///
+        /// 🚨 THIS IS NOT `unattempted == 0`, AND THE DIFFERENCE IS THE WHOLE
+        /// POINT. The global single-operation executor claims ONE row at a time
+        /// and stops the drain at a failure, so an operation sitting behind a
+        /// failed one is NEVER CLAIMED — legitimately, by design, that is the
+        /// guarantee. Waiting for `everAttempted` on every row therefore waits
+        /// for something that will not happen and burns the whole bound on a
+        /// healthy queue. What the transport actually needs is that no drain is
+        /// running and no row is still claimed; what the DIAGNOSTIC needs is
+        /// proof the drain was not silently unclaimable from the start (no
+        /// provider registered, no network), and one attempted row is exactly
+        /// that proof.
+        var aDrainReachedTheWire: Bool { total == 0 || unattempted < total }
+    }
+
+    private static func read(_ pool: DatabasePool) async throws -> QueueSettleReading {
+        try await pool.read { db in
+            QueueSettleReading(
+                total: try PendingOperation.fetchCount(db),
+                unattempted: try PendingOperation
+                    .filter(Column("everAttempted") == false)
+                    .fetchCount(db),
+                claimed: try PendingOperation
+                    .filter(Column("status") == PendingStatus.inFlight.rawValue)
+                    .fetchCount(db))
+        }
+    }
+
+    /// Blocks until no drain is in flight, no operation is still CLAIMED, and a
+    /// drain has demonstrably reached the wire — i.e. until nothing the caller
+    /// started is still using the transport it is about to tear down.
     ///
     /// Records a `Testing` issue rather than returning silently if the bound
     /// expires: a silent return here re-opens the process-killing race, and a
@@ -96,30 +133,26 @@ enum EscapedDrainTransport {
     /// network, a second drain source) that must be diagnosed, not slept off.
     static func awaitPendingQueueSettled(pool: DatabasePool) async throws {
         for _ in 0..<Config.settleAttempts {
-            let unattempted = try await pool.read { db in
-                try PendingOperation
-                    .filter(Column("everAttempted") == false)
-                    .fetchCount(db)
-            }
+            let reading = try await read(pool)
             let isQuiescent = await AccountManager.shared
                 .pendingQueueIsQuiescentForTesting()
-            if unattempted == 0 && isQuiescent { return }
+            if reading.aDrainReachedTheWire && reading.claimed == 0 && isQuiescent { return }
             try await Task.sleep(for: .milliseconds(Config.settleIntervalMs))
         }
-        let unattempted = try await pool.read { db in
-            try PendingOperation
-                .filter(Column("everAttempted") == false)
-                .fetchCount(db)
-        }
+        let reading = try await read(pool)
         let isQuiescent = await AccountManager.shared
             .pendingQueueIsQuiescentForTesting()
         Issue.record(
             """
-            The pending-queue drain never settled: \(unattempted) operation(s) \
-            still unattempted, quiescent = \(isQuiescent). Closing the scope's \
-            transport now would invalidate a URLSession an in-flight drain is \
-            using, which kills the whole test process. Diagnose the drain — do \
-            not widen this bound.
+            The pending-queue drain never settled: \(reading.total) operation(s) \
+            remain, \(reading.unattempted) of them never attempted, \
+            \(reading.claimed) still claimed, quiescent = \(isQuiescent). \
+            Closing the scope's transport now would invalidate a URLSession an \
+            in-flight drain is using, which kills the whole test process. \
+            Diagnose the drain — do not widen this bound. If EVERY row is \
+            unattempted the drain never claimed anything at all: check that a \
+            provider is registered for the account and that the connectivity \
+            gate lets the drain start.
             """)
     }
 

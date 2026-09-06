@@ -117,7 +117,7 @@ struct InsertBackfillBatchDedupTests {
                 if header.isReplied && header.actionTag == .reply {
                     header.actionTag = ActionTag.none
                     header.tagSortOrder = ActionTag.none.sortOrder
-                    let tagOp = PendingOperation(
+                    var tagOp = PendingOperation(
                         type: .setTag,
                         messageIds: [header.stableId],
                         accountId: accountId,
@@ -235,12 +235,13 @@ struct InsertBackfillBatchDedupTests {
 
         // Create a pending archive op for message "100"
         try db.write { db in
-            try PendingOperation(
+            var archiveOp = PendingOperation(
                 type: .archive,
                 messageIds: ["100"],
                 accountId: "acc1",
                 folderPath: "INBOX"
-            ).insert(db)
+            )
+            try archiveOp.insert(db)
         }
 
         let infos = [
@@ -264,12 +265,13 @@ struct InsertBackfillBatchDedupTests {
 
         // Pending move uses rfc822MessageId (IMAP undo pattern)
         try db.write { db in
-            try PendingOperation(
+            var moveOp = PendingOperation(
                 type: .move,
                 messageIds: ["<msg100@example.com>"],
                 accountId: "acc1",
                 folderPath: "INBOX"
-            ).insert(db)
+            )
+            try moveOp.insert(db)
         }
 
         let infos = [
@@ -293,12 +295,13 @@ struct InsertBackfillBatchDedupTests {
 
         // Pending delete in Sent folder
         try db.write { db in
-            try PendingOperation(
+            var deleteOp = PendingOperation(
                 type: .delete,
                 messageIds: ["100"],
                 accountId: "acc1",
                 folderPath: "Sent"
-            ).insert(db)
+            )
+            try deleteOp.insert(db)
         }
 
         let infos = [makeHeaderInfo(messageId: "100")]
@@ -406,7 +409,7 @@ struct InsertBackfillBatchReplyDetectTests {
                 if header.isReplied && header.actionTag == .reply {
                     header.actionTag = ActionTag.none
                     header.tagSortOrder = ActionTag.none.sortOrder
-                    let tagOp = PendingOperation(
+                    var tagOp = PendingOperation(
                         type: .setTag,
                         messageIds: [header.stableId],
                         accountId: "acc1",

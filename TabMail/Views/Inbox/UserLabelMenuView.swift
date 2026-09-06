@@ -289,7 +289,7 @@ final class UserLabelMenuModel {
                 // PROVIDER-AUTHORITATIVE no-op, so the op leaves the queue as if
                 // it had succeeded and the user's label action is silently
                 // discarded — the cardinal sin of this codebase.
-                let op = PendingOperation(
+                var op = PendingOperation(
                     type: .addUserLabel,
                     messageIds: admission.providerIds,
                     accountId: header.accountId,
@@ -340,7 +340,7 @@ final class UserLabelMenuModel {
                 // `applyLabel`, including the Gmail authoritative-rejection trap
                 // that turns a prefixed wire value into a SILENT drop of the
                 // user's intention rather than a visible failure.
-                let op = PendingOperation(
+                var op = PendingOperation(
                     type: .removeUserLabel,
                     messageIds: admission.providerIds,
                     accountId: header.accountId,

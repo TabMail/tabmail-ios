@@ -3065,23 +3065,52 @@ enum NSEDataBridge {
 
     /// Queue a `setTag` pending operation with a deterministic id, so re-runs
     /// of the merge (e.g. after a crash between write + staging-row delete)
-    /// don't stack duplicate ops for the same message+tag. The deterministic
-    /// id + `INSERT OR IGNORE` makes dedup explicit — on collision the existing
-    /// queued op is preserved; other SQL errors surface via `throws`.
+    /// don't stack duplicate ops for the same message+tag.
+    ///
+    /// 🚨 THIS USED TO BE A RAW `INSERT OR IGNORE`, AND THE BLANKET IGNORE IS
+    /// WHAT HAD TO GO. `pendingOperation.queuePosition` is `NOT NULL` with a
+    /// `CHECK (queuePosition > 0)` and no default, and it is allocated by
+    /// `PendingOperation.willInsert(_:)` — a callback a raw statement never
+    /// reaches. A raw insert that omitted the column would therefore fail its
+    /// constraint, `OR IGNORE` would SWALLOW that failure, and the user's tag
+    /// would be dropped with no error anywhere: a never-drop violation whose
+    /// only symptom is a tag that quietly never syncs. Going through the typed
+    /// record fixes both halves at once — the position is allocated, and any
+    /// remaining SQL error still surfaces through `throws`.
+    ///
+    /// 🚨 THE DEDUP IS PRESERVED AND IS NOW EXPLICIT. The deterministic id
+    /// `setTag:<accountId>:<messageId>:<tag>` is unchanged, and the existence
+    /// check replaces `OR IGNORE` with the same outcome for the case that
+    /// actually occurs: on collision the EXISTING queued row is left exactly as
+    /// it is — same position, same status, same retry count. It is deliberately
+    /// NOT an upsert: overwriting a live queued row would move a user intention
+    /// the drain may already be holding. GRDB serializes writers and this runs
+    /// inside the merge's own transaction, so the check and the insert cannot be
+    /// separated by another writer.
     ///
     /// Skips entirely when tag is nil, empty, or "none" (no IMAP write needed).
-    fileprivate static func queueSetTagPendingOp(
+    /// Internal rather than `fileprivate` so `MergeIdempotenceTests` can drive
+    /// THIS function twice instead of hand-writing an INSERT that resembles it.
+    /// The idempotence being asserted is a property of this admission path — the
+    /// deterministic id plus the existence check below — and a test that
+    /// reproduces the SQL instead of calling the function stays green when the
+    /// function changes shape, which is exactly what happened when this stopped
+    /// being a raw `INSERT OR IGNORE`.
+    static func queueSetTagPendingOp(
         db: GRDB.Database, accountId: String, messageId: String, tag: String?
     ) throws {
         guard let tag, !tag.isEmpty, tag != "none" else { return }
-        let messageIdsJSON = (try? JSONSerialization.data(withJSONObject: [messageId]))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
         // Deterministic id: (accountId, messageId, setTag, tag) tuple.
         let id = "setTag:\(accountId):\(messageId):\(tag)"
-        try db.execute(sql: """
-            INSERT OR IGNORE INTO pendingOperation (id, type, messageIdsJSON, accountId, folderPath, tagValue, createdAt, status, retryCount)
-            VALUES (?, 'setTag', ?, ?, 'INBOX', ?, ?, 'queued', 0)
-            """, arguments: [id, messageIdsJSON, accountId, tag, Date()])
+        guard try !PendingOperation.exists(db, key: id) else { return }
+        var op = PendingOperation(
+            type: .setTag,
+            messageIds: [messageId],
+            accountId: accountId,
+            folderPath: "INBOX",
+            tagValue: tag)
+        op.id = id
+        try op.insert(db)
     }
 
     // MARK: - NSE-rendered Body Persistence (merge path)

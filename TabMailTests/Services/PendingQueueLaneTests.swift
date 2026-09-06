@@ -7,26 +7,47 @@ import Foundation
 @testable import TabMail
 
 /// Pure unit tests for `AccountManager.buildLanes` — the connected-component
-/// lane-keying fix (ADR-IOS-018 amendment 2026-07-10, DECISIONS.md). No DB, no provider, no actor hop:
-/// `buildLanes` is a `nonisolated static` pure function over `[PendingOperation]`
-/// values constructed directly in-memory.
+/// grouping over provider ADDRESSES (ADR-IOS-018 amendment 2026-07-10,
+/// DECISIONS.md). No DB, no provider, no actor hop: `buildLanes` is a
+/// `nonisolated static` pure function over `[PendingOperation]` values
+/// constructed directly in-memory, and it PRESERVES THE CALLER'S ORDER within
+/// each component.
+///
+/// ⚠️ WHAT THE RESULT IS USED FOR CHANGED, AND THE TESTS BELOW PIN THE PART
+/// THAT DID NOT. It used to be a DISPATCH plan: the drain ran one Task per lane
+/// concurrently, so the grouping decided which ops could race. The global
+/// single-operation executor runs one operation at a time in `queuePosition`
+/// order, so nothing races and the grouping is no longer a dispatch decision at
+/// all — it is the RELATEDNESS relation, and its one consumer is chain
+/// deferral: when an operation cannot proceed, everything in its component
+/// moves to the queue's tail with it and is skipped for the rest of the drain,
+/// while unrelated mail keeps executing. Getting the component wrong therefore
+/// no longer causes a race; it causes a deferral to cover too much (a bystander
+/// held back) or too little (a follower attempted at an address its predecessor
+/// just invalidated). The component ITSELF is what these tests pin, and that is
+/// unchanged.
 ///
 /// Background: the OLD lane key was `"accountId:messageIds.first"`, so a batch
-/// move `[A,B,C]` landed in a lane keyed by A while a LATER single-id op on B
-/// landed in a SEPARATE lane keyed by B — even though B is a member of BOTH
-/// ops. Since `ProviderWorkQueue` runs each lane concurrently (bounded
+/// move `[A,B,C]` landed in a group keyed by A while a LATER single-id op on B
+/// landed in a SEPARATE group keyed by B — even though B is a member of BOTH
+/// ops. Because the drain of the day ran each group concurrently (bounded
 /// concurrency > 1, separate IMAP connections), the two ops could execute out
 /// of order relative to each other, causing a real remote race (flag STORE on
 /// B racing the batch MOVE of B, with the flag lost on EXPUNGE). `buildLanes`
-/// fixes this via
-/// union-find: any two ops sharing ANY member message id land in the same lane
-/// (connected component), scoped per-account so unrelated accounts never merge.
+/// fixed this via union-find: any two ops sharing ANY member message id land in
+/// the same component, scoped per-account so unrelated accounts never merge.
 @Suite("PendingOperation lane keying (buildLanes)")
 struct PendingQueueLaneTests {
 
     // MARK: - Helpers
 
-    /// Build a PendingOperation with an explicit createdAt so ordering is deterministic.
+    /// Build a PendingOperation with an explicit `createdAt`.
+    ///
+    /// ⚠️ IT DOES NOT DECIDE ANY ORDER HERE, and it decides none in production
+    /// either — `queuePosition` does, and `createdAt` is age only. It is set so
+    /// the fixtures read in the order a human issued them; `buildLanes` groups
+    /// the ARRAY IT IS GIVEN and preserves that array's order, so the assertions
+    /// below are about INPUT order, whatever produced it.
     private func makeOp(
         type: OperationType = .markRead,
         messageIds: [String],
@@ -44,7 +65,7 @@ struct PendingQueueLaneTests {
 
     // MARK: - 1. Batch + single sharing a member id merge into ONE lane
 
-    @Test("batch [A,B,C] + single [B] merge into ONE lane, in createdAt order")
+    @Test("batch [A,B,C] + single [B] merge into ONE component, in input order")
     func batchAndSingleShareMemberMergeIntoOneLane() {
         let now = Date()
         let batchOp = makeOp(type: .move, messageIds: ["A", "B", "C"], createdAt: now)
@@ -59,7 +80,7 @@ struct PendingQueueLaneTests {
 
     // MARK: - 2. Bridge merge across two components via a linking op
 
-    @Test("bridge merge: [A,B] then [C,D] then [B,C] merges into ONE lane of 3, createdAt order")
+    @Test("bridge merge: [A,B] then [C,D] then [B,C] merges into ONE component of 3, in input order")
     func bridgeMergeAcrossComponents() {
         let now = Date()
         let opAB = makeOp(messageIds: ["A", "B"], createdAt: now)
@@ -146,15 +167,18 @@ struct PendingQueueLaneTests {
     // MARK: - 6. Address space: stable-id accounts key WITHOUT the folder
 
     /// THE INVARIANT (`IOS-QUEUE-008`): two queued ops naming the same provider
-    /// RESOURCE never execute concurrently and execute in `createdAt` order.
+    /// RESOURCE never execute concurrently and execute in ISSUE order — which is
+    /// `queuePosition`, allocated at admission, not `createdAt`.
     ///
     /// On Gmail/Graph a message id is folder-INDEPENDENT, and an undo inverse is
     /// by construction stamped with the forward op's DESTINATION as its source:
-    /// delete → undo → delete again produces `TRASH→INBOX` at t0 and
-    /// `INBOX→TRASH` at t0+1 on ONE message. Folder-qualifying the key put them
-    /// in two lanes, `drainPendingQueue` ran the lanes concurrently, the inverse
-    /// landed last, and the message the user had just deleted came back.
-    @Test("stable-id account: an undo inverse (TRASH→INBOX) and a re-delete (INBOX→TRASH) of the SAME message share ONE lane, in createdAt order")
+    /// delete → undo → delete again produces `TRASH→INBOX` then `INBOX→TRASH` on
+    /// ONE message. Folder-qualifying the key put them in two components, the
+    /// drain of the day ran the two concurrently, the inverse landed last, and
+    /// the message the user had just deleted came back. Concurrent dispatch is
+    /// gone, so the same key error now costs a deferral that misses the follower
+    /// rather than a race; the key must still be right, which is what is pinned.
+    @Test("stable-id account: an undo inverse (TRASH→INBOX) and a re-delete (INBOX→TRASH) of the SAME message share ONE component, in input order")
     func stableIdUndoInverseAndRedeleteShareOneLane() {
         let now = Date()
         let opInverse = makeOp(
@@ -197,7 +221,7 @@ struct PendingQueueLaneTests {
     /// `AccountManagerQueueDrainTests.accountScopedIdAccountIdsAdmitsExactlyGmailOutlookAndTheDemoAccount`,
     /// and that the readdressing makes serialization SAFE is pinned by
     /// `OutlookQueueHandoffTests`.
-    @Test("Outlook: an undo inverse (TRASH→INBOX) and a re-delete (INBOX→TRASH) of the SAME Graph message share ONE lane, in createdAt order")
+    @Test("Outlook: an undo inverse (TRASH→INBOX) and a re-delete (INBOX→TRASH) of the SAME Graph message share ONE component, in input order")
     func outlookSameIdInTwoFoldersSharesOneLane() {
         let now = Date()
         let opInverse = makeOp(
@@ -218,7 +242,7 @@ struct PendingQueueLaneTests {
             """)
         guard lanes.count == 1 else { return }
         #expect(lanes[0].map(\.id) == [opInverse.id, opRedelete.id],
-                "the lane must preserve createdAt order — the newest gesture has to land last")
+                "the component must preserve INPUT order — the newest gesture has to land last")
     }
 
     // MARK: - 7. Address space: folder-local accounts keep the folder in the key
@@ -226,10 +250,13 @@ struct PendingQueueLaneTests {
     /// The NEGATIVE case that bounds test 6, and the `IOS-QUEUE-001` guard.
     ///
     /// An IMAP UID is mailbox-local: UID 77 in `INBOX` and UID 77 in `Archive`
-    /// are DIFFERENT PHYSICAL MESSAGES. Merging them was a never-drop violation
-    /// with a bystander — a lane halts on the first evidence refusal, so an op
-    /// permanently wedged on `(INBOX, 77)` starved the unrelated message at
-    /// `(Archive, 77)`, and no sync pass recovers a starved intention.
+    /// are DIFFERENT PHYSICAL MESSAGES. Merging them is a never-drop violation
+    /// with a bystander: an evidence refusal defers the failing op's WHOLE
+    /// component, so an op permanently wedged on `(INBOX, 77)` would take the
+    /// unrelated message at `(Archive, 77)` to the tail with it on every drain —
+    /// starved, and no sync pass recovers a starved intention. (Before the
+    /// executor the same merge halted a shared lane instead; the mechanism
+    /// changed, the cost to the bystander did not.)
     ///
     /// 🚨 THE EMPTY SET IS THE POINT, not a shortcut. Folder-qualified is what an
     /// account gets by being ABSENT from `accountScopedIdAccountIds`, so this test
@@ -297,7 +324,7 @@ struct PendingQueueLaneTests {
                 "expected one merged stable-id lane plus two folder-local lanes, got \(lanes.map { $0.map(\.id) })")
         let laneIds = lanes.map { $0.map(\.id) }
         #expect(laneIds.contains([stableInbox.id, stableTrash.id]),
-                "the stable-id account's two folder paths name ONE resource and must merge, in createdAt order")
+                "the stable-id account's two folder paths name ONE resource and must merge, in input order")
         #expect(laneIds.contains([imapInbox.id]))
         #expect(laneIds.contains([imapArchive.id]))
         // No lane may mix accounts — the key is account-qualified in both spaces.
@@ -305,79 +332,5 @@ struct PendingQueueLaneTests {
             #expect(Set(lane.map(\.accountId)).count == 1,
                     "a lane mixed accounts: \(lane.map { "\($0.accountId)/\($0.folderPath)" })")
         }
-    }
-
-    // MARK: - 9. The lane diagnostic renders every op, in lane order
-
-    /// `laneDiagnosticSummary` is the formatter `drainPendingQueue` logs right
-    /// after `buildLanes` returns, and it is the ONLY artifact that records which
-    /// ops shared a lane and in what order. The lane assignment IS the ordering
-    /// decision (`IOS-QUEUE-008`: same lane ⇒ serialized, separate lanes ⇒ raced),
-    /// so a summary that silently omitted an op, or reordered one, would misreport
-    /// the very fact a future investigation reads it for.
-    ///
-    /// It is deliberately pure — no dates, no clock, no I/O — so it can be pinned
-    /// here without a DB, a provider or an actor hop, exactly like `buildLanes`.
-    @Test("lane diagnostic names every op with its address, in lane order")
-    func laneDiagnosticSummaryNamesEveryOpInLaneOrder() {
-        let now = Date()
-        // Same two-lane shape the suite uses above: one merged stable-id lane
-        // (undo inverse + re-delete of ONE Gmail message) plus a disjoint lane.
-        let opInverse = makeOp(
-            type: .move, messageIds: ["m1"], accountId: "acc-gmail",
-            folderPath: "TRASH", destinationPath: "INBOX", createdAt: now)
-        let opRedelete = makeOp(
-            type: .move, messageIds: ["m1"], accountId: "acc-gmail",
-            folderPath: "INBOX", destinationPath: "TRASH",
-            createdAt: now.addingTimeInterval(1))
-        let opOther = makeOp(
-            type: .markRead, messageIds: ["m2"], accountId: "acc-gmail",
-            folderPath: "INBOX", createdAt: now.addingTimeInterval(2))
-
-        let lanes = AccountManager.buildLanes(
-            [opInverse, opRedelete, opOther], accountScopedIdAccountIds: ["acc-gmail"])
-        #expect(lanes.count == 2)
-        guard lanes.count == 2 else { return }
-
-        let summary = AccountManager.laneDiagnosticSummary(lanes)
-
-        // 🚨 EXACT ORACLE, NOT CONTAINMENT. This assertion used to be a stack of
-        // `summary.contains(…)` checks, and every one of them survived the
-        // failures a reader of this line would care about most: a dropped op
-        // (the other two still match), a swapped lane order, a missing type
-        // token, and a `→` rendered against the wrong pair of folders. The whole
-        // point of the diagnostic is that the reader trusts it verbatim when
-        // reconstructing an `IOS-QUEUE-008` interleaving months later, so the
-        // test pins it verbatim: separators, lane labels, sizes, short ids,
-        // type names, addresses, member lists, and the ORDER of all of them.
-        //
-        // The literals below are deliberately spelled out rather than rebuilt
-        // from `lanes` — deriving the expectation from the same data the
-        // formatter walked would make the test agree with any rendering.
-        let inverse = String(opInverse.id.prefix(8))
-        let redelete = String(opRedelete.id.prefix(8))
-        let other = String(opOther.id.prefix(8))
-        let expected =
-            "lane0(2): \(inverse) move TRASH→INBOX ids=[m1]"
-            + " | \(redelete) move INBOX→TRASH ids=[m1]"
-            + "  ;  "
-            + "lane1(1): \(other) markRead INBOX→- ids=[m2]"
-        #expect(summary == expected, """
-            lane diagnostic drifted.
-            expected: \(expected)
-            observed: \(summary)
-            """)
-    }
-
-    /// The empty case is not decoration: `drainPendingQueue` logs the summary
-    /// BEFORE its `guard !lanes.isEmpty else { break }`, so an empty result is a
-    /// reachable input on every drain that claimed nothing. It must render a
-    /// visible marker rather than an empty string, or the line reads as a missing
-    /// log instead of "nothing to drain".
-    @Test("lane diagnostic on empty input renders a visible marker, not an empty line")
-    func laneDiagnosticSummaryOnEmptyInputIsStable() {
-        let summary = AccountManager.laneDiagnosticSummary([])
-        #expect(!summary.isEmpty)
-        #expect(summary == "<no lanes>")
     }
 }

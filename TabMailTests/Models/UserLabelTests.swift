@@ -238,7 +238,7 @@ struct UserLabelTests {
     func pendingOpUserLabelIdPersistence() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .addUserLabel,
             messageIds: ["msg1"],
             accountId: "acc1",

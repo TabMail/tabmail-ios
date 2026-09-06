@@ -110,13 +110,14 @@ enum ReplyParentResolver {
                     sql: "UPDATE messageHeader SET actionTag = ?, tagSortOrder = ?, actionTagSetAt = ? WHERE id = ?",
                     arguments: [ActionTag.none.rawValue, ActionTag.none.sortOrder, Date(), id]
                 )
-                try PendingOperation(
+                var setTagOp = PendingOperation(
                     type: .setTag,
                     messageIds: [stableId],
                     accountId: parentAccountId,
                     folderPath: folderPath,
                     tagValue: ActionTag.none.rawValue
-                ).insert(db)
+                )
+                try setTagOp.insert(db)
             }
 
             updated.append(id)

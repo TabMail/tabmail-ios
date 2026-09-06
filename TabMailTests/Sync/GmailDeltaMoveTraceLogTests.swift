@@ -258,8 +258,10 @@ struct GmailDeltaMoveTraceLogTests {
             try Self.makeHeader(messageId: msgClosed, accountId: accountId, folderId: folder.id, folderPath: folderPath).insert(db)
             // Any pending op protects — a non-destructive flag op keeps this
             // fixture visibly distinct from Site 3/6's destructive ops.
-            try PendingOperation(type: .markRead, messageIds: [msgOpen], accountId: accountId, folderPath: folderPath).insert(db)
-            try PendingOperation(type: .markRead, messageIds: [msgClosed], accountId: accountId, folderPath: folderPath).insert(db)
+            var markReadOp = PendingOperation(type: .markRead, messageIds: [msgOpen], accountId: accountId, folderPath: folderPath)
+            try markReadOp.insert(db)
+            var markReadOp2 = PendingOperation(type: .markRead, messageIds: [msgClosed], accountId: accountId, folderPath: folderPath)
+            try markReadOp2.insert(db)
         }
 
         let logDir = FileManager.default.temporaryDirectory.appendingPathComponent("movetracelog_\(UUID().uuidString)", isDirectory: true)
@@ -325,8 +327,10 @@ struct GmailDeltaMoveTraceLogTests {
         try await pool.write { db in
             // Destructive ops key by the provider's native address on Gmail — a
             // bare messageId, matching `info.messageId` directly.
-            try PendingOperation(type: .archive, messageIds: [msgOpen], accountId: accountId, folderPath: folderPath).insert(db)
-            try PendingOperation(type: .archive, messageIds: [msgClosed], accountId: accountId, folderPath: folderPath).insert(db)
+            var archiveOp = PendingOperation(type: .archive, messageIds: [msgOpen], accountId: accountId, folderPath: folderPath)
+            try archiveOp.insert(db)
+            var archiveOp2 = PendingOperation(type: .archive, messageIds: [msgClosed], accountId: accountId, folderPath: folderPath)
+            try archiveOp2.insert(db)
         }
 
         let logDir = FileManager.default.temporaryDirectory.appendingPathComponent("movetracelog_\(UUID().uuidString)", isDirectory: true)
@@ -549,8 +553,10 @@ struct GmailDeltaMoveTraceLogTests {
             // `info.messageId`/`info.rfc822MessageId`) stays false, so execution
             // reaches Site 5's arm and then Site 6's nested check rather than
             // being intercepted earlier by Site 3.
-            try PendingOperation(type: .archive, messageIds: [orphanTagOpen], accountId: accountId, folderPath: folderPath).insert(db)
-            try PendingOperation(type: .archive, messageIds: [orphanTagClosed], accountId: accountId, folderPath: folderPath).insert(db)
+            var archiveOp3 = PendingOperation(type: .archive, messageIds: [orphanTagOpen], accountId: accountId, folderPath: folderPath)
+            try archiveOp3.insert(db)
+            var archiveOp4 = PendingOperation(type: .archive, messageIds: [orphanTagClosed], accountId: accountId, folderPath: folderPath)
+            try archiveOp4.insert(db)
         }
 
         let logDir = FileManager.default.temporaryDirectory.appendingPathComponent("movetracelog_\(UUID().uuidString)", isDirectory: true)

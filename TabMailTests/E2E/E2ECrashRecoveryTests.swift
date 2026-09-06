@@ -89,7 +89,7 @@ struct E2ECrashRecoveryTests {
 
         // Queue 3 ops in order
         for i in 0..<3 {
-            let op = PendingOperation(
+            var op = PendingOperation(
                 type: .markRead,
                 messageIds: ["msg\(i)"],
                 accountId: "acc1",

@@ -320,13 +320,15 @@ struct UndoDestructiveActionTests {
         defer { uninstall(fixture) }
         let member = try seedDrainedMove(fixture, destinationUid: "205")
         try await fixture.pool.write { db in
-            try PendingOperation(
+            var setTagOp = PendingOperation(
                 type: .setTag, messageIds: ["205"], accountId: fixture.accountId,
-                folderPath: "Archive", tagValue: ActionTag.reply.rawValue).insert(db)
-            try PendingOperation(
+                folderPath: "Archive", tagValue: ActionTag.reply.rawValue)
+            try setTagOp.insert(db)
+            var moveOp = PendingOperation(
                 type: .move, messageIds: ["205"], accountId: fixture.accountId,
                 folderPath: "INBOX", destinationPath: "Archive",
-                observedUidValidity: Self.sourceEpoch).insert(db)
+                observedUidValidity: Self.sourceEpoch)
+            try moveOp.insert(db)
         }
 
         await undo(fixture, [member])
@@ -433,10 +435,11 @@ struct UndoDestructiveActionTests {
             // The pre-ADR-IOS-068 shape: an op naming the message by its rfc822
             // Message-ID. Payload-exact in every other respect, so a match on
             // stableId would annihilate it.
-            try PendingOperation(
+            var moveOp2 = PendingOperation(
                 type: .move, messageIds: [rfc], accountId: fixture.accountId,
                 folderPath: "INBOX", destinationPath: "Archive",
-                observedUidValidity: Self.sourceEpoch).insert(db)
+                observedUidValidity: Self.sourceEpoch)
+            try moveOp2.insert(db)
         }
 
         await undo(fixture, [member])

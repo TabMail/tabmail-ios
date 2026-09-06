@@ -207,7 +207,7 @@ struct OptimisticUIQueueTests {
                 arguments: [true, "100", "acc1"]
             )
             // Queue the pending operation
-            let op = PendingOperation(
+            var op = PendingOperation(
                 type: .markRead,
                 messageIds: ["100"],
                 accountId: "acc1",
@@ -240,7 +240,7 @@ struct OptimisticUIQueueTests {
                 sql: "UPDATE messageHeader SET folderId = ?, folderPath = ?, isInInbox = ? WHERE messageId = ? AND accountId = ?",
                 arguments: ["acc1:Archive", "Archive", false, "200", "acc1"]
             )
-            let op = PendingOperation(
+            var op = PendingOperation(
                 type: .move,
                 messageIds: ["200"],
                 accountId: "acc1",
@@ -273,7 +273,7 @@ struct OptimisticUIQueueTests {
                 sql: "UPDATE messageHeader SET isFlagged = ? WHERE messageId = ? AND accountId = ?",
                 arguments: [true, "300", "acc1"]
             )
-            let op = PendingOperation(
+            var op = PendingOperation(
                 type: .markFlagged,
                 messageIds: ["300"],
                 accountId: "acc1",
@@ -305,7 +305,7 @@ struct OptimisticUIQueueTests {
                 sql: "UPDATE messageHeader SET isRead = ? WHERE accountId = ? AND folderPath = ?",
                 arguments: [true, "acc1", "INBOX"]
             )
-            let op = PendingOperation(
+            var op = PendingOperation(
                 type: .markRead,
                 messageIds: ["m1", "m2", "m3"],
                 accountId: "acc1",
@@ -331,7 +331,7 @@ struct OptimisticUIQueueTests {
 
         // Queue separate ops per account
         try db.write { dbConn in
-            let op1 = PendingOperation(
+            var op1 = PendingOperation(
                 type: .markRead,
                 messageIds: ["m1"],
                 accountId: "acc1",
@@ -339,7 +339,7 @@ struct OptimisticUIQueueTests {
             )
             try op1.insert(dbConn)
 
-            let op2 = PendingOperation(
+            var op2 = PendingOperation(
                 type: .markRead,
                 messageIds: ["m2"],
                 accountId: "acc2",
@@ -452,7 +452,7 @@ struct ErrorPropagationTests {
         try TestDatabase.insertAccount(db, id: "acc1")
 
         // Insert a pending op
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .markRead,
             messageIds: ["msg-1"],
             accountId: "acc1",
@@ -506,7 +506,7 @@ struct UndoPatternTests {
         // Original op was already drained (deleted from DB).
         // Undo must queue a reverse move.
         try db.write { dbConn in
-            let reverseOp = PendingOperation(
+            var reverseOp = PendingOperation(
                 type: .move,
                 messageIds: ["msg-1"],
                 accountId: "acc1",
@@ -575,14 +575,14 @@ struct UndoPatternTests {
         try TestDatabase.insertFolder(db, name: "Trash", path: "Trash", role: .trash, accountId: "acc1")
 
         // Queue two separate undo operations
-        let reverseOp1 = PendingOperation(
+        var reverseOp1 = PendingOperation(
             type: .move,
             messageIds: ["msg-1"],
             accountId: "acc1",
             folderPath: "Archive",
             destinationPath: "INBOX"
         )
-        let reverseOp2 = PendingOperation(
+        var reverseOp2 = PendingOperation(
             type: .move,
             messageIds: ["msg-2"],
             accountId: "acc1",
@@ -759,7 +759,7 @@ struct PendingOperationDispatchPersistenceTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db, id: "acc1")
 
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .move,
             messageIds: ["m1", "m2"],
             accountId: "acc1",
@@ -785,7 +785,7 @@ struct PendingOperationDispatchPersistenceTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db, id: "acc1")
 
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .markRead,
             messageIds: ["m1"],
             accountId: "acc1",
@@ -807,9 +807,9 @@ struct PendingOperationDispatchPersistenceTests {
         try TestDatabase.insertAccount(db, id: "acc1")
 
         try db.write { dbConn in
-            let op1 = PendingOperation(type: .markRead, messageIds: ["m1"], accountId: "acc1", folderPath: "INBOX")
-            let op2 = PendingOperation(type: .markFlagged, messageIds: ["m2"], accountId: "acc1", folderPath: "INBOX")
-            let op3 = PendingOperation(type: .move, messageIds: ["m3"], accountId: "acc1", folderPath: "INBOX", destinationPath: "Trash")
+            var op1 = PendingOperation(type: .markRead, messageIds: ["m1"], accountId: "acc1", folderPath: "INBOX")
+            var op2 = PendingOperation(type: .markFlagged, messageIds: ["m2"], accountId: "acc1", folderPath: "INBOX")
+            var op3 = PendingOperation(type: .move, messageIds: ["m3"], accountId: "acc1", folderPath: "INBOX", destinationPath: "Trash")
             try op1.insert(dbConn)
             try op2.insert(dbConn)
             try op3.insert(dbConn)

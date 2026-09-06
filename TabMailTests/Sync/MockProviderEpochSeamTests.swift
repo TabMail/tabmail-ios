@@ -150,7 +150,7 @@ struct MockProviderEpochSeamTests {
     /// `await` it must not have. Same idiom as
     /// `AccountManagerQueueDrainTests.insertOp`/`fetchOp`.
     private func insertOp(_ op: PendingOperation, pool: DatabasePool) throws {
-        try pool.writeWithoutTransaction { db in try op.insert(db) }
+        try pool.writeWithoutTransaction { db in _ = try op.inserted(db) }
     }
 
     private func fetchOp(_ id: String, pool: DatabasePool) throws -> PendingOperation? {

@@ -173,7 +173,7 @@ struct DatabaseSchemaEdgeCaseTests {
         try TestDatabase.insertAccount(db)
 
         let ids = (0..<100).map { "msg_\($0)" }
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .markRead, messageIds: ids,
             accountId: "acc1", folderPath: "INBOX"
         )

@@ -792,10 +792,13 @@ extension AccountManager {
     /// wire, addresses whatever now occupies that UID in the source folder —
     /// C3 wrong-message mutation, which nothing recovers.
     ///
-    /// Ordering on the wire follows from ordering here: the read op's
-    /// `createdAt` precedes the move op's (separate, strictly sequential write
-    /// transactions), the drain claims ops in `createdAt` order, and both ops
-    /// name the same member ids so `buildLanes` puts them in ONE FIFO lane.
+    /// Ordering on the wire follows from ordering here: the read op is ADMITTED
+    /// first, so it takes the lower `queuePosition` (allocated inside its own
+    /// insert transaction, and these are separate strictly sequential write
+    /// transactions), and the global single-operation executor claims the live
+    /// front row in `queuePosition` order. Nothing about the two ops naming the
+    /// same member ids is needed for that — the order is the ADMISSION order,
+    /// not a per-lane order, and `createdAt` does not decide it.
     ///
     /// The unread count decrements exactly ONCE: `markRead` decrements
     /// `folder.unreadCount` by its own fresh in-transaction
@@ -848,10 +851,11 @@ extension AccountManager {
                     if newlyRead > 0 {
                         try db.execute(sql: "UPDATE folder SET unreadCount = MAX(0, unreadCount - ?) WHERE id = ?", arguments: [newlyRead, folderId])
                     }
-                    try PendingOperation(
+                    var markReadOp = PendingOperation(
                         type: .markRead, messageIds: admission.providerIds,
                         accountId: accountId, folderPath: folderPath,
-                        observedUidValidity: admission.observedUidValidity).insert(db)
+                        observedUidValidity: admission.observedUidValidity)
+                    try markReadOp.insert(db)
                 }
                 return folderIds
             }
@@ -900,10 +904,11 @@ extension AccountManager {
                     if newlyUnread > 0 {
                         try db.execute(sql: "UPDATE folder SET unreadCount = unreadCount + ? WHERE id = ?", arguments: [newlyUnread, folderId])
                     }
-                    try PendingOperation(
+                    var markUnreadOp = PendingOperation(
                         type: .markUnread, messageIds: admission.providerIds,
                         accountId: accountId, folderPath: folderPath,
-                        observedUidValidity: admission.observedUidValidity).insert(db)
+                        observedUidValidity: admission.observedUidValidity)
+                    try markUnreadOp.insert(db)
                 }
                 return folderIds
             }
@@ -1314,11 +1319,12 @@ extension AccountManager {
             try db.execute(sql: "UPDATE folder SET unreadCount = unreadCount + ? WHERE id = ?", arguments: [unreadMoving, destFolderId])
         }
 
-        try PendingOperation(
+        var queuedOp = PendingOperation(
             type: opType, messageIds: admission.providerIds,
             accountId: accountId, folderPath: folderPath,
             destinationPath: destinationPath,
-            observedUidValidity: admission.observedUidValidity).insert(db)
+            observedUidValidity: admission.observedUidValidity)
+        try queuedOp.insert(db)
         print("[Queue] Queued \(opType.rawValue) for \(admission.providerIds.count) msgs: \(folderPath) → \(destinationPath) (account: \(accountId))")
         // The local mutation and the durable op are now in the SAME open
         // transaction — that is exactly what `durablyAdmitted` asserts.
@@ -1498,10 +1504,11 @@ extension AccountManager {
                         try db.execute(sql: "UPDATE messageHeader SET isFlagged = ? WHERE id = ?", arguments: [flagged, msg.id])
                     }
                     let opType: OperationType = flagged ? .markFlagged : .markUnflagged
-                    try PendingOperation(
+                    var flagOp = PendingOperation(
                         type: opType, messageIds: admission.providerIds,
                         accountId: accountId, folderPath: folderPath,
-                        observedUidValidity: admission.observedUidValidity).insert(db)
+                        observedUidValidity: admission.observedUidValidity)
+                    try flagOp.insert(db)
                 }
             }
         } catch {
@@ -2197,7 +2204,7 @@ extension AccountManager {
                     // `PendingOperation` is a `PersistableRecord` (non-mutating
                     // `insert`), so this is the same value, inserted the same way, in
                     // the same transaction.
-                    let inverseOp = PendingOperation(
+                    var inverseOp = PendingOperation(
                         type: .move,
                         messageIds: admission.providerIds,
                         accountId: accountId,
@@ -2258,12 +2265,14 @@ extension AccountManager {
         }
         registerDeferredMoveSuccessors(result.deferredSuccessors)
         // `opId` and `createdAt` are what CORRELATE this inverse with the drain
-        // lines it later produces: `queueLog` prints `id.prefix(8)` and
-        // `buildLanes` orders a lane by `createdAt`, so without both an undo
-        // cannot be matched to the lane it landed in — the gap that made
+        // lines it later produces: `queueLog` prints `id.prefix(8)` next to the
+        // claimed row's `queuePosition`, so without the id an undo cannot be
+        // matched to the position it was executed at — the gap that made
         // `IOS-QUEUE-008` unreadable from an exported log. `createdAt` is
-        // rendered as an epoch interval deliberately: sub-second resolution is
-        // what distinguishes a delete from the undo issued a moment later.
+        // rendered as an epoch interval deliberately: it is the operation's AGE,
+        // and sub-second resolution is what distinguishes a delete from the undo
+        // issued a moment later when reading a trace by hand. It does NOT decide
+        // wire order — `queuePosition` does.
         //
         // Emitted HERE rather than next to the insert because the write above
         // can still roll back after the row is inserted, and this sink is
@@ -2371,14 +2380,15 @@ extension AccountManager {
                     htmlContent: MessageBody.plainTextToHTML(draft.body)
                 ).save(db)
 
-                try PendingOperation(
+                var saveDraftOp = PendingOperation(
                     type: .saveDraft,
                     messageIds: [draft.id, placeholderMessageId],
                     accountId: accountId,
                     folderPath: folderPath,
                     instanceEpoch: instanceEpoch,
                     draftId: draft.id
-                ).insert(db)
+                )
+                try saveDraftOp.insert(db)
 
                 return (
                     FTSHeaderRecord(
@@ -2521,7 +2531,7 @@ extension AccountManager {
                     }
                 }
 
-                try PendingOperation(
+                var deleteDraftOp = PendingOperation(
                     type: .deleteDraft,
                     messageIds: [encodedId],
                     accountId: accountId,
@@ -2531,7 +2541,8 @@ extension AccountManager {
                     instanceEpoch: instanceEpoch,
                     draftId: draftId,
                     draftDeleteAddressKind: addressKind
-                ).insert(db)
+                )
+                try deleteDraftOp.insert(db)
                 if deleteOwnedLocalDraft {
                     guard let draftId,
                           let instanceEpoch,

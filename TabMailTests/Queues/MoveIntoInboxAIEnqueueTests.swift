@@ -133,7 +133,7 @@ struct MoveIntoInboxAIEnqueueTests {
         let op = PendingOperation(
             type: .move, messageIds: uids, accountId: accountId,
             folderPath: from, destinationPath: to)
-        try await pool.write { db in try op.insert(db) }
+        try await pool.write { db in _ = try op.inserted(db) }
         let context = AccountManager.DrainContext()
         let outcome = await AccountManager.shared.executeSingleOp(
             op, provider: MockEmailProvider(), context: context)
@@ -228,10 +228,12 @@ struct MoveIntoInboxAIEnqueueTests {
     /// the SECOND attempt settles through the whole-op arm is enqueued, and the
     /// member the narrowing pass proved has no AI target at all.
     ///
-    /// The two attempts are the drain's own pass loop: `executeSingleOp` returns
-    /// `.haltLane` after narrowing, `drainPendingQueue` takes another pass because
-    /// the pass set `executedAny`, and it re-claims the SAME durable row — which is
-    /// why both attempts share one `DrainContext`, exactly as they do in production.
+    /// The two attempts are the executor's own continuous run: a narrowing that
+    /// COMMITS leaves a strictly smaller operation at the SAME `queuePosition`,
+    /// so the next iteration re-claims that same durable row as the live front
+    /// row and finishes it — which is why both attempts share one `DrainContext`,
+    /// exactly as they do in production, and why one drain settles the whole
+    /// gesture instead of one member per drain.
     @Test("Every member proven by a narrowing retirement is AI-enqueued, not just the last one")
     func everyProvenMemberOfAMultiMemberMoveIntoInboxIsEnqueued() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -270,7 +272,7 @@ struct MoveIntoInboxAIEnqueueTests {
         let op = PendingOperation(
             type: .move, messageIds: ["300", "301"], accountId: accountId,
             folderPath: "Archive", destinationPath: "INBOX")
-        try await pool.write { db in try op.insert(db) }
+        try await pool.write { db in _ = try op.inserted(db) }
 
         // Attempt 1 settles ONE member and reports it — the shape every
         // multi-member Gmail/Graph move takes on its first attempt.
@@ -286,7 +288,8 @@ struct MoveIntoInboxAIEnqueueTests {
         // NON-VACUITY: the first attempt really did take the NARROWING path —
         // the durable row survived, narrowed to the member still owed. If it
         // retired whole, this test would be measuring the whole-op arm twice.
-        #expect(firstOutcome == .haltLane, "a narrowing retirement halts its lane")
+        #expect(firstOutcome == .proceed,
+                "a narrowing is strict progress, so the executor keeps claiming")
         let narrowed = try await pool.read { db in try PendingOperation.fetchOne(db, key: op.id) }
         #expect(narrowed?.messageIds == ["301"],
                 "precondition: the row must narrow to the unproven member, not retire whole")

@@ -64,7 +64,7 @@ struct IMAPActionEpochCheckpointTests {
 
     private func insert(_ operations: [PendingOperation], into pool: DatabasePool) throws {
         try pool.writeWithoutTransaction { db in
-            for operation in operations { try operation.insert(db) }
+            for var operation in operations { try operation.insert(db) }
         }
     }
 

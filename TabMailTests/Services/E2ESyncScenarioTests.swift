@@ -384,7 +384,7 @@ struct E2ESyncErrorRecoveryTests {
             destinationPath: "Archive"
         )
         let opId = op.id
-        try await db.write { try op.insert($0) }
+        try await db.write { _ = try op.inserted($0) }
 
         // Provider throws on move
         await provider.setMoveThrows(TestSyncError("connection lost"))
@@ -499,7 +499,7 @@ struct E2ESyncOptimisticUITests {
             destinationPath: "Archive"
         )
         let opId = op.id
-        try await db.write { try op.insert($0) }
+        try await db.write { _ = try op.inserted($0) }
 
         // 3. Drain: execute provider call
         try await provider.move(ids: ["100"], from: "INBOX", to: "Archive")
@@ -551,7 +551,7 @@ struct E2ESyncOptimisticUITests {
             folderPath: "INBOX"
         )
         let opId = op.id
-        try await db.write { try op.insert($0) }
+        try await db.write { _ = try op.inserted($0) }
 
         // 3. Drain
         try await provider.markRead(ids: ["100"], folder: "INBOX")
@@ -595,7 +595,7 @@ struct E2ESyncOptimisticUITests {
             folderPath: "INBOX"
         )
         let opId = op.id
-        try await db.write { try op.insert($0) }
+        try await db.write { _ = try op.inserted($0) }
 
         // 3. Drain
         try await provider.markFlagged(ids: ["100"], flagged: true, folder: "INBOX")
@@ -651,7 +651,7 @@ struct E2ESyncOptimisticUITests {
             destinationPath: "INBOX"
         )
         let opId = op.id
-        try await db.write { try op.insert($0) }
+        try await db.write { _ = try op.inserted($0) }
 
         // 3. Drain
         try await provider.move(ids: ["100"], from: "Archive", to: "INBOX")
@@ -787,7 +787,7 @@ struct E2ESyncIncrementalTests {
             folderPath: "INBOX",
             destinationPath: "Archive"
         )
-        try db.write { try op.insert($0) }
+        try db.write { _ = try op.inserted($0) }
 
         // Second sync: server still shows 102 (hasn't processed archive yet)
         // But what if server no longer shows 102? The pending op protects it.

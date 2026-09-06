@@ -116,7 +116,7 @@ struct UserLabelSyncTests {
         try db.write { db in
             try MessageUserLabel(messageId: header.id, userLabelId: "acc1:L1")
                 .insert(db, onConflict: .ignore)
-            let op = PendingOperation(
+            var op = PendingOperation(
                 type: .addUserLabel,
                 messageIds: [header.stableId],
                 accountId: header.accountId,
@@ -155,7 +155,7 @@ struct UserLabelSyncTests {
             try MessageUserLabel
                 .filter(Column("messageId") == header.id && Column("userLabelId") == "acc1:L1")
                 .deleteAll(db)
-            let op = PendingOperation(
+            var op = PendingOperation(
                 type: .removeUserLabel,
                 messageIds: [header.stableId],
                 accountId: header.accountId,

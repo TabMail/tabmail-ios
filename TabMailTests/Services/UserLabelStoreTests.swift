@@ -357,7 +357,7 @@ struct UserLabelStoreTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         // Insert a PendingOperation with userLabelId
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: .addUserLabel,
             messageIds: ["msg1"],
             accountId: "acc1",

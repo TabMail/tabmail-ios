@@ -4201,8 +4201,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// (15s, applied in `AccountManager.executeSingleOp`) bounds the whole
     /// provider operation, so on a server that withholds `COPYUID` a large
     /// archive completed its `UID COPY` and then blew that deadline inside this
-    /// probe. The throw lands in the drain's generic arm: the op is requeued,
-    /// the ACCOUNT is added to `failedAccounts`, and the lane halts — so no
+    /// probe. The throw lands in the drain's generic arm: the op and its related
+    /// chain move to the queue's tail and the ACCOUNT is added to
+    /// `failedAccounts` for the rest of that drain — so no
     /// source `\Deleted` is ever reached, the next drain REPEATS the `UID COPY`
     /// and seats another destination duplicate, and every later intention on
     /// that account is starved. That is the never-drop WEDGE corollary, not a
@@ -4271,12 +4272,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// safety gate needs and did not get a usable one, so nothing is determined
     /// about this op — and nothing about the ACCOUNT either.
     ///
-    /// That arm in `AccountManager.executeSingleOp` requeues the op, bumps
-    /// `retryCount`, inserts it into `evidenceRefused` and halts only this lane,
-    /// WITHOUT inserting the account into `failedAccounts`. Every one of those
-    /// properties is wanted here, and `evidenceRefused` especially: this refusal
-    /// is raised AFTER the `UID COPY`, so bounding the op to one attempt per
-    /// drain bounds the destination duplicates a re-attempt would seat.
+    /// That arm in `AccountManager.executeSingleOp` moves the op AND its related
+    /// chain to the tail of the queue, bumps `retryCount`, and records the whole
+    /// chain in `DrainContext.deferredOperationIds`, WITHOUT inserting the
+    /// account into `failedAccounts`. Every one of those properties is wanted
+    /// here, and the deferred set especially: this refusal is raised AFTER the
+    /// `UID COPY`, so bounding the op to one attempt per drain bounds the
+    /// destination duplicates a re-attempt would seat. Unrelated mail on the same
+    /// account keeps executing in the same drain, ahead of the deferred chain.
     ///
     /// Deliberately NOT `ProviderError.uidValidityChanged` (exit 4 retires the
     /// op, and no epoch was proven to have moved) and NOT
@@ -4340,9 +4343,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     //    for a move.
     //  - Audit round 3 deleted `noUidPlusCapability`: `COPYUID` is a UIDPLUS
     //    response code (RFC 4315 §3), so on a standards-valid non-UIDPLUS server
-    //    that refusal fired on EVERY attempt, forever, and its `.haltLane` drain
-    //    arm starved every later gesture on the same message. A capability the
-    //    server does not have is not evidence that can "arrive later".
+    //    that refusal fired on EVERY attempt, forever, and its drain arm (the
+    //    `.haltLane` disposition of the time, now chain deferral) starved every
+    //    later gesture on the same message. A capability the server does not
+    //    have is not evidence that can "arrive later".
     //  - Audit round 4 deletes `noCopyUidEvidence` for the SAME reason, which
     //    round 3 stopped one step short of. RFC 4315 §3 makes `COPYUID` a
     //    SHOULD with named exceptions — a `UIDNOTSTICKY` mail store, and a
@@ -4445,9 +4449,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// refusing `UID MOVE` (`ADR-IOS-073` accepts that a server may) would then
     /// starve every disjoint lane on the account on every drain: one intention
     /// preserved by denying every intention behind it. As a
-    /// `ProviderEvidenceUnavailable` it lands in the lane-local arm instead —
-    /// requeue, `retryCount += 1`, `evidenceRefused`, `.haltLane`, and the rest
-    /// of the account keeps draining.
+    /// `ProviderEvidenceUnavailable` it lands in the chain-local arm instead —
+    /// tail movement for the op and everything related to it, `retryCount += 1`,
+    /// `DrainContext.deferredOperationIds`, and the rest of the account keeps
+    /// draining.
     ///
     /// It also NEVER reaches the generic catch's `mailboxConfirmedAbsent` LIST
     /// probe, which is the second half of #115 round 3: an exact-name LIST that
@@ -4897,13 +4902,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         // below. Translating to `IMAPAtomicMoveRefused` — a
                         // `ProviderEvidenceUnavailable` — does two things the
                         // generic catch cannot:
-                        //  - it keeps the refusal LANE-LOCAL. The drain's
-                        //    evidence-unavailable arm requeues, bumps
-                        //    `retryCount`, records `evidenceRefused` and halts
-                        //    only this lane; the generic arm inserts the account
-                        //    into `failedAccounts`, so a server that keeps
-                        //    refusing MOVE would starve every disjoint lane on
-                        //    the account on every drain.
+                        //  - it keeps the refusal CHAIN-LOCAL. The drain's
+                        //    evidence-unavailable arm moves this op and its
+                        //    related chain to the queue's tail, bumps
+                        //    `retryCount` and records the chain in
+                        //    `DrainContext.deferredOperationIds`; the generic arm
+                        //    inserts the account into `failedAccounts`, so a
+                        //    server that keeps refusing MOVE would starve every
+                        //    unrelated intention on the account on every drain.
                         //  - it keeps this error away from the generic catch's
                         //    `mailboxConfirmedAbsent` LIST probe. An exact-name
                         //    LIST that omits a mailbox does NOT prove the mailbox
@@ -4968,7 +4974,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                                 code: responseCode, reason: reason)
                         }
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] Atomic MOVE refused with no COPYUID (leading response code: \(responseCode ?? "none")) — op stays queued, this lane parks, the rest of the account keeps draining: \(reason)")
+                            print("[IMAP] Atomic MOVE refused with no COPYUID (leading response code: \(responseCode ?? "none")) — op stays queued, it and its related chain move to the queue tail and are deferred for this drain, the rest of the account keeps draining: \(reason)")
                         }
                         throw IMAPAtomicMoveRefused.taggedFailureWithoutCopyUID(
                             destination: destination, reason: reason)
@@ -5005,9 +5011,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // not evidence that can arrive later: the guard threw on EVERY
                 // attempt, forever, so on a standards-valid non-UIDPLUS server
                 // archive/move could never complete at any time by any route.
-                // And because this error's drain arm returns `.haltLane`, the
-                // op held its whole lane — every op sharing that message id by
-                // construction — on every future drain as well. That is the
+                // And because this error's drain arm held the op back (the
+                // `.haltLane` disposition of the time; chain deferral today),
+                // the op held every op sharing that message id, by construction,
+                // on every future drain as well. That is the
                 // never-drop WEDGE corollary: an op that stays queued but
                 // prevents every intention behind it from executing has not
                 // been preserved. `v1.6.38` (`07a4bb703`) moved mail on these
@@ -5154,8 +5161,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // Letting it propagate instead re-runs A1/A2/A3 next drain and
                 // issues ANOTHER `UID COPY` for a copy the server already made —
                 // one more duplicate at the destination per drain, on an op that
-                // never retires and a lane that stays halted: the never-drop
-                // WEDGE corollary (`IOS-IMAP-005`).
+                // never retires and a related chain that stays deferred behind
+                // it: the never-drop WEDGE corollary (`IOS-IMAP-005`).
                 //
                 // ⚠ DELIBERATELY NARROW — DO NOT WIDEN THIS CATCH. A bare
                 // `catch`, a bare `IMAPError`, or `.commandFailed` would also
@@ -5407,7 +5414,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // refusal used to make it unreachable ("a RESIDUAL"); that
                     // refusal is deleted, so a non-UIDPLUS move now runs COPY →
                     // `\Deleted` STORE → *nothing here*, and RETURNS, which
-                    // retires the op and releases its lane.
+                    // retires the op and releases the chain queued behind it.
                     //
                     // 🚨 AUDIT ROUND 4 — this arm is now reached by a SECOND
                     // class of server as well: one that advertises UIDPLUS and
@@ -5733,8 +5740,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         } catch is IMAPActionMailboxAbsent {
             // T3.3 PORT — `v2final:…:IMAPProvider.deleteDraft`'s catch arm. The
             // Drafts mailbox is CONFIRMED gone (LIST probe), so the server copy
-            // of this draft went with it. Terminal no-op; propagating would pin
-            // the lane behind a delete no server can ever satisfy.
+            // of this draft went with it. Terminal no-op; propagating would make
+            // every operation related to this draft retry behind a delete no
+            // server can ever satisfy.
             //
             // This changes ONLY the mailbox-absent classification. It does not
             // touch draft IDENTITY handling (T3.9/T3.10) — an unknown,

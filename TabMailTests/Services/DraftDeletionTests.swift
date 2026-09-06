@@ -268,12 +268,13 @@ struct DraftDeletionTests {
             if let rfc822 = draft.rfc822MessageId {
                 opMsgIds.append(rfc822)
             }
-            try PendingOperation(
+            var saveDraftOp = PendingOperation(
                 type: .saveDraft,
                 messageIds: opMsgIds,
                 accountId: "acc1",
                 folderPath: "DRAFT"
-            ).insert(db)
+            )
+            try saveDraftOp.insert(db)
         }
 
         // Verify the PendingOperation has the right messageIds

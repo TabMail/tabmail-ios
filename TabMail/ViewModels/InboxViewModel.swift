@@ -2728,7 +2728,7 @@ final class InboxViewModel {
                 // is matched by `GmailProvider.isAuthoritativeActionRejection` as a
                 // provider-authoritative no-op, so the op leaves the queue as if
                 // it had been performed.
-                let op = PendingOperation(
+                var op = PendingOperation(
                     type: .removeUserLabel,
                     messageIds: admission.providerIds,
                     accountId: message.accountId,

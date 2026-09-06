@@ -114,7 +114,7 @@ struct IntentionLedgerTests {
         _ op: PendingOperation,
         into pool: DatabasePool
     ) throws {
-        try pool.writeWithoutTransaction { db in try op.insert(db) }
+        try pool.writeWithoutTransaction { db in _ = try op.inserted(db) }
     }
 
     /// Unwraps an `.unaccounted` detail string, failing loudly otherwise.

@@ -121,7 +121,7 @@ struct AppReleaseBoundaryTests {
     private func seedOperation(
         _ fixture: Fixture, messageIds: [String], type: OperationType = .move
     ) throws -> PendingOperation {
-        let op = PendingOperation(
+        var op = PendingOperation(
             type: type, messageIds: messageIds, accountId: Self.accountId,
             folderPath: Self.folderPath,
             destinationPath: type == .move ? "Archive" : nil,

@@ -93,8 +93,10 @@ struct PendingOperationSnapshotTests {
         try TestDatabase.insertAccount(db, id: "acc1")
         try TestDatabase.insertAccount(db, id: "acc2", email: "two@example.com")
         try db.write { dbConn in
-            try PendingOperation(type: .archive, messageIds: ["m1"], accountId: "acc1", folderPath: "INBOX").insert(dbConn)
-            try PendingOperation(type: .archive, messageIds: ["m2"], accountId: "acc2", folderPath: "INBOX").insert(dbConn)
+            var archiveOp = PendingOperation(type: .archive, messageIds: ["m1"], accountId: "acc1", folderPath: "INBOX")
+            try archiveOp.insert(dbConn)
+            var archiveOp2 = PendingOperation(type: .archive, messageIds: ["m2"], accountId: "acc2", folderPath: "INBOX")
+            try archiveOp2.insert(dbConn)
         }
         let snap = try db.read { dbConn in
             try PendingOperationSnapshot.load(accountId: "acc1", db: dbConn)

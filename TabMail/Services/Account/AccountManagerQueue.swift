@@ -151,12 +151,17 @@ extension AccountManager {
 
     // MARK: - Persistent Action Queue
 
-    /// Shared mutable state for parallel drain tasks. Reference type so lane Tasks
-    /// see each other's updates when they interleave at await points. The Tasks
-    /// inherit `AccountManager` isolation, and the `@Sendable` closure passed to
-    /// `ProviderWorkQueue.execute` only forwards the context back through
-    /// `await self.executeSingleOp`, so every mutation below is serialized by the
-    /// actor even while provider I/O overlaps.
+    /// Shared mutable state for ONE drain — the facts every iteration of the
+    /// executor loop accumulates and every later iteration reads.
+    ///
+    /// ⚠️ IT IS NOT SHARED BETWEEN CONCURRENT TASKS ANY MORE, and the reference
+    /// type is retained for a different reason. It existed so the parallel lane
+    /// Tasks could see each other's updates; the global single-operation executor
+    /// has no lane Tasks and never has two operations in flight, so the only
+    /// thing that still needs the reference is that the context outlives the
+    /// `@Sendable` closure passed to `ProviderWorkQueue.execute`, which forwards
+    /// it back through `await self.executeSingleOp`. Every mutation below is
+    /// therefore serialized by the actor, and now also by the loop itself.
     ///
     /// `@unchecked Sendable` is required solely because that `@Sendable` closure
     /// captures the reference; it does NOT make the fields thread-safe. A future
@@ -173,7 +178,8 @@ extension AccountManager {
         /// ⚠ Membership stops EVERY op on that account for the rest of the drain,
         /// so only an error that says something about the CONNECTION belongs here.
         /// A provider refusal that merely could not obtain a proof does not: see
-        /// `ProviderEvidenceUnavailable` and `evidenceRefused`.
+        /// `ProviderEvidenceUnavailable`, whose arm defers one related chain and
+        /// leaves the account alone.
         var failedAccounts = Set<String>()
         var foldersToSync: Set<String> = []
 
@@ -206,102 +212,76 @@ extension AccountManager {
         /// off-actor; never unprotect this field merely because the plain siblings
         /// currently rely on the actor contract above (`IOS-QUEUE-010`).
         let enteredInbox = Mutex<[String: [InboxEntry]]>([:])
-        /// `PendingOperation.id`s whose provider could not obtain the evidence its
-        /// own safety gate requires (`ProviderEvidenceUnavailable`). Per-op, not
-        /// per-account: the op stays durably queued and retries on a LATER drain,
-        /// while everything else on the account keeps executing in THIS one.
+        /// `PendingOperation.id`s that this drain has decided not to attempt
+        /// again — the spin guard, and the ONLY thing that stops the executor
+        /// re-claiming a row it just could not make progress on.
         ///
-        /// ⚠ THE SKIP IS LOAD-BEARING, not an optimization. Without it the outer
-        /// drain loop re-claims this op as soon as any other op sets `executedAny`,
-        /// and a refusal can be raised AFTER a wire mutation has already gone out —
-        /// so every re-attempt within one drain could repeat it. Attempt each
-        /// evidence-refused op AT MOST ONCE PER DRAIN.
+        /// 🚨 IT IS ALWAYS A WHOLE CONNECTED CHAIN, NEVER ONE ROW. Every writer
+        /// (`claimFrontierOperation`'s no-attempt skips and
+        /// `deferRelatedChainToTail`'s post-failure tail movement) inserts the
+        /// deferred row's ENTIRE component over provider addresses. That is what
+        /// makes it safe for the frontier walk to take the next candidate: no
+        /// operation naming a message the deferred one names can be reached, so a
+        /// later gesture can never overtake an unresolved predecessor, and only
+        /// genuinely unrelated mail proceeds.
         ///
-        /// ⚠ AUDIT ROUND 4 — the case that motivated this, `IMAPProvider.move`'s
-        /// withheld-`COPYUID` refusal, is GONE (it was raised after the `UID COPY`,
-        /// so each re-attempt seated another destination duplicate; RFC 4315 §3
-        /// names servers for which the evidence never arrives, so it was a wedge).
-        ///
-        /// ⚠ CENSUS CORRECTED (`IOS-QUEUE-004`). This paragraph used to claim
-        /// that "the surviving producers — the destination-epoch and source-epoch
-        /// refusals — are raised BEFORE any wire mutation, so the bound is now
-        /// about round trips rather than duplicates". BOTH halves were false at
-        /// the tip, and the correction is recorded rather than silently applied
-        /// because this comment is precisely a case of documentation outliving
-        /// the code it describes. `ProviderEvidenceUnavailable` has FOUR
-        /// conformers, all private enums in `IMAPProvider`:
-        /// `IMAPDestinationEpochRefusal`, `IMAPEpochEvidenceMissing`,
-        /// `IMAPLivenessProbeInconclusive` — the third was never enumerated —
-        /// and `IMAPAtomicMoveRefused`, added by GitHub #115 round 3 for a
-        /// tagged NO/BAD without `COPYUID` on the atomic route.
-        /// Some refusal sites in `IMAPProvider.move` ARE pre-mutation
-        /// (assertions A1 and A2, and `IMAPDestinationEpochRefusal
-        /// .unknownAtProbe` at the destination probe), which is what made the
-        /// retracted sentence plausible. But FOUR sit AFTER the `UID COPY`:
-        ///  - `IMAPDestinationEpochRefusal.movedAcrossCopy` — from the `catch`
-        ///    around the destination-epoch comparison, whose whole input is the
-        ///    server's `COPYUID` response, so it cannot exist before the COPY.
-        ///  - `IMAPLivenessProbeInconclusive.unparsedUid` — thrown from
-        ///    `liveSourceUIDs`, which `move` calls ONLY on the
-        ///    `copyProvenUIDs.count != sourceUIDs.count` arm, i.e. after the COPY.
-        ///  - `IMAPEpochEvidenceMissing` at assertion A4 — after the COPY and
-        ///    after the liveness probe, immediately before the `\Deleted` STORE.
-        ///  - the same type at assertion A5 — after the COPY *and* after that
-        ///    STORE, immediately before the `UID EXPUNGE`.
-        /// (A3 is a fifth, sitting after the INBOX-only legacy `tm_*` flag
-        /// strip; that strip is idempotent and reversible, so it is the one
-        /// post-mutation site whose repetition costs nothing.)
-        /// `IMAPLivenessProbeInconclusive`'s own doc comment says it "is raised
-        /// AFTER the `UID COPY`, so bounding the op to one attempt per drain
-        /// bounds the destination duplicates a re-attempt would seat" — the
-        /// exact opposite of the retracted paragraph, in the same tree.
-        ///
-        /// So the bound is STILL about duplicates, not merely round trips: a
-        /// UIDPLUS server that stops reporting `UIDVALIDITY` on SELECT between
-        /// the COPY and A4 (SwiftMail defaults `Mailbox.Selection.uidValidity`
-        /// to `UIDValidity(0)`, which `requireUidValidity`'s `live > 0` guard
-        /// turns into `unknownLiveEpoch`) leaves the op copied to the
-        /// destination and requeued, and every re-attempt seats another copy.
-        /// The skip is what bounds that to one per drain. It stays for both
-        /// reasons: it is the general contract for `ProviderEvidenceUnavailable`,
-        /// not a patch for one error case, AND four of its refusal sites already
-        /// refuse post-mutation today.
-        ///
-        /// ⚠ AND IT IS CONSULTED IN THE LANE LOOP, NEVER THE CLAIM LOOP. The op must
-        /// still be claimed and still enter `buildLanes`, or its lane-mates would
-        /// form a lane without it and run ahead of it — see the comment at the check
-        /// itself. Skipping is about not re-attempting the PROVIDER, not about
-        /// removing the op from its lane.
-        var evidenceRefused: Set<String> = []
-        var executedAny = false
+        /// 🚨 IT REPLACES BOTH v2final's PER-DRAIN DEMOTION SET AND v3's
+        /// `evidenceRefused`. v2final ended the drain when the frontier turned out
+        /// to be already-demoted; v3 held a separate per-op set consulted in the
+        /// lane loop so an evidence refusal could not be repeated after a wire
+        /// mutation. One set expresses both: an id in here is never claimed again
+        /// this drain, so an evidence-refused operation gets AT MOST ONE provider
+        /// attempt per drain, and the walk runs out of candidates instead of
+        /// spinning. The refusal case it was built for is real — some
+        /// `ProviderEvidenceUnavailable` sites in `IMAPProvider.move` are raised
+        /// AFTER the `UID COPY`, so a re-attempt within one drain would seat
+        /// another destination duplicate.
+        var deferredOperationIds: Set<String> = []
         // op.id values that have already produced a [QueueDiag] deep-dump this drain.
         // Prevents log-spam on the same stuck op that retries every drain cycle.
         var diagnosedOpIds: Set<String> = []
     }
 
-    /// Outcome of a single claimed-op execution (`executeSingleOp`), used by the
-    /// per-lane drain loop in `drainPendingQueue` to decide whether to keep draining
-    /// the lane or halt it for this pass.
+    /// Outcome of one claimed operation's execution (`executeSingleOp`), read by
+    /// the global executor to decide whether to keep claiming.
     enum SingleOpOutcome: Sendable, Equatable {
-        /// The op reached a terminal state this pass — either it completed
-        /// successfully, or it was CONFIRMED stale/invalid and dropped. The lane
-        /// may proceed to its next op.
+        /// THE EXECUTOR KEEPS CLAIMING. The operation reached a terminal state —
+        /// it completed, or it was CONFIRMED stale/invalid and dropped — or it
+        /// made STRICT MEMBER PROGRESS and was narrowed to the members still
+        /// owed. Either way the queue is strictly smaller than it was, so the
+        /// next iteration cannot be a repeat of this one.
+        ///
+        /// 🚨 THE NARROWING CASE IS WHY AN N-MEMBER GESTURE SETTLES IN ONE RUN.
+        /// A provider settles exactly one member per attempt (`MIS-IOS-022`), so
+        /// a healthy multi-member operation reports a proper prefix on every
+        /// attempt. Reporting that as `.proceed` — rather than as a deferral —
+        /// is what lets the executor come straight back for the next member
+        /// instead of waiting for another drain trigger. The narrowed row is
+        /// appended to the TAIL in the same transaction as its retirement, so
+        /// unrelated mail queued behind it goes first and the remainder is
+        /// re-claimed as soon as that work is done: one continuous run, and each
+        /// member under its own fresh `pendingOperationTimeoutSeconds`.
         case proceed
-        /// The op did not reach a terminal state this pass — its staleness or
-        /// success could NOT be confirmed. USUALLY it has been reset to `.queued`
-        /// for retry; since `ce4a0299d` there is one halt cause where it has
-        /// deliberately NOT been, because the provider PROVED the work and only
-        /// the local retirement failed: that row stays `inFlight` with all of its
-        /// members while this process holds the proof, so the claim loop refuses
-        /// it and the move is never sent to the wire twice
-        /// (`AccountManager.pendingRetirements`, `IOS-GRAPH-005`). Either way the
-        /// operation is unresolved. The REST of this lane must halt: a later op on
-        /// the same connected component (e.g. a flag change queued after a move of
-        /// the same message) must never run ahead of its unresolved predecessor —
-        /// running it would race the predecessor's eventual retry on the wire. The
-        /// lane loop requeues the remaining claimed ops in this lane (same as the
-        /// existing failedAccounts requeue path) and stops.
-        case haltLane
+        /// THE EXECUTOR KEEPS CLAIMING, BUT NOT THIS CHAIN. The attempt failed
+        /// in a way that says nothing terminal about the operation, so the row
+        /// and every pending row transitively related to it have been appended
+        /// to the queue TAIL in one write, `queued` again, and marked deferred
+        /// for the rest of this drain. Unrelated mail proceeds; nothing that
+        /// shares a message with this operation can overtake it; and the
+        /// operation gets exactly ONE provider attempt per drain, which is what
+        /// stops a persistent failure becoming a self-rescheduling hot loop.
+        case deferred
+        /// THE DRAIN STOPS. The operation is unresolved AND this process is
+        /// holding something no later claim may run ahead of: a provider result
+        /// that PROVED work whose local retirement could not commit (the row
+        /// stays `inFlight` with all of its members while the proof is retained,
+        /// so the move is never sent to the wire twice —
+        /// `AccountManager.pendingRetirements`, `IOS-GRAPH-005`), or a requeue
+        /// this process could not commit. `replayRetainedRetirements` and
+        /// `recoverPendingRequeues` own the recovery at the top of the next
+        /// drain; nothing is replayed here, because whatever refused the write
+        /// milliseconds ago is overwhelmingly still refusing it.
+        case stopDrain
     }
 
     /// The ids of the accounts whose message ids are ACCOUNT-SCOPED — one id names
@@ -366,19 +346,30 @@ extension AccountManager {
                 || Column("id") == DemoSeed.demoAccountId)))
     }
 
-    /// Groups claimed pending operations into serialized "lanes" via connected-
-    /// component grouping over shared message ADDRESSES. Two ops that name ANY
-    /// member at the same address land in the same lane — and transitively, any
-    /// op sharing an address with either of those joins too (union-find).
+    /// Groups pending operations into connected components over shared message
+    /// ADDRESSES. Two ops that name ANY member at the same address land in the
+    /// same component — and transitively, any op sharing an address with either
+    /// of those joins too (union-find).
     ///
-    /// 🚨 THE INVARIANT THIS EXISTS TO ENFORCE: two queued operations that name
-    /// the same provider RESOURCE do not execute concurrently, and execute in
-    /// `createdAt` (issue) order. `drainPendingQueue` launches one Task per lane
-    /// CONCURRENTLY, each drawing from a `ProviderWorkQueue` whose concurrency is
-    /// well above 1 (10 for Gmail and for Graph; up to
-    /// `SyncConfig.imapMaxConnectionCeiling` for IMAP, which is separate
-    /// connections), so "same resource ⇒ same lane" is the only thing standing
-    /// between two gestures on one message and a wire race.
+    /// 🚨 WHAT IT IS FOR NOW: DEFERRAL, NOT DISPATCH. Nothing executes
+    /// concurrently any more — the global executor claims ONE row, executes it,
+    /// and commits its result before claiming again — so this calculation no
+    /// longer decides what runs beside what. It decides what MOVES TOGETHER:
+    /// when an operation is deferred, its whole component goes to the tail in
+    /// its current relative order, and the executor's no-attempt skips defer the
+    /// skipped row's whole component too. That is what lets unrelated mail
+    /// proceed without any later gesture overtaking an unresolved predecessor
+    /// that names the same message.
+    ///
+    /// The relation is IDENTICAL to the one the lane dispatcher used, and
+    /// deliberately so — the address-space split, the conservative default, the
+    /// union-find and their regression tests are retained verbatim. Only the
+    /// CONSUMER changed. The name is kept because every routed document,
+    /// `KNOWN_ISSUES` entry and test in this tree calls it that.
+    ///
+    /// 🚨 SCHEDULING RELATEDNESS NEVER AUTHORIZES A MUTATION TARGET. A component
+    /// says two operations must not be reordered relative to each other; it
+    /// never says an address in one may be used to address the other.
     ///
     /// 🚨 THE KEY IS THE OP'S ADDRESS SPACE, NOT A FIXED SHAPE, and which space
     /// an op lives in is a property of its ACCOUNT. This function is pure, so it
@@ -403,12 +394,11 @@ extension AccountManager {
     ///   PHYSICAL MESSAGES, and every id an ordinary IMAP gesture enqueues is a
     ///   bare UID (`admittedOrdinaryActionTargets` requires
     ///   `messageId == String(uid)`).
-    ///   Merging them was a NEVER-DROP BUG (`IOS-QUEUE-001`): a lane halts on the
-    ///   first evidence refusal, `executeSingleOp`'s `ProviderEvidenceUnavailable`
-    ///   arm returns `.haltLane` and requeues, and a server that stops reporting
-    ///   `UIDVALIDITY` on SELECT reproduces that refusal identically on every
-    ///   drain, forever — so a permanent halt on `(INBOX, 77)` starved the
-    ///   unrelated message at `(Archive, 77)`. That is the WEDGE COROLLARY WITH A
+    ///   Merging them was a NEVER-DROP BUG (`IOS-QUEUE-001`): a component defers
+    ///   as a unit on the first evidence refusal, and a server that stops
+    ///   reporting `UIDVALIDITY` on SELECT reproduces that refusal identically on
+    ///   every drain, forever — so a permanent deferral of `(INBOX, 77)` starved
+    ///   the unrelated message at `(Archive, 77)`. That is the WEDGE COROLLARY WITH A
     ///   BYSTANDER, and its owner could neither see nor clear it, because no UI
     ///   lists `PendingOperation` rows. An op that stays queued but prevents
     ///   other intentions executing has not been preserved.
@@ -432,13 +422,14 @@ extension AccountManager {
     /// `MessageHeaderRekey.finishMove` now REWRITES every non-cancelled
     /// same-account operation whose members include an id the wire just
     /// re-addressed, inside the same transaction that retires the move
-    /// (`readdressQueuedOperations`), and the lane loop re-reads each op from the
-    /// table immediately before executing it. So "the follower runs after the
-    /// move" now means "the follower runs against the address the move PROVED",
-    /// and serialization is what makes the newest gesture win instead of racing.
+    /// (`readdressQueuedOperations`), and the executor claims each row inside a
+    /// fresh transaction immediately before executing it. So "the follower runs
+    /// after the move" now means "the follower runs against the address the move
+    /// PROVED", and single-operation execution is what makes the newest gesture
+    /// win instead of racing.
     /// ⚠️ The two halves are not independent: reverting either the handoff or the
-    /// per-op re-read while leaving Outlook in this set restores the deterministic
-    /// loss. `IOS-QUEUE-008`'s amendment records the supersession.
+    /// claim-time read while leaving Outlook in this set restores the
+    /// deterministic loss. `IOS-QUEUE-008`'s amendment records the supersession.
     ///
     /// 🚨 THE NEGATIVE CASE THAT MOTIVATED THE SPLIT (`IOS-QUEUE-008`): on
     /// Gmail, delete → undo → delete again. `undoMove` enqueues a real inverse
@@ -468,19 +459,18 @@ extension AccountManager {
     /// collide, which OVER-merges — the conservative direction, and precisely
     /// the behaviour that shipped before the folder was added to the key.
     ///
-    /// WHY LANES EXIST AT ALL: the ORIGINAL key was `"accountId:messageIds.first"`,
-    /// so a batch move `[A,B,C]` landed in a lane keyed by A while a LATER
-    /// single-id op on B (e.g. a flag change) landed in a SEPARATE lane keyed by
-    /// B — even though B is a member of both. The two lanes then ran
-    /// concurrently, racing on the wire: a flag STORE on B could race the batch
-    /// MOVE of B, silently losing the flag on the MOVE's source cleanup, or
-    /// running against the old location before the move finishes.
-    /// Connected-component lanes make any op sharing a member id with an
-    /// in-flight op serialize AFTER it.
+    /// WHY CONNECTED COMPONENTS AND NOT A SINGLE KEY: the ORIGINAL key was
+    /// `"accountId:messageIds.first"`, so a batch move `[A,B,C]` was grouped by A
+    /// while a LATER single-id op on B (e.g. a flag change) was grouped by B —
+    /// even though B is a member of both. Under the old lane dispatcher the two
+    /// groups ran concurrently and raced on the wire; under the executor they
+    /// would be deferred independently, so the flag change could be left ahead of
+    /// the move that invalidates its address. Either way, the union-find is what
+    /// makes an op sharing a member id with another op stay ordered behind it.
     ///
     /// Pure and side-effect free (no DB/IO) — `nonisolated static` so it's directly
-    /// unit-testable without an actor hop. Callers pass ops in createdAt-asc order;
-    /// each lane preserves that relative order (FIFO within its component).
+    /// unit-testable without an actor hop. Callers pass ops in `queuePosition`-asc
+    /// order; each component preserves that relative order (FIFO within it).
     /// Ops with empty `messageIds` (no id to key on) fall back to a singleton lane,
     /// matching the pre-existing fallback (`messageIds.first ?? op.id`).
     ///
@@ -534,7 +524,8 @@ extension AccountManager {
             }
         }
 
-        // Assign each op to its component's lane, in the ORIGINAL (createdAt-asc) order.
+        // Assign each op to its component's group, in the caller's ORIGINAL order
+        // (every production caller passes rows read `ORDER BY queuePosition ASC`).
         var laneIndexForRoot: [String: Int] = [:]
         var lanes: [[PendingOperation]] = []
         for op in ops {
@@ -554,47 +545,52 @@ extension AccountManager {
         return lanes
     }
 
-    /// Render the composition of a `buildLanes` result as ONE log line: per lane,
-    /// in lane order, every op's short id, type, `folderPath`→`destinationPath`
-    /// and member ids.
+    /// THE GLOBAL SINGLE-OPERATION FIFO EXECUTOR.
     ///
-    /// WHY THIS IS A SEPARATE FUNCTION AND NOT A LOG INSIDE `buildLanes`:
-    /// `buildLanes` is `nonisolated static` and PURE, and its unit tests depend on
-    /// that purity. Giving it a side effect — even a gated one — would make the
-    /// grouping decision and its diagnostic inseparable. This formatter is
-    /// likewise pure and deterministic (no dates, no clock, no I/O), so it is
-    /// directly unit-testable; the drain calls it through `queueLog`, whose
-    /// `@autoclosure` means it is not even evaluated unless debug logging is on.
+    /// One owner repeatedly claims the LIVE FRONT ROW of one durable queue —
+    /// `ORDER BY queuePosition ASC` — executes it, and commits its result before
+    /// looking at anything else. There are no lanes, no per-lane Tasks and no
+    /// claim-all snapshot: at most one operation is in flight across every
+    /// account at any instant, which is what makes "two gestures on one message
+    /// never race" a property of the SCHEDULER rather than of a grouping
+    /// heuristic that has to be right about which ops share a resource.
     ///
-    /// WHAT IT BUYS: the lane assignment IS the ordering decision — two ops on one
-    /// message in ONE lane serialize, in two lanes they race (`IOS-QUEUE-008`).
-    /// When a message reappears after a delete → undo → delete, the first question
-    /// is "which lane did each op land in, and in what order" and until now no
-    /// artifact answered it.
-    nonisolated static func laneDiagnosticSummary(_ lanes: [[PendingOperation]]) -> String {
-        guard !lanes.isEmpty else { return "<no lanes>" }
-        return lanes.enumerated().map { laneIndex, lane in
-            let ops = lane.map { op in
-                "\(op.id.prefix(8)) \(op.type.rawValue) "
-                    + "\(op.folderPath)→\(op.destinationPath ?? "-") "
-                    + "ids=[\(op.messageIds.joined(separator: ","))]"
-            }.joined(separator: " | ")
-            return "lane\(laneIndex)(\(lane.count)): \(ops)"
-        }.joined(separator: "  ;  ")
-    }
-
-    /// Drain all queued operations with per-message parallelism.
+    /// 🚨 THE LOOP HAS NO PASS CAP, AND THAT IS THE THROUGHPUT FIX. The
+    /// predecessor claimed everything, dispatched it across concurrent lanes and
+    /// stopped after at most THREE passes; a provider that settles one member per
+    /// attempt (`MIS-IOS-022`) therefore needed about `ceil(N/3)` separate DRAINS
+    /// to finish an N-member gesture, and the next drain waited on a new gesture,
+    /// a reconnect or the five-minute poll. On an idle device a ten-message
+    /// gesture took fifteen to twenty minutes. This loop instead keeps claiming
+    /// while a claimable front row exists, so the same gesture settles member
+    /// after member inside ONE continuous run — each member under its own fresh
+    /// `pendingOperationTimeoutSeconds`, because each is its own attempt.
     ///
-    /// Ops are grouped into lanes by `buildLanes`: an op joins the lane of ANY op
-    /// sharing any member message id (connected components), not just its first id.
-    /// Each lane is a FIFO — ops in the same connected component execute
-    /// sequentially (preserving ordering like removeTag→move, or a batch move and a
-    /// later single-id flag change on one of its members). The drain runs every
-    /// lane concurrently, so ops for disjoint messages make progress in parallel.
+    /// 🚨 WHY IT TERMINATES. Every iteration does exactly one of four things:
+    /// retires or drops a row (rows strictly decrease); narrows an operation
+    /// after STRICT member progress (members strictly decrease); marks at least
+    /// one id deferred for this drain, after which the frontier walk skips it
+    /// (the deferred set strictly grows and is bounded by the row count); or
+    /// stops the drain. No arm can leave all three quantities unchanged, so the
+    /// loop cannot spin. `executeSingleOp` owns that guarantee for the execution
+    /// arms and states it at each one.
     ///
-    /// Provider-level concurrency is managed by each provider (IMAP connection pool, HTTP pooling).
+    /// 🚨 A DEFERRAL IS A SKIP, NOT A STOP, AND THE CHAIN IS WHAT MAKES THAT
+    /// SAFE. When an operation cannot proceed, every pending row transitively
+    /// related to it — same connected component over provider ADDRESSES, the
+    /// calculation `buildLanes` already owns — is deferred with it. So the walk
+    /// can safely take the next unrelated row: nothing that shares a message with
+    /// the deferred operation is reachable, and unrelated mail proceeds. This
+    /// replaces v2final's "stop the drain when the frontier is already demoted"
+    /// spin guard with the same guarantee expressed once: an id in the deferred
+    /// set is never claimed again this drain, so the walk simply runs out of
+    /// candidates and the drain ends.
     ///
-    /// Re-fetches after each pass to pick up ops inserted during the drain.
+    /// Provider-level concurrency is managed by each provider (IMAP connection
+    /// pool, HTTP pooling); operations still execute through
+    /// `ProviderWorkQueue.execute(priority: .userAction)` so provider scheduling
+    /// priority is unchanged.
+    ///
     /// Skips drain when offline to prevent retry storms.
     func drainPendingQueue() async {
         guard !isDraining else {
@@ -612,517 +608,89 @@ extension AccountManager {
 
         let ctx = DrainContext()
 
-        // 🚨 NO CLAIM PASS STARTS WHILE THIS PROCESS HOLDS AN UNRESOLVED PROVEN
-        // RETIREMENT. That is the invariant, and it is enforced at BOTH of the
-        // places a claim pass can begin: here, at the top of the drain, and
-        // again at every pass boundary — see the `pendingRetirements` check
-        // beside `if !ctx.executedAny` below. Stating it in one place only was
-        // the defect: the top-of-drain replay runs ONCE, so a retirement
-        // retained by pass N left pass N+1 free to claim its follower.
+        // 🚨 NO CLAIM STARTS WHILE THIS PROCESS HOLDS AN UNRESOLVED PROVEN
+        // RETIREMENT. An operation whose provider result committed nowhere is
+        // holding an address every later gesture on that message needs, so it
+        // must be retired before anything is claimed — and it must not be made to
+        // wait for connectivity it does not use. `isDraining` is therefore set
+        // ABOVE the `NetworkMonitor` check: the replay is real work that must not
+        // run concurrently with itself or with a claim.
         //
-        // FINISH ANY RETIREMENT THIS PROCESS ALREADY HAS THE PROOF FOR, FIRST
-        // AND WHILE STILL OFFLINE. An operation whose provider result committed
-        // nowhere is holding an address every later gesture on that message
-        // needs, and its lane is halted until it commits — so it must be retired
-        // before anything is claimed, and it must not be made to wait for
-        // connectivity it does not use. `isDraining` is therefore set ABOVE the
-        // `NetworkMonitor` check now: the replay is real work that must not run
-        // concurrently with itself or with a pass.
+        // Under this executor the invariant needs stating ONCE rather than at
+        // every pass boundary, because there are no passes: the loop below
+        // re-checks it on every iteration, at the only place a claim can begin.
         guard await replayRetainedRetirements(context: ctx) else { return }
 
         // AND FINISH ANY REQUEUE THIS PROCESS COULD NOT COMMIT, for the same
         // reason and in the same window: a row this process claimed and did not
-        // execute is invisible to the claim loop until it is `queued` again, so
-        // resolving that ownership must happen before anything is claimed, and it
-        // must not wait for connectivity it does not use.
+        // execute is invisible to the frontier walk until it is `queued` again,
+        // so resolving that ownership must happen before anything is claimed, and
+        // it must not wait for connectivity it does not use.
         guard await recoverPendingRequeues() else { return }
 
         guard NetworkMonitor.checkConnected() else { return }
 
         pruneRecentlyCompleted()
 
-        // Max 3 passes to pick up ops inserted during drain.
-        for pass in 0..<3 {
-            let ops: [PendingOperation]
-            // Which accounts address their messages by an id that names ONE
-            // MESSAGE PER ACCOUNT rather than one per folder.
-            // Read here, in the SAME read as the ops snapshot and BEFORE anything is
-            // claimed, so a failure still takes the existing `break` and leaves no
-            // row stranded `inFlight`.
-            let accountScopedIds: Set<String>
-            do {
-                (ops, accountScopedIds) = try await dbPool.read({ db in
-                    let fetchedOps = try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
-                    return (fetchedOps, try Self.accountScopedIdAccountIds(db))
-                })
-            } catch {
-                queueLog("[Queue] ERROR: Failed to fetch pending ops: \(error)")
-                break
-            }
-            guard !ops.isEmpty else { break }
+        var claimedThisDrain = 0
+        executor: while true {
+            // 🚨 THE SAME INVARIANT AS THE TWO RECOVERIES ABOVE, RE-ASSERTED AT
+            // THE ONLY PLACE A CLAIM CAN BEGIN. A retirement whose local write
+            // could not commit leaves its row `inFlight` holding an address the
+            // provider has already invalidated; claiming ANY further work while
+            // that is outstanding is how a follower goes to the wire at a dead id
+            // and has the user's newest gesture deleted as "already done"
+            // (`IOS-GRAPH-005`). Stopping is the whole fix — the NEXT drain owns
+            // the recovery, because `replayRetainedRetirements` runs before it can
+            // claim anything (owner decision 2026-09-05, `#120`).
+            if !pendingRetirements.isEmpty || !pendingRequeues.isEmpty { break executor }
 
-            if pass == 0 {
-                let summary = ops.map { "\($0.type.rawValue)(\($0.messageIds.count)msgs)" }.joined(separator: ", ")
-                queueLog("[Queue] Draining \(ops.count) ops: \(summary)")
-            } else {
-                queueLog("[Queue] Drain pass \(pass + 1): \(ops.count) ops remaining/new")
-            }
-
-            // Claim all valid ops (unchanged: failedAccounts / provider checks / atomic claim).
-            var claimed: [PendingOperation] = []
-            for op in ops {
-                if ctx.failedAccounts.contains(op.accountId) { continue }
-                guard providers[op.accountId] != nil else {
-                    queueLog("[Queue] No provider for \(op.accountId) — skipping \(op.type.rawValue)")
-                    continue
+            let frontier = await claimFrontierOperation(context: ctx)
+            switch frontier {
+            case .exhausted:
+                queueLog("[Queue] drain complete — \(claimedThisDrain) operation(s) claimed this drain")
+                break executor
+            case .stop:
+                break executor
+            case .claimed(let op):
+                claimedThisDrain += 1
+                guard let queue = workQueues[op.accountId] else {
+                    // Unreachable: the frontier walk refuses to claim an op whose
+                    // account has no work queue. Handled rather than trapped so a
+                    // future re-ordering cannot strand a claimed row `inFlight`.
+                    await requeueOrRetain(op.id)
+                    break executor
                 }
-
-                let currentOp: PendingOperation?
-                do {
-                    currentOp = try await dbPool.write { db -> PendingOperation? in
-                        guard var fetched = try PendingOperation.fetchOne(db, key: op.id) else {
-                            return nil
-                        }
-                        if fetched.status == PendingStatus.cancelled.rawValue {
-                            _ = try PendingOperation.deleteOne(db, key: fetched.id)
-                            return nil
-                        }
-                        if fetched.status == PendingStatus.inFlight.rawValue {
-                            return nil
-                        }
-                        // T4.S6 — PARK (never drop) while this op's source folder is
-                        // mid UIDVALIDITY reset. The reaction has purged, or is about
-                        // to purge, every header in that folder, and the UIDs this op
-                        // addresses belong to a numbering the server has discarded:
-                        // executing it now would mutate whichever message the new
-                        // epoch put at that address (C3). The row stays `queued` with
-                        // its retry counters untouched, so nothing is lost and nothing
-                        // ages toward `failed` — Law 5. TRANSIENT: the flag is cleared
-                        // by the reaction's step-5 stamp, and full sync re-drives an
-                        // interrupted reaction on every cycle.
-                        //
-                        // ⚠ WHAT MAKES THE UNPARK SAFE — TWO CHECKS, NOT ONE. This
-                        // comment used to claim the step-5 transaction alone was enough
-                        // ("the same transaction that clears the flag also removes the
-                        // address-only ops"). It is NOT: `opIsAddressOnly` is false for
-                        // any op carrying a non-numeric id ALONGSIDE a UID, and
-                        // `.deleteDraft` is exactly that shape — `queueDraftDelete`
-                        // records `[uid, rfc822]`, and `executeOperation` used to hand
-                        // `messageIds.first` (the UID) alone to `provider.deleteDraft`.
-                        // Such an op survived the sweep and then unparked onto a UID the
-                        // new epoch had reassigned. The admission-time stamp compared
-                        // below is the second check, and the one that does not depend on
-                        // guessing an op's id shapes.
-                        // ⚑ UPDATE (2026-08-01, CORRECTED 2026-08-06):
-                        // `IMAPProvider.deleteDraft` no longer executes a bare UID on the
-                        // strength of the number alone — it requires the typed
-                        // `.imap(folder, uidValidity, uid)` address and compares the live
-                        // SELECT's epoch against the recorded (v72) minted epoch, failing
-                        // closed on a provable mismatch AND on an epoch the server did not
-                        // report. So that provider is now guarded at BOTH ends. The
-                        // 2026-08-01 wording said it "either verifies an rfc822 identity
-                        // on the wire, or (v72) corroborates the UID against the recorded
-                        // epoch": there is no rfc822 leg — `e0d3d30e0` removed it, and
-                        // ADR-IOS-068/D4 bans an RFC 822 Message-ID from selecting or
-                        // authorizing a mutation target — so the epoch arm is the only
-                        // arm. This check stays: it is provider-agnostic, it is what keeps
-                        // an op recorded under a discarded numbering from running at all,
-                        // and the reasoning above is what it exists for. (The paragraph
-                        // above describing `queueDraftDelete` recording `[uid, rfc822]` is
-                        // HISTORY — it explains why this check was added; today's
-                        // `.deleteDraft` records a single typed address plus
-                        // `draftServerUidValidity`.)
-                        let sourceFolderId = MessageIdentity.folderId(
-                            accountId: fetched.accountId, folderPath: fetched.folderPath)
-                        let sourceFolder = try Folder.fetchOne(db, key: sourceFolderId)
-                        if let sourceFolder, sourceFolder.uidValidityResetPendingAt != nil {
-                            if DebugModeManager.isLoggingEnabled() {
-                                print("[Queue] Op \(op.id.prefix(8)) (\(fetched.type.rawValue)) parked — folder \(fetched.folderPath) is mid UIDVALIDITY reset")
-                            }
-                            return nil
-                        }
-                        // T2.6 checkpoint A. PORT: v2final's A4 compare/delete
-                        // inside the claim transaction. SUBTRACT: RFC/hybrid
-                        // compatibility, nil fail-open, claimFrontier/global FIFO,
-                        // and demotion machinery. ⚑ NO REFERENCE — INVENTED: v3's
-                        // DB provider classification and fail-closed shape.
-                        //
-                        // 🚨 EXACTLY ONE ARM OF THIS CHECKPOINT MAY DELETE, and it is
-                        // the POSITIVE mismatch — two epochs that are both real
-                        // (`nz-number`) and disagree. That is exit 4 of
-                        // `Companion/Rules/Active/never-drop-user-intention.md`:
-                        // a PROVEN id reset in the operation's own address space.
-                        // Everything else this guard can observe — a malformed or
-                        // non-canonical provider address, an unstamped or zero op
-                        // epoch, a missing `Folder` row, a folder whose epoch is
-                        // unknown or zero, or a folder mid-reset — is an ABSENCE OF
-                        // EVIDENCE. "We could not determine the answer" is not an
-                        // exit: those ops are NOT claimed this pass and stay durably
-                        // `queued`, exactly as they would across an offline window.
-                        // The predecessor deleted on all of them, which is the single
-                        // most repeated defect class in this codebase's history.
-                        //
-                        // `.setTag`/`.removeTag` are deliberately NOT in this set:
-                        // action tags are LOCAL-ONLY (ADR-IOS-036) and their executor
-                        // arm is a `break`, so such an op carries no provider address
-                        // for a provider-address checkpoint to judge. Subjecting them
-                        // to it made every ReplyDetect `reply→none` op (7 producers,
-                        // all enqueueing an rfc822 `stableId`) a deterministic drop on
-                        // IMAP; leaving them in while the arm above stopped deleting
-                        // would instead accumulate unclaimable rows forever.
-                        let nonDraftTypes: Set<OperationType> = [
-                            .archive, .delete, .move,
-                            .markRead, .markUnread, .markFlagged, .markUnflagged,
-                            .markReplied, .markForwarded,
-                            .addUserLabel, .removeUserLabel,
-                        ]
-                        if nonDraftTypes.contains(fetched.type) {
-                            guard let account = try Account.fetchOne(db, key: fetched.accountId) else {
-                                // A missing account row tells us nothing about the
-                                // server's state. Leave the intention queued.
-                                if DebugModeManager.isLoggingEnabled() {
-                                    print("[Queue] Checkpoint A skipped \(fetched.id.prefix(8)) — no account row for \(fetched.accountId.prefix(8))")
-                                }
-                                return nil
-                            }
-                            let isDemo = fetched.accountId == DemoSeed.demoAccountId
-                            let isIMAP = !isDemo && (account.provider == .imap || account.provider == .icloud)
-                            if isIMAP {
-                                let idsAreCanonicalUIDs = !fetched.messageIds.isEmpty && fetched.messageIds.allSatisfy { id in
-                                    guard let uid = UInt32(id), uid > 0 else { return false }
-                                    return id == String(uid)
-                                }
-                                guard idsAreCanonicalUIDs,
-                                      let stamped = fetched.observedUidValidity,
-                                      let stampedUInt = UInt32(exactly: stamped), stampedUInt > 0,
-                                      let sourceFolder,
-                                      sourceFolder.uidValidityResetPendingAt == nil,
-                                      let live = sourceFolder.lastKnownUidValidity,
-                                      let liveUInt = UInt32(exactly: live), liveUInt > 0 else {
-                                    // ABSENCE OF EVIDENCE — never a drop. The row is
-                                    // left `queued` and simply not claimed this pass.
-                                    BackgroundSyncLogger.log(
-                                        "[Queue] Checkpoint A skipped \(fetched.id.prefix(8)) " +
-                                        "(\(fetched.type.rawValue), \(fetched.folderPath)) — " +
-                                        "provider address or UIDVALIDITY not established; op stays queued")
-                                    return nil
-                                }
-                                if live != stamped {
-                                    // EXIT 4 — a PROVEN turnover in this op's own
-                                    // source address space. Every retry would fail
-                                    // identically and forever, and executing under a
-                                    // numbering the op never observed is C3.
-                                    _ = try PendingOperation.deleteOne(db, key: fetched.id)
-                                    BackgroundSyncLogger.log(
-                                        "[Queue] Checkpoint A refused \(fetched.id.prefix(8)) " +
-                                        "(\(fetched.type.rawValue), \(fetched.folderPath)) — " +
-                                        "UIDVALIDITY moved \(stamped) → \(live); dropped whole before provider I/O")
-                                    return nil
-                                }
-                            }
-                        } else if let stamped = SyncEngine.knownUidValidity(fetched.observedUidValidity),
-                                  let live = SyncEngine.knownUidValidity(
-                                    sourceFolder?.lastKnownUidValidity),
-                                  live != stamped {
-                            // Preserve the already-landed draft/reset safeguard.
-                            // Draft operations remain outside generic checkpoint A
-                            // and continue through their typed execution gates.
-                            //
-                            // 🚨 BOTH EPOCHS MUST BE REAL BEFORE A DISAGREEMENT
-                            // MEANS ANYTHING (`IOS-QUEUE-002`). This arm used to
-                            // compare on bare inequality, so a ZERO on either
-                            // side read as a POSITIVE mismatch and took the
-                            // DELETE direction — turning an absence of evidence
-                            // into exit 4. `SyncEngine.knownUidValidity` is the
-                            // same normalizer the IMAP arm ten lines up already
-                            // requires (`stampedUInt > 0` / `liveUInt > 0`), and
-                            // exists because `Mailbox.Selection.uidValidity`
-                            // DEFAULTS to `UIDValidity(0)` rather than being
-                            // absent. Zero is "we were told nothing", and an
-                            // unknown epoch stays retryable forever.
-                            _ = try PendingOperation.deleteOne(db, key: fetched.id)
-                            BackgroundSyncLogger.log("[Queue] UIDVALIDITY changed under op \(fetched.id.prefix(8)) (\(fetched.type.rawValue), \(fetched.folderPath)): recorded under \(stamped), folder now \(live) — dropped without executing (C5)")
-                            return nil
-                        }
-                        fetched.status = PendingStatus.inFlight.rawValue
-                        // PORT — v2final's persisted attempted-row proof,
-                        // adapted to v3's lane claim. v3 has no post-claim
-                        // zombie/demotion stage, so status and proof change in
-                        // this same transaction before provider I/O. Never
-                        // infer this bit from status or retryCount.
-                        fetched.everAttempted = true
-                        try fetched.save(db)
-                        return fetched
-                    }
-                } catch {
-                    queueLog("[Queue] ERROR: Failed to claim op \(op.id): \(error)")
-                    continue
+                let provider = queue.provider
+                // WIRE ORDER, RECORDED. The pair of lines around this call is what
+                // lets an exported log answer "which operation went out, in what
+                // order" after the fact — the question `IOS-QUEUE-008` could not
+                // answer. Under a single-operation executor the queue position IS
+                // the answer, so it is what the line carries.
+                queueLog(
+                    "[Queue] drain pos \(op.queuePosition) — executing \(op.id.prefix(8)) "
+                        + "\(op.type.rawValue) \(op.folderPath)→\(op.destinationPath ?? "-") "
+                        + "ids=[\(op.messageIds.joined(separator: ","))]")
+                // Outcome captured via Mutex (not a plain var) — the closure passed
+                // to `queue.execute` is @Sendable, so it cannot capture a mutable
+                // local var directly under Swift 6 strict concurrency.
+                let outcomeBox = Mutex<SingleOpOutcome>(.proceed)
+                await queue.execute(priority: .userAction) {
+                    let result = await self.executeSingleOp(
+                        op, provider: provider, context: ctx)
+                    outcomeBox.withLock { $0 = result }
                 }
-                guard let currentOp else { continue }
-                claimed.append(currentOp)
+                let outcome = outcomeBox.withLock { $0 }
+                // The SAME fields as the `executing` line plus the outcome, on
+                // purpose: an equality oracle over the pair catches a dropped
+                // type, a reversed source→destination and a duplicated entry,
+                // none of which a bare `outcome=` line would constrain.
+                queueLog(
+                    "[Queue] drain pos \(op.queuePosition) — executed \(op.id.prefix(8)) "
+                        + "\(op.type.rawValue) \(op.folderPath)→\(op.destinationPath ?? "-") "
+                        + "ids=[\(op.messageIds.joined(separator: ","))] outcome=\(outcome)")
+                if outcome == .stopDrain { break executor }
             }
-
-            // Connected-component lane grouping (F1) — pure, see buildLanes doc comment.
-            // The lane key is the op's ADDRESS SPACE, which is a property of its
-            // ACCOUNT, not of the op: account-qualified for the ACCOUNT-SCOPED-ID
-            // accounts (Gmail, Outlook, demo), folder-qualified for everything
-            // else — IMAP, iCloud, and any provider string this build cannot
-            // decode. Folder-qualified is the base behaviour and the safe default.
-            let lanes = Self.buildLanes(claimed, accountScopedIdAccountIds: accountScopedIds)
-            // The lane assignment IS the concurrency decision, so record it before
-            // anything runs: same lane ⇒ serialized, different lanes ⇒ concurrent.
-            queueLog("[Queue] Lanes: \(Self.laneDiagnosticSummary(lanes))")
-            guard !lanes.isEmpty else { break }
-
-            // Launch one Task per lane. Each task drains its lane sequentially,
-            // halting (and requeuing the rest of the lane) on `.haltLane` so a later
-            // op never runs ahead of an unresolved predecessor sharing a message id.
-            // Different lanes (disjoint connected components) run concurrently.
-            var tasks: [Task<Void, Never>] = []
-            // `enumerated()` only supplies the lane's index to the diagnostic lines
-            // below — the iteration, its order and its body are unchanged.
-            for (laneIndex, lane) in lanes.enumerated() {
-                let capturedLane = lane
-                let capturedCtx = ctx
-                let task = Task { [self] in
-                    for (index, op) in capturedLane.enumerated() {
-                        if capturedCtx.failedAccounts.contains(op.accountId) {
-                            await requeueOrRetain(op.id)
-                            continue
-                        }
-                        // 🚨 ALREADY REFUSED THIS DRAIN for want of provider evidence.
-                        // Attempt it AT MOST ONCE per drain — a refusal raised after
-                        // a wire mutation has gone out would otherwise be repeated
-                        // within the same drain, and the one that motivated this
-                        // (`IMAPProvider.move`'s withheld-`COPYUID` refusal, deleted
-                        // in audit round 4) seated another destination duplicate
-                        // each time. See `DrainContext.evidenceRefused`.
-                        //
-                        // ⚠ THE CHECK BELONGS HERE, NOT IN THE CLAIM LOOP. Skipping
-                        // the op at claim time would keep it out of `buildLanes`
-                        // entirely, so its lane-mates — ops that share a message id
-                        // with it BY CONSTRUCTION — would form a lane without it and
-                        // execute, running ahead of an unresolved predecessor. That
-                        // is precisely the race `.haltLane` exists to prevent: a
-                        // `delete M` landing before the `move M` the user asked for
-                        // first, with the move's retry then acting on state it never
-                        // observed. Holding the op inside its lane and stopping the
-                        // lane HERE preserves lane membership and ordering while
-                        // still letting every other lane and account drain.
-                        if capturedCtx.evidenceRefused.contains(op.id) {
-                            // This op was claimed (`inFlight`) this pass, so the
-                            // requeue starts AT it, not after it — unlike the
-                            // `.haltLane` branch below, where the op has already been
-                            // dispositioned by `executeSingleOp`.
-                            for heldOp in capturedLane[index...] {
-                                await requeueOrRetain(heldOp.id)
-                            }
-                            break
-                        }
-                        guard let queue = self.workQueues[op.accountId] else {
-                            await requeueOrRetain(op.id)
-                            continue
-                        }
-                        let provider = queue.provider
-                        // 🚨 RE-READ THE ROW. `op` is a value from the snapshot this
-                        // pass took BEFORE any lane ran, and under account-qualified
-                        // lanes a predecessor in THIS lane may have rewritten this
-                        // op's `messageIds` while retiring its own move
-                        // (`MessageHeaderRekey.readdressQueuedOperations`,
-                        // `IOS-GRAPH-005`). Executing the captured value would send
-                        // the address the move just invalidated — the deterministic
-                        // dropped intention that account-qualifying Graph used to
-                        // cause. This is a happens-before, not a hopeful re-read: the
-                        // predecessor's retirement COMMITTED earlier in this same
-                        // sequential task, so there is no window to lose here and no
-                        // CAS is required.
-                        //
-                        // 🚨 A THROWN RE-READ IS NOT AN ABSENT ROW, and the two must
-                        // not share an arm. `try?` used to collapse them, so an
-                        // interrupted / busy / I-O read looked exactly like a deleted
-                        // row: the op stayed `inFlight` (the claim commits `inFlight`
-                        // AND `everAttempted` in one transaction), the lane kept
-                        // draining past it, no later drain could claim it because the
-                        // claim loop refuses `inFlight`, and at the next launch
-                        // `AppDatabase.recoverPreviousSessionResidue` (named
-                        // `reconcilePendingOperations` until 2026-09-05) DELETED an
-                        // attempted `.move`
-                        // that had never reached the wire. "We could not determine the
-                        // answer" is retryable, never authoritative — clause 2 of
-                        // `Companion/Rules/Active/never-drop-user-intention.md`.
-                        //
-                        // So the catch requeues THIS op and every remaining claimed
-                        // member of the lane — the same shape as the `evidenceRefused`
-                        // branch above — and halts the lane so no later member
-                        // overtakes an unresolved predecessor. The retry count is NOT
-                        // incremented: a database read failure says nothing about the
-                        // provider.
-                        //
-                        // 🚨 AND THE REQUEUE ITSELF IS OWNED, not best-effort. THE
-                        // INVARIANT: every row this process claimed and did not
-                        // execute becomes claimable again IN THIS PROCESS, even when
-                        // the failure that forced the requeue also refuses the requeue
-                        // write. `requeueOrRetain` keeps the id when its write throws
-                        // and `recoverPendingRequeues` finishes it before the next
-                        // drain claims anything; until then the pass boundary below
-                        // refuses to start another claim pass. (This comment used to
-                        // dismiss a failed requeue here as "the same pre-existing class
-                        // as every other `try? await retryWrite` requeue site in this
-                        // loop — nothing new and nothing widened". That was wrong
-                        // twice: this read boundary is new to this change, so its
-                        // residue was not inherited, and the class it appealed to is
-                        // now closed at all eight of its sites.)
-                        //
-                        // ⚠️ NO `?? op` FALLBACK, and `nil` means exactly one thing:
-                        // the row no longer exists. It CANNOT mean cancel or
-                        // annihilation — both of those predicates require `queued` and
-                        // `!everAttempted` (`AccountManagerActions`' exact-opposite
-                        // fold and `undoMove`'s `annihilable` filter), which the claim
-                        // has already made false for this row. The writers that CAN
-                        // delete it are the ones that never join a running drain: the
-                        // local wipes and resets — `SettingsView.localIndexWipeTxn`
-                        // (`DELETE FROM pendingOperation WHERE type != 'saveDraft'`),
-                        // `AppDataWiper`, `AccountManagerSetup`'s per-account delete
-                        // and `DemoSeed`'s demo reset — plus the UIDVALIDITY-reset
-                        // sweep. Those are the user's NEWER gesture, and it wins over
-                        // the one this lane captured. Falling back to the captured
-                        // struct would resurrect a withdrawn gesture from memory and
-                        // send it to the wire; a defaulted seam like that is
-                        // fail-DANGEROUS, not fail-safe.
-                        let reReadOp: PendingOperation?
-                        do {
-                            reReadOp = try await liveOperation(op.id)
-                        } catch {
-                            queueLog(
-                                "[Queue] drain lane \(laneIndex) pos \(index + 1)/\(capturedLane.count) — "
-                                    + "re-read of row \(op.id.prefix(8)) failed: \(error); "
-                                    + "requeueing it and the rest of this lane, lane halted")
-                            for heldOp in capturedLane[index...] {
-                                await requeueOrRetain(heldOp.id)
-                            }
-                            break
-                        }
-                        guard let liveOp = reReadOp else {
-                            queueLog(
-                                "[Queue] drain lane \(laneIndex) pos \(index + 1)/\(capturedLane.count) — "
-                                    + "row \(op.id.prefix(8)) no longer exists — a local wipe or reset "
-                                    + "removed it after the claim; skipping")
-                            continue
-                        }
-                        if liveOp.messageIds != op.messageIds {
-                            // The handoff is only observable here and in the DB. The
-                            // `IOS-QUEUE-008` lesson is that a race nobody can read
-                            // from the exported log gets misdiagnosed for a month.
-                            BackgroundSyncLogger.logQueue(
-                                "readdressed follower \(liveOp.id.prefix(8)) \(liveOp.type.rawValue): "
-                                    + "claimed ids=[\(op.messageIds.joined(separator: ","))] "
-                                    + "→ live ids=[\(liveOp.messageIds.joined(separator: ","))] "
-                                    + "(predecessor move retired in this lane)")
-                        }
-                        // Outcome captured via Mutex (not a plain var) — the closure
-                        // passed to queue.execute is @Sendable, so it cannot capture a
-                        // mutable local var directly under Swift 6 strict concurrency.
-                        let outcomeBox = Mutex<SingleOpOutcome>(.proceed)
-                        // WIRE ORDER, RECORDED. The pair of lines around this call is
-                        // what lets an exported log answer "which op went out first,
-                        // and in which lane" after the fact — the question
-                        // `IOS-QUEUE-008` could not answer. Position within the lane
-                        // proves FIFO; the lane index proves what serialized against
-                        // what; the outcome proves whether the lane kept draining.
-                        // The ids logged are the LIVE ones, because those are the ones
-                        // that go to the wire.
-                        queueLog(
-                            "[Queue] drain lane \(laneIndex) pos \(index + 1)/\(capturedLane.count) — "
-                                + "executing \(liveOp.id.prefix(8)) \(liveOp.type.rawValue) "
-                                + "\(liveOp.folderPath)→\(liveOp.destinationPath ?? "-") "
-                                + "ids=[\(liveOp.messageIds.joined(separator: ","))]")
-                        await queue.execute(priority: .userAction) {
-                            let result = await self.executeSingleOp(liveOp, provider: provider, context: capturedCtx)
-                            outcomeBox.withLock { $0 = result }
-                        }
-                        queueLog(
-                            "[Queue] drain lane \(laneIndex) pos \(index + 1)/\(capturedLane.count) — "
-                                + "executed \(liveOp.id.prefix(8)) \(liveOp.type.rawValue) "
-                                + "\(liveOp.folderPath)→\(liveOp.destinationPath ?? "-") "
-                                + "ids=[\(liveOp.messageIds.joined(separator: ","))] "
-                                + "outcome=\(outcomeBox.withLock({ $0 }))")
-                        if outcomeBox.withLock({ $0 }) == .haltLane {
-                            // Requeue the REMAINING claimed ops of this lane — exactly
-                            // like the failedAccounts requeue path above — then stop.
-                            let remaining = capturedLane[(index + 1)...]
-                            // 🚨 HAND THE SUFFIX TO THE RETAINED RETIREMENT FIRST.
-                            // The best-effort loop below is unchanged and still runs;
-                            // this only covers the ONE halt cause it cannot cover.
-                            // When this halt is a retirement whose write was refused,
-                            // whatever refused it is a DATABASE-WIDE refusal (GRDB
-                            // suspension while backgrounded, a full disk, an I/O error
-                            // at COMMIT — ADR-IOS-041), so the `try?` requeue below
-                            // fails in the SAME refusal and its error is discarded.
-                            // The suffix would then stay `inFlight` for the life of
-                            // the process — unclaimable, and deleted at the next
-                            // launch if it is an `everAttempted` `.move`. Recording it
-                            // here lets `replayRetainedRetirements` requeue it inside
-                            // the very transaction that finally commits the
-                            // retirement, which is the first write known to succeed.
-                            if pendingRetirements[liveOp.id] != nil {
-                                pendingRetirementSuffixes[liveOp.id] = remaining.map(\.id)
-                            }
-                            for remainingOp in remaining {
-                                await requeueOrRetain(remainingOp.id)
-                            }
-                            break
-                        }
-                    }
-                }
-                tasks.append(task)
-            }
-            for task in tasks { await task.value }
-
-            // 🚨 NO CLAIM PASS STARTS WHILE THIS PROCESS HOLDS AN UNRESOLVED
-            // PROVEN RETIREMENT, OR A CLAIMED ROW IT COULD NOT RETURN TO
-            // `queued` — the same invariant the top-of-drain recoveries enforce,
-            // restated at the drain's OTHER entry into a claim pass.
-            //
-            // A retirement whose local write could not commit leaves its move
-            // `inFlight` with every member, and halting its lane requeues the
-            // rest of that lane to `queued`. The claim loop refuses `inFlight`,
-            // so the predecessor is NOT re-claimed next pass — but the follower
-            // IS, alone, still naming the id the provider's uncommitted result
-            // has already invalidated. Its wire call 404s and the single-message
-            // conflict arm reads that as provider-authoritative "already done"
-            // and DELETES the user's NEWEST gesture, in a live process that is
-            // still holding the proof that would have re-addressed it.
-            //
-            // Progress by ANYTHING ELSE in the pass is enough to reach here with
-            // `executedAny` set: a successful bystander on the full arm, and
-            // `retirePartiallyCompletedOp` — which sets it unconditionally,
-            // after its retention catch as well — on the partial one.
-            //
-            // STOPPING IS THE WHOLE FIX, and the NEXT DRAIN owns the recovery:
-            // `replayRetainedRetirements` runs at the top of `drainPendingQueue`
-            // BEFORE anything is claimed, so either the retained proof commits —
-            // re-addressing every holder of the old address in that same
-            // transaction — or the drain refuses to start at all. Nothing is
-            // replayed here: whatever refused the write milliseconds ago is
-            // overwhelmingly still refusing it, and a second recovery point for
-            // one fact is two places to keep in step (owner decision
-            // 2026-09-05, `TabMail/tabmail-ios#120`, `IOS-GRAPH-005`).
-            //
-            // 🚨 AND `pendingRequeues` IS LOAD-BEARING HERE, NOT SYMMETRY. Inside
-            // the failed-read catch and the lane-halt loop each row is requeued
-            // by its OWN `retryWrite`, so a predecessor's requeue can fail while
-            // its follower's succeeds. That leaves the follower `queued` and
-            // claimable ALONE in the next pass — the claim loop refuses the
-            // predecessor, which is still `inFlight` — running ahead of an
-            // unresolved predecessor in the same lane, which is exactly the
-            // ordering violation `.haltLane` exists to prevent. The next drain
-            // owns the recovery: `recoverPendingRequeues` runs before anything is
-            // claimed, so either the ownership resolves or the drain refuses to
-            // start.
-            if !pendingRetirements.isEmpty || !pendingRequeues.isEmpty { break }
-
-            if !ctx.executedAny { break }
-            ctx.executedAny = false
         }
 
         // Post-drain: sync destination folders so new UIDs are picked up immediately.
@@ -1154,6 +722,410 @@ extension AccountManager {
                 // no earlier one is.
                 await enqueueAIForMembersThatEnteredInbox(key: key, folderPath: folderPath, context: ctx)
             }
+        }
+    }
+
+    /// What the frontier walk decided.
+    enum FrontierClaim: Sendable {
+        /// Nothing claimable is left: the queue is empty, or every remaining row
+        /// is deferred for this drain, belongs to a suppressed account, or is
+        /// unclaimable for want of evidence. The drain ends normally.
+        case exhausted
+        /// The walk must not advance: the front row is `inFlight` (owned by work
+        /// this process has not resolved), or the claim transaction itself failed.
+        /// Ending the drain is the safe answer — nothing may overtake an
+        /// unresolved frontier.
+        case stop
+        /// The claimed row, as read inside the claim transaction.
+        case claimed(PendingOperation)
+    }
+
+    /// CLAIM THE LIVE FRONT ROW, in one short write transaction.
+    ///
+    /// Walks `pendingOperation` in `queuePosition ASC` and claims the first row
+    /// that can actually be attempted. Everything it can decide without a
+    /// provider is decided here, before `inFlight`/`everAttempted` are written,
+    /// which is the point: an operation that is skipped for want of a provider,
+    /// an epoch or a folder has NOT been attempted, keeps its undo eligibility,
+    /// and does not widen crash-time retirement of a never-sent move.
+    ///
+    /// 🚨 A NO-ATTEMPT SKIP DEFERS THE WHOLE LIVE RELATED CHAIN, IN MEMORY.
+    /// Skipping one row and taking the next would let a LATER operation on the
+    /// SAME message overtake it — the exact ordering violation this executor
+    /// exists to prevent. So every skip marks the skipped row's entire connected
+    /// component (`buildLanes`, over the rows this transaction just read) as
+    /// deferred for this drain, and the walk refuses every id in that set. It is
+    /// an in-memory mark and NOT a durable tail movement: nothing was attempted,
+    /// no position changes, no retry is charged, and the rows stay exactly where
+    /// the user's gestures put them. Durable tail movement is reserved for a row
+    /// that actually FAILED a provider attempt (`deferRelatedChainToTail`).
+    ///
+    /// 🚨 EXACTLY ONE ARM OF THIS WALK MAY DELETE A ROW ON EVIDENCE, and it is
+    /// checkpoint A's POSITIVE epoch mismatch — two epochs that are both real and
+    /// disagree, which is exit 4 of `never-drop-user-intention.md`. Every other
+    /// thing the walk can observe is an ABSENCE of evidence and is a skip. (The
+    /// cancelled-row delete is not an evidence decision: the user withdrew it.)
+    private func claimFrontierOperation(context: DrainContext) async -> FrontierClaim {
+        // Actor-isolated process state, snapshotted OUTSIDE the write closure:
+        // the `@Sendable` GRDB closure cannot read it directly, and both facts are
+        // stable for the duration of this one synchronous walk.
+        let providerAccountIds = Set(providers.keys)
+        let workQueueAccountIds = Set(workQueues.keys)
+        let failedAccounts = context.failedAccounts
+        let alreadyDeferred = context.deferredOperationIds
+
+        struct WalkResult {
+            var claimed: PendingOperation?
+            var newlyDeferred: Set<String> = []
+            var stop = false
+        }
+
+        let result: WalkResult
+        do {
+            result = try await dbPool.write { db -> WalkResult in
+                var out = WalkResult()
+                var deferred = alreadyDeferred
+                // The address space each account's ids live in — read in the SAME
+                // transaction as the rows, so the relatedness calculation and the
+                // rows it partitions cannot disagree. ID-only and matched on the
+                // raw provider column, so one corrupt bystander `account` row
+                // cannot throw and wedge every account's drain.
+                let accountScopedIds = try Self.accountScopedIdAccountIds(db)
+                let rows = try PendingOperation
+                    .order(Column("queuePosition").asc)
+                    .fetchAll(db)
+
+                // The connected components over provider addresses, computed ONCE
+                // from the rows this transaction read and then indexed by id.
+                // Computing them per deferral instead would make a drain that
+                // defers k chains cost O(k · N) union-find passes over the whole
+                // queue, which is the shape that turns a long offline backlog into
+                // a visible stall.
+                //
+                // Deletes performed later in this walk do not invalidate it: an id
+                // that is no longer a row simply cannot be claimed, and its
+                // presence in a deferred set is inert.
+                var componentById: [String: [String]] = [:]
+                for lane in Self.buildLanes(rows, accountScopedIdAccountIds: accountScopedIds) {
+                    let ids = lane.map(\.id)
+                    for id in ids { componentById[id] = ids }
+                }
+
+                /// Every id in `seed`'s connected component over provider
+                /// addresses, computed from the rows THIS transaction read.
+                func relatedIds(of seed: PendingOperation) -> [String] {
+                    componentById[seed.id] ?? [seed.id]
+                }
+
+                func deferChain(_ seed: PendingOperation, reason: String) {
+                    let ids = relatedIds(of: seed)
+                    deferred.formUnion(ids)
+                    out.newlyDeferred.formUnion(ids)
+                    queueLog(
+                        "[Queue] frontier \(seed.id.prefix(8)) (\(seed.type.rawValue)) not attempted "
+                            + "— \(reason); deferring its live related chain "
+                            + "(\(ids.count) row(s)) for this drain, no claim and no retry charge")
+                }
+
+                for row in rows {
+                    if deferred.contains(row.id) { continue }
+                    guard var fetched = try PendingOperation.fetchOne(db, key: row.id) else {
+                        continue
+                    }
+                    if fetched.status == PendingStatus.cancelled.rawValue {
+                        _ = try PendingOperation.deleteOne(db, key: fetched.id)
+                        queueLog("[Queue] Op \(fetched.id.prefix(8)) cancelled by undo, deleted")
+                        continue
+                    }
+                    if fetched.status == PendingStatus.inFlight.rawValue {
+                        // THE PROTECTED-FRONTIER LAW. An `inFlight` row is owned by
+                        // work this process started and has not resolved. Skipping
+                        // past it would let a later gesture overtake an unresolved
+                        // predecessor; stealing it would send the same mutation
+                        // twice. Stop instead, and let the two recoveries at the top
+                        // of the next drain resolve the ownership.
+                        queueLog(
+                            "[Queue] frontier \(fetched.id.prefix(8)) is inFlight — "
+                                + "stopping this drain rather than overtaking it")
+                        out.stop = true
+                        return out
+                    }
+                    if failedAccounts.contains(fetched.accountId) {
+                        deferChain(fetched, reason: "its account is suppressed for this drain")
+                        continue
+                    }
+                    guard providerAccountIds.contains(fetched.accountId),
+                          workQueueAccountIds.contains(fetched.accountId) else {
+                        // Absence of a provider entry is a NO-ATTEMPT DEFERRAL,
+                        // explicitly not v2final's global-stop branch: a
+                        // not-yet-connected account must not hold every other
+                        // account's mail. Account removal purges that account's rows
+                        // separately, so this is transient state, not an orphan.
+                        deferChain(fetched, reason: "no registered provider or work queue")
+                        continue
+                    }
+                    // T4.S6 — PARK (never drop) while this op's source folder is
+                    // mid UIDVALIDITY reset. The reaction has purged, or is about
+                    // to purge, every header in that folder, and the UIDs this op
+                    // addresses belong to a numbering the server has discarded:
+                    // executing it now would mutate whichever message the new
+                    // epoch put at that address (C3). The row stays `queued` with
+                    // its retry counters untouched, so nothing is lost and nothing
+                    // ages toward `failed` — Law 5. TRANSIENT: the flag is cleared
+                    // by the reaction's step-5 stamp, and full sync re-drives an
+                    // interrupted reaction on every cycle.
+                    //
+                    // ⚠ WHAT MAKES THE UNPARK SAFE — TWO CHECKS, NOT ONE. This
+                    // comment used to claim the step-5 transaction alone was enough
+                    // ("the same transaction that clears the flag also removes the
+                    // address-only ops"). It is NOT: `opIsAddressOnly` is false for
+                    // any op carrying a non-numeric id ALONGSIDE a UID, and
+                    // `.deleteDraft` is exactly that shape — `queueDraftDelete`
+                    // records `[uid, rfc822]`, and `executeOperation` used to hand
+                    // `messageIds.first` (the UID) alone to `provider.deleteDraft`.
+                    // Such an op survived the sweep and then unparked onto a UID the
+                    // new epoch had reassigned. The admission-time stamp compared
+                    // below is the second check, and the one that does not depend on
+                    // guessing an op's id shapes.
+                    // ⚑ UPDATE (2026-08-01, CORRECTED 2026-08-06):
+                    // `IMAPProvider.deleteDraft` no longer executes a bare UID on the
+                    // strength of the number alone — it requires the typed
+                    // `.imap(folder, uidValidity, uid)` address and compares the live
+                    // SELECT's epoch against the recorded (v72) minted epoch, failing
+                    // closed on a provable mismatch AND on an epoch the server did not
+                    // report. So that provider is now guarded at BOTH ends. The
+                    // 2026-08-01 wording said it "either verifies an rfc822 identity
+                    // on the wire, or (v72) corroborates the UID against the recorded
+                    // epoch": there is no rfc822 leg — `e0d3d30e0` removed it, and
+                    // ADR-IOS-068/D4 bans an RFC 822 Message-ID from selecting or
+                    // authorizing a mutation target — so the epoch arm is the only
+                    // arm. This check stays: it is provider-agnostic, it is what keeps
+                    // an op recorded under a discarded numbering from running at all,
+                    // and the reasoning above is what it exists for. (The paragraph
+                    // above describing `queueDraftDelete` recording `[uid, rfc822]` is
+                    // HISTORY — it explains why this check was added; today's
+                    // `.deleteDraft` records a single typed address plus
+                    // `draftServerUidValidity`.)
+                    let sourceFolderId = MessageIdentity.folderId(
+                        accountId: fetched.accountId, folderPath: fetched.folderPath)
+                    let sourceFolder = try Folder.fetchOne(db, key: sourceFolderId)
+                    if let sourceFolder, sourceFolder.uidValidityResetPendingAt != nil {
+                        deferChain(
+                            fetched,
+                            reason: "folder \(fetched.folderPath) is mid UIDVALIDITY reset")
+                        continue
+                    }
+                    // T2.6 checkpoint A. PORT: v2final's A4 compare/delete
+                    // inside the claim transaction. SUBTRACT: RFC/hybrid
+                    // compatibility, nil fail-open, and the withdrawn recovery
+                    // machinery. ⚑ NO REFERENCE — INVENTED: v3's DB provider
+                    // classification and fail-closed shape.
+                    //
+                    // 🚨 EXACTLY ONE ARM OF THIS CHECKPOINT MAY DELETE, and it is
+                    // the POSITIVE mismatch — two epochs that are both real
+                    // (`nz-number`) and disagree. That is exit 4 of
+                    // `Companion/Rules/Active/never-drop-user-intention.md`:
+                    // a PROVEN id reset in the operation's own address space.
+                    // Everything else this guard can observe — a malformed or
+                    // non-canonical provider address, an unstamped or zero op
+                    // epoch, a missing `Folder` row, a folder whose epoch is
+                    // unknown or zero, or a folder mid-reset — is an ABSENCE OF
+                    // EVIDENCE. "We could not determine the answer" is not an
+                    // exit: those ops are NOT claimed and stay durably `queued`,
+                    // exactly as they would across an offline window. The
+                    // predecessor deleted on all of them, which is the single
+                    // most repeated defect class in this codebase's history.
+                    //
+                    // `.setTag`/`.removeTag` are deliberately NOT in this set:
+                    // action tags are LOCAL-ONLY (ADR-IOS-036) and their executor
+                    // arm is a `break`, so such an op carries no provider address
+                    // for a provider-address checkpoint to judge. Subjecting them
+                    // to it made every ReplyDetect `reply→none` op (7 producers,
+                    // all enqueueing an rfc822 `stableId`) a deterministic drop on
+                    // IMAP; leaving them in while the arm above stopped deleting
+                    // would instead accumulate unclaimable rows forever.
+                    let nonDraftTypes: Set<OperationType> = [
+                        .archive, .delete, .move,
+                        .markRead, .markUnread, .markFlagged, .markUnflagged,
+                        .markReplied, .markForwarded,
+                        .addUserLabel, .removeUserLabel,
+                    ]
+                    if nonDraftTypes.contains(fetched.type) {
+                        guard let account = try Account.fetchOne(db, key: fetched.accountId) else {
+                            // A missing account row tells us nothing about the
+                            // server's state. Leave the intention queued.
+                            deferChain(fetched, reason: "no account row for checkpoint A")
+                            continue
+                        }
+                        let isDemo = fetched.accountId == DemoSeed.demoAccountId
+                        let isIMAP = !isDemo && (account.provider == .imap || account.provider == .icloud)
+                        if isIMAP {
+                            let idsAreCanonicalUIDs = !fetched.messageIds.isEmpty && fetched.messageIds.allSatisfy { id in
+                                guard let uid = UInt32(id), uid > 0 else { return false }
+                                return id == String(uid)
+                            }
+                            guard idsAreCanonicalUIDs,
+                                  let stamped = fetched.observedUidValidity,
+                                  let stampedUInt = UInt32(exactly: stamped), stampedUInt > 0,
+                                  let sourceFolder,
+                                  sourceFolder.uidValidityResetPendingAt == nil,
+                                  let live = sourceFolder.lastKnownUidValidity,
+                                  let liveUInt = UInt32(exactly: live), liveUInt > 0 else {
+                                // ABSENCE OF EVIDENCE — never a drop. The row is
+                                // left `queued` and simply not claimed.
+                                BackgroundSyncLogger.log(
+                                    "[Queue] Checkpoint A skipped \(fetched.id.prefix(8)) " +
+                                    "(\(fetched.type.rawValue), \(fetched.folderPath)) — " +
+                                    "provider address or UIDVALIDITY not established; op stays queued")
+                                deferChain(
+                                    fetched,
+                                    reason: "checkpoint A has no address or epoch evidence")
+                                continue
+                            }
+                            if live != stamped {
+                                // EXIT 4 — a PROVEN turnover in this op's own
+                                // source address space. Every retry would fail
+                                // identically and forever, and executing under a
+                                // numbering the op never observed is C3.
+                                _ = try PendingOperation.deleteOne(db, key: fetched.id)
+                                BackgroundSyncLogger.log(
+                                    "[Queue] Checkpoint A refused \(fetched.id.prefix(8)) " +
+                                    "(\(fetched.type.rawValue), \(fetched.folderPath)) — " +
+                                    "UIDVALIDITY moved \(stamped) → \(live); dropped whole before provider I/O")
+                                continue
+                            }
+                        }
+                    } else if let stamped = SyncEngine.knownUidValidity(fetched.observedUidValidity),
+                              let live = SyncEngine.knownUidValidity(
+                                sourceFolder?.lastKnownUidValidity),
+                              live != stamped {
+                        // Preserve the already-landed draft/reset safeguard.
+                        // Draft operations remain outside generic checkpoint A
+                        // and continue through their typed execution gates.
+                        //
+                        // 🚨 BOTH EPOCHS MUST BE REAL BEFORE A DISAGREEMENT
+                        // MEANS ANYTHING (`IOS-QUEUE-002`). This arm used to
+                        // compare on bare inequality, so a ZERO on either
+                        // side read as a POSITIVE mismatch and took the
+                        // DELETE direction — turning an absence of evidence
+                        // into exit 4. `SyncEngine.knownUidValidity` is the
+                        // same normalizer the IMAP arm ten lines up already
+                        // requires (`stampedUInt > 0` / `liveUInt > 0`), and
+                        // exists because `Mailbox.Selection.uidValidity`
+                        // DEFAULTS to `UIDValidity(0)` rather than being
+                        // absent. Zero is "we were told nothing", and an
+                        // unknown epoch stays retryable forever.
+                        _ = try PendingOperation.deleteOne(db, key: fetched.id)
+                        BackgroundSyncLogger.log("[Queue] UIDVALIDITY changed under op \(fetched.id.prefix(8)) (\(fetched.type.rawValue), \(fetched.folderPath)): recorded under \(stamped), folder now \(live) — dropped without executing (C5)")
+                        continue
+                    }
+                    fetched.status = PendingStatus.inFlight.rawValue
+                    // PORT — v2final's persisted attempted-row proof, adapted to
+                    // v3's claim. Every no-attempt condition above has already
+                    // been evaluated, so this bit is written only when a provider
+                    // call is about to be made. Never infer it from status or
+                    // retryCount.
+                    fetched.everAttempted = true
+                    try fetched.update(db)
+                    out.claimed = fetched
+                    return out
+                }
+                return out
+            }
+        } catch {
+            queueLog("[Queue] ERROR: frontier claim failed: \(error) — this drain stops")
+            return .stop
+        }
+
+        context.deferredOperationIds.formUnion(result.newlyDeferred)
+        if result.stop { return .stop }
+        guard let claimed = result.claimed else { return .exhausted }
+        return .claimed(claimed)
+    }
+
+    /// APPEND A FAILED OPERATION AND ITS LIVE RELATED CHAIN TO THE TAIL, IN ONE
+    /// WRITE, and mark every one of them deferred for this drain.
+    ///
+    /// This is the durable half of related-chain deferral, and the only thing in
+    /// the executor that rewrites `queuePosition` after admission. Spec §3's
+    /// worked examples are what it implements:
+    ///
+    /// ```text
+    /// Before: A1, B1, A2, C1   A1 fails   After: B1, C1, A1, A2
+    /// Before: A1, X1, action(A+B), B2, Y1   A1 fails   After: X1, Y1, A1, action(A+B), B2
+    /// ```
+    ///
+    /// A2 cannot pass A1, because A2 moves WITH it; B1 and C1 keep their relative
+    /// order because nothing else is touched. Relatedness is the connected
+    /// component over provider ADDRESSES that `buildLanes` already computes — the
+    /// same pure calculation, the same account-qualified/folder-qualified split,
+    /// the same conservative default for a provider string this build cannot
+    /// decode — read from the LIVE rows inside this transaction rather than from
+    /// any snapshot. Scheduling relatedness never authorizes a mutation target;
+    /// it only decides what moves together.
+    ///
+    /// 🚨 THE MEMBERSHIP IS RE-READ HERE, AFTER THE PROVIDER CALL. A retirement
+    /// committed earlier in this drain may have re-addressed a follower
+    /// (`MessageHeaderRekey.readdressQueuedOperations`), and a chain computed from
+    /// pre-call ids would group by an address the wire has already replaced.
+    ///
+    /// 🚨 IT NEVER RECREATES A ROW. Every write is an `UPDATE … WHERE id`, so a
+    /// row that undo, a cancel or an account deletion removed while the provider
+    /// call was outstanding stays removed — the user's newer decision wins.
+    ///
+    /// - Returns: `true` when the tail movement committed. `false` means the
+    ///   transaction failed and NOTHING moved; the caller must not report a
+    ///   deferral it did not perform, and falls back to the ordinary requeue so
+    ///   the claimed row is never stranded `inFlight`.
+    @discardableResult
+    private func deferRelatedChainToTail(
+        failing op: PendingOperation,
+        incrementRetryCount: Bool,
+        context: DrainContext
+    ) async -> Bool {
+        do {
+            let movedIds = try await retryWrite(dbPool, label: "Queue deferral") { db -> [String] in
+                let accountScopedIds = try Self.accountScopedIdAccountIds(db)
+                let live = try PendingOperation
+                    .filter(Column("status") != PendingStatus.cancelled.rawValue)
+                    .order(Column("queuePosition").asc)
+                    .fetchAll(db)
+                guard live.contains(where: { $0.id == op.id }) else {
+                    // Undo, a cancel or an account deletion removed the row while
+                    // the provider call was outstanding. There is nothing to defer
+                    // and nothing to recreate.
+                    return []
+                }
+                let lanes = Self.buildLanes(live, accountScopedIdAccountIds: accountScopedIds)
+                let chain = lanes.first { $0.contains { $0.id == op.id } } ?? []
+                let ids = chain.map(\.id)
+                try PendingOperation.appendToTail(
+                    db, ids: ids, chargeRetryTo: incrementRetryCount ? op.id : nil)
+                return ids
+            }
+            guard !movedIds.isEmpty else {
+                queueLog(
+                    "[Queue] deferral — row \(op.id.prefix(8)) no longer exists; "
+                        + "nothing moved and nothing recreated")
+                context.deferredOperationIds.insert(op.id)
+                return true
+            }
+            context.deferredOperationIds.formUnion(movedIds)
+            queueLog(
+                "[Queue] deferral — moved \(movedIds.count) related row(s) to the tail after "
+                    + "\(op.id.prefix(8)) \(op.type.rawValue) failed, preserving their order; "
+                    + "they are deferred for the rest of this drain")
+            return true
+        } catch {
+            // NEVER REPORT SUCCESSFUL TAIL MOVEMENT ON A FAILED TRANSACTION.
+            // Nothing moved, so the claimed row is still `inFlight`; hand it to
+            // the ordinary requeue, which keeps ownership in `pendingRequeues`
+            // when its own write is refused too.
+            queueLog(
+                "[Queue] deferral — tail movement for \(op.id.prefix(8)) failed: \(error); "
+                    + "nothing moved, requeueing the claimed row and stopping this drain")
+            await requeueOrRetain(op.id, incrementRetryCount: incrementRetryCount)
+            return false
         }
     }
 
@@ -1219,6 +1191,30 @@ extension AccountManager {
     /// a partial outcome — members removed while the header keeps its source
     /// address, or the reverse — would be a dropped intention or a row nothing
     /// can address (`IOS-QUEUE-005`).
+    ///
+    /// 🚨 THE NARROWED REMAINDER AND ITS POST-REKEY LIVE RELATED CHAIN GO TO THE
+    /// TAIL, IN THIS SAME TRANSACTION. Spec §5's PR 2 sentence and the failure
+    /// table's "only some members are settled" row both require it, and §6
+    /// states the property it buys: *a partial Graph move must yield to
+    /// unrelated work before its remainder is attempted again, with remainder
+    /// and followers at the tail in order.* Every multi-member Gmail/Graph
+    /// operation reaches this function on its FIRST attempt (one member per
+    /// provider call, `MIS-IOS-022`), so without the move a ten-message gesture
+    /// would hold the head of the queue for ten consecutive provider calls and
+    /// an unrelated single-message action admitted behind it would wait for all
+    /// of them.
+    ///
+    /// 🚨 THE CHAIN IS READ AFTER `finishMove`, WHICH IS WHAT "POST-REKEY"
+    /// MEANS. `MessageHeaderRekey.readdressQueuedOperations` has already
+    /// rewritten the followers' member ids to the addresses the provider named
+    /// (ADR-IOS-081, `IOS-GRAPH-005`), so the connected component computed here
+    /// groups by the addresses the NEXT attempt will use. Computing it from
+    /// pre-call ids would group by an address the wire has already replaced and
+    /// could leave a follower ahead of the predecessor it depends on.
+    ///
+    /// ⚠️ NO RETRY IS CHARGED. Narrowing is strict progress, not a failure: the
+    /// provider settled a member and the row is smaller than it was. Charging
+    /// here would make `retryCount` count successes.
     nonisolated static func commitPartialRetirement(
         _ frozenRetiredOp: PendingOperation,
         remaining: [String],
@@ -1226,13 +1222,12 @@ extension AccountManager {
         addressChangesOnMove: Bool,
         db: Database
     ) throws -> MoveFinishResult {
-        let accountScopedIds = try AccountManager
-            .accountScopedIdAccountIds(db).contains(frozenRetiredOp.accountId)
+        let accountScopedIdAccounts = try AccountManager.accountScopedIdAccountIds(db)
         let result = try MessageHeaderRekey.finishMove(
             frozenRetiredOp,
             destinations: provenDestinations,
             addressChangesOnMove: addressChangesOnMove,
-            accountScopedIds: accountScopedIds,
+            accountScopedIds: accountScopedIdAccounts.contains(frozenRetiredOp.accountId),
             db: db)
         MessageHeaderRekey.publishAddressHandoffsAfterCommit(result.applied, in: db)
         guard var fresh = try PendingOperation.fetchOne(db, key: frozenRetiredOp.id) else {
@@ -1240,7 +1235,14 @@ extension AccountManager {
         }
         fresh.messageIds = remaining
         fresh.status = PendingStatus.queued.rawValue
-        try fresh.save(db)
+        try fresh.update(db)
+        let live = try PendingOperation
+            .filter(Column("status") != PendingStatus.cancelled.rawValue)
+            .order(Column("queuePosition").asc)
+            .fetchAll(db)
+        let lanes = buildLanes(live, accountScopedIdAccountIds: accountScopedIdAccounts)
+        let chain = lanes.first { $0.contains { $0.id == frozenRetiredOp.id } } ?? []
+        try PendingOperation.appendToTail(db, ids: chain.map(\.id))
         return result
     }
 
@@ -1257,18 +1259,13 @@ extension AccountManager {
     /// connectivity would strand a proven move behind an offline window it has
     /// nothing to do with.
     ///
-    /// 🚨 IT ALSO RETURNS THE HALTED LANE'S UNEXECUTED SUFFIX, in the SAME
-    /// transaction. The refusal that lost the retirement is database-wide, so it
-    /// also lost the halt site's best-effort requeue of the ops claimed behind
-    /// it; those rows would otherwise stay `inFlight` — unclaimable for the life
-    /// of the process, then deleted at the next launch if they are attempted
-    /// `.move`s. Requeuing them here and not at the pass boundary keeps ONE
-    /// recovery point for one fact, and putting them in the retirement's own
-    /// transaction means a follower is never made claimable while still naming
-    /// the address that transaction is about to invalidate. The requeue is
-    /// guarded on `status = 'inFlight'` (`PendingOperation.requeueIfInFlight`),
-    /// so a row the user has since cancelled, a row a local wipe deleted, and a
-    /// row the best-effort loop already requeued are all left alone.
+    /// 🚨 IT NO LONGER OWNS A CLAIMED SUFFIX, because under the global
+    /// single-operation executor there is never one. This function used to
+    /// requeue, in the retirement's own transaction, the ops this process had
+    /// claimed behind a halted lane; that suffix could only exist while several
+    /// rows were `inFlight` at once. One row is claimed at a time now, so the
+    /// operations behind a retained retirement are still `queued` and the next
+    /// executor iteration reaches them with no recovery step at all.
     ///
     /// - Returns: `false` when the drain must stop. A replay that still cannot
     ///   commit says the database is still refusing writes, and nothing else in
@@ -1295,54 +1292,27 @@ extension AccountManager {
                 // answer" and stays retryable (clause 2 of
                 // `never-drop-user-intention.md`). Two copies of that contract
                 // are two places for it to drift, and the copy carried no
-                // coverage for its thrown case at all. Reusing the function the
-                // lane loop already uses also inherits its `#if DEBUG` one-shot
-                // read fault, so the throw arm is now witnessable without a new
-                // seam. A throw lands in the catch below and stops the drain
+                // coverage for its thrown case at all. Reusing `liveOperation`
+                // also inherits its `#if DEBUG` one-shot read fault, so the throw
+                // arm is witnessable without a new seam — and this replay is now
+                // its ONLY caller, because the executor claims the live front row
+                // inside the claim transaction and has nothing left to re-read.
+                // A throw lands in the catch below and stops the drain
                 // with the proof still held, which is exactly what the bespoke
                 // read did.
                 guard try await liveOperation(opId) != nil else {
-                    let orphanedSuffix = pendingRetirementSuffixes[opId] ?? []
-                    if !orphanedSuffix.isEmpty {
-                        // The predecessor's row is gone, but the suffix rows this
-                        // process claimed behind it are NOT the same gesture and
-                        // were not necessarily removed with it. Return them so a
-                        // later pass can claim them; a failure here throws into
-                        // the catch and the entry is retained for the next drain.
-                        try await retryWrite(dbPool, label: "Queue") { db in
-                            for suffixId in orphanedSuffix {
-                                try PendingOperation.requeueIfInFlight(db, id: suffixId)
-                            }
-                        }
-                    }
                     pendingRetirements.removeValue(forKey: opId)
-                    pendingRetirementSuffixes.removeValue(forKey: opId)
                     queueLog(
                         "[Queue] retirement replay — row \(opId.prefix(8)) no longer exists; "
-                            + "a local wipe or reset removed it, so the retained proof is dropped"
-                            + (orphanedSuffix.isEmpty
-                                ? ""
-                                : "; requeued \(orphanedSuffix.count) claimed follower(s)"))
+                            + "a local wipe or reset removed it, so the retained proof is dropped")
                     continue
                 }
-                // The suffix this retirement owns, resolved once for both arms.
-                // Requeued INSIDE the retirement's own transaction below: the two
-                // facts — "the move is retired and its followers re-addressed"
-                // and "the followers this process claimed are claimable again" —
-                // must land together or not at all.
-                let ownedSuffix = pendingRetirementSuffixes[opId] ?? []
                 switch retirement {
                 case .full(let op, let executed):
                     let result = try await retryWrite(dbPool, label: "Queue") { db in
-                        let committed = try Self.commitFullRetirement(
-                            op, executed: executed, db: db)
-                        for suffixId in ownedSuffix {
-                            try PendingOperation.requeueIfInFlight(db, id: suffixId)
-                        }
-                        return committed
+                        try Self.commitFullRetirement(op, executed: executed, db: db)
                     }
                     pendingRetirements.removeValue(forKey: opId)
-                    pendingRetirementSuffixes.removeValue(forKey: opId)
                     queueLog(
                         "[Queue] retirement replay — committed the retained retirement of "
                             + "\(opId.prefix(8)) \(op.type.rawValue)")
@@ -1369,7 +1339,6 @@ extension AccountManager {
                     if [.saveDraft, .deleteDraft].contains(op.type) {
                         context.foldersToSync.insert("\(op.accountId)|\(op.folderPath)")
                     }
-                    context.executedAny = true
                 case .partial(let op, let provenMembers, let remaining,
                               let provenDestinations, let addressChangesOnMove,
                               let confirmedGoneMembers):
@@ -1379,17 +1348,12 @@ extension AccountManager {
                         return frozen
                     }()
                     let result = try await retryWrite(dbPool, label: "Queue") { db in
-                        let committed = try Self.commitPartialRetirement(
+                        try Self.commitPartialRetirement(
                             frozenRetiredOp, remaining: remaining,
                             provenDestinations: provenDestinations,
                             addressChangesOnMove: addressChangesOnMove, db: db)
-                        for suffixId in ownedSuffix {
-                            try PendingOperation.requeueIfInFlight(db, id: suffixId)
-                        }
-                        return committed
                     }
                     pendingRetirements.removeValue(forKey: opId)
-                    pendingRetirementSuffixes.removeValue(forKey: opId)
                     queueLog(
                         "[Queue] retirement replay — committed the retained narrowing of "
                             + "\(opId.prefix(8)) \(op.type.rawValue): "
@@ -1413,7 +1377,6 @@ extension AccountManager {
                                 frozenRetiredOp, destinationPath: dest, context: context)
                         }
                     }
-                    context.executedAny = true
                 }
             } catch {
                 queueLog(
@@ -1535,9 +1498,18 @@ extension AccountManager {
     ///
     /// `nil` means exactly one thing: the row no longer exists. A read that
     /// FAILS throws instead, because "we could not determine the answer" is not
-    /// evidence about the row and must stay retryable — see the lane loop for
-    /// what the caller does with each of the two, and for why there is
-    /// deliberately no `?? capturedOp` fallback.
+    /// evidence about the row and must stay retryable.
+    ///
+    /// 🚨 ITS ONLY CALLER IS `replayRetainedRetirements`, and that is a property
+    /// of the executor rather than an accident. The drain used to claim a row and
+    /// then re-read it before sending, so a stale snapshot could not reach the
+    /// wire; `claimFrontierOperation` now reads the live front row INSIDE the
+    /// claim transaction, so there is no window between the read and the claim
+    /// for anything to go stale in. What remains is the replay's existence
+    /// check, whose two outcomes are exactly the two this function distinguishes
+    /// — and that is also why there is deliberately no `?? capturedOp`
+    /// fallback: a row that is gone is the user's newer decision, never a value
+    /// to substitute for.
     private func liveOperation(_ id: String) async throws -> PendingOperation? {
         #if DEBUG
         let faultArmed = Self.liveOperationReadFaultForTesting.withLock { armed -> Bool in
@@ -1967,10 +1939,18 @@ extension AccountManager {
     #endif
 
     /// Execute a single claimed op against its provider. Updates shared DrainContext
-    /// with results (executedAny, failedAccounts, foldersToSync, recentActions).
-    /// Returns the outcome (`.proceed`/`.haltLane`) so the per-lane drain loop knows
-    /// whether it's safe to run this lane's next op. `internal` (not `private`) so
-    /// tests can call it directly against a `MockEmailProvider`.
+    /// with results (failedAccounts, foldersToSync, recentActions, the per-drain
+    /// deferred set). Returns the outcome (`.proceed` / `.deferred` / `.stopDrain`)
+    /// so the global executor knows whether to keep claiming. `internal` (not
+    /// `private`) so tests can call it directly against a `MockEmailProvider`.
+    ///
+    /// 🚨 EVERY ARM MUST MAKE THE QUEUE STRICTLY SMALLER OR DEFER A CHAIN. That is
+    /// the executor's termination argument, and this function is where it is
+    /// discharged: an arm either removes the row, narrows it by at least one
+    /// member, adds its whole related chain to `context.deferredOperationIds`, or
+    /// returns `.stopDrain`. An arm that returns `.proceed` without shrinking
+    /// anything would spin the executor forever — the strict-progress guard on the
+    /// narrowing path below exists for exactly that reason.
     func executeSingleOp(_ currentOp: PendingOperation, provider: any EmailProvider, context: DrainContext) async -> SingleOpOutcome {
         let opType = currentOp.type.rawValue
         let opMsgCount = currentOp.messageIds.count
@@ -1990,13 +1970,40 @@ extension AccountManager {
             // are retired, the rest stay queued and retry.
             if let provenMembers, Set(provenMembers) != Set(currentOp.messageIds) {
                 let remaining = currentOp.messageIds.filter { !provenMembers.contains($0) }
-                await retirePartiallyCompletedOp(
+                // 🚨 THE STRICT-PROGRESS GUARD, AND IT IS THE EXECUTOR'S TERMINATION
+                // ARGUMENT FOR THIS ARM. A narrowing is reported as `.proceed`, which
+                // means the executor comes straight back for the next member — sound
+                // only while the membership actually SHRANK. A report that named no
+                // member (`provenMembers` empty against a non-empty request) leaves
+                // `remaining == messageIds`, and re-claiming that row would replay the
+                // identical attempt forever, at wire speed, for as long as the app is
+                // running. No provider produces that shape today — every per-member
+                // loop settles exactly one member before reporting — but "no current
+                // producer" is a property of three provider files, not of this
+                // contract, so it is checked here rather than assumed. Without
+                // progress the outcome is an ordinary retryable failure: defer the
+                // chain to the tail and let unrelated mail through.
+                guard remaining.count < currentOp.messageIds.count else {
+                    queueLog(
+                        "[Queue] \(opType) reported \(provenMembers.count) proven member(s) but "
+                            + "narrowed nothing (\(remaining.count) of \(opMsgCount) still owed) — "
+                            + "treating it as a retryable failure rather than re-claiming an "
+                            + "identical attempt")
+                    if !context.diagnosedOpIds.contains(currentOp.id) {
+                        context.diagnosedOpIds.insert(currentOp.id)
+                        await logStuckOpDiagnostic(currentOp, error: ProviderError.messageNotFound)
+                    }
+                    guard await deferRelatedChainToTail(
+                        failing: currentOp, incrementRetryCount: true, context: context)
+                    else { return .stopDrain }
+                    return .deferred
+                }
+                return await retirePartiallyCompletedOp(
                     currentOp, provenMembers: provenMembers, remaining: remaining,
                     provenDestinations: executed.provenDestinations,
                     addressChangesOnMove: executed.addressChangesOnMove,
                     confirmedGoneMembers: executed.confirmedGoneMembers,
                     context: context)
-                return .haltLane
             }
             // TOCTOU fix: record recentActions BEFORE deleting PendingOp.
             // Sync engine has two guards against re-inserting moved messages:
@@ -2079,10 +2086,21 @@ extension AccountManager {
                 // single-message conflict arm below would delete the user's NEWER
                 // intention. So the returned result is kept in memory and replayed
                 // through the SAME transaction at the next drain
-                // (`replayRetainedRetirements`), and the lane halts so nothing
-                // behind this op runs against an address that has not been
-                // committed yet (owner decision 2026-09-05,
-                // `TabMail/tabmail-ios#120`, `IOS-GRAPH-005`).
+                // (`replayRetainedRetirements`), and THE WHOLE DRAIN STOPS so
+                // nothing runs against an address that has not been committed
+                // yet (owner decision 2026-09-05, `TabMail/tabmail-ios#120`,
+                // `IOS-GRAPH-005`).
+                //
+                // ⚠️ IT IS A FULL STOP NOW, NOT A LANE HALT, AND THAT IS A
+                // WIDENING ON PURPOSE. The write that failed is DATABASE-WIDE —
+                // GRDB suspends writes on background entry (ADR-IOS-041), and a
+                // full disk or an I/O error at COMMIT behaves the same — so the
+                // next operation's retirement would fail identically, and it
+                // would fail AFTER its own wire call had already mutated the
+                // server. Continuing would convert one retained proof into a
+                // growing set of them. The executor's first act on the next
+                // drain is `replayRetainedRetirements`, so the stop is what
+                // sequences the recovery.
                 //
                 // The row stays `inFlight`: the claim loop refuses `inFlight`, so
                 // it cannot be handed to the provider a second time, and that is
@@ -2108,7 +2126,7 @@ extension AccountManager {
                 BackgroundSyncLogger.logError(
                     "CRITICAL: failed to retire completed PendingOperation \(currentOp.id) (type \(opType)) after retries — the row stays inFlight, so it will NOT re-execute, and the provider's proven result is retained in memory and replayed at the next drain; a process death before that replay is the accepted crash window (TabMail/tabmail-ios#120): \(error)",
                     source: "actionQueue")
-                return .haltLane
+                return .stopDrain
             }
             await publishMoveFinish(finishResult)
             // 🚨 THE MEMBERS THE SERVER SAID ARE GONE, RETIRED LOCALLY TOO — the
@@ -2158,7 +2176,6 @@ extension AccountManager {
             if [.saveDraft, .deleteDraft].contains(currentOp.type) {
                 context.foldersToSync.insert("\(currentOp.accountId)|\(currentOp.folderPath)")
             }
-            context.executedAny = true
             return .proceed
         } catch {
             // T2.7 checkpoint B refusal is typed and precedes the generic
@@ -2171,13 +2188,19 @@ extension AccountManager {
                         _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                     }
                     dropDeferredMoveSuccessors(for: currentOp.id)
-                    context.executedAny = true
                     return .proceed
                 } catch {
                     // The provider wrote nothing. If retiring the refused op
                     // fails, preserve the exact original bundle for retry.
+                    //
+                    // ⚠️ `.stopDrain`, not a deferral. The failure is the DELETE,
+                    // i.e. a database-wide write refusal, and the deferral path
+                    // is itself a write — it would fail in the same breath and
+                    // leave the executor claiming the same protected frontier
+                    // row forever. Stopping lets the next drain retry from a
+                    // clean state.
                     await requeueOrRetain(currentOp.id)
-                    return .haltLane
+                    return .stopDrain
                 }
             }
             if isMessageNotFoundError(error) {
@@ -2233,21 +2256,21 @@ extension AccountManager {
                 // The disposition is the retryable one, and it is deliberately NOT
                 // the generic transient arm at the bottom of this `catch`: a
                 // not-found says nothing about the CONNECTION, so the account must
-                // not enter `failedAccounts` and stop every other lane on it. The
-                // lane still halts (its later ops share a member id by
-                // construction), the op is attempted at most once more per drain
-                // (`evidenceRefused`), and `executedAny` stays as it was because
-                // nothing advanced.
+                // not enter `failedAccounts` and stop every other account's mail.
+                // The op's whole related chain moves to the TAIL and is marked
+                // deferred, so it is attempted at most once per drain and every
+                // unrelated intention behind it executes in the same run.
                 if currentOp.messageIds.count > 1 {
                     let ageHours = Date().timeIntervalSince(currentOp.createdAt) / 3600
-                    queueLog("[Queue] Unresolved multi-member \(opType) (\(opMsgCount) msgs): \(error) (age \(String(format: "%.1f", ageHours))h) — no member was individually dispositioned, so the op stays queued with its original id and retries; the rest of this account keeps draining")
+                    queueLog("[Queue] Unresolved multi-member \(opType) (\(opMsgCount) msgs): \(error) (age \(String(format: "%.1f", ageHours))h) — no member was individually dispositioned, so the op keeps its id and moves to the tail with its related chain; unrelated mail keeps draining")
                     if !context.diagnosedOpIds.contains(currentOp.id) {
                         context.diagnosedOpIds.insert(currentOp.id)
                         await logStuckOpDiagnostic(currentOp, error: error)
                     }
-                    await requeueOrRetain(currentOp.id, incrementRetryCount: true)
-                    context.evidenceRefused.insert(currentOp.id)
-                    return .haltLane
+                    guard await deferRelatedChainToTail(
+                        failing: currentOp, incrementRetryCount: true, context: context)
+                    else { return .stopDrain }
+                    return .deferred
                 }
                 // Single-message conflict — drop (server wins)
                 queueLog("[Queue] Conflict: \(opType) — message not found, dropping")
@@ -2268,7 +2291,6 @@ extension AccountManager {
                     let hid = MessageIdentity.headerId(accountId: currentOp.accountId, folderPath: currentOp.folderPath, messageId: msgId)
                     await deleteConfirmedGoneHeader(headerId: hid, reason: "\(opType) 404")
                 }
-                context.executedAny = true
                 return .proceed
             }
             // Permanently invalid operation — drop immediately (will never succeed on retry).
@@ -2279,7 +2301,6 @@ extension AccountManager {
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                 }
                 dropDeferredMoveSuccessors(for: currentOp.id)
-                context.executedAny = true
                 return .proceed
             }
             // The provider REFUSED the id before touching the wire — it is not an
@@ -2357,18 +2378,29 @@ extension AccountManager {
                 // executor arm), so a refusal here is the provider's FINAL verdict on
                 // the whole identity, not an invitation to retry a fragment of it.
                 //
-                // Retrying cannot change it and parking it is a permanent lane wedge, so
-                // it ends here — but LOUDLY and immediately, not after three fake
-                // retries dressed up as a staleness confirmation. Nothing is destroyed:
+                // Retrying cannot change it, so it ends here — but LOUDLY and
+                // immediately, not after three fake retries dressed up as a staleness
+                // confirmation. Nothing is destroyed:
                 // the server-side object this op named is still there, still visible
                 // after the next sync, and the user's re-issued gesture goes through the
                 // UI paths that carry a full identity (`InboxViewModel.deleteDraftMessage`,
                 // `ComposeView`'s discard/send paths). ⚑ `v2final` demotes this case to
                 // its queue tail instead of dropping it, via
-                // `ProviderError.persistentActionFailure` — machinery this tree does not
-                // have (F2b L4). Terminal drop is the disposition **this tree already
-                // has** and keeps; the intention loss is bounded and visible, and adding
-                // a demote path is a separate change. ⚠️ This read *"the disposition v3
+                // `ProviderError.persistentActionFailure`.
+                // ⚠️ THE "MACHINERY THIS TREE DOES NOT HAVE (F2b L4)" CLAUSE THAT
+                // STOOD HERE IS NOW FALSE. The global single-operation FIFO executor
+                // gave this tree tail demotion (`deferRelatedChainToTail` →
+                // `PendingOperation.appendToTail`), and every retryable arm above uses
+                // it. So the drop is no longer forced by a missing mechanism, and it is
+                // NOT re-justified by one here. It is retained UNCHANGED and
+                // DELIBERATELY, because switching it is a product-behaviour change to a
+                // recorded, owner-accepted limitation (`KNOWN_ISSUES.md`
+                // `IOS-QUEUE-003` item 4) and not this change's business: a refused
+                // identity "never will be" verifiable, so demoting it substitutes an
+                // unbounded, forever-retrying row for an accepted bounded-and-VISIBLE
+                // loss. Which of those the product wants is the owner's call. Whoever
+                // asks the question next: the mechanism is available now, the argument
+                // is not. ⚠️ This read *"the disposition v3
                 // already shipped"* until R16-4's class census; **v3 has never shipped**
                 // — neither v3 nor its `v2final` sibling has ever been on a user device,
                 // both branch from `v1.6.38` (`07a4bb703`) — so the phrase asserted a
@@ -2398,7 +2430,6 @@ extension AccountManager {
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                 }
                 dropDeferredMoveSuccessors(for: currentOp.id)
-                context.executedAny = true
                 return .proceed
             }
             // 🚨 EVIDENCE UNAVAILABLE — RETRYABLE, AND NOT AN ACCOUNT-LEVEL FACT.
@@ -2418,33 +2449,40 @@ extension AccountManager {
             // Preserving one intention by denying every intention behind it is not
             // never-drop; it is a worse never-drop violation wearing a safe shape.
             //
-            // THREE properties, each load-bearing:
-            //  - `.haltLane`, NOT `.proceed`. Every op later in this lane shares a
-            //    message id with this one BY CONSTRUCTION (`buildLanes` is a
-            //    connected-component grouping), so running one ahead of an unresolved
-            //    predecessor races its eventual retry on the wire. The defect was the
-            //    account poisoning; the lane halt is correct and stays.
-            //  - `evidenceRefused`, so this op is attempted AT MOST ONCE per drain.
-            //    Required, not defensive: another lane's success sets `executedAny`,
-            //    the outer loop iterates, and this op would be re-claimed. The
-            //    refusal that made that costly — `IMAPProvider.move`'s withheld-
-            //    `COPYUID` gate, raised AFTER the `UID COPY` so each re-attempt
-            //    seated ANOTHER unproven duplicate at the destination — was deleted
-            //    in audit round 4, but the property is a contract of this arm and
-            //    not a patch for one error case, so it stays.
-            //  - `executedAny` is NOT set. This arm made no progress, so it must not
-            //    by itself keep the drain looping; `if !ctx.executedAny { break }`
-            //    still terminates when nothing else advanced.
+            // THREE properties, each load-bearing, now discharged by ONE call:
+            //  - THE WHOLE RELATED CHAIN MOVES, not just this row. Every op that
+            //    names a message this one names is in its `buildLanes` connected
+            //    component BY CONSTRUCTION, so running one ahead of an unresolved
+            //    predecessor races its eventual retry on the wire. Tail movement
+            //    keeps their relative order and puts all of them behind every
+            //    unrelated intention, which is the ordering guarantee the old
+            //    `.haltLane` bought — except that a lane halt also stopped the
+            //    unrelated ops that shared a LANE only through this one, and this
+            //    does not.
+            //  - `deferredOperationIds`, so this op is attempted AT MOST ONCE per
+            //    drain. Required, not defensive: the executor keeps claiming while
+            //    a live front row exists, so without the deferred set it would walk
+            //    the queue, come back round to this row at the tail, and retry it
+            //    at wire speed. The refusal that made that costly —
+            //    `IMAPProvider.move`'s withheld-`COPYUID` gate, raised AFTER the
+            //    `UID COPY` so each re-attempt seated ANOTHER unproven duplicate at
+            //    the destination — was deleted in audit round 4, but the property
+            //    is a contract of this arm and not a patch for one error case, so
+            //    it stays.
+            //  - THE ACCOUNT IS NOT MARKED FAILED. Nothing was determined about the
+            //    connection, so every other operation on this account still runs in
+            //    this same drain.
             if error is ProviderEvidenceUnavailable {
                 let ageHours = Date().timeIntervalSince(currentOp.createdAt) / 3600
-                queueLog("[Queue] Evidence unavailable for \(opType) (\(opMsgCount) msgs): \(error) (age \(String(format: "%.1f", ageHours))h) — op stays queued, retries next drain; the rest of this account keeps draining")
+                queueLog("[Queue] Evidence unavailable for \(opType) (\(opMsgCount) msgs): \(error) (age \(String(format: "%.1f", ageHours))h) — op and its related chain move to the tail, retry next drain; the rest of this account keeps draining")
                 if !context.diagnosedOpIds.contains(currentOp.id) {
                     context.diagnosedOpIds.insert(currentOp.id)
                     await logStuckOpDiagnostic(currentOp, error: error)
                 }
-                await requeueOrRetain(currentOp.id, incrementRetryCount: true)
-                context.evidenceRefused.insert(currentOp.id)
-                return .haltLane
+                guard await deferRelatedChainToTail(
+                    failing: currentOp, incrementRetryCount: true, context: context)
+                else { return .stopDrain }
+                return .deferred
             }
             // Connection/transient error — reset op to queued and mark account failed.
             // NEVER drop on age alone — transient errors don't confirm the op is stale.
@@ -2486,9 +2524,22 @@ extension AccountManager {
             // is visible in [QueueDiag] dumps). Previously this stayed at 0
             // forever, masking the runaway-retry case where we observed
             // `retryCount=0 ageHours=217` on the same op.
-            await requeueOrRetain(currentOp.id, incrementRetryCount: true)
+            //
+            // 🚨 THE CHAIN MOVES TO THE TAIL EVEN THOUGH THE ACCOUNT IS ALREADY
+            // MARKED FAILED, and the redundancy is deliberate. `failedAccounts`
+            // is per-drain and this row's position is DURABLE, so without the
+            // move a connection blip would leave a whole gesture parked at the
+            // head of the queue and the NEXT drain would open by re-attempting
+            // it before any newer intention. The deferred set additionally stops
+            // this drain re-claiming it after the account recovers.
+            guard await deferRelatedChainToTail(
+                failing: currentOp, incrementRetryCount: true, context: context)
+            else {
+                context.failedAccounts.insert(currentOp.accountId)
+                return .stopDrain
+            }
             context.failedAccounts.insert(currentOp.accountId)
-            return .haltLane
+            return .deferred
         }
     }
 
@@ -2682,13 +2733,16 @@ extension AccountManager {
     /// the narrowed row's retry copies them again.
     ///
     /// THE BOUND, stated because "one per drain" was assumed here and is not true
-    /// of this path: this arm sets `executedAny = true`, so the outer loop takes
-    /// another pass and re-claims the narrowed row IN THE SAME DRAIN. It did not
-    /// throw, so `evidenceRefused` — which bounded the zero-evidence sibling in
-    /// `IMAPProvider.move` — does not cover it. The narrowed members can therefore
-    /// be re-copied once per remaining pass, i.e. up to the drain's 3-pass cap,
-    /// and again on every later drain until the server proves or denies them.
-    /// Duplicated mail is recoverable; a dropped intention is not.
+    /// of this path: a narrowing is STRICT PROGRESS, so it does NOT enter the
+    /// drain's deferred set and the executor re-claims the narrowed row later in
+    /// the SAME continuous run — after the unrelated work it was just moved
+    /// behind. The narrowed members can therefore be re-copied once per pass
+    /// through the queue, and again on every later drain until the server proves
+    /// or denies them. Duplicated mail is recoverable; a dropped intention is
+    /// not. The termination argument is the strict shrink itself: `messageIds`
+    /// loses at least one member on every visit (`executeSingleOp`'s
+    /// strict-progress guard enforces it), so the row cannot be revisited more
+    /// times than it has members.
     ///
     /// ⚠ AUDIT ROUND 4, CORRECTED (`IOS-GRAPH-002`). `IMAPProvider.move` is no
     /// longer a producer — it dispositions every member positively before
@@ -2734,21 +2788,42 @@ extension AccountManager {
     /// materialization — must therefore be scoped as ORDINARY multi-member
     /// traffic, not as a contingency.
     ///
-    /// THE BOUND ON THAT TRAFFIC is the one stated above and it is worth reading
-    /// twice now that it is the common case: this arm sets `executedAny = true`
-    /// unconditionally (including in its retention `catch`) and returns
-    /// `.haltLane`, so the outer drain loop takes another pass and RE-CLAIMS the
-    /// narrowed row IN THE SAME DRAIN — up to `drainPendingQueue`'s 3-pass cap,
-    /// i.e. at most three members of one operation settle per drain, with the
-    /// remainder carried on the same row to the next drain (launch, foreground,
-    /// network restore, or a sync poll). Each pass narrows `messageIds` durably
-    /// and charges no retry, so progress is strict and monotonic; this is slow
-    /// convergence, never starvation (`MIS-IOS-022`).
+    /// 🚨 THE THROUGHPUT PROPERTY LIVES HERE, AND IT IS WHY THIS ARM RETURNS
+    /// `.proceed` RATHER THAN `.deferred`. Under the lane drain this arm halted
+    /// its lane and relied on the outer loop's next pass to re-claim the narrowed
+    /// row, so at most THREE members of one operation settled per drain and a
+    /// ten-message gesture needed four drains — waiting on a gesture, a
+    /// reconnect or the five-minute poll between each, i.e. 15–20 minutes on an
+    /// idle device, well past the convergence window the owner set. The global
+    /// executor keeps claiming while a live front row exists, and a narrowing is
+    /// strict progress rather than a deferral, so the SAME continuous run comes
+    /// back to the narrowed row once the work it yielded to is done. An N-member
+    /// operation settles in ONE run, each member under its own fresh
+    /// `SyncConfig.pendingOperationTimeoutSeconds`.
+    ///
+    /// ⚠️ IT STILL YIELDS FIRST. `commitPartialRetirement` moves the narrowed
+    /// remainder and its live related chain to the TAIL in the retirement
+    /// transaction, so unrelated mail admitted behind a ten-message gesture is
+    /// not stuck behind ten provider calls (spec §6). Yielding and settling in
+    /// one run are not in tension: the tail is still inside this drain.
+    ///
+    /// ⚠️ DEVIATION FROM SPEC §5, DELIBERATE AND REPORTED. The spec's
+    /// failure table also says to "mark the chain deferred for this drain" on a
+    /// partial completion. That would bound this path to ONE member per DRAIN —
+    /// ten drains for a ten-message gesture, strictly worse than the three-per-
+    /// drain shape it replaces — and directly contradicts the throughput
+    /// requirement the same document sets. The spin guard exists so that FAILURE
+    /// ALONE cannot create a self-rescheduling hot loop; a narrowing is not
+    /// failure, and its loop is bounded by the membership it strictly shrinks.
+    /// A "partial" that narrows NOTHING is not progress and does not come here:
+    /// `executeSingleOp`'s strict-progress guard routes it to the ordinary
+    /// retryable-failure disposition, which does defer.
     ///
     /// `internal` (not `private`) so tests can drive it directly, the same
     /// reason `executeSingleOp` and `DrainContext` are — but that is now a
     /// convenience for pinning shapes the wire reaches only rarely (an IMAP
     /// narrowing), not this path's only reachability.
+    @discardableResult
     func retirePartiallyCompletedOp(
         _ currentOp: PendingOperation,
         provenMembers: [String],
@@ -2757,7 +2832,7 @@ extension AccountManager {
         addressChangesOnMove: Bool,
         confirmedGoneMembers: [String] = [],
         context: DrainContext
-    ) async {
+    ) async -> SingleOpOutcome {
         queueLog("[Queue] Partial \(currentOp.type.rawValue): provider proved \(provenMembers.count) of \(currentOp.messageIds.count) member(s) — retiring those and keeping \(remaining.count) queued")
         // Same TOCTOU ordering as the whole-op success path: the sync-protection
         // entry for a retired member is recorded BEFORE its id leaves the row.
@@ -2919,11 +2994,23 @@ extension AccountManager {
             BackgroundSyncLogger.logError(
                 "CRITICAL: could not narrow partially-completed \(currentOp.id) (type \(currentOp.type.rawValue)) after retries — the row stays inFlight with all \(currentOp.messageIds.count) member(s), so nothing re-applies the \(provenMembers.count) member(s) the provider already proved, and the narrowing is retained in memory and replayed at the next drain; a process death before that replay is the accepted crash window (TabMail/tabmail-ios#120): \(error)",
                 source: "actionQueue")
+            if [.archive, .delete, .move].contains(currentOp.type),
+               let dest = currentOp.destinationPath {
+                context.foldersToSync.insert("\(currentOp.accountId)|\(dest)")
+            }
+            // 🚨 `.stopDrain`, matching the whole-op retention arm. The row is
+            // left `inFlight` holding a proof only this process can commit, and
+            // the write that failed is database-wide, so the next operation's
+            // retirement would fail the same way — after its own wire call had
+            // already mutated the server. The next drain opens with
+            // `replayRetainedRetirements`, which is the recovery this stop
+            // sequences.
+            return .stopDrain
         }
         if [.archive, .delete, .move].contains(currentOp.type), let dest = currentOp.destinationPath {
             context.foldersToSync.insert("\(currentOp.accountId)|\(dest)")
         }
-        context.executedAny = true
+        return .proceed
     }
 
     /// Returns true if the error indicates the message no longer exists (conflict — drop op).
@@ -3204,8 +3291,11 @@ extension AccountManager {
     /// forever, if the provider never explains itself, which is the correct
     /// disposition for "we could not determine the answer". (`v2final` demotes
     /// such a chain to its queue tail via `ProviderError.persistentActionFailure`;
-    /// v3 has no demote lane, so the cost of the honest classification is a
-    /// retrying row rather than a silently discarded gesture.)
+    /// this tree reaches the same end state by a shorter route — the generic arm
+    /// itself runs `deferRelatedChainToTail`, so the retrying chain sits at the
+    /// TAIL of the `queuePosition` order and nothing queues behind it. The cost
+    /// of the honest classification is a retrying row rather than a silently
+    /// discarded gesture, and that row costs no other intention anything.)
     ///
     /// The only shape that still retires is the one a provider can be held to:
     /// `HTTPError.networkErrorWithBody(400, body)` whose body decodes to Gmail's

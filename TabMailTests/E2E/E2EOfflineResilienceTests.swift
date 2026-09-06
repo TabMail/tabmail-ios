@@ -22,7 +22,7 @@ struct E2EOfflineResilienceTests {
 
         // User archives 3 messages while offline → 3 PendingOps
         for i in 0..<3 {
-            let op = PendingOperation(
+            var op = PendingOperation(
                 type: .archive,
                 messageIds: ["\(i)"],
                 accountId: "acc1",
@@ -55,13 +55,13 @@ struct E2EOfflineResilienceTests {
         try TestDatabase.insertAccount(db)
 
         // 2 pending ops + 1 outbox message queued offline
-        let op1 = PendingOperation(
+        var op1 = PendingOperation(
             type: .archive,
             messageIds: ["1"],
             accountId: "acc1",
             folderPath: "INBOX"
         )
-        let op2 = PendingOperation(
+        var op2 = PendingOperation(
             type: .markRead,
             messageIds: ["2"],
             accountId: "acc1",
@@ -92,7 +92,7 @@ struct E2EOfflineResilienceTests {
         try TestDatabase.insertAccount(db, id: "imap", email: "u@imap.com", provider: .imap)
 
         // Gmail op
-        let gmailOp = PendingOperation(
+        var gmailOp = PendingOperation(
             type: .archive,
             messageIds: ["g1"],
             accountId: "gmail",
@@ -101,7 +101,7 @@ struct E2EOfflineResilienceTests {
         try db.write { try gmailOp.insert($0) }
 
         // IMAP op
-        let imapOp = PendingOperation(
+        var imapOp = PendingOperation(
             type: .delete,
             messageIds: ["i1"],
             accountId: "imap",

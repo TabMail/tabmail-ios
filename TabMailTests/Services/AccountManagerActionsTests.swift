@@ -27,7 +27,8 @@ struct AccountManagerActionsTests {
 
         try db.write { dbConn in
             try dbConn.execute(sql: "UPDATE messageHeader SET isRead = 1 WHERE id = ?", arguments: [msg.id])
-            try PendingOperation(type: .markRead, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX").insert(dbConn)
+            var markReadOp = PendingOperation(type: .markRead, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX")
+            try markReadOp.insert(dbConn)
         }
 
         let updated = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
@@ -56,7 +57,8 @@ struct AccountManagerActionsTests {
                 for msg in msgs {
                     try dbConn.execute(sql: "UPDATE messageHeader SET isRead = 1 WHERE id = ?", arguments: [msg.id])
                 }
-                try PendingOperation(type: .markRead, messageIds: stableIds, accountId: msgs[0].accountId, folderPath: msgs[0].folderPath).insert(dbConn)
+                var markReadOp2 = PendingOperation(type: .markRead, messageIds: stableIds, accountId: msgs[0].accountId, folderPath: msgs[0].folderPath)
+                try markReadOp2.insert(dbConn)
             }
         }
 
@@ -79,7 +81,8 @@ struct AccountManagerActionsTests {
 
         try db.write { dbConn in
             try dbConn.execute(sql: "UPDATE messageHeader SET isRead = 0 WHERE id = ?", arguments: [msg.id])
-            try PendingOperation(type: .markUnread, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX").insert(dbConn)
+            var markUnreadOp = PendingOperation(type: .markUnread, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX")
+            try markUnreadOp.insert(dbConn)
         }
 
         let updated = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
@@ -207,10 +210,11 @@ struct AccountManagerActionsTests {
                         arguments: [newlyRead, folderId]
                     )
                 }
-                try PendingOperation(
+                var markReadOp3 = PendingOperation(
                     type: .markRead, messageIds: stableIds,
                     accountId: msgs[0].accountId, folderPath: msgs[0].folderPath
-                ).insert(dbConn)
+                )
+                try markReadOp3.insert(dbConn)
             }
         }
     }
@@ -239,10 +243,11 @@ struct AccountManagerActionsTests {
                         arguments: [newlyUnread, folderId]
                     )
                 }
-                try PendingOperation(
+                var markUnreadOp2 = PendingOperation(
                     type: .markUnread, messageIds: stableIds,
                     accountId: msgs[0].accountId, folderPath: msgs[0].folderPath
-                ).insert(dbConn)
+                )
+                try markUnreadOp2.insert(dbConn)
             }
         }
     }
@@ -441,7 +446,8 @@ struct AccountManagerActionsTests {
 
         try db.write { dbConn in
             try dbConn.execute(sql: "UPDATE messageHeader SET isFlagged = ? WHERE id = ?", arguments: [true, msg.id])
-            try PendingOperation(type: .markFlagged, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX").insert(dbConn)
+            var markFlaggedOp = PendingOperation(type: .markFlagged, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX")
+            try markFlaggedOp.insert(dbConn)
         }
 
         let updated = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
@@ -461,7 +467,8 @@ struct AccountManagerActionsTests {
 
         try db.write { dbConn in
             try dbConn.execute(sql: "UPDATE messageHeader SET isFlagged = ? WHERE id = ?", arguments: [false, msg.id])
-            try PendingOperation(type: .markUnflagged, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX").insert(dbConn)
+            var markUnflaggedOp = PendingOperation(type: .markUnflagged, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX")
+            try markUnflaggedOp.insert(dbConn)
         }
 
         let ops = try db.read { try PendingOperation.fetchAll($0) }
@@ -491,7 +498,8 @@ struct AccountManagerActionsTests {
                 Column("folderPath").set(to: destPath),
                 Column("isInInbox").set(to: destIsInbox)
             )
-            try PendingOperation(type: .move, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX", destinationPath: destPath).insert(dbConn)
+            var moveOp = PendingOperation(type: .move, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX", destinationPath: destPath)
+            try moveOp.insert(dbConn)
         }
 
         let moved = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
@@ -522,7 +530,8 @@ struct AccountManagerActionsTests {
                 Column("folderPath").set(to: "INBOX"),
                 Column("isInInbox").set(to: destIsInbox)
             )
-            try PendingOperation(type: .move, messageIds: [msg.stableId], accountId: "acc1", folderPath: "Archive", destinationPath: "INBOX").insert(dbConn)
+            var moveOp2 = PendingOperation(type: .move, messageIds: [msg.stableId], accountId: "acc1", folderPath: "Archive", destinationPath: "INBOX")
+            try moveOp2.insert(dbConn)
         }
 
         let moved = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
@@ -632,7 +641,8 @@ struct AccountManagerActionsTests {
                     Column("folderPath").set(to: destinationPath),
                     Column("isInInbox").set(to: false)
                 )
-                try PendingOperation(type: .move, messageIds: [msg.stableId], accountId: "acc1", folderPath: folderPath, destinationPath: destinationPath).insert(dbConn)
+                var moveOp3 = PendingOperation(type: .move, messageIds: [msg.stableId], accountId: "acc1", folderPath: folderPath, destinationPath: destinationPath)
+                try moveOp3.insert(dbConn)
             }
         }
 
@@ -678,7 +688,8 @@ struct AccountManagerActionsTests {
                 for msg in msgs {
                     try dbConn.execute(sql: "UPDATE messageHeader SET isRead = 1 WHERE id = ?", arguments: [msg.id])
                 }
-                try PendingOperation(type: .markRead, messageIds: stableIds, accountId: accountId, folderPath: folderPath).insert(dbConn)
+                var markReadOp4 = PendingOperation(type: .markRead, messageIds: stableIds, accountId: accountId, folderPath: folderPath)
+                try markReadOp4.insert(dbConn)
             }
         }
 
@@ -709,7 +720,8 @@ struct AccountManagerActionsTests {
                 for msg in msgs {
                     try dbConn.execute(sql: "UPDATE messageHeader SET isRead = 1 WHERE id = ?", arguments: [msg.id])
                 }
-                try PendingOperation(type: .markRead, messageIds: stableIds, accountId: msgs[0].accountId, folderPath: msgs[0].folderPath).insert(dbConn)
+                var markReadOp5 = PendingOperation(type: .markRead, messageIds: stableIds, accountId: msgs[0].accountId, folderPath: msgs[0].folderPath)
+                try markReadOp5.insert(dbConn)
             }
         }
 
@@ -747,7 +759,8 @@ struct AccountManagerActionsTests {
                 Column("folderPath").set(to: archivePath!),
                 Column("isInInbox").set(to: destIsInbox)
             )
-            try PendingOperation(type: .move, messageIds: [msg.stableId], accountId: msg.accountId, folderPath: "INBOX", destinationPath: archivePath!).insert(dbConn)
+            var moveOp4 = PendingOperation(type: .move, messageIds: [msg.stableId], accountId: msg.accountId, folderPath: "INBOX", destinationPath: archivePath!)
+            try moveOp4.insert(dbConn)
         }
 
         let moved = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
@@ -802,7 +815,8 @@ struct AccountManagerActionsTests {
                 Column("folderPath").set(to: trashPath!),
                 Column("isInInbox").set(to: destIsInbox)
             )
-            try PendingOperation(type: .move, messageIds: [msg.stableId], accountId: msg.accountId, folderPath: "INBOX", destinationPath: trashPath!).insert(dbConn)
+            var moveOp5 = PendingOperation(type: .move, messageIds: [msg.stableId], accountId: msg.accountId, folderPath: "INBOX", destinationPath: trashPath!)
+            try moveOp5.insert(dbConn)
         }
 
         let moved = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
@@ -909,7 +923,8 @@ struct AccountManagerActionsTests {
             if newlyRead > 0 {
                 try dbConn.execute(sql: "UPDATE folder SET unreadCount = MAX(0, unreadCount - ?) WHERE id = ?", arguments: [newlyRead, folderId])
             }
-            try PendingOperation(type: .markRead, messageIds: msgs.map(\.stableId), accountId: "acc1", folderPath: "INBOX").insert(dbConn)
+            var markReadOp6 = PendingOperation(type: .markRead, messageIds: msgs.map(\.stableId), accountId: "acc1", folderPath: "INBOX")
+            try markReadOp6.insert(dbConn)
         }
 
         let folder = try db.read { try Folder.fetchOne($0, key: "acc1:INBOX") }
@@ -1046,7 +1061,8 @@ struct AccountManagerActionsTests {
                 try dbConn.execute(sql: "UPDATE folder SET unreadCount = MAX(0, unreadCount - ?) WHERE id = ?", arguments: [unreadMoving, sourceFolderId])
                 try dbConn.execute(sql: "UPDATE folder SET unreadCount = unreadCount + ? WHERE id = ?", arguments: [unreadMoving, destFolderId])
             }
-            try PendingOperation(type: .move, messageIds: msgs.map(\.stableId), accountId: "acc1", folderPath: "INBOX", destinationPath: "Archive").insert(dbConn)
+            var moveOp6 = PendingOperation(type: .move, messageIds: msgs.map(\.stableId), accountId: "acc1", folderPath: "INBOX", destinationPath: "Archive")
+            try moveOp6.insert(dbConn)
         }
 
         let inbox = try db.read { try Folder.fetchOne($0, key: "acc1:INBOX") }

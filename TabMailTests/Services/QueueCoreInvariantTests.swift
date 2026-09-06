@@ -92,7 +92,7 @@ struct QueueCoreInvariantTests {
     }
 
     private func insertOp(_ op: PendingOperation, _ fixture: Fixture) throws {
-        try fixture.pool.writeWithoutTransaction { db in try op.insert(db) }
+        try fixture.pool.writeWithoutTransaction { db in _ = try op.inserted(db) }
     }
 
     private func fetchOp(_ id: String, _ fixture: Fixture) throws -> PendingOperation? {
@@ -136,10 +136,11 @@ struct QueueCoreInvariantTests {
 
     /// A provider refusal that could not obtain the proof its own safety gate
     /// requires. Conforms to the SAME protocol `IMAPProvider`'s three private
-    /// refusal enums do, so `executeSingleOp` routes it down the per-op
-    /// `evidenceRefused` arm — the arm that halts a lane WITHOUT poisoning the
-    /// account, and therefore the arm that makes a permanently-refusing op a
-    /// permanent lane halt rather than a whole-account stop.
+    /// refusal enums do, so `executeSingleOp` routes it down the
+    /// evidence-unavailable arm — the arm that moves the operation and its
+    /// related chain to the tail and defers them for the rest of this drain
+    /// WITHOUT poisoning the account, and therefore the arm that makes a
+    /// permanently-refusing op park its own chain rather than stop the account.
     private enum TestEvidenceUnavailable: ProviderEvidenceUnavailable {
         case noProofFromServer
     }
@@ -286,8 +287,9 @@ struct QueueCoreInvariantTests {
         defer { finish(fixture) }
 
         let provider = MockEmailProvider()
-        // The predecessor fails transiently, so the lane halts and the op under
-        // test is requeued instead of being executed and retired.
+        // The predecessor fails transiently, so its related chain is deferred to
+        // the tail and the op under test is never claimed rather than executed
+        // and retired.
         await provider.setMarkReadThrows(ProviderError.notConnected)
         try await TestProviderRegistry.withRegisteredProvider(
             accountId: fixture.accountId, provider: provider
@@ -325,24 +327,42 @@ struct QueueCoreInvariantTests {
         defer { finish(fixture) }
 
         let provider = MockEmailProvider()
-        await provider.setMarkReadThrows(ProviderError.notConnected)
         try await TestProviderRegistry.withRegisteredProvider(
             accountId: fixture.accountId, provider: provider
         ) {
 
             let t0 = baseTimestamp()
-            var predecessor = PendingOperation(
-                type: .markRead, messageIds: ["draft-1"], accountId: fixture.accountId,
-                folderPath: "Drafts")
-            predecessor.createdAt = t0
             // Both epochs REAL and disagreeing: a proven reset in this op's own
             // address space. This is the one arm of the checkpoint that may delete.
             var subject = PendingOperation(
-                type: .setTag, messageIds: ["draft-1"], accountId: fixture.accountId,
+                type: .setTag, messageIds: ["turnover-draft-1"], accountId: fixture.accountId,
                 folderPath: "Drafts", tagValue: "archive", observedUidValidity: 4)
-            subject.createdAt = t0.addingTimeInterval(1)
-            try insertOp(predecessor, fixture)
+            subject.createdAt = t0
+            // 🚨 THE TWO-SIDED CONTROL, and the reason this test no longer parks
+            // the subject behind an unresolved predecessor.
+            //
+            // `.setTag` is LOCAL-ONLY (its executor arm is a bare `break`), so a
+            // subject that EXECUTES and a subject that checkpoint A DELETES leave
+            // exactly the same durable state: no row. The old shape separated them
+            // by holding the subject in a lane behind a failing predecessor on the
+            // same message — but under the single-operation executor that
+            // predecessor's failure defers its whole related chain, the subject
+            // included, so the checkpoint is never reached and the row survives
+            // the drain. That is correct behaviour (a deferred op is not executed,
+            // so the C3 the checkpoint exists to prevent cannot happen) and it is
+            // the reason a "held" subject can no longer be the fixture.
+            //
+            // The separation is now an OUTCOME the checkpoint's two directions
+            // disagree about: `recentlyCompleted`, the sync-protection ledger every
+            // RETIREMENT writes and no checkpoint-A delete does. The matching-epoch
+            // sibling proves that ledger is live in this drain, so "the subject is
+            // absent from it" means "it never executed" rather than "nothing ran".
+            var matchingEpochControl = PendingOperation(
+                type: .setTag, messageIds: ["turnover-draft-2"], accountId: fixture.accountId,
+                folderPath: "Drafts", tagValue: "archive", observedUidValidity: 5)
+            matchingEpochControl.createdAt = t0.addingTimeInterval(1)
             try insertOp(subject, fixture)
+            try insertOp(matchingEpochControl, fixture)
 
             await AccountManager.shared.drainPendingQueue()
 
@@ -353,6 +373,17 @@ struct QueueCoreInvariantTests {
             #expect(
                 try fetchOp(subject.id, fixture) == nil,
                 "a proven epoch turnover must still retire the op before any provider I/O")
+            let completed = await AccountManager.shared.recentlyCompleted
+            #expect(completed["turnover-draft-2"] != nil, """
+                the matching-epoch sibling did not execute, so this drain proves \
+                nothing about the subject: \(completed.keys.sorted())
+                """)
+            #expect(completed["turnover-draft-1"] == nil, """
+                the subject was EXECUTED and retired rather than dropped before \
+                provider I/O — checkpoint A's proven-turnover arm did not fire
+                """)
+            #expect(try fetchOp(matchingEpochControl.id, fixture) == nil,
+                    "the matching-epoch sibling must retire normally")
         }
     }
 
@@ -1775,13 +1806,14 @@ struct QueueCoreInvariantTests {
                 Column("folderPath").set(to: "Archive"),
                 Column("isInInbox").set(to: false),
                 Column("observedUidValidity").set(to: nil as Int?))
-            try PendingOperation(
+            var undoTargetMove = PendingOperation(
                 type: .move,
                 messageIds: [latest.messageId],
                 accountId: fixture.accountId,
                 folderPath: "INBOX",
                 destinationPath: "Archive",
-                observedUidValidity: 42).insert(db)
+                observedUidValidity: 42)
+            try undoTargetMove.insert(db)
         }
 
         let olderAction = UndoableAction(
