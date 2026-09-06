@@ -4204,4 +4204,199 @@ struct OutlookQueueHandoffTests {
         await AccountManager.shared.unregisterProviderForTesting(accountId: secondAccountId)
         await finish(f)
     }
+
+    // MARK: - A confirmed-gone member's header follows the member, not the path
+
+    /// **THE PROPERTY: a member the server reported GONE loses its local header
+    /// whichever path commits the retirement — including the RETAINED REPLAY.**
+    ///
+    /// A confirmed-gone member is dispositioned in the provider loop and the
+    /// operation completes; the ghost header it leaves behind is retired in the
+    /// same drain. But the local retirement write can be refused — GRDB suspends
+    /// writes when the app is backgrounded mid-drain (`ADR-IOS-041`), and a full
+    /// disk or an I/O error at COMMIT does the same — in which case the proof is
+    /// retained and replayed at the next drain. The FIRST version of this change
+    /// put the header cleanup only at the direct site, so the replay retired the
+    /// queue row and left the ghost row in the mailbox forever: no operation names
+    /// that message any more, so nothing will ever retire it, and a sync that
+    /// re-reads the folder will not delete a row for a message the server has no
+    /// record of either.
+    ///
+    /// Both halves are asserted because they fail in opposite directions. While
+    /// the write is refused NOTHING may be committed — the ghost header is still
+    /// there, because the retirement it belongs to has not happened. After the
+    /// database accepts writes again BOTH must land together.
+    ///
+    /// RED PROOF (recorded): with the cleanup at the direct site only, the first
+    /// half passes unchanged and the recovery half fails at
+    /// `headerExists(gone) == false` — the queue is empty and the ghost row
+    /// survives.
+    @Test("Outlook: a confirmed-gone member's header is retired by the retained retirement REPLAY too")
+    @MainActor
+    func aConfirmedGoneMembersHeaderIsRetiredByTheReplay() async throws {
+        let liveRfc = "graph-gone-replay-live@example.com"
+        let goneRfc = "graph-gone-replay-gone@example.com"
+        // `graph-gone` is deliberately NOT on the server: its `/move` is a
+        // deterministic 404, Graph's authoritative "this message is gone".
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: liveRfc, providerMessageId: "graph-live", folderId: Self.source),
+        ])
+        defer { server.close() }
+
+        let f = try fixture(accountId: "graph-gone-replay")
+        try seedHeader(f, graphId: "graph-gone", rfc: goneRfc)
+        try seedHeader(f, graphId: "graph-live", rfc: liveRfc)
+
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a previous test left a retained retirement on the shared AccountManager")
+
+        let op = PendingOperation(
+            type: .move, messageIds: ["graph-gone", "graph-live"],
+            accountId: f.accountId, folderPath: Self.source,
+            destinationPath: Self.firstDestination)
+        try await f.pool.write { db in try op.insert(db) }
+
+        await register(server.provider(), f)
+
+        // Installed AFTER every fixture write, so the only header-writing
+        // transaction it can refuse is the retirement itself.
+        let refuser = HeaderCommitRefuser()
+        f.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // NON-VACUITY: the retirement really was attempted and really was
+        // refused, once per `retryWrite` attempt (`MIS-027`).
+        #expect(refuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on the retirement write for exactly its \
+            three attempts: \(refuser.refusals.withLock { $0 })
+            """)
+        #expect(await AccountManager.shared.pendingRetirements.count == 1,
+                "the proof was not retained, so the replay path is not under test")
+
+        // NOTHING COMMITTED YET — including the ghost. Deleting the header
+        // before the operation that retires it would be the wrong order.
+        #expect(try headerExists(f, graphId: "graph-gone") == true, """
+            the confirmed-gone member's header was deleted while the retirement \
+            that retires it had not committed
+            """)
+        #expect(try queuedOperationCount(f) == 1, "the operation row must survive a failed local write")
+
+        // The database accepts writes again.
+        f.pool.remove(transactionObserver: refuser)
+        try await drainToQuiescence(f)
+
+        #expect(try queuedOperationCount(f) == 0, "the retained retirement never replayed")
+        #expect(try headerExists(f, graphId: "graph-gone") == false, """
+            the queue row retired through the REPLAY and left the ghost header \
+            behind. Nothing names that message any more, so nothing will ever \
+            retire it — the cleanup has to follow the member, not the path.
+            """)
+        #expect(try headerExists(f, graphId: "graph-live") == false, """
+            the surviving member's header must have been re-keyed to the \
+            address Graph named, not left at its source id
+            """)
+        #expect(server.snapshot(providerMessageId: "graph-live") == nil,
+                "Graph did not reallocate the moved member's id, so the re-key oracle above is vacuous")
+        #expect(serverFolders(server, rfc: liveRfc) == [Self.firstDestination],
+                "the surviving member was stranded by its absent sibling")
+
+        await finish(f)
+    }
+
+    /// **THE PROPERTY: the NARROWING path retires a confirmed-gone member's
+    /// header too.**
+    ///
+    /// This shape did not exist before per-member absence moved to the provider
+    /// boundary, which is why the narrowing path legitimately had no header
+    /// cleanup: a partial outcome could only be a proven PREFIX, every retired
+    /// member had actually been mutated, and none of them was gone. A batch of
+    /// `[absent, moved, transiently-refused]` now retires the first two and keeps
+    /// the third queued — so a member the server reported gone leaves the row
+    /// through a path that used to be unable to see one.
+    ///
+    /// The refusal on the third member is a **503**, not a 404: a transient
+    /// refusal leaves that member durably owed, which is what makes this a
+    /// partial outcome at all. A 404 there would disposition it too and the
+    /// operation would retire whole, taking the direct path instead.
+    ///
+    /// RED PROOF (recorded): with the cleanup at the whole-op site only, the
+    /// narrowing assertions pass and `headerExists(gone) == false` fails — the
+    /// member is retired from the operation and its ghost row survives.
+    @Test("Outlook: the narrowing path retires a confirmed-gone member's header")
+    @MainActor
+    func theNarrowingPathRetiresAConfirmedGoneMembersHeader() async throws {
+        let liveRfc = "graph-gone-partial-live@example.com"
+        let goneRfc = "graph-gone-partial-gone@example.com"
+        let refusedRfc = "graph-gone-partial-refused@example.com"
+        // `graph-gone` is absent from the server on purpose.
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: liveRfc, providerMessageId: "graph-live", folderId: Self.source),
+            .init(rfc822MessageId: refusedRfc, providerMessageId: "graph-refused", folderId: Self.source),
+        ])
+        defer { server.close() }
+
+        let f = try fixture(accountId: "graph-gone-partial")
+        try seedHeader(f, graphId: "graph-gone", rfc: goneRfc)
+        try seedHeader(f, graphId: "graph-live", rfc: liveRfc)
+        try seedHeader(f, graphId: "graph-refused", rfc: refusedRfc)
+
+        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+                "a previous test left a retained retirement on the shared AccountManager")
+
+        // Member order is load-bearing: gone, then moved, then refused, so the
+        // provider returns a proven prefix with an unresolved remainder.
+        let op = PendingOperation(
+            type: .move, messageIds: ["graph-gone", "graph-live", "graph-refused"],
+            accountId: f.accountId, folderPath: Self.source,
+            destinationPath: Self.firstDestination)
+        try await f.pool.write { db in try op.insert(db) }
+
+        server.failMoveOnce(providerMessageId: "graph-refused")
+        await register(server.provider(), f)
+
+        try await drainToQuiescence(f)
+
+        // NON-VACUITY, ON THE WIRE: this really was the NARROWING path and not a
+        // whole-op retry. The one-shot 503 is spent on the first attempt, so the
+        // remainder completes in a later pass of the same drain — and the
+        // discriminator is that the PROVEN member was moved exactly ONCE. A row
+        // retried whole would have re-issued `/move` for `graph-live` too (at an
+        // id Graph had already reallocated).
+        let moves = server.http.servedCallSequence().filter { $0.hasSuffix("/move") }
+        #expect(moves.filter { $0.contains("graph-live") }.count == 1, """
+            the proven member was moved more than once, so the row was retried \
+            whole rather than narrowed: \(moves)
+            """)
+        #expect(moves.filter { $0.contains("graph-refused") }.count == 2, """
+            the transiently-refused member was not retried exactly once after \
+            its 503, so this is not the partial-then-complete shape: \(moves)
+            """)
+        #expect(moves.filter { $0.contains("graph-gone") }.count == 1, """
+            the absent member was addressed more than once — the drain re-shaped \
+            the operation to rediscover what the wire already said: \(moves)
+            """)
+
+        #expect(try queuedOperationCount(f) == 0, "the narrowed remainder never completed")
+        #expect(try headerExists(f, graphId: "graph-gone") == false, """
+            the confirmed-gone member left the operation through the NARROWING \
+            path and kept its local header. No operation names it any more, so \
+            nothing will ever retire it: the cleanup has to follow the member, \
+            not the path.
+            """)
+        #expect(serverFolders(server, rfc: liveRfc) == [Self.firstDestination],
+                "the proven member did not move, so this is not a partial outcome")
+        #expect(serverFolders(server, rfc: refusedRfc) == [Self.firstDestination],
+                "the transiently-refused member never landed")
+
+        await finish(f)
+    }
+
+    /// Does a local header exist at this Graph id, in the source folder?
+    private func headerExists(_ fixture: Fixture, graphId: String) throws -> Bool {
+        let id = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: Self.source, messageId: graphId)
+        return try fixture.pool.read { db in try MessageHeader.fetchOne(db, key: id) != nil }
+    }
+
 }

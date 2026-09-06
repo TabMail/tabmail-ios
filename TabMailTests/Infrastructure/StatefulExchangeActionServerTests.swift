@@ -200,11 +200,21 @@ struct StatefulExchangeActionServerTests {
         #expect(sourceHeaders.isEmpty)
 
         // Re-addressing the stale pre-move id must not reach the moved
-        // resource. Graph answers 404; classifying that throw belongs to the
-        // durable queue, not the transport.
-        await #expect(throws: ProviderError.self) {
+        // resource. Graph answers 404, and since `PATCH /messages/{id}` names ONE
+        // message, the transport attributes that answer to the id it addressed
+        // and reports it as `ProviderMembersAbsent` (changed 2026-09-06 — this
+        // used to expect a bare `ProviderError` and say the classification
+        // belonged to the durable queue; the queue's unattributed-404 batch split
+        // is deleted precisely because that attribution is available here).
+        var reportedAbsent: [String]?
+        do {
             try await provider.markUnread(ids: [originalId], folder: "destination-folder")
+        } catch let absence as ProviderMembersAbsent {
+            reportedAbsent = absence.absentMemberIds
         }
+        #expect(
+            reportedAbsent == [originalId],
+            "the 404 must be attributed to the stale id it was addressed to. Got \(String(describing: reportedAbsent))")
         let stillRead = server.snapshot(providerMessageId: movedId)
         #expect(stillRead != nil)
         guard let stillRead else { return }

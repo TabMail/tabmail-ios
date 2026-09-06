@@ -692,6 +692,70 @@ struct BackfillResult: Sendable {
 /// stays durably queued, retrying forever if the server never conforms.
 protocol ProviderEvidenceUnavailable: Error {}
 
+/// A provider's per-member action loop finished everything it could and the
+/// server AUTHORITATIVELY reported these members absent.
+///
+/// 🚨 THIS IS A COMPLETION REPORT WEARING THE ONLY CHANNEL AVAILABLE TO IT. The
+/// `EmailProvider` action requirements return `Void`, so a loop that skipped an
+/// absent member had no way to say WHICH member it skipped — and that attribution
+/// is the entire reason the drain used to split a batch into replacement rows.
+/// `AccountManager.executeOperation` catches this and converts it into an
+/// `ExecutedOperation` carrying `confirmedGoneMembers`; it never escapes to the
+/// scheduler and is never classified as a failure.
+///
+/// ⚠ "AUTHORITATIVELY" IS THE WHOLE CONTENT OF THE TYPE, and it means exactly one
+/// thing: the server answered the request addressed at THAT member with a
+/// structural not-found (`ProviderMemberAbsence.isAuthoritative`). A batch-level
+/// error, a rendered failure string that happens to contain `NONEXISTENT`, a
+/// timeout, or any error whose subject is the connection rather than the member is
+/// NOT this, must not be absorbed into it, and stays an ordinary throw so the
+/// whole operation retries. "We could not determine the answer" is never a
+/// disposition (`MIS-IOS-004`).
+struct ProviderMembersAbsent: Error {
+    /// The requested member ids the server said are gone, in request order.
+    /// Never empty — a loop with nothing to report simply returns.
+    let absentMemberIds: [String]
+}
+
+/// The predicate for "the server structurally confirmed THIS addressed message is
+/// gone", used by the provider loops that absorb a per-member absence.
+///
+/// 🚨 IT IS THE STRUCTURAL HALF OF `AccountManager.isMessageNotFoundError`, AND
+/// THAT IS THE ONLY CLASSIFICATION IT MAY COPY. That function is the gate a
+/// not-found has always had to pass before the drain could retire an operation at
+/// all, and it accepts `ProviderError.messageNotFound` and HTTP **404** — never
+/// `410`. Matching it exactly is what keeps this change non-destructive: a member
+/// absorbed here is retired and its local header deleted, so admitting a status
+/// the old path did not admit would retire operations that used to retry.
+///
+/// ⚠️ DO NOT REACH FOR `AccountManager.isConfirmedGoneError` INSTEAD, EVEN THOUGH
+/// IT LOOKS LIKE THE RIGHT NAME. That one is wider — it also accepts `410` — and
+/// it is not a retirement gate: it runs only INSIDE the single-message arm that
+/// `isMessageNotFoundError` already admitted, where it decides whether the local
+/// header may go too. Its extra `410` is therefore unreachable in the drain, and
+/// borrowing it here would make it reachable for the first time, silently turning
+/// every other meaning of `410` on a message endpoint into a retirement plus a
+/// header deletion. Being NARROWER than the header gate is the safe direction and
+/// is deliberate; if a message-endpoint `410` should ever be conclusive, that is a
+/// separate, evidence-backed, endpoint-specific change with its own tests.
+///
+/// STRUCTURAL ONLY. It deliberately does NOT match `isMessageNotFoundError`'s
+/// substring fallback either: IMAP failure text is noisy, RFC 5530's
+/// `[NONEXISTENT]` names a missing MAILBOX rather than a missing message, and a
+/// false positive here retires a member's intention and deletes user-visible data.
+enum ProviderMemberAbsence {
+    static func isAuthoritative(_ error: Error) -> Bool {
+        if case ProviderError.messageNotFound = error { return true }
+        if case ProviderError.networkError(let underlying) = error {
+            if case HTTPError.networkError(let statusCode) = underlying, statusCode == 404 {
+                return true
+            }
+            if (underlying as NSError).code == 404 { return true }
+        }
+        return false
+    }
+}
+
 enum ProviderError: LocalizedError {
     case notConnected
     case messageNotFound

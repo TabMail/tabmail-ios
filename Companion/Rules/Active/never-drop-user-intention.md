@@ -61,6 +61,31 @@
 > obsolete", "we are cleaning up" — is a drop, and must satisfy one of the four exits. And it does
 > not extend past queue state either: the lifecycle boundaries above do not authorize destroying
 > Outbox sends, user-authored drafts, bodies, attachments or FTS content.
+>
+> **2026-09-06 amendment (owner-approved): the APP-VERSION boundary is a standing member of that
+> lifecycle class, not a one-off migration.** `AppDatabase.retirePreviousReleaseActionQueue` runs
+> inside `AppDatabase.init`, on the raw pool, before `AppDatabase.shared` is published: if the
+> recorded release in `appReleaseStamp` differs from the running one, every `pendingOperation` row is
+> deleted **without being decoded**, every account is marked full-sync-due
+> (`Account.lastFullSyncAt = NULL`), and the new release is recorded — all in **one transaction**, so
+> either the whole boundary commits or none of it does and the next launch retries it. A missing
+> stamp counts as a boundary (first adoption cannot know which release queued the rows); an
+> **unchanged** release does not purge, so this is not a per-launch, per-foreground, per-login or
+> per-retry clear.
+>
+> It satisfies all three carve-out properties: owner-approved and explicit; the queue **as a whole**
+> at a boundary; **outside the drain**, consulting no evidence, epoch, identity or provider result.
+> It is emphatically **not a fifth exit** — it answers no question about any operation. The accepted
+> cost is that a user who updates while work is queued may have to repeat a gesture; the queue
+> normally drains in seconds, so the reachable set is small, and the full sync restores the server's
+> own state. `v74_purgeLegacyPendingOperations` remains the precedent for the PRINCIPLE only — it is
+> a frozen one-shot migration and does not implement this rule. The carve-out's scope limit is
+> unchanged: authored `Draft` and `outboxMessage` rows, mail, bodies, attachments and FTS content are
+> untouched, and no draft sweeper or automatic re-admission is added to compensate — a retired
+> `.saveDraft` loses only the automatic push intention, and reopening/editing/saving admits fresh
+> work. `IOS-ACTION-001` is amended through the routed KnownIssues amendment surface to record that
+> the blanket predicate-free purge is now a recurring launch rule rather than a single historical
+> migration.
 <!-- COMPANION-CURRENT-NOTE-END -->
 ## Core Philosophy: Never Drop User Intention
 

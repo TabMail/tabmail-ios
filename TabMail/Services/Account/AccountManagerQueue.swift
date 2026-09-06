@@ -42,17 +42,36 @@ struct ExecutedOperation: Sendable {
     /// `reconcileMoveSource` false, because nothing was copied and the message
     /// is untouched in the source mailbox on the server.
     let reconcileMoveSource: Bool
+    /// The members the server AUTHORITATIVELY reported absent on their own exact
+    /// addressed request (`ProviderMemberAbsence.isAuthoritative`) — the provider
+    /// asked about THIS message and was told it is gone.
+    ///
+    /// They are DISPOSITIONED, not failed: there is nothing left to do to them, so
+    /// they are part of a complete outcome and never hold the operation open. What
+    /// this field adds is ATTRIBUTION — which member — which the `Void`-returning
+    /// action protocol cannot express and which the drain needs for exactly one
+    /// thing: deleting that member's confirmed-gone local header, the same
+    /// disposition the single-message conflict arm has always applied.
+    ///
+    /// Before the batch-splitting arm was removed, a multi-member batch learned
+    /// this by re-shaping itself into one row per member and letting each 404
+    /// individually; the attribution now comes from the provider that issued the
+    /// per-member request in the first place. Empty for every provider and op type
+    /// that cannot produce it.
+    let confirmedGoneMembers: [String]
 
     init(
         provenMembers: [String]?,
         provenDestinations: [ProvenDestinationAddress],
         addressChangesOnMove: Bool = false,
-        reconcileMoveSource: Bool = false
+        reconcileMoveSource: Bool = false,
+        confirmedGoneMembers: [String] = []
     ) {
         self.provenMembers = provenMembers
         self.provenDestinations = provenDestinations
         self.addressChangesOnMove = addressChangesOnMove
         self.reconcileMoveSource = reconcileMoveSource
+        self.confirmedGoneMembers = confirmedGoneMembers
     }
 
     /// Every member dispositioned, nothing re-keyable.
@@ -265,8 +284,8 @@ extension AccountManager {
     /// the lane or halt it for this pass.
     enum SingleOpOutcome: Sendable, Equatable {
         /// The op reached a terminal state this pass — either it completed
-        /// successfully, or it was CONFIRMED stale/invalid and dropped (deleted, or
-        /// split into fresh individual ops). The lane may proceed to its next op.
+        /// successfully, or it was CONFIRMED stale/invalid and dropped. The lane
+        /// may proceed to its next op.
         case proceed
         /// The op did not reach a terminal state this pass — its staleness or
         /// success could NOT be confirmed. USUALLY it has been reset to `.queued`
@@ -438,9 +457,11 @@ extension AccountManager {
     /// folder-local key reads information that was present and discarded rather
     /// than reconstructing one. Every producer takes that path from the same
     /// source — a `Folder.path` or a `MessageHeader.folderPath`, never a literal
-    /// — and the batch-split site in `executeSingleOp` copies
-    /// `currentOp.folderPath`, so the children of a split key exactly as their
-    /// parent did.
+    /// — and no site rebuilds an operation from another one, so no row can be
+    /// keyed differently from the gesture that created it. (Until 2026-09-06 the
+    /// batch-split site in `executeSingleOp` DID rebuild rows, and had to copy
+    /// `currentOp.folderPath` onto every child so they keyed as their parent
+    /// did; deleting the split deleted that obligation with it.)
     ///
     /// The key is a plain colon join, exactly like `MessageIdentity.folderId`.
     /// A folder path containing a colon can only make two distinct addresses
@@ -1327,6 +1348,13 @@ extension AccountManager {
                             + "\(opId.prefix(8)) \(op.type.rawValue)")
                     logReaddressedFollowers(result, retiring: op)
                     await publishMoveFinish(result)
+                    // The retained retirement carries the provider's confirmed-gone
+                    // attribution, so the replay owes the same header cleanup the
+                    // original site would have done had its write committed.
+                    // Without this the row retires here and its ghost header
+                    // survives (GPT consult finding 2, 2026-09-06).
+                    await retireConfirmedGoneMemberHeaders(
+                        op, memberIds: executed.confirmedGoneMembers)
                     await materializeDeferredMoveSuccessors(after: op, result: result)
                     if [.archive, .delete, .move].contains(op.type), let dest = op.destinationPath {
                         context.foldersToSync.insert("\(op.accountId)|\(dest)")
@@ -1343,7 +1371,8 @@ extension AccountManager {
                     }
                     context.executedAny = true
                 case .partial(let op, let provenMembers, let remaining,
-                              let provenDestinations, let addressChangesOnMove):
+                              let provenDestinations, let addressChangesOnMove,
+                              let confirmedGoneMembers):
                     let frozenRetiredOp: PendingOperation = {
                         var frozen = op
                         frozen.messageIds = provenMembers
@@ -1368,6 +1397,8 @@ extension AccountManager {
                             + "\(remaining.count) still owed")
                     logReaddressedFollowers(result, retiring: frozenRetiredOp)
                     await publishMoveFinish(result)
+                    await retireConfirmedGoneMemberHeaders(
+                        op, memberIds: confirmedGoneMembers)
                     await materializeDeferredMoveSuccessors(
                         after: frozenRetiredOp, result: result)
                     if [.archive, .delete, .move].contains(op.type), let dest = op.destinationPath {
@@ -1954,6 +1985,7 @@ extension AccountManager {
                     currentOp, provenMembers: provenMembers, remaining: remaining,
                     provenDestinations: executed.provenDestinations,
                     addressChangesOnMove: executed.addressChangesOnMove,
+                    confirmedGoneMembers: executed.confirmedGoneMembers,
                     context: context)
                 return .haltLane
             }
@@ -2070,6 +2102,31 @@ extension AccountManager {
                 return .haltLane
             }
             await publishMoveFinish(finishResult)
+            // 🚨 THE MEMBERS THE SERVER SAID ARE GONE, RETIRED LOCALLY TOO — the
+            // same disposition the single-message conflict arm below has always
+            // applied, now reachable for a member of a BATCH.
+            //
+            // It is the batch split's cleanup half, relocated. That arm re-shaped
+            // the row into one operation per member; each child then 404'd on its
+            // own and took the single-message arm, which deletes the confirmed-gone
+            // header. With the split gone, the provider names the member directly
+            // and the deletion happens here, one drain earlier and without ever
+            // creating a replacement row.
+            //
+            // Runs AFTER the retirement commit, deliberately: the header row is a
+            // different table and its deletion releases FTS and body content, so
+            // it must not be able to precede the operation's own retirement.
+            //
+            // ⚠ ALL FOUR RETIREMENT SITES DO THIS, AND THAT SYMMETRY IS THE
+            // POINT (GPT consult finding 2/3, 2026-09-06). A confirmed-gone
+            // member is retired by whichever path commits — whole-op success,
+            // the narrowing path, or either of their retained replays — and the
+            // header cleanup has to follow the member, not the path. The first
+            // version of this change put the loop here only, so a retirement
+            // that failed its local write and replayed at the next drain, or a
+            // bundle with a transiently-failing sibling that took the narrowing
+            // path, retired the queue row and left the ghost header behind.
+            await retireConfirmedGoneMemberHeaders(currentOp, memberIds: executed.confirmedGoneMembers)
             await materializeDeferredMoveSuccessors(after: currentOp, result: finishResult)
             if [.archive, .delete, .move].contains(currentOp.type), let dest = currentOp.destinationPath {
                 context.foldersToSync.insert("\(currentOp.accountId)|\(dest)")
@@ -2095,10 +2152,10 @@ extension AccountManager {
             context.executedAny = true
             return .proceed
         } catch {
-            // T2.7 checkpoint B refusal is typed and precedes every generic
-            // message-not-found / UID-resolution split arm. The epoch scopes
-            // the whole provider-address bundle, so no member may be retried as
-            // a child under a different attempt.
+            // T2.7 checkpoint B refusal is typed and precedes the generic
+            // message-not-found arm. The epoch scopes the whole
+            // provider-address bundle, so no member may be dispositioned
+            // separately under a different attempt.
             if case ProviderError.uidValidityChanged = error {
                 do {
                     try await retryWrite(dbPool, label: "Queue") { db in
@@ -2115,66 +2172,64 @@ extension AccountManager {
                 }
             }
             if isMessageNotFoundError(error) {
+                // 🚨 A MULTI-MEMBER NOT-FOUND IS UNRESOLVED, AND THE TERMINAL
+                // ARM BELOW IS STRICTLY SINGLE-MESSAGE.
+                //
+                // This used to be the batch-splitting arm: it constructed one
+                // replacement `PendingOperation` per member, inserted them all and
+                // deleted the parent, so that each member could be re-addressed
+                // individually and succeed or fail on its own. It is DELETED, and
+                // nothing replaces it in the scheduler.
+                //
+                // The reason the split existed at all is that a batch error does
+                // not name a member: `messages.modify` on three ids answers `404`
+                // for the batch, and re-addressing each id separately was the only
+                // way to learn WHICH one is gone. That discovery belongs at the
+                // provider/action-adapter boundary, which issues the per-member
+                // request and can therefore attribute the answer — see
+                // `executeOperation`'s `ProviderMembersAbsent` conversion. The
+                // scheduler only ever sees a complete outcome, an unresolved one,
+                // or an already-authorized terminal exit, and never re-shapes the
+                // user's intention into different rows to find out which it is.
+                //
+                // 🚨 THE ONE THING THAT MUST NOT HAPPEN HERE is falling through
+                // into the single-message arm below, which DELETES the row. That
+                // arm is authorized by exit 2 — the provider told us this exact
+                // addressed message is gone — and with more than one member NOTHING
+                // told us that about any particular member. The batch error is an
+                // ABSENCE of per-member evidence, which is never authoritative
+                // (`MIS-IOS-004`), and it includes every hit of
+                // `isMessageNotFoundError`'s substring fallback (`NONEXISTENT`,
+                // `UID not found`) — RFC 5530's `[NONEXISTENT]` names a missing
+                // MAILBOX, not a missing message, and a rendered IMAP failure that
+                // merely quotes those words has dispositioned no member at all.
+                //
+                // It also protects the positional draft payloads. A `.deleteDraft`
+                // op's `messageIds` are an ADDRESS and an IDENTITY of ONE draft, not
+                // two mail members; the split arm treated them as members and the
+                // identity-only child it produced resolved by Message-ID `SEARCH`,
+                // which is a wrong-message delete built out of a refusal (see the
+                // `actionIdentityResolutionFailed` arm's ⚑ NEVER SPLIT THIS ONE
+                // note, which described this exact hazard while the arm that could
+                // still reach it sat above). Deleting the arm removes that reach.
+                //
+                // The disposition is the retryable one, and it is deliberately NOT
+                // the generic transient arm at the bottom of this `catch`: a
+                // not-found says nothing about the CONNECTION, so the account must
+                // not enter `failedAccounts` and stop every other lane on it. The
+                // lane still halts (its later ops share a member id by
+                // construction), the op is attempted at most once more per drain
+                // (`evidenceRefused`), and `executedAny` stays as it was because
+                // nothing advanced.
                 if currentOp.messageIds.count > 1 {
-                    // Batch op hit messageNotFound — one message is gone but others
-                    // may still need processing. Split into individual single-message
-                    // ops so each can succeed/fail independently.
-                    queueLog("[Queue] Conflict in batch \(opType) (\(opMsgCount) msgs) — splitting into individual ops")
-                    do {
-                        try await dbPool.write { db in
-                            for msgId in currentOp.messageIds {
-                                var splitOp = PendingOperation(
-                                    type: currentOp.type, messageIds: [msgId],
-                                    accountId: currentOp.accountId, folderPath: currentOp.folderPath,
-                                    destinationPath: currentOp.destinationPath, tagValue: currentOp.tagValue,
-                                    userLabelId: currentOp.userLabelId,
-                                    // 🚨 THE ADMISSION EPOCH MUST TRAVEL WITH THE CHILD.
-                                    // The parent is deleted in this same transaction, so
-                                    // anything not copied here is destroyed. A child built
-                                    // without this stamp is one checkpoint A cannot admit —
-                                    // and before the never-drop fix, one checkpoint A
-                                    // DELETED, silently reverting the whole gesture on the
-                                    // next sync. The children are the SAME user intention,
-                                    // re-shaped: they are admitted under exactly the epoch
-                                    // and identity the parent was.
-                                    observedUidValidity: currentOp.observedUidValidity,
-                                    draftServerUidValidity: currentOp.draftServerUidValidity,
-                                    instanceEpoch: currentOp.instanceEpoch,
-                                    draftId: currentOp.draftId)
-                                // Carried as the stored raw value rather than through the
-                                // typed initializer parameter: an unrecognized raw string
-                                // must survive verbatim, not decode to `nil`.
-                                splitOp.draftDeleteAddressKind = currentOp.draftDeleteAddressKind
-                                // The parent was claimed, so provider I/O may already have
-                                // started for these members. Undo may only annihilate an
-                                // unattempted bundle; a child that forgot this would be
-                                // annihilable after the wire was touched.
-                                splitOp.everAttempted = currentOp.everAttempted
-                                // Split ops inherit the batch's queue position — they are
-                                // the SAME user intention, re-shaped. Without this, the
-                                // default `PendingOperation.init` createdAt (Date()) would
-                                // stamp a LATER timestamp than a same-lane sibling op queued
-                                // between the batch and the split, starving the split op
-                                // behind it on every later buildLanes pass (createdAt-order
-                                // invariant).
-                                splitOp.createdAt = currentOp.createdAt
-                                try splitOp.insert(db)
-                            }
-                            _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                        }
-                        dropDeferredMoveSuccessors(for: currentOp.id)
-                    } catch {
-                        queueLog("[Queue] Failed to split batch op \(currentOp.id): \(error) — batch will retry as-is")
+                    let ageHours = Date().timeIntervalSince(currentOp.createdAt) / 3600
+                    queueLog("[Queue] Unresolved multi-member \(opType) (\(opMsgCount) msgs): \(error) (age \(String(format: "%.1f", ageHours))h) — no member was individually dispositioned, so the op stays queued with its original id and retries; the rest of this account keeps draining")
+                    if !context.diagnosedOpIds.contains(currentOp.id) {
+                        context.diagnosedOpIds.insert(currentOp.id)
+                        await logStuckOpDiagnostic(currentOp, error: error)
                     }
-                    context.executedAny = true
-                    // Halt the lane rather than .proceed: the split singles are
-                    // freshly queued (not yet executed) and a LATER same-lane op
-                    // sharing a member id (e.g. a chained move of one of the split
-                    // messages) must never run ahead of them this pass — that would
-                    // race/misread state the split children haven't written yet and
-                    // could act on stale row state. The lane loop requeues the rest back
-                    // to `.queued` so it serializes behind the split ops on a later
-                    // pass/drain.
+                    await requeueOrRetain(currentOp.id, incrementRetryCount: true)
+                    context.evidenceRefused.insert(currentOp.id)
                     return .haltLane
                 }
                 // Single-message conflict — drop (server wins)
@@ -2652,6 +2707,7 @@ extension AccountManager {
         remaining: [String],
         provenDestinations: [ProvenDestinationAddress],
         addressChangesOnMove: Bool,
+        confirmedGoneMembers: [String] = [],
         context: DrainContext
     ) async {
         queueLog("[Queue] Partial \(currentOp.type.rawValue): provider proved \(provenMembers.count) of \(currentOp.messageIds.count) member(s) — retiring those and keeping \(remaining.count) queued")
@@ -2691,7 +2747,18 @@ extension AccountManager {
             }
             logReaddressedFollowers(finishResult, retiring: frozenRetiredOp)
             await publishMoveFinish(finishResult)
-            await materializeDeferredMoveSuccessors(after: frozenRetiredOp, result: finishResult)
+            // 🚨 THE NARROWING PATH RETIRES CONFIRMED-GONE MEMBERS TOO (GPT
+            // consult finding 3, 2026-09-06). Before per-member absence moved to
+            // the provider boundary, a partial outcome could only be a proven
+            // PREFIX — every retired member had actually been mutated, and none
+            // of them was gone, so there was no header to clean up and this site
+            // correctly had none. It can now retire a member the server reported
+            // ABSENT alongside a sibling that moved and another that failed
+            // transiently, which is a shape that did not previously exist. The
+            // filter is not defensive decoration: only a member that actually
+            // left the row here may lose its header.
+            await retireConfirmedGoneMemberHeaders(
+                currentOp, memberIds: confirmedGoneMembers.filter(provenMembers.contains))
         } catch {
             // 🚨 THE PROVEN PREFIX IS RETAINED, NOT HANDED BACK TO THE WIRE. This
             // used to requeue the ORIGINAL bundle, accepting a duplicate at the
@@ -2724,7 +2791,8 @@ extension AccountManager {
             pendingRetirements[currentOp.id] = .partial(
                 op: currentOp, provenMembers: provenMembers, remaining: remaining,
                 provenDestinations: provenDestinations,
-                addressChangesOnMove: addressChangesOnMove)
+                addressChangesOnMove: addressChangesOnMove,
+                confirmedGoneMembers: confirmedGoneMembers.filter(provenMembers.contains))
             print("[Queue] CRITICAL: could not narrow partially-completed \(currentOp.id) after retries — the row stays inFlight with all members and the proven prefix is retained for replay at the next drain")
             BackgroundSyncLogger.logError(
                 "CRITICAL: could not narrow partially-completed \(currentOp.id) (type \(currentOp.type.rawValue)) after retries — the row stays inFlight with all \(currentOp.messageIds.count) member(s), so nothing re-applies the \(provenMembers.count) member(s) the provider already proved, and the narrowing is retained in memory and replayed at the next drain; a process death before that replay is the accepted crash window (TabMail/tabmail-ios#120): \(error)",
@@ -2785,6 +2853,24 @@ extension AccountManager {
     /// Deliberately does NOT match the string-matching fallback in
     /// `isMessageNotFoundError` — IMAP error descriptions can be noisy and we never
     /// want a false positive to permanently delete user data.
+    ///
+    /// 🚨 THIS IS NOT THE PREDICATE THE PROVIDER LOOPS USE, AND IT MUST NOT BE
+    /// UNIFIED WITH IT. `ProviderMemberAbsence.isAuthoritative` decides whether a
+    /// PER-MEMBER provider answer retires that member; this decides whether a
+    /// member the drain has ALREADY retired may also lose its local header. They
+    /// look like the same question and are not, because they sit at different
+    /// depths: this one is only ever consulted inside the single-message arm that
+    /// `isMessageNotFoundError` has already admitted, so its extra `410` is
+    /// unreachable there — `isMessageNotFoundError` accepts 404 only.
+    ///
+    /// A forwarding version of this function was written and REVERTED (2026-09-06,
+    /// GPT consult finding 1). Forwarding is harmless in this direction but not in
+    /// the other: the provider loops would have inherited the `410`, which no gate
+    /// on the old path admitted, and a bare `410` — a status a message endpoint can
+    /// return for meanings other than "this message no longer exists" — would have
+    /// gone from "retry forever" to "retire the operation AND delete the header" as
+    /// a side effect of sharing a helper. The member predicate is deliberately
+    /// NARROWER than this one; that asymmetry is the safety, not an oversight.
     nonisolated func isConfirmedGoneError(_ error: Error) -> Bool {
         if case ProviderError.messageNotFound = error { return true }
         if case ProviderError.networkError(let underlying) = error {
@@ -2796,6 +2882,34 @@ extension AccountManager {
             if nsCode == 404 || nsCode == 410 { return true }
         }
         return false
+    }
+
+    /// Retire the local headers of members a PROVIDER named as gone, for an
+    /// operation whose retirement has just committed.
+    ///
+    /// 🚨 CALLED FROM EVERY PATH THAT RETIRES SUCH A MEMBER, AND ONLY AFTER ITS
+    /// RETIREMENT HAS COMMITTED. The header row lives in a different table and its
+    /// deletion releases FTS and body content, so it must never be able to precede
+    /// the operation's own retirement; and the four sites that can commit one —
+    /// whole-op success, the narrowing path, and the retained replay of either —
+    /// must all do it, or a member is retired from the queue while its ghost row
+    /// survives in the mailbox.
+    ///
+    /// `memberIds` are ids the provider reported through
+    /// `ProviderMembersAbsent` / `MoveOutcome.confirmedGoneIds`, i.e. members a
+    /// request addressed to THAT member answered `ProviderMemberAbsence`-
+    /// authoritatively for. Nothing else may be passed here.
+    private func retireConfirmedGoneMemberHeaders(
+        _ op: PendingOperation, memberIds: [String]
+    ) async {
+        for goneId in memberIds {
+            let hid = MessageIdentity.headerId(
+                accountId: op.accountId,
+                folderPath: op.folderPath,
+                messageId: goneId)
+            await deleteConfirmedGoneHeader(
+                headerId: hid, reason: "\(op.type.rawValue) member gone")
+        }
     }
 
     /// Delete a single messageHeader (identified by its full primary key) that has
@@ -3007,6 +3121,46 @@ extension AccountManager {
     /// and throwing the attempt away would discard the very addresses the wire
     /// just supplied. So the narrowing path is live, not merely contractual.
     func executeOperation(_ op: PendingOperation, provider: any EmailProvider) async throws -> ExecutedOperation {
+        do {
+            return try await dispatchOperation(op, provider: provider)
+        } catch let absence as ProviderMembersAbsent {
+            // 🚨 THE ONLY PLACE `ProviderMembersAbsent` IS UNDERSTOOD, AND IT IS A
+            // COMPLETION, NOT A FAILURE.
+            //
+            // A provider's per-member loop finished every member it could and the
+            // server AUTHORITATIVELY reported these ones gone. There is nothing
+            // left to do to them, so the operation as a whole is complete — the
+            // outcome is `provenMembers: nil` ("all of them"), exactly as a
+            // clean run produces. What is carried forward is the ATTRIBUTION the
+            // `Void`-returning action protocol cannot express: WHICH members were
+            // gone, so the drain can retire their confirmed-gone local headers.
+            //
+            // ⚠ IT MUST NOT ESCAPE TO `executeSingleOp`. Out there it would be an
+            // unclassified error, land in the generic transient arm, requeue an
+            // operation whose work is finished, and poison the account for the
+            // rest of the drain. The conversion is here — one wrapper around the
+            // whole dispatch — rather than repeated in each arm, so a new arm
+            // cannot forget it.
+            //
+            // ⚠ NO DESTINATION EVIDENCE, EVER, ON THIS PATH. An absent member
+            // landed nowhere; `provenDestinations` stays empty and
+            // `addressChangesOnMove` stays false, so nothing is re-keyed to an
+            // address no server named. Graph's move arm does NOT come through
+            // here — it returns its outcome rather than throwing, precisely
+            // because it has destinations to report for the members that DID
+            // move.
+            queueLog("[Queue] \(op.type.rawValue) (\(op.messageIds.count) msgs): \(absence.absentMemberIds.count) member(s) confirmed gone by the server — the operation is complete and those members' local headers are retired")
+            return ExecutedOperation(
+                provenMembers: nil,
+                provenDestinations: [],
+                confirmedGoneMembers: absence.absentMemberIds)
+        }
+    }
+
+    /// The op-type switch `executeOperation` wraps. Split out for exactly one
+    /// reason: `ProviderMembersAbsent` must be converted in ONE place rather than
+    /// in every arm that can raise it.
+    private func dispatchOperation(_ op: PendingOperation, provider: any EmailProvider) async throws -> ExecutedOperation {
         switch op.type {
         case .archive, .delete:
             // Legacy enum cases — all new ops use .move. No-op for any stale rows.
@@ -3036,7 +3190,8 @@ extension AccountManager {
                     provenMembers: outcome.provenIds,
                     provenDestinations: outcome.provenDestinations,
                     addressChangesOnMove: true,
-                    reconcileMoveSource: outcome.requiresSourceReconciliation)
+                    reconcileMoveSource: outcome.requiresSourceReconciliation,
+                    confirmedGoneMembers: outcome.confirmedGoneIds)
             }
             // 🚨 THE SIBLING ARM THE `COPYUID` CENSUS NEVER REACHED
             // (`IOS-GRAPH-002`, `MIS-006` instance 5). Graph reallocates a
@@ -3061,7 +3216,8 @@ extension AccountManager {
                 return ExecutedOperation(
                     provenMembers: outcome.provenIds,
                     provenDestinations: outcome.provenDestinations,
-                    addressChangesOnMove: true)
+                    addressChangesOnMove: true,
+                    confirmedGoneMembers: outcome.confirmedGoneIds)
             }
             try await provider.move(ids: op.messageIds, from: op.folderPath, to: dest)
             queueLog("[MoveTrace] executeOperation.move — completed successfully")

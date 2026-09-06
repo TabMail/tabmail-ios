@@ -334,37 +334,16 @@ struct DrainAlgorithmTests {
         #expect(remaining == 1)
     }
 
-    @Test("Batch messageNotFound → split into individual ops")
-    func batchSplitOnMessageNotFound() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-
-        let batchOp = makeOp(type: .move, messageIds: ["msg1", "msg2", "msg3"], destinationPath: "Archive")
-        try db.write { try batchOp.insert($0) }
-
-        // Simulate split on messageNotFound for batch
-        try db.write { dbConn in
-            for msgId in batchOp.messageIds {
-                try PendingOperation(
-                    type: batchOp.type,
-                    messageIds: [msgId],
-                    accountId: batchOp.accountId,
-                    folderPath: batchOp.folderPath,
-                    destinationPath: batchOp.destinationPath,
-                    tagValue: batchOp.tagValue
-                ).insert(dbConn)
-            }
-            _ = try PendingOperation.deleteOne(dbConn, key: batchOp.id)
-        }
-
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 3)
-        for op in ops {
-            #expect(op.messageIds.count == 1)
-            #expect(op.type == .move)
-            #expect(op.destinationPath == "Archive")
-        }
-    }
+    // DELETED 2026-09-06: `batchSplitOnMessageNotFound`. It inserted three
+    // single-message rows and deleted the parent ITSELF, then asserted it had
+    // done so — a simulation of a drain arm that no longer exists, exercising no
+    // production code. The behaviour it described is now forbidden: a
+    // batch-level `messageNotFound` names no member, so no member may be
+    // dispositioned on it and the original row is retained whole. That is pinned
+    // against the real drain in
+    // `AccountManagerQueueDrainTests.messageNotFoundBatchRetainsTheOriginalRow`
+    // and end-to-end in `QueueMemberAbsenceTests`. The sibling test below stays:
+    // a SINGLE-message not-found is still an authoritative drop.
 
     @Test("Single messageNotFound → delete op (server wins)")
     func singleMessageNotFoundDeletesOp() throws {

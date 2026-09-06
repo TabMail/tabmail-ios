@@ -66,6 +66,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         case unclassified400
         case invalidId400
         case transient503
+        case gone410
     }
 
     private struct State: Sendable {
@@ -100,6 +101,13 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// disposition is not being applied to every failure alike.
         var transient503OnModifyProviderIds: Set<String> = []
         var transient503OnModifyServed = 0
+        /// Provider message ids whose `/messages/{id}/modify` returns a bare
+        /// `410 Gone`. NOT a synonym for the unseeded-id `404` this fixture
+        /// already serves: `410` is the status the drain has never treated as a
+        /// retirement, so it is the control that proves per-member absorption did
+        /// not silently widen what retires an operation.
+        var gone410OnModifyProviderIds: Set<String> = []
+        var gone410OnModifyServed = 0
         var modifyLog: [ModifyCall] = []
         /// Provider message ids whose exact-ID metadata `GET /messages/{id}`
         /// (token-member resolution, `resolveTokenMember`) returns a
@@ -239,6 +247,25 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// How many modify attempts were rejected with the injected 503.
     func transient503OnModifyServedCount() -> Int {
         state.value.withLock { $0.transient503OnModifyServed }
+    }
+
+    /// Inject a bare `410 Gone` for every `/messages/{id}/modify` naming
+    /// `providerMessageId`.
+    ///
+    /// ⚠️ DELIBERATELY DISTINCT FROM AN UNSEEDED ID, which this fixture answers
+    /// with `404`. `AccountManager.isMessageNotFoundError` — the gate a not-found
+    /// must pass before the drain may retire an operation — accepts `404` and has
+    /// never accepted `410`, so a `410` is the control for "a member-addressed
+    /// failure that is NOT authoritative absence". Its only other appearance is
+    /// inside `isConfirmedGoneError`, which runs after that gate has already
+    /// admitted the error and therefore never sees one.
+    func injectGone410OnModify(providerMessageId: String) {
+        _ = state.value.withLock { $0.gone410OnModifyProviderIds.insert(providerMessageId) }
+    }
+
+    /// How many modify attempts were rejected with the injected 410.
+    func gone410OnModifyServedCount() -> Int {
+        state.value.withLock { $0.gone410OnModifyServed }
     }
 
     /// Inject an UNCLASSIFIED structural 400 for the exact-ID metadata `GET
@@ -514,6 +541,10 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                     model.transient503OnModifyServed += 1
                     return .transient503
                 }
+                if model.gone410OnModifyProviderIds.contains(providerId) {
+                    model.gone410OnModifyServed += 1
+                    return .gone410
+                }
                 return .noneInjected
             }
             switch injection {
@@ -523,6 +554,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 return .bytes(Self.invalidIdErrorBody(providerId), contentType: "application/json", statusCode: 400)
             case .transient503:
                 return .status(503)
+            case .gone410:
+                return .status(410)
             case .noneInjected:
                 break
             }

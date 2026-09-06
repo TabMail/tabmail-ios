@@ -109,11 +109,13 @@ final class AppDatabase: Sendable {
     }
 
     /// Designated initializer. Wraps an already-open `pool`, runs schema
-    /// migrations, then — production only — the one-time destructive cached-mail
+    /// migrations, retires the previous RELEASE's action queue, then —
+    /// production only — the one-time destructive cached-mail
     /// resets, and finally reconciles whatever queue and draft residue the
     /// PREVIOUS process left behind. All of it runs BEFORE the pool is exposed
     /// (`AppDatabase.shared`) or the inbox observer is wired: DB opens → schema
-    /// migrates → data resets → previous-session queue/draft residue recovered →
+    /// migrates → previous-release action queue retired → data resets →
+    /// previous-session queue/draft residue recovered →
     /// only THEN can sync / NSE merge / demo+screenshot seed touch it.
     /// `runStartupResets` is false for tests so they never mutate global
     /// UserDefaults flags or the FTS directory.
@@ -135,6 +137,18 @@ final class AppDatabase: Sendable {
         try Self.runMigrations(on: pool)
         BackgroundSyncLogger.log("AppDatabase: schema migrations completed in \(Int((CFAbsoluteTimeGetCurrent() - migrateT0) * 1000))ms")
         BootProfiler.mark("AppDatabase.migrate done in \(Int((CFAbsoluteTimeGetCurrent() - migrateT0) * 1000))ms")
+        // The owner-approved APP-UPGRADE RETIREMENT BOUNDARY. It runs on the RAW
+        // pool, before every other step in this initializer, for the reason
+        // spelled out on the function itself: the queue rows a previous RELEASE
+        // left behind are retired without being decoded, so it has to happen
+        // before `recoverPreviousSessionResidue` reads them back as models and
+        // before anything can admit current-version work.
+        //
+        // Unconditional — production AND tests, exactly like the residue sweep
+        // below. It is a launch lifecycle rule, not a one-time flag-gated data
+        // reset, and a fixture that skipped it would be running a queue whose
+        // release boundary never ran.
+        try Self.retirePreviousReleaseActionQueue(on: pool, currentRelease: Self.currentAppRelease)
         if runStartupResets {
             StartupMigrations.run(pool)
         }
@@ -169,6 +183,107 @@ final class AppDatabase: Sendable {
             db.add(transactionObserver: observer)
         }
         return observer
+    }
+
+    /// The installed release this launch is running as: marketing version and
+    /// build, together. BOTH halves, because a TestFlight/App Store rebuild of
+    /// the same marketing version is a different binary with different queue
+    /// semantics, and that is exactly the change this boundary exists to notice.
+    ///
+    /// A missing key yields the empty string rather than a fabricated value: two
+    /// launches of a bundle with no version info compare EQUAL and therefore do
+    /// not purge, which is the safe direction — the unsafe direction would be a
+    /// value that differs every launch and retires the queue on every start.
+    static var currentAppRelease: String {
+        let info = Bundle.main.infoDictionary
+        let marketing = info?["CFBundleShortVersionString"] as? String ?? ""
+        let build = info?["CFBundleVersion"] as? String ?? ""
+        return "\(marketing) (\(build))"
+    }
+
+    /// THE OWNER-APPROVED APP-UPGRADE RETIREMENT BOUNDARY.
+    ///
+    /// On a change of installed release, every `pendingOperation` row queued by
+    /// the PREVIOUS release is deleted without being decoded, and every account
+    /// is marked full-sync-due so the server's own state is restored. The
+    /// accepted cost is that the user may have to repeat an action; the queue
+    /// normally drains in seconds, so the reachable set is small.
+    ///
+    /// 🚨 THIS IS THE LIFECYCLE CARVE-OUT, NOT A FIFTH EXIT. The four exits in
+    /// `Companion/Rules/Active/never-drop-user-intention.md` answer *"may the
+    /// drain retire THIS operation, on THIS attempt, given what the provider
+    /// said?"*. This function answers nothing about any operation: it consults no
+    /// evidence, no epoch, no identity and no provider result, it destroys the
+    /// queue AS A WHOLE at a boundary, it runs outside the drain, and it is
+    /// explicitly owner-approved. All three properties are required, and a
+    /// runtime retirement that dressed itself in this language would still owe
+    /// one of the four exits. `v74_purgeLegacyPendingOperations` is the precedent
+    /// for the PRINCIPLE — retire without decoding, preserve authored content —
+    /// but it is a one-shot migration and does not implement this rule.
+    ///
+    /// 🚨 THE CARVE-OUT DOES NOT EXTEND PAST QUEUE STATE. Authored `Draft` and
+    /// `outboxMessage` rows, bodies, attachments and FTS content keep their
+    /// existing lifecycle and are not touched here. A retired `.saveDraft` loses
+    /// only the automatic server-push intention — the local `Draft` row keeps the
+    /// content, and reopening/editing/saving admits fresh work. Sync alone cannot
+    /// upload content that never reached the server, and no draft sweeper or
+    /// automatic re-admission is added to pretend otherwise.
+    ///
+    /// 🚨 ONE TRANSACTION, AND THAT IS THE WHOLE SAFETY ARGUMENT. The delete, the
+    /// full-sync marking and the new stamp commit together or not at all. A
+    /// partial commit that recorded the new release while retaining old rows
+    /// would make the boundary un-rerunnable and strand exactly the work it
+    /// exists to retire; a failure instead propagates out of `AppDatabase.init`,
+    /// leaves initialization incomplete, and the next launch retries the whole
+    /// thing. There is no `try?` and no retry ladder, for the same reason the
+    /// migrations above have none.
+    ///
+    /// 🚨 THE READ IS ON THE RAW POOL, DELIBERATELY. `PrioritizedDatabase`'s
+    /// async `read` first calls `NSEDataBridge.mergeIfStagingPending`, which can
+    /// ADMIT work — so reading the stamp through it would let a staged
+    /// notification action enter the queue before the boundary that is supposed
+    /// to precede every current-release admission. The parameter is a
+    /// `DatabaseWriter` (a `DatabasePool` in production), which `PrioritizedDatabase`
+    /// is not, so that mistake cannot be made by a later caller either.
+    ///
+    /// A MISSING STAMP IS AN UPGRADE BOUNDARY. First adoption of this rule cannot
+    /// know which release queued the existing rows, so it retires them; a
+    /// genuinely fresh database is already empty and the delete is a no-op. An
+    /// UNCHANGED release does not purge — this is not a per-launch, per-foreground,
+    /// per-login or per-retry clear, and ordinary crash recovery
+    /// (`recoverPreviousSessionResidue`) is left to run exactly as before.
+    ///
+    /// - Returns: `true` when this launch crossed a release boundary and retired.
+    @discardableResult
+    static func retirePreviousReleaseActionQueue(
+        on pool: some DatabaseWriter, currentRelease: String
+    ) throws -> Bool {
+        let retiredRows = try pool.write { db -> Int? in
+            let recorded = try String.fetchOne(
+                db, sql: "SELECT release FROM appReleaseStamp WHERE id = 1")
+            guard recorded != currentRelease else { return nil }
+            let doomed = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM pendingOperation") ?? 0
+            try db.execute(sql: "DELETE FROM pendingOperation")
+            // The existing full-sync mechanism, reused rather than reinvented:
+            // `SyncEngine.fullSync`'s source-folder reconciliation is what
+            // repairs an optimistic move whose durable operation just went away.
+            try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL")
+            try db.execute(sql: """
+                INSERT INTO appReleaseStamp (id, release) VALUES (1, ?)
+                ON CONFLICT(id) DO UPDATE SET release = excluded.release
+                """, arguments: [currentRelease])
+            return doomed
+        }
+        guard let retiredRows else { return false }
+        // Debug-gated (project rule 12): a diagnostic, not production
+        // observability. The rows are gone either way; what this answers is
+        // "did the boundary fire, and how much did it take" when a user reports
+        // an action that did not survive an update.
+        if DebugModeManager.isLoggingEnabled() {
+            print("[AppDatabase] Release boundary crossed to \(currentRelease) — retired \(retiredRows) previous-release pendingOperation row(s) and marked full sync due")
+        }
+        return true
     }
 
     /// PREVIOUS-SESSION QUEUE AND DRAFT RESIDUE, reconciled at the one boundary
@@ -2108,7 +2223,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v88 RANGE ─────────────────────
+        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v89 RANGE ─────────────────────
         //
         // `registerTimedMigration`'s DEFAULT stays `.deferred` and is NOT
         // changed. v1…v67 have never been adjudicated for `.immediate` safety,
@@ -2186,6 +2301,9 @@ final class AppDatabase: Sendable {
         //     of either kind. Its index is NOT built here — it is deferred to
         //     `SyncEngine.createDeferredIndexes` off the launch path
         //     (ADR-IOS-029, 2026-08-05 amendment), so the body is one statement.
+        //   • v89 — one `CREATE TABLE appReleaseStamp`. A brand-new table with no
+        //     FK of its own and nothing referencing it, so it writes no key of
+        //     either kind and nothing can cascade to or from it.
         //
         //   • v82 — `DROP`/`CREATE` of `userLabel` + `messageUserLabel`. FK-clean
         //     per statement, verified statement by statement in that migration's own
@@ -2196,16 +2314,16 @@ final class AppDatabase: Sendable {
         //     the body safe.
         //
         // ⚑ AMENDED 2026-08-06, RANGE RE-DERIVED AT R17-6 — **EVERY MIGRATION IN
-        // v68…v88 NOW RUNS `.immediate`, so this range runs ZERO whole-database
+        // v68…v89 NOW RUNS `.immediate`, so this range runs ZERO whole-database
         // foreign-key checks.** The range is an OPEN interval that moves with the
         // top of the chain, so it is re-derived rather than restated (`MIS-031` — a
         // sentence that enumerates is a cache, and this one had gone stale at `v84`
         // in five places at once). Comments excluded so this paragraph cannot
         // satisfy its own predicate (`MIS-033`, `IOS-DOC-002`):
         //   rg -c --pcre2 '^(?!\s*(///|//)).*foreignKeyChecks: \.immediate' \
-        //      TabMail/Services/AppDatabase.swift                            → 21
+        //      TabMail/Services/AppDatabase.swift                            → 22
         //   rg -o '"v([0-9]+)_[A-Za-z0-9_]+"' -r '$1' \
-        //      TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 21
+        //      TabMail/Services/AppDatabase.swift | sort -n -u | awk '$1>=68' | wc -l → 22
         // Equal counts are the invariant: every migration from v68 to the top runs
         // `.immediate`, and none below v68 does. The sentence
         // that stood here said *"`v71` and `v82` stay `.deferred`, each for a
@@ -3881,10 +3999,13 @@ final class AppDatabase: Sendable {
         // GRDB keys on the FULL identifier string, so after a merge both run exactly
         // once, and nothing in this tree parses the integer out of an identifier. What
         // breaks is the SELF-CHECKING ARITHMETIC this file publishes below: the FK-range
-        // census counts DISTINCT migration numbers, so two v88s collapse to one (21)
-        // while `foreignKeyChecks: .immediate` counts 22, and the next reader reads a
-        // satisfied invariant as violated and goes hunting for a migration that is not
-        // `.immediate`. Whichever branch lands SECOND must renumber — legal, since
+        // census counts DISTINCT migration numbers, so two v88s would collapse to one
+        // while `foreignKeyChecks: .immediate` counts registrations, the two totals
+        // would disagree by exactly one, and the next reader would read a satisfied
+        // invariant as violated and go hunting for a migration that is not
+        // `.immediate`. (Stated as a DIFFERENCE, not as the pair of integers it was
+        // when written — those went stale the moment `v89` was appended, which is the
+        // same `MIS-031` trap this file warns about two paragraphs down.) Whichever branch lands SECOND must renumber — legal, since
         // neither has shipped in a tagged release — and per data integrity rule 5 every
         // dev database that ran the old name must then be wiped. (Found by audit.)
         //
@@ -3897,6 +4018,29 @@ final class AppDatabase: Sendable {
                 t.add(column: "bodyMetadataOversized", .boolean)
                     .notNull()
                     .defaults(to: false)
+            }
+        }
+
+        // ⚑ NO REFERENCE — INVENTED. The durable half of the owner-approved
+        // app-upgrade retirement boundary (`retirePreviousReleaseActionQueue`).
+        //
+        // ONE ROW, and the `CHECK` is what makes it one: the boundary's whole
+        // safety argument is that the recorded release is a single fact read and
+        // rewritten inside one transaction, and a table that can hold two rows
+        // has to decide which of them is the answer. `id = 1` is enforced by the
+        // schema rather than by convention so no later writer can create the
+        // ambiguity.
+        //
+        // It deliberately holds NO per-operation version, NO timestamp and NO
+        // history. Retirement is decided by one string comparison; anything else
+        // here would be a replay log for a boundary whose entire premise is that
+        // previous-version work is discarded without being decoded.
+        migrator.registerTimedMigration(
+            "v89_createAppReleaseStamp", foreignKeyChecks: .immediate
+        ) { db in
+            try db.create(table: "appReleaseStamp") { t in
+                t.primaryKey("id", .integer).check { $0 == 1 }
+                t.column("release", .text).notNull()
             }
         }
     }

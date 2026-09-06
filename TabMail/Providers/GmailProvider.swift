@@ -527,25 +527,67 @@ actor GmailProvider: EmailProvider {
         return headers
     }
 
-    func markRead(ids: [String], folder: String) async throws {
+    /// THE PER-MEMBER BOUNDARY for every Gmail label mutation.
+    ///
+    /// Gmail's `messages.modify` addresses ONE message per request, so this loop
+    /// is the only place in the system that can attribute a not-found answer to a
+    /// specific member. It therefore owns the per-member interpretation: a member
+    /// the server AUTHORITATIVELY reports gone is dispositioned and recorded, the
+    /// loop continues, and the surviving members are still processed. Reported
+    /// afterwards as `ProviderMembersAbsent`, which
+    /// `AccountManager.executeOperation` converts into a complete outcome naming
+    /// those members.
+    ///
+    /// 🚨 THIS IS WHAT REPLACES THE DRAIN'S BATCH SPLIT. The scheduler used to
+    /// respond to a batch not-found by writing one replacement `PendingOperation`
+    /// per member and deleting the parent, purely to discover which member was
+    /// gone. The discovery belongs here, where the request is actually addressed;
+    /// the durable row keeps its id and is never re-shaped.
+    ///
+    /// ⚠ ONLY A STRUCTURAL, MEMBER-ADDRESSED NOT-FOUND IS ABSORBED. Everything
+    /// else — a 5xx, a 429, a timeout, an auth failure, a cancellation — is
+    /// rethrown immediately with the remaining members untouched, so the whole
+    /// operation stays queued and retries. Re-running the already-successful
+    /// members on that retry is accepted: `messages.modify` add/remove label is
+    /// idempotent and does not change the message id.
+    private func modifyEachMessage(
+        ids: [String],
+        addLabelIds: [String] = [],
+        removeLabelIds: [String] = [],
+        moveTraceLabel: String? = nil
+    ) async throws {
+        var absent: [String] = []
         for id in ids {
-            try await modifyMessage(id: id, removeLabelIds: ["UNREAD"])
+            do {
+                try await modifyMessage(
+                    id: id, addLabelIds: addLabelIds, removeLabelIds: removeLabelIds)
+                if let moveTraceLabel, DebugModeManager.isLoggingEnabled() {
+                    print("[MoveTrace] \(moveTraceLabel) — modifyMessage completed for \(id)")
+                }
+            } catch {
+                guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
+                absent.append(id)
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Gmail] modifyMessage \(id): the server reports THIS message gone — the member is dispositioned and the remaining members are still processed")
+                }
+            }
         }
+        if !absent.isEmpty { throw ProviderMembersAbsent(absentMemberIds: absent) }
+    }
+
+    func markRead(ids: [String], folder: String) async throws {
+        try await modifyEachMessage(ids: ids, removeLabelIds: ["UNREAD"])
     }
 
     func markUnread(ids: [String], folder: String) async throws {
-        for id in ids {
-            try await modifyMessage(id: id, addLabelIds: ["UNREAD"])
-        }
+        try await modifyEachMessage(ids: ids, addLabelIds: ["UNREAD"])
     }
 
     func markFlagged(ids: [String], flagged: Bool, folder: String) async throws {
-        for id in ids {
-            if flagged {
-                try await modifyMessage(id: id, addLabelIds: ["STARRED"])
-            } else {
-                try await modifyMessage(id: id, removeLabelIds: ["STARRED"])
-            }
+        if flagged {
+            try await modifyEachMessage(ids: ids, addLabelIds: ["STARRED"])
+        } else {
+            try await modifyEachMessage(ids: ids, removeLabelIds: ["STARRED"])
         }
     }
 
@@ -571,10 +613,12 @@ actor GmailProvider: EmailProvider {
             return
         }
         if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] GmailProvider.move — ids=\(ids) addLabels=\(add) removeLabels=\(remove)") }
-        for id in ids {
-            try await modifyMessage(id: id, addLabelIds: add, removeLabelIds: remove)
-            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] GmailProvider.move — modifyMessage completed for \(id)") }
-        }
+        // A Gmail move is a label mutation, so it goes through the same
+        // per-member boundary as the setters: one gone member does not strand
+        // the rest, and the id is stable across it (no address churn to re-learn).
+        try await modifyEachMessage(
+            ids: ids, addLabelIds: add, removeLabelIds: remove,
+            moveTraceLabel: "GmailProvider.move")
     }
 
     func send(draft: DraftMessage) async throws {

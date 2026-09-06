@@ -189,16 +189,34 @@ struct AccountManagerQueueDrainTests {
         #expect(callLog.isEmpty)
     }
 
-    // MARK: - 6. Batch split preserves the parent op's createdAt (buildLanes FIFO invariant)
+    // MARK: - 6. A multi-member not-found keeps the ORIGINAL row, id and createdAt
     //
-    // The `messageNotFound` split constructs ops via `PendingOperation(...)`, whose init stamps
-    // `createdAt = Date()` — LATER than a same-lane sibling op queued between the
-    // original batch and the split. That starves the split op behind the sibling
-    // on every later `buildLanes` pass, since lanes preserve createdAt-asc order.
-    // The fix copies `currentOp.createdAt` onto each split op before insert.
+    // 🚨 THIS TEST USED TO MEASURE THE OPPOSITE, AND THE REASON IT CHANGED IS
+    // THE REASON THE SPLIT WAS DELETED (2026-09-06). The drain used to answer a
+    // multi-member `messageNotFound` by inserting one single-message child per
+    // member and deleting the parent. The child ops had to be hand-stamped with
+    // `currentOp.createdAt`, because `PendingOperation.init` stamps `Date()` and
+    // a child born LATER than a same-lane sibling starves behind it forever —
+    // that starvation is what this test guarded.
+    //
+    // Deleting the split deletes the hazard rather than guarding it: the row is
+    // never rebuilt, so its `createdAt` is never restamped and there is nothing
+    // to inherit. What has to be pinned now is the stronger property the split
+    // could never provide — a BATCH failure names no member, so no member may be
+    // dispositioned on it. `ProviderError.messageNotFound` raised for the
+    // operation as a whole is exactly that: it says something is gone, but not
+    // WHICH, and unknown evidence is never authoritative. Member-attributed
+    // absence is now decided at the provider boundary, where the wire says which
+    // id the 404 was for.
+    //
+    // Two things must therefore hold, and the second is the one with teeth:
+    // the surviving row is byte-for-byte the user's original intention (same id,
+    // same membership, same `createdAt`), and NO other row exists — a "split"
+    // that merely preserved timestamps would still destroy the original id and
+    // re-shape a three-member gesture into three separate ones.
 
-    @Test("Batch messageNotFound split: each new single-message op inherits the parent's createdAt, not Date()")
-    func messageNotFoundBatchSplitPreservesCreatedAt() async throws {
+    @Test("Batch messageNotFound: the original op is retained whole — same id, same members, same createdAt, no children")
+    func messageNotFoundBatchRetainsTheOriginalRow() async throws {
         let (pool, dir, previous) = try makeTestDB()
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
@@ -214,23 +232,31 @@ struct AccountManagerQueueDrainTests {
 
         let outcome = await AccountManager.shared.executeSingleOp(op, provider: provider, context: AccountManager.DrainContext())
 
-        // .haltLane (F3, not .proceed): the split singles are freshly queued,
-        // un-executed — the lane must halt so a later same-lane op never runs
-        // ahead of them. See laneHaltsAfterBatchSplitBlocksChainedOp below for
-        // the integration scenario this prevents.
+        // .haltLane: the operation is still owed, so a later same-lane op must
+        // not run ahead of it.
         #expect(outcome == .haltLane)
-        let originalStillThere = try fetchOp(op.id, pool: pool)
-        #expect(originalStillThere == nil)
 
-        let splitOps = try await pool.read { db in
+        let survivors = try await pool.read { db in
             try PendingOperation.filter(Column("accountId") == "acc1").fetchAll(db)
         }
-        #expect(splitOps.count == 2)
-        guard splitOps.count == 2 else { return }
-        for splitOp in splitOps {
-            #expect(splitOp.type == .move)
-            #expect(splitOp.createdAt == parentCreatedAt)
-        }
+        #expect(survivors.count == 1, """
+            the user made ONE gesture. Any other count means the drain re-shaped \
+            it — either into per-member children or into nothing at all. Got: \
+            \(survivors.map(\.id))
+            """)
+        guard survivors.count == 1 else { return }
+        let retained = survivors[0]
+        #expect(retained.id == op.id, "the retained row must be the SAME operation, not a replacement")
+        #expect(retained.messageIds == ["msg-1", "msg-2"], """
+            no member was individually dispositioned by a batch-level error, so \
+            every member must still be owed
+            """)
+        #expect(retained.createdAt == parentCreatedAt, """
+            the row was never rebuilt, so its queue position is untouched — a \
+            restamped createdAt would starve it behind any sibling queued since
+            """)
+        #expect(retained.status == PendingStatus.queued.rawValue, "an unresolved op must be retryable, not left claimed")
+        #expect(retained.retryCount == op.retryCount + 1)
     }
 
     // MARK: - 8. GAP1: AppDatabase startup recovery (real initializer) — previous-session residue
