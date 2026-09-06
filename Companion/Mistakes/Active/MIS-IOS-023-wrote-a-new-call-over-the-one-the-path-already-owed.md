@@ -2,7 +2,7 @@
 
 **Class:** data-integrity
 **Severity:** critical (dropped user intention — latent: unreachable on today's providers, reachable on the next provider change)
-**First seen:** 2026-09 · **Recurrences:** 1 · **Status:** Active
+**First seen:** 2026-09 · **Recurrences:** 2 · **Status:** Active
 **Related:** `MIS-IOS-008` (the deferred-successor mechanism this drops, `IOS-QUEUE-008`) · `MIS-IOS-021` and `MIS-IOS-022` (the other two defects that entered through this same refactor) · `MIS-IOS-012` (a caller census whose grep shape hid half the callers) · `Companion/Rules/Active/never-drop-user-intention.md`
 
 ## The tell
@@ -68,9 +68,29 @@ request `provenIds == ids` holds and a `provenIds`-only comparison returns silen
 the fix exists to close, letting the `Void` contract read the server's authoritative "gone" as
 "moved". Do not simplify it back to one comparison.
 
-`Recurrences` stays **1**: this instance is the same shape found by the same census in the same
-unmerged branch, closed by hardening the contract rather than by a second, later commission of the
-error. Counting it would double-charge one occurrence of the tell.
+That second instance does NOT raise `Recurrences`: it is the same shape found by the same census in
+the same unmerged branch, closed by hardening the contract rather than by a second, later commission
+of the error. Counting it would double-charge one occurrence of the tell.
+
+**A THIRD instance — and this one DOES raise `Recurrences` to 2 (2026-09-06).** After the census
+above reported clean, an independent architecture gate angle found that
+`AccountManager.retirePartiallyCompletedOp` — the path this same PR promoted to primary for every
+multi-member Gmail and Graph operation — never called `recordMembersThatEnteredInbox`, while both
+paths it displaced (the whole-op success arm and `replayRetainedRetirements`' `.full` arm) did. A
+multi-member move into the Inbox therefore recorded the ADR-IOS-008 decision-3 event for the single
+member that settled through the whole-op arm and silently dropped it for the other N−1;
+`ActiveAIQueue.repopulateFromDatabase` does not cover them, because it is bounded by the newest-
+`SyncConfig.maxRecentEmails` window that the window-exempt enqueue exists to escape. Fixed
+`f3f16169a` by adding the call post-commit with `frozenRetiredOp` (never `currentOp` —
+`optimisticMoveToFolder` has already moved all N header rows locally, so `currentOp` would enqueue
+members the server has not moved), mirrored into the `.partial` replay arm. Four call sites now.
+
+This is the **quieter form of the tell**, and it counts because I committed the error a second time
+after having written this record: I was satisfied that the path I edited was correct and did not go
+looking for the other paths that were supposed to agree with it.
+
+⚠️ **It also falsifies the mechanical check below as a sufficient guard — read that section's
+limitation before relying on it.**
 
 ## Why it is not obvious
 
@@ -106,6 +126,22 @@ done
 join -t$'\t' -a1 -e0 -o 0,1.2,2.2 "/tmp/cd_${B}.tsv" "/tmp/cd_${C}.tsv" \
   | awk -F'\t' '$2>$3 {printf "%-45s base=%s cand=%s\n", $1, $2, $3}'
 ```
+
+### ⚠️ What this check STRUCTURALLY CANNOT catch
+
+It compares call-site COUNTS between base and candidate and flags **drops**. The third instance above
+produced **no drop**: `recordMembersThatEnteredInbox` occurred 5 times in base and 5 times in the
+candidate. The lost call was not removed from an existing path — a NEW path was promoted to primary
+without ever acquiring the call its predecessors owed. A count that holds steady while the set of
+paths that need the call grows is invisible to this check, and it read CLEAN on the exact commit that
+carried the defect.
+
+So the count diff is a floor, not a ceiling. When a change promotes, replaces, or adds a path, the
+count comparison must be followed by a **per-path census**: enumerate every path that reaches the
+same terminal state, list the statements each one executes after its commit, and diff those lists
+against each other. State the resulting count as a falsifiable claim ("all four retirement paths
+execute the same five post-commit statements") so the next reviewer can refute it rather than re-derive
+it. That census — not this one — is what would have caught it.
 
 **Self-test it before trusting it** (a census that reports clean by failing is worse than none): run
 it with `C=a270c312a`, where the defect is live, and it must print
