@@ -109,6 +109,11 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         var gone410OnModifyProviderIds: Set<String> = []
         var gone410OnModifyServed = 0
         var modifyLog: [ModifyCall] = []
+        /// Seconds every `/messages/{id}/modify` response is withheld for.
+        /// `0` (the default) keeps the fixture instantaneous — only the tests
+        /// that need a loop to outrun a deadline pay for it. See
+        /// `holdEachModify(forSeconds:)`.
+        var modifyLatencySeconds: TimeInterval = 0
         /// Provider message ids whose exact-ID metadata `GET /messages/{id}`
         /// (token-member resolution, `resolveTokenMember`) returns a
         /// structural `400` whose body matches NO known terminal shape — the
@@ -249,6 +254,16 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         state.value.withLock { $0.transient503OnModifyServed }
     }
 
+    /// Heal every injected modify `503`, leaving the served count intact.
+    ///
+    /// A transient fault is only transient if the test can end it: a fixture that
+    /// can never recover proves retention but can never prove CONVERGENCE, and
+    /// convergence is half of every never-drop property. Mirrors
+    /// `clearUnclassified400s()`.
+    func clearTransient503sOnModify() {
+        state.value.withLock { $0.transient503OnModifyProviderIds.removeAll() }
+    }
+
     /// Inject a bare `410 Gone` for every `/messages/{id}/modify` naming
     /// `providerMessageId`.
     ///
@@ -266,6 +281,26 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// How many modify attempts were rejected with the injected 410.
     func gone410OnModifyServedCount() -> Int {
         state.value.withLock { $0.gone410OnModifyServed }
+    }
+
+    /// Make every `/messages/{id}/modify` take `seconds` to answer.
+    ///
+    /// The per-member provider loops are SEQUENTIAL, so this is the only way a
+    /// test can make one of them cost real wall-clock time and collide with the
+    /// operation deadline `AccountManager.executeSingleOp` wraps it in. Without
+    /// it the whole loop finishes in microseconds and the deadline is
+    /// unreachable, which is precisely the condition under which the starvation
+    /// this models is invisible.
+    ///
+    /// The wait happens in `CannedResponse.parked`, i.e. on a background queue,
+    /// so it delays THIS request without occupying the transport's loader thread
+    /// and starving every other route — see that method's note on the
+    /// `OutlookQueueHandoffTests` flake. The handler's synchronous part (the
+    /// `modifyLog` append, the injection budgets, the state mutation) still runs
+    /// in request order before the wait, so ordering of what was RECEIVED is
+    /// unchanged.
+    func holdEachModify(forSeconds seconds: TimeInterval) {
+        state.value.withLock { $0.modifyLatencySeconds = seconds }
     }
 
     /// Inject an UNCLASSIFIED structural 400 for the exact-ID metadata `GET
@@ -510,7 +545,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             let body = (try? JSONSerialization.data(withJSONObject: responseObject)) ?? Data()
             return .bytes(body, contentType: "application/json")
         }
-        http.register(path: "/messages/", method: "POST") { [state] request in
+        let serveModify: @Sendable (FakeHTTP.Request) -> FakeHTTP.CannedResponse = { [state] request in
             guard request.url.path.hasSuffix("/modify") else { return .status(404) }
             let components = request.url.pathComponents
             guard components.count >= 2 else { return .status(404) }
@@ -572,6 +607,12 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 return true
             }
             return found ? .json(raw: "{}") : .status(404)
+        }
+        http.register(path: "/messages/", method: "POST") { [state] request in
+            let response = serveModify(request)
+            let latency = state.value.withLock { $0.modifyLatencySeconds }
+            guard latency > 0 else { return response }
+            return .parked { Thread.sleep(forTimeInterval: latency); return response }
         }
     }
 

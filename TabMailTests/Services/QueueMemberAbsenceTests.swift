@@ -31,7 +31,7 @@ import Testing
 /// Every test states a SYSTEM PROPERTY and reads it off the wire and the
 /// durable queue — what the server ended up holding, how many times each member
 /// was addressed, what the user is still owed. Nothing here names
-/// `ProviderMembersAbsent`, `confirmedGoneMembers` or any other type introduced
+/// `ProviderMembersDispositioned`, `confirmedGoneMembers` or any other type introduced
 /// by the fix, deliberately: a test written against the mechanism inherits the
 /// spec error it was supposed to catch (`MIS-015`), and these tests must be
 /// compilable — and red — against the pre-fix tree.
@@ -315,6 +315,14 @@ struct QueueMemberAbsenceTests {
         // single-member request is a replacement child executing on its own,
         // which is exactly what the deleted split arm produced.
         let attempts = await provider.movedIds
+        // 🚨 TWO-SIDED. `allSatisfy` is TRUE of an empty array, so on its own it
+        // is also satisfied by a tree in which the operation never reached the
+        // provider at all — which is the OTHER way to lose the gesture (the
+        // wedge corollary), and the one a retention test is least able to notice.
+        #expect(!attempts.isEmpty, """
+            the operation never reached the provider, so nothing was classified \
+            and the retention asserted above is vacuous
+            """)
         #expect(attempts.allSatisfy { $0.ids == ["11", "12", "13"] }, """
             an unresolved operation is retried WHOLE. A request naming one member \
             means the scheduler re-shaped the user's intention to find out which \
@@ -565,6 +573,706 @@ struct QueueMemberAbsenceTests {
             takes its body and FTS content with it.
             """)
         #expect(try headerExists(f, messageId: "g-411") == true)
+
+        await finish(f)
+    }
+
+
+    // MARK: - 7. A slow batch keeps the progress it made under the operation deadline
+
+    /// **THE PROPERTY: whatever a per-member loop settles before the operation
+    /// deadline REACHES THE DRAIN. A batch too slow to finish inside one attempt
+    /// reports the members it finished instead of being discarded whole.**
+    ///
+    /// 🚨 THE FAILURE THIS PINS IS A WEDGE, NOT A SLOW PATH. `executeSingleOp`
+    /// wraps the provider call in `withTimeout(pendingOperationTimeoutSeconds)`,
+    /// and `withTimeout` resumes its caller with `TimeoutError` FIRST and cancels
+    /// the operation task second — so everything the loop produced is thrown away
+    /// with the abandoned task. The drain then takes the generic failure path,
+    /// `requeueOrRetain` resets the row **with its membership unchanged**, and the
+    /// next attempt re-issues the identical prefix into the identical deadline.
+    /// A batch whose members cost more wall-clock time in total than the deadline
+    /// therefore NEVER reaches its last member, on any attempt, forever. That is
+    /// persistent retry starvation — the wedge corollary that
+    /// `never-drop-user-intention.md` puts on the non-recoverable list beside a
+    /// dropped gesture, not an accepted delay.
+    ///
+    /// The oracle is the SHAPE OF WHAT COMES BACK: a report naming a proper,
+    /// non-empty prefix rather than a `TimeoutError` naming nothing. It is read
+    /// from the provider under the drain's own `withTimeout`, at a scaled deadline
+    /// — the loop budget keeps exactly the fraction of it that
+    /// `SyncConfig.providerMemberLoopBudgetFraction` gives it in production, so the
+    /// relationship under test is the production one and only the clock is smaller.
+    ///
+    /// TWO-SIDED: the prefix's members are read on the server AND the suffix's are
+    /// still unread and were never addressed, so this cannot pass by the loop
+    /// reporting members it did not touch.
+    ///
+    /// RED PROOF (recorded): with the budget stop removed, ten 0.4 s members cost
+    /// 4 s against a 2 s deadline; the call comes back `TimeoutError` — "the loop
+    /// was discarded by the operation deadline instead of reporting its prefix:
+    /// Operation timed out after 2.0s" — and `modifyLog` shows the last members
+    /// were never requested.
+    @Test("Gmail: a slow member loop reports its finished prefix instead of dying whole on the operation deadline")
+    @MainActor
+    func aSlowMemberLoopReportsItsPrefixBeforeTheOperationDeadline() async throws {
+        let ids = (1...10).map { "slow-\($0)" }
+        let server = StatefulGmailActionServer(messages: ids.map {
+            .init(rfc822MessageId: "\($0)@example.com", providerMessageId: $0,
+                  labels: ["INBOX", "UNREAD"])
+        })
+        defer { server.close() }
+        // Ten members at 0.4 s each = 4 s of provider work. The operation deadline
+        // below is 2 s, so a loop that does not stop on its own is guaranteed to
+        // be cancelled mid-batch; the budget is 1.2 s, so a loop that does stop
+        // finishes at ~1.2 s with 0.8 s of margin. Both sides clear by ~40 %.
+        server.holdEachModify(forSeconds: 0.4)
+
+        let operationDeadline: TimeInterval = 2.0
+        let budget = Duration.milliseconds(
+            Int(operationDeadline * SyncConfig.providerMemberLoopBudgetFraction * 1000))
+
+        let provider = server.provider()
+        let folder = Self.source
+        let outcome: Result<Void, any Error> = await ProviderMemberLoopBudget
+            .$overrideForTesting.withValue(budget) {
+                do {
+                    try await withTimeout(seconds: operationDeadline) {
+                        try await provider.markRead(ids: ids, folder: folder)
+                    }
+                    return .success(())
+                } catch {
+                    return .failure(error)
+                }
+            }
+
+        guard case .failure(let error) = outcome else {
+            Issue.record("""
+                the whole ten-member batch reported success inside the deadline, so \
+                nothing about the deadline was exercised and this test proves nothing
+                """)
+            return
+        }
+        guard let report = error as? ProviderMembersDispositioned else {
+            Issue.record("""
+                the loop was discarded by the operation deadline instead of \
+                reporting its prefix: \(error). Every member it had already \
+                mutated is lost with the cancelled task, so the row is requeued \
+                unchanged and the final member starves.
+                """)
+            return
+        }
+
+        let prefix = report.dispositionedMemberIds
+        #expect(!prefix.isEmpty,
+                "a report that settles nothing cannot make progress — the loop must always attempt at least one member")
+        #expect(prefix.count < ids.count, """
+            the loop reported every member, so it never stopped on its budget and \
+            this fixture is not slow enough to exercise the deadline at all
+            """)
+        guard !prefix.isEmpty, prefix.count < ids.count else { return }
+        #expect(prefix == Array(ids.prefix(prefix.count)),
+                "the finished prefix must be the members in request order. Got: \(prefix)")
+        #expect(report.absentMemberIds.isEmpty,
+                "every member exists on this server — stopping on a budget is not an absence")
+
+        // THE SUFFIX WAS NEVER TOUCHED, on the wire and in the server's state.
+        // This is what makes the prefix a claim about work actually done rather
+        // than a number the loop made up.
+        let addressed = server.modifyLog().map(\.providerMessageId)
+        #expect(addressed == prefix, """
+            the loop reported \(prefix.count) member(s) but addressed \(addressed.count): \
+            \(addressed). A reported member must be one the server was actually asked about.
+            """)
+        for id in prefix {
+            #expect(server.snapshot(providerMessageId: id)?.isRead == true,
+                    "\(id) is reported settled but the server never applied the gesture")
+        }
+        for id in ids.dropFirst(prefix.count) {
+            #expect(server.snapshot(providerMessageId: id)?.isRead == false,
+                    "\(id) is still owed and must not have been mutated")
+        }
+    }
+
+    // MARK: - 8. A budget-stopped batch converges without redoing its progress
+
+    /// **THE PROPERTY: an operation that stops on its budget narrows the SAME
+    /// durable row to its unproven remainder, so the work already done is never
+    /// repeated and the FINAL member is eventually executed.**
+    ///
+    /// This is the queue-side half of the property above. The provider can only
+    /// report a prefix; what makes the report worth anything is that the drain
+    /// converts it into a narrowing of the user's original row through
+    /// `ExecutedOperation.provenMembers` → `retirePartiallyCompletedOp` — same id,
+    /// same order, no replacement rows — so the next attempt starts where the last
+    /// one stopped. Without that, progress is not preserved and a batch that
+    /// cannot finish in one attempt cannot finish in any number of them.
+    ///
+    /// THE ORACLE IS THE WIRE, AND IT IS MONOTONIC. Every member is addressed
+    /// exactly once EXCEPT the one carrying an injected transient fault, which is
+    /// addressed again only after it failed. A member re-sent without having
+    /// failed is proof that the attempt which settled it was thrown away. Counting
+    /// requests avoids asserting on mid-drain row state, which a gesture-spawned
+    /// redrain can move underneath the assertion (`IOS-TEST-005`).
+    ///
+    /// The budget is `.zero`, so the loop stops after every single member — the
+    /// check is BETWEEN members and never before the first, so "stop immediately"
+    /// still means "settle exactly one". That makes the whole test deterministic:
+    /// no latency, no clock margin, one member per attempt by construction.
+    ///
+    /// RED PROOF (recorded): with the budget stop removed, each of the first two
+    /// drain passes re-runs `b-1` and `b-2` before hitting `b-3`'s 503, so
+    /// `b-1` is addressed 3 times and `b-2` 3 times — `#expect(counts["b-1"] == 1)`
+    /// fails with 3, and so does `b-2`'s.
+    @Test("Gmail: a batch that stops on its budget narrows the same row and converges without redoing its progress")
+    @MainActor
+    func aBudgetStoppedBatchNarrowsAndConvergesWithoutRedoingItsProgress() async throws {
+        // `b-1` is deliberately NOT seeded — modify answers 404, Gmail's
+        // authoritative "this message is gone" — so the batch is the MIXED
+        // absent/live shape the finding names.
+        let live = ["b-2", "b-3", "b-4", "b-5"]
+        let server = StatefulGmailActionServer(messages: live.map {
+            .init(rfc822MessageId: "\($0)@example.com", providerMessageId: $0,
+                  labels: ["INBOX", "UNREAD"])
+        })
+        defer { server.close() }
+        // The middle member fails transiently, so the run contains a genuine
+        // retry — the only situation in which "was this member re-sent?" can tell
+        // preserved progress apart from repeated progress.
+        server.injectTransient503OnModify(providerMessageId: "b-3")
+
+        let f = try fixture(accountId: "absence-gmail-budget", provider: .gmail)
+        let members = ["b-1"] + live
+        for id in members { try seedHeader(f, messageId: id, rfc: "\(id)@example.com") }
+
+        let op = PendingOperation(
+            type: .markRead, messageIds: members,
+            accountId: f.accountId, folderPath: Self.source)
+        try insert(op, into: f)
+
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: f.accountId, provider: server.provider())
+
+        try await ProviderMemberLoopBudget.$overrideForTesting.withValue(.zero) {
+            // TWO complete drains with the fault standing. One is not enough: a
+            // single drain addresses `b-1` and `b-2` exactly once on BOTH trees,
+            // and it is the SECOND drain that either resumes at `b-3` (progress
+            // preserved) or starts over at `b-1` (progress discarded).
+            await drainPasses(2)
+            #expect(server.transient503OnModifyServedCount() >= 1,
+                    "the injected 503 never reached the wire, so no retry was exercised")
+
+            // The fault heals; the operation must now converge on its own.
+            server.clearTransient503sOnModify()
+            try await drainToQuiescence(f)
+        }
+
+        var counts: [String: Int] = [:]
+        for call in server.modifyLog() {
+            counts[call.providerMessageId, default: 0] += 1
+        }
+        for id in ["b-1", "b-2", "b-4", "b-5"] {
+            #expect(counts[id] == 1, """
+                \(id) was addressed \(counts[id] ?? 0) time(s). A member that never \
+                failed must be sent exactly once: sending it again means the attempt \
+                that settled it was discarded instead of narrowing the row, which is \
+                the starvation this pins. Wire: \(counts)
+                """)
+        }
+        #expect((counts["b-3"] ?? 0) >= 2,
+                "the transiently failing member must have been retried after its 503")
+
+        // CONVERGENCE — every live member ended in the state the user asked for,
+        // including the LAST one, which is the member a starved batch never reaches.
+        for id in live {
+            #expect(server.snapshot(providerMessageId: id)?.isRead == true,
+                    "\(id) was never marked read — the batch did not converge")
+        }
+        #expect(try operations(f).isEmpty,
+                "the operation is fully dispositioned and must not be left queued")
+
+        // The narrowing path retires the confirmed-gone member's header and only
+        // that one — the same scoping the whole-op success path uses.
+        #expect(try headerExists(f, messageId: "b-1") == false,
+                "the member the server confirmed gone must not be left as a ghost row")
+        for id in live {
+            #expect(try headerExists(f, messageId: id) == true,
+                    "\(id) is live and its header must survive the narrowing")
+        }
+
+        await finish(f)
+    }
+
+
+    // MARK: - 9. The per-member continuation matrix
+
+    /// What the SERVER does to a given member of the batch.
+    enum MemberRole: Sendable {
+        /// Not seeded at all: `messages.modify` answers 404, Gmail's
+        /// authoritative "this message is gone". Absence is modelled by the
+        /// message not existing, never by an injected status, so the fixture
+        /// cannot drift from what the real endpoint does.
+        case absent
+        /// Seeded and mutable — the member whose intention must survive.
+        case live
+        /// Seeded, but its modify answers 503 until the fault is cleared.
+        case transient
+        /// Seeded, and its modify answers a bare 410 — the NEGATIVE control.
+        case gone410
+    }
+
+    /// The setters that route through a per-member loop, and what each of them
+    /// asks the server for. `markUnread` and `markUnflagged` are here because the
+    /// two flag directions are separate `modifyEachMessage` call sites with
+    /// separate label arguments, and a matrix that only ever sets a flag cannot
+    /// see a clear that never reaches the wire.
+    enum AbsenceSetter: String, Sendable, CaseIterable, CustomTestStringConvertible {
+        case markRead, markUnread, flag, unflag, labelMove
+
+        var testDescription: String { rawValue }
+
+        var opType: OperationType {
+            switch self {
+            case .markRead: .markRead
+            case .markUnread: .markUnread
+            case .flag: .markFlagged
+            case .unflag: .markUnflagged
+            case .labelMove: .move
+            }
+        }
+
+        /// The labels a member carries BEFORE the gesture, chosen so the gesture
+        /// is always a real change: a test that asks for a state the fixture
+        /// already holds proves nothing about whether the request went out.
+        var seededLabels: Set<String> {
+            switch self {
+            case .markRead: ["INBOX", "UNREAD"]
+            case .markUnread: ["INBOX"]
+            case .flag: ["INBOX"]
+            case .unflag: ["INBOX", "STARRED"]
+            case .labelMove: ["INBOX"]
+            }
+        }
+
+        var destinationPath: String? {
+            self == .labelMove ? QueueMemberAbsenceTests.destination : nil
+        }
+
+        /// Has the gesture actually landed on this member, ON THE SERVER? This is
+        /// the effect oracle the whole matrix turns on — a request that was
+        /// addressed but applied nothing is not a member that was dispositioned.
+        func isApplied(_ snapshot: StatefulGmailActionServer.Snapshot) -> Bool {
+            switch self {
+            case .markRead: snapshot.isRead
+            case .markUnread: !snapshot.isRead
+            case .flag: snapshot.isFlagged
+            case .unflag: !snapshot.isFlagged
+            case .labelMove:
+                snapshot.labels.contains(QueueMemberAbsenceTests.destination)
+                    && !snapshot.labels.contains(QueueMemberAbsenceTests.source)
+            }
+        }
+    }
+
+    /// Where the absent members sit relative to the live ones. Position is the
+    /// whole point: a loop that stops at the first absence, or that stops
+    /// accumulating after one, is only visible when something the user still
+    /// wants comes AFTER an absent member.
+    enum AbsenceLayout: String, Sendable, CaseIterable, CustomTestStringConvertible {
+        case absentFirstThenLiveSuffix
+        case twoAbsentSeparatedByALiveOne
+        case everyMemberAbsent
+        case absentPrefixThenTransientThenLive
+        case gone410FirstThenLiveSuffix
+
+        var testDescription: String { rawValue }
+
+        var roles: [MemberRole] {
+            switch self {
+            case .absentFirstThenLiveSuffix: [.absent, .live, .live]
+            case .twoAbsentSeparatedByALiveOne: [.absent, .live, .absent, .live]
+            case .everyMemberAbsent: [.absent, .absent, .absent, .absent, .absent]
+            case .absentPrefixThenTransientThenLive: [.absent, .live, .transient, .live]
+            case .gone410FirstThenLiveSuffix: [.gone410, .live, .live]
+            }
+        }
+    }
+
+    /// How many local header rows name this message, in ANY folder.
+    ///
+    /// Counted by `messageId` rather than by header id because a completed move
+    /// RE-KEYS the row to the destination folder path, so a source-scoped lookup
+    /// would report a moved member's header as "deleted" and turn the scoped
+    /// cleanup assertion into a false pass.
+    private func headerCount(_ fixture: Fixture, messageId: String) throws -> Int {
+        try fixture.pool.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM messageHeader WHERE accountId = ? AND messageId = ?",
+                arguments: [fixture.accountId, messageId]) ?? -1
+        }
+    }
+
+    /// **THE PROPERTY, across every setter that has a per-member loop and every
+    /// arrangement of absent members: an authoritative absence dispositions ONLY
+    /// that member, every other member still gets the gesture the user asked for,
+    /// and every member the server said is gone — not one of them, not the first
+    /// of them — loses its local header.**
+    ///
+    /// 🚨 THE ORACLE IS SERVER STATE, NOT ADDRESSED REQUESTS. A request that goes
+    /// out and applies nothing is not a dispositioned member, and a matrix that
+    /// counted requests would accept a loop that asked for the wrong label. Each
+    /// setter therefore declares the labels it seeds and the effect it must leave,
+    /// and both flag DIRECTIONS are present because setting and clearing are
+    /// separate call sites with separate arguments.
+    ///
+    /// The mutations this exists to kill, each of which survives a single
+    /// one-gone mark-read test:
+    ///
+    /// - **Accumulating only one absent id.** `twoAbsentSeparatedByALiveOne`
+    ///   fails at the second absent member's header, which is left as a ghost no
+    ///   operation names any more.
+    /// - **Absorbing a later transient failure once an earlier member was
+    ///   absent.** `absentPrefixThenTransientThenLive` fails twice: the
+    ///   transiently-refused member never receives the gesture, and its header is
+    ///   destroyed as though the server had confirmed it gone.
+    /// - **Widening what counts as absence to a 410.**
+    ///   `gone410FirstThenLiveSuffix` fails at the retained row and at every
+    ///   header — it is the negative control, and it runs for every setter
+    ///   because the predicate is shared by all of them.
+    ///
+    /// TWO-SIDED THROUGHOUT: the layouts with a refusal assert that the members
+    /// AFTER it are still in their seeded state, so "the gesture landed
+    /// everywhere" can never be satisfied by a loop that mutates indiscriminately.
+    ///
+    /// RED PROOF (recorded): see the per-mutation runs in the round-2 evidence —
+    /// truncating `absent` to its first id fails
+    /// `twoAbsentSeparatedByALiveOne` at `headerCount(m3) == 0`; absorbing a
+    /// non-authoritative error once `absent` is non-empty fails
+    /// `absentPrefixThenTransientThenLive` at the transient member's effect and
+    /// header; returning after the first absence fails the single-pass
+    /// convergence assertion.
+    @Test("Gmail: per-member absence dispositions only the absent members, for every setter and every layout",
+          arguments: AbsenceSetter.allCases, AbsenceLayout.allCases)
+    @MainActor
+    func perMemberAbsenceMatrix(setter: AbsenceSetter, layout: AbsenceLayout) async throws {
+        let roles = layout.roles
+        let ids = roles.indices.map { "m\($0 + 1)" }
+        let server = StatefulGmailActionServer(
+            messages: zip(ids, roles).filter { $0.1 != .absent }.map { id, _ in
+                .init(rfc822MessageId: "\(id)@example.com", providerMessageId: id,
+                      labels: setter.seededLabels)
+            })
+        defer { server.close() }
+        for (id, role) in zip(ids, roles) {
+            switch role {
+            case .transient: server.injectTransient503OnModify(providerMessageId: id)
+            case .gone410: server.injectGone410OnModify(providerMessageId: id)
+            case .absent, .live: break
+            }
+        }
+
+        let f = try fixture(
+            accountId: "absence-matrix-\(setter.rawValue)-\(layout.rawValue)", provider: .gmail)
+        for id in ids { try seedHeader(f, messageId: id, rfc: "\(id)@example.com") }
+
+        let op = PendingOperation(
+            type: setter.opType, messageIds: ids,
+            accountId: f.accountId, folderPath: Self.source,
+            destinationPath: setter.destinationPath)
+        try insert(op, into: f)
+
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: f.accountId, provider: server.provider())
+
+        // The members that must end up carrying the gesture, and the ones that
+        // must not have been touched while a refusal is standing.
+        let liveIds = zip(ids, roles).filter { $0.1 == .live || $0.1 == .transient }.map(\.0)
+        let absentIds = zip(ids, roles).filter { $0.1 == .absent }.map(\.0)
+
+        switch layout {
+        case .gone410FirstThenLiveSuffix:
+            await drainPasses(2)
+
+            // NON-VACUITY: the control status really reached the wire.
+            #expect(server.gone410OnModifyServedCount() >= 1,
+                    "the injected 410 never reached the wire, so nothing was classified")
+
+            let after = try operations(f)
+            #expect(after.count == 1, """
+                a 410 is not authoritative absence for \(setter.rawValue) either. \
+                Retiring on it destroys the user's gesture for a status the drain \
+                has never treated as conclusive. Got \(after.count) rows.
+                """)
+            guard after.count == 1 else { await finish(f); return }
+            #expect(after[0].id == op.id,
+                    "the retained row must be the user's ORIGINAL operation, not a replacement")
+            #expect(after[0].messageIds == ids,
+                    "no member was dispositioned, so every member is still owed")
+            #expect(after[0].status == PendingStatus.queued.rawValue,
+                    "an unresolved operation must be retryable, not left claimed")
+            #expect(after[0].retryCount >= 1,
+                    "the attempt was never charged, so the row was not actually retried")
+
+            // THE SUFFIX IS UNTOUCHED — the loop rethrew the unclassifiable
+            // failure with the remaining members unattempted.
+            for id in liveIds {
+                let snapshot = server.snapshot(providerMessageId: id)
+                #expect(snapshot.map(setter.isApplied) == false, """
+                    \(id) was mutated even though the batch was refused before it: \
+                    \(String(describing: snapshot))
+                    """)
+            }
+            for id in ids {
+                #expect(try headerCount(f, messageId: id) == 1, """
+                    \(id)'s local header was deleted on the strength of a 410. \
+                    Nothing confirmed that message gone, and a header deleted for a \
+                    live message takes its body and FTS content with it.
+                    """)
+            }
+            await finish(f)
+            return
+
+        case .absentPrefixThenTransientThenLive:
+            await drainPasses(2)
+
+            // NON-VACUITY: the transient really was served.
+            #expect(server.transient503OnModifyServedCount() >= 1,
+                    "the injected 503 never reached the wire, so no refusal was classified")
+
+            // MID-STATE — a transient refusal is NOT a disposition. The whole row
+            // is still owed under its own id, and the member AFTER the refusal was
+            // never attempted.
+            let held = try operations(f)
+            #expect(held.count == 1, "a transient refusal retired something. Got \(held.count) rows.")
+            guard held.count == 1 else { await finish(f); return }
+            #expect(held[0].id == op.id, "the retained row must be the user's ORIGINAL operation")
+            // THE NEVER-DROP HALF. Members the loop settled before the refusal
+            // may legitimately have left the row; the refused member and
+            // everything after it may NOT — nothing settled them.
+            #expect(held[0].messageIds.contains(ids[2]) && held[0].messageIds.contains(ids[3]), """
+                the transiently-refused member or the member behind it left the \
+                row: \(held[0].messageIds). A 503 settles nothing, and a member \
+                that was never attempted is still owed.
+                """)
+            #expect(held[0].retryCount >= 1, "the provider refusal was never charged")
+            let suffixId = ids[3]
+            let suffix = server.snapshot(providerMessageId: suffixId)
+            #expect(suffix.map(setter.isApplied) == false, """
+                \(suffixId) was mutated even though the member before it was \
+                refused: \(String(describing: suffix))
+                """)
+            #expect(try headerCount(f, messageId: ids[2]) == 1, """
+                the transiently-refused member's header was deleted as though the \
+                server had confirmed it gone. A 503 settles nothing.
+                """)
+
+            // The fault heals; the operation must converge on its own.
+            server.clearTransient503sOnModify()
+            try await drainToQuiescence(f)
+
+        case .absentFirstThenLiveSuffix, .twoAbsentSeparatedByALiveOne, .everyMemberAbsent:
+            // 🚨 EXACTLY ONE DRAIN, AND THAT IS AN ASSERTION, NOT A SETUP CHOICE.
+            // A loop that reported its FIRST absence and returned would still
+            // converge — the drain narrows the row and re-claims it — so
+            // "eventually every member lands" cannot tell the two apart. What
+            // separates them is that a narrowing costs a whole drain PASS, and
+            // `drainPendingQueue` takes at most three of them; `everyMemberAbsent`
+            // therefore carries FIVE members, so one-report-per-absence cannot
+            // finish inside this single drain and the queue is still non-empty
+            // below. The property being pinned is that one attempt dispositions
+            // every member it can reach inside its budget.
+            await drainPasses(1)
+        }
+
+        // CONVERGENCE — every member the server still holds carries the gesture.
+        for id in liveIds {
+            let snapshot = server.snapshot(providerMessageId: id)
+            #expect(snapshot.map(setter.isApplied) == true, """
+                \(id) never received the \(setter.rawValue) gesture: \
+                \(String(describing: snapshot)). An absent sibling must not strand it.
+                """)
+        }
+        let leftovers = try operations(f).map(\.messageIds)
+        #expect(leftovers.isEmpty, """
+            the operation is fully dispositioned and must not be left queued. \
+            Rows left: \(leftovers)
+            """)
+
+        // SCOPED CLEANUP — every gone member loses its header, and only they do.
+        for id in absentIds {
+            #expect(try headerCount(f, messageId: id) == 0, """
+                \(id) was confirmed gone by the server and its ghost header \
+                survived. Nothing names that message any more, so nothing will \
+                ever retire it.
+                """)
+        }
+        for id in liveIds {
+            #expect(try headerCount(f, messageId: id) == 1, """
+                \(id) is live and its header was destroyed with its absent \
+                sibling's — the cleanup must be scoped to the members the server \
+                actually reported gone.
+                """)
+        }
+
+        await finish(f)
+    }
+
+
+    // MARK: - 10. The unresolved arm is attempted ONCE per drain, and isolates nobody
+
+    /// **THE PROPERTY: an unresolved multi-member failure is attempted AT MOST
+    /// ONCE per drain and charged exactly one retry per drain, however many
+    /// further passes other work forces — and it neither mutates the follower
+    /// waiting on one of its members nor stops the rest of its account.**
+    ///
+    /// 🚨 THE FIXTURE HAS TO FORCE A SECOND PASS OR IT PROVES NOTHING.
+    /// `drainPendingQueue` only takes another claim pass when something in the
+    /// previous one EXECUTED (`DrainContext.executedAny`), so a fixture in which
+    /// the only op fails never reaches pass two — and every assertion about
+    /// "attempted once" is then satisfied by a drain that had one pass to begin
+    /// with. The independent `markRead` below is queued FIRST for exactly that
+    /// reason: it succeeds, the drain takes its remaining passes, and the bundle
+    /// is re-claimed on each of them.
+    ///
+    /// The three failure directions, all asserted:
+    ///
+    /// - **Re-sending the bundle inside one drain.** Each repeat is another round
+    ///   trip and — for a provider whose refusal comes AFTER a wire mutation —
+    ///   another duplicate. `movedIds` counts requests, so it sees this directly.
+    /// - **Charging a retry per pass instead of per drain.** Retry counts feed
+    ///   the stuck-op diagnostics and every future ageing policy; three charges
+    ///   for one refusal walks an operation toward a ceiling three times too fast.
+    /// - **Mutating the follower.** The follower names a member of the unresolved
+    ///   bundle, so running it would apply the user's LATER gesture to a message
+    ///   whose earlier gesture has not happened yet.
+    ///
+    /// The account is not isolated either: the independent work completes. Note
+    /// what that assertion can and cannot see — it runs BEFORE the refusal in the
+    /// same lane, so it cannot by itself rule out the arm having marked the
+    /// account failed. That property is decided in `DrainContext` and is asserted
+    /// where it is decided, on the owned context in
+    /// `AccountManagerQueueDrainTests.messageNotFoundBatchRetainsTheOriginalRow`.
+    ///
+    /// LIVENESS, asserted second because retention alone is satisfied forever by
+    /// a wedge: once the provider stops refusing, the bundle and then the follower
+    /// both execute, in that order.
+    ///
+    /// RED PROOF (recorded): with `context.evidenceRefused.insert(currentOp.id)`
+    /// removed from the unresolved arm, the bundle is re-sent on every remaining
+    /// pass of the same drain — `movedIds.count` is 3 instead of 1 after the first
+    /// drain and 6 instead of 2 after the second, and `retryCount` is 3 instead of
+    /// 1.
+    @Test("An unresolved multi-member failure is attempted once per drain, isolates nobody, and converges")
+    @MainActor
+    func anUnresolvedBatchIsAttemptedOncePerDrainAndConverges() async throws {
+        // `.gmail` so the lane key is ACCOUNT-qualified: the independent work, the
+        // bundle and the follower are then one ordered lane, and every claim pass
+        // re-forms it. Under a folder-qualified key the independent work would be
+        // a concurrent lane and the ordering below would be a race.
+        let f = try fixture(accountId: "absence-unresolved-passes", provider: .gmail)
+        try seedHeader(f, messageId: "u-1", rfc: "u-one@example.com")
+        try seedHeader(f, messageId: "u-2", rfc: "u-two@example.com")
+        try seedHeader(f, messageId: "u-3", rfc: "u-three@example.com")
+
+        let provider = MockEmailProvider()
+        await provider.setMoveThrows(ProviderError.messageNotFound)
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: f.accountId, provider: provider)
+
+        // Ordered by `createdAt`, whole-second so the GRDB round trip compares
+        // exactly, and relative to now (no hardcoded dates).
+        let base = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
+        var independent = PendingOperation(
+            type: .markRead, messageIds: ["u-3"],
+            accountId: f.accountId, folderPath: Self.source)
+        independent.createdAt = base
+        var bundle = PendingOperation(
+            type: .move, messageIds: ["u-1", "u-2"],
+            accountId: f.accountId, folderPath: Self.source,
+            destinationPath: Self.destination)
+        bundle.createdAt = base.addingTimeInterval(1)
+        var follower = PendingOperation(
+            type: .markRead, messageIds: ["u-1"],
+            accountId: f.accountId, folderPath: Self.source)
+        follower.createdAt = base.addingTimeInterval(2)
+        for op in [independent, bundle, follower] { try insert(op, into: f) }
+
+        await drainPasses(1)
+
+        // NON-VACUITY: the independent op really did execute, so the drain really
+        // did have further passes to make — and the account was not isolated.
+        let firstDrainReads = await provider.markedReadIds.map(\.ids)
+        #expect(firstDrainReads == [["u-3"]], """
+            the independent work did not execute exactly once, so this drain never \
+            had a second claim pass and "attempted once per drain" is untested: \
+            \(firstDrainReads)
+            """)
+
+        let firstDrainMoves = await provider.movedIds.map(\.ids)
+        #expect(firstDrainMoves == [["u-1", "u-2"]], """
+            the unresolved bundle was sent \(firstDrainMoves.count) time(s) in ONE \
+            drain. It is attempted at most once per drain: a refusal raised after a \
+            wire mutation would otherwise be repeated on every remaining pass. \
+            Got: \(firstDrainMoves)
+            """)
+
+        var rows = try operations(f)
+        #expect(rows.count == 2, "the bundle and its follower must both still be owed: \(rows.map(\.messageIds))")
+        guard rows.count == 2 else { await finish(f); return }
+        var heldBundle = try #require(rows.first { $0.id == bundle.id })
+        let heldFollower = try #require(rows.first { $0.id == follower.id })
+        #expect(heldBundle.messageIds == ["u-1", "u-2"],
+                "no member was individually dispositioned, so every member is still owed")
+        #expect(heldBundle.retryCount == 1, """
+            the unresolved bundle was charged \(heldBundle.retryCount) retries for \
+            ONE drain. A refusal is charged once per drain, not once per pass.
+            """)
+        #expect(heldBundle.status == PendingStatus.queued.rawValue,
+                "an unresolved operation must be retryable, not left claimed")
+        #expect(heldFollower.retryCount == 0,
+                "the follower was charged for its predecessor's refusal")
+
+        // THE FOLLOWER IS UNTOUCHED. It names a member of the unresolved bundle,
+        // so running it applies the user's LATER gesture to a message whose
+        // earlier one has not happened.
+        let readsAfterFirstDrain = await provider.markedReadIds.map(\.ids)
+        #expect(readsAfterFirstDrain.allSatisfy { $0 == ["u-3"] }, """
+            the follower ran ahead of the unresolved predecessor that shares its \
+            member: \(readsAfterFirstDrain)
+            """)
+
+        // ONE MORE DRAIN — "once per drain" is a rate, and a single drain cannot
+        // tell it apart from "once, ever".
+        await drainPasses(1)
+        let secondDrainMoves = await provider.movedIds.map(\.ids)
+        #expect(secondDrainMoves.count == 2, """
+            the second drain sent the bundle \(secondDrainMoves.count - 1) time(s) \
+            instead of once: \(secondDrainMoves)
+            """)
+        rows = try operations(f)
+        heldBundle = try #require(rows.first { $0.id == bundle.id })
+        #expect(heldBundle.retryCount == 2,
+                "the second drain charged \(heldBundle.retryCount - 1) retries instead of one")
+
+        // LIVENESS — the refusal ends and both gestures land, in the order the
+        // user made them.
+        await provider.setMoveThrows(nil)
+        try await drainToQuiescence(f)
+
+        #expect(try operations(f).isEmpty, """
+            the bundle or its follower starved after the refusal cleared. A gesture \
+            that never executes has been dropped just as surely as one that was \
+            deleted (the wedge corollary).
+            """)
+        let finalMoves = await provider.movedIds.map(\.ids)
+        #expect(finalMoves.last == ["u-1", "u-2"],
+                "the bundle never completed as ONE operation: \(finalMoves)")
+        let finalReads = await provider.markedReadIds.map(\.ids)
+        #expect(finalReads == [["u-3"], ["u-1"]], """
+            the follower did not execute exactly once, after its predecessor: \
+            \(finalReads)
+            """)
 
         await finish(f)
     }

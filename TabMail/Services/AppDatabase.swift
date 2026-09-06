@@ -196,9 +196,28 @@ final class AppDatabase: Sendable {
     /// value that differs every launch and retires the queue on every start.
     static var currentAppRelease: String {
         let info = Bundle.main.infoDictionary
-        let marketing = info?["CFBundleShortVersionString"] as? String ?? ""
-        let build = info?["CFBundleVersion"] as? String ?? ""
-        return "\(marketing) (\(build))"
+        return appRelease(
+            marketingVersion: info?["CFBundleShortVersionString"] as? String ?? "",
+            build: info?["CFBundleVersion"] as? String ?? "")
+    }
+
+    /// The release identity of a (marketing version, build) pair.
+    ///
+    /// 🚨 THE BUILD IS NOT DECORATION — IT IS HALF THE IDENTITY. Successive
+    /// TestFlight and App Store submissions of one marketing version are
+    /// different binaries with different queue semantics, and they are the
+    /// COMMON case: a marketing version changes a handful of times a release
+    /// cycle, the build number changes every submission. A release string that
+    /// carried only the marketing version would compare EQUAL across those
+    /// binaries, so the boundary would never fire for them and the previous
+    /// build's operations would run under this one — which is the exact failure
+    /// the boundary exists to prevent, silently, for most upgrades.
+    ///
+    /// Pure and separate from the property above so it can be tested on values
+    /// this process does not have: the running bundle has exactly one version,
+    /// so an equal-marketing/unequal-build pair is not otherwise expressible.
+    static func appRelease(marketingVersion: String, build: String) -> String {
+        "\(marketingVersion) (\(build))"
     }
 
     /// THE OWNER-APPROVED APP-UPGRADE RETIREMENT BOUNDARY.

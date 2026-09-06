@@ -534,7 +534,7 @@ actor GmailProvider: EmailProvider {
     /// specific member. It therefore owns the per-member interpretation: a member
     /// the server AUTHORITATIVELY reports gone is dispositioned and recorded, the
     /// loop continues, and the surviving members are still processed. Reported
-    /// afterwards as `ProviderMembersAbsent`, which
+    /// afterwards as `ProviderMembersDispositioned`, which
     /// `AccountManager.executeOperation` converts into a complete outcome naming
     /// those members.
     ///
@@ -550,6 +550,17 @@ actor GmailProvider: EmailProvider {
     /// operation stays queued and retries. Re-running the already-successful
     /// members on that retry is accepted: `messages.modify` add/remove label is
     /// idempotent and does not change the message id.
+    ///
+    /// 🚨 IT STOPS ON `ProviderMemberLoopBudget` AND REPORTS THE PREFIX IT
+    /// FINISHED. Without that, a batch whose members cost more wall time in total
+    /// than `SyncConfig.pendingOperationTimeoutSeconds` is cancelled mid-loop,
+    /// `withTimeout` has ALREADY resumed the drain with `TimeoutError`, and every
+    /// member this loop settled is discarded with the abandoned task — so the row
+    /// is requeued unchanged and the next attempt repeats the same prefix into the
+    /// same deadline, forever. The last member's intention never reaches Gmail.
+    /// That is the wedge corollary, and it is why the budget is checked BETWEEN
+    /// members: at least one member is always attempted, so every attempt makes
+    /// strict progress and a batch of any size converges.
     private func modifyEachMessage(
         ids: [String],
         addLabelIds: [String] = [],
@@ -557,22 +568,39 @@ actor GmailProvider: EmailProvider {
         moveTraceLabel: String? = nil
     ) async throws {
         var absent: [String] = []
+        var dispositioned: [String] = []
+        let deadline = ProviderMemberLoopBudget.deadlineFromNow()
         for id in ids {
+            // Never before the first member: an attempt that settles nothing is
+            // an attempt that cannot converge.
+            if !dispositioned.isEmpty, ContinuousClock.now >= deadline {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Gmail] modifyEachMessage: budget spent after \(dispositioned.count)/\(ids.count) member(s) — reporting the finished prefix so the operation narrows instead of repeating it")
+                }
+                break
+            }
             do {
                 try await modifyMessage(
                     id: id, addLabelIds: addLabelIds, removeLabelIds: removeLabelIds)
+                dispositioned.append(id)
                 if let moveTraceLabel, DebugModeManager.isLoggingEnabled() {
                     print("[MoveTrace] \(moveTraceLabel) — modifyMessage completed for \(id)")
                 }
             } catch {
                 guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
                 absent.append(id)
+                dispositioned.append(id)
                 if DebugModeManager.isLoggingEnabled() {
                     print("[Gmail] modifyMessage \(id): the server reports THIS message gone — the member is dispositioned and the remaining members are still processed")
                 }
             }
         }
-        if !absent.isEmpty { throw ProviderMembersAbsent(absentMemberIds: absent) }
+        // Silence is "every member, mutated": the only outcome the `Void`-returning
+        // protocol can express on its own. Anything else has to be reported.
+        if !absent.isEmpty || dispositioned.count != ids.count {
+            throw ProviderMembersDispositioned(
+                dispositionedMemberIds: dispositioned, absentMemberIds: absent)
+        }
     }
 
     func markRead(ids: [String], folder: String) async throws {

@@ -2187,7 +2187,7 @@ extension AccountManager {
                 // way to learn WHICH one is gone. That discovery belongs at the
                 // provider/action-adapter boundary, which issues the per-member
                 // request and can therefore attribute the answer — see
-                // `executeOperation`'s `ProviderMembersAbsent` conversion. The
+                // `executeOperation`'s `ProviderMembersDispositioned` conversion. The
                 // scheduler only ever sees a complete outcome, an unresolved one,
                 // or an already-authorized terminal exit, and never re-shapes the
                 // user's intention into different rows to find out which it is.
@@ -2896,7 +2896,7 @@ extension AccountManager {
     /// survives in the mailbox.
     ///
     /// `memberIds` are ids the provider reported through
-    /// `ProviderMembersAbsent` / `MoveOutcome.confirmedGoneIds`, i.e. members a
+    /// `ProviderMembersDispositioned` / `MoveOutcome.confirmedGoneIds`, i.e. members a
     /// request addressed to THAT member answered `ProviderMemberAbsence`-
     /// authoritatively for. Nothing else may be passed here.
     private func retireConfirmedGoneMemberHeaders(
@@ -3123,17 +3123,29 @@ extension AccountManager {
     func executeOperation(_ op: PendingOperation, provider: any EmailProvider) async throws -> ExecutedOperation {
         do {
             return try await dispatchOperation(op, provider: provider)
-        } catch let absence as ProviderMembersAbsent {
-            // 🚨 THE ONLY PLACE `ProviderMembersAbsent` IS UNDERSTOOD, AND IT IS A
-            // COMPLETION, NOT A FAILURE.
+        } catch let report as ProviderMembersDispositioned {
+            // 🚨 THE ONLY PLACE `ProviderMembersDispositioned` IS UNDERSTOOD, AND
+            // IT IS A COMPLETION REPORT, NOT A FAILURE.
             //
-            // A provider's per-member loop finished every member it could and the
-            // server AUTHORITATIVELY reported these ones gone. There is nothing
-            // left to do to them, so the operation as a whole is complete — the
-            // outcome is `provenMembers: nil` ("all of them"), exactly as a
-            // clean run produces. What is carried forward is the ATTRIBUTION the
-            // `Void`-returning action protocol cannot express: WHICH members were
-            // gone, so the drain can retire their confirmed-gone local headers.
+            // A provider's per-member loop settled the members it names — mutated
+            // or authoritatively gone — and says NOTHING about any member after
+            // them. Those settled members are exactly `provenMembers`, so a report
+            // naming the whole request takes the ordinary whole-op retirement and
+            // a report naming a PREFIX takes `retirePartiallyCompletedOp`: the
+            // same durable row, narrowed to the members still owed, with its id,
+            // its order and its position untouched. What is carried forward on top
+            // is the ATTRIBUTION the `Void`-returning action protocol cannot
+            // express: WHICH of them were gone, so the drain can retire their
+            // confirmed-gone local headers.
+            //
+            // 🚨 A PREFIX IS REPORTED BECAUSE THE LOOP STOPPED ON ITS BUDGET, AND
+            // THAT IS THE ONLY REASON IT CAN BE ONE. `withTimeout` resumes this
+            // caller with `TimeoutError` and cancels the operation task second, so
+            // a loop still running at the deadline reports nothing at all and the
+            // row is requeued whole — the same prefix then dies on the same
+            // deadline on every retry and the final member never reaches the
+            // provider. Narrowing on the prefix is what turns that starvation into
+            // strict per-attempt progress.
             //
             // ⚠ IT MUST NOT ESCAPE TO `executeSingleOp`. Out there it would be an
             // unclassified error, land in the generic transient arm, requeue an
@@ -3149,17 +3161,17 @@ extension AccountManager {
             // here — it returns its outcome rather than throwing, precisely
             // because it has destinations to report for the members that DID
             // move.
-            queueLog("[Queue] \(op.type.rawValue) (\(op.messageIds.count) msgs): \(absence.absentMemberIds.count) member(s) confirmed gone by the server — the operation is complete and those members' local headers are retired")
+            queueLog("[Queue] \(op.type.rawValue) (\(op.messageIds.count) msgs): provider settled \(report.dispositionedMemberIds.count) member(s), \(report.absentMemberIds.count) of them confirmed gone by the server — those members' local headers are retired and any member the loop did not reach stays owed under the same operation")
             return ExecutedOperation(
-                provenMembers: nil,
+                provenMembers: report.dispositionedMemberIds,
                 provenDestinations: [],
-                confirmedGoneMembers: absence.absentMemberIds)
+                confirmedGoneMembers: report.absentMemberIds)
         }
     }
 
     /// The op-type switch `executeOperation` wraps. Split out for exactly one
-    /// reason: `ProviderMembersAbsent` must be converted in ONE place rather than
-    /// in every arm that can raise it.
+    /// reason: `ProviderMembersDispositioned` must be converted in ONE place
+    /// rather than in every arm that can raise it.
     private func dispatchOperation(_ op: PendingOperation, provider: any EmailProvider) async throws -> ExecutedOperation {
         switch op.type {
         case .archive, .delete:

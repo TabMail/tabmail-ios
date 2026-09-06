@@ -595,18 +595,33 @@ actor ExchangeProvider: EmailProvider {
     /// members on a retry is accepted.
     private func patchEachMessage(ids: [String], body: [String: Any]) async throws {
         var absent: [String] = []
+        var dispositioned: [String] = []
+        let deadline = ProviderMemberLoopBudget.deadlineFromNow()
         for id in ids {
+            // See `GmailProvider.modifyEachMessage` for why this is checked
+            // BETWEEN members and never before the first one.
+            if !dispositioned.isEmpty, ContinuousClock.now >= deadline {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Exchange] patchEachMessage: budget spent after \(dispositioned.count)/\(ids.count) member(s) — reporting the finished prefix so the operation narrows instead of repeating it")
+                }
+                break
+            }
             do {
                 try await patchMessage(id: id, body: body)
+                dispositioned.append(id)
             } catch {
                 guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
                 absent.append(id)
+                dispositioned.append(id)
                 if DebugModeManager.isLoggingEnabled() {
                     print("[Exchange] patchMessage \(id): the server reports THIS message gone — the member is dispositioned and the remaining members are still processed")
                 }
             }
         }
-        if !absent.isEmpty { throw ProviderMembersAbsent(absentMemberIds: absent) }
+        if !absent.isEmpty || dispositioned.count != ids.count {
+            throw ProviderMembersDispositioned(
+                dispositionedMemberIds: dispositioned, absentMemberIds: absent)
+        }
     }
 
     func markRead(ids: [String], folder: String) async throws {
@@ -687,8 +702,23 @@ actor ExchangeProvider: EmailProvider {
         var provenIds: [String] = []
         var provenDestinations: [ProvenDestinationAddress] = []
         var confirmedGone: [String] = []
+        // 🚨 THE SAME STOPPING RULE THE SETTER LOOPS USE, for the same reason: a
+        // batch whose members cost more wall time than the operation deadline is
+        // cancelled mid-loop with `withTimeout` already resumed, so every proven
+        // destination this loop learned is discarded and the next attempt repeats
+        // the same prefix forever. Stopping early returns the prefix through the
+        // narrowing path that this method is already the producer for.
+        let deadline = ProviderMemberLoopBudget.deadlineFromNow()
+        var stoppedOnBudget = false
         do {
             for id in ids {
+                if !provenIds.isEmpty, ContinuousClock.now >= deadline {
+                    stoppedOnBudget = true
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[MoveTrace] ExchangeProvider.move — budget spent after \(provenIds.count)/\(ids.count) member(s); returning the proven prefix so the operation narrows instead of repeating it")
+                    }
+                    break
+                }
                 // Legacy-label decay (ADR-IOS-036): on inbox-exit, strip residual
                 // tm_* Graph categories so pre-ADR pollution fades naturally as
                 // the user triages. Best-effort — a strip failure must NOT
@@ -785,7 +815,8 @@ actor ExchangeProvider: EmailProvider {
                 confirmedGoneIds: confirmedGone)
         }
         return MoveOutcome(
-            provenIds: ids, provenDestinations: provenDestinations,
+            provenIds: stoppedOnBudget ? provenIds : ids,
+            provenDestinations: provenDestinations,
             confirmedGoneIds: confirmedGone)
     }
 

@@ -202,14 +202,14 @@ struct StatefulExchangeActionServerTests {
         // Re-addressing the stale pre-move id must not reach the moved
         // resource. Graph answers 404, and since `PATCH /messages/{id}` names ONE
         // message, the transport attributes that answer to the id it addressed
-        // and reports it as `ProviderMembersAbsent` (changed 2026-09-06 — this
+        // and reports it as `ProviderMembersDispositioned` (changed 2026-09-06 — this
         // used to expect a bare `ProviderError` and say the classification
         // belonged to the durable queue; the queue's unattributed-404 batch split
         // is deleted precisely because that attribution is available here).
         var reportedAbsent: [String]?
         do {
             try await provider.markUnread(ids: [originalId], folder: "destination-folder")
-        } catch let absence as ProviderMembersAbsent {
+        } catch let absence as ProviderMembersDispositioned {
             reportedAbsent = absence.absentMemberIds
         }
         #expect(
