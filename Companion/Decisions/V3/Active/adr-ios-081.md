@@ -8,6 +8,17 @@ known-issue section — the "why Outlook is excluded" section of
 [`Companion/Process/Current/KnownIssues/Amendments/ios-queue-008.md`](../../../Process/Current/KnownIssues/Amendments/ios-queue-008.md),
 whose text is preserved there verbatim and marked superseded.
 
+> ⚠️ **AMENDED 2026-09-06 by [ADR-IOS-082](adr-ios-082.md) — THE LANE DISPATCH MODEL THIS RECORD IS
+> WRITTEN AGAINST NO LONGER EXISTS.** The action queue is drained by a global single-operation FIFO
+> executor ordered by a durable `queuePosition`; lanes are no longer claimed as a set and dispatched
+> concurrently. What survives is the lane RELATION — `buildLanes` is renamed `buildRelatedChains` and
+> `laneKey` `addressKey`, with the two address spaces of clause 1 unchanged — now used to scope a
+> DEFERRAL rather than to compose a dispatch unit. **Read every "lane" below as "related chain", and
+> every "lane loop"/"lane task" as machinery that is gone.** Clauses 1–4 and 8 and the accepted
+> limitation are unaffected in substance; clauses 5, 6 and 7 and the "no schema, migration or
+> drain-ordering change" consequence carry their own correction notes at the point of use. Nothing
+> about identity, addressing or the exits of `never-drop-user-intention.md` changed.
+
 **Context.** Two distinct properties of a provider id had been treated as one, under one name:
 
 - **Folder-independence** — one provider id names one message per ACCOUNT, so two rows in different
@@ -123,6 +134,12 @@ race that is sometimes wrong and recoverable would become a DETERMINISTIC droppe
    expressed as a whole-row write from a stale snapshot, in any code that another writer can touch
    between the read and the write.**
 
+   > ⚠️ **2026-09-06 (ADR-IOS-082): the rule survives, the site count does not.** "The eight drain
+   > sites" belonged to the lane loop, which is gone; the requeue write is now `requeueOrRetain` →
+   > `PendingOperation.markQueued`, and the general rule is if anything more load-bearing, because a
+   > whole-row write from a stale snapshot would now also clobber the durable `queuePosition` that
+   > decides wire order.
+
 6. **The drain re-reads before it executes, and there is NO fallback.**
    The lane loop fetches each operation by primary key immediately before `executeSingleOp` and
    SKIPS it if the row is gone. A `?? capturedOp` fallback is refused: the only writers that delete a
@@ -144,8 +161,19 @@ race that is sometimes wrong and recoverable would become a DETERMINISTIC droppe
    > captured, which is why the conclusion survives its premise. Same correction as `IOS-GRAPH-005`
    > COR-1, which named the writers correctly while this clause did not.
 
+   > ⚠️ **2026-09-06 (ADR-IOS-082): THE RE-READ THIS CLAUSE DESCRIBES IS GONE FROM THE DRAIN.** It
+   > existed because the lane loop claimed a whole suffix and then executed its members one by one,
+   > with an unbounded gap between the two. A single-operation executor claims and executes
+   > adjacently, so `liveOperation` is no longer called there. The DECISION is unchanged and still
+   > binding wherever a re-read remains: `nil` means the row is gone, and a `?? capturedOp` fallback
+   > would resurrect a withdrawn gesture.
+
 7. **`finishMove` gains a NON-defaulted `accountScopedIds: Bool`.**
-   Every call site — two production, eight test — passes it explicitly. A defaulted parameter would
+   Every call site — two production, eight test — passes it explicitly.
+   *(⚠️ 2026-09-06: that count is STALE and is kept only as the record of what was true on
+   2026-09-05. It moves with every test added; the durable statement, restated without a number in
+   ADR-IOS-082 clause 7, is that the parameter has NO DEFAULT, so the compiler enumerates the call
+   sites and no provider can acquire or lose the re-key by silence.)* A defaulted parameter would
    let a future provider acquire, or lose, the row-following re-key and the queue handoff BY
    SILENCE, which is precisely how the immutable/account-scoped conflation entered the tree.
 
@@ -217,6 +245,13 @@ beside `readdressQueuedOperations`.
   404 batch split still copies `createdAt` onto its children. Making the queue's order durable
   against a backward clock step is a separate concern, routed by the owner to its own follow-up; it
   is NOT part of this decision and no column was added for it.
+
+  > ⚠️ **HISTORICAL AS OF 2026-09-06 — the follow-up landed, and it is
+  > [ADR-IOS-082](adr-ios-082.md).** The sentence above is preserved verbatim because it correctly
+  > records the scope of THIS change. All three of its clauses are now false of the tree: there is a
+  > schema change (`queuePosition`), a migration (**v90**), and a drain-ordering change (the drain
+  > orders by `queuePosition ASC`, and `createdAt` is age-only and decides nothing). The 404 batch
+  > split it names was itself deleted at the `ProviderMembersDispositioned` boundary.
 - **The 404 classification is untouched**, so no lane wedge is introduced. The re-key is what makes a
   retry terminate; reclassifying the error without re-keying would trade one never-drop violation for
   another, which `IOS-GRAPH-002` records as mirror-image trap 1.
@@ -237,7 +272,9 @@ churning Graph server, source folder only so the post-drain sync cannot mask a f
 `.imapRekeyStillDeclinesWhenTheRowLeftTheDestination`,
 `.queuedFollowerIsReaddressedAndBystandersAreNot`;
 `PendingQueueLaneTests.outlookSameIdInTwoFoldersSharesOneLane` and, as the untouched IMAP negative,
-`.imapSameUidInTwoFoldersStaysInSeparateLanes`;
+`.imapSameUidInTwoFoldersStaysInSeparateLanes` (⚠️ 2026-09-06: that file is now
+`PendingQueueChainTests.swift` and the first case is `outlookSameIdInTwoFoldersSharesOneChain`; both
+fences are unchanged in substance, and the IMAP negative keeps its name);
 `AccountManagerQueueDrainTests.accountScopedIdAccountIdsAdmitsExactlyGmailOutlookAndTheDemoAccount`;
 `ProviderIdQueueFuzzTests.stableIdQueueLaneFuzz`, now alternating `.gmail` and `.outlook` per round;
 and `StatefulExchangeActionServerTests`' self-checks for the three fixture seams. A fourth seam — a

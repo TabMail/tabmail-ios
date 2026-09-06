@@ -2201,9 +2201,21 @@ extension AccountManager {
                     else { return UndoMoveWriteResult() }
                     // Bound to a local ONLY so the diagnostic emitted after this
                     // write returns can name the row's `id` and `createdAt`.
-                    // `PendingOperation` is a `PersistableRecord` (non-mutating
-                    // `insert`), so this is the same value, inserted the same way, in
-                    // the same transaction.
+                    //
+                    // ⚠️ THE `var` IS LOAD-BEARING, AND THE SENTENCE THAT USED TO
+                    // STAND HERE IS FALSE IN BOTH HALVES. It read
+                    // "`PendingOperation` is a `PersistableRecord` (non-mutating
+                    // `insert`), so this is the same value, inserted the same
+                    // way". `PendingOperation` is a `MutablePersistableRecord`,
+                    // and its `willInsert(_:)` allocates the durable
+                    // `queuePosition` — the executor's order authority — INTO the
+                    // value being inserted, so `insert` mutates the receiver and
+                    // the value that comes back out is not the value that went
+                    // in. Nothing read below depends on the position (the
+                    // diagnostic names `id` and `createdAt`, both set at init),
+                    // but a future reader must not "simplify" this to a `let`
+                    // and a non-mutating insert: there is no non-mutating one,
+                    // and the admission would lose its position allocation.
                     var inverseOp = PendingOperation(
                         type: .move,
                         messageIds: admission.providerIds,

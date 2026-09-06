@@ -1566,13 +1566,13 @@ struct ProviderIdQueueFuzzTests {
 // planned gesture in `providerIdQueueFuzz` targets a DIFFERENT uid — so that
 // fuzzer never creates an account-scoped-id account and never creates two
 // cross-folder ops naming ONE provider resource. Reverting only the
-// account-scoped arm of `AccountManagerQueue.buildLanes`'s `laneKey`
+// account-scoped arm of `AccountManagerQueue.buildRelatedChains`'s `addressKey`
 // (folder-qualifying it unconditionally) therefore leaves the whole suite
 // above green. This extension closes that gap.
 //
 // ## The invariant under test
 //
-// `buildLanes(_:accountScopedIdAccountIds:)` keys an account whose provider id
+// `buildRelatedChains(_:accountScopedIdAccountIds:)` keys an account whose provider id
 // names ONE MESSAGE PER ACCOUNT by `"accountId:msgId"` — folder deliberately
 // EXCLUDED, because such an id is folder-independent. Everything else — IMAP
 // and iCloud — keys `"accountId:folderPath:msgId"`, the same folder-local key
@@ -1618,8 +1618,8 @@ struct ProviderIdQueueFuzzTests {
 //
 // ## ACCEPTANCE BAR (Testing Rule 11)
 //
-// With the account-scoped arm of `buildLanes`'s local `laneKey` reverted —
-//     func laneKey(_ op: PendingOperation, _ id: String) -> String {
+// With the account-scoped arm of `buildRelatedChains`'s local `addressKey` reverted —
+//     func addressKey(_ op: PendingOperation, _ id: String) -> String {
 //         accountScopedIdAccountIds.contains(op.accountId)
 //             ? "\(op.accountId):\(id)"
 //             : "\(op.accountId):\(op.folderPath):\(id)"
@@ -1759,7 +1759,7 @@ extension ProviderIdQueueFuzzTests {
         for round in 0..<FuzzConfig.rounds {
             // ALTERNATING, and the alternation is the point (`IOS-GRAPH-005`).
             // Both providers are now on the account-qualified side of
-            // `buildLanes`, but for DIFFERENT reasons, and only one of them can
+            // `buildRelatedChains`, but for DIFFERENT reasons, and only one of them can
             // catch a handoff regression:
             //  * Gmail's ids are genuinely immutable across a move, so
             //    `addressChangesOnMove` is false, `finishMove` returns `.empty`

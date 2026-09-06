@@ -177,7 +177,7 @@ struct FinishTheMoveLocallyGraphTests {
     /// modes are opposites and one assertion cannot see both: the safety
     /// property alone is satisfied by an operation that retries against the dead
     /// id forever, which is `IOS-GRAPH-002`'s named mirror-image trap — with
-    /// `buildLanes` keyed on `accountId:folderPath:messageId` that operation
+    /// `buildRelatedChains` keyed on `accountId:folderPath:messageId` that operation
     /// starves its whole lane, and a starved intention has not been preserved
     /// either (the wedge corollary). What makes retry TERMINATE is re-learning
     /// the address, which is why the fix is the re-key and not a

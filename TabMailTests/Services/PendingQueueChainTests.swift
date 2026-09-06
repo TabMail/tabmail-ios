@@ -6,9 +6,9 @@ import Testing
 import Foundation
 @testable import TabMail
 
-/// Pure unit tests for `AccountManager.buildLanes` — the connected-component
+/// Pure unit tests for `AccountManager.buildRelatedChains` — the connected-component
 /// grouping over provider ADDRESSES (ADR-IOS-018 amendment 2026-07-10,
-/// DECISIONS.md). No DB, no provider, no actor hop: `buildLanes` is a
+/// DECISIONS.md). No DB, no provider, no actor hop: `buildRelatedChains` is a
 /// `nonisolated static` pure function over `[PendingOperation]` values
 /// constructed directly in-memory, and it PRESERVES THE CALLER'S ORDER within
 /// each component.
@@ -33,11 +33,11 @@ import Foundation
 /// ops. Because the drain of the day ran each group concurrently (bounded
 /// concurrency > 1, separate IMAP connections), the two ops could execute out
 /// of order relative to each other, causing a real remote race (flag STORE on
-/// B racing the batch MOVE of B, with the flag lost on EXPUNGE). `buildLanes`
+/// B racing the batch MOVE of B, with the flag lost on EXPUNGE). `buildRelatedChains`
 /// fixed this via union-find: any two ops sharing ANY member message id land in
 /// the same component, scoped per-account so unrelated accounts never merge.
-@Suite("PendingOperation lane keying (buildLanes)")
-struct PendingQueueLaneTests {
+@Suite("PendingOperation address keying — related chains (buildRelatedChains)")
+struct PendingQueueChainTests {
 
     // MARK: - Helpers
 
@@ -45,7 +45,7 @@ struct PendingQueueLaneTests {
     ///
     /// ⚠️ IT DOES NOT DECIDE ANY ORDER HERE, and it decides none in production
     /// either — `queuePosition` does, and `createdAt` is age only. It is set so
-    /// the fixtures read in the order a human issued them; `buildLanes` groups
+    /// the fixtures read in the order a human issued them; `buildRelatedChains` groups
     /// the ARRAY IT IS GIVEN and preserves that array's order, so the assertions
     /// below are about INPUT order, whatever produced it.
     private func makeOp(
@@ -66,12 +66,12 @@ struct PendingQueueLaneTests {
     // MARK: - 1. Batch + single sharing a member id merge into ONE lane
 
     @Test("batch [A,B,C] + single [B] merge into ONE component, in input order")
-    func batchAndSingleShareMemberMergeIntoOneLane() {
+    func batchAndSingleShareMemberMergeIntoOneChain() {
         let now = Date()
         let batchOp = makeOp(type: .move, messageIds: ["A", "B", "C"], createdAt: now)
         let singleOp = makeOp(type: .markFlagged, messageIds: ["B"], createdAt: now.addingTimeInterval(1))
 
-        let lanes = AccountManager.buildLanes([batchOp, singleOp], accountScopedIdAccountIds: [])
+        let lanes = AccountManager.buildRelatedChains([batchOp, singleOp], accountScopedIdAccountIds: [])
 
         #expect(lanes.count == 1)
         guard lanes.count == 1 else { return }
@@ -87,7 +87,7 @@ struct PendingQueueLaneTests {
         let opCD = makeOp(messageIds: ["C", "D"], createdAt: now.addingTimeInterval(1))
         let opBridge = makeOp(messageIds: ["B", "C"], createdAt: now.addingTimeInterval(2))
 
-        let lanes = AccountManager.buildLanes([opAB, opCD, opBridge], accountScopedIdAccountIds: [])
+        let lanes = AccountManager.buildRelatedChains([opAB, opCD, opBridge], accountScopedIdAccountIds: [])
 
         #expect(lanes.count == 1)
         guard lanes.count == 1 else { return }
@@ -104,7 +104,7 @@ struct PendingQueueLaneTests {
         let opY = makeOp(messageIds: ["Y"], createdAt: now.addingTimeInterval(1))
         let opEmpty = makeOp(type: .saveDraft, messageIds: [], createdAt: now.addingTimeInterval(2))
 
-        let lanes = AccountManager.buildLanes([opX, opY, opEmpty], accountScopedIdAccountIds: [])
+        let lanes = AccountManager.buildRelatedChains([opX, opY, opEmpty], accountScopedIdAccountIds: [])
 
         #expect(lanes.count == 3)
         let laneIds = lanes.map { $0.map(\.id) }
@@ -117,9 +117,9 @@ struct PendingQueueLaneTests {
 
     /// THE INVARIANT: the lane key is account-qualified in BOTH address spaces,
     /// so two accounts that happen to name the same message-id string never
-    /// merge into one lane — whichever arm of `laneKey` their ops take.
+    /// merge into one lane — whichever arm of `addressKey` their ops take.
     ///
-    /// `buildLanes` builds the folder-qualified key `accountId:folderPath:id`
+    /// `buildRelatedChains` builds the folder-qualified key `accountId:folderPath:id`
     /// for accounts ABSENT from `accountScopedIdAccountIds` and the account-scoped key
     /// `accountId:id` for accounts NAMED in it. Passing only the empty set would
     /// exercise the folder-qualified arm twice and leave the account-scoped arm's
@@ -134,7 +134,7 @@ struct PendingQueueLaneTests {
         let opAcc1 = makeOp(messageIds: ["shared-id"], accountId: "acc1", createdAt: now)
         let opAcc2 = makeOp(messageIds: ["shared-id"], accountId: "acc2", createdAt: now.addingTimeInterval(1))
 
-        let lanes = AccountManager.buildLanes([opAcc1, opAcc2], accountScopedIdAccountIds: admitted)
+        let lanes = AccountManager.buildRelatedChains([opAcc1, opAcc2], accountScopedIdAccountIds: admitted)
 
         #expect(lanes.count == 2)
         let laneIds = lanes.map { $0.map(\.id) }
@@ -146,7 +146,7 @@ struct PendingQueueLaneTests {
 
     @Test("empty input produces no lanes")
     func emptyInputProducesNoLanes() {
-        let lanes = AccountManager.buildLanes([], accountScopedIdAccountIds: [])
+        let lanes = AccountManager.buildRelatedChains([], accountScopedIdAccountIds: [])
         #expect(lanes.isEmpty)
     }
 
@@ -156,7 +156,7 @@ struct PendingQueueLaneTests {
         let op1 = makeOp(type: .saveDraft, messageIds: [], createdAt: now)
         let op2 = makeOp(type: .deleteDraft, messageIds: [], createdAt: now.addingTimeInterval(1))
 
-        let lanes = AccountManager.buildLanes([op1, op2], accountScopedIdAccountIds: [])
+        let lanes = AccountManager.buildRelatedChains([op1, op2], accountScopedIdAccountIds: [])
 
         #expect(lanes.count == 2)
         let laneIds = lanes.map { $0.map(\.id) }
@@ -179,7 +179,7 @@ struct PendingQueueLaneTests {
     /// gone, so the same key error now costs a deferral that misses the follower
     /// rather than a race; the key must still be right, which is what is pinned.
     @Test("stable-id account: an undo inverse (TRASH→INBOX) and a re-delete (INBOX→TRASH) of the SAME message share ONE component, in input order")
-    func stableIdUndoInverseAndRedeleteShareOneLane() {
+    func stableIdUndoInverseAndRedeleteShareOneChain() {
         let now = Date()
         let opInverse = makeOp(
             type: .move, messageIds: ["m1"], accountId: "acc-gmail",
@@ -189,7 +189,7 @@ struct PendingQueueLaneTests {
             folderPath: "INBOX", destinationPath: "TRASH",
             createdAt: now.addingTimeInterval(1))
 
-        let lanes = AccountManager.buildLanes(
+        let lanes = AccountManager.buildRelatedChains(
             [opInverse, opRedelete], accountScopedIdAccountIds: ["acc-gmail"])
 
         #expect(lanes.count == 1,
@@ -215,14 +215,14 @@ struct PendingQueueLaneTests {
     /// the retirement transaction, which is what makes ONE lane the correct
     /// answer here rather than a deterministic dropped intention.
     ///
-    /// This test is PURE `buildLanes` — it injects the classification directly,
+    /// This test is PURE `buildRelatedChains` — it injects the classification directly,
     /// so it pins the lane KEY only. That the drain actually classifies an
     /// Outlook account this way is pinned by
     /// `AccountManagerQueueDrainTests.accountScopedIdAccountIdsAdmitsExactlyGmailOutlookAndTheDemoAccount`,
     /// and that the readdressing makes serialization SAFE is pinned by
     /// `OutlookQueueHandoffTests`.
     @Test("Outlook: an undo inverse (TRASH→INBOX) and a re-delete (INBOX→TRASH) of the SAME Graph message share ONE component, in input order")
-    func outlookSameIdInTwoFoldersSharesOneLane() {
+    func outlookSameIdInTwoFoldersSharesOneChain() {
         let now = Date()
         let opInverse = makeOp(
             type: .move, messageIds: ["m-graph-1"], accountId: "acc-outlook",
@@ -232,7 +232,7 @@ struct PendingQueueLaneTests {
             folderPath: "INBOX", destinationPath: "TRASH",
             createdAt: now.addingTimeInterval(1))
 
-        let lanes = AccountManager.buildLanes(
+        let lanes = AccountManager.buildRelatedChains(
             [opInverse, opRedelete], accountScopedIdAccountIds: ["acc-outlook"])
 
         #expect(lanes.count == 1, """
@@ -284,7 +284,7 @@ struct PendingQueueLaneTests {
             type: .markFlagged, messageIds: ["77"], accountId: "acc-imap",
             folderPath: "Archive", createdAt: now.addingTimeInterval(1))
 
-        let lanes = AccountManager.buildLanes(
+        let lanes = AccountManager.buildRelatedChains(
             [opInbox, opArchive], accountScopedIdAccountIds: [])
 
         #expect(lanes.count == 2,
@@ -298,7 +298,7 @@ struct PendingQueueLaneTests {
 
     /// The key's provenance is the ACCOUNT's address space, decided per op, not
     /// a global mode: the same two-folder shape merges for the stable-id account
-    /// and stays split for the folder-local one, in a single `buildLanes` call.
+    /// and stays split for the folder-local one, in a single `buildRelatedChains` call.
     @Test("one call, two address spaces: the same two-folder shape merges for the stable-id account and stays split for the folder-local one")
     func stableIdOpsInTwoFoldersMergeOnlyForTheStableIdAccount() {
         let now = Date()
@@ -316,7 +316,7 @@ struct PendingQueueLaneTests {
             type: .markRead, messageIds: ["shared-99"], accountId: "acc-imap",
             folderPath: "Archive", createdAt: now.addingTimeInterval(3))
 
-        let lanes = AccountManager.buildLanes(
+        let lanes = AccountManager.buildRelatedChains(
             [stableInbox, stableTrash, imapInbox, imapArchive],
             accountScopedIdAccountIds: ["acc-gmail"])
 

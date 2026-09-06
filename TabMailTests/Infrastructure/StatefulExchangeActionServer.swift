@@ -317,7 +317,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
     /// concurrency is real: `AccountManagerQueueDrainTests`'
     /// `setMoveHook` in-flight counter, and — for Graph — the ORDER a follower's
     /// verb reaches the wire in (`OutlookQueueHandoffTests` T1) plus
-    /// `PendingQueueLaneTests`' direct assertion on `buildLanes`.
+    /// `PendingQueueChainTests`' direct assertion on `buildRelatedChains`.
     func holdNextMove() -> @Sendable () -> Void {
         let gate = DispatchSemaphore(value: 0)
         state.value.withLock { $0.nextMoveHold = gate }

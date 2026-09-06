@@ -774,6 +774,10 @@ struct GlobalFifoExecutorTests {
         let after = try rowsByPosition(f)
         #expect(after.map(\.messageIds) == [["r1"], ["r2"], ["r3"]],
                 "recovery reordered the queue: \(after.map { "\($0.queuePosition):\($0.messageIds)" })")
+        // Testing rule 9 — an out-of-bounds read here is a `fatalError` Swift
+        // Testing does not catch, so a reordering regression would take the
+        // whole run down instead of failing this one test.
+        guard after.count == 3 else { return }
         #expect(after[1].status == PendingStatus.queued.rawValue,
                 "the stranded row must be returned to queued")
         #expect(after[1].queuePosition == 2,
@@ -832,5 +836,237 @@ struct GlobalFifoExecutorTests {
             recomputation over the whole queue.
             """)
         #expect(try rowsByPosition(f).count == 400, "nothing may be dropped")
+    }
+
+    // MARK: - 9. The strict-progress guard
+
+    /// **THE PROPERTY: a completion report that proves NO member is a retryable
+    /// failure, not progress. The row is attempted ONCE, kept whole and queued,
+    /// and unrelated mail behind it still executes.**
+    ///
+    /// The narrowing arm answers `.proceed`, which sends the executor straight
+    /// back for the next member — sound only while the membership actually
+    /// SHRANK. A report naming no member leaves `remaining == messageIds`, so
+    /// re-claiming the row replays the identical attempt at wire speed for as
+    /// long as the app is running: a hot loop against the provider that no
+    /// gesture, sync or relaunch escapes. The guard routes that shape to the
+    /// ordinary retryable disposition instead — one attempt, chain to the tail,
+    /// unrelated intentions through.
+    ///
+    /// This drives a REAL drain: the guard is reached through
+    /// `drainPendingQueue` → `claimFrontierOperation` → `executeSingleOp`, with
+    /// the empty report raised by the provider exactly as
+    /// `GmailProvider.modifyEachMessage` raises a one-member one.
+    ///
+    /// 🚨 THE ATTEMPT BUDGET IN THE FIXTURE IS WHAT LETS THIS TEST RUN RED, and
+    /// it is not decoration (`MIS-IOS-014`). The executor has no passes-per-drain
+    /// cap and `commitPartialRetirement` returns the row to `queued` at the tail,
+    /// so WITHOUT the guard this drain never returns — a red proof that hangs is
+    /// not a red proof. The budget makes the failing run terminate and report
+    /// its exhausted budget against the expected single attempt. On the green path the row
+    /// is attempted once, the budget is never approached, and nothing about it
+    /// participates in the assertions.
+    @Test("A report that proves no member is a retryable failure, not progress: one attempt, the row kept whole, unrelated work through")
+    @MainActor
+    func aReportThatNarrowsNothingIsTreatedAsAFailureNotAsProgress() async throws {
+        let f = try fixture(accountId: "fifo-strict-progress", provider: .gmail,
+                            folders: [Self.archive])
+        defer { finish(f) }
+        for id in ["sp-target", "sp-bystander"] { try seedHeader(f, messageId: id) }
+
+        let target = try admit(f, PendingOperation(
+            type: .move, messageIds: ["sp-target"], accountId: f.accountId,
+            folderPath: Self.source, destinationPath: Self.archive))
+        let bystander = try admit(f, PendingOperation(
+            type: .markRead, messageIds: ["sp-bystander"], accountId: f.accountId,
+            folderPath: Self.source))
+        #expect([target, bystander].map(\.queuePosition) == [1, 2])
+
+        let provider = MockEmailProvider()
+        // A completion report that names NO member against a request that has
+        // one. `executeOperation` converts it to `provenMembers == []`, so
+        // `Set(provenMembers) != Set(messageIds)` is true — the narrowing arm —
+        // while the remainder is still the whole request.
+        let emptyReport = ProviderMembersDispositioned(
+            dispositionedMemberIds: [], absentMemberIds: [])
+        await provider.setMoveThrowsOnId("sp-target", error: emptyReport)
+
+        // The bound described above. `move` awaits this hook BEFORE it reads
+        // `moveThrowsOnId`, so the swap takes effect on the attempt that trips
+        // the budget and the drain ends on an ordinary chain deferral. Calling
+        // back into the mock from inside `move` is safe actor REENTRANCY: the
+        // hook runs at an `await` suspension point, so the actor is free to
+        // service these calls.
+        let attemptBudget = 6
+        await provider.setMoveHook {
+            let attempts = await provider.callLog.filter { $0.contains("sp-target") }.count
+            guard attempts >= attemptBudget else { return }
+            await provider.setMoveThrowsOnId("sp-target", error: EvidenceRefused())
+        }
+
+        await TestProviderRegistry.withRegisteredProvider(
+            accountId: f.accountId, provider: provider
+        ) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+
+        // 1) EXACTLY ONE ATTEMPT for the row that reported nothing.
+        let attempts = await provider.callLog.filter { $0.contains("sp-target") }
+        #expect(attempts.count == 1, """
+            an operation whose report narrowed NOTHING was attempted \
+            \(attempts.count) time(s) in one drain. More than one is the hot loop \
+            the strict-progress guard exists to prevent — the executor treated an \
+            iteration that changed nothing as progress and came straight back for \
+            the same row: \(attempts)
+            """)
+
+        // 2) THE ROW IS KEPT WHOLE AND QUEUED — nothing was proven, so nothing
+        // may be retired, and the user's intention survives intact.
+        let survivors = try rowsByPosition(f)
+        #expect(survivors.map(\.id) == [target.id], """
+            the unproven operation must be the only survivor, kept in full: \
+            \(survivors.map { "\($0.queuePosition):\($0.messageIds)" })
+            """)
+        guard survivors.count == 1 else { return }
+        #expect(survivors[0].messageIds == ["sp-target"],
+                "no member was proven, so none may leave the row: \(survivors[0].messageIds)")
+        #expect(survivors[0].status == PendingStatus.queued.rawValue,
+                "the row must be returned to queued, got \(survivors[0].status)")
+        #expect(survivors[0].retryCount == 1,
+                "a failed attempt is charged exactly one retry, got \(survivors[0].retryCount)")
+
+        // 3) UNRELATED WORK PROCEEDS. The failure is operation-local, so the
+        // intention admitted behind it goes to the wire in this same drain.
+        let bystanderWire = await provider.markedReadIds.map(\.ids)
+        #expect(bystanderWire == [["sp-bystander"]], """
+            unrelated mail admitted behind the unproven operation did not \
+            execute: \(bystanderWire)
+            """)
+    }
+
+    // MARK: - 10. A retirement write that cannot commit must not wedge the queue
+
+    /// **THE PROPERTY: when a terminal arm's retirement WRITE fails, the drain
+    /// stops without claiming the frontier resolved — and the NEXT drain still
+    /// reaches an unrelated operation belonging to a DIFFERENT account.**
+    ///
+    /// The claim transaction has already committed `inFlight` + `everAttempted`,
+    /// and `claimFrontierOperation`'s protected-frontier law stops the walk at an
+    /// `inFlight` row. So an arm that answers `.proceed` after a retirement write
+    /// it never checked leaves that row `inFlight` with no entry in
+    /// `pendingRetirements` or `pendingRequeues`: every later drain, for EVERY
+    /// account, stops at it for the life of the process. Gestures are applied
+    /// locally and acknowledged in the UI and never reach the wire again, and at
+    /// the next launch `recoverPreviousSessionResidue` deletes an `everAttempted`
+    /// `.move` outright — the wedge corollary, which terminates in a DROPPED
+    /// intention rather than a delay.
+    ///
+    /// The write refusal here is a `BEFORE DELETE` trigger scoped to the one row,
+    /// which fails all three `retryWrite` attempts and nothing else — the shape
+    /// GRDB's write suspension while backgrounded (ADR-IOS-041), a
+    /// data-protection lock and `SQLITE_FULL` all produce, and it is transient in
+    /// exactly the same way: it is dropped before the second drain.
+    ///
+    /// The oracle is DELIBERATELY ANOTHER ACCOUNT'S WIRE, not this row's status:
+    /// what the wedge costs the user is every OTHER intention in the queue, and
+    /// an assertion about the wedged row alone would still pass on a fix that
+    /// resolved the row and stopped draining forever.
+    @Test("A retirement write refused three times stops the drain: the next drain still executes another account's mail")
+    @MainActor
+    func aRefusedRetirementWriteDoesNotWedgeEveryAccountsQueue() async throws {
+        let f = try fixture(accountId: "fifo-wedge", provider: .gmail)
+        defer { finish(f) }
+        let otherAccount = "fifo-wedge-other"
+        try await f.pool.writeWithoutTransaction { db in
+            var account = Account(
+                emailAddress: "\(otherAccount)@example.com", displayName: otherAccount,
+                provider: .gmail)
+            account.id = otherAccount
+            try account.insert(db)
+            try Folder(
+                name: Self.source, path: Self.source, role: .inbox, accountId: otherAccount
+            ).insert(db)
+        }
+        try seedHeader(f, messageId: "w-gone")
+
+        // The front row, whose provider will report the message gone — the
+        // single-message conflict arm, one of the three terminal arms that
+        // retires a row by DELETING it.
+        let wedger = try admit(f, PendingOperation(
+            type: .markRead, messageIds: ["w-gone"], accountId: f.accountId,
+            folderPath: Self.source))
+        // An unrelated intention, on a DIFFERENT account, behind it.
+        let bystander = try admit(f, PendingOperation(
+            type: .markRead, messageIds: ["w-other"], accountId: otherAccount,
+            folderPath: Self.source))
+        #expect([wedger, bystander].map(\.queuePosition) == [1, 2])
+
+        // THE WRITE REFUSAL: every DELETE of this one row is aborted, so all
+        // three `retryWrite` attempts throw. Scoped to the row and to DELETE, so
+        // the requeue UPDATE the fix depends on is unaffected — the point is a
+        // refused RETIREMENT, not a dead database.
+        try await f.pool.writeWithoutTransaction { db in
+            try db.execute(sql: """
+                CREATE TRIGGER refuse_retirement_write
+                BEFORE DELETE ON pendingOperation
+                WHEN OLD.id = '\(wedger.id)'
+                BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END
+                """)
+        }
+
+        let providerA = MockEmailProvider()
+        await providerA.setMarkReadThrows(ProviderError.messageNotFound)
+        let providerB = MockEmailProvider()
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: f.accountId, provider: providerA)
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: otherAccount, provider: providerB)
+        // Same reasoning as the eight-member test's defer: account ids are unique
+        // to this test, so a late provider removal cannot reach another test.
+        defer {
+            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: otherAccount) }
+            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: f.accountId) }
+        }
+
+        // DRAIN 1 — the provider answers "gone", the retirement cannot commit.
+        await AccountManager.shared.drainPendingQueue()
+
+        let firstWire = await providerA.markedReadIds.map(\.ids)
+        #expect(firstWire == [["w-gone"]],
+                "precondition: the front row must have been attempted once, got \(firstWire)")
+        let afterFirst = try rowsByPosition(f)
+        #expect(afterFirst.map(\.id) == [wedger.id, bystander.id], """
+            nothing may be dropped by a retirement that did not commit: \
+            \(afterFirst.map { "\($0.queuePosition):\($0.status)" })
+            """)
+        guard afterFirst.count == 2 else { return }
+        #expect(afterFirst[0].status != PendingStatus.inFlight.rawValue, """
+            the claimed row was left `inFlight` with its retirement uncommitted \
+            and no recovery entry owning it. That is the wedge: \
+            `claimFrontierOperation` stops every later drain at this row, for \
+            every account.
+            """)
+
+        // The refusal CLEARS — GRDB's write suspension ends when the app returns
+        // to the foreground, the disk frees up, the device unlocks.
+        try await f.pool.writeWithoutTransaction { db in
+            try db.execute(sql: "DROP TRIGGER refuse_retirement_write")
+        }
+
+        // DRAIN 2 — the only assertion that matters.
+        await AccountManager.shared.drainPendingQueue()
+
+        let otherWire = await providerB.markedReadIds.map(\.ids)
+        #expect(otherWire == [["w-other"]], """
+            AN UNRELATED ACCOUNT'S INTENTION NEVER REACHED THE WIRE: \(otherWire). \
+            A retirement whose write failed reported progress it had not made, so \
+            its row stayed `inFlight` and the protected-frontier law stopped this \
+            drain — and every later one — at it.
+            """)
+        let afterSecond = try rowsByPosition(f)
+        #expect(afterSecond.isEmpty, """
+            both operations must have left the queue once the write refusal \
+            cleared: \(afterSecond.map { "\($0.queuePosition):\($0.status)" })
+            """)
     }
 }

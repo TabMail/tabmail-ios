@@ -566,6 +566,10 @@ struct DrainQueueIntegrationTests {
         // Check provider call log for order
         let callLog = await provider.callLog
         #expect(callLog.count == 3)
+        // Testing rule 9: a failed count followed by an indexed read is a
+        // `fatalError` Swift Testing cannot catch — it kills the process and
+        // takes every other result in the run with it.
+        guard callLog.count == 3 else { return }
         #expect(callLog[0].contains("markRead"))
         #expect(callLog[1].contains("markUnread"))
         #expect(callLog[2].contains("markRead"))
@@ -575,6 +579,7 @@ struct DrainQueueIntegrationTests {
         let unreads = await provider.markedUnreadIds
         #expect(reads.count == 2)
         #expect(unreads.count == 1)
+        guard reads.count == 2, unreads.count == 1 else { return }
         // Admitted first, stamped LAST — a timestamp sort would put it third.
         #expect(reads[0].ids == ["msg-1"])
         #expect(unreads[0].ids == ["msg-2"])

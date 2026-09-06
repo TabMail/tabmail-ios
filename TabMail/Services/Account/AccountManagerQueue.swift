@@ -406,7 +406,7 @@ extension AccountManager {
     ///   the demo account** — key `"accountId:msgId"`, folder deliberately
     ///   EXCLUDED. The provider's id is folder-INDEPENDENT, so the folder is not
     ///   part of the address and including it splits one resource across two
-    ///   lanes.
+    ///   chains.
     ///
     /// 🚨 OUTLOOK/GRAPH IS HERE BECAUSE THE RETIREMENT HANDOFF EXISTS, AND ONLY
     /// BECAUSE OF IT (`IOS-GRAPH-005`). Folder-independent is not the same
@@ -471,26 +471,26 @@ extension AccountManager {
     /// Pure and side-effect free (no DB/IO) — `nonisolated static` so it's directly
     /// unit-testable without an actor hop. Callers pass ops in `queuePosition`-asc
     /// order; each component preserves that relative order (FIFO within it).
-    /// Ops with empty `messageIds` (no id to key on) fall back to a singleton lane,
+    /// Ops with empty `messageIds` (no id to key on) fall back to a singleton chain,
     /// matching the pre-existing fallback (`messageIds.first ?? op.id`).
     ///
     /// - Parameter accountScopedIdAccountIds: ids of the accounts whose message
     ///   ids name ONE MESSAGE PER ACCOUNT rather than one per folder (Gmail,
     ///   Outlook, plus the demo account). Everything absent from this set is
     ///   folder-qualified. Required, not defaulted.
-    nonisolated static func buildLanes(
+    nonisolated static func buildRelatedChains(
         _ ops: [PendingOperation],
         accountScopedIdAccountIds: Set<String>
     ) -> [[PendingOperation]] {
         /// The op's ADDRESS, in whichever address space its account uses. Both
         /// key-building passes below go through this one function, so the union
-        /// pass and the lane-assignment pass cannot drift apart.
-        func laneKey(_ op: PendingOperation, _ id: String) -> String {
+        /// pass and the chain-assignment pass cannot drift apart.
+        func addressKey(_ op: PendingOperation, _ id: String) -> String {
             accountScopedIdAccountIds.contains(op.accountId)
                 ? "\(op.accountId):\(id)"
                 : "\(op.accountId):\(op.folderPath):\(id)"
         }
-        // Union-Find over lane keys, with path compression.
+        // Union-Find over address keys, with path compression.
         var parent: [String: String] = [:]
 
         func find(_ x: String) -> String {
@@ -515,7 +515,7 @@ extension AccountManager {
         for op in ops {
             let ids = op.messageIds
             guard !ids.isEmpty else { continue }
-            let keys = ids.map { laneKey(op, $0) }
+            let keys = ids.map { addressKey(op, $0) }
             for key in keys where parent[key] == nil {
                 parent[key] = key
             }
@@ -526,23 +526,23 @@ extension AccountManager {
 
         // Assign each op to its component's group, in the caller's ORIGINAL order
         // (every production caller passes rows read `ORDER BY queuePosition ASC`).
-        var laneIndexForRoot: [String: Int] = [:]
-        var lanes: [[PendingOperation]] = []
+        var chainIndexForRoot: [String: Int] = [:]
+        var chains: [[PendingOperation]] = []
         for op in ops {
             guard let firstId = op.messageIds.first else {
-                // Empty messageIds — always its own singleton lane.
-                lanes.append([op])
+                // Empty messageIds — always its own singleton chain.
+                chains.append([op])
                 continue
             }
-            let root = find(laneKey(op, firstId))
-            if let idx = laneIndexForRoot[root] {
-                lanes[idx].append(op)
+            let root = find(addressKey(op, firstId))
+            if let idx = chainIndexForRoot[root] {
+                chains[idx].append(op)
             } else {
-                laneIndexForRoot[root] = lanes.count
-                lanes.append([op])
+                chainIndexForRoot[root] = chains.count
+                chains.append([op])
             }
         }
-        return lanes
+        return chains
     }
 
     /// THE GLOBAL SINGLE-OPERATION FIFO EXECUTOR.
@@ -578,7 +578,7 @@ extension AccountManager {
     /// 🚨 A DEFERRAL IS A SKIP, NOT A STOP, AND THE CHAIN IS WHAT MAKES THAT
     /// SAFE. When an operation cannot proceed, every pending row transitively
     /// related to it — same connected component over provider ADDRESSES, the
-    /// calculation `buildLanes` already owns — is deferred with it. So the walk
+    /// calculation `buildRelatedChains` already owns — is deferred with it. So the walk
     /// can safely take the next unrelated row: nothing that shares a message with
     /// the deferred operation is reachable, and unrelated mail proceeds. This
     /// replaces v2final's "stop the drain when the frontier is already demoted"
@@ -674,7 +674,26 @@ extension AccountManager {
                 // Outcome captured via Mutex (not a plain var) — the closure passed
                 // to `queue.execute` is @Sendable, so it cannot capture a mutable
                 // local var directly under Swift 6 strict concurrency.
-                let outcomeBox = Mutex<SingleOpOutcome>(.proceed)
+                //
+                // 🚨 THE DEFAULT IS `.stopDrain` BECAUSE THE CLOSURE MAY NEVER RUN,
+                // AND A DEFAULT OF `.proceed` WOULD BE FAIL-DANGEROUS. This is
+                // `ProviderWorkQueue.execute`'s NON-THROWING overload, which has
+                // three early returns that skip `work()` entirely — the invalidated
+                // fence, checked before and after the slot wait, and a refused
+                // `acquireSlot`. The row has already been claimed and committed
+                // `inFlight` by `claimFrontierOperation`, so a skipped closure
+                // leaves exactly the terminal state the retirement arms must never
+                // report: nothing attempted, nothing retired, nothing narrowed, no
+                // entry in `pendingRetirements`/`pendingRequeues` — and `.proceed`
+                // would send the executor back to a frontier the protected-frontier
+                // law then refuses on every later drain (the wedge corollary).
+                // Every early return here requires the account's queue to have been
+                // invalidated, which today happens only on account removal, and that
+                // path deletes the account's rows first — so this is unreachable
+                // rather than merely rare. The default is still the closed one: an
+                // unreachable path with a fail-dangerous default is a trap for the
+                // next caller, not a proof.
+                let outcomeBox = Mutex<SingleOpOutcome>(.stopDrain)
                 await queue.execute(priority: .userAction) {
                     let result = await self.executeSingleOp(
                         op, provider: provider, context: ctx)
@@ -753,7 +772,7 @@ extension AccountManager {
     /// Skipping one row and taking the next would let a LATER operation on the
     /// SAME message overtake it — the exact ordering violation this executor
     /// exists to prevent. So every skip marks the skipped row's entire connected
-    /// component (`buildLanes`, over the rows this transaction just read) as
+    /// component (`buildRelatedChains`, over the rows this transaction just read) as
     /// deferred for this drain, and the walk refuses every id in that set. It is
     /// an in-memory mark and NOT a durable tail movement: nothing was attempted,
     /// no position changes, no retry is charged, and the rows stay exactly where
@@ -806,8 +825,8 @@ extension AccountManager {
                 // that is no longer a row simply cannot be claimed, and its
                 // presence in a deferred set is inert.
                 var componentById: [String: [String]] = [:]
-                for lane in Self.buildLanes(rows, accountScopedIdAccountIds: accountScopedIds) {
-                    let ids = lane.map(\.id)
+                for chain in Self.buildRelatedChains(rows, accountScopedIdAccountIds: accountScopedIds) {
+                    let ids = chain.map(\.id)
                     for id in ids { componentById[id] = ids }
                 }
 
@@ -1057,7 +1076,7 @@ extension AccountManager {
     ///
     /// A2 cannot pass A1, because A2 moves WITH it; B1 and C1 keep their relative
     /// order because nothing else is touched. Relatedness is the connected
-    /// component over provider ADDRESSES that `buildLanes` already computes — the
+    /// component over provider ADDRESSES that `buildRelatedChains` already computes — the
     /// same pure calculation, the same account-qualified/folder-qualified split,
     /// the same conservative default for a provider string this build cannot
     /// decode — read from the LIVE rows inside this transaction rather than from
@@ -1096,8 +1115,8 @@ extension AccountManager {
                     // and nothing to recreate.
                     return []
                 }
-                let lanes = Self.buildLanes(live, accountScopedIdAccountIds: accountScopedIds)
-                let chain = lanes.first { $0.contains { $0.id == op.id } } ?? []
+                let chains = Self.buildRelatedChains(live, accountScopedIdAccountIds: accountScopedIds)
+                let chain = chains.first { $0.contains { $0.id == op.id } } ?? []
                 let ids = chain.map(\.id)
                 try PendingOperation.appendToTail(
                     db, ids: ids, chargeRetryTo: incrementRetryCount ? op.id : nil)
@@ -1152,9 +1171,9 @@ extension AccountManager {
     /// `replayRetainedRetirements` runs the SAME write rather than a second copy
     /// that can drift away from it. Nothing about the transaction's content
     /// changed in the extraction: the classification is still read INSIDE the
-    /// write, from the same `account` rows `drainPendingQueue` keyed the lanes
-    /// from, because the two facts must not be allowed to drift — the lane key
-    /// promises that a follower runs after this move, and `accountScopedIds` is
+    /// write, from the same `account` rows `drainPendingQueue` keyed the related
+    /// chains from, because the two facts must not be allowed to drift — the
+    /// address key promises a follower runs after this move, and `accountScopedIds` is
     /// what makes that promise safe by re-addressing it.
     ///
     /// 🚨 THE MOVE IS FINISHED LOCALLY HERE, IN THE SAME WRITE THAT DELETES THE
@@ -1240,8 +1259,8 @@ extension AccountManager {
             .filter(Column("status") != PendingStatus.cancelled.rawValue)
             .order(Column("queuePosition").asc)
             .fetchAll(db)
-        let lanes = buildLanes(live, accountScopedIdAccountIds: accountScopedIdAccounts)
-        let chain = lanes.first { $0.contains { $0.id == frozenRetiredOp.id } } ?? []
+        let chains = buildRelatedChains(live, accountScopedIdAccountIds: accountScopedIdAccounts)
+        let chain = chains.first { $0.contains { $0.id == frozenRetiredOp.id } } ?? []
         try PendingOperation.appendToTail(db, ids: chain.map(\.id))
         return result
     }
@@ -1951,6 +1970,46 @@ extension AccountManager {
     /// returns `.stopDrain`. An arm that returns `.proceed` without shrinking
     /// anything would spin the executor forever — the strict-progress guard on the
     /// narrowing path below exists for exactly that reason.
+    ///
+    /// 🚨 THE INVARIANT, STATED AS AN INVARIANT RATHER THAN AS A LIST OF ARMS:
+    /// **NO ARM MAY RETURN `.proceed` UNLESS THE CLAIMED ROW IS PROVABLY GONE,
+    /// PROVABLY NARROWED, OR PROVABLY OWNED BY `pendingRequeues` /
+    /// `pendingRetirements`.** The claim transaction has already committed
+    /// `inFlight` + `everAttempted`, and `claimFrontierOperation`'s
+    /// protected-frontier law STOPS the walk at an `inFlight` row — so a
+    /// `.proceed` on an iteration that changed nothing does not merely waste a
+    /// pass: it wedges the drain at that row for EVERY account for the life of
+    /// the process, every gesture is applied locally and acknowledged in the UI
+    /// and never reaches the wire, and at the next launch
+    /// `AppDatabase.recoverPreviousSessionResidue` deletes an `everAttempted`
+    /// `.move` outright. That is the wedge corollary, and it terminates in a
+    /// DROPPED INTENTION rather than a delay.
+    ///
+    /// The failure shape it rules out is `try? await retryWrite { … deleteOne }`
+    /// followed by `return .proceed`: `retryWrite` is three attempts 100 ms apart,
+    /// and GRDB write suspension on backgrounding (ADR-IOS-041), a data-protection
+    /// lock and `SQLITE_FULL` all make all three throw while reads keep working.
+    /// `try?` then discards the only evidence that nothing happened. Three arms
+    /// did exactly that until 2026-09-06 (the single-message conflict, the
+    /// permanently-invalid drop and the identity refusal); all three now use the
+    /// `uidValidityChanged` arm's shape — a real `do`/`catch`, `requeueOrRetain`
+    /// in the catch, `.stopDrain`. This is the same class the eight
+    /// `try? … markQueued` requeue sites were fixed for one commit earlier
+    /// (`288231f1b`); that census covered the REQUEUE writes and not the
+    /// RETIREMENT writes, which is why it has to be stated as an invariant here
+    /// rather than as a list of sites (`MIS-006`, `MIS-IOS-020`).
+    ///
+    /// CENSUS, STATED AS A FALSIFIABLE COUNT SO IT CAN BE CHECKED RATHER THAN
+    /// TRUSTED. Before this change `grep -n '\.proceed'` over this file returned
+    /// SEVEN sites: six `return .proceed` statements and the executor's
+    /// outcome-box default (`drainPendingQueue`). Three of the six were provably
+    /// resolved — whole-op success, `uidValidityChanged`, and
+    /// `retirePartiallyCompletedOp`'s tail, each reached only after its
+    /// retirement transaction COMMITTED. Three were the arms named above. The
+    /// seventh, the outcome-box default, was fail-dangerous for the same reason
+    /// (the closure can be skipped entirely) and is now `.stopDrain`. AFTER the
+    /// change the same grep returns SIX, and every one of them is in the
+    /// provably-resolved class. An eighth site, then or now, is a finding.
     func executeSingleOp(_ currentOp: PendingOperation, provider: any EmailProvider, context: DrainContext) async -> SingleOpOutcome {
         let opType = currentOp.type.rawValue
         let opMsgCount = currentOp.messageIds.count
@@ -2274,9 +2333,35 @@ extension AccountManager {
                 }
                 // Single-message conflict — drop (server wins)
                 queueLog("[Queue] Conflict: \(opType) — message not found, dropping")
-                try? await retryWrite(dbPool, label: "Queue") { db in
-                    _ = try PendingOperation.deleteOne(db, key: currentOp.id)
+                do {
+                    try await retryWrite(dbPool, label: "Queue") { db in
+                        _ = try PendingOperation.deleteOne(db, key: currentOp.id)
+                    }
+                } catch {
+                    // ⚠️ `.stopDrain`, not `.proceed` — the SAME shape as the
+                    // `uidValidityChanged` arm above, for the same reason. The
+                    // DELETE is what failed, so the row is still `inFlight` with
+                    // every member it had, this iteration changed NOTHING, and
+                    // `.proceed` would send the executor back to a frontier that
+                    // `claimFrontierOperation`'s protected-frontier law refuses —
+                    // `.stop` at that row on every later drain, for every account,
+                    // for the life of the process. That is the wedge corollary:
+                    // every gesture is applied locally and acknowledged in the UI
+                    // and none of them ever reaches the wire again.
+                    // `requeueOrRetain` returns the row to `queued`, or keeps
+                    // ownership in `pendingRequeues` so `recoverPendingRequeues`
+                    // finishes it at the top of the next drain.
+                    queueLog(
+                        "[Queue] Conflict retirement of \(currentOp.id.prefix(8)) (\(opType)) "
+                            + "could not commit: \(error); the row is returned to `queued` and "
+                            + "this drain stops rather than reporting progress it did not make")
+                    await requeueOrRetain(currentOp.id)
+                    return .stopDrain
                 }
+                // 🚨 INSIDE THE SUCCESS BRANCH, DELIBERATELY. This discards the
+                // in-memory successor an undo already gestured (and releases its
+                // overlay entry); doing that for an operation that is still LIVE
+                // would drop a user intention whose predecessor has not retired.
                 dropDeferredMoveSuccessors(for: currentOp.id)
                 // If the error was a structurally-confirmed permanent gone (HTTP 404/410
                 // or ProviderError.messageNotFound), also delete the local header. The
@@ -2297,8 +2382,21 @@ extension AccountManager {
             // E.g., Gmail "Invalid label: DRAFT" when a .move op tried to remove the DRAFT label.
             if isPermanentlyInvalidError(error) {
                 queueLog("[Queue] Permanently invalid \(opType): \(error) — dropping")
-                try? await retryWrite(dbPool, label: "Queue") { db in
-                    _ = try PendingOperation.deleteOne(db, key: currentOp.id)
+                do {
+                    try await retryWrite(dbPool, label: "Queue") { db in
+                        _ = try PendingOperation.deleteOne(db, key: currentOp.id)
+                    }
+                } catch {
+                    // Same invariant as the conflict arm above: a `.proceed` here
+                    // would claim the frontier is resolved while the row is still
+                    // `inFlight` with all of its members, and the protected-frontier
+                    // law would then stop every drain at it forever.
+                    queueLog(
+                        "[Queue] Permanently-invalid retirement of \(currentOp.id.prefix(8)) "
+                            + "(\(opType)) could not commit: \(error); the row is returned to "
+                            + "`queued` and this drain stops")
+                    await requeueOrRetain(currentOp.id)
+                    return .stopDrain
                 }
                 dropDeferredMoveSuccessors(for: currentOp.id)
                 return .proceed
@@ -2426,8 +2524,24 @@ extension AccountManager {
                 BackgroundSyncLogger.logError(
                     "TERMINAL DROP: identity refused in \(opType) (\(opMsgCount) id(s)) — '\(refusedId)' is not a verifiable identity and never will be, so the op is dropped (IOS-QUEUE-003 item 4; the server-side object is untouched and remains visible for a re-issued gesture)",
                     source: "actionQueue")
-                try? await retryWrite(dbPool, label: "Queue") { db in
-                    _ = try PendingOperation.deleteOne(db, key: currentOp.id)
+                do {
+                    try await retryWrite(dbPool, label: "Queue") { db in
+                        _ = try PendingOperation.deleteOne(db, key: currentOp.id)
+                    }
+                } catch {
+                    // The accepted limitation is a drop that COMMITTED. A DELETE
+                    // that did not commit has dropped nothing and resolved
+                    // nothing: the row is still `inFlight` with its whole payload,
+                    // so reporting `.proceed` would wedge the frontier for every
+                    // account instead of discharging `IOS-QUEUE-003` item 4.
+                    // Requeue and stop; the next drain re-reaches this arm and the
+                    // logged terminal drop above is re-emitted when it commits.
+                    queueLog(
+                        "[Queue] Identity-refusal drop of \(currentOp.id.prefix(8)) (\(opType)) "
+                            + "could not commit: \(error); the row is returned to `queued` and "
+                            + "this drain stops — the drop is retried at the next drain")
+                    await requeueOrRetain(currentOp.id)
+                    return .stopDrain
                 }
                 dropDeferredMoveSuccessors(for: currentOp.id)
                 return .proceed
@@ -2451,7 +2565,7 @@ extension AccountManager {
             //
             // THREE properties, each load-bearing, now discharged by ONE call:
             //  - THE WHOLE RELATED CHAIN MOVES, not just this row. Every op that
-            //    names a message this one names is in its `buildLanes` connected
+            //    names a message this one names is in its `buildRelatedChains` connected
             //    component BY CONSTRUCTION, so running one ahead of an unresolved
             //    predecessor races its eventual retry on the wire. Tail movement
             //    keeps their relative order and puts all of them behind every
@@ -2945,12 +3059,23 @@ extension AccountManager {
             // `MessageHeaderRekey.currentHeaderId(afterHandoffFrom:)`, whose
             // aliases are published by `db.afterNextTransaction` and so exist
             // only once that write commits. ⚠️ DO NOT MOVE THIS INTO THE TAIL
-            // BLOCK BELOW where the `foldersToSync` insert lives — that block
-            // runs on the retention path too, and recording there would publish
-            // an inbox-entry event for a retirement that never landed. The
+            // BLOCK BELOW where the `foldersToSync` insert lives.
+            //
+            // ⚠️ THE GUIDANCE STANDS; ITS STATED REASON NO LONGER DOES. That
+            // sentence used to end "— that block runs on the retention path
+            // too", and it does not any more: the `catch` below returns
+            // `.stopDrain` before reaching the tail block, and carries its own
+            // `foldersToSync` insert precisely because it never gets there. The
+            // instruction is unchanged because it never depended on that control
+            // flow: this event must be tied to the COMMIT, not to the function's
+            // exit. The retention path commits its narrowing somewhere else
+            // entirely — `replayRetainedRetirements`' `.partial` arm at the next
+            // drain — and that arm is what records the event for a retirement
+            // that lands late, so an event recorded on a shared exit here would
+            // announce an inbox entry for a retirement that never landed and
+            // then announce it a second time when the replay commits. The
             // whole-op arm is shaped the same way (it returns from its catch
-            // before recording), and the retained result is what carries the
-            // event instead, through `replayRetainedRetirements`' `.partial` arm.
+            // before recording).
             if currentOp.type == .move, let dest = currentOp.destinationPath,
                dest != currentOp.folderPath {
                 await recordMembersThatEnteredInbox(
@@ -3007,6 +3132,24 @@ extension AccountManager {
             // sequences.
             return .stopDrain
         }
+        // 🚨 `reconcileMoveSource` IS NOT CARRIED INTO THIS FUNCTION, AND THE
+        // OMISSION GETS AN EXPLICIT NOTE FOR THE SAME REASON ITS SIBLING ABOVE
+        // DOES (the deferred-successor materialization) — so the next reader does
+        // not have to re-derive why the two retirement arms differ. The whole-op
+        // success arm answers `ExecutedOperation.reconcileMoveSource` by adding
+        // the SOURCE folder to `foldersToSync` as well as the destination; this
+        // arm cannot, because `executeSingleOp` does not pass the flag to it.
+        //
+        // ⚠️ UNREACHABLE TODAY, NOT WRONG — and that is a property of today's
+        // providers, not of this contract. `IMAPProvider.move` is the only
+        // producer of `reconcileMoveSource`, and it returns `provenIds: ids` at
+        // every `MoveOutcome` return site, so an IMAP move dispositions every
+        // member and never takes the narrowing path that arrives here. The moment
+        // any move both asks for a source reconcile AND returns a strict subset,
+        // this arm silently skips the source-folder sync the provider asked for
+        // and the source keeps showing rows the server no longer has there: add
+        // the parameter then, rather than reading this omission as proof the flag
+        // is dead.
         if [.archive, .delete, .move].contains(currentOp.type), let dest = currentOp.destinationPath {
             context.foldersToSync.insert("\(currentOp.accountId)|\(dest)")
         }
@@ -3108,6 +3251,24 @@ extension AccountManager {
     /// `ProviderMembersDispositioned` / `MoveOutcome.confirmedGoneIds`, i.e. members a
     /// request addressed to THAT member answered `ProviderMemberAbsence`-
     /// authoritatively for. Nothing else may be passed here.
+    ///
+    /// 🚨 WHY `op.folderPath` RECONSTRUCTS THE HEADER'S REAL PRIMARY KEY, even
+    /// though the gesture has already moved the row locally. A header's id is
+    /// `(accountId, folderPath, messageId)`, and a `.move` gesture applies
+    /// `optimisticMoveToFolder` immediately — but that helper UPDATEs
+    /// `folderId` / `folderPath` / `isInInbox` / `observedUidValidity` BY PRIMARY
+    /// KEY `id` and does NOT re-key the row, so the id still spells the SOURCE
+    /// folder while the columns spell the destination. The operation's
+    /// `folderPath` is that same source folder, so it is the correct component
+    /// here; taking `destinationPath`, or re-deriving from the header's current
+    /// `folderPath` column, would compute an id no row has and the delete would
+    /// silently match nothing.
+    ///
+    /// The same reasoning covers a FOLLOWER of an already-landed move: the drain
+    /// re-keys a row only through `MessageHeaderRekey.finishMove`, and a
+    /// follower's own `folderPath` is by construction its predecessor's landing
+    /// folder — the address space the follower was admitted into — so the pair
+    /// (op.folderPath, memberId) is exactly what that row's id was built from.
     private func retireConfirmedGoneMemberHeaders(
         _ op: PendingOperation, memberIds: [String]
     ) async {
