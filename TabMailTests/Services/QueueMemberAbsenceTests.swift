@@ -578,185 +578,99 @@ struct QueueMemberAbsenceTests {
     }
 
 
-    // MARK: - 7. A batch too slow to finish in one attempt still reaches its tail
+    // MARK: - 7. One member per attempt narrows the original row and reaches its tail
 
-    /// The wall-clock profile of a batch whose members are each comfortably
-    /// inside the operation deadline while their SUM is not — the shape both
-    /// round-2 reviewers reproduced against production timings (four members,
-    /// each ~8 s, under the 15 s `pendingOperationTimeoutSeconds`).
-    ///
-    /// 🚨 THE PREMISE IS ASSERTED, NOT ASSUMED, by
-    /// `assertIsAnOverrunProfile(_:deadline:)` below: every member individually
-    /// admissible, the batch jointly inadmissible. A fixture that quietly stopped
-    /// satisfying either half would turn all three deadline tests into tests of
-    /// nothing, and neither half is visible from an assertion on the outcome.
-    private static let overrunHoldSeconds: [TimeInterval] = [0.05, 0.90, 1.40]
-    /// The scaled stand-in for `SyncConfig.pendingOperationTimeoutSeconds`.
-    /// Scaled because the production value is a `let` and the property under
-    /// test is a RELATIONSHIP between the deadline and one member's request, not
-    /// either number: 2.35 s of members against a 2.0 s deadline is the same
-    /// relationship as 32 s against 15 s, and the suite does not have to spend
-    /// half a minute per provider to state it.
-    private static let overrunDeadlineSeconds: TimeInterval = 2.0
+    /// A watchdog bounds a stuck fixture; elapsed time is not the behavioral oracle.
+    private static let memberAttemptWatchdogSeconds: TimeInterval = 30
 
-    private func assertIsAnOverrunProfile(
-        _ holds: [TimeInterval], deadline: TimeInterval
-    ) {
-        #expect(holds.allSatisfy { $0 < deadline }, """
-            a member of this fixture cannot finish inside the operation deadline \
-            on its own, so the batch is not the overrun shape at all — it is a \
-            batch of individually impossible members, which no stopping rule can \
-            help. Holds: \(holds), deadline: \(deadline)
-            """)
-        #expect(holds.reduce(0, +) > deadline, """
-            the whole batch fits inside one deadline, so nothing here can overrun \
-            it and the test proves nothing. Holds: \(holds), deadline: \(deadline)
-            """)
-    }
-
-    /// One attempt at the provider boundary, under a stand-in for the drain's
-    /// own `withTimeout(SyncConfig.pendingOperationTimeoutSeconds)`.
     private enum AttemptOutcome {
-        /// The attempt settled these members and said nothing about the rest.
         case settled([String])
-        /// The attempt settled the whole request and reported nothing, which is
-        /// what silence means on a `Void`-returning action.
         case settledEverything
-        /// The attempt was discarded by the deadline. THE FAILURE THIS SUITE
-        /// EXISTS FOR: everything the attempt had already done is lost with the
-        /// abandoned task, so the row is requeued unchanged and the next attempt
-        /// repeats it.
-        case discardedByTheDeadline(any Error)
+        case failed(any Error)
     }
 
-    /// Drive `attempt` the way `executeSingleOp` drives a provider — one
-    /// deadline-bounded call, then narrow the request to whatever is still owed —
-    /// and return the order in which members were settled.
-    ///
-    /// 🚨 THIS IS THE DRAIN'S NARROWING LOOP, NOT A NEW POLICY. Its only job is to
-    /// make the composition of "one bounded attempt" with "narrow and retry"
-    /// observable at the provider boundary, where the deadline can be scaled. The
-    /// DURABLE half of the same property — that the narrowing happens on the
-    /// user's own row, under its own id — is asserted separately below, through
-    /// the real drain.
+    /// Each invocation must address and acknowledge exactly its first owed member.
+    /// The wire and remote state distinguish progress from a report alone. The real
+    /// drain tests below separately prove that progress narrows the original row.
     @MainActor
-    private func settleUnderRepeatedDeadlines(
+    private func settleOneMemberPerAttempt<State: Equatable>(
         _ ids: [String],
+        addressedIds: () -> [String],
+        snapshot: (_ id: String) -> State,
+        hasGesture: (_ id: String) -> Bool?,
         attempt: (_ owed: [String]) async -> AttemptOutcome
     ) async -> [String] {
         var owed = ids
         var settled: [String] = []
-        // Bounded so a loop that stops making progress fails an assertion instead
-        // of hanging the suite: one attempt per member is the most a converging
-        // implementation can need, and the slack catches an off-by-one.
-        for _ in 0..<(ids.count + 2) {
-            guard !owed.isEmpty else { break }
-            switch await attempt(owed) {
+        for _ in ids.indices {
+            guard let first = owed.first else { break }
+            let wireBefore = addressedIds()
+            let stateBefore = ids.map(snapshot)
+            for id in owed {
+                #expect(hasGesture(id) == false, "the owed member must exist without the gesture before its attempt: \(id)")
+            }
+            let outcome = await attempt(owed)
+            #expect(addressedIds() == wireBefore + [first],
+                    "each invocation must address exactly its first owed member: \(first)")
+            #expect(hasGesture(first) == true,
+                    "the first owed member must receive the gesture: \(first)")
+            for (index, id) in ids.enumerated() where id != first {
+                #expect(snapshot(id) == stateBefore[index],
+                        "an attempt must leave every other member unchanged: \(id)")
+            }
+            let members: [String]
+            switch outcome {
             case .settledEverything:
-                settled.append(contentsOf: owed)
-                owed = []
-            case .settled(let members):
-                guard !members.isEmpty else {
-                    Issue.record("""
-                        an attempt settled NOTHING and still reported. An attempt \
-                        that can settle nothing can never converge — this is the \
-                        starvation the report exists to prevent, wearing the \
-                        report's clothes. Still owed: \(owed)
-                        """)
-                    return settled
-                }
-                #expect(members == Array(owed.prefix(members.count)), """
-                    the settled members are not a prefix of what was requested, in \
-                    request order: settled \(members) out of \(owed)
-                    """)
-                settled.append(contentsOf: members)
-                owed.removeFirst(min(members.count, owed.count))
-            case .discardedByTheDeadline(let error):
-                Issue.record("""
-                    the attempt was discarded by the operation deadline instead of \
-                    reporting what it had settled: \(error). Everything it had \
-                    already mutated is lost with the abandoned task, so the row is \
-                    requeued unchanged and the next attempt repeats the identical \
-                    prefix into the identical deadline — the last member's \
-                    intention never reaches the provider. That is persistent retry \
-                    starvation, the wedge corollary. Settled so far: \(settled), \
-                    still owed: \(owed)
-                    """)
+                members = owed
+            case .settled(let reported):
+                members = reported
+            case .failed(let error):
+                Issue.record("provider attempt failed before reporting settlement: \(error); still owed: \(owed)")
                 return settled
             }
+            #expect(members == [first],
+                    "an attempt must report exactly its nonempty first owed member: \(members) out of \(owed)")
+            guard members == [first] else { return settled }
+            settled.append(first)
+            owed.removeFirst()
         }
-        #expect(owed.isEmpty, """
-            the batch never converged: \(owed) is still owed after one attempt per \
-            member. A member that is never requested has had its intention dropped \
-            just as surely as one that was deleted.
-            """)
+        #expect(owed.isEmpty, "the batch did not converge; still owed: \(owed)")
         return settled
     }
 
-    /// **THE PROPERTY, for Gmail's label setter: a batch whose members are each
-    /// admissible under the operation deadline but jointly are not still reaches
-    /// its LAST member, and the progress each attempt makes is banked on the
-    /// user's own durable row rather than repeated.**
-    ///
-    /// 🚨 WHAT THE ROUND-2 FINDING WAS. A between-member time budget cannot
-    /// deliver this. It bounds what an attempt has ALREADY spent and says nothing
-    /// about the duration of the request it is about to start, so for
-    /// `[gone, live-a, live-b, tail]` at ~8 s a member the loop checks 8 s against
-    /// its 9 s reserve, starts `live-b`, and is cancelled at 15 s — `withTimeout`
-    /// having ALREADY resumed the drain with `TimeoutError`, so the settled prefix
-    /// is discarded with the abandoned task, `requeueOrRetain` resets the row with
-    /// its membership unchanged, and `tail` is never requested on any attempt.
-    /// Choosing a smaller fraction cannot fix it and deleting the check alone
-    /// restores unbounded replay; only bounding an attempt to ONE request makes
-    /// the attempt's exposure equal to the quantity the deadline actually bounds.
-    ///
-    /// PHASE 1 — the deadline composition, at the provider boundary under a scaled
-    /// stand-in for the drain's own `withTimeout`. Every attempt must come back
-    /// with a report rather than a `TimeoutError`, and repeating on the remainder
-    /// must reach the tail. PHASE 2 — the durable half, through the REAL drain: the
-    /// row that survives is the user's original id with its `createdAt` intact,
-    /// narrowed to the members still owed, and every member is addressed exactly
-    /// once across the whole run.
-    ///
-    /// TWO-SIDED: phase 1 asserts the fixture really is an overrun profile
-    /// (individually admissible, jointly not) and phase 2 asserts the mid-run row
-    /// is a PROPER, NON-EMPTY suffix — so neither "the loop settled everything in
-    /// one attempt" nor "the loop settled nothing" can satisfy them.
-    ///
-    /// RED PROOF (recorded): with the loop restored to its between-member time
-    /// budget, phase 1's first attempt spends 2.35 s of member latency against the
-    /// 2.0 s deadline and comes back `TimeoutError`, and phase 2's single drain
-    /// retires the whole five-member row so the narrowed row is absent.
-    @Test("Gmail: a batch too slow to finish in one attempt narrows the same row and still reaches its last member")
+    /// PHASE 1 uses immediate responses to assert one addressed and acknowledged
+    /// member per invocation, then ordered convergence on the remaining suffix.
+    /// PHASE 2 observes a proper nonempty suffix on the original durable row and
+    /// requires the same real drain to finish, addressing every member once.
+    @Test("Gmail: each attempt settles one member and the same row reaches its last member")
     @MainActor
     func gmailSetterOverrunNarrowsUnderTheOriginalIdAndReachesTheTail() async throws {
-        // PHASE 1 — the deadline composition.
-        let holds = Self.overrunHoldSeconds
-        let deadline = Self.overrunDeadlineSeconds
-        assertIsAnOverrunProfile(holds, deadline: deadline)
+        // PHASE 1 — immediate responses, with per-invocation wire and progress checks.
 
-        let slowIds = (1...holds.count).map { "slow-g-\($0)" }
+        let slowIds = (1...3).map { "slow-g-\($0)" }
         let slowServer = StatefulGmailActionServer(messages: slowIds.map {
             .init(rfc822MessageId: "\($0)@example.com", providerMessageId: $0,
                   labels: ["INBOX", "UNREAD"])
         })
         defer { slowServer.close() }
-        for (id, hold) in zip(slowIds, holds) {
-            slowServer.holdModify(providerMessageId: id, forSeconds: hold)
-        }
 
         let slowProvider = slowServer.provider()
         let folder = Self.source
-        let settled = await settleUnderRepeatedDeadlines(slowIds) { owed in
+        let settled = await settleOneMemberPerAttempt(
+            slowIds,
+            addressedIds: { slowServer.modifyLog().map(\.providerMessageId) },
+            snapshot: { slowServer.snapshot(providerMessageId: $0) },
+            hasGesture: { slowServer.snapshot(providerMessageId: $0)?.isRead }
+        ) { owed in
             do {
-                try await withTimeout(seconds: deadline) {
+                try await withTimeout(seconds: Self.memberAttemptWatchdogSeconds) {
                     try await slowProvider.markRead(ids: owed, folder: folder)
                 }
                 return .settledEverything
             } catch let report as ProviderMembersDispositioned {
                 return .settled(report.dispositionedMemberIds)
             } catch {
-                return .discardedByTheDeadline(error)
+                return .failed(error)
             }
         }
         #expect(settled == slowIds,
@@ -934,39 +848,35 @@ struct QueueMemberAbsenceTests {
     /// **THE PROPERTY, for Graph's `PATCH /messages/{id}` setter loop.** Same two
     /// phases, same reasoning, different provider — the finding named all three
     /// loops and a fix verified on one of them says nothing about the others.
-    ///
-    /// RED PROOF (recorded): with the loop restored to its between-member time
-    /// budget, phase 1's first attempt comes back `TimeoutError` and phase 2's
-    /// single drain retires the whole five-member row.
-    @Test("Graph: a setter batch too slow to finish in one attempt narrows the same row and still reaches its last member")
+    @Test("Graph: each setter attempt settles one member and the same row reaches its last member")
     @MainActor
     func graphSetterOverrunNarrowsUnderTheOriginalIdAndReachesTheTail() async throws {
-        let holds = Self.overrunHoldSeconds
-        let deadline = Self.overrunDeadlineSeconds
-        assertIsAnOverrunProfile(holds, deadline: deadline)
+        // PHASE 1 — immediate responses, with per-invocation wire and progress checks.
 
-        let slowIds = (1...holds.count).map { "slow-x-\($0)" }
+        let slowIds = (1...3).map { "slow-x-\($0)" }
         let slowServer = StatefulExchangeActionServer(messages: slowIds.map {
             .init(rfc822MessageId: "\($0)@example.com", providerMessageId: $0,
                   folderId: Self.source)
         })
         defer { slowServer.close() }
-        for (id, hold) in zip(slowIds, holds) {
-            slowServer.holdPatch(providerMessageId: id, forSeconds: hold)
-        }
 
         let slowProvider = slowServer.provider()
         let folder = Self.source
-        let settled = await settleUnderRepeatedDeadlines(slowIds) { owed in
+        let settled = await settleOneMemberPerAttempt(
+            slowIds,
+            addressedIds: { Self.patchedIds(slowServer) },
+            snapshot: { slowServer.snapshot(providerMessageId: $0) },
+            hasGesture: { slowServer.snapshot(providerMessageId: $0)?.isRead }
+        ) { owed in
             do {
-                try await withTimeout(seconds: deadline) {
+                try await withTimeout(seconds: Self.memberAttemptWatchdogSeconds) {
                     try await slowProvider.markRead(ids: owed, folder: folder)
                 }
                 return .settledEverything
             } catch let report as ProviderMembersDispositioned {
                 return .settled(report.dispositionedMemberIds)
             } catch {
-                return .discardedByTheDeadline(error)
+                return .failed(error)
             }
         }
         #expect(settled == slowIds,
@@ -1040,41 +950,39 @@ struct QueueMemberAbsenceTests {
     /// The move loop reports through its RETURN VALUE rather than by throwing, so
     /// phase 1 reads the settled members off `MoveOutcome.provenIds`; everything
     /// else is identical.
-    ///
-    /// RED PROOF (recorded): with the loop restored to its between-member time
-    /// budget, phase 1's first attempt comes back `TimeoutError` and phase 2's
-    /// single drain retires the whole five-member row.
-    @Test("Graph: a move batch too slow to finish in one attempt narrows the same row and still reaches its last member")
+    @Test("Graph: each move attempt settles one member and the same row reaches its last member")
     @MainActor
     func graphMoveOverrunNarrowsUnderTheOriginalIdAndReachesTheTail() async throws {
-        let holds = Self.overrunHoldSeconds
-        let deadline = Self.overrunDeadlineSeconds
-        assertIsAnOverrunProfile(holds, deadline: deadline)
+        // PHASE 1 — immediate responses, with per-invocation wire and progress checks.
 
-        let slowIds = (1...holds.count).map { "slow-mv-\($0)" }
+        let slowIds = (1...3).map { "slow-mv-\($0)" }
         let slowServer = StatefulExchangeActionServer(messages: slowIds.map {
             .init(rfc822MessageId: "\($0)@example.com", providerMessageId: $0,
                   folderId: Self.source)
         })
         defer { slowServer.close() }
-        for (id, hold) in zip(slowIds, holds) {
-            slowServer.holdMove(providerMessageId: id, forSeconds: hold)
-        }
 
         let slowProvider = slowServer.provider()
         let source = Self.source
         let destination = Self.destination
-        let settled = await settleUnderRepeatedDeadlines(slowIds) { owed in
+        let settled = await settleOneMemberPerAttempt(
+            slowIds,
+            addressedIds: { Self.movedIds(slowServer) },
+            snapshot: { slowServer.snapshots(rfc822MessageId: "\($0)@example.com") },
+            hasGesture: {
+                let snapshots = slowServer.snapshots(rfc822MessageId: "\($0)@example.com")
+                guard snapshots.count == 1 else { return nil }
+                return snapshots[0].folderId == destination
+            }
+        ) { owed in
             do {
-                let outcome = try await withTimeout(seconds: deadline) {
+                let outcome = try await withTimeout(seconds: Self.memberAttemptWatchdogSeconds) {
                     try await slowProvider.moveProvingDestinations(
                         ids: owed, from: source, to: destination)
                 }
-                return outcome.provenIds.count == owed.count
-                    ? .settledEverything
-                    : .settled(outcome.provenIds)
+                return .settled(outcome.provenIds)
             } catch {
-                return .discardedByTheDeadline(error)
+                return .failed(error)
             }
         }
         #expect(settled == slowIds,
