@@ -587,23 +587,39 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Actions
 
-    func markRead(ids: [String], folder: String) async throws {
+    /// THE PER-MEMBER BOUNDARY for every Graph setter. Graph's `PATCH /messages/{id}`
+    /// addresses ONE message per request, so this loop is where a not-found answer
+    /// can be attributed to a member; see the identical reasoning on
+    /// `GmailProvider.modifyEachMessage`, including why only a structural,
+    /// member-addressed not-found is absorbed and why re-running the surviving
+    /// members on a retry is accepted.
+    private func patchEachMessage(ids: [String], body: [String: Any]) async throws {
+        var absent: [String] = []
         for id in ids {
-            try await patchMessage(id: id, body: ["isRead": true])
+            do {
+                try await patchMessage(id: id, body: body)
+            } catch {
+                guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
+                absent.append(id)
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Exchange] patchMessage \(id): the server reports THIS message gone — the member is dispositioned and the remaining members are still processed")
+                }
+            }
         }
+        if !absent.isEmpty { throw ProviderMembersAbsent(absentMemberIds: absent) }
+    }
+
+    func markRead(ids: [String], folder: String) async throws {
+        try await patchEachMessage(ids: ids, body: ["isRead": true])
     }
 
     func markUnread(ids: [String], folder: String) async throws {
-        for id in ids {
-            try await patchMessage(id: id, body: ["isRead": false])
-        }
+        try await patchEachMessage(ids: ids, body: ["isRead": false])
     }
 
     func markFlagged(ids: [String], flagged: Bool, folder: String) async throws {
         let flagBody: [String: Any] = ["flag": ["flagStatus": flagged ? "flagged" : "notFlagged"]]
-        for id in ids {
-            try await patchMessage(id: id, body: flagBody)
-        }
+        try await patchEachMessage(ids: ids, body: flagBody)
     }
 
     /// `EmailProvider` conformance. The protocol returns `Void`, so it has no
@@ -670,6 +686,7 @@ actor ExchangeProvider: EmailProvider {
         }
         var provenIds: [String] = []
         var provenDestinations: [ProvenDestinationAddress] = []
+        var confirmedGone: [String] = []
         do {
             for id in ids {
                 // Legacy-label decay (ADR-IOS-036): on inbox-exit, strip residual
@@ -683,7 +700,38 @@ actor ExchangeProvider: EmailProvider {
                         if DebugModeManager.isLoggingEnabled() { print("[Exchange] Legacy tm_* strip failed for \(id) (continuing): \(error)") }
                     }
                 }
-                let movedId = try await moveMessage(id: id, destinationId: destination)
+                // 🚨 THE PER-MEMBER BOUNDARY, and it is what lets a batch whose
+                // FIRST member is gone still move the rest. Before it, an absent
+                // member threw with `provenIds` empty, the whole attempt was
+                // rethrown, and the drain split the row into one operation per
+                // member purely to find out which one it was. Graph addressed
+                // THIS id and answered that it is gone, so the member is
+                // dispositioned — nothing left to move — and it is recorded
+                // separately so its local header can be retired too.
+                //
+                // ⚠ NO WIDER THAN THE CLASSIFICATION THIS TREE ALREADY RETIRED
+                // ON: `ProviderMemberAbsence` matches a structural 404 or
+                // `ProviderError.messageNotFound` on this exact addressed request
+                // and nothing else — the same set `isMessageNotFoundError` has
+                // always required before the drain could retire an op. A bare 410
+                // is NOT in it (see that enum's doc comment), so no status becomes
+                // retirable that was not already.
+                // `IOS-GRAPH-002` records that a Graph 404 can also mean "the id
+                // churned on a move we performed" — that world state is closed by
+                // ADR-IOS-081's retirement-time re-addressing, and this arm does
+                // not reopen it.
+                let movedId: String?
+                do {
+                    movedId = try await moveMessage(id: id, destinationId: destination)
+                } catch {
+                    guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
+                    provenIds.append(id)
+                    confirmedGone.append(id)
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[MoveTrace] ExchangeProvider.move — \(id) is gone on the server; the member is dispositioned and the remaining members are still moved")
+                    }
+                    continue
+                }
                 // ⚑ THE ASYMMETRY IS DELIBERATE, AND IT ANSWERS TWO DIFFERENT
                 // QUESTIONS. `provenIds` answers *"did the work happen?"*;
                 // `provenDestinations` answers *"where did it land?"*. A 2xx
@@ -733,9 +781,12 @@ actor ExchangeProvider: EmailProvider {
                 print("[MoveTrace] ExchangeProvider.move — \(provenIds.count)/\(ids.count) member(s) moved before \(error); returning the proven prefix so their re-learned addresses are not discarded")
             }
             return MoveOutcome(
-                provenIds: provenIds, provenDestinations: provenDestinations)
+                provenIds: provenIds, provenDestinations: provenDestinations,
+                confirmedGoneIds: confirmedGone)
         }
-        return MoveOutcome(provenIds: ids, provenDestinations: provenDestinations)
+        return MoveOutcome(
+            provenIds: ids, provenDestinations: provenDestinations,
+            confirmedGoneIds: confirmedGone)
     }
 
     /// Remove any residual `tm_*` categories from a message. PATCH replaces

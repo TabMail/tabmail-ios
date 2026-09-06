@@ -347,42 +347,6 @@ struct AccountManagerQueueIntegrationTests {
         #expect(remaining.isEmpty)
     }
 
-    @Test("drain pattern: batch split on messageNotFound creates individual ops")
-    func drainPatternBatchSplit() throws {
-        let db = try TestDatabase.make()
-
-        let batchOp = PendingOperation(
-            type: .move,
-            messageIds: ["msg-1", "msg-2", "msg-3"],
-            accountId: "acc1",
-            folderPath: "INBOX",
-            destinationPath: "Trash"
-        )
-        try db.write { try batchOp.insert($0) }
-
-        // Simulate batch split: delete original, create individual ops
-        try db.write { dbConn in
-            for msgId in batchOp.messageIds {
-                try PendingOperation(
-                    type: batchOp.type,
-                    messageIds: [msgId],
-                    accountId: batchOp.accountId,
-                    folderPath: batchOp.folderPath,
-                    destinationPath: batchOp.destinationPath
-                ).insert(dbConn)
-            }
-            _ = try PendingOperation.deleteOne(dbConn, key: batchOp.id)
-        }
-
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 3)
-        for op in ops {
-            #expect(op.messageIds.count == 1)
-            #expect(op.type == .move)
-            #expect(op.destinationPath == "Trash")
-        }
-    }
-
     @Test("drain pattern: atomic claim marks inFlight, skips already-inFlight ops")
     func drainPatternAtomicClaim() throws {
         let db = try TestDatabase.make()

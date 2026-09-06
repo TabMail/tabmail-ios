@@ -124,21 +124,22 @@ struct DrainQueueIntegrationTests {
                 // Message not found
                 if isMessageNotFoundError(error) {
                     if currentOp.messageIds.count > 1 {
-                        // Split batch into individual ops
+                        // UNRESOLVED. A batch error names no member, so nothing is
+                        // retired and the row keeps its own id — the mirror of
+                        // production's multi-member arm. This used to SPLIT the op
+                        // into one child per member and delete the parent; the
+                        // scheduler no longer re-shapes an intention to find out
+                        // which member is gone, because only the provider that
+                        // addressed the member can attribute the answer. The
+                        // guard is `> 1` rather than `== 1` below it for the
+                        // reason the guard exists at all: the single-message arm
+                        // DELETES, and it may only ever see one member.
                         try await db.write { db in
-                            for msgId in currentOp.messageIds {
-                                try PendingOperation(
-                                    type: currentOp.type,
-                                    messageIds: [msgId],
-                                    accountId: currentOp.accountId,
-                                    folderPath: currentOp.folderPath,
-                                    destinationPath: currentOp.destinationPath,
-                                    tagValue: currentOp.tagValue
-                                ).insert(db)
-                            }
-                            _ = try PendingOperation.deleteOne(db, key: currentOp.id)
+                            var updated = currentOp
+                            updated.status = PendingStatus.queued.rawValue
+                            updated.retryCount += 1
+                            try updated.save(db)
                         }
-                        executedCount += 1
                         continue
                     }
                     // Single message: drop (server wins)
@@ -333,10 +334,15 @@ struct DrainQueueIntegrationTests {
         #expect(!failedAccounts.contains("acc1"))
     }
 
-    // MARK: - 7. MessageNotFound batch splitting
+    // MARK: - 7. MessageNotFound on a batch is UNRESOLVED
 
-    @Test("MessageNotFound on batch: splits into individual single-message ops")
-    func messageNotFoundBatchSplit() async throws {
+    /// The dispatch-contract mirror of the real-drain pin in
+    /// `QueueMemberAbsenceTests`. It exists here for the same reason every other
+    /// test in this file does — to keep `simulateDrainPass` a faithful copy of the
+    /// arm it models — and it is that suite, not this one, that proves the
+    /// production drain behaves this way.
+    @Test("MessageNotFound on a batch: the original row is retained, not split or dropped")
+    func messageNotFoundBatchIsUnresolved() async throws {
         await provider.setMoveThrows(ProviderError.messageNotFound)
 
         let op = PendingOperation(
@@ -352,26 +358,17 @@ struct DrainQueueIntegrationTests {
         var failedAccounts = Set<String>()
         try await simulateDrainPass(provider: provider, failedAccounts: &failedAccounts)
 
-        // Original batch op should be deleted
-        let originalOp = try fetchOp(originalId)
-        #expect(originalOp == nil)
-
-        // Should have 3 new individual ops
-        let newOps = try fetchAllOps()
-        #expect(newOps.count == 3)
-
-        let msgIds = newOps.map(\.messageIds)
-        #expect(msgIds.contains(["msg-1"]))
-        #expect(msgIds.contains(["msg-2"]))
-        #expect(msgIds.contains(["msg-3"]))
-
-        // All new ops should be queued
-        for newOp in newOps {
-            #expect(newOp.type == .move)
-            #expect(newOp.folderPath == "INBOX")
-            #expect(newOp.destinationPath == "Trash")
-            #expect(newOp.status == PendingStatus.queued.rawValue)
-        }
+        let after = try fetchAllOps()
+        #expect(after.count == 1, """
+            a batch not-found dispositions no member: it may neither retire the \
+            operation nor re-shape it into replacement rows. Got \(after.count).
+            """)
+        guard after.count == 1 else { return }
+        #expect(after[0].id == originalId, "the retained row must be the user's original")
+        #expect(after[0].messageIds == ["msg-1", "msg-2", "msg-3"])
+        #expect(after[0].status == PendingStatus.queued.rawValue)
+        #expect(!failedAccounts.contains("acc1"),
+                "a not-found says nothing about the connection, so the account keeps draining")
     }
 
     // MARK: - 8. Connection error retry

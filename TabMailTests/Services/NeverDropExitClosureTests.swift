@@ -123,40 +123,47 @@ struct NeverDropExitClosureTests {
         return provider
     }
 
-    // MARK: - A-2 — a batch split must not destroy the admission the parent held
+    // MARK: - A-2 — a conflict on one member must not revert the gesture for all of them
 
-    /// A-2. The split rebuilds each member as a fresh child and deletes the
-    /// parent IN THE SAME TRANSACTION, so any field not copied across is
-    /// destroyed. The children were being built without `observedUidValidity`,
-    /// which on IMAP made every one of them un-admittable — and, before A-3, a
-    /// deterministic DELETE on the very next drain. A conflict on ONE member of
-    /// a batch silently reverted the gesture for ALL of them.
+    /// A-2, RESTATED. The original hazard was the batch SPLIT: it rebuilt each
+    /// member as a fresh child and deleted the parent in the same transaction, so
+    /// any field not copied across was destroyed — the children were being built
+    /// without `observedUidValidity`, which on IMAP made every one of them
+    /// un-admittable and (before A-3) a deterministic DELETE on the next drain.
+    /// A conflict on ONE member silently reverted the gesture for ALL of them.
     ///
-    /// THE PROPERTY: the members that were NOT the conflict still get moved.
-    /// The test never inspects a stamp and never inspects the intermediate split
-    /// rows — `drainPendingQueue` keeps claiming until nothing is claimable, so
-    /// the children are born and executed inside the same call. What it observes
-    /// is the provider's own record of what it was asked to do.
+    /// The split is now DELETED, and with it the class of defect this test was
+    /// written to catch: the scheduler no longer re-shapes an operation at all,
+    /// so there is no child that can lose an admission. What remains is the
+    /// property the split was a (wrong) means to — **a batch-level conflict must
+    /// not cost the user the members it never said anything about** — and it is
+    /// now satisfied by RETENTION rather than by children. This test therefore
+    /// asserts that property directly, in both directions:
     ///
-    /// The conflict is armed on the FIRST member so the batch attempt records no
-    /// partial prefix; every entry in `movedIds` afterwards is therefore a split
-    /// child, which is what makes the assertion unambiguous. Member "1" itself
-    /// is correctly retired — `messageNotFound` is exit 2, the provider telling
-    /// us the work is moot.
+    /// - SAFETY: the batch error attributes nothing, so nothing is moved, nothing
+    ///   is retired, and the row keeps its own id and all three members.
+    /// - LIVENESS: once the conflict clears, the SAME operation moves all three
+    ///   members and terminates. Safety alone is satisfied forever by an op that
+    ///   starves, which is a dropped intention by the wedge corollary.
     ///
-    /// RED PROOF (recorded): dropping `observedUidValidity: currentOp.observedUidValidity`
-    /// from the `splitOp` initializer fails this at the `movedIds` assertion —
-    /// the set is empty, because checkpoint A cannot admit an unstamped child
-    /// (and, before A-3, deleted it outright). The conflict on ONE member
-    /// silently reverted the gesture for ALL of them.
-    @Test("A batch split leaves children the drain can still execute")
+    /// The conflict is armed on the FIRST member so the attempt records no
+    /// partial prefix — the batch reaches the drain as a bare not-found with
+    /// nothing succeeded and nothing attributable, which is the exact shape that
+    /// used to trigger the split.
+    ///
+    /// RED PROOF (recorded): against the pre-fix tree the split fires inside the
+    /// first `drainPendingQueue` call, the three children are executed in the same
+    /// call, and member "1" is dropped by the single-message terminal arm — the
+    /// first `stillOwed.count == 1` assertion fails with 0 rows and the "nothing
+    /// moved" assertion fails with `["2"], ["3"]`.
+    @Test("A batch-level conflict retains every member, and the same operation completes once it clears")
     @MainActor
-    func batchSplitChildrenRemainExecutable() async throws {
+    func batchConflictRetainsEveryMemberAndConverges() async throws {
         let f = try fixture(accountId: "closure-split")
         let provider = MockEmailProvider(staleWindowMode: .uid)
         await AccountManager.shared.registerProviderForTesting(accountId: f.accountId, provider: provider)
-        // A conflict on the FIRST member is what triggers the split, and leaves
-        // the batch attempt with an empty "already succeeded" prefix.
+        // A conflict on the FIRST member leaves the attempt with an empty
+        // "already succeeded" prefix: the drain learns only that the batch failed.
         await provider.setMoveThrowsOnId("1", error: ProviderError.messageNotFound)
 
         let parent = PendingOperation(
@@ -166,15 +173,33 @@ struct NeverDropExitClosureTests {
 
         await AccountManager.shared.drainPendingQueue()
 
-        let movedIds = await provider.movedIds
-        let movedMembers = Set(movedIds.flatMap(\.ids))
+        let duringConflict = await provider.movedIds
         #expect(
-            movedMembers == Set(["2", "3"]),
-            "the members that were not the conflict must still be moved — a child that lost its admission is a silently reverted gesture: \(movedIds)"
+            duringConflict.flatMap(\.ids).isEmpty,
+            "no member was individually dispositioned, so no member may be moved on its own: \(duringConflict)"
         )
-        // Each survivor moved as its own single-member op, which is what "split"
-        // means; a whole-batch retry would show ["1","2","3"] in one entry.
-        #expect(movedIds.allSatisfy { $0.ids.count == 1 })
+        let stillOwed = try operations(f.pool)
+        #expect(
+            stillOwed.count == 1,
+            "a batch error attributes nothing; the user's gesture must still be owed in full, not retired and not re-shaped"
+        )
+        guard stillOwed.count == 1 else {
+            await finish(f)
+            return
+        }
+        #expect(stillOwed[0].id == parent.id, "the retained row must be the user's original operation")
+        #expect(stillOwed[0].messageIds == ["1", "2", "3"])
+
+        // LIVENESS — the conflict clears (the message is back, the server settles)
+        // and the ONE operation that was queued all along completes.
+        await provider.clearMoveThrowsOnId()
+        await AccountManager.shared.drainPendingQueue()
+
+        let movedMembers = Set((await provider.movedIds).flatMap(\.ids))
+        #expect(
+            movedMembers == Set(["1", "2", "3"]),
+            "the retained operation must still be executable — an op that can never complete is a dropped intention by the wedge corollary"
+        )
         #expect(try operations(f.pool).isEmpty)
         await finish(f)
     }

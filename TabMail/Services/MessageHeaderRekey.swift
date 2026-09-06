@@ -74,15 +74,27 @@ struct MoveOutcome: Sendable {
     /// identifiers is unsafe; the queue must refresh the source as well as the
     /// destination after retiring this attempt.
     let requiresSourceReconciliation: Bool
+    /// The subset of `provenIds` that is dispositioned because the server said
+    /// THAT addressed message is gone, rather than because it moved.
+    ///
+    /// They are in `provenIds` — a member with nothing left to do is
+    /// dispositioned, exactly as an IMAP member that is no longer in the source
+    /// mailbox is — and they carry no `ProvenDestinationAddress`, because nothing
+    /// landed anywhere. The separate list exists only so the drain can delete
+    /// their confirmed-gone local headers; see
+    /// `ExecutedOperation.confirmedGoneMembers`.
+    let confirmedGoneIds: [String]
 
     init(
         provenIds: [String],
         provenDestinations: [ProvenDestinationAddress],
-        requiresSourceReconciliation: Bool = false
+        requiresSourceReconciliation: Bool = false,
+        confirmedGoneIds: [String] = []
     ) {
         self.provenIds = provenIds
         self.provenDestinations = provenDestinations
         self.requiresSourceReconciliation = requiresSourceReconciliation
+        self.confirmedGoneIds = confirmedGoneIds
     }
 }
 

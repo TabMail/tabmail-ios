@@ -254,10 +254,19 @@ struct StatefulGmailActionServerTests {
     /// On `v2final` a missing RFC resolved to zero candidates and the adapter
     /// returned silently. `v3` has no resolution step, so a gone/never-valid
     /// provider id reaches `POST /messages/{id}/modify` and Gmail's 404 surfaces
-    /// as a thrown `ProviderError` — classification of that throw belongs to the
-    /// durable queue, not the transport. What this pins is the safety property
-    /// that survives the keying change: a provider id that names nothing must
-    /// NOT fall back to the RFC map and land on a live sibling.
+    /// as a throw. What this pins is the safety property that survives the keying
+    /// change: a provider id that names nothing must NOT fall back to the RFC map
+    /// and land on a live sibling.
+    ///
+    /// ⚠️ THE THROWN TYPE CHANGED 2026-09-06 and the change is the point, not an
+    /// incidental. This used to expect a bare `ProviderError`, with a comment
+    /// saying classification of the throw belonged to the durable queue rather
+    /// than the transport. It belongs HERE now: `messages.modify` addresses ONE
+    /// message, so this is the only layer that can say WHICH member the 404 was
+    /// about, and it reports that as `ProviderMembersAbsent` naming exactly that
+    /// id. The queue used to answer an unattributed batch 404 by splitting the
+    /// operation into one row per member purely to rediscover what the wire
+    /// already knew. The safety property below is untouched by that move.
     @Test("a stale Gmail provider id never falls back to its RFC sibling")
     func staleProviderIdNeverFallsBackToItsRfcSibling() async throws {
         let sharedRFC = "gmail-stale@example.com"
@@ -273,9 +282,17 @@ struct StatefulGmailActionServerTests {
 
         server.failNextLookup()
 
-        await #expect(throws: ProviderError.self) {
+        // Attributed, not merely refused: the transport names the member it was
+        // told about, which is what removes the queue's need to split.
+        var reportedAbsent: [String]?
+        do {
             try await provider.markRead(ids: [gone], folder: "INBOX")
+        } catch let absence as ProviderMembersAbsent {
+            reportedAbsent = absence.absentMemberIds
         }
+        #expect(
+            reportedAbsent == [gone],
+            "the 404 must be attributed to the id it was addressed to. Got \(String(describing: reportedAbsent))")
 
         #expect(server.snapshot(providerMessageId: gone) == nil)
 

@@ -490,12 +490,19 @@ actor AccountManager {
         /// `executeSingleOp`'s whole-op success path.
         case full(op: PendingOperation, executed: ExecutedOperation)
         /// `retirePartiallyCompletedOp`'s narrowing path.
+        ///
+        /// `confirmedGoneMembers` is the subset of `provenMembers` the provider
+        /// reported ABSENT rather than mutated. It is carried here for the same
+        /// reason `executed` is carried by `.full`: the replay runs the same
+        /// local work the original site would have, and that work includes
+        /// retiring those members' local headers.
         case partial(
             op: PendingOperation,
             provenMembers: [String],
             remaining: [String],
             provenDestinations: [ProvenDestinationAddress],
-            addressChangesOnMove: Bool)
+            addressChangesOnMove: Bool,
+            confirmedGoneMembers: [String])
     }
 
     /// `PendingOperation.id` -> the retirement whose local write has not

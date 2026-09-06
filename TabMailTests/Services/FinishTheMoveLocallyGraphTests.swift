@@ -314,20 +314,35 @@ struct FinishTheMoveLocallyGraphTests {
     /// which member fails, and the gesture path does not promise one: pinning it
     /// here keeps the test deterministic instead of depending on the order rows
     /// happen to come back from GRDB.
+    ///
+    /// ⚠️ THE SECOND MEMBER'S FAILURE IS A 503, NOT A 404, AND THE CHOICE IS
+    /// LOAD-BEARING (changed 2026-09-06). A `404` is not a partial batch at all
+    /// any more: it is the server AUTHORITATIVELY reporting that member gone, and
+    /// `moveProvingDestinations` now dispositions it in place — the member is
+    /// counted proven AND reported as confirmed-gone, so the operation retires in
+    /// full instead of narrowing to a member that can never move. Failing this
+    /// test's second member with a 404 would therefore measure that disposition
+    /// rather than the partial-prefix property named above, and `failMoveOnce`'s
+    /// own doc comment records the same distinction for the same reason. The
+    /// gone-member behaviour has its own test immediately below.
     @Test("A batch that fails partway returns the addresses Graph already gave it")
     @MainActor
     func aPartiallyFailedBatchReturnsTheProvenAddresses() async throws {
         let movedRfc = "graph-batch-moved@example.com"
+        let refusedRfc = "graph-batch-refused@example.com"
         let server = StatefulExchangeActionServer(messages: [
             .init(rfc822MessageId: movedRfc, providerMessageId: "graph-a", folderId: Self.source),
+            .init(rfc822MessageId: refusedRfc, providerMessageId: "graph-b", folderId: Self.source),
         ])
         defer { server.close() }
         let provider = server.provider()
 
-        // `graph-missing` has no resource on the server at all, so its move is a
-        // deterministic 404 — the second member fails after the first landed.
+        // `graph-b` EXISTS and is refused once, transiently — the second member
+        // fails after the first landed, with nothing said about whether it is
+        // still there.
+        server.failMoveOnce(providerMessageId: "graph-b")
         let outcome = try await provider.moveProvingDestinations(
-            ids: ["graph-a", "graph-missing"],
+            ids: ["graph-a", "graph-b"],
             from: Self.source, to: Self.firstDestination)
 
         // NON-VACUITY: the batch really did fail partway.
@@ -335,8 +350,8 @@ struct FinishTheMoveLocallyGraphTests {
             serverFolders(server, rfc: movedRfc) == [Self.firstDestination],
             "the first member never moved, so there is no proven address to preserve")
         #expect(
-            server.snapshot(providerMessageId: "graph-missing") == nil,
-            "the second member exists after all, so this is not a partial batch")
+            serverFolders(server, rfc: refusedRfc) == [Self.source],
+            "the second member moved after all, so this is not a partial batch")
 
         // THE PROPERTY: the member that moved is dispositioned and its
         // re-learned address survives the sibling's failure.
@@ -357,5 +372,71 @@ struct FinishTheMoveLocallyGraphTests {
         // `nil`, which `roleMoveRejectDispositions` treats as its only TERMINAL
         // arm — the mirror image of the bug this change closes.
         #expect(proven.destinationUidValidity == nil)
+
+        // The refused member is NOT dispositioned — a transient refusal proves
+        // nothing about it, so it stays owed.
+        #expect(
+            !outcome.provenIds.contains("graph-b"),
+            "a 503 says nothing about the member; counting it proven would retire work the server never did")
+        #expect(
+            outcome.confirmedGoneIds.isEmpty,
+            "nothing here was confirmed gone: an unavailable member is an absence of evidence, not a disposition")
+    }
+
+    // MARK: - The batch with a member the server says is gone
+
+    /// **THE PROPERTY: a member Graph answers `404` for is dispositioned in
+    /// place, its siblings still move, and the operation has nothing left to
+    /// narrow to.**
+    ///
+    /// This is the provider half of deleting the drain's batch split. The split
+    /// existed because a batch failure names no member; a per-member `/move`
+    /// DOES name one, so the attribution belongs here. Before this, an absent
+    /// member ended the loop and `moveProvingDestinations` returned or threw with
+    /// that member unproven — the drain then either split the row or narrowed it
+    /// onto an address that can never resolve, which starves every later
+    /// operation on that message (the wedge corollary).
+    ///
+    /// The gone member is deliberately FIRST, so the proven prefix is empty and
+    /// the pre-change path had nothing at all to report — the shape that made the
+    /// old code rethrow.
+    ///
+    /// RED PROOF (recorded): against the pre-fix tree `moveProvingDestinations`
+    /// throws instead of returning, so this test fails at the `try await` with
+    /// the 404's `ProviderError`; the surviving member is never moved.
+    @Test("A gone member is dispositioned in place and its siblings still move")
+    @MainActor
+    func aGoneMemberIsDispositionedAndTheSiblingsStillMove() async throws {
+        let movedRfc = "graph-gone-sibling@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: movedRfc, providerMessageId: "graph-live", folderId: Self.source),
+        ])
+        defer { server.close() }
+        let provider = server.provider()
+
+        // `graph-gone` has no resource on the server at all: a deterministic 404,
+        // Graph's authoritative "this message no longer exists".
+        let outcome = try await provider.moveProvingDestinations(
+            ids: ["graph-gone", "graph-live"],
+            from: Self.source, to: Self.firstDestination)
+
+        #expect(
+            serverFolders(server, rfc: movedRfc) == [Self.firstDestination],
+            "the surviving member was stranded by its absent sibling")
+        #expect(
+            outcome.confirmedGoneIds == ["graph-gone"],
+            "the member the server reported gone must be named, or the drain cannot retire its ghost header")
+        #expect(
+            outcome.provenIds.contains("graph-gone"),
+            """
+            a confirmed-gone member must count as dispositioned. Leaving it \
+            unproven narrows the operation onto an address that can never \
+            resolve, and an operation that can never complete is a dropped \
+            intention by the wedge corollary.
+            """)
+        #expect(outcome.provenIds.contains("graph-live"))
+        // It carries no destination address, because it never moved — only the
+        // member that actually landed has one to re-key onto.
+        #expect(outcome.provenDestinations.map(\.sourceProviderId) == ["graph-live"])
     }
 }
