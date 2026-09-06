@@ -299,32 +299,40 @@ struct FinishTheMoveLocallyGraphTests {
 
     // MARK: - The batch that failed partway
 
-    /// **THE PROPERTY: an address the server already gave us for one member is
-    /// not thrown away because a LATER member of the same batch failed.**
+    /// **THE PROPERTY: the address the server gave us for the member an attempt
+    /// SETTLES is returned, and the member behind it is left untouched — neither
+    /// moved nor dispositioned.**
     ///
-    /// Each Graph move is its own request, so a two-member batch can land one and
-    /// fail the next. Throwing the whole attempt away would discard the
-    /// destination address the wire had already supplied for the first member —
-    /// re-creating, one mid-batch failure later, exactly the state this change
-    /// exists to prevent. The proven prefix is returned instead, which is the
-    /// input `AccountManager.retirePartiallyCompletedOp` re-keys from
-    /// (covered end-to-end by `QueueCoreInvariantTests`).
+    /// Each Graph move is its own request and an attempt issues exactly ONE of
+    /// them, for `ids.first`: a loop that commits to a second request cannot
+    /// protect what it has already settled from `withTimeout`'s cancellation by
+    /// any elapsed-time margin (`MIS-IOS-022`, twice). So a two-member request
+    /// moves the first member, re-learns the address Graph assigned it, and
+    /// returns that one-member outcome; the second member is never addressed on
+    /// this attempt and stays owed under the same durable row, which
+    /// `AccountManager.retirePartiallyCompletedOp` narrows to it (covered
+    /// end-to-end by `QueueCoreInvariantTests`). Throwing the attempt away
+    /// instead would discard the destination address the wire had already
+    /// supplied for the settled member — re-creating, one incomplete request
+    /// later, exactly the state this change exists to prevent.
     ///
     /// Driven at the provider boundary because the member ORDER is what decides
-    /// which member fails, and the gesture path does not promise one: pinning it
-    /// here keeps the test deterministic instead of depending on the order rows
-    /// happen to come back from GRDB.
+    /// which member an attempt addresses, and the gesture path does not promise
+    /// one: pinning it here keeps the test deterministic instead of depending on
+    /// the order rows happen to come back from GRDB.
     ///
-    /// ⚠️ THE SECOND MEMBER'S FAILURE IS A 503, NOT A 404, AND THE CHOICE IS
-    /// LOAD-BEARING (changed 2026-09-06). A `404` is not a partial batch at all
-    /// any more: it is the server AUTHORITATIVELY reporting that member gone, and
-    /// `moveProvingDestinations` now dispositions it in place — the member is
-    /// counted proven AND reported as confirmed-gone, so the operation retires in
-    /// full instead of narrowing to a member that can never move. Failing this
-    /// test's second member with a 404 would therefore measure that disposition
-    /// rather than the partial-prefix property named above, and `failMoveOnce`'s
-    /// own doc comment records the same distinction for the same reason. The
-    /// gone-member behaviour has its own test immediately below.
+    /// ⚠️ THE FAULT ARMED ON THE SECOND MEMBER IS NEVER SERVED — this comment
+    /// used to describe that member being refused mid-batch, which stopped being
+    /// what the fixture does when the loop became one member per attempt (prose
+    /// corrected 2026-09-06; no assertion changed, because every one of them was
+    /// already true of the new shape). `failMoveOnce(providerMessageId:
+    /// "graph-b")` arms a transient 503 for a request this attempt never issues.
+    /// It is kept deliberately, as the fixture's statement that the second member
+    /// EXISTS and is merely unreached: a `404` there would make it a member the
+    /// server AUTHORITATIVELY reports gone, which `moveProvingDestinations`
+    /// dispositions in place — counted proven AND reported confirmed-gone — and
+    /// that behaviour has its own test immediately below. `failMoveOnce`'s own
+    /// doc comment records the same distinction for the same reason.
     @Test("A batch that fails partway returns the addresses Graph already gave it")
     @MainActor
     func aPartiallyFailedBatchReturnsTheProvenAddresses() async throws {
@@ -337,21 +345,24 @@ struct FinishTheMoveLocallyGraphTests {
         defer { server.close() }
         let provider = server.provider()
 
-        // `graph-b` EXISTS and is refused once, transiently — the second member
-        // fails after the first landed, with nothing said about whether it is
-        // still there.
+        // `graph-b` EXISTS, and the armed refusal is what a request for it would
+        // meet. This attempt addresses only `graph-a`, so the fault stays
+        // unserved and the second member is simply never reached — nothing is
+        // said about whether it is still there, because nothing asked.
         server.failMoveOnce(providerMessageId: "graph-b")
         let outcome = try await provider.moveProvingDestinations(
             ids: ["graph-a", "graph-b"],
             from: Self.source, to: Self.firstDestination)
 
-        // NON-VACUITY: the batch really did fail partway.
+        // NON-VACUITY: the attempt really did settle exactly one of the two —
+        // the first member is at the destination on the wire, and the second is
+        // still in the source folder rather than having travelled with it.
         #expect(
             serverFolders(server, rfc: movedRfc) == [Self.firstDestination],
             "the first member never moved, so there is no proven address to preserve")
         #expect(
             serverFolders(server, rfc: refusedRfc) == [Self.source],
-            "the second member moved after all, so this is not a partial batch")
+            "the second member moved too, so this attempt settled more than one member")
 
         // THE PROPERTY: the member that moved is dispositioned and its
         // re-learned address survives the sibling's failure.
@@ -373,14 +384,14 @@ struct FinishTheMoveLocallyGraphTests {
         // arm — the mirror image of the bug this change closes.
         #expect(proven.destinationUidValidity == nil)
 
-        // The refused member is NOT dispositioned — a transient refusal proves
-        // nothing about it, so it stays owed.
+        // The unreached member is NOT dispositioned — an attempt that never
+        // addressed it has learned nothing about it, so it stays owed.
         #expect(
             !outcome.provenIds.contains("graph-b"),
-            "a 503 says nothing about the member; counting it proven would retire work the server never did")
+            "a member this attempt never addressed cannot be proven; counting it would retire work the server never did")
         #expect(
             outcome.confirmedGoneIds.isEmpty,
-            "nothing here was confirmed gone: an unavailable member is an absence of evidence, not a disposition")
+            "nothing here was confirmed gone: a member nothing addressed is an absence of evidence, not a disposition")
     }
 
     // MARK: - The batch with a member the server says is gone

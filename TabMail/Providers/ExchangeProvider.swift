@@ -634,8 +634,52 @@ actor ExchangeProvider: EmailProvider {
     /// `IOS-GRAPH-002` was about (a `_ =` on the only path that had them).
     /// The action queue calls `moveProvingDestinations` instead; nothing in
     /// production reaches this overload for a `.move` operation.
+    ///
+    /// 🚨 SILENCE HERE WOULD MEAN "ALL N MOVED", AND ITS DELEGATE SETTLES ONE.
+    /// `moveProvingDestinations` addresses `ids.first` and returns a ONE-member
+    /// outcome (`MIS-IOS-022` — an attempt may commit to exactly one request, so
+    /// nothing a cancellation can destroy is ever larger than one member). A
+    /// bare `_ =` on that outcome would hand the `Void` contract's "every member
+    /// moved" back to a caller for a batch of which one member moved, retiring
+    /// N − 1 user intentions on an absence of evidence. That is unreachable
+    /// today — `dispatchOperation`'s `.move` arm calls `moveProvingDestinations`
+    /// from inside its `provider as? ExchangeProvider` branch and returns there —
+    /// but unreachability is a property of the CALLER, not of this contract, and
+    /// this is the shape `MIS-IOS-023`'s second instance names. Reporting it
+    /// makes the trap impossible instead of merely unsprung.
+    ///
+    /// The report is `GmailProvider.modifyEachMessage`'s, member for member:
+    /// throw whenever the outcome is not "this whole request, all mutated", so a
+    /// settled-but-absent single member is reported too rather than passing as
+    /// silence. `AccountManager.executeOperation` converts it at its single
+    /// chokepoint into `provenMembers` + `confirmedGoneMembers`, so the members
+    /// behind the settled one stay owed under the same durable row.
+    ///
+    /// ⚠️ `confirmedGoneIds` IS THE LOAD-BEARING HALF OF THE CONDITION, and a
+    /// `provenIds`-only comparison structurally cannot see the case it exists
+    /// for. The two lists OVERLAP by design on the gone branch, which returns
+    /// `MoveOutcome(provenIds: [id], provenDestinations: [], confirmedGoneIds:
+    /// [id])`: `provenIds` answers *"is this member settled — is there anything
+    /// left to do?"* and `confirmedGoneIds` answers *"is it still there?"*. So
+    /// for a SINGLE-member request whose member Graph reported gone,
+    /// `provenIds == ids` holds and `provenIds != ids` alone is false — the
+    /// conformance would return silently and the `Void` contract would read the
+    /// server's authoritative "gone" as "moved". Do not simplify this back to
+    /// one comparison.
+    ///
+    /// ⚠️ NO DESTINATION EVIDENCE SURVIVES THIS PATH, by construction: the
+    /// chokepoint's conversion sets `provenDestinations` empty, which is exactly
+    /// why the queue calls `moveProvingDestinations` directly. Nothing is
+    /// re-keyed to an address no server named, and the local row keeps the
+    /// address it had until a sync corrects it.
     func move(ids: [String], from source: String, to destination: String) async throws {
-        _ = try await moveProvingDestinations(ids: ids, from: source, to: destination)
+        let outcome = try await moveProvingDestinations(
+            ids: ids, from: source, to: destination)
+        if !outcome.confirmedGoneIds.isEmpty || outcome.provenIds != ids {
+            throw ProviderMembersDispositioned(
+                dispositionedMemberIds: outcome.provenIds,
+                absentMemberIds: outcome.confirmedGoneIds)
+        }
     }
 
     /// Move each member and RE-LEARN the address the move gave it.

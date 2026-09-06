@@ -44,16 +44,33 @@ decision — the call simply stopped existing.
   `narrowedRetirementMaterializesTheDeferredInverseItsPredecessorOwes`, red-first: with the restored
   call commented out it fails `inverse.count -> 0`, `deferredStillWaiting=1 ops=[move["202"]]`.
 
-**A second candidate instance of the identical shape, same PR, found 2026-09-06 and NOT counted in
-`Recurrences` because it has not been adjudicated.** The same change narrowed
+**A second instance of the identical shape, same PR — ADJUDICATED AND FIXED 2026-09-06, and still
+NOT counted in `Recurrences`.** The same change narrowed
 `ExchangeProvider.moveProvingDestinations` from `for id in ids` / `MoveOutcome(provenIds: ids)` to
 addressing `ids.first` and returning a one-member outcome without throwing. Its caller inside the
-same file — the `EmailProvider` conformance `move(ids:from:to:)`, whose whole body is
-`_ = try await moveProvingDestinations(...)` — is **byte-identical to base** and now discards a
-partial result while returning `Void`, which its protocol contract means "all N moved". Unreachable
-today only because `dispatchOperation`'s `.move` arm casts `provider as? ExchangeProvider` and
-returns from inside that branch. Held pending a design consult; recorded here so the class is
-visible even if the ruling is "leave it".
+same file — the `EmailProvider` conformance `move(ids:from:to:)`, whose whole body was
+`_ = try await moveProvingDestinations(...)` — was **byte-identical to base** and therefore discarded
+a partial result while returning `Void`, which its protocol contract means "all N moved". Three
+reviewers independently confirmed it was unreachable, because `dispatchOperation`'s `.move` arm casts
+`provider as? ExchangeProvider` and returns from inside that branch.
+
+The ruling was to make it IMPOSSIBLE rather than leave it merely unreached, because unreachability is
+a property of the CALLER and this is a contract. The conformance now mirrors
+`GmailProvider.modifyEachMessage` member for member: it throws
+`ProviderMembersDispositioned(dispositionedMemberIds: outcome.provenIds, absentMemberIds:
+outcome.confirmedGoneIds)` unless the outcome is "this whole request, all mutated", and
+`AccountManager.executeOperation` converts that at its single chokepoint. ⚠️ The condition is
+`!outcome.confirmedGoneIds.isEmpty || outcome.provenIds != ids` and **both disjuncts are load-bearing**:
+`moveProvingDestinations`' gone branch returns `MoveOutcome(provenIds: [id], provenDestinations: [],
+confirmedGoneIds: [id])` — the two lists OVERLAP by design, because `provenIds` answers *"is this
+member settled?"* and `confirmedGoneIds` answers *"is it still there?"* — so for a single-member
+request `provenIds == ids` holds and a `provenIds`-only comparison returns silence for the exact case
+the fix exists to close, letting the `Void` contract read the server's authoritative "gone" as
+"moved". Do not simplify it back to one comparison.
+
+`Recurrences` stays **1**: this instance is the same shape found by the same census in the same
+unmerged branch, closed by hardening the contract rather than by a second, later commission of the
+error. Counting it would double-charge one occurrence of the tell.
 
 ## Why it is not obvious
 

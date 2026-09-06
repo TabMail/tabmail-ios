@@ -1403,6 +1403,15 @@ extension AccountManager {
                         after: frozenRetiredOp, result: result)
                     if [.archive, .delete, .move].contains(op.type), let dest = op.destinationPath {
                         context.foldersToSync.insert("\(op.accountId)|\(dest)")
+                        // The live narrowing path records the members that
+                        // entered an inbox, so its own replay owes the same
+                        // event on the same frozen membership. A live path that
+                        // disagrees with its own replay is the defect, not the
+                        // extra call (`MIS-IOS-023`).
+                        if op.type == .move, dest != op.folderPath {
+                            await recordMembersThatEnteredInbox(
+                                frozenRetiredOp, destinationPath: dest, context: context)
+                        }
                     }
                     context.executedAny = true
                 }
@@ -2204,14 +2213,22 @@ extension AccountManager {
                 // MAILBOX, not a missing message, and a rendered IMAP failure that
                 // merely quotes those words has dispositioned no member at all.
                 //
-                // It also protects the positional draft payloads. A `.deleteDraft`
-                // op's `messageIds` are an ADDRESS and an IDENTITY of ONE draft, not
-                // two mail members; the split arm treated them as members and the
-                // identity-only child it produced resolved by Message-ID `SEARCH`,
-                // which is a wrong-message delete built out of a refusal (see the
-                // `actionIdentityResolutionFailed` arm's ⚑ NEVER SPLIT THIS ONE
-                // note, which described this exact hazard while the arm that could
-                // still reach it sat above). Deleting the arm removes that reach.
+                // ⚠️ IT IS NOT WHAT PROTECTS THE POSITIONAL DRAFT PAYLOADS —
+                // this paragraph used to claim it was. The hazard was real: a
+                // `.deleteDraft` op's `messageIds` are an ADDRESS and an IDENTITY
+                // of ONE draft, not two mail members; the split arm treated them
+                // as members, and the identity-only child it produced resolved by
+                // Message-ID `SEARCH`, which is a wrong-message delete built out
+                // of a refusal (see the `actionIdentityResolutionFailed` arm's ⚑
+                // NEVER SPLIT THIS ONE note, which described this exact hazard
+                // while the arm that could still reach it sat above). What removes
+                // that reach is DELETING the split arm, not the `count > 1` test
+                // below, which `.deleteDraft` cannot reach in the first place: its
+                // only producer — the draft-delete gesture in
+                // `AccountManagerActions` — inserts `messageIds: [encodedId]`, one
+                // element, so a `.deleteDraft` row is always single-member. The
+                // test below is about mail members; the draft payload is safe
+                // because nothing splits it any more.
                 //
                 // The disposition is the retryable one, and it is deliberately NOT
                 // the generic transient arm at the bottom of this `catch`: a
@@ -2726,7 +2743,7 @@ extension AccountManager {
     /// remainder carried on the same row to the next drain (launch, foreground,
     /// network restore, or a sync poll). Each pass narrows `messageIds` durably
     /// and charges no retry, so progress is strict and monotonic; this is slow
-    /// convergence, never starvation (`MIS-IOS-022`, `IOS-ACTION-003`).
+    /// convergence, never starvation (`MIS-IOS-022`).
     ///
     /// `internal` (not `private`) so tests can drive it directly, the same
     /// reason `executeSingleOp` and `DrainContext` are — but that is now a
@@ -2785,9 +2802,22 @@ extension AccountManager {
             // of them was gone, so there was no header to clean up and this site
             // correctly had none. It can now retire a member the server reported
             // ABSENT alongside a sibling that moved and another that failed
-            // transiently, which is a shape that did not previously exist. The
-            // filter is not defensive decoration: only a member that actually
-            // left the row here may lose its header.
+            // transiently, which is a shape that did not previously exist.
+            //
+            // ⚠️ THE FILTER IS A NO-OP AGAINST TODAY'S PRODUCERS, and saying so
+            // is more useful than the "not defensive decoration" claim that used
+            // to stand here. All three producers already guarantee the subset
+            // relation: `executeOperation`'s chokepoint forwards
+            // `ProviderMembersDispositioned.absentMemberIds`, which
+            // `GmailProvider.modifyEachMessage` and
+            // `ExchangeProvider.patchEachMessage` build from the SAME single
+            // member they name as dispositioned; `ExchangeProvider
+            // .moveProvingDestinations` reports `confirmedGoneIds` only for the
+            // id it also proved; and `IMAPProvider.move` never populates the
+            // field. It is kept for the producer that does not exist yet — only a
+            // member that actually left the row here may lose its header, and
+            // this is the one place that stays true when a fourth producer
+            // arrives.
             await retireConfirmedGoneMemberHeaders(
                 currentOp, memberIds: confirmedGoneMembers.filter(provenMembers.contains))
             // 🚨 DO NOT DELETE THIS BECAUSE NO PROVIDER REACHES IT TODAY.
@@ -2812,6 +2842,45 @@ extension AccountManager {
             // not the dead code. Reachability is covered by
             // `narrowedRetirementMaterializesTheDeferredInverseItsPredecessorOwes`.
             await materializeDeferredMoveSuccessors(after: frozenRetiredOp, result: finishResult)
+            // ADR-IOS-008 decision 3's third event — "message moved to inbox" —
+            // for the members THIS path proved. It is the same block the whole-op
+            // success arm and the `.full` replay already run, and it belongs here
+            // for the same reason `materializeDeferredMoveSuccessors` does: a
+            // member proven by NARROWING owes exactly what a member proven whole
+            // owes. Without it a multi-member move into the Inbox gives the event
+            // only to the LAST member — the one that happens to settle through the
+            // whole-op arm — and `ActiveAIQueue.repopulateFromDatabase` cannot
+            // substitute, because `repopulationCandidates` is bounded in SQL to
+            // the newest `SyncConfig.maxRecentEmails` Inbox rows, which is exactly
+            // the bound this window-EXEMPT enqueue exists to escape (ADR-IOS-078,
+            // `IOS-AI-007`).
+            //
+            // 🚨 `frozenRetiredOp`, NEVER `currentOp`. `optimisticMoveToFolder`
+            // already moved ALL N header rows to the destination locally, so the
+            // helper's `header.folderPath == destinationPath` guard passes for
+            // members the server has not moved yet. Naming the whole bundle here
+            // would enqueue AI for members still owed — the mirror image of the
+            // miss this closes.
+            //
+            // 🚨 IT RUNS ONLY AFTER THE COMMIT, and that is a property of
+            // CONTROL FLOW rather than of any guard inside the helper: the first
+            // statement of this `do` is the retirement write, so a commit that
+            // fails throws straight past this line into the `catch`. The helper
+            // also resolves through
+            // `MessageHeaderRekey.currentHeaderId(afterHandoffFrom:)`, whose
+            // aliases are published by `db.afterNextTransaction` and so exist
+            // only once that write commits. ⚠️ DO NOT MOVE THIS INTO THE TAIL
+            // BLOCK BELOW where the `foldersToSync` insert lives — that block
+            // runs on the retention path too, and recording there would publish
+            // an inbox-entry event for a retirement that never landed. The
+            // whole-op arm is shaped the same way (it returns from its catch
+            // before recording), and the retained result is what carries the
+            // event instead, through `replayRetainedRetirements`' `.partial` arm.
+            if currentOp.type == .move, let dest = currentOp.destinationPath,
+               dest != currentOp.folderPath {
+                await recordMembersThatEnteredInbox(
+                    frozenRetiredOp, destinationPath: dest, context: context)
+            }
         } catch {
             // 🚨 THE PROVEN PREFIX IS RETAINED, NOT HANDED BACK TO THE WIRE. This
             // used to requeue the ORIGINAL bundle, accepting a duplicate at the
