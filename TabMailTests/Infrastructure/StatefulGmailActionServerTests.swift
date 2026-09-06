@@ -263,7 +263,7 @@ struct StatefulGmailActionServerTests {
     /// saying classification of the throw belonged to the durable queue rather
     /// than the transport. It belongs HERE now: `messages.modify` addresses ONE
     /// message, so this is the only layer that can say WHICH member the 404 was
-    /// about, and it reports that as `ProviderMembersAbsent` naming exactly that
+    /// about, and it reports that as `ProviderMembersDispositioned` naming exactly that
     /// id. The queue used to answer an unattributed batch 404 by splitting the
     /// operation into one row per member purely to rediscover what the wire
     /// already knew. The safety property below is untouched by that move.
@@ -287,7 +287,7 @@ struct StatefulGmailActionServerTests {
         var reportedAbsent: [String]?
         do {
             try await provider.markRead(ids: [gone], folder: "INBOX")
-        } catch let absence as ProviderMembersAbsent {
+        } catch let absence as ProviderMembersDispositioned {
             reportedAbsent = absence.absentMemberIds
         }
         #expect(

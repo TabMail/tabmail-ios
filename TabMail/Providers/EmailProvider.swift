@@ -692,29 +692,88 @@ struct BackfillResult: Sendable {
 /// stays durably queued, retrying forever if the server never conforms.
 protocol ProviderEvidenceUnavailable: Error {}
 
-/// A provider's per-member action loop finished everything it could and the
-/// server AUTHORITATIVELY reported these members absent.
+/// A provider's per-member action loop is reporting exactly which members it
+/// finished, and saying NOTHING about the rest.
 ///
 /// 🚨 THIS IS A COMPLETION REPORT WEARING THE ONLY CHANNEL AVAILABLE TO IT. The
 /// `EmailProvider` action requirements return `Void`, so a loop that skipped an
-/// absent member had no way to say WHICH member it skipped — and that attribution
-/// is the entire reason the drain used to split a batch into replacement rows.
+/// absent member — or that ran out of budget before the last member — had no way
+/// to say WHICH members it settled. That attribution is the entire reason the
+/// drain used to split a batch into replacement rows.
 /// `AccountManager.executeOperation` catches this and converts it into an
-/// `ExecutedOperation` carrying `confirmedGoneMembers`; it never escapes to the
-/// scheduler and is never classified as a failure.
+/// `ExecutedOperation` carrying `provenMembers` and `confirmedGoneMembers`; it
+/// never escapes to the scheduler and is never classified as a failure.
 ///
-/// ⚠ "AUTHORITATIVELY" IS THE WHOLE CONTENT OF THE TYPE, and it means exactly one
-/// thing: the server answered the request addressed at THAT member with a
-/// structural not-found (`ProviderMemberAbsence.isAuthoritative`). A batch-level
-/// error, a rendered failure string that happens to contain `NONEXISTENT`, a
-/// timeout, or any error whose subject is the connection rather than the member is
-/// NOT this, must not be absorbed into it, and stays an ordinary throw so the
-/// whole operation retries. "We could not determine the answer" is never a
-/// disposition (`MIS-IOS-004`).
-struct ProviderMembersAbsent: Error {
-    /// The requested member ids the server said are gone, in request order.
-    /// Never empty — a loop with nothing to report simply returns.
+/// ⚠ "DISPOSITIONED" MEANS THERE IS NOTHING LEFT TO DO TO THAT MEMBER — it was
+/// mutated successfully, or the server AUTHORITATIVELY answered the request
+/// addressed at THAT member with a structural not-found
+/// (`ProviderMemberAbsence.isAuthoritative`). A batch-level error, a rendered
+/// failure string that happens to contain `NONEXISTENT`, a timeout, or any error
+/// whose subject is the connection rather than the member is NOT this, must not be
+/// absorbed into it, and stays an ordinary throw so the whole operation retries.
+/// "We could not determine the answer" is never a disposition (`MIS-IOS-004`).
+struct ProviderMembersDispositioned: Error {
+    /// Every member the loop settled, in request order. A PROPER PREFIX of the
+    /// request when the loop stopped on its budget; the whole request otherwise.
+    /// The members after it are untouched and stay owed.
+    let dispositionedMemberIds: [String]
+    /// The subset of `dispositionedMemberIds` the server said is gone. May be
+    /// empty — a loop that stopped early having mutated everything it reached has
+    /// a partial disposition to report and no absence.
     let absentMemberIds: [String]
+}
+
+/// THE DEADLINE A PER-MEMBER PROVIDER LOOP STOPS AT, so that its partial report
+/// reaches the drain instead of being thrown away with the operation's task.
+///
+/// 🚨 WHY A SECOND DEADLINE EXISTS AT ALL. `executeSingleOp` already bounds the
+/// whole operation with `withTimeout(SyncConfig.pendingOperationTimeoutSeconds)`,
+/// and that bound is correct and stays. But `withTimeout` resumes its caller with
+/// `TimeoutError` FIRST and cancels the operation task second, so a loop still
+/// running at the deadline reports nothing: the members it had already mutated or
+/// dispositioned are lost with the abandoned task, the row is requeued with its
+/// membership unchanged, and every retry repeats the same prefix into the same
+/// deadline. A batch big enough or slow enough never reaches its last member —
+/// persistent retry starvation, the wedge corollary. Stopping at a strictly
+/// earlier deadline is what makes each attempt make PROGRESS.
+///
+/// It is checked BETWEEN members and never interrupts one, so it is a stopping
+/// rule rather than a second cancellation mechanism, and it can never cut a member
+/// off mid-request into an unknown state.
+enum ProviderMemberLoopBudget {
+    #if DEBUG
+    /// Tests shrink the budget so a loop stops after a member or two without the
+    /// suite having to spend real seconds.
+    ///
+    /// 🚨 `@TaskLocal`, NOT a global — and that is a correctness requirement, not
+    /// a style choice. A process-wide budget of near-zero would make EVERY
+    /// per-member loop in the test process stop after its first member, including
+    /// the ones belonging to suites running concurrently in other tasks, which
+    /// would see a `ProviderMembersDispositioned` where they expect success.
+    /// `.processGlobalState` cannot help: it serializes only the suites that
+    /// declare it. A task-local is scoped to the setting test's own task tree,
+    /// and the drain reaches the provider through non-detached `Task { … }`s
+    /// (`drainPendingQueue`'s per-lane tasks, `withTimeout`'s operation task),
+    /// all of which inherit it. `#if DEBUG` so it is never compiled into a
+    /// shipping binary.
+    @TaskLocal static var overrideForTesting: Duration?
+    #endif
+
+    /// The instant a loop starting NOW must stop by.
+    ///
+    /// `ContinuousClock` deliberately: it does not move when the wall clock is
+    /// corrected or the user changes the time zone, and a budget that could be
+    /// retro-actively exceeded by a clock adjustment would stop a loop that had
+    /// spent no time at all.
+    static func deadlineFromNow() -> ContinuousClock.Instant {
+        #if DEBUG
+        if let override = overrideForTesting {
+            return ContinuousClock.now.advanced(by: override)
+        }
+        #endif
+        return ContinuousClock.now.advanced(
+            by: .seconds(SyncConfig.providerMemberLoopBudgetSeconds))
+    }
 }
 
 /// The predicate for "the server structurally confirmed THIS addressed message is

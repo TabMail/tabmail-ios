@@ -230,11 +230,32 @@ struct AccountManagerQueueDrainTests {
         op.createdAt = parentCreatedAt
         try insertOp(op, pool: pool)
 
-        let outcome = await AccountManager.shared.executeSingleOp(op, provider: provider, context: AccountManager.DrainContext())
+        let context = AccountManager.DrainContext()
+        let outcome = await AccountManager.shared.executeSingleOp(op, provider: provider, context: context)
 
         // .haltLane: the operation is still owed, so a later same-lane op must
         // not run ahead of it.
         #expect(outcome == .haltLane)
+
+        // 🚨 A NOT-FOUND SAYS NOTHING ABOUT THE CONNECTION, and this is the only
+        // place that fact is decidable. `failedAccounts` stops every OTHER lane on
+        // the account for the rest of the drain, so routing this refusal through
+        // the generic transient arm would isolate an account because one batch
+        // could not be attributed. A real-drain fixture cannot see it: the claim
+        // loop claims every lane up front, so independent work is already running
+        // when the flag would be set, and an op behind this one in the same lane
+        // is held by `.haltLane` regardless. Asserting it on the context this call
+        // owns is what makes it unmaskable.
+        #expect(context.failedAccounts.isEmpty, """
+            an unattributable batch not-found marked the whole account failed: \
+            \(context.failedAccounts). Every other lane on it then stops for the \
+            rest of the drain, on evidence that named no message and no connection.
+            """)
+        #expect(context.executedAny == false, """
+            nothing advanced, so nothing may claim it did — `executedAny` is what \
+            buys the drain another claim pass, and an unresolved refusal that \
+            granted one would let this same op be re-sent inside one drain.
+            """)
 
         let survivors = try await pool.read { db in
             try PendingOperation.filter(Column("accountId") == "acc1").fetchAll(db)
