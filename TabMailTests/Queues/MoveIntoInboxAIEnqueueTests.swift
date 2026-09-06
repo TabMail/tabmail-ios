@@ -190,6 +190,142 @@ struct MoveIntoInboxAIEnqueueTests {
         #expect(targets[0].accountId == accountId)
     }
 
+    // MARK: - 1b. Every member the drain PROVES, whichever path proves it
+
+    /// **THE INVARIANT: every member a retirement path proves gets the same
+    /// post-retirement treatment as a member proven by the whole-op path — so a
+    /// multi-member move into the Inbox produces an AI target for EVERY member,
+    /// not only the one that happens to settle last.**
+    ///
+    /// This is the ordinary shape of multi-member Gmail and Graph traffic, not a
+    /// contingency. `GmailProvider.modifyEachMessage`,
+    /// `ExchangeProvider.patchEachMessage` and
+    /// `ExchangeProvider.moveProvingDestinations` each address exactly ONE id per
+    /// attempt and report it (`MIS-IOS-022`: an attempt may commit to one request
+    /// and no elapsed-time margin can bound the next one), so the FIRST attempt of
+    /// every two-member move on those providers proves a strict subset and retires
+    /// through `AccountManager.retirePartiallyCompletedOp`. Only the final member
+    /// is ever proven by the whole-op arm.
+    ///
+    /// A path that commits a retirement without recording the inbox entry is not
+    /// recovered by anything downstream: `ActiveAIQueue.repopulateFromDatabase`
+    /// runs `repopulationCandidates`, bounded in SQL to the newest
+    /// `SyncConfig.maxRecentEmails` Inbox rows, and escaping exactly that bound is
+    /// why this producer is window-EXEMPT (ADR-IOS-078, `IOS-AI-007`). The member
+    /// silently gets no summary and no action tag — the user-must-click gap
+    /// ADR-IOS-008 decision 3 exists to close.
+    ///
+    /// **THE ORACLE IS EACH MEMBER'S OWN INDEXED BODY**, for the reason the suite
+    /// header gives: a target id that no longer addresses an FTS row yields a job
+    /// that is silently dropped, so "an entry was recorded" is not the property.
+    /// The two members carry DIFFERENT bodies, so an implementation that records
+    /// one member twice cannot satisfy it either.
+    ///
+    /// RED PROOF (recorded 2026-09-06): with the `recordMembersThatEnteredInbox`
+    /// call commented out of `retirePartiallyCompletedOp`, this fails
+    /// `(recorded.count → 1) == 2` with `enteredInbox recorded 1 of 2 proven
+    /// members (["301"])`, and then `(targets.count → 1) == 2` — only the member
+    /// the SECOND attempt settles through the whole-op arm is enqueued, and the
+    /// member the narrowing pass proved has no AI target at all.
+    ///
+    /// The two attempts are the drain's own pass loop: `executeSingleOp` returns
+    /// `.haltLane` after narrowing, `drainPendingQueue` takes another pass because
+    /// the pass set `executedAny`, and it re-claims the SAME durable row — which is
+    /// why both attempts share one `DrainContext`, exactly as they do in production.
+    @Test("Every member proven by a narrowing retirement is AI-enqueued, not just the last one")
+    func everyProvenMemberOfAMultiMemberMoveIntoInboxIsEnqueued() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "acc-enter-inbox-narrowed"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "Archive", role: .archive, pool: pool)
+
+        // Distinct bodies: the oracle below reads each target's indexed body, so
+        // one member resolved twice cannot pass for two members.
+        let narrowedBody = "the member the NARROWING pass proves"
+        let wholeOpBody = "the member the whole-op pass proves"
+        let narrowedId = try insertHeader(
+            accountId: accountId, folderPath: "Archive", uid: "300",
+            rfc822: "narrowed-member@example.com", isInInbox: false, pool: pool)
+        let wholeOpId = try insertHeader(
+            accountId: accountId, folderPath: "Archive", uid: "301",
+            rfc822: "whole-op-member@example.com", isInInbox: false, pool: pool)
+        try await seedIndexedBody(headerId: narrowedId, body: narrowedBody)
+        try await seedIndexedBody(headerId: wholeOpId, body: wholeOpBody)
+        defer {
+            Task {
+                try? await index.removeMessages(contentKeys: [
+                    ContentKey(rawValue: narrowedId), ContentKey(rawValue: wholeOpId)])
+            }
+        }
+
+        // The gesture moves BOTH members at once, so both rows sit at the
+        // destination locally while the queue still owes the server both moves.
+        for headerId in [narrowedId, wholeOpId] {
+            try applyOptimisticMove(
+                headerId: headerId, accountId: accountId, toFolderPath: "INBOX",
+                isInInbox: true, pool: pool)
+        }
+        let op = PendingOperation(
+            type: .move, messageIds: ["300", "301"], accountId: accountId,
+            folderPath: "Archive", destinationPath: "INBOX")
+        try await pool.write { db in try op.insert(db) }
+
+        // Attempt 1 settles ONE member and reports it — the shape every
+        // multi-member Gmail/Graph move takes on its first attempt.
+        let provider = MockEmailProvider()
+        await provider.setMoveThrowsOnId(
+            "301",
+            error: ProviderMembersDispositioned(
+                dispositionedMemberIds: ["300"], absentMemberIds: []))
+        let context = AccountManager.DrainContext()
+        let firstOutcome = await AccountManager.shared.executeSingleOp(
+            op, provider: provider, context: context)
+
+        // NON-VACUITY: the first attempt really did take the NARROWING path —
+        // the durable row survived, narrowed to the member still owed. If it
+        // retired whole, this test would be measuring the whole-op arm twice.
+        #expect(firstOutcome == .haltLane, "a narrowing retirement halts its lane")
+        let narrowed = try await pool.read { db in try PendingOperation.fetchOne(db, key: op.id) }
+        #expect(narrowed?.messageIds == ["301"],
+                "precondition: the row must narrow to the unproven member, not retire whole")
+        #expect(narrowed?.status == PendingStatus.queued.rawValue)
+
+        // Attempt 2 is the drain's next pass over the same row, now single-member,
+        // which the provider settles silently — the whole-op success arm.
+        await provider.clearMoveThrowsOnId()
+        guard let remainingOp = narrowed else { return }
+        let secondOutcome = await AccountManager.shared.executeSingleOp(
+            remainingOp, provider: provider, context: context)
+        #expect(secondOutcome == .proceed)
+
+        // THE PROPERTY: both proven members produced an AI target, and each one
+        // addresses its OWN indexed body.
+        let recorded = context.enteredInbox.withLock { $0["\(accountId)|INBOX"] ?? [] }
+        #expect(recorded.count == 2, """
+            enteredInbox recorded \(recorded.count) of 2 proven members \
+            (\(recorded.map(\.messageId).sorted())). A member proven by the narrowing \
+            retirement owes the same ADR-IOS-008 decision-3 event as one proven whole; \
+            the window-bounded repopulation sweep cannot recover it.
+            """)
+        let targets = try resolveTargets(context, accountId: accountId, folderPath: "INBOX", pool: pool)
+        #expect(targets.count == 2, "every recorded member must resolve to a live inbox row")
+        guard targets.count == 2 else { return }
+        var resolvedBodies: Set<String> = []
+        for target in targets {
+            if let body = try await index.bodyText(contentKey: ContentKey(rawValue: target.headerId)) {
+                resolvedBodies.insert(body)
+            }
+            #expect(target.accountId == accountId)
+        }
+        #expect(resolvedBodies == [narrowedBody, wholeOpBody], """
+            the AI targets must address BOTH moved messages' own indexed bodies — got \
+            \(resolvedBodies.sorted()). A job whose id addresses no FTS row is silently \
+            dropped, which the user cannot tell apart from never enqueueing at all.
+            """)
+    }
+
     // MARK: - 2. The negative direction — "always enqueue" must not pass
 
     @Test("A move to a non-inbox folder yields no AI target")
