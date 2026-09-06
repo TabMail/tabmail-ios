@@ -328,6 +328,63 @@ struct AppReleaseBoundaryTests {
         #expect(try stamp(f) == AppDatabase.currentAppRelease)
     }
 
+    // MARK: - 3b. A genuinely fresh database
+
+    /// **THE PROPERTY: a database that has never existed before takes the
+    /// boundary, records the release, and produces a working `AppDatabase` — the
+    /// delete is simply a no-op because there is nothing to retire.**
+    ///
+    /// This is the other half of "a missing stamp is a boundary", and it is the
+    /// one every FIRST LAUNCH of the app takes. The sibling above proves the
+    /// missing stamp retires rows when there ARE rows; nothing proved that the
+    /// same path is harmless when there are none, and the failure it guards
+    /// against is not subtle: a boundary that threw, or that left the stamp
+    /// unwritten, on an empty database would break first launch outright and then
+    /// re-run on every launch after it.
+    ///
+    /// 🚨 THE POOL IS OPENED HERE RATHER THAN THROUGH `fixture()`, because
+    /// `fixture()` has already run `AppDatabase.init` once and a database that
+    /// has been stamped is no longer fresh. Nothing is seeded before the launch —
+    /// that absence IS the fixture.
+    ///
+    /// RED PROOF (recorded): with the stamp write removed from the boundary
+    /// transaction, `stamp(f)` is nil after the first launch and the second
+    /// launch retires again — `secondLaunchRetired` is true where it must be
+    /// false, which is the observable form of "the boundary fires on every
+    /// launch".
+    @Test("A fresh database takes the boundary as a no-op, records its release, and does not take it again")
+    @MainActor
+    func aFreshDatabaseTakesTheBoundaryAndRecordsItsRelease() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration)
+        let f = Fixture(pool: pool, directory: directory)
+        defer { finish(f) }
+
+        // FIRST LAUNCH of a database that has never been opened.
+        _ = try AppDatabase(dbPool: f.pool)
+
+        #expect(try operationCount(f) == 0, "a fresh database has no queue to begin with")
+        #expect(try stamp(f) == AppDatabase.currentAppRelease, """
+            the boundary did not record the release on a fresh database, so every \
+            subsequent launch is an upgrade and destroys the queue
+            """)
+
+        // The boundary is not taken again. Observed through its RETURN VALUE, so
+        // this cannot be satisfied by an empty queue that was never touched.
+        let secondLaunchRetired = try AppDatabase.retirePreviousReleaseActionQueue(
+            on: f.pool, currentRelease: AppDatabase.currentAppRelease)
+        #expect(secondLaunchRetired == false, """
+            the boundary fired a second time on an unchanged release; on a \
+            database with work queued that is a per-launch clear
+            """)
+    }
+
     // MARK: - 4. Work admitted after the boundary survives the next launch
 
     /// **THE PROPERTY: the boundary precedes admission, and what is admitted
