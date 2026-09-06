@@ -527,16 +527,17 @@ actor GmailProvider: EmailProvider {
         return headers
     }
 
-    /// THE PER-MEMBER BOUNDARY for every Gmail label mutation.
+    /// THE PER-MEMBER BOUNDARY for every Gmail label mutation, and it settles
+    /// EXACTLY ONE MEMBER PER ATTEMPT.
     ///
-    /// Gmail's `messages.modify` addresses ONE message per request, so this loop
-    /// is the only place in the system that can attribute a not-found answer to a
-    /// specific member. It therefore owns the per-member interpretation: a member
-    /// the server AUTHORITATIVELY reports gone is dispositioned and recorded, the
-    /// loop continues, and the surviving members are still processed. Reported
-    /// afterwards as `ProviderMembersDispositioned`, which
-    /// `AccountManager.executeOperation` converts into a complete outcome naming
-    /// those members.
+    /// Gmail's `messages.modify` addresses ONE message per request, so this is the
+    /// only place in the system that can attribute a not-found answer to a
+    /// specific member. It therefore owns the per-member interpretation: the
+    /// member is mutated, or the server AUTHORITATIVELY reports it gone, and
+    /// either way it is dispositioned and named in a `ProviderMembersDispositioned`
+    /// report that `AccountManager.executeOperation` converts into a complete
+    /// outcome. The members behind it are untouched and stay owed under the SAME
+    /// durable row, which `retirePartiallyCompletedOp` narrows to them.
     ///
     /// 🚨 THIS IS WHAT REPLACES THE DRAIN'S BATCH SPLIT. The scheduler used to
     /// respond to a batch not-found by writing one replacement `PendingOperation`
@@ -546,60 +547,64 @@ actor GmailProvider: EmailProvider {
     ///
     /// ⚠ ONLY A STRUCTURAL, MEMBER-ADDRESSED NOT-FOUND IS ABSORBED. Everything
     /// else — a 5xx, a 429, a timeout, an auth failure, a cancellation — is
-    /// rethrown immediately with the remaining members untouched, so the whole
-    /// operation stays queued and retries. Re-running the already-successful
-    /// members on that retry is accepted: `messages.modify` add/remove label is
-    /// idempotent and does not change the message id.
+    /// rethrown with the remaining members untouched, so the whole operation stays
+    /// queued and retries.
     ///
-    /// 🚨 IT STOPS ON `ProviderMemberLoopBudget` AND REPORTS THE PREFIX IT
-    /// FINISHED. Without that, a batch whose members cost more wall time in total
-    /// than `SyncConfig.pendingOperationTimeoutSeconds` is cancelled mid-loop,
-    /// `withTimeout` has ALREADY resumed the drain with `TimeoutError`, and every
-    /// member this loop settled is discarded with the abandoned task — so the row
-    /// is requeued unchanged and the next attempt repeats the same prefix into the
-    /// same deadline, forever. The last member's intention never reaches Gmail.
-    /// That is the wedge corollary, and it is why the budget is checked BETWEEN
-    /// members: at least one member is always attempted, so every attempt makes
-    /// strict progress and a batch of any size converges.
+    /// 🚨 WHY ONE MEMBER AND NOT A TIME BUDGET. `AccountManager.executeSingleOp`
+    /// wraps this call in `withTimeout(SyncConfig.pendingOperationTimeoutSeconds)`,
+    /// and `withTimeout` resumes the drain with `TimeoutError` FIRST and cancels
+    /// the operation task second — so everything a loop is still holding at the
+    /// deadline is discarded with the abandoned task, `requeueOrRetain` resets the
+    /// row with its membership unchanged, and the next attempt repeats the same
+    /// prefix into the same deadline forever. The last member's intention never
+    /// reaches Gmail: persistent retry starvation, the wedge corollary that
+    /// `never-drop-user-intention.md` puts on the non-recoverable list.
+    ///
+    /// A margin measured in ELAPSED TIME cannot close that, and an earlier fix
+    /// that reserved a fixed fraction of the deadline was itself insufficient for
+    /// exactly this reason (`MIS-IOS-022`): the check happens BETWEEN members, so
+    /// it bounds what has already been spent and says nothing about the duration
+    /// of the request it is about to start. Members that each fit the operation
+    /// deadline comfortably can still straddle it two at a time. Settling ONE
+    /// member makes an attempt's exposure equal to one request's, which is the
+    /// only quantity the deadline actually bounds.
+    ///
+    /// ⚠ THE COST IS DELIBERATE AND ACCEPTED: a healthy N-member operation now
+    /// converges in N attempts rather than one, narrowing the same row each time.
+    /// Monotonic progress is the property being bought; do not reintroduce
+    /// batching to recover the old convergence rate.
     private func modifyEachMessage(
         ids: [String],
         addLabelIds: [String] = [],
         removeLabelIds: [String] = [],
         moveTraceLabel: String? = nil
     ) async throws {
+        // An empty request has nothing to settle and nothing to report; silence
+        // is the truthful answer, exactly as it was for a request whose every
+        // member was mutated.
+        guard let id = ids.first else { return }
         var absent: [String] = []
-        var dispositioned: [String] = []
-        let deadline = ProviderMemberLoopBudget.deadlineFromNow()
-        for id in ids {
-            // Never before the first member: an attempt that settles nothing is
-            // an attempt that cannot converge.
-            if !dispositioned.isEmpty, ContinuousClock.now >= deadline {
-                if DebugModeManager.isLoggingEnabled() {
-                    print("[Gmail] modifyEachMessage: budget spent after \(dispositioned.count)/\(ids.count) member(s) — reporting the finished prefix so the operation narrows instead of repeating it")
-                }
-                break
+        do {
+            try await modifyMessage(
+                id: id, addLabelIds: addLabelIds, removeLabelIds: removeLabelIds)
+            if let moveTraceLabel, DebugModeManager.isLoggingEnabled() {
+                print("[MoveTrace] \(moveTraceLabel) — modifyMessage completed for \(id)")
             }
-            do {
-                try await modifyMessage(
-                    id: id, addLabelIds: addLabelIds, removeLabelIds: removeLabelIds)
-                dispositioned.append(id)
-                if let moveTraceLabel, DebugModeManager.isLoggingEnabled() {
-                    print("[MoveTrace] \(moveTraceLabel) — modifyMessage completed for \(id)")
-                }
-            } catch {
-                guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
-                absent.append(id)
-                dispositioned.append(id)
-                if DebugModeManager.isLoggingEnabled() {
-                    print("[Gmail] modifyMessage \(id): the server reports THIS message gone — the member is dispositioned and the remaining members are still processed")
-                }
+        } catch {
+            guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
+            absent.append(id)
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Gmail] modifyMessage \(id): the server reports THIS message gone — the member is dispositioned and the operation narrows to the members still owed")
             }
         }
         // Silence is "every member, mutated": the only outcome the `Void`-returning
-        // protocol can express on its own. Anything else has to be reported.
-        if !absent.isEmpty || dispositioned.count != ids.count {
+        // protocol can express on its own, and it stays available to the
+        // single-member request that settled its one member. Anything else — a
+        // member the server reported gone, or members this attempt never
+        // addressed — has to be reported.
+        if !absent.isEmpty || ids.count != 1 {
             throw ProviderMembersDispositioned(
-                dispositionedMemberIds: dispositioned, absentMemberIds: absent)
+                dispositionedMemberIds: [id], absentMemberIds: absent)
         }
     }
 

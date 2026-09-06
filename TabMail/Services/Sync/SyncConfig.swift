@@ -607,35 +607,6 @@ enum SyncConfig {
     /// Timeout for a single pending operation (archive, move, flag, etc.) in drainPendingQueue.
     /// Prevents one stalled operation from blocking the entire queue.
     static let pendingOperationTimeoutSeconds: TimeInterval = 15
-    /// The share of `pendingOperationTimeoutSeconds` a PROVIDER's per-member
-    /// action loop may spend before it must stop and report the members it
-    /// finished.
-    ///
-    /// 🚨 IT MUST BE STRICTLY BELOW 1, AND THAT INEQUALITY IS THE WHOLE POINT.
-    /// `withTimeout` resumes its caller with `TimeoutError` and only THEN cancels
-    /// the operation task, so ANYTHING the loop produces at or after the deadline
-    /// is discarded — including the record of which members it had already
-    /// dispositioned. A loop that runs to the aggregate deadline therefore reports
-    /// nothing at all: `requeueOrRetain` resets the row with its membership
-    /// unchanged, the next attempt repeats the same prefix into the same deadline,
-    /// and the final member's intention never reaches the provider. That is
-    /// persistent retry starvation — the wedge corollary, which
-    /// `never-drop-user-intention.md` puts on the non-recoverable list, not an
-    /// accepted slow path. Stopping early lets the partial report arrive, the row
-    /// narrows to its unproven remainder through the existing
-    /// `retirePartiallyCompletedOp` path, and the next attempt starts where this
-    /// one stopped, so a batch of ANY size converges.
-    ///
-    /// The margin is deliberately large rather than minimal: the loop can only
-    /// check the budget BETWEEN members, so the reserve has to cover one more
-    /// in-flight request plus the drain's own per-op work on either side of the
-    /// provider call.
-    static let providerMemberLoopBudgetFraction: Double = 0.6
-    /// The wall-clock budget derived from the two values above. Derived rather
-    /// than written twice so the two deadlines cannot drift apart.
-    static var providerMemberLoopBudgetSeconds: TimeInterval {
-        pendingOperationTimeoutSeconds * providerMemberLoopBudgetFraction
-    }
 
     // MARK: - IMAP Connection Pool
 

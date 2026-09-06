@@ -97,6 +97,17 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         /// chain-demotion path for RFC members.
         var unclassified400RFCs: Set<String> = []
         var unclassified400Served = 0
+        /// Seconds a `PATCH /messages/{id}` response is withheld for, per
+        /// provider message id. Absent (the default) keeps the fixture
+        /// instantaneous. PER ID rather than uniform because the shape the
+        /// deadline tests need is a batch whose members each fit the operation
+        /// deadline while their SUM does not, which one latency cannot express
+        /// without putting every margin on a knife edge.
+        /// See `holdPatch(providerMessageId:forSeconds:)`.
+        var patchLatencyByProviderId: [String: TimeInterval] = [:]
+        /// The `/move` counterpart of `patchLatencyByProviderId`.
+        /// See `holdMove(providerMessageId:forSeconds:)`.
+        var moveLatencyByProviderId: [String: TimeInterval] = [:]
     }
 
     private final class StateBox: Sendable {
@@ -235,6 +246,24 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
     /// change what the calling test measures.
     func failMoveOnce(providerMessageId: String) {
         _ = state.value.withLock { $0.oneShotMoveFailureIds.insert(providerMessageId) }
+    }
+
+    /// Make `PATCH /messages/{providerMessageId}` take `seconds` to answer.
+    ///
+    /// Distinct from `holdNextMove()`, which is a GATE the test opens: this is a
+    /// fixed cost the request pays on its own, which is what a deadline test
+    /// needs — a loop must be able to outrun the operation deadline with no
+    /// participation from the test body. The wait happens in
+    /// `CannedResponse.parked`, i.e. off the transport's loader thread, and the
+    /// handler's synchronous part (state mutation, failure budgets) still runs in
+    /// request order before it.
+    func holdPatch(providerMessageId: String, forSeconds seconds: TimeInterval) {
+        state.value.withLock { $0.patchLatencyByProviderId[providerMessageId] = seconds }
+    }
+
+    /// The `/move` counterpart of `holdPatch(providerMessageId:forSeconds:)`.
+    func holdMove(providerMessageId: String, forSeconds seconds: TimeInterval) {
+        state.value.withLock { $0.moveLatencyByProviderId[providerMessageId] = seconds }
     }
 
     /// Block the NEXT `/move` inside the route until the returned closure is
@@ -426,7 +455,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             let body = (try? JSONSerialization.data(withJSONObject: Self.graphRow(message))) ?? Data()
             return .bytes(body, contentType: "application/json")
         }
-        http.register(path: "/messages/", method: "PATCH") { [state] request in
+        let servePatch: @Sendable (FakeHTTP.Request) -> FakeHTTP.CannedResponse = { [state] request in
             let patchFailed = state.value.withLock { model -> Bool in
                 guard model.patchFailuresRemaining > 0 else { return false }
                 model.patchFailuresRemaining -= 1
@@ -462,6 +491,13 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             return found
                 ? .json(raw: "{\"id\":\"\(providerId)\"}")
                 : .status(404)
+        }
+        http.register(path: "/messages/", method: "PATCH") { [state] request in
+            let response = servePatch(request)
+            let providerId = Self.messageId(from: request.url, move: false) ?? ""
+            let latency = state.value.withLock { $0.patchLatencyByProviderId[providerId] ?? 0 }
+            guard latency > 0 else { return response }
+            return .parked { Thread.sleep(forTimeInterval: latency); return response }
         }
         http.register(path: "/messages/", method: "DELETE") { [state] request in
             guard !Self.consumeMutationFailure(state) else { return .status(503) }
@@ -506,7 +542,11 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                     return Self.serveMove(request, state: state, churnsIdOnMove: churnsIdOnMove)
                 }
             }
-            return Self.serveMove(request, state: state, churnsIdOnMove: churnsIdOnMove)
+            let response = Self.serveMove(request, state: state, churnsIdOnMove: churnsIdOnMove)
+            let providerId = Self.messageId(from: request.url, move: true) ?? ""
+            let latency = state.value.withLock { $0.moveLatencyByProviderId[providerId] ?? 0 }
+            guard latency > 0 else { return response }
+            return .parked { Thread.sleep(forTimeInterval: latency); return response }
         }
     }
 

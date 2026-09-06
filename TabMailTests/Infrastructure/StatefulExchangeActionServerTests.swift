@@ -753,17 +753,21 @@ struct StatefulExchangeActionServerTests {
                 "clearing the permanent fault did not restore ordinary service")
     }
 
-    /// `failMoveOnce(providerMessageId:)` fails ONE named member of a batch move
-    /// and lets the members around it through, which is the only way this
-    /// fixture can produce a PARTIAL `MoveOutcome`.
+    /// `failMoveOnce(providerMessageId:)` fails the ONE named member and nothing
+    /// else, once.
     ///
-    /// Both sides are asserted because they fail in opposite directions: a seam
-    /// that failed the whole batch would leave `provenIds` empty and the caller
-    /// would rethrow (no partial retirement at all), and a seam that fired for
-    /// the wrong member would prove the LATER one instead. Its one-shot-ness is
-    /// asserted too — a budget that outlived the batch would make the retry that
-    /// every calling test depends on fail as well.
-    @Test("failMoveOnce fails exactly the named member of a batch move, once")
+    /// 🚨 THE SEAM IS ID-SCOPED, NOT ORDINAL, AND THAT IS WHAT IS UNDER TEST. It
+    /// consumes only when the request it is armed for actually arrives, so an
+    /// armed id that a batch never reaches stays armed for the attempt that does
+    /// — which is the only way it can be useful now that a move settles ONE
+    /// member per attempt and a two-member request never addresses its second
+    /// member at all. A seam that fired on the first `/move` regardless of id
+    /// would refuse the wrong member and every calling test would be measuring
+    /// something else.
+    ///
+    /// Its one-shot-ness is asserted too — a budget that outlived the refusal
+    /// would make the retry that every calling test depends on fail as well.
+    @Test("failMoveOnce fails exactly the named member, once")
     func failMoveOnceTargetsOneMemberOfABatch() async throws {
         let firstRfc = "fail-move-once-a@example.com"
         let secondRfc = "fail-move-once-b@example.com"
@@ -775,11 +779,16 @@ struct StatefulExchangeActionServerTests {
         let provider = server.provider()
 
         server.failMoveOnce(providerMessageId: "graph-batch-b")
+
+        // The attempt addresses only the FIRST member, so the armed fault is not
+        // reached and must not be spent: the member that moved is proven, the one
+        // behind it is untouched and still owed.
         let partial = try await provider.moveProvingDestinations(
             ids: ["graph-batch-a", "graph-batch-b"], from: "source", to: "archive")
 
         #expect(partial.provenIds == ["graph-batch-a"], """
-            the seam did not fail exactly the named member: proven=\(partial.provenIds)
+            the attempt settled something other than exactly its first member: \
+            proven=\(partial.provenIds)
             """)
         #expect(partial.provenDestinations.count == 1)
         guard partial.provenDestinations.count == 1 else { return }
@@ -787,9 +796,18 @@ struct StatefulExchangeActionServerTests {
         #expect(server.snapshots(rfc822MessageId: firstRfc).map(\.folderId) == ["archive"],
                 "the member that was NOT failed did not move")
         #expect(server.snapshots(rfc822MessageId: secondRfc).map(\.folderId) == ["source"],
-                "the failed member moved anyway, so the fault applied an effect")
+                "a member the attempt never addressed moved anyway")
         #expect(server.snapshot(providerMessageId: "graph-batch-b") != nil,
-                "the failed member's id was reallocated even though its move failed")
+                "an unaddressed member's id was reallocated")
+
+        // The attempt that DOES address the armed member is refused, and refused
+        // with nothing proven — a 503 settles no member.
+        await #expect(throws: (any Error).self, "the armed fault did not fire on the member it names") {
+            _ = try await provider.moveProvingDestinations(
+                ids: ["graph-batch-b"], from: "source", to: "archive")
+        }
+        #expect(server.snapshots(rfc822MessageId: secondRfc).map(\.folderId) == ["source"],
+                "the failed member moved anyway, so the fault applied an effect")
 
         // One-shot: the retry lands.
         let retry = try await provider.moveProvingDestinations(
