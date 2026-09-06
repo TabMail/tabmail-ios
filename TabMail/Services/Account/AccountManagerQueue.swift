@@ -3191,14 +3191,31 @@ extension AccountManager {
             // express: WHICH of them were gone, so the drain can retire their
             // confirmed-gone local headers.
             //
-            // 🚨 A PREFIX IS REPORTED BECAUSE THE LOOP STOPPED ON ITS BUDGET, AND
-            // THAT IS THE ONLY REASON IT CAN BE ONE. `withTimeout` resumes this
-            // caller with `TimeoutError` and cancels the operation task second, so
-            // a loop still running at the deadline reports nothing at all and the
-            // row is requeued whole — the same prefix then dies on the same
-            // deadline on every retry and the final member never reaches the
-            // provider. Narrowing on the prefix is what turns that starvation into
-            // strict per-attempt progress.
+            // 🚨 A PREFIX IS THE ORDINARY REPORT, NOT AN EXCEPTIONAL STOP.
+            // There is no elapsed-time budget on these loops any more, so nothing
+            // here depends on one running out. `GmailProvider.modifyEachMessage`
+            // and `ExchangeProvider.patchEachMessage` address exactly ONE id per
+            // attempt and then raise this report whenever `ids.count != 1`, so
+            // `dispositionedMemberIds` is a ONE-ELEMENT proper prefix on the FIRST
+            // attempt of every multi-member Gmail or Graph operation. The
+            // narrowing conversion is therefore the COMMON path for that traffic,
+            // not a contingency — scope anything downstream of it accordingly.
+            // A report names the whole request only when the request named a
+            // single member.
+            //
+            // WHY ONE MEMBER PER ATTEMPT, which is what makes the prefix routine
+            // (`MIS-IOS-022`, twice). `withTimeout` resumes this caller with
+            // `TimeoutError` and cancels the operation task second, so anything a
+            // loop is still holding at the deadline is discarded with the
+            // abandoned task, the row is requeued whole, and every retry repeats
+            // the same prefix into the same deadline — the final member never
+            // reaches the provider. A margin measured in ELAPSED TIME cannot close
+            // that: it bounds what an attempt has already spent and nothing bounds
+            // the duration of the request it is about to start, so members that
+            // each fit the deadline still straddle it two at a time. Bounding an
+            // attempt to ONE request makes its exposure equal to the quantity the
+            // deadline actually bounds, and narrowing on the reported prefix is
+            // what turns the starvation into strict per-attempt progress.
             //
             // ⚠ IT MUST NOT ESCAPE TO `executeSingleOp`. Out there it would be an
             // unclassified error, land in the generic transient arm, requeue an
