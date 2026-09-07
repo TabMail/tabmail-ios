@@ -375,6 +375,61 @@ struct DemoMoveRekeyChildrenTests {
             previous: fixture.2, pool: fixture.0, directory: fixture.1)
     }
 
+    @Test("Demo action setters mutate every addressed member and preserve folder/account bystanders")
+    func demoActionSettersPreserveNativeIdentity() async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let pool = fixture.0
+        let accountId = DemoSeed.demoAccountId
+        let targetIds = ["first", "second"]
+        try await pool.write { db in
+            for accountId in [accountId, "other-demo-account"] {
+                var account = Account(emailAddress: "demo@example.com", displayName: "Demo", provider: .imap)
+                account.id = accountId
+                try account.insert(db)
+                for folder in ["INBOX", "OTHER"] {
+                    try Folder(name: folder, path: folder, role: .custom, accountId: accountId).insert(db)
+                    for messageId in ["first", "second", "bystander"] {
+                        var header = MessageHeader(
+                            messageId: messageId, subject: "Demo", from: "Peer",
+                            fromAddress: "peer@example.com", to: "demo@example.com", date: Date(),
+                            snippet: "", folderId: "\(accountId):\(folder)", accountId: accountId,
+                            folderPath: folder, isInInbox: folder == "INBOX")
+                        header.isRead = false
+                        header.isFlagged = false
+                        try header.insert(db)
+                    }
+                }
+            }
+        }
+        let provider: any EmailProvider = DemoProvider(accountId: accountId)
+        let source = ProviderMessageSource(memberIds: targetIds, folderPath: "INBOX", admittedUidValidity: nil)
+        for value in [true, false] {
+            for action in [ProviderMessageAction.read(value), .flagged(value)] {
+                let outcome = try await provider.performMessageAction(action, at: source)
+                #expect(outcome.dispositionedMemberIds == targetIds)
+                #expect(outcome.confirmedGoneMemberIds.isEmpty)
+                #expect(outcome.provenDestinations.isEmpty)
+                #expect(!outcome.addressChangesOnMove)
+                let rows = try await pool.read { try MessageHeader.fetchAll($0) }
+                #expect(rows.count == 12)
+                for row in rows {
+                    let targeted = row.accountId == accountId && row.folderPath == "INBOX"
+                        && targetIds.contains(row.messageId)
+                    switch action {
+                    case .read:
+                        #expect(row.isRead == (targeted && value))
+                        #expect(row.isFlagged == (targeted && !value))
+                    case .flagged:
+                        #expect(row.isRead == (targeted && value))
+                        #expect(row.isFlagged == (targeted && value))
+                    default: Issue.record("Unexpected setter action")
+                    }
+                }
+            }
+        }
+    }
+
     /// 🚨 THE INVARIANT, as the system property and not the mechanism
     /// (`MIS-015`): **a header that changes its primary key keeps its labels and
     /// its threading edges.** No assertion names `MessageHeaderRekey.apply`.
@@ -412,6 +467,21 @@ struct DemoMoveRekeyChildrenTests {
                 fromAddress: "peer@example.com", to: "demo@example.com", date: Date(),
                 snippet: "", folderId: "\(accountId):INBOX", accountId: accountId,
                 folderPath: "INBOX", isInInbox: true)
+            var otherAccount = Account(emailAddress: "other@example.com", displayName: "Other", provider: .imap)
+            otherAccount.id = "other-demo-account"
+            try otherAccount.insert(db)
+            for (owner, folder, messageId) in [
+                (accountId, "OTHER", "d1"),
+                ("other-demo-account", "INBOX", "d1"),
+                (accountId, "INBOX", "bystander")
+            ] {
+                let bystander = MessageHeader(
+                    messageId: messageId, subject: "Untouched", from: "Peer",
+                    fromAddress: "peer@example.com", to: "demo@example.com", date: Date(),
+                    snippet: "", folderId: "\(owner):\(folder)", accountId: owner,
+                    folderPath: folder, isInInbox: folder == "INBOX")
+                try bystander.insert(db)
+            }
             header.inReplyTo = parentRfc
             try header.insert(db)
             try ThreadUtils.insertMessageReferences(for: header, db: db)
@@ -437,8 +507,14 @@ struct DemoMoveRekeyChildrenTests {
         #expect(before.1 == 1, "precondition: the message has a threading edge to its parent")
         #expect(before.2, "precondition: the message has a cached body")
 
-        let provider = DemoProvider(accountId: accountId)
-        try await provider.move(ids: ["d1"], from: "INBOX", to: "ARCHIVE")
+        let provider: any EmailProvider = DemoProvider(accountId: accountId)
+        let outcome = try await provider.performMessageAction(.move(destination: "ARCHIVE"), at: .init(
+            memberIds: ["d1"], folderPath: "INBOX", admittedUidValidity: nil))
+        #expect(outcome.dispositionedMemberIds == ["d1"])
+        #expect(outcome.confirmedGoneMemberIds.isEmpty)
+        #expect(outcome.provenDestinations.isEmpty)
+        #expect(!outcome.addressChangesOnMove)
+        #expect(try await pool.read { try MessageHeader.fetchOne($0, key: oldId) } == nil)
 
         let after = try await pool.read { db -> (Bool, [String], [String], String?, Bool) in
             (try MessageHeader.fetchOne(db, key: newId) != nil,
@@ -451,6 +527,16 @@ struct DemoMoveRekeyChildrenTests {
              try MessageBody.fetchOne(db, key: ContentKey(rawValue: newId))?.htmlContent,
              try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) != nil)
         }
+        let headers = try await pool.read { try MessageHeader.fetchAll($0) }
+        #expect(Set(headers.map(\.id)) == Set([
+            newId,
+            MessageIdentity.headerId(accountId: accountId, folderPath: "OTHER", messageId: "d1"),
+            MessageIdentity.headerId(accountId: "other-demo-account", folderPath: "INBOX", messageId: "d1"),
+            MessageIdentity.headerId(accountId: accountId, folderPath: "INBOX", messageId: "bystander")
+        ]))
+        #expect(headers.first { $0.id == newId }?.folderPath == "ARCHIVE")
+        #expect(headers.first { $0.id == newId }?.isInInbox == false)
+        #expect(headers.filter { $0.id != newId }.allSatisfy { $0.subject == "Untouched" })
         #expect(after.0, "setup: the move must have re-keyed the header to the destination")
         #expect(after.1 == ["\(accountId):keep"],
                 """
