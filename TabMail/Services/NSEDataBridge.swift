@@ -3522,7 +3522,7 @@ enum NSEDataBridge {
             // false) also skip — reply precompute should run ASAP there.
             let booted = await MainActor.run { AppStartup.shared.dbReady }
             if DatabaseSuspension.isAppActive && booted {
-                await AppStartup.shared.awaitLaunchReady(background: false)
+                guard await AppStartup.shared.awaitLaunchReady(background: false) else { return }
                 try? await Task.sleep(for: .seconds(SyncConfig.nseMergeHerdSettleSeconds))
             }
             // Task.detached starts with inPrivilegedContext = false (task-locals

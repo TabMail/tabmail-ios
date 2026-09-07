@@ -42,6 +42,9 @@ final class DatabaseSuspension {
     /// BGProcessing). While > 0, completion of one unit does not arm the
     /// quiesce window — the last one out arms it.
     private var backgroundWorkCount = 0
+    #if DEBUG
+    var backgroundWorkCountForTesting: Int { backgroundWorkCount }
+    #endif
 
     /// Thread-safe mirror of "is the app foreground/active?", maintained by the
     /// main-actor lifecycle observers. Read from the **off-main** BGTask
