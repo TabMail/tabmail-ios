@@ -1259,9 +1259,12 @@ struct GlobalFifoExecutorTests {
         }
     }
 
-    @Test("A refused limit deletion retains ownership, emits no terminal log and admits no follower until local recovery")
+    @Test("A refused limit deletion retains ownership and locally replays before connectivity", arguments: [false, true])
     @MainActor
-    func refusalLimitCommitOrdersLogAndFollower() async throws {
+    func refusalLimitCommitOrdersLogAndFollower(offlineReplay: Bool) async throws {
+        let previousConnectivity = NetworkMonitor.checkConnected()
+        NetworkMonitor.setConnectedForTesting(true)
+        defer { NetworkMonitor.setConnectedForTesting(previousConnectivity) }
         let f = try fixture(accountId: "fifo-limit-write", provider: .gmail, folders: [Self.archive])
         defer { finish(f) }
         var op = PendingOperation(type: .move, messageIds: ["refused"],
@@ -1302,7 +1305,16 @@ struct GlobalFifoExecutorTests {
             #expect(await provider.markedReadIds.isEmpty)
             #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 1)
             try await f.pool.write { db in try db.execute(sql: "DROP TRIGGER refuse_limit_delete") }
+            NetworkMonitor.setConnectedForTesting(!offlineReplay)
             try await joinedFailurePolicyDrain()
+            if offlineReplay {
+                #expect(try rowsByPosition(f).map(\.id) == [follower.id])
+                #expect(await provider.markedReadIds.isEmpty)
+                #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 0)
+                #expect(AppLogStore.read(channel: .error).components(separatedBy: "retired after reaching the provider failure retry limit").count == before + 1)
+                NetworkMonitor.setConnectedForTesting(true)
+                try await joinedFailurePolicyDrain()
+            }
             #expect(try rowsByPosition(f).isEmpty)
             #expect(await provider.callLog.filter { $0.hasPrefix("move(ids:") }.count == 1)
             #expect(await provider.markedReadIds.map(\.ids) == [["refused"]])
@@ -1400,6 +1412,68 @@ struct GlobalFifoExecutorTests {
         }
     }
 
+    @Test("Cancellation during an actual provider attempt does not charge its later refusal")
+    @MainActor
+    func cancellationDuringProviderAttemptIsUncharged() async throws {
+        let f = try fixture(accountId: "fifo-cancel-in-provider", provider: .gmail)
+        defer { finish(f) }
+        var op = PendingOperation(type: .markRead, messageIds: ["attempted"],
+            accountId: f.accountId, folderPath: Self.source)
+        op.retryCount = 9
+        let target = try admit(f, op)
+        let provider = MockEmailProvider()
+        let entered = Mutex(false)
+        let release = DeliveryGate()
+        await provider.setMarkReadThrows(ProviderError.authenticationFailed)
+        await provider.setMarkReadHook {
+            entered.withLock { $0 = true }
+            await release.wait()
+        }
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            let drain = Task { await AccountManager.shared.drainPendingQueue() }
+            let started = (try? await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+                while !entered.withLock({ $0 }) {
+                    try Task.checkCancellation()
+                    await Task.yield()
+                }
+                return true
+            }) ?? false
+            #expect(started, "the provider attempt never entered the controlled barrier")
+            guard started else {
+                drain.cancel()
+                await release.open()
+                await drain.value
+                return
+            }
+            #expect(await provider.markedReadIds.count == 1)
+            #expect((try? rowsByPosition(f))?.first?.status == PendingStatus.inFlight.rawValue)
+            drain.cancel()
+            await release.open()
+            await drain.value
+            #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting())
+            let rows = try rowsByPosition(f)
+            #expect(rows.map(\.id) == [target.id])
+            #expect(rows.first?.retryCount == 9)
+            #expect(await !AccountManager.shared.hasPendingOperationSettlement)
+            // Cancellation also refuses local deferral writes. Its uncharged requeue
+            // remains owned until a non-cancelled drain can commit it.
+            #expect(rows.first?.status == PendingStatus.inFlight.rawValue)
+            #expect(await AccountManager.shared.pendingRequeues[target.id] == false)
+            let recoveredCount = Mutex<Int?>(nil)
+            await provider.setMarkReadHook {
+                let count = try? await f.pool.read { db in
+                    try PendingOperation.fetchOne(db, key: target.id)?.retryCount
+                }
+                recoveredCount.withLock { $0 = count }
+            }
+            await provider.setMarkReadThrows(nil)
+            try await joinedFailurePolicyDrain()
+            #expect(try rowsByPosition(f).isEmpty)
+            #expect(await provider.markedReadIds.count == 2)
+            #expect(recoveredCount.withLock { $0 } == 9)
+        }
+    }
+
     private func joinedFailurePolicyDrain() async throws {
         #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting())
         await AccountManager.shared.drainPendingQueue()
@@ -1410,9 +1484,12 @@ struct GlobalFifoExecutorTests {
         Issue.record("the owned drain and requested redrain did not become quiescent")
     }
 
-    @Test("A refused accounting write replays exactly once without another provider attempt")
+    @Test("A refused accounting write replays exactly once, including offline, without another provider attempt", arguments: [false, true])
     @MainActor
-    func refusalAccountingWriteReplaysOnce() async throws {
+    func refusalAccountingWriteReplaysOnce(offlineReplay: Bool) async throws {
+        let previousConnectivity = NetworkMonitor.checkConnected()
+        NetworkMonitor.setConnectedForTesting(true)
+        defer { NetworkMonitor.setConnectedForTesting(previousConnectivity) }
         let f = try fixture(accountId: "fifo-accounting-write", provider: .gmail)
         defer { finish(f) }
         var op = PendingOperation(type: .markRead, messageIds: ["refused"],
@@ -1434,12 +1511,14 @@ struct GlobalFifoExecutorTests {
             try await joinedFailurePolicyDrain()
             #expect(await provider.markedReadIds.count == 1)
             try await f.pool.write { db in try db.execute(sql: "DROP TRIGGER refuse_retry_accounting") }
+            NetworkMonitor.setConnectedForTesting(!offlineReplay)
             try await joinedFailurePolicyDrain()
             let rows = try rowsByPosition(f)
             #expect(rows.map(\.id) == [target.id])
             #expect(rows.first?.status == PendingStatus.queued.rawValue)
             #expect(rows.first?.retryCount == 9)
             #expect(await provider.markedReadIds.count == 1)
+            NetworkMonitor.setConnectedForTesting(true)
             try await joinedFailurePolicyDrain()
             #expect(try rowsByPosition(f).isEmpty)
             #expect(await provider.markedReadIds.count == 2)

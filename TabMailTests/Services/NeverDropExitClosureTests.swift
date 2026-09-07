@@ -1367,8 +1367,8 @@ struct NeverDropExitClosureTests {
         #expect(parked.observedUidValidity == 10)
         #expect(parked.status == PendingStatus.queued.rawValue)
         #expect(
-            parked.retryCount == 1,
-            "the retry count is \(parked.retryCount) after one drain, so the op was claimed more than once")
+            parked.retryCount == 0,
+            "inconclusive member evidence must not spend the refusal budget")
 
         await AccountManager.shared.drainPendingQueue()
 
@@ -1799,8 +1799,8 @@ struct NeverDropExitClosureTests {
             """)
         #expect(afterRefusedDrain.first?.status == PendingStatus.queued.rawValue)
         #expect(
-            afterRefusedDrain.first?.retryCount == 1,
-            "the refused attempt was not recorded as a retry: \(String(describing: afterRefusedDrain.first?.retryCount))")
+            afterRefusedDrain.first?.retryCount == 0,
+            "unavailable destination evidence must not charge the refusal budget")
         #expect(server.messageIDs(in: "INBOX") == ["<\(target)>"])
         #expect(server.messageIDs(in: "Archive").isEmpty)
         #expect(server.flags(in: "INBOX", uid: 77).isEmpty)
@@ -2264,10 +2264,9 @@ struct NeverDropExitClosureTests {
         let refusedRowAfterFirstDrain = try #require(
             afterFirstDrain.first { $0.id == refusedMove.id })
         #expect(
-            refusedRowAfterFirstDrain.retryCount == 1,
+            refusedRowAfterFirstDrain.retryCount == 0,
             """
-            the durable retry count advanced to \(refusedRowAfterFirstDrain.retryCount) in a \
-            single drain, so the op was claimed and refused more than once in that pass
+            unavailable move evidence must preserve the historical retry count
             """)
 
         // The remaining drains are for property 1: the refusal keeps being
@@ -2309,8 +2308,8 @@ struct NeverDropExitClosureTests {
         let refusedRow = try #require(remaining.first { $0.id == refusedMove.id })
         #expect(refusedRow.status == PendingStatus.queued.rawValue)
         #expect(
-            refusedRow.retryCount == drains,
-            "the repeatedly refused move advanced its retry count \(refusedRow.retryCount) times over \(drains) drains — the bound is exactly one per drain")
+            refusedRow.retryCount == 0,
+            "unavailable evidence must leave the refusal budget unchanged across drains")
         // The lane-mate is HELD, not executed: it names the same message as an
         // unresolved predecessor. NON-VACUOUS by construction — the identical
         // `.markFlagged` gesture on uid 88 provably landed above.
@@ -2345,7 +2344,7 @@ struct NeverDropExitClosureTests {
     /// `UID MOVE` and on nothing else.
     ///
     /// THE PROPERTY, in two halves: the first attempt left the intention
-    /// durable and re-attemptable — row still queued, `retryCount` bumped,
+    /// durable and re-attemptable — row still queued, `retryCount` unchanged,
     /// INBOX still holding the message, Archive empty, no COPY/STORE/EXPUNGE
     /// fallback — and a later drain converges: Archive holds exactly the
     /// message, INBOX is empty, the queue is empty, no wrong-message mutation.
@@ -2395,8 +2394,8 @@ struct NeverDropExitClosureTests {
             """)
         #expect(afterKilledDrain.first?.status == PendingStatus.queued.rawValue)
         #expect(
-            afterKilledDrain.first?.retryCount == 1,
-            "the failed attempt was not recorded as a retry: \(String(describing: afterKilledDrain.first?.retryCount))")
+            afterKilledDrain.first?.retryCount == 0,
+            "transport failure must preserve the historical retry count")
         #expect(server.messageIDs(in: "INBOX") == ["<\(target)>"])
         #expect(server.messageIDs(in: "Archive").isEmpty)
         #expect(firstAttempt.filter { $0.contains("UID COPY") }.isEmpty)
@@ -2746,6 +2745,41 @@ struct NeverDropExitClosureTests {
         await finish(f)
     }
 
+    @Test("A refused draft delete preserves its separate retry policy and later deletes exactly its draft", arguments: [9, 15])
+    @MainActor
+    func draftDeleteFailureAboveOrdinaryCapRecovers(initialCount: Int) async throws {
+        let target = "draft-refusal-cap@example.com"
+        let server = FakeIMAPServer(mailboxes: ["Drafts": [Self.message(uid: 5, id: target)]])
+        server.setUidValidity(10, for: "Drafts")
+        server.expectMutation(rfc822MessageId: target)
+        server.failNextCommand(containing: "UID STORE", message: "Injected draft delete refusal")
+        try server.start()
+        defer { server.stop() }
+        let f = try fixture(accountId: "closure-draft-delete-cap",
+            folders: [("INBOX", .inbox, 10), ("Drafts", .drafts, 10)])
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        var op = PendingOperation(type: .deleteDraft, messageIds: ["5"], accountId: f.accountId,
+            folderPath: "Drafts", observedUidValidity: 10, draftServerUidValidity: 10,
+            draftDeleteAddressKind: .providerResource)
+        op.retryCount = initialCount
+        try insert([op], into: f.pool)
+        await AccountManager.shared.drainPendingQueue()
+        let retained = try operations(f.pool)
+        #expect(retained.map(\.id) == [op.id])
+        #expect(retained.first?.retryCount == initialCount + 1)
+        #expect(retained.first?.status == PendingStatus.queued.rawValue)
+        #expect(retained.first?.messageIds == ["5"])
+        #expect(server.messageIDs(in: "Drafts") == ["<\(target)>"])
+        #expect(server.consumedInjectedFailureCount() == 1)
+        await AccountManager.shared.drainPendingQueue()
+        #expect(try operations(f.pool).isEmpty)
+        #expect(server.messageIDs(in: "Drafts").isEmpty)
+        #expect(server.recordedCommands().filter { $0.uppercased().contains("UID STORE") }.count == 2)
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
     /// THE OTHER DIRECTION, and it must not regress: two epochs that are BOTH real
     /// and disagree is a PROVEN turnover in this op's own address space — exit 4.
     /// The op is retired and the draft is not touched, because the UID it names now
@@ -2952,9 +2986,9 @@ struct NeverDropExitClosureTests {
     /// RED PROOF (recorded): against the pre-fix `DraftStore` this fails on the
     /// first assertion — `operations(f.pool)` is empty after the failing drain,
     /// i.e. the durable producer was retired by a thrown call.
-    @Test("A thrown draft APPEND never retires the Save producer, and the next drain lands it")
+    @Test("A thrown draft APPEND preserves its separate retry policy and the next drain lands it", arguments: [0, 9, 15])
     @MainActor
-    func aThrownDraftAppendKeepsItsSaveProducerAndTheNextDrainLandsIt() async throws {
+    func aThrownDraftAppendKeepsItsSaveProducerAndTheNextDrainLandsIt(initialCount: Int) async throws {
         let server = FakeIMAPServer(mailboxes: ["INBOX": [], "Drafts": []])
         server.setUidValidity(10, for: "INBOX")
         server.setUidValidity(10, for: "Drafts")
@@ -2984,6 +3018,7 @@ struct NeverDropExitClosureTests {
         var save = PendingOperation(
             type: .saveDraft, messageIds: [draftId], accountId: f.accountId,
             folderPath: "Drafts", instanceEpoch: "E1", draftId: draftId)
+        save.retryCount = initialCount
         save.createdAt = Date().addingTimeInterval(-60)
         try insert([save], into: f.pool)
 
@@ -2998,6 +3033,9 @@ struct NeverDropExitClosureTests {
             durable user intention, which is none of the four exits — remaining ops: \
             \(afterFailedDrain.map(\.type))
             """)
+        #expect(afterFailedDrain.first?.retryCount == initialCount + 1)
+        #expect(afterFailedDrain.first?.status == PendingStatus.queued.rawValue)
+        #expect(try await f.pool.read { db in try Draft.fetchOne(db, key: draftId)?.body } == "draft body")
         let draftsAfterFailure = server.messageIDs(in: "Drafts")
         #expect(
             draftsAfterFailure.isEmpty,

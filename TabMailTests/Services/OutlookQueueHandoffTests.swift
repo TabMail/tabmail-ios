@@ -3398,7 +3398,7 @@ struct OutlookQueueHandoffTests {
     /// BYSTANDER first: it succeeds on the wire, which is what proves the
     /// executor was live at all — without it the drain could stop for a reason
     /// unrelated to anything under test and every assertion below would be
-    /// vacuous. Then the `.move`, which the server refuses ONCE with a `503`: the
+    /// vacuous. Then the `.move`, whose transport fails ONCE: the
     /// transient arm first tries to move that operation's related chain to the
     /// tail, and the commit observer scoped to the move's row refuses both that
     /// write and the requeue it falls back to, leaving the row `inFlight` and
@@ -3419,8 +3419,7 @@ struct OutlookQueueHandoffTests {
     ///   (i)   while the refusal stands, nothing runs BEHIND the unresolved
     ///         operation — the follower is still owed rather than executed;
     ///   (ii)  a further drain under the same refusal sends NO new provider work
-    ///         and charges no retry, because the charge rolled back with the
-    ///         write that carried it;
+    ///         and charges no retry, because transport failures are uncharged;
     ///   (iii) once writes recover, the move lands and its follower executes
     ///         EXACTLY ONCE after it, in issue order, and the newest intended
     ///         server state wins.
@@ -3474,7 +3473,7 @@ struct OutlookQueueHandoffTests {
 
         // The move is refused ONCE, transiently, which is the arm that defers the
         // chain and — when that write cannot commit — requeues the claimed row.
-        server.failMoveOnce(providerMessageId: "graph-1")
+        server.failMoveOnce(providerMessageId: "graph-1", transportError: .networkConnectionLost)
 
         await AccountManager.shared.drainPendingQueue()
 
@@ -3575,7 +3574,7 @@ struct OutlookQueueHandoffTests {
         // 🚨 ORACLE (iii). Both gestures execute exactly once, in issue order, and
         // the newest intended state is what the server ends up holding.
         let finalCalls = server.http.servedCallSequence()
-        // TWO `/move` requests: the one the server refused with a 503, and the
+        // TWO `/move` requests: the one interrupted by transport loss, and the
         // one that landed after the requeue recovered. The refused attempt is why
         // the count is not one, and the server-state assertion further down is
         // what says the move was APPLIED exactly once.
@@ -4061,7 +4060,7 @@ struct OutlookQueueHandoffTests {
         guard predecessorRowIDs.count == 2 else { return }
 
         // DRAIN 1 — account A's predecessor is claimed, reaches its provider, is
-        // refused with a 503, and both the tail movement that refusal asks for and
+        // interrupted by transport loss, and both the tail movement that refusal asks for and
         // the requeue it falls back to are themselves refused. The drain stops
         // there, owning ONE unresolved requeue; account B is next in the queue and
         // entirely healthy, and must not move.
@@ -4070,8 +4069,8 @@ struct OutlookQueueHandoffTests {
         f.pool.add(transactionObserver: firstRefuser, extent: .databaseLifetime)
         f.pool.add(transactionObserver: secondRefuser, extent: .databaseLifetime)
 
-        firstServer.failNextPatch()
-        secondServer.failNextPatch()
+        firstServer.failNextPatch(transportError: .networkConnectionLost)
+        secondServer.failNextPatch(transportError: .networkConnectionLost)
 
         await AccountManager.shared.drainPendingQueue()
 
@@ -4080,7 +4079,7 @@ struct OutlookQueueHandoffTests {
 
         // NON-VACUITY, the provider side: account A's predecessor really was
         // attempted, exactly once and at its own address, and nothing followed it
-        // — so it really did take the arm that requeues with a retry charge.
+        // — so it really did take the arm that requeues without a retry charge.
         #expect(firstAfterDrainOne.filter { $0.hasPrefix("PATCH ") }.count == 1, """
             account A's predecessor did not reach the provider exactly once, so \
             no requeue was ever asked for: \(firstAfterDrainOne)

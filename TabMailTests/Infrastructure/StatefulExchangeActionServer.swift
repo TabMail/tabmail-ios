@@ -75,6 +75,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         /// (which any mutating verb consumes) so a test can fail the FOLLOWER's
         /// verb without touching the `/move` that precedes it in the same lane.
         var patchFailuresRemaining = 0
+        var patchFailureTransport: URLError.Code?
         /// When true EVERY mutating verb answers 503, for as long as it is set —
         /// a permanent fault, as opposed to the one-shot budgets above. Modeled
         /// as its own flag rather than a huge budget so a test asserts "the lane
@@ -85,6 +86,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         /// rather than to a count because the shape it exists for is a BATCH
         /// whose earlier member must succeed.
         var oneShotMoveFailureIds: Set<String> = []
+        var oneShotMoveTransportFailures: [String: URLError.Code] = [:]
         /// Handed to the NEXT `/move` to arrive, which blocks on it until the
         /// TEST signals it. One-shot; a second move is not held.
         var nextMoveHold: DispatchSemaphore?
@@ -213,15 +215,18 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         state.value.withLock { $0.mutationFailuresRemaining += 1 }
     }
 
-    /// Fail the next PATCH (and only a PATCH) with 503.
+    /// Fail the next PATCH (and only a PATCH) with 503 by default, or a transport error.
     ///
     /// `failNextMutation()` is consumed by whichever mutating verb happens to
     /// arrive first, which in a move-then-flag lane is the MOVE. This seam exists
     /// so a test can fail the FOLLOWER while letting its predecessor's move
     /// succeed — the shape that proves a re-addressed follower stays queued at its
     /// NEW id rather than being retried at the dead one.
-    func failNextPatch() {
-        state.value.withLock { $0.patchFailuresRemaining += 1 }
+    func failNextPatch(transportError: URLError.Code? = nil) {
+        state.value.withLock {
+            $0.patchFailuresRemaining += 1
+            $0.patchFailureTransport = transportError
+        }
     }
 
     /// Turn a PERMANENT mutation fault on or off: while on, every mutating verb
@@ -237,7 +242,8 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         state.value.withLock { $0.allMutationsFail = failing }
     }
 
-    /// Fail the NEXT `/move` of exactly ONE provider id with 503, applying
+    /// Fail the NEXT `/move` of exactly ONE provider id with 503 by default
+    /// (or the requested transport error), applying
     /// nothing, and let every other member of the same batch through.
     ///
     /// Neither existing mutation seam can express this. `failNextMutation()` is
@@ -255,8 +261,11 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
     /// than 404 deliberately — a transient refusal leaves the unproven member
     /// durably queued, where a 404 would make it an authoritative-stale drop and
     /// change what the calling test measures.
-    func failMoveOnce(providerMessageId: String) {
-        _ = state.value.withLock { $0.oneShotMoveFailureIds.insert(providerMessageId) }
+    func failMoveOnce(providerMessageId: String, transportError: URLError.Code? = nil) {
+        state.value.withLock {
+            $0.oneShotMoveFailureIds.insert(providerMessageId)
+            $0.oneShotMoveTransportFailures[providerMessageId] = transportError
+        }
     }
 
     /// Make `PATCH /messages/{providerMessageId}` take `seconds` to answer.
@@ -483,7 +492,12 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                 model.patchFailuresRemaining -= 1
                 return true
             }
-            guard !patchFailed else { return .status(503) }
+            guard !patchFailed else {
+                if let error = state.value.withLock({ $0.patchFailureTransport }) {
+                    return .transportError(error)
+                }
+                return .status(503)
+            }
             guard !Self.consumeMutationFailure(state) else { return .status(503) }
             guard let providerId = Self.messageId(from: request.url, move: false) else {
                 return .status(404)
@@ -593,6 +607,9 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         // it consumes only when it actually fires — so an armed id that a test
         // never moves stays armed rather than being eaten by a sibling member.
         guard !state.value.withLock({ $0.oneShotMoveFailureIds.remove(providerId) != nil }) else {
+            if let error = state.value.withLock({ $0.oneShotMoveTransportFailures.removeValue(forKey: providerId) }) {
+                return .transportError(error)
+            }
             return .status(503)
         }
         let body = request.body.flatMap {
