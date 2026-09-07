@@ -3935,6 +3935,37 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         return infos.compactMap { mapMessageInfo($0) }
     }
 
+    func performMessageAction(_ action: ProviderMessageAction, at source: ProviderMessageSource) async throws -> ProviderActionOutcome {
+        guard let admitted = source.admittedUidValidity,
+              let epoch = UInt32(exactly: admitted), epoch > 0 else {
+            throw IMAPEpochEvidenceMissing.unknownAdmittedEpoch(folder: source.folderPath, live: 0)
+        }
+        switch action {
+        case .move(let destination):
+            return ProviderActionOutcome(move: try await move(
+                ids: source.memberIds, from: source.folderPath, to: destination,
+                admittedUidValidity: epoch))
+        case .read(let read):
+            if read {
+                try await markRead(ids: source.memberIds, folder: source.folderPath, admittedUidValidity: epoch)
+            } else {
+                try await markUnread(ids: source.memberIds, folder: source.folderPath, admittedUidValidity: epoch)
+            }
+        case .flagged(let flagged):
+            try await markFlagged(ids: source.memberIds, flagged: flagged, folder: source.folderPath, admittedUidValidity: epoch)
+        case .replied:
+            try await markReplied(ids: source.memberIds, folder: source.folderPath, admittedUidValidity: epoch)
+        case .forwarded:
+            try await markForwarded(ids: source.memberIds, folder: source.folderPath, admittedUidValidity: epoch)
+        case .userLabel(let id, let add):
+            if let member = source.memberIds.first {
+                try await setUserLabel(messageId: member, keyword: id, add: add, folder: source.folderPath, admittedUidValidity: epoch)
+            }
+            return ProviderActionOutcome(dispositionedMemberIds: Array(source.memberIds.prefix(1)))
+        }
+        return ProviderActionOutcome(dispositionedMemberIds: source.memberIds)
+    }
+
     func markRead(ids: [String], folder: String) async throws {
         throw ProviderError.actionIdentityResolutionFailed(ids.first ?? "")
     }

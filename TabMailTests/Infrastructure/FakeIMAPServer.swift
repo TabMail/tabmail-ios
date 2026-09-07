@@ -1691,7 +1691,8 @@ final class FakeIMAPServer: @unchecked Sendable {
             return "\(tag) OK LOGIN completed\r\n"
         case "SELECT", "EXAMINE":
             guard authenticated else { return "\(tag) NO Not authenticated\r\n" }
-            let mailbox = args.trimmingCharacters(in: .init(charactersIn: "\" "))
+            // Spaces inside a quoted mailbox are address bytes, not delimiters.
+            let mailbox = Self.firstQuoted(args) ?? args.trimmingCharacters(in: .whitespaces)
             if let includeNonexistentCode = withState({ $0.deletedMailboxes[mailbox] }) {
                 // Deliberately two distinct real-world shapes: `[NONEXISTENT]`
                 // (RFC 5530 §3) is a fast-path HINT the adapter may use, but

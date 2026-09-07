@@ -614,6 +614,34 @@ actor ExchangeProvider: EmailProvider {
         }
     }
 
+    func performMessageAction(_ action: ProviderMessageAction, at source: ProviderMessageSource) async throws -> ProviderActionOutcome {
+        do {
+            switch action {
+            case .move(let destination):
+                return ProviderActionOutcome(move: try await moveProvingDestinations(ids: source.memberIds, from: source.folderPath, to: destination))
+            case .read(let read):
+                if read {
+                    try await markRead(ids: source.memberIds, folder: source.folderPath)
+                } else {
+                    try await markUnread(ids: source.memberIds, folder: source.folderPath)
+                }
+            case .flagged(let flagged):
+                try await markFlagged(ids: source.memberIds, flagged: flagged, folder: source.folderPath)
+            case .replied, .forwarded:
+                // These flags have no remote representation; local state is preserved by sync.
+                break
+            case .userLabel(let id, let add):
+                if let member = source.memberIds.first {
+                    try await setUserLabel(messageId: member, category: id, add: add)
+                }
+                return ProviderActionOutcome(dispositionedMemberIds: Array(source.memberIds.prefix(1)))
+            }
+            return ProviderActionOutcome(dispositionedMemberIds: source.memberIds)
+        } catch let disposition as ProviderMembersDispositioned {
+            return ProviderActionOutcome(disposition: disposition)
+        }
+    }
+
     func markRead(ids: [String], folder: String) async throws {
         try await patchEachMessage(ids: ids, body: ["isRead": true])
     }
@@ -632,8 +660,8 @@ actor ExchangeProvider: EmailProvider {
     /// therefore discards them **because its caller asked for a shape that
     /// cannot carry them**, which is not the same thing as the discard
     /// `IOS-GRAPH-002` was about (a `_ =` on the only path that had them).
-    /// The action queue calls `moveProvingDestinations` instead; nothing in
-    /// production reaches this overload for a `.move` operation.
+    /// `performMessageAction` calls `moveProvingDestinations` directly and
+    /// carries its destination proof across the ordinary action boundary.
     ///
     /// 🚨 SILENCE HERE WOULD MEAN "ALL N MOVED", AND ITS DELEGATE SETTLES ONE.
     /// `moveProvingDestinations` addresses `ids.first` and returns a ONE-member
@@ -642,8 +670,8 @@ actor ExchangeProvider: EmailProvider {
     /// bare `_ =` on that outcome would hand the `Void` contract's "every member
     /// moved" back to a caller for a batch of which one member moved, retiring
     /// N − 1 user intentions on an absence of evidence. That is unreachable
-    /// today — `dispatchOperation`'s `.move` arm calls `moveProvingDestinations`
-    /// from inside its `provider as? ExchangeProvider` branch and returns there —
+    /// through the ordinary action API — its move arm calls
+    /// `moveProvingDestinations` and returns its complete outcome directly —
     /// but unreachability is a property of the CALLER, not of this contract, and
     /// this is the shape `MIS-IOS-023`'s second instance names. Reporting it
     /// makes the trap impossible instead of merely unsprung.
@@ -651,9 +679,9 @@ actor ExchangeProvider: EmailProvider {
     /// The report is `GmailProvider.modifyEachMessage`'s, member for member:
     /// throw whenever the outcome is not "this whole request, all mutated", so a
     /// settled-but-absent single member is reported too rather than passing as
-    /// silence. `AccountManager.executeOperation` converts it at its single
-    /// chokepoint into `provenMembers` + `confirmedGoneMembers`, so the members
-    /// behind the settled one stay owed under the same durable row.
+    /// silence. The ordinary action adapter normalizes the same carrier into
+    /// an explicit outcome; independent callers of this Void convenience API
+    /// must likewise account for the members it leaves unresolved.
     ///
     /// ⚠️ `confirmedGoneIds` IS THE LOAD-BEARING HALF OF THE CONDITION, and a
     /// `provenIds`-only comparison structurally cannot see the case it exists

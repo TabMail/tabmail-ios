@@ -90,6 +90,30 @@ struct FakeIMAPServerOracleTests {
         }
     }
 
+    @Test("SELECT preserves whitespace inside a quoted mailbox name")
+    func selectPreservesQuotedMailboxWhitespace() async throws {
+        let exact = " Projects "
+        // Keep this parser oracle independent of client namespace normalization.
+        let server = FakeIMAPServer(
+            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "NAMESPACE" }, mailboxes: [
+            exact: [Self.message(uid: 7, id: "duplicate@example.com")],
+            "Projects": [Self.message(uid: 7, id: "duplicate@example.com")],
+        ])
+        server.setUidValidity(10, for: exact)
+        server.setUidValidity(20, for: "Projects")
+        try server.start()
+        defer { server.stop() }
+        try await Self.withClient(server) { client in
+            let selection = try await client.selectMailbox(exact)
+            #expect(selection.uidValidity.value == 10)
+            try await client.store(flags: [.seen], on: UIDSet(UID(7)), operation: .add)
+            let bystander = try await client.selectMailbox("Projects")
+            #expect(bystander.uidValidity.value == 20)
+        }
+        #expect(server.flags(in: exact, uid: 7).contains("\\Seen"))
+        #expect(server.flags(in: "Projects", uid: 7).isEmpty)
+    }
+
     // MARK: - Deliverable 1: the oracle fires
 
     /// THE headline red-first proof for T0.2: a `UID STORE` aimed at a UID

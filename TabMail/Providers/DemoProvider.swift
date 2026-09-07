@@ -117,6 +117,32 @@ actor DemoProvider: EmailProvider {
 
     // MARK: - Writes (mutate GRDB, return success)
 
+    func performMessageAction(_ action: ProviderMessageAction, at source: ProviderMessageSource) async throws -> ProviderActionOutcome {
+        do {
+            switch action {
+            case .move(let destination):
+                try await move(ids: source.memberIds, from: source.folderPath, to: destination)
+            case .read(let read):
+                if read {
+                    try await markRead(ids: source.memberIds, folder: source.folderPath)
+                } else {
+                    try await markUnread(ids: source.memberIds, folder: source.folderPath)
+                }
+            case .flagged(let flagged):
+                try await markFlagged(ids: source.memberIds, flagged: flagged, folder: source.folderPath)
+            case .replied, .forwarded:
+                // These flags have no remote representation; local state is preserved by sync.
+                break
+            case .userLabel:
+                // Demo has no remote user-label representation.
+                break
+            }
+            return ProviderActionOutcome(dispositionedMemberIds: source.memberIds)
+        } catch let disposition as ProviderMembersDispositioned {
+            return ProviderActionOutcome(disposition: disposition)
+        }
+    }
+
     func markRead(ids: [String], folder: String) async throws {
         try await flagUpdate(ids: ids, folder: folder) { $0.isRead = true }
     }

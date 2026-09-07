@@ -35,6 +35,28 @@ struct HandleMissedItemsTests {
         func fetchMessages(folder: String, limit: Int, offset: Int) async throws -> [MessageHeaderInfo] { [] }
         func fetchMessage(id: String, folder: String) async throws -> FullMessageInfo { throw ProviderError.messageNotFound }
         func search(query: String, folder: String, after: Date?, before: Date?, from: String?, to: String?) async throws -> [MessageHeaderInfo] { [] }
+        func performMessageAction(_ action: ProviderMessageAction, at source: ProviderMessageSource) async throws -> ProviderActionOutcome {
+            do {
+                switch action {
+                case .move(let destination):
+                    try await move(ids: source.memberIds, from: source.folderPath, to: destination)
+                case .read(let read):
+                    if read {
+                        try await markRead(ids: source.memberIds, folder: source.folderPath)
+                    } else {
+                        try await markUnread(ids: source.memberIds, folder: source.folderPath)
+                    }
+                case .flagged(let flagged):
+                    try await markFlagged(ids: source.memberIds, flagged: flagged, folder: source.folderPath)
+                case .replied, .forwarded, .userLabel:
+                    break
+                }
+                return ProviderActionOutcome(dispositionedMemberIds: source.memberIds)
+            } catch let disposition as ProviderMembersDispositioned {
+                return ProviderActionOutcome(disposition: disposition)
+            }
+        }
+
         func markRead(ids: [String], folder: String) async throws {}
         func markUnread(ids: [String], folder: String) async throws {}
         func markFlagged(ids: [String], flagged: Bool, folder: String) async throws {}
@@ -75,6 +97,28 @@ struct HandleMissedItemsTests {
         func fetchMessages(folder: String, limit: Int, offset: Int) async throws -> [MessageHeaderInfo] { [] }
         func fetchMessage(id: String, folder: String) async throws -> FullMessageInfo { throw ProviderError.messageNotFound }
         func search(query: String, folder: String, after: Date?, before: Date?, from: String?, to: String?) async throws -> [MessageHeaderInfo] { [] }
+        func performMessageAction(_ action: ProviderMessageAction, at source: ProviderMessageSource) async throws -> ProviderActionOutcome {
+            do {
+                switch action {
+                case .move(let destination):
+                    try await move(ids: source.memberIds, from: source.folderPath, to: destination)
+                case .read(let read):
+                    if read {
+                        try await markRead(ids: source.memberIds, folder: source.folderPath)
+                    } else {
+                        try await markUnread(ids: source.memberIds, folder: source.folderPath)
+                    }
+                case .flagged(let flagged):
+                    try await markFlagged(ids: source.memberIds, flagged: flagged, folder: source.folderPath)
+                case .replied, .forwarded, .userLabel:
+                    break
+                }
+                return ProviderActionOutcome(dispositionedMemberIds: source.memberIds)
+            } catch let disposition as ProviderMembersDispositioned {
+                return ProviderActionOutcome(disposition: disposition)
+            }
+        }
+
         func markRead(ids: [String], folder: String) async throws {}
         func markUnread(ids: [String], folder: String) async throws {}
         func markFlagged(ids: [String], flagged: Bool, folder: String) async throws {}

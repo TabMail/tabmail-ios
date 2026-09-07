@@ -318,7 +318,7 @@ struct MockProviderEpochSeamTests {
         }
 
         let outcome = await AccountManager.shared.executeSingleOp(
-            op, provider: provider, context: AccountManager.DrainContext())
+            op, provider: provider, context: AccountOperationExecutor.DrainContext())
 
         let (fired, rowPresentInFlight) = observed.withLock { $0 }
         #expect(fired, "the hook must actually be awaited from inside the provider call, not skipped")
@@ -328,7 +328,7 @@ struct MockProviderEpochSeamTests {
                 discharges it is in flight — releasing it first opens a window in which a crash \
                 loses the user's action with the server never having been told
                 """)
-        #expect(outcome == .proceed, "a successful markRead completes the op")
+        #expect(outcome == .completed, "a successful markRead completes the op")
 
         let after = try fetchOp(opId, pool: pool)
         #expect(after == nil, "and only once the call returned is the row released")

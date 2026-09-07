@@ -608,6 +608,34 @@ actor GmailProvider: EmailProvider {
         }
     }
 
+    func performMessageAction(_ action: ProviderMessageAction, at source: ProviderMessageSource) async throws -> ProviderActionOutcome {
+        do {
+            switch action {
+            case .move(let destination):
+                try await move(ids: source.memberIds, from: source.folderPath, to: destination)
+            case .read(let read):
+                if read {
+                    try await markRead(ids: source.memberIds, folder: source.folderPath)
+                } else {
+                    try await markUnread(ids: source.memberIds, folder: source.folderPath)
+                }
+            case .flagged(let flagged):
+                try await markFlagged(ids: source.memberIds, flagged: flagged, folder: source.folderPath)
+            case .replied, .forwarded:
+                // These flags have no remote representation; local state is preserved by sync.
+                break
+            case .userLabel(let id, let add):
+                if let member = source.memberIds.first {
+                    try await modifyMessage(id: member, addLabelIds: add ? [id] : [], removeLabelIds: add ? [] : [id])
+                }
+                return ProviderActionOutcome(dispositionedMemberIds: Array(source.memberIds.prefix(1)))
+            }
+            return ProviderActionOutcome(dispositionedMemberIds: source.memberIds)
+        } catch let disposition as ProviderMembersDispositioned {
+            return ProviderActionOutcome(disposition: disposition)
+        }
+    }
+
     func markRead(ids: [String], folder: String) async throws {
         try await modifyEachMessage(ids: ids, removeLabelIds: ["UNREAD"])
     }

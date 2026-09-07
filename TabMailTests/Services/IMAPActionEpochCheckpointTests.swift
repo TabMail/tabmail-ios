@@ -117,6 +117,76 @@ struct IMAPActionEpochCheckpointTests {
         }
     }
 
+    @Test("The native action API refuses every missing or invalid admitted epoch before wire")
+    func actionAPIRejectsUnadmittedEpochBeforeWire() async throws {
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [Self.message(uid: 7, id: "target@example.com")]])
+        server.setUidValidity(10, for: "INBOX")
+        try server.start()
+        defer { server.stop() }
+        let provider: any EmailProvider = Self.provider(server)
+        try await provider.connect()
+        let before = server.recordedCommands()
+        let actions: [ProviderMessageAction] = [.read(true), .read(false), .flagged(true), .flagged(false),
+                                                .replied, .forwarded, .userLabel(id: "Label_1", add: true),
+                                                .userLabel(id: "Label_1", add: false), .move(destination: "Archive")]
+        let epochs: [Int?] = [nil, 0, -1, Int(UInt32.max) + 1]
+        for epoch in epochs {
+            for action in actions {
+                do {
+                    _ = try await provider.performMessageAction(action, at: .init(
+                        memberIds: ["7"], folderPath: "INBOX", admittedUidValidity: epoch))
+                    Issue.record("Unadmitted native address must not report completion")
+                } catch {
+                    #expect(error is ProviderEvidenceUnavailable)
+                }
+            }
+        }
+        #expect(server.recordedCommands() == before, "Missing admission evidence must be rejected before even SELECT")
+        #expect(!server.flags(in: "INBOX", uid: 7).contains("\\Seen"))
+        try await provider.disconnect()
+    }
+
+    @Test("The native action API preserves exact source bytes and all IMAP flag commands")
+    func actionAPIForwardsExactSourceAndCommands() async throws {
+        let source = " Projects "
+        let message = Self.message(uid: 7, id: "duplicate@example.com")
+        // Omit NAMESPACE to exercise the adapter byte boundary independently of
+        // SwiftMail namespace normalization, which trims mailbox names.
+        let server = FakeIMAPServer(
+            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "NAMESPACE" },
+            mailboxes: [source: [message, Self.message(uid: 8, id: "tail@example.com")],
+                        "Projects": [message]])
+        server.setUidValidity(10, for: source)
+        server.setUidValidity(10, for: "Projects")
+        try server.start()
+        defer { server.stop() }
+        let provider: any EmailProvider = Self.provider(server)
+        try await provider.connect()
+        let address = ProviderMessageSource(memberIds: ["7"], folderPath: source, admittedUidValidity: 10)
+        for value in [true, false] {
+            _ = try await provider.performMessageAction(.read(value), at: address)
+            #expect(server.flags(in: source, uid: 7).contains("\\Seen") == value)
+            #expect(server.flags(in: "Projects", uid: 7).isEmpty)
+            _ = try await provider.performMessageAction(.flagged(value), at: address)
+            #expect(server.flags(in: source, uid: 7).contains("\\Flagged") == value)
+            #expect(server.flags(in: "Projects", uid: 7).isEmpty)
+            let label = try await provider.performMessageAction(.userLabel(id: "Label_1", add: value), at: .init(
+                memberIds: ["7", "8"], folderPath: source, admittedUidValidity: 10))
+            #expect(label.dispositionedMemberIds == ["7"])
+            #expect(server.flags(in: source, uid: 8).isEmpty)
+            #expect(server.flags(in: source, uid: 7).contains("Label_1") == value)
+            #expect(server.flags(in: "Projects", uid: 7).isEmpty)
+        }
+        _ = try await provider.performMessageAction(.replied, at: address)
+        #expect(server.flags(in: "Projects", uid: 7).isEmpty)
+        _ = try await provider.performMessageAction(.forwarded, at: address)
+        #expect(server.flags(in: source, uid: 7).contains("\\Answered"))
+        #expect(server.flags(in: source, uid: 7).contains("$Forwarded"))
+        #expect(server.flags(in: "Projects", uid: 7).isEmpty, "Same UID/RFC in another exact mailbox is a bystander")
+        #expect(!server.recordedCommands().contains { $0.uppercased().contains("SEARCH") })
+        try await provider.disconnect()
+    }
+
     /// 🚨 CORRECTED (audit round 1, finding A-3). This test previously asserted
     /// `operations(f.pool).isEmpty` — it BLESSED the defect, requiring that an
     /// op with a MISSING or ZERO admitted epoch be deleted alongside the one

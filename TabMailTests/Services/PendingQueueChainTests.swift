@@ -6,7 +6,7 @@ import Testing
 import Foundation
 @testable import TabMail
 
-/// Pure unit tests for `AccountManager.buildRelatedChains` — the connected-component
+/// Pure unit tests for `AccountOperationExecutor.relatedOperationsForTesting` — the connected-component
 /// grouping over provider ADDRESSES (ADR-IOS-018 amendment 2026-07-10,
 /// DECISIONS.md). No DB, no provider, no actor hop: `buildRelatedChains` is a
 /// `nonisolated static` pure function over `[PendingOperation]` values
@@ -71,7 +71,7 @@ struct PendingQueueChainTests {
         let batchOp = makeOp(type: .move, messageIds: ["A", "B", "C"], createdAt: now)
         let singleOp = makeOp(type: .markFlagged, messageIds: ["B"], createdAt: now.addingTimeInterval(1))
 
-        let lanes = AccountManager.buildRelatedChains([batchOp, singleOp], accountScopedIdAccountIds: [])
+        let lanes = AccountOperationExecutor.relatedOperationsForTesting([batchOp, singleOp], accountScopedIdAccountIds: [])
 
         #expect(lanes.count == 1)
         guard lanes.count == 1 else { return }
@@ -87,7 +87,7 @@ struct PendingQueueChainTests {
         let opCD = makeOp(messageIds: ["C", "D"], createdAt: now.addingTimeInterval(1))
         let opBridge = makeOp(messageIds: ["B", "C"], createdAt: now.addingTimeInterval(2))
 
-        let lanes = AccountManager.buildRelatedChains([opAB, opCD, opBridge], accountScopedIdAccountIds: [])
+        let lanes = AccountOperationExecutor.relatedOperationsForTesting([opAB, opCD, opBridge], accountScopedIdAccountIds: [])
 
         #expect(lanes.count == 1)
         guard lanes.count == 1 else { return }
@@ -104,7 +104,7 @@ struct PendingQueueChainTests {
         let opY = makeOp(messageIds: ["Y"], createdAt: now.addingTimeInterval(1))
         let opEmpty = makeOp(type: .saveDraft, messageIds: [], createdAt: now.addingTimeInterval(2))
 
-        let lanes = AccountManager.buildRelatedChains([opX, opY, opEmpty], accountScopedIdAccountIds: [])
+        let lanes = AccountOperationExecutor.relatedOperationsForTesting([opX, opY, opEmpty], accountScopedIdAccountIds: [])
 
         #expect(lanes.count == 3)
         let laneIds = lanes.map { $0.map(\.id) }
@@ -134,7 +134,7 @@ struct PendingQueueChainTests {
         let opAcc1 = makeOp(messageIds: ["shared-id"], accountId: "acc1", createdAt: now)
         let opAcc2 = makeOp(messageIds: ["shared-id"], accountId: "acc2", createdAt: now.addingTimeInterval(1))
 
-        let lanes = AccountManager.buildRelatedChains([opAcc1, opAcc2], accountScopedIdAccountIds: admitted)
+        let lanes = AccountOperationExecutor.relatedOperationsForTesting([opAcc1, opAcc2], accountScopedIdAccountIds: admitted)
 
         #expect(lanes.count == 2)
         let laneIds = lanes.map { $0.map(\.id) }
@@ -146,7 +146,7 @@ struct PendingQueueChainTests {
 
     @Test("empty input produces no lanes")
     func emptyInputProducesNoLanes() {
-        let lanes = AccountManager.buildRelatedChains([], accountScopedIdAccountIds: [])
+        let lanes = AccountOperationExecutor.relatedOperationsForTesting([], accountScopedIdAccountIds: [])
         #expect(lanes.isEmpty)
     }
 
@@ -156,7 +156,7 @@ struct PendingQueueChainTests {
         let op1 = makeOp(type: .saveDraft, messageIds: [], createdAt: now)
         let op2 = makeOp(type: .deleteDraft, messageIds: [], createdAt: now.addingTimeInterval(1))
 
-        let lanes = AccountManager.buildRelatedChains([op1, op2], accountScopedIdAccountIds: [])
+        let lanes = AccountOperationExecutor.relatedOperationsForTesting([op1, op2], accountScopedIdAccountIds: [])
 
         #expect(lanes.count == 2)
         let laneIds = lanes.map { $0.map(\.id) }
@@ -189,7 +189,7 @@ struct PendingQueueChainTests {
             folderPath: "INBOX", destinationPath: "TRASH",
             createdAt: now.addingTimeInterval(1))
 
-        let lanes = AccountManager.buildRelatedChains(
+        let lanes = AccountOperationExecutor.relatedOperationsForTesting(
             [opInverse, opRedelete], accountScopedIdAccountIds: ["acc-gmail"])
 
         #expect(lanes.count == 1,
@@ -232,7 +232,7 @@ struct PendingQueueChainTests {
             folderPath: "INBOX", destinationPath: "TRASH",
             createdAt: now.addingTimeInterval(1))
 
-        let lanes = AccountManager.buildRelatedChains(
+        let lanes = AccountOperationExecutor.relatedOperationsForTesting(
             [opInverse, opRedelete], accountScopedIdAccountIds: ["acc-outlook"])
 
         #expect(lanes.count == 1, """
@@ -284,7 +284,7 @@ struct PendingQueueChainTests {
             type: .markFlagged, messageIds: ["77"], accountId: "acc-imap",
             folderPath: "Archive", createdAt: now.addingTimeInterval(1))
 
-        let lanes = AccountManager.buildRelatedChains(
+        let lanes = AccountOperationExecutor.relatedOperationsForTesting(
             [opInbox, opArchive], accountScopedIdAccountIds: [])
 
         #expect(lanes.count == 2,
@@ -316,7 +316,7 @@ struct PendingQueueChainTests {
             type: .markRead, messageIds: ["shared-99"], accountId: "acc-imap",
             folderPath: "Archive", createdAt: now.addingTimeInterval(3))
 
-        let lanes = AccountManager.buildRelatedChains(
+        let lanes = AccountOperationExecutor.relatedOperationsForTesting(
             [stableInbox, stableTrash, imapInbox, imapArchive],
             accountScopedIdAccountIds: ["acc-gmail"])
 

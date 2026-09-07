@@ -350,9 +350,9 @@ struct WindowExemptAdmissionTests {
         await ActiveAIQueue.shared.clearForTesting()
 
         let key = "\(accountId)|INBOX"
-        let context = AccountManager.DrainContext()
+        let context = AccountOperationExecutor.DrainContext()
         context.enteredInbox.withLock {
-            $0[key] = [AccountManager.DrainContext.InboxEntry(
+            $0[key] = [AccountOperationExecutor.DrainContext.InboxEntry(
                 accountId: accountId, messageId: "moved-1",
                 rfc822MessageId: moved.rfc822MessageId)]
         }

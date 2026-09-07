@@ -373,6 +373,9 @@ protocol EmailProvider: Sendable {
     func fetchMessage(id: String, folder: String) async throws -> FullMessageInfo
     func search(query: String, folder: String, after: Date?, before: Date?, from: String?, to: String?) async throws -> [MessageHeaderInfo]
 
+    /// Execute ordinary message intent at its admitted native address.
+    func performMessageAction(_ action: ProviderMessageAction, at source: ProviderMessageSource) async throws -> ProviderActionOutcome
+
     func markRead(ids: [String], folder: String) async throws
     func markUnread(ids: [String], folder: String) async throws
     func markFlagged(ids: [String], flagged: Bool, folder: String) async throws
@@ -692,6 +695,59 @@ struct BackfillResult: Sendable {
 /// stays durably queued, retrying forever if the server never conforms.
 protocol ProviderEvidenceUnavailable: Error {}
 
+/// Ordinary message intent; drafts retain their separate typed identity contract.
+enum ProviderMessageAction: Sendable {
+    case move(destination: String)
+    case read(Bool)
+    case flagged(Bool)
+    case replied
+    case forwarded
+    case userLabel(id: String, add: Bool)
+}
+
+/// Ephemeral native operands. Folder spelling and the admission epoch are never reconstructed.
+struct ProviderMessageSource: Sendable {
+    let memberIds: [String]
+    let folderPath: String
+    let admittedUidValidity: Int?
+}
+
+/// Settled provider work from one attempt, including explicit no-ops, not a mutation claim.
+/// Members omitted from this result remain unresolved. Label commands settle only their
+/// first native member on remote providers; Demo explicitly no-ops the whole command.
+struct ProviderActionOutcome: Sendable {
+    let dispositionedMemberIds: [String]
+    let provenDestinations: [ProvenDestinationAddress]
+    let addressChangesOnMove: Bool
+    let requiresSourceReconciliation: Bool
+    let confirmedGoneMemberIds: [String]
+
+    init(dispositionedMemberIds: [String],
+         provenDestinations: [ProvenDestinationAddress] = [],
+         addressChangesOnMove: Bool = false,
+         requiresSourceReconciliation: Bool = false,
+         confirmedGoneMemberIds: [String] = []) {
+        self.dispositionedMemberIds = dispositionedMemberIds
+        self.provenDestinations = provenDestinations
+        self.addressChangesOnMove = addressChangesOnMove
+        self.requiresSourceReconciliation = requiresSourceReconciliation
+        self.confirmedGoneMemberIds = confirmedGoneMemberIds
+    }
+
+    init(move: MoveOutcome) {
+        self.init(dispositionedMemberIds: move.provenIds,
+                  provenDestinations: move.provenDestinations,
+                  addressChangesOnMove: true,
+                  requiresSourceReconciliation: move.requiresSourceReconciliation,
+                  confirmedGoneMemberIds: move.confirmedGoneIds)
+    }
+
+    init(disposition: ProviderMembersDispositioned) {
+        self.init(dispositionedMemberIds: disposition.dispositionedMemberIds,
+                  confirmedGoneMemberIds: disposition.absentMemberIds)
+    }
+}
+
 /// A provider's per-member action loop is reporting exactly which member it
 /// settled, and saying NOTHING about the rest.
 ///
@@ -701,9 +757,8 @@ protocol ProviderEvidenceUnavailable: Error {}
 /// because the server said it is gone — had no way to say WHICH member it
 /// settled. That attribution is the entire reason the drain used to split a batch
 /// into replacement rows.
-/// `AccountManager.executeOperation` catches this and converts it into an
-/// `ExecutedOperation` carrying `provenMembers` and `confirmedGoneMembers`; it
-/// never escapes to the scheduler and is never classified as a failure.
+/// Each adapter normalizes this compatibility carrier into `ProviderActionOutcome`
+/// at `performMessageAction`; it never escapes to the scheduler as a failure.
 ///
 /// ⚠ "DISPOSITIONED" MEANS THERE IS NOTHING LEFT TO DO TO THAT MEMBER — it was
 /// mutated successfully, or the server AUTHORITATIVELY answered the request
