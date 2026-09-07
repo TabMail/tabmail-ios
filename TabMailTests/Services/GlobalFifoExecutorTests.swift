@@ -1069,4 +1069,216 @@ struct GlobalFifoExecutorTests {
             cleared: \(afterSecond.map { "\($0.queuePosition):\($0.status)" })
             """)
     }
+    @Test("Invalidated delivery preserves the claim, including a refused requeue, then converges", arguments: [false, true])
+    @MainActor
+    func invalidatedDeliveryKeepsLifecycleOwnership(refuseRequeue: Bool) async throws {
+        let f = try fixture(accountId: "fifo-invalidated", provider: .gmail)
+        defer { finish(f) }
+        try seedHeader(f, messageId: "delivery-member")
+        let admitted = try admit(f, PendingOperation(type: .markRead,
+            messageIds: ["delivery-member"], accountId: f.accountId, folderPath: Self.source))
+        if refuseRequeue {
+            try await f.pool.writeWithoutTransaction { db in
+                try db.execute(sql: """
+                    CREATE TRIGGER refuse_delivery_requeue BEFORE UPDATE OF status ON pendingOperation
+                    WHEN NEW.status = 'queued'
+                    BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END
+                    """)
+            }
+        }
+        let provider = MockEmailProvider()
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            let queue = try #require(await AccountManager.shared.workQueues[f.accountId])
+            queue.markInvalidated()
+            await AccountManager.shared.drainPendingQueue()
+            let rows = try rowsByPosition(f)
+            #expect(rows.count == 1)
+            #expect(rows.first?.id == admitted.id)
+            #expect(rows.first?.queuePosition == admitted.queuePosition)
+            #expect(rows.first?.everAttempted == true, "the real frontier must have committed a claim")
+            #expect(rows.first?.retryCount == 0)
+            #expect(rows.first?.status == (refuseRequeue ? PendingStatus.inFlight.rawValue : PendingStatus.queued.rawValue))
+            #expect(await AccountManager.shared.pendingRequeues.keys.contains(admitted.id) == refuseRequeue)
+            #expect(await !AccountManager.shared.hasPendingOperationSettlement)
+            #expect(await provider.markedReadIds.isEmpty, "invalidated delivery must never enter provider work")
+            if refuseRequeue {
+                try await f.pool.writeWithoutTransaction { db in
+                    try db.execute(sql: "DROP TRIGGER refuse_delivery_requeue")
+                }
+            }
+            await AccountManager.shared.registerProviderForTesting(accountId: f.accountId, provider: provider)
+            await AccountManager.shared.drainPendingQueue()
+            #expect(try rowsByPosition(f).isEmpty)
+            #expect(await provider.markedReadIds.map(\.ids) == [["delivery-member"]])
+            #expect(await AccountManager.shared.pendingRequeues.isEmpty)
+        }
+    }
+
+    private actor DeliveryGate {
+        private var isOpen = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+        func wait() async {
+            if isOpen { return }
+            await withCheckedContinuation { waiters.append($0) }
+        }
+        func open() {
+            isOpen = true
+            let held = waiters
+            waiters.removeAll()
+            for waiter in held { waiter.resume() }
+        }
+    }
+
+    @Test("Cancellation while a claimed action waits for a provider slot returns lifecycle ownership")
+    @MainActor
+    func cancelledDeliveryKeepsLifecycleOwnership() async throws {
+        let f = try fixture(accountId: "fifo-cancelled", provider: .gmail)
+        defer { finish(f) }
+        try seedHeader(f, messageId: "cancelled-member")
+        let admitted = try admit(f, PendingOperation(type: .markRead,
+            messageIds: ["cancelled-member"], accountId: f.accountId, folderPath: Self.source))
+        let provider = MockEmailProvider()
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            let queue = try #require(await AccountManager.shared.workQueues[f.accountId])
+            let gate = DeliveryGate()
+            await withTaskGroup(of: Void.self) { group in
+                for _ in 0..<SyncConfig.imapMaxConnectionCeiling {
+                    group.addTask { await queue.execute(priority: .bodyFetch) { await gate.wait() } }
+                }
+                let occupied = (try? await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+                    while await queue.activeOperations != SyncConfig.imapMaxConnectionCeiling {
+                        try Task.checkCancellation()
+                        await Task.yield()
+                    }
+                    return true
+                }) ?? false
+                #expect(occupied, "the controlled holders never occupied the provider slots")
+                guard occupied else { await gate.open(); return }
+                let drain = Task { await AccountManager.shared.drainPendingQueue() }
+                let waiting = (try? await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+                    while await queue.waitingCount == 0 {
+                        try Task.checkCancellation()
+                        await Task.yield()
+                    }
+                    return true
+                }) ?? false
+                #expect(waiting, "the claimed operation never reached the queue's actual slot wait")
+                let before = try? rowsByPosition(f)
+                #expect(before?.first?.status == PendingStatus.inFlight.rawValue)
+                #expect(before?.first?.everAttempted == true)
+                drain.cancel()
+                // Release only after the cancelled owner returns: a non-cancellable
+                // delivery cannot produce the queued-state witness while work is held.
+                if waiting {
+                    let returned = (try? await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+                        await drain.value
+                        return true
+                    }) ?? false
+                    #expect(returned, "cancelled delivery did not return while the slots remained held")
+                }
+                await gate.open()
+                await drain.value
+            }
+            let rows = try rowsByPosition(f)
+            #expect(rows.map(\.id) == [admitted.id])
+            let retainedRequeue = await AccountManager.shared.pendingRequeues[admitted.id]
+            #expect(rows.first?.status == PendingStatus.queued.rawValue ||
+                (rows.first?.status == PendingStatus.inFlight.rawValue && retainedRequeue == false))
+            #expect(rows.first?.retryCount == 0)
+            #expect(rows.first?.queuePosition == admitted.queuePosition)
+            #expect(await provider.markedReadIds.isEmpty)
+            #expect(await !AccountManager.shared.hasPendingOperationSettlement)
+            await AccountManager.shared.drainPendingQueue()
+            #expect(try rowsByPosition(f).isEmpty)
+            #expect(await provider.markedReadIds.map(\.ids) == [["cancelled-member"]])
+            #expect(await AccountManager.shared.pendingRequeues.isEmpty)
+        }
+    }
+
+    @Test("Full and partial immediate/replayed settlements enqueue only committed Inbox members after real folder sync", arguments: [1, 2], [false, true])
+    @MainActor
+    func committedInboxEffectsReachDrainFinalization(memberCount: Int, replay: Bool) async throws {
+        let f = try fixture(accountId: "fifo-inbox-effects", provider: .gmail, folders: [Self.archive])
+        defer { finish(f) }
+        let members = Array(["entry-a", "entry-b"].prefix(memberCount))
+        for member in members { try seedHeader(f, messageId: member, folderPath: Self.archive) }
+        let admitted = try admit(f, PendingOperation(type: .move, messageIds: members,
+            accountId: f.accountId, folderPath: Self.archive, destinationPath: Self.source))
+        try await f.pool.writeWithoutTransaction { db in
+            // Exactly the optimistic header shape: source primary key, destination location.
+            try db.execute(sql: "UPDATE messageHeader SET folderId = ?, folderPath = ?, isInInbox = 1",
+                arguments: [MessageIdentity.folderId(accountId: f.accountId, folderPath: Self.source), Self.source])
+            if replay {
+                let event = memberCount == 1 ? "DELETE" : "UPDATE OF messageIdsJSON"
+                let condition = memberCount == 1 ? "" : "WHEN NEW.messageIdsJSON != OLD.messageIdsJSON"
+                try db.execute(sql: """
+                    CREATE TRIGGER refuse_effect_settlement BEFORE \(event) ON pendingOperation
+                    \(condition)
+                    BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END
+                    """)
+            }
+        }
+        let provider = MockEmailProvider()
+        if memberCount > 1 {
+            await provider.setMoveThrowsOnId("entry-b", error:
+                ProviderMembersDispositioned(dispositionedMemberIds: ["entry-a"], absentMemberIds: []))
+            let calls = Mutex(0)
+            await provider.setMoveHook {
+                let next = calls.withLock { $0 += 1; return $0 }
+                if next > 1 { await provider.clearMoveThrowsOnId() }
+            }
+        }
+        // Reconciliation really reaches the provider. Its failure must still be
+        // followed by the established post-sync AI admission, with no early enqueue.
+        await provider.setFetchMessagesThrows(ProviderError.notConnected)
+        let syncObservations = Mutex<[Int]>([])
+        await provider.setFetchMessagesHook { _ in
+            let jobs = await ActiveAIQueue.shared.queuedJobsForTesting
+            syncObservations.withLock { $0.append(jobs.filter { $0.accountId == f.accountId }.count) }
+        }
+        await ActiveAIQueue.shared.setDispatchSuppressedForTesting(true)
+        await ActiveAIQueue.shared.clearForTesting()
+        do {
+            try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+                await AccountManager.shared.drainPendingQueue()
+                if replay {
+                    try #require(await AccountManager.shared.hasPendingOperationSettlement,
+                        "the settlement transaction must actually refuse after provider execution")
+                    #expect(await ActiveAIQueue.shared.queuedJobsForTesting.isEmpty,
+                        "a rolled-back settlement must publish no Inbox-entry effects")
+                    #expect(await AccountManager.shared.isRecentlyCompleted(members[0]),
+                        "the pre-commit sync shield must survive a refused settlement")
+                    let before = try rowsByPosition(f)
+                    #expect(before.map(\.id) == [admitted.id])
+                    #expect(before.first?.messageIds == members)
+                    #expect(before.first?.status == PendingStatus.inFlight.rawValue)
+                    try await f.pool.writeWithoutTransaction { db in
+                        try db.execute(sql: "DROP TRIGGER refuse_effect_settlement")
+                    }
+                    await AccountManager.shared.drainPendingQueue()
+                }
+                let jobs = await ActiveAIQueue.shared.queuedJobsForTesting.filter { $0.accountId == f.accountId }
+                #expect(jobs.count == memberCount * 2)
+                #expect(Set(jobs.map(\.headerId)) == Set(members.map {
+                    MessageIdentity.headerId(accountId: f.accountId, folderPath: Self.archive, messageId: $0)
+                }))
+                #expect(Set(jobs.map(\.jobType)) == [.summary, .reply])
+                #expect(jobs.allSatisfy { $0.windowExempt })
+                let observations = syncObservations.withLock { $0 }
+                #expect(!observations.isEmpty, "the executor never reached real drain-finalization sync")
+                #expect(observations.allSatisfy { $0 == 0 }, "AI was enqueued before the folder's sync attempt")
+                #expect(try rowsByPosition(f).isEmpty)
+                #expect(await !AccountManager.shared.hasPendingOperationSettlement)
+                let moved = await provider.movedIds.flatMap(\.ids)
+                #expect(moved == members, "retained settlement must replay locally without repeating the proven member")
+            }
+        } catch {
+            await ActiveAIQueue.shared.clearForTesting()
+            await ActiveAIQueue.shared.setDispatchSuppressedForTesting(false)
+            throw error
+        }
+        await ActiveAIQueue.shared.clearForTesting()
+        await ActiveAIQueue.shared.setDispatchSuppressedForTesting(false)
+    }
+
 }

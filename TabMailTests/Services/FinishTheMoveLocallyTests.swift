@@ -844,7 +844,7 @@ struct FinishTheMoveLocallyTests {
         let seeded = try seedHeader(f, uid: 88, rfc: target)
 
         await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
 
         // The gesture is issued with NO provider registered, so its own drain
@@ -870,7 +870,7 @@ struct FinishTheMoveLocallyTests {
             the refusal did not land on the retirement write for exactly its \
             three attempts: \(refuser.refusals.withLock { $0 })
             """)
-        #expect(await AccountManager.shared.pendingRetirements.count == 1,
+        #expect(await AccountManager.shared.hasPendingOperationSettlement,
                 "the provider's proven result was not retained, so no replay happens")
 
         // THE UNDO, pressed inside the held window. It cannot be queued yet, so
@@ -917,7 +917,7 @@ struct FinishTheMoveLocallyTests {
             the queue did not converge: \
             \(survivors.map { "\($0.type.rawValue)/\($0.status)" })
             """)
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "the retained proof was not cleared by the replay that committed it")
 
         try? await provider.disconnect()

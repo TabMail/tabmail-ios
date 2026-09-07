@@ -1348,7 +1348,7 @@ struct OutlookQueueHandoffTests {
         // PRECONDITION — no earlier test leaked a retained retirement into the
         // shared `AccountManager`. One would stop this drain for a reason that
         // has nothing to do with what is being measured.
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
         #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
                 "a drain from an earlier test is still running, so this schedule is not this test's")
@@ -1539,7 +1539,7 @@ struct OutlookQueueHandoffTests {
         UndoService.shared.push(undoAction)
         defer { UndoService.shared.dismissAll() }
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
         #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
                 "a drain from an earlier test is still running, so this schedule is not this test's")
@@ -1729,7 +1729,7 @@ struct OutlookQueueHandoffTests {
         try seedOptimisticallyMovedHeader(
             f, graphId: "graph-1", rfc: rfc, destination: Self.firstDestination)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
         #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
                 "a drain from an earlier test is still running, so this schedule is not this test's")
@@ -1759,7 +1759,7 @@ struct OutlookQueueHandoffTests {
             the refusal did not land on the retirement write for exactly its \
             three attempts: \(refuser.refusals.withLock { $0 })
             """)
-        #expect(await AccountManager.shared.pendingRetirements.count == 1, """
+        #expect(await AccountManager.shared.hasPendingOperationSettlement, """
             the provider's proven result was not retained, so the second drain \
             below has no replay to attempt
             """)
@@ -1793,7 +1793,7 @@ struct OutlookQueueHandoffTests {
             \(server.http.servedCallSequence()). The only address the follower \
             can name is the one the still-uncommitted proof is holding.
             """)
-        #expect(await AccountManager.shared.pendingRetirements.count == 1, """
+        #expect(await AccountManager.shared.hasPendingOperationSettlement, """
             the provider's proven result was DISCARDED by a replay that failed — \
             the wire effect it applied is now recorded nowhere
             """)
@@ -1875,7 +1875,7 @@ struct OutlookQueueHandoffTests {
         try seedOptimisticallyMovedHeader(
             f, graphId: "graph-b", rfc: secondRfc, destination: Self.firstDestination)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
         #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
                 "a drain from an earlier test is still running, so this schedule is not this test's")
@@ -1906,7 +1906,7 @@ struct OutlookQueueHandoffTests {
             the refusal did not land on the narrowing write for exactly its \
             three attempts: \(refuser.refusals.withLock { $0 })
             """)
-        #expect(await AccountManager.shared.pendingRetirements.count == 1,
+        #expect(await AccountManager.shared.hasPendingOperationSettlement,
                 "the partial result was not retained, so there is no replay to attempt")
 
         // An attempt settles ONE member, so a two-member move is partial by
@@ -1930,7 +1930,7 @@ struct OutlookQueueHandoffTests {
             a claim pass ran after a narrowing replay that could not commit: \
             \(server.http.servedCallSequence())
             """)
-        #expect(await AccountManager.shared.pendingRetirements.count == 1,
+        #expect(await AccountManager.shared.hasPendingOperationSettlement,
                 "the proven half of the batch was DISCARDED by a replay that failed")
 
         let (heldMove, heldFollower) = try await f.pool.read { db in
@@ -2018,7 +2018,7 @@ struct OutlookQueueHandoffTests {
         try seedOptimisticallyMovedHeader(
             f, graphId: "graph-1", rfc: movedRfc, destination: Self.firstDestination)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
         #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
                 "a drain from an earlier test is still running, so this schedule is not this test's")
@@ -2042,7 +2042,7 @@ struct OutlookQueueHandoffTests {
             the refusal did not land on the retirement write for exactly its \
             three attempts: \(refuser.refusals.withLock { $0 })
             """)
-        #expect(await AccountManager.shared.pendingRetirements.count == 1,
+        #expect(await AccountManager.shared.hasPendingOperationSettlement,
                 "the provider's proven result was not retained, so there is nothing to drop")
         let afterMove = server.http.servedCallSequence()
         #expect(afterMove.filter { $0.hasSuffix("/move") }.count == 1,
@@ -2074,7 +2074,7 @@ struct OutlookQueueHandoffTests {
 
         // 🚨 THE ORACLE, both halves. The dead entry is gone, and the drain that
         // dropped it went on to do the work in front of it.
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty, """
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement, """
             a retained proof whose durable row no longer exists was kept, so the \
             top-of-drain gate refuses every later drain for the life of the \
             process and the whole queue wedges
@@ -2140,7 +2140,7 @@ struct OutlookQueueHandoffTests {
         try seedOptimisticallyMovedHeader(
             f, graphId: "graph-1", rfc: rfc, destination: Self.firstDestination)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
         #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
                 "a drain from an earlier test is still running, so this schedule is not this test's")
@@ -2173,7 +2173,7 @@ struct OutlookQueueHandoffTests {
             the refusal did not land on the retirement write for exactly its \
             three attempts: \(refuser.refusals.withLock { $0 })
             """)
-        #expect(await AccountManager.shared.pendingRetirements.count == 1, """
+        #expect(await AccountManager.shared.hasPendingOperationSettlement, """
             the provider's proven result was not retained, so there is nothing \
             for the sweep to erase and this test proves nothing
             """)
@@ -2231,7 +2231,7 @@ struct OutlookQueueHandoffTests {
             a PATCH went out at an address the move had already invalidated \
             (proven id \(current)): \(patches)
             """)
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "the retained proof never resolved")
 
         try expectGesturePreservedAndExecuted(
@@ -2274,7 +2274,7 @@ struct OutlookQueueHandoffTests {
         try seedOptimisticallyMovedHeader(
             f, graphId: "graph-b", rfc: secondRfc, destination: Self.firstDestination)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
         #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
                 "a drain from an earlier test is still running, so this schedule is not this test's")
@@ -2304,7 +2304,7 @@ struct OutlookQueueHandoffTests {
             the refusal did not land on the narrowing write for exactly its \
             three attempts: \(refuser.refusals.withLock { $0 })
             """)
-        #expect(await AccountManager.shared.pendingRetirements.count == 1, """
+        #expect(await AccountManager.shared.hasPendingOperationSettlement, """
             the provider's proven partial result was not retained, so there is \
             nothing for the sweep to erase
             """)
@@ -2359,7 +2359,7 @@ struct OutlookQueueHandoffTests {
             a PATCH went out at an address the move had already invalidated \
             (proven id \(provenA)): \(patches)
             """)
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "the retained proof never resolved")
 
         try expectGesturePreservedAndExecuted(
@@ -2403,7 +2403,7 @@ struct OutlookQueueHandoffTests {
         try seedOptimisticallyMovedHeader(
             f, graphId: "graph-1", rfc: rfc, destination: Self.firstDestination)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
         #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
                 "a drain from an earlier test is still running, so this schedule is not this test's")
@@ -2488,7 +2488,7 @@ struct OutlookQueueHandoffTests {
             a PATCH went out at an address the move had already invalidated \
             (proven id \(current)): \(patches)
             """)
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a retirement was retained by a drain that had no write failure in it")
 
         try expectGesturePreservedAndExecuted(
@@ -2582,7 +2582,7 @@ struct OutlookQueueHandoffTests {
         try seedOptimisticallyMovedHeader(
             f, graphId: "graph-1", rfc: rfc, destination: Self.firstDestination)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
         #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
                 "a drain from an earlier test is still running, so this schedule is not this test's")
@@ -2638,7 +2638,7 @@ struct OutlookQueueHandoffTests {
             attempts, so this is not the scenario under test: \
             \(refuser.refusals.withLock { $0 })
             """)
-        #expect(await AccountManager.shared.pendingRetirements.count == 1,
+        #expect(await AccountManager.shared.hasPendingOperationSettlement,
                 "the provider's proven result was not retained, so there is no replay to attempt")
 
         let afterFirstDrain = server.http.servedCallSequence()
@@ -2700,7 +2700,7 @@ struct OutlookQueueHandoffTests {
             \(recovered) row(s) were left `inFlight` after the queue drained — \
             unclaimable for the life of the process, and deleted at the next launch
             """)
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "the retained proof was never resolved")
 
         try expectGesturePreservedAndExecuted(
@@ -2741,7 +2741,7 @@ struct OutlookQueueHandoffTests {
         try seedOptimisticallyMovedHeader(
             f, graphId: "graph-b", rfc: secondRfc, destination: Self.firstDestination)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
         #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
                 "a drain from an earlier test is still running, so this schedule is not this test's")
@@ -2787,7 +2787,7 @@ struct OutlookQueueHandoffTests {
             the refusal did not land on exactly the narrowing's three write \
             attempts: \(refuser.refusals.withLock { $0 })
             """)
-        #expect(await AccountManager.shared.pendingRetirements.count == 1,
+        #expect(await AccountManager.shared.hasPendingOperationSettlement,
                 "the partial result was not retained, so there is no replay to attempt")
 
         // An attempt settles ONE member, so a two-member move is partial by
@@ -2851,7 +2851,7 @@ struct OutlookQueueHandoffTests {
             \(recovered) row(s) were left `inFlight` after the queue drained — \
             unclaimable for the life of the process, and deleted at the next launch
             """)
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "the retained narrowing was never resolved")
 
         try expectGesturePreservedAndExecuted(
@@ -2897,7 +2897,7 @@ struct OutlookQueueHandoffTests {
         try seedOptimisticallyMovedHeader(
             f, graphId: "graph-1", rfc: rfc, destination: Self.firstDestination)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
         #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
                 "a drain from an earlier test is still running, so this schedule is not this test's")
@@ -2926,7 +2926,7 @@ struct OutlookQueueHandoffTests {
             the refusal did not land on the retirement write for exactly its \
             three attempts: \(refuser.refusals.withLock { $0 })
             """)
-        #expect(await AccountManager.shared.pendingRetirements.count == 1,
+        #expect(await AccountManager.shared.hasPendingOperationSettlement,
                 "the provider's proven result was not retained, so there is no replay to fault")
 
         let afterFirstDrain = server.http.servedCallSequence()
@@ -2958,7 +2958,7 @@ struct OutlookQueueHandoffTests {
         // 🚨 THE ORACLE. A thrown read is not an absent row: the proof is KEPT,
         // and because the drain stops before claiming anything, nothing reached
         // the wire.
-        #expect(await AccountManager.shared.pendingRetirements.count == 1, """
+        #expect(await AccountManager.shared.hasPendingOperationSettlement, """
             a read that FAILED was read as "the row is gone" and the provider's \
             proven result was DROPPED — every holder of the old address is now \
             stranded
@@ -3002,7 +3002,7 @@ struct OutlookQueueHandoffTests {
             a PATCH went out at an address the move had already invalidated \
             (proven id \(current)): \(patches)
             """)
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "the retained proof was never resolved")
 
         try expectGesturePreservedAndExecuted(
@@ -3132,7 +3132,7 @@ struct OutlookQueueHandoffTests {
             f, graphId: "graph-b", rfc: secondRfc, destination: Self.firstDestination,
             accountId: secondAccountId)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
         #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
                 "a drain from an earlier test is still running, so this schedule is not this test's")
@@ -3177,8 +3177,8 @@ struct OutlookQueueHandoffTests {
             while a proven result was still uncommitted, which is the whole thing \
             the stop prevents: \(bothRefused.refusals.withLock { $0 })
             """)
-        let retainedAfterDrainOne = await AccountManager.shared.pendingRetirements.count
-        #expect(retainedAfterDrainOne == 1, """
+        let retainedAfterDrainOne = await AccountManager.shared.hasPendingOperationSettlement
+        #expect(retainedAfterDrainOne, """
             this process is not holding the one proof the retention contract is \
             about: \(retainedAfterDrainOne)
             """)
@@ -3206,8 +3206,8 @@ struct OutlookQueueHandoffTests {
             a retirement committed while the refusal was still armed, so drain 2 \
             is not the unresolved-replay scenario
             """)
-        let retainedAfterDrainTwo = await AccountManager.shared.pendingRetirements.count
-        #expect(retainedAfterDrainTwo == 1, """
+        let retainedAfterDrainTwo = await AccountManager.shared.hasPendingOperationSettlement
+        #expect(retainedAfterDrainTwo, """
             the proof was dropped by a replay that could not commit it — the \
             provider's result now exists nowhere: \(retainedAfterDrainTwo) proof(s) held
             """)
@@ -3289,7 +3289,7 @@ struct OutlookQueueHandoffTests {
             account B's PATCH went out at an address the move had already \
             invalidated (proven id \(secondCurrent)): \(secondPatches)
             """)
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a retained proof was never resolved")
 
         try expectGesturePreservedAndExecuted(
@@ -3438,7 +3438,7 @@ struct OutlookQueueHandoffTests {
             f, graphId: "graph-1", rfc: rfc, destination: Self.firstDestination,
             isRead: true, isFlagged: true)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
         #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
                 "a drain from an earlier test is still running, so this schedule is not this test's")
@@ -3690,7 +3690,7 @@ struct OutlookQueueHandoffTests {
         let f = try fixture(accountId: "graph-handoff-recovered-charge")
         try seedHeader(f, graphId: "graph-1", rfc: rfc)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
         #expect(await AccountManager.shared.pendingRequeues.isEmpty,
                 "a previous test left a retained requeue on the shared AccountManager")
@@ -4020,7 +4020,7 @@ struct OutlookQueueHandoffTests {
         try seedHeader(f, graphId: "graph-a", rfc: firstRfc)
         try seedHeader(f, graphId: "graph-b", rfc: secondRfc, accountId: secondAccountId)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
         #expect(await AccountManager.shared.pendingRequeues.isEmpty,
                 "a previous test left a retained requeue on the shared AccountManager")
@@ -4134,7 +4134,7 @@ struct OutlookQueueHandoffTests {
             this process is not holding the unresolved requeue the recovery under \
             test is about: \(retainedAfterDrainOne)
             """)
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty, """
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement, """
             a retirement was retained, so this scenario is not the requeue-only \
             one it claims to be
             """)
@@ -4273,7 +4273,7 @@ struct OutlookQueueHandoffTests {
 
         #expect(await AccountManager.shared.pendingRequeues.isEmpty,
                 "a retained requeue was never resolved")
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a retirement was retained by a scenario that has no move in it")
         let finalHeaders = try rows(f)
         #expect(finalHeaders.count == 2,
@@ -4349,7 +4349,7 @@ struct OutlookQueueHandoffTests {
         let f = try fixture(accountId: "graph-gone-replay")
         try seedHeader(f, graphId: "graph-gone", rfc: goneRfc)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
 
         let op = PendingOperation(
@@ -4383,7 +4383,7 @@ struct OutlookQueueHandoffTests {
             the refusal did not land on the retirement write for exactly its \
             three attempts: \(refuser.refusals.withLock { $0 })
             """)
-        #expect(await AccountManager.shared.pendingRetirements.count == 1,
+        #expect(await AccountManager.shared.hasPendingOperationSettlement,
                 "the proof was not retained, so the replay path is not under test")
 
         // NOTHING COMMITTED YET — including the ghost. Deleting the header
@@ -4398,7 +4398,7 @@ struct OutlookQueueHandoffTests {
         refuser.disarm()
         try await drainToQuiescence(f)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "the retained retirement never replayed")
         #expect(try queuedOperationCount(f) == 0, "the retained retirement never replayed")
         #expect(try headerExists(f, graphId: "graph-gone") == false, """
@@ -4456,7 +4456,7 @@ struct OutlookQueueHandoffTests {
         try seedHeader(f, graphId: "graph-live", rfc: liveRfc)
         try seedHeader(f, graphId: "graph-refused", rfc: refusedRfc)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
 
         // Member order is load-bearing: gone, then moved, then refused, so the
@@ -4570,7 +4570,7 @@ struct OutlookQueueHandoffTests {
         try seedHeader(f, graphId: "graph-gone", rfc: goneRfc)
         try seedHeader(f, graphId: "graph-live", rfc: liveRfc)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "a previous test left a retained retirement on the shared AccountManager")
 
         // Member order is load-bearing: the GONE member first, so the attempt
@@ -4606,7 +4606,7 @@ struct OutlookQueueHandoffTests {
             the refusal did not land on the narrowing write for exactly its \
             three attempts: \(refuser.refusals.withLock { $0 })
             """)
-        #expect(await AccountManager.shared.pendingRetirements.count == 1,
+        #expect(await AccountManager.shared.hasPendingOperationSettlement,
                 "the narrowing was not retained, so the PARTIAL replay path is not under test")
 
         // NON-VACUITY on the wire: the gone member 404'd and the member behind it
@@ -4643,7 +4643,7 @@ struct OutlookQueueHandoffTests {
         refuser.disarm()
         try await drainToQuiescence(f)
 
-        #expect(await AccountManager.shared.pendingRetirements.isEmpty,
+        #expect(await !AccountManager.shared.hasPendingOperationSettlement,
                 "the retained narrowing never replayed")
         #expect(try queuedOperationCount(f) == 0, "the narrowed remainder never completed")
 
