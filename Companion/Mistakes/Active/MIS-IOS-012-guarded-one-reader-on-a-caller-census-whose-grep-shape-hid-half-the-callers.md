@@ -102,3 +102,16 @@ line had accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-012](Companion/Mistakes/Active/MIS-IOS-012-guarded-one-reader-on-a-caller-census-whose-grep-shape-hid-half-the-callers.md)** — added a fail-closed throw to `AccountManager.fetchAttachment` and enumerated its callers with `rg "\.fetchAttachment\(for:"`, which encodes the call's TYPOGRAPHY: two of four callers wrap their arguments across lines and cannot match. The unseen `ComposeView.carryForwardAttachments` swallows every error into a `print`, so the refusal turned a forward into a draft SILENTLY missing the original's attachments. **Enumerate by the BARE SYMBOL when a change makes a function throw, then read every catch and say whether it retries, reports, swallows, or terminalizes.** (×1)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-06, pass 6)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 55% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-012](Companion/Mistakes/Active/MIS-IOS-012-guarded-one-reader-on-a-caller-census-whose-grep-shape-hid-half-the-callers.md)** — added a fail-closed throw to `AccountManager.fetchAttachment` and enumerated callers with `rg "\.fetchAttachment\(for:"`, which encodes the call's TYPOGRAPHY — two of four wrap arguments across lines. The unseen `ComposeView.carryForwardAttachments` swallows errors into a `print`, so the refusal made a forward SILENTLY drop attachments. **Enumerate by the BARE SYMBOL when a change makes a function throw, then read every catch.** (×1)
+```

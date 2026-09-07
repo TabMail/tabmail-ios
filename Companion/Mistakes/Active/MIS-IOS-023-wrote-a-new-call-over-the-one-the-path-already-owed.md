@@ -154,3 +154,16 @@ Pair it with the mirror-path check, which needs judgment and so is not automatab
 or finalisation path, list every sibling path that is supposed to reach the same terminal state
 (here `replayRetainedRetirements`) and diff their call sequences against each other, not against
 their own previous revision.
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-06, pass 6)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 55% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-023](Companion/Mistakes/Active/MIS-IOS-023-wrote-a-new-call-over-the-one-the-path-already-owed.md)** — **I wrote a new call over the one that path already owed, and the diff GREW so nothing looked lost.** (1) `retireConfirmedGoneMemberHeaders` overwrote `materializeDeferredMoveSuccessors` in `retirePartiallyCompletedOp` — base 4 call sites, branch 3 — so the live narrowing retirement disagreed with its own replay; restored `a2666c7fa`. (2) `ExchangeProvider.move(ids:from:to:)` stayed `Void` while its delegate narrowed to one member, discarding a partial result; now throws `ProviderMembersDispositioned` unless the outcome is "this whole request, all mutated" — the `confirmedGoneIds` disjunct is load-bearing, the gone branch puts the member in BOTH lists so `provenIds != ids` alone cannot see it. (3) **`retirePartiallyCompletedOp`, promoted to the primary multi-member path, never called `recordMembersThatEnteredInbox`** though both paths it displaced did — N−1 members of a move into the Inbox silently lost their ADR-IOS-008 AI event, outside `repopulateFromDatabase`'s window; fixed `f3f16169a`, 4 call sites, `frozenRetiredOp` never `currentOp`. ⚠️ **Instance 3 had NO count drop (5 in base, 5 in candidate) — the call-site-count census reads CLEAN when a NEW path is promoted without acquiring the call its predecessors owed.** So: diff call-site counts against base AND run a per-path census — enumerate every path reaching the same terminal state, diff their post-commit statement lists, and state the count as a falsifiable claim. (×2)
+```

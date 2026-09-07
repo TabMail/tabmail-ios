@@ -150,3 +150,16 @@ line had accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-016](Companion/Mistakes/Active/MIS-IOS-016-shipped-a-test-whose-precondition-never-occurs.md)** — shipped a test whose **PRECONDITION never occurs**: green forever without ever exercising the path it names. ⚠️ **Distinct from `MIS-014`** — a blessing test goes red when you fix the bug; a **VACUOUS** test stays green through bug AND fix, so **red-first cannot find it**. Three instances in one day: a re-staged row differing only in an unprojected column (`prevCount=0`, measured **50/50**), an assertion against an implementation that IS the assertion, and a bare `Task.sleep(3s)` as a load barrier. Instance 4 (2026-08-18, `#45`) is the **TYPE-SYSTEM-tautology** form — `theTwoFailureShapesDoNotMatchEachOther` asserted only that distinct enum cases are distinct, so no compiling implementation could turn it red, while its comment claimed to pin a view-`Task`-closure refresh asymmetry it never touched; deleted, with the real pin moved to a composed-closure coordinator test. ⚠️ **a fast `waitUntil` return proves its condition was true on ENTRY.** ***Tell: I can name what the test asserts, but not the observable proving the SETUP took effect — or, for the tautology form, no production edit that COMPILES would turn it red.*** (×2)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-06, pass 6)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 55% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-016](Companion/Mistakes/Active/MIS-IOS-016-shipped-a-test-whose-precondition-never-occurs.md)** — shipped a test whose **PRECONDITION never occurs** — green forever without exercising the path it names. ⚠️ **Distinct from `MIS-014`**: a blessing test goes red when you fix the bug; a **VACUOUS** one stays green through bug AND fix, so **red-first cannot find it**. Four forms: an unprojected-column re-stage (`prevCount=0`), an assertion against an implementation that IS the assertion, a `Task.sleep(3s)` barrier, and the **TYPE-SYSTEM tautology** (`theTwoFailureShapesDoNotMatchEachOther`, `#45`). ⚠️ **a fast `waitUntil` proves its condition was true on ENTRY.** (×2)
+```

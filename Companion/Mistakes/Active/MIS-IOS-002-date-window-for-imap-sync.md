@@ -103,3 +103,16 @@ line had accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-002](Companion/Mistakes/Active/MIS-IOS-002-date-window-for-imap-sync.md)** — windowed an IMAP sync query by DATE; UID is archive-time, not message-date → multi-month Archive data loss (ADR-IOS-042, `4145d2a`, `v59`). Display ordering is exempt. Instance 2: same mass deletion, wrong **provenance** rather than wrong unit — `if fetched.count < limit` read a `compactMap` **parse-survivor** count as server coverage. **A count that gates a deletion must be SERVER-reported and travel bound to the fetch.** Closed structurally by `6d460aa99` (`coverage:` replaces `limit:`). (×2)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-06, pass 6)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 55% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-002](Companion/Mistakes/Active/MIS-IOS-002-date-window-for-imap-sync.md)** — windowed an IMAP sync query by DATE (a UID is archive-time, not message-date) → multi-month Archive data loss; ADR-IOS-042, `4145d2a`, `v59`; display ordering exempt. ×2: wrong **provenance** — `fetched.count < limit` read a `compactMap` parse-survivor count as server coverage; **a count that gates a deletion must be SERVER-reported** (`6d460aa99`, `coverage:`). (×2)
+```

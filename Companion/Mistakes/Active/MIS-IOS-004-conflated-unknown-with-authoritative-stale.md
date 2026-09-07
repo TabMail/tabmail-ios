@@ -249,3 +249,16 @@ line had accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-004](Companion/Mistakes/Active/MIS-IOS-004-conflated-unknown-with-authoritative-stale.md)** — treated "could not determine" as "provider says done" and dropped a user intention. **The single most repeated defect in this codebase's history.** Recurs OUTSIDE the queue, where nothing looks like a queue exit: a missing UIDNEXT arrived as `UID(0)`, took the `< 1` early-out written for UIDNEXT **1**, and wrote `backfillComplete = true`; a Graph **404 on an address WE invalidated** collapsed three world-states into "gone, therefore done" (`IOS-GRAPH-002`, BLOCKING). **Any terminal, non-revisiting state — `backfillComplete`, an advanced cursor, a folder dropped from `remaining` — is a queue exit in other clothes.** (×many)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-06, pass 6)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 55% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-004](Companion/Mistakes/Active/MIS-IOS-004-conflated-unknown-with-authoritative-stale.md)** — treated "could not determine" as "the provider says done" and dropped a user intention — **the single most repeated defect in this codebase's history.** Recurs OUTSIDE the queue: a missing UIDNEXT arrived as `UID(0)`, hit a `< 1` early-out and set `backfillComplete = true`; a Graph **404 on an address WE invalidated** became "gone, therefore done" (`IOS-GRAPH-002`). **Any terminal, non-revisiting state is a queue exit in other clothes.** +1 (#115): `IMAPProvider.move` retired on `moveFailedAfterPossiblePartialCompletion` — a tagged NO the server **"may"** have mutated behind; a raw-channel `NO No mailbox selected` (zero mutation) emptied the queue. **"May have" is absence of evidence.** +1 (#115 r3): its own fix's deletion left the case to a pre-existing LIST-omission catch — **a deleted handler moves the decision off-diff.** +1 (#115 r4): the round-3b RECOGNIZER stopped at the delimiter without requiring the CLOSING `]`, so an UNCLOSED bracket NIOIMAP reports as uncoded text yielded a permanent code and retired the move — **a prefix is not a token; consume the grammar's terminator.** (×many)
+```

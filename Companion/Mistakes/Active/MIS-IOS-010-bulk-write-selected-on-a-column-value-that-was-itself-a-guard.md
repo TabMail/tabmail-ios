@@ -106,3 +106,16 @@ line had accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-010](Companion/Mistakes/Active/MIS-IOS-010-bulk-write-selected-on-a-column-value-that-was-itself-a-guard.md)** — designed a bulk `UPDATE … WHERE folderId = :folderId AND observedUidValidity IS NULL` reading `IS NULL` as *"rows we haven't reached yet"*. It is a guard in the OPPOSITE direction: `optimisticMoveToFolder` writes that NULL **deliberately** while `folderId` is the DESTINATION and `messageId` still the SOURCE UID, until `MessageHeaderRekey.finishMove` installs the `COPYUID`-proven address — so the predicate selected **exactly** the rows the sentinel protected: **C3 on a compliant server**. **Before any bulk UPDATE, grep every WRITER of every column in the WHERE clause; a value written deliberately elsewhere is a guard, and selecting on it makes you its second writer.** (×1)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-06, pass 6)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 55% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-010](Companion/Mistakes/Active/MIS-IOS-010-bulk-write-selected-on-a-column-value-that-was-itself-a-guard.md)** — designed a bulk `UPDATE … WHERE folderId = :folderId AND observedUidValidity IS NULL`, reading `IS NULL` as "rows we haven't reached yet". It is a guard the OTHER way — `optimisticMoveToFolder` writes that NULL **deliberately** mid-move — so the predicate selected **exactly** the rows the sentinel protected: **C3 on a compliant server**. **Before any bulk UPDATE grep every WRITER of every WHERE column; selecting on a deliberately-written value makes you its second writer.** (×1)
+```

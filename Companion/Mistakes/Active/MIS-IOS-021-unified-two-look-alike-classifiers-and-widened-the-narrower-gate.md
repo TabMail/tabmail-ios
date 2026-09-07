@@ -79,3 +79,16 @@ excluded before it runs — then diff the acceptance sets, not the function bodi
 
 The comment that now sits on both functions names the asymmetry and says it is deliberate, so the
 next reader who notices the duplication finds the reason before the refactor.
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-06, pass 6)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 55% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-021](Companion/Mistakes/Active/MIS-IOS-021-unified-two-look-alike-classifiers-and-widened-the-narrower-gate.md)** — de-duplicated two look-alike "did the server say this message is gone?" classifiers into one shared predicate, and made a DEAD acceptance branch live. `isMessageNotFoundError` (the retirement gate) accepts 404 only; `isConfirmedGoneError` also accepts **410** but runs only INSIDE that gate, so its 410 was unreachable. Reusing it for the new per-member provider absence turned a bare 410 from "retry forever" into "retire the op AND delete the header" — strictly more destructive than base, chosen by picking a helper rather than by deciding anything. **A helper's effective acceptance set is its own ∩ every guard its current callers sit behind; before reusing one, diff the EFFECTIVE sets per input class, not the function bodies — and if either branch is currently unreachable, ask what was keeping it that way.** (×1)
+```

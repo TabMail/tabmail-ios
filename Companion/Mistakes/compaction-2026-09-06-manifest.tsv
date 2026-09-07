@@ -1,0 +1,36 @@
+# companion-compact manifest — tabmail-ios/MISTAKES.md / Mistakes tree (2026-09-06 pass 6)
+# Source: MISTAKES.md BEFORE this pass (18608 B, sha256 d28660c90f053c090879da7e1accf5fbfca39824f2848f1a53265b3500ce0d8f)
+# CONTENT DELETED: none. Every row below is a byte-exact fragment MOVED out of the index
+# into the named route target; the index kept a shortened routing line in its place.
+# Each fragment is the pre-pass index LINE, preserved inside a ```text fence in its own entry file so verify_markdown_links does not re-resolve the index-relative link.
+# Stage 4a rebuild (run from the directory holding this index):
+#   python3 - <<'EOF'
+#   import re, glob, hashlib
+#   cur = open('MISTAKES.md').read().split('\n')
+#   for f in glob.glob('Companion/Mistakes/Active/*.md'):
+#       m = re.search(r'## Pre-compaction index line \(verbatim, 2026-09-06, pass 6\)\n\n.*?\n\n```text\n(.*?)\n```', open(f).read(), re.S)
+#       if not m: continue
+#       v = m.group(1); mid = re.match(r'- \*\*\[([A-Z0-9-]+)\]', v).group(1)
+#       cur = [v if l.startswith('- **[%s](' % mid) else l for l in cur]
+#   b = '\n'.join(cur).encode(); print(len(b), hashlib.sha256(b).hexdigest())
+#   EOF
+fragment_id	route_target	index_line	bytes	sha256	replacement_bytes
+MIS-IOS-002	Companion/Mistakes/Active/MIS-IOS-002-date-window-for-imap-sync.md	24	467	3467c9b49542e3784cee2bd54cb6d00a811042572e0fad9a38fe43568f3f9098	399
+MIS-IOS-004	Companion/Mistakes/Active/MIS-IOS-004-conflated-unknown-with-authoritative-stale.md	25	1227	1a9f9d72031f820440b3a306d2ab0c21441a38eca9c58ac5680fc40f6d9dd7c5	468
+MIS-IOS-021	Companion/Mistakes/Active/MIS-IOS-021-unified-two-look-alike-classifiers-and-widened-the-narrower-gate.md	27	960	1c7e6f8d2369b9428bdafa60cd9bd675b1b60dbc9631734b63b9de3bd67ab5a2	453
+MIS-IOS-008	Companion/Mistakes/Active/MIS-IOS-008-verified-the-recovery-path-not-the-states-where-it-cannot-run.md	29	520	fc360696b62f98efa02ff960524cd305e4662f020f3cb7acc963323fa6e916cc	368
+MIS-IOS-013	Companion/Mistakes/Active/MIS-IOS-013-asked-a-byte-level-question-with-a-grapheme-level-string-api.md	30	593	33d8d955c4294dc794c5d3bb36f75e5f0e92d12306073e20b82a55eccd998a5c	416
+MIS-IOS-003	Companion/Mistakes/Active/MIS-IOS-003-reconstructed-an-address-the-wire-already-gave-us.md	34	796	902ba48614221a790ff2e508f344b5ff8a2e417f44ad194d9f740d92cb7095cd	417
+MIS-IOS-015	Companion/Mistakes/Active/MIS-IOS-015-made-a-guard-depend-on-a-transient-globals-lifetime-across-an-async-hop.md	36	544	1e14a51ddf82a13e8d52333bacaf65d3e87ab83619f5e1aacd36f9aa0ec43f2d	426
+MIS-IOS-016	Companion/Mistakes/Active/MIS-IOS-016-shipped-a-test-whose-precondition-never-occurs.md	37	697	015781124b98f7edd208f10df972f002893fd0cec3bd602f99547df33a379317	347
+MIS-IOS-017	Companion/Mistakes/Active/MIS-IOS-017-gated-a-view-on-state-that-only-that-view-could-resolve.md	39	689	cb3649127eb82f11be05ba9f0f5f7507ddeff24b463e4d579ebd6c3fd709e3af	449
+MIS-IOS-018	Companion/Mistakes/Active/MIS-IOS-018-extended-a-processing-bound-into-display-semantics.md	40	431	97a41894ed449b3341757d849d7743084f48d9e00fa4e2f7d2de33f01948666e	339
+MIS-IOS-019	Companion/Mistakes/Active/MIS-IOS-019-added-persistent-log-writers-outside-the-facade-its-registry-test-was-built-to-see.md	41	819	c298a6c164c9503158bb57563e4020608e6981e58fe2b2110ed4921b91fbfaf4	444
+MIS-IOS-020	Companion/Mistakes/Active/MIS-IOS-020-fixed-the-one-site-the-finding-named-and-built-the-retained-shape.md	42	730	9381de28c5f00d3b8c4e21e8de9acd8e0a3bdd02cf669ec51d51b31f2887b32e	384
+MIS-IOS-022	Companion/Mistakes/Active/MIS-IOS-022-replaced-a-splitting-mechanism-and-left-its-loop-under-the-old-aggregate-deadline.md	43	1637	a9828f2e50fa80e01124ee90accfdc2091ada0f01a08d92e45f519b905617354	521
+MIS-IOS-023	Companion/Mistakes/Active/MIS-IOS-023-wrote-a-new-call-over-the-one-the-path-already-owed.md	44	1588	40854e033cc6fa5488402f1fa5f65c67758ce86d2bafddf94cbca555d9927a91	476
+MIS-IOS-006	Companion/Mistakes/Active/MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md	49	546	9587cf88d287c0e187d982f757bb161b0f8b41676ddad9f6f7b6aaa0b2042178	381
+MIS-IOS-014	Companion/Mistakes/Active/MIS-IOS-014-wrote-a-red-first-proof-that-could-not-run-red.md	50	476	e63d2d5ace8f8b2f094838ecbdf9be16287b2c61594a0a69b8b868c6a4af329c	378
+MIS-IOS-010	Companion/Mistakes/Active/MIS-IOS-010-bulk-write-selected-on-a-column-value-that-was-itself-a-guard.md	55	618	4e0a4798c3cff1922ea799a95c852710878f61f2042a5346788187eed4e7853a	372
+MIS-IOS-011	Companion/Mistakes/Active/MIS-IOS-011-declared-a-residual-acceptable-on-an-argument-i-never-ran.md	57	1014	a029cc6599cb5f0ed7e793cd570772322ade67d17195026cfe84400e70ba0acf	452
+MIS-IOS-012	Companion/Mistakes/Active/MIS-IOS-012-guarded-one-reader-on-a-caller-census-whose-grep-shape-hid-half-the-callers.md	58	582	8249a18f1e63a2aba4303556cfd6b44fd5e4ec3aa0853c4463f47f1031643124	432
