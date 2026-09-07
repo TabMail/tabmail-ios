@@ -14,19 +14,86 @@ import Synchronization
 /// expiration handler. `@unchecked Sendable` lets it be freely captured across
 /// isolation domains without triggering Swift 6 region-based sending errors.
 /// NSLock provides the actual thread safety.
-private final class BGTaskContext: @unchecked Sendable {
+final class BGTaskContext: @unchecked Sendable {
     private var _expired = false
+    private var _completed = false
     private var _task: Task<Void, Never>?
     private let lock = NSLock()
     let label: String
+    private let completion: @Sendable (Bool) -> Void
+    #if DEBUG
+    private let cancelQueuesHook: (@Sendable (Bool) async -> Void)?
+    private let suspendHook: (@Sendable (String) -> Void)?
 
-    init(label: String) {
+    init(
+        label: String,
+        completion: @escaping @Sendable (Bool) -> Void,
+        cancelQueues: @escaping @Sendable (Bool) async -> Void,
+        suspend: @escaping @Sendable (String) -> Void
+    ) {
         self.label = label
+        self.completion = completion
+        cancelQueuesHook = cancelQueues
+        suspendHook = suspend
+    }
+    #endif
+
+    init(label: String, completion: @escaping @Sendable (Bool) -> Void) {
+        self.label = label
+        self.completion = completion
+        #if DEBUG
+        cancelQueuesHook = nil
+        suspendHook = nil
+        #endif
         print("[BGTaskCtx:\(label)] created on thread \(Thread.current)")
     }
 
     var expired: Bool {
         lock.withLock { _expired }
+    }
+
+    /// Atomically choose the sole completion/rescheduling owner. Invoke BGTask
+    /// APIs outside the lock; expiration may run on an arbitrary system thread.
+    func claimCompletion(success: Bool) -> Bool? {
+        lock.withLock {
+            guard !_completed else { return nil }
+            _completed = true
+            return success && !_expired
+        }
+    }
+
+    /// Delivers the external callback only for the atomic terminal claimant.
+    func complete(success: Bool) -> Bool? {
+        guard let result = claimCompletion(success: success) else { return nil }
+        completion(result)
+        return result
+    }
+
+    #if DEBUG
+    func waitForTaskForTesting() async {
+        let task = lock.withLock { _task }
+        await task?.value
+    }
+    #endif
+
+    func cancelQueues(inboxOnly: Bool) async {
+        #if DEBUG
+        if let cancelQueuesHook {
+            await cancelQueuesHook(inboxOnly)
+            return
+        }
+        #endif
+        await SyncScheduler.cancelAllInFlightQueues(inboxOnly: inboxOnly)
+    }
+
+    func suspendDatabases(reason: String) {
+        #if DEBUG
+        if let suspendHook {
+            suspendHook(reason)
+            return
+        }
+        #endif
+        DatabaseSuspension.postSuspendImmediately(reason: reason)
     }
 
     /// Mark as expired and cancel the processing task (if registered).
@@ -152,6 +219,37 @@ final class SyncScheduler {
     }
 
     private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
+
+    #if DEBUG
+    private var backgroundReadinessHook: (@MainActor @Sendable () async -> Bool)?
+    private var backgroundWorkHook: (@MainActor @Sendable (Bool) async -> Void)?
+    private var processingHasWorkHook: (@MainActor @Sendable () async -> Bool)?
+    private var backgroundScheduleHook: (@MainActor @Sendable (Bool) -> Void)?
+    private var refreshNetworkAvailableForTesting: Bool?
+
+    init(
+        backgroundReadiness: @escaping @MainActor @Sendable () async -> Bool,
+        backgroundWork: @escaping @MainActor @Sendable (Bool) async -> Void,
+        processingHasWork: @escaping @MainActor @Sendable () async -> Bool,
+        backgroundSchedule: @escaping @MainActor @Sendable (Bool) -> Void,
+        refreshNetworkAvailable: Bool,
+        pollActive: Bool = false
+    ) {
+        backgroundReadinessHook = backgroundReadiness
+        backgroundWorkHook = backgroundWork
+        processingHasWorkHook = processingHasWork
+        backgroundScheduleHook = backgroundSchedule
+        refreshNetworkAvailableForTesting = refreshNetworkAvailable
+        isPollActive = pollActive
+    }
+    #endif
+
+    private func backgroundDatabaseReady() async -> Bool {
+        #if DEBUG
+        if let backgroundReadinessHook { return await backgroundReadinessHook() }
+        #endif
+        return await AppStartup.shared.awaitLaunchReady(background: true)
+    }
 
     private init() {
         // Authoritative pre-suspension signal. iOS posts didEnterBackgroundNotification
@@ -516,7 +614,7 @@ final class SyncScheduler {
         Task {
             // Instant once the inbox has painted (warm foreground); on a cold-launch
             // first foreground this waits for first paint, same as the herd gate.
-            await AppStartup.shared.awaitLaunchReady(background: false)
+            guard await AppStartup.shared.awaitLaunchReady(background: false) else { return }
             // Emits its OWN immediate `.inboxDataDidChange` (debounce-bypass flag)
             // when it stages new mail.
             await NSEDataBridge.mergeNSEStagingData()
@@ -576,8 +674,8 @@ final class SyncScheduler {
                 // — not a fixed timer. The quick merge above already ran ungated; this
                 // gate only holds back the heavy network work. Warm returns skip it.
                 if !didFirstForegroundSettle {
+                    guard await AppStartup.shared.awaitLaunchReady(background: false) else { return }
                     didFirstForegroundSettle = true
-                    await AppStartup.shared.awaitLaunchReady(background: false)
                     fgStep("first-paint gate cleared")
                     BootProfiler.mark("startForegroundPolling: first paint reached — herd starting")
                 }
@@ -971,6 +1069,12 @@ final class SyncScheduler {
     /// Schedule BGAppRefresh unconditionally (replaces any existing pending request).
     /// Used by: BGAppRefresh completion, foreground return, no-network skip, NetworkMonitor restore.
     func scheduleBackgroundSync() {
+        #if DEBUG
+        if let backgroundScheduleHook {
+            backgroundScheduleHook(false)
+            return
+        }
+        #endif
         submitBGAppRefreshRequest(caller: "schedule")
     }
 
@@ -1029,6 +1133,16 @@ final class SyncScheduler {
     private static let bgAppRefreshBudgetSeconds: TimeInterval = 25
 
     nonisolated func handleBackgroundSync(_ task: BGAppRefreshTask) {
+        let ctx = BGTaskContext(label: "sync") { success in
+            task.setTaskCompleted(success: success)
+        }
+        handleBackgroundSync(context: ctx) { expiration in task.expirationHandler = expiration }
+    }
+
+    nonisolated func handleBackgroundSync(
+        context ctx: BGTaskContext,
+        installExpirationHandler: (@escaping @Sendable () -> Void) -> Void
+    ) {
         let networkConnected = NetworkMonitor.checkConnected()
         print("[SyncScheduler] handleBackgroundSync() enter, thread=\(Thread.current), isMainThread=\(Thread.isMainThread)")
         BackgroundSyncLogger.log("BGAppRefresh STARTED (network=\(networkConnected))")
@@ -1037,12 +1151,11 @@ final class SyncScheduler {
         // Opportunistic delivered-notification cleanup.
         Task { await NotificationCleanupService.sweepExpired() }
 
-        let ctx = BGTaskContext(label: "sync")
 
         // Set expiration handler BEFORE creating the Task so `task` is
         // used (property set) then sent (captured in Task) — satisfies
         // Swift 6 region-based "no use after send" rule.
-        task.expirationHandler = {
+        installExpirationHandler {
             print("[SyncScheduler] SYNC expiration handler fired, thread=\(Thread.current), isMainThread=\(Thread.isMainThread)")
             BackgroundSyncLogger.log("BGAppRefresh EXPIRED (iOS killed)")
             BackgroundSyncLogger.logBGAppRefresh("EXPIRED (iOS killed)")
@@ -1052,22 +1165,21 @@ final class SyncScheduler {
             // 0xdead10cc). ctx.expire() already cancels the syncStartup Task,
             // but actor-owned inFlightTasks aren't its children — cancel them
             // explicitly via the unified helper.
-            Task { await SyncScheduler.cancelAllInFlightQueues(inboxOnly: true) }
+            Task { await ctx.cancelQueues(inboxOnly: true) }
             // Mechanical 0xdead10cc backstop (ADR-IOS-041): suspend GRDB
             // databases NOW — cooperative cancellation above is asynchronous
             // and can't guarantee no lock is held when the process freezes.
             // Stragglers get SQLITE_ABORT and retry on next wake.
-            DatabaseSuspension.postSuspendImmediately(reason: "BGAppRefresh expired")
+            ctx.suspendDatabases(reason: "BGAppRefresh expired")
             // Safety net: complete the task and reschedule even if the sync Task
             // never executed. Without this, iOS counts incomplete tasks as failures
             // and permanently throttles BGAppRefresh.
-            task.setTaskCompleted(success: false)
-            Task { @MainActor in
-                SyncScheduler.shared.scheduleBackgroundSync()
-                // The success path always schedules BGProcessing (drains queued
-                // work + finishes the FTS tokenizer migration); expiration must
-                // too, or repeated expirations orphan that follow-up work.
-                SyncScheduler.shared.scheduleBackgroundProcessing()
+            if ctx.complete(success: false) != nil {
+                Task { @MainActor in
+                    self.scheduleBackgroundSync()
+                    // Preserve the follow-up window for unfinished queued work.
+                    self.scheduleBackgroundProcessing()
+                }
             }
             print("[SyncScheduler] SYNC expiration handler done")
         }
@@ -1075,6 +1187,15 @@ final class SyncScheduler {
 
         // BGAppRefreshTask: unified sync startup with budget-limited drain.
         let syncTask = Task { @MainActor in
+            @MainActor func finishFailure() {
+                guard ctx.complete(success: false) != nil else { return }
+                self.scheduleBackgroundSync()
+                self.scheduleBackgroundProcessing()
+            }
+            guard !ctx.expired, !Task.isCancelled else {
+                finishFailure()
+                return
+            }
             // Resume databases (may be suspended from a previous quiesce) for
             // the duration of this BGTask; re-arm quiesce on exit (ADR-IOS-041).
             DatabaseSuspension.shared.beginBackgroundWork("bg-app-refresh")
@@ -1083,7 +1204,14 @@ final class SyncScheduler {
             // where the SwiftUI scene `.task` never runs — so the DB may not be
             // built yet. Build/await it before any `AppDatabase.dbPool` access
             // (which force-unwraps `AppDatabase.shared`) → otherwise crash.
-            await AppStartup.shared.awaitLaunchReady(background: true)
+            guard await self.backgroundDatabaseReady() else {
+                finishFailure()
+                return
+            }
+            guard !ctx.expired, !Task.isCancelled else {
+                finishFailure()
+                return
+            }
             print("[SyncScheduler] SYNC Task body start")
             let pollActive = self.isPollActive
             BackgroundSyncLogger.logBGAppRefresh("Task body start (pollActive=\(pollActive), network=\(NetworkMonitor.checkConnected()))")
@@ -1093,46 +1221,65 @@ final class SyncScheduler {
                 BackgroundSyncLogger.log("BGAppRefresh SKIPPED (foreground poll active)")
                 BackgroundSyncLogger.logBGAppRefresh("SKIPPED (foreground poll active)")
                 print("[SyncScheduler] SYNC skipped — foreground poll active")
-                task.setTaskCompleted(success: true)
-                self.scheduleBackgroundSync()
+                if let success = ctx.complete(success: !Task.isCancelled) {
+                    self.scheduleBackgroundSync()
+                    if !success { self.scheduleBackgroundProcessing() }
+                }
                 return
             }
 
             // No network → skip sync but always reschedule. Can't rely solely on
             // NetworkMonitor restore — its handler runs in Task { @MainActor in }
             // which may not execute if the app is suspended before MainActor drains.
-            guard NetworkMonitor.checkConnected() else {
+            #if DEBUG
+            let connected = self.refreshNetworkAvailableForTesting ?? NetworkMonitor.checkConnected()
+            #else
+            let connected = NetworkMonitor.checkConnected()
+            #endif
+            guard connected else {
                 BackgroundSyncLogger.log("BGAppRefresh SKIPPED (no network)")
                 BackgroundSyncLogger.logBGAppRefresh("SKIPPED (no network)")
                 print("[SyncScheduler] SYNC skipped — no network")
-                task.setTaskCompleted(success: true)
-                self.scheduleBackgroundSync()
+                if let success = ctx.complete(success: !Task.isCancelled) {
+                    self.scheduleBackgroundSync()
+                    if !success { self.scheduleBackgroundProcessing() }
+                }
                 return
             }
 
-            await self.syncStartup(inboxOnly: true, drain: .budget(Self.bgAppRefreshBudgetSeconds))
-
-            // One-time FTS tokenizer migration (ADR-024) — small post-sync slice
-            // only, so the refresh window's primary purpose (sync) is never
-            // starved. No-op when nothing is stale; cancellation/expiration
-            // winds down at a shard boundary.
-            await SearchIndex.shared.rebuildStaleTokenizerShards(
-                deadline: Date().addingTimeInterval(SearchConfig.retokenizeShortWindowBudgetSec))
+            #if DEBUG
+            if let backgroundWorkHook = self.backgroundWorkHook {
+                await backgroundWorkHook(true)
+            } else {
+                await self.performBackgroundRefreshWork()
+            }
+            #else
+            await self.performBackgroundRefreshWork()
+            #endif
 
             let success = !ctx.expired
             BackgroundSyncLogger.log("BGAppRefresh COMPLETED (success=\(success))")
             BackgroundSyncLogger.logBGAppRefresh("COMPLETED (success=\(success))")
             print("[SyncScheduler] SYNC completing: expired=\(ctx.expired), success=\(success)")
-            // Only complete if expiration handler hasn't already done it
-            if !ctx.expired {
-                task.setTaskCompleted(success: true)
+            if ctx.complete(success: !Task.isCancelled) != nil {
+                self.scheduleBackgroundSync() // Re-schedule for next cycle
+                self.scheduleBackgroundProcessing() // Always schedule BGProcessing
             }
-            self.scheduleBackgroundSync() // Re-schedule for next cycle
-            self.scheduleBackgroundProcessing() // Always schedule BGProcessing
             print("[SyncScheduler] SYNC Task body done")
         }
         ctx.setTask(syncTask)
         print("[SyncScheduler] handleBackgroundSync() exit")
+    }
+
+    private func performBackgroundRefreshWork() async {
+        await self.syncStartup(inboxOnly: true, drain: .budget(Self.bgAppRefreshBudgetSeconds))
+
+        // One-time FTS tokenizer migration (ADR-024) — small post-sync slice
+        // only, so the refresh window's primary purpose (sync) is never
+        // starved. No-op when nothing is stale; cancellation/expiration
+        // winds down at a shard boundary.
+        await SearchIndex.shared.rebuildStaleTokenizerShards(
+            deadline: Date().addingTimeInterval(SearchConfig.retokenizeShortWindowBudgetSec))
     }
 
     // MARK: - Tier 3: Background Processing (long-running)
@@ -1142,6 +1289,12 @@ final class SyncScheduler {
     /// so queued work from the delta sync gets processed promptly.
     /// Also called on app background as a periodic fallback.
     func scheduleBackgroundProcessing() {
+        #if DEBUG
+        if let backgroundScheduleHook {
+            backgroundScheduleHook(true)
+            return
+        }
+        #endif
         let request = BGProcessingTaskRequest(identifier: Self.backgroundAITaskIdentifier)
         request.requiresNetworkConnectivity = true
         request.requiresExternalPower = false
@@ -1167,12 +1320,21 @@ final class SyncScheduler {
     }
 
     nonisolated func handleBackgroundAIProcessing(_ task: BGProcessingTask) {
+        let ctx = BGTaskContext(label: "processing") { success in
+            task.setTaskCompleted(success: success)
+        }
+        handleBackgroundAIProcessing(context: ctx) { expiration in task.expirationHandler = expiration }
+    }
+
+    nonisolated func handleBackgroundAIProcessing(
+        context ctx: BGTaskContext,
+        installExpirationHandler: (@escaping @Sendable () -> Void) -> Void
+    ) {
         print("[SyncScheduler] handleBackgroundProcessing() enter, thread=\(Thread.current), isMainThread=\(Thread.isMainThread)")
         BackgroundSyncLogger.log("BGProcessing STARTED")
         BackgroundSyncLogger.logBGProcessing("STARTED")
-        let ctx = BGTaskContext(label: "processing")
 
-        task.expirationHandler = {
+        installExpirationHandler {
             print("[SyncScheduler] PROCESSING expiration handler fired, thread=\(Thread.current), isMainThread=\(Thread.isMainThread)")
             BackgroundSyncLogger.log("BGProcessing EXPIRED (iOS killed)")
             BackgroundSyncLogger.logBGProcessing("EXPIRED (iOS killed)")
@@ -1181,16 +1343,15 @@ final class SyncScheduler {
             // BGProcessing path runs the full backfill+embedding fan-out, so
             // cancel inboxOnly: false to also reach BackfillAIQueue / embedding
             // queues whose actor-owned Tasks ctx.expire() doesn't reach.
-            Task { await SyncScheduler.cancelAllInFlightQueues(inboxOnly: false) }
+            Task { await ctx.cancelQueues(inboxOnly: false) }
             // Mechanical 0xdead10cc backstop (ADR-IOS-041) — see the
             // BGAppRefresh expiration handler for rationale.
-            DatabaseSuspension.postSuspendImmediately(reason: "BGProcessing expired")
-            task.setTaskCompleted(success: false)
-            // Expiration means work remained (queues and/or tokenizer-migration
-            // shards) — reschedule so it gets another window. The success path
-            // reschedules conditionally; expiration is unconditional by definition.
-            Task { @MainActor in
-                SyncScheduler.shared.scheduleBackgroundProcessing()
+            ctx.suspendDatabases(reason: "BGProcessing expired")
+            if ctx.complete(success: false) != nil {
+                // Expiration retains an unconditional follow-up window.
+                Task { @MainActor in
+                    self.scheduleBackgroundProcessing()
+                }
             }
             print("[SyncScheduler] PROCESSING expiration handler done")
         }
@@ -1200,6 +1361,14 @@ final class SyncScheduler {
         // by the preceding BGAppRefreshTask or silent push delta sync.
         // Has minutes of execution time (vs 30s for BGAppRefreshTask).
         let processingTask = Task { @MainActor in
+            @MainActor func finishFailure() {
+                guard ctx.complete(success: false) != nil else { return }
+                self.scheduleBackgroundProcessing()
+            }
+            guard !ctx.expired, !Task.isCancelled else {
+                finishFailure()
+                return
+            }
             // Resume databases (may be suspended from a previous quiesce) for
             // the duration of this BGTask; re-arm quiesce on exit (ADR-IOS-041).
             DatabaseSuspension.shared.beginBackgroundWork("bg-processing")
@@ -1208,7 +1377,14 @@ final class SyncScheduler {
             // where the SwiftUI scene `.task` never runs — so the DB may not be
             // built yet. Build/await it before any `AppDatabase.dbPool` access
             // (which force-unwraps `AppDatabase.shared`) → otherwise crash.
-            await AppStartup.shared.awaitLaunchReady(background: true)
+            guard await self.backgroundDatabaseReady() else {
+                finishFailure()
+                return
+            }
+            guard !ctx.expired, !Task.isCancelled else {
+                finishFailure()
+                return
+            }
             let taskT0 = CFAbsoluteTimeGetCurrent()
             print("[SyncScheduler] PROCESSING Task body start")
             BackgroundSyncLogger.logBGProcessing("Task body start")
@@ -1218,38 +1394,58 @@ final class SyncScheduler {
             AccountManagerState.shared.fastSyncModeActive = true
             defer { Task { @MainActor in AccountManagerState.shared.fastSyncModeActive = false } }
 
-            // Full startup: sync + drain all queues + backfill + notification refresh
-            await self.syncStartup(inboxOnly: false, drain: .full)
-
-            // One-time FTS tokenizer migration (ADR-024) — AFTER sync so it never
-            // steals resources from push/sync work. No-op when no stale shards
-            // remain; resumes at the next unconverted shard; ctx.expire()
-            // cancellation winds it down at a shard boundary (each shard is one
-            // transaction). No deadline — BGProcessing has minutes of budget.
-            await SearchIndex.shared.rebuildStaleTokenizerShards()
+            #if DEBUG
+            if let backgroundWorkHook = self.backgroundWorkHook {
+                await backgroundWorkHook(false)
+            } else {
+                await self.performBackgroundProcessingWork()
+            }
+            #else
+            await self.performBackgroundProcessingWork()
+            #endif
 
             let totalElapsed = Int((CFAbsoluteTimeGetCurrent() - taskT0) * 1000)
             let success = !ctx.expired
             BackgroundSyncLogger.log("BGProcessing COMPLETED in \(totalElapsed)ms (success=\(success))")
             BackgroundSyncLogger.logBGProcessing("COMPLETED in \(totalElapsed)ms (success=\(success))")
             print("[SyncScheduler] PROCESSING completing in \(totalElapsed)ms: expired=\(ctx.expired), success=\(success)")
-            // Only complete if expiration handler hasn't already done it
-            if !ctx.expired {
-                task.setTaskCompleted(success: true)
+            guard let completionSuccess = ctx.complete(success: !Task.isCancelled) else { return }
+            if !completionSuccess {
+                self.scheduleBackgroundProcessing()
+                return
             }
             // Only reschedule if queues still have work — prevents unconditional
             // rescheduling. Pending tokenizer-shard conversions count as work so
             // an interrupted migration gets another BG window.
-            let bodyIdle = await ActiveBodyQueue.shared.isIdle
-            let aiIdle = await ActiveAIQueue.shared.isIdle
-            let staleShards = await SearchIndex.shared.hasStaleTokenizerShards()
-            if !bodyIdle || !aiIdle || staleShards {
+            if await self.backgroundProcessingHasWork() {
                 self.scheduleBackgroundProcessing()
             }
             print("[SyncScheduler] PROCESSING Task body done")
         }
         ctx.setTask(processingTask)
         print("[SyncScheduler] handleBackgroundProcessing() exit")
+    }
+
+    private func performBackgroundProcessingWork() async {
+        // Full startup: sync + drain all queues + backfill + notification refresh
+        await self.syncStartup(inboxOnly: false, drain: .full)
+
+        // One-time FTS tokenizer migration (ADR-024) — AFTER sync so it never
+        // steals resources from push/sync work. No-op when no stale shards
+        // remain; resumes at the next unconverted shard; ctx.expire()
+        // cancellation winds it down at a shard boundary (each shard is one
+        // transaction). No deadline — BGProcessing has minutes of budget.
+        await SearchIndex.shared.rebuildStaleTokenizerShards()
+    }
+
+    private func backgroundProcessingHasWork() async -> Bool {
+        #if DEBUG
+        if let processingHasWorkHook { return await processingHasWorkHook() }
+        #endif
+        let bodyIdle = await ActiveBodyQueue.shared.isIdle
+        let aiIdle = await ActiveAIQueue.shared.isIdle
+        let staleShards = await SearchIndex.shared.hasStaleTokenizerShards()
+        return !bodyIdle || !aiIdle || staleShards
     }
 
     /// Check if the device is currently on WiFi.

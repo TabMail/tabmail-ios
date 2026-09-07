@@ -25,6 +25,49 @@ struct TabMailApp: App {
     @State private var showDelayedSplash = false
     @Environment(\.scenePhase) private var scenePhase
 
+    nonisolated private static func initializeEmbeddingAfterStartup(
+        readiness: @Sendable () async -> Bool = {
+            await AppStartup.shared.awaitLaunchReady(
+                background: false,
+                firstPaintTimeoutSeconds: SyncConfig.embeddingLoadGateTimeoutSeconds
+            )
+        },
+        initialize: @Sendable () -> Void = {
+            // Restored from `v2final` (`e28dd4edb`) — `EmbeddingStartupPolicy`.
+            // An app-hosted XCTest launch would otherwise compile and load the
+            // ~45 MB bundled CoreML model in every unit-test process, for tests
+            // that never embed anything. The unit-test-host policy branch is
+            // absent from Release: the `#else` arm retains the plain call.
+            #if DEBUG
+            let embeddingDecision = EmbeddingStartupPolicy.initializeForAppStartup()
+            if embeddingDecision == .skippedUnitTestHost {
+                BootProfiler.mark("EmbeddingService.initialize() SKIPPED (unit-test host)")
+            }
+            #else
+            EmbeddingService.initialize()
+            #endif
+        }
+    ) async {
+        // background: false → wait for first paint (foreground) so the CoreML
+        // load can't starve the pre-paint merge / first render. On a cold
+        // BACKGROUND launch (no paint) the shorter `embeddingLoadGateTimeoutSeconds`
+        // applies instead of the 8s herd default: just long enough for the
+        // now-unburdened merge to win the CPU, then load — no wasted budget.
+        guard await readiness() else { return }
+        BootProfiler.mark("EmbeddingService.initialize() START (CoreML ~45MB, .utility, post-first-paint)")
+        initialize()
+        BootProfiler.mark("EmbeddingService.initialize() DONE")
+    }
+
+    #if DEBUG
+    nonisolated static func initializeEmbeddingForTesting(
+        readiness: @escaping @Sendable () async -> Bool,
+        initialize: @escaping @Sendable () -> Void
+    ) async {
+        await initializeEmbeddingAfterStartup(readiness: readiness, initialize: initialize)
+    }
+    #endif
+
     init() {
         // First app-code mark — its `+Nms` is the pre-main (dyld / runtime /
         // static-init) cost, usually the biggest single chunk of a cold launch.
@@ -112,31 +155,7 @@ struct TabMailApp: App {
         // `EmbeddingService.shared` and degrade to keyword-only until it lands. Left
         // here (not in body.task) so a cold BACKGROUND launch still loads it.
         Task.detached(priority: .utility) {
-            // background: false → wait for first paint (foreground) so the CoreML
-            // load can't starve the pre-paint merge / first render. On a cold
-            // BACKGROUND launch (no paint) the shorter `embeddingLoadGateTimeoutSeconds`
-            // applies instead of the 8s herd default: just long enough for the
-            // now-unburdened merge to win the CPU, then load — no wasted budget.
-            await AppStartup.shared.awaitLaunchReady(
-                background: false,
-                firstPaintTimeoutSeconds: SyncConfig.embeddingLoadGateTimeoutSeconds
-            )
-            BootProfiler.mark("EmbeddingService.initialize() START (CoreML ~45MB, .utility, post-first-paint)")
-            // Restored from `v2final` (`e28dd4edb`) — `EmbeddingStartupPolicy`.
-            // An app-hosted XCTest launch would otherwise compile and load the
-            // ~45 MB bundled CoreML model in every unit-test process, for tests
-            // that never embed anything. RELEASE BUILDS HAVE NO SEAM AND NO
-            // BRANCH: the `#else` arm is the plain call, so shipped behaviour is
-            // byte-for-byte what it was.
-            #if DEBUG
-            let embeddingDecision = EmbeddingStartupPolicy.initializeForAppStartup()
-            if embeddingDecision == .skippedUnitTestHost {
-                BootProfiler.mark("EmbeddingService.initialize() SKIPPED (unit-test host)")
-            }
-            #else
-            EmbeddingService.initialize()
-            #endif
-            BootProfiler.mark("EmbeddingService.initialize() DONE")
+            await Self.initializeEmbeddingAfterStartup()
         }
         // SearchIndex's eager init is deliberately NOT here. Its 257k-doc FTS open
         // was landing IN the inbox first-render window (it fired at dbReady, before
@@ -497,8 +516,8 @@ struct TabMailApp: App {
 ///      blank launch screen holds until `isReady` flips straight to the inbox.
 ///      This keeps the migration splash from flashing on every normal launch.
 ///
-/// CRITICAL invariant: until `ensureDatabaseReady()` completes, `AppDatabase.shared`
-/// is nil and `AppDatabase.dbPool` (which force-unwraps it) MUST NOT be touched.
+/// CRITICAL invariant: callers must receive true from `ensureDatabaseReady()`
+/// before touching `AppDatabase.dbPool`; failure leaves the pool unpublished.
 /// The UI is gated by the launch screen / splash; background / UIKit entry points
 /// that can fire during this window (silent push, notification actions, BGTask
 /// sync/AI) gate via `awaitLaunchReady(background: true)`.
@@ -540,6 +559,31 @@ final class AppStartup {
 
     private init() {}
 
+    #if DEBUG
+    // Instance-only operation boundaries; tests run the live readiness algorithm
+    // without publishing a database or starting unrelated process-global upkeep.
+    private var testProbe: (@Sendable () async throws -> (pool: DatabasePool, pending: Bool))?
+    private var testBuildAndPublish: (@Sendable (DatabasePool) async throws -> Void)?
+    private var testPreparation: (@MainActor () async -> Void)?
+    private var testUpkeep: (@MainActor () -> Void)?
+    var databaseWaiterCountForTesting: Int { dbWaiters.count }
+    private(set) var paintPollCountForTesting = 0
+
+    init(
+        probe: @escaping @Sendable () async throws -> (pool: DatabasePool, pending: Bool),
+        buildAndPublish: @escaping @Sendable (DatabasePool) async throws -> Void,
+        preparation: @escaping @MainActor () async -> Void,
+        upkeep: @escaping @MainActor () -> Void
+    ) {
+        testProbe = probe
+        testBuildAndPublish = buildAndPublish
+        testPreparation = preparation
+        testUpkeep = upkeep
+    }
+
+    func signalFirstPaintForTesting() { isReady = true }
+    #endif
+
     /// Builds + migrates the database (once) and runs the non-UI DB-dependent
     /// launch steps (screenshot seed, orphan demo wipe, NSE staging + mirror).
     /// Idempotent and `navigationStore`-independent so it can be driven from ANY
@@ -547,16 +591,17 @@ final class AppStartup {
     /// `AppDelegate.didFinishLaunchingWithOptions` (which always runs, including
     /// cold BACKGROUND launches where the SwiftUI scene `.task` never fires).
     /// Concurrent callers while a build is in flight park on `dbWaiters` rather
-    /// than starting a second build.
-    func ensureDatabaseReady() async {
-        if dbReady { return }
+    /// than starting a second build. Returns false on terminal database failure.
+    func ensureDatabaseReady() async -> Bool {
+        if dbReady { return true }
+        if failureMessage != nil { return false }
         if hasStarted {
             // A build is already running (started by another launch path).
             // Park until it finishes — don't start a second one.
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                if dbReady { cont.resume() } else { dbWaiters.append(cont) }
+                if dbReady || failureMessage != nil { cont.resume() } else { dbWaiters.append(cont) }
             }
-            return
+            return dbReady
         }
         hasStarted = true
 
@@ -572,9 +617,15 @@ final class AppStartup {
         // Phase 1 (off main): open the pool + cheaply probe for pending migration
         // work. Fast — opens the connection and reads the migrator's applied set
         // + the one-time-reset flags. The heavy migration passes are Phase 2.
+        #if DEBUG
+        let probeHook = testProbe
+        #endif
         let probe: (pool: DatabasePool, pending: Bool)? =
             await Task.detached(priority: .userInitiated) {
                 do {
+                    #if DEBUG
+                    if let probeHook { return try await probeHook() }
+                    #endif
                     let pool = try AppDatabase.makePool()
                     let pending = try AppDatabase.hasPendingMigrationWork(pool)
                     return (pool, pending)
@@ -587,7 +638,7 @@ final class AppStartup {
         guard let probe else {
             failureMessage = "TabMail couldn’t open its local database. Please relaunch the app."
             resumeDBWaiters()
-            return
+            return false
         }
 
         // Only NOW — knowing there is real (and potentially slow) migration work
@@ -604,8 +655,17 @@ final class AppStartup {
         // resets on the probed pool, then publish it. This is the work that used
         // to freeze launch; it now runs behind the gating splash (when shown).
         let pool = probe.pool
+        #if DEBUG
+        let buildHook = testBuildAndPublish
+        #endif
         let built = await Task.detached(priority: .userInitiated) { () -> Bool in
             do {
+                #if DEBUG
+                if let buildHook {
+                    try await buildHook(pool)
+                    return true
+                }
+                #endif
                 let db = try AppDatabase(pool: pool, runStartupResets: true)
                 AppDatabase.shared.withLock { $0 = db }
                 return true
@@ -618,7 +678,7 @@ final class AppStartup {
         guard built else {
             failureMessage = "TabMail couldn’t open its local database. Please relaunch the app."
             resumeDBWaiters()
-            return
+            return false
         }
         BackgroundSyncLogger.log("AppStartup: database ready in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms")
         BootProfiler.mark("db.built+migrated (AppDatabase.shared published)")
@@ -630,6 +690,36 @@ final class AppStartup {
         //   • screenshot seeding (only under --screenshot-mode)
         //   • orphan demo-row wipe (demo state never persists across launches)
         //   • NSE staging DB creation + state mirror
+        #if DEBUG
+        if let testPreparation {
+            await testPreparation()
+        } else {
+            await prepareDatabaseForLaunch()
+        }
+        #else
+        await prepareDatabaseForLaunch()
+        #endif
+        // DB is usable — unblock everything parked in `awaitLaunchReady` (background
+        // push / notification-action / BGTask handlers, detached startup tasks).
+        // Flip this BEFORE the staging-DB upkeep below: that work is NOT needed to
+        // present the inbox, so it must never sit in front of this gate.
+        dbReady = true
+        resumeDBWaiters()
+        BootProfiler.mark("dbReady=true (push / NSE-merge / BGTask waiters unblocked)")
+
+        #if DEBUG
+        if let testUpkeep {
+            testUpkeep()
+        } else {
+            startDatabaseUpkeep()
+        }
+        #else
+        startDatabaseUpkeep()
+        #endif
+        return true
+    }
+
+    private func prepareDatabaseForLaunch() async {
         ScreenshotMode.seedIfNeeded()
         ScreenshotMode.seedChatSessionsIfNeeded()
         if let db = AppDatabase.shared.withLock({ $0 }) {
@@ -653,14 +743,9 @@ final class AppStartup {
                 if DebugModeManager.isLoggingEnabled() { print("[AppStartup] Orphan demo wipe failed: \(error)") }
             }
         }
-        // DB is usable — unblock everything parked in `awaitLaunchReady` (background
-        // push / notification-action / BGTask handlers, detached startup tasks).
-        // Flip this BEFORE the staging-DB upkeep below: that work is NOT needed to
-        // present the inbox, so it must never sit in front of this gate.
-        dbReady = true
-        resumeDBWaiters()
-        BootProfiler.mark("dbReady=true (push / NSE-merge / BGTask waiters unblocked)")
+    }
 
+    private func startDatabaseUpkeep() {
         // v1.7.1 one-shot epoch rebuild — OFF the launch gate, and it CANNOT sit in
         // `StartupMigrations` (which runs synchronously inside `AppDatabase.init`,
         // before `AppDatabase.shared` is published): the arm goes through
@@ -707,9 +792,7 @@ final class AppStartup {
     /// — the initial sidebar load — and flip `isReady` to route splash → inbox.
     /// Called from `TabMailApp.body.task`. Idempotent.
     func runIfNeeded(navigationStore: NavigationStore) async {
-        await ensureDatabaseReady()
-        // Build failed (failureMessage shown) or the sidebar already loaded.
-        guard dbReady, !isReady else { return }
+        guard await ensureDatabaseReady(), !isReady else { return }
         // Debug-gated (no-op unless debug logging is unlocked): stamps
         // "⚠ MAIN THREAD STALL ~Xms" into the BootProfile timeline so a reported
         // main-actor stall can be correlated against the surrounding merge/sync/
@@ -768,8 +851,9 @@ final class AppStartup {
     ///   never-paints case — and lets a task that runs on BOTH launch kinds (the
     ///   CoreML load) still proceed on a background launch.
     ///
-    /// Both paths first `await ensureDatabaseReady()`, so a `false` caller is also
-    /// guaranteed a usable DB even if it hits the timeout. The paint wait is polled
+    /// Both paths return false on database failure. A foreground caller receives
+    /// true after usable readiness even if painting times out or is cancelled.
+    /// The paint wait is polled
     /// (no continuation bookkeeping) — every caller is a one-shot boot task, so
     /// ~100ms granularity is invisible. Acyclic: the work that flips `isReady` (the
     /// pre-paint merge + `loadInitialData`, driven from `runIfNeeded`) never calls
@@ -778,19 +862,23 @@ final class AppStartup {
     func awaitLaunchReady(
         background: Bool,
         firstPaintTimeoutSeconds: Double = SyncConfig.firstPaintGateTimeoutSeconds
-    ) async {
-        await ensureDatabaseReady()
-        guard !background else { return }
+    ) async -> Bool {
+        guard await ensureDatabaseReady() else { return false }
+        guard !background else { return true }
         let step = Duration.milliseconds(100)
         var waited = Duration.zero
         let limit = Duration.seconds(firstPaintTimeoutSeconds)
         while !isReady, waited < limit {
+            #if DEBUG
+            paintPollCountForTesting += 1
+            #endif
             // Bail on cancellation rather than busy-iterating: a cancelled
             // `Task.sleep` throws immediately, so without this the loop would
             // burst through `limit/step` no-op iterations on the MainActor.
-            if Task.isCancelled { return }
-            do { try await Task.sleep(for: step) } catch { return }
+            if Task.isCancelled { return true }
+            do { try await Task.sleep(for: step) } catch { return true }
             waited += step
         }
+        return true
     }
 }

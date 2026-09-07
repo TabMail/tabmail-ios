@@ -483,6 +483,32 @@ enum NotificationActionRouter {
 /// Swift 6 isolation errors.
 final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 
+    #if DEBUG
+    private let readinessHook: (@MainActor @Sendable () async -> Bool)?
+    private var foregroundMergeHook: (@MainActor @Sendable () async -> Void)?
+    private var foregroundSyncHook: (@MainActor @Sendable () async -> Void)?
+    private let actionHook: (@MainActor @Sendable (String, String, String) async -> Void)?
+
+    override init() {
+        readinessHook = nil
+        actionHook = nil
+        super.init()
+    }
+
+    init(
+        readiness: @escaping @MainActor @Sendable () async -> Bool,
+        action: @escaping @MainActor @Sendable (String, String, String) async -> Void,
+        foregroundMerge: (@MainActor @Sendable () async -> Void)? = nil,
+        foregroundSync: (@MainActor @Sendable () async -> Void)? = nil
+    ) {
+        readinessHook = readiness
+        actionHook = action
+        foregroundMergeHook = foregroundMerge
+        foregroundSyncHook = foregroundSync
+        super.init()
+    }
+    #endif
+
     /// Handle notification while app is in foreground.
     /// For NSE pushes (email/task): suppress and trigger immediate sync.
     /// For other notifications (proactive, local): show normally.
@@ -499,21 +525,42 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         // NSE email pushes: suppress in foreground, trigger sync instead.
         // Fan-out chain stops naturally — app's sync discovers all new messages.
         if let provider, ["gmail", "outlook", "imap_new_mail"].contains(provider) {
-            Task { @MainActor in
-                // A push can arrive during the one-time migration window; wait
-                // for the DB before touching it (AppStartup / PLAN_HANG_FIX).
-                await AppStartup.shared.awaitLaunchReady(background: true)
-                await NSEDataBridge.mergeNSEStagingData()
-                // willPresent only fires while the app is foreground-active, so request the
-                // fast-path: syncStartup still cancels in-flight AI if the oracle detects any
-                // background/suspension since the last recovery — it only skips when the app
-                // is provably continuous-foreground (connections live, nothing to recover).
-                await SyncScheduler.shared.syncStartup(inboxOnly: true, foregroundFastPath: true)
-            }
+            startForegroundNotificationWork()
             return []  // Suppress — user is already in the app
         }
 
         return [.banner, .sound, .list]
+    }
+
+    /// Owns the Task used by willPresent; the returned handle lets tests join it.
+    @discardableResult
+    func startForegroundNotificationWork() -> Task<Void, Never> {
+        #if DEBUG
+        let ready = readinessHook ?? { await AppStartup.shared.awaitLaunchReady(background: true) }
+        let merge = foregroundMergeHook ?? { await NSEDataBridge.mergeNSEStagingData() }
+        let sync = foregroundSyncHook ?? {
+            await SyncScheduler.shared.syncStartup(inboxOnly: true, foregroundFastPath: true)
+        }
+        #else
+        let ready: @MainActor @Sendable () async -> Bool = {
+            await AppStartup.shared.awaitLaunchReady(background: true)
+        }
+        let merge: @MainActor @Sendable () async -> Void = { await NSEDataBridge.mergeNSEStagingData() }
+        let sync: @MainActor @Sendable () async -> Void = {
+            await SyncScheduler.shared.syncStartup(inboxOnly: true, foregroundFastPath: true)
+        }
+        #endif
+        return Task { @MainActor in
+            // A push can arrive during the one-time migration window; wait
+            // for the DB before touching it (AppStartup / PLAN_HANG_FIX).
+            guard await ready() else { return }
+            await merge()
+            // willPresent only fires while the app is foreground-active, so request the
+            // fast-path: syncStartup still cancels in-flight AI if the oracle detects any
+            // background/suspension since the last recovery — it only skips when the app
+            // is provably continuous-foreground (connections live, nothing to recover).
+            await sync()
+        }
     }
 
     /// Build the deep-link forwarding for an NSE new-mail notification TAP. Pure
@@ -556,12 +603,33 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
             print("[NotificationDelegate] didReceive notification: \(response.notification.request.identifier)")
         }
 
+        handleNotificationResponse(
+            actionId: response.actionIdentifier,
+            userInfo: userInfo,
+            completionHandler: completionHandler
+        )
+    }
+
+    func handleNotificationResponse(
+        actionId: String,
+        userInfo: [AnyHashable: Any],
+        completionHandler: @escaping () -> Void
+    ) {
         // ObjC completion handler — inherently thread-safe one-shot callback,
         // but not marked @Sendable. Safe to send to main queue.
         nonisolated(unsafe) let finish = completionHandler
 
+        #if DEBUG
+        // Capture immutable Sendable operations, never the nonisolated delegate.
+        let ready: @MainActor @Sendable () async -> Bool = readinessHook ?? {
+            await AppStartup.shared.awaitLaunchReady(background: true)
+        }
+        let execute: @MainActor @Sendable (String, String, String) async -> Void = actionHook ?? {
+            await NotificationActionRouter.execute(actionId: $0, messageId: $1, accountId: $2)
+        }
+        #endif
+
         // Handle notification actions (archive, mark read, delete) from NSE notifications
-        let actionId = response.actionIdentifier
 
         // MARK_READ wires through AccountManager.markRead so the local
         // MessageHeader.isRead + folder.unreadCount flip optimistically, the
@@ -597,12 +665,19 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 // the last quiesce (ADR-IOS-041). Resume or the user's action
                 // write would abort: NEVER DROP USER INTENTION.
                 DatabaseSuspension.shared.beginBackgroundWork("notification-action")
-                defer { DatabaseSuspension.shared.endBackgroundWork("notification-action") }
+                defer {
+                    finish()
+                    DatabaseSuspension.shared.endBackgroundWork("notification-action")
+                }
                 // A notification action can fire during the one-time migration
                 // window; wait for the DB before touching it (AppStartup).
-                await AppStartup.shared.awaitLaunchReady(background: true)
+                #if DEBUG
+                guard await ready() else { return }
+                await execute(actionId, messageId, accountId)
+                #else
+                guard await AppStartup.shared.awaitLaunchReady(background: true) else { return }
                 await NotificationActionRouter.execute(actionId: actionId, messageId: messageId, accountId: accountId)
-                finish()
+                #endif
             }
             return
         }
@@ -617,12 +692,19 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 // Background notification action — same resume rationale as
                 // MARK_READ above (ADR-IOS-041).
                 DatabaseSuspension.shared.beginBackgroundWork("notification-action")
-                defer { DatabaseSuspension.shared.endBackgroundWork("notification-action") }
+                defer {
+                    finish()
+                    DatabaseSuspension.shared.endBackgroundWork("notification-action")
+                }
                 // Can fire during the one-time migration window — wait for
                 // the DB before touching it (AppStartup).
-                await AppStartup.shared.awaitLaunchReady(background: true)
+                #if DEBUG
+                guard await ready() else { return }
+                await execute(actionId, messageId, accountId)
+                #else
+                guard await AppStartup.shared.awaitLaunchReady(background: true) else { return }
                 await NotificationActionRouter.execute(actionId: actionId, messageId: messageId, accountId: accountId)
-                finish()
+                #endif
             }
             return
         }
@@ -716,6 +798,114 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 /// APNs device tokens or silent push notifications.
 class AppDelegate: NSObject, UIApplicationDelegate {
 
+    #if DEBUG
+    private var checkpointReadyHook: (@MainActor () -> Bool)?
+    private var checkpointBeginHook: (@MainActor (@escaping @MainActor @Sendable () -> Void) -> UIBackgroundTaskIdentifier)?
+    private var checkpointEndHook: (@MainActor (UIBackgroundTaskIdentifier) -> Void)?
+    private var checkpointDrainHook: (@MainActor () async -> Void)?
+    private var checkpointWorkHook: (@MainActor () async -> Void)?
+
+    init(
+        checkpointReady: @escaping @MainActor () -> Bool,
+        beginAssertion: @escaping @MainActor (@escaping @MainActor @Sendable () -> Void) -> UIBackgroundTaskIdentifier,
+        endAssertion: @escaping @MainActor (UIBackgroundTaskIdentifier) -> Void,
+        drain: @escaping @MainActor () async -> Void,
+        checkpoint: @escaping @MainActor () async -> Void
+    ) {
+        checkpointReadyHook = checkpointReady
+        checkpointBeginHook = beginAssertion
+        checkpointEndHook = endAssertion
+        checkpointDrainHook = drain
+        checkpointWorkHook = checkpoint
+        super.init()
+    }
+
+    private var silentPushReadinessHook: (@MainActor () async -> Bool)?
+    private var silentPushWorkHook: (@MainActor () async -> UIBackgroundFetchResult)?
+
+    override init() { super.init() }
+
+    init(
+        silentPushReadiness: @escaping @MainActor () async -> Bool,
+        silentPushWork: @escaping @MainActor () async -> UIBackgroundFetchResult
+    ) {
+        silentPushReadinessHook = silentPushReadiness
+        silentPushWorkHook = silentPushWork
+        super.init()
+    }
+    #endif
+
+    /// Synchronous admission from didEnterBackground; async work retains the same finish owner.
+    func startBackgroundCheckpoint() {
+        #if DEBUG
+        let usable = checkpointReadyHook?() ?? AppStartup.shared.dbReady
+        #else
+        let usable = AppStartup.shared.dbReady
+        #endif
+        guard usable else { return }
+        // Idempotent finish: the normal-completion path (end of the
+        // Task below) and the expiration handler both funnel through
+        // this one closure, so `endBackgroundWork` (a refcount) is
+        // NEVER decremented twice for one `beginBackgroundWork`, and
+        // the OS task assertion is released exactly once. Mirrors
+        // SyncScheduler.requestBackgroundGracePeriod's `ended`/
+        // `bgTaskId` Mutex idiom.
+        let ended = Mutex(false)
+        let bgTaskId = Mutex<UIBackgroundTaskIdentifier>(.invalid)
+        let finish: @MainActor @Sendable () -> Void = {
+            guard !ended.withLock({ let was = $0; $0 = true; return was }) else { return }
+            DatabaseSuspension.shared.endBackgroundWork("wal-durability-checkpoint")
+            let id = bgTaskId.withLock { $0 }
+            #if DEBUG
+            if let endAssertion = self.checkpointEndHook { endAssertion(id) }
+            else if id != .invalid { UIApplication.shared.endBackgroundTask(id) }
+            #else
+            if id != .invalid { UIApplication.shared.endBackgroundTask(id) }
+            #endif
+        }
+        #if DEBUG
+        let bgTask = if let checkpointBeginHook { checkpointBeginHook(finish) }
+            else { UIApplication.shared.beginBackgroundTask(withName: "wal-durability-checkpoint", expirationHandler: finish) }
+        #else
+        let bgTask = UIApplication.shared.beginBackgroundTask(
+            withName: "wal-durability-checkpoint",
+            expirationHandler: finish
+        )
+        #endif
+        bgTaskId.withLock { $0 = bgTask }
+        DatabaseSuspension.shared.beginBackgroundWork("wal-durability-checkpoint")
+        Task { @MainActor in
+            // Drain the in-memory write queue BEFORE the durability
+            // checkpoint. The checkpoint fsyncs the WAL as of "now";
+            // closures still sitting in AccountManager.writeQueue —
+            // including queued ADR-IOS-057 intent-cycle executors —
+            // haven't committed yet, so checkpointing first could
+            // fsync a WAL that's missing whatever the queue hasn't
+            // flushed. Deadline-bounded (see
+            // SyncConfig.backgroundWriteQueueFlushTimeoutSeconds) so a
+            // pathological queue can't hold the background budget
+            // hostage — on timeout we proceed to the checkpoint
+            // anyway; the un-drained tail closures still run later
+            // (never dropped), they just miss this fsync window.
+            #if DEBUG
+            if let drain = self.checkpointDrainHook { await drain() }
+            else {
+                await AccountManager.awaitWriteQueueDrainOrTimeout(
+                    timeoutSeconds: SyncConfig.backgroundWriteQueueFlushTimeoutSeconds
+                )
+            }
+            if let checkpoint = self.checkpointWorkHook { await checkpoint() }
+            else { await AppDatabase.checkpointForDurability() }
+            #else
+            await AccountManager.awaitWriteQueueDrainOrTimeout(
+                timeoutSeconds: SyncConfig.backgroundWriteQueueFlushTimeoutSeconds
+            )
+            await AppDatabase.checkpointForDurability()
+            #endif
+            finish()
+        }
+    }
+
     /// Retained so the delegate isn't deallocated.
     private let notificationDelegate = NotificationDelegate()
 
@@ -760,46 +950,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             object: nil, queue: .main
         ) { _ in
             MainActor.assumeIsolated {
-                // Idempotent finish: the normal-completion path (end of the
-                // Task below) and the expiration handler both funnel through
-                // this one closure, so `endBackgroundWork` (a refcount) is
-                // NEVER decremented twice for one `beginBackgroundWork`, and
-                // the OS task assertion is released exactly once. Mirrors
-                // SyncScheduler.requestBackgroundGracePeriod's `ended`/
-                // `bgTaskId` Mutex idiom.
-                let ended = Mutex(false)
-                let bgTaskId = Mutex<UIBackgroundTaskIdentifier>(.invalid)
-                let finish: @MainActor @Sendable () -> Void = {
-                    guard !ended.withLock({ let was = $0; $0 = true; return was }) else { return }
-                    DatabaseSuspension.shared.endBackgroundWork("wal-durability-checkpoint")
-                    let id = bgTaskId.withLock { $0 }
-                    if id != .invalid { UIApplication.shared.endBackgroundTask(id) }
-                }
-                let bgTask = UIApplication.shared.beginBackgroundTask(
-                    withName: "wal-durability-checkpoint",
-                    expirationHandler: finish
-                )
-                bgTaskId.withLock { $0 = bgTask }
-                DatabaseSuspension.shared.beginBackgroundWork("wal-durability-checkpoint")
-                Task { @MainActor in
-                    // Drain the in-memory write queue BEFORE the durability
-                    // checkpoint. The checkpoint fsyncs the WAL as of "now";
-                    // closures still sitting in AccountManager.writeQueue —
-                    // including queued ADR-IOS-057 intent-cycle executors —
-                    // haven't committed yet, so checkpointing first could
-                    // fsync a WAL that's missing whatever the queue hasn't
-                    // flushed. Deadline-bounded (see
-                    // SyncConfig.backgroundWriteQueueFlushTimeoutSeconds) so a
-                    // pathological queue can't hold the background budget
-                    // hostage — on timeout we proceed to the checkpoint
-                    // anyway; the un-drained tail closures still run later
-                    // (never dropped), they just miss this fsync window.
-                    await AccountManager.awaitWriteQueueDrainOrTimeout(
-                        timeoutSeconds: SyncConfig.backgroundWriteQueueFlushTimeoutSeconds
-                    )
-                    await AppDatabase.checkpointForDurability()
-                    finish()
-                }
+                self.startBackgroundCheckpoint()
             }
         }
         // Build the database OFF the synchronous launch path, on EVERY launch
@@ -812,7 +963,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // idempotent with `body.task`'s `runIfNeeded`. NSE staging DB creation +
         // state mirror live inside `ensureDatabaseReady` (they touch AppDatabase),
         // so they still run on every launch as they did before the splash work.
-        Task { await AppStartup.shared.ensureDatabaseReady() }
+        Task { _ = await AppStartup.shared.ensureDatabaseReady() }
         migrateOptOutFlagToSharedSuite()
         BootProfiler.mark("AppDelegate.didFinishLaunching exit (DB build kicked async)")
         return true
@@ -903,7 +1054,16 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // A silent push can arrive during the one-time migration window; wait
         // for the DB to finish building before any handler touches it
         // (AppDatabase.dbPool force-unwraps AppDatabase.shared). See AppStartup.
-        await AppStartup.shared.awaitLaunchReady(background: true)
+        #if DEBUG
+        let usable = if let silentPushReadinessHook {
+            await silentPushReadinessHook()
+        } else {
+            await AppStartup.shared.awaitLaunchReady(background: true)
+        }
+        #else
+        let usable = await AppStartup.shared.awaitLaunchReady(background: true)
+        #endif
+        guard usable else { return .failed }
 
         let appState = application.applicationState
         let stateStr = appState == .active ? "active" : appState == .background ? "background" : "inactive"
@@ -927,6 +1087,9 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             PushHealthStore.recordPush(accountEmail: accountEmail)
         }
 
+        #if DEBUG
+        if let silentPushWorkHook { return await silentPushWorkHook() }
+        #endif
         return await PushNotificationService.shared.handleSilentPush(provider: info["provider"], accountEmail: info["accountEmail"])
     }
 }
