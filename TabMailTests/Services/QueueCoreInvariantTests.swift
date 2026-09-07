@@ -164,7 +164,7 @@ struct QueueCoreInvariantTests {
 
     // A3.1: parameterized over BOTH mailbox-local providers. The lane key is
     // folder-qualified for every account ABSENT from
-    // `AccountManager.accountScopedIdAccountIds` (which admits `.gmail`,
+    // `AccountOperationExecutor.accountScopedIdAccountIds` (which admits `.gmail`,
     // `.outlook` and the demo account), so `.imap` and `.icloud` must classify
     // identically here — an iCloud UID is just as mailbox-local as an IMAP one.
     // A mutation that
@@ -426,7 +426,7 @@ struct QueueCoreInvariantTests {
             provenDestinations: [ProvenDestinationAddress(
                 sourceProviderId: "77", destinationProviderId: "5", destinationUidValidity: 42)],
             addressChangesOnMove: true,
-            context: AccountManager.DrainContext())
+            context: AccountOperationExecutor.DrainContext())
 
         let destinationId = MessageIdentity.headerId(
             accountId: fixture.accountId, folderPath: "Archive", messageId: "5")
@@ -468,7 +468,7 @@ struct QueueCoreInvariantTests {
         await AccountManager.shared.retirePartiallyCompletedOp(
             op, provenMembers: ["77"], remaining: ["88"],
             provenDestinations: [], addressChangesOnMove: true,
-            context: AccountManager.DrainContext())
+            context: AccountOperationExecutor.DrainContext())
 
         // THE CONTROL: the re-key is authorized by the server's own `COPYUID`
         // and by nothing else. With no destination proved, the address must not
@@ -541,7 +541,7 @@ struct QueueCoreInvariantTests {
                 sourceProviderId: "graph-old", destinationProviderId: "graph-new",
                 destinationUidValidity: nil)],
             addressChangesOnMove: true,
-            context: AccountManager.DrainContext())
+            context: AccountOperationExecutor.DrainContext())
 
         // The row answers to the proven address, IN THE FOLDER IT OCCUPIES.
         let landedId = MessageIdentity.headerId(
@@ -647,7 +647,7 @@ struct QueueCoreInvariantTests {
                     destinationUidValidity: nil),
             ],
             addressChangesOnMove: true,
-            context: AccountManager.DrainContext())
+            context: AccountOperationExecutor.DrainContext())
 
         let readdressed = try fetchOp(frozenFollower.id, fixture)
         #expect(readdressed?.messageIds == ["graph-untouched", "graph-new-1", "graph-new-2"], """
@@ -778,7 +778,7 @@ struct QueueCoreInvariantTests {
                 sourceProviderId: "77", destinationProviderId: "5",
                 destinationUidValidity: 42)],
             addressChangesOnMove: true,
-            context: AccountManager.DrainContext())
+            context: AccountOperationExecutor.DrainContext())
 
         // NON-VACUITY: the narrowing write really was attempted and really was
         // refused — once per `retryWrite` attempt, and never more.
@@ -908,7 +908,7 @@ struct QueueCoreInvariantTests {
                     sourceProviderId: "graph-old", destinationProviderId: "graph-new",
                     destinationUidValidity: nil)],
                 addressChangesOnMove: true,
-                context: AccountManager.DrainContext())
+                context: AccountOperationExecutor.DrainContext())
 
             #expect(refuser.refusals.withLock { $0 } == 3, """
                 the refusal did not land on the narrowing write for all three \

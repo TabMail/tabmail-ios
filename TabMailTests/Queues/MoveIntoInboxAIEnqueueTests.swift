@@ -117,7 +117,7 @@ struct MoveIntoInboxAIEnqueueTests {
     }
 
     private func resolveTargets(
-        _ context: AccountManager.DrainContext, accountId: String, folderPath: String,
+        _ context: AccountOperationExecutor.DrainContext, accountId: String, folderPath: String,
         pool: DatabasePool
     ) throws -> [(headerId: String, accountId: String)] {
         let entries = context.enteredInbox.withLock { $0["\(accountId)|\(folderPath)"] ?? [] }
@@ -129,15 +129,15 @@ struct MoveIntoInboxAIEnqueueTests {
 
     private func runMove(
         accountId: String, from: String, to: String, uids: [String], pool: DatabasePool
-    ) async throws -> AccountManager.DrainContext {
+    ) async throws -> AccountOperationExecutor.DrainContext {
         let op = PendingOperation(
             type: .move, messageIds: uids, accountId: accountId,
             folderPath: from, destinationPath: to)
         try await pool.write { db in _ = try op.inserted(db) }
-        let context = AccountManager.DrainContext()
+        let context = AccountOperationExecutor.DrainContext()
         let outcome = await AccountManager.shared.executeSingleOp(
             op, provider: MockEmailProvider(), context: context)
-        #expect(outcome == .proceed, "the mock move succeeds, so the op must retire")
+        #expect(outcome == .completed, "the mock move succeeds, so the op must retire")
         return context
     }
 
@@ -281,14 +281,14 @@ struct MoveIntoInboxAIEnqueueTests {
             "301",
             error: ProviderMembersDispositioned(
                 dispositionedMemberIds: ["300"], absentMemberIds: []))
-        let context = AccountManager.DrainContext()
+        let context = AccountOperationExecutor.DrainContext()
         let firstOutcome = await AccountManager.shared.executeSingleOp(
             op, provider: provider, context: context)
 
         // NON-VACUITY: the first attempt really did take the NARROWING path —
         // the durable row survived, narrowed to the member still owed. If it
         // retired whole, this test would be measuring the whole-op arm twice.
-        #expect(firstOutcome == .proceed,
+        #expect(firstOutcome == .progressed,
                 "a narrowing is strict progress, so the executor keeps claiming")
         let narrowed = try await pool.read { db in try PendingOperation.fetchOne(db, key: op.id) }
         #expect(narrowed?.messageIds == ["301"],
@@ -301,7 +301,7 @@ struct MoveIntoInboxAIEnqueueTests {
         guard let remainingOp = narrowed else { return }
         let secondOutcome = await AccountManager.shared.executeSingleOp(
             remainingOp, provider: provider, context: context)
-        #expect(secondOutcome == .proceed)
+        #expect(secondOutcome == .completed)
 
         // THE PROPERTY: both proven members produced an AI target, and each one
         // addresses its OWN indexed body.
@@ -427,9 +427,9 @@ struct MoveIntoInboxAIEnqueueTests {
             rfc822: sharedRfc, isInInbox: true, pool: pool)
         #expect(lowestId < insertedFirst)
 
-        let context = AccountManager.DrainContext()
+        let context = AccountOperationExecutor.DrainContext()
         context.enteredInbox.withLock {
-            $0["\(accountId)|INBOX"] = [AccountManager.DrainContext.InboxEntry(
+            $0["\(accountId)|INBOX"] = [AccountOperationExecutor.DrainContext.InboxEntry(
                 accountId: accountId, messageId: "stale-source-uid", rfc822MessageId: sharedRfc)]
         }
         let targets = try resolveTargets(

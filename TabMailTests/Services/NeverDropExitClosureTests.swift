@@ -1420,6 +1420,75 @@ struct NeverDropExitClosureTests {
             configure: { $0.failUIDMoveAfterVerifiedPartialCompletion() })
     }
 
+    /// Exercise the adapter and the drain's actual sync, not only its folder set.
+    /// The source witness is absent locally before drain and cannot be discovered
+    /// by syncing Archive; losing the adapter's reconciliation flag leaves it absent.
+    @Test("A COPYUID-proven tagged failure drains through source reconciliation and durable rekey")
+    @MainActor
+    func verifiedPartialMoveFullDrainReconcilesSourceAndRekeys() async throws {
+        let target = "full-drain-target@example.com"
+        let witness = "full-drain-source-witness@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 77, id: target), Self.message(uid: 88, id: witness)],
+            "Archive": [],
+        ])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(20, for: "Archive")
+        server.failUIDMoveAfterVerifiedPartialCompletion()
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "closure-verified-full-drain",
+                            folders: [("INBOX", .inbox, 10), ("Archive", .archive, 20)])
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let sourceId = MessageIdentity.headerId(
+            accountId: f.accountId, folderPath: "INBOX", messageId: "77")
+        let witnessId = MessageIdentity.headerId(
+            accountId: f.accountId, folderPath: "INBOX", messageId: "88")
+        let destinationId = MessageIdentity.headerId(
+            accountId: f.accountId, folderPath: "Archive", messageId: "1")
+        // Match the optimistic gesture: retain the source primary key while the
+        // row displays in Archive and has no destination epoch authority yet.
+        var optimistic = MessageHeader(
+            messageId: "77", subject: "Move target", from: "Sender",
+            fromAddress: "sender@example.com", to: "receiver@example.com", date: Date(),
+            snippet: "target", folderId: MessageIdentity.folderId(
+                accountId: f.accountId, folderPath: "Archive"),
+            accountId: f.accountId, folderPath: "Archive", isInInbox: false)
+        optimistic.id = sourceId
+        optimistic.rfc822MessageId = target
+        optimistic.headerComplete = true
+        let stored = optimistic
+        try await f.pool.writeWithoutTransaction { db in try stored.insert(db) }
+        let move = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        try insert([move], into: f.pool)
+        #expect(try await f.pool.read { db in try MessageHeader.fetchOne(db, key: witnessId) } == nil)
+        #expect(try operations(f.pool).map(\.id) == [move.id])
+
+        await AccountManager.shared.drainPendingQueue()
+
+        let sourceWitness = try await f.pool.read { db in try MessageHeader.fetchOne(db, key: witnessId) }
+        #expect(sourceWitness?.messageId == "88", "the source folder must actually reconcile")
+        #expect(sourceWitness?.observedUidValidity == 10)
+        let landed = try await f.pool.read { db in try MessageHeader.fetchOne(db, key: destinationId) }
+        #expect(landed?.messageId == "1")
+        #expect(landed?.observedUidValidity == 20)
+        #expect(try await f.pool.read { db in try MessageHeader.fetchOne(db, key: sourceId) } == nil)
+        #expect(try operations(f.pool).isEmpty)
+
+        await AccountManager.shared.drainPendingQueue()
+        let moves = server.recordedCommands().filter { $0.uppercased().contains("UID MOVE") }
+        #expect(moves.count == 1, "retired work must never be reissued: \(moves)")
+        #expect(server.messageIDs(in: "INBOX") == ["<\(witness)>"])
+        #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
     @MainActor
     private func assertPostCommitAtomicMoveFailureIsNeverReissued(
         accountId: String,
@@ -1444,11 +1513,11 @@ struct NeverDropExitClosureTests {
             folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
         try insert([move], into: f.pool)
 
-        let context = AccountManager.DrainContext()
+        let context = AccountOperationExecutor.DrainContext()
         let outcome = await AccountManager.shared.executeSingleOp(
             move, provider: provider, context: context)
 
-        #expect(outcome == .proceed)
+        #expect(outcome == .completed)
         #expect(
             context.foldersToSync == ["\(f.accountId)|INBOX", "\(f.accountId)|Archive"],
             "a post-completion failure must reconcile both the source and destination")
