@@ -235,6 +235,8 @@ private final class BackgroundReadinessEvents: Sendable {
     let cancellationReceived = OneShotGate()
     let workEntered = OneShotGate()
     let releaseWork = OneShotGate()
+    let expirationSuspended = OneShotGate()
+    let releaseExpiration = DispatchSemaphore(value: 0)
 }
 
 @MainActor
@@ -248,7 +250,8 @@ private final class BackgroundReadinessFixture {
         remainingWork: Bool = false,
         connected: Bool = true,
         pollActive: Bool = false,
-        pauseWork: Bool = false
+        pauseWork: Bool = false,
+        pauseExpiration: Bool = false
     ) {
         let events = BackgroundReadinessEvents()
         self.events = events
@@ -262,6 +265,10 @@ private final class BackgroundReadinessFixture {
             suspend: { reason in
                 #expect(!Thread.isMainThread)
                 events.expirationEffects.withLock { $0.append(reason) }
+                if pauseExpiration {
+                    events.expirationSuspended.open()
+                    #expect(events.releaseExpiration.wait(timeout: .now() + 5) == .success)
+                }
             }
         )
         scheduler = SyncScheduler(
@@ -411,6 +418,51 @@ struct BackgroundStartupHandlerTests {
             #expect(fixture.events.workQueries.withLock { $0 } == 0)
             #expect(DatabaseSuspension.shared.backgroundWorkCountForTesting == initialWorkCount)
         }
+    }
+
+    @Test("Cancelled processing body owns failure before the expiration callback completes")
+    func processingBodyCompletesFailureBeforeExpirationCallback() async throws {
+        let startupFixture = try StartupReadinessFixture()
+        let fixture = BackgroundReadinessFixture(
+            startup: startupFixture.startup(), pauseWork: true, pauseExpiration: true
+        )
+        let initialWorkCount = DatabaseSuspension.shared.backgroundWorkCountForTesting
+        fixture.start(processing: true)
+        defer {
+            fixture.events.releaseWork.open()
+            fixture.events.releaseExpiration.signal()
+        }
+        try await withTimeout(seconds: 3) { await fixture.events.workEntered.wait() }
+        let callback = try #require(fixture.events.expiration.withLock { $0 })
+        let expiration = Task.detached { callback() }
+        do {
+            try await withTimeout(seconds: 3) { await fixture.events.expirationSuspended.wait() }
+            #expect(fixture.context.expired)
+            #expect(fixture.events.completions.withLock { $0.isEmpty })
+            #expect(AccountManagerState.shared.fastSyncModeActive)
+            #expect(DatabaseSuspension.shared.backgroundWorkCountForTesting == initialWorkCount + 1)
+            fixture.events.releaseWork.open()
+            try await fixture.join()
+            try await observeStartup { !AccountManagerState.shared.fastSyncModeActive }
+            #expect(fixture.events.completions.withLock { $0 } == [false])
+            #expect(fixture.events.schedules.withLock { $0 } == [true])
+            #expect(fixture.events.workQueries.withLock { $0 } == 0)
+            #expect(DatabaseSuspension.shared.backgroundWorkCountForTesting == initialWorkCount)
+        } catch {
+            fixture.events.releaseWork.open()
+            fixture.events.releaseExpiration.signal()
+            await expiration.value
+            throw error
+        }
+        fixture.events.releaseExpiration.signal()
+        try await withTimeout(seconds: 3) { await expiration.value }
+        try await withTimeout(seconds: 3) { await fixture.events.cancellationReceived.wait() }
+        #expect(fixture.events.completions.withLock { $0 } == [false])
+        #expect(fixture.events.schedules.withLock { $0 } == [true])
+        #expect(fixture.events.workQueries.withLock { $0 } == 0)
+        #expect(fixture.events.work.withLock { $0 } == [false])
+        #expect(!AccountManagerState.shared.fastSyncModeActive)
+        #expect(DatabaseSuspension.shared.backgroundWorkCountForTesting == initialWorkCount)
     }
 
     @Test("Ready refresh does work once and schedules both follow-up families")
