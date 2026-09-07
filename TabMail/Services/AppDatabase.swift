@@ -115,7 +115,7 @@ final class AppDatabase: Sendable {
     /// PREVIOUS process left behind. All of it runs BEFORE the pool is exposed
     /// (`AppDatabase.shared`) or the inbox observer is wired: DB opens → schema
     /// migrates → previous-release action queue retired → data resets →
-    /// previous-session queue/draft residue recovered →
+    /// previous-session mail/draft residue recovered → calendar recovery attempted →
     /// only THEN can sync / NSE merge / demo+screenshot seed touch it.
     /// `runStartupResets` is false for tests so they never mutate global
     /// UserDefaults flags or the FTS directory.
@@ -159,11 +159,25 @@ final class AppDatabase: Sendable {
         // directory, and a test fixture that skipped it would be running a queue
         // whose launch boundary never ran.
         try Self.recoverPreviousSessionResidue(on: pool)
+        // Only a previous process can own these claims before publication. Keep
+        // calendar recovery separate: its failure must not roll back mandatory
+        // mail/draft recovery or prevent access to mail. Retry on the next launch.
+        do {
+            try pool.write { db in
+                try db.execute(
+                    sql: "UPDATE pendingCalendarOperation SET status = ? WHERE status = ?",
+                    arguments: [PendingStatus.queued.rawValue, PendingStatus.inFlight.rawValue])
+            }
+        } catch {
+            BackgroundSyncLogger.logError(
+                "Calendar crash recovery failed; residue preserved for the next launch.",
+                source: "AppDatabase")
+        }
         self.inboxNotificationObserver = try Self.makeInboxNotificationObserver(on: pool)
     }
 
     /// Test-only initializer: accepts an already-configured DatabasePool (e.g.
-    /// temp-file) and runs schema migrations only — no destructive resets, so no
+    /// temp-file) and runs migrations and launch recovery — no cached-mail resets, so no
     /// global flag / FTS side effects. Not for production use.
     convenience init(dbPool: DatabasePool) throws {
         try self.init(pool: dbPool, runStartupResets: false)

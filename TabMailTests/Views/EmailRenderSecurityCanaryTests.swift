@@ -1755,7 +1755,7 @@ struct RenderContentWorldIsolationTests {
         // transforms still ran — quote collapse is one of the behaviours a botched world
         // migration would silently kill.
         let body = """
-        <div>P3 isolation probe</div>
+        <div id="\(headerId)">P3 isolation probe</div>
         <div>-----Original Message-----</div>
         <div>From: Someone &lt;someone@example.com&gt;</div>
         <div>Quoted text that should end up inside the collapsed quote.</div>
@@ -1765,7 +1765,26 @@ struct RenderContentWorldIsolationTests {
         }
         defer { host.tearDown() }
         let wv = host.webView
-        try? await Task.sleep(for: .seconds(4))
+        // Layout only proves that the native view exists. Wait for this invocation's
+        // document, without making the isolated helpers under test a readiness condition.
+        // A single outstanding evaluation keeps a slow WebContent launch bounded by
+        // the native watchdog, even if JavaScript has not started answering yet.
+        var documentReady = false
+        var evaluationPending = false
+        let ready = await CanaryKit.waitUntil(45) {
+            if !documentReady && !evaluationPending {
+                evaluationPending = true
+                wv.evaluateJavaScript("document.readyState === 'complete' && document.getElementById('\(headerId)') !== null") { value, _ in
+                    documentReady = (value as? Bool) == true
+                    evaluationPending = false
+                }
+            }
+            return documentReady
+        }
+        guard ready else {
+            #expect(Bool(false), "the intended P3 document did not become ready before the watchdog expired")
+            return
+        }
 
         // ── Side A: our scripts DID run, and they ran in the isolated world. ──
         // This is the hard-stop half. If it fails, the migration is broken and the phase

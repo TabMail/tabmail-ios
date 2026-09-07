@@ -203,7 +203,7 @@ struct CalendarQueueOutcomeTests {
     ///
     /// The defect: `retireCalendarOperation` was `async -> Void` and swallowed its
     /// write failure, with a catch-arm comment stating that the row stays
-    /// `inFlight`, `reconcileCalendarQueue` returns it to `queued`, and **the op
+    /// `inFlight`, `AppDatabase.init` returns it to `queued`, and **the op
     /// retries**. All six terminal arms then ran
     /// `signalCalendarOpOutcome(… .permanentFailure(reason:))` unconditionally,
     /// three lines later. Producer says RETRYABLE, consumer announces TERMINAL.
@@ -281,7 +281,7 @@ struct CalendarQueueOutcomeTests {
                 "fixture check: the injected ABORT must have prevented the terminal write, or this test proves nothing")
 
         // And the op is genuinely still claimable — the half that makes
-        // `.permanentFailure` a lie. `reconcileCalendarQueue`'s recovery filter is
+        // `.permanentFailure` a lie. `AppDatabase.init`'s recovery filter is
         // `status == inFlight`, so a row in that state IS one the next launch
         // returns to `queued` and retries.
         #expect(rows[0].status == PendingStatus.inFlight.rawValue,
@@ -294,7 +294,9 @@ struct CalendarQueueOutcomeTests {
         // does exactly what the catch arm promised — the op is retried and THEN
         // retired for real. The intention was never dropped and never duplicated.
         try await pool.write { db in try db.execute(sql: "DROP TRIGGER r17_2_block_retirement") }
-        await AccountManager.shared.reconcileCalendarQueue()
+        let reopened = try AppDatabase(pool: pool, runStartupResets: false)
+        AppDatabase.shared.withLock { $0 = reopened }
+        await AccountManager.shared.drainCalendarQueue()
         let recovered = try await pool.read { db in try PendingCalendarOperation.fetchAll(db) }
         #expect(recovered.count == 1)
         guard recovered.count == 1 else { return }
@@ -303,5 +305,170 @@ struct CalendarQueueOutcomeTests {
         #expect(!(recovered[0].failureReason ?? "").isEmpty)
         let wire = await mock.deletedEvents
         #expect(wire.isEmpty, "nothing should have reached the provider — got \(wire.count) delete(s)")
+    }
+
+    @Test("Calendar residue recovers before publication without startup resets and preserves every other field")
+    func calendarResidueRecoversBeforePublication() throws {
+        let (pool, dir, previous) = try makeTestDB(accountId: "calendar-startup")
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir) }
+        let published = AppDatabase.shared.withLock { $0 }
+        var residue = PendingCalendarOperation(operationType: .edit, accountId: "calendar-startup",
+            eventId: "event", calendarId: "primary", arguments: ["title": .string("Retained intention")])
+        residue.status = PendingStatus.inFlight.rawValue
+        residue.createdAt = Date().addingTimeInterval(-3600)
+        residue.retryCount = 7
+        residue.failureReason = "preserved diagnostic"
+        var failed = residue
+        failed.id = UUID().uuidString
+        failed.status = PendingStatus.failed.rawValue
+        var queued = residue
+        queued.id = UUID().uuidString
+        queued.status = PendingStatus.queued.rawValue
+        try pool.write { db in
+            try residue.insert(db)
+            try failed.insert(db)
+            try queued.insert(db)
+        }
+        let before = try pool.read { try Row.fetchAll($0, sql: "SELECT * FROM pendingCalendarOperation ORDER BY id") }
+        let recovered = try AppDatabase(pool: pool, runStartupResets: false)
+        #expect(AppDatabase.shared.withLock { $0 } === published,
+            "construction must recover before the caller publishes its database")
+        let after = try recovered.dbPool.read { try Row.fetchAll($0, sql: "SELECT * FROM pendingCalendarOperation ORDER BY id") }
+        #expect(before.count == after.count)
+        guard before.count == after.count else { return }
+        for (old, new) in zip(before, after) {
+            for column in old.columnNames where column != "status" {
+                #expect(old[column] as DatabaseValue == new[column] as DatabaseValue,
+                    "startup changed a calendar payload or retry field: \(column)")
+            }
+            let oldStatus: String = old["status"]
+            #expect(new["status"] as String == (oldStatus == PendingStatus.inFlight.rawValue
+                ? PendingStatus.queued.rawValue : oldStatus))
+        }
+    }
+
+    @Test("Failed calendar startup recovery is logged and cannot roll back mail or draft recovery; a later startup retries")
+    func calendarRecoveryFailureIsIsolatedAndLaterStartupRecovers() throws {
+        let accountId = "calendar-startup-fault"
+        let (pool, dir, previous) = try makeTestDB(accountId: accountId)
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir) }
+        var calendar = PendingCalendarOperation(operationType: .edit, accountId: accountId,
+            eventId: "event", calendarId: "primary", arguments: ["title": .string("Keep this edit")])
+        calendar.status = PendingStatus.inFlight.rawValue
+        calendar.retryCount = 3
+        var mail = PendingOperation(type: .markRead, messageIds: ["message"], accountId: accountId, folderPath: "INBOX")
+        mail.status = PendingStatus.inFlight.rawValue
+        var draft = Draft(id: "draft-startup-fault", accountId: accountId, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+            subject: "Keep this draft", body: "Authored body", replyToId: nil, isForward: false,
+            editHistoryJSON: nil, createdAt: Date().timeIntervalSince1970, updatedAt: Date().timeIntervalSince1970)
+        draft.serverPushStatus = "pushing"
+        try pool.write { db in
+            try calendar.insert(db)
+            try mail.insert(db)
+            try draft.insert(db)
+            try db.execute(sql: """
+                CREATE TRIGGER block_calendar_startup BEFORE UPDATE ON pendingCalendarOperation
+                WHEN OLD.status = 'inFlight' AND NEW.status = 'queued'
+                BEGIN SELECT RAISE(ROLLBACK, 'calendar startup fault'); END
+                """)
+        }
+        let before = try pool.read { try Row.fetchOne($0, sql: "SELECT * FROM pendingCalendarOperation WHERE id = ?", arguments: [calendar.id]) }
+        let errorMarker = "Calendar crash recovery failed"
+        let logCount = AppLogStore.read(channel: .error).components(separatedBy: errorMarker).count
+        let recovered = try AppDatabase(pool: pool, runStartupResets: false)
+        #expect(AppLogStore.read(channel: .error).components(separatedBy: errorMarker).count == logCount + 1,
+            "the optional recovery failure needs an emitted production error")
+        try recovered.dbPool.read { db in
+            let recoveredMail = try PendingOperation.fetchOne(db, key: mail.id)
+            let recoveredDraft = try Draft.fetchOne(db, key: draft.id)
+            let preservedCalendar = try Row.fetchOne(db,
+                sql: "SELECT * FROM pendingCalendarOperation WHERE id = ?", arguments: [calendar.id])
+            #expect(recoveredMail?.status == PendingStatus.queued.rawValue,
+                "calendar failure must not roll back mandatory mail recovery")
+            #expect(recoveredDraft?.serverPushStatus == "dirty",
+                "calendar failure must not roll back mandatory draft recovery")
+            #expect(recoveredDraft?.body == draft.body)
+            #expect(preservedCalendar == before,
+                "failed calendar recovery must retain the entire intention")
+        }
+        try pool.write { try $0.execute(sql: "DROP TRIGGER block_calendar_startup") }
+        let later = try AppDatabase(pool: pool, runStartupResets: false)
+        let row = try later.dbPool.read { try PendingCalendarOperation.fetchOne($0, key: calendar.id) }
+        #expect(row?.status == PendingStatus.queued.rawValue)
+        #expect(row?.argumentsJSON == calendar.argumentsJSON)
+        #expect(row?.retryCount == calendar.retryCount)
+    }
+
+    @Test("Late account reconciliation never resets a calendar claim held by the live provider call")
+    func lateReconciliationPreservesLiveCalendarClaim() async throws {
+        let accountId = "calendar-live-claim"
+        let (pool, dir, previous) = try makeTestDB(accountId: accountId)
+        let mock = MockCalendarProvider()
+        let release = AsyncStream<Void>.makeStream()
+        await mock.setDeleteEventHook {
+            for await _ in release.stream { break }
+        }
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer {
+            release.continuation.yield(())
+            release.continuation.finish()
+            Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+        }
+        let op = PendingCalendarOperation(operationType: .delete, accountId: accountId,
+            eventId: "event", calendarId: "primary", arguments: [:])
+        try await pool.write { try op.insert($0) }
+        let drain = Task { await AccountManager.shared.drainCalendarQueue() }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await mock.deletedEvents.isEmpty && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let entered = await mock.deletedEvents.count
+        #expect(entered == 1, "the provider must actually hold an admitted claim")
+        if entered == 1 {
+            #expect(try await pool.read { try PendingCalendarOperation.fetchOne($0, key: op.id)?.status } == PendingStatus.inFlight.rawValue)
+            await AccountManager.shared.reconcilePendingOperations()
+            #expect(try await pool.read { try PendingCalendarOperation.fetchOne($0, key: op.id)?.status } == PendingStatus.inFlight.rawValue,
+                "late reconciliation reset a claim whose provider call is still executing")
+        }
+        release.continuation.yield(())
+        release.continuation.finish()
+        await drain.value
+        #expect(await mock.deletedEvents.count == 1)
+        #expect(try await pool.read { try PendingCalendarOperation.fetchOne($0, key: op.id) } == nil,
+            "the original claim must settle after the provider is released")
+        await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId)
+    }
+
+    @Test("Production startup recovery reaches the post-connect calendar drain")
+    func productionStartupRecoveredWorkDrains() async throws {
+        let accountId = "calendar-production-lifecycle"
+        let (pool, dir, previous) = try makeTestDB(accountId: accountId)
+        let flags = StartupMigrationsTests.snapshotFlags()
+        for key in StartupMigrationsTests.allFlagKeys { UserDefaults.standard.set(true, forKey: key) }
+        let mock = MockCalendarProvider()
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer {
+            StartupMigrationsTests.restoreFlags(flags)
+            Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+        }
+        var op = PendingCalendarOperation(operationType: .delete, accountId: accountId,
+            eventId: "retained-event", calendarId: "primary", arguments: [:])
+        op.status = PendingStatus.inFlight.rawValue
+        let frozenOp = op
+        try await pool.write { try frozenOp.insert($0) }
+        let recovered = try AppDatabase(pool: pool, runStartupResets: true)
+        AppDatabase.shared.withLock { $0 = recovered }
+        await AccountManager.shared.reconcilePendingOperations()
+        let calls = await mock.deletedEvents
+        #expect(calls.count == 1, "a recovered calendar intention must reach its provider after account connection")
+        if calls.count == 1 {
+            #expect(calls[0].eventId == "retained-event")
+            #expect(calls[0].calendarId == "primary")
+        }
+        #expect(try await pool.read { try PendingCalendarOperation.fetchOne($0, key: frozenOp.id) } == nil,
+            "the recovered calendar intention must settle durably")
+        await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId)
     }
 }

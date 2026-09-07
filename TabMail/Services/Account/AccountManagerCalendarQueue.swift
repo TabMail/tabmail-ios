@@ -139,7 +139,7 @@ extension AccountManager {
     /// is why the silent case survived so long. Enumerate the drain's SIX production
     /// triggers and only ONE of them (`queueCalendarOperation`'s
     /// `Task { await drainCalendarQueue() }`) is causally paired with an awaiter
-    /// registration; `reconcileCalendarQueue`, both `NetworkMonitor` arms and both
+    /// registration; `reconcilePendingOperations`, both `NetworkMonitor` arms and both
     /// `SyncScheduler` arms can never have one. So "the tool is told" is not a race
     /// on a 10 s timeout, it is the MINORITY path. The durable retirement in
     /// `retireCalendarOperation` is what makes the outcome survive that; this
@@ -169,13 +169,13 @@ extension AccountManager {
     /// account's calendar lane — the exact `MIS-006` defect R15-FIX-4 was fixing.
     /// `PendingStatus.failed` is a THIRD state: durable, so the outcome outlives the
     /// waiter, and outside `drainCalendarQueue`'s `status == queued` filter and
-    /// `reconcileCalendarQueue`'s `inFlight` reset, so it can never be re-executed
+    /// `AppDatabase.init`'s `inFlight` reset, so it can never be re-executed
     /// and can never starve a later op.
     ///
     /// The write is the SAME write that used to delete, so the retirement cannot
     /// outrun its own record. If it throws, the row stays `inFlight`, launch
-    /// reconciliation returns it to `queued`, and the op is retried — a retry loop,
-    /// never a drop.
+    /// database recovery can return it to `queued` on a later successful launch
+    /// recovery. A persistent storage failure leaves the intention retained.
     ///
     /// 🚨 **AND THAT IS WHY THIS RETURNS A `Bool` (R17-2). PRODUCER AND CONSUMER
     /// MUST AGREE ON WHETHER THE OP IS OVER.** This was `-> Void`, so all six
@@ -192,7 +192,7 @@ extension AccountManager {
     /// So `.permanentFailure` may be signalled ONLY on a committed retirement.
     /// On a failed write the honest outcome is `.stillQueued`, which is what the
     /// transient arm already signals and which every tool renders as "in flight,
-    /// will appear shortly" — true, because reconciliation requeues it.
+    /// will appear shortly" — still pending, with recovery attempted at the next launch.
     ///
     /// ⚠️ THE MIRROR IMAGE, stated because it is the obvious alternative
     /// (`MIS-005`): signalling NOTHING on a failed write leaves the awaiter to
@@ -250,8 +250,8 @@ extension AccountManager {
             }
             return true
         } catch {
-            // The row stays `inFlight`; `reconcileCalendarQueue` returns it to
-            // `queued` at next launch and the op retries. Recorded, not silent —
+            // The row stays `inFlight`; `AppDatabase.init` attempts to return it
+            // to `queued` at next launch. Recorded, not silent —
             // and reported, so no caller announces `.permanentFailure` over it.
             BackgroundSyncLogger.logError(
                 "[CalendarQueue] FAILED to record terminal outcome for op \(op.id) — it will be retried: \(error)",
@@ -411,8 +411,8 @@ extension AccountManager {
                     // next launch. The six TERMINAL arms are gated on
                     // `retireCalendarOperation`'s Bool, R17-2.)
                     // If the delete never commits, the row stays
-                    // `inFlight`, `reconcileCalendarQueue` returns it to `queued` at
-                    // next launch, and the drain RE-EXECUTES work the server already
+                    // `inFlight`; after successful recovery in `AppDatabase.init`
+                    // on a later launch, the drain RE-EXECUTES work the server already
                     // did. Registered as `IOS-CAL-008`; read that row before changing
                     // anything here.
                     //
@@ -441,9 +441,9 @@ extension AccountManager {
                         }
                     } catch {
                         BackgroundSyncLogger.logError(
-                            "[CalendarQueue] CRITICAL: failed to delete completed op \(currentOp.id) — it stays claimable and will re-execute after reconcileCalendarQueue: \(error)",
+                            "[CalendarQueue] CRITICAL: failed to delete completed op \(currentOp.id) — it stays inFlight and can re-execute after successful startup recovery: \(error)",
                             source: "CalendarQueue")
-                        print("[CalendarQueue] CRITICAL: Failed to delete completed op \(currentOp.id) — will re-execute on next drain")
+                        print("[CalendarQueue] CRITICAL: Failed to delete completed op \(currentOp.id) — can re-execute after successful startup recovery")
                     }
                     executedAny = true
 
@@ -616,11 +616,10 @@ extension AccountManager {
                     // silently-dropped failure leaves the row `inFlight`, where the
                     // drain's `status == queued` filter skips it for the rest of the
                     // session with nothing in the log to say so. The DISPOSITION is
-                    // deliberately unchanged — `reconcileCalendarQueue` returns the
-                    // row to `queued` at next launch, and `.stillQueued` below is
-                    // truthful in BOTH branches (the op is still queued, or still
-                    // claimable at `inFlight`), so there is nothing to decide here,
-                    // only something to see. Same shape as
+                    // deliberately unchanged — `AppDatabase.init` attempts to
+                    // requeue it at next launch. `.stillQueued` below means the
+                    // intention is pending, including when it remains `inFlight`
+                    // awaiting successful startup recovery. Same shape as
                     // `retireCalendarOperation`'s catch and the in-flight marker
                     // above; Outbox rule 2 ("never `try?` on queue state
                     // transitions") is the stated precedent.
@@ -633,7 +632,7 @@ extension AccountManager {
                         }
                     } catch {
                         BackgroundSyncLogger.logError(
-                            "[CalendarQueue] WARNING: failed to requeue transient op \(currentOp.id) — it stays inFlight until reconcileCalendarQueue at next launch: \(error)",
+                            "[CalendarQueue] WARNING: failed to requeue transient op \(currentOp.id) — it stays inFlight until database recovery at next launch: \(error)",
                             source: "CalendarQueue")
                         print("[CalendarQueue] WARNING: Could not requeue \(currentOp.id) — stays in-flight until next launch: \(error)")
                     }
@@ -1426,27 +1425,4 @@ extension AccountManager {
         return "\(source) HTTP \(code)"
     }
 
-    // MARK: - Crash Recovery
-
-    /// Reset inFlight calendar ops back to queued on app launch. Called from reconcilePendingOperations.
-    func reconcileCalendarQueue() async {
-        do {
-            try await dbPool.write { db in
-                let staleOps = try PendingCalendarOperation
-                    .filter(Column("status") == PendingStatus.inFlight.rawValue)
-                    .fetchAll(db)
-                if !staleOps.isEmpty {
-                    print("[CalendarQueue] Crash recovery: resetting \(staleOps.count) inFlight calendar ops to queued")
-                    for op in staleOps {
-                        var updated = op
-                        updated.status = PendingStatus.queued.rawValue
-                        try updated.save(db)
-                    }
-                }
-            }
-        } catch {
-            print("[CalendarQueue] ERROR: reconcileCalendarQueue failed: \(error)")
-        }
-        await drainCalendarQueue()
-    }
 }

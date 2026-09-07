@@ -403,7 +403,7 @@ extension SyncEngine {
     /// LATER than a true failure-age window would, never earlier than the op
     /// existed. That asymmetry is acceptable precisely because a `failed` row is
     /// inert: it is outside `drainCalendarQueue`'s `status == queued` filter and
-    /// outside `reconcileCalendarQueue`'s `inFlight` reset, so it can never be
+    /// outside `AppDatabase.init`'s `inFlight` reset, so it can never be
     /// re-executed and can never starve a later op. Reclaiming one drops a
     /// diagnostic record, never a user intention.
     nonisolated static func runReclaimRetiredCalendarOps(dbPool: PrioritizedDatabase) {
