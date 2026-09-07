@@ -86,6 +86,34 @@
 > work. `IOS-ACTION-001` is amended through the routed KnownIssues amendment surface to record that
 > the blanket predicate-free purge is now a recurring launch rule rather than a single historical
 > migration.
+>
+> **2026-09-06 amendment: ordinary message actions have a fifth runtime exit.** This latest
+> amendment supersedes the earlier four-exit enumeration and its statement that exit 4 is the
+> only failure exit; all earlier text is retained as history. Exit 5 is **the counted provider
+> failure limit**: an ordinary `PendingOperation` dispatched through `performMessageAction` may
+> retire when a no-progress provider failure reaches
+> `SyncConfig.pendingOperationServerRefusalRetryLimit` (10), using the existing durable
+> `retryCount`. Historical counts are accepted unchanged; no migration or reset is applied.
+>
+> Count only a failure passing the unchanged `!SyncEngine.isConnectionError(error)` classifier.
+> This is a bounded retry policy, not proof that the server permanently refused the action:
+> final HTTP 429/5xx and authentication refusals count. Transport failures, cancellation,
+> pre-dispatch skips, local claim/storage failures, opaque `AuthError.refreshFailed`, unavailable
+> evidence, ambiguous multi-member absence and empty completion reports do not count. Proven member
+> progress neither charges nor evaluates the cap and preserves historical counts, so healthy
+> operations with more than ten members still converge. `.saveDraft` and `.deleteDraft` keep their
+> existing separate retry policy; Outbox, calendar and AI queues are outside this amendment.
+>
+> The terminal deletion must commit before an App Logs error reports retirement, deferred move
+> successors are dropped or another operation is claimed. A failed write retains explicit local
+> ownership and stops the drain; recovery precedes connectivity checks and cannot send the failed
+> provider attempt again. Cached connectivity is checked before each claim. No age-only retirement,
+> broader transient exemption, new durable state or provider-classification framework is authorized.
+>
+> **Accepted user-visible cost:** after ten counted failures the action is no longer automatically
+> retried, and the user may need to repeat the gesture. The App Logs error records that outcome;
+> this is not a successful server mutation or an authoritative stale/no-op finding. The current
+> qualification of the authentication retry limitation is recorded in `IOS-QUEUE-009`.
 <!-- COMPANION-CURRENT-NOTE-END -->
 ## Core Philosophy: Never Drop User Intention
 

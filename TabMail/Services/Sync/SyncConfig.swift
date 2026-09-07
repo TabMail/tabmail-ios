@@ -608,6 +608,9 @@ enum SyncConfig {
     /// Prevents one stalled operation from blocking the entire queue.
     static let pendingOperationTimeoutSeconds: TimeInterval = 15
 
+    /// Ordinary message actions retire after this many counted provider failures.
+    static let pendingOperationServerRefusalRetryLimit = 10
+
     // MARK: - IMAP Connection Pool
 
     /// NOOP liveness check threshold (seconds). Connections idle longer than this

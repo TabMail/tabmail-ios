@@ -1516,9 +1516,9 @@ struct QueueMemberAbsenceTests {
         let heldFollower = try #require(rows.first { $0.id == follower.id })
         #expect(heldBundle.messageIds == ["u-1", "u-2"],
                 "no member was individually dispositioned, so every member is still owed")
-        #expect(heldBundle.retryCount == 1, """
+        #expect(heldBundle.retryCount == 0, """
             the unresolved bundle was charged \(heldBundle.retryCount) retries for \
-            ONE drain. A refusal is charged once per drain, not once per pass.
+            ONE drain. Unavailable evidence remains uncharged.
             """)
         #expect(heldBundle.status == PendingStatus.queued.rawValue,
                 "an unresolved operation must be retryable, not left claimed")
@@ -1544,8 +1544,8 @@ struct QueueMemberAbsenceTests {
             """)
         rows = try operations(f)
         heldBundle = try #require(rows.first { $0.id == bundle.id })
-        #expect(heldBundle.retryCount == 2,
-                "the second drain charged \(heldBundle.retryCount - 1) retries instead of one")
+        #expect(heldBundle.retryCount == 0,
+                "unavailable evidence must remain uncharged on the second drain")
 
         // LIVENESS — the refusal ends and both gestures land, in the order the
         // user made them.

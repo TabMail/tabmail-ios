@@ -216,11 +216,11 @@ struct GlobalFifoExecutorTests {
     ///
     /// The oracle is the server's own arrival log — the real Graph wire, in the
     /// order the requests were served.
-    @Test("An eight-member Graph operation settles every member in ONE drain, one per attempt, yielding to unrelated work after the first")
+    @Test("A twelve-member Graph operation with historical failures settles every member in ONE drain, one per attempt, yielding to unrelated work after the first")
     @MainActor
-    func eightMemberGraphOperationSettlesInOneContinuousRunAndYieldsToUnrelatedWork() async throws {
+    func twelveMemberGraphOperationSettlesInOneContinuousRunAndYieldsToUnrelatedWork() async throws {
         let f = try fixture(accountId: "fifo-graph-throughput")
-        let members = (1...8).map { "graph-member-\($0)" }
+        let members = (1...12).map { "graph-member-\($0)" }
         let bystanderId = "graph-bystander"
         let server = StatefulExchangeActionServer(
             messages: (members + [bystanderId]).map {
@@ -238,11 +238,13 @@ struct GlobalFifoExecutorTests {
         }
         for id in members + [bystanderId] { try seedHeader(f, messageId: id) }
 
-        // Position 1: the eight-member gesture. Position 2: an unrelated
+        // Position 1: the twelve-member gesture. Position 2: an unrelated
         // single-message action admitted behind it.
-        try admit(f, PendingOperation(
+        var progressing = PendingOperation(
             type: .markRead, messageIds: members, accountId: f.accountId,
-            folderPath: Self.source))
+            folderPath: Self.source)
+        progressing.retryCount = 10
+        try admit(f, progressing)
         try admit(f, PendingOperation(
             type: .markFlagged, messageIds: [bystanderId], accountId: f.accountId,
             folderPath: Self.source))
@@ -267,7 +269,7 @@ struct GlobalFifoExecutorTests {
                 "the unrelated bystander never reached the provider")
 
         // THE WIRE ORDER, exactly: member 1, then the unrelated action it
-        // yielded to, then the remaining seven members in order.
+        // yielded to, then the remaining eleven members in order.
         let expected = ["PATCH \(members[0])", "PATCH \(bystanderId)"]
             + members.dropFirst().map { "PATCH \($0)" }
         #expect(server.mutationLog() == expected, """
@@ -348,7 +350,7 @@ struct GlobalFifoExecutorTests {
             """)
         #expect(survivors[0].status == PendingStatus.queued.rawValue)
         #expect(survivors[1].status == PendingStatus.queued.rawValue)
-        #expect(survivors[0].retryCount == 1, "the attempted row is charged exactly one retry")
+        #expect(survivors[0].retryCount == 0, "unavailable evidence consumes no retry")
         #expect(survivors[1].retryCount == 0,
                 "a follower deferred WITHOUT a provider attempt consumes no retry")
         #expect(survivors[0].everAttempted, "A1 was claimed and attempted")
@@ -460,8 +462,8 @@ struct GlobalFifoExecutorTests {
             let held = try rowsByPosition(f)
             #expect(held.map(\.id) == [first.id, second.id],
                     "the unrelated Q move must have retired; the P chain must be held in order")
-            #expect(held.first?.retryCount == 3,
-                    "one retry charged per attempt: \(held.first?.retryCount ?? -1)")
+            #expect(held.first?.retryCount == 0,
+                    "unavailable evidence remains uncharged: \(held.first?.retryCount ?? -1)")
             #expect(held.last?.retryCount == 0,
                     "the never-attempted follower is charged nothing")
 
@@ -932,8 +934,8 @@ struct GlobalFifoExecutorTests {
                 "no member was proven, so none may leave the row: \(survivors[0].messageIds)")
         #expect(survivors[0].status == PendingStatus.queued.rawValue,
                 "the row must be returned to queued, got \(survivors[0].status)")
-        #expect(survivors[0].retryCount == 1,
-                "a failed attempt is charged exactly one retry, got \(survivors[0].retryCount)")
+        #expect(survivors[0].retryCount == 0,
+                "an empty report is uncharged, got \(survivors[0].retryCount)")
 
         // 3) UNRELATED WORK PROCEEDS. The failure is operation-local, so the
         // intention admitted behind it goes to the wire in this same drain.
@@ -1148,10 +1150,10 @@ struct GlobalFifoExecutorTests {
             #expect(rows.map(\.id) == [first.id, unrelated.id, follower.id])
             #expect(rows.map(\.queuePosition) == [first.queuePosition, unrelated.queuePosition, follower.queuePosition])
             #expect(rows.first?.status == (refuseRequeue ? PendingStatus.inFlight.rawValue : PendingStatus.queued.rawValue))
-            #expect(rows.first?.retryCount == (refuseRequeue ? 0 : 1))
+            #expect(rows.first?.retryCount == 0)
             #expect(rows.first?.everAttempted == true)
             #expect(rows.dropFirst().allSatisfy { !$0.everAttempted && $0.retryCount == 0 })
-            #expect(await AccountManager.shared.pendingRequeues[first.id] == (refuseRequeue ? true : nil))
+            #expect(await AccountManager.shared.pendingRequeues[first.id] == (refuseRequeue ? false : nil))
             let beforeRecovery = await provider.callLog.filter { $0.hasPrefix("move(ids:") }
             #expect(beforeRecovery == ["move(ids:[\"A\"],from:INBOX,to:Archive)"],
                     "a failed tail write must stop before unrelated work: \(beforeRecovery)")
@@ -1186,7 +1188,7 @@ struct GlobalFifoExecutorTests {
             await AccountManager.shared.drainPendingQueue()
             let rows = try rowsByPosition(f)
             #expect(rows.map(\.id) == (accountFailure ? [unrelated.id, failed.id] : [failed.id]))
-            #expect(rows.last?.retryCount == 1)
+            #expect(rows.last?.retryCount == 0)
             if accountFailure {
                 #expect(rows.first?.everAttempted == false)
                 #expect(rows.first?.retryCount == 0)
@@ -1197,6 +1199,439 @@ struct GlobalFifoExecutorTests {
             await AccountManager.shared.drainPendingQueue()
             #expect(try rowsByPosition(f).isEmpty)
             #expect(await provider.movedIds.map(\.ids) == [["B"], ["A"]])
+        }
+    }
+
+    @Test("Provider failure limit uses the exact durable boundary and retires only once", arguments: [8, 9, 15])
+    @MainActor
+    func ordinaryFailureLimitBoundary(initialCount: Int) async throws {
+        let f = try fixture(accountId: "fifo-failure-limit", provider: .gmail)
+        defer { finish(f) }
+        var op = PendingOperation(type: .markRead, messageIds: ["refused"],
+            accountId: f.accountId, folderPath: Self.source)
+        op.retryCount = initialCount
+        let target = try admit(f, op)
+        let provider = MockEmailProvider()
+        await provider.setMarkReadThrows(ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 503)))
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            try await joinedFailurePolicyDrain()
+            let rows = try rowsByPosition(f)
+            if initialCount == 8 {
+                #expect(rows.first?.id == target.id)
+                #expect(rows.first?.retryCount == 9)
+                try await joinedFailurePolicyDrain()
+            }
+            #expect(try rowsByPosition(f).isEmpty)
+            let calls = await provider.markedReadIds.count
+            #expect(calls == (initialCount == 8 ? 2 : 1))
+            try await joinedFailurePolicyDrain()
+            #expect(await provider.markedReadIds.count == calls)
+        }
+    }
+
+    @Test("Transport, opaque authentication, cancellation, storage and absent evidence do not spend the limit", arguments: 0..<6)
+    @MainActor
+    func ordinaryUnchargedFailureKeepsHistoricalCount(kind: Int) async throws {
+        let f = try fixture(accountId: "fifo-uncharged", provider: .gmail)
+        defer { finish(f) }
+        var op = PendingOperation(type: .markRead, messageIds: ["unresolved"],
+            accountId: f.accountId, folderPath: Self.source)
+        op.retryCount = 9
+        let target = try admit(f, op)
+        let error: any Error
+        switch kind {
+        case 0: error = ProviderError.notConnected
+        case 1: error = AuthError.refreshFailed(underlying: "opaque refresh failure")
+        case 2: error = CancellationError()
+        case 3: error = DatabaseError(resultCode: .SQLITE_IOERR)
+        case 4: error = EvidenceRefused()
+        default: error = ProviderMembersDispositioned(dispositionedMemberIds: [], absentMemberIds: [])
+        }
+        let provider = MockEmailProvider()
+        await provider.setMarkReadThrows(error)
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            for _ in 0..<12 { try await joinedFailurePolicyDrain() }
+            let rows = try rowsByPosition(f)
+            #expect(rows.map(\.id) == [target.id])
+            #expect(rows.first?.retryCount == 9)
+            #expect(rows.first?.status == PendingStatus.queued.rawValue)
+            #expect(await provider.markedReadIds.count == 12)
+        }
+    }
+
+    @Test("A refused limit deletion retains ownership and locally replays before connectivity", arguments: [false, true])
+    @MainActor
+    func refusalLimitCommitOrdersLogAndFollower(offlineReplay: Bool) async throws {
+        let previousConnectivity = NetworkMonitor.checkConnected()
+        NetworkMonitor.setConnectedForTesting(true)
+        defer { NetworkMonitor.setConnectedForTesting(previousConnectivity) }
+        let f = try fixture(accountId: "fifo-limit-write", provider: .gmail, folders: [Self.archive])
+        defer { finish(f) }
+        var op = PendingOperation(type: .move, messageIds: ["refused"],
+            accountId: f.accountId, folderPath: Self.source, destinationPath: Self.archive)
+        op.retryCount = 9
+        let target = try admit(f, op)
+        let follower = try admit(f, PendingOperation(type: .markRead, messageIds: ["refused"],
+            accountId: f.accountId, folderPath: Self.source))
+        try await f.pool.write { db in
+            try db.execute(sql: """
+                CREATE TRIGGER refuse_limit_delete BEFORE DELETE ON pendingOperation
+                WHEN OLD.id = '\(target.id)'
+                BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END
+                """)
+        }
+        let before = AppLogStore.read(channel: .error).components(separatedBy: "retired after reaching the provider failure retry limit").count
+        let provider = MockEmailProvider()
+        await provider.setMoveThrows(ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 429)))
+        await AccountManager.shared.installRefusalSuccessorForTesting(predecessor: target.id)
+        let followerSawCommittedEffects = Mutex(false)
+        await provider.setMarkReadHook {
+            let rowGone: Bool
+            do { rowGone = try await f.pool.read { db in try PendingOperation.fetchOne(db, key: target.id) == nil } }
+            catch { rowGone = false }
+            let successorGone = await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 0
+            let logged = AppLogStore.read(channel: .error).components(separatedBy: "retired after reaching the provider failure retry limit").count == before + 1
+            followerSawCommittedEffects.withLock { $0 = rowGone && successorGone && logged }
+        }
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            try await joinedFailurePolicyDrain()
+            #expect(try rowsByPosition(f).map(\.id) == [target.id, follower.id])
+            #expect(await provider.callLog.filter { $0.hasPrefix("move(ids:") }.count == 1)
+            #expect(await provider.markedReadIds.isEmpty)
+            #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 1)
+            #expect(AppLogStore.read(channel: .error).components(separatedBy: "retired after reaching the provider failure retry limit").count == before)
+            try await joinedFailurePolicyDrain()
+            #expect(await provider.callLog.filter { $0.hasPrefix("move(ids:") }.count == 1)
+            #expect(await provider.markedReadIds.isEmpty)
+            #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 1)
+            try await f.pool.write { db in try db.execute(sql: "DROP TRIGGER refuse_limit_delete") }
+            NetworkMonitor.setConnectedForTesting(!offlineReplay)
+            try await joinedFailurePolicyDrain()
+            if offlineReplay {
+                #expect(try rowsByPosition(f).map(\.id) == [follower.id])
+                #expect(await provider.markedReadIds.isEmpty)
+                #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 0)
+                #expect(AppLogStore.read(channel: .error).components(separatedBy: "retired after reaching the provider failure retry limit").count == before + 1)
+                NetworkMonitor.setConnectedForTesting(true)
+                try await joinedFailurePolicyDrain()
+            }
+            #expect(try rowsByPosition(f).isEmpty)
+            #expect(await provider.callLog.filter { $0.hasPrefix("move(ids:") }.count == 1)
+            #expect(await provider.markedReadIds.map(\.ids) == [["refused"]])
+            #expect(followerSawCommittedEffects.withLock { $0 }, "commit, terminal log and successor drop must all precede follower wire")
+            #expect(AppLogStore.read(channel: .error).components(separatedBy: "retired after reaching the provider failure retry limit").count == before + 1)
+        }
+    }
+
+    @Test("The refusal boundary observes a live count changed while provider work was held", arguments: [false, true])
+    @MainActor
+    func refusalLimitUsesLiveDurableCount(raiseCount: Bool) async throws {
+        let f = try fixture(accountId: "fifo-live-limit", provider: .gmail)
+        defer { finish(f) }
+        var op = PendingOperation(type: .markRead, messageIds: ["refused"],
+            accountId: f.accountId, folderPath: Self.source)
+        op.retryCount = raiseCount ? 0 : 9
+        let target = try admit(f, op)
+        let provider = MockEmailProvider()
+        let writeSucceeded = Mutex(false)
+        await provider.setMarkReadHook {
+            do {
+                try await f.pool.write { db in
+                try db.execute(sql: "UPDATE pendingOperation SET retryCount = ? WHERE id = ?",
+                    arguments: [raiseCount ? 9 : 0, target.id])
+                }
+                writeSucceeded.withLock { $0 = true }
+            } catch {}
+        }
+        await provider.setMarkReadThrows(ProviderError.authenticationFailed)
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            try await joinedFailurePolicyDrain()
+            let rows = try rowsByPosition(f)
+            #expect(await provider.markedReadIds.count == 1)
+            #expect(writeSucceeded.withLock { $0 }, "the concurrent count write must commit")
+            if raiseCount { #expect(rows.isEmpty) }
+            else {
+                #expect(rows.map(\.id) == [target.id])
+                #expect(rows.first?.retryCount == 1)
+            }
+        }
+    }
+
+    @Test("Connectivity lost inside one provider attempt prevents claiming the next item")
+    @MainActor
+    func cachedConnectivityIsCheckedBetweenClaims() async throws {
+        let wasConnected = NetworkMonitor.checkConnected()
+        NetworkMonitor.setConnectedForTesting(true)
+        defer { NetworkMonitor.setConnectedForTesting(wasConnected) }
+        let f = try fixture(accountId: "fifo-connectivity", provider: .gmail)
+        defer { finish(f) }
+        try admit(f, PendingOperation(type: .markRead, messageIds: ["first"],
+            accountId: f.accountId, folderPath: Self.source))
+        let second = try admit(f, PendingOperation(type: .markUnread, messageIds: ["second"],
+            accountId: f.accountId, folderPath: Self.source))
+        let provider = MockEmailProvider()
+        await provider.setMarkReadHook { NetworkMonitor.setConnectedForTesting(false) }
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            try await joinedFailurePolicyDrain()
+            let rows = try rowsByPosition(f)
+            #expect(rows.map(\.id) == [second.id])
+            #expect(rows.first?.everAttempted == false)
+            #expect(rows.first?.retryCount == 0)
+            #expect(await provider.markedReadIds.count == 1)
+            #expect(await provider.markedUnreadIds.isEmpty)
+            NetworkMonitor.setConnectedForTesting(true)
+            try await joinedFailurePolicyDrain()
+            #expect(try rowsByPosition(f).isEmpty)
+            #expect(await provider.markedUnreadIds.map(\.ids) == [["second"]])
+        }
+    }
+
+    @Test("Cancellation before scheduled drain work cannot charge or call the provider")
+    @MainActor
+    func cancelledDrainBeforeWorkIsUncharged() async throws {
+        let f = try fixture(accountId: "fifo-cancel-before-work", provider: .gmail)
+        defer { finish(f) }
+        var op = PendingOperation(type: .markRead, messageIds: ["unattempted"],
+            accountId: f.accountId, folderPath: Self.source)
+        op.retryCount = 9
+        let target = try admit(f, op)
+        let provider = MockEmailProvider()
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            let gate = DeliveryGate()
+            let drain = Task {
+                await gate.wait()
+                try await joinedFailurePolicyDrain()
+            }
+            drain.cancel()
+            await gate.open()
+            try await drain.value
+            let rows = try rowsByPosition(f)
+            #expect(rows.map(\.id) == [target.id])
+            #expect(rows.first?.retryCount == 9)
+            #expect(await provider.markedReadIds.isEmpty)
+        }
+    }
+
+    @Test("Cancellation during an actual provider attempt does not charge its later refusal")
+    @MainActor
+    func cancellationDuringProviderAttemptIsUncharged() async throws {
+        let f = try fixture(accountId: "fifo-cancel-in-provider", provider: .gmail)
+        defer { finish(f) }
+        var op = PendingOperation(type: .markRead, messageIds: ["attempted"],
+            accountId: f.accountId, folderPath: Self.source)
+        op.retryCount = 9
+        let target = try admit(f, op)
+        let provider = MockEmailProvider()
+        let entered = Mutex(false)
+        let release = DeliveryGate()
+        await provider.setMarkReadThrows(ProviderError.authenticationFailed)
+        await provider.setMarkReadHook {
+            entered.withLock { $0 = true }
+            await release.wait()
+        }
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            let drain = Task { await AccountManager.shared.drainPendingQueue() }
+            let started = (try? await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+                while !entered.withLock({ $0 }) {
+                    try Task.checkCancellation()
+                    await Task.yield()
+                }
+                return true
+            }) ?? false
+            #expect(started, "the provider attempt never entered the controlled barrier")
+            guard started else {
+                drain.cancel()
+                await release.open()
+                await drain.value
+                return
+            }
+            #expect(await provider.markedReadIds.count == 1)
+            #expect((try? rowsByPosition(f))?.first?.status == PendingStatus.inFlight.rawValue)
+            drain.cancel()
+            await release.open()
+            await drain.value
+            #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting())
+            let rows = try rowsByPosition(f)
+            #expect(rows.map(\.id) == [target.id])
+            #expect(rows.first?.retryCount == 9)
+            #expect(await !AccountManager.shared.hasPendingOperationSettlement)
+            // Cancellation also refuses local deferral writes. Its uncharged requeue
+            // remains owned until a non-cancelled drain can commit it.
+            #expect(rows.first?.status == PendingStatus.inFlight.rawValue)
+            #expect(await AccountManager.shared.pendingRequeues[target.id] == false)
+            let recoveredCount = Mutex<Int?>(nil)
+            await provider.setMarkReadHook {
+                let count = try? await f.pool.read { db in
+                    try PendingOperation.fetchOne(db, key: target.id)?.retryCount
+                }
+                recoveredCount.withLock { $0 = count }
+            }
+            await provider.setMarkReadThrows(nil)
+            try await joinedFailurePolicyDrain()
+            #expect(try rowsByPosition(f).isEmpty)
+            #expect(await provider.markedReadIds.count == 2)
+            #expect(recoveredCount.withLock { $0 } == 9)
+        }
+    }
+
+    private func joinedFailurePolicyDrain() async throws {
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting())
+        await AccountManager.shared.drainPendingQueue()
+        for _ in 0..<1_000 {
+            if await AccountManager.shared.pendingQueueIsQuiescentForTesting() { return }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        Issue.record("the owned drain and requested redrain did not become quiescent")
+    }
+
+    @Test("A refused accounting write replays exactly once, including offline, without another provider attempt", arguments: [false, true])
+    @MainActor
+    func refusalAccountingWriteReplaysOnce(offlineReplay: Bool) async throws {
+        let previousConnectivity = NetworkMonitor.checkConnected()
+        NetworkMonitor.setConnectedForTesting(true)
+        defer { NetworkMonitor.setConnectedForTesting(previousConnectivity) }
+        let f = try fixture(accountId: "fifo-accounting-write", provider: .gmail)
+        defer { finish(f) }
+        var op = PendingOperation(type: .markRead, messageIds: ["refused"],
+            accountId: f.accountId, folderPath: Self.source)
+        op.retryCount = 8
+        let target = try admit(f, op)
+        try await f.pool.write { db in
+            try db.execute(sql: """
+                CREATE TRIGGER refuse_retry_accounting BEFORE UPDATE OF retryCount ON pendingOperation
+                BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END
+                """)
+        }
+        let provider = MockEmailProvider()
+        await provider.setMarkReadThrows(ProviderError.authenticationFailed)
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            try await joinedFailurePolicyDrain()
+            #expect(try rowsByPosition(f).first?.retryCount == 8)
+            #expect(await provider.markedReadIds.count == 1)
+            try await joinedFailurePolicyDrain()
+            #expect(await provider.markedReadIds.count == 1)
+            try await f.pool.write { db in try db.execute(sql: "DROP TRIGGER refuse_retry_accounting") }
+            NetworkMonitor.setConnectedForTesting(!offlineReplay)
+            try await joinedFailurePolicyDrain()
+            let rows = try rowsByPosition(f)
+            #expect(rows.map(\.id) == [target.id])
+            #expect(rows.first?.status == PendingStatus.queued.rawValue)
+            #expect(rows.first?.retryCount == 9)
+            #expect(await provider.markedReadIds.count == 1)
+            NetworkMonitor.setConnectedForTesting(true)
+            try await joinedFailurePolicyDrain()
+            #expect(try rowsByPosition(f).isEmpty)
+            #expect(await provider.markedReadIds.count == 2)
+        }
+    }
+
+    @Test("Interleaved member progress preserves historical counts and only refusal consumes one")
+    @MainActor
+    func interleavedProgressAndRefusalConverges() async throws {
+        let f = try fixture(accountId: "fifo-interleaved-limit", provider: .gmail)
+        defer { finish(f) }
+        let members = (1...12).map { "member-\($0)" }
+        var op = PendingOperation(type: .markRead, messageIds: members,
+            accountId: f.accountId, folderPath: Self.source)
+        op.retryCount = 8
+        let target = try admit(f, op)
+        let provider = MockEmailProvider()
+        let calls = Mutex(0)
+        await provider.setMarkReadHook {
+            let count = calls.withLock { $0 += 1; return $0 }
+            if count == 2 {
+                await provider.setMarkReadThrows(ProviderError.authenticationFailed)
+            } else if let member = await provider.markedReadIds.last?.ids.first {
+                await provider.setMarkReadThrows(ProviderMembersDispositioned(
+                    dispositionedMemberIds: [member], absentMemberIds: []))
+            }
+        }
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            try await joinedFailurePolicyDrain()
+            let rows = try rowsByPosition(f)
+            #expect(rows.map(\.id) == [target.id])
+            #expect(rows.first?.messageIds == Array(members.dropFirst()))
+            #expect(rows.first?.retryCount == 9)
+            try await joinedFailurePolicyDrain()
+            #expect(try rowsByPosition(f).isEmpty)
+            #expect(await provider.markedReadIds.compactMap { $0.ids.first } == [members[0], members[1]] + Array(members.dropFirst()))
+        }
+    }
+
+    @Test("A seeded connectivity storm preserves retry counts and ordered followers until recovery")
+    @MainActor
+    func seededConnectivityStormPreservesIntent() async throws {
+        let previousConnectivity = NetworkMonitor.checkConnected()
+        defer { NetworkMonitor.setConnectedForTesting(previousConnectivity) }
+        let f = try fixture(accountId: "fifo-connectivity-storm", provider: .gmail)
+        defer { finish(f) }
+        var op = PendingOperation(type: .markRead, messageIds: ["first"],
+            accountId: f.accountId, folderPath: Self.source)
+        op.retryCount = 9
+        let first = try admit(f, op)
+        let second = try admit(f, PendingOperation(type: .markUnread, messageIds: ["first"],
+            accountId: f.accountId, folderPath: Self.source))
+        let provider = MockEmailProvider()
+        await provider.setMarkReadThrows(ProviderError.notConnected)
+        await provider.setMarkReadHook { NetworkMonitor.setConnectedForTesting(false) }
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            var seed: UInt64 = 0x5EED
+            var attempts = 0
+            var offlinePasses = 0
+            for _ in 0..<32 {
+                seed = seed &* 6364136223846793005 &+ 1
+                let connected = (seed >> 16) & 1 == 1
+                NetworkMonitor.setConnectedForTesting(connected)
+                if connected { attempts += 1 } else { offlinePasses += 1 }
+                try await joinedFailurePolicyDrain()
+                let rows = try rowsByPosition(f)
+                #expect(Set(rows.map(\.id)) == Set([first.id, second.id]))
+                #expect(rows.first { $0.id == first.id }?.retryCount == 9)
+                #expect(rows.first { $0.id == second.id }?.everAttempted == false)
+                #expect(await provider.markedReadIds.count == attempts)
+                #expect(await provider.markedUnreadIds.isEmpty)
+            }
+            #expect(attempts > 10 && offlinePasses > 0, "the seed must exercise repeated wire loss and offline skips")
+            await provider.setMarkReadHook(nil)
+            await provider.setMarkReadThrows(nil)
+            NetworkMonitor.setConnectedForTesting(true)
+            try await joinedFailurePolicyDrain()
+            #expect(try rowsByPosition(f).isEmpty)
+            #expect(await provider.markedReadIds.count == attempts + 1)
+            #expect(await provider.markedUnreadIds.map(\.ids) == [["first"]])
+        }
+    }
+
+    @Test("Retained failure accounting cannot resurrect a row removed or cancelled before replay", arguments: [false, true])
+    @MainActor
+    func retainedFailureRespectsWithdrawnRows(cancel: Bool) async throws {
+        let f = try fixture(accountId: "fifo-withdrawn-failure", provider: .gmail)
+        defer { finish(f) }
+        var op = PendingOperation(type: .markRead, messageIds: ["withdrawn"],
+            accountId: f.accountId, folderPath: Self.source)
+        op.retryCount = 8
+        let target = try admit(f, op)
+        try await f.pool.write { db in
+            try db.execute(sql: """
+                CREATE TRIGGER refuse_withdrawn_accounting BEFORE UPDATE OF retryCount ON pendingOperation
+                BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END
+                """)
+        }
+        let provider = MockEmailProvider()
+        await provider.setMarkReadThrows(ProviderError.authenticationFailed)
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            try await joinedFailurePolicyDrain()
+            #expect(await AccountManager.shared.hasPendingOperationSettlement)
+            #expect(await provider.markedReadIds.count == 1)
+            try await f.pool.write { db in
+                if cancel {
+                    try db.execute(sql: "UPDATE pendingOperation SET status = 'cancelled' WHERE id = ?", arguments: [target.id])
+                } else { _ = try PendingOperation.deleteOne(db, key: target.id) }
+            }
+            try await joinedFailurePolicyDrain()
+            #expect(try rowsByPosition(f).isEmpty)
+            #expect(await !AccountManager.shared.hasPendingOperationSettlement)
+            #expect(await provider.markedReadIds.count == 1)
         }
     }
 
@@ -1367,4 +1802,13 @@ struct GlobalFifoExecutorTests {
         await ActiveAIQueue.shared.setDispatchSuppressedForTesting(false)
     }
 
+}
+
+private extension AccountManager {
+    func installRefusalSuccessorForTesting(predecessor: String) {
+        let id = "refusal-successor-header"
+        deferredMoveSuccessors[id] = DeferredMoveSuccessor(
+            predecessorOperationId: predecessor, predecessorDestinationPath: "Archive",
+            oldHeaderId: id, desiredDestinationPath: "INBOX")
+    }
 }

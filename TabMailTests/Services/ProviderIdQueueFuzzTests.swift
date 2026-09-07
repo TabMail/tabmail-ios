@@ -1126,7 +1126,7 @@ struct ProviderIdQueueFuzzTests {
         #expect(diagnostic.operations.count == 1)
         #expect(diagnostic.operations[0].type == .markRead)
         #expect(diagnostic.operations[0].status == PendingStatus.queued.rawValue)
-        #expect(diagnostic.operations[0].retryCount == 3)
+        #expect(diagnostic.operations[0].retryCount == 2)
         #expect(diagnostic.operations[0].everAttempted)
         #expect(diagnostic.operations[0].messageIds == [String(ids.markReadUid)])
         #expect(diagnostic.commandTail.count == FuzzConfig.diagnosticCommandTailCount)
@@ -1928,8 +1928,8 @@ extension ProviderIdQueueFuzzTests {
                     if let predecessor = predecessor, let successor = successor {
                         #expect(predecessor.status == PendingStatus.queued.rawValue,
                                 "\(tag): predecessor status must be queued, got \(predecessor.status)")
-                        #expect(predecessor.retryCount == 1,
-                                "\(tag): predecessor must carry exactly ONE failed attempt, got retryCount=\(predecessor.retryCount)")
+                        #expect(predecessor.retryCount == 0,
+                                "\(tag): transport failure must preserve the historical retry count, got retryCount=\(predecessor.retryCount)")
                         #expect(predecessor.everAttempted,
                                 "\(tag): the predecessor was claimed, so everAttempted must be true")
                         #expect(successor.status == PendingStatus.queued.rawValue,

@@ -32,16 +32,17 @@ extension AccountManager {
                 Task { await drainPendingQueue() }
             }
         }
+        var state = QueueDrainState()
         operationExecutor.beginDrain(using: self)
-        guard await operationExecutor.recoverPendingSettlement(using: self) else { return }
+        guard await operationExecutor.recoverPendingSettlement(state: &state, using: self) else { return }
         guard await recoverPendingRequeues() else { return }
         guard NetworkMonitor.checkConnected() else { return }
         operationExecutor.prepareDrain(using: self)
 
-        var state = QueueDrainState()
         var claimedThisDrain = 0
         executor: while true {
             if operationExecutor.hasPendingSettlement || !pendingRequeues.isEmpty { break }
+            guard NetworkMonitor.checkConnected() else { break }
             switch await claimFrontierOperation(state: &state) {
             case .exhausted:
                 queueLog("[Queue] drain complete — \(claimedThisDrain) operation(s) claimed this drain")

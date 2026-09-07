@@ -37,6 +37,8 @@ Before starting any task in this project, read these files and update them when 
 
 ## Core Philosophy: Never Drop User Intention
 
+**Current amendment:** ordinary message-action provider failures have a bounded fifth runtime exit; the [normative rule](Companion/Rules/Active/never-drop-user-intention.md) defines the exact cap, exclusions and commit-before-effects requirement. The earlier enumeration below is historical.
+
 **This is the single most important principle in the entire codebase. Every system — actions, sends, tags — is built on it.**
 
 User intention is sacred. When a user archives a message, sends an email, or changes a tag, that intention MUST survive any failure — crashes, disconnections, app kills, device reboots. The system achieves this through two complementary queues:
