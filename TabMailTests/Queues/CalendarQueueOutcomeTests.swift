@@ -439,4 +439,36 @@ struct CalendarQueueOutcomeTests {
             "the original claim must settle after the provider is released")
         await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId)
     }
+
+    @Test("Production startup recovery reaches the post-connect calendar drain")
+    func productionStartupRecoveredWorkDrains() async throws {
+        let accountId = "calendar-production-lifecycle"
+        let (pool, dir, previous) = try makeTestDB(accountId: accountId)
+        let flags = StartupMigrationsTests.snapshotFlags()
+        for key in StartupMigrationsTests.allFlagKeys { UserDefaults.standard.set(true, forKey: key) }
+        let mock = MockCalendarProvider()
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer {
+            StartupMigrationsTests.restoreFlags(flags)
+            Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+        }
+        var op = PendingCalendarOperation(operationType: .delete, accountId: accountId,
+            eventId: "retained-event", calendarId: "primary", arguments: [:])
+        op.status = PendingStatus.inFlight.rawValue
+        let frozenOp = op
+        try await pool.write { try frozenOp.insert($0) }
+        let recovered = try AppDatabase(pool: pool, runStartupResets: true)
+        AppDatabase.shared.withLock { $0 = recovered }
+        await AccountManager.shared.reconcilePendingOperations()
+        let calls = await mock.deletedEvents
+        #expect(calls.count == 1, "a recovered calendar intention must reach its provider after account connection")
+        if calls.count == 1 {
+            #expect(calls[0].eventId == "retained-event")
+            #expect(calls[0].calendarId == "primary")
+        }
+        #expect(try await pool.read { try PendingCalendarOperation.fetchOne($0, key: frozenOp.id) } == nil,
+            "the recovered calendar intention must settle durably")
+        await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId)
+    }
 }
