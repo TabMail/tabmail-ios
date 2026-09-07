@@ -239,9 +239,9 @@ actor PushNotificationService {
         // reregisterAllDeviceAccounts during app relaunch). Gate BOTH sub-calls
         // on DB readiness — registerDeviceWithWorker's own gate sits after its
         // early-return guards, and reregisterAllDeviceAccounts has none. The
-        // registration is deferred, never dropped (awaitLaunchReady resumes on
-        // both DB-build success and failure).
-        await AppStartup.shared.awaitLaunchReady(background: true)
+        // registration waits for usable readiness. A failed launch must not
+        // reach registration work that assumes the pool was published.
+        guard await AppStartup.shared.awaitLaunchReady(background: true) else { return }
         let tokenHex = tokenData.map { String(format: "%02x", $0) }.joined()
         print("[Push] APNs device token: \(tokenHex.prefix(16))...")
         BackgroundSyncLogger.logPush("APNs device token received: \(tokenHex.prefix(16))...")
@@ -293,7 +293,7 @@ actor PushNotificationService {
         // app update the DB build is delayed by migrations, so this path wins the
         // race. Gate on readiness like every other dbPool entry point. (Cheap once
         // ready; the no-session / no-token early returns above already skipped it.)
-        await AppStartup.shared.awaitLaunchReady(background: true)
+        guard await AppStartup.shared.awaitLaunchReady(background: true) else { return }
 
         do {
             let emails = try await dbPool.read { db in

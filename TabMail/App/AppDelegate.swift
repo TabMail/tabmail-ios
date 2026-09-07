@@ -483,6 +483,26 @@ enum NotificationActionRouter {
 /// Swift 6 isolation errors.
 final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 
+    #if DEBUG
+    private let readinessHook: (@MainActor @Sendable () async -> Bool)?
+    private let actionHook: (@MainActor @Sendable (String, String, String) async -> Void)?
+
+    override init() {
+        readinessHook = nil
+        actionHook = nil
+        super.init()
+    }
+
+    init(
+        readiness: @escaping @MainActor @Sendable () async -> Bool,
+        action: @escaping @MainActor @Sendable (String, String, String) async -> Void
+    ) {
+        readinessHook = readiness
+        actionHook = action
+        super.init()
+    }
+    #endif
+
     /// Handle notification while app is in foreground.
     /// For NSE pushes (email/task): suppress and trigger immediate sync.
     /// For other notifications (proactive, local): show normally.
@@ -502,7 +522,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
             Task { @MainActor in
                 // A push can arrive during the one-time migration window; wait
                 // for the DB before touching it (AppStartup / PLAN_HANG_FIX).
-                await AppStartup.shared.awaitLaunchReady(background: true)
+                guard await AppStartup.shared.awaitLaunchReady(background: true) else { return }
                 await NSEDataBridge.mergeNSEStagingData()
                 // willPresent only fires while the app is foreground-active, so request the
                 // fast-path: syncStartup still cancels in-flight AI if the oracle detects any
@@ -556,12 +576,33 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
             print("[NotificationDelegate] didReceive notification: \(response.notification.request.identifier)")
         }
 
+        handleNotificationResponse(
+            actionId: response.actionIdentifier,
+            userInfo: userInfo,
+            completionHandler: completionHandler
+        )
+    }
+
+    func handleNotificationResponse(
+        actionId: String,
+        userInfo: [AnyHashable: Any],
+        completionHandler: @escaping () -> Void
+    ) {
         // ObjC completion handler — inherently thread-safe one-shot callback,
         // but not marked @Sendable. Safe to send to main queue.
         nonisolated(unsafe) let finish = completionHandler
 
+        #if DEBUG
+        // Capture immutable Sendable operations, never the nonisolated delegate.
+        let ready: @MainActor @Sendable () async -> Bool = readinessHook ?? {
+            await AppStartup.shared.awaitLaunchReady(background: true)
+        }
+        let execute: @MainActor @Sendable (String, String, String) async -> Void = actionHook ?? {
+            await NotificationActionRouter.execute(actionId: $0, messageId: $1, accountId: $2)
+        }
+        #endif
+
         // Handle notification actions (archive, mark read, delete) from NSE notifications
-        let actionId = response.actionIdentifier
 
         // MARK_READ wires through AccountManager.markRead so the local
         // MessageHeader.isRead + folder.unreadCount flip optimistically, the
@@ -597,12 +638,19 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 // the last quiesce (ADR-IOS-041). Resume or the user's action
                 // write would abort: NEVER DROP USER INTENTION.
                 DatabaseSuspension.shared.beginBackgroundWork("notification-action")
-                defer { DatabaseSuspension.shared.endBackgroundWork("notification-action") }
+                defer {
+                    finish()
+                    DatabaseSuspension.shared.endBackgroundWork("notification-action")
+                }
                 // A notification action can fire during the one-time migration
                 // window; wait for the DB before touching it (AppStartup).
-                await AppStartup.shared.awaitLaunchReady(background: true)
+                #if DEBUG
+                guard await ready() else { return }
+                await execute(actionId, messageId, accountId)
+                #else
+                guard await AppStartup.shared.awaitLaunchReady(background: true) else { return }
                 await NotificationActionRouter.execute(actionId: actionId, messageId: messageId, accountId: accountId)
-                finish()
+                #endif
             }
             return
         }
@@ -617,12 +665,19 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 // Background notification action — same resume rationale as
                 // MARK_READ above (ADR-IOS-041).
                 DatabaseSuspension.shared.beginBackgroundWork("notification-action")
-                defer { DatabaseSuspension.shared.endBackgroundWork("notification-action") }
+                defer {
+                    finish()
+                    DatabaseSuspension.shared.endBackgroundWork("notification-action")
+                }
                 // Can fire during the one-time migration window — wait for
                 // the DB before touching it (AppStartup).
-                await AppStartup.shared.awaitLaunchReady(background: true)
+                #if DEBUG
+                guard await ready() else { return }
+                await execute(actionId, messageId, accountId)
+                #else
+                guard await AppStartup.shared.awaitLaunchReady(background: true) else { return }
                 await NotificationActionRouter.execute(actionId: actionId, messageId: messageId, accountId: accountId)
-                finish()
+                #endif
             }
             return
         }
@@ -716,6 +771,22 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 /// APNs device tokens or silent push notifications.
 class AppDelegate: NSObject, UIApplicationDelegate {
 
+    #if DEBUG
+    private var silentPushReadinessHook: (@MainActor () async -> Bool)?
+    private var silentPushWorkHook: (@MainActor () async -> UIBackgroundFetchResult)?
+
+    override init() { super.init() }
+
+    init(
+        silentPushReadiness: @escaping @MainActor () async -> Bool,
+        silentPushWork: @escaping @MainActor () async -> UIBackgroundFetchResult
+    ) {
+        silentPushReadinessHook = silentPushReadiness
+        silentPushWorkHook = silentPushWork
+        super.init()
+    }
+    #endif
+
     /// Retained so the delegate isn't deallocated.
     private let notificationDelegate = NotificationDelegate()
 
@@ -760,6 +831,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             object: nil, queue: .main
         ) { _ in
             MainActor.assumeIsolated {
+                guard AppStartup.shared.dbReady else { return }
                 // Idempotent finish: the normal-completion path (end of the
                 // Task below) and the expiration handler both funnel through
                 // this one closure, so `endBackgroundWork` (a refcount) is
@@ -812,7 +884,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // idempotent with `body.task`'s `runIfNeeded`. NSE staging DB creation +
         // state mirror live inside `ensureDatabaseReady` (they touch AppDatabase),
         // so they still run on every launch as they did before the splash work.
-        Task { await AppStartup.shared.ensureDatabaseReady() }
+        Task { _ = await AppStartup.shared.ensureDatabaseReady() }
         migrateOptOutFlagToSharedSuite()
         BootProfiler.mark("AppDelegate.didFinishLaunching exit (DB build kicked async)")
         return true
@@ -903,7 +975,16 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // A silent push can arrive during the one-time migration window; wait
         // for the DB to finish building before any handler touches it
         // (AppDatabase.dbPool force-unwraps AppDatabase.shared). See AppStartup.
-        await AppStartup.shared.awaitLaunchReady(background: true)
+        #if DEBUG
+        let usable = if let silentPushReadinessHook {
+            await silentPushReadinessHook()
+        } else {
+            await AppStartup.shared.awaitLaunchReady(background: true)
+        }
+        #else
+        let usable = await AppStartup.shared.awaitLaunchReady(background: true)
+        #endif
+        guard usable else { return .failed }
 
         let appState = application.applicationState
         let stateStr = appState == .active ? "active" : appState == .background ? "background" : "inactive"
@@ -927,6 +1008,9 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             PushHealthStore.recordPush(accountEmail: accountEmail)
         }
 
+        #if DEBUG
+        if let silentPushWorkHook { return await silentPushWorkHook() }
+        #endif
         return await PushNotificationService.shared.handleSilentPush(provider: info["provider"], accountEmail: info["accountEmail"])
     }
 }
