@@ -237,3 +237,16 @@ line had accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-008](Companion/Mistakes/Active/MIS-IOS-008-verified-the-recovery-path-not-the-states-where-it-cannot-run.md)** — called a state "recoverable" after finding a mechanism, without proving it can run there (`IOS-AI-003`/`004`). Instance 2 adds the affordance a user gesture needs. **Instance 3 imposed RFC identity on `repopulationCandidates`, though that fallback selects by state. Enumerate the recovery's actual predicates; never transfer a guard from the failing path.** Re-run the argument whenever the residual changes shape. (×3)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-06, pass 6)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 55% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-008](Companion/Mistakes/Active/MIS-IOS-008-verified-the-recovery-path-not-the-states-where-it-cannot-run.md)** — called a state "recoverable" after finding a mechanism, without proving it can RUN there (`IOS-AI-003`/`004`). ×3 imposed RFC identity on `repopulationCandidates`, which selects by STATE; ×4 mistook completing Send for recovering refused Undo. **Name which intention the fallback completes.** ×5 (`IOS-QUEUE-008`): the "one ordinary gesture" re-entered the race it was meant to cure. (×5)
+```

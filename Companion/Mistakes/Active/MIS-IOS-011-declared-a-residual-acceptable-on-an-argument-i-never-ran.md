@@ -131,3 +131,16 @@ line had accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-011](Companion/Mistakes/Active/MIS-IOS-011-declared-a-residual-acceptable-on-an-argument-i-never-ran.md)** — classified a finding as an **accepted residual** under THE MANTRA and wrote the registration comment **in the same motion as deciding it qualified**, justified by a fact about a mechanism I had never opened. The render phase persists inline images keyed by the **victim's** content key *before* `BodyAddressGate` can refuse the body write, so a later fetch with a **colliding CID** renders the **stranger's image** — not recoverable, so not a residual. Root shape: **asset files on disk are a THIRD durable output of a body fetch**, invisible because the code never reads them back. ***Tell: writing "accepted residual" before writing down the concrete inputs that reach the bad state.*** (×1)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-06, pass 6)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 55% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-011](Companion/Mistakes/Active/MIS-IOS-011-declared-a-residual-acceptable-on-an-argument-i-never-ran.md)** — classified a finding as an **accepted residual** under THE MANTRA, writing the registration comment in the same motion as deciding it qualified, on a mechanism I had never opened. The render phase persists inline images keyed by the **victim's** content key *before* `BodyAddressGate` can refuse the body write, so a **colliding CID** renders the **stranger's image** — not recoverable, so not a residual. Root shape: **asset files on disk are a THIRD durable output of a body fetch.** ×2: ADR-IOS-079 §5 accepted `gcStaleEntries` aging out `t:` hashes iOS can no longer put in `freshHashes` (**absent = ENABLED**) because *"the desktop re-seeds iOS"* — a recovering event NAMED but never opened: Device Sync retains nothing, so a phone-only copy is a lost disable. **Ask whether the named peer still EXISTS.** Invariant: *GC only collects namespaces this device can re-derive*. (×2)
+```

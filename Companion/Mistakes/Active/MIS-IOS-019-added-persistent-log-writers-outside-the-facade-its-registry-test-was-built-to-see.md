@@ -71,3 +71,16 @@ rg -n "AppLogStore\.append\(" TabMail/ | rg -v "BackgroundSyncLogger|DeviceSyncL
 # `guard DebugModeManager.isLoggingEnabled()` in the diff with no test touching
 # `loggingEnabledOverrideForTesting` means the suite measures the guard, not the body.
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-06, pass 6)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 55% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-019](Companion/Mistakes/Active/MIS-IOS-019-added-persistent-log-writers-outside-the-facade-its-registry-test-was-built-to-see.md)** — added three debug-gated `AppLogStore.append(…, channel: .sync)` writers OUTSIDE `BackgroundSyncLogger` because I wanted their lines to INTERLEAVE with sync's (`4f9bd4bbc`, PR #113): the store already interleaves every tag; the always-on `.sync` tag now carried debug-gated writers; `AppLogStoreTests.everyChannelIsClassifiedExactlyOnce` could not see them; every new gated body had **0 hits** in 9,437 tests; unescaped `folderPath`/error text could forge another channel's entry. **A new persistent diagnostic stream = new `AppLogChannel` case + tag + ONE facade + a `debugGatedWriters` row; `rg "AppLogStore.append\("` outside the three facades must be empty.** (×1)
+```

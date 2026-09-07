@@ -145,3 +145,16 @@ line had accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-003](Companion/Mistakes/Active/MIS-IOS-003-reconstructed-an-address-the-wire-already-gave-us.md)** — designed identity machinery to rebuild the destination address `COPYUID` already returned; 4 audit rounds argued evidence when the defect was granularity. Undo is JUST a reverse move. Instance 5 is the **quiet** form — a **discarded return value**: `ExchangeProvider.moveMessage` binds Graph's `/move` response to `_` though it carries the new `id`, and no `Prefer: IdType="ImmutableId"` exists in the tree (`IOS-GRAPH-002`, BLOCKING; Gmail exempt). **A second guard that makes a defect benign in one arm is not a guard the other arm has.** (×5)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-06, pass 6)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 55% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-003](Companion/Mistakes/Active/MIS-IOS-003-reconstructed-an-address-the-wire-already-gave-us.md)** — designed identity machinery to rebuild the destination address `COPYUID` already returned; 4 audit rounds argued evidence when the defect was **granularity**. Undo is JUST a reverse move. ×5 is the **quiet** form — `ExchangeProvider.moveMessage` binds Graph's `/move` response to `_` though it carries the new `id`; no `Prefer: IdType="ImmutableId"` in the tree (`IOS-GRAPH-002`; Gmail exempt). ×6 = the SAME id then applied to the header and NOT to the `PendingOperation`s naming it, nor to a row an undo had moved out of the destination folder — enumerate every HOLDER of an invalidated address, not just the table you fixed last time (`IOS-GRAPH-005`, ADR-IOS-081). (×6)
+```

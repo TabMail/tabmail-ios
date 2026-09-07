@@ -93,3 +93,16 @@ line had accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-015](Companion/Mistakes/Active/MIS-IOS-015-made-a-guard-depend-on-a-transient-globals-lifetime-across-an-async-hop.md)** — made a fail-open guard read a **transient in-memory global** across an async hop: `InboxView`'s `.messageDismissedFromDetail` receiver carries `.receive(on: DispatchQueue.main)`, so it runs a turn LATER than the `post` and nothing orders it against the optimistic overlay's `release` — losing the race returns `nil` → `false` → the exact dismissal the guard existed to prevent. Fixed by carrying the destination folder id in the notification `userInfo`. ***Tell: "registered before the enqueue, released after the write, so it is definitely still live" — and quoting a LOG to settle an ordering without asking what the OTHER ordering would look like in that same log.*** (×1)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-06, pass 6)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 55% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-015](Companion/Mistakes/Active/MIS-IOS-015-made-a-guard-depend-on-a-transient-globals-lifetime-across-an-async-hop.md)** — made a fail-open guard read a **transient in-memory global** across an async hop — `InboxView`'s `.messageDismissedFromDetail` receiver is `.receive(on: DispatchQueue.main)`, so losing the race returns `nil` → `false` → the exact dismissal the guard existed to prevent. Fixed by carrying the destination folder id in the notification `userInfo`. ***Tell: quoting a LOG to settle an ordering.*** (×1)
+```

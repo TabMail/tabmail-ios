@@ -179,3 +179,16 @@ grep -rn "throw ProviderMembersDispositioned(\|provenIds:" TabMail/Providers/
 #    mechanism this entry exists to keep deleted.
 grep -n "pendingOperationTimeout\|memberLoopBudget" TabMail/Services/Sync/SyncConfig.swift
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-06, pass 6)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 55% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-022](Companion/Mistakes/Active/MIS-IOS-022-replaced-a-splitting-mechanism-and-left-its-loop-under-the-old-aggregate-deadline.md)** — deleted the queue's batch-**splitting** arm and replaced it with a sequential per-member provider loop **under the same 15 s `withTimeout`** the splitting had been escaping. `withTimeout` resumes with `TimeoutError` **before** it cancels, so the loop's accumulated report is **discarded**; `requeueOrRetain` bumps `retryCount` without narrowing `messageIds`, so every attempt repeats the identical prefix and the last member is **never sent** — retry **starvation = the wedge corollary**, non-recoverable, and a REGRESSION (splitting used to give each member its own deadline). ⛔ **×2 — the first fix was the same mistake one level in.** `ProviderMemberLoopBudget` (a **strictly earlier** 0.6 × budget checked BETWEEN members) still starved: a margin bounds what an attempt has ALREADY spent and says **nothing about the duration of the next request** (no per-request ceiling exists), so members that each fit the deadline still straddle it two at a time. **No smaller fraction fixes it; deleting the check alone restores recurrence 1.** Fixed by DELETING the budget and settling **exactly ONE member per attempt** in all three loops (`modifyEachMessage`, `patchEachMessage`, `moveProvingDestinations`) — accepted cost: an N-member op converges in N attempts on the SAME row; do not re-batch. ***Tell: defending finished work with a margin measured in elapsed TIME against a request whose duration is unbounded — asking "is 0.6 right?" means the error is already made.*** (×2)
+```

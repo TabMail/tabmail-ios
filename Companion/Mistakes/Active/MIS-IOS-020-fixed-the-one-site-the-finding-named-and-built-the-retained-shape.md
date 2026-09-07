@@ -79,3 +79,16 @@ PY
 There is no mechanical check for the second half — reaching for the retained shape when deletion was
 offered is caught only by a reader who reads the reviewer's own "deletion-first answer" paragraph
 before writing the brief.
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-06, pass 6)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 55% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-020](Companion/Mistakes/Active/MIS-IOS-020-fixed-the-one-site-the-finding-named-and-built-the-retained-shape.md)** — fixed the ONE symbol a finding named (`R4-RS-1`, the full-sync upsert line inside `dbPool.write`, `ef81ee3e5`) and never censused the class: round 5 returned the identical rollback-survives-the-line mechanism at **eleven** more sites (six `deltaMoveTraceLog`, five `queueLog`, `undoMove`'s `phase=queuedInverse`). Both round-5 reports carried a **"Deletion-first answer"** paragraph; round 6 built the carrier anyway and the owner chose deletion (2026-09-05), discarding that branch. **Census the MECHANISM, not the symbol; price DELETION before the retained shape and let the owner choose.** (×1)
+```

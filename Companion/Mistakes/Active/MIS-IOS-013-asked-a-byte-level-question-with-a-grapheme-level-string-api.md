@@ -152,3 +152,16 @@ line had accumulated recurrence detail that exists nowhere else in this file.
 ```text
 - **[MIS-IOS-013](Companion/Mistakes/Active/MIS-IOS-013-asked-a-byte-level-question-with-a-grapheme-level-string-api.md)** — asked what a filesystem / MIME parameter / wire field will parse, and answered with a `Character`-wise `String` API: `hasSuffix` `hasPrefix` `contains` `split(separator:)` `drop(while:)` `dropLast` are extended-**grapheme**-cluster-wise, so a `Prepend` or combining **scalar** chooses what a cluster is. 4 instances / 6 sites on the attachment-filename path, born as PAIRS; ASCII fixtures cannot see it. 🚨 **Instance 5 was in the ORACLE, not the product** — a CoreText harness assuming one glyph per UTF-16 unit called an in-order string REORDERED on an `fi` LIGATURE. **Compare over `unicodeScalars`, in ONE named function the classifier and its guard both call.** (×5)
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-06, pass 6)
+
+Routed out of the always-loaded `tabmail-ios/MISTAKES.md` by the `companion-compact` skill, which
+was reporting that file 55% over its 12,000 B budget. Kept **byte-for-byte**, inside a fenced
+block so its index-relative link is not re-resolved from this directory, because the index
+line had accumulated recurrence detail that exists nowhere else in this file.
+
+```text
+- **[MIS-IOS-013](Companion/Mistakes/Active/MIS-IOS-013-asked-a-byte-level-question-with-a-grapheme-level-string-api.md)** — asked a filesystem / MIME-parameter / wire-field question with **grapheme**-wise `String` APIs (`hasSuffix` `hasPrefix` `contains` `split(separator:)` `drop(while:)` `dropLast`) — a `Prepend` or combining **scalar** picks the cluster; 4 instances / 6 sites on the attachment-filename path, invisible to ASCII fixtures. 🚨 ×5 was in the **ORACLE**: a CoreText harness reordered by an `fi` LIGATURE. **Compare over `unicodeScalars`, in ONE named function.** (×5)
+```
