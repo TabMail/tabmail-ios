@@ -1114,6 +1114,92 @@ struct GlobalFifoExecutorTests {
         }
     }
 
+    @Test("A refused failure-tail commit stops before unrelated work and preserves claim ownership", arguments: [false, true])
+    @MainActor
+    func refusedFailureDeferralKeepsOwnership(refuseRequeue: Bool) async throws {
+        let f = try fixture(accountId: "fifo-refused-tail", provider: .gmail,
+                            folders: [Self.archive])
+        defer { finish(f) }
+        let first = try admit(f, PendingOperation(type: .move, messageIds: ["A"],
+            accountId: f.accountId, folderPath: Self.source, destinationPath: Self.archive))
+        let unrelated = try admit(f, PendingOperation(type: .move, messageIds: ["B"],
+            accountId: f.accountId, folderPath: Self.source, destinationPath: Self.archive))
+        let follower = try admit(f, PendingOperation(type: .move, messageIds: ["A"],
+            accountId: f.accountId, folderPath: Self.archive, destinationPath: Self.source))
+        try await f.pool.writeWithoutTransaction { db in
+            try db.execute(sql: """
+                CREATE TRIGGER refuse_failure_tail BEFORE UPDATE OF queuePosition ON pendingOperation
+                WHEN NEW.queuePosition != OLD.queuePosition
+                BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END
+                """)
+            if refuseRequeue {
+                try db.execute(sql: """
+                    CREATE TRIGGER refuse_failure_requeue BEFORE UPDATE OF status ON pendingOperation
+                    WHEN NEW.status = 'queued'
+                    BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END
+                    """)
+            }
+        }
+        let provider = MockEmailProvider()
+        await provider.setMoveThrowsOnId("A", error: EvidenceRefused())
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            await AccountManager.shared.drainPendingQueue()
+            let rows = try rowsByPosition(f)
+            #expect(rows.map(\.id) == [first.id, unrelated.id, follower.id])
+            #expect(rows.map(\.queuePosition) == [first.queuePosition, unrelated.queuePosition, follower.queuePosition])
+            #expect(rows.first?.status == (refuseRequeue ? PendingStatus.inFlight.rawValue : PendingStatus.queued.rawValue))
+            #expect(rows.first?.retryCount == (refuseRequeue ? 0 : 1))
+            #expect(rows.first?.everAttempted == true)
+            #expect(rows.dropFirst().allSatisfy { !$0.everAttempted && $0.retryCount == 0 })
+            #expect(await AccountManager.shared.pendingRequeues[first.id] == (refuseRequeue ? true : nil))
+            let beforeRecovery = await provider.callLog.filter { $0.hasPrefix("move(ids:") }
+            #expect(beforeRecovery == ["move(ids:[\"A\"],from:INBOX,to:Archive)"],
+                    "a failed tail write must stop before unrelated work: \(beforeRecovery)")
+
+            try await f.pool.writeWithoutTransaction { db in
+                try db.execute(sql: "DROP TRIGGER refuse_failure_tail")
+                if refuseRequeue { try db.execute(sql: "DROP TRIGGER refuse_failure_requeue") }
+            }
+            await provider.clearMoveThrowsOnId()
+            await AccountManager.shared.drainPendingQueue()
+            #expect(try rowsByPosition(f).isEmpty)
+            #expect(await AccountManager.shared.pendingRequeues.isEmpty)
+            let completed = await provider.movedIds
+            #expect(completed.map(\.ids) == [["A"], ["B"], ["A"]])
+        }
+    }
+
+    @Test("Only connection failures suppress unrelated jobs on the same account", arguments: [false, true])
+    @MainActor
+    func retryScopeControlsOnlyItsIntendedJobs(accountFailure: Bool) async throws {
+        let f = try fixture(accountId: "fifo-retry-scope", provider: .gmail,
+                            folders: [Self.archive])
+        defer { finish(f) }
+        let failed = try admit(f, PendingOperation(type: .move, messageIds: ["A"],
+            accountId: f.accountId, folderPath: Self.source, destinationPath: Self.archive))
+        let unrelated = try admit(f, PendingOperation(type: .move, messageIds: ["B"],
+            accountId: f.accountId, folderPath: Self.source, destinationPath: Self.archive))
+        let provider = MockEmailProvider()
+        if accountFailure { await provider.setMoveThrowsOnId("A", error: ProviderError.notConnected) }
+        else { await provider.setMoveThrowsOnId("A", error: EvidenceRefused()) }
+        try await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            await AccountManager.shared.drainPendingQueue()
+            let rows = try rowsByPosition(f)
+            #expect(rows.map(\.id) == (accountFailure ? [unrelated.id, failed.id] : [failed.id]))
+            #expect(rows.last?.retryCount == 1)
+            if accountFailure {
+                #expect(rows.first?.everAttempted == false)
+                #expect(rows.first?.retryCount == 0)
+                #expect(rows.first?.queuePosition == unrelated.queuePosition)
+            }
+            #expect(await provider.movedIds.map(\.ids) == (accountFailure ? [] : [["B"]]))
+            await provider.clearMoveThrowsOnId()
+            await AccountManager.shared.drainPendingQueue()
+            #expect(try rowsByPosition(f).isEmpty)
+            #expect(await provider.movedIds.map(\.ids) == [["B"], ["A"]])
+        }
+    }
+
     private actor DeliveryGate {
         private var isOpen = false
         private var waiters: [CheckedContinuation<Void, Never>] = []

@@ -1444,11 +1444,11 @@ struct NeverDropExitClosureTests {
             folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
         try insert([move], into: f.pool)
 
-        let context = AccountManager.DrainContext()
+        let context = AccountOperationExecutor.DrainContext()
         let outcome = await AccountManager.shared.executeSingleOp(
             move, provider: provider, context: context)
 
-        #expect(outcome == .proceed)
+        #expect(outcome == .completed)
         #expect(
             context.foldersToSync == ["\(f.accountId)|INBOX", "\(f.accountId)|Archive"],
             "a post-completion failure must reconcile both the source and destination")

@@ -347,7 +347,7 @@ struct OutlookQueueHandoffTests {
     /// ⚠️ CORRECTED — those two are NOT both red witnesses for the CLASSIFIER.
     /// `outlookSameIdInTwoFoldersSharesOneChain` INJECTS the set it is testing
     /// against (`accountScopedIdAccountIds: ["acc-outlook"]`) and never calls
-    /// `AccountManager.accountScopedIdAccountIds`, so it pins `buildRelatedChains`' pure
+    /// `AccountOperationExecutor.accountScopedIdAccountIds`, so it pins `buildRelatedChains`' pure
     /// grouping and stays green no matter which providers the classifier admits.
     /// Removing `.outlook` from the set is caught by `T1`, which drives a real
     /// drain through the classifier, and by

@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 
 /// What one dispatched operation PROVED, as reported by `executeOperation` to
 /// `executeSingleOp`.
@@ -81,8 +82,48 @@ struct ExecutedOperation: Sendable {
 /// Executes and settles one claimed action on AccountManager's existing isolation.
 /// The manager owns this object; calls borrow the manager without retaining it.
 final class AccountOperationExecutor {
-    typealias DrainContext = AccountManager.DrainContext
-    typealias SingleOpOutcome = AccountManager.SingleOpOutcome
+    /// Accessed only on AccountManager isolation, including work-queue callbacks.
+    class DrainContext: @unchecked Sendable {
+        var foldersToSync: Set<String> = []
+
+        /// One member a completed `.move` landed in a folder the account treats
+        /// as its INBOX, recorded by DURABLE IDENTITY rather than by address.
+        ///
+        /// `messageId` alone is NOT enough and using it alone would be a C3
+        /// hazard, not merely a miss: on IMAP a UID is mailbox-local, so
+        /// resolving a bare source UID against the destination folder can land
+        /// on an unrelated message that happens to share that number
+        /// (`DurableIdentityLookup`'s G3 rejection exists for exactly this).
+        /// The rfc822 identity is what survives BOTH re-key paths, so it is
+        /// captured beside the address and both are handed to
+        /// `DurableIdentityLookup.find` later.
+        struct InboxEntry: Hashable, Sendable {
+            let accountId: String
+            let messageId: String
+            let rfc822MessageId: String?
+        }
+
+        /// Members that ENTERED an inbox during this drain, keyed by the same
+        /// `"accountId|destinationPath"` string as `foldersToSync` so the
+        /// post-drain phase can enqueue them immediately after that folder's
+        /// sync — the moment both the durable row and its FTS entry are under
+        /// their final ids (ADR-IOS-008 decision 3; see `recordMembersThatEnteredInbox`).
+        ///
+        /// `Mutex`-protected even though current accesses inherit `AccountManager`
+        /// isolation. This value-level protection is deliberate future-proofing:
+        /// preserve the lock and protect consistency upward if a sibling ever moves
+        /// off-actor; never unprotect this field merely because the plain siblings
+        /// currently rely on the actor contract above (`IOS-QUEUE-010`).
+        let enteredInbox = Mutex<[String: [InboxEntry]]>([:])
+        // op.id values that have already produced a [QueueDiag] deep-dump this drain.
+        // Prevents log-spam on the same stuck op that retries every drain cycle.
+        var diagnosedOpIds: Set<String> = []
+    }
+
+    private var drainContext = DrainContext()
+
+    func beginDrain(using manager: isolated AccountManager) { drainContext = DrainContext() }
+    func prepareDrain(using manager: isolated AccountManager) { manager.pruneRecentlyCompleted() }
 
     /// A retirement whose LOCAL write could not commit, kept exactly as the
     /// provider handed it to us so the next drain can replay it.
@@ -132,16 +173,17 @@ final class AccountOperationExecutor {
     private var retainedSettlement: RetainedSettlement?
     var hasPendingSettlement: Bool { retainedSettlement != nil }
 
-    func attempt(operationId: String, context: DrainContext,
-                 using manager: isolated AccountManager) async -> SingleOpOutcome {
+    func attempt(operationId: String,
+                 using manager: isolated AccountManager) async -> QueueAttemptDisposition {
+        let context = drainContext
         do {
-            guard let op = try await manager.liveOperation(operationId) else { return .proceed }
+            guard let op = try await manager.liveOperation(operationId) else { return .completed }
             guard let queue = manager.workQueues[op.accountId] else {
                 await manager.requeueOrRetain(operationId)
-                return .stopDrain
+                return .blockedOnCommit
             }
             queueLog("[Queue] drain pos \(op.queuePosition) — executing \(op.id.prefix(8)) \(op.type.rawValue) \(op.folderPath)→\(op.destinationPath ?? "-") ids=[\(op.messageIds.joined(separator: ","))]")
-            let outcome: SingleOpOutcome = try await queue.execute(priority: .userAction) {
+            let outcome: QueueAttemptDisposition = try await queue.execute(priority: .userAction) {
                 await manager.executeSingleOp(op, provider: queue.provider, context: context)
             }
             queueLog("[Queue] drain pos \(op.queuePosition) — executed \(op.id.prefix(8)) \(op.type.rawValue) \(op.folderPath)→\(op.destinationPath ?? "-") ids=[\(op.messageIds.joined(separator: ","))] outcome=\(outcome)")
@@ -150,12 +192,13 @@ final class AccountOperationExecutor {
             // Includes cancellation/invalidation before work begins and failed live reads.
             // A claim always remains durably queued or explicitly owned for recovery.
             await manager.requeueOrRetain(operationId)
-            return .stopDrain
+            return .blockedOnCommit
         }
     }
 
-    func recoverPendingSettlement(context: DrainContext,
+    func recoverPendingSettlement(
                                   using manager: isolated AccountManager) async -> Bool {
+        let context = drainContext
         guard let settlement = retainedSettlement else { return true }
         let op: PendingOperation
         switch settlement {
@@ -223,7 +266,8 @@ final class AccountOperationExecutor {
         }
     }
 
-    func finishDrain(context: DrainContext, using manager: isolated AccountManager) async {
+    func finishDrain(using manager: isolated AccountManager) async {
+        let context = drainContext
         // Post-drain: sync destination folders so new UIDs are picked up immediately.
         if !context.foldersToSync.isEmpty {
             queueLog("[MoveTrace] post-drain sync — syncing \(context.foldersToSync.count) destination folders: \(context.foldersToSync)")
@@ -399,7 +443,7 @@ final class AccountOperationExecutor {
     nonisolated static func commitFullRetirement(
         _ op: PendingOperation, executed: ExecutedOperation, db: Database
     ) throws -> MoveFinishResult {
-        let accountScopedIds = try AccountManager
+        let accountScopedIds = try AccountOperationExecutor
             .accountScopedIdAccountIds(db).contains(op.accountId)
         let result = try MessageHeaderRekey.finishMove(
             op,
@@ -454,7 +498,7 @@ final class AccountOperationExecutor {
         addressChangesOnMove: Bool,
         db: Database
     ) throws -> MoveFinishResult {
-        let accountScopedIdAccounts = try AccountManager.accountScopedIdAccountIds(db)
+        let accountScopedIdAccounts = try AccountOperationExecutor.accountScopedIdAccountIds(db)
         let result = try MessageHeaderRekey.finishMove(
             frozenRetiredOp,
             destinations: provenDestinations,
@@ -472,67 +516,18 @@ final class AccountOperationExecutor {
             .filter(Column("status") != PendingStatus.cancelled.rawValue)
             .order(Column("queuePosition").asc)
             .fetchAll(db)
-        let chains = AccountManager.buildRelatedChains(live, accountScopedIdAccountIds: accountScopedIdAccounts)
+        let chains = QueueScheduling.relatedChains(live.map { schedulingMetadata($0, accountScopedIds: accountScopedIdAccounts) })
         let chain = chains.first { $0.contains { $0.id == frozenRetiredOp.id } } ?? []
         try PendingOperation.appendToTail(db, ids: chain.map(\.id))
         return result
     }
 
 
-    /// Execute a single claimed op against its provider. Updates shared DrainContext
-    /// with results (failedAccounts, foldersToSync, recentActions, the per-drain
-    /// deferred set). Returns the outcome (`.proceed` / `.deferred` / `.stopDrain`)
-    /// so the global executor knows whether to keep claiming. `internal` (not
-    /// `private`) so tests can call it directly against a `MockEmailProvider`.
-    ///
-    /// 🚨 EVERY ARM MUST MAKE THE QUEUE STRICTLY SMALLER OR DEFER A CHAIN. That is
-    /// the executor's termination argument, and this function is where it is
-    /// discharged: an arm either removes the row, narrows it by at least one
-    /// member, adds its whole related chain to `context.deferredOperationIds`, or
-    /// returns `.stopDrain`. An arm that returns `.proceed` without shrinking
-    /// anything would spin the executor forever — the strict-progress guard on the
-    /// narrowing path below exists for exactly that reason.
-    ///
-    /// 🚨 THE INVARIANT, STATED AS AN INVARIANT RATHER THAN AS A LIST OF ARMS:
-    /// **NO ARM MAY RETURN `.proceed` UNLESS THE CLAIMED ROW IS PROVABLY GONE,
-    /// PROVABLY NARROWED, OR PROVABLY OWNED BY `pendingRequeues` /
-    /// `retainedSettlement`.** The claim transaction has already committed
-    /// `inFlight` + `everAttempted`, and `claimFrontierOperation`'s
-    /// protected-frontier law STOPS the walk at an `inFlight` row — so a
-    /// `.proceed` on an iteration that changed nothing does not merely waste a
-    /// pass: it wedges the drain at that row for EVERY account for the life of
-    /// the process, every gesture is applied locally and acknowledged in the UI
-    /// and never reaches the wire, and at the next launch
-    /// `AppDatabase.recoverPreviousSessionResidue` deletes an `everAttempted`
-    /// `.move` outright. That is the wedge corollary, and it terminates in a
-    /// DROPPED INTENTION rather than a delay.
-    ///
-    /// The failure shape it rules out is `try? await retryWrite { … deleteOne }`
-    /// followed by `return .proceed`: `retryWrite` is three attempts 100 ms apart,
-    /// and GRDB write suspension on backgrounding (ADR-IOS-041), a data-protection
-    /// lock and `SQLITE_FULL` all make all three throw while reads keep working.
-    /// `try?` then discards the only evidence that nothing happened. Three arms
-    /// did exactly that until 2026-09-06 (the single-message conflict, the
-    /// permanently-invalid drop and the identity refusal); all three now use the
-    /// `uidValidityChanged` arm's shape — a real `do`/`catch`, `requeueOrRetain`
-    /// in the catch, `.stopDrain`. This is the same class the eight
-    /// `try? … markQueued` requeue sites were fixed for one commit earlier
-    /// (`288231f1b`); that census covered the REQUEUE writes and not the
-    /// RETIREMENT writes, which is why it has to be stated as an invariant here
-    /// rather than as a list of sites (`MIS-006`, `MIS-IOS-020`).
-    ///
-    /// CENSUS, STATED AS A FALSIFIABLE COUNT SO IT CAN BE CHECKED RATHER THAN
-    /// TRUSTED. Before this change `grep -n '\.proceed'` over this file returned
-    /// SEVEN sites: six `return .proceed` statements and the executor's
-    /// outcome-box default (`drainPendingQueue`). Three of the six were provably
-    /// resolved — whole-op success, `uidValidityChanged`, and
-    /// `retirePartiallyCompletedOp`'s tail, each reached only after its
-    /// retirement transaction COMMITTED. Three were the arms named above. The
-    /// seventh, the outcome-box default, was fail-dangerous for the same reason
-    /// (the closure can be skipped entirely) and is now `.stopDrain`. AFTER the
-    /// change the same grep returns SIX, and every one of them is in the
-    /// provably-resolved class. An eighth site, then or now, is a finding.
-    func executeSingleOp(_ currentOp: PendingOperation, provider: any EmailProvider, context: DrainContext, using manager: isolated AccountManager) async -> SingleOpOutcome {
+    /// Domain execution classifies evidence and commits full/partial settlement.
+    /// Completion requires durable removal; progress requires durable narrowing.
+    /// Retry returns an explicit generic scope and charge for the scheduler to
+    /// commit. Every blocked exit retains settlement or requeue ownership.
+    func executeSingleOp(_ currentOp: PendingOperation, provider: any EmailProvider, context: DrainContext, using manager: isolated AccountManager) async -> QueueAttemptDisposition {
         let opType = currentOp.type.rawValue
         let opMsgCount = currentOp.messageIds.count
 
@@ -552,7 +547,7 @@ final class AccountOperationExecutor {
             if let provenMembers, Set(provenMembers) != Set(currentOp.messageIds) {
                 let remaining = currentOp.messageIds.filter { !provenMembers.contains($0) }
                 // 🚨 THE STRICT-PROGRESS GUARD, AND IT IS THE EXECUTOR'S TERMINATION
-                // ARGUMENT FOR THIS ARM. A narrowing is reported as `.proceed`, which
+                // ARGUMENT FOR THIS ARM. A narrowing is reported as `.progressed`, which
                 // means the executor comes straight back for the next member — sound
                 // only while the membership actually SHRANK. A report that named no
                 // member (`provenMembers` empty against a non-empty request) leaves
@@ -574,10 +569,7 @@ final class AccountOperationExecutor {
                         context.diagnosedOpIds.insert(currentOp.id)
                         await manager.logStuckOpDiagnostic(currentOp, error: ProviderError.messageNotFound)
                     }
-                    guard await manager.deferRelatedChainToTail(
-                        failing: currentOp, incrementRetryCount: true, context: context)
-                    else { return .stopDrain }
-                    return .deferred
+                    return .retryLater(scope: .relatedChain, chargeRetry: true)
                 }
                 return await retirePartiallyCompletedOp(
                     currentOp, provenMembers: provenMembers, remaining: remaining,
@@ -706,14 +698,14 @@ final class AccountOperationExecutor {
                 BackgroundSyncLogger.logError(
                     "CRITICAL: failed to retire completed PendingOperation \(currentOp.id) (type \(opType)) after retries — the row stays inFlight, so it will NOT re-execute, and the provider's proven result is retained in memory and replayed at the next drain; a process death before that replay is the accepted crash window (TabMail/tabmail-ios#120): \(error)",
                     source: "actionQueue")
-                return .stopDrain
+                return .blockedOnCommit
             }
             await publishCommittedEffects(
                 currentOp, result: finishResult,
                 confirmedGoneMembers: executed.confirmedGoneMembers,
                 reconcileMoveSource: executed.reconcileMoveSource,
                 context: context, using: manager)
-            return .proceed
+            return .completed
         } catch {
             // T2.7 checkpoint B refusal is typed and precedes the generic
             // message-not-found arm. The epoch scopes the whole
@@ -725,19 +717,19 @@ final class AccountOperationExecutor {
                         _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                     }
                     manager.dropDeferredMoveSuccessors(for: currentOp.id)
-                    return .proceed
+                    return .completed
                 } catch {
                     // The provider wrote nothing. If retiring the refused op
                     // fails, preserve the exact original bundle for retry.
                     //
-                    // ⚠️ `.stopDrain`, not a deferral. The failure is the DELETE,
+                    // ⚠️ `.blockedOnCommit`, not a deferral. The failure is the DELETE,
                     // i.e. a database-wide write refusal, and the deferral path
                     // is itself a write — it would fail in the same breath and
                     // leave the executor claiming the same protected frontier
                     // row forever. Stopping lets the next drain retry from a
                     // clean state.
                     await manager.requeueOrRetain(currentOp.id)
-                    return .stopDrain
+                    return .blockedOnCommit
                 }
             }
             if Self.isMessageNotFoundError(error) {
@@ -793,7 +785,7 @@ final class AccountOperationExecutor {
                 // The disposition is the retryable one, and it is deliberately NOT
                 // the generic transient arm at the bottom of this `catch`: a
                 // not-found says nothing about the CONNECTION, so the account must
-                // not enter `failedAccounts` and stop every other account's mail.
+                // not enter account suppression and stop every other account's mail.
                 // The op's whole related chain moves to the TAIL and is marked
                 // deferred, so it is attempted at most once per drain and every
                 // unrelated intention behind it executes in the same run.
@@ -804,10 +796,7 @@ final class AccountOperationExecutor {
                         context.diagnosedOpIds.insert(currentOp.id)
                         await manager.logStuckOpDiagnostic(currentOp, error: error)
                     }
-                    guard await manager.deferRelatedChainToTail(
-                        failing: currentOp, incrementRetryCount: true, context: context)
-                    else { return .stopDrain }
-                    return .deferred
+                    return .retryLater(scope: .relatedChain, chargeRetry: true)
                 }
                 // Single-message conflict — drop (server wins)
                 queueLog("[Queue] Conflict: \(opType) — message not found, dropping")
@@ -816,11 +805,11 @@ final class AccountOperationExecutor {
                         _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                     }
                 } catch {
-                    // ⚠️ `.stopDrain`, not `.proceed` — the SAME shape as the
+                    // ⚠️ `.blockedOnCommit`, not `.completed` — the SAME shape as the
                     // `uidValidityChanged` arm above, for the same reason. The
                     // DELETE is what failed, so the row is still `inFlight` with
                     // every member it had, this iteration changed NOTHING, and
-                    // `.proceed` would send the executor back to a frontier that
+                    // `.completed` would send the executor back to a frontier that
                     // `claimFrontierOperation`'s protected-frontier law refuses —
                     // `.stop` at that row on every later drain, for every account,
                     // for the life of the process. That is the wedge corollary:
@@ -834,7 +823,7 @@ final class AccountOperationExecutor {
                             + "could not commit: \(error); the row is returned to `queued` and "
                             + "this drain stops rather than reporting progress it did not make")
                     await manager.requeueOrRetain(currentOp.id)
-                    return .stopDrain
+                    return .blockedOnCommit
                 }
                 // 🚨 INSIDE THE SUCCESS BRANCH, DELIBERATELY. This discards the
                 // in-memory successor an undo already gestured (and releases its
@@ -854,7 +843,7 @@ final class AccountOperationExecutor {
                     let hid = MessageIdentity.headerId(accountId: currentOp.accountId, folderPath: currentOp.folderPath, messageId: msgId)
                     await manager.deleteConfirmedGoneHeader(headerId: hid, reason: "\(opType) 404")
                 }
-                return .proceed
+                return .completed
             }
             // Permanently invalid operation — drop immediately (will never succeed on retry).
             // E.g., Gmail "Invalid label: DRAFT" when a .move op tried to remove the DRAFT label.
@@ -865,7 +854,7 @@ final class AccountOperationExecutor {
                         _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                     }
                 } catch {
-                    // Same invariant as the conflict arm above: a `.proceed` here
+                    // Same invariant as the conflict arm above: a `.completed` here
                     // would claim the frontier is resolved while the row is still
                     // `inFlight` with all of its members, and the protected-frontier
                     // law would then stop every drain at it forever.
@@ -874,10 +863,10 @@ final class AccountOperationExecutor {
                             + "(\(opType)) could not commit: \(error); the row is returned to "
                             + "`queued` and this drain stops")
                     await manager.requeueOrRetain(currentOp.id)
-                    return .stopDrain
+                    return .blockedOnCommit
                 }
                 manager.dropDeferredMoveSuccessors(for: currentOp.id)
-                return .proceed
+                return .completed
             }
             // The provider REFUSED the id before touching the wire — it is not an
             // identity anything can verify (a bare numeric UID, or a value that does
@@ -1010,7 +999,7 @@ final class AccountOperationExecutor {
                     // The accepted limitation is a drop that COMMITTED. A DELETE
                     // that did not commit has dropped nothing and resolved
                     // nothing: the row is still `inFlight` with its whole payload,
-                    // so reporting `.proceed` would wedge the frontier for every
+                    // so reporting `.completed` would wedge the frontier for every
                     // account instead of discharging `IOS-QUEUE-003` item 4.
                     // Requeue and stop; the next drain re-reaches this arm and the
                     // logged terminal drop above is re-emitted when it commits.
@@ -1019,10 +1008,10 @@ final class AccountOperationExecutor {
                             + "could not commit: \(error); the row is returned to `queued` and "
                             + "this drain stops — the drop is retried at the next drain")
                     await manager.requeueOrRetain(currentOp.id)
-                    return .stopDrain
+                    return .blockedOnCommit
                 }
                 manager.dropDeferredMoveSuccessors(for: currentOp.id)
-                return .proceed
+                return .completed
             }
             // 🚨 EVIDENCE UNAVAILABLE — RETRYABLE, AND NOT AN ACCOUNT-LEVEL FACT.
             //
@@ -1031,7 +1020,7 @@ final class AccountOperationExecutor {
             // determined about this op, so it stays durably queued — and nothing was
             // determined about the ACCOUNT either, which is the half this arm exists
             // to say. Before it, these errors fell through to the generic arm below
-            // and inserted the account into `failedAccounts`, whose skip is
+            // and inserted the account into account suppression, whose skip is
             // account-wide. On a standards-valid non-UIDPLUS server (RFC 4315 §3
             // makes `COPYUID` a MAY) one unprovable op therefore stopped EVERY later
             // gesture on that account from executing — permanently, since `ctx` is
@@ -1071,15 +1060,12 @@ final class AccountOperationExecutor {
                     context.diagnosedOpIds.insert(currentOp.id)
                     await manager.logStuckOpDiagnostic(currentOp, error: error)
                 }
-                guard await manager.deferRelatedChainToTail(
-                    failing: currentOp, incrementRetryCount: true, context: context)
-                else { return .stopDrain }
-                return .deferred
+                return .retryLater(scope: .relatedChain, chargeRetry: true)
             }
             // Connection/transient error — reset op to queued and mark account failed.
             // NEVER drop on age alone — transient errors don't confirm the op is stale.
             // Staleness is confirmed only by messageNotFound (server says gone).
-            // failedAccounts prevents hammering within a single drain.
+            // Account suppression prevents hammering within a single drain.
             let ageHours = Date().timeIntervalSince(currentOp.createdAt) / 3600
             queueLog("[Queue] Failed \(opType): \(error) (age \(String(format: "%.1f", ageHours))h) — will retry")
             // Deep diagnostic on the failing op — fires once per (drain, opId) so a
@@ -1118,20 +1104,13 @@ final class AccountOperationExecutor {
             // `retryCount=0 ageHours=217` on the same op.
             //
             // 🚨 THE CHAIN MOVES TO THE TAIL EVEN THOUGH THE ACCOUNT IS ALREADY
-            // MARKED FAILED, and the redundancy is deliberate. `failedAccounts`
+            // MARKED FAILED, and the redundancy is deliberate. account suppression
             // is per-drain and this row's position is DURABLE, so without the
             // move a connection blip would leave a whole gesture parked at the
             // head of the queue and the NEXT drain would open by re-attempting
             // it before any newer intention. The deferred set additionally stops
             // this drain re-claiming it after the account recovers.
-            guard await manager.deferRelatedChainToTail(
-                failing: currentOp, incrementRetryCount: true, context: context)
-            else {
-                context.failedAccounts.insert(currentOp.accountId)
-                return .stopDrain
-            }
-            context.failedAccounts.insert(currentOp.accountId)
-            return .deferred
+            return .retryLater(scope: .account, chargeRetry: true)
         }
     }
 
@@ -1213,7 +1192,7 @@ final class AccountOperationExecutor {
     /// traffic, not as a contingency.
     ///
     /// 🚨 THE THROUGHPUT PROPERTY LIVES HERE, AND IT IS WHY THIS ARM RETURNS
-    /// `.proceed` RATHER THAN `.deferred`. Under the lane drain this arm halted
+    /// `.progressed` RATHER THAN a retry deferral. Under the lane drain this arm halted
     /// its lane and relied on the outer loop's next pass to re-claim the narrowed
     /// row, so at most THREE members of one operation settled per drain and a
     /// ten-message gesture needed four drains — waiting on a gesture, a
@@ -1256,7 +1235,7 @@ final class AccountOperationExecutor {
         confirmedGoneMembers: [String] = [],
         context: DrainContext,
         using manager: isolated AccountManager
-    ) async -> SingleOpOutcome {
+    ) async -> QueueAttemptDisposition {
         queueLog("[Queue] Partial \(currentOp.type.rawValue): provider proved \(provenMembers.count) of \(currentOp.messageIds.count) member(s) — retiring those and keeping \(remaining.count) queued")
         // Same TOCTOU ordering as the whole-op success path: the sync-protection
         // entry for a retired member is recorded BEFORE its id leaves the row.
@@ -1338,16 +1317,16 @@ final class AccountOperationExecutor {
                let dest = currentOp.destinationPath {
                 context.foldersToSync.insert("\(currentOp.accountId)|\(dest)")
             }
-            // 🚨 `.stopDrain`, matching the whole-op retention arm. The row is
+            // 🚨 `.blockedOnCommit`, matching the whole-op retention arm. The row is
             // left `inFlight` holding a proof only this process can commit, and
             // the write that failed is database-wide, so the next operation's
             // retirement would fail the same way — after its own wire call had
             // already mutated the server. The next drain opens with
             // `recoverPendingSettlement`, which is the recovery this stop
             // sequences.
-            return .stopDrain
+            return .blockedOnCommit
         }
-        return .proceed
+        return .progressed
     }
 
 
@@ -1509,7 +1488,7 @@ extension AccountManager {
     func executeOperation(_ op: PendingOperation, provider: any EmailProvider) async throws -> ExecutedOperation {
         try await operationExecutor.executeOperation(op, provider: provider, using: self)
     }
-    func executeSingleOp(_ op: PendingOperation, provider: any EmailProvider, context: DrainContext) async -> SingleOpOutcome {
+    func executeSingleOp(_ op: PendingOperation, provider: any EmailProvider, context: AccountOperationExecutor.DrainContext) async -> QueueAttemptDisposition {
         await operationExecutor.executeSingleOp(op, provider: provider, context: context, using: self)
     }
     #if DEBUG
@@ -1520,7 +1499,7 @@ extension AccountManager {
     @discardableResult
     func retirePartiallyCompletedOp(_ op: PendingOperation, provenMembers: [String], remaining: [String],
         provenDestinations: [ProvenDestinationAddress], addressChangesOnMove: Bool,
-        confirmedGoneMembers: [String] = [], context: DrainContext) async -> SingleOpOutcome {
+        confirmedGoneMembers: [String] = [], context: AccountOperationExecutor.DrainContext) async -> QueueAttemptDisposition {
         await operationExecutor.retirePartiallyCompletedOp(op, provenMembers: provenMembers,
             remaining: remaining, provenDestinations: provenDestinations,
             addressChangesOnMove: addressChangesOnMove, confirmedGoneMembers: confirmedGoneMembers,

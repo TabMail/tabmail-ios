@@ -8,6 +8,33 @@ its "no schema, migration or drain-ordering change" consequence — **this recor
 that consequence routed to the owner.** Supersedes no ADR; nothing about identity, addressing or
 the four exits of `never-drop-user-intention.md` changes here.
 
+**Current execution boundary (2026-09-06).** `AccountManagerQueue` schedules `QueueJob`
+metadata: id, account, durable position, lifecycle status, and opaque equality keys. The
+`AccountOperationExecutor.SchedulingPolicy` projects those keys and evaluates domain eligibility
+synchronously inside the same write snapshot that claims the frontier. Eligibility stays lazy:
+an unresolved `inFlight` frontier stops the walk before any later job is considered. The generic
+`QueueScheduling.relatedChains` retains transitive equality and input order without interpreting
+provider addresses.
+
+The executor reads the claimed id and returns `completed`, `progressed`,
+`retryLater(scope:chargeRetry:)`, or `blockedOnCommit`. Only the retry disposition requests a
+scheduler tail write and per-drain deferral; account scope additionally suppresses that account.
+A failed tail write requeues or retains explicit ownership and stops the drain. Partial settlement
+atomically narrows and readdresses the live rows before projecting their new dependencies and
+moving the remainder's component to the tail; it returns `progressed` without retry charge or
+per-drain deferral. The executor owns the drain's domain state and finalization, its single optional
+retained settlement, and committed effects on `AccountManager` isolation. Recovery precedes the
+connectivity check. `ProviderWorkQueue` returns the throwing work value directly.
+
+The historical `.proceed`/`.stopDrain`, outcome-box, `pendingRetirements`, and semantic
+`buildRelatedChains` descriptions below record the preceding implementation. Their current
+ownership law is stricter: `completed` proves removal, `progressed` proves committed narrowing,
+`retryLater` hands lifecycle scheduling to the caller, and `blockedOnCommit` stops with explicit
+retained settlement or requeue ownership. Native fences include
+`GlobalFifoExecutorTests.refusedFailureDeferralKeepsOwnership(refuseRequeue:)` and
+`retryScopeControlsOnlyItsIntendedJobs(accountFailure:)`, alongside the existing real-drain FIFO,
+transitive dependency, epoch-frontier, partial-progress, and retained-settlement tests.
+
 **Context.** The v2→v3 port carried v2final's queue SEMANTICS forward and lost its SCHEDULER. v3
 claimed every queued row up front, partitioned the claim into connected-component lanes and
 dispatched those lanes CONCURRENTLY under a three-pass outer loop. Three properties fell out of that

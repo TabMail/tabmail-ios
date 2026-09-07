@@ -370,7 +370,7 @@ struct UndoProviderIdentitySafetyTests {
                 destinationProviderId: "901",
                 destinationUidValidity: 52)],
             addressChangesOnMove: true,
-            context: AccountManager.DrainContext())
+            context: AccountOperationExecutor.DrainContext())
         await AccountManager.shared.awaitWriteQueueDrain()
 
         let ops = try await fixture.pool.read { db in

@@ -80,7 +80,7 @@ struct AccountManagerQueueDrainTests {
     ///
     /// `provider` defaults to `.gmail` — every pre-existing caller. A3.1 adds a
     /// second account-scoped-id shape (the demo account, whose row is stored
-    /// `.imap` but admitted into `AccountManager.accountScopedIdAccountIds` BY ID), so a
+    /// `.imap` but admitted into `AccountOperationExecutor.accountScopedIdAccountIds` BY ID), so a
     /// caller that needs to pin that classification passes it explicitly instead
     /// of this file growing a near-duplicate helper.
     private func insertStableProviderFixture(
@@ -140,10 +140,10 @@ struct AccountManagerQueueDrainTests {
 
         let queuedDrain = Task {
             await queue.execute(priority: .userAction) {
-                _ = await AccountManager.shared.executeSingleOp(
+                _ = await executeAndSchedule(
                     claimedSnapshot,
                     provider: provider,
-                    context: AccountManager.DrainContext()
+                    context: AccountOperationExecutor.DrainContext()
                 )
             }
         }
@@ -180,9 +180,9 @@ struct AccountManagerQueueDrainTests {
         let op = PendingOperation(type: .setTag, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX", tagValue: "archive")
         try insertOp(op, pool: pool)
 
-        let outcome = await AccountManager.shared.executeSingleOp(op, provider: provider, context: AccountManager.DrainContext())
+        let outcome = await executeAndSchedule(op, provider: provider, context: AccountOperationExecutor.DrainContext())
 
-        #expect(outcome == .proceed)
+        #expect(outcome == .completed)
         let after = try fetchOp(op.id, pool: pool)
         #expect(after == nil)
         let callLog = await provider.callLog
@@ -230,37 +230,17 @@ struct AccountManagerQueueDrainTests {
         op.createdAt = parentCreatedAt
         try insertOp(op, pool: pool)
 
-        let context = AccountManager.DrainContext()
-        let outcome = await AccountManager.shared.executeSingleOp(op, provider: provider, context: context)
+        let context = AccountOperationExecutor.DrainContext()
+        let outcome = await executeAndSchedule(op, provider: provider, context: context)
 
         // `.deferred`: the operation is still owed, so it and its whole related
         // chain move to the tail and are held for the rest of this drain. Every
         // later op that names one of its messages moves WITH it, so none of them
         // can run ahead of it; unrelated mail proceeds.
-        #expect(outcome == .deferred)
+        #expect(outcome == .retryLater(scope: .relatedChain, chargeRetry: true))
 
-        // 🚨 A NOT-FOUND SAYS NOTHING ABOUT THE CONNECTION, and this is the only
-        // place that fact is decidable. `failedAccounts` stops every OTHER lane on
-        // the account for the rest of the drain, so routing this refusal through
-        // the generic transient arm would isolate an account because one batch
-        // could not be attributed. A real-drain fixture cannot see it: unrelated
-        // work on the same account is claimed either before this op (already
-        // executed) or after it (executed BECAUSE the account was not marked
-        // failed), and an op behind this one in the same chain is held by the
-        // deferral regardless — so the flag's absence never changes an observable
-        // outcome from outside. Asserting it on the context this call owns is
-        // what makes it unmaskable.
-        #expect(context.failedAccounts.isEmpty, """
-            an unattributable batch not-found marked the whole account failed: \
-            \(context.failedAccounts). Every other lane on it then stops for the \
-            rest of the drain, on evidence that named no message and no connection.
-            """)
-        #expect(context.deferredOperationIds.contains(op.id), """
-            nothing advanced, so the op must be held for the rest of this drain — \
-            the deferred set is what stops the executor re-claiming it after it \
-            reaches the tail, and an unresolved refusal that skipped it would let \
-            this same op be re-sent inside one drain.
-            """)
+        // The related-chain disposition preserves account availability; the real
+        // drain's wire-order tests independently prove the scheduler applies it.
 
         let survivors = try await pool.read { db in
             try PendingOperation.filter(Column("accountId") == "acc1").fetchAll(db)
@@ -683,12 +663,10 @@ struct AccountManagerQueueDrainTests {
         let op = PendingOperation(type: .move, messageIds: ["A", "B", "C"], accountId: "acc-gap2", folderPath: "INBOX", destinationPath: "Archive")
         try insertOp(op, pool: pool)
 
-        let context = AccountManager.DrainContext()
-        let outcome = await AccountManager.shared.executeSingleOp(op, provider: provider, context: context)
+        let context = AccountOperationExecutor.DrainContext()
+        let outcome = await executeAndSchedule(op, provider: provider, context: context)
 
-        #expect(outcome == .deferred)
-        #expect(context.failedAccounts.contains("acc-gap2"))
-        #expect(context.deferredOperationIds.contains(op.id))
+        #expect(outcome == .retryLater(scope: .account, chargeRetry: true))
 
         let after = try fetchOp(op.id, pool: pool)
         #expect(after != nil, "the whole op must be reset to queued — a generic transient error is not confirmed staleness, so it must NOT split")
@@ -714,8 +692,8 @@ struct AccountManagerQueueDrainTests {
         let reclaimed = mutableReclaimed
         try await pool.writeWithoutTransaction { db in try reclaimed.update(db) }
 
-        let secondOutcome = await AccountManager.shared.executeSingleOp(reclaimed, provider: provider, context: AccountManager.DrainContext())
-        #expect(secondOutcome == .proceed)
+        let secondOutcome = await executeAndSchedule(reclaimed, provider: provider, context: AccountOperationExecutor.DrainContext())
+        #expect(secondOutcome == .completed)
 
         let final = try fetchOp(op.id, pool: pool)
         #expect(final == nil, "op deleted — completed on retry")
@@ -825,7 +803,7 @@ struct AccountManagerQueueDrainTests {
     /// parallel pair must be seen as parallel, so a regression cannot pass by
     /// timing luck, and a serialized pair cannot fail by it either.
     ///
-    /// A3.1: parameterized over EVERY way `AccountManager.accountScopedIdAccountIds`
+    /// A3.1: parameterized over EVERY way `AccountOperationExecutor.accountScopedIdAccountIds`
     /// admits an account into the account-qualified lane space. It admits an id
     /// two ways — by PROVIDER (`provider == .gmail`) and by ID
     /// (`DemoSeed.demoAccountId`, whose row is nonetheless stored `.imap`). A
@@ -896,7 +874,7 @@ struct AccountManagerQueueDrainTests {
     /// classifier reads the RAW `provider` column rather than decoding
     /// `AccountProvider`, so one corrupt bystander row cannot throw the whole
     /// snapshot (`DecodingError.dataCorrupted`) and wedge every account's drain.
-    @Test("AccountManager.accountScopedIdAccountIds admits Gmail, Outlook and the demo account and NOTHING else — not IMAP, not iCloud, not an undecodable provider string")
+    @Test("AccountOperationExecutor.accountScopedIdAccountIds admits Gmail, Outlook and the demo account and NOTHING else — not IMAP, not iCloud, not an undecodable provider string")
     func accountScopedIdAccountIdsAdmitsExactlyGmailOutlookAndTheDemoAccount() async throws {
         let (pool, dir, previous) = try makeTestDB()
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
@@ -946,7 +924,7 @@ struct AccountManagerQueueDrainTests {
                 "fixture is not exercising the corrupt-row path — Account.fetchAll decoded cleanly")
 
         let classified = try await pool.read { db in
-            try AccountManager.accountScopedIdAccountIds(db)
+            try AccountOperationExecutor.accountScopedIdAccountIds(db)
         }
 
         #expect(classified == [gmailId, outlookId, DemoSeed.demoAccountId], """
@@ -1084,10 +1062,10 @@ struct AccountManagerQueueDrainTests {
     /// hard-enabled would satisfy the first half and look correct.
     ///
     /// A third phase, between the two, arms a RETRYABLE provider fault so the
-    /// operation is DEFERRED: `outcome=deferred` is the instrument's only positive
+    /// operation is DEFERRED: `outcome=retryLater(scope: TabMail.QueueAttemptDisposition.RetryScope.account, chargeRetry: true)` is the instrument's only positive
     /// statement that an operation yielded, and an all-succeed phase can never
     /// observe it — replacing that interpolation with the literal
-    /// `outcome=proceed` left every test in the tree green while the exported log
+    /// `outcome=completed` left every test in the tree green while the exported log
     /// would describe a deferred operation as one that kept draining. A debug
     /// instrument may miss a line, but it must not lie.
     ///
@@ -1167,18 +1145,18 @@ struct AccountManagerQueueDrainTests {
             let redelete = unlockedPair.redelete
             let expected = [
                 "[Queue] drain pos 1 — executing \(inverse) move TRASH→INBOX ids=[m1]",
-                "[Queue] drain pos 1 — executed \(inverse) move TRASH→INBOX ids=[m1] outcome=proceed",
+                "[Queue] drain pos 1 — executed \(inverse) move TRASH→INBOX ids=[m1] outcome=completed",
                 "[Queue] drain pos 2 — executing \(redelete) move INBOX→TRASH ids=[m1]",
-                "[Queue] drain pos 2 — executed \(redelete) move INBOX→TRASH ids=[m1] outcome=proceed",
+                "[Queue] drain pos 2 — executed \(redelete) move INBOX→TRASH ids=[m1] outcome=completed",
             ]
             let observed = Self.laneOrderEntries(in: queueLog)
             #expect(observed == expected,
                     "the exported log does not reconstruct the drain.\nexpected:\n\(expected.joined(separator: "\n"))\nobserved:\n\(observed.joined(separator: "\n"))")
 
             // ---- Gate OPEN, ARMED FAULT: an operation that DEFERS ---------
-            // The m1 phase above can only ever observe `outcome=proceed`, so it
+            // The m1 phase above can only ever observe `outcome=completed`, so it
             // does not constrain the field at all: replacing the interpolation
-            // with the literal `outcome=proceed` keeps every test in this tree
+            // with the literal `outcome=completed` keeps every test in this tree
             // green while the exported log reports a DEFERRED operation as one
             // that kept draining. `outcome=` is the instrument's only positive
             // statement that an operation yielded — the thing `IOS-QUEUE-008`
@@ -1208,7 +1186,7 @@ struct AccountManagerQueueDrainTests {
             // describing a wire event that did not happen.
             let armedExpected = [
                 "[Queue] drain pos 1 — executing \(armedInverse) move TRASH→INBOX ids=[m3]",
-                "[Queue] drain pos 1 — executed \(armedInverse) move TRASH→INBOX ids=[m3] outcome=deferred",
+                "[Queue] drain pos 1 — executed \(armedInverse) move TRASH→INBOX ids=[m3] outcome=retryLater(scope: TabMail.QueueAttemptDisposition.RetryScope.account, chargeRetry: true)",
             ]
             let armedObserved = Self.laneOrderEntries(in: AppLogStore.read(channel: .queue))
             #expect(armedObserved == armedExpected,
@@ -1265,9 +1243,9 @@ struct AccountManagerQueueDrainTests {
 
             let clearedExpected = [
                 "[Queue] drain pos \(haltedOp.queuePosition) — executing \(armedInverse) move TRASH→INBOX ids=[m3]",
-                "[Queue] drain pos \(haltedOp.queuePosition) — executed \(armedInverse) move TRASH→INBOX ids=[m3] outcome=proceed",
+                "[Queue] drain pos \(haltedOp.queuePosition) — executed \(armedInverse) move TRASH→INBOX ids=[m3] outcome=completed",
                 "[Queue] drain pos \(heldOp.queuePosition) — executing \(armedRedelete) move INBOX→TRASH ids=[m3]",
-                "[Queue] drain pos \(heldOp.queuePosition) — executed \(armedRedelete) move INBOX→TRASH ids=[m3] outcome=proceed",
+                "[Queue] drain pos \(heldOp.queuePosition) — executed \(armedRedelete) move INBOX→TRASH ids=[m3] outcome=completed",
             ]
             let clearedObserved = Self.laneOrderEntries(in: AppLogStore.read(channel: .queue))
             #expect(clearedObserved == clearedExpected,
@@ -1666,7 +1644,7 @@ struct AccountManagerQueueDrainTests {
     // (`case .networkError(400), .networkErrorWithBody(400, _): return true`),
     // `unclassifiedGmailActionBadRequestKeepsTheDurableOpQueued` fails at
     // `after != nil` — the row is nil, the intention destroyed — and its
-    // `outcome == .deferred` expectation fails with `.proceed`.
+    // `outcome == .retryLater(scope: .relatedChain, chargeRetry: true)` expectation fails with `.proceed`.
     //
     // NON-VACUITY is two-sided and DURABLE + WIRE on every one of the three:
     // each asserts both the row's end state and that its injected response was
@@ -1695,11 +1673,11 @@ struct AccountManagerQueueDrainTests {
         )
         try insertOp(op, pool: pool)
 
-        let outcome = await AccountManager.shared.executeSingleOp(
-            op, provider: server.provider(), context: AccountManager.DrainContext()
+        let outcome = await executeAndSchedule(
+            op, provider: server.provider(), context: AccountOperationExecutor.DrainContext()
         )
 
-        #expect(outcome == .deferred)
+        #expect(outcome == .retryLater(scope: .account, chargeRetry: true))
         let after = try fetchOp(op.id, pool: pool)
         #expect(
             after != nil,
@@ -1739,14 +1717,14 @@ struct AccountManagerQueueDrainTests {
         )
         try insertOp(op, pool: pool)
 
-        let outcome = await AccountManager.shared.executeSingleOp(
-            op, provider: server.provider(), context: AccountManager.DrainContext()
+        let outcome = await executeAndSchedule(
+            op, provider: server.provider(), context: AccountOperationExecutor.DrainContext()
         )
 
         // The NON-VACUITY partner of the unclassified test: if the fix had
         // narrowed the classifier to nothing, this row would survive too and
         // the pair would stop distinguishing anything.
-        #expect(outcome == .proceed)
+        #expect(outcome == .completed)
         let after = try fetchOp(op.id, pool: pool)
         #expect(
             after == nil,
@@ -1780,14 +1758,14 @@ struct AccountManagerQueueDrainTests {
         )
         try insertOp(op, pool: pool)
 
-        let outcome = await AccountManager.shared.executeSingleOp(
-            op, provider: server.provider(), context: AccountManager.DrainContext()
+        let outcome = await executeAndSchedule(
+            op, provider: server.provider(), context: AccountOperationExecutor.DrainContext()
         )
 
         // The CONTROL: if the terminal classification were over-broad — or if
         // "the row is gone" in the sibling test came from something other than
         // the 400 — this row would be gone too.
-        #expect(outcome == .deferred)
+        #expect(outcome == .retryLater(scope: .account, chargeRetry: true))
         let after = try fetchOp(op.id, pool: pool)
         #expect(after != nil, "a transient failure must never retire the user's intention")
         guard let after else { return }
@@ -1832,4 +1810,16 @@ private extension AccountManager {
         providers[accountId] = provider
         workQueues[accountId] = queue
     }
+}
+
+/// Direct execution fixtures also apply the real scheduler disposition, so their
+/// durability assertions continue to exercise the lifecycle writer that owns it.
+private func executeAndSchedule(_ op: PendingOperation, provider: any EmailProvider,
+    context: AccountOperationExecutor.DrainContext) async -> QueueAttemptDisposition {
+    let manager = AccountManager.shared
+    let disposition = await manager.executeSingleOp(op, provider: provider, context: context)
+    var state = AccountManager.QueueDrainState()
+    let metadata = AccountOperationExecutor.schedulingMetadata(op, accountScopedIds: [])
+    let advanced = await manager.applyQueueDisposition(disposition, job: metadata, state: &state)
+    return advanced ? disposition : .blockedOnCommit
 }
